@@ -50,17 +50,22 @@ class Cooldowns:
     def branches(self, steps: int | None, tokens: int | None, accumulation: int) -> tuple[Branch, ...]:
         """Each point resolved against a run of `steps` microsteps, or a budget of `tokens` alone,
         `accumulation` microsteps an update (`every_step`); a point of steps inside an update, whose
-        branch would begin with that update's window part filled, is refused."""
+        branch would begin with that update's window part filled, and one at or past the run's last
+        step are refused. A point on the committed-token clock that falls on the run's last step
+        branches none."""
         inside = [at for at in self.at if isinstance(at, int) and at % accumulation]
         if inside:
             raise ValueError(f"cooldowns at steps {inside} branch inside an update of {accumulation} steps")
         points = [every_step(at, steps, tokens, accumulation, name="cooldowns.at") for at in self.at]
+        ended = [point for point in points if isinstance(point, int) and steps is not None and point >= steps]
+        if ended:
+            raise ValueError(f"cooldowns at steps {ended} branch at or past the run's last step, {steps}, "
+                             "where there is no run to come back to; its own end decays it")
         return tuple(Branch(point, self) for point in points if point is not None)
 
     def factor(self, update: int, updates: int) -> float:
         """The share of the run's rate a branch of `updates` updates trains its `update`th at."""
-        done = update / updates
-        return 1.0 - done if self.shape == "linear" else 1.0 - math.sqrt(done)
+        return decay(self.shape, update, updates)
 
     def steps(self, current: int, accumulation: int) -> int:
         """The steps of a branch from step `current`: `length`, or its share of the steps so far, the
@@ -84,6 +89,11 @@ class Branch:
     at: int | Tokens
     cooldowns: Cooldowns
 
+    def pending(self, current: int, accumulation: int) -> Pending:
+        """The branch from step `current` as it runs, resolved: its steps and decay, which a run cut
+        short inside it keeps to run it again (`Checkpoints.control`), whatever its config then."""
+        return {"steps": self.cooldowns.steps(current, accumulation), "shape": self.cooldowns.shape}
+
     def due(self, step: int, real: int, before: int) -> bool:
         """Whether the step `step`, which brought the committed tokens from `before` to `real`, branches."""
         if isinstance(self.at, Tokens):
@@ -95,30 +105,33 @@ class Branch:
         return recorded(self.at)
 
 
-def scaled(rates: Mapping[str | None, Mapping[str, float]], factor: float
-           ) -> dict[str | None, dict[str, float]]:
-    """A config's rates (`OptimConfig.rates`), each group's every rate-valued field times `factor`:
-    the rates a branch trains at, which `dew.optim.with_rates` sets in the optimizer's state. A
-    schedule's values are proportional to its rate-valued fields (`ScheduleBase.values`), so its
-    every value is the run's times `factor`."""
-    return {group: {name: value * factor for name, value in held.items()} for group, held in rates.items()}
+type Pending = dict[str, int | str]
+"""A cooldown branch resolved at the step it leaves from: its `steps` and its decay's `shape`."""
 
 
-def check_branches(branches: tuple[Branch, ...], suites: Mapping[str, object], *, configured: bool,
+def decay(shape: str, update: int, updates: int) -> float:
+    """The share of a run's rate the `update`th of a branch's `updates` updates trains at: 1 - sqrt(u / U)
+    for `1-sqrt`, 1 - u / U for `linear`."""
+    done = update / updates
+    return 1.0 - done if shape == "linear" else 1.0 - math.sqrt(done)
+
+
+def check_branches(branches: tuple[Branch, ...], suites: Mapping[str, object], *, settable: bool,
                    rollout: bool, scheduled: bool) -> None:
     """Refuse cooldown branches a run could not score, decay or read as it reads on: one with no
-    validation suite to score them; an optimizer that is no `OptimConfig`, whose rates the branch could
-    not scale (`configured`); a rollout's (`rollout`), whose acquisition one reader at a time owns; and
-    a schedule's of stages that end on the committed-token clock (`scheduled`), whose stages the
-    branch's reads would not end."""
+    validation suite to score them; an optimizer whose state holds no learning rate a branch can scale
+    (`settable`, `dew.optim.settable_rates`); a rollout's (`rollout`), whose acquisition one reader at
+    a time owns; and a schedule's of stages that end on the committed-token clock (`scheduled`), whose
+    stages the branch's reads would not end."""
     if not branches:
         return
     if not suites:
         raise ValueError("a cooldown branch is scored by the run's validation suites, and this run "
                          "scores none: pass validation=, or eval_every= or metrics= over its val split")
-    if not configured:
-        raise ValueError("a cooldown scales the rates an OptimConfig's solvers hold; this trainer's "
-                         "optimizer is an optax transformation")
+    if not settable:
+        raise ValueError("a cooldown scales the learning rate the optimizer's state holds, as an "
+                         "OptimConfig's solvers and optax.inject_hyperparams of a constant hold it; this "
+                         "state holds none, or one Optax computes from a step count at each update")
     if rollout:
         raise ValueError("a cooldown branch reads a stream of its own, and a rollout's acquisition is "
                          "one reader's at a time: cooldowns of rollout runs are not built")

@@ -1280,30 +1280,27 @@ def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
-def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path, monkeypatch):
-    """A preemption that reaches a run inside a cooldown branch stops it at the step the branch left
-    from, its state as it stood there, unscored; the resume runs the branch again first, recording
+def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path):
+    """A preemption that reaches a run as it branches into a cooldown stops it at the step the branch
+    left from, its state as it stood there, unscored; the resume runs the branch again first, recording
     the score an uninterrupted run records, and trains on to the parameters a run with no cooldown
     reaches, bit for bit."""
     from dew.optim import Linear
     from dew.training.cooldown import Cooldowns
-    from dew.training.runtime import PreemptionNotice
 
     stable, cooldowns = Linear(2.0 ** -4, decay_start=64, decay_steps=128), Cooldowns(at=(4,), length=4)
     uninterrupted = RecordingTracker()
     cooldown_run(stable, 12, 1, uninterrupted, cooldowns)
     expected = {step: scalars["cooldown_val/loss"] for step, scalars in uninterrupted.scalars
                 if "cooldown_val/loss" in scalars}
-    asked = []
-    # Steps 1-3 ask once each; the branch from step 4 asks before each of its steps, and its second
-    # ask finds the notice.
-    monkeypatch.setattr(PreemptionNotice, "reached", lambda self: asked.append(1) or len(asked) == 5)
-    stopped = RecordingTracker()
+    optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
+    # The notice step 3's log sends reaches the run after step 4, as its branch begins.
+    stopped = Preempting(3)
     with pytest.raises(Preempted):
-        cooldown_run(stable, 12, 1, stopped, cooldowns, tmp_path)
+        make_trainer(tmp_path, tracker=stopped, optimizer=optimizer).fit(
+            dataset(val=val_batches(2)), steps=12, log_every=1, eval_every=12, cooldowns=cooldowns)
     assert not any("cooldown_val/loss" in scalars for _, scalars in stopped.scalars)
     assert Checkpoints(str(tmp_path / "run")).latest == 4
-    monkeypatch.setattr(PreemptionNotice, "reached", lambda self: False)
     resumed = RecordingTracker()
     state = cooldown_run(stable, 12, 1, resumed, cooldowns, tmp_path)
     assert {step: scalars["cooldown_val/loss"] for step, scalars in resumed.scalars
@@ -1330,17 +1327,42 @@ def test_a_cooldown_resolves_its_points_and_lengths_as_shares_of_the_run():
     assert [linear.factor(update, 4) for update in range(4)] == [1.0, 0.75, 0.5, 0.25]
 
 
-@pytest.mark.parametrize("refused", ["unscored", "unscaled", "inside"])
-def test_a_cooldown_a_run_could_not_score_decay_or_begin_on_an_update_is_refused(refused):
-    """A run with no validation to score its branches, an optimizer holding no learning rate a branch can
-    scale, and a point inside an update's window are refused before the run trains."""
+@pytest.mark.parametrize("refused", ["unscored", "unheld", "computed", "inside", "ended"])
+def test_a_cooldown_a_run_could_not_score_decay_or_come_back_from_is_refused(refused):
+    """A run with no validation to score its branches, an optimizer whose state holds no learning rate
+    (plain SGD) or one Optax computes from a step count at each update (an injected schedule function),
+    a point inside an update's window, and a point at the run's last step are each refused before the
+    run trains."""
     from dew.training.cooldown import Cooldowns
 
-    trainer = make_trainer(optimizer=optax.sgd(0.1) if refused == "unscaled" else OptimConfig(),
+    computed = optax.inject_hyperparams(optax.sgd)(learning_rate=optax.linear_schedule(0.1, 0.0, 8))
+    optimizers = {"unheld": optax.sgd(0.1), "computed": computed}
+    trainer = make_trainer(optimizer=optimizers.get(refused, OptimConfig()),
                            accumulation=2 if refused == "inside" else 1)
+    at = {"inside": 3, "ended": 8}.get(refused, 4)
     with pytest.raises(ValueError):
         trainer.fit(dataset(val=val_batches(2)), steps=8, eval_every=None if refused == "unscored" else 8,
-                    cooldowns=Cooldowns(at=(3 if refused == "inside" else 4,)))
+                    cooldowns=Cooldowns(at=(at,)))
+
+
+def test_a_cooldown_of_an_injected_constant_rate_is_the_run_that_decays_there():
+    """An optax optimizer injecting a constant rate (`optax.inject_hyperparams`) holds it in its state
+    as an OptimConfig does, and a linear cooldown from it is the run whose injected schedule decays
+    there, its score bit for bit."""
+    from dew.training.cooldown import Cooldowns
+
+    peak = 2.0 ** -4
+    decaying = optax.join_schedules([optax.constant_schedule(peak), optax.linear_schedule(peak, 0.0, 4)], [4])
+    tracker, decayed = RecordingTracker(), RecordingTracker()
+    for optimizer, steps, sink, cooldowns in (
+            (optax.inject_hyperparams(optax.sgd)(learning_rate=peak), 12, tracker,
+             Cooldowns(at=(4,), length=4, shape="linear")),
+            (optax.inject_hyperparams(optax.sgd)(learning_rate=decaying), 8, decayed, None)):
+        make_trainer(tracker=sink, optimizer=optimizer).fit(
+            dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps, cooldowns=cooldowns)
+    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
+              if "cooldown_val/loss" in scalars}
+    assert cooled == {4: [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars][-1]}
 
 
 def test_the_run_start_records_the_cadences_and_warmups_it_resolved(tmp_path):

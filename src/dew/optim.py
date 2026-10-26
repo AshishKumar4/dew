@@ -1060,8 +1060,67 @@ def with_rates(opt_state: optax.OptState, rates: Mapping[str | None, Mapping[str
     """`opt_state` with each `scheduled_solver`'s rate set to `rates`' for its param group, by name, or
     under None for a solver of no group (`rates_of`): a schedule's rate-valued fields in its
     `RateState`, or a constant in Optax's `learning_rate` hyperparameter. A solver an injected wrapper
-    of the run's own holds is reached through the wrapper's inner state. Each keeps the old value's
-    dtype and placement."""
+    of the run's own holds is reached through the wrapper's inner state (`_rated`). Each keeps the old
+    value's dtype and placement."""
+    def wanted(path: jax.tree_util.KeyPath, held: Mapping[str, jax.typing.ArrayLike]) -> Mapping[str, float]:
+        return rates[next((entry.key for entry in path
+                           if isinstance(entry, jax.tree_util.DictKey) and entry.key in rates), None)]
+
+    return _rated(opt_state, wanted)
+
+
+def held_rates(opt_state: optax.OptState) -> dict[jax.tree_util.KeyPath, dict[str, float]]:
+    """Each injected solver's learning rate as `opt_state` holds it, on the host, by the solver's path
+    (`_rated`): a schedule's rate-valued fields, or a constant under `CONSTANT`."""
+    held: dict[jax.tree_util.KeyPath, dict[str, float]] = {}
+
+    def read(path: jax.tree_util.KeyPath, rates: Mapping[str, jax.typing.ArrayLike]) -> None:
+        held[path] = {name: float(np.asarray(value)) for name, value in rates.items()}
+
+    _rated(opt_state, read)
+    return held
+
+
+def scaled_rates(opt_state: optax.OptState, held: Mapping[jax.tree_util.KeyPath, Mapping[str, float]],
+                 factor: float) -> optax.OptState:
+    """`opt_state` training at `factor` times the learning rate each injected solver held where `held`
+    was read (`held_rates`), of a state of the same optimizer: a schedule's values are proportional to
+    its rate-valued fields (`ScheduleBase.values`), so its every value is the held one's times
+    `factor`."""
+    return _rated(opt_state, lambda path, _: {name: value * factor for name, value in held[path].items()})
+
+
+def settable_rates(opt_state: optax.OptState) -> bool:
+    """Whether `opt_state` holds a learning rate and every one it holds is one `with_rates` sets: a
+    schedule's fields in its `RateState` or a constant, not a rate Optax computes from a step count
+    alone at each update (`optax.inject_hyperparams` of a schedule function)."""
+    found: list[bool] = []
+
+    injected = optax.InjectStatefulHyperparamsState
+
+    def walked(tree) -> None:
+        for node in jax.tree.leaves(tree, is_leaf=lambda node: isinstance(node, injected)):
+            if not isinstance(node, injected):
+                continue
+            walked(node.inner_state)
+            if 'learning_rate' in node.hyperparams:
+                schedule = node.hyperparams_states.get('learning_rate')
+                found.append(schedule is None or isinstance(schedule, RateState))
+
+    walked(opt_state)
+    return bool(found) and all(found)
+
+
+type Wanted = Callable[[jax.tree_util.KeyPath, Mapping[str, jax.typing.ArrayLike]],
+                       Mapping[str, float] | None]
+"""What a solver at a path should hold of the learning rate it holds (`_rated`), None for what it holds."""
+
+
+def _rated(opt_state: optax.OptState, wanted: Wanted) -> optax.OptState:
+    """`opt_state` with each injected solver's learning rate set to what `wanted` gives for the solver's
+    path and the rate it holds: a schedule's rate-valued fields in its `RateState`, or a constant's own
+    value under `CONSTANT`, None leaving it as it is. A solver an injected wrapper holds is reached
+    through the wrapper's inner state. Each keeps the old value's dtype and placement."""
     injected = optax.InjectStatefulHyperparamsState
 
     def put(value, like):
@@ -1076,14 +1135,17 @@ def with_rates(opt_state: optax.OptState, rates: Mapping[str | None, Mapping[str
                                                     (*full, jax.tree_util.GetAttrKey('inner_state'))))
             if 'learning_rate' not in node.hyperparams:
                 return node
-            group = next((entry.key for entry in full
-                          if isinstance(entry, jax.tree_util.DictKey) and entry.key in rates), None)
-            wanted, schedule = rates[group], node.hyperparams_states.get('learning_rate')
-            if isinstance(schedule, RateState):
-                fields = {name: put(wanted[name], held) for name, held in schedule.rates.items()}
+            schedule = node.hyperparams_states.get('learning_rate')
+            scheduled = isinstance(schedule, RateState)
+            held = schedule.rates if scheduled else {CONSTANT: node.hyperparams['learning_rate']}
+            given = wanted(full, held)
+            if given is None:
+                return node
+            if scheduled:
+                fields = {name: put(given[name], held) for name, held in schedule.rates.items()}
                 states = {**node.hyperparams_states, 'learning_rate': schedule._replace(rates=fields)}
                 return node._replace(hyperparams_states=states)
-            rate = put(wanted[CONSTANT], node.hyperparams['learning_rate'])
+            rate = put(given[CONSTANT], node.hyperparams['learning_rate'])
             return node._replace(hyperparams={**node.hyperparams, 'learning_rate': rate})
 
         return jax.tree_util.tree_map_with_path(replaced, tree,
