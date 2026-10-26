@@ -49,6 +49,7 @@ from dew.data.analysis import (
     _until,
     _volatile,
     _written,
+    reach,
 )
 from dew.data.dataset import (
     Closeable,
@@ -854,11 +855,14 @@ def _compile_phases(
 
     @functools.cache
     def opened(index: int, ends: tuple[int, ...]) -> Loader:
-        """Phase `index` as it reads where the phases before it ended at `ends`, in records."""
+        """Phase `index` as it reads where the phases before it ended at `ends`, in records: as staged,
+        unless a corpus it reads continues from theirs."""
         if not tokens or not index:
             return built[index][0]
-        return _compiled(staged_at(index, consumed_by([phase for phase, _ in staged[:index]], ends)), packed,
-                         host=host, resume=resume)
+        consumed = consumed_by([phase for phase, _ in staged[:index]], ends)
+        if not any(consumed.get(_name(chain), 0) for chain, _ in _leaves(source.pipelines[index])):
+            return built[index][0]
+        return _compiled(staged_at(index, consumed), packed, host=host, resume=resume)
 
     def training(partition: DataPartition) -> Iterator[Batch]:
         def global_reader(index: int, ends: tuple[int, ...]) -> GlobalReader:
@@ -870,8 +874,7 @@ def _compile_phases(
             return opened_reader
 
         phases = [(functools.partial(global_reader, index), end) for index, (_, end) in enumerate(built)]
-        ending = tuple(end for end in source.ends[:-1] if end is not None)
-        return PhasedStream(phases, loading.stop_seconds, tokens=ending if tokens else None)
+        return PhasedStream(phases, loading.stop_seconds, tokens=source.ends if tokens else None)
 
     # Only the last phase's order can end, so its batch decides what an epoch's short batch does.
     return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None,
@@ -1141,13 +1144,16 @@ def fitted[Entry](
 
 
 def _endless(chain: Pipeline) -> Pipeline:
-    """`chain` read endlessly: a repeat before its batch where it has none and its read can end. Each
-    phase of a phased read repeats on its own, so one that already does is read as it is, and a
-    mixture whose members all repeat endlessly never ends."""
+    """`chain` read endlessly: a repeat before its batch where it has none and its read can end. A
+    chain of phases repeats in each phase its read can end, at the place the chain's own repeat
+    takes in it, and none in a phase that already reads on (`_reads_on`), as Grain refuses to
+    repeat an order without end; a mixture whose members all read on is read as it is."""
     if any(isinstance(stage, Repeat) for stage in chain.stages) or _reads_on(chain):
         return chain
-    if isinstance(chain.source, Phases):
-        return with_children(chain, _endless)
+    source = chain.source
+    if isinstance(source, Phases) and any(_reads_on(child) for child in source.pipelines):
+        # Each phase reads its stages then the chain's, where the repeat goes after the phase's own.
+        return with_children(chain, lambda child: child if _reads_on(child) else child.repeat())
     batching = [index for index, stage in enumerate(chain.stages)
                 if isinstance(stage, (BatchStage, TokenBudget))]
     at = batching[0] if batching else len(chain.stages)
@@ -1155,12 +1161,11 @@ def _endless(chain: Pipeline) -> Pipeline:
 
 
 def _reads_on(chain: Pipeline) -> bool:
-    """Whether `chain` reads endlessly as written: it repeats without end, or mixes members that all
-    do."""
-    if any(isinstance(stage, Repeat) and stage.epochs is None for stage in chain.stages):
-        return True
+    """Whether `chain` reads without end as written (`analysis.reach`): its stages leave it endless, or
+    it mixes members that all read on."""
     source = chain.source
-    return isinstance(source, Mixture) and all(_reads_on(child) for child in source.pipelines)
+    unending = isinstance(source, Mixture) and all(_reads_on(child) for child in source.pipelines)
+    return reach(chain.stages, unending)[0]
 
 
 def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int | None = None,

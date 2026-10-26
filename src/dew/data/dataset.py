@@ -1291,7 +1291,7 @@ class PhasedStream:
     before the records the run already read in it, is refused.
 
     A run on the committed-token clock (`tokens`, the committed tokens each
-    phase but the last ends at, `dew.data.pipeline.schedule`) knows no phase's
+    phase ends at, the last's where the data ends or None, `dew.data.pipeline.schedule`) knows no phase's
     end in records ahead: the trainer ends the phase it stands in at the step
     whose commit reaches the phase's tokens (`ending`), and the saved position
     carries that end, as the end of a phase the run completed. Each phase opens
@@ -1304,11 +1304,11 @@ class PhasedStream:
     endless = True
 
     def __init__(self, phases: Sequence[tuple[Callable[[tuple[int, ...]], GlobalReader], int | None]],
-                 stop_seconds: float, *, tokens: Sequence[int] | None = None):
+                 stop_seconds: float, *, tokens: Sequence[int | None] | None = None):
         ends = [end for _, end in phases]
         if tokens is None:
             phase_ends(ends, "record")
-        elif any(end is not None for end in ends) or len(tokens) != len(ends) - 1:
+        elif any(end is not None for end in ends) or len(tokens) != len(ends):
             raise ValueError("a phase on the token clock ends where the run's commits reach its tokens, "
                              "so it has no end in records until the run reaches it")
         self._tokens = None if tokens is None else tuple(tokens)
@@ -1474,14 +1474,12 @@ class PhasedStream:
         return self.get_state()
 
     def identity(self) -> str:
-        if self._tokens is None:
-            return "; ".join(
-                [*(self._streams[index].identity() for index in sorted(self._streams)),
-                 f"phases ending at records {list(self._ends)}"]
-            )
-        # A phase opens where the run reaches it, so the pool agrees on the first (the trainer agrees
-        # each later one as it opens it) and on the tokens they all end at.
-        return f"{self._stream(0).identity()}; phases ending at committed tokens {list(self._tokens)}"
+        # A phase on the token clock opens where the run reaches it: the pool agrees on those open (the
+        # trainer agrees again as it opens a later one) and on where every phase ends.
+        ends = (f"records {list(self._ends)}" if self._tokens is None
+                else f"committed tokens {list(self._tokens)}")
+        return "; ".join([*(self._streams[index].identity() for index in sorted(self._streams)),
+                          f"phases ending at {ends}"])
 
     def close(self) -> None:
         if self._current is not None:
