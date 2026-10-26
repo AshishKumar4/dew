@@ -624,7 +624,9 @@ def test_group_norm_is_as_exact_as_torch_s_where_a_group_s_mean_dwarfs_its_sprea
                 np.asarray(jax.random.normal(keys[3], shape, jnp.float32)))
 
     def normalized(module):
-        return with_gradients(lambda x, scale, bias: module.apply({"params": {"scale": scale, "bias": bias}}, x))
+        def apply(x, scale, bias):
+            return module.apply({"params": {"scale": scale, "bias": bias}}, x)
+        return with_gradients(apply)
 
     def torch_s(x, scale, bias):
         return torch.nn.functional.group_norm(x.movedim(-1, 1), groups, scale, bias, eps=1e-6).movedim(1, -1)
