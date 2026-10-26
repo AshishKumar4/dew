@@ -173,6 +173,22 @@ def assert_published_checkpoint(measured, name: str) -> None:
             np.testing.assert_array_equal(row.dew_continuation, row.reference_continuation)
 
 
+def written_tensors(directory) -> dict[str, np.ndarray]:
+    """Every tensor a saved checkpoint holds, by its name in its file: its safetensors shards and a slot
+    readout's `readout_head.pt` where it writes one."""
+    from safetensors.numpy import load_file
+
+    held = {}
+    for shard in sorted(Path(directory).glob("*.safetensors")):
+        held.update(load_file(str(shard)))
+    if (Path(directory) / "readout_head.pt").is_file():
+        import torch
+
+        held.update({name: tensor.numpy() for name, tensor in
+                     torch.load(Path(directory) / "readout_head.pt", weights_only=True).items()})
+    return held
+
+
 def assert_same_stored_tensors(written: dict, original: dict) -> None:
     """`written` holds every tensor of `original` and no other, each with its
     dtype, shape and bytes; a scalar's bytes are read through a flat view."""

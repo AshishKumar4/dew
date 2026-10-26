@@ -29,6 +29,7 @@ import multiprocess_worker as worker
 import numpy as np
 import pytest
 from lane_environment import MESH_DEVICES
+from interop_support import assert_same_stored_tensors, written_tensors
 from process_support import (
     free_port,
     report_of,
@@ -132,6 +133,26 @@ def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_pat
     assert [report["step"] for report in reports] == [3, 3]
     assert [report["updates"] for report in reports] == [3, 3]
     assert [report["logged"] for report in reports] == [3, 0]
+
+
+@pytest.mark.distributed
+def test_a_decision_release_partitioned_over_a_pool_publishes_its_readout(tmp_path):
+    """A slot release placed over two processes, its readout partitioned across them, publishes every
+    tensor it saves: its readout gathered home to process 0 beside its backbone, written to
+    safetensors as `SafetensorsReload` writes them and exported as `NCCLPush` sends them, the tensors
+    the release saves and exports on one host."""
+    from test_slot_sources import slot_release
+
+    from dew.interop import Pretrained
+
+    source, _ = slot_release(tmp_path, "head")
+    reports = run_pool("decision_publish", tmp_path / "out", 2, release=source, run_dir=tmp_path / "served")
+    assert [report["partitioned"] for report in reports] == [True, True]
+    host = Pretrained.load(source, dtype="float32", attention_impl="xla", on_host=True)
+    host.save(tmp_path / "saved")
+    assert_same_stored_tensors(written_tensors(tmp_path / "served"), written_tensors(tmp_path / "saved"))
+    assert_same_stored_tensors(dumped_params(tmp_path / "out" / "process0.json"),
+                               {name: np.asarray(value) for name, value in host.export().items()})
 
 
 def document_corpus(directory: Path, documents: int, length) -> Corpus:
