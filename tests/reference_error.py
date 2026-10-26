@@ -294,10 +294,17 @@ def _compiled(fn, compile):
     return compile(fn)
 
 
+_HOST_WORK = (jax.errors.TracerArrayConversionError, jax.errors.ConcretizationTypeError,
+              jax.errors.TracerBoolConversionError, jax.errors.TracerIntegerConversionError)
+"""What tracing raises where a function does host work on its inputs (NumPy on them, Python control
+flow on their values): such a truth runs as given (`_Truth`)."""
+
+
 class _Truth:
     """A check's float64 truth as the gate runs it (`_truth_program`): its first call runs `fn` as it is
-    given and decides the rest, compiled where that call returned JAX values, as given where it
-    returned host values (a NumPy truth)."""
+    given and decides the rest, compiled where that call returned JAX values and `fn` traces on its
+    inputs, as given where it returned host values (a NumPy truth) or does host work on its inputs
+    (a widening or a conversion on the host, `_HOST_WORK` at its trace)."""
 
     def __init__(self, fn):
         self.fn, self.run = fn, None
@@ -306,8 +313,15 @@ class _Truth:
         if self.run is not None:
             return self.run(*inputs)
         first = self.fn(*inputs)
-        on_device = all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(first))
-        self.run = jax.jit(self.fn) if on_device else self.fn
+        self.run = self.fn
+        if all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(first)):
+            compiled = jax.jit(self.fn)
+            try:
+                compiled.trace(*inputs)
+            except _HOST_WORK:
+                pass
+            else:
+                self.run = compiled
         return first
 
 
