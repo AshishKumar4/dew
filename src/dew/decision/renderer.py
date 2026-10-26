@@ -16,12 +16,15 @@ from __future__ import annotations
 import bisect
 from collections.abc import Hashable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal
+from typing import Literal, Protocol
 
 from dew.data.text import Offsets
 
-if TYPE_CHECKING:
-    from dew.data.text import Tokenizer
+
+class Encoder(Protocol):
+    """What the renderer reads of a tokenizer: a text's ids (`dew.data.text.Tokenizer` is one)."""
+
+    def encode(self, text: str, *, add_special_tokens: bool = ...) -> Sequence[int]: ...
 
 type Unit = Literal["pieces", "whole"]
 """How a layout encodes its text: piece by piece, or each run of it whole."""
@@ -55,7 +58,7 @@ class Rendered:
     points: dict[Hashable, int]
 
 
-def render(chunks: Sequence[Chunk], encoder: Tokenizer, unit: Unit) -> Rendered:
+def render(chunks: Sequence[Chunk], encoder: Encoder, unit: Unit) -> Rendered:
     """`chunks` encoded by `unit`, each mark's tokens and each point's located in them. A `whole`
     encoding needs a vocabulary that keeps character offsets (TypeError), and a mark that covers no
     token, or under `pieces` a mark of part of a chunk or a point inside one, is refused (ValueError)."""
@@ -96,7 +99,7 @@ def render(chunks: Sequence[Chunk], encoder: Tokenizer, unit: Unit) -> Rendered:
     return Rendered(tuple(tokens), marks, points)
 
 
-def _whole(run: Sequence[Chunk], encoder: Tokenizer, offset: int, marks: dict[Hashable, tuple[int, int]],
+def _whole(run: Sequence[Chunk], encoder: Encoder, offset: int, marks: dict[Hashable, tuple[int, int]],
            points: dict[Hashable, int]) -> list[int]:
     """A run of text chunks encoded once, its marks' tokens and its points', after `offset` tokens,
     written to `marks` and `points`."""
