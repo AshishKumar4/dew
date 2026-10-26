@@ -24,7 +24,8 @@ from steady_state import steady_state
 import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
-from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.batch import merge
+from dew.config import MetricConfig, ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data import ByteTokenizer, presets
 from dew.data.dataset import Loader
@@ -34,7 +35,7 @@ from dew.data.sources.files import Files
 from dew.diffusion.presets import EDM, Flow
 from dew.inference import Images, RunProcessor, TextGeneration, TextToImage
 from dew.inputs import Field, TextCondition, unit_range
-from dew.objectives.base import merge
+from dew.registry import ModelConfig
 from dew.sampling import CFG, DPMSolverSDE, Euler, Heun
 from dew.telemetry.instrumentation import Compiles
 from dew.training import Checkpoints, LocalTracker, Trainer
@@ -319,6 +320,43 @@ def test_a_metric_a_run_names_without_a_validation_split_refuses_before_an_updat
     assert Checkpoints(str(tmp_path / "checkpoints"), keep=1).latest is None
 
 
+def test_an_lm_run_over_a_source_stops_at_its_end_of_sequence_ids(tmp_path):
+    """An LM objective over a loaded source takes the source's end-of-sequence ids into the policy it
+    trains, its task and its saved run, where its own sampling names none: each stops a greedy response
+    at the first id the source ends at, which the same objective over the bare model generates past."""
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective, Samples
+    from dew.sampling import Sampling
+
+    source = Pretrained.load(Path(__file__).resolve().parent / "fixtures/hf/qwen3-tiny", dtype="float32",
+                             attention_impl="xla")
+    greedy = Samples([1, 2, 3], 0, sampling=Sampling(temperature=0))
+    prompt = jnp.asarray([[1, 2, 3], [4, 5, 6]], jnp.int32)
+
+    def generated(objective):
+        state = Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(0)).initial_state()
+        return objective, state, objective.pipeline(state, ema=False)(prompt, 6, key=7).host()
+
+    _, _, free = generated(LMObjective(source.model, 8, variables=source.variables, ema_decay=None,
+                                       samples=greedy))
+    eos = int(free.tokens[0, 3 + 2])
+    ending = dataclasses.replace(source, generation_config={**source.generation_config, "eos_token_id": eos})
+    objective, state, stopped = generated(LMObjective(ending, 8, ema_decay=None, samples=greedy,
+                                                      processor=None))
+    responses = np.asarray(free.tokens[:, 3:])
+    hits = [np.flatnonzero(row == eos) for row in responses]
+    expected = [int(hit[0]) + 1 if hit.size else 6 for hit in hits]
+    np.testing.assert_array_equal(stopped.lengths, expected)
+    np.testing.assert_array_equal(stopped.terminated, [bool(hit.size) for hit in hits])
+    policy = objective.policy(state.variables, Sampling(temperature=0))(prompt, 6, key=7).host()
+    np.testing.assert_array_equal(policy.lengths, expected)
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    restored = TextGeneration.from_run(str(tmp_path / "run"))(prompt, 6, key=7).host()
+    np.testing.assert_array_equal(restored.lengths, expected)
+
+
 def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=None):
     """Two training steps of a tiny byte-level decoder, its checkpoints, whose
     record names the byte tokenizer it decodes through, and the `run.json` the
@@ -355,6 +393,41 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=N
         "max_new_tokens": 4, "sampling": dataclasses.asdict(objective.samples.sampling),
         "ema_decay": ema_decay, "data": {"seq_len": 8}}))
     return objective, state
+
+
+@pytest.mark.parametrize("family", ["qwen3_5", "mimo"])
+def test_an_earlier_projector_record_reloads_its_saved_image_model(tmp_path, family):
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import MiMoProjector, Qwen35Projector, SiglipVision
+    from dew.objectives.lm import LMObjective
+
+    projector = {"qwen3_5": Qwen35Projector, "mimo": MiMoProjector}[family](
+        hidden_size=4, spatial_merge_size=2, width=16, out_width=8, bias=family == "qwen3_5")
+    model = MultimodalTransformer(
+        CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=2,
+                          mlp_features=16, max_seq_len=16, attention_impl="reference"),
+        SiglipVision(hidden_size=4, intermediate_size=8, num_layers=1, num_heads=1,
+                      image_size=4, patch_size=2), projector, family, 30)
+    objective = LMObjective(model, 4, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.01), key=3).initial_state()
+    record = objective.inference_record()
+    projection = record["model"]["fields"]["projection"]
+    projection["fields"] = {"vision_width": 4, "merge_size": 2, "out_width": 8}
+    with Checkpoints(str(tmp_path), keep=2) as checkpoints:
+        checkpoints.save(0, state, artifact=record)
+        checkpoints.wait()
+        checkpoints.save(1, state, artifact=objective.inference_record())
+        checkpoints.wait()
+    restored = TextGeneration.from_run(str(tmp_path), step=0)
+    pixels = jnp.arange(48, dtype=jnp.float32).reshape(1, 1, 3, 4, 4) / 48
+    tokens = jnp.asarray([[1, 30, 4, 5]], jnp.int32)
+    conditioning = {"pixel_values": pixels, "image_lengths": jnp.asarray([[1]], jnp.int32)}
+    images = jnp.asarray([[-1, 0, -1, -1]], jnp.int32)
+    expected = model.apply(state.variables, tokens, conditioning=conditioning, image_indices=images)
+    actual = restored.model.apply(restored.variables, tokens, conditioning=conditioning,
+                                  image_indices=images)
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_every_route_generates_through_the_same_packed_projections(tmp_path):
@@ -545,7 +618,8 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
         dataclasses.replace(task, max_new_tokens=None)("the ", key=2)
 
 
-def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path):
+@pytest.mark.parametrize("earlier", [False, True])
+def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path, earlier):
     """A decoder fine-tuned from a checkpoint encodes text with the processor the
     checkpoint ships; its run records that processor's source, so the reloaded task
     encodes as the trained one does rather than loading as weights that take ids."""
@@ -561,9 +635,14 @@ def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path)
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0), checkpoints=checkpoints)
-    trainer.fit(Loader(train=lambda partition: Replaying(lambda position: batch), val=None, records=None,
-                       batch=8), steps=1, log_every=100, checkpoint_every=1)
+    state = trainer.fit(Loader(train=lambda partition: Replaying(lambda position: batch),
+                               val=None, records=None, batch=8),
+                        steps=1, log_every=100, checkpoint_every=1)
     checkpoints.wait()
+    if earlier:
+        record = {**objective.inference_record(), "processor": str(source)}
+        checkpoints.save(int(state.step) + 1, state, artifact=record)
+        checkpoints.wait()
 
     task = dew.pipeline(str(run))
     assert loaded.text_processor is not None and task.processor is not None
@@ -859,8 +938,8 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
 ):
     import jax.numpy as jnp
 
+    from dew.batch import FROZEN
     from dew.inference import TextGeneration
-    from dew.objectives.base import FROZEN
 
     objective, state = make_lm_run(tmp_path)
     baseline = dew.pipeline(str(tmp_path))

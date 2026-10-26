@@ -54,6 +54,34 @@ def test_a_versioned_s3_read_is_the_filesystems_own_request():
             Store(f"s3://{bucket}/absent", options).get_versioned()
 
 
+def test_a_conditional_s3_write_is_the_filesystems_own_request():
+    """An S3 store's conditional writes send what its filesystem's options add to every request, as its
+    reads do: a write under a customer-provided key (SSE-C) puts the object with that key, which a read
+    of it then needs; a write whose condition fails raises PreconditionFailed, the stored object as it
+    was."""
+    import base64
+    import hashlib
+
+    secret = os.urandom(32)
+    sealed = {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": base64.b64encode(secret).decode(),
+              "SSECustomerKeyMD5": base64.b64encode(hashlib.md5(secret).digest()).decode()}
+    with moto_bucket("sealed-put", s3_additional_kwargs=sealed) as (bucket, options):
+        fs = fsspec.filesystem("s3", **options)
+        sent = []
+        fs.s3.meta.events.register("before-parameter-build.s3.PutObject",
+                                   lambda params, **kwargs: sent.append(dict(params)))
+        store = Store(f"s3://{bucket}/value", options)
+        first = store.put_if_absent(b"first")
+        assert sent and all(sent[-1].get(name) == value for name, value in sealed.items())
+        with pytest.raises(PreconditionFailed):
+            store.put_if_absent(b"again")
+        second = store.put_if_match(b"second", first)
+        with pytest.raises(PreconditionFailed):
+            store.put_if_match(b"stale", first)
+        read = store.get_versioned()
+        assert (read.data, read.version) == (b"second", second)
+
+
 @pytest.mark.parametrize("publish", ["write", "put_if_absent"])
 def test_a_local_publication_has_a_plain_writes_mode_and_a_failed_one_leaves_nothing(tmp_path, monkeypatch,
                                                                                        publish):

@@ -20,9 +20,10 @@ import optax
 import pytest
 from diffusion_stubs import PROMPTS, batch_for
 from diffusion_support import images_of
+from interop_support import allocated_bytes
 from reference_error import assert_as_exact
 
-from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig, FlowRolloutConfig
 from dew.diffusion.presets import Flow, ResolutionShift
 from dew.diffusion.process import Process
@@ -34,7 +35,7 @@ from dew.objectives import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED_WEIGHTS, EndToEnd
 from dew.objectives.rl.flow import OLD_LOG_PROBS_KEY, REWARDS_KEY, FlowGRPOObjective
-from dew.registry import to_record
+from dew.registry import ModelConfig, to_record
 from dew.sampling import Euler
 from dew.training import Trainer
 
@@ -68,21 +69,10 @@ def test_a_shape_only_pipeline_load_retains_geometry_without_eager_native_copies
     expected = Pretrained.load(original, dtype="float32", attention_impl="xla", on_host=True)
     selected = tmp_path / "source"
     shutil.copytree(original, selected)
-    allocated = []
-    allocate = np.empty
-
-    def recording(*args, **kwargs):
-        array = allocate(*args, **kwargs)
-        allocated.append(array.nbytes)
-        return array
-
-    with monkeypatch.context() as patch:
-        patch.setattr(np, "empty", recording)
-        Pretrained.load(selected, dtype="float32", attention_impl="xla", on_host=True)
-        eager_bytes = sum(allocated)
-        allocated.clear()
-        loaded = Pretrained.load(selected, dtype="float32", attention_impl="xla", weights=False)
-        deferred_bytes = sum(allocated)
+    _, eager_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
+        selected, dtype="float32", attention_impl="xla", on_host=True))
+    loaded, deferred_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
+        selected, dtype="float32", attention_impl="xla", weights=False))
     assert eager_bytes > 0 and deferred_bytes < eager_bytes
     shapes = jax.tree.leaves(loaded.variables)
     assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in shapes)

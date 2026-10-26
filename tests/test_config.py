@@ -14,13 +14,14 @@ from flax import linen as nn
 
 import dew.config
 import dew.nn.backbones
-from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config import RunConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
-from dew.registry import Aliases, projectors, towers
-from dew.training import Checkpoints, Layout, MeshSpec
+from dew.optim import OptimConfig
+from dew.registry import Aliases, ModelConfig, projectors, towers
+from dew.training import Checkpoints, Layout, MeshSpec, Wandb
 
 
 @pytest.mark.parametrize("dataset", ["tfds", "arrayrecord_shards"])
@@ -328,7 +329,7 @@ def test_a_run_can_disable_final_checkpoint_saving(tmp_path):
 
 def test_publishing_requires_a_final_checkpoint_policy():
     with pytest.raises(ValueError):
-        TrainerConfig(publish=True, wandb=dew.config.Wandb(project="test"), checkpoint_final=False)
+        TrainerConfig(publish=True, wandb=Wandb(project="test"), checkpoint_final=False)
 
 
 def test_train_scores_every_named_validation_split(tmp_path):
@@ -465,7 +466,7 @@ def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
     import jax
 
     run = VisionRun()
-    tower, projector = run.vision["tower"].build(), run.vision["projector"].build()
+    tower, projector = run.vision["tower"].build(), run.vision["projector"]
     pixels = jnp.arange(12, dtype=jnp.float32).reshape(1, 3, 2, 2)
     tower_params = tower.init(jax.random.key(2), pixels)
     encoded = tower.apply(tower_params, pixels)
@@ -473,7 +474,7 @@ def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
     expected = projector.apply(projector_params, encoded)
     run.save(str(tmp_path))
     restored = VisionRun.load(str(tmp_path))
-    actual = projectors.from_record(restored.vision["projector"]).build().apply(
+    actual = projectors.from_record(restored.vision["projector"]).apply(
         projector_params, towers.from_record(restored.vision["tower"]).build().apply(
             tower_params, pixels))
     assert jnp.array_equal(actual, expected)

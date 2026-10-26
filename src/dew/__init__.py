@@ -69,6 +69,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.objectives.base import Aux, EMASpec, Step
     from dew.objectives.supervised import Supervised
     from dew.sampling import CFG, sample
+    from dew.state import TrainState
     from dew.telemetry.profile import Profiler
     from dew.training import (
         Best,
@@ -88,7 +89,6 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         Tracker,
         Trackers,
         Trainer,
-        TrainState,
         WandbTracker,
     )
 
@@ -97,7 +97,7 @@ __version__ = "0.1.0"
 _EXPORTS = {
     "Best": "dew.training", "Keep": "dew.training", "Plateau": "dew.training", "EvalSuite": "dew.training",
     "Observe": "dew.training", "Pause": "dew.training",
-    "Trainer": "dew.training", "TrainState": "dew.training", "Step": "dew.objectives.base",
+    "Trainer": "dew.training", "TrainState": "dew.state", "Step": "dew.objectives.base",
     "Aux": "dew.objectives.base", "EMASpec": "dew.objectives.base", "MeshSpec": "dew.training",
     "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
     "WandbTracker": "dew.training", "LocalTracker": "dew.training", "Trackers": "dew.training",

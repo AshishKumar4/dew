@@ -15,6 +15,7 @@ from decision_support import decision_rows
 from recording import RecordingTracker
 from reference_error import assert_as_exact
 
+from dew.batch import VALID_ROWS
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import (
@@ -29,12 +30,12 @@ from dew.decision import (
     StateFirstLayout,
 )
 from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
-from dew.decision.layout import OPTION_TILE, DecisionInputs, Labels, compacted
-from dew.decision.objective import _ALONG_THE_QUESTIONS, _READ_OUT
+from dew.decision.layout import OPTION_TILE, QUESTION_FIELDS, DecisionInputs, Labels, compacted
+from dew.decision.objective import TRAINING_FIELDS
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import VALID_ROWS, Step
+from dew.objectives.base import Step
 from dew.training.trainer import Trainer
 
 QWEN35 = Path(__file__).parent / "fixtures" / "hf" / "qwen35-tiny"
@@ -105,7 +106,7 @@ def windows(objective, rows: int) -> dict:
 
 def along(batch) -> tuple[str, ...]:
     """The batch's fields along its questions, its answer cues' where its options stand under labels."""
-    return tuple(name for name in (*_ALONG_THE_QUESTIONS, *_READ_OUT) if name in batch)
+    return tuple(field.name for field in (*QUESTION_FIELDS, *TRAINING_FIELDS) if field.name in batch)
 
 
 def owners(batch) -> np.ndarray:

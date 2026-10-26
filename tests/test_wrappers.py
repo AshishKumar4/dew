@@ -82,8 +82,8 @@ def test_an_explicit_causal_source_override_exports_through_the_native_decoder(t
 def test_a_wrapper_dtype_change_reaches_the_decoder_that_computes_its_logits():
     """Changing the multimodal model's run dtype changes its native text decoder too, while the
     fp32 master variables remain reusable by the original model."""
-    from dew.config import ModelConfig
     from dew.interop import Pretrained
+    from dew.registry import ModelConfig
 
     loaded = Pretrained.load(FIXTURES / "qwen35-tiny-mm", dtype="float32", attention_impl="reference")
     changed = ModelConfig.from_model(loaded.model).with_dtype("bfloat16").build()
@@ -184,7 +184,7 @@ def test_wrapper_tower_and_projector_match_the_reference():
         tower = towers.from_record(record["tower"]).build()
         assert np.max(np.abs(np.asarray(
             tower.apply(variables["tower"], pixels)) - tower_ref)) < tolerance
-        projector = projectors.from_record(record["projector"]).build()
+        projector = projectors.from_record(record["projector"])
         assert np.max(np.abs(np.asarray(
             projector.apply(variables["projector"], tower_ref))
             - projector_ref)) < tolerance
@@ -307,3 +307,27 @@ def test_a_text_only_load_keeps_what_the_wrapper_declares_for_its_language_model
     np.testing.assert_array_equal(first(ids), first(altered))
     assert np.any(first(ids, blocked) != first(altered, blocked))
     assert eos_ids(text.config, text.generation_config) == (3,)
+
+
+@pytest.mark.parametrize(("fixture", "dropped"), [
+    ("qwen35-native-tiny", "model.visual.patch_embed.proj.weight"),
+    ("qwen35-native-tiny", "model.visual.merger.linear_fc1.weight"),
+    ("qwen38-dense-tiny", "mtp.layers.0.mlp.down_proj.weight"),
+], ids=["tower", "projector", "prediction_depth"])
+def test_a_wrapper_missing_a_tensor_of_a_component_it_builds_is_refused(tmp_path, fixture, dropped):
+    """A wrapper checkpoint lacking one tensor of its tower, its projector, or a prediction depth it
+    holds the rest of is refused at load, rather than loading that component without it."""
+    import shutil
+
+    from safetensors.numpy import save_file
+
+    from dew.interop import Pretrained
+
+    target = tmp_path / fixture
+    shutil.copytree(FIXTURES / fixture, target)
+    tensors = load_file(target / "model.safetensors")
+    assert dropped in tensors
+    kept = {name: array for name, array in tensors.items() if name != dropped}
+    save_file(kept, target / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(ValueError):
+        Pretrained.load(target, dtype="float32", attention_impl="reference")

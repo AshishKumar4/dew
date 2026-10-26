@@ -17,16 +17,17 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 
+from dew._records import JSON, integers, json_value
+from dew.batch import Batch, Variables
 from dew.data.dataset import rows_of
 from dew.devices import gpu_free_bytes, xla_flag
+from dew.mesh import mesh_axes
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import Recomputing, TritonGemm
-from dew.nn.sharding import mesh_axes
-from dew.objectives.base import Batch, Objective, Variables
-from dew.records import JSON, integers, json_value
+from dew.objectives.base import Objective
+from dew.state import TrainState
 from dew.training.distributed import parameter_axes
-from dew.training.state import TrainState
 
 _log = logging.getLogger(__name__)
 
@@ -340,7 +341,7 @@ def fits_everywhere(headroom: int | None) -> bool:
     A process reads only its own devices' memory, so the pool takes the minimum;
     a process that reports none does not affect the result.
     """
-    from dew.coordination import from_every_process
+    from dew._coordination import from_every_process
 
     return min((value for value in from_every_process(headroom) if value is not None), default=0) >= 0
 

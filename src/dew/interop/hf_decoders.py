@@ -36,10 +36,11 @@ from typing import Protocol
 
 import numpy as np
 
-from dew import records
+from dew import _records
 from dew._model_types import QWEN35_TEXT_TYPES, QWEN35_TYPES
+from dew.batch import Variables
 from dew.files import write_atomically
-from dew.interop.config_records import NativeFields
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.decoder_parts import (
     NO_AUDIO,
@@ -69,7 +70,6 @@ from dew.nn.vision.gemma4 import translate_gemma4_projector_config, translate_ge
 from dew.nn.vision.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
 from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
 from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
-from dew.objectives.base import Variables
 from dew.registry import from_record, towers
 
 GENERATION_CONFIG_FILE = "generation_config.json"
@@ -77,7 +77,7 @@ GENERATION_CONFIG_FILE = "generation_config.json"
 
 def _kind_name(record: Mapping[str, object], section: str) -> str:
     """Return the alias a nested value record names its class by."""
-    return records.text(records.record(record[section], section)['class'], f"{section} class")
+    return _records.text(_records.record(record[section], section)['class'], f"{section} class")
 type AltUpFields = NativeFields[AltUp]
 type AttentionResidualsFields = NativeFields[AttentionResiduals]
 
@@ -106,7 +106,7 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     if model_type not in families():
         refuse(f"model_type {model_type!r}",
                 f"expected one of {', '.join(repr(name) for name in families())}")
-    return translated(hf_config, families()[records.text(model_type, 'model_type')])
+    return translated(hf_config, families()[_records.text(model_type, 'model_type')])
 
 
 def _wrapper_text(hf_config: Mapping[str, object], used: set, *,
@@ -144,7 +144,7 @@ def _wrapper_token_id(hf_config: Mapping[str, object], used: set, *names: str) -
     for name in names:
         if hf_config.get(name) is not None:
             used.add(name)
-            return records.integer(hf_config[name], name)
+            return _records.integer(hf_config[name], name)
     return refuse(names[0], f"the placeholder positions are marked by {list(names)}, none is set")
 
 
@@ -169,7 +169,7 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     tower = translate_siglip_vision_config(hf_config)
     used.add("mm_tokens_per_image")
     projector = translate_gemma_projector_config(
-        tower["fields"], records.integer(text.get("emb_features"), "emb_features"),
+        tower["fields"], _records.integer(text.get("emb_features"), "emb_features"),
         hf_config.get("mm_tokens_per_image"))
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     return _wrapper_fields("gemma3", used, text, tower, projector, image,
@@ -181,7 +181,7 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     text = _wrapper_text(hf_config, used)
     tower = translate_llama4_vision_config(hf_config)
     projector = translate_llama4_projector_config(
-        records.integer(text.get("emb_features"), "emb_features"))
+        _records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     vision = tower["fields"]
     grid = record_int(vision, "image_size") // record_int(vision, "patch_size")
@@ -206,7 +206,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
     used.update(("audio_config", "audio_token_id", "audio_soft_tokens_per_image"))
     if stated is None:
         return NO_AUDIO.copy()
-    audio = records.record(stated, "audio_config")
+    audio = _records.record(stated, "audio_config")
     encoder = audio_nn.audio_config(audio)
     slots = None
     projector: Mapping[str, object]
@@ -214,14 +214,15 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
         projector = translate_gemma4_projector_config(
             {"rms_norm_eps": encoder.rms_norm_eps}, text_width)
     else:
-        slots = records.integer(hf_config.get("audio_soft_tokens_per_image"), "audio_soft_tokens_per_image")
+        slots = _records.integer(hf_config.get("audio_soft_tokens_per_image"), "audio_soft_tokens_per_image")
         if slots < 1:
             refuse("audio_soft_tokens_per_image", "Gemma 3n audio needs its fixed slot count per clip")
-        projector = {"class": "gemma3n", "fields": {**asdict(from_record(vision_nn.Gemma3nProjector, {
-            "vision_width": encoder.hidden_size, "text_width": text_width,
-            "vocab_size": audio.get("vocab_size", 128), "vocab_offset": audio.get("vocab_offset", 262272),
-            "norm_eps": encoder.rms_norm_eps}))}}
-    return {"audio": {"class": records.text(audio["model_type"], "audio_config model_type"), "fields": {
+        projector = {"class": "gemma3n", "fields": native_fields(vision_nn.Gemma3nProjector)(
+            vision_width=encoder.hidden_size, text_width=text_width,
+            vocab_size=_records.integer(audio.get("vocab_size", 128), "vocab_size"),
+            vocab_offset=_records.integer(audio.get("vocab_offset", 262272), "vocab_offset"),
+            norm_eps=encoder.rms_norm_eps)}
+    return {"audio": {"class": _records.text(audio["model_type"], "audio_config model_type"), "fields": {
                       **asdict(encoder)}},
             "audio_token_id": _wrapper_token_id(hf_config, used, "audio_token_id"),
             "audio_soft_tokens": slots, "audio_projector": projector}
@@ -232,7 +233,7 @@ def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     text = _wrapper_text(hf_config, used, declared_type='gemma4_text')
     tower = translate_gemma4_vision_config(hf_config)
     projector = translate_gemma4_projector_config(
-        tower["fields"], records.integer(text.get("emb_features"), "emb_features"))
+        tower["fields"], _records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
     # The soft-token count follows the image resolution, so the record leaves
     # it open and each call reads it off the tower output. The wrapper's
@@ -241,7 +242,7 @@ def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
                  "boa_token_id", "eoa_token_id", "eoa_token_index"))
     # Gemma4Config's defaults where a config leaves them out: its video and audio placeholders stay
     # placeholders to the decoder whether or not an audio tower reads the latter.
-    video, audio_id = (records.integer(hf_config.get(name, default), name)
+    video, audio_id = (_records.integer(hf_config.get(name, default), name)
                        for name, default in (("video_token_id", 258884), ("audio_token_id", 258881)))
     return _wrapper_fields("gemma4", used, text, tower, projector, image, None,
                            _wrapper_audio(hf_config, used, record_int(text, "emb_features")),
@@ -256,15 +257,15 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     text = _wrapper_text(hf_config, used)
     tower = translate_qwen35_vision_config(hf_config)
     projector = translate_qwen35_projector_config(
-        hf_config, records.integer(text.get("emb_features"), "emb_features"))
+        hf_config, _records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id")
     # One resolution per call, so the soft-token count varies with the image
     # and the record leaves it open the way the Gemma 4 wrapper does.
     used.update(("video_token_id", "vision_start_token_id", "vision_end_token_id"))
     video = hf_config.get("video_token_id")
     if video is not None:
-        video = records.integer(video, "video_token_id")
-    return _wrapper_fields(records.text(hf_config['model_type'], 'model_type'), used, text, tower, projector,
+        video = _records.integer(video, "video_token_id")
+    return _wrapper_fields(_records.text(hf_config['model_type'], 'model_type'), used, text, tower, projector,
                            image, None, video=video)
 
 
@@ -409,7 +410,7 @@ def language_model_config(hf_config: Mapping[str, object], record: WrapperFields
     for field in ("modeling_overrides", "eos_token_id", "pad_token_id", "bos_token_id"):
         if hf_config.get(field) is not None:
             text[field] = hf_config[field]
-    family = families().get(records.text(text["model_type"], "model_type"))
+    family = families().get(_records.text(text["model_type"], "model_type"))
     if family is not None and "architectures" not in text:
         text["architectures"] = [family.architecture]
     return text
@@ -547,7 +548,7 @@ def validate_source_aliases(names: Collection[str], read: Callable[[str], np.nda
     record = translate_config(config)
     # translate_config refused every model_type but a registered family's name, which
     # spells the tensors: Kimi K2.5 computes DeepSeek V3 under `language_model.` names.
-    family = families()[records.text(config.get("model_type"), "model_type")]
+    family = families()[_records.text(config.get("model_type"), "model_type")]
     return _text_aliases(names, read, record, _tied_names(family, record, names))
 
 
@@ -880,7 +881,7 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
         raise ValueError(f'no decoder tensor encoder for model_type {model_type!r}')
     family = families()[model_type]
     tied = (bool(config['tie_word_embeddings']) if 'tie_word_embeddings' in config
-            else records.boolean(family.translate_config(config, set()).get('tie_embeddings'),
+            else _records.boolean(family.translate_config(config, set()).get('tie_embeddings'),
                        'tie_embeddings'))
     if tied != model.tie_embeddings:
         raise ValueError('tie_word_embeddings disagrees with the native model')

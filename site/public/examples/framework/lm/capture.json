@@ -1,7 +1,7 @@
 {
 	"about": "The screen lm.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "6f732ee2c8cbccf24007283cada8b8ca6e40b58d1bcb905cb1a232826262f66e",
+	"script_sha256": "44afb279dfd56d30a07c3ed679bcf15ad4b8785e26e8e147132513040301ef34",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",

@@ -14,7 +14,8 @@ from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, run
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.dataset import WORKER_BUFFER, Batch, Records, phase_ends
+from dew.batch import Batch
+from dew.data.dataset import WORKER_BUFFER, Records, phase_ends
 
 if TYPE_CHECKING:
     import jax
@@ -860,9 +861,9 @@ class Dataset:
         settings default to none, while workers or prefetching the chain writes run as written),
         and for token rows, under "text", the tokens they hold (`data/tokens`) and the share of
         their places that pad a row (`data/padding`)."""
+        from dew._records import record
         from dew.data.compile import _diagnostic
         from dew.data.mixing import data_metrics, state_counts
-        from dew.records import record
 
         chain = self._chain()
         if any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
@@ -913,9 +914,9 @@ class Dataset:
         """This dataset's records, or its batches where it batches: one pass,
         or the passes its `repeat` asks for, with training's random draws
         (`for record in dataset`)."""
+        from dew.batch import VALID_ROWS
         from dew.data.compile import _batch_steps, _diagnostic
         from dew.data.dataset import take_batch
-        from dew.objectives.base import VALID_ROWS
 
         chain = self._chain()
         batched = any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages)
@@ -988,13 +989,13 @@ def concat(datasets: Sequence[Dataset]) -> Pipeline:
 
 def _token_places(batch: Batch) -> tuple[int, int]:
     """The places a batch's token rows under "text" hold, and those of them that pad a row, as a
-    model reads them (`dew.nn.inputs.real_slots`): segment 0 of a packed row and the places its
+    model reads them (`dew.batch.real_slots`): segment 0 of a packed row and the places its
     validity marks invalid, in its `text_coordinates` or in stored `text_segment_ids` and
     `text_attention_mask`; none where it holds no token ids."""
     tokens = batch.get("text")
     if not isinstance(tokens, np.ndarray) or tokens.dtype.kind not in "iu":
         return 0, 0
-    from dew.nn.inputs import COORDINATES_FIELD, VALIDITY_FIELD, real_slots
+    from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, real_slots
 
     fields = {name: batch[f"text_{name}"] for name in (COORDINATES_FIELD, VALIDITY_FIELD, "segment_ids")
               if f"text_{name}" in batch}
