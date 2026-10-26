@@ -389,14 +389,16 @@ class Loading:
         Grain's own pick (`pick_performance_config`) reads memory alone, takes the machine's CPU
         count where a container may run on a few of them, and counts one batch for each worker.
 
-        A worker for each CPU but one, which the reading process keeps to batch, place and drive
-        the step, at most `max_workers`; and no more of them than half the memory the process may
-        still take holds (`ram_budget_mb` where given), each a process of its own
-        (`WORKER_PROCESS_BYTES`) holding its `worker_buffer` batches and `read_buffer` reads, the
-        read buffer itself no more reads than that half holds. `records` are the batches the
-        read makes without workers, `SAMPLED_BATCHES` of which are measured; `reads` is how many
-        reads make one: one where the order is read by batch, its rows where it streams records.
-        A read that makes no batch reads without workers."""
+        A worker for each CPU, as tf.data's parallelism takes each schedulable one, where there is
+        more than one: on one CPU a worker adds a process and no parallelism, so the reading process
+        reads. On four CPUs of an eight-core host, an image read in three workers read 11% fewer
+        images a second than in eight (armada, 2026-10-26). At most `max_workers` of them, and no
+        more than half the memory the process may still take holds (`ram_budget_mb` where given),
+        each a process of its own (`WORKER_PROCESS_BYTES`) holding its `worker_buffer` batches and
+        `read_buffer` reads, the read buffer itself no more reads than that half holds. `records`
+        are the batches the read makes without workers, `SAMPLED_BATCHES` of which are measured;
+        `reads` is how many reads make one: one where the order is read by batch, its rows where it
+        streams records. A read that makes no batch reads without workers."""
         if self.workers != "auto":
             return self
         sampled = list(itertools.islice(records, SAMPLED_BATCHES))
@@ -406,7 +408,9 @@ class Loading:
         batch = max(1, sum(batch_bytes(value) for value in sampled) // len(sampled))
         read = max(1, batch // reads)
         budget = host.memory // 2 if self.ram_budget_mb is None else self.ram_budget_mb * 2**20
-        cpus = host.cpus - 1 if self.max_workers is None else min(self.max_workers, host.cpus - 1)
+        cpus = host.cpus if host.cpus > 1 else 0
+        if self.max_workers is not None:
+            cpus = min(cpus, self.max_workers)
         read_buffer = min(self.read_buffer, budget // read)
         held = WORKER_PROCESS_BYTES + self.worker_buffer * batch + read_buffer * read
         workers = max(0, min(cpus, budget // held))
