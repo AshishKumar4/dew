@@ -125,7 +125,7 @@ def drawn_steps(plain, stepped, *, routed: bool, within=contextlib.nullcontext, 
     objective = objective_for(plain)
     scored = jax.jit(lambda variables, tokens, key: objective.token_scores(
         variables, tokens, train=True, rngs=model_rngs(key, training=True), routing=True,
-        depths=objective.mtp_weight is not None, qk_stats=objective.qk_stats).routing)
+        depths=objective.mtp_weight is not None, qk_stats=True).routing)
     inferred = jax.jit(lambda variables, tokens: objective.token_scores(
         variables, tokens, routing=True).routing)
 
