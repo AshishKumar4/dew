@@ -139,6 +139,26 @@ def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_pat
 
 
 @pytest.mark.distributed
+def test_a_schedule_ends_its_stage_at_one_step_on_every_process(tmp_path):
+    """The committed tokens a schedule's stage ends on are the pool's, summed over its processes, so
+    two processes end the first stage at one step, the one a single process ends it at, and land on
+    its parameters."""
+    # Fifteen windows of four, whose tokens all stand in the model's vocabulary of 64.
+    corpus = token_corpus(tmp_path / "tokens", records=15, seq_len=4)
+    flags = {"tokens": corpus.train, "seq_len": 4, "steps": 6}
+    pool = run_pool("schedule_fit", tmp_path / "pool", 2, **flags)
+    alone = run_pool("schedule_fit", tmp_path / "alone", 1, **flags)
+    assert [report["step"] for report in pool + alone] == [6, 6, 6]
+    ends = {tuple(report["stage_ends"]) for report in pool + alone}
+    assert len(ends) == 1, ends
+    (end,) = ends.pop()
+    assert 0 < end < 6 * worker.BATCH
+    for index in range(2):
+        assert_same_parameters(dumped_params(tmp_path / "pool" / f"process{index}.json"),
+                               dumped_params(tmp_path / "alone" / "process0.json"))
+
+
+@pytest.mark.distributed
 def test_a_decision_release_partitioned_over_a_pool_publishes_its_readout(tmp_path):
     """A slot release placed over two processes, its readout partitioned across them, publishes every
     tensor it saves: its readout gathered home to process 0 beside its backbone, written to
