@@ -563,8 +563,8 @@ class Trainer(Generic[Loss, Effects]):
         The state is a fresh run's: its parameters, optimizer state and EMA, and, given one
         global `batch` as the run reads it, the accumulation its steps pool where `accumulation`
         is above 1, read in the first of the splits its plan may take whose devices hold it, the
-        trainer's own where it fixes one (`splits`). A CPU host leaves out the narrow copies a GPU step
-        reads (`TrainState.compute`).
+        trainer's own where it fixes one (`splits`). It leaves out the narrow copies a step may read
+        (`TrainState.compute`), which the plan drops first where the step does not fit with them.
         An `OptimConfig` is built over `steps`, as `fit(steps=...)` builds it. `capacity` is the
         bytes each device has, for a mesh whose devices report none: a CPU mesh of
         `--xla_force_host_platform_device_count` devices standing in for GPUs.
@@ -1334,8 +1334,8 @@ class Trainer(Generic[Loss, Effects]):
         artifacts go to the tracker and to `metrics`, whose reductions are logged as `val/<name>`.
         `validation` is that split as a Dataset, or names several, each a Dataset, a reader scored as
         `dataset.val` would be or an `EvalSuite` with its own metrics and cadence, logged as
-        `<name>/<metric>`. Each of `summaries` weighs those scores into one, `summary/<name>`, formed
-        at an evaluation that scored every split it weighs, which `best` and `Plateau` rank by.
+        `<name>/<metric>`. Each of `summaries` weighs those scores into one, `evaluation/summary/<name>`,
+        formed at a step that scored every split it weighs, which `best` and `Plateau` rank by.
 
         `restore_best=True` returns the model the run ranked best: the final
         state with the counters, variables and EMA of the best step
@@ -1680,11 +1680,12 @@ class Trainer(Generic[Loss, Effects]):
                          ) -> Validation:
         """`Layout.validate` of the whole state the run's steps keep between them reading `batch`'s
         shapes (a marked batch, as the stream gives it) in `split` microbatches: `state` with the
-        accumulation its window pools and the narrow copies its step builds."""
+        accumulation its window pools. The narrow copies are left out: the plan's first rung drops
+        them where the step does not fit with them (`dew.training.planning.plan_step`)."""
         device, _ = split_fields(batch)
         with self._traced_on(self.device_mesh) as schedule:
             _, _, whole = self._prepared(state, microbatch_shapes(device, split), schedule,
-                                         split * self.accumulation)
+                                         split * self.accumulation, narrow=False)
         return self._validated(whole, capacity)[1]
 
     def _fitting(self, state: TrainState, batch: Batch, capacity: int | None = None) -> Validation:
@@ -1904,23 +1905,20 @@ class Trainer(Generic[Loss, Effects]):
             # The last step has to land before the wall time is read.
             loss.block_until_ready()
         scores: Mapping[str, float] = {}
-        # A stream that ran out ends a run whose last step may have evaluated some suites already: only
-        # the others are scored now, beside the scores that step reported.
-        scored = run.scored if run.evaluation is not None and run.evaluation.step == current else frozenset()
+        # A plateau or a stream that ran out ends a run whose last step may have evaluated some suites
+        # already: only the others are scored now, joined to the scores that step reported.
+        joined = run.evaluation if run.evaluation is not None and run.evaluation.step == current else None
+        scored = run.scored if joined is not None else frozenset()
         if (
             (plan.validation or plan.eval_every or plan.best or plan.stop or plan.held_best)
             and run.preempted is None
             and run.paused is None
         ):
             missing = [name for name in plan.suites if name not in scored]
-            if not plan.suites or len(missing) == len(plan.suites):
-                run.evaluation = self._evaluation(plan, state, shardings, run.training)
+            if not plan.suites or missing:
+                run.evaluation = self._evaluation(plan, state, shardings, run.training, missing,
+                                                  joined=None if joined is None else joined.scores)
                 run.other += run.evaluation.elapsed_seconds
-            elif missing:
-                assert run.evaluation is not None
-                added = self._evaluation(plan, state, shardings, run.training, missing)
-                run.other += added.elapsed_seconds
-                run.evaluation = dataclasses.replace(added, scores={**run.evaluation.scores, **added.scores})
             assert run.evaluation is not None
             scores = run.evaluation.scores
         # A token update may cross the pause and the budget at once, which still saves the whole state.
@@ -2044,8 +2042,9 @@ class Trainer(Generic[Loss, Effects]):
 
     def _evaluation(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState],
                     training: Mapping[str, jax.Array], names: Sequence[str] | None = None, *,
-                    warm: bool = False) -> Evaluation:
-        """Score the suites in `names`, every suite when None, as one evaluation.
+                    warm: bool = False, joined: Mapping[str, float] | None = None) -> Evaluation:
+        """Score the suites in `names`, every suite when None, as one evaluation, joined to the scores
+        the step's earlier evaluation of the others recorded (`joined`, `_wind_down`).
 
         With no suite at all, the evaluation carries the training values a
         ranking or a stopping rule reads. `warm` warms every suite instead and
@@ -2066,13 +2065,14 @@ class Trainer(Generic[Loss, Effects]):
                     and not any(metric.name == 'loss' for metric in suite.metrics))
             evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
                                               loss=loss, split=split, training=reports, warm=warm))
-        scores = {name: value for report in evaluations for name, value in report.scores.items()}
-        # Each summary is formed once, here, and only where this pass scored every split it weighs.
+        scores = {**(joined or {}),
+                  **{name: value for report in evaluations for name, value in report.scores.items()}}
+        # Each summary is formed once a step, here, by the evaluation that completes the splits it weighs.
         formed = {} if warm else {name: value for summary in plan.summaries
-                                  for name, value in summary.formed(scores, chosen).items()}
+                                  for name, value in summary.formed(scores).items() if name not in scores}
         if formed:
-            self._report_evaluation(dataclasses.replace(evaluations[0], scores=formed, previews=(),
-                                                        coordinated_batches=0))
+            self._report_evaluation(dataclasses.replace(evaluations[0], split=Summary.SPLIT, scores=formed,
+                                                        previews=(), coordinated_batches=0))
         return dataclasses.replace(evaluations[0], scores={**scores, **formed},
                                    elapsed_seconds=sum(report.elapsed_seconds for report in evaluations))
 
