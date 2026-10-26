@@ -1002,26 +1002,35 @@ def test_the_head_gradient_accumulates_every_token_tile_before_it_rounds(dtype):
 
     tile_product = jax.jit(lambda states, logits: jnp.einsum("tf,tv->fv", states, logits,
                                                              precision=precision))
+    reference = jax.jit(once)
+    # The tiled head's pieces, from the site's own constants: 4 chunks of 17 columns, so blocks of
+    # ceil(17 / 4) = 5 columns, each over token tiles of RAGGED's 128.
+    columns_wide, tokens_tall = -(-17 // 4), RAGGED[0]
 
     @as_given
     def library(states, matrix, targets, cotangent):
         """The library arm (BIBLE §7's exception, row 1543): the oracle's loss and state gradient, and
-        its head gradient as the tiled head takes it, one fp32 product a token tile of `RAGGED`'s
-        through the library, on the site's own logits' cotangent, the tiles summed exactly in float64
-        on the host and rounded to `dtype` once. On an H100 PCIe a 128-token tile's product rounds
-        1.85 times as far from float64 as the 257-token whole product (per element 3.8-7.3e-9 RMS
-        against 1.9-4.5e-9, both cuBLASLt at beta 0 with a 32 MiB workspace; TL-h100-tokentiles-1725),
+        its head gradient as the tiled head takes it, one fp32 product a block of its columns by a token
+        tile, through the library, on the site's own logits' cotangent, the pieces summed exactly in
+        float64 on the host and rounded to `dtype` once; the loss and the state gradient the reference
+        program's own, so the exception reaches the head gradient alone. On an H100 PCIe a 128-token
+        tile's product rounds 1.85 times as far from float64 as the 257-token whole product (per element
+        3.8-7.3e-9 RMS against 1.9-4.5e-9, both cuBLASLt at beta 0 with a 32 MiB workspace;
+        TL-h100-tokentiles-1725),
         which no combining of the tiles repairs."""
-        loss, d_hidden, _ = once(states, matrix, targets, cotangent)
+        loss, d_hidden, _ = reference(states, matrix, targets, cotangent)
         wide_states = states.astype(jnp.float32)
         d_logits = logits_cotangent(wide_states, matrix.astype(jnp.float32), targets, cotangent)
-        tiles = [np.asarray(tile_product(wide_states[start:start + RAGGED[0]],
-                                         d_logits[start:start + RAGGED[0]]), np.float64)
-                 for start in range(0, states.shape[0], RAGGED[0])]
-        return loss, d_hidden, np.sum(tiles, axis=0).astype(dtype)
+        d_head = np.zeros(matrix.shape, np.float64)
+        for first in range(0, matrix.shape[1], columns_wide):
+            for start in range(0, states.shape[0], tokens_tall):
+                d_head[:, first:first + columns_wide] += np.asarray(tile_product(
+                    wide_states[start:start + tokens_tall],
+                    d_logits[start:start + tokens_tall, first:first + columns_wide]), np.float64)
+        return loss, d_hidden, d_head.astype(dtype)
 
     drawn = with_cotangent(draw, full)
-    assert_as_exact(jax.jit(pulled(tiled)), jax.jit(once), drawn, f"{dtype} token tiles",
+    assert_as_exact(jax.jit(pulled(tiled)), reference, drawn, f"{dtype} token tiles",
                     seeds=SEEDS["token tiles"], truth_fn=pulled(full), library_fn=library,
                     library_row=1543)
     _, d_hidden, d_head = pulled(tiled)(*drawn(0))
