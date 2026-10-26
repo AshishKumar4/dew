@@ -32,7 +32,7 @@ from dew.interop.decoder_parts import (
     layer_depth_path,
     layout_tensors,
     leaf_layouts,
-    plain_partial_rope,
+    read_partial_rope,
     record_float,
     record_int,
     refuse,
@@ -227,9 +227,6 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
         'mlp_layer_types': ['sparse' if index in routed else 'dense' for index in range(model.num_layers)],
         'head_dim': 0, 'qk_rope_head_dim': 0, 'qk_head_dim': sparse.qk_nope_head_dim,
         'num_key_value_heads': model.num_heads, 'attention_dropout': 0.0,
-        # Native embeddings have no padding row; omission selects the released
-        # vocabulary-specific default (configuration_glm5_next.py:126).
-        'pad_token_id': None,
         'rope_theta': None, 'rope_scaling': None, 'rope_parameters': None,
         'mhc': True, 'mla_use_nope': True, 'index_kpool_compress': True,
         'hc_mult': hc.hc_mult, 'hc_eps': hc.hc_eps, 'hc_sinkhorn_iters': hc.hc_sinkhorn_iters,
@@ -332,15 +329,12 @@ def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
     """
     # The released configs spell the rotary flat (rope_theta beside
     # partial_rotary_factor); a config transformers wrote nests both under
-    # rope_parameters, the spelling Glm4MoeRotaryEmbedding reads.
-    if hf_config.get('rope_scaling') is not None:
-        refuse("rope_scaling", "Glm4MoeRotaryEmbedding is the plain rotary")
+    # rope_parameters. Glm4MoeRotaryEmbedding builds any rope_type over the
+    # rotated half (modeling_glm4_moe.py:55-59), YaRN among them, and
     # Glm4MoeConfig sets an absent factor to half the head (configuration_glm4_moe.py:123).
-    theta, factor = plain_partial_rope(hf_config, PLAIN_SPELLING, default_factor=0.5,
-                                       reference='Glm4MoeRotaryEmbedding')
-    used.update(('rope_theta', 'rope_parameters', 'rope_scaling', 'use_qk_norm',
-                 'partial_rotary_factor', 'num_nextn_predict_layers'))
-    config = base_config(hf_config, used, rope=Ropes(theta),
+    ropes, factor = read_partial_rope(hf_config, used, PLAIN_SPELLING, default_factor=0.5)
+    used.update(('use_qk_norm', 'num_nextn_predict_layers'))
+    config = base_config(hf_config, used, rope=ropes,
                           qk_norm=bool(hf_config.get('use_qk_norm', False)))
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     config.update(
@@ -452,7 +446,8 @@ GLM5_NEXT_TEXT = DecoderFamily(
     export_weights=_glm5_next_export_weights,
     preserve_source_layout=True,
     # The config class's norm epsilon.
-    defaults={'rms_norm_eps': 1e-5},
+    defaults={'rms_norm_eps': 1e-5, 'pad_token_id': 154820},
+    padding_idx=True,
 )
 
 GLM4_MOE = DecoderFamily(
@@ -471,6 +466,7 @@ GLM4_MOE = DecoderFamily(
     # Glm4MoeConfig's defaults for the fields its decoder reads.
     defaults={'rms_norm_eps': 1e-5, 'num_key_value_heads': 8, 'max_position_embeddings': 131072,
               'n_shared_experts': 1, 'first_k_dense_replace': 1, 'num_nextn_predict_layers': 1},
+    padding_idx=True,
 )
 
 
@@ -490,5 +486,6 @@ GLM_MOE_DSA = DecoderFamily(
     weight_path=layer_depth_path,
     preserve_source_layout=True,
     # The config class's norm epsilon.
-    defaults={'rms_norm_eps': 1e-5},
+    defaults={'max_position_embeddings': 202752, 'rms_norm_eps': 1e-5},
+    padding_idx=True,
 )
