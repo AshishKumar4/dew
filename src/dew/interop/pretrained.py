@@ -1141,7 +1141,8 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
                                         placed=placed, streaming=streaming, dtype=dtype,
                                         param_dtype=param_dtype, attention_impl=attention_impl,
                                         max_seq_len=max_seq_len, weights=weights,
-                                        overrides=overrides, code=code())
+                                        overrides=overrides,
+                                        code=None if composite.backbone is None else code())
     elif fallback is not None:
         from dew.interop import torchax_fallback
 
