@@ -5,6 +5,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A tiled LM head's backward carries the state gradient over its vocabulary tiles as a compensated
+  pair on every backend (`dew.nn.precision.paired_sum`), so its error is the tile products' own: on an
+  H100 XLA took the plain sum's addition into each GEMM, which could then not split its sum, and the
+  state gradient sat about twice as far from float64 as the whole head's.
 - `divided`, IEEE division on every backend, moved from `dew.diffusion.schedules` to
   `dew.nn.precision`, beside the float32 algorithm it dispatches to; `dew.inputs.unit_range` and
   `dew.nn.mp.mp_silu` divide through it, where XLA took their division by a constant as a product
