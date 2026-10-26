@@ -1216,14 +1216,12 @@ def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
     assert publish(chunked(first).pack(4, bins=2), cache, read="streamed").url != generation.url
 
 
-@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
 def test_a_warm_cache_read_by_worker_processes_refuses_a_manifest_rewritten_since_it_was_committed(
         tmp_path, read):
     """Worker processes read a published generation's manifest checked against the size and digest
     its cache's CURRENT committed it under, as the process that compiled the read does: a manifest
-    rewritten since, the same records in other bytes, is refused, not read, and the read the refusal
-    stopped closes whole, no shard's iterator half built."""
+    rewritten since, the same records in other bytes, is refused, not read."""
     from dew.data.compile import compile, publish
     from dew.data.dataset import DataPartition, Loading
 
@@ -1233,6 +1231,32 @@ def test_a_warm_cache_read_by_worker_processes_refuses_a_manifest_rewritten_sinc
     publish(chain, cache, read=read)
     loader = compile(chain.cache(cache).repeat().batch(2), read=read,
                      loading=Loading(workers=2, threads=1, read_buffer=2))
+    (manifest,) = (tmp_path / "cache").rglob("generations/*/manifest.json")
+    rewritten = json.dumps(json.loads(manifest.read_bytes()), indent=1).encode()
+    manifest.unlink()
+    manifest.write_bytes(rewritten)
+    reader = loader.train(DataPartition())
+    try:
+        with pytest.raises(OSError):
+            next(reader)
+    finally:
+        reader.close()
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_cached_read_its_cache_refuses_leaves_no_shard_iterator_half_built(tmp_path, read):
+    """A read whose published generation the cache refuses, its manifest rewritten since it was
+    committed, raises where it opens, and the iterators it opened close whole: none is left half
+    built for the collector to close, so no close raises unraisably."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+
+    chain = Memory([{"id": index} for index in range(8)], shard_rows=2).map(Offset(1))
+    cache = Cache(str(tmp_path / "cache"))
+    publish(chain, cache, read=read)
+    loader = compile(chain.cache(cache).repeat().batch(2), read=read,
+                     loading=Loading(workers=0, threads=1, read_buffer=0))
     (manifest,) = (tmp_path / "cache").rglob("generations/*/manifest.json")
     rewritten = json.dumps(json.loads(manifest.read_bytes()), indent=1).encode()
     manifest.unlink()
