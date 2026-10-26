@@ -115,27 +115,70 @@ def test_a_cached_slot_release_reopens_with_the_hub_offline(tmp_path):
             np.testing.assert_array_equal(head[native], stored[name])
 
 
-@pytest.mark.parametrize("released, overridden", [("noncausal", "causal"), ("causal", "block_bidirectional")])
+def gemma2_backbone(directory):
+    """The slot fixture's release over a tiny Gemma 2, whose sliding and full attention are two kinds: its
+    config sized to the fixture's tokenizer, its weights drawn, the fixture's readout head beside it."""
+    import torch
+    import transformers
+
+    config = json.loads((BACKBONE.parent / "gemma2-tiny" / "config.json").read_text())
+    text = json.loads((REFERENCE / "config.json").read_text())["text_config"]
+    sized = ("vocab_size", "pad_token_id", "bos_token_id", "eos_token_id")
+    config.update({name: text[name] for name in sized}, max_position_embeddings=4096)
+    torch.manual_seed(0)
+    model = transformers.Gemma2ForCausalLM(transformers.Gemma2Config(**config))
+    model.save_pretrained(directory)
+    for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        shutil.copy(REFERENCE / name, directory / name)
+    rng, width = np.random.default_rng(0x1716), config["hidden_size"]
+    shapes = {"slot": (16, width), "q.weight": (8, width), "k.weight": (8, width)}
+    torch.save({name: torch.from_numpy((rng.standard_normal(shape) * width ** -0.5).astype(np.float32))
+                for name, shape in shapes.items()}, directory / "readout_head.pt")
+
+
+OVERRIDES = {
+    "full off": ("noncausal", {"full_attention": "causal"}),
+    "full on": ("causal", {"full_attention": "block_bidirectional"}),
+    "sliding on, full off": ("noncausal",
+                             {"full_attention": "causal", "sliding_attention": "block_bidirectional"}),
+}
+"""A release's declared attention, and the attention modes a load overrides it with: the slot fixture's
+full attention off or on, and a Gemma 2 release's turned from its full layers to its sliding ones."""
+
+
+@pytest.mark.parametrize("case", sorted(OVERRIDES))
 def test_a_loads_attention_override_lays_the_rows_its_backbone_reads_and_saves_as_that_release(
-        tmp_path, released, overridden):
+        tmp_path, case):
     """A load's modeling_overrides reach a slot release's row layout as they reach its backbone: a
-    release loaded with its full attention overridden is the release that declares that attention,
-    its rows laid in blocks where its backbone reads blocks and scored alike, and it saves and reloads
-    as that release."""
+    release loaded with its attention overridden is the release whose config states those modes, its
+    rows laid in blocks where any of its backbone's layers reads blocks and scored alike, and it saves
+    and reloads as that release."""
     from dew.decision import Question
 
-    def release(name, attention):
+    released, overridden = OVERRIDES[case]
+    backbone = tmp_path / "backbone"
+    if case.startswith("sliding"):
+        backbone.mkdir()
+        gemma2_backbone(backbone)
+    else:
+        shutil.copytree(REFERENCE, backbone)
+
+    def release(name, attention, modes=None):
         source = tmp_path / name
-        shutil.copytree(REFERENCE, source)
-        (source / "readout.json").write_text(json.dumps({"readout": "head", "head_dim": 8, "n_slots": 16,
-                                                         "attention": attention}))
+        shutil.copytree(backbone, source)
+        readout = {"readout": "head", "head_dim": 8, "n_slots": 16}
+        (source / "readout.json").write_text(json.dumps(readout if attention is None
+                                                        else {**readout, "attention": attention}))
+        if modes is not None:
+            config = json.loads((source / "config.json").read_text())
+            stated = {**config, "modeling_overrides": {"attention": modes}}
+            (source / "config.json").write_text(json.dumps(stated))
         return source
 
     load = {"dtype": "float32", "attention_impl": "reference"}
     bundle = Pretrained.load(release("released", released), **load,
-                             modeling_overrides={"attention": {"full_attention": overridden}})
-    declared = Decide.from_pretrained(
-        release("declared", "noncausal" if overridden == "block_bidirectional" else "causal"), **load)
+                             modeling_overrides={"attention": overridden})
+    declared = Decide.from_pretrained(release("declared", None, overridden), **load)
     bundle.save(tmp_path / "saved")
     reloaded = Decide.from_pretrained(tmp_path / "saved", **load)
     request = json.loads((REFERENCE / "requests.json").read_text())[0][0]
