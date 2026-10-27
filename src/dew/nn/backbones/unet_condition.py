@@ -13,7 +13,6 @@ from dew.nn.attention import BasicTransformerBlock, GroupNorm
 from dew.nn.blocks import ResidualBlock, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
-from dew.nn.dropout import Dropout
 from dew.nn.flops import MissingFlopsCount, projection_flops
 from dew.nn.precision import at_least_fp32, float32_dot_general
 
@@ -48,11 +47,12 @@ class _SpatialAttention(nn.Module):
     A group norm and a residual wrap the whole block. `linear_projection`
     picks the projection into and out of the token width, a dense layer or a
     1x1 convolution; SD1/2 store the convolution and SDXL the dense layer.
+    Nothing in it drops: diffusers' conditional UNet builds its transformers
+    without the model's dropout, which only its residual blocks take.
     """
 
     stage: UNetStage
     linear_projection: bool
-    dropout: float
     dtype: Dtype
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
@@ -89,7 +89,7 @@ class _SpatialAttention(nn.Module):
                 self.stage.features, self.stage.heads, self.stage.features // self.stage.heads, self.dtype,
                 self.precision, qkv_bias=False,
                 first_attention="context" if self.stage.cross_only else "self", norm="layer",
-                norm_epsilon=1e-5, dropout_rate=self.dropout, approximate_gelu=self.approximate_gelu,
+                norm_epsilon=1e-5, approximate_gelu=self.approximate_gelu,
                 attention_impl=self.attention_impl, name=f"layer_{index}")
 
         def run(blocks, x, context):
@@ -110,8 +110,7 @@ class _SpatialAttention(nn.Module):
         else:
             x = Conv(channels, (1, 1), padding="VALID", dtype=self.dtype, precision=self.precision,
                      name="output")(x.reshape(batch, height, width, channels))
-        x = residual + x
-        return Dropout(self.dropout)(x, deterministic=not train) if self.dropout else x
+        return residual + x
 
 
 class _Level(nn.Module):
@@ -169,7 +168,6 @@ class _Level(nn.Module):
                 x = operations.attention(_SpatialAttention(
                     self.stage,
                     self.linear_projection,
-                    self.dropout,
                     self.dtype,
                     self.precision,
                     self.attention_impl,
@@ -322,7 +320,6 @@ class UNet2DCondition(nn.Module):
             x = operations.attention(_SpatialAttention(
                 stage,
                 self.linear_projection,
-                self.dropout,
                 self.dtype,
                 self.precision,
                 self.attention_impl,
