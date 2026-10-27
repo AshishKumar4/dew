@@ -135,7 +135,7 @@ def windows_of(objective: DecisionObjective, rows, count: int = 6) -> list[dict]
     held = DecisionObjective.bounds
 
     def three(self) -> Bounds:
-        return dataclasses.replace(held.fget(self), segments=3)
+        return dataclasses.replace(held.func(self), segments=3)
 
     DecisionObjective.bounds = property(three)
     try:
