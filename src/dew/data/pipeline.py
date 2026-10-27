@@ -946,6 +946,18 @@ class Dataset:
         return self.loading(dataclasses.replace(loading, threads=count,
                                                 read_buffer=max(loading.read_buffer, count)))
 
+    def elastic(self) -> Pipeline:
+        """Read it for training so a run resumes on any number of readers that splits its batch, as
+        a global order does, where its own order is read per share (a stream, or steps that drop,
+        expand, pack or draw). Every reader reads the order one reader reads, through its last step
+        that is not a map of each record alone, and keeps every count-th row of each batch, its
+        share; the maps written after that step run on its own rows alone, on its read threads. So
+        its rows are a one-reader run's, and its position, the same on every reader, resumes on any
+        count, as HF's `split_dataset_by_node` reads a stream on every node; each reader reads the
+        steps before those maps over every record. It reads without loading workers (ledger row
+        1837)."""
+        return dataclasses.replace(self._chain(), _elastic=True)
+
     def loading(self, loading: Loading) -> Pipeline:
         """Read with these workers, threads and buffers (`Loading`), rather than the measured
         defaults, recorded with the chain; `threads` sets its read threads alone."""
@@ -1007,6 +1019,8 @@ class Pipeline(Dataset):
     name: str | None = None
     mode: Read | None = None
     _loading: Loading | None = None
+    _elastic: bool = False
+    """Whether a training run reads it elastically (`Dataset.elastic`)."""
     piped: tuple[Piped, ...] = dataclasses.field(default=(), compare=False, repr=False)
     """The calls of `pipe` that made its stages (`Piped`), outermost last; no plan reads them."""
 
