@@ -74,8 +74,8 @@ CELLS = [("dit", "fsdp2_stage2"), ("dit", "stage2_sequence2"), ("hybrid_dit", "f
 
 SEEDS = {"dit": 32, "hybrid_dit": 32, "jepa": 32, "jepa_video": 32, "unet": 128, "patch_conv": 8}
 """Each model's check-1 seeds, the most any of its layouts took, sized paired by `seeds_for` (`dew_fn`, the
-layout's arm) on armada, at 9efb77a3e and the UNet's at 4a9a8d2a4 (64 over fsdp2_stage2, 128 beside the
-sequence axis): the arms share their inputs and variables."""
+layout's arm) on armada, at 9efb77a3e and the UNet's with the confirming block at 8ce8072b5 (64 over
+fsdp2_stage2, 128 beside the sequence axis): the arms share their inputs and variables."""
 
 
 def drawn(kind: str):
