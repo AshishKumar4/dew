@@ -32,7 +32,14 @@ from dew.data.dataset import Loader
 from dew.objectives.base import Step
 from dew.objectives.rl import EpisodeCollector, EpisodeStatus, PPOObjective, PPORollout, ValueHead
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
-from dew.objectives.rl.sessions import BEHAVIOR_LOG_PROBS_KEY, OLD_LOG_PROBS_KEY
+from dew.objectives.rl.sessions import (
+    ADVANTAGES_KEY,
+    BEHAVIOR_LOG_PROBS_KEY,
+    OLD_LOG_PROBS_KEY,
+    RESPONSE_MASK_KEY,
+    SEGMENT_IDS_KEY,
+    SESSION_WEIGHTS_KEY,
+)
 from dew.rl import clipped_value_loss_terms, gae, token_log_ratio
 from dew.training import Trainer
 
@@ -363,11 +370,9 @@ def ppo_equations(objective, options):
         policy = actor.packed_log_probs(part(variables, "policy"), batch)
         frozen = actor.packed_log_probs(part(ema, "policy"), batch)
         dtype = policy.dtype
-        column = {key: jnp.asarray(batch[key]).astype(dtype) for key in (
-            "response_mask", OLD_LOG_PROBS_KEY, BEHAVIOR_LOG_PROBS_KEY, "advantages")}
-        mask, old, behavior, advantages = (column[key] for key in (
-            "response_mask", OLD_LOG_PROBS_KEY, BEHAVIOR_LOG_PROBS_KEY, "advantages"))
-        segments = jnp.asarray(batch["segment_ids"])
+        columns = (RESPONSE_MASK_KEY, OLD_LOG_PROBS_KEY, BEHAVIOR_LOG_PROBS_KEY, ADVANTAGES_KEY)
+        mask, old, behavior, advantages = (jnp.asarray(batch[key]).astype(dtype) for key in columns)
+        segments = jnp.asarray(batch[SEGMENT_IDS_KEY])
         keep = jnp.ones_like(mask)
         for band, geometric in ((options.get("sequence_mask"), False), (options.get("geometric_mask"), True)):
             if band is not None:
@@ -383,7 +388,7 @@ def ppo_equations(objective, options):
         kl = jnp.clip(jnp.exp(drift) - drift - 1, -10, 10)
         effective = mask * keep
         weights = (effective if options.get("aggregation", "token-mean") == "token-mean"
-                   else jnp.asarray(batch["session_weights"]).astype(dtype) * keep * (effective != 0))
+                   else jnp.asarray(batch[SESSION_WEIGHTS_KEY]).astype(dtype) * keep * (effective != 0))
         mass = jax.lax.stop_gradient(jnp.sum(weights))
         terms = jnp.where(weights != 0, surrogate + actor.beta * kl, 0) * weights
         policy_loss = jnp.where(mass > 0, jnp.sum(terms) / jnp.where(mass > 0, mass, 1), 0)
@@ -425,7 +430,7 @@ def test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged(o
     def draw(seed):
         batch = rolled(int(seed))
         old = objective.actor.packed_log_probs(part(state.variables, "policy"), batch)
-        mask = jnp.asarray(batch["response_mask"])
+        mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
         return {**batch, OLD_LOG_PROBS_KEY: old, BEHAVIOR_LOG_PROBS_KEY: old - 2 * mask},
 
     step = Step(jnp.array(0), jax.random.key(1), state.averaged)
