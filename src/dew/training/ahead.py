@@ -46,11 +46,11 @@ def target_config(generation: str) -> str:
     multiprocessors, clock and bandwidth; CUDA's per-capability limits for the rest. The fields past
     the capability and shared memory only steer XLA's own fusions, never a Triton kernel's code."""
     target, version = gpu_target(generation), capability(generation)
-    facts = (target.shared_limit, target.multiprocessors, target.clock_hz, target.memory_bandwidth)
-    if version is None or any(fact is None for fact in facts):
+    shared, multiprocessors = target.shared_limit, target.multiprocessors
+    clock, bandwidth = target.clock_hz, target.memory_bandwidth
+    if version is None or shared is None or multiprocessors is None or clock is None or bandwidth is None:
         raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
     major, minor = version
-    shared, multiprocessors, clock, bandwidth = facts
     return f"""gpu_device_info {{
   threads_per_block_limit: 1024
   threads_per_warp: 32
@@ -89,7 +89,7 @@ def compile_only_gpus(generation: str, count: int = 1) -> tuple:
 @dataclasses.dataclass(frozen=True)
 class AheadOfTime:
     """A training step compiled for `devices` GPUs of `generation` (`compile_ahead`): the executable,
-    serialized with the trees of its inputs and outputs, and what XLA states of it. `flops` and
+    serialized, and what XLA states of it. `flops` and
     `bytes_accessed` are its cost analysis of one step on one device; the byte counts are its
     memory analysis of one device: the arguments it reads (the state and the batch's share), the
     outputs it writes, those that alias an argument (the donated state), its temporaries and its
@@ -99,8 +99,8 @@ class AheadOfTime:
     devices: int
     mesh: dict[str, int]
     executable: bytes
-    in_tree: jax.tree_util.PyTreeDef
-    out_tree: jax.tree_util.PyTreeDef
+    trees: tuple
+    """The trees of the executable's inputs and outputs, as `serialize_executable.serialize` gives them."""
     flops: float | None
     bytes_accessed: float | None
     argument_bytes: int
@@ -136,7 +136,8 @@ class AheadOfTime:
         if len(found) != self.devices or generations != {self.generation}:
             raise ValueError(f"this step was compiled for {self.devices} {self.generation} GPUs; this "
                              f"process has {len(found)} of {sorted(generations)}")
-        return serialize_executable.deserialize_and_load(self.executable, self.in_tree, self.out_tree,
+        in_tree, out_tree = self.trees
+        return serialize_executable.deserialize_and_load(self.executable, in_tree, out_tree,
                                                          backend=found[0].client)
 
 
@@ -156,10 +157,12 @@ def compile_ahead(trainer: Trainer, batch: Batch) -> AheadOfTime:
     compiled = trainer._lowered_for(start.abstract, batch, generation, trainer.device_mesh).compile()
     executable, in_tree, out_tree = serialize_executable.serialize(compiled)
     memory = compiled.memory_analysis()
+    if memory is None:
+        raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
     cost = compiled.cost_analysis()
     stated = cost[0] if isinstance(cost, list) else cost
     return AheadOfTime(
-        generation, len(devices), dict(trainer.device_mesh.shape), executable, in_tree, out_tree,
+        generation, len(devices), dict(trainer.device_mesh.shape), executable, (in_tree, out_tree),
         flops=None if stated is None else stated.get("flops"),
         bytes_accessed=None if stated is None else stated.get("bytes accessed"),
         argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
