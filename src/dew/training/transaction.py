@@ -358,7 +358,7 @@ class Transaction:
     run; only where each phase executes differs.
     """
     def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
-                 record: bool = False):
+                 record: bool = False, fetch: Callable[[TrainState], TrainState] | None = None):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -369,7 +369,12 @@ class Transaction:
         replay. `copies` names the parameters the forward reads through the
         state's narrow copies, which the commit rewrites (`dew.training.narrow`). `record` makes each
         evaluation return what its `Step.sample` and `Step.boundary` calls produced (`recorded`).
+        `fetch` brings the fields a resident step's state keeps in host memory to the device
+        (`Trainer._fetched`): the step reads them only once its gradient is ready, as the commit does,
+        so the device holds them through the update and not through the forward and backward, but for
+        an EMA the objective reads in its forward.
         """
+        self.fetch = (lambda state: state) if fetch is None else fetch
         self.record = record
         self.objective = objective
         self.optimizer = optimizer
@@ -494,8 +499,8 @@ class Transaction:
         accepted, attempt = state.microstep - fill + index, previous.attempts[index]
         # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
         step_info = Step(accepted // self.split, jax.random.fold_in(state.key, attempt),
-                         with_ema(variables, state.ema), committed=state.updates, record=self.record,
-                         qk_stats=clips_qk(state.opt_state),
+                         with_ema(variables, self.fetch(state).ema), committed=state.updates,
+                         record=self.record, qk_stats=clips_qk(state.opt_state),
                          **self.examples(state, index, batch, part=attempt % self.split,
                                          rejected=attempt - accepted))
         return self.read(variables, state.compute), batch, step_info
@@ -707,7 +712,7 @@ class Transaction:
             # Every attempt the run made and did not accept, so a rejected one's slot draws afresh.
             rejected = attempt - state.microstep
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
-                             with_ema(state.variables, state.ema), committed=state.updates,
+                             with_ema(state.variables, self.fetch(state).ema), committed=state.updates,
                              record=self.record, qk_stats=clips_qk(state.opt_state),
                              **self.examples(state, state.microstep % self.size, batch, part, rejected))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
@@ -771,10 +776,13 @@ class Transaction:
                 # producers into the optimizer's arithmetic, which then rounds
                 # otherwise than the host's compiled commit on the same platform.
                 # One barrier a leaf, so each leaf's update can start as soon as
-                # its own gradient is ready.
+                # its own gradient is ready. The host-resident fields pass the
+                # barrier with the gradient, so the device takes them only past it.
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
-                return finish(state, batch, aux, pending, gradient, attempt, tokens)
+                _, kept = jax.lax.optimization_barrier((gradient, (state.opt_state, state.ema)))
+                fetched = self.fetch(dataclasses.replace(state, opt_state=kept[0], ema=kept[1]))
+                return finish(fetched, batch, aux, pending, gradient, attempt, tokens)
             moving, held = apart(state)
             advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,
                                                     tokens)

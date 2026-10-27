@@ -134,6 +134,7 @@ from dew.training.budget import Pause, Plateau, run_length, run_steps, run_token
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
+    OFFLOADABLE,
     check_batch,
     check_stream,
     link_bandwidth,
@@ -505,15 +506,16 @@ class Trainer(Generic[Loss, Effects]):
             variables=buffered_shardings(accumulation.variables, batches=False))
         return dataclasses.replace(placed, accumulation=pending)
 
-    def _fetched(self, state: TrainState, shardings: Placement[TrainState]) -> TrainState:
-        """Bring the layout's host-resident fields to the device, where a step
-        or an evaluation reads them."""
+    def _fetched(self, state: TrainState, shardings: Placement[TrainState],
+                 fields: Sequence[str] | None = None) -> TrainState:
+        """Bring the layout's host-resident fields, or those of them among `fields`, to the device,
+        where a step or an evaluation reads them."""
         if self.host_master:
             return state
         return dataclasses.replace(state, **{
             field: jax.device_put(getattr(state, field), jax.tree.map(
                 lambda s: s.with_memory_kind("device"), getattr(shardings, field)))
-            for field in self.layout.host})
+            for field in self.layout.host if fields is None or field in fields})
 
     @ruled
     def validate(self, batch: Batch | None = None, *, steps: int | None = None,
@@ -878,12 +880,13 @@ class Trainer(Generic[Loss, Effects]):
               nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
             yield schedule
 
-    def _step_body(self, shapes, copies, split: int):
-        """The objective transaction over a step's batch read in `split` microbatches, or a
-        custom step with no invented commit telemetry, which reads it whole."""
+    def _step_body(self, shapes, copies, split: int, fetch: Callable[[TrainState], TrainState] | None = None):
+        """The objective transaction over a step's batch read in `split` microbatches, which brings the
+        state's fields `fetch` brings to the device only once its gradient is ready, or a custom step
+        with no invented commit telemetry, which reads it whole."""
         if self.step is None:
             return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
-                               split=split, record=self.record).step()
+                               split=split, record=self.record, fetch=fetch).step()
         custom = self.step(self.objective, self.optimizer)
 
         def run(current, batch, part, tokens):
@@ -1100,7 +1103,10 @@ class Trainer(Generic[Loss, Effects]):
         (`apart`): the moving state, which it donates and returns advanced, and the frozen tree, which
         it reads and neither donates nor returns, so the frozen arrays stay the ones the run (and the
         objective's held tree) holds, and no output copies them."""
-        body = self._step_body(shapes, copies, split)
+        # The transaction brings the optimizer state and the EMA to the device once its gradient is ready
+        # (`Transaction.fetch`); a custom step, and every other field, reads them from its start.
+        late = () if self.step is not None else OFFLOADABLE
+        body = self._step_body(shapes, copies, split, lambda state: self._fetched(state, shardings, late))
         moving, frozen = apart(shardings)
 
         def step(current, held, batch, part):
@@ -1108,8 +1114,9 @@ class Trainer(Generic[Loss, Effects]):
             # return the host-resident ones to pinned host memory.
             current = together(current, held)
             micro = microbatch(batch, part, split)
-            advanced, loss, aux, committed = body(self._fetched(current, shardings), self._model_batch(micro),
-                                                  part, batch_tokens(micro))
+            early = [field for field in self.layout.host if field not in late]
+            advanced, loss, aux, committed = body(self._fetched(current, shardings, early),
+                                                  self._model_batch(micro), part, batch_tokens(micro))
             stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1)
             return (apart(stepped)[0], *rest)
 
