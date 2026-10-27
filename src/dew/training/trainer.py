@@ -444,7 +444,7 @@ class Trainer(Generic[Loss, Effects]):
     def _boxed_init(self, initialized: Variables, params: Variables) -> optax.OptState:
         """The optimizer's state of `params`, Muon's grouping reading the axes modules boxed on
         them in `initialized`, each rule a stage-local run's leaves as its layers (`StageLocal.refused`)."""
-        with boxed(ruled_boxes(boxed_axes(initialized), self.layout.axis_rules)), self.staging.held():
+        with self.staging.held(boxed(ruled_boxes(boxed_axes(initialized), self.layout.axis_rules))):
             return self.staging.refused(self.optimizer.init(params))
 
     @functools.cached_property
@@ -479,7 +479,7 @@ class Trainer(Generic[Loss, Effects]):
     def _declared(self):
         """The context in which the layout reads the axes the objective's
         modules box, as its rules place them."""
-        return boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules))
+        return self.staging.held(boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules)))
 
     def _shardings(self, state: TrainState) -> Placement[TrainState]:
         mesh = self.state_mesh
@@ -571,7 +571,7 @@ class Trainer(Generic[Loss, Effects]):
     def _validation(self, placed: TrainState, capacity: int | None = None) -> Validation:
         """`Layout.validate` of `placed`, read in every axis the modules box, which every process
         agrees, each reading its own devices' memory."""
-        with boxed(self._boxed_axes()):
+        with self.staging.held(boxed(self._boxed_axes())):
             return agreed("state placement", functools.partial(
                 self.layout.validate, self.device_mesh, placed, capacity=capacity))
 

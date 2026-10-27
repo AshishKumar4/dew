@@ -142,7 +142,8 @@ def muon_weight_dimension_numbers(params):
             return None
         stacked = _layers_of(path)[1]
         rank = param.ndim - stacked
-        axes = declared_axes(path, rank, declared)
+        axes = declared_axes(path, param.ndim, declared)
+        axes = None if axes is None else axes[stacked:]
         # A declaration that names no axis says how the parameter shards (whole, on every device),
         # not which of its axes form the matrix, so it reads as an undeclared one (AltUp's).
         if axes is None or all(axis is None for axis in axes):

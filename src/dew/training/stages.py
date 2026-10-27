@@ -36,10 +36,11 @@ traffic a pipeline exists to avoid; and a checkpoint in the stacked form, which 
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import jax
@@ -179,10 +180,14 @@ class StageLocal:
         return self.layered(placement, lambda path, sharding, shape: [
             _sharded(sharding, self.mesh, sharding.spec[len(shape):])] * math.prod(shape))
 
-    def held(self):
-        """The context a step traces in, its optimizer's rules reading each stacked run's leaves as the
-        stored layers they stack (`held_by_stage`)."""
-        return held_by_stage(self.sites)
+    @contextlib.contextmanager
+    def held(self, *within: contextlib.AbstractContextManager) -> Iterator[None]:
+        """The context a step traces and a layout reads the state in, every rule reading each stacked
+        run's leaves as the stored layers they stack (`held_by_stage`), entered with `within`."""
+        with held_by_stage(self.sites), contextlib.ExitStack() as entered:
+            for context in within:
+                entered.enter_context(context)
+            yield
 
     def check(self, layout: Layout, variables, placement, mesh: Mesh) -> None:
         """`layout.check` of `variables` placed as `placement`, read as their stored layers: what it

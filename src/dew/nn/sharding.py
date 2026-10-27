@@ -681,16 +681,21 @@ def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> Lo
     axes its module boxed on it (`boxed`), matched by its whole path, a
     variables leaf by its own and a leaf of a tree that mirrors the params
     collection (an optimizer moment, a gradient) under `params`; else those
-    `declared`, the `declarations` of the tree it is a leaf of, give it.
+    `declared`, the `declarations` of the tree it is a leaf of, give it. A
+    stage-local run's leaf (`stacked_layers`) has its first layer's axes,
+    after a dimension it names none of for each it stacks the layers over.
     """
     names = parameter_path(path)
+    layers = stacked_layers(path)
+    stacked, keys = (0, (names,)) if layers is None else (layers[1], (parameter_path(layers[0][0]), names))
     held = _BOXED.get()
-    axes = held.get(names) or held.get(("params", *names)) or declared.get(names)
+    axes = next((found for key in keys
+                 if (found := held.get(key) or held.get(("params", *key)) or declared.get(key)) is not None), None)
     if axes is None:
         return None
-    if ndim > len(axes):
+    if ndim - stacked > len(axes):
         raise ValueError(f"{'/'.join(names)} has the axes {axes}, which cannot name its {ndim} dimensions")
-    return axes[len(axes) - ndim:]
+    return (*(None,) * stacked, *axes[len(axes) - (ndim - stacked):])
 
 
 __all__ = ["ADAPTER_RANK", "RESIDUAL", "Link", "Schedule", "logical_axes"]
