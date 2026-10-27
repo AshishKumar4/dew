@@ -102,8 +102,9 @@ def test_an_optimizer_that_holds_updates_back_moves_no_clock_average_or_tokens_u
     applies them (`TrainState.deferred`); with the fourth they commit (row 1870, AT-01)."""
     def run(steps):
         tracker = RecordingTracker()
-        state = make_trainer(objective=TokenRegression(), optimizer=optax.MultiSteps(optax.sgd(0.1), 2),
-                             tracker=tracker).fit(dataset(), steps=steps, log_every=1)
+        held = optax.MultiSteps(optax.sgd(0.1), 2).gradient_transformation()
+        state = make_trainer(objective=TokenRegression(), optimizer=held, tracker=tracker).fit(
+            dataset(), steps=steps, log_every=1)
         return state, [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars]
 
     two, _ = run(2)

@@ -416,10 +416,7 @@ class Trainer(Generic[Loss, Effects]):
             # The average starts equal to the parameters but as its own buffers: the step donates
             # the state, and a buffer can be donated once.
             ema=None if ema is None else jax.tree.map(jnp.copy, select(params, ema.select)),
-            key=run_key,
-            # The tokens of updates an optimizer holds back, which commit with the one that applies them.
-            deferred=jnp.zeros((2,), jnp.uint32) if defers(opt_state) else None,
-        )
+            key=run_key, deferred=jnp.zeros((2,), jnp.uint32) if defers(opt_state) else None)
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
