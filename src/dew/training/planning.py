@@ -15,12 +15,16 @@ import dataclasses
 import json
 import logging
 import os
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import AbstractMesh, Mesh
+import numpy as np
+from jax.experimental.profiler import get_profiled_instructions_proto
+from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
 from dew._records import JSON
@@ -33,6 +37,7 @@ from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.benchmark import samples
+from dew.telemetry.profile import capture_options
 from dew.training.distributed import batch_divisor
 from dew.training.memory import (
     compiled_if_it_fits,
@@ -238,22 +243,33 @@ def unplanned(probes: Sequence[Probe]) -> str:
 @dataclasses.dataclass(frozen=True)
 class Planned:
     """A plan `plan_step` found: the step reading its batch in `split`
-    microbatches and its executable, whether it keeps XLA's default options
-    and reads the parameters through narrow copies, and the rung it compiled
+    microbatches, its executable and the options it compiled under, whether it keeps XLA's default
+    options and reads the parameters through narrow copies, and the rung it compiled
     at, as a record and as the objective's modules, head tile and whether that
-    head is fused."""
+    head is fused. `profiled` is the runs and the bytes of the profile that guided its executable
+    (`guided`), None where none did."""
     split: int
     candidate: Candidate
     executable: jax.stages.Compiled
+    options: jax.stages.CompilerOptions | None
     xla_defaults: bool
     narrow: bool
     rung: Mapping[str, JSON]
     modules: tuple
     tile: tuple[int, int] | None
     fused: bool
+    profiled: tuple[int, int] | None = None
 
     def record(self) -> dict[str, JSON]:
-        return {"split": self.split, "rows": rows_of(self.candidate.micro), **self.rung}
+        record: dict[str, JSON] = {"split": self.split, "rows": rows_of(self.candidate.micro), **self.rung}
+        if self.profiled is not None:
+            runs, profile = self.profiled
+            record["pgle"] = {"runs": runs, "bytes": profile}
+        return record
+
+    def parts(self, mesh: Mesh) -> list[jax.Array]:
+        """The microbatch index of each of the step's `split` calls, on every device of `mesh`."""
+        return [jax.device_put(np.int32(part), NamedSharding(mesh, P())) for part in range(self.split)]
 
 
 TIMED_STEPS, TIMED_REPEATS, TIMED_WARMUP = 10, 3, 2
@@ -324,6 +340,58 @@ class Timer:
         seconds += [step_seconds(step, together(restore(), frozen), self.batch) for step in steps[1:]]
         self.state = together(restore(), frozen)
         return seconds
+
+    def profiled(self, step: Callable, planned: Planned, mesh: Mesh, runs: int) -> bytes:
+        """XLA's profile of `runs` runs of `planned`'s executable, each over the microbatches of `batch`
+        and waited on, as JAX's AutoPGLE waits on the runs it profiles
+        (`jax.experimental.profiler.get_profiled_instructions_proto`): on a copy of `state`, which `step`
+        steps once first, untraced, so what a step builds at its first call (its window, its narrow copies)
+        is built and the trace holds the executable alone. `state` is then a fresh copy, as a frontier's
+        timing leaves it; the profile is empty on a backend XLA profiles none of."""
+        moving, frozen = apart(self.state)
+        restore = snapshot(moving)
+        stepped, *_ = step(self.state, self.batch)
+        current, held = apart(stepped)
+        parts = planned.parts(mesh)
+        with tempfile.TemporaryDirectory() as directory:
+            with jax.profiler.trace(directory, profiler_options=capture_options()):
+                for _ in range(runs):
+                    for part in parts:
+                        current, loss, *_ = planned.executable(current, held, self.batch, part)
+                    loss.block_until_ready()
+            (capture,) = Path(directory).glob("plugins/profile/*")
+            profile = get_profiled_instructions_proto(str(capture))
+        for leaf in jax.tree.leaves(current):
+            if not leaf.is_deleted():
+                leaf.delete()
+        self.state = together(restore(), frozen)
+        return profile
+
+
+def pgle_runs() -> int:
+    """The runs of a step JAX's AutoPGLE profiles before compiling it again guided by their profile
+    (`jax_enable_pgle`, `jax_pgle_profiling_runs`), 0 where it is off. JAX's jit guides the programs it
+    compiles at a call; a step the plan compiles ahead of its run (`Lowered.compile`) is no such call,
+    which JAX compiles for the profile's sake (command buffers off) and never guides, so the trainer
+    guides it (`guided`)."""
+    return jax.config.jax_pgle_profiling_runs if jax.config.jax_enable_pgle else 0
+
+
+def guided(planned: Planned, profile: bytes, runs: int, mesh: Mesh) -> Planned:
+    """`planned` with its program compiled again under the options its executable compiled under, guided
+    by `profile` of `runs` runs (`Timer.profiled`) as JAX's jit guides AutoPGLE's (XLA's feedback-directed
+    `fdo_profile`, which JAX shares across a pool's processes), and held to the fit check the plan passed:
+    a schedule the profile guides may keep more alive at once, and one that no longer fits is refused.
+    An empty profile, of a backend XLA profiles none of, leaves the executable as it is."""
+    if not profile:
+        return dataclasses.replace(planned, profiled=(runs, 0))
+    executable = planned.candidate.program.compile({**(planned.options or {}), "fdo_profile": profile})
+    fit, headroom = step_fits(executable, mesh, planned.candidate.held)
+    if not fit:
+        raise RuntimeError(f"the step guided by its profile (jax_enable_pgle) needs {-(headroom or 0)} "
+                           "bytes more than its tightest device has, where unguided it fits; train it "
+                           "without AutoPGLE")
+    return dataclasses.replace(planned, executable=executable, profiled=(runs, len(profile)))
 
 
 @dataclasses.dataclass
@@ -415,7 +483,7 @@ def plan_step[LossT, EffectsT](
     halves: set[str] = set()  # the remat rungs (`recompute_record`) the search has asked as half rungs
     forecast, factor = Forecast(), temporaries_factor(mesh)
     chosen: jax.stages.CompilerOptions | None = None
-    fitted: tuple[Candidate, jax.stages.Compiled] | None = None
+    fitted: tuple[Candidate, jax.stages.Compiled, jax.stages.CompilerOptions | None] | None = None
     dropped: str | None = None  # the rung (`rung`) the narrow copies were dropped at
     # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
     required = compiler_options(*objective.towers()) or None
@@ -462,7 +530,7 @@ def plan_step[LossT, EffectsT](
         forecast.read(rung(), split, executable, headroom, factor)
         if fit:
             assert executable is not None
-            fitted = candidate, executable
+            fitted = candidate, executable, chosen
         elif resumed is not None:
             _log.warning("the step does not fit the devices at the rung its checkpoint trained on (%s); from "
                          "here the resumed run computes otherwise than the run it continues", resumed)

@@ -177,6 +177,8 @@ from dew.training.planning import (
     Planned,
     Timer,
     faster,
+    guided,
+    pgle_runs,
     plan_step,
     read_whole,
     settled,
@@ -939,8 +941,7 @@ class Trainer(Generic[Loss, Effects]):
         return run
 
     @ruled
-    def compile(self, state: TrainState, batch: Batch,
-                timed: Callable[[list[CompiledStep]], list[list[float]]] | None = None) -> CompiledStep:
+    def compile(self, state: TrainState, batch: Batch, timed: Timer | None = None) -> CompiledStep:
         """Compile a transaction over the state and one already-produced global batch.
 
         The step consumes the state it is given. The returned state takes over its
@@ -959,7 +960,9 @@ class Trainer(Generic[Loss, Effects]):
         a run is split alike, as its first compile planned or its pooling
         state's window holds; later shapes climb the ladder alone. A plan that
         splits or spans devices, left open and unrecorded, is timed by `timed`
-        (`fit`) against the batch whole a rung up, and the faster kept.
+        (`fit`) against the batch whole a rung up, and the faster kept. Where JAX's AutoPGLE is on
+        (`jax_enable_pgle`), `timed` profiles the plan's first runs on a copy of the state, and the
+        same program compiles again guided by that profile (`dew.training.planning.guided`).
         """
         if self.lower_for is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
@@ -1006,7 +1009,7 @@ class Trainer(Generic[Loss, Effects]):
         # The program compiled above, not the jit: a call through the jit traces and compiles its own,
         # without the step's compiler options, which was 25 s of an A100's cold start.
         split, candidate, executable = planned.split, planned.candidate, planned.executable
-        parts = [jax.device_put(np.int32(part), NamedSharding(mesh, P())) for part in range(split)]
+        parts = planned.parts(mesh)
         window = split * self.accumulation
 
         def run(current, batch):
@@ -1037,8 +1040,7 @@ class Trainer(Generic[Loss, Effects]):
         return run
 
     def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
-                 timed: Callable[[list[CompiledStep]], list[list[float]]] | None,
-                 ) -> tuple[Planned, StepFlops | None]:
+                 timed: Timer | None) -> tuple[Planned, StepFlops | None]:
         """The plan `compile` reads `batch` in (`plan_step`), from the run's splits (`splits`), the
         faster by `timed` of a frontier of two, with `plan` its record and the objective at its rung,
         and a microbatch's FLOPs (`plan_flops`). A plan recorded beside the compilation cache
@@ -1069,11 +1071,15 @@ class Trainer(Generic[Loss, Effects]):
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
             objective=self.objective, mesh=mesh, xla_defaults=self._xla_defaults, narrow=self._narrow,
             base=None if self._base_rung is None else self._base_rung[1], resumed=resumed,
-            # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
-            frontier=timed is not None and recorded is None and resumed is None)
+            # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again. Dew's
+            # tests keep a frontier's first plan (`UNTIMED_FRONTIER`), a test setting.
+            frontier=timed is not None and not untimed_frontier() and recorded is None and resumed is None)
         seconds = timed([self._runner(plan, mesh) for plan in plans]) if len(plans) > 1 and timed else []
         # Every process runs the plan process zero timed clearly faster (`faster`).
         planned = plans[broadcast_from_process_zero(faster(seconds) if seconds else 0)]
+        if (runs := pgle_runs()) and timed is not None:
+            profile = timed.profiled(self._runner(planned, mesh), planned, mesh, runs)
+            planned = guided(planned, profile, runs, mesh)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         self.validation = self._validation(planned.candidate.prepared)
@@ -2144,9 +2150,7 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
             with region("compile"):
-                # Dew's tests keep a frontier's first plan (`UNTIMED_FRONTIER`), a test setting.
-                compiled[signature] = (self.compile(state, batch, None if untimed_frontier() else timer),
-                                       self.step_flops)
+                compiled[signature] = (self.compile(state, batch, timer), self.step_flops)
             seconds = time.perf_counter() - began
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}

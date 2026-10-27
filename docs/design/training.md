@@ -170,7 +170,7 @@ Trainer(objective, opt, key=0,
 
 ## 6. Compilation
 
-Compiled programs depend only on the model, shapes, dtypes, shardings and configuration, never on where a run happens to be: a compiled program captures no run path, temporary directory or checkout location. The persistent compile cache is shared across runs, processes and checkouts. A resumed or repeated run reuses its programs. `lower_for=` lowers a step for a GPU generation on any host. Compiling that lowered step before a GPU is held and carrying its executable into the run is tracked in the [roadmap](../roadmap.md#training-and-parallelism).
+Compiled programs depend only on the model, shapes, dtypes, shardings and configuration, never on where a run happens to be: a compiled program captures no run path, temporary directory or checkout location. The persistent compile cache is shared across runs, processes and checkouts. A resumed or repeated run reuses its programs. JAX's AutoPGLE (`JAX_ENABLE_PGLE=1`, `JAX_PGLE_PROFILING_RUNS`) guides the programs JAX's jit compiles at a call; the trainer's step is compiled ahead of its run, so the trainer guides it the same way: it profiles the plan's executable for as many runs on a copy of the state, compiles the same program under the same options with that profile (XLA's `fdo_profile`), and holds the guided executable to the plan's fit check. `lower_for=` lowers a step for a GPU generation on any host. Compiling that lowered step before a GPU is held and carrying its executable into the run is tracked in the [roadmap](../roadmap.md#training-and-parallelism).
 
 ## 7. Seeing what happens
 

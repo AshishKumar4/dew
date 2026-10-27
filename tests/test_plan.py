@@ -5,7 +5,9 @@ the update pools the same rows, the clocks count the same steps, and a
 resumed run reads its batches as the run it continues did.
 """
 
+import contextlib
 import re
+from collections.abc import Iterator
 
 import jax
 import jax.numpy as jnp
@@ -329,6 +331,63 @@ def test_a_recorded_plan_settles_its_kernel_launches_without_lowering_the_step_f
     finally:
         jax.monitoring.unregister_event_duration_listener(lowering)
     assert counts[1] == 1
+
+
+@contextlib.contextmanager
+def autopgle(runs: int) -> Iterator[None]:
+    """JAX's AutoPGLE on for the block, profiling a program's first `runs` runs before compiling it
+    again guided by them (`jax_enable_pgle`, `jax_pgle_profiling_runs`)."""
+    before = jax.config.jax_enable_pgle, jax.config.jax_pgle_profiling_runs
+    jax.config.update("jax_enable_pgle", val=True)
+    jax.config.update("jax_pgle_profiling_runs", val=runs)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_pgle", val=before[0])
+        jax.config.update("jax_pgle_profiling_runs", val=before[1])
+
+
+def timed_steps(trainer, steps: int):
+    """The state after `steps` steps of BATCH from the trainer's placed state, compiled with the timer
+    `fit` hands its compile (`Timer`), which steps a copy of the state where the plan runs trials."""
+    state, _, _ = trainer.place()
+    timer = Timer(state, BATCH)
+    step = trainer.compile(state, BATCH, timer)
+    state = timer.state
+    for _ in range(steps):
+        state, *_ = step(state, BATCH)
+    return state
+
+
+@pytest.mark.parametrize("split", [1, 2], ids=["whole-batch", "two-microbatches"])
+def test_a_step_compiled_ahead_is_profiled_on_a_copy_of_its_state_under_autopgle(split):
+    """Under JAX's AutoPGLE, the step a plan compiles ahead of its run, which no jit call profiles, is
+    profiled by the trainer: as many runs of its executable as AutoPGLE profiles, each over the step's
+    microbatches, on a copy of the state, which the plan records; the run then trains from the state it
+    was given, as a run without AutoPGLE does. XLA's profile of a CPU holds nothing, so here the plan
+    keeps the executable it admitted."""
+    unguided = timed_steps(lm(split=split), steps=3)
+    with autopgle(2):
+        trainer = lm(split=split)
+        state = timed_steps(trainer, steps=3)
+    assert trainer.plan["pgle"] == {"runs": 2, "bytes": 0}
+    assert int(state.step) == 3
+    for guided_leaf, unguided_leaf in zip(jax.tree.leaves(state.variables),
+                                          jax.tree.leaves(unguided.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(guided_leaf), np.asarray(unguided_leaf))
+
+
+@pytest.mark.gpu(reason="XLA profiles the instructions of an NVIDIA GPU's programs alone")
+def test_a_step_compiled_ahead_is_compiled_again_guided_by_its_profile_under_autopgle():
+    """On an NVIDIA GPU the profile of the step's first runs holds its instructions' times, and the
+    plan's program compiles again under the options it compiled under, guided by it, the run training
+    on the guided executable."""
+    with autopgle(2):
+        trainer = lm()
+        state = timed_steps(trainer, steps=3)
+    assert trainer.plan["pgle"]["runs"] == 2 and trainer.plan["pgle"]["bytes"] > 0
+    assert int(state.step) == 3 and all(np.isfinite(np.asarray(leaf)).all()
+                                        for leaf in jax.tree.leaves(state.variables))
 
 
 def test_a_pinned_split_is_read_as_given_and_its_state_holds_it():
