@@ -485,14 +485,16 @@ def custom_call_targets(lowered) -> list[str]:
 
 @pytest.mark.gpu(reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
 @pytest.mark.skipif(not bf16_dot_runs(), reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
-def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn(without_deterministic_ops):
-    """'auto' hands the band mask of a packed, windowed bf16 call to cuDNN
-    as a bias: finite everywhere, padding rows included, and as close to a
-    float64 oracle as the xla band is. The file's one site not on check 1
-    (ledger row 1321): cuDNN's backward leaves dQ off zero on a query that
-    reads one key, where the oracle and the xla band are exactly zero, so
-    check 1's zero rows fail it. It converts to check 1 against the xla band
-    when the attention template, exact there, takes this route."""
+def test_packed_windowed_bf16_attention_runs_its_band_on_its_targets_kernel(without_deterministic_ops):
+    """'auto' runs the band of a packed, windowed bf16 call on its target's kernel. On a GPU whose Mosaic
+    template has a routed mainloop (Hopper's wgmma), the template, which takes it whole (FlashAttention-3,
+    the cell's declared route, refuses the document bound): check 1 against the xla band over drawn calls,
+    as this site's docstring held it would convert. Elsewhere cuDNN, by legality, its band mask a bias:
+    finite everywhere, padding rows included, and as close to a float64 oracle as the xla band is, the
+    file's one site not on check 1 (ledger row 1321): cuDNN's backward leaves dQ off zero on a query that
+    reads one key, where the oracle and the xla band are exactly zero, so check 1's zero rows fail it."""
+    from dew.nn.kernels import generation
+
     batch, length, heads, kv_heads, width, window = 1, 1024, 8, 2, 64, 256
     # Three documents fill 880 of 1024 rows; the rest is padding, segment 0.
     lengths = [300, 200, 380]
@@ -513,7 +515,26 @@ def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn(without_determini
             return jnp.sum(out.astype(jnp.float32) * cotangent * real[None, :, None, None]), out
         return jax.jit(jax.value_and_grad(run, argnums=(0, 1, 2), has_aux=True))
 
-    targets = custom_call_targets(loss("auto").lower(query, key, value))
+    with generation.routes() as found:
+        targets = custom_call_targets(loss("auto").lower(query, key, value))
+    templated = generation.family(generation.device_generation()) == "wgmma"
+    assert {route.kernel for route in found if route.choice == "attention"} == (
+        {"template"} if templated else {"cudnn"})
+    if templated:
+        def draw(seed):
+            streams = jax.random.split(jax.random.key(seed), 4)
+            return (jax.random.normal(streams[0], query.shape, jnp.bfloat16),
+                    jax.random.normal(streams[1], key.shape, jnp.bfloat16),
+                    jax.random.normal(streams[2], value.shape, jnp.bfloat16),
+                    jax.random.normal(streams[3], query.shape, jnp.bfloat16))
+
+        def band(implementation):
+            return jax.jit(with_gradients(lambda q, k, v: local_attention(
+                q, k, v, window=window, segment_ids=segment_ids, implementation=implementation)))
+
+        assert_as_exact(band("auto"), band("xla"), draw, "packed windowed band on the template",
+                        seeds=FEWEST_SEEDS)
+        return
     assert any(target.startswith("__cudnn$fmha") for target in targets), targets
 
     def oracle(query, key, value):
