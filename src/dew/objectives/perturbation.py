@@ -15,11 +15,12 @@ rows its ids read. Every other parameter (a norm's scale, a mixing scalar, a con
 estimated by two-sided weight-space evolution strategies, rewarded by the whole loss.
 
 `NodePerturbation`, mixed into any objective over a Flax model (`class Forward(NodePerturbation,
-Supervised)`), does this: it reads every `nn.Dense` and `nn.Embed` call (`flax.linen.intercept_methods`), a subclass of either among them, and credits each unit
-of an output by the objective's own loss of that unit (`Objective.unit_losses`, a language model's tokens,
-a supervised model's examples) where the output's leading axes are the units', else by the whole loss.
-Crediting a token's jitter by its own token's loss alone, as Dust's direct draws do, leaves out what the
-jitter changes in later tokens' losses through attention: a lower-variance estimate, biased by that. No
+Supervised)`), does this: it reads every `nn.Dense` and `nn.Embed` call (`flax.linen.intercept_methods`),
+a subclass of either among them, and credits each unit of an output by the objective's own loss of that
+unit (`Objective.unit_losses`, a supervised model's examples) where the output's leading axes are the
+units', else by the whole loss. An objective whose units' losses read other units' outputs, a causal
+model's tokens, would credit a token's jitter by its own token's loss alone, as Dust's direct draws do,
+leaving out what the jitter changes in later tokens' losses: a lower-variance estimate, biased by that. No
 derivative of the model is taken: the estimate is the loss's stated gradient (`Objective.with_gradients`),
 which the trainer applies as it applies `jax.grad`'s. A model that maps or scans its layers (`nn.scan`,
 `jax.vmap` inside its call) hides their calls' values from a capture outside them, and is refused.
@@ -54,8 +55,8 @@ class Site:
 
 
 def _flat(tree) -> dict[tuple[str, ...], jax.Array]:
-    """Every leaf of a tree of mappings, by the path of keys to it."""
-    return {tuple(str(getattr(key, "key", key)) for key in path): leaf
+    """Every leaf of a tree of mappings, by the path of its keys (each a `DictKey`)."""
+    return {tuple(str(key.key) for key in path if isinstance(key, jax.tree_util.DictKey)): leaf
             for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
 
 
