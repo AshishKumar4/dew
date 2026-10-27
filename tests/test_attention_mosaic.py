@@ -1005,3 +1005,45 @@ def test_the_backward_is_on_par_on_an_h100(call, form):
 def test_the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
     """The backward in both forms under each score hook compiled on an H100."""
     _check_hooked_backward(hooks, form=form, interpret=False)
+
+
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
+def test_the_mosaic_launches_state_the_models_attention_flops(causal):
+    """A bf16 call's plain forward, training forward and backward through the Mosaic mainloop, each lowered
+    for an H100: every launch states its cost (`attention_mosaic_program.stated`), which Dew's FLOP count
+    reads to size it (`instrumentation._stated_flops`: no launch unsized), and together they state the
+    library's fused attention's own count, a multiply-add a reached pair, head and product column: the
+    forward's two products, the training forward's two and the backward's four
+    (`instrumentation._fused_attention_flops`), a rerun (the guarded launch, the fold's natural walk) adding
+    none. The launches' own statements are read: the training forward's overflowed rows rerun the plain-JAX
+    walk in a conditional, whose products the count bounds apart."""
+    import re
+
+    from dew.telemetry.instrumentation import _stated_flops
+
+    rows, tokens, heads, kv_heads, width = 1, 256, 4, 2, 64
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
+    spans = template.spans(tokens, tokens, rows, causal=causal)
+    pairs = tokens * (tokens + 1) // 2 if causal else tokens * tokens
+    forward = 2 * rows * heads * pairs * (width + width)
+
+    def counted(fn, *arrays):
+        with generation.assumed("sm90"):
+            text = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
+        launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
+        assert launches and all(_stated_flops(line) is not None for line in launches)
+        return sum(_stated_flops(line) or 0.0 for line in launches)
+
+    def trained(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, residuals=True)
+
+    with generation.assumed("sm90"):
+        residuals = jax.eval_shape(trained, query, key, key)[1:]
+
+    def backward(query, key, value, dout, residuals):
+        return attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals)
+
+    assert counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key) == forward
+    assert counted(trained, query, key, key) == forward
+    assert counted(backward, query, key, key, query, residuals) == 2 * forward
