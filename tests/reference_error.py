@@ -955,36 +955,101 @@ def leaf_summary(reference, truth, spread=None) -> RecordedLeaf:
                         np.flatnonzero(~sized), rows[~sized],
                         finite=bool(np.isfinite(reference).all() and np.isfinite(truth).all()), dtype=dtype,
                         zero_sizes=own[~sized], worst_log=logged,
-                        zero_spreads=None if spread is None else _scaled_rms(
+                        zero_spreads=None if spread is None or truth.ndim < 2 else _scaled_rms(
                             np.asarray(spread, np.float64).reshape(-1, truth.shape[-1]))[~sized])
 
 
 SPREAD_DRAWS = 2
-"""The perturbed evaluations of a truth `_truth_spread` takes."""
+"""The Monte Carlo evaluations of a truth `_truth_spread` takes."""
+
+ROUNDED = frozenset({
+    "add", "sub", "mul", "div", "rem", "pow", "integer_pow", "square", "sqrt", "rsqrt", "cbrt", "exp",
+    "exp2", "expm1", "log", "log1p", "logistic", "tanh", "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "sinh", "cosh", "asinh", "acosh", "atanh", "erf", "erfc", "erf_inv", "lgamma", "digamma", "dot_general",
+    "conv_general_dilated", "reduce_sum", "reduce_prod", "cumsum", "cumprod", "cumlogsumexp"})
+"""The primitives whose float results are roundings (`_rounded`): arithmetic, not a move of data (a
+reshape, a slice, a select, a maximum or a negation is exact)."""
 
 
-def _ulp_moved(inputs, seed: int):
-    """`inputs` with each float moved one float64 unit, up or down by `seed`'s draw: a float64 rounding
-    of every input."""
-    rng = np.random.default_rng([0x1856, seed])
+def _rounded(jaxpr, consts, args, rng):
+    """`jaxpr` evaluated op by op in Monte Carlo arithmetic: every float result of a rounding primitive
+    (ROUNDED) scaled by 1 ± float64's unit roundoff at random, element by element, through calls, scans,
+    loops and branches alike, so a value the truth rounds to its own resolution moves by that rounding,
+    and one it computes exactly (0 = x - x) does not. A shard_map's program runs as it is."""
+    from jax.extend.core import Literal
 
-    def moved(leaf):
-        leaf = np.asarray(leaf)
-        if not np.issubdtype(leaf.dtype, np.floating):
-            return leaf
-        return np.nextafter(leaf, np.where(rng.random(leaf.shape) < 0.5, -np.inf, np.inf)).astype(leaf.dtype)
-    return jax.tree.map(moved, inputs)
+    values = dict(zip(jaxpr.constvars + jaxpr.invars, [*consts, *args], strict=True))
+
+    def read(var):
+        return var.val if isinstance(var, Literal) else values[var]
+
+    unit = float(np.finfo(np.float64).eps) / 2
+    for equation in jaxpr.eqns:
+        inputs = [read(var) for var in equation.invars]
+        name, params = equation.primitive.name, equation.params
+        body = _body(equation)
+        with equation.ctx.manager:
+            if body is not None:
+                outputs = _rounded(*body, inputs, rng)
+            elif name == "scan":
+                outputs = _rounded_scan(params, inputs, rng)
+            elif name == "while":
+                condition, loop = params["cond_jaxpr"], params["body_jaxpr"]
+                tested, run = params["cond_nconsts"], params["body_nconsts"]
+                carry = inputs[tested + run:]
+                while bool(jax.core.eval_jaxpr(condition.jaxpr, condition.consts, *inputs[:tested],
+                                               *carry)[0]):
+                    carry = _rounded(loop.jaxpr, loop.consts, [*inputs[tested:tested + run], *carry], rng)
+                outputs = carry
+            elif name == "cond":
+                branch = params["branches"][int(inputs[0])]
+                outputs = _rounded(branch.jaxpr, branch.consts, inputs[1:], rng)
+            else:
+                outputs = equation.primitive.bind(*inputs, **equation.primitive.get_bind_params(params))
+                outputs = list(outputs) if equation.primitive.multiple_results else [outputs]
+                if name in ROUNDED:
+                    outputs = [jnp.asarray(output) * (1 + unit * rng.choice((-1.0, 1.0), np.shape(output)))
+                               if jnp.issubdtype(jnp.result_type(output), jnp.floating) else output
+                               for output in outputs]
+        values.update(zip(equation.outvars, outputs, strict=True))
+    return [read(var) for var in jaxpr.outvars]
+
+
+def _rounded_scan(params, inputs, rng):
+    """A scan in Monte Carlo arithmetic (`_rounded`), its body evaluated a step at a time."""
+    body = params["jaxpr"]
+    constants, carries = params["num_consts"], params["num_carry"]
+    consts, carry = inputs[:constants], inputs[constants:constants + carries]
+    xs = inputs[constants + carries:]
+    ys = []
+    steps = range(params["length"])
+    for step in reversed(steps) if params["reverse"] else steps:
+        outputs = _rounded(body.jaxpr, body.consts, [*consts, *carry, *(x[step] for x in xs)], rng)
+        carry = outputs[:carries]
+        ys.append(outputs[carries:])
+    if params["reverse"]:
+        ys.reverse()
+    return [*carry, *([jnp.stack(column) for column in zip(*ys, strict=True)] if ys else [])]
 
 
 def _truth_spread(truth_fn, wide, truth):
-    """How far `truth_fn` moves from `truth` on `wide`, its float64 inputs, each moved by one float64
-    unit (`_ulp_moved`), element by element the largest over SPREAD_DRAWS draws: the truth's own
-    uncertainty where its inputs' rounding reaches it, conditioning included."""
+    """How far the truth moves from `truth` when its own roundings move (`_rounded`, Monte Carlo
+    arithmetic on `truth_fn` of `wide`, its float64 inputs), element by element the largest over
+    SPREAD_DRAWS evaluations: the truth's own uncertainty, conditioning and its chain of roundings
+    included. Its inputs are the truth's as given: a float32 draw widened is exact."""
+    truth_fn = truth_fn.fn if isinstance(truth_fn, _Truth) else truth_fn
+    if _given(truth_fn) or getattr(truth_fn, "recorded", False):
+        raise ValueError("a truth's roundings are moved where it is a JAX function the gate traces; this "
+                         "one runs as given or is a recording")
+    closed = jax.make_jaxpr(truth_fn)(*wide)
+    tree = jax.tree.structure(jax.eval_shape(truth_fn, *wide))
     spread = None
     for seed in range(SPREAD_DRAWS):
+        outputs = _rounded(closed.jaxpr, closed.consts, jax.tree.leaves(wide),
+                           np.random.default_rng([0x1856, seed]))
         moved = jax.tree.map(lambda one, other: np.abs(np.asarray(one, np.float64)
                                                        - np.asarray(other, np.float64)),
-                             truth_fn(*_ulp_moved(wide, seed)), truth)
+                             tree.unflatten(outputs), truth)
         spread = moved if spread is None else jax.tree.map(np.maximum, spread, moved)
     return spread
 
@@ -1115,7 +1180,8 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     float64's accuracy on it; a sum that cancels to float64's residue is never measured so, and a
     product far below its leaf, which float64 holds to its own precision, is. Where the site asks the
     truth's own spread on its rows (`resolve_rows`), a row is measured only where the truth resolves
-    it too: its spread under float64 rounding of its inputs at most its size over ROW_FACTOR², so the
+    it too: its spread under Monte Carlo arithmetic of its own roundings at most its size over
+    ROW_FACTOR², in both truths of a pair, so the
     truth's uncertainty there sits a ROW_FACTOR under the least the row rule tells apart (ledger 1856:
     a Sinkhorn gradient's rows, eps times the derivative of a residual below float64's resolution,
     which JAX's and torch's float64 put 2 times apart and each float32 arm leaves as noise, read as
@@ -1137,9 +1203,14 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
                              f"{unrecorded[:4]}")
     sizes = (dict(zip(theirs.zero_rows.tolist(), theirs.zero_sizes.tolist(), strict=True))
              if theirs.zero_sizes is not None else {})
-    # The truth's own spread on each row (`resolve_rows`): a row it does not resolve measures nothing.
-    held = mine.zero_spreads if mine.zero_spreads is not None else theirs.zero_spreads
-    spreads = {} if held is None else dict(zip(mine.zero_rows.tolist(), held.tolist(), strict=True))
+    # Each truth's own spread on each row (`resolve_rows`): a row either truth does not resolve measures
+    # nothing. A spread that is not a number resolves nothing either way, and the row keeps its rule.
+    spreads: dict[int, float] = {}
+    for summary in (mine, theirs):
+        if summary.zero_spreads is not None:
+            for at, spread in zip(summary.zero_rows.tolist(), summary.zero_spreads.tolist(), strict=True):
+                if np.isfinite(spread):
+                    spreads[at] = max(spreads.get(at, 0.0), spread)
     worst, their_worst, zero = mine.log_worst, theirs.log_worst, []
     for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True):
         size = sizes.get(at, 0.0)
@@ -1338,10 +1409,12 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/certified.py).
 
-    `resolve_rows` evaluates the truth again on its inputs each moved one float64 unit (`_truth_spread`)
-    and counts a row of float64 zero as measured only where the truth resolves it (`_paired`), for a
-    site whose tiny rows are below what float64 itself resolves; a row it does not resolve keeps the
-    zero rows' rule. The truth then runs SPREAD_DRAWS more times a draw."""
+    `resolve_rows` evaluates the truth SPREAD_DRAWS more times in Monte Carlo arithmetic, each of its
+    own roundings moved by float64's unit roundoff at random (`_truth_spread`), and counts a row of
+    float64 zero as measured only where both truths resolve it (`_paired`), for a site whose tiny rows
+    are below what float64 itself resolves; a row they do not resolve keeps the zero rows' rule. The
+    truth is a JAX function the gate traces, evaluated op by op there; one run as given or recorded is
+    refused."""
     if seeds < FEWEST_SEEDS:
         raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
                                     f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
