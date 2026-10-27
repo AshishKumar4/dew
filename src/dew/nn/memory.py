@@ -418,18 +418,19 @@ class InContextMemory(nn.Module):
             read = read.reshape(batch, length, -1)
         return read
 
-    def _keys(self, x: jax.Array) -> dict[str, jax.Array] | None:
-        """Each token and head's key data `[B, S, H, ...]` of every RNG stream the call carries, each
-        split from its own stream, so the streams stay as apart as the call holds them: a training
-        forward's `dropout` and `stochastic_rounding` (`training_rngs`), and an initialization's
-        `params`, which a stream the network asks for and the call lacks falls back to, as at any
-        child; None without any. An application folds its use into its token's key (`_applied`)."""
+    def _keys(self, x: jax.Array) -> dict[tuple, jax.Array] | None:
+        """Each token and head's key data `[B, S, H, ...]` of every RNG stream the call carries, by the
+        stream's name and its key's implementation, each split from its own stream, so the streams stay
+        as apart as the call holds them: a training forward's `dropout` and `stochastic_rounding`
+        (`training_rngs`), and an initialization's `params`, which a stream the network asks for and the
+        call lacks falls back to, as at any child; None without any. An application rewraps each token's
+        data in its stream's implementation, a typed rbg key's as rbg, and folds its use in (`_applied`)."""
         assert self.scope is not None, "a bound memory has a scope"
         streams = sorted(self.scope.rngs)
         batch, length = x.shape[:2]
-        return {name: rows_like(jax.random.key_data(jax.random.split(self.make_rng(name),
-                                                                     (batch, length, self.heads))), x)
-                for name in streams} or None
+        split = {name: jax.random.split(self.make_rng(name), (batch, length, self.heads)) for name in streams}
+        return {(name, jax.random.key_impl(keys)): rows_like(jax.random.key_data(keys), x)
+                for name, keys in split.items()} or None
 
     @property
     def residuals(self) -> tuple[str, ...]:
@@ -565,7 +566,7 @@ class InContextMemory(nn.Module):
 
     # The function, token by token and chunk by chunk.
 
-    def _applied(self, head: _Head, fast: dict, x: jax.Array, keys: dict[str, jax.Array] | None = None, *,
+    def _applied(self, head: _Head, fast: dict, x: jax.Array, keys: dict[tuple, jax.Array] | None = None, *,
                  wide: bool, use: int) -> jax.Array:
         """`head`'s network at its moving weights `fast` and the ones it holds over one token's vector
         `x`, at the state's precision where `wide` (the gradients) and else the layer's dtype (a
@@ -577,8 +578,9 @@ class InContextMemory(nn.Module):
             dtype = self.dtype or x.dtype
             params = jax.tree.map(lambda leaf: leaf.astype(dtype) if self.dtype is not None else leaf, params)
             x = x.astype(dtype)
-        rngs = {} if keys is None else {name: jax.random.fold_in(jax.random.wrap_key_data(key), use)
-                                        for name, key in keys.items()}
+        rngs = {} if keys is None else {
+            name: jax.random.fold_in(jax.random.wrap_key_data(key, impl=impl), use)
+            for (name, impl), key in keys.items()}
         # The weights move from W_0 each call, so a serving quantization rounds their products as quantized
         # training does, no stored copy of them existing.
         with moving_weights():
@@ -588,7 +590,7 @@ class InContextMemory(nn.Module):
         return out
 
     def _gradient(self, head: _Head, state: dict, key: jax.Array, target: jax.Array,
-                  keys: dict[str, jax.Array] | None) -> dict:
+                  keys: dict[tuple, jax.Array] | None) -> dict:
         """One head's gradient of the objective at the moving weights `state` for one token, in the
         state's precision, each matrix orthogonalized where `orthogonalize` asks. An adapter's B factor
         rides the state, so a retention forgets the adapter's update s A B as it forgets W_0's, and the
@@ -605,7 +607,7 @@ class InContextMemory(nn.Module):
 
         return jax.tree_util.tree_map_with_path(stepped, gradient)
 
-    def _target(self, head: _Head, state: dict, value: jax.Array, keys: dict[str, jax.Array] | None
+    def _target(self, head: _Head, state: dict, value: jax.Array, keys: dict[tuple, jax.Array] | None
                 ) -> jax.Array:
         """A token's target: its value view, or the network's image of it at `state` (Nested Learning
         Eq 84). The inner gradient holds it fixed (`_gradient` differentiates the prediction alone); the
@@ -615,11 +617,11 @@ class InContextMemory(nn.Module):
         return self._applied(head, state, value, keys, wide=True, use=TARGET)
 
     def _step(self, head: _Head, state: dict, key: jax.Array, value: jax.Array,
-              keys: dict[str, jax.Array] | None) -> dict:
+              keys: dict[tuple, jax.Array] | None) -> dict:
         """One head's gradient for one token at `state`, of the objective against its target there."""
         return self._gradient(head, state, key, self._target(head, state, value, keys), keys)
 
-    def _read(self, head: _Head, state: dict, query: jax.Array, keys: dict[str, jax.Array] | None
+    def _read(self, head: _Head, state: dict, query: jax.Array, keys: dict[tuple, jax.Array] | None
               ) -> jax.Array:
         """One head's readout of a token at `state`, at the layer's dtype."""
         return self._applied(head, state, query, keys, wide=False, use=READ)
@@ -783,7 +785,7 @@ class _Steps(NamedTuple):
     a: jax.Array
     real: jax.Array
     places: jax.Array
-    keys: dict[str, jax.Array] | None
+    keys: dict[tuple, jax.Array] | None
 
 
 def _documents(steps: _Steps) -> tuple[jax.Array, jax.Array]:
@@ -816,7 +818,7 @@ def _within(values: jax.Array, begins: jax.Array) -> jax.Array:
     return jax.lax.associative_scan(combined, (begins, values), axis=1)[1]
 
 
-def _at(keys: dict[str, jax.Array] | None, head: int, axis: int) -> dict[str, jax.Array] | None:
+def _at(keys: dict[tuple, jax.Array] | None, head: int, axis: int) -> dict[tuple, jax.Array] | None:
     """Each stream's key data in `keys` at head `head` of its `axis`; None stays None."""
     return None if keys is None else {name: jnp.take(key, head, axis=axis) for name, key in keys.items()}
 
