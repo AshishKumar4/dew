@@ -28,9 +28,9 @@ from dew._records import number, record
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
 from dew.decision.laya import LAYA
-from dew.decision.layout import Framing, Labels, Layout, QuestionLayout, Schema, Segment, default_layout
+from dew.decision.layout import Framing, Labels, Layout, QuestionLayout, RowSegment, Schema, default_layout
 from dew.decision.model import DecisionModel
-from dew.decision.objective import DecisionObjective
+from dew.decision.objective import DecisionObjective, tokenizer_of
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
@@ -62,10 +62,11 @@ class JointShape:
 class Letters:
     """The letter readout (`LabelReadout`): each option scored by the backbone's own logit at its
     label's token, read at the row's answer cue, as a slot release reads it; its rows lettered as
-    `labels` letter them, each label one token of the run's tokenizer. The head holds `count`
-    labels, and its rows letter no more: a question of more options, one the objective's
-    none-of-the-above adds among them, is refused where its row is laid out. `untied` gives each
-    label a trainable output row of its own, drawn from the backbone's."""
+    `labels` letter them, each label one token of the run's tokenizer: where `labels` names none,
+    the first `count` of `LABEL_NAMES` the tokenizer spells as one token (`Labels.spelled`). The head
+    holds `count` labels, and its rows letter no more: a question of more options, one the
+    objective's none-of-the-above adds among them, is refused where its row is laid out. `untied`
+    gives each label a trainable output row of its own, drawn from the backbone's."""
 
     labels: Labels = dataclasses.field(default_factory=Labels)
     count: int = 26
@@ -116,10 +117,13 @@ class DecisionRunConfig(DecoderRunConfig):
     (a hundred options, or a document's many hypotheses) fits under a `max_len`
     set for it without lengthening every other row's state. None lets the
     state fill the row."""
-    segments: Annotated[tuple[Segment, ...], record_argument(tuple[Segment, ...])] | None = None
-    """A joint row's user turn, its parts in order (`JointLayout.segments`): the schema first, or
-    read as the row's context through `context_layers` (`Schema(stream="context")`), its
-    `context_length` holding the whole schema. None keeps the layout's own, the release's turn."""
+    segments: Annotated[tuple[RowSegment, ...], record_argument(tuple[RowSegment, ...])] | None = None
+    """The row's parts in order, as its layout reads them. A joint row's user turn
+    (`JointLayout.segments`): the schema first, or read as the row's context through
+    `context_layers` (`Schema(stream="context")`), its `context_length` holding the whole schema. A
+    question row's text (`QuestionLayout.segments`): its instructions, option lines and answer cue
+    beside the state, the question first or the state first, its blocks following that order
+    (`QuestionLayout.blocks`). None keeps the layout's own, the release's turn."""
     framing: Framing | None = None
     """How a joint row frames itself as a conversation (`Framing`): its system message, the
     assistant's prefill, the reasoning switch, a Jinja chat template in place of the tokenizer's
@@ -209,21 +213,7 @@ class DecisionRunConfig(DecoderRunConfig):
             start = Decide.of(start)
             derived["layout"] = _budgeted(start.layout, budgets)
         else:
-            labels = None
-            if isinstance(self.head, JointShape):
-                width, head_dtype = DecisionModel.head_size(start.model)
-                derived["head"] = JointSchemaHead(hidden_size=width, dtype=head_dtype,
-                                                  **dataclasses.asdict(self.head))
-            elif isinstance(self.head, Letters):
-                # Its ids are its labels' under the objective's tokenizer, which lays the rows out too.
-                letters, (width, head_dtype) = self.head.labels, DecisionModel.head_size(start.model)
-                labels = dataclasses.replace(letters, names=letters.names_for(self.head.count))
-                derived["head"] = LabelReadout(features=width, label_ids=(), untied=self.head.untied,
-                                               dtype=head_dtype)
-            head = derived.get("head", DecisionHead)
-            # Lettered rows lie one question to a row, as the backbone's order asks.
-            layout = _fresh_layout(start.model.causal, head.one_question or labels is not None, budgets)
-            derived["layout"] = _laid(layout, blocked, labels)
+            derived.update(self._fresh_head(start, blocked, budgets))
         objective = self.objective.build(backbone=start, **derived)
         assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
         summary: dict[str, object] = {"pretrained": self.pretrained}
@@ -259,6 +249,29 @@ class DecisionRunConfig(DecoderRunConfig):
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
                                                       summary=summary, after=after, validation=held))
 
+    def _fresh_head(self, start, blocked: bool, budgets: Budgets) -> dict[str, object]:
+        """The head a fresh backbone `start` reads and its rows' layout: the joint schema head, the
+        letter readout of its own logits (`Letters`), its labels named by the backbone's tokenizer, or
+        Laya's head, over the layout their rows take, in blocks where `blocked` (`_fresh_layout`)."""
+        labels, head = None, None
+        if isinstance(self.head, JointShape):
+            width, head_dtype = DecisionModel.head_size(start.model)
+            head = JointSchemaHead(hidden_size=width, dtype=head_dtype, **dataclasses.asdict(self.head))
+        elif isinstance(self.head, Letters):
+            # Its ids are its labels' under the objective's tokenizer, which lays the rows out too and
+            # names the labels it spells as one token each.
+            encoder = tokenizer_of(start.text_processor)
+            if encoder is None:
+                raise ValueError("the letter readout names its labels by the backbone's tokenizer, and "
+                                 "this checkpoint loads none")
+            labels = self.head.labels.spelled(encoder, self.head.count)
+            width, head_dtype = DecisionModel.head_size(start.model)
+            head = LabelReadout(features=width, label_ids=(), untied=self.head.untied, dtype=head_dtype)
+        # Lettered rows lie one question to a row, as the backbone's order asks.
+        one_question = (DecisionHead if head is None else head).one_question or labels is not None
+        layout = _fresh_layout(start.model.causal, one_question, budgets, blocked, labels)
+        return {"layout": layout} if head is None else {"head": head, "layout": layout}
+
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """The task's own held-out suite (`default_metrics`), where the data holds held-out rows."""
         if not validates:
@@ -266,27 +279,25 @@ class DecisionRunConfig(DecoderRunConfig):
         return tuple(MetricConfig(import_path(type(metric))) for metric in default_metrics())
 
 
-type Budgets = dict[str, int | Framing | tuple[Segment, ...] | None]
+type Budgets = dict[str, int | bool | Framing | Labels | tuple[RowSegment, ...] | None]
 """A run's budgets of a row's layout, by the layout's field names (`_budgeted`)."""
 
 
-def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets) -> Layout:
-    """The layout a fresh head reads (`default_layout`), with the run's `budgets`."""
-    return _budgeted(default_layout(causal, one_question), budgets)
-
-
-def _laid(layout: Layout, blocked: bool, labels: Labels | None) -> Layout:
-    """A fresh head's `layout` with its rows in blocks where its backbone's text reads each of a row's
-    blocks whole, as the checkpoint's attention and the run's `--source.attention` declare it
-    (`blocked`, `reads_blocks`), not where a checkpoint reads its own media so, and lettered by
-    `labels` where the run reads letters; a layout whose rows can do neither, a joint row of every
-    question, is refused."""
+def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets, blocked: bool,
+                  labels: Labels | None) -> Layout:
+    """The layout a fresh head reads (`default_layout`), with the run's `budgets`, its rows in blocks
+    where its backbone's text reads each of a row's blocks whole, as the checkpoint's attention and the
+    run's `--source.attention` declare it (`blocked`, `reads_blocks`), not where a checkpoint reads its
+    own media so, and lettered by `labels` where the run reads letters, all set at once, so that a
+    question row's segments read under the labels they need; a layout whose rows can do neither, a
+    joint row of every question, is refused."""
+    layout = default_layout(causal, one_question)
     stated = {**({"blocks": True} if blocked else {}), **({} if labels is None else {"labels": labels})}
     if stated and not isinstance(layout, QuestionLayout):
         raise ValueError(f"{type(layout).__name__} lays every question in one row, which lies in no blocks "
                          "and carries no labels; a block_bidirectional --source.attention and the letter "
                          "readout read a question to a row")
-    return dataclasses.replace(layout, **stated)
+    return _budgeted(layout, {**budgets, **stated})
 
 
 def _budgeted(layout: Layout, budgets: Budgets) -> Layout:

@@ -448,14 +448,15 @@ class Layout:
 LETTERS = tuple(chr(ord("A") + index) for index in range(26))
 
 
+LABEL_NAMES = (*LETTERS, *(first + second for first in LETTERS for second in LETTERS))
+"""Every label, in order: `A` to `Z`, then `AA`, `AB`, ..., `ZZ`, as a release's slots name them."""
+
+
 def label_names(count: int) -> tuple[str, ...]:
-    """The first `count` labels: `A` to `Z`, then `AA`, `AB`, ..., as a release's slots name them."""
-    names = list(LETTERS)
-    for first in LETTERS:
-        names.extend(first + second for second in LETTERS)
-    if count > len(names):
-        raise ValueError(f"{count} options outnumber the {len(names)} labels")
-    return tuple(names[:count])
+    """The first `count` labels of `LABEL_NAMES`."""
+    if count > len(LABEL_NAMES):
+        raise ValueError(f"{count} options outnumber the {len(LABEL_NAMES)} labels")
+    return LABEL_NAMES[:count]
 
 
 @dataclass(frozen=True)
@@ -483,6 +484,21 @@ class Labels:
         if count > len(self.names):
             raise ValueError(f"{count} options outnumber the layout's {len(self.names)} labels")
         return self.names[:count]
+
+    def spelled(self, encoder: Tokenizer, count: int) -> "Labels":
+        """These labels named for `encoder`: their own `names` where set, else the first `count` of
+        `LABEL_NAMES` whose every variant `encoder` spells as one token, skipping those it spells as
+        two (Qwen3.5 spells " BQ" as two, and 570 of the 702 as one), so a run letters as many options
+        as its tokenizer can. Fewer than `count` such names is refused."""
+        if self.names is not None:
+            return dataclasses.replace(self, names=self.names_for(count))
+        same = _same(encoder)
+        named = [name for name in LABEL_NAMES
+                 if all(len(_piece(same, variant.format(name))) == 1 for variant in self.variants)]
+        if count > len(named):
+            raise ValueError(f"{count} options outnumber the {len(named)} labels this tokenizer spells as "
+                             f"one token each (of {len(LABEL_NAMES)})")
+        return dataclasses.replace(self, names=tuple(named[:count]))
 
     def ids(self, encoder: Tokenizer, count: int) -> tuple[tuple[int, ...], ...]:
         """Each of the first `count` labels' ids, one a variant."""
@@ -531,10 +547,12 @@ class QuestionLayout(Layout):
     framing: "Framing | None" = None
     """The conversation `segments`' text is the user's turn of, or None for none."""
     blocks: bool = False
-    """Whether each row splits into two blocks (`Encoded.blocks`): what comes before its question (a
-    state-first row's state), and its question to the row's end, a published slot release's prefix
-    and suffix (serve.patch `block_ids`); a backbone that reads blocks attends to each whole, and the
-    second to the first in order. Off, every row is read in order."""
+    """Whether each row splits into two blocks (`Encoded.blocks`), its parts as `segments` order them:
+    a state-first row's state, and its question from its header to the row's end, a published slot
+    release's prefix and suffix (serve.patch `block_ids`); a question-first row's question, and its
+    state from the state's first token to the row's end (the `Text` between them keeps to the part it
+    follows). A backbone that reads blocks attends to each whole, and the second to the first in
+    order. Off, every row is read in order."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -583,6 +601,11 @@ class QuestionLayout(Layout):
         slots = (_slots(len(described), order) if order is not None
                  else [1, 0] if isinstance(question, Noul) else list(range(len(described))))
         names = self.labels.names_for(len(slots))
+        # The second block opens where the row's second part begins (`blocks`): the question's header
+        # after a state, or the state's first copy after a question.
+        kinds = [segment for segment in self.segments if isinstance(segment, (State, Instructions))]
+        question_first = bool(kinds) and isinstance(kinds[0], Instructions) and any(
+            isinstance(segment, State) for segment in kinds)
         chunks: list[Chunk | State] = []
         for segment in self.segments:
             if isinstance(segment, Text):
@@ -594,8 +617,8 @@ class QuestionLayout(Layout):
                                 or segment.defaults.get(question.kind, ""))
                 head, tail = segment.headers[question.kind].split("{}")
                 # The question starts at its header: the suffix a release's blocks read from
-                # (serve.patch `suffix_start`).
-                opening = (("suffix", 0),) if self.blocks else ()
+                # (serve.patch `suffix_start`), where it follows the state.
+                opening = (("suffix", 0),) if self.blocks and not question_first else ()
                 chunks.extend([Chunk(head, points=opening),
                                Chunk(instructions, marks=(("question", 0, len(instructions)),)), Chunk(tail)])
             elif isinstance(segment, OptionLines):
@@ -620,8 +643,16 @@ class QuestionLayout(Layout):
         def built(kept: Sequence[str | tuple[int, ...]]) -> Rendered:
             # Under pieces each copy is its own piece, its ids; whole, its text read with the rest.
             given = iter(kept)
-            pieces = [(lambda own: Chunk(ids=own) if isinstance(own, tuple) else Chunk(own))(next(given))
-                      if isinstance(part, State) else part for part in chunks]
+            # The state's first copy opens a question-first row's second block.
+            first = next((at for at, part in enumerate(chunks) if isinstance(part, State)), None)
+            opening = (("suffix", 0),) if self.blocks and question_first else ()
+
+            def piece(at: int, own: str | tuple[int, ...]) -> Chunk:
+                points = opening if at == first else ()
+                return Chunk(ids=own, points=points) if isinstance(own, tuple) else Chunk(own, points=points)
+
+            pieces = [piece(at, next(given)) if isinstance(part, State) else part
+                      for at, part in enumerate(chunks)]
             return rendered_chunks(self._framed(encoder, pieces), encoder, self.unit)
 
         laid, (whole, state_kept) = (self._cut_ids(built, texts, copies, encoder) if self.unit == "pieces"
@@ -1124,6 +1155,10 @@ class AnswerCue:
 
 type QuestionSegment = Text | State | Instructions | OptionLines | AnswerCue
 """A part of a question row's text (`QuestionLayout.segments`)."""
+
+type RowSegment = Text | Media | State | Schema | Instructions | OptionLines | AnswerCue
+"""A part of either layout's row (`Segment`, `QuestionSegment`), as a run names its row's parts
+(`DecisionRunConfig.segments`); each layout refuses the parts it has none of."""
 
 
 
