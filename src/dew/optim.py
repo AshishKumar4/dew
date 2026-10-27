@@ -889,22 +889,48 @@ class PowerProfilesState(NamedTuple):
     inner: optax.OptState
 
 
+def _deferring(opt_state: optax.OptState) -> list[optax.MultiStepsState]:
+    """The states in `opt_state` of wrappers that accumulate their gradients over several calls."""
+    def deferring(node) -> bool:
+        return isinstance(node, optax.MultiStepsState)
+
+    return [node for node in jax.tree.leaves(opt_state, is_leaf=deferring) if deferring(node)]
+
+
+def defers(opt_state: optax.OptState) -> bool:
+    """Whether the optimizer whose state is `opt_state` holds some updates back (optax.MultiSteps),
+    applying several calls' gradients as one update (`emitted`)."""
+    return bool(_deferring(opt_state))
+
+
+def emitted(opt_state: optax.OptState) -> jax.Array:
+    """Whether the call that left the optimizer's state `opt_state` applied an update: false where a
+    wrapper that accumulates its gradients (optax.MultiSteps) held it back and returned zeros, as its
+    state's `mini_step`, the calls it holds, is not back at 0; true for an optimizer that applies every
+    update it makes. The update count, the EMA, an objective's post-step effects, the committed tokens
+    and `power_profiles`' averages advance on applied updates alone."""
+    held = _deferring(opt_state)
+    if not held:
+        return jnp.asarray(a=True)
+    return jnp.all(jnp.stack([jnp.asarray(state.mini_step) == 0 for state in held]))
+
+
 def power_profiles(solver: optax.GradientTransformation,
                    stds: Sequence[float]) -> optax.GradientTransformationExtraArgs:
     """`solver`, keeping one power-function average of the parameters it
     produces per relative standard deviation in `stds`, for post-hoc EMA
-    (`dew.training.posthoc`).
+    (`dew.averaging`).
 
     Update t keeps (1 - 1/t)^(γ + 1) of each average and blends in the rest
-    of the parameters it just made (Karras et al. 2024, Eq. 127). The
+    of the parameters it just made (Karras et al. 2024, Eq. 127); a call `solver`
+    holds back (optax.MultiSteps, `emitted`) neither counts nor moves them. The
     averages ride in the optimizer state, so they are sharded, placed and
     skipped on a rejected step exactly as its moments are. Each checkpoint
     is also the snapshot of its step (`Checkpoints.profile_steps`), retained
     whole so the state and averages share one atomic save. Each std is rounded to fp32 first, the
     precision the state records it in.
     """
-    from dew.training.posthoc import exponent, powered_decay
-    from dew.training.transaction import ema_update
+    from dew.averaging import ema_update, exponent, powered_decay
 
     stds = tuple(float(np.float32(std)) for std in stds)
     if not stds:
@@ -922,9 +948,13 @@ def power_profiles(solver: optax.GradientTransformation,
             raise ValueError("power_profiles averages the parameters, so its update needs them")
         updates, inner = solver.update(updates, state.inner, params, **extra_args)
         produced = stepped(params, updates, state.inner, inner)
-        averages = tuple(ema_update(average, produced, powered_decay(state.powers[index])(state.updates))
-                         for index, average in enumerate(state.averages))
-        return updates, PowerProfilesState(state.updates + 1, state.stds, state.powers, averages, inner)
+        # Only an update `solver` applies counts and moves the averages (`emitted`).
+        applied = emitted(inner)
+        averages = tuple(jax.tree.map(lambda new, old: jnp.where(applied, new, old), ema_update(
+            average, produced, powered_decay(state.powers[index])(state.updates)), average)
+            for index, average in enumerate(state.averages))
+        return updates, PowerProfilesState(state.updates + applied.astype(state.updates.dtype), state.stds,
+                                           state.powers, averages, inner)
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 

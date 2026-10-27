@@ -18,7 +18,7 @@ from .runtime import Preempted, prepare_process, run_timestamp
 from .selection import Best
 from .tracker import LocalTracker, MLflowTracker, TensorBoardTracker, Tracker, Trackers, Wandb, WandbTracker
 from .trainer import Rollout, Trainer
-from .transaction import ema_update
+from dew.averaging import ema_update
 
 __all__ = ["Aux", "Best", "Checkpoints", "Cooldowns", "EMASpec", "EvalSuite", "Evaluation", "Keep",
            "Layout", "LocalTracker", "MLflowTracker", "MeshSpec", "Metric", "Objective", "Observe", "Pause",

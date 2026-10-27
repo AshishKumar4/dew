@@ -263,7 +263,7 @@ averaged = checkpoints.posthoc_ema(0.07)               # at the latest snapshot
 averaged = checkpoints.posthoc_ema(0.07, step=40000)
 ```
 
-`posthoc_ema` returns the `params` collection as host arrays, in the weights' structure and dtypes. It reads one snapshot at a time and weights every snapshot up to the step by the least-squares solve of the paper's Algorithm 3 (`dew.training.posthoc.coefficients`). On the paper's setting, those weights match NVlabs' `phema.py` to the last bit.
+`posthoc_ema` returns the `params` collection as host arrays, in the weights' structure and dtypes. It reads one snapshot at a time and weights every snapshot up to the step by the least-squares solve of the paper's Algorithm 3 (`dew.averaging.coefficients`). On the paper's setting, those weights match NVlabs' `phema.py` to the last bit.
 
 The accuracy depends on how many snapshots there are. In a 96-step CPU run tracking 0.05 and 0.10, I rebuilt an average of 0.07 and compared it with one tracked directly, on weights of scale 2. From snapshots every 4 steps the two differed by at most 1.2e-7, from every 8 steps by 4.8e-7, and from every 16 steps by 5.7e-6. For comparison, the tracked 0.05 average was 1.3e-4 from the directly tracked 0.07.
 

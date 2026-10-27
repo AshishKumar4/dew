@@ -16,7 +16,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable
-from typing import Generic, overload
+from typing import Generic
 
 import jax
 import jax.numpy as jnp
@@ -26,6 +26,7 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
+from dew.averaging import ema_update
 from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
@@ -40,7 +41,7 @@ from dew.objectives.base import (
     recorded_metrics,
     with_projected,
 )
-from dew.optim import clips_qk, stepped
+from dew.optim import clips_qk, emitted, stepped
 from dew.state import Accumulation, TrainState, apart, together
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
@@ -151,46 +152,6 @@ def recorded(evaluations: list[tuple[Evaluated, jax.Array]], ran: jax.Array) -> 
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
     """The variables tree with the averaged leaves in place of the live ones."""
     return None if ema is None else merge(params, ema)
-
-
-def _project(tree: optax.Params, like: optax.Params) -> optax.Params:
-    """The leaves of tree at the key paths like holds, in like's containers."""
-    leaves = dict(jax.tree_util.tree_flatten_with_path(tree)[0])
-    return jax.tree_util.tree_map_with_path(lambda path, _: leaves[path], like)
-
-
-@overload
-def ema_update(ema: Variables, params: Variables, decay: jax.typing.ArrayLike) -> Variables: ...
-
-
-@overload
-def ema_update(ema: optax.Params, params: optax.Params, decay: jax.typing.ArrayLike) -> optax.Params: ...
-
-
-def ema_update(ema, params, decay):
-    """Update the EMA leaves toward `params`, keeping each leaf's storage dtype.
-
-    Each leaf of `ema` becomes `decay * average + (1 - decay) * live`, and a
-    leaf the step left as it was keeps its average bit for bit wherever that
-    sum is finite, however a program fuses it (a select, not a difference
-    that finite leaves of opposite signs overflow; a NaN decay stays NaN);
-    the live value is the leaf of `params` at the same path; leaves that
-    `ema` does not hold are not averaged. The arithmetic runs in fp32 or
-    wider, so fp64 leaves keep fp64 precision. A decay of 1 or more returns
-    the average leaf as it was, even when it holds nonfinite values, as a
-    frozen reference can.
-    """
-    def step(average, live):
-        dtype = jnp.result_type(average.dtype, live.dtype, decay, jnp.float32)
-        if average.dtype != dtype or live.dtype != dtype:
-            average, live = jax.lax.optimization_barrier((average, live))
-        weight = jnp.asarray(decay, dtype)
-        wide, moved = average.astype(dtype), live.astype(dtype)
-        weighted = weight * wide + (1 - weight) * moved
-        updated = jnp.where((moved == wide) & jnp.isfinite(weighted), wide, weighted)
-        stored = updated.astype(average.dtype)
-        return jnp.where(jnp.asarray(decay) >= 1.0, average, stored)
-    return jax.tree.map(step, ema, _project(params, ema))
 
 
 def write_back(params: Variables, variables: Variables | None) -> Variables:
@@ -554,18 +515,20 @@ class Transaction:
             # rescale, a bounded group's clamp) acts on them (`stepped`).
             params = {**current.variables, "params": self.objective.projected(
                 stepped(stored, update, current.opt_state, opt_state), updated=True)}
+            # An update the optimizer holds back (optax.MultiSteps) moves no clock, average or effect.
+            applied = emitted(opt_state)
             if self.aux_shape.effects is not None:
-                params = write_back(params, self.objective.apply_effects(
-                    params, self.effects_tree.unflatten(effects)))
+                params = _chosen(applied, write_back(params, self.objective.apply_effects(
+                    params, self.effects_tree.unflatten(effects))), params)
             averaged = current.ema
             if self.objective.ema is not None:
                 if averaged is None:
                     raise ValueError("the objective declares EMA but the state carries none")
-                averaged = _chosen(self.objective.averages(current.updates),
+                averaged = _chosen(self.objective.averages(current.updates) & applied,
                                    ema_update(averaged, params, self.objective.ema.decay(current.updates)),
                                    averaged)
             return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
-                                       updates=current.updates + 1)
+                                       updates=current.updates + applied.astype(current.updates.dtype))
 
         if current.scale is None:
             return apply(current), native_finite, norm
@@ -676,9 +639,17 @@ class Transaction:
             advanced = dataclasses.replace(advanced, compute=narrowed(advanced.variables, self.copies))
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
-        counted = due & accepted
+        # An update the optimizer holds back commits nothing yet: its tokens wait, as the state's
+        # `deferred`, for the update that applies them (`emitted`).
+        applied = emitted(advanced.opt_state)
+        counted = due & accepted & applied
+        zeros = jnp.zeros((2,), jnp.uint32)
+        if state.deferred is not None:
+            carried = _TokenCount.add(state.deferred, held)
+            waiting = jnp.where(due & accepted & ~applied, carried, jnp.where(counted, zeros, state.deferred))
+            advanced, held = dataclasses.replace(advanced, deferred=waiting), carried
         return advanced, loss, aux, Committed(jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
-                                              jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)))
+                                              jnp.where(counted, held, zeros))
 
     def step(self, *, realize=None, host=False):
         """Build the function that runs one attempt over the shared phases.

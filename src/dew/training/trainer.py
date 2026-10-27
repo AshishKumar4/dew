@@ -106,7 +106,7 @@ from dew.objectives.base import (
     TrainingScalar,
     taken_record,
 )
-from dew.optim import clips_qk, held_rates, learning_rate, scaled_rates, settable_rates, with_rates
+from dew.optim import clips_qk, defers, held_rates, learning_rate, scaled_rates, settable_rates, with_rates
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts, count_compilation_cache
@@ -402,6 +402,7 @@ class Trainer(Generic[Loss, Effects]):
                 f"the objective's tree has no params collection, only {sorted(params)}; "
                 "the optimizer moves params and treats every other collection as state")
         ema = self.objective.ema
+        opt_state = self._boxed_init(initialized, params["params"])
         return TrainState(
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
@@ -411,11 +412,13 @@ class Trainer(Generic[Loss, Effects]):
                 lambda leaf: jnp.array(leaf, copy=True), self._loss_scale),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
             variables=params,
-            opt_state=self._boxed_init(initialized, params["params"]),
+            opt_state=opt_state,
             # The average starts equal to the parameters but as its own buffers: the step donates
             # the state, and a buffer can be donated once.
             ema=None if ema is None else jax.tree.map(jnp.copy, select(params, ema.select)),
             key=run_key,
+            # The tokens of updates an optimizer holds back, which commit with the one that applies them.
+            deferred=jnp.zeros((2,), jnp.uint32) if defers(opt_state) else None,
         )
 
     @functools.cached_property

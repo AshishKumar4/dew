@@ -786,8 +786,8 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
             f"({' and '.join(RETIRED_RATE)}), which Dew's optimizer no longer forms: it holds the "
             "schedule's own rate fields (dew.optim.RateState), so a run cannot resume it. Resume it "
             "with the Dew that wrote it, or start a fresh run from its weights in a directory of its own.")
-    from dew.state import CHECKPOINTED
-    missing = set(CHECKPOINTED).difference(stored)
+    from dew.state import CHECKPOINTED, LATER_FIELDS
+    missing = set(CHECKPOINTED).difference(stored) - LATER_FIELDS
     if missing:
         raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
     if (metadata["scale"] is None) != (template.scale is None):
@@ -1515,7 +1515,7 @@ class Checkpoints:
         the result where the run's params go:
         `merge(variables, {"params": checkpoints.posthoc_ema(...)})`.
         """
-        from dew.training.posthoc import coefficients
+        from dew.averaging import coefficients
 
         steps = self.profile_steps()
         if not steps:
@@ -1739,9 +1739,9 @@ class Checkpoints:
 
     def accumulation_template(self, step: int):
         """Return the persisted pending-array shapes, without reading their values."""
-        from dew.state import CHECKPOINTED, Accumulation
+        from dew.state import CHECKPOINTED, LATER_FIELDS, Accumulation
         metadata = _item_metadata(self._step_metadata(step, local=step == self._local_latest()))
-        missing = set(CHECKPOINTED).difference(metadata.keys())
+        missing = set(CHECKPOINTED).difference(metadata.keys()) - LATER_FIELDS
         if missing:
             raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
         pending = metadata["accumulation"]
@@ -1828,8 +1828,10 @@ class Checkpoints:
                     lambda path, leaf: _from_delta_planes(leaf, weights[path])
                     if path in deltas else leaf, restored['ema'])
         else:
-            from dew.state import CHECKPOINTED
-            state_tree = {name: getattr(template, name) for name in CHECKPOINTED} \
+            from dew.state import CHECKPOINTED, LATER_FIELDS
+            # A field a checkpoint written before it lacks keeps the run's own (`LATER_FIELDS`).
+            state_tree = {name: getattr(template, name) for name in CHECKPOINTED
+                          if name in metadata or name not in LATER_FIELDS} \
                 if not isinstance(template, Mapping) else dict(template)
             held = _held_apart(state_tree, frozen)
             if from_local:
@@ -2124,8 +2126,11 @@ def _effective_weights(run: SavedRun, ema: bool | None, mesh, layout
 
 def _on_host(leaf) -> np.ndarray:
     """`leaf` on the host, a floating one in fp32, bf16 and the float8 types among them, which
-    NumPy's own type hierarchy does not count as floating."""
+    NumPy's own type hierarchy does not count as floating, and a complex one in complex64, both of its
+    components fp32."""
     value = np.asarray(leaf)
+    if jnp.issubdtype(value.dtype, jnp.complexfloating):
+        return value.astype(np.complex64)
     return value.astype(np.float32) if jnp.issubdtype(value.dtype, jnp.inexact) else value
 
 
@@ -2135,8 +2140,14 @@ def _taken(held: np.ndarray, leaf: np.ndarray, count: int, directory: str, first
     that cannot overflow (and is exact wherever its half could round), and `held / 2 + leaf / 2`
     above, exact halves, one rounding either way, so float64's mean rounded to fp32; for a later one
     `held + (leaf - held) / count` where both share a sign, whose difference cannot overflow, and
-    `held * (1 - 1/count) + leaf / count` where they differ, whose terms cannot. An integer or
-    boolean leaf must equal `held`."""
+    `held * (1 - 1/count) + leaf / count` where they differ, whose terms cannot. A complex leaf's real
+    and imaginary parts are each so averaged. An integer or boolean leaf must equal `held`."""
+    if jnp.issubdtype(held.dtype, jnp.complexfloating):
+        real, imaginary = (_taken(np.ascontiguousarray(part(held)), np.ascontiguousarray(part(leaf)), count,
+                                  directory, first) for part in (np.real, np.imag))
+        averaged = real.astype(np.complex64)
+        averaged.imag = imaginary
+        return averaged
     if not jnp.issubdtype(held.dtype, jnp.inexact):
         if not np.array_equal(held, leaf):
             raise ValueError(f"an integer or boolean variable of the run in {directory} differs from "
