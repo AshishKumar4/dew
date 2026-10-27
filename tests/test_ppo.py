@@ -403,9 +403,9 @@ def ppo_equations(objective, options):
     return loss
 
 
-ACTOR_CONTROL_SEEDS = 16
-"""Check 1's declared seeds for PPO's composed loss under each actor control, sized by `seeds_for` on
-armada."""
+ACTOR_CONTROL_SEEDS = 8
+"""Check 1's declared seeds for PPO's composed loss under each actor control, sized by `seeds_for` paired
+on armada: PPO and the equations score one rollout through one model, sharing its upstream rounding."""
 
 
 @pytest.mark.parametrize("options", [
