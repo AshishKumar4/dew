@@ -76,11 +76,18 @@ device_description_str: "{target.device_kind}"
 
 
 @functools.cache
+def compile_only_gpus(generation: str, count: int = 1) -> tuple:
+    """`count` compile-only devices of the CUDA `generation`, none attached: XLA's CUDA backend compiles a
+    program over them, a mesh's collectives included, as for that many of the generation's GPUs."""
+    topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=target_config(generation),
+                                            topology=f"1x1x{count}")
+    return tuple(topology.devices[:count])
+
+
+@functools.cache
 def _device(generation: str) -> Mesh:
     """A one-device mesh of a compile-only device of `generation`."""
-    topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=target_config(generation),
-                                            topology="1x1x1")
-    return Mesh(np.array(topology.devices[:1]), ("data",))
+    return Mesh(np.array(compile_only_gpus(generation)), ("data",))
 
 
 def failures(found: list[dict]) -> list[str]:

@@ -177,7 +177,7 @@ class MeshSpec:
         if self.replicas < 1:
             raise ValueError(f"replicas counts host groups, got {self.replicas}")
 
-    def build(self, devices: list | None = None) -> Mesh:
+    def build(self, devices: Sequence | None = None) -> Mesh:
         """Build the six-axis device mesh this spec describes.
 
         Parameters shard over 'fsdp', 'expert' and 'tensor'. A batch's rows
@@ -196,10 +196,11 @@ class MeshSpec:
         without a flag. The axes are Auto, so GSPMD infers the collectives,
         but for those `explicit` names.
 
-        `devices` lists the devices of one slice in the order to use them. The
-        mesh takes them row-major over `MESH_AXES`, so neighbouring entries
-        land on the last axes. When it is unset, the mesh uses every device, in
-        the order `jax.make_mesh` gives the platform's topology.
+        `devices` lists the devices of one slice in the order to use them, any
+        devices a mesh holds (a compile-only GPU's among them). The mesh takes
+        them row-major over `MESH_AXES`, so neighbouring entries land on the
+        last axes. When it is unset, the mesh uses every device, in the order
+        `jax.make_mesh` gives the platform's topology.
 
         When `replicas` is above 1, or the devices are on several slices, the
         mesh is built the way MaxText builds a multislice one, through
