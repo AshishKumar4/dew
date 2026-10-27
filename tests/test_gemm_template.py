@@ -342,13 +342,15 @@ def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
 @runs("v5e")
 def test_a_tpu_runs_an_exactly_summed_product_in_xla():
     """A kernel gradient into fp32 above the default precision adds each step's products apart, which
-    the TPU's launches do not promise (their MXUs add within a step): XLA runs it, the refusal reported."""
+    the TPU's launches do not promise (their MXUs add within a step): XLA runs it, the refusal reported
+    by each branch that selects (the TPU's, and the CPU's interpreting it)."""
     x, _, _, _, _, _, _, dy = _draw(0)
     with generation.assumed("v5e"), generation.routes() as taken:
         template.gemm_t(x, dy.astype(jnp.bfloat16), jnp.asarray(SIZES), out_dtype=jnp.float32,
                         precision="highest", interpret_on_cpu=True)
-    [found] = [route for route in taken if route.choice == 'grouped_matmul']
-    assert found.kernel == 'xla' and "MXUs" in found.refusal.detail
+    found = {(route.kernel, "MXUs" in route.refusal.detail) for route in taken
+             if route.choice == 'grouped_matmul' and route.refusal is not None}
+    assert found == {('xla', True)}
 
 @runs("sm80")
 def test_an_empty_rows_undefined_derivative_reaches_no_shared_gradient():
