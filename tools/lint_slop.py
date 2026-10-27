@@ -2015,7 +2015,7 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
 
 def promotions(module: Module) -> Iterator[Finding]:
     """SLOP022: a torch module promoted to float64 after its construction (`promotion_rules`)."""
-    for call in promotion_rules.promotions(module.tree, _parent(module)):
+    for call in promotion_rules.promotions(module.tree, _parent(module), _module_name(module)):
         yield Finding(module.relative, call.lineno, call.col_offset + 1, "SLOP022",
                       promotion_rules.message(call))
 

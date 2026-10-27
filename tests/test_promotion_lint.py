@@ -148,3 +148,12 @@ def test_a_module_promoted_to_float64_after_its_construction_is_reported(lint, c
 
 def test_the_library_holds_no_torch_truth_so_the_rule_reads_none_of_it(lint, tmp_path):
     assert "SLOP022" not in _codes(lint, tmp_path, ("src", "dew", "case.py"), LINEAR + "model.double()")
+
+
+def test_a_float64_context_is_read_by_its_bare_name_in_the_file_that_defines_it(lint, tmp_path):
+    """The block references' `oracle_precision`, called where it is defined, is the float64 context
+    it is where imported; a function of that name in another file is not."""
+    body = ("import torch\ndef oracle_precision():\n    pass\nwith oracle_precision():\n"
+            "    model = torch.nn.Linear(4, 4)\n    model.double()")
+    assert "SLOP022" not in _codes(lint, tmp_path, ("tools", "block_override_reference.py"), body)
+    assert _codes(lint, tmp_path, ("tools", "other_reference.py"), body).count("SLOP022") == 1

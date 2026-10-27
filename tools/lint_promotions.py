@@ -59,8 +59,12 @@ class _File:
     base (or on another such), the functions of it that return a module and those that promote a
     parameter (`_promoter`), and the nodes built inside a float64 context."""
 
-    def __init__(self, tree: ast.Module, parent: Sequence[str]):
+    def __init__(self, tree: ast.Module, parent: Sequence[str], name: str = ""):
         self.tables = {id(node): table for node, table in scopes.scoped(tree.body, {}, list(parent))}
+        # The file's own dotted name and top-level functions: a context it defines is called by its bare
+        # name there (block_override_reference's `oracle_precision`).
+        self.name = name
+        self.defined = {node.name for node in tree.body if isinstance(node, ast.FunctionDef)}
         # Each node built where a float64 context is active, by the condition that picks it ("" where
         # none does), and each promotion's guards: the tests of the conditions it runs under.
         self.wide: dict[int, str] = {}
@@ -132,6 +136,8 @@ class _File:
                 return ast.dump(node.test)
             return None
         called = self.resolved(node.func) if isinstance(node, ast.Call) else ""
+        if called in self.defined:
+            called = f"{self.name}.{called}"
         return "" if any(called == path or called.endswith("." + path) for path in WIDE) else None
 
     def built_wide(self, node: ast.AST) -> bool:
@@ -397,9 +403,10 @@ def _scopes(body: Sequence[ast.stmt]) -> Iterator[ast.FunctionDef | ast.AsyncFun
             yield from _scopes(node.body)
 
 
-def promotions(tree: ast.Module, parent: Sequence[str]) -> Iterator[ast.Call]:
-    """Every promotion of a module to float64 in a file (the module's docstring), in code order."""
-    file = _File(tree, parent)
+def promotions(tree: ast.Module, parent: Sequence[str], name: str = "") -> Iterator[ast.Call]:
+    """Every promotion of a module to float64 in a file (the module's docstring), in code order: `name`
+    the file's own dotted name."""
+    file = _File(tree, parent, name)
     found: list[ast.Call] = []
 
     def walk(body: Sequence[ast.stmt], around: Mapping[str, ast.AST], around_aliases: frozenset[str],
