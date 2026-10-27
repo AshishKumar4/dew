@@ -1312,7 +1312,8 @@ class RunConfig:
             examples=None, stop=None, best=None, cooldowns=None, log_every=steps, eval_every=None,
             checkpoint_every=None, checkpoint_final=False, wandb=None, publish=False)
         prepare_process(None, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir)
-        directory = directory or os.path.join("profiles", name, run_timestamp())
+        # The report names its paths whole, wherever it is read from.
+        directory = os.path.abspath(directory or os.path.join("profiles", name, run_timestamp()))
         if (Path(directory) / name / "tracking").exists():
             raise ValueError(f"{directory} holds a profile of {name} already; give the profile a directory "
                              "of its own")
