@@ -1,5 +1,6 @@
 """PPO with a separate trainable critic, clipped value loss and episode GAE."""
 
+import contextlib
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -336,6 +337,11 @@ class PPORollout:
     @property
     def shown(self) -> Mapping[str, Shown]:
         return self.rollout.shown
+
+    def branch(self, name: str) -> contextlib.AbstractContextManager[None]:
+        """The cooldown branch `name`'s calls (`dew.training.rollout`), as its scheduler draws them
+        (`RolloutScheduler.branch`)."""
+        return self.rollout.branch(name)
 
     def _order(self, batch: Mapping[str, np.ndarray], count: int) -> np.ndarray:
         """Per episode, the flat packed positions of its action ids in the order they were drawn.

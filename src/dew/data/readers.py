@@ -160,11 +160,18 @@ class _PerShare(Forwarding):
         return self._read
 
     def _reader(self) -> pygrain.DatasetIterator[Batch]:
-        """Open and restore the reader on its iteration thread."""
+        """Open and restore the reader on its iteration thread, every loading worker's process
+        started at once (`start_prefetch`). Grain's interleave of its workers makes their iterators
+        unstarted where it is asked its position before its first read, as a flat map over it asks
+        at its start (a pooled read's, `_Build.handed`), and where it is restored, and each then
+        starts at its first turn, after the one before it has read: a spawn and an import apart,
+        3.5 s each on a 4-CPU host, so 30 workers read their first two minutes at 73 rows/s on an
+        A100 host (ledger row 1846)."""
         if self._read is None:
             self._read = self._open()
             if self._saved is not None:
                 self._read.set_state(self._saved)
+            self._read.start_prefetch()
         return self._read
 
     def __iter__(self) -> Iterator[Batch]:
