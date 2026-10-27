@@ -38,10 +38,11 @@ from dew import position
 from dew.artifacts import Representations
 from dew.batch import merge, under
 from dew.checkpoints import Ranking
-from dew.data import Memory
+from dew.data import Memory, presets, schedule
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.data.pipeline import Pipeline
+from dew.data.sources.tokens import TokenFiles
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Aux, EMASpec, Objective
 from dew.objectives.lm import LMObjective
@@ -263,6 +264,37 @@ def test_a_token_budget_resumed_inside_an_update_ends_where_an_unbroken_run_does
     lm_trainer(tmp_path / "broken", accumulation=2).fit(lm_data(), steps=3)
     resumed = lm_trainer(tmp_path / "broken", accumulation=2).fit(lm_data(), tokens=budget)
     assert int(unbroken.step) == int(resumed.step) == 4
+
+
+def context_schedule(tmp_path, longer: int) -> Pipeline:
+    """A context-extension schedule over one token store: windows of LM_CONTEXT inputs until the run
+    commits two steps' targets, then windows of `longer`."""
+    corpus = write_token_corpus(tmp_path / "tokens", np.tile(np.arange(13), 64), tokenizer="symbols",
+                                vocab_size=13)
+
+    def stage(seq_len: int) -> Pipeline:
+        return TokenFiles(corpus.train).pipe(presets.token_windows, seq_len=seq_len, batch=None)
+
+    return schedule([(stage(LM_CONTEXT), 2 * LM_ROWS * LM_CONTEXT), (stage(longer), None)]).batch(LM_ROWS)
+
+
+def test_a_schedule_trains_each_stage_at_the_row_length_it_lays_out(tmp_path):
+    """The second stage of a context-extension schedule lays out windows of ten inputs, past the
+    objective's own six and within the model's context (max_seq_len 12): the run trains it at that
+    length, compiled when its first batch arrives, and commits every target of both stages, two steps
+    of 8 x 6, then steps of 8 x 10."""
+    tracker = RecordingTracker()
+    lm_trainer(tracker=tracker).fit(context_schedule(tmp_path, 10), steps=4, log_every=1)
+    committed = [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars]
+    assert committed == [LM_ROWS * LM_CONTEXT] * 2 + [LM_ROWS * 10] * 2
+
+
+def test_a_schedule_stage_past_the_models_context_is_refused(tmp_path):
+    """A stage whose windows hold thirteen inputs, past the model's max_seq_len of twelve, is refused
+    once its rows arrive, where a stage of twelve trains."""
+    lm_trainer().fit(context_schedule(tmp_path / "held", 12), steps=4)
+    with pytest.raises(ValueError):
+        lm_trainer().fit(context_schedule(tmp_path / "past", 13), steps=4)
 
 
 @pytest.mark.parametrize("variant", ["ema", "accumulation", "schedule", "dynamic_scale", "checkpoints"])
@@ -670,9 +702,8 @@ def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
 
 
 def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_path):
-    from dew.data import Loading, presets
+    from dew.data import Loading
     from dew.data.dataset import Forwarding
-    from dew.data.sources.tokens import TokenFiles
 
     corpus = write_token_corpus(tmp_path / "tokens", np.arange(29))
 
@@ -746,8 +777,7 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
     before the backend opens. Check every state leaf, not just parameters.
     bf16 at the default precision runs the head that rounds its logits and
     their gradient to bf16, and resumes bit-exactly too."""
-    from dew.data import Loading, presets
-    from dew.data.sources.tokens import TokenFiles
+    from dew.data import Loading
 
     corpus = write_token_corpus(tmp_path / "tokens", np.tile(np.arange(8), 256), tokenizer="symbols",
                                 vocab_size=8)

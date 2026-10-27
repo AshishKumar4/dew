@@ -92,8 +92,8 @@ class SingleReader(Protocol):
 
 @runtime_checkable
 class TokenGeometry(Protocol):
-    """A record step whose rows each hold `max_length` tokens, which a token
-    budget divides into rows (`TokenBudget`)."""
+    """A record step, or a stage that lays rows out (`Pack`, `Windows`), whose rows each hold
+    `max_length` tokens, which a token budget divides into rows (`TokenBudget`)."""
 
     @property
     def max_length(self) -> int: ...
@@ -318,6 +318,12 @@ class Pack:
 
         return windowed(facts, self.seq_len - 1, self.fields, packed=True, along=self.along)
 
+    @property
+    def max_length(self) -> int:
+        """The inputs each window holds, its last token their target, which a token budget divides
+        into rows (`TokenGeometry`)."""
+        return self.seq_len - 1
+
     def __post_init__(self) -> None:
         if self.policy == "concat" and (self.segments is not None or self.along):
             raise ValueError("concatenated packing cuts documents across windows; it takes no "
@@ -343,6 +349,11 @@ class Windows:
         from dew.data.facts import windowed
 
         return windowed(facts, self.seq_len, self.fields, packed=False)
+
+    @property
+    def max_length(self) -> int:
+        """The inputs each window holds, which a token budget divides into rows (`TokenGeometry`)."""
+        return self.seq_len
 
     def __post_init__(self) -> None:
         if self.seq_len < 1 or (self.stride is not None and self.stride < 1) or not self.fields:
@@ -1088,6 +1099,10 @@ class ObjectiveData:
     packed: tuple[RecordStep, ...] = ()
     train_batch: tuple[HostStep, ...] = ()
     evaluate_batch: tuple[HostStep, ...] = ()
+    geometry: RecordStep | None = None
+    """The rows the objective reads where a chain lays out none of its own, after its other record
+    steps; rows a chain packs or cuts into windows (`Pack`, `Windows`) keep the length it gives them, as
+    a schedule's stages each give theirs (`dew.data.compile.objective_steps`)."""
 
 
 type _Step = RecordStep | RandomStep | HostStep | Configured | ExpandStep | ColumnStep
