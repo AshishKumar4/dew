@@ -167,13 +167,14 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 across the containers of an armada gang."""
 SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
           "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py")
-"""The files every test file's key covers whole, beside tests/ and src/'s data, every lock (a GPU node
-builds its environment from its CUDA lock), the environment's own inputs, which .armada.json names
-(`environment_files`), and .armada.json's parts a test process sees (`armada_seen`): what every test
-process runs or reads, the session it runs in, the process group it runs as and the plugins loaded
-into it among them. The plan's own code (this file) runs outside the tests, so a change to it reruns
-none of them; nor does the durations record (`session.DURATIONS`), which only a split file's groups
-are cut from, so a group's key covers its own file's entries alone (`cache_key`)."""
+"""The files every test file's key covers whole, beside every lock (a GPU node builds its environment
+from its CUDA lock), the environment's own inputs, which .armada.json names (`environment_files`),
+and .armada.json's parts a test process sees (`armada_seen`): what every test process runs or reads,
+the session it runs in, the process group it runs as and the plugins loaded into it among them. The
+plan's own code (this file) runs outside the tests, so a change to it reruns none of them; nor does
+the durations record (`session.DURATIONS`), which only a split file's groups are cut from, so a
+group's key covers its own file's entries alone (`cache_key`); nor does a fixture or a package's data,
+which is the input of the files whose runs opened it, however they opened it (executed.py's `Opens`)."""
 ARMADA_SEEN = ("environment", "environments", "env")
 """.armada.json's parts a test process runs in, beside its task's command and secrets (`armada_seen`):
 its pool, size, target, plan and the task's deadline and mode decide where and when tasks run, never
@@ -213,23 +214,17 @@ CACHE_PREFIX = f"testcache/format-{RECORD_FORMAT}"
 
 def shared(python: str) -> str:
     """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock,
-    .armada.json's parts a test process sees (`armada_seen`), every non-Python file under tests/ and
-    src/ (a fixture, a package's data: a native reader reads one with no audit event, so no record
-    names it), and the names of the Python files under tests/ but its test modules and of src/'s own
-    entries, whose arrival can change what an import finds (a conftest.py, a helper or a top-level
-    package that shadows another), which a record does not see. A module within a package under src/
-    is its importers' input alone, with its package's other modules (`inputs`), and a test module is no
-    other file's: so a train that loses a head runs again only what that head's modules reached."""
+    .armada.json's parts a test process sees (`armada_seen`), and the names of the Python files under
+    tests/ but its test modules and of src/'s own entries, whose arrival can change what an import finds
+    (a conftest.py, a helper or a top-level package that shadows another), which a record does not see. A
+    module within a package under src/ is its importers' input alone, with its package's other modules
+    (`inputs`), a test module is no other file's, and a fixture or a package's data is its openers'
+    (executed.py's `Opens`): so a train that loses a head runs again only what that head's files reached
+    (owner, 2026-10-27: 8 fixtures changed reran all 485 tasks of train 222's second round)."""
     digest = hashlib.sha256(python.encode())
-    for top in ("tests", "src"):
-        for path in sorted(Path(top).rglob("*")):
-            if not path.is_file() or "__pycache__" in path.parts or path == session.DURATIONS:
-                continue
-            if path.suffix == ".py" and (top == "src" or path.name.startswith("test_")):
-                continue
+    for path in sorted(Path("tests").rglob("*.py")):
+        if "__pycache__" not in path.parts and not path.name.startswith("test_"):
             digest.update(str(path).encode())
-            if path.suffix != ".py":
-                digest.update(hashlib.sha256(path.read_bytes()).digest())
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
