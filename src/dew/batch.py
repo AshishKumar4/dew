@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -157,6 +157,20 @@ class Coordinates:
     firsts: jax.Array | None = None
     max_segments: int = struct.field(pytree_node=False, default=1)
     right_padded: bool = struct.field(pytree_node=False, default=False)
+
+    TOKEN_ALIGNED: ClassVar[tuple[str, ...]] = ("positions", "segments", "valid", "starts")
+    """The fields one entry a token, `[B, S]`; `firsts` is one a document, `[B, D]`, its entries slots."""
+
+    def tokens(self) -> dict[str, jax.Array]:
+        """The token-aligned fields it holds (`TOKEN_ALIGNED`), by name: what a check of a batch's token
+        layout reads."""
+        return {name: getattr(self, name) for name in self.TOKEN_ALIGNED if getattr(self, name) is not None}
+
+    def along_tokens(self, transform: Callable[[jax.Array], jax.Array]) -> Coordinates:
+        """`transform` applied along the tokens to each token-aligned field (`TOKEN_ALIGNED`): a slice or a
+        rotation of the slots. The documents' firsts, which index the slots, go, their reader rebuilding
+        them from the moved starts (`with_firsts`, `dew.nn.inputs.cu_seqlens`)."""
+        return replace(self, firsts=None, **{name: transform(value) for name, value in self.tokens().items()})
 
     def places(self) -> jax.Array | None:
         """Each token's logical place in an uncached call: the given `positions`, else its rank among

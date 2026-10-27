@@ -215,12 +215,18 @@ class ModelInputs:
                 f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}"
             )
         for name, value in self.token_fields.items():
-            # A field may be a tree of arrays, as `coordinates` is; each of its arrays is token-aligned.
-            for leaf in jax.tree.leaves(value):
+            # A field may be a tree of arrays; `coordinates` states which of its arrays run along the tokens
+            # (`Coordinates.TOKEN_ALIGNED`), its documents' firsts one entry a document.
+            aligned = value.tokens() if isinstance(value, Coordinates) else value
+            for leaf in jax.tree.leaves(aligned):
                 if leaf.ndim < 2 or leaf.shape[:2] != self.tokens.shape:
                     raise ValueError(
                         f"token field {name!r} must start with {self.tokens.shape}, got {leaf.shape}"
                     )
+            if isinstance(value, Coordinates) and value.firsts is not None and (
+                    value.firsts.shape[0] != self.tokens.shape[0]):
+                raise ValueError(f"token field {name!r}'s documents' firsts must have batch size "
+                                 f"{self.tokens.shape[0]}, got {value.firsts.shape}")
         for name, value in self.conditioning.items():
             if value.ndim < 1 or value.shape[0] != self.tokens.shape[0]:
                 raise ValueError(f"conditioning {name!r} must have batch size {self.tokens.shape[0]}")
@@ -236,11 +242,12 @@ class ModelInputs:
     def slice_tokens(self, start: int | None = None, stop: int | None = None) -> ModelInputs:
         """Slice the tokens and token fields to slots `start:stop`; media features keep their indices."""
         selection = slice(start, stop)
-        # A field may be a tree of arrays, as `coordinates` is; each of its arrays is sliced alike, but
-        # its documents' firsts, which index the slots, are rebuilt from the sliced starts by their reader.
+        # A field may be a tree of arrays, each sliced alike; `coordinates` slices its token-aligned ones
+        # (`Coordinates.along_tokens`).
         def sliced(value):
-            value = jax.tree.map(lambda leaf: leaf[:, selection], value)
-            return replace(value, firsts=None) if isinstance(value, Coordinates) else value
+            if isinstance(value, Coordinates):
+                return value.along_tokens(lambda leaf: leaf[:, selection])
+            return jax.tree.map(lambda leaf: leaf[:, selection], value)
 
         return replace(self, tokens=self.tokens[:, selection],
                        token_fields={name: sliced(value) for name, value in self.token_fields.items()})
@@ -259,9 +266,9 @@ class ModelInputs:
             return rotate_rows(value, left_padding)
 
         def shifted(value):
-            # The documents' firsts index the slots, not along them: rebuilt from the rotated starts.
+            # `coordinates` rotates its token-aligned arrays (`Coordinates.along_tokens`).
             if isinstance(value, Coordinates):
-                return jax.tree.map(shift, replace(value, firsts=None))
+                return value.along_tokens(shift)
             return jax.tree.map(shift, value)
 
         return replace(self, tokens=shift(self.tokens),
