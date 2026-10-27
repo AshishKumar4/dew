@@ -77,7 +77,7 @@ def test_a_step_that_fits_only_with_its_state_in_host_memory_keeps_it_there(monk
     free(monkeypatch, device_bound(monkeypatch))
     trainer = offloading()
     state = trained(trainer)
-    assert (trainer.plan["host"], trainer.plan["remat"]) == (OFFLOADED, None)
+    assert (trainer.plan.get("host"), trainer.plan["remat"]) == (OFFLOADED, None)
     compiles = searched(trainer)
     assert not any(fits for _, host, fits in compiles if host == [])
     assert {remat for remat, host, _ in compiles if host == []} >= {None, "minimal", "full"}
@@ -110,9 +110,9 @@ def test_a_plan_that_offloads_is_timed_against_the_first_that_keeps_the_state_on
     step = trainer.compile(state, BATCH, None if seconds is None else (
         lambda steps: (timed.append(len(steps)), seconds)[1]))
     assert timed == ([] if seconds is None else [2])
-    assert (trainer.plan["host"], trainer.plan["remat"]) == (host, remat)
+    assert (trainer.plan.get("host"), trainer.plan["remat"]) == (host, remat)
     if seconds is not None:
-        assert [(plan["host"], plan["remat"]) for plan in trainer.plan["timed"]] == [
+        assert [(plan.get("host"), plan["remat"]) for plan in trainer.plan["timed"]] == [
             ([], "minimal"), (OFFLOADED, None)]
     state, loss, *_ = step(state, BATCH)
     assert np.isfinite(float(loss))
@@ -161,13 +161,13 @@ def test_a_run_whose_plan_kept_its_state_in_host_memory_resumes_from_its_checkpo
     free(monkeypatch, room)
     first = offloading(seq_len=4, checkpoints=Checkpoints(directory))
     saved = first.fit(windows(corpus), steps=2, checkpoint_every=2)
-    assert first.plan["host"] == OFFLOADED
+    assert first.plan.get("host") == OFFLOADED
     # The resumed run's devices hold no moments and no EMA: what the first plan freed is free from the start.
     free(monkeypatch, room + sum(leaf.nbytes for leaf in jax.tree.leaves((saved.opt_state, saved.ema))))
     resumed = offloading(seq_len=4, checkpoints=Checkpoints(directory))
     state = resumed.fit(windows(corpus), steps=3, checkpoint_every=None)
     assert int(state.step) == 3
-    assert (resumed.plan["host"], resumed.plan["remat"]) == (OFFLOADED, first.plan["remat"])
+    assert (resumed.plan.get("host"), resumed.plan["remat"]) == (OFFLOADED, first.plan["remat"])
     assert memory_kinds(state.opt_state) == memory_kinds(state.ema) == {"pinned_host"}
 
 
@@ -175,9 +175,7 @@ def test_an_offloading_remat_rung_keeps_its_residuals_in_host_temporaries():
     """A decoder climbs from 'minimal' to 'minimal_offloaded', which keeps 'minimal''s residuals in
     pinned host memory. Compiled for a compile-only H100, its step keeps host temporaries where
     'minimal''s keeps none: what the device-resident search reads to refuse the rung
-    (`keeps_host_temporaries`)."""
-    from dew.training.planning import keeps_host_temporaries
-
+    (`dew.training.planning.keeps_host_temporaries`)."""
     model = CausalTransformer(vocab_size=64, emb_features=64, num_layers=2, num_heads=2, mlp_features=128,
                               max_seq_len=64, remat="minimal")
     assert model.recompute_more().remat == REMAT_POLICIES["minimal_offloaded"]
@@ -194,8 +192,8 @@ def test_an_offloading_remat_rung_keeps_its_residuals_in_host_temporaries():
         gradient = jax.jit(lambda params, batch: jax.grad(step_loss(objective, placed, batch))(params))
         return gradient.trace(placed["params"], batch).lower().compile()
 
-    assert not keeps_host_temporaries(compiled("minimal"))
-    assert keeps_host_temporaries(compiled("minimal_offloaded"))
+    assert compiled("minimal").memory_analysis().host_temp_size_in_bytes == 0
+    assert compiled("minimal_offloaded").memory_analysis().host_temp_size_in_bytes > 0
 
 
 STEP_SEEDS = 8
@@ -237,7 +235,7 @@ def test_a_step_with_its_state_in_host_memory_trains_what_one_with_it_on_the_dev
                            stepping(offloading(), initial, exact=True))
     free(monkeypatch, room)
     host(*draw(0))
-    assert offloads.plan["host"] == OFFLOADED
+    assert offloads.plan.get("host") == OFFLOADED
     free(monkeypatch, LIMIT)
     device(*draw(0))
     with jax.enable_x64(new_val=True):
