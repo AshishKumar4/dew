@@ -18,6 +18,7 @@ import numpy as np
 import tokamax
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.devices import deterministic_ops_requested
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, resources
 from dew.nn.kernels.templates.attention import (
@@ -287,9 +288,12 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
-    operands' dtype; its peak walk holds less."""
+    operands' dtype, and the tile's key indices int32 its anchor test compares (TWOPASS5-h100: uncounted, 64 x 128 on
+    two consumers derived and spilled, 6.6 ms against 64 x 64's 1.06); its peak walk holds less."""
     block_q, block_k = tiles.block_q, tiles.block_k
     step = [(block_q, block_k, jnp.float32)] + [(block_q, block_k, dtype)] * (2 if residuals else 1)
+    if residuals:
+        step.append((block_q, block_k, jnp.int32))
     return resources.live_registers(family, [(block_q, value_width, jnp.float32)], step)
 
 
@@ -420,16 +424,22 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         """Its tiles from the facts (`_derived`): each dK/dV consumer a unit of keys, the query tile both
         launches walk the largest their registers and the block hold, two stages, one consumer, whose step
         issues its products back to back (TRAINC-h100: 6.88 against 3.72 ms causal, 9.68 against 7.56 full,
-        at 64 x 64 with two consumers and one), and two launches (the dQ launch, then the dK/dV one):
-        deterministic, and of the least memory; the one-launch schedule, which adds dQ in shared order, runs
-        where a test names it until FlashAttention-3's structure replaces it."""
+        at 64 x 64 with two consumers and one). The fast form of a hookless call takes one launch, the dK/dV
+        program adding each tile's dQ atomically (FUSEDFORM-h100: 1.05 to 1.4 times as fast at widths 64 and
+        128 over 1k to 8k tokens; check 1 on drawn inputs and finite over every stability family it takes,
+        FUSEDSTAB-h100; 384 MB of temporaries against 258 at llama-d128 2 x 4096, its dQ fp32); the accurate
+        form, a hooked call and deterministic mode (`deterministic_ops_requested`) two launches, the dQ launch
+        then the dK/dV one, in a fixed order."""
         family = self._family(ba, target)
         if family is None:
             return None
         query, key = ba.arguments["query"], ba.arguments["key"]
 
+        hooked = self.score_mod is not None or ba.arguments["initial"] is not None
+        fused = not (self.accurate or hooked or deterministic_ops_requested())
+
         def tiles(rows: int, walked: int, consumers: int) -> BackwardTiles:
-            return BackwardTiles(walked, rows, 2, consumers, fused=False, family=family.name)
+            return BackwardTiles(walked, rows, 2, consumers, fused=fused, family=family.name)
 
         return _derived(family, query.dtype, key.shape[1], query.shape[1], tiles,
                         lambda config: self.legal(ba, config, target), overlapped=False)
