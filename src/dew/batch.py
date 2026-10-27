@@ -211,8 +211,15 @@ def document_firsts(starts, documents: int, *, xp=jnp):
     first slot and each of `starts` `[B, S]`, `S` past its last: a sort of each row's slots, which a mesh
     splitting the rows sorts on each device (`Coordinates.firsts`)."""
     rows, length = starts.shape
-    slots = xp.broadcast_to(xp.arange(length, dtype=np.int32), (rows, length))
-    begun = xp.concatenate([xp.ones((rows, 1), bool), xp.asarray(starts, bool)[:, 1:]], axis=1)
+    if xp is np:
+        begun = np.asarray(starts, bool).copy()
+        begun[:, 0] = True
+        slots = np.broadcast_to(np.arange(length, dtype=np.int32), (rows, length))
+    else:
+        # Placed as the starts are (an Explicit mesh's rows split), each row sorted on its own device.
+        begun = jnp.asarray(starts, bool).at[:, 0].set(True)
+        placed = jax.typeof(begun).sharding
+        slots = jax.lax.broadcasted_iota(jnp.int32, (rows, length), 1, out_sharding=placed)
     return xp.sort(xp.where(begun, slots, length), axis=1)[:, :min(documents, length)].astype(np.int32)
 
 

@@ -32,7 +32,7 @@ from dew.batch import (
     with_validity,
 )
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS
-from dew.nn.sharding import rows_like
+from dew.nn.sharding import explicit_spec, rows_like
 
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -327,6 +327,11 @@ def cu_seqlens(begins: jax.Array, sequences: int, firsts: jax.Array | None = Non
     a loop iteration (row 1897)."""
     rows, length = begins.shape
     given = document_firsts(begins, -(-sequences // rows)) if firsts is None else firsts
+    split = explicit_spec(given)
+    if split is not None:
+        # A batch's few documents, whole on each device, as the kernels read the offsets.
+        whole = jax.sharding.NamedSharding(split.mesh, jax.sharding.PartitionSpec())
+        given = jax.sharding.reshard(given, whole)
     placed = jnp.where(given < length, given + jnp.arange(rows, dtype=jnp.int32)[:, None] * length,
                        rows * length).reshape(-1)
     starts = jnp.sort(placed)[:sequences]
