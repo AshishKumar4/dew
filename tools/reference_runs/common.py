@@ -2,9 +2,10 @@
 
 The torch generators run in a venv without Dew, the Dew generators in one
 without torch, so this module imports numpy and the standard library only,
-`tools/reference_source.py`, which loads Dew's host-only modules here, and
-`tools/trace_window.py`, which names and splits a profile's kernels the
-way `tools/benchmark_step.py` does. Every number the comparison reads is
+`tools/reference_source.py`, which loads Dew's host-only modules here (among
+them `dew.telemetry.trace`, which splits a profile's kernels as
+`tools/benchmark_step.py` does), and `tools/trace_window.py`, which names
+them. Every number the comparison reads is
 produced by one definition, so a difference between two records is a
 difference between the runs.
 """
@@ -28,7 +29,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from reference_source import loaded
-from trace_window import device_events, kernel_category, kernel_totals, window_totals
+from trace_window import kernel_category, kernel_totals
 
 SOURCE = Path(__file__).resolve().parents[2] / "src" / "dew"
 EVIDENCE = Path(os.environ.get(
@@ -38,6 +39,7 @@ EVIDENCE = Path(os.environ.get(
 # Dew's host-only records and target table, read without its backend import policy.
 gpu_target = loaded("dew_gpu_targets", SOURCE / "nn/kernels/generation.py").gpu_target
 WorkloadWork = loaded("dew_workload", SOURCE / "telemetry/workload.py").WorkloadWork
+trace = loaded("dew_trace", SOURCE / "telemetry/trace.py")
 
 
 def peak_flops(device_kind: str) -> float | None:
@@ -121,7 +123,7 @@ def kernel_summary(kernels: Sequence[tuple[str, int, int, int]], steps: int) -> 
     """Per-step device time from `(name, start_ns, end_ns, device)` kernel
     records of `steps` traced steps.
 
-    Each device's window is split by `trace_window.window_split`, the split
+    Each device's window is split by `trace.window_split`, the split
     `tools/benchmark_step.py` reports, and the figures are averaged over the
     devices: busy is the union of a device's kernels, the window runs from its
     first kernel's start to its last one's end, and the window is compute +
@@ -131,7 +133,7 @@ def kernel_summary(kernels: Sequence[tuple[str, int, int, int]], steps: int) -> 
     if not kernels:
         raise ValueError("the trace holds no device kernels")
     devices = sorted({device for *_, device in kernels})
-    figures = window_totals([[(name, start, end) for name, start, end, owner in kernels if owner == device]
+    figures = trace.window_totals([[(name, start, end) for name, start, end, owner in kernels if owner == device]
                              for device in devices])
     scale = 1e-6 / steps / len(devices)
     records = [(name, start, end) for name, start, end, _ in kernels]
@@ -368,7 +370,7 @@ def attach_xplane_profile(record: dict, trace_dir: str | Path, steps: int,
     recorded as such: the run's curves stand without it."""
     trace_dir = Path(trace_dir)
     try:
-        planes, lines = device_events(trace_dir)
+        planes, lines = trace.device_events(trace_dir)
         kernels = [(event.name, event.start_ns, event.end_ns, int(plane.rsplit(":", 1)[1]))
                    for plane, events in planes.items() for event in events]
         record["profile"] = kernel_summary(kernels, steps)
