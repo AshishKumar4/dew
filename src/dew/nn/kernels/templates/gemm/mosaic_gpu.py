@@ -378,17 +378,23 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         outs = tuple(value.astype(dtype) for value, dtype in zip(values, dtypes, strict=True))
         return outs if out_dtypes else outs[0]
     # Dew: a TMA descriptor tiles the rows by 8, so they are padded to a multiple of 8, and the rows past
-    # the routed ones, the padding among them, are a last group, whose tiles store zeros.
+    # the routed ones, the padding among them, are a last group, whose tiles store zeros. A group's tiles
+    # start at its first row (`tile_groups`), so a tile reads up to a tile's rows past the last group's
+    # first: every row-bearing operand is allocated to the schedule's extent (`row_extent`), zeros past
+    # its rows, which a group's stores never reach (a 128-row lhs of groups [120, 8] at 64-row tiles read
+    # rows 120 to 183 unpredicated on an A100, cp.async's loads).
     lhs = rows_padded(lhs, 0, TMA_ROWS)
     m = lhs.shape[0]
     lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
     row_tile = tiles.block_m * tiles.cluster
     table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g)
-    prologue_operands = tuple(_side_padded(side, axes) for side, axes in zip(prologue_operands, prologue_axes,
-                                                                               strict=True))
-    epilogue_operands = tuple(_side_padded(side, axes) for side, axes in zip(epilogue_operands, epilogue_axes,
-                                                                               strict=True))
+    extent = row_extent(m, row_tile)
+    lhs = _rows_extended(lhs, 0, extent)
+    prologue_operands = tuple(_side_extended(side, axes, extent)
+                              for side, axes in zip(prologue_operands, prologue_axes, strict=True))
+    epilogue_operands = tuple(_side_extended(side, axes, extent)
+                              for side, axes in zip(epilogue_operands, epilogue_axes, strict=True))
     outs = _gmm_mainloop(lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
                          dtypes=dtypes, multiprocessors=multiprocessors, interpret=interpret,
                          hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
@@ -414,14 +420,6 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     m, n, k, g = shape
     block_m, block_n, block_k, consumers = tiles.block_m, tiles.block_n, tiles.block_k, tiles.warpgroups
     pair = tiles.cluster
-    if not family.bounded_loads:
-        # Its loads read past an operand unpredicated: a last row tile reads rows the padding holds, the
-        # side operands' rows as the rows' own.
-        lhs = jnp.pad(lhs, ((0, -m % block_m), (0, 0)))
-        prologue_operands = tuple(_side_padded(side, axes, block_m)
-                                  for side, axes in zip(prologue_operands, prologue_axes, strict=True))
-        epilogue_operands = tuple(_side_padded(side, axes, block_m)
-                                  for side, axes in zip(epilogue_operands, epilogue_axes, strict=True))
     share = block_m // consumers
     part = (share, block_n)
     # A stream for each operand that follows the steps, but a vector a family does not copy, which its
@@ -790,6 +788,25 @@ def _group_blocks(group_sizes: jax.Array, block_k: int) -> tuple:
     group_block_starts = group_starts // block_k * block_k
     group_block_ends = -(group_ends // -block_k) * block_k
     return group_starts, group_ends, (group_block_ends - group_block_starts) // block_k, group_block_starts
+
+
+def row_extent(rows: int, row_tile: int) -> int:
+    """Dew: the rows `gmm`'s tile schedule reads of `rows` rows (a multiple of `TMA_ROWS`) at tiles of
+    `row_tile` rows: a tile starts at most `TMA_ROWS` before the rows end (`tile_groups`) and reads
+    `row_tile` rows on."""
+    return rows + row_tile - TMA_ROWS
+
+
+def _rows_extended(array: jax.Array, axis: int, extent: int) -> jax.Array:
+    """Dew: `array` with zeros after its own along `axis` up to `extent`."""
+    pad = extent - array.shape[axis]
+    widths = tuple((0, pad if dim == axis else 0) for dim in range(array.ndim))
+    return jnp.pad(array, widths) if pad > 0 else array
+
+
+def _side_extended(side: jax.Array, axes: tuple, extent: int) -> jax.Array:
+    """Dew: a side operand allocated as the rows are along the dimension that follows them (`row_extent`)."""
+    return _rows_extended(side, axes.index('rows'), extent) if 'rows' in axes else side
 
 
 def _side_padded(side: jax.Array, axes: tuple, multiple: int = 8) -> jax.Array:

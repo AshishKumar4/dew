@@ -606,3 +606,20 @@ def test_each_groups_row_tiles_start_at_its_first_row():
     assert table.tolist() == [[0, 0, 0, 100], [2, 96, 100, 228], [2, 224, 100, 228], [3, 224, 228, 357],
                               [3, 352, 228, 357], [4, 352, 357, 360], [5, 360, 360, 400], [0, 0, 0, 0],
                               [0, 0, 0, 0]]
+
+
+@pytest.mark.parametrize("sizes, row_tile", [([120, 8], 64), ([3, 200, 1, 0, 57], 128), ([0, 0, 13], 256),
+                                             ([64, 64], 64), ([7] * 9, 128)])
+def test_no_row_tile_reads_past_its_operands_allocation(sizes, row_tile):
+    """Every row tile `gmm`'s schedule takes (`mosaic_gpu.tile_groups`, a group's tiles from its first row)
+    reads within the rows its operands are allocated to (`mosaic_gpu.row_extent`): its first row plus the
+    tile's rows, unpredicated on an A100, stay inside the extent (row 1866 K3: groups [120, 8] at 64-row
+    tiles read rows 120 to 183 of a 128-row lhs)."""
+    rows = -(-sum(sizes) // mosaic_gpu.TMA_ROWS) * mosaic_gpu.TMA_ROWS
+    lengths = jnp.asarray([*sizes, rows - sum(sizes)], jnp.int32)
+    table = np.asarray(mosaic_gpu.tile_groups(lengths, row_tile, -(-rows // row_tile) + len(sizes)))
+    used = table[:, 3] > table[:, 2]
+    reads = int((table[used, 1] + row_tile).max())
+    assert reads <= mosaic_gpu.row_extent(rows, row_tile)
+    if sizes == [120, 8]:
+        assert reads > -(-rows // row_tile) * row_tile  # past the row-tile padding that held before
