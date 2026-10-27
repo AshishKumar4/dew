@@ -41,7 +41,7 @@ from dew._coordination import (
     agreed_same,
     broadcast_from_process_zero,
 )
-from dew._records import JSON, boolean, json_value, record
+from dew._records import JSON, boolean, json_value, record, strings
 from dew.batch import FROZEN, Batch, Variables, owned_dicts, select
 from dew.checkpoints import Checkpoints, Ranking
 from dew.cleanup import attempted
@@ -84,7 +84,7 @@ from dew.distributed.placement import (
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes, batch_axes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
-from dew.nn.kernels.generation import assumed, backend, gpu_mesh, gpu_target, measured_kernel
+from dew.nn.kernels.generation import assumed, backend, gpu_mesh, measured_kernel
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     Link,
@@ -134,6 +134,7 @@ from dew.training.budget import Pause, Plateau, run_length, run_steps, run_token
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
+    HOST_LINK,
     check_batch,
     check_stream,
     link_bandwidth,
@@ -141,7 +142,11 @@ from dew.training.distributed import (
     marked,
     microbatch,
     microbatch_shapes,
+    offloadable,
+    peak_flops,
+    placed_as,
     placed_start,
+    rehomed,
     resumed_link_figures,
     ruled,
     stage_microbatches,
@@ -390,7 +395,7 @@ class Trainer(Generic[Loss, Effects]):
         # placed one does (`distributed.placed_held`). The frozen tree no step donates (`apart`), so
         # it shares the held arrays as they are, one copy for the run. Traced, no leaf is a held array,
         # so nothing is copied; a state held on the host is never donated, and takes the arrays over
-        # leaf by leaf as it is placed (`_placed_host`), so it takes them as they are.
+        # leaf by leaf as it is placed (`execution.placed_host`), so it takes them as they are.
         if not self.host_master:
             held = {id(leaf) for leaf in jax.tree.leaves(self.objective.held_variables())
                     if isinstance(leaf, jax.Array)}
@@ -605,13 +610,16 @@ class Trainer(Generic[Loss, Effects]):
         checkpoints = self.checkpoints
         if checkpoints is None or resume is None:
             if self.host_master:
-                return self._placed_host(initializer, key, shardings), shardings, None
+                from dew.training.execution import placed_host
+                return (placed_host(self.objective, lambda: self.initial_state(initializer, key),
+                                    self.state_mesh, self.device_mesh, shardings), shardings, None)
             return (placed_start(self.initial_state, initializer, key, abstract, shardings, start.through,
                                  self.device_mesh), shardings, None)
         if self.host_master and FROZEN in abstract.variables:
+            from dew.training.execution import banked_frozen
             abstract = dataclasses.replace(abstract, variables={
-                **abstract.variables, FROZEN: self._banked_frozen(
-                    abstract.variables,
+                **abstract.variables, FROZEN: banked_frozen(
+                    self.objective, abstract.variables,
                     lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         share = DataPartition.of(self.device_mesh) if positioned else None
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share)
@@ -651,7 +659,7 @@ class Trainer(Generic[Loss, Effects]):
         the step keeps XLA's default options, the half rung `compile` climbs
         to before the next. A checkpoint records it, since each decides the
         program a step runs."""
-        return rung_record(self.objective, self._xla_defaults, narrow=self._narrow)
+        return rung_record(self.objective, self._xla_defaults, narrow=self._narrow, host=self.layout.host)
 
     def _checkpoint_rung(self) -> JSON:
         """The rung a checkpoint records: the run's own, which every newly met
@@ -719,6 +727,7 @@ class Trainer(Generic[Loss, Effects]):
             fields.get("xla_defaults", False), "rung xla_defaults"
         )
         self._narrow = self._narrow and boolean(fields.get("narrow", True), "rung narrow")
+        self.layout = self.layout.keeping(strings(fields.get("host", []), "rung host"))
         self._resumed_rung = self._rung()
 
 
@@ -739,67 +748,6 @@ class Trainer(Generic[Loss, Effects]):
             self.state_mesh, dataclasses.replace(state, variables={FROZEN: frozen}, accumulation=None))
         sites = stack_sites(self.objective, {**state.variables, FROZEN: frozen})
         return resident(rows.variables[FROZEN], sites, self.device_mesh)
-
-    def _banked_frozen(self, variables, stack, release=None):
-        """Stack each scanned run's shared leaves of the frozen collection of `variables` into one bank
-        (`dew.inference.banks.banked`).
-
-        That is the shape a placement and a checkpoint template take, and the
-        arrays the state holds."""
-        from dew.inference.banks import banked
-        from dew.training.execution import stack_sites
-        return banked(variables[FROZEN], stack_sites(self.objective, variables), stack, release)
-
-    def _placed_host(self, initializer, key, shardings: Placement[TrainState]) -> TrainState:
-        """A fresh CPU-owned state, its leaves streamed into place one at a time.
-
-        The tree is built eagerly on the CPU, where the held leaves the
-        objective hands over are read by reference and nothing of size is
-        computed. Each leaf is then moved to its placement and the source let
-        go as it lands (`host.stream`): a moving leaf to the companion, a
-        frozen one to where it stays resident (`execution.resident`). The
-        transient is one leaf, not the tree, and one JIT could not have
-        returned to the two device sets anyway.
-        """
-        from dew.distributed.host import evict, place_leaf, stream, transfer
-        from dew.training.execution import bank_bytes, check_bank_pool, stack_sites
-        held = self.objective.held_variables()
-        with jax.default_device(self.state_mesh.local_devices[0]):
-            state = self.initial_state(initializer, key)
-            if FROZEN in state.variables:
-                sites = stack_sites(self.objective, state.variables)
-                check_bank_pool(bank_bytes(state.variables[FROZEN], sites), self.device_mesh)
-                # A scanned run's frozen rows become its bank here and the bank lands where it stays
-                # resident before the next is stacked, so the host holds one bank in transit, not the
-                # stack; the rows' pages are let go as it lands and the held tree holds the placed bank
-                # where each row was. An objective placed this way holds banks at its rows afterwards and
-                # does not seed a second trainer.
-                targets = shardings.variables[FROZEN]
-
-                def stack(rows, path):
-                    target = targets
-                    for component in path:
-                        target = target[component]
-                    bank = place_leaf(jnp.stack(rows), target)
-                    for row in rows:
-                        evict(np.asarray(row))
-                    return bank
-
-                def release(namespace, index, keys, bank):
-                    # The rows sit under the held tree's own frozen split
-                    # when it came split, or under its params when init split it.
-                    node = None if held is None else held.get(FROZEN, held.get("params"))
-                    for component in (*namespace, f"layers_{index}", *keys[:-1]):
-                        node = node.get(component) if isinstance(node, dict) else None
-                    if isinstance(node, dict) and keys[-1] in node:
-                        node[keys[-1]] = bank
-                frozen = self._banked_frozen(state.variables, stack, release)
-                state = dataclasses.replace(state, variables={**state.variables, FROZEN: frozen})
-        params = stream(state.variables, shardings.variables, held)
-        ema = None if state.ema is None else stream(state.ema, shardings.ema)
-        rest = dataclasses.replace(state, variables=None, ema=None)
-        placed = transfer(rest, dataclasses.replace(shardings, variables=None, ema=None))
-        return dataclasses.replace(placed, variables=params, ema=ema)
 
     # ------------------------------------------------------------------ The step
     # ------------------------------------------------------------------
@@ -887,31 +835,26 @@ class Trainer(Generic[Loss, Effects]):
         return dataclasses.replace(state, accumulation=pending)
 
     def _links(self, mesh: Mesh) -> dict[str, Link]:
-        """The links of `mesh`'s tensor and sequence axes, those it splits,
-        for one trace. Every process lists the mesh's devices alike and
-        `link_bandwidth` agrees one figure across the pool, so every process
-        decides alike and compiles the same program. The peak is the fastest
-        device's, on which the FLOPs a spread saves take the least time. Each
-        axis's bandwidth is measured once per mesh, and not at all for a
-        device the peak table does not name (a CPU's among them), where it
-        decides nothing; a link the run states (`links`) is taken as stated."""
-        devices = list(mesh.devices.flat)
-        peaks = [peak for device in devices if (peak := gpu_target(device.device_kind).bf16_peak) is not None]
-        peak = max(peaks) if len(peaks) == len(devices) else None
-        links = {}
-        for axis in (TENSOR_AXIS, SEQUENCE_AXIS):
-            if mesh.shape.get(axis, 1) == 1:
-                continue
-            if axis in self._stated_links:
-                stated = self._stated_links[axis]
-                links[axis] = Link(stated.bytes_per_second, stated.flops_per_second)
-                continue
-            if (mesh, axis) not in self._bandwidths:
-                # A resumed run takes the figure its checkpoint traced with, on this very placement.
-                self._bandwidths[mesh, axis] = None if peak is None else (
-                    self._resumed_links.get(link_topology(mesh, axis)) or link_bandwidth(mesh, axis))
-            links[axis] = Link(self._bandwidths[mesh, axis], peak)
-        return links
+        """The links of `mesh`'s tensor and sequence axes, those it splits, for one trace (`_link`)."""
+        return {axis: self._link(mesh, axis) for axis in (TENSOR_AXIS, SEQUENCE_AXIS)
+                if mesh.shape.get(axis, 1) > 1}
+
+    def _link(self, mesh: Mesh, axis: str) -> Link:
+        """`mesh`'s link `axis`, a mesh axis or the host link (`HOST_LINK`): as the run states it
+        (`links`), else its bandwidth (`link_bandwidth`) beside the fastest device's peak (`peak_flops`),
+        on which the FLOPs a decision saves take the least time. Every process lists the mesh's devices
+        alike and `link_bandwidth` agrees one figure across the pool, so every process decides alike
+        and compiles the same program. Each is measured once per mesh, and not at all for a device the
+        peak table does not name (a CPU's among them), where it decides nothing; a resumed run takes the
+        figure its checkpoint traced with, on this very placement."""
+        if axis in self._stated_links:
+            stated = self._stated_links[axis]
+            return Link(stated.bytes_per_second, stated.flops_per_second)
+        peak = peak_flops(mesh)
+        if (mesh, axis) not in self._bandwidths:
+            self._bandwidths[mesh, axis] = None if peak is None else (
+                self._resumed_links.get(link_topology(mesh, axis)) or link_bandwidth(mesh, axis))
+        return Link(self._bandwidths[mesh, axis], peak)
 
     @contextlib.contextmanager
     def _traced_on(self, mesh: Mesh | AbstractMesh,
@@ -1013,6 +956,7 @@ class Trainer(Generic[Loss, Effects]):
 
         def run(current, batch):
             with self._traced_on(mesh):
+                current = placed_as(current, candidate.shardings)
                 # Each shape plans its copies (`_at_base_rung`), and a step reads the state with its own.
                 if not candidate.copies:
                     current = dataclasses.replace(current, compute=None)
@@ -1050,7 +994,8 @@ class Trainer(Generic[Loss, Effects]):
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
         shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
 
-        def lower(split: int, narrow: bool) -> Candidate:
+        def lower(split: int, narrow: bool, host: tuple[str, ...]) -> Candidate:
+            self.layout = dataclasses.replace(self.layout, host=host)
             rung = {**self._rung(), 'narrow': narrow, 'split': split}
             return self._candidate(state, batch, schedule, placement, replicated, split, narrow,
                                    recorded_launches(recorded, rung))
@@ -1072,7 +1017,10 @@ class Trainer(Generic[Loss, Effects]):
             objective=self.objective, mesh=mesh, xla_defaults=self._xla_defaults, narrow=self._narrow,
             base=None if self._base_rung is None else self._base_rung[1], resumed=resumed,
             # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
-            frontier=timed is not None and recorded is None and resumed is None)
+            frontier=timed is not None and recorded is None and resumed is None, host=self.layout.host,
+            # The run's first plan places its state once for every shape (`placed_as`).
+            offloadable=() if self._shape_rungs else offloadable(state, self.layout.host),
+            link=lambda: self._link(mesh, HOST_LINK))
         seconds = timed([self._runner(plan, mesh) for plan in plans]) if len(plans) > 1 and timed else []
         # Every process runs the plan process zero timed clearly faster (`faster`).
         planned = plans[broadcast_from_process_zero(faster(seconds) if seconds else 0)]
@@ -1082,6 +1030,7 @@ class Trainer(Generic[Loss, Effects]):
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
         self._xla_defaults, self._narrow = planned.xla_defaults, planned.narrow
+        self.layout = dataclasses.replace(self.layout, host=tuple(planned.rung['host']))
         chosen = {**self._rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
@@ -1104,11 +1053,12 @@ class Trainer(Generic[Loss, Effects]):
         prepared = placed_shapes(prepared, shardings)
         # The check reads the state's arguments as already on the devices. The copies and accumulators
         # `run` builds on the first call are not yet, so they count with the prefetched batches beside
-        # the step, a ramp stage's window too, which `run` builds beside the last, already resident.
+        # the step, a ramp stage's window too, which `run` builds beside the last, already resident; a
+        # field the plan moves to or from host memory counts as it moves (`rehomed`).
         last = state.accumulation
         rebuilt = last is not None and not last.replays(prepared.accumulation)
         built = [(prepared.compute, state.compute), (prepared.accumulation, None if rebuilt else last)]
-        held = prefetched_bytes(batch, placement, self._prefetch) + placed_bytes(
+        held = prefetched_bytes(batch, placement, self._prefetch) + rehomed(state, shardings) + placed_bytes(
             [field for field, kept in built if kept is None and field is not None])
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)

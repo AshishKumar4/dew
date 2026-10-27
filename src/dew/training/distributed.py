@@ -5,6 +5,7 @@ is `dew.distributed.placement`'s."""
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
 import json
@@ -27,6 +28,7 @@ from dew.distributed.batches import Signature
 from dew.distributed.placement import Layout, Placement, link_topology
 from dew.files import write_atomically
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
+from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import microbatched
 from dew.objectives.base import Initializer
 from dew.state import TrainState, apart, together
@@ -144,6 +146,56 @@ def _round_tripped(mesh: Mesh, size: int) -> float | None:
     seconds = samples(lambda array: jax.device_put(jax.device_put(array, host), sharding), source,
                       warmup=2, repeats=5)
     return 2 * count // mesh.size * 4 / statistics.median(seconds)
+
+
+def peak_flops(mesh: Mesh) -> float | None:
+    """The fastest dense bf16 peak among `mesh`'s devices (`gpu_target(...).bf16_peak`), on which the
+    FLOPs a link's decision saves take the least time; None where the peak table does not name every
+    one of them."""
+    peaks = [peak for device in mesh.devices.flat
+             if (peak := gpu_target(device.device_kind).bf16_peak) is not None]
+    return max(peaks) if len(peaks) == mesh.devices.size else None
+
+
+OFFLOADABLE = ("opt_state", "ema")
+"""The state's fields a plan may keep in its host's pinned memory (`dew.training.planning.Search`), each
+fetched for the update and written back after it, as `Layout.host` keeps them."""
+
+
+def offloadable(state: TrainState, host: tuple[str, ...]) -> tuple[str, ...]:
+    """The fields of `state` a plan may move to its host's pinned memory: those of `OFFLOADABLE` it
+    holds that `host`, a layout's, keeps on the device."""
+    return tuple(field for field in OFFLOADABLE
+                 if field not in host and jax.tree.leaves(getattr(state, field)))
+
+
+def _memory(sharding) -> str:
+    return sharding.memory_kind or "device"
+
+
+def rehomed(state: TrainState, shardings: Placement[TrainState]) -> int:
+    """The bytes each device gains where `state`'s `OFFLOADABLE` fields move to the memory `shardings`
+    places them in: positive for a field it brings from host memory, negative for one it moves there,
+    which the fit check counts beside the step (`dew.training.planning.Candidate.held`)."""
+    gained = 0
+    for field in OFFLOADABLE:
+        placed = jax.tree.leaves(getattr(shardings, field))
+        for leaf, sharding in zip(jax.tree.leaves(getattr(state, field)), placed, strict=True):
+            before, after = _memory(leaf.sharding), _memory(sharding)
+            if before != after:
+                gained += math.prod(sharding.shard_shape(leaf.shape)) * leaf.dtype.itemsize * (
+                    1 if after == "device" else -1)
+    return gained
+
+
+def placed_as(state: TrainState, shardings: Placement[TrainState]) -> TrainState:
+    """`state` with each of its `OFFLOADABLE` fields in the memory `shardings` places it in, moved only
+    where it is elsewhere: a plan that keeps one in host memory, or no longer does, moves it at its
+    first step, and every later step finds it there."""
+    moved = {field: jax.device_put(getattr(state, field), getattr(shardings, field)) for field in OFFLOADABLE
+             if (leaves := jax.tree.leaves(getattr(state, field)))
+             and _memory(leaves[0].sharding) != _memory(jax.tree.leaves(getattr(shardings, field))[0])}
+    return dataclasses.replace(state, **moved) if moved else state
 
 
 def link_figures(bandwidths: Mapping[tuple[Mesh, str], float | None]) -> dict[str, JSON]:

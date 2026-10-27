@@ -20,14 +20,14 @@ import json
 import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import AbstractMesh, Mesh
 
 from dew._coordination import from_every_process
-from dew._records import JSON
+from dew._records import JSON, strings
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
@@ -224,7 +224,8 @@ class Probe:
         tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
                 else ", the head tiled, its gradient in the backward")
         defaults = ", XLA's default options" if self.rung["xla_defaults"] else ""
-        held = f", {' and '.join(self.rung['host'])} in host memory" if self.rung["host"] else ""
+        host = strings(self.rung["host"], "rung host")
+        held = f", {' and '.join(host)} in host memory" if host else ""
         exposed = ", its offload exposed" if self.hidden is False else ""
         return (f"{self.split} x {self.rows} rows at remat {self.rung['remat']!r}"
                 f"{tile}{defaults}{held}{exposed}")
@@ -442,7 +443,7 @@ class Search:
     host memory at a remat rung above the run's own (an offloading rung's residuals)."""
     lower: Callable[[int, bool, tuple[str, ...]], Candidate]
     options: Callable[[Candidate], jax.stages.CompilerOptions | None]
-    objective: Objective
+    objective: Objective[Any, Any]
     mesh: Mesh
     xla_defaults: bool
     narrow: bool
@@ -526,7 +527,7 @@ class Search:
         None where it offloads nothing."""
         stats = executable.memory_analysis()
         temporaries = (0 if stats is None or self.remat_rung() == self.own_remat
-                       else int(getattr(stats, "host_temp_size_in_bytes", 0)))
+                       else int(stats.host_temp_size_in_bytes))
         moved = offloaded(candidate.prepared, [field for field in self.host if field not in self.own],
                           temporaries)
         if not moved:

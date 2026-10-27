@@ -11,7 +11,7 @@ import dataclasses
 import fnmatch
 import json
 import math
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import numpy as np
@@ -462,6 +462,11 @@ class Layout:
                 f"{list(HOST_RESIDENT)}, got {unknown}")
         object.__setattr__(self, "host", host)
         object.__setattr__(self, "host_parameters", tuple(self.host_parameters))
+
+    def keeping(self, fields: Sequence[str]) -> Layout:
+        """This layout with `fields` of `HOST_RESIDENT` kept in pinned host memory beside its own."""
+        kept = (field for field in fields if field not in self.host)
+        return dataclasses.replace(self, host=(*self.host, *kept))
 
     @property
     def axis_rules(self) -> LogicalAxisRules:
