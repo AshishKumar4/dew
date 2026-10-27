@@ -14,7 +14,6 @@ from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
-from dew.nn.mixers.mamba2 import Mamba2
 from dew.nn.precision import float32_einsum
 
 ROWS, LENGTH, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH = 2, 70, 1, 2, 16, 8
@@ -509,26 +508,33 @@ def test_the_portable_rule_takes_nested_differentiation(packed):
     assert all(bool(jnp.all(jnp.isfinite(x))) for x in found)
 
 
-def test_a_mamba2_layer_traced_for_a_jvp_on_a_tpu_gives_its_scans_tangent():
+def test_a_rated_scan_traced_for_a_jvp_on_a_tpu_gives_its_tangent():
     """A rated scan the TPU's Pallas scan tiles takes in reverse mode alone, its custom VJP giving no tangent
-    (row 1869, audit K2): a Mamba-2 layer traced for `jax.jvp` (`forward_mode_attention`) on an assumed v6e
-    gives its tangent, on par with the layer's on this CPU over the draws (check 1), truth its float64
-    layer's."""
-    from dew.nn.attention import forward_mode_attention
+    (row 1869, audit K2): Mamba-2's SSD scan (`mamba2.SSD` without its skip, whose own custom VJP refuses a
+    jvp, row 1933) traced for `jax.jvp` (`forward_mode_attention`) on an assumed v6e gives its tangent, on par
+    with the scan's on this CPU over the draws (check 1), truth its float64 run."""
+    import dataclasses
 
-    layer = Mamba2(emb_features=64, num_heads=4, head_dim=16, state_size=16, n_groups=2, chunk_size=32)
-    params = layer.init(jax.random.key(1), jnp.zeros((1, 64, 64)))
+    from dew.nn.attention import forward_mode_attention
+    from dew.nn.mixers.mamba2 import SSD
+
+    hooks = dataclasses.replace(SSD, skip=False)
 
     def draw(seed):
-        keys = jax.random.split(jax.random.key(seed))
-        return tuple(jax.random.normal(key, (1, 64, 64)) for key in keys)
+        keys = jax.random.split(jax.random.key(seed), 6)
+        x, direction = (jax.random.normal(key, (1, 64, 4, 16)) for key in keys[:2])
+        B, C = (jax.random.normal(key, (1, 64, 2, 16)) for key in keys[2:4])
+        dt = jax.nn.softplus(jax.random.normal(keys[4], (1, 64, 4)))
+        A = -jnp.exp(jax.random.normal(keys[5], (4,)))
+        return x, direction, B, C, dt, A
 
-    def tangent(module, target=None):
-        def run(x, direction):
-            variables = jax.tree.map(lambda leaf: leaf.astype(x.dtype), params)
+    def tangent(target=None):
+        def run(x, direction, B, C, dt, A):
+            def scan(x):
+                return chunk(hooks, Chunk(C, B, x, beta=dt, rate=A), chunk_size=CHUNK, dtype=x.dtype)[0]
             with generation.assumed(target), forward_mode_attention():
-                return jax.jvp(lambda x: module.apply(variables, x), (x,), (direction,))[1]
+                return jax.jvp(scan, (x,), (direction,))[1]
         return run
 
-    assert_as_exact(jax.jit(tangent(layer, "v6e")), jax.jit(tangent(layer)), draw, "a TPU's scan under jvp",
-                    seeds=PORTABLE_SEEDS, truth_fn=tangent(layer.clone(dtype=jnp.float64)))
+    assert_as_exact(jax.jit(tangent("v6e")), jax.jit(tangent()), draw, "a TPU's scan under jvp",
+                    seeds=PORTABLE_SEEDS, truth_fn=tangent())
