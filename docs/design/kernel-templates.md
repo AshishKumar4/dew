@@ -318,7 +318,7 @@ A second copy of the algebra written in triton.language is not an acceptable ans
 Two measures decide whether a mainloop lands and whether it replaces a route: the accuracy gate (check 1 against float64, and the stability suite), and performance, compute time and peak memory, on the operator rows and the model step. No code-equality or bitwise agreement between implementations is a gate; a bitwise comparison of two mainloops in interpret mode may stay as a cheap debugging aid, never blocking.
 
 1. **Check 1 per mainloop**, in interpret mode on a CPU and compiled on a GPU, and the stability suite.
-2. **A same-schedule reproducibility test**: one mainloop, one schedule, the same bits run to run (determinism, not a comparison of implementations).
+2. **A same-schedule reproducibility test**: in deterministic mode, one mainloop, one schedule, the same bits run to run (determinism, not a comparison of implementations).
 3. **Zero cost, per scoreboard row,** in compute time and peak memory: with no hooks, at a given configuration, the template runs within noise of its named comparator:
    - sm80: jax mha, then FA2;
    - sm90: Tokamax Mosaic, then FA3.
