@@ -226,12 +226,16 @@ def test_a_reference_exactly_zero_on_a_residue_row_does_not_measure_it():
     measures it."""
     from reference_error import _paired, leaf_summary
 
-    truth = np.asarray([[1.0, -1.0, 0.5], [1.6e-40, -1.6e-40, 1.6e-40]])
-    reference = np.asarray([[1.0, -1.0, 0.5], [0.0, 0.0, 0.0]])
-    dew = np.asarray([[1.0, -1.0, 0.5], [1e-15, -1e-15, 1e-15]])
+    # Residue rows whose squares fall below float64's normal range, where a size and an error taken by
+    # two arithmetics part by more than a rounding.
+    residue = [[1.6e-40, -1.6e-40, 1.6e-40], [3e-160, -2e-160, 1e-160], [7e-161, 5e-161, -3e-161],
+               [1.1e-159, -9e-160, 4e-161], [2.3e-160, 2.9e-160, -1.7e-160]]
+    truth = np.asarray([[1.0, -1.0, 0.5], *residue])
+    reference = np.where(np.arange(len(truth))[:, None] == 0, truth, 0.0)
+    dew = np.where(np.arange(len(truth))[:, None] == 0, truth, 1e-15)
     mine = leaf_summary(dew, truth)
     _, _, worst, _, (rows, _, _), _ = _paired("leaf", mine, leaf_summary(reference, truth))
-    assert rows.tolist() == [1] and worst < 0
-    close = np.asarray([[1.0, -1.0, 0.5], [1.6e-40, -1.6e-40, 1.5e-40]])
+    assert rows.tolist() == list(range(1, len(truth))) and worst < 0
+    close = np.where(np.arange(len(truth))[:, None] == 1, [1.6e-40, -1.6e-40, 1.5e-40], reference)
     _, _, worst, _, (rows, _, _), _ = _paired("leaf", mine, leaf_summary(close, truth))
-    assert rows.tolist() == [] and worst > 50
+    assert 1 not in rows.tolist() and worst > 50
