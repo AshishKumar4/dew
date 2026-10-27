@@ -6,8 +6,8 @@ register XLA FFI targets with JAX: FlashAttention-2 through flash_attn_jax's
 port, and FlashAttention-3, Hopper's kernels, through flash-attn3-jax's
 torch-free port, all BSD-3.
 
-There is one wheel for each CUDA major of your jax, for Linux x86_64 and any
-Python from 3.11:
+There is one wheel for each CUDA major of your jax, for Linux x86_64 and
+aarch64 and any Python from 3.11:
 
     pip install dew-flash-attn-cu12   # jax with jax-cuda12-plugin
     pip install dew-flash-attn-cu13   # jax with jax-cuda13-plugin
