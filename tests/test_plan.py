@@ -690,10 +690,8 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
             raise error
 
     refusals = []
-    if refused:
-        assert compiled_if_it_fits(Program(), None, refusals) is None
-        assert refusals == [error]
-    else:
-        with pytest.raises(jax.errors.JaxRuntimeError) as raised:
-            compiled_if_it_fits(Program(), None, refusals)
-        assert raised.value is error and refusals == []
+    try:
+        outcome = compiled_if_it_fits(Program(), None, refusals)
+    except jax.errors.JaxRuntimeError as raised:
+        outcome = raised
+    assert (outcome, refusals) == ((None, [error]) if refused else (error, []))

@@ -149,15 +149,6 @@ GPU_STEPS = {
 }
 
 
-def step_loss(objective, variables, batch):
-    """`objective`'s loss over `batch` at the first step, a function of the parameters, the rest of
-    `variables` held."""
-    def loss(params):
-        at = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
-        return objective.scalar_loss({**variables, "params": params}, batch, at)[0]
-    return loss
-
-
 @pytest.mark.parametrize("case", list(GPU_STEPS))
 def test_a_gpu_step_runs_the_collectives_its_layout_plans(case):
     """A fine-tune's step (its forward, backward and Adam update over the placed state, under the
@@ -178,9 +169,12 @@ def test_a_gpu_step_runs_the_collectives_its_layout_plans(case):
     batch = {"text": jax.ShapeDtypeStruct((BATCH, SEQ_LEN + 1), jnp.int32, sharding=rows)}
 
     def step(variables, batch):
+        def loss(params):
+            at = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
+            return objective.scalar_loss({**variables, "params": params}, batch, at)[0]
+
         params = variables["params"]
-        grads = jax.grad(step_loss(objective, variables, batch))(params)
-        updates, _ = optimizer.update(grads, optimizer.init(params), params)
+        updates, _ = optimizer.update(jax.grad(loss)(params), optimizer.init(params), params)
         return optax.apply_updates(params, updates)
 
     with assumed(generation), jax.set_mesh(mesh), nn.logical_axis_rules(layout.axis_rules):
