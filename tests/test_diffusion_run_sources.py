@@ -364,7 +364,7 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     and the text towers. The loss the two share is held to Diffusers'
     train_dreambooth_flux.py statements on matched draws in
     tests/test_flow_matching.py (ad63cc6a). Both sample by the same policy, the
-    pipeline's own grid and finish too."""
+    pipeline's own grid and finish too, and their tasks draw the same images."""
     from dew.interop.pretrained import load_diffusion_source
 
     directory = pipelines / family / "pipeline"
@@ -398,6 +398,13 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
         np.testing.assert_array_equal(ours, theirs)
     batch = batch_for(configured, size)
     assert value(configured, states[0].variables, batch) == value(written, states[1].variables, batch)
+    # Each samples by its settings: the configured run's task draws what the API's draws, at the two
+    # steps the run configured, which an explicit two-step call draws too.
+    tasks = [TextToImage.from_objective(objective, state.variables)
+             for objective, state in zip((configured, written), states, strict=True)]
+    drawn = [task(PROMPTS, key=5).host().images for task in tasks]
+    np.testing.assert_array_equal(drawn[0], drawn[1])
+    np.testing.assert_array_equal(drawn[0], tasks[0](PROMPTS, key=5, steps=2).host().images)
 
 
 def test_a_pretrained_run_refuses_a_preset_of_another_kind(pipelines):
