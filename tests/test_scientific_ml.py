@@ -115,6 +115,15 @@ class LeastSquares(Residuals):
         return (self.model.apply(variables, batch["x"]) - batch["y"])[:, None]
 
 
+def least_squares_draw(rows: int, features: int, stream: int):
+    """A draw of `rows` rows of `features` unit normals and their targets, from `stream`'s seeds."""
+    def draw(seed):
+        generator = np.random.default_rng([stream, rows, seed])
+        return (generator.normal(size=(rows, features)).astype(np.float32),
+                generator.normal(size=rows).astype(np.float32))
+    return draw
+
+
 def solved(x: np.ndarray, y: np.ndarray, damping: float) -> np.ndarray:
     """The damped Gauss-Newton step of the residuals `x @ 0 - y` in NumPy at x's own dtype: the normal
     equations' solve where the rows outnumber the features, the Gram form's otherwise."""
@@ -134,11 +143,7 @@ def test_a_damped_gauss_newton_step_is_the_normal_equations_solve(rows, features
     objective = LeastSquares(features, damping=1e-3)
     params = objective.init(jax.random.key(0))["params"]
     step = Step(jnp.asarray(0), jax.random.key(0), None)
-
-    def draw(seed):
-        generator = np.random.default_rng([0x6A, rows, seed])
-        return (generator.normal(size=(rows, features)).astype(np.float32),
-                generator.normal(size=rows).astype(np.float32))
+    draw = least_squares_draw(rows, features, 0x6A)
 
     def dews(x, y):
         gradient = jax.grad(lambda p: objective.scalar_loss({"params": p}, {"x": x, "y": y}, step)[0])(params)
@@ -182,11 +187,7 @@ def test_an_accumulated_gauss_newton_update_solves_its_whole_batch_once():
     float64 solve (check 1). A solve per microbatch, averaged, would be another step: for the rows (1, 1)
     and (2, 0) at damping 1, -1/4 where the batch's is -1/6."""
     rows, features = 64, 8
-
-    def draw(seed):
-        generator = np.random.default_rng([0x6B, rows, seed])
-        return (generator.normal(size=(rows, features)).astype(np.float32),
-                generator.normal(size=rows).astype(np.float32))
+    draw = least_squares_draw(rows, features, 0x6B)
 
     # The weights start at zero, so the step's weights are the solve's step, negated.
     exact = as_given(lambda x, y: -solved(x.astype(np.float64), y.astype(np.float64), 1e-3))

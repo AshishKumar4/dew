@@ -52,7 +52,6 @@ import string
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
 
 from dew._distributions import counter_key
@@ -112,15 +111,6 @@ def _site(context, args, kwargs, output) -> Site | None:
                 contracted)
 
 
-def _zero_cotangents(tree):
-    """The zero cotangent of every leaf of `tree`: float0 for an integer or a key."""
-    def zero(leaf):
-        if jnp.issubdtype(jnp.result_type(leaf), jnp.inexact):
-            return jnp.zeros_like(leaf)
-        return np.zeros(jnp.shape(leaf), jax.dtypes.float0)
-    return jax.tree.map(zero, tree)
-
-
 class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
     """Trains the objective it is mixed into without backpropagation (the module's docstring), by `draws`
     antithetic pairs of output jitters of scale `sigma` a step, and `weight_draws` pairs of weight jitters
@@ -153,7 +143,8 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
             params, rest = saved
             others, held_batch, held_step = rest
             stats = cotangent[0] if isinstance(cotangent, tuple) else cotangent
-            return self.estimate(params, others, held_batch, held_step, stats), _zero_cotangents(rest)
+            # None: the variables held, the batch and the step take no cotangent.
+            return self.estimate(params, others, held_batch, held_step, stats), None
 
         estimated.defvjp(forward, backward)
         return estimated(variables["params"], (held, batch, step))
