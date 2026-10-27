@@ -1302,3 +1302,10 @@ def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
         slope = jax.grad(lambda centre, edge=edge, value=value: edge.replace(mean=centre).log_prob(
             jnp.full((1, 1), value, jnp.float32)).sum())(edge.mean)
         np.testing.assert_array_equal(np.asarray(slope), [[np.float32((value - mean) / variance)]])
+    # A residual of 2**-30 under a variance of 2**-120: the variance's derivative, -term / variance, passes
+    # float32's largest, and a gradient in the mean alone, which never moves the variance, is the
+    # residual over the variance, 2**90, finite, no inf times zero in the tangent (ledger 1916).
+    small = GaussianTransition(jnp.zeros((1, 1), jnp.float32), jnp.asarray([2.0 ** -120], jnp.float32))
+    slope = jax.grad(lambda centre: small.replace(mean=centre).log_prob(
+        jnp.full((1, 1), 2.0 ** -30, jnp.float32)).sum())(small.mean)
+    np.testing.assert_array_equal(np.asarray(slope), [[2.0 ** 90]])
