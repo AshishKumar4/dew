@@ -34,6 +34,7 @@ from dew.nn.precision import (
     stochastic_bf16,
 )
 
+from ..sharding import explicit_spec
 from . import chunked_launch, norm_swiglu, short_conv, tuning
 from .generation import INHERENT, Refusal, triton_runs
 
@@ -323,8 +324,13 @@ def _skip_forward(skip, value):
 
 def _skip_backward(residual, grad):
     skip, value = residual
-    heads, width = value.shape[-2:]
-    summed = float32_einsum('nhv,nhv->h', grad.reshape(-1, heads, width), value.reshape(-1, heads, width))
+    # Rows an Explicit axis splits contract into `D`'s own placement, which JAX cannot infer from a
+    # contraction over a split dimension (a data-parallel layout's hybrid, test_parallelism_matrix).
+    placed = explicit_spec(value)
+    stated = {} if placed is None else {
+        'out_sharding': jax.sharding.NamedSharding(placed.mesh, jax.typeof(skip).sharding.spec)}
+    leading = 'abcdefg'[:value.ndim - 2]
+    summed = float32_einsum(f'{leading}hv,{leading}hv->h', grad, value, **stated)
     return summed.astype(skip.dtype), (grad * skip[:, None]).astype(value.dtype)
 
 
