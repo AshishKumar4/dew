@@ -52,8 +52,17 @@ def require_profile_support() -> _Converter:
     return converter
 
 
-def capture_options() -> jax.profiler.ProfileOptions:
-    """The options a Dew capture starts with, for any JAX trace that should read like one.
+ACTIVITY_CAP = 2 * 1024 * 1024
+"""The CUDA activity events (kernels, copies) a Dew capture keeps on GPU, CUPTI's
+`gpu_max_activity_api_events`: past it CUPTI drops whole buffers of events and says so only in a C++
+log, so Dew states the cap it set and reads a capture holding that many as cut short (`Profiler`'s
+manifest)."""
+
+
+def capture_options(*, host_tracer_level: int = 2, python_tracer_level: int = 0,
+                    activity_cap: int = ACTIVITY_CAP) -> jax.profiler.ProfileOptions:
+    """The options a Dew capture starts with, for any JAX trace that should read like one: by default host
+    events at level 2, no Python tracer, and on GPU at most `activity_cap` CUDA activity events.
 
     Host events at level 2 and the compiled HLO, and no Python tracer: it
     records every Python and C call, which slows Python-heavy host work
@@ -63,8 +72,8 @@ def capture_options() -> jax.profiler.ProfileOptions:
     trace also carries compute and sync events.
     """
     options = jax.profiler.ProfileOptions()
-    options.host_tracer_level = 2
-    options.python_tracer_level = 0
+    options.host_tracer_level = host_tracer_level
+    options.python_tracer_level = python_tracer_level
     # Exporting every live executable's HLO cost 0.95 s and 3.4 MB for a
     # 4-layer decoder's fit that had evaluated and sampled first (RTX 4080).
     # 400 unrelated compiled programs made a CPU capture of small work take
@@ -72,6 +81,8 @@ def capture_options() -> jax.profiler.ProfileOptions:
     options.enable_hlo_proto = True
     if jax.default_backend() == "tpu":
         options.advanced_configuration = {"tpu_trace_mode": "TRACE_COMPUTE_AND_SYNC"}
+    elif jax.default_backend() == "gpu":
+        options.advanced_configuration = {"gpu_max_activity_api_events": activity_cap}
     return options
 
 

@@ -230,10 +230,25 @@ class Profile:
     """`path=value`, once a field, as `dew train` reads it."""
     trust: tuple[str, ...] = ()
     """Packages outside Dew whose modules a `run.json` may import."""
+    host_tracer_level: int | None = None
+    """The capture's host events: 1 the user's annotations, 2 those and Dew's and JAX's, 3 every host event;
+    unset, `ProfileWindow`'s."""
+    python_tracer_level: int | None = None
+    """1 traces every Python call, which slows Python-heavy host work several times over; unset,
+    `ProfileWindow`'s (none)."""
+    activity_cap: int | None = None
+    """The CUDA activity events a GPU capture keeps, CUPTI's cap, past which the capture is cut short; unset,
+    `ProfileWindow`'s."""
 
     def run_command(self) -> int:
+        from dew.training.profiling import ProfileWindow
+
+        given = {"host_tracer_level": self.host_tracer_level, "python_tracer_level": self.python_tracer_level,
+                 "activity_cap": self.activity_cap}
+        capture = ProfileWindow("", self.steps,
+                                **{name: value for name, value in given.items() if value is not None})
         report = run_named(self.run, self.trust).assigned(self.set).profile(self.out, warmup=self.warmup,
-                                                                            steps=self.steps)
+                                                                            steps=self.steps, capture=capture)
         if report is not None:
             emit(report.text())
         return 0

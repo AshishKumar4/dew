@@ -32,6 +32,11 @@ class ProfileWindow:
     A fit under JAX's AutoPGLE, which profiles programs in sessions of its own,
     refuses a window (`PGLE_CAPTURE`).
 
+    The capture's options are the window's: host events at `host_tracer_level`,
+    Python calls at `python_tracer_level` (0, none: the Python tracer slows
+    Python-heavy host work several times over), and on GPU at most
+    `activity_cap` CUDA activity events (`dew.telemetry.profile.capture_options`).
+
     `dew.Profiler` is the other way to capture a trace, as a context manager
     around any code; a fit refuses to schedule a window inside one. The loop
     reports the window it wrote as the `ProfileWindow` record of
@@ -40,6 +45,9 @@ class ProfileWindow:
     directory: str
     steps: int
     warmup: int = 2
+    host_tracer_level: int = 2
+    python_tracer_level: int = 0
+    activity_cap: int = telemetry_profile.ACTIVITY_CAP
 
 
 def pgle_runs() -> int:
@@ -86,7 +94,9 @@ def owned_capture(window: ProfileWindow | None) -> "Profiler | None":
         if pgle_runs():
             raise ValueError(PGLE_CAPTURE)
         telemetry_profile.require_profile_support()
-        return telemetry_profile.Profiler(window.directory)
+        return telemetry_profile.Profiler(window.directory, options=telemetry_profile.capture_options(
+            host_tracer_level=window.host_tracer_level, python_tracer_level=window.python_tracer_level,
+            activity_cap=window.activity_cap))
 
     return agreed("profiling window setup", own_window)
 

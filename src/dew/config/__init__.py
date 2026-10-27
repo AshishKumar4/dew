@@ -1290,8 +1290,8 @@ class RunConfig:
                                 f"{_chain_label(prepared.run.data)}/date-{run_timestamp()}")
         return prepared.train(name)
 
-    def profile(self, directory: str | None = None, *, warmup: int = 20,
-                steps: int = 10) -> ProfileReport | None:
+    def profile(self, directory: str | None = None, *, warmup: int = 20, steps: int = 10,
+                capture: ProfileWindow | None = None) -> ProfileReport | None:
         """Train this run afresh under `directory` for `warmup` steps, then a window of `steps` more traced
         (`ProfileWindow`), and report where the window's steps spent their time (`ProfileReport`), written
         as `report.json` beside XProf's own reports. The warmup is whole windows, at least one, so the step
@@ -1301,8 +1301,10 @@ class RunConfig:
         and their metrics and summaries (a split its chain holds out scores after the window), and its W&B
         sink. `directory` unset is profiles/<the run's name>/<the time
         it starts>, read once the process is prepared, as `run` reads a run's name. The run's own
-        directory is left as it is. Raises ValueError for a directory that holds this run's profile
-        already. The report is process zero's, which logs the run; None on the others."""
+        directory is left as it is. `capture` gives the capture's options (its `host_tracer_level`,
+        `python_tracer_level` and `activity_cap`; its directory and steps are the profile's). Raises
+        ValueError for a directory that holds this run's profile already. The report is process zero's,
+        which logs the run; None on the others."""
         from dew.training import prepare_process, run_timestamp
 
         name = self.trainer.name or "profile"
@@ -1318,7 +1320,8 @@ class RunConfig:
             raise ValueError(f"{directory} holds a profile of {name} already; give the profile a directory "
                              "of its own")
         window = os.path.join(directory, "capture")
-        captured = ProfileWindow(window, steps, warmup)
+        captured = dataclasses.replace(capture or ProfileWindow(window, steps), directory=window, steps=steps,
+                                       warmup=warmup)
         trainer = dataclasses.replace(trainer, checkpoint_dir=directory, profile=captured)
         profiled = dataclasses.replace(self, validation=None, val_metrics=None, val_summaries=(),
                                        trainer=trainer)
