@@ -1063,6 +1063,56 @@ def _elastic_cut(stages: Sequence[Stage]) -> int:
                default=0)
 
 
+class _InputOrder(pygrain.IterDataset):
+    """An elastic read's indexed rows read in its loading workers (`_Build.handed`), in the inputs'
+    order whatever their count: groups of `size` consecutive inputs (`_Grouped`), group k read by
+    worker k mod W, which Grain's interleave of the workers hands on in turn, so group after group
+    in order. Its position is the input its next group begins at, so a resume opens its workers
+    there (`rows[next:]`) on any count; `size` is the chain's batch, the same on every topology, so
+    a flat map over it (`_Ungrouped`) finds the group it was inside where it left it."""
+
+    def __init__(self, rows: pygrain.MapDataset, size: int,
+                 read: Callable[[pygrain.MapDataset], pygrain.IterDataset]):
+        super().__init__([])
+        self.rows, self.size, self.read = rows, size, read
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return _InputOrderIterator(self)
+
+
+class _InputOrderIterator(pygrain.DatasetIterator):
+    def __init__(self, ordered: _InputOrder):
+        super().__init__()
+        self._ordered, self._next, self._reads = ordered, 0, None
+
+    def _opened(self) -> pygrain.DatasetIterator:
+        if self._reads is None:
+            ordered = self._ordered
+            # Each group a dataset element of its own, so the workers' slices of them, every W-th,
+            # interleave back into the inputs' order.
+            groups = ordered.rows[self._next:].batch(ordered.size, drop_remainder=False, batch_fn=_Grouped())
+            self._reads = iter(ordered.read(groups))
+            self._reads.start_prefetch()
+        return self._reads
+
+    def __next__(self) -> Batch:
+        group = next(self._opened())
+        self._next += self._ordered.size
+        return group
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"next_input": self._next}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self.close()
+        self._next = integer(state["next_input"], "elastic read's next input")
+
+    def close(self) -> None:
+        if self._reads is not None:
+            self._reads.close()
+            self._reads = None
+
+
 class _ElasticBatches(pygrain.IterDataset):
     """An elastic read's batches (`_Build.elastic_batches`): `rows`, the order one reader reads,
     taken a whole batch's `size` at a time, of which this reader keeps its share (`partition.held`),
@@ -1223,8 +1273,11 @@ class _Build:
         in those."""
         count = _workers(pipeline, self.loading)
         written = any(isinstance(stage, Workers) for stage in _steps(pipeline))
-        if (self.global_order or not self.training or not (count or written)
-                or not _dropping(pipeline, self.lowering)):
+        # An elastic read reads its inputs as workers do (`_InputOrder`), none of them too, so its
+        # position is the same whatever their count; after its batch they would read every
+        # count-th of its rows.
+        pooled = (count or written) and _dropping(pipeline, self.lowering)
+        if self.global_order or not self.training or not (self.elastic or pooled):
             return self
         pool = next((stage for stage in pipeline.stages if isinstance(stage, Workers)),
                     Workers(count, self.loading.worker_buffer))
@@ -1422,7 +1475,8 @@ class _Build:
         # This corpus's own workers, where they read its first steps (`pooled`): those steps keep
         # each record they drop as a marker, which the reading process drops after them.
         pool = self.owning(pipeline).pool
-        pooled = pool is not None and pool.count > 0 and not isinstance(source, (Mixture, Phases))
+        pooled = (pool is not None and (pool.count > 0 or self.elastic)
+                  and not isinstance(source, (Mixture, Phases)))
         # A Grain step of the caller's reads its rows as Grain gives them, without a marker.
         native = next((isinstance(stage, Native) for stage in pipeline.stages
                        if not isinstance(stage, (Shuffle, Slice, Limit, Repeat))), False)
@@ -1603,10 +1657,27 @@ class _Build:
         # A worker hands on its rows and markers a share's batch count at a time, the fields that
         # stack stacked as a batch's are, as many groups in flight as it had batches.
         size = partition.rows(self.batch)
-        grouped = _as_iter(rows, self.loading).batch(size, drop_remainder=False, batch_fn=_Grouped())
-        handed = self.stage(grouped, pool, pipeline, partition, len(pipeline.stages))
+        if self.elastic:
+            if not isinstance(rows, pygrain.MapDataset):
+                raise ValueError(
+                    f"{_name(pipeline)} is read elastically in loading workers, which read its inputs "
+                    "by index, a batch's count at a time in their order; a step before its workers "
+                    "hand on that streams them (an expansion) reads no index: write it after a filter "
+                    "or a map, or read it with Loading(workers=0)")
+            size = self.batch
+            handed = _InputOrder(rows, size, functools.partial(self.read_in, pipeline=pipeline,
+                                                               partition=partition, pool=pool))
+        else:
+            grouped = _as_iter(rows, self.loading).batch(size, drop_remainder=False, batch_fn=_Grouped())
+            handed = self.read_in(grouped, pipeline=pipeline, partition=partition, pool=pool)
         flat = gx.FlatMapIterDataset(_as_iter(handed, self.loading), _Ungrouped(size))
         return Accepted(flat, _name(pipeline), _label(pipeline))
+
+    def read_in(self, groups: Rows, *, pipeline: Pipeline, partition: DataPartition,
+                pool: Workers) -> pygrain.IterDataset:
+        """`groups` (`_Grouped`) read by the loading workers of `pool`."""
+        return _as_iter(self.stage(_as_iter(groups, self.loading), pool, pipeline, partition,
+                                   len(pipeline.stages)), self.loading)
 
     def record_stage(
         self, rows: Rows, run: tuple[RecordStage, ...], pipeline: Pipeline, partition: DataPartition, at: int,

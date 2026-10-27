@@ -8,6 +8,7 @@ pool's own resume is tests/test_multiprocess.py's
 
 import dataclasses
 import itertools
+import json
 import threading
 from typing import ClassVar
 
@@ -20,7 +21,7 @@ from dew.batch import VALID_ROWS
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
 from dew.data.pipeline import Pipeline
-from dew.data.sources import Memory
+from dew.data.sources import Files, Memory
 
 READ = Loading(workers=0, threads=4, read_buffer=4)
 BATCH = 8
@@ -137,11 +138,58 @@ def test_a_finite_elastic_read_ends_on_every_reader_at_once_its_last_batch_fille
     assert real[:3] == [17, 19, 21]
 
 
-def test_an_elastic_read_refuses_loading_workers_and_a_per_share_position():
-    """Loading workers split the one order by their count, so an elastic read refuses them; and
+def worker_reader(chain: Pipeline, index: int, count: int, workers: int):
+    loading = Loading(workers=workers, threads=2, read_buffer=2, worker_buffer=2)
+    return compile(chain, read="indexed", loading=loading, seed=3).train(DataPartition(index, count))
+
+
+@pytest.mark.parametrize(("saved", "resumed"), [((2, 3), (4, 2)), ((1, 2), (2, 0))],
+                         ids=["2-readers-3-workers-to-4-readers-2-workers",
+                              "1-reader-2-workers-to-2-readers-none"])
+def test_an_elastic_read_in_loading_workers_reads_one_readers_order_and_resumes_on_any_count(saved, resumed):
+    """Loading workers read an elastic read's inputs in their order, a batch's count at a time, so
+    every reader's rows are those one reader reads in threads alone, whatever the count of either,
+    and the position readers of one count save in workers of one count resumes readers of another
+    in another count of workers, in the batches one reader reads from there."""
+    one = reader(stream(), 0, 1)
+    whole = [rows(batch) for batch in itertools.islice(one, 5)]
+    (readers, workers), (again, more) = saved, resumed
+
+    def assert_one_readers(shares, count, step):
+        held = [rows(next(share)) for share in shares]
+        assert [row for index in range(count) for row in held[index]] == [
+            whole[step][at] for index in range(count) for at in range(index, BATCH, count)]
+
+    shares = [worker_reader(stream(), index, readers, workers) for index in range(readers)]
+    try:
+        for step in range(3):
+            assert_one_readers(shares, readers, step)
+        states = {share.get_state() for share in shares}
+    finally:
+        for share in shares:
+            share.close()
+    assert len(states) == 1
+    (state,) = states
+    shares = [worker_reader(stream(), index, again, more) for index in range(again)]
+    try:
+        for share in shares:
+            share.set_state(state)
+        for step in range(3, 5):
+            assert_one_readers(shares, again, step)
+    finally:
+        for share in shares:
+            share.close()
+
+
+def test_an_elastic_stream_refuses_loading_workers_and_elastic_and_per_share_positions_each_other(tmp_path):
+    """A streamed elastic read refuses loading workers, which read a stream's shards each their own;
     elastic and per-share positions each refuse the other's read."""
+    lines = "".join(json.dumps({"id": index}) + "\n" for index in range(96))
+    (tmp_path / "ids.jsonl").write_text(lines)
+    streamed = (Pipeline(Files(str(tmp_path / "ids.jsonl"), format="jsonl")).repeat().filter(odd).batch(BATCH)
+                .elastic().read("streamed"))
     with pytest.raises(ValueError):
-        compile(stream(), loading=Loading(workers=2), seed=3).train(DataPartition(0, 2))
+        compile(streamed, loading=Loading(workers=2), seed=3).train(DataPartition(0, 2))
     shared = reader(stream(elastic=False), 0, 2)
     listed(shared, 1)
     elastic = reader(stream(), 0, 2)
