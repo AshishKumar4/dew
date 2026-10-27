@@ -48,7 +48,7 @@ from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Varia
 from dew.nn import categorical
 from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
-from dew.nn.protocols import HiddenStates, ProjectsParameters
+from dew.nn.protocols import HiddenStates, ProjectsParameters, StagedStacks
 from dew.nn.sharding import rows_taken
 
 if TYPE_CHECKING:
@@ -854,6 +854,16 @@ class Objective(ABC, Generic[Loss, Effects]):
         trainer keeps never take them on.
         """
         return ()
+
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """Where the runs a pipeline over `stages` stages stacks lie in `store`, the variables a
+        stage-local state is made from: the trainer keeps each stacked by stage on the stage's own
+        devices, its optimizer state and EMA with it (`dew.training.stages`). The default is the
+        `model` the objective holds, whose tree is the objective's own, as its model declares
+        them (`StagedStacks`); an objective that holds its networks in parts of its tree says
+        where each lies."""
+        model = vars(self).get("model")
+        return model.stage_sites(store, stages) if isinstance(model, StagedStacks) else ()
 
     @property
     def initializer(self) -> Initializer:

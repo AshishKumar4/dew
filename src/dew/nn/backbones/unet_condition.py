@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.batch import Variables
 from dew.nn.attention import BasicTransformerBlock, GroupNorm
 from dew.nn.blocks import ResidualBlock, sinusoidal_time
 from dew.nn.conv import Conv
@@ -17,7 +18,7 @@ from dew.nn.dropout import Dropout
 from dew.nn.flops import MissingFlopsCount, projection_flops
 from dew.nn.precision import at_least_fp32, float32_dot_general
 
-from .decoder_stack import pipelined_blocks, pipelines
+from .decoder_stack import DecoderBank, block_sites, nested_sites, pipelined_blocks, pipelines
 from .joint import embedding, embedding_flops
 from .spatial import SpatialCount, SpatialForward, SpatialShape
 
@@ -70,6 +71,18 @@ class _SpatialAttention(nn.Module):
         return (2 * projection_flops(lengths, width, width)
                 + self.stage.depth * block.cross_flops(lengths, context_lengths, text_features))
 
+    block_prefixes: ClassVar[tuple[str, ...]] = ("layer_",)
+    """The names the transformers are stored under, `{prefix}N`."""
+
+    @nn.nowrap
+    def kinds(self) -> list[str]:
+        return ["transformer"] * self.stage.depth
+
+    @nn.nowrap
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """`StagedStacks`: the transformers, where `stages` split them (`pipelines`)."""
+        return block_sites((), self.block_prefixes, self.kinds(), stages)
+
     @nn.compact
     def __call__(self, x, context, *, train=False):
         residual = x
@@ -99,8 +112,8 @@ class _SpatialAttention(nn.Module):
 
         # The level's transformers are like blocks, which a stage axis that
         # splits them runs as a pipeline; SDXL's levels of two and ten do.
-        if pipelines(self, ["transformer"] * self.stage.depth):
-            x = pipelined_blocks(self, ("layer_",), self.stage.depth, x, layer, run, rows=context)
+        if pipelines(self, self.kinds()):
+            x = pipelined_blocks(self, self.block_prefixes, self.stage.depth, x, layer, run, rows=context)
         else:
             x = run([layer(index) for index in range(self.stage.depth)], x, context)
         if self.linear_projection:
@@ -190,6 +203,26 @@ class _Level(nn.Module):
         return x, tuple(outputs)
 
 
+class _StageSites(SpatialCount):
+    """The walk that finds each level's transformers' site over `stages` stages
+    (`UNet2DCondition.stage_sites`), transporting shapes alone."""
+
+    def __init__(self, stages: int):
+        super().__init__()
+        self.stages, self.sites = stages, []
+
+    def attention(self, module, x: SpatialShape, context, *, train=False) -> SpatialShape:
+        self.sites.extend(nested_sites(module.name, module.stage_sites({}, self.stages)))
+        return x
+
+    def level(self, module, x: SpatialShape, time: SpatialShape, context, skips=(), *,
+              upsample_shape=None, train=False):
+        held = len(self.sites)
+        walked = super().level(module, x, time, context, skips, upsample_shape=upsample_shape, train=train)
+        self.sites[held:] = nested_sites(module.name, self.sites[held:])
+        return walked
+
+
 class UNet2DCondition(nn.Module):
     """Denoises NHWC latents conditioned on text, pooled and size features, and optional inpainting inputs.
 
@@ -263,6 +296,16 @@ class UNet2DCondition(nn.Module):
         self.spatial_walk(SpatialShape((rows, height, width, self.in_channels)),
                           SpatialShape((rows, self.time_features)), None, operations=operations)
         return operations.flops
+
+    @nn.nowrap
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """`StagedStacks`: each level's transformers, where `stages` split them, found by walking the
+        levels' shapes (`spatial_walk`) as the FLOP count does."""
+        operations = _StageSites(stages)
+        size = 2 ** len(self.stages)
+        self.spatial_walk(SpatialShape((1, size, size, self.in_channels)),
+                          SpatialShape((1, self.time_features)), None, operations=operations)
+        return tuple(operations.sites)
 
     @property
     def text_keyword(self) -> str:

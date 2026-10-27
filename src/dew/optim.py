@@ -36,7 +36,7 @@ from dew._hashing import fmix32
 from dew._records import share
 from dew.mesh import LogicalAxes
 from dew.nn.precision import at_least_fp32, stochastic_bf16
-from dew.nn.sharding import declarations, declared_axes
+from dew.nn.sharding import declarations, declared_axes, stacked_layers
 from dew.registry import JsonDict, from_record, record_argument, schedules, to_record
 
 # Attention stores its projections either as one matrix over the flattened
@@ -87,12 +87,31 @@ def _matrix_sides(path: jax.tree_util.KeyPath, axes: LogicalAxes) -> tuple[tuple
     return tuple(sides[0]), tuple(sides[1])
 
 
+def _layers_of(path: jax.tree_util.KeyPath) -> tuple[tuple[jax.tree_util.KeyPath, ...], int]:
+    """The stored layers' paths a leaf at `path` stands for, and how many of its leading dimensions
+    stack them: a stage-local run's layers (`stacked_layers`), each rule here reading the leaf as those
+    layers, or the leaf itself, stacked over none."""
+    held = stacked_layers(path)
+    return ((path,), 0) if held is None else held
+
+
 def weight_decay_mask(params):
     """Mark every parameter but the biases and the vectors, which weight decay spares by default:
     nanoGPT's split (model.py, `GPT.configure_optimizers`), with Megatron Core's and timm's `bias`
-    of any rank (core/optimizer/__init__.py, optim/_param_groups.py), a per-head one included."""
-    return jax.tree_util.tree_map_with_path(lambda path, param: param.ndim >= 2 and not (
-        isinstance(path[-1], jax.tree_util.DictKey) and path[-1].key == "bias"), params)
+    of any rank (core/optimizer/__init__.py, optim/_param_groups.py), a per-head one included. A
+    stage-local run's leaf is read as a layer of it (`_layers_of`)."""
+    def decays(path: jax.tree_util.KeyPath, param) -> bool:
+        return param.ndim - _layers_of(path)[1] >= 2 and not (
+            isinstance(path[-1], jax.tree_util.DictKey) and path[-1].key == "bias")
+    return jax.tree_util.tree_map_with_path(decays, params)
+
+
+def _shifted(numbers: optax.contrib.MuonDimensionNumbers, stacked: int) -> optax.contrib.MuonDimensionNumbers:
+    """`numbers` of a layer's leaf on a leaf that stacks layers over its `stacked` leading dimensions,
+    which Muon reads as batch axes and orthogonalizes each matrix of on its own."""
+    def moved(axes):
+        return tuple(axis + stacked for axis in axes) if isinstance(axes, Sequence) else axes + stacked
+    return optax.contrib.MuonDimensionNumbers(moved(numbers.reduction_axis), moved(numbers.output_axis))
 
 
 def muon_weight_dimension_numbers(params):
@@ -121,20 +140,22 @@ def muon_weight_dimension_numbers(params):
     def leaf(path: jax.tree_util.KeyPath, param: jax.Array, decays: bool):
         if not decays:
             return None
-        axes = declared_axes(path, param.ndim, declared)
+        stacked = _layers_of(path)[1]
+        rank = param.ndim - stacked
+        axes = declared_axes(path, rank, declared)
         # A declaration that names no axis says how the parameter shards (whole, on every device),
         # not which of its axes form the matrix, so it reads as an undeclared one (AltUp's).
         if axes is None or all(axis is None for axis in axes):
-            if param.ndim > 2:
+            if rank > 2:
                 raise ValueError(
-                    f"{jax.tree_util.keystr(path)} has rank {param.ndim} and no "
+                    f"{jax.tree_util.keystr(path)} has rank {rank} and no "
                     "declared logical axes, so Muon cannot tell which of its axes "
                     "form the matrix. Declare it with @logical_axes on its module.")
-            return optax.contrib.MuonDimensionNumbers()
+            return _shifted(optax.contrib.MuonDimensionNumbers(), stacked)
         named = {axis for axis in axes if axis is not None}
         if SELECTION_AXES & named or axes[-1] in BATCH_AXES:
             return None
-        return optax.contrib.MuonDimensionNumbers(*_matrix_sides(path, axes))
+        return _shifted(optax.contrib.MuonDimensionNumbers(*_matrix_sides(path, axes)), stacked)
     return jax.tree_util.tree_map_with_path(leaf, params, weight_decay_mask(params))
 
 
@@ -190,7 +211,9 @@ def _columns(gamma: jax.Array, split: int, last: int) -> jax.Array:
 def _rescaled(stepped: jax.Array, columns: jax.Array) -> jax.Array:
     """`stepped`, a leaf after its step, rescaled by its float32 `columns` factors along its last axis:
     the product formed at float32 or wider and rounded to the leaf's dtype once, the paper's
-    `gamma * (W + update)` (Megatron Core's `clip_qk`, MaxText's `_clip_mla_weight`)."""
+    `gamma * (W + update)` (Megatron Core's `clip_qk`, MaxText's `_clip_mla_weight`). A stage-local
+    run's leaf takes its layers' columns stacked ahead of the last axis, each layer's on its own row."""
+    columns = columns.reshape((*columns.shape[:-1], *(1,) * (stepped.ndim - columns.ndim), columns.shape[-1]))
     return (stepped.astype(at_least_fp32(stepped.dtype)) * columns).astype(stepped.dtype)
 
 
@@ -218,12 +241,14 @@ def _mla_key_gamma(scale: jax.Array, nope: jax.Array, width: int) -> jax.Array:
 
 def _qk_normed(params) -> set[tuple[str, ...]]:
     """The layers whose parameters hold a query or key norm (`q_norm`,
-    `k_norm`), read off the tree's paths."""
+    `k_norm`), read off the tree's paths, a stage-local run's as its stored
+    layers (`_layers_of`)."""
     layers = set()
     for path, _ in jax.tree_util.tree_leaves_with_path(params):
-        names = _dict_names(path)
-        if len(names) >= 2 and names[-2] in ('q_norm', 'k_norm'):
-            layers.add(names[:-2])
+        for held in _layers_of(path)[0]:
+            names = _dict_names(held)
+            if len(names) >= 2 and names[-2] in ('q_norm', 'k_norm'):
+                layers.add(names[:-2])
     return layers
 
 
@@ -313,7 +338,8 @@ class QKClipState(NamedTuple):
     """The rescale QK-Clip leaves for the stepped weights (`stepped`): the updates the clip has taken
     part in, `steps`, and each query and key leaf's factor a column of its last axis by its path,
     every factor one before the first update or where no maxima were sown, so the state keeps one
-    structure."""
+    structure. A stage-local run's leaf holds one entry a stored layer, by the layer's path
+    (`_layers_of`), as an unstacked tree holds it."""
 
     steps: jax.Array
     rescales: Mapping[str, jax.Array]
@@ -374,8 +400,10 @@ def _rescales(params, qk_stats, tau: float) -> dict[str, jax.Array]:
         names = _dict_names(path)
         if len(names) < 2 or names[-1] not in ('kernel', 'bias') or names[-2] not in QK_PROJECTIONS:
             continue
-        held[jax.tree_util.keystr(path)] = (jnp.ones(param.shape[-1], jnp.float32) if qk_stats is None
-                                             else _clip_leaf(qk_stats, tau, normed, path, param))
+        # A stage-local run's leaf is its stored layers', each clipped by its own layer's maxima.
+        for layer in _layers_of(path)[0]:
+            held[jax.tree_util.keystr(layer)] = (jnp.ones(param.shape[-1], jnp.float32) if qk_stats is None
+                                                 else _clip_leaf(qk_stats, tau, normed, layer, param))
     return held
 
 
@@ -402,19 +430,34 @@ def stepped(params, updates, before, after):
         return moved
     paths, leaves = zip(*jax.tree_util.tree_leaves_with_path(moved), strict=True)
     held = dict(zip(map(jax.tree_util.keystr, paths), leaves, strict=True))
+    # Each leaf's entries in the effects' states, by the stored layers it stands for (`_layers_of`).
+    entries = {}
+    for path in paths:
+        layers, stacked = _layers_of(path)
+        entries[jax.tree_util.keystr(path)] = ([jax.tree_util.keystr(layer) for layer in layers], stacked)
     for previous, current in pairs:
         taken = current.steps != previous.steps
         acted = current.rescales if isinstance(current, QKClipState) else current.bounds
-        lacking = acted.keys() - held.keys()
+        lacking = acted.keys() - {entry for layers, _ in entries.values() for entry in layers}
         if lacking:
             raise ValueError(f"the optimizer's state acts on {sorted(lacking)} after a step, which the "
                              "stepped parameters lack: step the tree the optimizer was updated with")
-        for path, operand in acted.items():
-            leaf = held[path]
-            done = (_rescaled(leaf, operand) if isinstance(current, QKClipState)
-                    else jnp.clip(leaf, operand[0], operand[1]))
+        for path, (layers, stacked) in entries.items():
+            if layers[0] not in acted:
+                continue
+            leaf, first = held[path], acted[layers[0]]
+            # A stacked leaf's layers' entries, stacked as the leaf stacks its layers.
+            operand = jnp.stack([acted[layer] for layer in layers]).reshape(
+                (*leaf.shape[:stacked], *first.shape)) if stacked else first
+            done = (_rescaled(leaf, operand) if isinstance(current, QKClipState) else _clamped(leaf, operand))
             held[path] = jnp.where(taken, done, leaf)
     return jax.tree_util.tree_unflatten(jax.tree_util.tree_structure(moved), list(held.values()))
+
+
+def _clamped(leaf: jax.Array, bounds: jax.Array) -> jax.Array:
+    """`leaf` clamped into its `[lower, upper]` `bounds`, a stacked leaf's layers' bounds stacked ahead."""
+    bounds = bounds.reshape((*bounds.shape[:-1], *(1,) * (leaf.ndim - bounds.ndim + 1), 2))
+    return jnp.clip(leaf, bounds[..., 0], bounds[..., 1])
 
 
 def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts):
@@ -740,16 +783,21 @@ def int8_moments(b1: float, b2: float, eps: float, eps_root: float, nesterov: bo
     float32 scale, 1/64 a value at the default block."""
     maps = {signed: jnp.asarray(dynamic_map(signed=signed)) for signed in (True, False)}
 
-    def held(leaf) -> bool:
-        return leaf.size >= QUANTIZED_SIZE and leaf.ndim > 0 and leaf.shape[-1] % block == 0
+    def held(path: jax.tree_util.KeyPath, leaf) -> bool:
+        # A stage-local run's leaf is held as each of its stored layers would be (`_layers_of`).
+        layers, stacked = _layers_of(path)
+        return (leaf.size // len(layers) >= QUANTIZED_SIZE and leaf.ndim > stacked
+                and leaf.shape[-1] % block == 0)
 
     def zeros(params, signed: bool) -> QuantizedMoments:
         zero = _zero_code(dynamic_map(signed=signed))
         return QuantizedMoments(
-            jax.tree.map(lambda leaf: jnp.full(leaf.shape, zero, jnp.uint8) if held(leaf)
-                         else jnp.zeros(leaf.shape, jnp.float32), params),
-            jax.tree.map(lambda leaf: jnp.zeros((*leaf.shape[:-1], leaf.shape[-1] // block), jnp.float32)
-                         if held(leaf) else None, params))
+            jax.tree_util.tree_map_with_path(lambda path, leaf: jnp.full(leaf.shape, zero, jnp.uint8)
+                                             if held(path, leaf) else jnp.zeros(leaf.shape, jnp.float32),
+                                             params),
+            jax.tree_util.tree_map_with_path(
+                lambda path, leaf: jnp.zeros((*leaf.shape[:-1], leaf.shape[-1] // block), jnp.float32)
+                if held(path, leaf) else None, params))
 
     def encoded(moment, part, signed, salt):
         return (moment, None) if part[1] is None else quantized(moment, block, signed=signed)
@@ -929,6 +977,35 @@ def power_profiles(solver: optax.GradientTransformation,
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
+def scale_by_trust_ratio(min_norm: float = 0.0, trust_coefficient: float = 1.0,
+                         eps: float = 0.0) -> optax.GradientTransformation:
+    """optax's `scale_by_trust_ratio`, LAMB's (You et al., arXiv 1904.00962), each stored layer's
+    own: a stage-local run's leaf takes one ratio a layer, of that layer's norms (`_layers_of`), and
+    any other leaf its own, as optax's does."""
+    def update_fn(updates, state, params=None):
+        if params is None:
+            raise ValueError("the trust ratio reads the parameters; pass them to the update")
+
+        def scaled(path, update, param):
+            axes = tuple(range(_layers_of(path)[1], update.ndim))
+            param_norm = optax.safe_norm(param, min_norm, axis=axes, keepdims=True)
+            update_norm = optax.safe_norm(update, min_norm, axis=axes, keepdims=True)
+            ratio = trust_coefficient * param_norm / (update_norm + eps)
+            # A layer whose parameters or update are zero would never move: it keeps its update.
+            return update * jnp.where((param_norm == 0.0) | (update_norm == 0.0),
+                                      jnp.array(1.0, param.dtype), ratio)
+        return jax.tree_util.tree_map_with_path(scaled, updates, params), state
+
+    return optax.GradientTransformation(optax.init_empty_state, update_fn)
+
+
+def _lamb(learning_rate, b1=0.9, b2=0.999, eps=1e-6, eps_root=0.0, weight_decay=0.0, mask=None):
+    """optax.lamb, its trust ratio each stored layer's (`scale_by_trust_ratio`)."""
+    return optax.chain(optax.scale_by_adam(b1=b1, b2=b2, eps=eps, eps_root=eps_root),
+                       optax.add_decayed_weights(weight_decay=weight_decay, mask=mask),
+                       scale_by_trust_ratio(), optax.scale_by_learning_rate(learning_rate))
+
+
 Optimizer = Literal['adam', 'adamw', 'lamb', 'muon', 'muonclip']
 """The optimizers `OptimConfig.optimizer` names, each built by its `OPTIMIZER_MAP` entry."""
 
@@ -943,7 +1020,7 @@ their moments stored in bf16 (`bf16_moments`) or in 8 bits (`int8_moments`), the
 OPTIMIZER_MAP: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
     'adam': _adam,
     'adamw': _adamw,
-    'lamb': optax.lamb,
+    'lamb': _lamb,
     'muon': _muon_groups,
     'muonclip': _muonclip_groups,
 }
@@ -1164,8 +1241,8 @@ def _keep_within(lower: float, upper: float) -> optax.GradientTransformation:
 
     def init_fn(params) -> BoundsState:
         return BoundsState(jnp.zeros([], jnp.int32), {
-            jax.tree_util.keystr(path): jnp.asarray([lower, upper], leaf.dtype)
-            for path, leaf in jax.tree_util.tree_leaves_with_path(params)})
+            jax.tree_util.keystr(layer): jnp.asarray([lower, upper], leaf.dtype)
+            for path, leaf in jax.tree_util.tree_leaves_with_path(params) for layer in _layers_of(path)[0]})
 
     def update_fn(updates, state, params=None):
         del params
@@ -1278,7 +1355,7 @@ def param_labels(groups: Sequence[ParamGroup]):
     # The first match wins, as in lm-engine's optimization/params_group.py at
     # 45b6b57b.
     def labels(params):
-        def label(path: jax.tree_util.KeyPath, _) -> str:
+        def named(path: jax.tree_util.KeyPath) -> str:
             name = "/".join(_dict_names(path))
             for group in groups:
                 if any(fnmatch.fnmatchcase(name, pattern) for pattern in group.patterns):
@@ -1286,6 +1363,17 @@ def param_labels(groups: Sequence[ParamGroup]):
             raise ValueError(
                 f"parameter {name} matches no param group's patterns; add a "
                 f"catch-all group, patterns=('*',), if that is intended")
+
+        def label(path: jax.tree_util.KeyPath, _) -> str:
+            # A stage-local run's leaf is its stored layers', which one solver steps together.
+            layers = _layers_of(path)[0]
+            found = {named(layer) for layer in layers}
+            if len(found) > 1:
+                raise ValueError(
+                    f"the layers {sorted('/'.join(_dict_names(layer)) for layer in layers)}, which a "
+                    f"pipeline over the stage axis stacks in one leaf, fall in the param groups "
+                    f"{sorted(found)}; give a run's like layers one group, or train without a stage axis")
+            return found.pop()
         return jax.tree_util.tree_map_with_path(label, params)
     return labels
 
@@ -1816,6 +1904,41 @@ class OptimConfig:
         return {group.name: group.rates(self.learning_rate) for group in self.param_groups}
 
 
-__all__ = ["NEWTON_SCHULZ", "BoundsState", "Cosine", "DeltaState", "Exponential", "Linear", "M3State",
-           "OneCycle", "OptimConfig", "ParamGroup", "Power", "PowerProfilesState", "PowerTail",
-           "QKClipState", "ScheduleBase", "ScheduleSpec", "delta_gradient_descent", "scale_by_m3", "stepped"]
+STACKED_STATES: frozenset[type] = frozenset({
+    optax.EmptyState, optax.MaskedNode, optax.ScaleByAdamState, optax.ScaleByAmsgradState,
+    optax.ScaleByAdaDeltaState, optax.ScaleByAdanState, optax.ScaleByBeliefState, optax.ScaleByLionState,
+    optax.ScaleByRmsState, optax.ScaleByRpropState, optax.ScaleByRssState, optax.ScaleByRStdDevState,
+    optax.ScaleByScheduleState, optax.TraceState, optax.EmaState, optax.AddNoiseState, optax.ZeroNansState,
+    optax.MaskedState, optax.MultiTransformState, optax.MultiStepsState, optax.ApplyIfFiniteState,
+    optax.ConditionallyMaskState, optax.ConditionallyTransformState, optax.InjectHyperparamsState,
+    optax.InjectStatefulHyperparamsState, optax.LookaheadState,
+    QKClipState, BoundsState, M3State, RateState, PowerProfilesState, QuantizedMoments})
+"""The optimizer states whose transforms step a stage-local run's stacked leaf as they step its layers
+one by one (`dew.training.stages.refuse_stacked`): optax's that act a number at a time, or read every
+leaf together, and Dew's own, whose rules read a stacked leaf as its layers (`_layers_of`). The masks
+and labels a transform holds as functions are its caller's, which Dew cannot read."""
+
+
+__all__ = [
+    "NEWTON_SCHULZ",
+    "STACKED_STATES",
+    "BoundsState",
+    "Cosine",
+    "DeltaState",
+    "Exponential",
+    "Linear",
+    "M3State",
+    "OneCycle",
+    "OptimConfig",
+    "ParamGroup",
+    "Power",
+    "PowerProfilesState",
+    "PowerTail",
+    "QKClipState",
+    "ScheduleBase",
+    "ScheduleSpec",
+    "delta_gradient_descent",
+    "scale_by_m3",
+    "scale_by_trust_ratio",
+    "stepped",
+]

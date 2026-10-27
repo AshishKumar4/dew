@@ -7,13 +7,14 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.batch import Variables
 from dew.mesh import LayoutRefused
 
 from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
 from ..flops import MissingFlopsCount, counted_flops, patch_lengths
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
-from .decoder_stack import pipelined_blocks, pipelines
+from .decoder_stack import DecoderBank, block_sites, pipelined_blocks, pipelines
 
 
 def gather_tokens(tokens: jax.Array, kept: jax.Array) -> jax.Array:
@@ -105,6 +106,11 @@ class SimpleDiT(_DiTStackOptions):
     def kinds(self) -> list[str]:
         """Each layer's mixer, in order."""
         return ['attn'] * self.num_layers
+
+    @nn.nowrap
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """`StagedStacks`: the blocks, where `stages` split them (`pipelined`)."""
+        return block_sites((), self.block_prefixes, self.kinds(), stages)
 
     @nn.nowrap
     def layer(self, index: int, kind: str, *, counted: bool = False) -> ModulatedBlock:

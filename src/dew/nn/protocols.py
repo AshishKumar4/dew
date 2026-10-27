@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
     from dew.inputs.encoders import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
+    from dew.nn.backbones.decoder_stack import DecoderBank
     from dew.nn.cross_attention import CrossAttention
     from dew.nn.dit import TextContext
     from dew.nn.dspark import DSpark
@@ -113,6 +114,7 @@ __all__ = [
     "RequiresText",
     "Selective",
     "Serving",
+    "StagedStacks",
     "TimeScaled",
     "TokenModel",
     "TritonGemm",
@@ -523,6 +525,16 @@ class CacheCapacity(Protocol):
     the same draws for a request that fits."""
 
     def with_cache_capacity(self, capacity: int) -> Self: ...
+
+
+@runtime_checkable
+class StagedStacks(Protocol):
+    """A model whose stacks of like layers a pipeline over the stage axis runs: where in `store`, the
+    variables a stage-local state is made from, each stack's run lies and how the pipeline over
+    `stages` stages stacks it (`DecoderBank`), so a trainer keeps that run stacked by stage on the
+    stage's own devices (`dew.training.stages`). A stack that runs whole on every stage has none."""
+
+    def stage_sites(self, store: VariableDict, stages: int) -> tuple[DecoderBank, ...]: ...
 
 
 @runtime_checkable

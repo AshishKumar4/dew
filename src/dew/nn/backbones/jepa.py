@@ -30,6 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.batch import Variables
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
 
@@ -44,7 +45,7 @@ from ..dit import (
 from ..flops import MissingFlopsCount, counted_flops, patch_lengths, projection_flops, real_lengths
 from ..scan_orders import ScanOrder
 from ..sharding import constrain, down_projection, explicit_spec, rows_like, rows_taken
-from .decoder_stack import pipelined_blocks, pipelines
+from .decoder_stack import DecoderBank, block_sites, nested_sites, pipelined_blocks, pipelines
 from .dit import gather_tokens
 
 
@@ -52,6 +53,9 @@ class TokenStack(_JepaStackOptions):
     """A stack of unmodulated blocks over a token sequence."""
     features: int
     num_layers: int
+
+    block_prefixes: ClassVar[tuple[str, ...]] = ("block_",)
+    """The names the blocks are stored under, `{prefix}N`."""
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -69,6 +73,11 @@ class TokenStack(_JepaStackOptions):
     def kinds(self) -> list[str]:
         """Each block's mixer, in order."""
         return build_block_pattern(self.num_layers, self.ssm_attention_ratio)
+
+    @nn.nowrap
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """`StagedStacks`: the blocks, where `stages` split them (`pipelines`)."""
+        return block_sites((), self.block_prefixes, self.kinds(), stages)
 
     @nn.nowrap
     def _block(self, index: int, kind: str) -> ModulatedBlock:
@@ -89,7 +98,7 @@ class TokenStack(_JepaStackOptions):
         has one that splits them (`pipelines`)."""
         kinds = self.kinds()
         if pipelines(self, kinds):
-            return pipelined_blocks(self, ("block_",), len(kinds), tokens,
+            return pipelined_blocks(self, self.block_prefixes, len(kinds), tokens,
                                     lambda index: self._block(index, kinds[index]),
                                     lambda blocks, x, _: run_blocks(blocks, x, freqs_cis, train))
         return self.run(tokens, freqs_cis, train)
@@ -114,6 +123,9 @@ class FactorizedTokenStack(_JepaStackOptions):
     """
     features: int
     num_layers: int
+
+    block_prefixes: ClassVar[tuple[str, ...]] = ("spatial_", "temporal_")
+    """The names a layer's spatial and temporal stacks are stored under, `{prefix}N`."""
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
@@ -146,6 +158,11 @@ class FactorizedTokenStack(_JepaStackOptions):
         return build_block_pattern(self.num_layers, self.ssm_attention_ratio)
 
     @nn.nowrap
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """`StagedStacks`: the layers' spatial and temporal stacks, where `stages` split them."""
+        return block_sites((), self.block_prefixes, self.kinds(), stages)
+
+    @nn.nowrap
     def _layer(self, index: int, kind: str) -> tuple[TokenStack, TokenStack]:
         """Layer `index`'s spatial and temporal single-block stacks, `spatial_{index}` and
         `temporal_{index}`."""
@@ -162,7 +179,7 @@ class FactorizedTokenStack(_JepaStackOptions):
         the mesh in context has one that splits them (`pipelines`)."""
         kinds = self.kinds()
         if pipelines(self, kinds):
-            return pipelined_blocks(self, ("spatial_", "temporal_"), len(kinds), tokens,
+            return pipelined_blocks(self, self.block_prefixes, len(kinds), tokens,
                                     lambda index: self._layer(index, kinds[index]),
                                     lambda layers, x, _: self._walk(layers, x, train))
         return self._walk(list(zip(self.spatial, self.temporal, strict=True)), tokens, train)
@@ -210,6 +227,12 @@ class JepaEncoder(_JepaStackOptions):
         stack = self.stack_type(self.emb_features, self.num_layers, **self._stack_options(), parent=None)
         return (self._embedding(self.patch_size, self.emb_features).model_flops(lengths, input_channels)
                 + counted_flops(stack, lengths))
+
+    @nn.nowrap
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """`StagedStacks`: the stack's, under its name."""
+        stack = self.stack_type(self.emb_features, self.num_layers, **self._stack_options(), parent=None)
+        return nested_sites("stack", stack.stage_sites(store, stages))
 
     def setup(self):
         self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order)
@@ -295,6 +318,13 @@ class JepaPredictor(_JepaStackOptions):
         return (stack.model_flops((context + target).astype(np.int64))
                 + projection_flops(context_lengths, self.emb_features, self.predictor_features)
                 + projection_flops(target_lengths, self.predictor_features, self.emb_features))
+
+    @nn.nowrap
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """`StagedStacks`: the stack's, under its name."""
+        stack = (FactorizedTokenStack if self.factorized else TokenStack)(
+            self.predictor_features, self.num_layers, **self._stack_options(), parent=None)
+        return nested_sites("stack", stack.stage_sites(store, stages))
 
     def setup(self):
         self.proj_in = Dense(features=self.predictor_features, dtype=self.dtype,

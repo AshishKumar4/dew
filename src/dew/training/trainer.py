@@ -192,6 +192,7 @@ from dew.training.rollout import Rollout, _reported, _rollout_metrics
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, rankings
+from dew.training.stages import StageLocal
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
     Committed,
@@ -401,6 +402,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
                 "the optimizer moves params and treats every other collection as state")
+        params = self.staging.staged(params)
         ema = self.objective.ema
         return TrainState(
             step=jnp.zeros((), jnp.int32),
@@ -440,10 +442,17 @@ class Trainer(Generic[Loss, Effects]):
         return companion_mesh(self.device_mesh)
 
     def _boxed_init(self, initialized: Variables, params: Variables) -> optax.OptState:
-        """The optimizer's state of `params`, Muon's grouping reading the axes
-        modules boxed on them in `initialized`."""
-        with boxed(ruled_boxes(boxed_axes(initialized), self.layout.axis_rules)):
-            return self.optimizer.init(params)
+        """The optimizer's state of `params`, Muon's grouping reading the axes modules boxed on
+        them in `initialized`, each rule a stage-local run's leaves as its layers (`StageLocal.refused`)."""
+        with boxed(ruled_boxes(boxed_axes(initialized), self.layout.axis_rules)), self.staging.held():
+            return self.staging.refused(self.optimizer.init(params))
+
+    @functools.cached_property
+    def staging(self) -> StageLocal:
+        """Where the state keeps each pipelined run stacked by stage (`dew.training.stages`), as the objective
+        declares it over its tree; a CPU-owned state, which streams its stack's banks, keeps none."""
+        tree = {} if self.host_master else jax.eval_shape(self.objective.initializer, jax.random.key(0))
+        return StageLocal.of(self.objective, tree, self.device_mesh, built=self._config is not None)
 
     def _boxed_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
         """The axes the objective's modules box on their own parameters
@@ -465,7 +474,7 @@ class Trainer(Generic[Loss, Effects]):
         reads it (`execution.resident`) for the whole run.
         """
         with self._declared():
-            return self._shardings(state)
+            return self.staging.placed(state, self._shardings)
 
     def _declared(self):
         """The context in which the layout reads the axes the objective's
@@ -551,7 +560,7 @@ class Trainer(Generic[Loss, Effects]):
             placement = {**placement, FROZEN: spread(
                 placement[FROZEN], lambda sharding, count: [row_sharding(sharding)] * count)}
         with self._declared():
-            self.layout.check(variables, placement, self.device_mesh)
+            self.staging.check(self.layout, variables, placement, self.device_mesh)
         self.validation = self._validation(placed_shapes(dataclasses.replace(state, variables=variables),
                                                          dataclasses.replace(shardings, variables=placement)),
                                            capacity)
@@ -591,7 +600,8 @@ class Trainer(Generic[Loss, Effects]):
         # another's: every process resumes from one step or none does.
         resume = None if checkpoints is None else agreed_same("newest checkpoint", lambda: checkpoints.latest)
         if checkpoints is not None and resume is not None:
-            abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
+            abstract = self.staging.state(dataclasses.replace(
+                abstract, accumulation=checkpoints.accumulation_template(resume)), self.staging.staged_shapes)
         shardings, _ = self._validated(abstract)
         return Start(initializer, key, abstract, through, resume, shardings)
 
@@ -614,7 +624,7 @@ class Trainer(Generic[Loss, Effects]):
                     abstract.variables,
                     lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         share = DataPartition.of(self.device_mesh) if positioned else None
-        state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share)
+        state, position = self.staging.restore(checkpoints, placed_shapes(abstract, shardings), resume, share)
         if self._config is not None:
             # The rate this run configures, not the one its checkpoint holds.
             state = dataclasses.replace(state, opt_state=with_rates(state.opt_state, self._config.rates()))
@@ -922,7 +932,7 @@ class Trainer(Generic[Loss, Effects]):
         parameters, and the links of the axes the step measured, none by
         default. An abstract mesh is a GPU's this process lacks (`_lowered_for`)."""
         on = jax.sharding.use_abstract_mesh(mesh) if isinstance(mesh, AbstractMesh) else jax.set_mesh(mesh)
-        with (on, pipeline_microbatches(self.microbatches) as schedule,
+        with (on, pipeline_microbatches(self.microbatches) as schedule, self.staging.held(),
               nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
             yield schedule
 
@@ -1127,7 +1137,7 @@ class Trainer(Generic[Loss, Effects]):
         step traces them over microbatches of `batch`'s shapes, none where `narrow` (the trainer's) is off."""
         shapes = None if self.step is not None else self._loss_shape(state, batch)
         if shapes is not None:
-            self._refuse_unpipelined(schedule)
+            self.staging.refuse_unpipelined(schedule, self.objective)
         prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
         copies = self._narrow_copies(state, batch) if (self._narrow if narrow is None else narrow) else {}
         prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
@@ -1208,16 +1218,6 @@ class Trainer(Generic[Loss, Effects]):
         return narrowed_paths(loss, variables["params"], rest, batch, state.microstep, state.key, state.step,
                               state.ema)
 
-    def _refuse_unpipelined(self, schedule: Schedule) -> None:
-        """Refuse a stage axis under a model whose traced step ran no pipeline."""
-        stages = self.device_mesh.shape.get(STAGE_AXIS, 1)
-        if stages > 1 and not schedule.pipelined:
-            raise LayoutRefused(
-                f"the stage axis of {stages} holds a pipeline's stages of a stack of like layers (a "
-                f"decoder's, a DiT's or a ViT's blocks, a UNet level's transformers) that it splits "
-                f"evenly, and {type(self.objective).__name__}'s model runs none, so every stage would "
-                f"compute the whole step; give those devices to the data or fsdp axis")
-
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
         from dew.distributed.host import transfer
         from dew.training.execution import HostExecution, stack_sites
@@ -1227,7 +1227,7 @@ class Trainer(Generic[Loss, Effects]):
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with self._traced_on(cpu) as schedule:
             shapes = self._loss_shape(state, cpu_batch)
-            self._refuse_unpipelined(schedule)
+            self.staging.refuse_unpipelined(schedule, self.objective)
             prepared = self._initialize_accumulation(state, cpu_batch, shapes, window=self.accumulation,
                                                      shape_only=True)
             placement = self.shardings(prepared)
@@ -1544,10 +1544,9 @@ class Trainer(Generic[Loss, Effects]):
         checkpoints = self.checkpoints
         if initial is not None:
             # A supplied state's trees are held as dicts too (`initial_state`), its optimizer's and
-            # accumulation's mirrors of the parameters with them.
+            # accumulation's mirrors of the parameters with them, each pipelined run stacked by stage.
             initial = owned_dicts(dataclasses.replace(initial, variables=dict(initial.variables)))
-            shardings, _ = self._validated(initial)
-            supplied = jax.device_put(initial, shardings)
+            supplied, shardings = self.staging.supplied(initial, lambda staged: self._validated(staged)[0])
             return int(supplied.step), None, lambda: (supplied, shardings), None
         start = self._started()
         if checkpoints is not None and checkpoints.latest is not None:
@@ -1880,7 +1879,7 @@ class Trainer(Generic[Loss, Effects]):
         template = {name: jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), value)
             for name in MODEL_STATE if (value := getattr(final, name)) is not None}
-        model, _ = checkpoints.restore(template, step="best")
+        model, _ = self.staging.restore(checkpoints, template, "best")
         return dataclasses.replace(final, **{name: model[name] for name in template})
 
     def _take(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState, *,
@@ -2193,7 +2192,8 @@ class Trainer(Generic[Loss, Effects]):
         began = time.perf_counter()
         assert self.rollout is not None
         key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
-        batch = shard_batch(self.device_mesh, self._marked(self.rollout(state, batch, key)))
+        rolled = self.rollout(self.staging.outside(state), batch, key)
+        batch = shard_batch(self.device_mesh, self._marked(rolled))
         return batch, time.perf_counter() - began
 
     def _compiled_for(self, compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]],
@@ -2262,8 +2262,8 @@ class Trainer(Generic[Loss, Effects]):
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         write = functools.partial(
-            checkpoints.save, step, state, position, metadata, share=DataPartition.of(self.device_mesh),
-            ranking=ranking, control={**(control or {}), **interval.token_control},
+            checkpoints.save, step, self.staging.saved(state), position, metadata, ranking=ranking,
+            share=DataPartition.of(self.device_mesh), control={**(control or {}), **interval.token_control},
             weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
             boxed=self._boxed_axes())
         self._report(CheckpointRequested(checkpoints.directory), step, write)
@@ -2288,8 +2288,8 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
         write = functools.partial(
-            checkpoints.save_local, step, state, position, share=DataPartition.of(self.device_mesh),
-            control={**(control or {}), **interval.token_control}, rung=self._checkpoint_rung(),
+            checkpoints.save_local, step, self.staging.saved(state), position, rung=self._checkpoint_rung(),
+            share=DataPartition.of(self.device_mesh), control={**(control or {}), **interval.token_control},
             artifact=self._artifact(), boxed=self._boxed_axes())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step, write)
         self._display.status("")
@@ -2465,7 +2465,7 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, params, reader, metrics=metrics, key=key,
                 step=state.step, schedule_step=state.microstep * self.accumulation // state.window_size,
                 averaged=averaged, preview=preview, mesh=mesh, loss=loss, split=split, training=training,
-                warm=warm, updates=state.updates)
+                warm=warm, updates=state.updates, outside=self.staging.whole)
         if not warm:
             # The training values ride along for ranking (`_ranking`); the log interval reports
             # them, so the evaluation's own report leaves them out.

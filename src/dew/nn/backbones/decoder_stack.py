@@ -44,6 +44,13 @@ StageLayer = Callable[[int], nn.Module | tuple[nn.Module, ...]]
 """A stack of blocks' layer `j` of a stage (`BlockStage`): its block, or the
 modules it repeats per layer (a factorized stack's spatial and temporal pair)."""
 
+type RowStack[Leaf] = Callable[[list[Leaf], tuple[int, ...]], Leaf]
+"""How a run's rows become one leaf (`StackView.stage_form`): the rows, stage-major, and the leading
+dimensions they fill; arrays, their shapes or their shardings."""
+
+type RowCut[Leaf] = Callable[[tuple, Leaf, tuple[int, ...]], Sequence[Leaf]]
+"""How a stacked leaf at a path becomes its rows (`StackView.layer_form`), `RowStack`'s inverse."""
+
 StageRun = Callable[[list, jax.Array, jax.Array | None], jax.Array]
 """How a stack of blocks runs a stage's layers over a microbatch, with its rows
 of the inputs held by row, None where it holds none (`BlockStage`)."""
@@ -586,6 +593,15 @@ def stack_layers(*trees):
     return jax.tree.map(lambda *leaves: jnp.stack(leaves), *trees)
 
 
+def stacked_rows(rows: Sequence[jax.Array], shape: tuple[int, ...]) -> jax.Array:
+    """A run's rows (`StackView.stage_form`'s order) as one array whose leading `shape` they fill."""
+    return jnp.stack(rows).reshape((*shape, *jnp.shape(rows[0])))
+
+
+def _rows_on_stages(rows: Sequence[jax.Array], shape: tuple[int, ...]) -> jax.Array:
+    return _on_stage_axis(stacked_rows(rows, shape))
+
+
 def _refuse_unlike(collection: str, trees: Sequence, names: Sequence[str]) -> None:
     """Refuse layers one bank or the pipeline stages' like positions read
     whose `collection` differs in structure, as layers a checkpoint quantizes
@@ -613,7 +629,9 @@ class StackView:
     where the plain loop would put it.
 
     The `banked` collections are already stored the inside way, one array per
-    run, and both methods leave them alone. `bank_names` returns the name of the
+    run, and both methods leave them alone, as they leave the `staged` ones,
+    whose runs a stage-local state already holds stacked by stage
+    (`stage_form`). `bank_names` returns the name of the
     bank that holds each run's layers. Outside a scope, `unstack` reads one
     layer's slice at a time, for a save or an export. Inside a pipeline, a
     collection that entered it has `[stage, ...]` leaves, and one the loop
@@ -641,10 +659,16 @@ class StackView:
     offset: int = 0
     """The first stored layer a pipeline's stages run (`StageSplit.prefix`); the layers before it
     and after its stages stay as they are stored."""
+    staged: tuple[str, ...] = ()
 
     @property
     def per_stage(self) -> int:
         return sum(count for _, count in self.groups)
+
+    def stacked_shape(self, count: int) -> tuple[int, ...]:
+        """The leading dimensions a run of `count` layers stacks into: the stages, then the run's
+        own layers, each where there is more than one."""
+        return tuple(size for size in (self.stages, count) if size > 1)
 
     def _inside_name(self, first: int, count: int, prefix: str = 'layers_') -> str | None:
         """A run's name inside, None for a layer the view leaves as it is."""
@@ -661,6 +685,31 @@ class StackView:
     def _runs(self) -> list[tuple[int, int, str]]:
         """Every run, `(first, count, prefix)`, once for each of `prefixes`."""
         return [(first, count, prefix) for first, count in self.groups for prefix in self.prefixes]
+
+    def _named_runs(self) -> list[tuple[str, list[str], int]]:
+        """Every run the view stacks, `(name, layers, count)`: its name inside, its stored layers in
+        `stage_form`'s order, and how many of them each stage runs."""
+        return [(name, [layer for stage in self._outside_names(first, count, prefix) for layer in stage],
+                 count) for first, count, prefix in self._runs()
+                if (name := self._inside_name(first, count, prefix)) is not None]
+
+    def holds(self, tree: Mapping) -> bool:
+        """Whether `tree`, a collection's subtree where the stack is stored, holds some run of the view,
+        on its stored layers or stacked by stage (`stage_form`)."""
+        staged = tree.get('stages', {})
+        return any(name in staged or any(layer in tree for layer in layers)
+                   for name, layers, _ in self._named_runs())
+
+    def splits(self, tree: Mapping) -> bool:
+        """Whether `tree` holds some of a run's stored layers and not the others, as a collection
+        that keeps part of a stack (layers frozen by index) does."""
+        return any(0 < sum(layer in tree for layer in layers) < len(layers)
+                   for _, layers, _ in self._named_runs())
+
+    def run_layers(self, name: str) -> tuple[list[str], int] | None:
+        """The stored layers of the run named `name` inside, in `stage_form`'s order, and how many
+        layers of it each stage runs; None where no run has that name."""
+        return next(((layers, count) for run, layers, count in self._named_runs() if run == name), None)
 
     @staticmethod
     def layer_structures(variables: Mapping[str, Mapping], layers: int) -> tuple[tuple, ...]:
@@ -697,64 +746,88 @@ class StackView:
             if collection in self.banked:
                 inside[collection] = tree
                 continue
-            stages = {}
-            for first, count, prefix in self._runs():
-                name = self._inside_name(first, count, prefix)
-                if name is None:
-                    continue
-                names = self._outside_names(first, count, prefix)
-                held = [layer in tree for stage in names for layer in stage]
-                if not any(held):
-                    continue
-                if not all(held):
-                    raise ValueError(
-                        f"collection {collection!r} holds some of the layers "
-                        f"{sorted(layer for stage in names for layer in stage)} and not "
-                        "the others; a run reads every one of its layers or none")
-                _refuse_unlike(collection, [tree[layer] for stage in names for layer in stage],
-                               [layer for stage in names for layer in stage])
-                runs = [stack_layers(*[tree.pop(layer) for layer in stage]) if count > 1
-                        else tree.pop(stage[0]) for stage in names]
-                if self.stages == 1:
+            if self.stages == 1:
+                for name, run in self._stacked_runs(collection, tree, stacked_rows).items():
                     # A bank already stored under the run's name holds the
                     # leaves its rows lack (`banked_collections`); the rows
                     # stack into it.
-                    tree[name] = merge(tree[name], runs[0]) if name in tree else runs[0]
-                else:
-                    stages[name] = jax.tree.map(_on_stage_axis, stack_layers(*runs))
-            if stages:
-                tree['stages'] = stages
-            if self.stages > 1:
-                # The layers a pipeline runs outside its stages (`StageSplit`) run beside it, so their
-                # entries, a prefix's sown statistics among them, stay out of the stages' scan; the
-                # entries the stages write merge back beside them.
-                stored = re.compile(f"({'|'.join(map(re.escape, self.prefixes))})\\d+")
-                tree = {name: value for name, value in tree.items() if not stored.fullmatch(name)}
-            inside[collection] = tree
+                    tree[name] = merge(tree[name], run) if name in tree else run
+                inside[collection] = tree
+                continue
+            if collection not in self.staged:
+                tree = self.stage_form(collection, tree, _rows_on_stages)
+            # The layers a pipeline runs outside its stages (`StageSplit`) run beside it, so their
+            # entries, a prefix's sown statistics among them, stay out of the stages' scan; the
+            # entries the stages write merge back beside them.
+            stored = re.compile(f"({'|'.join(map(re.escape, self.prefixes))})\\d+")
+            inside[collection] = {name: value for name, value in tree.items() if not stored.fullmatch(name)}
         return inside
 
     def unstack(self, variables: Mapping[str, Mapping]) -> dict:
         outside = {}
         for collection, tree in variables.items():
-            tree = dict(tree)
-            if collection in self.banked:
-                outside[collection] = tree
+            if collection in self.banked or collection in self.staged:
+                outside[collection] = dict(tree)
                 continue
-            stages = dict(tree.pop('stages', {})) if self.stages > 1 else tree
-            for first, count, prefix in self._runs():
-                name = self._inside_name(first, count, prefix)
-                if name is None or name not in stages:
-                    continue
-                view = stages.pop(name)
-                for stage, names in enumerate(self._outside_names(first, count, prefix)):
-                    for offset, layer in enumerate(names):
-                        tree[layer] = jax.tree_util.tree_map_with_path(
-                            functools.partial(self._leaf, stage, offset if count > 1 else None,
-                                              collection in self.broadcast), view)
-            if self.stages > 1 and stages:
-                tree['stages'] = stages
-            outside[collection] = tree
+            broadcast = collection in self.broadcast
+
+            def rows(path, leaf, shape, broadcast=broadcast):
+                count = math.prod(shape) // self.stages
+                return [self._leaf(stage, offset if count > 1 else None, broadcast, path, leaf)
+                        for stage in range(self.stages) for offset in range(count)]
+            outside[collection] = self.layer_form(tree, rows)
         return outside
+
+    def stage_form[Leaf](self, collection: str, tree: Mapping, stack: RowStack[Leaf]) -> dict:
+        """`tree`, `collection`'s subtree where the stack is stored, with each run the stages repeat
+        held as a pipeline reads it: its stored layers' leaves stacked by `stack(rows, shape)` into
+        one under the run's inside name below `stages`, the rows stage-major, a run's own layers
+        inside each stage, and `shape` the leading dimensions they fill (`stacked_shape`). That is a
+        stage-local state's form (`staged`), which `layer_form` takes back; `stack` takes arrays,
+        their shapes or their shardings alike."""
+        tree = dict(tree)
+        runs = self._stacked_runs(collection, tree, stack)
+        if runs:
+            tree['stages'] = {**tree.get('stages', {}), **runs}
+        return tree
+
+    def layer_form[Leaf](self, tree: Mapping, cut: RowCut[Leaf]) -> dict:
+        """`tree` with each run back on its stored layers, `cut(path, leaf, shape)` giving a stacked
+        leaf's rows in `stage_form`'s order: under `stages` in a pipeline's form, under the run's
+        bank name on one stage. What a run leaves beside its layers stays."""
+        tree = dict(tree)
+        held = dict(tree.pop('stages', {})) if self.stages > 1 else tree
+        for name, layers, count in self._named_runs():
+            if name not in held:
+                continue
+            shape = self.stacked_shape(count)
+            rows = jax.tree_util.tree_map_with_path(
+                lambda path, leaf, shape=shape: tuple(cut(path, leaf, shape)), held.pop(name))
+            for index, layer in enumerate(layers):
+                tree[layer] = jax.tree.map(lambda cuts, index=index: cuts[index], rows,
+                                           is_leaf=lambda node: isinstance(node, tuple))
+        if self.stages > 1 and held:
+            tree['stages'] = held
+        return tree
+
+    def _stacked_runs[Leaf](self, collection: str, tree: dict, stack: RowStack[Leaf]) -> dict:
+        """Pop each run `tree` holds out of it, its rows stacked by `stack` (`stage_form`), by the
+        run's inside name. A collection holding some of a run's layers and not the others is
+        refused, and so are layers whose structures differ (`_refuse_unlike`)."""
+        runs = {}
+        for name, layers, count in self._named_runs():
+            held = [layer in tree for layer in layers]
+            if not any(held):
+                continue
+            if not all(held):
+                raise ValueError(
+                    f"collection {collection!r} holds some of the layers {sorted(layers)} and not "
+                    "the others; a run reads every one of its layers or none")
+            _refuse_unlike(collection, [tree[layer] for layer in layers], layers)
+            shape = self.stacked_shape(count)
+            runs[name] = jax.tree.map(lambda *rows, shape=shape: stack(list(rows), shape),
+                                      *[tree.pop(layer) for layer in layers])
+        return runs
 
     def _leaf(self, stage: int, offset: int | None, broadcast: bool, path, leaf):
         """One layer's leaf, at `path` below its run, out of a run's stacked one, taken with
@@ -779,11 +852,12 @@ class StackView:
 
 @dataclasses.dataclass(frozen=True)
 class DecoderBank:
-    """Where one decoder's layer stack is stored, below every variables collection.
+    """Where one stack of layers is stored, below every variables collection: a decoder's, or a stack
+    of like blocks' (`block_sites`).
 
-    `namespace` is the module path to the decoder. A container module adds its
+    `namespace` is the module path to the stack. A container module adds its
     own name in front of the namespace and leaves `view` unchanged, so the layer
-    groups, module names and RNG streams stay the decoder's. A shared scope is
+    groups, module names and RNG streams stay the stack's. A shared scope is
     one site, even when several methods read the same parameters.
     """
     namespace: tuple[str, ...]
@@ -904,7 +978,7 @@ def run_pipeline(model: nn.Module, view: StackView, x, stage: Callable[[nn.Modul
             lambda index: jax.lax.dynamic_index_in_dim(values, index, 0, keepdims=False))(ids))
 
     def call_stage(stage, x, layered, rows):
-        with pipeline_stage():
+        with pipeline_stage(model.path, view):
             return stage(x, layered, rows)
 
     def iteration(module, carry, step):
@@ -943,9 +1017,41 @@ def pipelines(module: nn.Module, kinds: Sequence) -> bool:
     which draws the stored blocks in the plain loop. A stack they do not split so runs whole on
     every stage, as the layers outside a decoder's pipelined run do, and a model none of whose
     stacks pipelines is refused the axis (`Trainer`)."""
-    stages, count = pipeline_stages(), len(kinds)
-    return (stages > 1 and count % stages == 0 and not module.is_initializing()
+    return not module.is_initializing() and _splits(kinds, pipeline_stages())
+
+
+def _splits(kinds: Sequence, stages: int) -> bool:
+    """Whether `stages` stages split a stack of blocks of `kinds` into equal stretches that repeat one
+    pattern of kinds (`pipelines`)."""
+    count = len(kinds)
+    return (stages > 1 and count % stages == 0
             and all(kind == kinds[index % (count // stages)] for index, kind in enumerate(kinds)))
+
+
+def _block_view(prefixes: tuple[str, ...], count: int, stages: int) -> StackView:
+    """How a pipeline over `stages` stages stacks a stack of `count` like blocks stored under
+    `prefixes`: one block a run, stage s's from block s * count / stages on."""
+    return StackView(tuple((index, 1) for index in range(count // stages)), stages=stages, prefixes=prefixes)
+
+
+def block_sites(namespace: tuple[str, ...], prefixes: tuple[str, ...], kinds: Sequence,
+                stages: int) -> tuple[DecoderBank, ...]:
+    """Where a stack of like blocks of `kinds` stored under `prefixes` at `namespace` keeps the run a
+    pipeline over `stages` stages stacks (`pipelined_blocks`): the whole stack where they split it
+    (`pipelines`), nothing where it runs whole on every stage."""
+    if not _splits(kinds, stages):
+        return ()
+    return (DecoderBank(namespace, _block_view(prefixes, len(kinds), stages)),)
+
+
+def nested_sites(name: str, sites: Sequence[DecoderBank]) -> tuple[DecoderBank, ...]:
+    """`sites` a module declares over its own tree, seen from the module holding it as `name`."""
+    return tuple(dataclasses.replace(site, namespace=(name, *site.namespace)) for site in sites)
+
+
+def stored_by_stage(variables: Mapping[str, Mapping]) -> tuple[str, ...]:
+    """The collections of a stack's `variables` that hold its run stacked by stage (`StackView.staged`)."""
+    return tuple(name for name, tree in variables.items() if 'stages' in tree)
 
 
 def pipelined_blocks(module: nn.Module, prefixes: tuple[str, ...], count: int, x: jax.Array,
@@ -963,12 +1069,12 @@ def pipelined_blocks(module: nn.Module, prefixes: tuple[str, ...], count: int, x
     batch `microbatch_count` refuses raises `LayoutRefused`.
     """
     stages = pipeline_stages()
-    view = StackView(tuple((index, 1) for index in range(count // stages)), stages=stages,
-                     microbatches=microbatch_count(x.shape[0]),
-                     # What enters the loop is read on every iteration; what
-                     # the loop creates (what a block sows) comes out per iteration.
-                     broadcast=tuple(name for name, tree in module.variables.items() if tree),
-                     prefixes=prefixes)
+    view = dataclasses.replace(
+        _block_view(prefixes, count, stages), microbatches=microbatch_count(x.shape[0]),
+        # What enters the loop is read on every iteration; what
+        # the loop creates (what a block sows) comes out per iteration.
+        broadcast=tuple(name for name, tree in module.variables.items() if tree),
+        staged=stored_by_stage(module.variables))
     x = x.astype(_settled(module, prefixes, x, layer, run, rows))
     piped = nn.map_variables(_pipelined, mapped_collections=True, trans_in_fn=view.stack,
                              trans_out_fn=view.unstack, init=False, mutable=True)
@@ -980,10 +1086,16 @@ def _settled(module: nn.Module, prefixes: tuple[str, ...], x: jax.Array, layer: 
              rows: jax.Array | None) -> jnp.dtype:
     """The dtype `x` settles in through `module`'s first stored block: its own, promoted with the
     block's output's, evaluated abstractly (nothing sown or drawn, a placeholder `params` key flax
-    draws any other stream from), as `CausalTransformer.residual_dtype` reads a decoder's."""
+    draws any other stream from), as `CausalTransformer.residual_dtype` reads a decoder's. A
+    stage-local store's first block is its stacked run's first row."""
     names = [f'{prefix}0' for prefix in prefixes]
-    first = {collection: {name: tree[name] for name in names if name in tree}
-             for collection, tree in module.variables.items() if any(name in tree for name in names)}
+    first = {}
+    for collection, tree in module.variables.items():
+        staged = tree.get('stages', {})
+        held = {name: tree[name] if name in tree else jax.tree.map(lambda leaf: leaf[0], staged[name])
+                for name in names if name in tree or name in staged}
+        if held:
+            first[collection] = held
     output = jax.eval_shape(lambda held: BlockStage(layer, 1, run, parent=None).apply(
         held, x, None, rows, mutable=True, rngs={'params': jax.random.key(0)})[0], first)
     return jnp.result_type(x.dtype, output.dtype)

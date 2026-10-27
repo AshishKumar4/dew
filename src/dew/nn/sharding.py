@@ -40,7 +40,8 @@ import contextvars
 import dataclasses
 import math
 import types
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -59,6 +60,9 @@ from dew.mesh import (
     mesh_axes,
     row_axes,
 )
+
+if TYPE_CHECKING:
+    from dew.nn.backbones.decoder_stack import DecoderBank, StackView
 
 type Suffix = tuple[str, ...]
 
@@ -144,14 +148,16 @@ def microbatches() -> int:
     return pipeline_stages() if schedule.count is None else schedule.count
 
 
-_STAGED: contextvars.ContextVar[bool] = contextvars.ContextVar('pipeline_stage', default=False)
+_STAGED: contextvars.ContextVar[tuple[tuple[str, ...], StackView] | None] = contextvars.ContextVar(
+    'pipeline_stage', default=None)
 
 
 @contextlib.contextmanager
-def pipeline_stage() -> Iterator[None]:
+def pipeline_stage(stack: tuple[str, ...], view: StackView) -> Iterator[None]:
     """Trace one stage's body inside a pipeline over the stage axis, whose vmap places the stage axis
-    (`dew.nn.backbones.decoder_stack.run_pipeline`)."""
-    token = _STAGED.set(True)
+    (`dew.nn.backbones.decoder_stack.run_pipeline`): the stage of the stack at module path `stack`,
+    whose layers `view` stacks."""
+    token = _STAGED.set((stack, view))
     try:
         yield
     finally:
@@ -162,7 +168,59 @@ def in_pipeline_stage() -> bool:
     """Whether a pipeline stage's body is tracing (`pipeline_stage`): the stage axis is its vmap's
     there, and an automatic mesh axis like any other everywhere else, where whatever runs outside
     the pipeline runs on every stage."""
-    return _STAGED.get()
+    return _STAGED.get() is not None
+
+
+def stored_paths(path: tuple[str, ...]) -> tuple[tuple[str, ...], ...]:
+    """The stored module paths a module at `path` runs as: inside a pipeline stage that is tracing
+    (`pipeline_stage`), a stage's layer `stages/{name}` stands for that layer of every stage
+    (`StackView.run_layers`), the paths a reader keyed by stored layers (an adapter's targets) knows;
+    any other module, itself."""
+    held = _STAGED.get()
+    if held is None:
+        return (path,)
+    stack, view = held
+    depth = len(stack)
+    inside = path[:depth + 1] == (*stack, 'stages') and len(path) > depth + 1
+    run = view.run_layers(path[depth + 1]) if inside else None
+    return (path,) if run is None else tuple((*stack, layer, *path[depth + 2:]) for layer in run[0])
+
+
+_STAGE_SITES: contextvars.ContextVar[tuple[DecoderBank, ...]] = contextvars.ContextVar(
+    'stage_sites', default=())
+
+
+@contextlib.contextmanager
+def held_by_stage(sites: Sequence[DecoderBank]) -> Iterator[None]:
+    """Trace over a state that holds `sites`' runs stacked by stage (`StackView.stage_form`), for the
+    rules that read a leaf as the stored layers it stacks (`stacked_layers`)."""
+    token = _STAGE_SITES.set(tuple(sites))
+    try:
+        yield
+    finally:
+        _STAGE_SITES.reset(token)
+
+
+def stacked_layers(path: tuple) -> tuple[tuple[tuple, ...], int] | None:
+    """The paths of the stored layers a leaf at `path` stacks, in its rows' order, and how many of
+    its leading dimensions stack them, where `path` is a stage-local run's under the sites in
+    context (`held_by_stage`): a parameter's, or a mirror's of one (an optimizer's moment, an
+    average), whose path ends in the parameter's. None for any other leaf, whose rule reads it as
+    it is."""
+    for index, entry in enumerate(path[:-1]):
+        if not (isinstance(entry, jax.tree_util.DictKey) and entry.key == 'stages'):
+            continue
+        before = tuple(key.key for key in path[:index] if isinstance(key, jax.tree_util.DictKey))
+        inside = path[index + 1]
+        for site in _STAGE_SITES.get():
+            held = site.view.run_layers(inside.key) if isinstance(inside, jax.tree_util.DictKey) else None
+            if held is None or before[len(before) - len(site.namespace):] != site.namespace:
+                continue
+            layers, count = held
+            paths = tuple((*path[:index], jax.tree_util.DictKey(layer), *path[index + 2:])
+                          for layer in layers)
+            return paths, len(site.view.stacked_shape(count))
+    return None
 
 
 @dataclasses.dataclass

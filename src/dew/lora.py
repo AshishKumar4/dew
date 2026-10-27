@@ -86,7 +86,7 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
-from dew.nn.sharding import LOW_RANK_FACTORS
+from dew.nn.sharding import LOW_RANK_FACTORS, stored_paths
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
@@ -516,6 +516,17 @@ def _target_at(targets: Mapping[Path, Target], path: Path) -> Target | None:
     return None
 
 
+def _stored_target(targets: Mapping[Path, Target], root: Path, path: Path) -> Target | None:
+    """The target of the module at `path` below `root`, a pipeline stage's layer standing for each
+    stored layer it runs (`stored_paths`), whose targets must agree, since the stages run one program
+    over one stacked factor pair."""
+    found = {_target_at(targets, root + held) for held in stored_paths(path)}
+    if len(found) > 1:
+        raise ValueError(f"{'/'.join(path)} runs the layers of every pipeline stage, whose adapter targets "
+                         f"differ; a pipeline stacks one factor pair over all of them")
+    return found.pop()
+
+
 @dataclass(frozen=True)
 class _Bound:
     """An adapter's settings, held once by the model it adapts (its branch, `_Branch`) and read by its
@@ -563,20 +574,21 @@ class _Branch:
             name = args[0] if args else kwargs["name"]
             return next_fun(*args, **kwargs) or bool(
                 self.dropout and module.has_rng("dropout")
-                and _targets_under(self.targets, root + module.path + (name,)))
+                and any(_targets_under(self.targets, root + path)
+                        for path in stored_paths((*module.path, name))))
         if context.method_name == "applied_kernel":
             # A model asks for the kernel its submodule multiplies by
             # (`CausalTransformer.applied_kernel`): a target's carries the
             # branch's update, as `LoRA.merge` sums it.
             name = args[0] if args else kwargs["name"]
             kernel = next_fun(*args, **kwargs)
-            target = _target_at(self.targets, root + module.path + (name,))
+            target = _stored_target(self.targets, root, (*module.path, name))
             if target is None:
                 return kernel
             child = getattr(module, name)
             a, b = child.get_variable("params", "lora_A"), child.get_variable("params", "lora_B")
             return _updated(kernel, a, b, _scale(target, self.rslora))
-        target = (_target_at(self.targets, root + module.path)
+        target = (_stored_target(self.targets, root, module.path)
                   if context.method_name in ("__call__", "_linear") else None)
         if target is None:
             return next_fun(*args, **kwargs)

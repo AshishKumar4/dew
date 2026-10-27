@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, ClassVar, Self
 
 from flax import linen as nn
 
-from dew.batch import Variables
-from dew.nn.backbones.decoder_stack import DecoderBank
+from dew.batch import Variables, part
+from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites
 from dew.nn.protocols import block_chunks_of
 
 if TYPE_CHECKING:
@@ -70,9 +70,10 @@ class DecoderWrapper(nn.Module):
         return self._decoder.shifted_logits
 
     def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
-        decoder = {collection: tree[self.wraps] for collection, tree in store.items() if self.wraps in tree}
-        return tuple(DecoderBank((self.wraps, *site.namespace), site.view, site.scanned)
-                     for site in self._decoder.bank_sites(decoder))
+        return nested_sites(self.wraps, self._decoder.bank_sites(part(store, self.wraps)))
+
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        return nested_sites(self.wraps, self._decoder.stage_sites(part(store, self.wraps), stages))
 
     @property
     def kv_cache(self) -> KVCache:

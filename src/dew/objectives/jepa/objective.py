@@ -35,7 +35,9 @@ from flax import linen as nn
 from dew.artifacts import Representations
 from dew.batch import Variables, dicts, part, thaw, under
 from dew.inputs import Field, InputSpec, unit_range
+from dew.nn.backbones.decoder_stack import DecoderBank, nested_sites
 from dew.nn.precision import accumulated, at_least_fp32
+from dew.nn.protocols import StagedStacks
 from dew.nn.sharding import explicit_spec, whole_spec
 from dew.objectives.base import (
     Aux,
@@ -193,6 +195,12 @@ class JepaObjective(Objective[Ratio]):
             predictor = projected_draw(self.predictor,
                                        self.predictor.init(predictor_key, context, context_idx, target_idx))
         return joined({CONTEXT_ENCODER: encoder, PREDICTOR: predictor})
+
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """The encoder's stacks and the predictor's, each under its part of the tree."""
+        return tuple(site for name, module in ((CONTEXT_ENCODER, self.encoder), (PREDICTOR, self.predictor))
+                     if isinstance(module, StagedStacks)
+                     for site in nested_sites(name, module.stage_sites(part(store, name), stages)))
 
     def projected(self, params: Variables, *, updated: bool) -> Variables:
         """The encoder's projection of its own tree, and the predictor's of its own."""

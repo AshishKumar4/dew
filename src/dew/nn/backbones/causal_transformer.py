@@ -118,8 +118,9 @@ from .decoder_stack import (
     run_pipeline,
     run_stack,
     split_stages,
+    stored_by_stage,
 )
-from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, layer_index, scan_groups
+from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_layers, group_name, layer_index, scan_groups
 
 _INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
@@ -1905,19 +1906,33 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 "Single-Pass mHC carries each sublayer's collapse beside the streams, "
                 "which the pipeline's microbatch buffers do not hold; run the stack whole")
-        split = split_stages(self.specs, stages)
         batch_axis = 1 if self.altup is not None else 0
-        count_microbatches = microbatch_count(x.shape[batch_axis])
-        start, count = split.prefix, split.per_stage
-        view = StackView(
-            scan_groups(self.scan_keys[start:start + count], self.bank_layers) if self.scan_layers
-            else tuple((index, 1) for index in range(count)),
-            stages=stages, microbatches=count_microbatches,
+        view = dataclasses.replace(
+            self.stage_view(stages), microbatches=microbatch_count(x.shape[batch_axis]),
             # What enters the loop is read on every iteration; what the
             # loop creates (the routers' sowing) comes out per iteration.
             broadcast=tuple(name for name, tree in self.variables.items() if tree),
-            batch_axis=batch_axis, offset=start)
-        return view, split
+            staged=stored_by_stage(self.variables), batch_axis=batch_axis)
+        return view, split_stages(self.specs, stages)
+
+    def stage_view(self, stages: int) -> StackView:
+        """How a pipeline over `stages` stacks the run of layers they repeat (`split_stages`): each
+        stage's runs as its scan takes them, from the store's rows (`scan_keys`)."""
+        split = split_stages(self.specs, stages)
+        start, count = split.prefix, split.per_stage
+        groups = (scan_groups(self.scan_keys[start:start + count], self.bank_layers) if self.scan_layers
+                  else tuple((index, 1) for index in range(count)))
+        return StackView(groups, stages=stages, offset=start)
+
+    def stage_sites(self, store: Variables, stages: int) -> tuple[DecoderBank, ...]:
+        """Where the run a pipeline over `stages` stacks is stored in `store`, the variables a
+        stage-local state is made from (`stage_view`): none for a looped stack, which no pipeline
+        runs."""
+        if self.loop is not None:
+            return ()
+        bound = self if self.scope is not None else self.bind(jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store))
+        return (DecoderBank((), bound.stage_view(stages)),)
 
     def banked_collections(self) -> tuple[str, ...]:
         """Return the collections whose layer subtrees the store holds as banks.
@@ -1992,7 +2007,9 @@ class CausalTransformer(nn.Module):
 
         These are layer 0's variables, a bank's first row with the layer axis
         dropped, or layer 0's variables completed by the bank's
-        (`banked_collections`). Nothing is read, fetched or sliced.
+        (`banked_collections`), or a stage-local store's first stage's first
+        row of the run that holds layer 0 (`StackView.stage_form`). Nothing is
+        read, fetched or sliced.
         """
         banked = self.banked_collections()
         first = StackView(self.groups).bank_names()[0]
@@ -2015,6 +2032,13 @@ class CausalTransformer(nn.Module):
                 held = jax.tree.map(functools.partial(shapes, drop=True), tree[first])
             if 'layers_0' in tree:
                 held = merge(held, jax.tree.map(functools.partial(shapes, drop=False), tree['layers_0']))
+            for name, run in tree.get('stages', {}).items():
+                layers = group_layers(name)
+                if layers is not None and layers.start == 0 and 'layers_0' not in tree:
+                    # The stage axis, and a scanned run's own layer axis.
+                    rows = 1 + (len(layers) > 1)
+                    held = jax.tree.map(
+                        lambda leaf, rows=rows: jax.ShapeDtypeStruct(leaf.shape[rows:], leaf.dtype), run)
             if held:
                 variables[collection] = held
         return variables

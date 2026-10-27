@@ -29,6 +29,7 @@ from diffusion_support import images_of
 from recording import RecordingTracker
 from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from residual_orders import permuted, residual_width
+from sharded import split_axes
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import MetricConfig, ObjectiveConfig
@@ -531,16 +532,18 @@ def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: i
             built.append(trainer)
         trainer = built[0]
         start = reordered(widened_state(initial) if exact else jax.tree.map(jnp.copy, initial), order)
-        # A copy each draw, as each step donates the state it is handed.
-        state = jax.device_put(start, trainer.shardings(start))
+        # A copy each draw, as each step donates the state it is handed, held as the trainer holds it:
+        # a pipelined run stacked by stage (`StageLocal.supplied`).
+        state, _ = trainer.staging.supplied(start, trainer.shardings)
         batch = shard_batch(trainer.device_mesh, prepare_counts(
             trainer.objective, wide(case, raw) if exact else raw, count_model=False))
         if len(built) == 1:
             built.append(trainer.compile(state, batch))
         for _ in range(steps):
             state, *_ = built[1](state, batch)
+        saved = trainer.staging.saved(state)
         return in_identity_order(
-            jax.device_get({name: getattr(state, name) for name in ("variables", "opt_state", "ema")}), order)
+            jax.device_get({name: getattr(saved, name) for name in ("variables", "opt_state", "ema")}), order)
 
     return stepped
 
@@ -641,17 +644,17 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
 
     seeds = LAYOUT_SEEDS[case.name]
     mesh = LAYOUTS[layout]
-    _, alone, _ = run_case(case, tmp_path, MeshSpec(), devices=1, state=copied(), steps=steps)
-    _, state, _ = run_case(case, tmp_path, mesh, state=copied(), steps=steps)
+    single, alone, _ = run_case(case, tmp_path, MeshSpec(), devices=1, state=copied(), steps=steps)
+    laid, state, _ = run_case(case, tmp_path, mesh, state=copied(), steps=steps)
     drawn = {"one device": drawn_steps(case, tmp_path, MeshSpec(), 1, initial, steps),
              layout: drawn_steps(case, tmp_path, mesh, None, initial, steps)}
     # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
     # the cell's own batch in its own order, whatever selection margin a draw then asks.
     own = (next(batches(case, encoder)()), np.arange(width))
-    for fitted, stepped in zip((alone, state), drawn.values(), strict=True):
+    for run, fitted, stepped in zip((single, laid), (alone, state), drawn.values(), strict=True):
         ours = stepped(*own)
         for name, tree in ours.items():
-            held = jax.device_get(getattr(fitted, name))
+            held = jax.device_get(getattr(run.staging.saved(fitted), name))
             assert jax.tree.structure(tree) == jax.tree.structure(held), name
             for mine, theirs in zip(jax.tree.leaves(tree), jax.tree.leaves(held), strict=True):
                 mine, theirs = np.asarray(mine), np.asarray(theirs)
@@ -668,7 +671,9 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     sharded = fsdp_leaves(state.variables)
     assert sharded, "no parameter was sharded over the fsdp axis"
     for param in sharded:
-        assert param.addressable_shards[0].data.size == param.size // mesh.fsdp, \
+        # A pipelined run's leaf is stacked by stage, each stage's layers on its own devices.
+        stages = mesh.stage if "stage" in split_axes([param]) else 1
+        assert param.addressable_shards[0].data.size == param.size // (mesh.fsdp * stages), \
             "shard is not the fsdp axis's part of the global parameter"
     # The optimizer's state and the EMA copy follow the params they track,
     # without the optimizer or the model ever describing a layout.

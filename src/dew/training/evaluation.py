@@ -7,7 +7,7 @@ import dataclasses
 import sys
 import time
 import types
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar, Literal
 
@@ -147,7 +147,8 @@ class Evaluation:
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
             schedule_step: int | jax.Array | None = None, loss: bool = False,
             training: Mapping[str, jax.Array] | None = None, warm: bool = False,
-            updates: int | jax.Array | None = None) -> Evaluation:
+            updates: int | jax.Array | None = None,
+            outside: Callable[[Variables], Variables] | None = None) -> Evaluation:
         """Evaluate `variables` on the batches every process can read, without an optimizer or a tracker.
 
         Every process calls this with the same objective, metrics and numerical
@@ -174,6 +175,9 @@ class Evaluation:
         microbatches (`TrainState.microstep`, as `fit` does) so the schedule follows
         only the work training accepted. `updates` is the updates training
         committed (`Step.updates`), and defaults to the schedule's step.
+        `outside` gives the variables as a model run outside the mesh reads them,
+        which a preview's decode does (a stage-local state's runs on their stored
+        layers, `dew.training.stages.StageLocal.whole`); unset, they are as given.
 
         `warm` scores at most `WARM_BATCHES` batches and finalizes no score, so
         the evaluation holds none: a pass over them runs every program a longer
@@ -208,7 +212,7 @@ class Evaluation:
             scores, previews, scored, records = _score_split(
                 objective, variables, batches, context, mesh, metrics=metrics, split=split,
                 root=root, preview_enabled=preview_enabled, score_key=score_key,
-                preview_key=preview_key, loss=loss, warm=warm)
+                preview_key=preview_key, loss=loss, warm=warm, outside=outside)
         scores.update(training_scores)
         elapsed = time.perf_counter() - started
         scores, elapsed = broadcast_from_process_zero((scores, elapsed))
@@ -354,7 +358,8 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                  context: Step, mesh: Mesh | None, *, metrics: Sequence[Metric],
                  split: str, root: bool, preview_enabled: bool,
                  score_key: jax.Array, preview_key: jax.Array, loss: bool = False,
-                 warm: bool = False) -> tuple[dict[str, float], tuple[Artifact, ...], int, int]:
+                 warm: bool = False, outside: Callable[[Variables], Variables] | None = None
+                 ) -> tuple[dict[str, float], tuple[Artifact, ...], int, int]:
     """Score every record of a validation split, or its first `WARM_BATCHES`
     batches unfinalized where `warm`.
 
@@ -408,7 +413,9 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                         produced = _merged(produced, batch, held, scored, mesh=mesh, metrics=metrics,
                                            summaries=summaries, root=root)
             if scored == 0 and preview_enabled:
-                previews = _previewed(objective, variables, batch, context,
+                whole = (lambda tree: tree) if outside is None else outside
+                previews = _previewed(objective, whole(variables), batch, replace(
+                    context, ema=None if context.ema is None else whole(context.ema)),
                                       preview_key=preview_key, scored=produced, root=root)
             produced = batch = None
             scored += 1
