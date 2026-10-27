@@ -131,7 +131,7 @@ from dew.training._fit import (
 )
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau, run_length, run_steps, run_tokens
-from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved
+from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     check_batch,
@@ -250,6 +250,7 @@ class Trainer(Generic[Loss, Effects]):
         lower_for: str | None = None,
         tune_kernels: bool = False,
         record: bool = False,
+        links: Mapping[str, Link] | None = None,
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -272,6 +273,7 @@ class Trainer(Generic[Loss, Effects]):
         `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its
         derived config. `record` makes each step return in its metrics what each evaluation, replays
         too, sampled or passed as a boundary (`taken_record`).
+        `links` states an axis's `Link` by name in place of measuring it (`_links`).
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -289,17 +291,14 @@ class Trainer(Generic[Loss, Effects]):
         self._loss_scale = loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         self.checkpoints = checkpoints
-        self.tracker = tracker
-        self.step = step
-        self.rollout = rollout
-        self.tune_kernels = tune_kernels
+        self.tracker, self.step, self.rollout = tracker, step, rollout
         if record and step is not None:
             raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
                              "build them with Step(record=True)")
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
-        self.lower_for = lower_for
+        self.lower_for, self.tune_kernels = lower_for, tune_kernels
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
         # `fit` keeps them beside each step. The program is the step as handed to XLA, before GSPMD partitions
         # it, and the executable the step as compiled, whose memory analysis a benchmark reads.
@@ -318,6 +317,7 @@ class Trainer(Generic[Loss, Effects]):
         # The links the last compiled step decided its projections by, which say whether one spread over
         # each axis (`dew.nn.sharding.Link`), and each mesh axis's measured bandwidth.
         self.links: dict[str, Link] = {}
+        self._stated_links = dict(links or {})
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
         self._refusal: str | None = None
@@ -611,7 +611,7 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master and FROZEN in abstract.variables:
             abstract = dataclasses.replace(abstract, variables={
                 **abstract.variables, FROZEN: self._banked_frozen(
-                    abstract.variables[FROZEN],
+                    abstract.variables,
                     lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         share = DataPartition.of(self.device_mesh) if positioned else None
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share)
@@ -734,25 +734,21 @@ class Trainer(Generic[Loss, Effects]):
         leaves = jax.tree.leaves(frozen)
         if leaves and all(isinstance(leaf, jax.Array) for leaf in leaves):
             return jax.tree.map(lambda leaf: leaf.sharding, frozen)
-        from dew.training.execution import resident
+        from dew.training.execution import resident, stack_sites
         rows = self.layout.shardings(
             self.state_mesh, dataclasses.replace(state, variables={FROZEN: frozen}, accumulation=None))
-        return resident(rows.variables[FROZEN], self.bank_sites, self.device_mesh)
+        sites = stack_sites(self.objective, {**state.variables, FROZEN: frozen})
+        return resident(rows.variables[FROZEN], sites, self.device_mesh)
 
-    @functools.cached_property
-    def bank_sites(self):
-        """List the objective's declared layer stacks, which a host layout streams as banks."""
-        from dew.inference.banks import bank_sites
-        return bank_sites(self.objective) if self.objective.bank_sites else ()
-
-    def _banked_frozen(self, tree, stack, release=None):
-        """Stack each scanned run's shared leaves of `tree` into one bank
+    def _banked_frozen(self, variables, stack, release=None):
+        """Stack each scanned run's shared leaves of the frozen collection of `variables` into one bank
         (`dew.inference.banks.banked`).
 
         That is the shape a placement and a checkpoint template take, and the
         arrays the state holds."""
         from dew.inference.banks import banked
-        return banked(tree, self.bank_sites, stack, release)
+        from dew.training.execution import stack_sites
+        return banked(variables[FROZEN], stack_sites(self.objective, variables), stack, release)
 
     def _placed_host(self, initializer, key, shardings: Placement[TrainState]) -> TrainState:
         """A fresh CPU-owned state, its leaves streamed into place one at a time.
@@ -766,12 +762,13 @@ class Trainer(Generic[Loss, Effects]):
         returned to the two device sets anyway.
         """
         from dew.distributed.host import evict, place_leaf, stream, transfer
-        from dew.training.execution import bank_bytes, check_bank_pool
+        from dew.training.execution import bank_bytes, check_bank_pool, stack_sites
         held = self.objective.held_variables()
         with jax.default_device(self.state_mesh.local_devices[0]):
             state = self.initial_state(initializer, key)
             if FROZEN in state.variables:
-                check_bank_pool(bank_bytes(state.variables[FROZEN], self.bank_sites), self.device_mesh)
+                sites = stack_sites(self.objective, state.variables)
+                check_bank_pool(bank_bytes(state.variables[FROZEN], sites), self.device_mesh)
                 # A scanned run's frozen rows become its bank here and the bank lands where it stays
                 # resident before the next is stacked, so the host holds one bank in transit, not the
                 # stack; the rows' pages are let go as it lands and the held tree holds the placed bank
@@ -796,7 +793,7 @@ class Trainer(Generic[Loss, Effects]):
                         node = node.get(component) if isinstance(node, dict) else None
                     if isinstance(node, dict) and keys[-1] in node:
                         node[keys[-1]] = bank
-                frozen = self._banked_frozen(state.variables[FROZEN], stack, release)
+                frozen = self._banked_frozen(state.variables, stack, release)
                 state = dataclasses.replace(state, variables={**state.variables, FROZEN: frozen})
         params = stream(state.variables, shardings.variables, held)
         ema = None if state.ema is None else stream(state.ema, shardings.ema)
@@ -895,22 +892,25 @@ class Trainer(Generic[Loss, Effects]):
         `link_bandwidth` agrees one figure across the pool, so every process
         decides alike and compiles the same program. The peak is the fastest
         device's, on which the FLOPs a spread saves take the least time. Each
-        axis's bandwidth is measured once per mesh, and not at all on a CPU
-        mesh or for a device the peak table does not name, where it decides
-        nothing."""
+        axis's bandwidth is measured once per mesh, and not at all for a
+        device the peak table does not name (a CPU's among them), where it
+        decides nothing; a link the run states (`links`) is taken as stated."""
         devices = list(mesh.devices.flat)
         peaks = [peak for device in devices if (peak := gpu_target(device.device_kind).bf16_peak) is not None]
         peak = max(peaks) if len(peaks) == len(devices) else None
-        platform = devices[0].platform
         links = {}
         for axis in (TENSOR_AXIS, SEQUENCE_AXIS):
             if mesh.shape.get(axis, 1) == 1:
                 continue
+            if axis in self._stated_links:
+                stated = self._stated_links[axis]
+                links[axis] = Link(stated.bytes_per_second, stated.flops_per_second)
+                continue
             if (mesh, axis) not in self._bandwidths:
                 # A resumed run takes the figure its checkpoint traced with, on this very placement.
-                self._bandwidths[mesh, axis] = None if platform == 'cpu' or peak is None else (
+                self._bandwidths[mesh, axis] = None if peak is None else (
                     self._resumed_links.get(link_topology(mesh, axis)) or link_bandwidth(mesh, axis))
-            links[axis] = Link(self._bandwidths[mesh, axis], peak, platform)
+            links[axis] = Link(self._bandwidths[mesh, axis], peak)
         return links
 
     @contextlib.contextmanager
@@ -1220,9 +1220,10 @@ class Trainer(Generic[Loss, Effects]):
 
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
         from dew.distributed.host import transfer
-        from dew.training.execution import HostExecution
+        from dew.training.execution import HostExecution, stack_sites
         cpu = self.state_mesh
-        execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu, device=self._device)
+        execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu,
+                                  stack_sites(self.objective, state.variables), device=self._device)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with self._traced_on(cpu) as schedule:
             shapes = self._loss_shape(state, cpu_batch)
@@ -1406,7 +1407,7 @@ class Trainer(Generic[Loss, Effects]):
         run.committed = plan.real(interval)
         if run.cooling is not None and not plan.ended(run.current, plan.real(interval)):
             # A branch a preemption cut short runs again before the run reads on from where it stood.
-            state, cut = self._cooled(plan, run, state, shardings, position, run.cooling)
+            state, cut = self._cooled(plan, run, interval, state, shardings, position, run.cooling)
             if cut:
                 run.preempted = run.current
                 return self._wind_down(plan, run, interval, state, shardings, position, profiler)
@@ -1618,7 +1619,7 @@ class Trainer(Generic[Loss, Effects]):
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
         check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(state.opt_state),
-                       rollout=self.rollout is not None, scheduled=plan.dataset.token_ends is not None)
+                       rollout=self.rollout is not None)
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
@@ -1767,8 +1768,8 @@ class Trainer(Generic[Loss, Effects]):
             checkpoints.cooling(branch)
         if ending:
             run.cooling, branch = branch, None
-        state, cut = (state, False) if branch is None else self._cooled(plan, run, state, shardings, position,
-                                                                         branch)
+        state, cut = (state, False) if branch is None else self._cooled(plan, run, interval, state, shardings,
+                                                                         position, branch)
         # Asked at every step on every process, as JAX's agreement needs, before the step's save, so a
         # stop's save is its one save, whole; the last step ends the run. A pause falls on the same step
         # on every process, so where it is reached none asks.
@@ -1795,8 +1796,9 @@ class Trainer(Generic[Loss, Effects]):
             return True, state
         return False, state
 
-    def _cooled(self, plan: FitPlan, run: FitRun, state: TrainState, shardings: Placement[TrainState],
-                position: bytes | None, pending: Pending) -> tuple[TrainState, bool]:
+    def _cooled(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState,
+                shardings: Placement[TrainState], position: bytes | None,
+                pending: Pending) -> tuple[TrainState, bool]:
         """Train the cooldown branch `pending` from `state`, on the run's batches from its data `position`,
         by the run's own compiled steps at the rates its state holds times the branch's decay
         (`scaled_rates`); score every suite on it as `cooldown_<split>` at the run's step, and discard
@@ -1815,16 +1817,22 @@ class Trainer(Generic[Loss, Effects]):
             checkpoints.cooling(pending)
         moving, frozen = apart(state)
         restore, step_at = snapshot(moving), jax.device_put(np.asarray(int(at), at.dtype), at.sharding)
-        reading = run.train is not None
+        reading, run.ahead = run.train is not None, None
         if run.train is not None:
             run.train.close()
-        run.ahead = None
         branched = FitRun(run.started, current=run.current, partition=run.partition, reads=run.reads,
                           compiled=run.compiled)
         branched.train = self._prefetched(plan, branched, plan.dataset.train(run.partition), position)
+        # The branch's own clock of committed tokens, from the run's, which a schedule's stages end at
+        # as the run's do (`_scheduled`); the stages it begins are its own, the run's kept as they were.
+        counted = Interval(time.time(), None, tokens_before_log=interval.real_tokens)
+        starts = self._stage_starts
         cooled, done, cut = state, 0, False
         try:
-            while done < steps and not (cut := run.notice.reached()):
+            while (done < steps and not schedule_ended(plan.dataset.token_ends, lambda: counted.real_tokens)
+                   and not (cut := run.notice.reached())):
+                self._scheduled(plan, branched, counted)
+                assert branched.train is not None
                 batch = agreed_next("cooldown read", branched.train)
                 if batch is None:
                     break
@@ -1833,25 +1841,28 @@ class Trainer(Generic[Loss, Effects]):
                                                      reported=run.current)
                 factor = decay(shape, done // self.accumulation, steps // self.accumulation)
                 scaled = scaled_rates(cooled.opt_state, held, factor)
-                cooled = step(dataclasses.replace(cooled, opt_state=scaled), device)[0]
+                cooled, loss, aux, finite, _, committed = step(dataclasses.replace(cooled, opt_state=scaled),
+                                                              device)
+                counted.count(batch, None, loss, finite, committed, aux)
                 done, branched.current = done + 1, branched.current + 1
         finally:
-            branched.train.close()
+            self._stage_starts = starts
+            if branched.train is not None:
+                branched.train.close()
         run.cooling = pending if cut else None
         if cut:
             self._display.note(f"Preempted inside the cooldown from step {run.current}, which a resume runs")
         elif done < steps:
             self._display.note(f"The training data ran out {done} steps into the cooldown from step "
                                f"{run.current}, which records no score")
-        elif not cut:
+        else:
             suites = {f"cooldown_{name}": suite for name, suite in plan.suites.items()}
             self._evaluation(dataclasses.replace(plan, suites=suites, summaries=()),
                              dataclasses.replace(cooled, step=step_at), shardings, {})
         if checkpoints is not None and not cut:
             checkpoints.cooling(None)
-        for leaf in jax.tree.leaves(apart(cooled)[0]):
-            if not leaf.is_deleted():
-                leaf.delete()
+        for leaf in (leaf for leaf in jax.tree.leaves(apart(cooled)[0]) if not leaf.is_deleted()):
+            leaf.delete()
         restored = together(restore(), frozen)
         if reading:
             run.train = self._prefetched(plan, run, plan.dataset.train(run.partition), position)
@@ -1992,7 +2003,7 @@ class Trainer(Generic[Loss, Effects]):
         if run.cooling is not None and run.preempted is None and run.paused is None:
             # The last step's branch, its main model scored and saved first, which a resume from the
             # step runs again where a preemption cuts it short.
-            state, cut = self._cooled(plan, run, state, shardings, position, run.cooling)
+            state, cut = self._cooled(plan, run, interval, state, shardings, position, run.cooling)
             if cut and checkpoints is not None and interval.resumable != current:
                 # Whatever the final-save policy, the step the branch resumes from is written whole.
                 run.other += self._saved_checkpoint(checkpoints, current, state, position, interval,
@@ -2438,8 +2449,9 @@ class Trainer(Generic[Loss, Effects]):
         averaged = with_ema(state.variables, self._fetched(state, shardings).ema)
         key = state.key
         if self.host_master:
-            from dew.training.execution import HostExecution
-            execution = HostExecution(self.objective, self.layout, mesh, self.state_mesh)
+            from dew.training.execution import HostExecution, stack_sites
+            execution = HostExecution(self.objective, self.layout, mesh, self.state_mesh,
+                                      stack_sites(self.objective, state.variables))
             with jax.set_mesh(self.state_mesh):
                 params, averaged = execution.snapshot(params), execution.snapshot(averaged)
             key = execution.on_accelerator(key)

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 
 from dew import _records
@@ -115,6 +115,13 @@ def resolved(pending: Pending, accumulation: int) -> tuple[int, str]:
     return steps, _records.text(pending["shape"], "cooldown shape")
 
 
+def schedule_ended(token_ends: Sequence[int | None] | None, committed: Callable[[], int]) -> bool:
+    """Whether a branch's `committed` tokens reached the end of a schedule whose last stage ends its
+    data at its tokens (`dew.data.pipeline.schedule`), as the run's own budget ends it there; the count,
+    read from the devices, is asked only of such a schedule."""
+    return token_ends is not None and token_ends[-1] is not None and committed() >= token_ends[-1]
+
+
 def decay(shape: str, update: int, updates: int) -> float:
     """The share of a run's rate the `update`th of a branch's `updates` updates trains at: 1 - sqrt(u / U)
     for `1-sqrt`, 1 - u / U for `linear`."""
@@ -122,13 +129,11 @@ def decay(shape: str, update: int, updates: int) -> float:
     return 1.0 - done if shape == "linear" else 1.0 - math.sqrt(done)
 
 
-def check_branches(branching: bool, suites: Mapping[str, object], *, settable: bool,
-                   rollout: bool, scheduled: bool) -> None:
+def check_branches(branching: bool, suites: Mapping[str, object], *, settable: bool, rollout: bool) -> None:
     """Refuse cooldown branches, where the run is `branching`, that it could not score, decay or read
     as it reads on: one with no validation suite to score them; an optimizer whose state holds no
-    learning rate a branch can scale (`settable`, `dew.optim.settable_rates`); a rollout's (`rollout`),
-    whose acquisition one reader at a time owns; and a schedule's of stages that end on the
-    committed-token clock (`scheduled`), whose stages the branch's reads would not end."""
+    learning rate a branch can scale (`settable`, `dew.optim.settable_rates`); and a rollout's
+    (`rollout`), whose acquisition one reader at a time owns."""
     if not branching:
         return
     if not suites:
@@ -141,9 +146,6 @@ def check_branches(branching: bool, suites: Mapping[str, object], *, settable: b
     if rollout:
         raise ValueError("a cooldown branch reads a stream of its own, and a rollout's acquisition is "
                          "one reader's at a time: cooldowns of rollout runs are not built")
-    if scheduled:
-        raise ValueError("a cooldown branch of a schedule's stages ending on the committed-token clock "
-                         "would not end them as the run does: cooldowns of token schedules are not built")
 
 
 __all__ = ["Branch", "Cooldowns"]

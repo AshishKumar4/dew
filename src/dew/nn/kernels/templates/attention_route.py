@@ -20,7 +20,7 @@ from typing import Literal, overload
 import jax
 import jax.numpy as jnp
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, selection
 from dew.nn.kernels.templates import attention_mosaic, attention_portable, attention_triton
 from dew.nn.kernels.templates.attention import ACCURATE, NATURAL, Gradients, Hooks, KeySpans, Split
 
@@ -136,20 +136,52 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     ...
 
 
+@dataclasses.dataclass(frozen=True)
+class _Pass:
+    """A pass of the template as its mainloop's selector reads it (`MAINLOOP`): whether it runs on a GPU,
+    why the Mosaic mainloop declines it (`attention_mosaic.forward_declined`, `backward_declined`, None where
+    it takes it) and why the Triton one refuses its spans (`attention_triton.refused`)."""
+
+    on_gpu: bool
+    mosaic: str | None
+    triton: str | None
+
+
+_ON_GPU = selection.Requirement[_Pass]('off_gpu', lambda case: case.on_gpu, "the call runs off a GPU",
+                                       generation.INHERENT)
+MAINLOOP = selection.Op[_Pass]('attention_mainloop', (
+    selection.Kernel[_Pass]('mosaic', (_ON_GPU, selection.Requirement[_Pass](
+        'declined', lambda case: case.mosaic is None, lambda case: str(case.mosaic),
+        'roadmap: the Mosaic template takes every call'))),
+    selection.Kernel[_Pass]('triton', (_ON_GPU, selection.Requirement[_Pass](
+        'spans', lambda case: case.triton is None, lambda case: str(case.triton), generation.INHERENT))),
+    selection.Kernel[_Pass]('portable', (), generic=True),
+), preferred=lambda case: 'mosaic' if case.on_gpu else 'portable')
+"""The template's mainloops, the first that takes a pass: Mosaic GPU's, which a GPU prefers, the frozen
+Triton one's, the plain-JAX one's, which a CPU runs. `generation.chosen(attention_mainloop=...)` names one
+for every pass in its block, which runs it or refuses it by name (`selection.select`); each pass reports its
+route, so the kernel-route audit sees a call on a GPU that leaves the Mosaic template, with Mosaic's own
+reason."""
+
+
+def _mainloop(declined: str | None, spans: KeySpans) -> str:
+    """The mainloop a pass runs, reported (`MAINLOOP`), from Mosaic's reason it `declined` the pass."""
+    on_gpu = _on_gpu()
+    case = _Pass(on_gpu, declined, attention_triton.refused(spans) if on_gpu else None)
+    return selection.select(MAINLOOP, case).kernel
+
+
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
              config: _Config, *, residuals: bool):
-    """The forward on the first mainloop that takes the call here: Mosaic GPU's (the template), Triton's,
-    the plain-JAX one's."""
+    """The forward on its mainloop (`_mainloop`)."""
     form = {"scale": config.scale, "natural": config.natural}
     declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=residuals,
                                                  **form) if _on_gpu() else None
-    if _on_gpu() and declined is None:
-        _report('mosaic')
+    mainloop = _mainloop(declined, spans)
+    if mainloop == 'mosaic':
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=residuals, **form)
-    if _on_gpu() and attention_triton.refused(spans) is None:
-        _report('triton', declined)
+    if mainloop == 'triton':
         return attention_triton.forward(query, key, value, spans, hooks, residuals=residuals, **form)
-    _report('portable', declined)
     return attention_portable.attend(query, key, value, spans, hooks, block_q=PLAIN_TILE, block_k=PLAIN_TILE,
                                      pad=PLAIN_TILE, residuals=residuals, **form)
 
@@ -168,33 +200,20 @@ _attend.defvjp(_attend_forward, _attend_backward)
 
 def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
               dout: jax.Array, residuals: Residuals, config: _Config) -> Gradients:
-    """The backward from the forward's residuals on the first mainloop that takes the call here: Mosaic
-    GPU's, Triton's, the plain-JAX one's; its key's and value's gradients unrounded where the call narrowed
-    them (`_Config.operand_dtype`)."""
+    """The backward from the forward's residuals on its mainloop (`_mainloop`); its key's and value's
+    gradients unrounded where the call narrowed them (`_Config.operand_dtype`)."""
     call = (query, key, value, spans, hooks, dout)
     form = {"scale": config.scale, "natural": config.natural, "accurate": config.accurate}
     rounded = config.operand_dtype is None
     declined = (attention_mosaic.backward_declined(*call, residuals=residuals, **form) if _on_gpu()
                 else None)
-    if _on_gpu() and declined is None:
-        _report('mosaic')
+    mainloop = _mainloop(declined, spans)
+    if mainloop == 'mosaic':
         return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, **form)
-    if _on_gpu() and attention_triton.refused(spans) is None:
-        _report('triton', declined)
+    if mainloop == 'triton':
         return attention_triton.backward(*call, residuals=residuals, rounded=rounded, **form)
-    _report('portable', declined)
     return attention_portable.backward(*call, block_q=PLAIN_TILE, block_k=PLAIN_TILE, pad=PLAIN_TILE,
                                        residuals=residuals, rounded=rounded, **form)
-
-
-def _report(kernel: str, declined: str | None = None) -> None:
-    """Report the mainloop a pass of the template runs (`generation.route`, 'attention_mainloop'): Mosaic
-    GPU's on a GPU, else the plain-JAX one's; a GPU pass off Mosaic's names why it `declined` the call
-    (`attention_mosaic.forward_declined`, `backward_declined`: each refusal's own reason and ledger row),
-    undeclared, so the kernel-route audit holds it unexplained until a row or a fix answers it."""
-    preferred = 'mosaic' if _on_gpu() else 'portable'
-    refusal = None if declined is None else generation.Refusal('mosaic', declined)
-    generation.route('attention_mainloop', kernel=kernel, preferred=preferred, refusal=refusal)
 
 
 def _hooks_cotangent(hooks: Hooks, grads: Gradients) -> Hooks:

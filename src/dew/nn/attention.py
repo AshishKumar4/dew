@@ -263,12 +263,12 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
     values or, in Splash's backward, gradients from a uniform weight over
     masked keys. The call's spans decide a row (`template.reads`); an
     explicit mask is reduced over its keys, folded with them
-    (`visibility_mask`). Without a mask, key bounds, key validity or another
-    sequence's documents, a row sees its own key where the keys reach it,
+    (`visibility_mask`). Without a mask, key bounds, key validity, counted
+    places or another sequence's documents, a row sees its own key where the keys reach it,
     which the program knows as it traces, unless it is a packed row's padding.
     """
     if (mask is None and key_value_seq_lengths is None and key_value_seq_starts is None and key_valid is None
-            and key_runs is None and not isinstance(segment_ids, CrossDocuments)):
+            and key_runs is None and places is None and not isinstance(segment_ids, CrossDocuments)):
         # The keys row i may see run from 0 to the last one; causality keeps 0 in reach, and a
         # window ends w - 1 keys before the row (`windowed`). A call's own documents keep each row's
         # own key, and block and image groups only add keys beside it.
@@ -1560,7 +1560,11 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     if (key_value_seq_lengths is not None and query.shape[-3] == 1 and not causal
             and sliding_window is None and mask is None and bias is None and sinks is None
             and segment_ids is None and query.shape[-2] > key.shape[-2]
-            and query.shape[-2] % key.shape[-2] == 0 and dropout_seed is None):
+            and query.shape[-2] % key.shape[-2] == 0 and dropout_seed is None
+            and key_valid is None and key_runs is None and block_groups is None and image_groups is None
+            and places is None):
+        # The grouped call carries key lengths and starts alone, so a call masking its keys otherwise
+        # (key validity, runs, block or image groups, counted places) takes the whole path.
         # The key heads repeated as each shard would hold them (`_per_shard`), so the tensor axes
         # split the groups as they split the query heads.
         key, value = split_with_queries(key, value, tensor_shards(query))

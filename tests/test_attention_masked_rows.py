@@ -131,3 +131,27 @@ def test_a_row_whose_window_holds_no_valid_key_reads_nothing(implementation):
     np.testing.assert_array_equal(out[0, 3], 0)
     np.testing.assert_array_equal(out[0, 2], np.asarray(value)[0, 1])
     np.testing.assert_array_equal(out[0, 5], np.asarray(value)[0, 4])
+
+
+def test_a_lone_grouped_query_keeps_its_key_validity():
+    """A decode step's one query of two heads over one key head, its keys bounded by their lengths and one
+    of the two invalid: the invalid key's value takes no weight (train 217's K1: the grouped shortcut, which
+    carries key lengths alone, read it)."""
+    query = jnp.ones((1, 1, 2, 16), jnp.float32)
+    key = jnp.ones((1, 2, 1, 16), jnp.float32)
+    value = jnp.stack([jnp.zeros((1, 16)), jnp.full((1, 16), 10.0)])[None]
+    out = scaled_dot_product_attention(query, key, value, key_value_seq_lengths=jnp.asarray([2]),
+                                       key_valid=jnp.asarray([[True, False]]))
+    np.testing.assert_array_equal(np.asarray(out), 0.0)
+
+
+def test_a_row_its_counted_places_bring_in_reach_reads_its_key():
+    """Two queries at counted places 0 and 0 over one key at place 0 in a window of one: each sees the key,
+    so neither row comes back zero (train 217's K2: the rows' trace-time reach read their indices, not
+    their places)."""
+    query = jnp.ones((1, 2, 1, 16), jnp.float32)
+    key = jnp.ones((1, 1, 1, 16), jnp.float32)
+    value = jnp.full((1, 1, 1, 16), 10.0)
+    out = scaled_dot_product_attention(query, key, value, sliding_window=1,
+                                       places=(jnp.asarray([[0, 0]]), jnp.asarray([[0]])))
+    np.testing.assert_array_equal(np.asarray(out), 10.0)

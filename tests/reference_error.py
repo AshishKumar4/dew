@@ -943,8 +943,9 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
         return RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=True, dtype=dtype)
     sizes, rows = row_errors(reference, truth)
     sized = sizes > 0
-    own = (np.sqrt(np.mean(np.square(truth.reshape(-1, truth.shape[-1])), axis=1)) if truth.ndim >= 2
-           else np.zeros(0))
+    # Each row's own size by the arithmetic its errors take (`_scaled_rms`), so an arm exactly zero on a
+    # row is exactly its size from it.
+    own = _scaled_rms(truth.reshape(-1, truth.shape[-1])) if truth.ndim >= 2 else np.zeros(0)
     logged = float(np.max(_log_over(rows[sized], sizes[sized]))) if sized.any() else LOG_ZERO
     return RecordedLeaf(float(np.mean(np.square(reference - truth))),
                         float(np.max(_over(rows[sized], sizes[sized]))) if sized.any() else 0.0,
@@ -1065,9 +1066,12 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     both arms' errors on them (`ZeroRows`, pooled over the run's seeds by `pooled_zero_rows`), and
     whether every value was finite. A row the truth sizes zero (below RESOLUTION of its leaf)
     is one of float64 zero unless a live reference measures it: its error there below the row's own
-    float64 RMS, so it carries the row better than zero would. That is an engineering definition of a
-    measured row, not a proof of float64's accuracy on it; a sum that cancels to float64's residue is
-    never measured so, and a product far below its leaf, which float64 holds to its own precision, is.
+    float64 RMS, so it carries the row better than zero would. The two are taken by one arithmetic
+    (`_scaled_rms`), so a reference exactly zero on a row is exactly the row's size from it and never
+    measures it (ledger 1831: two arithmetics broke that tie, and Dew's ordinary rounding on a residue
+    row read 1e8 of the row). That is an engineering definition of a measured row, not a proof of
+    float64's accuracy on it; a sum that cancels to float64's residue is never measured so, and a
+    product far below its leaf, which float64 holds to its own precision, is.
     A measured row is judged at its own size as any row is, its error over its size entering both worst
     rows: against the reference's worst row over the leaf, which holds it with less power than the zero
     rows' rule held it against the reference's own error on it. Both arms are classified alike, from the
@@ -1401,7 +1405,11 @@ def recorded_pilots(reference_fn, draw, count: int):
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
               truth_fn=None, dew_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
-    interval is no wider than PARITY in every leaf. Of the reference compared with itself, its errors on
+    interval is no wider than PARITY in every leaf, on the count's own draws and again on as many more
+    (`_confirmed`): a doubling stops at the first count whose draws resolve, and where a leaf's errors
+    are heavy-tailed across draws those draws may hold none of the tail the verdict's will (ledger 1824:
+    a site sized at 16 left Inconclusive at 160), so a second block of the count's size must resolve
+    too. Of the reference compared with itself, its errors on
     two disjoint seed sets resampled apart (`_interval`'s control), by default; with `dew_fn`, paired:
     Dew's errors against the reference's on the same draws, the two resampled by the same seeds as the
     verdict resamples them (`_interval`), on draws from SIZING_FROM on that no verdict takes. A pair
@@ -1420,14 +1428,15 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     factors, not more seeds.
 
     Each draw is evaluated once however many doublings the sizing takes: a count's draws are its
-    predecessor's and the seeds it adds, the reference compared with itself takes its seeds 0 to twice
-    the count (the first half against the second), and the reference on the same inputs runs once."""
+    predecessor's and the seeds it adds, twice the count of them with the confirming block, the
+    reference compared with itself takes its seeds 0 to four times the count (each block's first half
+    against its second), and the reference on the same inputs runs once."""
     if dew_fn is not None and getattr(reference_fn, "recorded", False):
         pilots = getattr(reference_fn, "pilots", None)
         if pilots is None:
             raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
                              f"sizing's from SIZING_FROM; its site keeps its recorded count")
-        most = min(most, len(pilots))
+        most = min(most, len(pilots) // 2)
     paired = dew_fn is not None
     _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
     dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
@@ -1440,21 +1449,34 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     first = 0 if dew_fn is None else SIZING_FROM
     while count <= most:
         held = 0 if drawn is None else len(drawn.theirs)
-        fresh = _drawn(dew_fn or reference_fn, reference_fn, draw,
-                       range(first + held, first + (2 * count if dew_fn is None else count)), truth_fn)
+        block = 2 * count if dew_fn is None else count
+        fresh = _drawn(dew_fn or reference_fn, reference_fn, draw, range(first + held, first + 2 * block),
+                       truth_fn)
         drawn = fresh if drawn is None else drawn.joined(fresh)
-        if dew_fn is None:
-            wide = _unresolved_against_itself(drawn.theirs, drawn.names, count)
-        else:
-            wide = [name for index, name in enumerate(drawn.names)
-                    if np.sum(drawn.theirs[:, index]) > 0
-                    and not _resolves(*_interval(drawn.mine[:, index], drawn.theirs[:, index]))]
+        wide = _confirmed(drawn.names, drawn.theirs, count, None if dew_fn is None else drawn.mine)
         if not wide:
             return count
         count *= 2
     compared = "the reference compared with itself" if dew_fn is None else "Dew paired with the reference"
     raise AssertionError(f"{label}: {compared} does not resolve {PARITY} within {most} seeds at {wide[:4]}; "
                          f"give the site larger inputs or fewer shared factors")
+
+
+def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = None) -> list[str]:
+    """The leaves `seeds_for` leaves unresolved at `count`: on the count's own block of draws or on the
+    next block of as many (`seeds_for`'s confirmation), each judged as the sizing judges it: paired,
+    `mine` Dew's squared errors against the reference's (`theirs`, seed by leaf) on the same draws, or
+    the reference compared with itself (`_unresolved_against_itself`, each block twice the count)."""
+    wide: list[str] = []
+    for start in (0, count) if mine is not None else (0, 2 * count):
+        if mine is not None:
+            held, ours = theirs[start:start + count], mine[start:start + count]
+            unresolved = [name for index, name in enumerate(names) if np.sum(held[:, index]) > 0
+                          and not _resolves(*_interval(ours[:, index], held[:, index]))]
+        else:
+            unresolved = _unresolved_against_itself(theirs[start:start + 2 * count], names, count)
+        wide += [name for name in unresolved if name not in wide]
+    return wide
 
 
 def _unresolved_against_itself(errors: np.ndarray, names, count: int) -> list[str]:
@@ -1472,11 +1494,12 @@ def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWES
     """`seeds_for`'s count for the reference compared with itself, from its errors already measured:
     `errors` holds its squared errors a seed (rows, from seed 0) and a leaf (columns), such as a
     recording's merged shards, and the count is the fewest, doubling from `start` to `most`, that
-    resolves every leaf (`_unresolved_against_itself`), as `seeds_for` doubles. Fails past `most`, as
-    `seeds_for` does, and where the rows held run out first: the recording then holds too few seeds."""
+    resolves every leaf on its own block and the next (`_confirmed`), as `seeds_for` doubles. Fails past
+    `most`, as `seeds_for` does, and where the rows held run out first: the recording then holds too
+    few seeds."""
     count, wide = max(start, FEWEST_SEEDS), []
-    while count <= most and 2 * count <= len(errors):
-        wide = _unresolved_against_itself(errors, names, count)
+    while count <= most and 4 * count <= len(errors):
+        wide = _confirmed(names, errors, count)
         if not wide:
             return count
         count *= 2
@@ -1485,7 +1508,7 @@ def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWES
                              f"{most} seeds at {wide[:4]}; give the site larger inputs or fewer shared "
                              f"factors")
     raise AssertionError(f"{label}: the reference compared with itself does not resolve {PARITY} within the "
-                         f"{len(errors)} seeds recorded, {len(errors) // 2} a half")
+                         f"{len(errors)} seeds recorded, {len(errors) // 4} a half of each block")
 
 
 def recording(path) -> dict[str, np.ndarray]:

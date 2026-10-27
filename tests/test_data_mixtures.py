@@ -1096,6 +1096,64 @@ def token_trainer(directory: Path, tracker: RecordingTracker | None = None,
                    checkpoints=Checkpoints(str(directory), keep=8), tracker=tracker)
 
 
+def test_a_cooldown_branch_ends_a_schedules_stage_where_a_run_decayed_there_does(tmp_path):
+    """A cooldown branch from before a schedule's first stage ends trains on across its end, the stage
+    ending at the step whose commit brings the branch's own committed tokens to its 50, as a run's
+    does: the branch scores, bit for bit, what a run whose rate decays from the same step over the
+    same steps scores, and the run it left trains on as one with no cooldown."""
+    from dew.training.cooldown import Cooldowns
+
+    first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
+    second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
+    data = schedule([(first, 50), (second, None)]).batch(8)
+    held_out = Pipeline(Memory(Indexed(3, 16))).batch(8)
+
+    def run(optimizer, steps: int, tracker=None, cooldowns=None):
+        trainer = Trainer(TokenCounted(), optimizer, key=jax.random.key(0), tracker=tracker,
+                          layout=Layout(min_shard=1, tolerance=1.0))
+        return trainer.fit(data, steps=steps, log_every=1, eval_every=steps, validation=held_out,
+                           cooldowns=cooldowns)
+
+    peak = 0.5
+    constant = optax.inject_hyperparams(optax.sgd)(learning_rate=peak)
+    tracker = RecordingTracker()
+    branched = run(constant, 8, tracker, Cooldowns(at=(2,), length=4, shape="linear"))
+    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
+              if "cooldown_val/loss" in scalars}
+    decaying = optax.inject_hyperparams(optax.sgd)(learning_rate=optax.join_schedules(
+        [optax.constant_schedule(peak), optax.linear_schedule(peak, 0.0, 4)], [2]))
+    decayed = RecordingTracker()
+    run(decaying, 6, decayed)
+    committed = list(itertools.accumulate(scalars["train/tokens"] for _, scalars in decayed.scalars
+                                          if "train/tokens" in scalars))
+    assert committed[1] < 50 <= committed[-1], "the branch's steps cross the stage's end"
+    finals = [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars]
+    assert cooled == {2: finals[-1]}
+    assert_same(parameters(branched), parameters(run(constant, 8)), "the run a branch left")
+
+
+def test_a_cooldown_branch_past_a_schedules_last_tokens_records_no_score(tmp_path):
+    """A schedule whose last stage ends its data at its tokens ends a cooldown branch's data there too:
+    a branch longer than the tokens left reads to that end and records no score, as a branch whose data
+    runs out does, and the run ends at its own end as one with no cooldown."""
+    from dew.training.cooldown import Cooldowns
+
+    first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
+    second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
+    data = schedule([(first, 30), (second, 30)]).batch(8)
+    held_out = Pipeline(Memory(Indexed(3, 16))).batch(8)
+
+    def run(tracker=None, cooldowns=None):
+        trainer = Trainer(TokenCounted(), optax.inject_hyperparams(optax.sgd)(learning_rate=0.5),
+                          key=jax.random.key(0), tracker=tracker, layout=Layout(min_shard=1, tolerance=1.0))
+        return trainer.fit(data, log_every=1, eval_every=1, validation=held_out, cooldowns=cooldowns)
+
+    tracker = RecordingTracker()
+    branched = run(tracker, Cooldowns(at=(1,), length=12, shape="linear"))
+    assert not any("cooldown_val/loss" in scalars for _, scalars in tracker.scalars)
+    assert_same(parameters(branched), parameters(run()), "the run a branch left")
+
+
 @pytest.mark.parametrize("accumulation", [1, 2])
 def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(tmp_path, accumulation):
     """A run on a schedule ends its first stage at the step whose commit brings the run's committed

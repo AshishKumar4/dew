@@ -581,6 +581,48 @@ def test_the_template_reports_the_mainloop_each_pass_runs():
     assert reported == [("portable", "portable", None)] * 2
 
 
+@pytest.mark.parametrize("named", ["portable", "mosaic", "triton"])
+def test_a_named_mainloop_runs_or_is_refused(named):
+    """`generation.chosen(attention_mainloop=...)` runs the mainloop it names on every template pass: on a
+    CPU the plain-JAX one runs, and Mosaic's and Triton's, which run on a GPU alone, are refused by name
+    (`selection.KernelRefused`), none silently replaced (train 217's K3)."""
+    from dew.nn.kernels import selection
+
+    with jax.default_device(jax.devices("cpu")[0]):
+        query, key, value, sinks, dout = drawing(QUERIES, KEYS, jnp.float32, sinks=True)(0)
+        traced = jax.jit(pulled("template", CASES["causal"]))
+        with generation.chosen(attention_mainloop=named), generation.routes() as found:
+            if named != "portable":
+                with pytest.raises(selection.KernelRefused) as refused:
+                    traced.trace(query, key, value, sinks, dout)
+                assert refused.value.kernel == named
+                return
+            traced.trace(query, key, value, sinks, dout)
+    assert [route.kernel for route in found if route.choice == "attention_mainloop"] == [named] * 2
+
+
+def test_the_mainloop_is_the_shared_selectors_choice():
+    """The template's mainloop is an op of the shared selector (`attention_route.MAINLOOP`,
+    `selection.select`), one chooser for its preference, its named choice and its route: on a GPU Mosaic
+    preferred, and where it declines a pass the frozen Triton one runs, Mosaic's reason the refusal, its row
+    the coverage the roadmap tracks; where Triton refuses the spans too, the plain-JAX one; off a GPU the
+    plain-JAX one, no refusal (train 221's 1843)."""
+    from dew.nn.kernels import selection
+
+    declined = attention_route._Pass(on_gpu=True, mosaic="a reason", triton=None)
+    with generation.routes():
+        route = selection.select(attention_route.MAINLOOP, declined)
+    assert (route.kernel, route.preferred, route.refusal.code, route.refusal.detail) == (
+        "triton", "mosaic", "declined", "a reason")
+    assert route.refusal.row
+    with generation.routes():
+        refused = attention_route._Pass(on_gpu=True, mosaic="a reason", triton="spans")
+        assert selection.select(attention_route.MAINLOOP, refused).kernel == "portable"
+        route = selection.select(attention_route.MAINLOOP, attention_route._Pass(on_gpu=False, mosaic=None,
+                                                                                 triton=None))
+    assert (route.kernel, route.preferred, route.refusal) == ("portable", "portable", None)
+
+
 def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output_hook():
     """`attend` runs a score hook and the initial state, and refuses an output hook of its own: its backward
     takes the output before one, so the caller applies it."""
