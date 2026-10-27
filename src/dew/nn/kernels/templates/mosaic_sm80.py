@@ -16,6 +16,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import cost, mosaic, resources
+from dew.nn.sharding import per_shard
 
 _TILING: Callable[[tuple[int, int]], object] = plgpu.TilingTransform
 _SWIZZLE: Callable[[int], object] = plgpu.SwizzleTransform
@@ -169,6 +170,7 @@ class Mma(mosaic.Family):
                cluster: int = 1, cost: pl.CostEstimate | None = None) -> Callable:
         # Its one warpgroup is its consumer, no producer beside it, and no cluster.
         _one(consumers, clustered=cluster > 1)
+        per_shard(name or self.name)
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             compiler_params=plgpu.CompilerParams(approx_math=approx_math),
                             interpret=mosaic.interpreted(interpret), kernel_name=name, cost_estimate=cost)

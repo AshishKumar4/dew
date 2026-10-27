@@ -301,6 +301,38 @@ KERNEL_CALL = re.compile(r"stablehlo\.custom_call @(?:mosaic_gpu_v2|__gpu\$xla\.
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_kernel_launches_only_where_every_axis_of_its_mesh_is_manual(generation):
+    """Row 1923: the toolkit's launch point refuses, as it traces, a kernel under a mesh axis larger than
+    one device that XLA's partitioner would split around it (`sharding.per_shard`); inside a `shard_map`
+    holding that axis manual, each device's launch reads its own rows and lowers."""
+    from jax.sharding import AbstractMesh, AxisType, PartitionSpec
+
+    from dew.nn.kernels import grouped_matmul
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    x, w = jax.ShapeDtypeStruct((512, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+    with assumed(generation):
+        target = gpu_target(generation)
+        launch = grouped_matmul.MosaicGmm()
+        bound = launch.bind(x, w, sizes, interpret=False, out_dtype="bfloat16", trans_rhs=False)
+        tile = launch.derived(bound, target)
+
+    def launched(x, w, sizes):
+        return mosaic_gpu.gmm(x, w, sizes, tiles=tile, transpose_rhs=False, out_dtype=jnp.bfloat16,
+                              multiprocessors=target.multiprocessors)
+
+    mesh = gpu_mesh(AbstractMesh((2,), ("data",), axis_types=(AxisType.Auto,)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        with pytest.raises(ValueError):
+            jax.jit(launched).trace(x, w, sizes)
+        per_device = jax.shard_map(launched, mesh=mesh, in_specs=(PartitionSpec("data"), PartitionSpec(),
+                                                                  PartitionSpec()),
+                                   out_specs=PartitionSpec("data"), check_vma=False)
+        jax.jit(per_device).trace(x, w, sizes).lower(lowering_platforms=("cuda",))
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_an_expert_layers_kernels_take_each_devices_own_rows_on_a_two_device_mesh(generation):
     """Bible §7 (owner, 10-27): an expert layer's forward and backward, lowered for the GPU on an abstract
     two-device mesh that splits its tokens (MoE's global dispatch, a `shard_map` holding them as the
