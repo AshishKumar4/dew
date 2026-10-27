@@ -157,6 +157,22 @@ def test_dew_profile_trains_a_run_afresh_and_reports_where_its_window_spent_the_
         main(command)
 
 
+def test_dew_profiles_capture_options_reach_the_capture(tmp_path):
+    """`dew profile --host-tracer-level 1 --python-tracer-level 1` captures with those options: the window
+    owns them (`ProfileWindow`), the command only maps its flags onto it, and the capture's manifest records
+    what it ran with (row 1894)."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    import autoencoder_experiment
+
+    from dew.cli.main import main
+
+    out = tmp_path / "profile"
+    assert main(["profile", autoencoder_experiment.__file__, "--warmup", "2", "--steps", "2", "--out",
+                 str(out), "--host-tracer-level", "1", "--python-tracer-level", "1"]) == 0
+    manifest = json.loads((Path(profiled(out / "report.json")["capture"]) / "manifest.json").read_text())
+    assert (manifest["options"]["host_tracer_level"], manifest["options"]["python_tracer_level"]) == (1, 1)
+
+
 def test_dew_profile_with_no_output_prepares_its_process_before_naming_its_directory(tmp_path):
     """`dew profile run.py` with no `--out` profiles into profiles/<the run's name>/<the time it starts>,
     the time agreed across the pool once the process is prepared: the run's XLA flags reach XLA, which
