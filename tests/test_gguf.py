@@ -20,7 +20,7 @@ import jax
 import numpy as np
 import pytest
 import torch
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, float64_forward
 
 from dew.interop import Pretrained, gguf as dew_gguf
 
@@ -201,10 +201,14 @@ def test_tensors_are_the_ones_transformers_reads(tmp_path, architecture, qtype):
 
 def test_load_pretrained_reads_the_file_and_its_tokenizer(tmp_path):
     """The whole load: logits against transformers over the same GGUF, and the
-    tokenizer the file carries, since the directory ships none. The directory
+    tokenizer the file carries, since the directory ships none: Dew's logits as
+    exact as transformers' (`assert_as_exact_as_the_reference`), the truth
+    transformers' float64 twin of the same dequantized weights. The directory
     also ships a diffusion pipeline's index, and the selected file is still
     what loads; a second payload selector beside it is refused."""
     from transformers import AutoModelForCausalLM
+
+    from tools.torch_precision import float64, float64_twin
 
     rng = np.random.default_rng(0)
     write_gguf(tmp_path / "model.gguf", "llama", gguf.GGMLQuantizationType.Q8_0,
@@ -220,11 +224,13 @@ def test_load_pretrained_reads_the_file_and_its_tokenizer(tmp_path):
     reference.set_attn_implementation("eager")
     ids = rng.integers(0, VOCAB, (2, 12))
     ours = np.asarray(pretrained.model.apply(pretrained.variables, ids), np.float32)
+    given = torch.from_numpy(ids)
     with torch.no_grad():
-        theirs = reference(input_ids=torch.from_numpy(ids)).logits.numpy()
-
-    # Twice the measured 6.2e-6 (CPU), logits of magnitude 4: fp32 rounding.
-    np.testing.assert_allclose(ours, theirs, atol=1.3e-5, rtol=0)
+        theirs = reference(input_ids=given).logits.numpy()
+        with float64():
+            wide = float64_twin(reference)(input_ids=given).logits.numpy()
+    _, terms = float64_forward(pretrained.model, pretrained.variables, ids)
+    assert_as_exact_as_the_reference(ours, theirs, wide, "the file's logits", terms=terms)
     assert pretrained.processor is not None, "the file's tokenizer did not become the processor"
     tokens = np.asarray(pretrained.processor("Hello, GGUF").tokens)
     # The file's merges reached the processor: "llo" is the second merge's product.
@@ -301,26 +307,27 @@ def test_an_adapter_on_a_gguf_file_chosen_out_of_a_hub_repo_names_no_base(tmp_pa
 PROMPTS = ("The Cascade Range runs from northern California through Oregon and Washington, "
            "and its tallest volcano is",
            "The capital of France is")
-# Twice the worst fp32 residual measured over PROMPTS against transformers
-# over the same file: 6.63e-5 CPU and 6.20e-5 GPU (Q8_0), 1.55e-4 CPU and
-# 8.77e-5 GPU (Q4_K_M), the GPU at the suite's highest matmul precision.
-# Both sides dequantize the same bytes with gguf-py, so what remains is the
-# fp32 forward's rounding, which tests/test_released_checkpoints.py puts at
-# 1.47e-4 for the SmolLM2-135M safetensors.
-LOGITS = {"SmolLM2-135M-Instruct-Q8_0.gguf": 1.4e-4, "SmolLM2-135M-Instruct-Q4_K_M.gguf": 3.2e-4}
+RELEASED = ("SmolLM2-135M-Instruct-Q8_0.gguf", "SmolLM2-135M-Instruct-Q4_K_M.gguf")
+"""The released files: both sides dequantize the same bytes with gguf-py, so what remains between
+them is the fp32 forward's rounding."""
 
 
 @pytest.mark.network
-@pytest.mark.parametrize("name", list(LOGITS))
+@pytest.mark.parametrize("name", RELEASED)
 def test_released_gguf_logits_match_transformers(name):
-    """Dew over the released file against transformers over the same file, fp32."""
+    """Dew over the released file against transformers over the same file, fp32: Dew's logits as exact
+    as transformers' (`assert_as_exact_as_the_reference`), the truth transformers' float64 twin of the
+    same dequantized weights, each element sized by Dew's own float64 terms."""
     from transformers import AutoModelForCausalLM
+
+    from tools.torch_precision import float64, float64_twin
 
     pretrained = Pretrained.load(REPO, revision=REVISION, gguf_file=name, dtype="float32",
                                  attention_impl="reference", max_seq_len=64)
     reference = AutoModelForCausalLM.from_pretrained(REPO, revision=REVISION, gguf_file=name,
                                                      dtype=torch.float32)
     reference.set_attn_implementation("eager")
+    truth = float64_twin(reference)
 
     assert pretrained.revision == REVISION
     assert pretrained.processor is not None, "the file's tokenizer did not become the processor"
@@ -328,11 +335,13 @@ def test_released_gguf_logits_match_transformers(name):
         ids = np.asarray(pretrained.processor(text).tokens)
         assert pretrained.processor.decode(ids) == [text]
         ours = np.asarray(pretrained.model.apply(pretrained.variables, ids), np.float32)
+        given = torch.from_numpy(ids.astype(np.int64))
         with torch.no_grad():
-            theirs = reference(input_ids=torch.from_numpy(ids.astype(np.int64))).logits.numpy()
-        assert np.array_equal(ours.argmax(-1), theirs.argmax(-1))
-        difference = float(np.abs(ours - theirs).max())
-        assert difference < LOGITS[name], f"max |logit difference| {difference:.3e}"
+            theirs = reference(input_ids=given).logits.numpy()
+            with float64():
+                wide = truth(input_ids=given).logits.numpy()
+        _, terms = float64_forward(pretrained.model, pretrained.variables, ids)
+        assert_as_exact_as_the_reference(ours, theirs, wide, f"{name} logits", terms=terms)
 
 
 # Gemma's and the MoE architectures' files: each written as llama.cpp's converter writes its source

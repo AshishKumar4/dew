@@ -37,7 +37,7 @@ from dew.nn.kernels.generation import (
     triton_runs,
 )
 from dew.nn.kernels.templates import bundles
-from dew.training._lowering import triton_kernels
+from dew.training._lowering import custom_calls, triton_kernels
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -293,11 +293,10 @@ def test_a_mamba2_layer_lowers_its_ssd_scan_on_each_shard_of_a_tpu_mesh():
     mesh = AbstractMesh((2,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
     with assumed("v5p"), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=("tpu",))
-    calls = [line for line in lowered.as_text().splitlines()
-             if "tpu_custom_call" in line and "stablehlo.custom_call" in line]
+    calls = [call for call in custom_calls(lowered) if call.target == "tpu_custom_call"]
     assert len(calls) == 2, calls
     for call in calls:
-        assert "tensor<1x128x4x64xf32>" in call or "tensor<1x4x128x64xf32>" in call, call
+        assert {(1, 128, 4, 64), (1, 4, 128, 64)} & {*call.operands, *call.results}, call
 
 
 Shapes = set[tuple[int, ...]]

@@ -474,35 +474,46 @@ class CrossContext:
 
     @classmethod
     def from_conditioning(cls, conditioning: Mapping[str, jax.Array]) -> CrossContext:
-        """The context a call's `conditioning` carries under `CONTEXT` and `CONTEXT_LENGTHS`.
+        """The context a call's `conditioning` carries under `CONTEXT`, `CONTEXT_LENGTHS` and
+        `CONTEXT_SEGMENTS`, as JAX arrays (`checked`)."""
+        embeddings, lengths, segments = cls.checked(conditioning, jnp)
+        return cls(jnp.asarray(embeddings), jnp.asarray(lengths, jnp.int32),
+                   None if segments is None else jnp.asarray(segments, jnp.int32))
+
+    @staticmethod
+    def checked(conditioning: Mapping[str, jax.typing.ArrayLike], xp=np
+                ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike, jax.typing.ArrayLike | None]:
+        """The context, its lengths and its tokens' documents a call's `conditioning` carries under
+        `CONTEXT`, `CONTEXT_LENGTHS` and `CONTEXT_SEGMENTS`, as arrays of `xp` (NumPy's on the host,
+        where a server admits a request; JAX's), each row's length its context's width where none is
+        given, the documents None where none are given, each in the dtype given.
 
         Raises ValueError for any other entry, for a context that is not
-        `[B, C, features]` floats, and for lengths that are not one integer
-        per row.
+        `[B, C, features]` floats, for lengths that are not one integer
+        per row, and for documents that are not one integer per context token.
         """
         unknown = sorted(set(conditioning) - {CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS})
         if unknown or CONTEXT not in conditioning:
             raise ValueError(f"a decoder's conditioning is {CONTEXT!r} and optionally {CONTEXT_LENGTHS!r} "
                              f"and {CONTEXT_SEGMENTS!r}, got {sorted(conditioning)}")
-        embeddings = jnp.asarray(conditioning[CONTEXT])
+        embeddings = xp.asarray(conditioning[CONTEXT])
         if embeddings.ndim != 3 or not jnp.issubdtype(embeddings.dtype, jnp.floating):
             raise ValueError(f"a context is [B, C, features] floats, got "
                              f"{embeddings.dtype}{embeddings.shape}")
         lengths = conditioning.get(CONTEXT_LENGTHS)
         if lengths is None:
-            lengths = jnp.full(embeddings.shape[:1], embeddings.shape[1], jnp.int32)
-        lengths = jnp.asarray(lengths)
+            lengths = xp.full(embeddings.shape[:1], embeddings.shape[1], np.int32)
+        lengths = xp.asarray(lengths)
         if lengths.shape != embeddings.shape[:1] or not jnp.issubdtype(lengths.dtype, jnp.integer):
             raise ValueError(f"context lengths are one integer per row, [{embeddings.shape[0]}], "
                              f"got {lengths.dtype}{lengths.shape}")
         segments = conditioning.get(CONTEXT_SEGMENTS)
         if segments is not None:
-            segments = jnp.asarray(segments)
+            segments = xp.asarray(segments)
             if segments.shape != embeddings.shape[:2] or not jnp.issubdtype(segments.dtype, jnp.integer):
                 raise ValueError(f"context segments are one integer per context token, "
                                  f"{list(embeddings.shape[:2])}, got {segments.dtype}{segments.shape}")
-            segments = segments.astype(jnp.int32)
-        return cls(embeddings, lengths.astype(jnp.int32), segments)
+        return embeddings, lengths, segments
 
 
 @struct.dataclass

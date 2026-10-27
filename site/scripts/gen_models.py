@@ -94,6 +94,7 @@ WRAPPERS = {
     "qwen3_5_moe": ("Qwen 3.5 MoE", "Images, video"),
     "llama4": ("Llama 4", "Images"),
     "deepseek_v41": ("DeepSeek V4.1", "Images"),
+    "muse_glimmer": ("Muse Glimmer", "Images"),
 }
 PIPELINES = {
     "StableDiffusionPipeline": ("Stable Diffusion", "Text to image"),

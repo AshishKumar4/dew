@@ -388,7 +388,7 @@ def reordered(batch, seed: int):
     return jax.tree.map(lambda leaf: np.asarray(leaf)[order], batch)
 
 
-def _drawn(params, key):
+def zeros_drawn(params, key):
     """`params` with every leaf its initializer left all zeros drawn from a
     normal of std 0.02 instead, each from its own fold of `key`.
 
@@ -421,7 +421,7 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     """The trainer of `case` on the layout `fields` names over the first
     `devices` devices (every device by default), or on this process's first
     device, stashing each gradient the optimizer is handed. Its initial
-    parameters have no all-zero leaf (`_drawn`). In a one-process run, once
+    parameters have no all-zero leaf (`zeros_drawn`). In a one-process run, once
     the case's one-device state is computed (`_initial`), every other
     trainer copies it onto its mesh: every layout starts from the very state
     one device does, without a compile of the model's initialization on each.
@@ -441,8 +441,9 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
             state = super().initial_state(initializer, key)
             with jax.ensure_compile_time_eval():
                 drawing = jax.random.key(7)
-            params = {**state.variables, "params": _drawn(state.variables["params"], drawing)}
-            return dataclasses.replace(state, variables=params, opt_state=self.optimizer.init(params["params"]))
+            params = {**state.variables, "params": zeros_drawn(state.variables["params"], drawing)}
+            return dataclasses.replace(state, variables=params,
+                                       opt_state=self.optimizer.init(params["params"]))
 
         def place(self):
             held = _initial.get((repr(case), accumulation)) if jax.process_count() == 1 else None

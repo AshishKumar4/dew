@@ -43,6 +43,7 @@ from reference_error import (
 from dew.batch import coordinates
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
+from dew.interop.pretrained import PretrainedFallback
 from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
@@ -1302,8 +1303,9 @@ def _longcat(tmp_path, config: dict, **load):
     torch.manual_seed(0)
     model = transformers.LongcatFlashForCausalLM(transformers.LongcatFlashConfig(**config)).eval()
     model.save_pretrained(tmp_path)
-    with pytest.warns(TransformersTierWarning):
-        loaded = Pretrained.load(tmp_path, dtype="float32", **load)
+    # The tier by the load's result: its warning went unseen in listed-file runs (row 1728).
+    loaded = Pretrained.load(tmp_path, dtype="float32", **load)
+    assert isinstance(loaded, PretrainedFallback)
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
                                                              attn_implementation="eager").eval()
