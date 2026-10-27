@@ -84,6 +84,10 @@ def test_a_paired_sizing_sizes_an_orbit_over_its_orders():
                       orders=_swapped)
     assert_as_exact(_left_to_right, _outer_first, _cancelling_draw, "cancelling sums", seeds=seeds,
                     orders=_swapped)
+    # The orders reach the sizing's draws: an orbit of the draw's own order alone is refused there.
+    with pytest.raises(ValueError):
+        seeds_for(_outer_first, _cancelling_draw, "one order", dew_fn=_left_to_right,
+                  orders=lambda inputs: [inputs])
 
 
 def test_an_orbit_fails_a_dew_wrong_only_at_another_order():

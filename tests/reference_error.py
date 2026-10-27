@@ -496,14 +496,22 @@ def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
     truth = np.asarray(truth, np.float64)
     if truth.ndim < 2:
         return np.zeros(0), np.zeros(0)
+    return _row_sizes(truth, terms)[1], _rows_rms(np.asarray(value, np.float64) - truth, truth.shape[-1])
 
-    def rms(values):
-        return _scaled_rms(np.reshape(values, (-1, truth.shape[-1])))
 
-    sizes = rms(truth) if terms is None else np.maximum(rms(truth), rms(terms))
+def _rows_rms(values, width: int) -> np.ndarray:
+    """Each row's RMS of `values`, a row `width` wide (`_scaled_rms`)."""
+    return _scaled_rms(np.reshape(values, (-1, width)))
+
+
+def _row_sizes(truth: np.ndarray, terms=None) -> tuple[np.ndarray, np.ndarray]:
+    """A truth leaf's rows, of rank two or more: each row's own RMS, and its size as `row_errors` reads
+    it, the RMS (or, with `terms`, the larger of it and its terms') where it is past RESOLUTION of the
+    leaf, else zero."""
+    own = _rows_rms(truth, truth.shape[-1])
+    sized = own if terms is None else np.maximum(own, _rows_rms(terms, truth.shape[-1]))
     leaf = max(distance(truth, 0), 0.0 if terms is None else distance(terms, 0))
-    sizes = np.where(sizes > RESOLUTION * leaf, sizes, 0.0)
-    return sizes, rms(np.asarray(value, np.float64) - truth)
+    return own, np.where(sized > RESOLUTION * leaf, sized, 0.0)
 
 
 def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tuple[str, float, str]]:
@@ -944,9 +952,8 @@ class _TruthRows:
 
     @staticmethod
     def of(truth: np.ndarray) -> "_TruthRows":
-        own = _scaled_rms(truth.reshape(-1, truth.shape[-1])) if truth.ndim >= 2 else np.zeros(0)
-        leaf = distance(truth, 0)
-        return _TruthRows(own, np.where(own > RESOLUTION * leaf, own, 0.0), bool(np.isfinite(truth).all()))
+        own, sizes = _row_sizes(truth) if truth.ndim >= 2 else (np.zeros(0), np.zeros(0))
+        return _TruthRows(own, sizes, bool(np.isfinite(truth).all()))
 
 
 def leaf_summary(reference, truth, rows_of: _TruthRows | None = None) -> RecordedLeaf:
@@ -963,8 +970,7 @@ def leaf_summary(reference, truth, rows_of: _TruthRows | None = None) -> Recorde
     # Each row's own size by the arithmetic its errors take (`_scaled_rms`), so an arm exactly zero on a
     # row is exactly its size from it: `row_errors`' sizes and errors, the truth's read once.
     sizes, own = held.sizes, held.own
-    rows = (_scaled_rms((reference - truth).reshape(-1, truth.shape[-1])) if truth.ndim >= 2
-            else np.zeros(0))
+    rows = _rows_rms(reference - truth, truth.shape[-1]) if truth.ndim >= 2 else np.zeros(0)
     sized = sizes > 0
     logged = float(np.max(_log_over(rows[sized], sizes[sized]))) if sized.any() else LOG_ZERO
     return RecordedLeaf(float(np.mean(np.square(reference - truth))),
