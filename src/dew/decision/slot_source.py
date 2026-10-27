@@ -55,6 +55,16 @@ def _attention(overrides: Mapping[str, object]) -> Mapping[str, object]:
     return _records.record(overrides.get("attention", {}), "modeling_overrides.attention")
 
 
+def reads_blocks(config: Mapping[str, object], overrides: Mapping[str, object] | None) -> bool:
+    """Whether a backbone loaded from `config` under the load's `overrides` reads each of a row's blocks
+    whole on some layer kind of its text, as the attention its `modeling_overrides` declares, the
+    load's over the checkpoint's (`with_overrides`): its decision rows then lie in blocks. A
+    checkpoint reading its own media in blocks declares none."""
+    built = _records.record(with_overrides(config, overrides).get("modeling_overrides", {}),
+                            "modeling_overrides")
+    return "block_bidirectional" in _attention(built).values()
+
+
 def _full_attention(overrides: Mapping[str, object]) -> str:
     """The full-attention layers' mode a `modeling_overrides` record states: causal, or the release's
     block_bidirectional; causal where it states none. The release's `attention` field states it."""
@@ -234,9 +244,7 @@ class SlotSource(SourceKind):
             config["modeling_overrides"] = native
         # The load's own overrides over the release's: its rows lie in blocks exactly where a layer of
         # the backbone the native loader builds under them reads blocks, of whatever kind.
-        built = _records.record(with_overrides(config, overrides).get("modeling_overrides", {}),
-                                "modeling_overrides")
-        blocks = "block_bidirectional" in _attention(built).values()
+        blocks = reads_blocks(config, overrides)
         tokenizer = HFTokenizer(str(directory), local_files_only=True)
         labels, ids = _labels(tokenizer, count)
         head = (SlotHeadSource({"class": import_path(LabelReadout), "fields": {

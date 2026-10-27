@@ -471,6 +471,23 @@ def test_a_backbone_reading_its_own_media_in_blocks_keeps_a_joint_layout():
     assert isinstance(objective.layout, JointLayout)
 
 
+def test_a_checkpoint_declaring_block_attention_lays_a_fresh_heads_rows_in_blocks(tmp_path):
+    """A checkpoint whose own config declares its full-attention layers block-bidirectional
+    (`modeling_overrides`) lays a fresh head's rows in blocks for them, with no run option asking it,
+    as the run's `--source.attention` would."""
+    import shutil
+
+    declared = tmp_path / "declared"
+    shutil.copytree(QWEN, declared)
+    config = json.loads((declared / "config.json").read_text())
+    config["modeling_overrides"] = {"attention": {"full_attention": "block_bidirectional"}}
+    (declared / "config.json").write_text(json.dumps(config))
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    objective, _ = dataclasses.replace(default, pretrained=str(declared), trainer=trainer).prepare().train("x")
+    assert objective.layout.blocks
+
+
 def test_a_decision_run_lays_its_rows_in_blocks_its_source_reads_whole():
     """`--source.attention full_attention block_bidirectional` loads the backbone's full-attention
     layers reading blocks (`Pretrained.load`'s `modeling_overrides`), and the run's rows lie in blocks
