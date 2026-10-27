@@ -960,7 +960,7 @@ def test_a_frozen_rendering_spacing_is_reported_and_its_content_claims_are_not(t
         "src/sparx/graph.py": "EDGES = 1\n",
         "tests/test_graph.py": (
             "def test_table(table):\n"
-            "    assert table.splitlines() == ['   a  b', 'x  1  2']\n"
+            "    assert report.table().splitlines() == ['   a  b', 'x  1  2']\n"
             "    assert table.plain == 'data 4,824 rows  ·  0 rejected'\n"
             "    assert '4,824' in table.split()\n"
             "    assert table.title == 'data rows'\n"
