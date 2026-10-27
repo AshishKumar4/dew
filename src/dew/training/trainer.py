@@ -1781,7 +1781,7 @@ class Trainer(Generic[Loss, Effects]):
         starts = self._stage_starts
         cooled, done, cut = state, 0, False
         try:
-            while (done < steps and not schedule_ended(plan.dataset.token_ends, counted.real_tokens)
+            while (done < steps and not schedule_ended(plan.dataset.token_ends, lambda: counted.real_tokens)
                    and not (cut := run.notice.reached())):
                 self._scheduled(plan, branched, counted)
                 assert branched.train is not None

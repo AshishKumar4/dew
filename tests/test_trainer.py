@@ -1358,6 +1358,29 @@ def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume
     assert not any("cooldown_val/loss" in scalars for _, scalars in again.scalars)
 
 
+def test_a_cooldown_of_a_run_without_a_token_schedule_reads_nothing_from_the_devices_a_step(monkeypatch):
+    """A branch of a run with no token schedule asks the devices for nothing between its steps: a
+    branch three times as long reads from the devices as often as a short one, its tokens left
+    uncounted on the host, as the run's own steps leave them."""
+    from dew.optim import Linear
+    from dew.training.cooldown import Cooldowns
+
+    stable, reads = Linear(2.0 ** -4, decay_start=64, decay_steps=128), []
+    fetched = jax.device_get
+
+    def counted(tree):
+        reads.append(1)
+        return fetched(tree)
+
+    monkeypatch.setattr(jax, "device_get", counted)
+    per_branch = []
+    for length in (2, 6):
+        reads.clear()
+        cooldown_run(stable, 8, 1, cooldowns=Cooldowns(at=(2,), length=length, shape="linear"))
+        per_branch.append(len(reads))
+    assert per_branch[0] == per_branch[1]
+
+
 def test_a_cooldown_resolves_its_points_and_lengths_as_shares_of_the_run():
     """A cooldown's point is a step or a share of the run, resolved as a cadence's is, and its length a
     step count or a share of the steps the run has taken; it decays as 1 - sqrt(u / U), or linearly."""
