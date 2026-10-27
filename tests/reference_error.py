@@ -884,22 +884,22 @@ sign times its column's and its row's sign k (`truth_sketch`), which a leaf's gr
 product, sixfold cheaper on armada's CPUs at 2^20 entries (Main, 10-27: gemma4_unified's recorded
 backward spent 430 s of its 700 s sketching)."""
 SKETCH_COLUMNS = 4096
-"""The columns of a leaf's grid in the structured sketch: its entries in order, row by row, the last row
-padded with zeros, each sign k an entry's own random sign times its column's and its row's sign k. For
-each k the signs are independent over the entries, as the dense sketch's are, so each projection is a
-Rademacher sum of the truth's move, of mean square its squared norm; given the entries' signs the SKETCH
-projections are independent, each a bilinear form in its column's and row's signs, whose tail is no
-heavier than a Rademacher sum's where the move is spread and whose square is bounded by its support's
-size times the squared norm where it is not. Measured against the dense sketch over 4000 seeds a kind on a
-[64, 64] leaf of 64 columns (debug/sketch-cost tests/bench_sketch_nulls.py, 10-27): every kind of move
-(dense, one entry, two, sixteen, one row, one column, rank one, sparse rank one, 2x2 and 8x8 rectangles)
-has the dense sketch's upper quantiles (its largest root mean square over its norm 1.54 against the dense
-1.59), and every fault (two entries swapped anywhere, in a row or a column, two rows swapped, one entry
-moved by 1e-6) moves the projections by at least a quarter of its norm at every seed, as the dense sketch's
-do. A 2x2 rectangle's four signs multiply to their entries' own at every k, its lowest root mean square
-0.35 of its norm against the dense 0.61: a move that cancels in it, shaped against those four signs, is
-no move independent of them."""
-SKETCH_GRID_ROWS = 64
+"""The most columns of a leaf's grid in the structured sketch, a smaller leaf's one row of its own entries:
+its entries in order, row by row, the last row padded with zeros, each sign k an entry's own random sign
+times its column's and its row's sign k. For each k the signs are independent over the entries, as the
+dense sketch's are, so each projection is a Rademacher sum of the truth's move, of mean square its squared
+norm; given the entries' signs the SKETCH projections are independent, each a bilinear form in its column's
+and row's signs, whose tail is no heavier than a Rademacher sum's where the move is spread and whose square
+is bounded by its support's size times the squared norm where it is not. Measured against the dense sketch
+over 4000 seeds a kind on a [64, 64] leaf of 64 columns (debug/sketch-cost tests/bench_sketch_nulls.py,
+10-27): every kind of move (dense, one entry, two, sixteen, one row, one column, rank one, sparse rank one,
+2x2 and 8x8 rectangles) has the dense sketch's upper quantiles (its largest root mean square over its norm
+1.54 against the dense 1.59), and every fault (two entries swapped anywhere, in a row or a column, two rows
+swapped, one entry moved by 1e-6) moves the projections by at least a quarter of its norm at every seed, as
+the dense sketch's do. A 2x2 rectangle's four signs multiply to their entries' own at every k, its lowest
+root mean square 0.35 of its norm against the dense 0.61: a move that cancels in it, shaped against those
+four signs, is no move independent of them."""
+SKETCH_GRID_ROWS = 16
 """The rows of the grid the structured sketch reads at once, so a chunk stays in a CPU's cache."""
 
 
@@ -948,20 +948,21 @@ def _structured_sketch(flat: np.ndarray, seed: int) -> np.ndarray:
     at most 2^-60 of the leaf's magnitudes. Its signs are the seed's own: an entry's from a stream
     of bits, its column's and row's from the same stream after."""
     size = flat.size
-    rows = -(-size // SKETCH_COLUMNS)
+    columns = min(SKETCH_COLUMNS, size)
+    rows = -(-size // columns)
     rng = np.random.default_rng([0x5E7C4, 2, size, seed])
     flips = np.unpackbits(np.frombuffer(rng.bytes(-(-size // 8)), np.uint8), bitorder="little")[:size]
-    across = rng.integers(0, 2, (SKETCH_COLUMNS, SKETCH), dtype=np.int8) * 2.0 - 1
+    across = rng.integers(0, 2, (columns, SKETCH), dtype=np.int8) * 2.0 - 1
     down = rng.integers(0, 2, (rows, SKETCH), dtype=np.int8) * 2.0 - 1
-    scales = _sketch_scales(flat)
+    scales = _sketch_scales(flat, columns * SKETCH_GRID_ROWS)
     sums = np.zeros((len(scales), SKETCH))
     for first in range(0, rows, SKETCH_GRID_ROWS):
         last = min(first + SKETCH_GRID_ROWS, rows)
-        start, stop = first * SKETCH_COLUMNS, min(last * SKETCH_COLUMNS, size)
-        rest = np.zeros((last - first) * SKETCH_COLUMNS)
+        start, stop = first * columns, min(last * columns, size)
+        rest = np.zeros((last - first) * columns)
         rest[:stop - start] = flat[start:stop]
         np.negative(rest[:stop - start], out=rest[:stop - start], where=flips[start:stop] == 0)
-        rest = rest.reshape(last - first, SKETCH_COLUMNS)
+        rest = rest.reshape(last - first, columns)
         for level, scale in enumerate(scales):
             whole = np.rint(np.ldexp(rest, -scale))
             sums[level] += ((whole @ across) * down[first:last]).sum(axis=0)
@@ -972,16 +973,19 @@ def _structured_sketch(flat: np.ndarray, seed: int) -> np.ndarray:
                                  for total, scale in zip(column, scales, strict=True)) for column in sums.T])
 
 
-def _sketch_scales(flat: np.ndarray) -> list[int]:
+def _sketch_scales(flat: np.ndarray, chunk: int) -> list[int]:
     """The powers of two the structured sketch splits `flat` by, largest first: the entries rounded to
     integers of 52 - bit_length(size) bits at each in turn, what each leaves split at the next, so every
     level's sum over all the entries, in any order, is an integer below 2^53; down to what leaves at most
-    2^-60 of the entries' magnitudes, or to the subnormals' unit, where nothing is left."""
-    top = float(np.max(np.abs(flat)))
+    2^-60 of the entries' magnitudes, or to the subnormals' unit, where nothing is left. Read `chunk`
+    entries at a time, so a large leaf is read once from memory."""
+    top, magnitude = 0.0, 0.0
+    for start in range(0, flat.size, chunk):
+        part = np.abs(flat[start:start + chunk])
+        top, magnitude = max(top, float(np.max(part))), magnitude + float(np.sum(part))
     if top == 0:
         return []
     size, width = flat.size, 52 - flat.size.bit_length()
-    magnitude = float(np.sum(np.abs(flat)))
     scales = [max(math.frexp(top)[1] - width, -1074)]
     while scales[-1] > -1074 and size * math.ldexp(1.0, scales[-1] - 1) > math.ldexp(magnitude, -60):
         scales.append(max(scales[-1] - width, -1074))

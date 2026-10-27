@@ -35,16 +35,17 @@ def test_a_truths_sketch_is_its_signed_block_sums_summed_exactly(size):
 def _structured_signs(size: int, seed: int) -> np.ndarray:
     """The structured sketch's signs `[size, SKETCH]` at `seed`, from its definition: an entry's own sign
     (its bit of the seed's first stream) times its column's and its row's of the grid of SKETCH_COLUMNS
-    columns (drawn after)."""
+    columns, or of one row a smaller leaf (drawn after)."""
     from reference_error import SKETCH, SKETCH_COLUMNS
 
-    rows = -(-size // SKETCH_COLUMNS)
+    columns = min(SKETCH_COLUMNS, size)
+    rows = -(-size // columns)
     rng = np.random.default_rng([0x5E7C4, 2, size, seed])
     own = np.unpackbits(np.frombuffer(rng.bytes(-(-size // 8)), np.uint8), bitorder="little")[:size] * 2.0 - 1
-    across = rng.integers(0, 2, (SKETCH_COLUMNS, SKETCH), dtype=np.int8) * 2.0 - 1
+    across = rng.integers(0, 2, (columns, SKETCH), dtype=np.int8) * 2.0 - 1
     down = rng.integers(0, 2, (rows, SKETCH), dtype=np.int8) * 2.0 - 1
     place = np.arange(size)
-    return own[:, None] * across[place % SKETCH_COLUMNS] * down[place // SKETCH_COLUMNS]
+    return own[:, None] * across[place % columns] * down[place // columns]
 
 
 @pytest.mark.parametrize("size", [1, 7, 4095, 4096, 4097, 3 * 4096 + 5, 70 * 4096 + 3])
