@@ -603,11 +603,16 @@ def ids_per_reader(path: Path, readers: int, kind: str = "jsonl") -> list[list[i
 
 
 @pytest.mark.parametrize("kind", ["jsonl", "text"])
-def test_a_long_first_record_moves_the_cuts_it_holds_on_to_the_records_after_it(tmp_path, kind):
-    """Four records, the first 10,000 characters long, read by four readers: the even cuts that fall
-    inside the first record move on to the records after it, so each reader reads one record of its
-    own, where they collapsed into one another, left two parts and the read was refused."""
-    lines = [json.dumps({"id": index, "pad": "x" * (10_000 if index == 0 else index)}) for index in range(4)]
+@pytest.mark.parametrize("long", [pytest.param(0, id="first"), pytest.param(1, id="second"),
+                                  pytest.param(2, id="third"), pytest.param(3, id="last")])
+def test_a_long_record_leaves_each_of_four_readers_a_record(tmp_path, kind, long):
+    """Four records, one of them 10,000 characters long, read by four readers: the even cuts that fall
+    inside the long record move on to the records after it, and where none is left after them (a
+    long last record) the parts before them split at the records they hold, so each reader reads
+    one record of its own. Cuts that collapsed into one another left two parts; cuts past the last
+    record start left the file fewer parts than records, and the read was refused."""
+    lines = [json.dumps({"id": index, "pad": "x" * (10_000 if index == long else index)})
+             for index in range(4)]
     (tmp_path / "rows.jsonl").write_text("".join(line + "\n" for line in lines))
     shares = ids_per_reader(tmp_path / "rows.jsonl", 4, kind)
     assert sorted(len(ids) for ids in shares) == [1, 1, 1, 1]
@@ -635,6 +640,19 @@ def test_no_part_of_a_json_lines_file_starts_on_blank_lines_alone(tmp_path):
     shares = ids_per_reader(tmp_path / "rows.jsonl", 4)
     assert sorted(len(ids) for ids in shares) == [1, 1, 1, 1]
     assert sorted(itertools.chain(*shares)) == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize("blank", [pytest.param("", id="empty"), pytest.param("\n", id="blank-line"),
+                                   pytest.param(" \n\t\n" * 1000, id="blank-lines")])
+def test_a_json_lines_file_of_no_records_takes_no_part_beside_one_that_holds_them(tmp_path, blank):
+    """An empty or blank JSON-lines file holds no record, so a streamed read cut into more parts than
+    the store's files gives it none: three readers each read one record of the file beside it,
+    whatever share of the bytes the blank one holds, where its empty plan broke the read."""
+    (tmp_path / "blank.jsonl").write_text(blank)
+    (tmp_path / "rows.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(3)))
+    shares = ids_per_reader(tmp_path, 3)
+    assert sorted(len(ids) for ids in shares) == [1, 1, 1]
+    assert sorted(itertools.chain(*shares)) == [0, 1, 2]
 
 
 def test_a_corrupt_export_manifest_is_refused_and_never_falls_back_to_raw_shards():
