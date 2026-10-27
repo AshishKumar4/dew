@@ -37,7 +37,14 @@ import torch
 from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
-from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    float64_forward,
+    torch_with_gradients,
+    with_gradients,
+)
 from selection_margins import indexer_margins
 from tool_support import load
 
@@ -48,9 +55,18 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import MixerCall
 from dew.nn.kernels import generation
+from dew.nn.kv_cache import KVCache
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.precision import FP32_SUMS
-from dew.nn.rope import YarnScaling, rotary_freqs, yarn_attention_factor, yarn_inv_freq, yarn_query_scale
+from dew.nn.rope import (
+    LongRopeScaling,
+    RopeScaling,
+    YarnScaling,
+    rotary_freqs,
+    yarn_attention_factor,
+    yarn_inv_freq,
+    yarn_query_scale,
+)
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, MeshSpec, Trainer
@@ -86,7 +102,7 @@ def yarn_of(settings: dict) -> YarnScaling:
 
 
 def mla_module(settings: dict, max_seq_len: int = 64,
-               attention_impl: str = "reference"
+               attention_impl: str = "reference", kv_cache: KVCache | None = None
                ) -> MultiHeadLatentAttention:
     """The fixture's reference config as a dew mixer."""
     return MultiHeadLatentAttention(
@@ -100,13 +116,14 @@ def mla_module(settings: dict, max_seq_len: int = 64,
         v_head_dim=settings["v_head_dim"],
         rope_theta=float(settings["rope_theta"]),
         rope_interleave=settings.get("rope_interleave", True),
-        yarn=yarn_of(settings),
+        rope_scaling=yarn_of(settings),
         norm_eps=float(settings["rms_norm_eps"]),
         attention_bias=bool(settings["attention_bias"]),
         index_topk=settings.get("index_topk"),
         index_n_heads=settings.get("index_n_heads"),
         index_head_dim=settings.get("index_head_dim"),
-        attention_impl=attention_impl)
+        attention_impl=attention_impl,
+        kv_cache=KVCache() if kv_cache is None else kv_cache)
 
 
 def block_variables(tensors: dict) -> dict:
@@ -316,6 +333,26 @@ def test_decode_matches_prefill(name):
                     seeds=SEEDS["decode"])
 
 
+@pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
+@pytest.mark.parametrize("name", ["mla_v3", "mla_v32"])
+def test_a_paged_latent_cache_decodes_what_the_compact_cache_decodes(name, quantized):
+    """A latent attention's cache takes the layer's layout: paged, it decodes every step as the compact
+    cache does at the same format, bit for bit, full precision or quantized, over the latents (V3) and
+    over the expanded keys the indexer selects among (V3.2), the quantized keys read back in the basis
+    their queries or their expansion take."""
+    settings = CONFIG[SETTINGS[name]]
+    variables = block_variables(fixture(name))
+    hidden = block_draw(name)(0)[0]
+
+    def decoded(layout):
+        module = mla_module(settings, kv_cache=layout)
+        return np.asarray(jax.jit(lambda variables, hidden: decode_loop(module, variables, hidden))(
+            variables, hidden))
+
+    np.testing.assert_array_equal(decoded(KVCache(quantized=quantized, page_size=4)),
+                                  decoded(KVCache(quantized=quantized)))
+
+
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v3n"])
 def test_mla_reproduces_the_v3_block(name):
     """DeepseekV3Attention, with the query LoRA and without (the plain-q_proj variant no released
@@ -469,6 +506,64 @@ def test_a_decoder_on_the_mla_kind_runs_the_reference_block(name):
     assert jnp.array_equal(inside, standalone)
     logits = model.apply(variables, jnp.arange(14, dtype=jnp.int32).reshape(2, 7))
     assert logits.shape == (2, 7, 37)
+
+
+@pytest.mark.parametrize("scaling", [
+    RopeScaling(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=4),
+    LongRopeScaling(short_factor=(1.0, 1.5, 2.0, 2.5), long_factor=(3.0, 4.0, 5.0, 6.0),
+                    original_max_position_embeddings=4)], ids=["llama3", "longrope"])
+def test_the_mla_kind_rotates_by_the_models_rope_scaling(scaling):
+    """A model's Llama 3.1 or LongRoPE scaling reaches its latent attention as
+    it reaches its ordinary attention (`MixerContext.rotary_scaling`): the
+    kind's layer computes, bit for bit, what the standalone block given that
+    scaling computes, where a kind that forwarded YaRN alone rotated at the
+    plain frequencies (audit NN-04). The seven positions pass LongRoPE's four,
+    so it reads its long factors."""
+    settings = CONFIG["v3"]
+    tensors = fixture("mla_v3")
+    model = mla_model(settings, yarn=None, rope_scaling=scaling)
+    variables = model.init(jax.random.key(0), jnp.zeros((2, 7), jnp.int32))
+    layer = variables["params"]["layers_0"]
+    variables = {**variables, "params": {
+        **variables["params"], "layers_0": {**layer, "self_attn": block_variables(tensors)["params"]}}}
+    hidden = jnp.asarray(tensors["hidden"])
+    inside = model.apply(variables, hidden, method=lambda m, x: m.layers[0].self_attn(x))
+    standalone = mla_module(settings).clone(rope_scaling=scaling).apply(block_variables(tensors), hidden)
+    np.testing.assert_array_equal(inside, standalone)
+
+
+def test_a_deepseek_checkpoint_scaled_by_llama3_loads_and_rotates_its_latents_by_it(tmp_path):
+    """A DeepSeek V3 checkpoint whose config scales its rope by Llama 3.1's ramp loads through the
+    shared rope codec, and its latent attention rotates by the ramp: Dew's logits as exact as
+    transformers' DeepseekV3 under the same config (`assert_as_exact_as_the_reference`, the truth its
+    float64 twin), where the family read YaRN alone and refused the checkpoint (audit NN-04)."""
+    import shutil
+
+    from transformers import AutoModelForCausalLM
+
+    from dew.interop import Pretrained
+    from tools.torch_precision import float64, float64_twin
+
+    source = Path(__file__).resolve().parent / "fixtures" / "hf" / "deepseek-v3-tiny"
+    for name in ("model.safetensors", "generation_config.json"):
+        shutil.copy(source / name, tmp_path / name)
+    config = json.loads((source / "config.json").read_text())
+    config["rope_scaling"] = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+                              "high_freq_factor": 4.0, "original_max_position_embeddings": 4}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    # The eager experts, which run in float64 too: the grouped kernel takes float32 or narrower.
+    reference = AutoModelForCausalLM.from_pretrained(
+        tmp_path, dtype=torch.float32, attn_implementation="eager", experts_implementation="eager").eval()
+    ids = np.load(source / "input_ids.npy")
+    given = torch.from_numpy(ids.astype(np.int64))
+    with torch.no_grad():
+        theirs = reference(input_ids=given).logits.numpy()
+        with float64():
+            wide = float64_twin(reference)(input_ids=given).logits.numpy()
+    _, terms = float64_forward(loaded.model, loaded.variables, ids)
+    assert_as_exact_as_the_reference(np.asarray(loaded.model.apply(loaded.variables, ids)), theirs, wide,
+                                     "a llama3-scaled DeepSeek V3's logits", terms=terms)
 
 
 # --------------------------------------------------------------------------

@@ -74,20 +74,21 @@ class Mosaic(base.Template[mainloop.Tiles]):
     """The chunked rule on the recurrence template's mainloop (`recurrence_chunk.mosaic_rule`), its config
     the forward's tiles. Its operands are the rule's: queries and keys `[B, T, H, Dk]`, values
     `[B, T, HV, Dv]`, the log decay a head's `[B, T, HV]` or a key dimension's `[B, T, HV, Dk]`, the write
-    gate `[B, T, HV]`, each row's initial memory and packed documents' first tokens."""
+    gate `[B, T, HV]`, each row's initial memory and packed documents' first tokens, and their rows'
+    documents' first slots as the batch built them (`firsts`, `dew.batch.Coordinates.firsts`)."""
 
     name: ClassVar[str] = "mosaic_gpu"
     config_cls: ClassVar[type[mainloop.Tiles]] = mainloop.Tiles
 
     def _fwd(self, query: jax.Array, key: jax.Array, value: jax.Array, g: jax.Array, beta: jax.Array,
              state: jax.Array | None = None, starts: jax.Array | None = None, *,
-             max_segments: int | None = None, scale: float | None = None, delta: bool = True,
-             wide: bool = False, floor: float | None = None, config: mainloop.Tiles,
+             firsts: jax.Array | None = None, max_segments: int | None = None, scale: float | None = None,
+             delta: bool = True, wide: bool = False, floor: float | None = None, config: mainloop.Tiles,
              return_residuals: bool = False):
         from dew.nn.kernels.recurrence_chunk import mosaic_rule
 
         del return_residuals
-        return mosaic_rule(query, key, value, g, beta, state, tiles=config, starts=starts,
+        return mosaic_rule(query, key, value, g, beta, state, tiles=config, starts=starts, firsts=firsts,
                            max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor), None
 
     @staticmethod

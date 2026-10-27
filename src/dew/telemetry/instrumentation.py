@@ -26,6 +26,7 @@ import jax
 import numpy as np
 
 from dew.nn.kernels.generation import gpu_target
+from dew.telemetry.trace import collective
 
 _cache_counts = {'/jax/compilation_cache/cache_hits': 0, '/jax/compilation_cache/cache_misses': 0}
 _cache_lock = threading.Lock()
@@ -152,16 +153,6 @@ _GROUPED = re.compile(r"(?:replica_groups|source_target_pairs)=(\{\}|\{\{[\d,{}]
 _NUMBERS = re.compile(r'\d+')
 _SIZED = re.compile(r"'([^']+)'=(\d+)")
 _QUOTED = re.compile(r"'([^']+)'")
-COLLECTIVES = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "collective-permute")
-"""The HLO ops that move data between devices. XLA runs some as an async
-pair, `<op>-start` and `<op>-done`, and wraps others in `async-start` over a
-computation that holds the op itself."""
-
-
-def collective(op: str) -> str | None:
-    """The collective (`COLLECTIVES`) HLO op `op` is, or runs half of; None for any other."""
-    kind = op.removesuffix('-start').removesuffix('-done')
-    return kind if kind in COLLECTIVES else None
 
 
 def _groups(attributes: str) -> tuple[tuple[int, ...], ...]:
