@@ -179,7 +179,10 @@ def test_a_muse_glimmer_wrapper_loads_whole_and_computes_its_logits(wrapper):
         return ids, rng.random((1, 3, IMAGE_SIDE, IMAGE_SIDE)).astype(np.float32)
 
     def ours(ids, image=None):
-        media = {} if image is None else {"conditioning": {"pixel_values": jnp.asarray(image)[:, None]}}
+        # The image's soft tokens take its placeholders, image 0 of the row.
+        media = {} if image is None else {
+            "image_indices": jnp.where(jnp.asarray(ids) == IMAGE_TOKEN, 0, -1),
+            "conditioning": {"pixel_values": jnp.asarray(image)[:, None]}}
         return {"logits": loaded.model.apply(loaded.variables, jnp.asarray(ids), **media)}
 
     for label, with_image in (("text", False), ("image", True)):
