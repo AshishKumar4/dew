@@ -214,6 +214,44 @@ def test_a_grpo_stage_scores_decoded_text_and_stops_at_the_tokenizer_eos(tmp_pat
     identical(states[2].ema, states[1].variables)
 
 
+def test_one_model_is_pretrained_tuned_and_reinforced_in_one_recipe(tmp_path):
+    """One bigram policy through pretraining on text, SFT on conversations and online GRPO, in one run
+    of the recipe, each stage in its own checkpoint directory and starting from the last one's final
+    tree: SFT's rows of the table no conversation trains hold pretraining's values, not the start's;
+    GRPO's reference is SFT's final tree, and it trains on rewards it reads from its own draws."""
+    tokenizer = tokenizer_for(str(TOKENIZER))
+    letter, = tokenizer.encode("a", add_special_tokens=False)
+    assert tokenizer.eos_id is not None
+    start = leaning(tokenizer.vocab_size, letter, tokenizer.eos_id)
+    model = ToolPolicy(vocab_size=tokenizer.vocab_size, max_seq_len=32, logits=lambda: start)
+    read = []
+
+    def reward(text, record):
+        read.append(text)
+        return float(len(text))
+
+    text = Memory([{"text": "the quick brown fox jumps over the lazy dog"}] * 16).pipe(
+        presets.lm, str(TOKENIZER), seq_len=8, batch=8)
+    prompts = Memory([{"prompt": "hi"}] * 8).pipe(presets.prompts, str(TOKENIZER), max_prompt_len=8, batch=8,
+                                                  long="truncate")
+    states = Recipe(model, optax.sgd(.1), jax.random.key(0), (
+        Stage(name="pretraining", loss="pretrain", data=text, steps=1),
+        Stage(name="sft", loss="sft", data=chat(tmp_path), steps=1),
+        Stage(name="grpo", loss="grpo", data=prompts, steps=1, beta=.01, reward=reward, max_new_tokens=4),
+    ), str(tmp_path / "chain"), layout=LAYOUT).run()
+
+    assert [path.name for path in sorted((tmp_path / "chain").iterdir())] == ["grpo", "pretraining", "sft"]
+    pretrained, tuned = (np.asarray(state.variables["params"]["table"]) for state in states[:2])
+    assert moved(states[0].variables, {"params": {"table": start}})
+    assert moved(states[1].variables, states[0].variables)
+    # A row pretraining moved and no conversation reaches holds its pretrained values after SFT.
+    carried = np.all(tuned == pretrained, axis=1) & np.any(pretrained != start, axis=1)
+    assert carried.any()
+    identical(states[2].ema, states[1].variables)
+    assert moved(states[2].variables, states[1].variables)
+    assert len(read) == 8 * 4 and set(read) == {"", "a"}
+
+
 def test_a_mislinked_chain_is_refused_before_anything_trains(tmp_path):
     """Each refused stage follows a sound one, and the run fails before the
     sound stage writes its directory."""
