@@ -45,7 +45,7 @@ COLLECTIVES = ("AllReduce", "AllGather", "ReduceScatter", "SendRecv", "Broadcast
 @dataclass(frozen=True)
 class Kernel:
     """One kernel's event as a trace holds it, read out of JAX's native ProfileEvent, whose fields live
-    only as long as the ProfileData it came from: its stats read after that was freed crashed the reader."""
+    only as long as the ProfileData it came from: read after that is freed, they crash the reader."""
 
     name: str
     start_ns: float
@@ -71,7 +71,9 @@ def device_events(directory: str | Path) -> tuple[dict[str, list[KernelEvent]], 
         raise FileNotFoundError(f"no xplane.pb under {directory}")
     planes: dict[str, list[KernelEvent]] = {}
     lines = set()
-    for plane in ProfileData.from_file(str(traces[-1])).planes:
+    # The trace's planes, lines and events are views into `data`, which lives to the loop's end.
+    data = ProfileData.from_file(str(traces[-1]))
+    for plane in data.planes:
         match = re.match(r"/device:(GPU|TPU):\d+", plane.name)
         if match is None:
             continue
