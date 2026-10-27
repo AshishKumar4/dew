@@ -50,6 +50,7 @@ and `tiny_inputs`, which that file's registry-wide parametrization needs.
 import contextlib
 import dataclasses
 import functools
+import itertools
 import json
 from pathlib import Path
 from typing import NamedTuple
@@ -561,6 +562,17 @@ def _call(model, variables, inputs, **apply) -> jax.Array:
     return model.apply(variables, *inputs, **apply)
 
 
+def _saved(model, variables, inputs, **apply) -> int:
+    """The bytes `model`'s forward keeps for its backward: the residuals its linearization holds
+    (`jax.linearize`), traced abstractly. A remat rung recomputes what it does not keep, so a stronger
+    rung keeps fewer."""
+    def forward(params):
+        return _call(model, {**variables, "params": params}, inputs, **apply)
+
+    kept = jax.eval_shape(lambda params: jax.linearize(forward, params)[1], variables["params"])
+    return sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(kept))
+
+
 def _stepped(model, variables, inputs, **apply) -> dict:
     """A step's gradient in every floating parameter, along a cotangent drawn at its output's shape."""
     output = jax.eval_shape(lambda: _call(model, variables, inputs, **apply))
@@ -647,7 +659,9 @@ def _redrawn(inputs, seed: int):
 
 def _climbs_and_restores(name: str, model, variables, inputs, **apply) -> None:
     """Each rung holds less than the one below it, and its top rung steps the
-    forward the model does: the top rung's checkpoint makes its forward another
+    forward the model does. Each rung keeps fewer residual bytes for its
+    backward than the rung below it (`_saved`), so no rung is a remat that
+    recomputes nothing. The top rung's checkpoint makes its forward another
     program, which check 1 holds against the model's from the model's float64
     twin over drawn inputs. Its backward recomputes, which can round apart
     (gemma2-tiny's gradients by up to 1.2e-4, kimi-k3-tiny's 8.3e-3 of 10.8;
@@ -678,6 +692,9 @@ def _climbs_and_restores(name: str, model, variables, inputs, **apply) -> None:
     assert all(rung.restore_recompute("no rung").recompute_record() == record
                for rung, record in zip(rungs, records, strict=True))
     variables = {**variables, "params": ZEROS_DRAWN(variables["params"], jax.random.key(7))}
+    saved = [_saved(rung, variables, inputs, **apply) for rung in rungs]
+    assert all(above < below for below, above in itertools.pairwise(saved)), list(zip(records, saved,
+                                                                                         strict=True))
     written = model.apply(variables, *inputs, mutable=True, **apply)[1].keys()
     twin, wide_variables = float64_twin(model), widened(variables)
 

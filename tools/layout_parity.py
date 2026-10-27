@@ -413,7 +413,8 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
             with jax.ensure_compile_time_eval():
                 drawing = jax.random.key(7)
             params = {**state.variables, "params": zeros_drawn(state.variables["params"], drawing)}
-            return dataclasses.replace(state, variables=params, opt_state=self.optimizer.init(params["params"]))
+            return dataclasses.replace(state, variables=params,
+                                       opt_state=self.optimizer.init(params["params"]))
 
         def place(self):
             held = _initial.get((repr(case), accumulation)) if jax.process_count() == 1 else None
