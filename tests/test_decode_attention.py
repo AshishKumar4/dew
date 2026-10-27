@@ -355,6 +355,14 @@ def test_attention_the_decode_kernel_takes_lowers_for_the_gpu_differentiated_in_
             jax.jit(differentiated).trace(query, key, key).lower(lowering_platforms=("cuda",))
 
 
+def _decoded_lengths(query, key, value):
+    """Two rows of a decode step reading 1 and 20 keys through the decode kernel, named for the step
+    (`generation.chosen`), so it lowers or is refused by name."""
+    with chosen(decode="decode"):
+        return scaled_dot_product_attention(query, key, value,
+                                            key_value_seq_lengths=jnp.asarray([1, 20], jnp.int32))
+
+
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
 def test_a_grouped_query_in_its_own_layout_reaches_the_decode_kernel(generation):
     """A decode step's query of 4 heads over 2 key heads, called in the layer's own `[B, 1, N, D]`
@@ -365,14 +373,9 @@ def test_a_grouped_query_in_its_own_layout_reaches_the_decode_kernel(generation)
     query = jax.ShapeDtypeStruct((2, 1, 4, 64), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((2, 64, 2, 64), jnp.bfloat16)
 
-    def attend(query, key, value):
-        with chosen(decode="decode"):
-            return scaled_dot_product_attention(query, key, value,
-                                                key_value_seq_lengths=jnp.asarray([1, 20], jnp.int32))
-
     mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(attend).trace(query, key, key).lower(lowering_platforms=("cuda",))
+        jax.jit(_decoded_lengths).trace(query, key, key).lower(lowering_platforms=("cuda",))
 
 
 @pytest.mark.parametrize("implementation", ["xla", "reference"])
@@ -619,14 +622,9 @@ def test_a_grouped_query_over_one_key_head_reaches_the_decode_kernel_on_each_ten
     query = jax.ShapeDtypeStruct((2, 1, 8, 64), jnp.bfloat16)
     key = jax.ShapeDtypeStruct((2, 256, 1, 64), jnp.bfloat16)
 
-    def attend(query, key, value):
-        with chosen(decode="decode"):
-            return scaled_dot_product_attention(query, key, value,
-                                                key_value_seq_lengths=jnp.asarray([1, 20], jnp.int32))
-
     mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:2]), ("tensor",)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(attend).trace(query, key, key).lower(lowering_platforms=("cuda",))
+        jax.jit(_decoded_lengths).trace(query, key, key).lower(lowering_platforms=("cuda",))
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
