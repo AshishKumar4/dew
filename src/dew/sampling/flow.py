@@ -78,7 +78,7 @@ class GaussianTransition:
         # The form of JAX's isotropic `multivariate_normal.logpdf` (a scalar covariance): log(2 pi) and
         # the log variance summed apart, so a variance near float32's largest does not overflow 2 pi
         # times it. Each row has its own variance, which that function would take one row at a time.
-        log_prob = -(_half_mahalanobis(value - mean, safe_variance)
+        log_prob = -(_half_mahalanobis(value, mean, safe_variance)
                      + 0.5 * dimensions * (jnp.log(2 * math.pi) + jnp.log(safe_variance)))
         return jnp.where(variance > 0, log_prob, jnp.nan)
 
@@ -101,19 +101,31 @@ class GaussianTransition:
                          jnp.where(variance == 0, deterministic, jnp.nan))
 
 
-def _half_mahalanobis(residual: jax.Array, variance: jax.Array) -> jax.Array:
-    """`|residual|**2 / (2 variance)` per row, one variance a row: the plain formula over the residual
-    and the variance each scaled by an exact power of two, 2**-k and 2**-2k for the variance's 2**(2k),
-    so it rounds bit for bit as the plain formula wherever that stays in range, and a residual whose
-    square passes float32's largest (2**64 over a variance of 2**126, a standardized square of 4) stays
-    finite. The power is a constant of the variance's exponent, so its derivatives are the plain
-    formula's, at every order."""
-    held = jax.lax.stop_gradient(variance)
-    # 2**-k for the variance's 2**(2k), a normal number for every float32 variance, made apart from the
-    # values it scales, which a product by it then takes exactly.
-    factor = jnp.ldexp(jnp.ones_like(held), -(jnp.frexp(held)[1] // 2))
-    error = jnp.square(residual * expand(factor, residual)).sum(axis=tuple(range(1, residual.ndim)))
-    return error / (2 * (variance * factor * factor))
+def _half_mahalanobis(value: jax.Array, mean: jax.Array, variance: jax.Array) -> jax.Array:
+    """`|value - mean|**2 / (2 variance)` per row, one variance a row, as half the squared standardized
+    residual: the value, the mean and the deviation are first scaled by a power of two that takes the
+    row's largest of them below one (two normal factors, so no factor flushes), the residual formed and
+    divided by the deviation there, so it is finite wherever the term is: a residual of 2**64 under unit
+    variance (2**127), a value of 2**127 beside a mean of -2**127. The scale is a constant of the row's
+    magnitudes, so the derivatives are the plain formula's at every order."""
+    deviation = jnp.sqrt(variance)
+    axes = tuple(range(1, value.ndim))
+    largest = jax.lax.stop_gradient(jnp.maximum(
+        jnp.maximum(jnp.max(jnp.abs(value), axis=axes), jnp.max(jnp.abs(mean), axis=axes)), deviation))
+    exponent = jnp.frexp(jnp.where(largest > 0, largest, 1))[1]
+    first = jnp.ldexp(jnp.ones_like(largest), -(exponent // 2))
+    second = jnp.ldexp(jnp.ones_like(largest), -(exponent - exponent // 2))
+
+    def scaled(x):
+        return x * expand(first, x) * expand(second, x)
+
+    # A deviation far below the row's largest scales to below float32's least normal, which a device may
+    # flush: the least normal holds a zero residual at zero, any other past float32's largest as the
+    # term itself is.
+    spread = deviation * first * second
+    spread = jnp.where(spread > 0, spread, jnp.finfo(spread.dtype).tiny)
+    standardized = (scaled(value) - scaled(mean)) / expand(spread, value)
+    return 0.5 * jnp.square(standardized).sum(axis=axes)
 
 
 def _exponent(x: jax.Array) -> jax.Array:

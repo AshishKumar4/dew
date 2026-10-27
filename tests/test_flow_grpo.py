@@ -1287,3 +1287,12 @@ def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
 
     for second in (jax.jacfwd(jax.jacrev(density)), jax.jacrev(jax.jacfwd(density))):
         np.testing.assert_array_equal(np.asarray(second(unit.mean)).reshape(3, 3), -np.eye(3))
+    # Finite wherever the term is: a residual of 2**64 under unit variance, half its square 2**127, and
+    # a value of 2**127 beside a mean of -2**127 under float32's largest variance.
+    for value, mean, variance, term in ((2.0 ** 64, 0.0, 1.0, 2.0 ** 127),
+                                        (2.0 ** 127, -(2.0 ** 127), float(np.finfo(np.float32).max),
+                                         2.0 ** 255 / float(np.finfo(np.float32).max))):
+        edge = GaussianTransition(jnp.full((1, 1), mean, jnp.float32), jnp.asarray([variance], jnp.float32))
+        density = float(edge.log_prob(jnp.full((1, 1), value, jnp.float32))[0])
+        truth = -(term + 0.5 * (math.log(2 * math.pi) + math.log(variance)))
+        assert np.isfinite(density) and abs(density - truth) <= 4 * np.spacing(np.float32(abs(truth)))

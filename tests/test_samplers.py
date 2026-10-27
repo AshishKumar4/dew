@@ -982,6 +982,17 @@ def test_lms_walks_a_variance_exploding_grid_near_float32s_largest():
     np.testing.assert_array_equal(latents[0], np.full((1, 3), 0.5))
 
 
+def test_a_tiny_lms_step_beside_a_distant_node_keeps_its_coefficient():
+    """Nodes 2**-100 and 2**-99 beside 1, a step from 2**-100 to 0: the basis of the latest node
+    integrates to -1.5 * 2**-100 (on s in [0, 1], (1 + s)(1 + 2**-100 s) times the step -2**-100), its
+    coefficient kept where a scale set by the distant node would round it to zero (ledger 1874)."""
+    from dew.sampling.solvers.sigma import _lagrange_integral
+
+    tiny = jnp.float32(2.0 ** -100)
+    coefficient = float(_lagrange_integral([tiny, 2 * tiny, jnp.float32(1.0)], 0, tiny, jnp.float32(0.0)))
+    assert coefficient == pytest.approx(-1.5 * 2.0 ** -100, rel=4 * float(np.finfo(np.float32).eps))
+
+
 def test_an_empty_lms_step_integrates_to_zero_with_the_basis_as_its_derivative():
     """Over an empty step (a = b) the Lagrange basis integrates to zero, and its derivative in the
     step's end is the basis at that end: 1 for the node it is 1 at, 0 for the other (ledger 1874)."""

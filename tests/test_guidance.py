@@ -226,3 +226,9 @@ def test_a_unit_scale_guides_to_the_conditional_prediction_exactly():
     np.testing.assert_array_equal(np.asarray(gradients[0]), [[1.0], [3.0]])
     np.testing.assert_array_equal(np.asarray(gradients[1]), [[0.0], [-2.0]])
     np.testing.assert_array_equal(np.asarray(gradients[2]), [1.0, 1.0])
+    # Opposite finite predictions whose difference passes float32's largest: moving the conditional
+    # alone at a unit scale moves the guided prediction by as much, finitely.
+    largest = jnp.asarray([[2.0 ** 127]], jnp.float32)
+    still = (jnp.ones((1, 1), jnp.float32), jnp.zeros((1, 1), jnp.float32), jnp.zeros((1,), jnp.float32))
+    _, moved = jax.jvp(guide, (largest, -largest, jnp.ones((1,), jnp.float32)), still)
+    np.testing.assert_array_equal(np.asarray(moved), [[1.0]])

@@ -158,8 +158,11 @@ def _guided_jvp(primals, tangents):
     conditional the value selects would leave the scale's out."""
     conditional, unconditional, scale = primals
     along_conditional, along_unconditional, along_scale = tangents
+    # The scale's direction over the predictions' halves, exact powers of two, so the difference of two
+    # finite predictions of opposite sign stays finite where the scale does not move.
+    spread = 0.5 * conditional - 0.5 * unconditional
     return _guided(*primals), (scale * along_conditional + (1 - scale) * along_unconditional
-                               + (conditional - unconditional) * along_scale)
+                               + 2 * (spread * along_scale))
 
 
 @struct.dataclass
