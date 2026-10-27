@@ -170,6 +170,15 @@ def dumped(tmp_path, name: str, text: str):
     return dump
 
 
+def attributed(tmp_path, dump, *arguments: str) -> dict:
+    """The attribution's time section, the tool run as a person runs it on the capture and `dump`, with
+    `arguments`."""
+    out = tmp_path / "attribution.json"
+    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out),
+                           *arguments]) == 0
+    return json.loads(out.read_text())["time"]
+
+
 def test_a_nameless_fusion_is_attributed_by_the_ops_it_fuses(tmp_path):
     """A multi-output fusion carries no op_name of its own (that step's 50 ms of
     "other"): its part and direction come from the ops fused inside it."""
@@ -177,10 +186,8 @@ def test_a_nameless_fusion_is_attributed_by_the_ops_it_fuses(tmp_path):
               "fusion(f32[8,3072,1024]{2,1,0} %p0)")
     captured(tmp_path, [("15", "input fusion", "input_reduce_fusion.4", fusion, "", "1", 2000.0, "")],
              311869.0)
-    dump = dumped(tmp_path, "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt", NAMELESS)
-    out = tmp_path / "attribution.json"
-    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out)]) == 0
-    time = json.loads(out.read_text())["time"]
+    time = attributed(tmp_path, dumped(tmp_path, "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt",
+                                       NAMELESS))
     assert time["by_part_kind_ms"] == {"norm": {"reduce": 2.0}}
     assert time["by_part_ms"] == {"norm": {"backward": 2.0}}
 
@@ -221,10 +228,8 @@ def test_a_fusion_that_reads_optimizer_state_is_the_optimizers(tmp_path):
     captured(tmp_path, [("3", "loop fusion", "loop_convert_fusion.7", fusion,
                          "jit(step)/convert_element_type", "1", 3000.0, "src/dew/training/narrow.py:94")],
              311869.0)
-    dump = dumped(tmp_path, "module_0003.jit_step.sm_8.0_gpu_after_optimizations.txt", UPDATE)
-    out = tmp_path / "attribution.json"
-    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out)]) == 0
-    time = json.loads(out.read_text())["time"]
+    time = attributed(tmp_path, dumped(tmp_path, "module_0003.jit_step.sm_8.0_gpu_after_optimizations.txt",
+                                       UPDATE))
     assert time["by_part_kind_ms"] == {"optimizer": {"elementwise": 3.0}}
     # A capture with no accelerator timeline (no trace here) says so: its device time is unknown, not 0.
     assert time["device_busy_ms_per_step"] is None and time["op_self_time_ms_per_step"] == 3.0
@@ -244,11 +249,8 @@ def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
     traced(tmp_path, [(compute, "flash_bwd", 0, 6, 15), (compute, "gemm", 10, 12, 15),
                       (other, "pallas_recurrence", 4, 8, 15), (compute, "other", 8, 9, 7),
                       (copies, "MemcpyH2D", 9.5, 10, None)])
-    dump = dumped(tmp_path, "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt", MODULE)
-    out = tmp_path / "attribution.json"
-    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump),
-                           "--out", str(out), "--steps", "2"]) == 0
-    time = json.loads(out.read_text())["time"]
+    time = attributed(tmp_path, dumped(tmp_path, "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt",
+                                       MODULE), "--steps", "2")
     assert time["step_program"] == "15"
     assert time["programs_ms"] == {"15": 9.5, "7": 7.5}
     # Its window is 12 ms over two steps; busy the union of its kernels and the transfer, 8 + 2.5 ms,
