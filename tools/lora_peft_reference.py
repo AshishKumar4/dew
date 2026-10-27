@@ -283,19 +283,25 @@ def write_masks() -> None:
 
 @contextlib.contextmanager
 def widened(model):
-    """`model` in float64 with every float32 pin of transformers' Llama (5.16.1) widened, so the
-    float64 run rounds in float64 alone: its RMSNorm's cast (modeling_llama.py:64), its rotary
-    tables' (:108, :115-117), whose inverse frequencies are computed again, and its attention
-    softmax's (:208)."""
-    from torch_precision import dtype_widened, float_as, replaced, widened_to
+    """`model`'s float64 twin (`float64_twin`): the same base and adapter built inside `float64`, so
+    every value their constructors compute is float64's (the rotary tables' among them), loaded with
+    `model`'s weights and run inside `float64`, every float32 pin of transformers' Llama (5.16.1)
+    widened: its RMSNorm's cast (modeling_llama.py:64), its rotary tables' (:108, :115-117) and its
+    attention softmax's (:208)."""
+    import copy
 
-    with replaced(float_as(torch.float64), (torch.Tensor, "to", widened_to(torch.Tensor.to)),
-                  (torch, "arange", dtype_widened(torch.arange)),
-                  (torch.nn.functional, "softmax", dtype_widened(torch.nn.functional.softmax))):
-        model = model.to(torch.float64)
-        rotary = model.get_base_model().model.rotary_emb
-        rotary.inv_freq = rotary.compute_default_rope_parameters(rotary.config)[0]
-        yield model
+    from peft import get_peft_model
+    from torch_precision import float64, float64_twin
+    from transformers import AutoModelForCausalLM
+
+    def build():
+        base = AutoModelForCausalLM.from_config(copy.deepcopy(model.get_base_model().config),
+                                                dtype=torch.float64)
+        return get_peft_model(base, copy.deepcopy(model.peft_config["default"]))
+
+    twin = float64_twin(model, build)
+    with float64():
+        yield twin
 
 
 def run(model, input_ids: torch.Tensor, dtype, drawn: dict[str, np.ndarray] | None, rate: float) -> dict:
