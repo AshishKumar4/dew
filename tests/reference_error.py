@@ -1596,7 +1596,30 @@ def input_digest(inputs) -> np.uint64:
     return np.frombuffer(digest.digest()[:8], np.uint64)[0]
 
 
-def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn=None):
+LEAF_ENTRIES = ("reference", "truth", "mse", "worst", "finite", "sketch", "zero_rows", "zero_errors",
+                "zero_offsets", "shape", "dtype")
+"""The kinds of a recording's entries kept one a leaf, `<site>.<kind>.<leaf>` (a pilot's
+`<site>.pilot.<kind>.<leaf>`): a full recording's outputs and truths, a summarized one's evidence and
+sketches. Every other entry (inputs, digests, counts, provenance) is the whole recording's."""
+
+
+def _of_leaves(stored, site: str, leaves) -> dict:
+    """`stored` with the entries of `leaves` alone of those kept one a leaf (LEAF_ENTRIES), verdict and
+    pilot alike, and every entry the whole recording shares; a leaf the recording lacks is refused."""
+    wanted, found, kept = set(leaves), set(), {}
+    for key, value in stored.items():
+        kind, _, name = key.removeprefix(f"{site}.").removeprefix("pilot.").partition(".")
+        if key.startswith(f"{site}.") and kind in LEAF_ENTRIES and name:
+            if name not in wanted:
+                continue
+            found.add(name)
+        kept[key] = value
+    if wanted - found:
+        raise ValueError(f"{site}: the recording holds no leaves {sorted(wanted - found)}")
+    return kept
+
+
+def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn=None, leaves=None):
     """`assert_as_exact`'s draw, reference and truth for a reference recorded over seeds, where it cannot
     run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.reference.<name>` and
     `<site>.truth.<name>`, and `<site>.input.<name>` unless `inputs_of(seed)` draws a seed's inputs again
@@ -1623,7 +1646,14 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     truth has a row of float64 zero the recording's had not is refused. Its reference and truth are
     host functions, called as check 1 calls them, not traced. Where it holds pilots (`<site>.pilot.`,
     `merge_shards`), seeds from SIZING_FROM on read them, and its reference carries them
-    (`recorded_pilots`'s `.pilots`), so a paired sizing of it takes those draws alone (`seeds_for`)."""
+    (`recorded_pilots`'s `.pilots`), so a paired sizing of it takes those draws alone (`seeds_for`).
+
+    With `leaves`, the recording is read for those leaves alone (`_of_leaves`): a site whose leaves are
+    judged in groups, each its own test, reads each group so, its Dew arm and truth giving that group's
+    leaves. Check 1 judges every leaf on its own tails, so a group draws its second stage on its own
+    leaves' account alone, which looks at a passing leaf no more often than the whole site would."""
+    if leaves is not None:
+        stored = _of_leaves(stored, site, leaves)
     if any(name.startswith(f"{site}.sketch.") for name in stored):
         return _summarized(stored, site, seeds, inputs_of, truth_fn)
 
