@@ -13,7 +13,7 @@ executable (`jax.experimental.serialize_executable`), for a host of that topolog
     devices = compile_only_gpus("h100", 8)
     trainer = Trainer(objective, adamw(3e-4), mesh=MeshSpec(fsdp=8).build(devices))
     ahead = compile_ahead(trainer, batch)
-    ahead.peak_bytes, ahead.flops
+    ahead.peak_bytes, ahead.flops.hardware
     ahead.save("step.dew-aot")
 """
 
@@ -31,6 +31,7 @@ from jax.experimental import serialize_executable
 
 from dew.batch import Batch
 from dew.nn.kernels.generation import capability, gpu_target
+from dew.telemetry.instrumentation import StepFlops, step_flops
 
 if TYPE_CHECKING:
     from dew.training.trainer import Trainer
@@ -89,11 +90,12 @@ def compile_only_gpus(generation: str, count: int = 1) -> tuple:
 @dataclasses.dataclass(frozen=True)
 class AheadOfTime:
     """A training step compiled for `devices` GPUs of `generation` (`compile_ahead`): the executable,
-    serialized, and what XLA states of it. `flops` and
-    `bytes_accessed` are its cost analysis of one step on one device; the byte counts are its
-    memory analysis of one device: the arguments it reads (the state and the batch's share), the
-    outputs it writes, those that alias an argument (the donated state), its temporaries and its
-    code. None where XLA states none."""
+    serialized, and what it costs. `flops` are its matmuls' and convolutions' on one device, read
+    off its optimized program as a run's are (`dew.telemetry.instrumentation.step_flops`, which
+    counts the cuBLAS and cuDNN calls XLA's own cost analysis cannot see into), None where it runs a
+    loop of unstated length; the byte counts are XLA's memory analysis of one device: the arguments
+    it reads (the state and the batch's share), the outputs it writes, those that alias an argument
+    (the donated state), its temporaries and its code."""
 
     generation: str
     devices: int
@@ -101,8 +103,7 @@ class AheadOfTime:
     executable: bytes
     trees: tuple
     """The trees of the executable's inputs and outputs, as `serialize_executable.serialize` gives them."""
-    flops: float | None
-    bytes_accessed: float | None
+    flops: StepFlops | None
     argument_bytes: int
     output_bytes: int
     alias_bytes: int
@@ -159,12 +160,8 @@ def compile_ahead(trainer: Trainer, batch: Batch) -> AheadOfTime:
     memory = compiled.memory_analysis()
     if memory is None:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
-    cost = compiled.cost_analysis()
-    stated = cost[0] if isinstance(cost, list) else cost
     return AheadOfTime(
         generation, len(devices), dict(trainer.device_mesh.shape), executable, (in_tree, out_tree),
-        flops=None if stated is None else stated.get("flops"),
-        bytes_accessed=None if stated is None else stated.get("bytes accessed"),
-        argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
+        flops=step_flops(compiled), argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
         code_bytes=memory.generated_code_size_in_bytes)

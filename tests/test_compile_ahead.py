@@ -46,7 +46,8 @@ def test_a_step_compiled_ahead_for_eight_gpus_reads_and_writes_what_the_run_on_e
     assert (ahead.argument_bytes, ahead.output_bytes, ahead.alias_bytes) == (
         here.argument_size_in_bytes, here.output_size_in_bytes, here.alias_size_in_bytes)
     assert (ahead.generation, ahead.devices, ahead.mesh) == ("sm90", 8, dict(run.device_mesh.shape))
-    assert ahead.executable and ahead.flops is not None and ahead.flops > 0 and ahead.temp_bytes > 0
+    assert ahead.executable and ahead.temp_bytes > 0
+    assert ahead.flops is not None and ahead.flops.hardware > 0
     beside = ahead.output_bytes - ahead.alias_bytes + ahead.temp_bytes
     assert ahead.peak_bytes == ahead.argument_bytes + beside
 

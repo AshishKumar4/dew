@@ -945,8 +945,10 @@ def _from_replicas(tree, grid: Mapping[str, object], holders: frozenset[int]):
         placed = leaf.sharding
         assert isinstance(placed, jax.sharding.NamedSharding), "a covered save places by name (`_grid`)"
         mesh, split = placed.mesh, tuple(_split_axes(placed.spec))
-        along = tuple(name for name in mesh.axis_names if name not in split and mesh.shape[name] > 1)
-        if not along:
+        # Every axis the copies lie along, those of one device too, so the sum is replicated as its
+        # placement says.
+        along = tuple(name for name in mesh.axis_names if name not in split)
+        if all(mesh.shape[name] == 1 for name in along):
             return leaf
         if split not in masks:
             sources = _sources(grid, split, holders)
