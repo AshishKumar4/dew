@@ -353,7 +353,7 @@ Two measures decide whether a mainloop lands and whether it replaces a route: th
   A rule that a measurement shows is wrong is corrected as a rule from facts, never by a table entry or a fitted constant.
 - **The opt-in tuner times variants of the derived kernel** (owner, 2026-10-25). `KernelOp.variants(ba)` states them: the derived config first, then a few legal neighbours. The tests prove each variant (the gate holds at every one at the tested shapes, `tests/tuned.py`'s `each_config`), so the tuner only times proven configs and makes no runtime accuracy check. Picks are stored per device kind beside the compilation cache. Ranked config spaces, fitted cost terms and route ranking stay deleted.
 - **New hardware is the maintainers' work.** A known family's new GPU runs from its device facts, plus the few per-device facts Dew's maintainers add where no attribute states one. A new instruction family gets one Family bundle, and a thin mainloop only where its overlap structure differs (§6).
-- **The analytic model states what the derived kernel costs**, in one schema for all templates: planned, not built (the GEMM's costed models were deleted with its ranking, 2026-10-27), it would be the terms a whole step's schedule is derived from:
+- **The analytic model's terms**, one schema for all templates, which no code computes (the GEMM's costed models were deleted with its ranking, 2026-10-26):
   - work per pipe and bytes per memory level;
   - tile, stage, warp and cluster geometry;
   - residency from shared memory and registers, with hook register pressure;
