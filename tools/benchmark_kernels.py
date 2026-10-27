@@ -22,6 +22,7 @@ with these commands, for example:
 """
 
 import argparse
+import dataclasses
 import json
 
 import grouped_oracle
@@ -145,9 +146,9 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
 
 
 def step(args: argparse.Namespace) -> dict[str, object]:
-    case = case_for(args.path, args.batch, args)
-    trainer = build_trainer(case, optimizer=OptimConfig(
-        optimizer="adam", learning_rate=1e-4, state_dtype=args.state_dtype).build(1000))
+    case = dataclasses.replace(case_for(args.path, args.batch, args), optimizer={
+        "optimizer": "adam", "learning_rate": 1e-4, "state_dtype": args.state_dtype})
+    trainer = build_trainer(case)
     with compiled_step(case, trainer) as compiled:
         state, loss, _, _ = timed_steps(compiled.step, compiled.state, 5)
         losses = [float(loss)]

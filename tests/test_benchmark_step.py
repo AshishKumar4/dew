@@ -12,6 +12,8 @@ import os
 import subprocess
 import sys
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from tool_support import REPO_ROOT, load
@@ -91,3 +93,29 @@ def test_a_cases_measured_peak_holds_at_least_the_bytes_xla_planned(tmp_path):
     row = peak_row(tmp_path, "cuda", "--profile-dir", str(tmp_path / "traces"), "--profile-steps", "1")
     assert row["peak_device_bytes"] == row["peak_bytes_by_device"][0] >= row["planned_device_bytes"] > 0
     assert any((tmp_path / "traces/peak-run").rglob("*.xplane.pb"))
+
+
+def test_a_released_decoders_case_trains_its_committed_shape_under_the_optimizer_it_names(monkeypatch):
+    """A case naming a released decoder (`Case.family`) trains the model its committed config
+    translates to, as a pretrained load reads it, under the optimizer it names (`Case.optimizer`):
+    a looped nGPT decoder's, under AdamW with its moments in bf16, a finite step through the
+    trainer."""
+    tool = load("benchmark_step")
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
+    import benchmark_models as models
+    from benchmark_cases import Case
+
+    config = tool.BenchmarkConfig(
+        cases=[Case("causal_transformer", family="dory-tiny", batch_size=8, seq_len=32,
+                    optimizer={"state_dtype": "bfloat16"})], warmup=1, steps=2, dtype="float32")
+    (case,) = tool.build_cases(config)
+    released = json.loads((REPO_ROOT / "tests/fixtures/hf/dory-tiny/config.json").read_text())
+
+    trainer = models.build_trainer(case)
+    model = trainer.objective.model
+    assert (model.num_layers, model.loop.steps) == (released["num_hidden_layers"],
+                                                    released["n_recurrent_loops"])
+    moments = trainer.optimizer.init({"kernel": jnp.zeros((4, 4), jnp.float32)})
+    assert jnp.bfloat16 in {leaf.dtype for leaf in jax.tree.leaves(moments)}
+    row = tool.measure(case, config, None)
+    assert row["finite"] and np.isfinite(row["loss"])

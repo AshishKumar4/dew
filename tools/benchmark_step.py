@@ -72,7 +72,7 @@ from dew.pool import joins_pool, pool_cluster
 from dew.registry import models
 from dew.telemetry.benchmark import carried
 from dew.telemetry.instrumentation import COLLECTIVES, model_flops_utilization
-from dew.telemetry.profile import capture_options
+from dew.telemetry.profile import Profiler
 from dew.training import Trainer
 from dew.training.memory import recompute_record
 from dew.training.runtime import prepare_process
@@ -88,7 +88,7 @@ from benchmark_cases import (
     mesh_label,
     small_cases,
 )
-from benchmark_models import build_trainer, compiled_step, global_batch, timed_steps, trainer_mesh
+from benchmark_models import build_trainer, compiled_step, global_batch, released, timed_steps, trainer_mesh
 from trace_window import communication_totals, device_events, kernel_category, kernel_totals, window_split
 
 Row = dict[str, object]
@@ -240,7 +240,7 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
         packed = ({'packed_documents': config.packed_documents}
                   if config.packed_documents is not None and case.packs_documents else {})
         dtype = {'dtype': config.dtype} if case.dtype is None else {}
-        return dataclasses.replace(case, **overrides, **frames, **packed, **dtype)
+        return released(dataclasses.replace(case, **overrides, **frames, **packed, **dtype))
 
     return [apply(case) for case in cases]
 
@@ -383,19 +383,10 @@ def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None)
             # directory, since the trace file is named after the host.
             directory = os.path.join(config.profile_dir, case.label.replace(" ", "_"),
                                      f"process{jax.process_index()}")
-            jax.profiler.start_trace(directory, profiler_options=capture_options())
-            try:
+            # A Dew capture, whose reports (hlo_stats) tools/attribute_step.py reads.
+            with Profiler(directory):
                 for _ in range(config.profile_steps):
                     state, loss, is_finite = step(state)
-                loss.block_until_ready()
-            finally:
-                primary = sys.exception()
-                try:
-                    jax.profiler.stop_trace()
-                except BaseException as error:
-                    if primary is None:
-                        raise
-                    primary.add_note(f"Profiler stop failed: {error!r}")
             # A peak process traces the steps for their memory; their timeline is the case process's.
             if not config.peak_run:
                 planes = device_events(directory)[0]

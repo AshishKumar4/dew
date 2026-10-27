@@ -91,6 +91,15 @@ class Case:
     ("grpo"), or masked diffusion's negative ELBO over a bidirectional
     decoder ("mdlm", MDLM's process)."""
     fsdp_min_param_size: int = 2 ** 16
+    family: str | None = None
+    """A released decoder's shape (`dory-1.0-4b`): its committed config,
+    tests/fixtures/hf/<family>/config.json, read as a pretrained load reads it,
+    with `config`'s fields over it. The tool resolves it into `config` before a
+    case runs (benchmark_step's `build_cases`)."""
+    optimizer: dict[str, object] | None = None
+    """`OptimConfig` fields, the optimizer a recipe would configure:
+    `{"state_dtype": "bfloat16"}` trains AdamW with its moments in bf16. None
+    trains `optax.adam(1e-4)`."""
 
     @property
     def is_jepa(self) -> bool:
@@ -122,7 +131,7 @@ class Case:
         images = f" x{images_per_row(self)}img" if self.media else ""
         order = "" if self.device_order is None else " order" + "".join(map(str, self.device_order))
         pooled = "" if self.accumulation == 1 else f" x{self.accumulation}acc"
-        return (f"{self.architecture}{experts}{canvases}{images} b{self.batch_size}{pooled} "
+        return (f"{self.family or self.architecture}{experts}{canvases}{images} b{self.batch_size}{pooled} "
                 f"{mesh_label(self.mesh)}{order}")
 
 

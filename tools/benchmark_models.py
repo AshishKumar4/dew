@@ -2,8 +2,10 @@
 
 import contextlib
 import dataclasses
+import json
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from pathlib import Path
 from typing import Any
 
 import jax
@@ -33,6 +35,7 @@ from dew.diffusion.process import DenoisingCondition
 from dew.distributed.batches import DevicePrefetchIterator
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.encoders import ConditionEncoder
+from dew.interop import hf_decoders
 from dew.nn.attention import AttentionImpl
 from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.flux2 import Flux2Transformer
@@ -51,12 +54,25 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
+from dew.optim import OptimConfig
 from dew.registry import models, projectors, read_arguments, resolve_dtype, towers
 from dew.state import TrainState
 from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
+
+RELEASED = Path(__file__).resolve().parent.parent / "tests" / "fixtures" / "hf"
+"""Each released decoder's committed config.json, under its family's name (`Case.family`)."""
+
+
+def released(case: Case) -> Case:
+    """`case` with its released decoder's fields (`Case.family`) in `config`, the case's own over
+    them: the committed config read as a pretrained load reads it (`hf_decoders.translate_config`)."""
+    if case.family is None:
+        return case
+    record = json.loads((RELEASED / case.family / "config.json").read_text())
+    return dataclasses.replace(case, config={**hf_decoders.translate_config(record), **case.config})
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -270,13 +286,15 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
     return objective
 
 
-def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto',
-                  optimizer: optax.GradientTransformation | None = None) -> Trainer:
+def build_trainer(case: Case, attention_impl: AttentionImpl = 'auto') -> Trainer:
     """The trainer a recipe would build for this case, minus the tracker and the
-    checkpoints, on the case's device order. A case measures its own batch,
-    so the step reads it whole and climbs the remat ladder where it must."""
+    checkpoints, on the case's device order, training the case's optimizer
+    (`Case.optimizer`). A case measures its own batch, so the step reads it
+    whole and climbs the remat ladder where it must."""
+    optimizer = (optax.adam(1e-4) if case.optimizer is None
+                 else OptimConfig(**read_arguments(OptimConfig, case.optimizer)).build(None))
     trainer = Trainer(
-        build_objective(case, attention_impl), optimizer or optax.adam(1e-4), key=jax.random.key(0),
+        build_objective(case, attention_impl), optimizer, key=jax.random.key(0),
         **trainer_mesh(case.mesh), layout=Layout(min_shard=case.fsdp_min_param_size),
         accumulation=case.accumulation, split=1, checkpoints=None, tracker=None)
     if case.device_order is not None:
