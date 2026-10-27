@@ -11,8 +11,8 @@ before it, beta given, fla's varlen sequences, 64-token chunks and fla's default
 is fla's gated delta rule (`fla_gdn`) with a decay per key dimension, and shares that port's memory
 kernels, whose USE_GK branch it takes (`fla_gdn.chunk_fwd_h`, `fla_gdn.chunk_bwd_dhu`), its forward
 substitution and its dot helpers, the recurrence template's decay prefix (`recurrence.cumulated`),
-and the chunked launches' token spans (`Sequences`) and base (`chunked_launch._Launch`, a tuner
-KernelOp); the kernels here are KDA's own. Each names its fla origin.
+and the chunked launches' token spans (`Sequences`) and base (`chunked_launch._Launch`, a
+`tuning.KernelOp`); the kernels here are KDA's own. Each names its fla origin.
 `dew.nn.kernels.recurrence_chunk.chunk_gated_delta_rule` runs it for a decay per key dimension.
 
 fla's grids are kept: a program per place of each chunk for the intra-chunk diagonal blocks (fla's
@@ -48,8 +48,6 @@ from dew.nn.kernels.chunked_launch import (
     _picks,
     _row,
     _rows,
-    _spaces,
-    _tiles,
     read_rows,
     sequences,
     write_rows,
@@ -106,8 +104,6 @@ class IntraRows(_Launch):
 
     NAME = "intra_rows"
     KEYS, VALUES = "k", None
-    # fla autotunes BH over 1, 2, 4, 8 and warps over 1, 2, 4, 8 (chunk_intra_token_parallel.py:13-20).
-    SPACES = _spaces(frozenset(Tiles(0, 0, warps, 1, bh) for bh in (1, 2, 4, 8) for warps in (1, 2, 4, 8)))
     PICKS = _picks(Tiles(0, 0, 4, 1, 4))
 
     def _tiles(self, ba, tiles: Tiles) -> Tiles:
@@ -203,11 +199,11 @@ def _intra_solve_kernel(chunk_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *, chun
 class IntraSolve(_Launch):
     """`intra_solve`'s launch (tuning.KernelOp)."""
 
+    revision: int = 2
+
     NAME = "intra_solve"
     KEYS, VALUES = "aqk", None
-    SPACES = _spaces(_tiles([(0, 0)], (1, 2, 4), (1,)))
     PICKS = _picks(Tiles(0, 0, 1, 1), small=Tiles(0, 0, 2, 1))
-    revision: int = 2
 
     def _fwd(self, aqk: jax.Array, akk: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *,
              chunk: int, interpret: bool, config: Tiles, return_residuals: bool = False):
@@ -287,7 +283,6 @@ class RecomputeWU(_Launch):
 
     NAME = "recompute_w_u"
     KEYS, VALUES = "k", "v"
-    SPACES = _spaces(_tiles([(64, 64)], (2, 4), (2, 3, 4)))
     PICKS = _picks(Tiles(64, 64, 4, 2))
 
     def _fwd(self, k: jax.Array, v: jax.Array, beta: jax.Array, a: jax.Array, g: jax.Array,
@@ -370,8 +365,6 @@ class ChunkFwdO(_Launch):
 
     NAME = "chunk_fwd_o"
     KEYS, VALUES = "q", "v"
-    SPACES = _spaces(_tiles([(32, 64), (64, 64), (32, 128), (64, 128)], (2, 4, 8), (2, 3, 4)),
-                     _tiles([(32, 64), (64, 64)], (2, 4, 8), (2,)))
     # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: 0.25 -> 0.23 ms.
     PICKS = _picks(Tiles(64, 128, 4, 2), small=Tiles(64, 64, 4, 2))
 
@@ -447,7 +440,6 @@ class BwdDav(_Launch):
 
     NAME = "bwd_dav"
     KEYS, VALUES = None, "v"
-    SPACES = _spaces(_tiles([(0, 64)], (2, 4, 8), (2, 3, 4)), _tiles([(0, 64)], (2, 4, 8), (2,)))
     PICKS = _picks(Tiles(0, 64, 4, 2))
 
     def _fwd(self, v: jax.Array, do: jax.Array, a: jax.Array, chunk_spans: jax.Array,
@@ -579,7 +571,6 @@ class BwdWyDqkg(_Launch):
 
     NAME = "bwd_wy_dqkg"
     KEYS, VALUES = "k", "v"
-    SPACES = _spaces(_tiles([(32, 32), (32, 64)], (2, 4), (1,)), _tiles([(32, 32)], (2, 4), (1,)))
     PICKS = _picks(Tiles(32, 64, 4, 1), small=Tiles(32, 32, 4, 1))
 
     def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, corrected: jax.Array, g: jax.Array,
@@ -783,7 +774,6 @@ class BwdIntra(_Launch):
 
     NAME = "bwd_intra"
     KEYS, VALUES = "k", None
-    SPACES = _spaces(_tiles([(32, 0), (64, 0)], (2, 4, 8), (1,)))
     # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: 2.49 -> 1.98 ms.
     PICKS = _picks(Tiles(64, 0, 4, 1), small=Tiles(32, 0, 4, 1))
 

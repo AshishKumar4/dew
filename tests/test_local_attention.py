@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
 from model_support import model_draw
-from reference_error import as_given, assert_as_exact, with_gradients
+from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -274,6 +274,42 @@ def test_a_row_with_padding_among_its_tokens_bands_its_window_over_a_sequence_ax
         banded = temporaries(lambda q, k, v, valid: local_attention(
             q, k, v, window=window, valid=valid, implementation="xla"))
     assert banded * 4 < dense
+
+
+@pytest.mark.mesh(devices=8)
+def test_row_fields_split_as_the_query_rows_do_where_the_heads_contend_for_the_axis():
+    """Eight query heads over a tensor and an expert axis of two each, which the heads take before the rows
+    (the rows' rule names the expert axis too), and a sequence axis of two: the window's segment ids and
+    validity split as the query's own rows do (`query_split`), not as their names alone would, so each shard
+    bands its own rows'. The same output as the whole sequence's."""
+    from flax import linen as nn
+
+    from dew.mesh import DEFAULT_RULES
+    from dew.training import MeshSpec
+
+    length, window = 64, 8
+    segment_ids = jnp.asarray(np.tile(packed(length, (20, 45, 60)), (4, 1)))
+    valid = jnp.asarray(np.arange(length) % 7 != 3)[None].repeat(4, axis=0)
+
+    def attend(q, k, v):
+        return local_attention(q, k, v, window=window, segment_ids=segment_ids, valid=valid,
+                               implementation="xla")
+
+    def draw(seed):
+        return inputs(length, heads=8, kv_heads=2, batch=4, seed=seed)
+
+    rules = (("activation_heads", ("tensor", "expert")), ("activation_kv", ("tensor", "expert")),
+             ("activation_batch", "expert"), *DEFAULT_RULES)
+    mesh, banded = MeshSpec(tensor=2, expert=2, sequence=2).build(), jax.jit(attend)
+
+    @as_given
+    def split(query, key, value):
+        # The band under the mesh and the contending rules; the whole sequence outside them.
+        with jax.set_mesh(mesh), nn.logical_axis_rules(rules):
+            return banded(query, key, value)
+
+    assert_as_exact(split, jax.jit(attend), draw, "local attention under contending heads",
+                    seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize("layout", [KVCache(), KVCache(page_size=4)], ids=["dense", "paged"])

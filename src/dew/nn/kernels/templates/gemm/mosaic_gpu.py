@@ -35,9 +35,10 @@ a power-of-two ladder of TMA stores. Changed for Dew, each marked `# Dew:`:
 - the program count is the device's multiprocessors, where `ragged_dot` fixed an H100 SXM's 132;
 - `tgmm`'s shared-memory tiling and swizzle are the warpgroup lowering's inference, as `gmm`'s are
   upstream, where upstream stated them with transforms whose type JAX leaves abstract;
-- both take a cooperative tile (`Tiles.warpgroups`, `Tiles.cluster`: two consumer warpgroups beside a
-  producer, CUTLASS's cooperative sm90 schedule, as JAX's `hopper_matmul_mgpu`, and a pair of
-  multiprocessors sharing one operand's blocks), and the template's hooks (`gmm`, `tgmm`).
+- both take a cooperative tile (`Tiles.warpgroups`: two consumer warpgroups beside a producer, CUTLASS's
+  cooperative sm90 schedule, as JAX's `hopper_matmul_mgpu`; `tgmm`'s operand stages stream across its
+  persistent loop's tiles), `gmm` a pair of multiprocessors sharing one operand's blocks
+  (`Tiles.cluster`), and the template's hooks (`gmm`, `tgmm`).
 
 Each sums exact products of its 16-bit operands in fp32 (wgmma's accumulator) and rounds once to the
 output dtype.
@@ -52,16 +53,33 @@ from jax import lax, numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90
+from dew.nn.kernels.templates.gemm import rows_padded
+
+FAMILY: mosaic.Family = mosaic_sm90.WGMMA
+"""Hopper's warpgroup MMA bundle, a wgmma tile's (`family_of`)."""
+
+
+def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
+    """The bundle a tile runs on: its instruction family's (`Tiles.family`), mma.sync's a dtype's with its
+    warps arranged for a consumer's share of the tile (`mosaic_sm80.Mma.for_tile`)."""
+    if tiles.family != 'mma.sync':
+        return FAMILY
+    return mosaic_sm80.Mma.for_tile(dtype, tiles.block_m // tiles.warpgroups, tiles.block_n)
+
 
 @dataclasses.dataclass(frozen=True)
 class Tiles:
     """One launch's output tile (`block_m` x `block_n`), contraction step (`block_k`), the steps in flight
     (`stages`, upstream's `max_concurrent_steps`) and the column tiles in each band of the planar snake
-    (`grid_block_n`); Dew: the warpgroups computing a tile (`warpgroups`: 2 halve `block_n` between two
+    (`grid_block_n`); Dew: the warpgroups computing a tile (`warpgroups`: 2 halve `block_m` between two
     consumer warpgroups beside a producer that issues the loads, CUTLASS's cooperative sm90 schedule), and
-    the multiprocessors of a cluster (`cluster`: 2 pair two tiles of one group, which load the block of
-    the operand they share once between them, multicast: `gmm`'s row tiles its matrix block, `tgmm`'s depth
-    tiles its cotangent's), only for a cooperative tile."""
+    the multiprocessors of a cluster (`cluster`: 2 pair two row tiles of one group of `gmm`, which load
+    their matrix block once between them, multicast), only for a cooperative tile; `tgmm` takes no pair;
+    and the instruction family's bundle that runs it (`family`: Hopper's warpgroup MMA, or Ampere's
+    mma.sync, one warpgroup whose loads `emit_pipeline` issues, the plain product alone); and the programs
+    a multiprocessor runs at once (`programs`, at most its family's, `mosaic.Family.programs`), each in its
+    share of the multiprocessor's shared memory (`mosaic.program_shared`)."""
     block_m: int
     block_n: int
     block_k: int
@@ -69,14 +87,93 @@ class Tiles:
     grid_block_n: int
     warpgroups: int = 1
     cluster: int = 1
+    family: str = 'wgmma'
+    programs: int = 1
 
     def __post_init__(self):
         paired = self.cluster == 2 and self.warpgroups == 1
         if self.warpgroups not in (1, 2) or self.cluster not in (1, 2) or paired:
             raise ValueError(f"{self}: one warpgroup alone, or two in a cluster of one or two "
                              "multiprocessors")
-        if self.warpgroups == 2 and (self.block_n % 2 or self.block_m % 2):
-            raise ValueError(f"{self}: two warpgroups halve the tile's columns and rows")
+        if self.family not in ('wgmma', 'mma.sync') or (self.family == 'mma.sync' and self.cluster != 1):
+            raise ValueError(f"{self}: Hopper's warpgroup MMA, or Ampere's mma.sync on one multiprocessor")
+        wide = self.family == 'wgmma' and self.block_n > 256
+        if self.warpgroups == 2 and (self.block_m % 128 or wide):
+            # Each consumer's half of the rows is a role's, a multiple of 64 rows, and on warpgroup MMA at
+            # most 256 columns.
+            raise ValueError(f"{self}: two warpgroups halve the tile's rows into whole roles")
+        if self.warpgroups == 2 and self.stages < 2:
+            # A stage is released a step late (an MMA in flight), so one stage would wait on itself.
+            raise ValueError(f"{self}: two warpgroups stream at least two stages")
+
+
+def derived(family, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, holds,
+            grouped: bool) -> Tiles | None:
+    """The one tile a GEMM mainloop runs on `family` for a call whose output has `rows` rows (a group's,
+    on average, where `grouped`: a product's rows split among its groups) and `width` columns and whose
+    steps run over `depth` (None: a group's rows, padded to whole steps), from the family's facts, the
+    call's extents and the device's multiprocessors alone (no table, no ranking;
+    docs/design/kernel-templates.md §7). `holds(tile)` is the launch's legality on the device (its
+    staged bytes within a block, its registers within a consumer's: `Template.legal`).
+
+    - Columns: the widest the family's one product spans (`Family.widest_product`) that divides the
+      call's width in its column unit, which reads its rows' slice fewest times a FLOP (each instruction
+      reads the columns' block whole) and writes its output in the longest runs.
+    - Consumers: as many roles as the family has (`Family.consumers`), a warpgroup each, or one where
+      rows a tile must divide (not grouped) take no whole role for each, or where no tile of them holds.
+    - Programs: the most a multiprocessor runs at once that the family's registers hold at those
+      consumers (`Family.programs`) and whose share of its shared memory (`mosaic.program_shared`) holds
+      a tile, one at least; a wave is all of them.
+    - Rows: the most, in whole roles of its consumers, its consumers' registers hold
+      (`mosaic.held_rows`, `mosaic.tile_registers`), and no more than the call's rows rounded up to a
+      role's or, where grouped, half a group's in whole roles, at least one role (each group takes a
+      partial tile more, so at half its rows that tile adds at most a third of its work).
+    - Step: the family's widest depth dividing the call's (`Family.depths`) at those rows, a shallower
+      one before fewer rows (a family whose products read registers holds a step's fragments).
+    - Stages: the deepest a block holds (`holds`, `mosaic.deepest`), at least those the walk keeps busy
+      (one loading ahead beside the one consumed and, on a family that keeps its products in flight,
+      the one in flight: `_IN_FLIGHT`); a tile that cannot stage that deep gives way to the next
+      narrower or shorter one.
+    - Band: the planar snake's column tiles a band (`mosaic.band`), the rows' and the columns' blocks
+      balanced over a wave or, grouped, wider while a wave spans each group's row tiles whole.
+
+    None where no tile holds."""
+    unit = family.column_unit(dtype)
+    widest = min(width, family.widest_product or width)
+    columns = [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0]
+    steps = [step for step in family.depths(dtype) if depth is None or depth % step == 0]
+    busy = 2 + (0 if family.operands_in_registers else _IN_FLIGHT)
+
+    def tiled(consumers: int, programs: int) -> Tiles | None:
+        role = family.role_rows * consumers
+        shared = mosaic.program_shared(family.most_shared, programs)
+        most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
+        fallback = None
+        for block_n in columns:
+            for block_m in range(min(most_rows, mosaic.held_rows(family, consumers, block_n)), 0, -role):
+                band = mosaic.band(multiprocessors * programs, block_m, block_n, width // block_n,
+                                   -(-rows // block_m) if grouped else None)
+                # More rows before a deeper step: each reads the columns' block fewer times a FLOP, where
+                # a step's depth only sets how many steps a tile takes (and, in registers, its fragments').
+                for step in steps:
+                    tile = mosaic.deepest(
+                        lambda stages, block_m=block_m, block_n=block_n, step=step, band=band: Tiles(
+                            block_m, block_n, step, stages, band, warpgroups=consumers, family=family.name,
+                            programs=programs),
+                        holds, shared // ((block_m + block_n) * step))
+                    if tile is None:
+                        continue
+                    if tile.stages >= busy:
+                        return tile
+                    fallback = fallback or tile
+        return fallback
+
+    # Rows a tile divides (a kernel gradient's) that take no whole role for each consumer take one, as
+    # does a call no cooperative tile holds (a wide epilogue's outputs past a block).
+    whole = grouped or rows % (family.role_rows * family.consumers) == 0
+    return next((tile for consumers in dict.fromkeys((family.consumers if whole else 1, 1))
+                 for programs in range(family.programs(consumers), 0, -1)
+                 if (tile := tiled(consumers, programs)) is not None), None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -84,7 +181,6 @@ class GroupInfo:
     """Information regarding the group being processed in a block."""
 
     group_id: jax.Array
-    block: jax.Array
     block_start: jax.Array
     actual_start: jax.Array
     actual_end: jax.Array
@@ -92,46 +188,51 @@ class GroupInfo:
     actual_size: jax.Array
 
     @classmethod
-    def create(cls, group_lengths, tile, tid):
-        """Get the group info for the current block."""
-
+    def create(cls, table, tile, tid):
+        """Dew: the group info of row tile `tid`, read from `tile_groups`' table (its group, its first row,
+        its group's first and past-last row) rather than walked over every group's length in each tile."""
         tile = jnp.int32(tile)
-        group_boundaries = [group_lengths[i] for i in range(len(group_lengths))]
-
-        # We usually only have very few groups, so we unroll the loop processing
-        # them. Normally we'd break out of the loop early, once we'd have found our
-        # boundary, but we can't do that when unrolling, so we rely on many selects
-        # to mask out the epilogue of the loop.
-        group_end = group_start = block = group = end = jnp.array(0, dtype=jnp.int32)
-
-        for i, b in enumerate(group_boundaries):
-            # Start/end are inclusive
-            start = end
-            end = start + b
-            final = end - 1
-            start_block = lax.div(start, tile)
-            final_block = lax.div(final, tile)
-            block_end = final_block + 1
-            tid_begin = start_block + i
-            tid_end = block_end + i
-            # How many blocks after is our block?
-            this_is_group = (tid_begin <= tid) & (tid < tid_end)
-            block = lax.select(this_is_group, tid - tid_begin + start_block, block)
-            group = lax.select(this_is_group, jnp.int32(i), group)
-            group_start = lax.select(this_is_group, start, group_start)
-            group_end = lax.select(this_is_group, end, group_end)
-
-        block_start = block * tile
+        group, block_start, group_start, group_end = (table[tid, column] for column in range(4))
+        # Mosaic's copies and stores read a slice's start as a multiple of the rows its tiling takes.
+        block_start = pl.multiple_of(block_start, TMA_ROWS)
         actual_start = jnp.maximum(group_start, block_start)
         actual_end = jnp.minimum(group_end, block_start + tile)
         start_within_block = actual_start - block_start
         actual_size = actual_end - actual_start
-        return cls(group_id=group, block=block, block_start=block_start, actual_start=actual_start,
+        return cls(group_id=group, block_start=block_start, actual_start=actual_start,
                    actual_end=actual_end, start_within_block=start_within_block, actual_size=actual_size)
 
 
-def _compiler_params():
-    return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup)
+def tile_groups(lengths: jax.Array, tile: int, tiles: int) -> jax.Array:
+    """Dew: each row tile's group info for `GroupInfo.create`, in XLA before the launch: of tiles `0` to
+    `tiles`, the group (`lengths`' index), the tile's first row, and its group's first and past-last row,
+    int32 `[tiles, 4]`; a tile no group reaches, zeros. A group's tiles start at its first row (rounded
+    down to the 8 rows a TMA descriptor tiles by, `TMA_ROWS`), whole tiles after it, as CUTLASS's grouped
+    GEMM tiles each group: a group of up to a tile's rows reads its matrix once, where tiles on the
+    product's own row grid read it once a tile the group touches (two for most of Kimi Linear's
+    128-row experts at 128-row tiles). The tiles number at most `cdiv(rows, tile)` plus the groups less
+    one (a ceiling's sum exceeds the sum's ceiling by at most one a part). Upstream's
+    `GroupInfo.create` walked every group's length in every tile, unrolled: at 129 groups (Qwen3's 128
+    experts and the unrouted rows) two thirds of a down projection's instructions, and its global loads a
+    third of its stalls (NCU-full)."""
+    lengths = lengths.astype(jnp.int32)
+    ends = jnp.cumsum(lengths)
+    starts = ends - lengths
+    rows = jnp.int32(tile)
+    first_rows = starts // TMA_ROWS * TMA_ROWS
+    counts = lax.div(ends - first_rows + rows - 1, rows) * (lengths > 0)
+    firsts = jnp.cumsum(counts) - counts
+    tids = jnp.arange(tiles, dtype=jnp.int32)[:, None]
+    ours = (firsts[None] <= tids) & (tids < (firsts + counts)[None])
+    group = jnp.argmax(ours, axis=1).astype(jnp.int32)
+    found = jnp.any(ours, axis=1)
+    block_start = first_rows[group] + (tids[:, 0] - firsts[group]) * rows
+    columns = (group, block_start, starts[group], ends[group])
+    return jnp.stack([jnp.where(found, column, 0) for column in columns], axis=1)
+
+
+TMA_ROWS = 8
+"""The rows a TMA descriptor tiles by, to which `gmm` pads its rows and a group's first tile starts."""
 
 
 def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, transpose_rhs: bool,
@@ -145,7 +246,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
 
 Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of `lhs` (a cooperative
     tile's consumer, half its rows) in its shared memory stage before the warpgroup MMA reads it;
-    `epilogue(acc, *side_tiles)` each fp32 accumulator tile (a cooperative consumer's, half its columns),
+    `epilogue(acc, *side_tiles)` each fp32 accumulator tile (a cooperative consumer's, half its rows),
     returning one output or a tuple of them (`out_dtypes`). A side operand's dimensions follow the launch
     axes its `*_axes` entry names, 'rows' and 'depth' for the prologue's, 'rows' and 'columns' for the
     epilogue's, each brought to shared memory by TMA."""
@@ -156,369 +257,185 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         k2, n = n, k2
     if k != k2 or k % block_k or n % block_n:
         raise ValueError(f"a [{rows}, {k}] x [{g}, {k2}, {n}] product does not take {tiles}")
+    dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
+    if k == 0:
+        # Dew: a product of no depth sums nothing, its rows zeros through the epilogue on whole arrays (its
+        # hooks are a tile's elementwise arithmetic), with no launch: a walk of no steps has no block of the
+        # matrix to view (JAX 0.12 refuses a zero-extent slice).
+        zeros = jnp.zeros((rows, n), jnp.float32)
+        values = (zeros,) if epilogue is None else epilogue(zeros, *epilogue_operands)
+        values = values if isinstance(values, tuple) else (values,)
+        outs = tuple(value.astype(dtype) for value, dtype in zip(values, dtypes, strict=True))
+        return outs if out_dtypes else outs[0]
     # Dew: a TMA descriptor tiles the rows by 8, so they are padded to a multiple of 8, and the rows past
     # the routed ones, the padding among them, are a last group, whose tiles store zeros.
-    lhs = _rows_padded(lhs)
+    lhs = rows_padded(lhs, 0, TMA_ROWS)
     m = lhs.shape[0]
     lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
+    row_tile = tiles.block_m * tiles.cluster
+    table = tile_groups(lengths, row_tile, pl.cdiv(m, row_tile) + g)
     prologue_operands = tuple(_side_padded(side, axes) for side, axes in zip(prologue_operands, prologue_axes,
                                                                                strict=True))
     epilogue_operands = tuple(_side_padded(side, axes) for side, axes in zip(epilogue_operands, epilogue_axes,
                                                                                strict=True))
-    dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
-    launch = _gmm_cooperative if tiles.warpgroups == 2 else _gmm_alone
-    outs = launch(lhs, rhs, lengths, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs, dtypes=dtypes,
-                  multiprocessors=multiprocessors, interpret=interpret,
-                  hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
-                  sides=(prologue_operands, epilogue_operands))
+    outs = _gmm_mainloop(lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
+                         dtypes=dtypes, multiprocessors=multiprocessors, interpret=interpret,
+                         hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
+                         sides=(prologue_operands, epilogue_operands))
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
 
 
-def _gmm_alone(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
-               multiprocessors: int, interpret, hooks: tuple, sides: tuple) -> tuple:
-    """`gmm`'s product at a tile one warpgroup computes, loading and multiplying (upstream's kernel), with
-    `_gmm_cooperative`'s arguments."""
+def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
+                  multiprocessors: int, interpret, hooks: tuple, sides: tuple) -> tuple:
+    """Dew: `gmm` on its instruction family's bundle (`family_of`): `tiles.warpgroups` consumer roles, each
+    its share of the rows by all the columns, one MMA a step (two: CUTLASS's cooperative split, 2-7% faster
+    on every H100 scoreboard row than halving the columns), persistent over the tiles in a planar snake,
+    the family owning the operands' streams across tiles, their staging and the outputs' stores
+    (`mosaic.Family.persist`). Each consumer's prologue rewrites its share of the rows' slot, its epilogue
+    takes its share of each side tile. `lhs` is padded; `table` is `tile_groups`' (`gmm`). One
+    multiprocessor a tile."""
+    family = family_of(tiles, lhs.dtype)
+    if tiles.cluster != 1:
+        raise ValueError(f"{tiles}: the bundles' streams go to one multiprocessor")
     prologue, prologue_axes, epilogue, epilogue_axes = hooks
     prologue_operands, epilogue_operands = sides
     m, n, k, g = shape
-    block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
-    side_count = len(prologue_operands) + len(epilogue_operands)
-
-    def body(rows_per_expert_gmem, lhs_gmem, rhs_gmem, *refs):
-        prologue_gmems = refs[:len(prologue_operands)]
-        epilogue_gmems = refs[len(prologue_operands):side_count]
-        o_gmems = refs[side_count:]
-        grid_m = pl.cdiv(m, block_m) + g  # Dew: g groups and the unrouted rows
-        grid_n = pl.cdiv(n, block_n)
-
-        @plgpu.nd_loop((grid_m * grid_n,), collective_axes="sm")
-        def mn_loop(loop_info: plgpu.NDLoopInfo):
-            mi, ni = plgpu.planar_snake(loop_info.index[0], (grid_m, grid_n), 1, tiles.grid_block_n)
-            group_info = GroupInfo.create(rows_per_expert_gmem, block_m, mi)
-            # Dew: each prologue side operand's block at the launch axes it follows.
-            side_block = {'rows': (block_m, lambda k: group_info.block), 'depth': (block_k, lambda k: k)}
-            side_specs = [plgpu.BlockSpec(tuple(side_block[axis][0] for axis in axes),
-                                          lambda k, axes=axes: tuple(side_block[axis][1](k) for axis in axes),
-                                          delay_release=1)
-                          for axes in prologue_axes]
-
-            def acc_scope(acc_ref):
-                def step(_, lhs_smem, rhs_smem, *side_smems):
-                    if prologue is not None:
-                        # Dew: the prologue rewrites the stage of `lhs` in place, which the one warpgroup
-                        # owns, before the MMA reads it.
-                        lhs_smem[...] = prologue(lhs_smem[...], *(side[...] for side in side_smems)).astype(
-                            lhs_smem.dtype)
-                        plgpu.commit_smem()
-                    plgpu.wgmma(acc_ref, lhs_smem, rhs_smem.transpose((1, 0)) if transpose_rhs else rhs_smem)
-
-                # Dew: the unrouted rows' tiles multiply nothing, their accumulator stays zero, and a grid
-                # slot past the last tile no group has (GroupInfo's group 0, no rows) multiplies nothing.
-                @pl.when((group_info.group_id < g) & (group_info.actual_size > 0))
-                def _():
-                    plgpu.emit_pipeline(
-                        step,
-                        grid=(k // block_k,),
-                        in_specs=[
-                            plgpu.BlockSpec((block_m, block_k), lambda k: (group_info.block, k),
-                                            delay_release=1),
-                            plgpu.BlockSpec((block_n, block_k) if transpose_rhs else (block_k, block_n),
-                                            lambda k: (ni, k) if transpose_rhs else (k, ni), delay_release=1),
-                            *side_specs,
-                        ],
-                        max_concurrent_steps=tiles.stages,
-                    )(lhs_gmem, rhs_gmem.at[jnp.minimum(group_info.group_id, g - 1)], *prologue_gmems)
-                return acc_ref[...]
-
-            acc = pl.run_scoped(acc_scope, plgpu.WGMMAAccumulatorRef((block_m, block_n)))
-            outs = (acc,) if epilogue is None else _epilogue(
-                epilogue, acc, epilogue_gmems, epilogue_axes, group_info.block_start, ni * block_n,
-                block_m, block_n)
-            # Dew: the rows past the routed ones multiplied nothing: each output there is the epilogue of a
-            # zero accumulator, zero without one.
-            for o_gmem, out in zip(o_gmems, outs, strict=True):
-                @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype))
-                def store_scope(o_smem, o_gmem=o_gmem, out=out):
-                    o_smem[...] = out.astype(o_smem.dtype)
-                    plgpu.commit_smem()
-
-                    # TMA descriptors need static extents, but how many rows to store is known only at run
-                    # time: a ladder of power-of-two stores (`_store_ladder`).
-                    _store_ladder(o_smem, o_gmem, group_info.block_start, group_info.start_within_block,
-                                  group_info.actual_size, ni * block_n, min(block_m, m))
-                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-
-    kernel = plgpu.kernel(
-        body,
-        # Dew: the output dtypes asked for, and the device's multiprocessors.
-        out_type=tuple(jax.ShapeDtypeStruct((m, n), dtype) for dtype in dtypes),
-        grid=(multiprocessors,),
-        grid_names=("sm",),
-        compiler_params=_compiler_params(),
-        interpret=interpret,
-    )
-    return kernel(lengths, lhs, rhs, *prologue_operands, *epilogue_operands)
-
-
-def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
-                     multiprocessors: int, interpret, hooks: tuple, sides: tuple) -> tuple:
-    """Dew: `gmm` at a tile two consumer warpgroups compute (half its columns each) beside a producer
-    issuing the loads (as `hopper_matmul_mgpu`); `tiles.cluster` 2 pairs two row tiles of one group, which
-    load each matrix block once, multicast. A prologue's consumers each rewrite half the rows' shared stage,
-    then meet. `lhs` is padded, `lengths` ends with the unrouted rows' group (`gmm`)."""
-    prologue, prologue_axes, epilogue, epilogue_axes = hooks
-    prologue_operands, epilogue_operands = sides
-    m, n, k, g = shape
-    block_m, block_n, block_k, pair = tiles.block_m, tiles.block_n, tiles.block_k, tiles.cluster
-    half, rows_half = block_n // 2, block_m // 2
-    side_shapes = [tuple({'rows': block_m, 'columns': half}[axis] for axis in axes) for axes in epilogue_axes]
-    # A pipeline's operands each follow its steps: a prologue side operand without depth is loaded once a
-    # tile.
-    stepped = tuple(i for i, axes in enumerate(prologue_axes) if 'depth' in axes)
+    block_m, block_n, block_k, consumers = tiles.block_m, tiles.block_n, tiles.block_k, tiles.warpgroups
+    if not family.bounded_loads:
+        # Its loads read past an operand unpredicated: a last row tile reads rows the padding holds, the
+        # side operands' rows as the rows' own.
+        lhs = jnp.pad(lhs, ((0, -m % block_m), (0, 0)))
+        prologue_operands = tuple(_side_padded(side, axes, block_m)
+                                  for side, axes in zip(prologue_operands, prologue_axes, strict=True))
+        epilogue_operands = tuple(_side_padded(side, axes, block_m)
+                                  for side, axes in zip(epilogue_operands, epilogue_axes, strict=True))
+    share = block_m // consumers
+    part = (share, block_n)
+    side_shapes = [tuple({'rows': part[0], 'columns': part[1]}[axis] for axis in axes)
+                   for axes in epilogue_axes]
+    # A stream for each operand that follows the steps, but a vector a family does not copy, which its
+    # step reads from global memory (`mosaic.Family.copies_vectors`); a prologue side operand without
+    # depth is loaded once a tile.
+    stepped = tuple(i for i, axes in enumerate(prologue_axes)
+                    if 'depth' in axes and (len(axes) > 1 or family.copies_vectors))
+    read = tuple(i for i, axes in enumerate(prologue_axes) if 'depth' in axes and i not in stepped)
     fixed = tuple(i for i, axes in enumerate(prologue_axes) if 'depth' not in axes)
     extent = {'rows': block_m, 'depth': block_k}
-    pipeline = functools.partial(_gmm_pipeline, tiles, transpose_rhs, k // block_k,
-                                 tuple(prologue_axes[i] for i in stepped))
+    steps = k // block_k
+    grid = (pl.cdiv(m, block_m) + g, n // block_n)  # g groups' boundaries, and the unrouted rows
+    rhs_block = (block_n, block_k) if transpose_rhs else (block_k, block_n)
 
-    def body(lengths_gmem, lhs_gmem, rhs_gmem, *refs):
+    def body(table_gmem, lhs_gmem, rhs_gmem, *refs):
         prologue_gmems, side_gmems, o_gmems = _split(refs, len(prologue_operands), len(epilogue_operands))
-        grid_m, grid_n = pl.cdiv(m, block_m * pair) + g, n // block_n  # pairs: g groups, the unrouted rows
-        rhs_columns = functools.partial(_matrix_columns, block_n=block_n, transpose_rhs=transpose_rhs)
+        blocks = {'rows': ((block_m, block_k), lhs_gmem.dtype), 'matrix': (rhs_block, rhs_gmem.dtype),
+                  **{f'side_{i}': (tuple(extent[axis] for axis in prologue_axes[i]), prologue_gmems[i].dtype)
+                     for i in stepped}}
 
-        def stepped_views(rows):
-            return [prologue_gmems[i].at[tuple(rows if axis == 'rows' else slice(None)
-                                               for axis in prologue_axes[i])] for i in stepped]
+        def schedule(index):
+            """A tile's whether it multiplies any row, its steps, its streams' views and its group and
+            column tile."""
+            mi, ni = plgpu.planar_snake(index[0], grid, 1, tiles.grid_block_n)
+            group = GroupInfo.create(table_gmem, block_m, mi)
+            views = _gmm_views(lhs_gmem, rhs_gmem, prologue_gmems, group, ni, tiles=tiles, groups=g,
+                               transpose_rhs=transpose_rhs, axes_of={i: prologue_axes[i] for i in stepped})
+            return (group.group_id < g) & (group.actual_size > 0), steps, views, (group, ni)
 
-        @functools.partial(
-            pl.run_scoped,
-            allocations=pipeline(_ignore, _ignore).get_allocations(
-                lhs_gmem.at[pl.ds(0, block_m)], rhs_columns(rhs_gmem.at[0], 0),
-                *stepped_views(pl.ds(0, block_m))),
-            o_smems=[plgpu.SMEM((2, block_m, half), gmem.dtype) for gmem in o_gmems],
-            **_staging('side', zip(side_shapes, side_gmems, strict=True)),
-            **_staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), prologue_gmems[i])
-                                 for i in fixed]),
-            halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
-            drained=_drained(tiles),
-            collective_axes="wg",
-        )
-        def scope(allocations, o_smems, side_smems, side_barriers, fixed_smems, fixed_barriers, halves,
-                  drained):
-            wg = lax.axis_index("wg")
-            cta = lax.axis_index("cluster") if pair == 2 else 0
-            mine_rows = pl.ds(wg * rows_half, rows_half)
-            fixed_refs = [smem.at[wg] for smem in fixed_smems]
+        def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, *, streams):
+            def consumer(wg, tile, walk, store, *, active):
+                group, ni = tile
+                row_start = group.block_start
+                fixed_refs = [smem.at[wg] for smem in fixed_smems]
+                if active:
+                    family.loaded([(prologue_gmems[i].at[pl.ds(row_start, block_m)], ref, barrier.at[wg])
+                                   for i, ref, barrier in zip(fixed, fixed_refs, fixed_barriers,
+                                                              strict=True)])
+                step = functools.partial(_gmm_step, family=family, prologue=prologue,
+                                         prologue_axes=prologue_axes,
+                                         fixed_tiles=dict(zip(fixed, fixed_refs, strict=True)),
+                                         read_tiles={i: prologue_gmems[i] for i in read},
+                                         mine_rows=pl.ds(wg * share, share), transpose_rhs=transpose_rhs,
+                                         interpret=bool(interpret))
+                # The unrouted rows, and a slot past the last tile, multiply nothing: zeros.
+                _, (acc,) = walk(step, None, (part,))
+                # This consumer's share of the tile: its first row, and its group's rows there.
+                part_row, column = row_start + wg * share, ni * block_n
+                first = jnp.clip(group.actual_start - part_row, 0, part[0])
+                stored = jnp.clip(group.actual_end - part_row, 0, part[0]) - first
+                origins = {'rows': pl.ds(part_row, part[0]), 'columns': pl.ds(column, part[1])}
+                family.loaded([(gmem.at[tuple(origins[axis] for axis in axes)], smem.at[wg], barrier.at[wg])
+                               for gmem, axes, smem, barrier
+                               in zip(side_gmems, epilogue_axes, side_smems, side_barriers, strict=True)])
+                values = (acc,) if epilogue is None else epilogue(acc, *(smem[wg] for smem in side_smems))
+                values = values if isinstance(values, tuple) else (values,)
+                for output, (o_gmem, value) in enumerate(zip(o_gmems, values, strict=True)):
+                    store(output, value, o_gmem, (part_row, first, stored, column, min(part[0], m)))
 
-            @plgpu.nd_loop((grid_m * grid_n,), collective_axes="cluster_grid")
-            def mn_loop(loop_info: plgpu.NDLoopInfo):
-                mi, ni = plgpu.planar_snake(loop_info.index[0], (grid_m, grid_n), 1, tiles.grid_block_n)
-                group_info = GroupInfo.create(lengths_gmem, block_m * pair, mi)
-                # This multiprocessor's row tile of the pair and its group's rows there.
-                row_block = group_info.block * pair + cta
-                row_start = row_block * block_m
-                first = jnp.clip(group_info.actual_start - row_start, 0, block_m)
-                stored = jnp.clip(group_info.actual_end - row_start, 0, block_m) - first
-                column = ni * block_n + wg * half
+            family.persist(streams, (grid[0] * grid[1],), schedule, consumer, consumers=consumers,
+                           axis="programs", outputs=tuple((part, dtype) for dtype in dtypes),
+                           interpret=bool(interpret), in_flight=_IN_FLIGHT)
 
-                def finish(acc):
-                    origins = {'rows': pl.ds(row_start, block_m), 'columns': pl.ds(column, half)}
-                    views = [gmem.at[tuple(origins[axis] for axis in axes)]
-                             for gmem, axes in zip(side_gmems, epilogue_axes, strict=True)]
-                    _finish_half(acc, epilogue, (views, side_smems, side_barriers), (o_gmems, o_smems),
-                                 (row_start, first, stored, column, min(block_m, m)), wg)
+        staged_sides = mosaic.staging('side', zip(side_shapes, side_gmems, strict=True))
+        staged_fixed = mosaic.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]),
+                                                 prologue_gmems[i]) for i in fixed])
+        family.scoped(scope, staged_sides['side_smems'], staged_sides['side_barriers'],
+                      staged_fixed['fixed_smems'], staged_fixed['fixed_barriers'],
+                      streams=family.streams(blocks, tiles.stages, consumers))
 
-                def context(run):
-                    _load_fixed([prologue_gmems[i].at[pl.ds(row_start, block_m)] for i in fixed], fixed_refs,
-                                fixed_barriers, wg)
-
-                    _finished(run, (block_m, half), drained, finish)
-
-                def mma(_, lhs_smem, rhs_smem, *rest):
-                    *side_smems, acc_ref = rest
-                    if prologue is not None:
-                        # This warpgroup's half of the rows, then the other's, before an MMA reads them all.
-                        tiles_of = dict(zip(stepped, side_smems, strict=True)) | dict(zip(fixed, fixed_refs,
-                                                                                          strict=True))
-                        _rewritten(prologue, prologue_axes, lhs_smem.at[mine_rows], tiles_of, 'rows',
-                                   mine_rows)
-                        _meet(halves)
-                    columns = pl.ds(wg * half, half)
-                    matrix = (rhs_smem.at[columns].transpose((1, 0)) if transpose_rhs
-                              else rhs_smem.at[:, columns])
-                    plgpu.wgmma(acc_ref, lhs_smem, matrix)
-                    # An MMA in flight: the next stage is prepared while this one runs.
-                    plgpu.wgmma_wait(_IN_FLIGHT)
-                    return acc_ref
-
-                # Both multiprocessors of a pair run its pipeline, or neither: they share its loads.
-                active = (group_info.group_id < g) & (group_info.actual_size > 0)
-
-                @pl.when(active)
-                def _():
-                    pipeline(mma, context)(
-                        lhs_gmem.at[pl.ds(row_start, block_m)],
-                        rhs_columns(rhs_gmem.at[jnp.minimum(group_info.group_id, g - 1)], ni),
-                        *stepped_views(pl.ds(row_start, block_m)),
-                        allocations=allocations)
-                    _drain(drained, wg)
-
-                # The unrouted rows, and a slot past the last tile, multiply nothing.
-                @pl.when(~active & (wg < 2))
-                def _():
-                    finish(jnp.zeros((block_m, half), jnp.float32))
-
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-
-    kernel = _cooperative_kernel(body, tuple(jax.ShapeDtypeStruct((m, n), dtype) for dtype in dtypes),
-                                 tiles=tiles, multiprocessors=multiprocessors, interpret=interpret)
-    return kernel(lengths, lhs, rhs, *prologue_operands, *epilogue_operands)
+    kernel = family.kernel(body, out_type=tuple(jax.ShapeDtypeStruct((m, n), dtype) for dtype in dtypes),
+                           grid=(multiprocessors,), grid_names=("programs",), consumers=consumers,
+                           interpret=interpret, approx_math=False, name="dew_gmm")
+    return kernel(table, lhs, rhs, *prologue_operands, *epilogue_operands)
 
 
-def _finished(run, shape: tuple[int, int], drained, finish) -> None:
-    """A consumer's output tile: `run` on a scoped warpgroup accumulator of `shape`, its MMAs waited
-    for, the tile reported drained (`drained`, the producer's cue to reload its stage), then `finish` of
-    its value."""
-    @functools.partial(pl.run_scoped, acc_ref=plgpu.WGMMAAccumulatorRef(shape))
-    def _(acc_ref):
-        run(acc_ref)
-        plgpu.wgmma_wait(0)
-        plgpu.barrier_arrive(drained)
-        finish(acc_ref[...])
+def _gmm_views(lhs_gmem, rhs_gmem, prologue_gmems, group, column_tile, *, tiles: Tiles, groups: int,
+               transpose_rhs: bool, axes_of: dict) -> dict:
+    """Dew: `gmm`'s streams' views at a tile (`group`'s rows, `column_tile`; `mosaic.viewed`): its rows',
+    its group's matrix's, and each prologue side operand's that follows the depth (`axes_of`, by
+    operand), step `j` each one's `j`-th depth block."""
+    rows = pl.ds(group.block_start, tiles.block_m)
+    matrix = _matrix_columns(rhs_gmem.at[jnp.minimum(group.group_id, groups - 1)], column_tile,
+                             block_n=tiles.block_n, transpose_rhs=transpose_rhs)
+    return {'rows': (lhs_gmem.at[rows], lambda j: (0, j)), 'matrix': (matrix, _rhs_index(transpose_rhs)),
+            **{f'side_{i}': (prologue_gmems[i].at[tuple(rows if axis == 'rows' else slice(None)
+                                                        for axis in axes)],
+                             lambda j, axes=axes: tuple(0 if axis == 'rows' else j for axis in axes))
+               for i, axes in axes_of.items()}}
 
 
-def _side_spec(axes: tuple, extent: dict, stepped: str) -> plgpu.BlockSpec:
-    """A side operand's block in shared memory: its tile at `extent` per launch axis, advancing along
-    `stepped` (the pipeline's axis) and fixed along the others, held one step longer for the MMA in
-    flight."""
-    return plgpu.BlockSpec(tuple(extent[axis] for axis in axes),
-                           lambda step: tuple(step if axis == stepped else 0 for axis in axes),
-                           memory_space=plgpu.SMEM, delay_release=_IN_FLIGHT)
-
-def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tuple, body, context):
-    """Dew: the cooperative `gmm`'s pipeline over the depth's `steps` blocks: the rows' stage, the matrix's
-    (multicast to a pair), and each prologue side operand's that has depth, in a producer warpgroup; a
-    stage stays one step longer, for the MMA in flight."""
-    extent = {'rows': tiles.block_m, 'depth': tiles.block_k}
-
-    def side_spec(axes):
-        return _side_spec(axes, extent, 'depth')
-
-    rhs_block = (tiles.block_n, tiles.block_k) if transpose_rhs else (tiles.block_k, tiles.block_n)
-    return plgpu.emit_pipeline_warp_specialized(
-        body,
-        grid=(steps,),
-        memory_registers=40,
-        in_specs=[plgpu.BlockSpec((tiles.block_m, tiles.block_k), lambda step: (0, step),
-                                  memory_space=plgpu.SMEM, delay_release=_IN_FLIGHT),
-                  plgpu.BlockSpec(rhs_block, _rhs_index(transpose_rhs), memory_space=plgpu.SMEM,
-                                  delay_release=_IN_FLIGHT, collective_axes=_shared(tiles)),
-                  *(side_spec(axes) for axes in side_axes)],
-        wg_axis="wg",
-        num_compute_wgs=2,
-        max_concurrent_steps=tiles.stages,
-        compute_context=context,
-    )
-
-
-def _cooperative_kernel(body, out_type, *, tiles: Tiles, multiprocessors: int, interpret):
-    """Dew: a cooperative kernel's launch: a pair of multiprocessors a cluster where `tiles.cluster` is 2,
-    persistent over them, three warpgroups a block (two consumers and a producer)."""
-    if multiprocessors < tiles.cluster:
-        raise ValueError(f"{tiles} pairs multiprocessors, and the launch has {multiprocessors} (an "
-                         "interpreter's one block does not model a cluster)")
-    return plgpu.kernel(
-        body,
-        out_type=out_type,
-        grid=(multiprocessors // tiles.cluster,),
-        grid_names=("cluster_grid",),
-        cluster=(tiles.cluster,),
-        cluster_names=("cluster",),
-        num_threads=3,
-        thread_name="wg",
-        compiler_params=_compiler_params(),
-        interpret=interpret,
-    )
-
-
-def _staging(name: str, shaped) -> dict:
-    """Dew: each consumer warpgroup's staging buffer for each side operand (`shaped`: its tile's shape and
-    its operand) and a barrier for each, as `{name}_smems` and `{name}_barriers`."""
-    shaped = list(shaped)
-    return {f'{name}_smems': [plgpu.SMEM((2, *shape), gmem.dtype) for shape, gmem in shaped],
-            f'{name}_barriers': [plgpu.Barrier(num_barriers=2) for _ in shaped]}
-
-
-def _load_fixed(views: list, refs: list, barriers: list, wg) -> None:
-    """Dew: each prologue side operand a tile reads whole (`views`), into this warpgroup's `refs`."""
-    for view, ref, barrier in zip(views, refs, barriers, strict=True):
-        plgpu.copy_gmem_to_smem(view, ref, barrier.at[wg])
-        plgpu.barrier_wait(barrier.at[wg])
+def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, prologue, prologue_axes: tuple,
+              fixed_tiles: dict, read_tiles: dict, mine_rows, transpose_rhs: bool, interpret: bool):
+    """Dew: a consumer's step of the cooperative `gmm` (`mosaic.Family.walk`): its half of the rows' slot,
+    rewritten by the prologue on its side tiles (the streamed ones' slots, the fixed ones' `fixed_tiles`,
+    a depth vector the family does not copy read at step `index` from global memory: `read_tiles`),
+    times the matrix's slot into its accumulator."""
+    stage = slots['rows']
+    if prologue is not None:
+        # This warpgroup's half of the rows, the only half its MMA reads.
+        depth = stage.shape[1]
+        tiles_of = {i: fixed_tiles[i] if i in fixed_tiles
+                    else read_tiles[i].at[pl.ds(index * depth, depth)] if i in read_tiles
+                    else slots[f'side_{i}'] for i in range(len(prologue_axes))}
+        _rewritten(prologue, prologue_axes, stage.at[mine_rows], tiles_of, 'rows', mine_rows)
+        family.published()
+    matrix = slots['matrix'].transpose((1, 0)) if transpose_rhs else slots['matrix']
+    (acc,) = accumulators
+    return nothing, (family.products(acc, stage.at[mine_rows], matrix, interpret),)
 
 
 def _rewritten(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> None:
-    """Dew: `mine`, this warpgroup's half of a stage both consumers read, rewritten by the prologue on its
-    side tiles (`tiles_of`, by operand) cut to the same half along the `halved` launch axis."""
+    """Dew: `mine`, this warpgroup's half of a stage, rewritten by the prologue on its side tiles
+    (`tiles_of`, by operand) cut to the same half along the `halved` launch axis; its reader publishes
+    the writes (`mosaic.Family.published`)."""
     cut = [tiles_of[i].at[tuple(half if axis == halved else slice(None) for axis in axes)][...]
            for i, axes in enumerate(axes_of)]
     mine[...] = prologue(mine[...], *cut).astype(mine.dtype)
-    plgpu.commit_smem()
-
-
-def _finish_half(acc, epilogue, sides: tuple, outs: tuple, place: tuple, wg) -> None:
-    """Dew: a consumer warpgroup's half tile: the epilogue on its side tiles (`sides`: their views at the
-    half tile, staging buffers and barriers), then its group's rows of each output (`outs`: the outputs
-    and their staging buffers) by `_store_ladder` (`place`: the tile's first row, the group's first row
-    in it and count, the half's first column, the most rows a rung stores)."""
-    row_start, first, stored, column, most = place
-    tiles_of = []
-    for view, smem, barrier in zip(*sides, strict=True):
-        plgpu.copy_gmem_to_smem(view, smem.at[wg], barrier.at[wg])
-        plgpu.barrier_wait(barrier.at[wg])
-        tiles_of.append(smem[wg])
-    values = (acc,) if epilogue is None else epilogue(acc, *tiles_of)
-    values = values if isinstance(values, tuple) else (values,)
-    for o_gmem, o_smem, value in zip(*outs, values, strict=True):
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-        o_smem[wg] = value.astype(o_smem.dtype)
-        plgpu.commit_smem()
-        _store_ladder(o_smem.at[wg], o_gmem, row_start, first, stored, column, most)
 
 
 _IN_FLIGHT = 1
-"""The MMAs the cooperative kernels keep in flight while they prepare the next stage. A pipeline's last
-stage is released one step late, past its end, so a persistent kernel's producer would load the next
-tile's first stages over one an MMA still reads: the consumers report each tile drained (`_drain`)."""
-
-
-def _drained(tiles: Tiles):
-    """Dew: the barrier the consumers report a tile drained at: both multiprocessors' of a pair (each
-    producer's next loads are multicast into both), a block's own otherwise."""
-    if tiles.cluster == 2:
-        return plgpu.ClusterBarrier(collective_axes=("cluster",), num_arrivals=2)
-    return plgpu.Barrier(num_arrivals=2)
-
-
-def _drain(drained, wg) -> None:
-    """Dew: the producer warpgroup waits until the consumers have finished the tile's MMAs (each arrives at
-    `drained` after its last wait; a pair's four, `_drained`) before its next tile's loads reuse the
-    pipeline's stages."""
-    pl.when(wg == 2)(lambda: plgpu.barrier_wait(drained))
-
-
-def _meet(halves) -> None:
-    """Dew: the two consumer warpgroups wait for each other at `halves`, two barriers of two arrivals, in
-    turn: neither arrives at a barrier's next phase before the other has seen its last, however the meets
-    fall (the interpreter's invariant, and the hardware's parity waits)."""
-    for barrier in (halves.at[0], halves.at[1]):
-        plgpu.barrier_arrive(barrier)
-        plgpu.barrier_wait(barrier)
-
-
-def _shared(tiles: Tiles) -> tuple[str, ...]:
-    """The axes a block a pair shares is loaded over, multicast: the cluster's, for a pair."""
-    return ("cluster",) if tiles.cluster == 2 else ()
+"""The MMAs the kernels keep in flight while they prepare the next stage (`mosaic.Family.walk`): a step's
+slots go back a step late, and a tile's last once its walk ends, before the next tile's loads reuse them."""
 
 
 def _split(refs: tuple, prologue: int, epilogue: int) -> tuple:
@@ -537,55 +454,13 @@ def _rhs_index(transpose_rhs: bool):
     return (lambda step: (0, step)) if transpose_rhs else (lambda step: (step, 0))
 
 
-def _ignore(*_, **__) -> None:
-    """A pipeline body or compute context that does nothing: the allocations a pipeline takes do not
-    depend on them (`hopper_matmul_mgpu`'s `ignore`)."""
-
-
-def _store_ladder(o_smem, o_gmem, row_start, first, stored, column, most: int) -> None:
-    """Dew: rows `first` to `first + stored` of `o_smem` to `o_gmem` at row `row_start + first` and
-    `column`, in a power-of-two ladder of TMA stores (a descriptor's extents are static), the largest
-    `most` rows' (`gmm`'s ladder)."""
-    start, size = first, most
-    while size:
-        rung = 1 << int(math.log2(size))
-        size //= 2
-
-        @pl.when(stored & rung != 0)
-        def _(start=start, rung=rung):
-            plgpu.copy_smem_to_gmem(o_smem.at[pl.ds(start, rung)],
-                                    o_gmem.at[pl.ds(row_start + start, rung), pl.ds(column, o_smem.shape[1])])
-
-        start = start + (stored & rung)
-
-
-def _epilogue(epilogue, acc, gmems, axes_of, row_start, column_start, block_m: int, block_n: int):
-    """Dew: `epilogue(acc, *side_tiles)` as a tuple of outputs, each side operand's tile brought to shared
-    memory by TMA at the output tile's rows and columns first."""
-    origins = {'rows': (row_start, block_m), 'columns': (column_start, block_n)}
-    shapes = [tuple(origins[axis][1] for axis in axes) for axes in axes_of]
-
-    smems = [plgpu.SMEM(shape, gmem.dtype) for shape, gmem in zip(shapes, gmems, strict=True)]
-
-    @functools.partial(pl.run_scoped, smems=smems, barriers=[plgpu.Barrier() for _ in gmems])
-    def scope(smems, barriers):
-        for gmem, smem, barrier, axes in zip(gmems, smems, barriers, axes_of, strict=True):
-            plgpu.copy_gmem_to_smem(gmem.at[tuple(pl.ds(*origins[axis]) for axis in axes)], smem, barrier)
-        for barrier in barriers:
-            plgpu.barrier_wait(barrier)
-        outs = epilogue(acc, *(smem[...] for smem in smems))
-        return outs if isinstance(outs, tuple) else (outs,)
-
-    return scope
-
-
 def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, out_dtype,
          multiprocessors: int, interpret: bool | plgpu.InterpretGPUParams = False, prologue=None,
          prologue_operands: tuple = (), prologue_axes: tuple = (), exact_sums: bool = False) -> jax.Array:
     """Each group's rows of `lhs` `[rows, depth]` transposed times its rows of `rhs` `[rows, width]`:
     `[groups, depth, width]` in `out_dtype`, an empty group's zero. The depth must divide by
-    `tiles.block_m` (a pair's two) and the width by `tiles.block_n`; `tiles.block_k` is the rows a step
-    takes.
+    `tiles.block_m` and the width by `tiles.block_n`, and the tile takes one multiprocessor;
+    `tiles.block_k` is the rows a step takes.
 
     Dew: `prologue(rows, *side_tiles)` transforms each `[block_k, block_m]` stage of `lhs`'s rows (a
     cooperative tile's consumer, half its depth) in place before the group masking and the MMA; side
@@ -596,247 +471,211 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     k, m = lhs.shape
     k2, n = rhs.shape
     g = group_sizes.shape[0]
-    if k != k2 or m % (block_m * tiles.cluster) or n % block_n:
+    if k != k2 or m % block_m or n % block_n or tiles.cluster != 1:
         raise ValueError(f"a [{k}, {m}] by [{k2}, {n}] kernel gradient does not take {tiles}")
-    # Dew: the rows padded to a multiple of 8, as `gmm`'s, past every group.
-    lhs, rhs = _rows_padded(lhs), _rows_padded(rhs)
+    # Dew: the rows padded to a multiple of 8, as `gmm`'s, past every group; to whole row blocks where the
+    # family's loads read past an operand unpredicated (its last group's last block).
+    multiple = 8 if family_of(tiles, lhs.dtype).bounded_loads else math.lcm(8, block_k)
+    lhs, rhs = rows_padded(lhs, 0, multiple), rows_padded(rhs, 0, multiple)
     k = lhs.shape[0]
-    prologue_operands = tuple(_side_padded(side, axes) for side, axes in zip(prologue_operands, prologue_axes,
-                                                                               strict=True))
+    prologue_operands = tuple(_side_padded(side, axes, multiple)
+                              for side, axes in zip(prologue_operands, prologue_axes, strict=True))
 
     group_sizes = group_sizes.astype(jnp.int32)
     group_starts, group_ends, group_num_blocks, group_block_starts = _group_blocks(group_sizes, block_k)
     out_dtype = jnp.dtype(out_dtype)
-    if tiles.warpgroups == 2:
-        return _tgmm_cooperative(
-            (lhs, rhs), (group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts),
-            (k, m, n, g), tiles=tiles, out_dtype=out_dtype, multiprocessors=multiprocessors,
-            interpret=interpret, prologue=prologue, prologue_operands=prologue_operands,
-            prologue_axes=prologue_axes, exact_sums=exact_sums)
-
-    def body(group_sizes_gmem, group_starts_gmem, group_ends_gmem, group_num_blocks_gmem,
-             group_block_starts_gmem, lhs_gmem, rhs_gmem, *refs):
-        *side_gmems, o_gmem = refs
-        grid_m = pl.cdiv(m, block_m)
-        grid_n = pl.cdiv(n, block_n)
-
-        @plgpu.nd_loop((g, grid_m * grid_n), collective_axes="sm")
-        def mn_loop(loop_info: plgpu.NDLoopInfo):
-            g_i = loop_info.index[0]
-            m_i, n_i = plgpu.planar_snake(loop_info.index[1], (grid_m, grid_n), 1, tiles.grid_block_n)
-
-            # This slice is potentially out of bounds, but we never access the out of bound part in
-            # emit_pipeline.
-            group_block_start = pl.multiple_of(group_block_starts_gmem[g_i], block_k)
-            gmem_slice = pl.ds(group_block_start, k)
-
-            side_specs, sides = _tgmm_sides(side_gmems, prologue_axes, gmem_slice, m_i, tiles)
-
-            def staged(block_idx, lhs_smem, rhs_smem, side_smems):
-                if prologue is not None:
-                    # Dew: the prologue rewrites the rows' stage in place, which the one warpgroup owns.
-                    lhs_smem[...] = prologue(lhs_smem[...], *(side[...] for side in side_smems)).astype(
-                        lhs_smem.dtype)
-                    plgpu.commit_smem()
-                _zero_neighbours(lhs_smem, rhs_smem, block_idx, group_starts_gmem[g_i],
-                                 group_ends_gmem[g_i], group_num_blocks_gmem[g_i], tiles)
-
-            pipeline = functools.partial(
-                plgpu.emit_pipeline, grid=(group_num_blocks_gmem[g_i],),
-                in_specs=[plgpu.BlockSpec((block_k, block_m), lambda k_i: (k_i, m_i),
-                                          delay_release=int(tiles.stages > 1)),
-                          plgpu.BlockSpec((block_k, block_n), lambda k_i: (k_i, n_i),
-                                          delay_release=int(tiles.stages > 1)),
-                          *side_specs],
-                max_concurrent_steps=tiles.stages)
-            operands = (lhs_gmem.at[gmem_slice, :], rhs_gmem.at[gmem_slice, :], *sides)
-            tile = o_gmem.at[g_i, pl.ds(m_i * block_m, block_m), pl.ds(n_i * block_n, block_n)]
-            nonempty = group_sizes_gmem[g_i] > 0  # Skip the group if it is empty.
-
-            summed = _exactly_summed_gradient if exact_sums else _summed_gradient
-            summed(pipeline, operands, staged, tile, nonempty, tiles)
-
-    kernel = plgpu.kernel(
-        body,
-        out_type=jax.ShapeDtypeStruct((g, m, n), out_dtype),
-        grid=(multiprocessors,),
-        grid_names=("sm",),
-        compiler_params=_compiler_params(),
-        interpret=interpret,
-    )
-    return kernel(group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts, lhs, rhs,
-                  *prologue_operands)
+    return _tgmm_streamed(
+        (lhs, rhs), (group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts),
+        (k, m, n, g), tiles=tiles, out_dtype=out_dtype, multiprocessors=multiprocessors,
+        interpret=interpret, prologue=prologue, prologue_operands=prologue_operands,
+        prologue_axes=prologue_axes, exact_sums=exact_sums)
 
 
-def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles, out_dtype,
+def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles, out_dtype,
                       multiprocessors: int, interpret, prologue, prologue_operands: tuple,
                       prologue_axes: tuple, exact_sums: bool) -> jax.Array:
-    """Dew: `tgmm`'s product at a tile two consumer warpgroups compute, each a half of its columns, beside a
-    producer warpgroup issuing the loads, with `tiles.cluster` 2 a pair of multiprocessors on two depth
-    tiles of one group, which load each step's cotangent block once between them, multicast. Both
-    warpgroups read the whole stage of the rows: each prepares a depth half of it (the prologue, the
-    neighbouring groups' rows zeroed) and its own column half of the cotangent's, and each waits for the
-    other's half before its MMA. `operands` are padded and `groups` is `_group_blocks`' with the sizes
-    first (`tgmm`)."""
+    """Dew: `tgmm`'s product at a tile `tiles.warpgroups` consumer roles compute, each its share of the depth
+    by all the columns, one MMA a step (two: CUTLASS's cooperative sm90 schedule), on its instruction
+    family's bundle (`family_of`), its streams running across the persistent loop's tiles where the family
+    streams so (the next tile's first row blocks load while the consumers store this one, which a group's
+    few rows, a tile's few steps, make most of the time). Each consumer reads its depth share of the rows'
+    stage, which it prepares (the prologue, the neighbouring groups' rows zeroed), and the whole
+    cotangent's, a column share of which each zeroes, waiting for the other's where a group boundary falls
+    in the step. A side operand with rows streams beside the operands; one without is loaded once a tile.
+    One multiprocessor a tile. `operands` are padded and `groups` is `_group_blocks`' with the sizes first
+    (`tgmm`)."""
     lhs, rhs = operands
-    k, m, n, g = shape
-    block_m, block_n, block_k, pair = tiles.block_m, tiles.block_n, tiles.block_k, tiles.cluster
-    half, depth_half = block_n // 2, block_m // 2
-    # A pipeline's operands each follow its steps: a side operand without rows is loaded once a tile.
-    stepped = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' in axes)
+    family = family_of(tiles, lhs.dtype)
+    _, m, n, g = shape
+    block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
+    consumers = tiles.warpgroups
+    depth_half = block_m // consumers
+    # Each consumer zeroes whole swizzled rows of the cotangent's stage (`_zeroed_share`), as many each as
+    # the stage's divide among them, the last's share short where they do not divide evenly.
+    atom = mosaic.SWIZZLE_BYTES // jnp.dtype(rhs.dtype).itemsize
+    atoms_each = -(-(block_n // atom) // consumers)
+    part = (depth_half, block_n)
+    grid = (m // block_m, n // block_n)
+    # A stream for each side operand with rows, but a vector a family does not copy, which its step reads
+    # from global memory (`mosaic.Family.copies_vectors`).
+    stepped = tuple(i for i, axes in enumerate(prologue_axes)
+                    if 'rows' in axes and (len(axes) > 1 or family.copies_vectors))
+    read = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' in axes and i not in stepped)
     fixed = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' not in axes)
     extent = {'rows': block_k, 'depth': block_m}
-    pipeline = functools.partial(_tgmm_pipeline, tiles, tuple(prologue_axes[i] for i in stepped))
 
     def body(sizes_gmem, starts_gmem, ends_gmem, blocks_gmem, block_starts_gmem, lhs_gmem, rhs_gmem, *refs):
         *side_gmems, o_gmem = refs
-        grid_m, grid_n = m // (block_m * pair), n // block_n
 
-        def views(rows, depth, columns):
-            """The pipeline's operands at a group's rows (from its first block) and a tile's depth and
-            columns."""
-            sides = [side_gmems[i].at[tuple(rows if axis == 'rows' else depth for axis in prologue_axes[i])]
-                     for i in stepped]
-            return lhs_gmem.at[rows, depth], rhs_gmem.at[rows, columns], *sides
+        def schedule(index):
+            """A tile's whether its group has rows, its row blocks, its streams' views (step `j` its
+            group's `j`-th row block at the tile's depth and columns), and its group, depth and columns."""
+            g_i = index[0]
+            m_i, n_i = plgpu.planar_snake(index[1], grid, 1, tiles.grid_block_n)
+            depth, columns = pl.ds(m_i * block_m, block_m), pl.ds(n_i * block_n, block_n)
+            first = pl.multiple_of(block_starts_gmem[g_i], block_k) // block_k
+            steps = jnp.where(sizes_gmem[g_i] > 0, blocks_gmem[g_i], 0)
 
-        @functools.partial(
-            pl.run_scoped,
-            allocations=pipeline(_ignore, _ignore, tiles.stages).get_allocations(
-                *views(pl.ds(0, k), pl.ds(0, block_m), pl.ds(0, block_n))),
-            o_smem=plgpu.SMEM((2, block_m, half), out_dtype),
-            **_staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), side_gmems[i])
-                                 for i in fixed]),
-            halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
-            drained=_drained(tiles),
-            collective_axes="wg",
-        )
-        def scope(allocations, o_smem, fixed_smems, fixed_barriers, halves, drained):
-            wg = lax.axis_index("wg")
-            cta = lax.axis_index("cluster") if pair == 2 else 0
-            mine_depth, mine_columns = pl.ds(wg * depth_half, depth_half), pl.ds(wg * half, half)
-            fixed_refs = [smem.at[wg] for smem in fixed_smems]
+            def row_block(j):
+                return first + j, 0
 
-            @plgpu.nd_loop((g, grid_m * grid_n), collective_axes="cluster_grid")
-            def mn_loop(loop_info: plgpu.NDLoopInfo):
-                g_i = loop_info.index[0]
-                pair_i, n_i = plgpu.planar_snake(loop_info.index[1], (grid_m, grid_n), 1, tiles.grid_block_n)
-                depth = pl.ds((pair_i * pair + cta) * block_m, block_m)
-                # This slice may run past the rows; the pipeline reads only the group's blocks.
-                rows = pl.ds(pl.multiple_of(block_starts_gmem[g_i], block_k), k)
-                steps, start, end = blocks_gmem[g_i], starts_gmem[g_i], ends_gmem[g_i]
+            views = {'ring_0': (lhs_gmem.at[:, depth], row_block),
+                     'ring_1': (rhs_gmem.at[:, columns], row_block),
+                     **{f'ring_{2 + position}': (
+                         side_gmems[i].at[tuple(slice(None) if axis == 'rows' else depth
+                                                for axis in prologue_axes[i])],
+                         lambda j, axes=prologue_axes[i]: tuple(first + j if axis == 'rows' else 0
+                                                                for axis in axes))
+                        for position, i in enumerate(stepped)}}
+            return steps > 0, steps, views, (g_i, depth, columns, steps)
 
-                def staged(step, lhs_smem, rhs_smem, side_smems):
-                    """This warpgroup's depth half of the rows' stage and column half of the cotangent's,
-                    ready; then the other's half, before an MMA reads the whole stage."""
-                    mine = lhs_smem.at[:, mine_depth]
-                    if prologue is not None:
-                        tiles_of = dict(zip(stepped, side_smems, strict=True)) | dict(zip(fixed, fixed_refs,
-                                                                                          strict=True))
-                        _rewritten(prologue, prologue_axes, mine, tiles_of, 'depth', mine_depth)
-                    boundary = _zero_neighbours_of((mine, rhs_smem.at[:, mine_columns]), step, start, end,
-                                                   steps, block_k)
-                    plgpu.commit_smem()
-                    if prologue is not None:
-                        _meet(halves)
-                    else:
-                        pl.when(boundary)(lambda: _meet(halves))
+        blocks = [((block_k, block_m), lhs_gmem), ((block_k, block_n), rhs_gmem),
+                  *((tuple(extent[axis] for axis in prologue_axes[i]), side_gmems[i]) for i in stepped)]
+        fixed_staging = mosaic.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]),
+                                                  side_gmems[i]) for i in fixed])
 
-                def mma(indices, lhs_smem, rhs_smem, *rest):
-                    *side_smems, carry = rest
-                    staged(indices[0], lhs_smem, rhs_smem, side_smems)
-                    return _gradient_step(lhs_smem, rhs_smem.at[:, mine_columns], carry, exact_sums)
+        def scope(fixed_smems, fixed_barriers, halves, *, streams):
+            names = tuple(f'ring_{i}' for i in range(len(blocks)))
 
-                def store(acc):
-                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-                    o_smem[wg] = acc.astype(o_smem.dtype)
-                    plgpu.commit_smem()
-                    plgpu.copy_smem_to_gmem(o_smem.at[wg],
-                                            o_gmem.at[g_i, depth, pl.ds(n_i * block_n + wg * half, half)])
+            def consumer(wg, tile, walk, store, *, active):
+                g_i, depth, columns, steps = tile
+                mine_depth = pl.ds(wg * depth_half, depth_half)
+                mine_columns = (wg * atoms_each, atoms_each, atoms_each * consumers > block_n // atom)
+                fixed_refs = [smem.at[wg] for smem in fixed_smems]
+                group = (starts_gmem[g_i], ends_gmem[g_i], steps, block_k)
+                first = pl.multiple_of(block_starts_gmem[g_i], block_k) // block_k
+                if active:
+                    family.loaded([(side_gmems[i].at[tuple(depth for _ in prologue_axes[i])], ref,
+                                    barrier.at[wg])
+                                   for i, ref, barrier in zip(fixed, fixed_refs, fixed_barriers,
+                                                              strict=True)])
 
-                def context(run):
-                    _load_fixed([side_gmems[i].at[tuple(depth for _ in prologue_axes[i])] for i in fixed],
-                                fixed_refs, fixed_barriers, wg)
-                    if exact_sums:
-                        zeros = jnp.zeros((block_m, half), jnp.float32)
-                        summed = run(plgpu.layout_cast(zeros, plgpu.Layout.WGMMA))
-                        plgpu.barrier_arrive(drained)
-                        store(summed)
-                        return
+                def staged_at(index, slots):
+                    # A vector read from global memory at the step's row block (`read`).
+                    read_refs = {i: side_gmems[i].at[pl.ds((first + index) * block_k, block_k)] for i in read}
+                    hook = (None if prologue is None
+                            else (prologue, prologue_axes, stepped, fixed, fixed_refs, read_refs))
+                    return _staged_halves(family, [slots[name] for name in names], (index, *group),
+                                          (mine_depth, mine_columns), hook,
+                                          halves if consumers == 2 else None)
 
-                    _finished(run, (block_m, half), drained, store)
+                # An empty group's tile reads none and stores zeros.
+                summed = _walked_gradient(family, walk, staged_at, part, exact_sums, bool(interpret))
+                store(0, summed, o_gmem.at[g_i],
+                      (depth.start + wg * depth_half, 0, depth_half, columns.start, depth_half))
 
-                nonempty = sizes_gmem[g_i] > 0  # an empty group's tile is zero
+            family.persist(streams, (g, grid[0] * grid[1]), schedule, consumer, consumers=consumers,
+                           axis="programs", outputs=((part, out_dtype),), interpret=bool(interpret),
+                           in_flight=_IN_FLIGHT)
 
-                @pl.when(nonempty)
-                def _():
-                    pipeline(mma, context, steps)(*views(rows, depth, pl.ds(n_i * block_n, block_n)),
-                                                  allocations=allocations)
-                    _drain(drained, wg)
+        family.scoped(scope, fixed_staging['fixed_smems'], fixed_staging['fixed_barriers'],
+                      mosaic.meeting(consumers),
+                      streams=family.streams({f'ring_{i}': (block, gmem.dtype)
+                                              for i, (block, gmem) in enumerate(blocks)}, tiles.stages,
+                                             consumers))
 
-                @pl.when(~nonempty & (wg < 2))
-                def _():
-                    store(jnp.zeros((block_m, half), jnp.float32))
-
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-
-    kernel = _cooperative_kernel(body, jax.ShapeDtypeStruct((g, m, n), out_dtype), tiles=tiles,
-                                 multiprocessors=multiprocessors, interpret=interpret)
+    kernel = family.kernel(body, out_type=jax.ShapeDtypeStruct((g, m, n), out_dtype),
+                           grid=(multiprocessors,), grid_names=("programs",), consumers=consumers,
+                           interpret=interpret, approx_math=False, name="dew_tgmm")
     return kernel(*groups, lhs, rhs, *prologue_operands)
 
 
-def _tgmm_pipeline(tiles: Tiles, side_axes: tuple, body, context, steps):
-    """Dew: the cooperative `tgmm`'s pipeline over a group's `steps` row blocks: the rows' stage, the
-    cotangent's (multicast to a pair), and each side operand's that has rows, in a producer warpgroup; a
-    stage stays one step longer, for the MMA in flight."""
-    extent = {'rows': tiles.block_k, 'depth': tiles.block_m}
-
-    def side_spec(axes):
-        return _side_spec(axes, extent, 'rows')
-
-    return plgpu.emit_pipeline_warp_specialized(
-        body,
-        grid=(steps,),
-        memory_registers=40,
-        in_specs=[plgpu.BlockSpec((tiles.block_k, tiles.block_m), lambda step: (step, 0),
-                                  memory_space=plgpu.SMEM, delay_release=_IN_FLIGHT),
-                  plgpu.BlockSpec((tiles.block_k, tiles.block_n), lambda step: (step, 0),
-                                  memory_space=plgpu.SMEM, delay_release=_IN_FLIGHT,
-                                  collective_axes=_shared(tiles)),
-                  *(side_spec(axes) for axes in side_axes)],
-        wg_axis="wg",
-        num_compute_wgs=2,
-        max_concurrent_steps=tiles.stages,
-        compute_context=context,
-    )
-
-
-def _gradient_step(rows_smem, cotangent_smem, carry, exact_sums: bool):
-    """Dew: one step of a kernel gradient tile, the rows' stage transposed times the cotangent's, into the
-    carry: the accumulator itself, or with `exact_sums` the running fp32 sum, which the step's product,
-    summed apart, joins by an IEEE add (a tensor core's accumulation truncates each add)."""
-    if not exact_sums:
-        plgpu.wgmma(carry, rows_smem.transpose((1, 0)), cotangent_smem)
-        plgpu.wgmma_wait(_IN_FLIGHT)
-        return carry
-
-    def step_scope(step_ref):
-        plgpu.wgmma(step_ref, rows_smem.transpose((1, 0)), cotangent_smem)
-        plgpu.wgmma_wait(0)
-        return step_ref[...]
-
-    return carry + pl.run_scoped(step_scope, plgpu.WGMMAAccumulatorRef(carry.shape))
+def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tuple, hook, halves) -> tuple:
+    """Dew: a streamed kernel gradient step's operands for one consumer warpgroup, from its `stages` (the
+    rows', the cotangent's, then each side operand's with rows): its depth half of the rows, rewritten by
+    the prologue (`hook`: it, its operands' axes, which are stepped and which fixed, the fixed ones' tiles
+    and the vectors read from global memory, by operand), and the whole cotangent, the neighbouring
+    groups' rows zeroed in its shares of both (`group`: the step, the group's first and last row, its
+    steps, the rows a step takes; `mine`: its depth half, and its first swizzled row of the cotangent's,
+    how many, and whether the last consumer's share runs short of them), the other's share awaited at
+    `halves`
+    where it zeroed any. Both consumers' MMAs read the whole cotangent stage, so each zeroes its share of
+    it and they meet where a group boundary falls in the step, the kernel's one exchange between them."""
+    rows_stage, cotangent_stage, *side_stages = stages
+    mine_depth, (first_atom, atoms_each, short) = mine
+    if hook is not None:
+        prologue, axes_of, stepped, fixed, fixed_refs, read_refs = hook
+        tiles_of = (dict(zip(stepped, side_stages, strict=True)) | dict(zip(fixed, fixed_refs, strict=True))
+                    | read_refs)
+        _rewritten(prologue, axes_of, rows_stage.at[:, mine_depth], tiles_of, 'depth', mine_depth)
+    atom = mosaic.SWIZZLE_BYTES // jnp.dtype(cotangent_stage.dtype).itemsize
+    atoms = cotangent_stage.shape[1] // atom
+    # Its depth half's swizzled rows, each its own, and its share of the cotangent's, the last consumer's
+    # past the stage's end held (`atoms_each` rounds the share up).
+    shares = [(rows_stage.at[:, pl.ds(mine_depth.start + column, atom)], None)
+              for column in range(0, mine_depth.size, atom)]
+    shares += [(cotangent_stage.at[:, pl.ds((first_atom + j) * atom, atom)],
+                first_atom + j < atoms if short else None) for j in range(atoms_each)]
+    boundary = _zero_neighbours_of(family, shares, *group)
+    family.published()
+    if halves is not None:
+        pl.when(boundary)(lambda: mosaic.meet(halves))
+    return rows_stage.at[:, mine_depth].transpose((1, 0)), cotangent_stage
 
 
-def _zero_neighbours_of(refs: tuple, step, start, end, steps, block_k: int):
-    """Dew: in a group's first and last row blocks, zero each of `refs` (`[block_k, columns]` stages) on the
-    rows a neighbouring group holds, by selection; whether `step` is either block."""
+def _walked_gradient(family: mosaic.Family, walk, staged, shape: tuple, exact_sums: bool, interpret: bool):
+    """Dew: a streamed kernel gradient tile's steps (`walk`, a tile's of `mosaic.Family.persist`;
+    `staged(index, slots)` their operands), summed into an fp32 tile of `shape`: as the tensor cores add, or
+    with `exact_sums` each step's product summed apart and added into the running sum by an IEEE add (a
+    tensor core's accumulation truncates each add). A tile of no steps is zero."""
+    if exact_sums:
+        def exact_step(index, slots, running, accumulators):
+            lhs, rhs = staged(index, slots)
+            if interpret:
+                # The in-place product's own arithmetic: the CPU's dots sum in IEEE fp32 either way.
+                return family.products(running, lhs, rhs, interpret=True), accumulators
+            return running + family.product(lhs, rhs, shape), accumulators
+
+        running, _ = walk(exact_step, family.zeros(shape), ())
+        return running
+
+    def step(index, slots, nothing, accumulators):
+        (acc,) = accumulators
+        lhs, rhs = staged(index, slots)
+        return nothing, (family.products(acc, lhs, rhs, interpret),)
+
+    _, (summed,) = walk(step, None, (shape,))
+    return summed
+
+
+def _zero_neighbours_of(family: mosaic.Family, refs: list, step, start, end, steps, block_k: int):
+    """Dew: in a group's first and last row blocks, zero each of `refs` (`[block_k, columns]` stages, each
+    one swizzled row wide, so one holds a thread's few registers whatever the tile's width; each with
+    whether it is held, None where always) on the rows a neighbouring group holds, by selection; whether
+    `step` is either block."""
     first, last = step == 0, step == steps - 1
 
     def zero(kept):
-        for ref in refs:
-            values = ref[...]
-            rows = plgpu.layout_cast(lax.broadcasted_iota(jnp.int32, values.shape, 0), plgpu.Layout.WGMMA)
-            ref[...] = jnp.where(kept(rows), values, jnp.zeros_like(values))
+        for ref, held in refs:
+            def zeroed(ref=ref):
+                values = family.tile_of(ref)
+                rows = family.iota((values.shape[0], values.shape[1]), 0)
+                ref[...] = jnp.where(kept(rows), values, jnp.zeros_like(values))
+
+            if held is None:
+                zeroed()
+            else:
+                pl.when(held)(zeroed)
 
     pl.when(first)(lambda: zero(lambda rows: rows >= lax.rem(start, block_k)))
     pl.when(last)(lambda: zero(lambda rows: rows <= lax.rem(end - 1, block_k)))
@@ -852,115 +691,7 @@ def _group_blocks(group_sizes: jax.Array, block_k: int) -> tuple:
     return group_starts, group_ends, (group_block_ends - group_block_starts) // block_k, group_block_starts
 
 
-def _tgmm_sides(side_gmems, axes_of, gmem_slice, m_i, tiles: Tiles) -> tuple[list, list]:
-    """Dew: each prologue side operand's block spec and its view: its rows the group's slice as `lhs`'s,
-    wherever they are among its dimensions, its depth the tile's."""
-    block = {'rows': (tiles.block_k, lambda k_i: k_i), 'depth': (tiles.block_m, lambda k_i: m_i)}
-
-    def spec(axes):
-        return plgpu.BlockSpec(tuple(block[axis][0] for axis in axes),
-                               lambda k_i: tuple(block[axis][1](k_i) for axis in axes),
-                               delay_release=int(tiles.stages > 1))
-
-    views = [side.at[tuple(gmem_slice if axis == 'rows' else slice(None) for axis in axes)]
-             for side, axes in zip(side_gmems, axes_of, strict=True)]
-    return [spec(axes) for axes in axes_of], views
-
-
-def _zero_neighbours(lhs_smem, rhs_smem, block_idx, start, end, blocks, tiles: Tiles) -> None:
-    """Dew: the first and last blocks of a group may hold a neighbour's rows, which both operands zero by
-    selection, so a neighbour's NaN or infinity stays out."""
-    @pl.when(block_idx == 0)
-    def _():
-        start_index = lax.rem(start, tiles.block_k)
-        _zero_rows(lhs_smem, rhs_smem, lambda rows: rows >= start_index, tiles.block_k, tiles.block_m,
-                   tiles.block_n)
-
-    @pl.when(block_idx == blocks - 1)
-    def _():
-        last_index = lax.rem(end - 1, tiles.block_k)
-        _zero_rows(lhs_smem, rhs_smem, lambda rows: rows <= last_index, tiles.block_k, tiles.block_m,
-                   tiles.block_n)
-
-
-def _summed_gradient(pipeline, operands, staged, tile, nonempty, tiles: Tiles) -> None:
-    """Dew: a kernel gradient tile's sum over its group's row steps, each step's product into one
-    accumulator by the warpgroup MMA, stored to `tile`; an empty group's zero."""
-    def acc_scope(acc_ref):
-        def block_matmul(block_idx, lhs_smem, rhs_smem, *side_smems):
-            staged(block_idx[0], lhs_smem, rhs_smem, side_smems)
-            plgpu.wgmma(acc_ref, lhs_smem.transpose((1, 0)), rhs_smem)
-            if tiles.stages == 1:
-                # Without delayed release, we won't have at least two separate smem blocks in flight, so
-                # we cannot rely on the implicit wait of wgmma to guarantee that the data in smem is ready
-                # to be overwritten by the next pipeline iteration.
-                plgpu.wgmma_wait(0)
-
-        @pl.when(nonempty)
-        def _():
-            pipeline(block_matmul)(*operands)
-
-        return acc_ref[...]
-
-    _store_gradient_tile(pl.run_scoped(acc_scope, plgpu.WGMMAAccumulatorRef((tiles.block_m, tiles.block_n))),
-                         tile)
-
-
-def _exactly_summed_gradient(pipeline, operands, staged, tile, nonempty, tiles: Tiles) -> None:
-    """Dew: `_summed_gradient` with each step's product summed apart in a fresh accumulator, then added
-    into the running fp32 sum, the pipeline's carry, by an IEEE add: a tensor core's accumulation
-    truncates each add."""
-    shape = (tiles.block_m, tiles.block_n)
-
-    def exact_step(block_idx, lhs_smem, rhs_smem, *rest):
-        *side_smems, running = rest
-        staged(block_idx[0], lhs_smem, rhs_smem, side_smems)
-
-        def step_scope(step_ref):
-            plgpu.wgmma(step_ref, lhs_smem.transpose((1, 0)), rhs_smem)
-            return step_ref[...]
-
-        return running + pl.run_scoped(step_scope, plgpu.WGMMAAccumulatorRef(shape))
-
-    zeros = plgpu.layout_cast(jnp.zeros(shape, jnp.float32), plgpu.Layout.WGMMA)
-
-    @pl.when(nonempty)
-    def _():
-        _store_gradient_tile(pipeline(exact_step, init_carry=zeros)(*operands), tile)
-
-    @pl.when(~nonempty)
-    def _():
-        _store_gradient_tile(zeros, tile)
-
-
-def _store_gradient_tile(acc, o_gmem) -> None:
-    """Dew: a kernel gradient's tile in the output's own dtype, an fp32 gradient above all."""
-    @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM(acc.shape, dtype=o_gmem.dtype))
-    def store_scope(o_smem):
-        o_smem[...] = acc.astype(o_smem.dtype)
-        plgpu.commit_smem()
-        plgpu.copy_smem_to_gmem(o_smem, o_gmem)
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-
-
-def _rows_padded(array: jax.Array, axis: int = 0) -> jax.Array:
-    """`array` with zeros after its own along `axis` up to a multiple of 8, the rows a TMA descriptor tiles
-    by."""
-    pad = -array.shape[axis] % 8
-    widths = tuple((0, pad if dim == axis else 0) for dim in range(array.ndim))
-    return jnp.pad(array, widths) if pad else array
-
-
-def _side_padded(side: jax.Array, axes: tuple) -> jax.Array:
-    """A side operand padded as the rows are along the dimension that follows them, wherever it is."""
-    return _rows_padded(side, axes.index('rows')) if 'rows' in axes else side
-
-
-def _zero_rows(lhs_smem, rhs_smem, kept, block_k: int, block_m: int, block_n: int) -> None:
-    """Zero the rows of both staged blocks, `[block_k, block_m]` and `[block_k, block_n]`, that `kept`
-    (of each row's index) turns down, by selection."""
-    for ref, columns in ((lhs_smem, block_m), (rhs_smem, block_n)):
-        values = ref[...]
-        rows = plgpu.layout_cast(lax.broadcasted_iota(jnp.int32, (block_k, columns), 0), plgpu.Layout.WGMMA)
-        ref[...] = jnp.where(kept(rows), values, jnp.zeros_like(values))
-    plgpu.commit_smem()
+def _side_padded(side: jax.Array, axes: tuple, multiple: int = 8) -> jax.Array:
+    """A side operand padded as the rows are along the dimension that follows them, wherever it is: to a
+    multiple of 8 (a TMA descriptor's tiling), or of `multiple` (a family's unpredicated loads)."""
+    return rows_padded(side, axes.index('rows'), multiple) if 'rows' in axes else side

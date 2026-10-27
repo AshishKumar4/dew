@@ -563,7 +563,8 @@ def test_analytical_count_equals_every_forward_dot_and_convolution(family):
 
 @pytest.mark.parametrize("kind", ["gdn", "kda", "ssd", "mamba"])
 def test_recurrent_state_macs_are_algorithm_independent_and_scan_aware(kind):
-    """Three delta MACs, two SSD/Mamba MACs, executed once per real token."""
+    """Three delta MACs and the one-pass update's readout (`readout_products`), two SSD/Mamba MACs,
+    executed once per real token."""
     batch, length, heads, key, value = 2, 7, 2, 3, 5
     q = jnp.ones((batch, length, heads, key))
     v = jnp.ones((batch, length, heads, value))
@@ -572,7 +573,7 @@ def test_recurrent_state_macs_are_algorithm_independent_and_scan_aware(kind):
         g = jnp.zeros((batch, length, heads, key) if kind == "kda" else (batch, length, heads))
         rule = recurrent_delta_rule if kind == "kda" else recurrent_gated_delta_rule
         counted = forward_products(rule, q, q, v, g, beta, state_mac=True)
-        assert counted == 6 * batch * length * heads * key * value
+        assert counted == 6 * batch * length * heads * key * value + 2 * batch * length * heads * key
     elif kind == "ssd":
         b = jnp.ones((batch, length, heads, key))
         counted = forward_products(recurrent_ssd, v, beta, jnp.ones((heads,)), b, b,
@@ -601,7 +602,20 @@ def test_remaining_recurrent_and_latent_modules_match_token_paths(model):
     projection."""
     x = jnp.ones((2, 1, 8))
     variables = model.init(jax.random.key(202), x)
-    assert model.model_flops(np.array([1, 1])) == forward_products(model.apply, variables, x, state_mac=True)
+    assert (model.model_flops(np.array([1, 1])) + readout_products(model, 2)
+            == forward_products(model.apply, variables, x, state_mac=True))
+
+
+def readout_products(model, tokens: int) -> int:
+    """The `q . k` product a delta rule's token takes beside its analytic rule's three state products
+    (`delta_flops`): the token scan is the decode step's one-pass update (`recurrence.update`), whose
+    output reads the old state and adds the token's own write by `q . k`, two a key dimension and a value
+    head."""
+    if isinstance(model, GatedDeltaNet):
+        return 2 * tokens * model.num_v_heads * model.head_k_dim
+    if isinstance(model, KimiDeltaAttention):
+        return 2 * tokens * model.num_heads * model.head_dim
+    return 0
 
 
 @pytest.mark.parametrize("kind", ["sparse", "latent", "gpt_oss", "gemma4"])

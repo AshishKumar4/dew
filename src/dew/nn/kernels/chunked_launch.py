@@ -5,9 +5,9 @@
 
 """What the chunked recurrences' launches share: the token spans of a call's sequences, packed
 documents each its own (`Sequences`, fla's `cu_seqlens`, `chunk_indices` and `chunk_offsets`), a
-chunk's place and its masked loads and stores, and the tiles a launch is measured over (`Tiles`,
-`_Launch`). The recurrence template's stages (`dew.nn.kernels.recurrence`) and the ported kernels
-(`fla_gdn`, `fla_kda`) read them alike.
+chunk's place and its masked loads and stores, and the tiles a launch takes (`Tiles`, `_Launch`). The
+recurrence template's stages (`dew.nn.kernels.recurrence`) and the ported kernels (`fla_gdn`,
+`fla_kda`) read them alike.
 """
 
 import dataclasses
@@ -35,32 +35,22 @@ class Tiles:
     bh: int = 0
 
 
+def _even(batch: int, length: int, count: int) -> jax.Array:
+    """`cu_seqlens` of `count` sequences over `batch` rows of `length` tokens, at least one a row as
+    every packed call's, none crossing a row: each row cut as evenly as its share, the first rows'
+    shares one larger."""
+    shares = [count // batch + (row < count % batch) for row in range(batch)]
+    cuts = [row * length + piece * length // share
+            for row, share in enumerate(shares) for piece in range(share)]
+    return jnp.asarray([*cuts, batch * length], jnp.int32)
+
+
 @dataclasses.dataclass(frozen=True)
 class _Launch(tuning.KernelOp):
-    """One of the port's launches, its `Tiles` measured per GPU model and shape over its 16-bit
-    `SPACES` by the tuner, `PICKS` its heuristic. A subclass names its kernel, the arguments whose
-    widths clip its blocks, and its tiles (`_spaces`, `_picks`)."""
+    """One of the port's launches, its `Tiles` by activation dtype and GPU block `PICKS`. A subclass names
+    its kernel, the arguments whose widths clip its blocks, and its tiles (`_picks`)."""
 
     config_cls: ClassVar[type[Tiles]] = Tiles
-    NAME: ClassVar[str]
-    KEYS: ClassVar[str | None] = None
-    VALUES: ClassVar[str | None] = None
-    SPACES: ClassVar[Mapping[bool, frozenset[Tiles]]]
-    PICKS: ClassVar[Mapping[tuple[str, bool], Tiles]]
-
-    def _tiles(self, ba, tiles: Tiles) -> Tiles:
-        """`tiles` with its blocks clipped to the call's key and value widths."""
-        bk, bv = (block if name is None else min(block, ba.arguments[name].shape[-1])
-                  for block, name in ((tiles.bk, self.KEYS), (tiles.bv, self.VALUES)))
-        return dataclasses.replace(tiles, bk=bk, bv=bv)
-
-    def _get_heuristics_config(self, ba) -> Tiles:
-        return self._tiles(ba, self.PICKS[_dtype(ba.arguments[self.KEYS or self.VALUES or "g"]), _wide()])
-
-    def _get_autotuning_configs(self, ba) -> set[Tiles]:
-        if _dtype(ba.arguments[self.KEYS or self.VALUES or "g"]) == "float32":
-            return {self._get_heuristics_config(ba)}
-        return {self._tiles(ba, tiles) for tiles in self.SPACES[_wide()]}
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Normal floats, and chunk and sequence descriptors (`Sequences`) a timed launch can run: the
@@ -81,42 +71,28 @@ class _Launch(tuning.KernelOp):
         return [jnp.asarray(drawn.chunks if spec.shape[-1] == 4 else drawn.spans)
                 if spec.dtype == jnp.int32 and spec.ndim == 2 else array
                 for spec, array in zip(specs, arrays, strict=True)]
+    NAME: ClassVar[str]
+    KEYS: ClassVar[str | None] = None
+    VALUES: ClassVar[str | None] = None
+    PICKS: ClassVar[Mapping[tuple[str, bool], Tiles]]
 
+    def _tiles(self, ba, tiles: Tiles) -> Tiles:
+        """`tiles` with its blocks clipped to the call's key and value widths."""
+        bk, bv = (block if name is None else min(block, ba.arguments[name].shape[-1])
+                  for block, name in ((tiles.bk, self.KEYS), (tiles.bv, self.VALUES)))
+        return dataclasses.replace(tiles, bk=bk, bv=bv)
 
-def _even(batch: int, length: int, count: int) -> jax.Array:
-    """`cu_seqlens` of `count` sequences over `batch` rows of `length` tokens, at least one a row as
-    every packed call's, none crossing a row: each row cut as evenly as its share, the first rows'
-    shares one larger."""
-    shares = [count // batch + (row < count % batch) for row in range(batch)]
-    cuts = [row * length + piece * length // share
-            for row, share in enumerate(shares) for piece in range(share)]
-    return jnp.asarray([*cuts, batch * length], jnp.int32)
-
-
-def _tiles(blocks, warps, stages) -> frozenset[Tiles]:
-    return frozenset(Tiles(bk, bv, w, s) for bk, bv in blocks for w in warps for s in stages)
-
-
-def _spaces(wide: frozenset[Tiles],
-            narrow: frozenset[Tiles] | None = None) -> Mapping[bool, frozenset[Tiles]]:
-    """A launch's 16-bit tiles to measure on a GPU whose block holds an A100's shared memory (True) and
-    on one of 99 KB: fla's own autotune lists for the kernel (chunk_delta_h.py:41-44, 350-353;
-    chunk_o.py:35-37, 151-153, 339-341, 444-446; wy_fast.py:31-33, 111-113; cumsum.py:26-27;
-    chunk_scaled_dot_kkt.py:24-27; chunk_intra.py:33-39; gla/chunk.py:335-344; chunk_bwd.py:331), the
-    blocks fla picks by heuristic tried at both of its sizes; `narrow` where the 99 KB one differs. A
-    candidate that a call's shape puts past a GPU's block is the tuner's to drop where it measures
-    (`tuning`); the heuristics (`_picks`) are compiled by Triton on a CPU at the training shapes and
-    the widest keys (tests/test_kernel_configs.py)."""
-    return {True: wide, False: wide if narrow is None else narrow}
+    def _get_heuristics_config(self, ba) -> Tiles:
+        return self._tiles(ba, self.PICKS[_dtype(ba.arguments[self.KEYS or self.VALUES or "g"]), _wide()])
 
 
 def _picks(tiles: Tiles, *, small: Tiles | None = None, wide_bf16: Tiles | None = None,
            wide_fp32: Tiles | None = None,
            small_fp32: Tiles | None = None) -> Mapping[tuple[str, bool], Tiles]:
-    """A launch's tiles without a measurement, by activation dtype and whether the GPU's block holds
-    an A100's shared memory: `tiles`, fla's A100 choice, where no other is named; `small`, fla's
-    narrower pick for 99 KB devices; fp32 runs the tests, not training, so its space is its pick
-    alone."""
+    """A launch's tiles by activation dtype and whether the GPU's block holds an A100's shared memory:
+    `tiles`, fla's A100 choice, where no other is named; `small`, fla's narrower pick for 99 KB devices.
+    The picks are compiled by Triton on a CPU at the training shapes and the widest keys
+    (tests/test_kernel_configs.py)."""
     small = tiles if small is None else small
     return {("bfloat16", True): wide_bf16 or tiles, ("bfloat16", False): small,
             ("float32", True): wide_fp32 or tiles, ("float32", False): small_fp32 or small}
@@ -129,9 +105,9 @@ def _dtype(x) -> str:
 
 def _wide() -> bool:
     """Whether the GPU's block (its assumed generation's off a GPU) holds an A100's shared memory: a GPU
-    the targets do not list takes the 99 KB picks, which every Triton GPU's block holds, and a CPU's
-    interpretation an A100's."""
-    target = generation.effective(generation.gpu_target())
+    the targets do not list takes the 99 KB picks, which every Triton GPU's block holds, as a CPU does that
+    states no GPU it emulates."""
+    target = generation.gpu_target()
     return (target.shared_limit or 0) >= (generation.TARGETS["sm80"].shared_limit or 0)
 
 
