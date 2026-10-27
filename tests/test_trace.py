@@ -26,3 +26,12 @@ def test_a_nested_last_kernel_does_not_shorten_a_traced_window():
     split = window_split([("nested", 30.5, 40.25), ("long_kernel", 10.25, 100.75)])
     assert (split["busy"], split["compute"], split["window"]) == (90.5, 90.5, 90.5)
     assert split["idle_input"] == split["idle_host"] == 0
+
+
+def test_a_tpus_collective_ops_are_its_communication():
+    """A TPU's `XLA Ops` line names each op after its HLO instruction: an all-reduce there, and its async
+    halves, move data between devices as NCCL's kernels do on a GPU, and count as communication, the part no
+    compute ran beside exposed."""
+    split = window_split([("fusion.1", 0, 10), ("all-reduce-start.2", 5, 12), ("all-reduce-done.2", 12, 15),
+                          ("convolution.3", 15, 20)])
+    assert (split["compute"], split["communication"], split["exposed_communication"]) == (15, 10, 5)

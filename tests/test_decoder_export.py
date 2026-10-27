@@ -551,7 +551,7 @@ def test_a_failed_export_ends_with_its_own_error(tmp_path):
                           str(FIXTURES / "qwen3-tiny"), "main", str(out)], capture_output=True, text=True,
                          env=environment | {"JAX_PLATFORMS": "cpu", "PYTHONPATH": str(REPO_ROOT / "src")},
                          timeout=300)
-    assert run.returncode != 0 and "Traceback" in run.stderr, run.stderr[-2000:]
+    assert run.returncode == 1, run.stderr[-2000:]
 
 
 def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it(tmp_path):

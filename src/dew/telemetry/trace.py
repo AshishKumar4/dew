@@ -17,29 +17,29 @@ import re
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
-
-
-class KernelEvent(Protocol):
-    """The fields a kernel's event is read by: `Kernel`'s, as `device_events` reads them."""
-
-    @property
-    def name(self) -> str: ...
-    @property
-    def start_ns(self) -> int: ...
-    @property
-    def end_ns(self) -> int: ...
-    @property
-    def duration_ns(self) -> int: ...
-    @property
-    def stats(self) -> Iterable[tuple[str, object]]: ...
-
 
 # NCCL names its kernels after the collective it runs:
 # `ncclDevKernel_AllGather_RING_LL`, `ncclDevKernel_ReduceScatter_Sum_bf16_RING_LL`,
 # `ncclDevKernel_SendRecv` (collective-permute and all-to-all), and the same
 # with `ncclKernel_` before NCCL 2.19.
-COLLECTIVES = ("AllReduce", "AllGather", "ReduceScatter", "SendRecv", "Broadcast", "Reduce")
+NCCL_COLLECTIVES = ("AllReduce", "AllGather", "ReduceScatter", "SendRecv", "Broadcast", "Reduce")
+
+COLLECTIVES = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "collective-permute")
+"""The HLO ops that move data between devices. XLA runs some as an async
+pair, `<op>-start` and `<op>-done`, and wraps others in `async-start` over a
+computation that holds the op itself."""
+
+
+def collective(op: str) -> str | None:
+    """The collective (`COLLECTIVES`) HLO op `op` is, or runs half of; None for any other."""
+    kind = op.removesuffix("-start").removesuffix("-done")
+    return kind if kind in COLLECTIVES else None
+
+
+def communicates(name: str) -> bool:
+    """Whether a kernel named `name` moves data between devices: NCCL's (torch's and a GPU's), or an HLO
+    collective's (`collective`), as a TPU's `XLA Ops` line names its ops (`all-reduce.1`)."""
+    return "nccl" in name.lower() or collective(name.split(".", 1)[0]) is not None
 
 
 @dataclass(frozen=True)
@@ -54,7 +54,7 @@ class Kernel:
     stats: tuple[tuple[str, object], ...]
 
 
-def device_events(directory: str | Path) -> tuple[dict[str, list[KernelEvent]], list[str]]:
+def device_events(directory: str | Path) -> tuple[dict[str, list[Kernel]], list[str]]:
     """The kernel events of the newest JAX trace under `directory`, by device
     plane (`/device:GPU:0`) in the trace's order, and the names of every
     device line.
@@ -69,11 +69,11 @@ def device_events(directory: str | Path) -> tuple[dict[str, list[KernelEvent]], 
     traces = sorted(Path(directory).rglob("*.xplane.pb"), key=os.path.getmtime)
     if not traces:
         raise FileNotFoundError(f"no xplane.pb under {directory}")
-    planes: dict[str, list[KernelEvent]] = {}
+    planes: dict[str, list[Kernel]] = {}
     lines = set()
-    # The trace's planes, lines and events are views into `data`, which lives to the loop's end.
-    data = ProfileData.from_file(str(traces[-1]))
-    for plane in data.planes:
+    # The trace's planes, lines and events are views into `capture`, which lives to the loop's end.
+    capture = ProfileData.from_file(str(traces[-1]))
+    for plane in capture.planes:
         match = re.match(r"/device:(GPU|TPU):\d+", plane.name)
         if match is None:
             continue
@@ -87,7 +87,7 @@ def device_events(directory: str | Path) -> tuple[dict[str, list[KernelEvent]], 
     return planes, sorted(lines)
 
 
-def program_of(event: KernelEvent) -> str | None:
+def program_of(event: Kernel) -> str | None:
     """The XLA program a kernel ran for, from its `program_id` stat (XProf's hlo_stats name programs so); none
     for a host transfer, which no program launches."""
     return next((str(value) for name, value in event.stats if name == "program_id"), None)
@@ -137,11 +137,12 @@ def window_split[Time: (int, float)](events: Sequence[tuple[str, Time, Time]]) -
     Times keep the input unit, JAX nanoseconds or torch microseconds.
 
     `window` runs from the first kernel's start to the last one's end and
-    `busy` is the union of every kernel. A kernel is a collective when NCCL
-    runs it and compute otherwise: `compute` and `communication` are their
-    unions, and `exposed_communication` the collective time no compute kernel
-    ran beside, what overlap did not hide. Each of `COLLECTIVES` gets the union
-    of its own kernels. The idle rest is split by what ends each gap: a
+    `busy` is the union of every kernel. A kernel is a collective where it moves
+    data between devices (`communicates`: NCCL's, or an HLO collective a TPU's
+    ops are named after) and compute otherwise: `compute` and `communication` are
+    their unions, and `exposed_communication` the collective time no compute
+    kernel ran beside, what overlap did not hide. Each of `NCCL_COLLECTIVES` gets
+    the union of its own kernels. The idle rest is split by what ends each gap: a
     host-to-device copy (`idle_input`, the device waited on a batch) or
     anything else (`idle_host`, it waited on dispatch or host work). So the
     window is compute + exposed_communication + idle_input + idle_host.
@@ -157,15 +158,15 @@ def window_split[Time: (int, float)](events: Sequence[tuple[str, Time, Time]]) -
         if start > high:
             idle["idle_input" if _host_to_device(name) else "idle_host"].append((high, start))
         high = max(high, end)
-    collectives = [(name, start, end) for name, start, end in ordered if "nccl" in name.lower()]
-    compute = union([(start, end) for name, start, end in ordered if "nccl" not in name.lower()])
+    collectives = [(name, start, end) for name, start, end in ordered if communicates(name)]
+    compute = union([(start, end) for name, start, end in ordered if not communicates(name)])
     every = union([(start, end) for _, start, end in collectives])
     figures = {
         "window": high - ordered[0][1], "busy": busy_time([(start, end) for _, start, end in ordered]),
         "compute": length(compute), "communication": length(every),
         "exposed_communication": length(every) - overlap(every, compute),
         **{key: length(spans) for key, spans in idle.items()}}
-    for kind in COLLECTIVES:
+    for kind in NCCL_COLLECTIVES:
         figures[kind] = length(union([
             (start, end) for name, start, end in collectives
             if f"_{kind.lower()}_" in f"_{name.lower()}_".replace("(", "_")]))
@@ -183,27 +184,24 @@ def window_totals[Time: (int, float)](
     return totals
 
 
-def hlo_collective(event: KernelEvent, collectives: Sequence[str]) -> str | None:
-    """The HLO collective of `collectives` an NCCL kernel ran for, from XLA's hlo_op stat, which tells
+def hlo_collective(event: Kernel) -> str | None:
+    """The HLO collective (`COLLECTIVES`) an NCCL kernel ran for, from XLA's hlo_op stat, which tells
     apart the all-to-all and collective-permute that NCCL runs as the same SendRecv kernel."""
     for name, value in event.stats:
         if name == "hlo_op" and isinstance(value, str):
             spelled = value.replace("_", "-")
-            return next((op for op in collectives if spelled.startswith(op)), None)
+            return next((op for op in COLLECTIVES if spelled.startswith(op)), None)
     return None
 
 
-def communication_totals(devices: Sequence[Sequence[KernelEvent]],
-                         collectives: Sequence[str]) -> dict[str, int]:
-    """Per-device window totals and the busy and exposed time of each HLO collective of `collectives`
-    (`dew.telemetry.instrumentation.COLLECTIVES`, which an XLA trace's caller passes: this module
-    imports nothing of Dew's, for a torch environment's tools)."""
+def communication_totals(devices: Sequence[Sequence[Kernel]]) -> dict[str, float]:
+    """Per-device window totals and the busy and exposed time of each HLO collective (`COLLECTIVES`)."""
     kernels = [[(event.name, event.start_ns, event.end_ns) for event in events] for events in devices]
     totals = window_totals(kernels)
     for events, records in zip(devices, kernels, strict=True):
-        compute = union([(start, end) for name, start, end in records if "nccl" not in name.lower()])
-        ops = [hlo_collective(event, collectives) for event in events]
-        for op in collectives:
+        compute = union([(start, end) for name, start, end in records if not communicates(name)])
+        ops = [hlo_collective(event) for event in events]
+        for op in COLLECTIVES:
             spans = union([(start, end) for (_, start, end), of in zip(records, ops, strict=True)
                            if of == op])
             key = op.replace("-", "_")

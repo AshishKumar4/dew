@@ -55,9 +55,9 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 from dew.nn.kernels.generation import gpu_target
-from dew.telemetry.instrumentation import HloInstruction, collective, custom_call_kind, hlo_instructions
+from dew.telemetry.instrumentation import HloInstruction, custom_call_kind, hlo_instructions
 from dew.telemetry.profile import report_table
-from dew.telemetry.trace import device_events, overlap, program_of, union, window_split
+from dew.telemetry.trace import collective, device_events, overlap, program_of, union, window_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from trace_window import program_times
@@ -192,10 +192,9 @@ def program_window(capture: Path, step: str) -> dict[str, float] | None:
     into the time other programs' kernels ran in them (`other_programs`) and the device's own
     `idle`. A host transfer, which no program launches, counts where it falls in the window. None
     where the capture holds no accelerator timeline (a CPU's)."""
-    try:
-        planes, _ = device_events(capture)
-    except FileNotFoundError:
+    if not any(capture.rglob("*.xplane.pb")):
         return None
+    planes, _ = device_events(capture)
     found = []
     for events in planes.values():
         mine = [(event.name, event.start_ns, event.end_ns) for event in events if program_of(event) == step]
@@ -323,7 +322,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         # is utilization only when every GEMM is bf16 and otherwise a bf16-equivalent throughput;
         # mfu_mixed, each GEMM's FLOPs over its own precision's peak, the true utilization, null where
         # an FP8 GEMM runs on a device with no FP8 peak in Dew's table.
-        seconds = figure["busy"] * 1e-3 if figure else None
+        seconds = timeline["busy"] / steps / 1e9 if timeline else None
         fp8 = fp8_gflop * 1e9
         throughput = round(model_flops / seconds / 1e12, 2) if seconds else None
         result.update(model_flops_per_step=model_flops, fp8_gemm_flops_per_step=fp8,
