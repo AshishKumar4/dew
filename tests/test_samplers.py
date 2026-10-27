@@ -973,25 +973,23 @@ def test_lms_walks_a_variance_exploding_grid_near_float32s_largest():
                               [1.0, 0.5, 0.25]))
     # Every step's arithmetic is exact in binary on this grid: the walk is the exact one.
     np.testing.assert_array_equal(latents, [np.full((1, 3), 0.5), np.full((1, 3), 0.25)])
-    # A last step far shorter than its history (sigmas 2, 1, 2**-100, 2**-101 at order 3) keeps its
-    # basis in range: the walk is finite and its first step the exact one.
-    process = Process(KarrasVENoiseScheduler(sigma_min=0, sigma_max=2.0, rho=1), DirectPredictionTransform())
-    latents = np.asarray(walk(LMS(3), process, ZeroEndpoint(), jnp.ones((1, 3), jnp.float32),
-                              [1.0, 0.5, 2.0 ** -101, 2.0 ** -102]))
-    assert np.isfinite(latents).all()
-    np.testing.assert_array_equal(latents[0], np.full((1, 3), 0.5))
 
 
 def test_a_tiny_lms_step_beside_a_distant_node_keeps_its_coefficient():
     """Nodes 2**-100 and 2**-99 beside 1, a step from 2**-100 to 0: the basis of the latest node
     integrates to -1.5 * 2**-100 (on s in [0, 1], (1 + s)(1 + 2**-100 s) times the step -2**-100), its
-    coefficient kept where a scale set by the distant node would round it to zero (ledger 1874)."""
+    coefficient kept where a scale set by the distant node would round it to zero; and beside nodes 1
+    and 2, where a power of the nodes would overflow, to the step's width (ledger 1874)."""
     from dew.sampling.solvers.sigma import _lagrange_integral
 
     tiny = jnp.float32(2.0 ** -100)
     coefficient = float(_lagrange_integral([tiny, 2 * tiny, jnp.float32(1.0)], 0, tiny, jnp.float32(0.0)))
     # 1.5 plus terms of 2**-100 rounds to 1.5, and the step's width is a power of two: exact in float32.
     assert coefficient == -1.5 * 2.0 ** -100
+    # A step to zero from 2**-100 beside nodes 1 and 2, the end of a VE walk at order 3: its factors
+    # are 1 plus terms of 2**-100, so the latest node's basis integrates to the step's width.
+    coefficient = float(_lagrange_integral([tiny, jnp.float32(1.0), jnp.float32(2.0)], 0, tiny, jnp.float32(0.0)))
+    assert coefficient == -(2.0 ** -100)
 
 
 def test_an_empty_lms_step_integrates_to_zero_with_the_basis_as_its_derivative():
