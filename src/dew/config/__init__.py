@@ -498,8 +498,8 @@ class TrainerConfig:
     `jax.experimental.topologies` names one), builds the run's mesh over that
     topology's devices and compiles its first step for them on any host that
     holds libtpu, as MaxText's train_compile does: the run saves the executable
-    in its checkpoint directory, `compiled-v5e:4x4`, with each device's memory
-    and work beside it (`compiled-v5e:4x4.json`, `dew.training._lowering.Lowered`),
+    in its checkpoint directory, `compiled-v5e-4x4`, with each device's memory
+    and work beside it (`compiled-v5e-4x4.json`, `dew.training._lowering.Lowered`),
     and exits.
     """
     tune_kernels: bool = False

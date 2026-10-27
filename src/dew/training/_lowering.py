@@ -17,7 +17,10 @@ compiled too, as MaxText's train_compile does: libtpu compiles for a TPU it
 is not running on, so the run's mesh is built over the topology's devices
 (`topology_devices`), the step lowers and compiles for them, and its
 executable states the memory and work each device's step takes and saves to
-a file a host of that topology loads (`Lowered.save`).
+a file a host of that topology loads (`Lowered.save`). `fit` starts as it
+would on the topology, from shapes: the state's, a resume's rung and window
+with it, and the first batch its stream reads at the run's position, marked
+as each step's is, and compiles its step there, before anything is placed.
 
 A choice keyed on the platform reads `generation.backend()`, the assumed
 generation's platform, and takes the GPU's path here. Two read
@@ -32,15 +35,15 @@ host, so attention traces its XLA path.
 from __future__ import annotations
 
 import json
-import math
 import pickle
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
 import jax
-import numpy as np
 from jax.extend.mlir import ir
+
+from dew.cache import uncached
 
 TRITON = "__gpu$xla.gpu.triton"
 """The custom call Pallas lowers a Triton kernel to."""
@@ -102,33 +105,41 @@ def topology_devices(target: str | None) -> list | None:
     return list(topologies.get_topology_desc(target, "tpu").devices)
 
 
-def compile_for_topology(trainer, plan, initial) -> None:
-    """Compile `trainer`'s first step for the TPU topology it names, from shapes alone, as `fit` begins
-    (`Trainer.compile` raises `Lowered`): the supplied state's, or the fresh state its initializer
-    makes, at the rung a checkpoint it would resume records, and the first batch the run's data reads
-    on this host, its host fields set aside as a step's are. Nothing is placed on the topology's
-    devices, which this host does not run. A rollout's batches are its policy's own draws, which no
-    device here draws, so its step is compiled from a batch of its shapes (`Trainer.compile`)."""
-    from dew.data.dataset import DataPartition
-    from dew.distributed.batches import split_fields
+def compiled_name(target: str) -> str:
+    """The file a run's executable compiled for the TPU topology `target` is saved as beside its
+    checkpoints ('compiled-v5e-4x4'): its name with no colon, which some filesystems and tools read as
+    a drive or a host."""
+    return f"compiled-{target.replace(':', '-')}"
 
+
+def compile_opened(trainer, abstract, batch, current: int, *, resumed: bool) -> None:
+    """Compile `trainer`'s step for its TPU topology as `fit` opens at step `current`, from the whole
+    state's shapes (`abstract`, a resume's window with it) and the first batch its stream read at the
+    run's position, marked as every step's is and placed as shapes (`placed_abstract`): its device
+    fields, which the objective's inputs are checked against first, at the rung a `resumed`
+    checkpoint records, as the step it continues compiles there. `compile` raises `Lowered`."""
+    from dew.distributed.batches import split_fields
+    from dew.training._fit import check_inputs
+
+    if resumed and trainer.checkpoints is not None:
+        trainer._resume_rung(trainer.checkpoints.rung(current))
+    device, _ = split_fields(batch)
+    check_inputs(trainer, device)
+    trainer.compile(abstract, device)
+
+
+def uncompiled(trainer, current: int, complete: bool) -> ValueError:
+    """Why `trainer`'s fit at step `current` compiled no step for its TPU topology, whose devices it
+    places nothing on: a rollout's batches are its policy's draws, which no device here draws, and a
+    `complete` run has no step left to take."""
     if trainer.rollout is not None:
-        raise ValueError("a rollout run's batches are its policy's draws, which a TPU topology this host "
-                         "does not run cannot draw: compile its step with Trainer.compile(state, batch) "
-                         "over a batch of its shapes")
-    checkpoints = trainer.checkpoints
-    if initial is None and checkpoints is not None and checkpoints.latest is not None:
-        trainer._resume_rung(checkpoints.rung(checkpoints.latest))
-    state = (jax.eval_shape(lambda: initial) if initial is not None else
-             jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key))
-    stream = plan.dataset.train(DataPartition())
-    try:
-        first = next(iter(stream))
-    finally:
-        stream.close()
-    batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(np.shape(x), np.asarray(x).dtype),
-                         split_fields(first)[0])
-    trainer.compile(state, batch)
+        return ValueError(
+            f"a rollout run's batches are its policy's draws, which the TPU topology {trainer.lower_for} "
+            f"this host does not run cannot draw: compile its step with Trainer.compile(state, batch) "
+            f"over a batch of its shapes")
+    assert complete, "fit compiles a TPU topology's step as its stream opens"
+    return ValueError(f"the run is complete at step {current}, its last checkpoint written, so it has no "
+                      f"step to compile for the TPU topology {trainer.lower_for}")
 
 
 class Lowered(SystemExit):
@@ -149,15 +160,10 @@ class Lowered(SystemExit):
         self.kernels = triton_kernels(lowered)
         self.compiled = None
         if compiled:
-            # Compiled for devices this host is not, its executable cannot load back here, so the
-            # persistent cache writes it no entry, which a later compile of it here could not read:
-            # JAX writes an entry for a compile at least this long (it decides at each write).
-            floor = jax.config.jax_persistent_cache_min_compile_time_secs
-            jax.config.update("jax_persistent_cache_min_compile_time_secs", val=math.inf)
-            try:
+            # Compiled for devices this host is not, its executable loads onto no client here: the
+            # persistent cache neither reads an entry for it nor writes one (`dew.cache.uncached`).
+            with uncached():
                 self.compiled = lowered.compile()
-            finally:
-                jax.config.update("jax_persistent_cache_min_compile_time_secs", val=floor)
 
     @property
     def memory(self) -> dict[str, int]:

@@ -622,10 +622,18 @@ def _topology_trainer(topology: str, **options):
                    **{"mesh": MeshSpec(fsdp=devices), "layout": Layout(min_shard=1), **options})
 
 
+def _batch_fields(lowered) -> set[str]:
+    """The fields of the batch a lowered training step reads, its arguments' second to last."""
+    args, _ = lowered.lowered.args_info
+    return set(args[-2])
+
+
 def test_a_run_compiled_for_a_tpu_topology_keeps_its_executable_beside_its_checkpoints(tmp_path):
     """A run's fit under `lower_for` of a TPU topology compiles its step for it from its first batch's
-    shapes, its host fields set aside, before anything is placed, and saves the executable, with each
-    device's memory and work, in its checkpoint directory."""
+    shapes, before anything is placed: the batch every step reads, marked with each row's place in its
+    step (`EXAMPLE_ROWS`) and its host fields set aside. The executable, with each device's memory and
+    work, is saved in its checkpoint directory under a name with no colon."""
+    from dew.batch import EXAMPLE_ROWS
     from dew.checkpoints import Checkpoints
     from dew.data.dataset import Loader
     from dew.training._lowering import Lowered
@@ -637,11 +645,96 @@ def test_a_run_compiled_for_a_tpu_topology_keeps_its_executable_beside_its_check
     trainer = _topology_trainer("v5e:2x2", checkpoints=Checkpoints(str(tmp_path / "run")))
     with pytest.raises(Lowered) as lowered:
         trainer.fit(Loader(train=batches, val=None, batch=4, records=None), steps=1)
-    assert (tmp_path / "run" / "compiled-v5e:2x2").stat().st_size > 0
-    stated = json.loads((tmp_path / "run" / "compiled-v5e:2x2.json").read_text())
+    assert {"text", EXAMPLE_ROWS} <= _batch_fields(lowered.value)
+    assert "caption" not in _batch_fields(lowered.value)
+    assert (tmp_path / "run" / "compiled-v5e-2x2").stat().st_size > 0
+    stated = json.loads((tmp_path / "run" / "compiled-v5e-2x2.json").read_text())
     assert stated["memory"] == lowered.value.memory
 
 
+class _Placed:
+    """A reader of token rows that keeps its place (`get_state`) and has no `close`, noting in `read`
+    each place it reads a batch at."""
+
+    def __init__(self, read: list[int]):
+        self.at, self.read = 0, read
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self.read.append(self.at)
+        self.at += 1
+        return {"text": np.full((4, 65), self.at % 256, np.int32)}
+
+    def get_state(self):
+        return json.dumps(self.at).encode()
+
+    def set_state(self, state):
+        self.at = json.loads(state)
+
+
+@pytest.mark.mesh(devices=4)
+def test_a_resumed_run_compiles_for_a_tpu_topology_where_its_checkpoint_left_it(tmp_path):
+    """A run trained a step here and resumed under `lower_for` of a TPU topology compiles its step as
+    the resume would take it: its stream, a reader with no `close`, reads its first batch from the
+    checkpoint's position, not the start, and nothing is placed on the topology's devices."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.data.dataset import Loader
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, Trainer
+    from dew.training._lowering import Lowered
+
+    read: list[int] = []
+    data = Loader(train=lambda partition: _Placed(read), val=None, batch=4, records=None)
+    model = CausalTransformer(vocab_size=256, num_layers=2, num_heads=4, emb_features=128, mlp_features=256,
+                              dtype=jnp.bfloat16)
+    here = Trainer(LMObjective(model, 64), optax.adamw(1e-4), key=jax.random.key(0),
+                   mesh=Mesh(np.asarray(jax.devices()[:4]), ("fsdp",)), layout=Layout(min_shard=1),
+                   checkpoints=Checkpoints(str(tmp_path / "run")))
+    here.fit(data, steps=1, checkpoint_every=1)
+    assert read[0] == 0
+    read.clear()
+    trainer = _topology_trainer("v5e:2x2", checkpoints=Checkpoints(str(tmp_path / "run")))
+    with pytest.raises(Lowered):
+        trainer.fit(data, steps=2)
+    assert read and read[0] == 1
+    assert (tmp_path / "run" / "compiled-v5e-2x2").stat().st_size > 0
+
+
+def test_a_topology_compile_neither_reads_nor_writes_the_persistent_cache(tmp_path, monkeypatch):
+    """The executable a TPU topology's compile makes loads onto no client here, so the persistent cache
+    is out of its way (`dew.cache.uncached`): a cache that a program here writes to gains nothing from
+    the topology's compile, and the next program here writes to it again."""
+    from jax.experimental.compilation_cache import compilation_cache
+
+    from dew.cache import enable_compilation_cache
+
+    monkeypatch.setenv("XLA_FLAGS", os.environ.get("XLA_FLAGS", ""))
+    settings = ("jax_compilation_cache_dir", "jax_enable_compilation_cache",
+                "jax_persistent_cache_min_compile_time_secs", "jax_persistent_cache_min_entry_size_bytes")
+    previous = {name: getattr(jax.config, name) for name in settings}
+    try:
+        jax.config.update("jax_enable_compilation_cache", val=True)
+        enable_compilation_cache(str(tmp_path / "cache"))
+        compilation_cache.reset_cache()
+        jax.jit(lambda x: x * 3.0).lower(1.0).compile()
+        written = sorted((tmp_path / "cache").iterdir())
+        assert written
+        assert _topology_lowered("v5e:2x2").compiled is not None
+        assert sorted((tmp_path / "cache").iterdir()) == written
+        jax.jit(lambda x: x * 5.0).lower(1.0).compile()
+        assert len(list((tmp_path / "cache").iterdir())) > len(written)
+    finally:
+        for name, value in previous.items():
+            jax.config.update(name, val=value)
+        compilation_cache.reset_cache()
+
+
+@pytest.mark.mesh(devices=4)
 def test_a_native_mesh_lies_over_the_topology_it_compiles_for():
     """A native mesh keeps its shape, axes and their types over the TPU topology's devices; one of
     another device count is refused."""

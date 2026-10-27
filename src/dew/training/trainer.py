@@ -124,12 +124,20 @@ from dew.training._fit import (
     FitPlan,
     FitRun,
     Start,
+    check_inputs,
     declarations,
     stage_reached,
     unrecorded_parts,
     waited_read,
 )
-from dew.training._lowering import Lowered, compile_for_topology, generation_of, topology_devices
+from dew.training._lowering import (
+    Lowered,
+    compile_opened,
+    compiled_name,
+    generation_of,
+    topology_devices,
+    uncompiled,
+)
 from dew.training.budget import Pause, Plateau, run_length, run_steps, run_tokens
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -972,7 +980,7 @@ class Trainer(Generic[Loss, Effects]):
             target, compiled = self.lower_for, self.topology is not None
             lowered = Lowered(target, self._lowered_for(state, batch, target), compiled=compiled)
             if compiled and self.checkpoints is not None:  # The run's own record of its target's compile.
-                lowered.save(f"{self.checkpoints.directory}/compiled-{self.lower_for}")
+                lowered.save(f"{self.checkpoints.directory}/{compiled_name(target)}")
             raise lowered
         split, unaligned = divmod(int(state.window_size), self.accumulation)
         if unaligned or (state.accumulation is not None and self._split not in (None, split)):
@@ -1383,8 +1391,6 @@ class Trainer(Generic[Loss, Effects]):
         The loop is the state's one holder: each step donates the state it is
         handed, and a reference kept past that, as fit's own once was, holds
         an array whose buffers the step consumed."""
-        if self.topology is not None:  # A TPU topology's step compiles from shapes, nothing placed on it.
-            compile_for_topology(self, plan, initial)
         current, position, placed, abstract = self._starting(run, initial)
         run.last_checkpoint = time.perf_counter()
         interval = Interval.resumed(run.stop_control, last_saved=(
@@ -1428,13 +1434,8 @@ class Trainer(Generic[Loss, Effects]):
                     batch, sampled = self._rolled_out(state, batch)
                     interval.rollout_seconds += sampled
                 device, _ = split_fields(batch)
-                inputs = self.objective.inputs
-                if not compiled and self.rollout is None and inputs is not None:
-                    # A rollout writes the batch its loss reads, from prompts it reads itself.
-                    # The objective reads the batch its device steps make (`_model_batch`).
-                    with jax.set_mesh(self.device_mesh):
-                        checked = self._model_shapes(device) if self._device else device
-                    agreed("training input declaration", functools.partial(inputs.check, checked))
+                if not compiled and self.rollout is None:  # A rollout writes the batch its loss reads.
+                    check_inputs(self, device)
                 known, began = len(compiled), time.perf_counter()
                 train_step, measured_flops, state = self._compiled_for(compiled, state, device, run)
                 if len(compiled) > known and self.executable is not None and not self.host_master:
@@ -1539,6 +1540,8 @@ class Trainer(Generic[Loss, Effects]):
             # accumulation's mirrors of the parameters with them.
             initial = owned_dicts(dataclasses.replace(initial, variables=dict(initial.variables)))
             shardings, _ = self._validated(initial)
+            if self.topology is not None:  # Compiled from its shapes (`_opened`), placed on nothing.
+                return int(initial.step), None, lambda: (initial, shardings), jax.eval_shape(lambda: initial)
             supplied = jax.device_put(initial, shardings)
             return int(supplied.step), None, lambda: (supplied, shardings), None
         start = self._started()
@@ -1607,6 +1610,10 @@ class Trainer(Generic[Loss, Effects]):
                     # a compile refuses it, before the state it would check is traced from that batch.
                     agreed_same("training batch layout", lambda: batch_layout(split_fields(placed_first)[0]))
                     self._fitting(abstract, placed_first)
+                    if self.topology is not None:  # Its step compiles from these shapes (`compile`).
+                        compile_opened(self, abstract, placed_first, current, resumed=resumed)
+        if self.topology is not None:
+            raise uncompiled(self, current, complete)
         state, shardings = placed()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
