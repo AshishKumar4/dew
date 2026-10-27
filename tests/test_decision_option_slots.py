@@ -106,13 +106,18 @@ def test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid():
     assert drawn[0] == drawn[1] == drawn[2]
 
 
+CLAUSES, HYPOTHESES, INTENTS = 40, 6, 24
+"""The ragged rows' real options: one question of `CLAUSES`, `HYPOTHESES` of three and one of `INTENTS`."""
+
+
 def ragged() -> list[Example]:
-    """Ragged rows: one question of forty options, six of three and one of twenty-four. A window's grid
-    is its bound's questions times forty slots, more than the 128 (`OPTION_TILE`) its real options
-    compact into."""
-    clauses = Choice("Which clause?", [f"c{index}" for index in range(40)])
-    hypotheses = {f"h{index}": Choice(f"Hypothesis {index}?", ["yes", "no", "unsaid"]) for index in range(6)}
-    intents = Choice("Which intent?", [f"i{index}" for index in range(24)])
+    """Ragged rows: one question of `CLAUSES` options, `HYPOTHESES` of three and one of `INTENTS`. A
+    window's grid is its bound's questions times `CLAUSES` slots, more than the 128 (`OPTION_TILE`) its
+    real options compact into."""
+    clauses = Choice("Which clause?", [f"c{index}" for index in range(CLAUSES)])
+    hypotheses = {f"h{index}": Choice(f"Hypothesis {index}?", ["yes", "no", "unsaid"])
+                  for index in range(HYPOTHESES)}
+    intents = Choice("Which intent?", [f"i{index}" for index in range(INTENTS)])
     return [Example("a clause on fees", {"clause": clauses}, {"clause": "c7"}),
             Example("a contract", hypotheses, dict.fromkeys(hypotheses, "unsaid")),
             Example("book a flight", {"intent": intents}, {"intent": "i3"})]
@@ -216,16 +221,16 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}
     options = np.asarray(slotted["options"])
     bounds = objective.bounds
-    assert options.shape[1:] == (bounds.questions, 40)
+    assert options.shape[1:] == (bounds.questions, CLAUSES)
     starts = np.asarray(slotted["spans"])[..., 0]
     owners = np.where(slotted["questions"], np.take_along_axis(slotted["segments"], starts, axis=1), 0)
     totals = [int(options[window][owners[window] == row].sum()) for window in range(len(options))
               for row in range(1, int(np.max(slotted["segments"][window])) + 1)]
-    assert sorted(totals) == [18, 24, 40]
+    assert sorted(totals) == sorted([CLAUSES, 3 * HYPOTHESES, INTENTS])
     # A window's real options compact into the slots its bounds allow, a multiple of 128.
     capacity = -(-bounds.options // 128) * 128
     compact = laid_out(slotted, bounds.segments)
-    assert compact.option_slots.shape == (len(options), capacity)
+    assert compact.option_slots.shape == (len(options), capacity) and capacity < bounds.questions * CLAUSES
     batch = {name: value for name, value in slotted.items() if name not in ("option_slots", "slotted")}
     grid = laid_out(batch, bounds.segments)
     variables = objective.init(jax.random.key(0))

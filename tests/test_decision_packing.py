@@ -305,12 +305,12 @@ scorer_out bias, shared by a question's options, and the joint arm's attention k
 each draw twice the work."""
 
 
-def assert_rows_decided_alone(objective, wide_modules, seeds: int) -> None:
-    """Two packed windows of the examples decide each row's questions as the row does alone where its
-    window packed it (`rows_alone`), logits and every parameter's gradient on par with it (check 1)
+def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 2) -> None:
+    """`count` packed windows of the examples decide each row's questions as the row does alone where
+    its window packed it (`rows_alone`), logits and every parameter's gradient on par with it (check 1)
     over drawn parameters, the truth `wide_modules`, the backbone and head in float64, over the rows
     in windows of their own."""
-    batch = windows(objective, 2)
+    batch = windows(objective, count)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
     # more sequence (`dew.nn.attention.flash_attention`).
