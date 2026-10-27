@@ -186,7 +186,8 @@ def test_every_trainer_option_set_on_the_command_line_reaches_the_kinds_run(kind
     assert sorted(step for step, row in logged.items() if "train/grad_norm" in row) == [2, 4]
     for step in (1, 2, 3, 4):
         row = logged[step]
-        assert row["train/learning_rate"] == pytest.approx(RATE)
+        # The optimizer holds its rate in float32, which the log reads back.
+        assert row["train/learning_rate"] == float(np.float32(RATE))
         assert "train/loss_scale" in row
         assert row[f"{Summary.SPLIT}/board"] == row["val/loss"]
         assert DEFAULT_METRICS.get(kind) not in row
