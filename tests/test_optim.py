@@ -20,7 +20,7 @@ from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
 from model_support import largest_difference
 from optim_support import LR, decoder_params, drawn_tree
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, equations
+from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, equations
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
@@ -514,27 +514,35 @@ def test_a_query_group_clips_as_megatron_clips_it(case):
     heads and its key head each scale by sqrt(eta). Under grouped queries a
     group with one firing head clips all four of its query heads and its
     key, and the quiet group keeps its weights; multi-head attention is the
-    group of one. The kernels a zero gradient's update lands on are held to
-    Megatron's float64 run by the float64 rule, and the values are
-    untouched."""
+    group of one. The clip is Megatron's: run in float64, the kernels a zero
+    gradient's update lands on are Megatron's float64 run within the float64
+    rounding of Dew's own chain of operations (the oracle rule), and the
+    values are untouched."""
     heads, width = MEGATRON[f"{case}/max_logits"].shape[0], MEGATRON[f"{case}/k"].shape[1]
     parts = {"q_proj": "q", "k_proj": "k", "v_proj": "v"}
-    params = {"attn": {proj: {"kernel": jnp.asarray(MEGATRON[f"{case}/{part}"])}
-                       for proj, part in parts.items()}}
     head_dim = MEGATRON[f"{case}/q"].shape[1] // heads
-    stats = {"attn": {"max_logits": (jnp.asarray(MEGATRON[f"{case}/max_logits"])[None],),
-                      "kv_heads": jnp.asarray(width // head_dim), "head_dim": jnp.asarray(head_dim)}}
     tx = scale_by_qk_clip(100.0)
-    initial = tx.init(params)
-    updates, state = tx.update(jax.tree.map(jnp.zeros_like, params), initial, params, qk_stats=stats)
-    applied = stepped(params, updates, initial, state)
+
+    def clipped(kernels, max_logits):
+        params = {"attn": {proj: {"kernel": kernel} for proj, kernel in kernels.items()}}
+        stats = {"attn": {"max_logits": (max_logits[None],), "kv_heads": jnp.asarray(width // head_dim),
+                          "head_dim": jnp.asarray(head_dim)}}
+        initial = tx.init(params)
+        updates, state = tx.update(jax.tree.map(jnp.zeros_like, params), initial, params, qk_stats=stats)
+        moved = stepped(params, updates, initial, state)["attn"]
+        return {proj: leaf["kernel"] for proj, leaf in moved.items()}
+
+    with jax.enable_x64(new_val=True):
+        kernels = {proj: jnp.asarray(MEGATRON[f"{case}/{part}"], jnp.float64) for proj, part in parts.items()}
+        max_logits = jnp.asarray(MEGATRON[f"{case}/max_logits"], jnp.float64)
+        applied = jax.device_get(clipped(kernels, max_logits))
+        roundings = chain_roundings(jax.make_jaxpr(clipped)(kernels, max_logits))
     for proj, part in parts.items():
-        got = np.asarray(applied["attn"][proj]["kernel"])
         if part == "v":
-            np.testing.assert_array_equal(got, MEGATRON[f"{case}/clipped_v_f64"])
+            np.testing.assert_array_equal(applied[proj], MEGATRON[f"{case}/clipped_v_f64"])
         else:
-            assert_as_exact_as_the_reference(got, MEGATRON[f"{case}/clipped_{part}"],
-                                             MEGATRON[f"{case}/clipped_{part}_f64"], f"{case} {proj}")
+            assert_computes_the_oracle(applied[proj], MEGATRON[f"{case}/clipped_{part}_f64"],
+                                       f"{case} {proj}", roundings=roundings)
 
 
 def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
@@ -645,30 +653,34 @@ def test_the_latent_branches_match_maxtext():
     """The MLA branches against MaxText 0.2.4's own outputs, committed as
     tests/fixtures/muonclip/maxtext_mla.json: `q_proj` stands in for `wq_b`
     and `kv_b_proj` for `wkv_b`, the same per-head tensors under Dew's
-    names. Each case's clipped kernel held by the float64 rule to MaxText's
-    own float32 output, its truth the fixture's transcription of MaxText
-    (`clip_mla_reference`, recorded bit for bit equal to it) in float64."""
+    names. Each case's clip is MaxText's: run in float64, its kernel is the
+    fixture's transcription of MaxText (`clip_mla_reference`, recorded bit
+    for bit equal to it) in float64 within the float64 rounding of Dew's own
+    chain of operations (the oracle rule)."""
     fixture = json.loads(QK_FIXTURE.read_text())
     assert fixture['maxtext'] == '0.2.4'
     tx = scale_by_qk_clip(100.0)
     for index, case in enumerate(fixture['cases']):
         proj = 'q_proj' if case['layer'] == 'wq_b' else 'kv_b_proj'
         param = np.asarray(case['param'], np.float32)
-        flat = param.reshape(len(param), -1)
-        params = {'l': {'m': {proj: {'kernel': jnp.asarray(flat)}}}}
-        grads = jax.tree.map(jnp.zeros_like, params)
         max_logits = np.asarray(case['max_logits'], np.float32)
-        stats = {'l': {'m': {'max_logits': (jnp.asarray(max_logits),),
-                             'qk_nope': jnp.asarray(case['qk_nope'])}}}
-        initial = tx.init(params)
-        updates, state = tx.update(grads, initial, params, qk_stats=stats)
-        applied = np.asarray(stepped(params, updates, initial, state)['l']['m'][proj]['kernel'])
-        applied = applied.reshape(param.shape)
+
+        def clipped(flat, max_logits, proj=proj, case=case):
+            params = {'l': {'m': {proj: {'kernel': flat}}}}
+            stats = {'l': {'m': {'max_logits': (max_logits,), 'qk_nope': jnp.asarray(case['qk_nope'])}}}
+            initial = tx.init(params)
+            updates, state = tx.update(jax.tree.map(jnp.zeros_like, params), initial, params, qk_stats=stats)
+            return stepped(params, updates, initial, state)['l']['m'][proj]['kernel']
+
         with jax.enable_x64(new_val=True):
+            flat = jnp.asarray(param.reshape(len(param), -1), jnp.float64)
+            wide = jnp.asarray(max_logits, jnp.float64)
+            applied = np.asarray(clipped(flat, wide)).reshape(param.shape)
+            roundings = chain_roundings(jax.make_jaxpr(clipped)(flat, wide))
             scale = np.asarray(clip_scale(np.max(max_logits.astype(np.float64), axis=0), case['tau']))
         truth = clip_mla_reference(param.astype(np.float64), scale, case['qk_nope'], case['layer'])
-        assert_as_exact_as_the_reference(applied, np.asarray(case['expected'], np.float32), truth,
-                                         f"MaxText's {case['layer']}, case {index}")
+        assert_computes_the_oracle(applied, truth, f"MaxText's {case['layer']}, case {index}",
+                                   roundings=roundings)
 
 
 THRESHOLD_SEEDS = 8
@@ -1104,32 +1116,51 @@ def test_a_resumed_rate_reaches_a_solver_inside_an_injected_wrapper(name):
     np.testing.assert_array_equal(state.hyperparams["gain"], 2.0)
 
 
+ADAMW_SEEDS = 8
+"""Check 1's declared seeds for AdamW's steps against torch's (`seeds_for`, paired)."""
+
+
 def test_adamw_steps_land_as_near_float64_as_torchs():
     """Three AdamW steps from zero parameters, where each update is the rate times the gradient's
-    sign, land as near their float64 values as torch's AdamW does (`reference_error`): the bias
-    corrections are formed in double, as torch forms them, where optax's own forms 1 - b2**count
+    sign, land as near their float64 values as torch's AdamW does, over drawn gradients (check 1): the
+    bias corrections are formed in double, as torch forms them, where optax's own forms 1 - b2**count
     from b2 rounded to float32 first, 1.3e-5 off at the first step (google-deepmind/optax#1827)."""
     import torch
 
     rate, decay, b1, b2, eps = 1e-3, 1e-2, 0.9, 0.999, 1e-8
-    grads = [np.random.default_rng(step).normal(size=4096).astype(np.float32) for step in range(3)]
-    params, first, second = np.zeros(4096), np.zeros(4096), np.zeros(4096)
-    for count, grad in enumerate(grads, start=1):
-        grad = grad.astype(np.float64)
-        first, second = b1 * first + (1 - b1) * grad, b2 * second + (1 - b2) * grad ** 2
-        clean = first / (1 - b1 ** count) / (np.sqrt(second / (1 - b2 ** count)) + eps)
-        params = params - rate * (clean + decay * params)
-    tensor = torch.zeros(4096, dtype=torch.float32, requires_grad=True)
-    torch_adamw = torch.optim.AdamW([tensor], lr=rate, betas=(b1, b2), eps=eps, weight_decay=decay)
     solver = OPTIMIZER_MAP['adamw'](rate, b1=b1, b2=b2, eps=eps, weight_decay=decay)
-    ours = jnp.zeros(4096, jnp.float32)
-    state = solver.init(ours)
-    for grad in grads:
-        tensor.grad = torch.from_numpy(grad)
-        torch_adamw.step()
-        updates, state = solver.update(jnp.asarray(grad), state, ours)
-        ours = optax.apply_updates(ours, updates)
-    assert_as_exact_as_the_reference(np.asarray(ours), tensor.detach().numpy(), params, "adamw steps")
+
+    def draw(seed):
+        return (np.random.default_rng([0xADA, seed]).normal(size=(3, 4096)).astype(np.float32),)
+
+    @as_given
+    def truth(grads):
+        params, first, second = np.zeros(4096), np.zeros(4096), np.zeros(4096)
+        for count, grad in enumerate(np.asarray(grads, np.float64), start=1):
+            first, second = b1 * first + (1 - b1) * grad, b2 * second + (1 - b2) * grad ** 2
+            clean = first / (1 - b1 ** count) / (np.sqrt(second / (1 - b2 ** count)) + eps)
+            params = params - rate * (clean + decay * params)
+        return {"params": params}
+
+    @as_given
+    def torchs(grads):
+        tensor = torch.zeros(4096, dtype=torch.float32, requires_grad=True)
+        torch_adamw = torch.optim.AdamW([tensor], lr=rate, betas=(b1, b2), eps=eps, weight_decay=decay)
+        for grad in np.asarray(grads, np.float32):
+            tensor.grad = torch.from_numpy(grad.copy())
+            torch_adamw.step()
+        return {"params": tensor.detach().numpy().copy()}
+
+    @as_given
+    def dews(grads):
+        ours = jnp.zeros(4096, jnp.float32)
+        state = solver.init(ours)
+        for grad in np.asarray(grads, np.float32):
+            updates, state = solver.update(jnp.asarray(grad), state, ours)
+            ours = optax.apply_updates(ours, updates)
+        return {"params": np.asarray(ours)}
+
+    assert_as_exact(dews, torchs, draw, "adamw steps", seeds=ADAMW_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize("optimizer", ["adam", "adamw"])
