@@ -388,7 +388,8 @@ def test_the_blocks_train_beside_an_adapter_with_the_source_frozen(source, tmp_p
 def test_the_blocks_train_beside_a_whole_source_where_it_is_not_frozen(source):
     """With `frozen=False` the blocks join an unsplit source's weights, which all train beside them, a
     full fine-tune: the source's leaves are its own, the blocks' gates zero, so the bundle computes
-    what the source does, and two steps move the source's weights and the gates both."""
+    what the source does, and two steps move the source's weights and the gates both. A LoRA adapter
+    over it, attached in either order, trains its factors and the blocks over the frozen base."""
     cross = CrossAttention(layer_ids=(1,), context_length=3, context_features=8)
     attached = source.with_cross_attention(cross, key=0, frozen=False)
     assert FROZEN not in attached.variables
@@ -399,6 +400,14 @@ def test_the_blocks_train_beside_a_whole_source_where_it_is_not_frozen(source):
     tokens = jnp.arange(8, dtype=jnp.int32)[None] % 256
     np.testing.assert_array_equal(np.asarray(attached.model.apply(attached.variables, tokens)),
                                   np.asarray(source.model.apply(source.variables, tokens)))
+    lora = LoRA(rank=2, modules=("q_proj",))
+    later = attached.adapt(lora, key=1)
+    earlier = source.adapt(lora, key=1).with_cross_attention(cross, key=0, frozen=False)
+    for adapted in (later, earlier):
+        held = flat_tree(adapted.variables["params"])
+        assert any("alpha_" in path for path in held) and any("lora_A" in path for path in held)
+        assert all(crossing(path) or "lora_" in path for path in held)
+    assert set(flat_tree(later.variables["params"])) == set(flat_tree(earlier.variables["params"]))
 
     rng = np.random.default_rng(0)
     rows = 2 * jax.device_count()

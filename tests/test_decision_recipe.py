@@ -393,8 +393,8 @@ def test_a_decision_run_reads_letters_as_its_letter_readout():
 def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_where_asked():
     """`--no-context-frozen` trains the backbone whole beside its context layers' blocks, a full
     fine-tune, where by default it holds frozen and the blocks train alone: the objective's held tree
-    then splits off no frozen backbone, every backbone weight trained. It is refused without context
-    layers, and with LoRA, whose adapter trains over a frozen base."""
+    then splits off no frozen backbone, every backbone weight trained. With LoRA the adapter trains
+    beside the blocks over its frozen base; without context layers the flag is refused."""
     from model_support import flat_tree
 
     from dew.decision.objective import DecisionObjective
@@ -415,9 +415,14 @@ def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_wher
     assert FROZEN not in whole.variables
     trained = flat_tree(whole.variables["params"]["backbone"])
     assert any(crossing(path) for path in trained) and any(not crossing(path) for path in trained)
-    for refused in ({"context_layers": None}, {"lora": LoRA(rank=2, modules=("q_proj",))}):
-        with pytest.raises(ValueError):
-            dataclasses.replace(run, context_frozen=False, **refused).prepare()
+    adapted, _ = dataclasses.replace(run, context_frozen=False,
+                                     lora=LoRA(rank=2, modules=("q_proj",))).prepare().train("x")
+    assert isinstance(adapted, DecisionObjective) and adapted.variables is not None
+    held = flat_tree(adapted.variables["params"]["backbone"])
+    assert any(crossing(path) for path in held) and any("lora_A" in path for path in held)
+    assert "backbone" in adapted.variables[FROZEN]
+    with pytest.raises(ValueError):
+        dataclasses.replace(run, context_frozen=False, context_layers=None).prepare()
 
 
 def test_a_decision_run_lays_its_rows_in_blocks_its_source_reads_whole():

@@ -132,10 +132,11 @@ class DecisionRunConfig(DecoderRunConfig):
     (`Pretrained.with_cross_attention`) unless `context_frozen` is off, with
     `lora` its adapter beside them. None reads no context."""
     context_frozen: bool = True
-    """Whether the backbone holds frozen beside the context layers' blocks, which
-    then train alone with the head; off, the backbone trains whole beside them,
-    a full fine-tune (`--no-context-frozen`). With `context_layers` alone; a
-    `lora` run trains its adapter beside the blocks, its base frozen."""
+    """Whether the context layers freeze the backbone beside their blocks, which
+    then train alone with the head; off, they freeze nothing more, so the
+    backbone trains as the run trains it: whole, a full fine-tune, or through
+    its `lora` adapter over the frozen base (`--no-context-frozen`). With
+    `context_layers` alone."""
     context_length: int = 256
     """The most tokens of an example's context the cross-attention reads; an
     example with a longer context refuses the run where its data reads it,
@@ -170,9 +171,9 @@ class DecisionRunConfig(DecoderRunConfig):
                              "--context-layers")
         if self.context_encoder != "table" and self.context_layers is None:
             raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
-        if not self.context_frozen and (self.context_layers is None or self.lora is not None):
-            raise ValueError("--no-context-frozen trains the backbone whole beside its context layers: set "
-                             "--context-layers, and no --lora, whose adapter trains over a frozen base")
+        if not self.context_frozen and self.context_layers is None:
+            raise ValueError("--no-context-frozen says how context layers hold the backbone; set "
+                             "--context-layers")
         derived = {}
         if self.context_layers is not None:
             derived["context_encoder"] = self.context_encoder
