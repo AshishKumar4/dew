@@ -874,8 +874,33 @@ for its chance of lying near the signs' complement, which is no guarantee: two e
 sign words agree move no projection, one pair in 2^32 at a seed, and each seed draws its own signs, so
 a wrong truth repeated over a site's seeds hides at all of them only by that chance to their power."""
 SKETCH_BLOCK = 64
-"""The entries `truth_sketch` sums in float64 in one block, each block's sum then summed exactly: its
-rounding at most gamma(SKETCH_BLOCK) of the magnitudes', in whatever order a host takes a block."""
+"""The entries the dense sketch (version 1, `truth_sketch`) sums in float64 in one block, each block's sum
+then summed exactly: its rounding at most gamma(SKETCH_BLOCK) of the magnitudes', in whatever order a host
+takes a block."""
+SKETCH_VERSION = 2
+"""The sketch a recording keeps (`<site>.sketch_version`; a recording that names none keeps version 1):
+1 dense, an entry's SKETCH signs its own random bits; 2 structured, an entry's sign k its own random
+sign times its column's and its row's sign k (`truth_sketch`), which a leaf's grid multiplies by a matrix
+product, sixfold cheaper on armada's CPUs at 2^20 entries (Main, 10-27: gemma4_unified's recorded
+backward spent 430 s of its 700 s sketching)."""
+SKETCH_COLUMNS = 4096
+"""The columns of a leaf's grid in the structured sketch: its entries in order, row by row, the last row
+padded with zeros, each sign k an entry's own random sign times its column's and its row's sign k. For
+each k the signs are independent over the entries, as the dense sketch's are, so each projection is a
+Rademacher sum of the truth's move, of mean square its squared norm; given the entries' signs the SKETCH
+projections are independent, each a bilinear form in its column's and row's signs, whose tail is no
+heavier than a Rademacher sum's where the move is spread and whose square is bounded by its support's
+size times the squared norm where it is not. Measured against the dense sketch over 4000 seeds a kind on a
+[64, 64] leaf of 64 columns (debug/sketch-cost tests/bench_sketch_nulls.py, 10-27): every kind of move
+(dense, one entry, two, sixteen, one row, one column, rank one, sparse rank one, 2x2 and 8x8 rectangles)
+has the dense sketch's upper quantiles (its largest root mean square over its norm 1.54 against the dense
+1.59), and every fault (two entries swapped anywhere, in a row or a column, two rows swapped, one entry
+moved by 1e-6) moves the projections by at least a quarter of its norm at every seed, as the dense sketch's
+do. A 2x2 rectangle's four signs multiply to their entries' own at every k, its lowest root mean square
+0.35 of its norm against the dense 0.61: a move that cancels in it, shaped against those four signs, is
+no move independent of them."""
+SKETCH_GRID_ROWS = 64
+"""The rows of the grid the structured sketch reads at once, so a chunk stays in a CPU's cache."""
 
 
 def _sign_bits(size: int, seed: int) -> np.ndarray:
@@ -889,15 +914,20 @@ _BYTE_SIGNS = ((np.arange(256)[:, None] >> np.arange(8)) & 1) * 2.0 - 1
 is not, least significant bit first."""
 
 
-def truth_sketch(truth, seed: int) -> np.ndarray:
+def truth_sketch(truth, seed: int, *, version: int = SKETCH_VERSION) -> np.ndarray:
     """A float64 truth leaf's sketch `[SKETCH]` at a recorded seed: its entries summed under SKETCH random
-    signs of that seed's own (`_sign_bits`), each sign's
-    product exact, in blocks of SKETCH_BLOCK whose float64 sums are summed exactly (`math.fsum`), so a
-    truth recomputed apart is held to the recorded one without the recording keeping it, every host
-    rounding the sketch alike within `sketch_rounding` (`indexed_recording`)."""
+    signs of that seed's own, so a truth recomputed apart is held to the recorded one without the recording
+    keeping it, every host rounding the sketch alike within `sketch_rounding` (`indexed_recording`).
+    Version 2 (SKETCH_COLUMNS) sums it near exactly (`_structured_sketch`); version 1, a recording's
+    that names none, each sign its entry's own (`_sign_bits`), each product exact, in blocks of
+    SKETCH_BLOCK whose float64 sums are summed exactly (`math.fsum`)."""
     flat = np.asarray(truth, np.float64).reshape(-1)
     if not flat.size:
         return np.zeros(SKETCH)
+    if version == 2:
+        return _structured_sketch(flat, seed)
+    if version != 1:
+        raise ValueError(f"no truth sketch of version {version}")
     bits, partials = _sign_bits(flat.size, seed), []
     for start in range(0, flat.size, 1 << 16):
         chunk = flat[start:start + (1 << 16)]
@@ -910,9 +940,58 @@ def truth_sketch(truth, seed: int) -> np.ndarray:
     return np.asarray([math.fsum(column) for column in np.concatenate(partials).T.tolist()])
 
 
+def _structured_sketch(flat: np.ndarray, seed: int) -> np.ndarray:
+    """Version 2 of `truth_sketch`, of a non-empty leaf: its grid (SKETCH_COLUMNS) times its columns' signs
+    by a matrix product, times its rows' signs, summed, near exactly in any order a host takes: the entries
+    split in levels of integers times a power of two (`_sketch_scales`), each level's every partial sum an
+    integer below 2^53 and so exact, the levels summed exactly (`math.fsum`); what the last level leaves is
+    at most 2^-60 of the leaf's magnitudes. Its signs are the seed's own: an entry's from a stream
+    of bits, its column's and row's from the same stream after."""
+    size = flat.size
+    rows = -(-size // SKETCH_COLUMNS)
+    rng = np.random.default_rng([0x5E7C4, 2, size, seed])
+    flips = np.unpackbits(np.frombuffer(rng.bytes(-(-size // 8)), np.uint8), bitorder="little")[:size]
+    across = rng.integers(0, 2, (SKETCH_COLUMNS, SKETCH), dtype=np.int8) * 2.0 - 1
+    down = rng.integers(0, 2, (rows, SKETCH), dtype=np.int8) * 2.0 - 1
+    scales = _sketch_scales(flat)
+    sums = np.zeros((len(scales), SKETCH))
+    for first in range(0, rows, SKETCH_GRID_ROWS):
+        last = min(first + SKETCH_GRID_ROWS, rows)
+        start, stop = first * SKETCH_COLUMNS, min(last * SKETCH_COLUMNS, size)
+        rest = np.zeros((last - first) * SKETCH_COLUMNS)
+        rest[:stop - start] = flat[start:stop]
+        np.negative(rest[:stop - start], out=rest[:stop - start], where=flips[start:stop] == 0)
+        rest = rest.reshape(last - first, SKETCH_COLUMNS)
+        for level, scale in enumerate(scales):
+            whole = np.rint(np.ldexp(rest, -scale))
+            sums[level] += ((whole @ across) * down[first:last]).sum(axis=0)
+            rest = rest - np.ldexp(whole, scale)
+            if not rest.any():
+                break
+    return np.asarray([math.fsum(math.ldexp(float(total), scale)
+                                 for total, scale in zip(column, scales, strict=True)) for column in sums.T])
+
+
+def _sketch_scales(flat: np.ndarray) -> list[int]:
+    """The powers of two the structured sketch splits `flat` by, largest first: the entries rounded to
+    integers of 52 - bit_length(size) bits at each in turn, what each leaves split at the next, so every
+    level's sum over all the entries, in any order, is an integer below 2^53; down to what leaves at most
+    2^-60 of the entries' magnitudes, or to the subnormals' unit, where nothing is left."""
+    top = float(np.max(np.abs(flat)))
+    if top == 0:
+        return []
+    size, width = flat.size, 52 - flat.size.bit_length()
+    magnitude = float(np.sum(np.abs(flat)))
+    scales = [max(math.frexp(top)[1] - width, -1074)]
+    while scales[-1] > -1074 and size * math.ldexp(1.0, scales[-1] - 1) > math.ldexp(magnitude, -60):
+        scales.append(max(scales[-1] - width, -1074))
+    return scales
+
+
 def sketch_rounding(magnitude: float) -> float:
-    """The most `truth_sketch` of a leaf whose magnitudes sum to `magnitude` may round by, on any host:
-    gamma(SKETCH_BLOCK) of it within the blocks, and the exact sum's one rounding."""
+    """The most `truth_sketch` of a leaf whose magnitudes sum to `magnitude` may round by, on any host, of
+    either version: the dense sketch's gamma(SKETCH_BLOCK) of it within the blocks and the exact sum's one
+    rounding, which holds the structured sketch's one rounding and the 2^-60 of it its last level leaves."""
     eps = float(np.finfo(np.float64).eps)
     return (SKETCH_BLOCK * eps / 2 / (1 - SKETCH_BLOCK * eps / 2) + eps / 2) * magnitude
 
@@ -1752,6 +1831,7 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
     verdict, pilot = ({kind: tree(prefix + kind) for kind in kinds} for prefix in ("", "pilot."))
     mse, worst, finite, sketch, zero_offsets = (verdict[kind] for kind in
                                                 ("mse", "worst", "finite", "sketch", "zero_offsets"))
+    version = int(stored.get(f"{site}.sketch_version", 1))
     shapes, dtypes = tree("shape"), tree("dtype")
     if truth_fn is None or inputs_of is None:
         raise AssertionError(f"{site}: a recording of the reference's evidence alone takes `truth_fn`, "
@@ -1833,7 +1913,7 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
             oracle = 2 * roundings["count"] * eps * norm
             magnitude = float(np.sum(np.abs(value))) * (1 + value.size * eps) + np.sqrt(value.size) * oracle
             bound = (SKETCH_DEVIATIONS * oracle + 2 * sketch_rounding(magnitude)) * (1 + 1e-6)
-            apart = truth_sketch(value, index) - recorded
+            apart = truth_sketch(value, index, version=version) - recorded
             # Its root mean square, scaled by its largest first so no square overflows.
             widest = float(np.max(np.abs(apart))) if apart.shape == recorded.shape else np.inf
             away = (widest * float(np.sqrt(np.mean(np.square(apart / widest)))) if 0 < widest < np.inf
