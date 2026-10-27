@@ -237,8 +237,8 @@ class Profile:
     """1 traces every Python call, which slows Python-heavy host work several times over; unset,
     `ProfileWindow`'s (none)."""
     activity_cap: int | None = None
-    """The CUDA activity events a GPU capture keeps, CUPTI's cap, past which the capture is cut short; unset,
-    `ProfileWindow`'s."""
+    """The CUDA activity events a GPU capture keeps, CUPTI's cap, past which the capture is cut short; -1
+    keeps every one (XLA's no limit); unset, `ProfileWindow`'s."""
 
     def run_command(self) -> int:
         from dew.training.profiling import ProfileWindow

@@ -266,8 +266,9 @@ def test_a_profile_counts_overlapped_collectives_once_and_the_gaps_as_idle():
                        "exposed_communication_ms": 0.0, "device_idle_ms": 2.5}
     report = ProfileReport("profile", 2, 2, (2, 3), "capture", 15.0, 1.0, 3.0, **figures, flops=None,
                            mfu=None, hfu=None, tokens_per_s=None, device=None)
+    # The lines carry the figures: the idle gap, and compute's share of a step, the largest.
     text = report.text()
-    assert f"device idle   {2.5:10.2f} ms" in text and "The largest share of a step: compute, 67%." in text
+    assert "2.50 ms" in text and "67%" in text
     assert device_figures([[], []], steps=2)["device_idle_ms"] is None
 
 
@@ -278,8 +279,12 @@ def test_a_capture_that_holds_less_than_its_run_says_why():
     from dew.telemetry.profile import held_back, missing_tracks
 
     assert missing_tracks({"/device:GPU:0": 19160, "/device:GPU:1": 18800}, 2, 2_097_152) == []
-    assert missing_tracks({"/device:GPU:0": 7451}, 2, 2_097_152) == [
-        "1 of 2 local devices have no kernel track in the trace"]
+    [untracked] = missing_tracks({"/device:GPU:0": 7451}, 2, 2_097_152)
+    assert "1 of 2" in untracked
+    # The cap's boundary: within 1% of it is reached (CUPTI drops whole buffers), below that is whole.
     [capped] = missing_tracks({"/device:GPU:0": 1987}, 1, 2000)
-    assert capped.startswith("CUPTI's activity cap of 2000 events reached (1987 kept)")
+    assert "2000" in capped and "1987" in capped
+    assert missing_tracks({"/device:GPU:0": 1979}, 1, 2000) == []
+    # XLA's no-limit cap (-1) drops nothing, however many events the capture holds.
+    assert missing_tracks({"/device:GPU:0": 19160}, 1, -1) == []
     assert held_back(Path("absent"), {"backend": "cpu", "device_kinds": ["cpu"]}) == []

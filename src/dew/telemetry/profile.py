@@ -79,14 +79,15 @@ def held_back(capture: Path, metadata: dict) -> list[str]:
 
 def missing_tracks(events: dict[str, int], devices: int, cap: int | None) -> list[str]:
     """`held_back`'s reasons from the number of kernel events each device plane holds (`events`), the
-    local `devices` and CUPTI's activity `cap` (None off GPU). Within 1% of the cap is the cap reached:
-    CUPTI drops whole buffers (a 2000-event cap kept 1987 kernel events of an H100 step's 19160)."""
+    local `devices` and CUPTI's activity `cap` (None off GPU; a negative cap is XLA's no limit, which
+    drops nothing). Within 1% of the cap is the cap reached: CUPTI drops whole buffers (a 2000-event cap
+    kept 1987 kernel events of an H100 step's 19160)."""
     reasons = []
     tracked = sum(1 for count in events.values() if count)
     if tracked < devices:
         reasons.append(f"{devices - tracked} of {devices} local devices have no kernel track in the trace")
     total = sum(events.values())
-    if cap is not None and total >= cap * 0.99:
+    if cap is not None and cap >= 0 and total >= cap * 0.99:
         reasons.append(f"CUPTI's activity cap of {cap} events reached ({total} kept): the events past it "
                        "were dropped, so the trace is cut short (a capture's `activity_cap` raises it)")
     return reasons

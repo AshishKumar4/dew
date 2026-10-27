@@ -192,8 +192,11 @@ class ProfileReport:
     communication whole. Input wait is the host's, which the device's queue can hide, so no device
     figure is taken from it. Each figure is per step; None where the run reports none: no analytic work
     for its model (`Objective.training_flops`, never the compiled program's count), no device peak to
-    rate it against, or no device track in the capture (`device` says why). The window holds no
-    checkpoint, validation or log read but its own, so their time is outside every figure here.
+    rate it against, or no device track in the capture, or a capture that holds less than the window
+    ran (its manifest's `capture_status` "partial", CUPTI's activity cap reached or a device's track
+    missing), whose surviving kernels no full-window figure may be read from (`device` says why). The
+    window holds no checkpoint, validation or log read but its own, so their time is outside every
+    figure here.
     `directory` is the profile's, its `report.json` beside the run."""
 
     directory: str
@@ -236,15 +239,18 @@ class ProfileReport:
         records = (run / "tracking" / "records.jsonl").read_text().splitlines()
         compiles = [entry["value"]["seconds"] for entry in map(json.loads, records)
                     if entry["type"] == "StepCompiled"]
+        manifest = json.loads((capture / "manifest.json").read_text())
+        reasons = manifest.get("capture_reasons") or []
         planes, _ = device_events(capture)
         figures = device_figures([[(event.name, event.start_ns, event.end_ns) for event in events]
-                                  for events in planes.values()], steps)
+                                  for events in ([] if reasons else planes.values())], steps)
+        device = (f"the capture holds less than the window ran: {'; '.join(reasons)}" if reasons
+                  else None if figures["device_window_ms"] is not None
+                  else "the capture holds no device track (a CPU run, or its trace has none)")
         return cls(str(directory), steps, warmup, traced, str(capture), logged["train/step_time_ms"],
                    logged["train/data_wait_ms"], compiles[0] if compiles else None, **figures,
                    flops=logged.get("train/flops"), mfu=logged.get("train/mfu"), hfu=logged.get("train/hfu"),
-                   tokens_per_s=logged.get("train/tokens_per_s"),
-                   device=None if figures["device_window_ms"] is not None
-                   else "the capture holds no device track (a CPU run, or its trace has none)")
+                   tokens_per_s=logged.get("train/tokens_per_s"), device=device)
 
     def text(self) -> str:
         """The report as lines a person reads, the largest share of a step named last."""
