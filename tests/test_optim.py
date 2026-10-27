@@ -1156,7 +1156,7 @@ def test_adams_first_moment_keeps_a_complex_gradients_both_components(state_dtyp
     of the same size it does quantize: a repeated gradient of 1+2j leaves the moment's imaginary part
     twice its real part to the bit, as each update scales both alike and a doubling rounds as its half
     does, where a real store would drop it (row 1870, AT-05); the real leaf's moment is real."""
-    from dew.optim import OptimConfig
+    from dew.optim import OptimConfig, QuantizedMoments
 
     shape = (16, 256)
     params = {"w": jnp.full(shape, 0.5 + 0.5j, jnp.complex64), "v": jnp.full(shape, 0.5, jnp.float32)}
@@ -1167,7 +1167,8 @@ def test_adams_first_moment_keeps_a_complex_gradients_both_components(state_dtyp
         _, state = optimizer.update(gradient, state, params)
     moments = [node for node in jax.tree.leaves(state, is_leaf=lambda node: hasattr(node, "mu"))
                if hasattr(node, "mu")]
-    mu = moments[0].mu
+    # The int8 store keeps a moment as its codes and scales (`QuantizedMoments`), a complex leaf whole.
+    mu = moments[0].mu.codes if isinstance(moments[0].mu, QuantizedMoments) else moments[0].mu
     held = np.asarray(mu["w"])
     assert np.iscomplexobj(held)
     np.testing.assert_array_equal(held.imag, 2 * held.real)
