@@ -736,9 +736,10 @@ class Loader:
         (`examples`), with every row the objective makes of each, its last batch short where they end
         inside one, in whole updates of `window` steps. A global order's plan counts them ahead
         (`order_records`); one read in its own order, as a pack that runs as rows arrive makes, or one
-        an objective expands after the bound, is counted by reading it once to its end, on the host. Refused where the read is bounded to another count, in a pool, whose processes
-        split the short batch the examples end in unevenly, so each would end at a step of its own,
-        and where the last steps would make no whole update, so some examples would train nothing."""
+        an objective expands after the bound, is counted by reading it once to its end, on the host.
+        Refused where the read is bounded to another count, in a pool, whose processes split the short
+        batch the examples end in unevenly, so each would end at a step of its own, and where the last
+        steps would make no whole update, so some examples would train nothing."""
         if self.examples != examples:
             held = "not bounded" if self.examples is None else f"bounded to {self.examples}"
             raise ValueError(f"examples={examples} reads a training chain bounded to that many records "
