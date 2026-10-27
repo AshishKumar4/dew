@@ -496,3 +496,14 @@ def test_evaluate_and_serve_smoke_runs_an_lm_eval_harness_task(tmp_path):
     harness = json.loads((tmp_path / "report.json").read_text())["harness"]
     assert {name.split("/")[0] for name in harness} == {"hellaswag"}
     assert all(0.0 <= value <= 1.0 for name, value in harness.items() if name.endswith("acc,none"))
+
+
+@pytest.mark.parametrize("arguments", [(), ("--damping", "1e-8")], ids=["adam", "gauss-newton"])
+def test_pinn_burgers_smoke_trains_the_profile_in_float64_and_reports_its_residuals(tmp_path, arguments):
+    """The self-similar Burgers profile through a four-level Fourier feature pyramid, by Adam and by
+    Gauss-Newton, in float64: the run writes the paper's two figures on its diagnostic grid, finite."""
+    out = tmp_path / "burgers"
+    smoke("pinn_burgers", out, *arguments)
+    metrics = json.loads((out / "metrics.json").read_text())
+    assert metrics["steps"] == 20 and np.isfinite(metrics["pde_mse"])
+    assert np.isfinite(metrics["log10_max_residual"])
