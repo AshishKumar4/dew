@@ -117,9 +117,10 @@ def test_an_elastic_position_is_every_readers_and_resumes_on_another_count(saved
 
 
 def test_a_finite_elastic_read_ends_on_every_reader_at_once_its_last_batch_filled():
-    """A finite read's last batch holds fewer rows than the batch: every reader still reads it, its
-    share's rows real and the rest filled and marked, and every reader ends after it together."""
-    chain = (Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(22)))).filter(odd)
+    """A read of one pass (a training read without a repeat reads on without end) whose last batch
+    holds fewer rows than the batch: every reader still reads it, its share's rows real and the rest
+    filled and marked, and every reader ends after it together."""
+    chain = (Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(22)))).repeat(1).filter(odd)
              .batch(BATCH, drop_remainder=False).elastic())
     batches = [list(reader(chain, index, 4)) for index in range(4)]
     assert {len(read) for read in batches} == {2}
