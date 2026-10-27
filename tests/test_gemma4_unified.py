@@ -1,7 +1,9 @@
 """The encoder-free wrapper, its processor layout and its ordinary-forward mask policy."""
 
 import copy
+import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import jax
@@ -208,15 +210,20 @@ def gradient_functions(source):
     @as_given
     def ours(inputs):
         """Each row's program over its own length (`native_observations`), compiled once a length
-        rather than once a window's lengths, and the rows' observations collected on the device: every
-        row is dispatched before any is read, so the rows' programs run side by side."""
-        observed = []
+        rather than once a window's lengths, and the rows' observations collected. The rows' programs
+        are independent, so they run side by side on the host's cores, one thread a core; the trace in
+        which the gate counts a truth's roundings runs them in turn, a trace being its thread's own."""
+        rows = []
         for row in range(inputs["input/input_ids"].shape[0]):
             prefix = f"native/{row}/"
             fields = unflatten_dict({name.removeprefix(prefix): value for name, value in inputs.items()
                                      if name.startswith(prefix)}, sep="/")
-            observed.append(native_observations(ModelInputs(**fields), inputs[f"probe/{row}"]))
-        return collect(observed, jnp)
+            rows.append((ModelInputs(**fields), inputs[f"probe/{row}"]))
+        if any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(inputs)):
+            return collect([native_observations(*row) for row in rows], jnp)
+        with ThreadPoolExecutor(len(os.sched_getaffinity(0))) as pool:
+            observed = list(pool.map(lambda row: jax.device_get(native_observations(*row)), rows))
+        return collect(observed, np)
 
     def theirs(model, given, *, wide=False):
         inputs = {name.removeprefix("input/"): value for name, value in given.items()
