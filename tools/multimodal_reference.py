@@ -453,8 +453,9 @@ TRUTHS = {"gemma4-native-tiny": "gemma4-native-tiny", "qwen35-native-tiny": "qwe
 def write_float64_truths(references: str) -> None:
     """The float64 truth of what `_write_forward_backward` recorded in `references`: the reference
     model's float64 twin (tools/torch_precision.py) over the same stored batch encoding, one row at a
-    time, its summed next-token loss, pixel gradient and logits after one SGD step of LEARNING_RATE,
-    in training_f64.json, pixel_gradient_f64.npy and updated_logits_f64.npy. The Dew side's
+    time: its logits, then its summed next-token loss, pixel gradient and logits after one SGD step of
+    LEARNING_RATE, in logits_f64.npy, training_f64.json, pixel_gradient_f64.npy and
+    updated_logits_f64.npy. The Dew side's
     checks hold Dew and the fp32 reference to it (tests/test_multimodal_model.py)."""
     from transformers import AutoModelForImageTextToText
 
@@ -472,14 +473,18 @@ def write_float64_truths(references: str) -> None:
                    for name, value in encoded.items()}
         valid = widened["attention_mask"].bool()
         singles = _row_slices(widened, twin)
+        shape = (*widened["input_ids"].shape, twin.config.get_text_config().vocab_size)
+        logits, updated = torch.zeros(shape, dtype=torch.float64), torch.zeros(shape, dtype=torch.float64)
+        with torch.no_grad():
+            for row, single in enumerate(singles):
+                logits[row, valid[row]] = twin(**single, use_cache=False).logits[0]
         loss, pixel_inputs = _sgd_step(twin, singles, valid)
-        updated = torch.zeros((*widened["input_ids"].shape, twin.config.get_text_config().vocab_size),
-                              dtype=torch.float64)
         with torch.no_grad():
             for row, single in enumerate(singles):
                 updated[row, valid[row]] = twin(**single, use_cache=False).logits[0]
     np.save(destination / "pixel_gradient_f64.npy",
             torch.cat([pixels.grad for pixels in pixel_inputs]).numpy())
+    np.save(destination / "logits_f64.npy", logits.numpy())
     np.save(destination / "updated_logits_f64.npy", updated.numpy())
     (destination / "training_f64.json").write_text(json.dumps({"loss": float(loss.detach())}) + "\n")
     print(destination, "float64 loss", float(loss.detach()), flush=True)
