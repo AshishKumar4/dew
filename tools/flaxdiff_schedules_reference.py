@@ -5,22 +5,30 @@ FlaxDiff (github.com/AshishKumar4/FlaxDiff) is the project Dew grew out of.
 Its scheduler modules, fetched at commit 15c55b001304604147a2a8002a76cf5d4c32092f
 and checked against their SHA-256, build the exponential beta table
 (`ExpNoiseScheduler`), the continuous cosine (`CosineContinuousNoiseScheduler`)
-and the tangent grid of sigmas (`CosineGeneralNoiseScheduler`), whose tables,
-rates, sigmas and weights the tool records in float32, as FlaxDiff computes
-them (tests/test_diffusion_schedules_flaxdiff.py measures Dew's against them
-and float64).
+and the tangent grid of sigmas (`CosineGeneralNoiseScheduler`). tests/test_schedulers.py measures Dew's
+against them and float64.
+
+`python tools/flaxdiff_schedules_reference.py OUTPUT.npz` writes what the
+tests compare bit for bit: the beta tables, and each case's rates, sigmas and
+conditioning (`transform_inputs`, the model's integer thousandths) at 33
+times from 0 to 1, with the conditioning also at CONDITIONED random times.
+
+`python tools/flaxdiff_schedules_reference.py seeds OUTPUT.npz` records each
+site over the seeds check 1 declares (`record_case`): FlaxDiff's float32
+outputs and their float64 truth, FlaxDiff's own program run on the inputs
+widened, where it computes in its inputs' dtype (the continuous cosine, the
+tangent grid and its weights), and the same formulas in float64 on FlaxDiff's
+own float64 betas where it fixes float32 (a beta table's rates and P2 weights).
 
 Cases:
 - `exp/default`: 1000 steps at the default beta_end and P2 weights;
 - `exp/clipped`: 8 steps, every beta clipped at a beta_end of 0.5, P2 weights
   of k = 2 and gamma = 0.5;
-- `cosine_continuous`: 33 times from 0 to 1;
-- `cosine_general/default` and `cosine_general/bounded`: the same times, at
-  the defaults and at sigma_min 0.002, sigma_max 160 and kappa 0.5.
+- `cosine_continuous`;
+- `cosine_general/default`, `cosine_general/bounded` and `cosine_general/steep`:
+  the defaults, sigma_min 0.002, sigma_max 160 and kappa 0.5, and kappa 2.
 
-Run with the Dew test environment, on CPU:
-
-    python tools/flaxdiff_schedules_reference.py OUTPUT.npz
+Run with the Dew test environment, on CPU.
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ import sys
 import types
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from reference_source import loaded, package, published_files, saved_fixture
@@ -46,7 +55,12 @@ TIMES = np.linspace(0, 1, 33, dtype=np.float32)
 EXP = {"exp/default": {"timesteps": 1000},
        "exp/clipped": {"timesteps": 8, "beta_end": 0.5, "p2_loss_weight_k": 2, "p2_loss_weight_gamma": 0.5}}
 GENERAL = {"cosine_general/default": {}, "cosine_general/bounded": {"sigma_min": 0.002, "sigma_max": 160.0,
-                                                                     "kappa": 0.5}}
+                                                                     "kappa": 0.5},
+           "cosine_general/steep": {"kappa": 2.0}}
+CONDITIONED = 4096
+"""The random times each tangent grid's conditioning is also recorded at, drawn from seed 0."""
+ROWS = 64
+"""The times, or a beta table's steps, of one seed's draw."""
 
 
 def schedulers() -> dict[str, types.ModuleType]:
@@ -76,14 +90,93 @@ def main(destination: Path) -> None:
     weight = continuous.get_schedule_weights(steps, shape=(-1,))
     arrays.update({"cosine_continuous/alpha": np.asarray(alpha), "cosine_continuous/sigma": np.asarray(sigma),
                    "cosine_continuous/weight": np.asarray(weight)})
+    conditioned = np.random.default_rng(0).uniform(0, 1, CONDITIONED).astype(np.float32)
+    arrays["conditioning_times"] = conditioned
     for case, arguments in GENERAL.items():
         general = modules["cosine"].CosineGeneralNoiseScheduler(**arguments)
         signal, noise = general.get_rates(steps, shape=(-1,))
         arrays.update({f"{case}/sigma": np.asarray(general.get_sigmas(steps)),
-                       f"{case}/signal": np.asarray(signal), f"{case}/noise": np.asarray(noise)})
+                       f"{case}/signal": np.asarray(signal), f"{case}/noise": np.asarray(noise),
+                       f"{case}/conditioning": np.asarray(general.transform_inputs(None, steps)[1]),
+                       f"{case}/conditioning_drawn": np.asarray(
+                           general.transform_inputs(None, jnp.asarray(conditioned))[1])})
     saved_fixture(destination, arrays, {"repo": REPO, "commit": COMMIT, "files": FILES, "exp": EXP,
                                         "general": GENERAL})
 
 
+def time_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's ROWS times, uniform on [0, 1)."""
+    return {"t": np.random.default_rng(seed).uniform(0, 1, ROWS).astype(np.float32)}
+
+
+def evaluated(evaluate):
+    """`evaluate(steps)`'s outputs at a draw's times as FlaxDiff computes them, and their float64
+    truth, the same program on the times widened."""
+    def outputs(inputs):
+        reference = jax.tree.map(np.asarray, evaluate(jnp.asarray(inputs["t"])))
+        with jax.enable_x64(new_val=True):
+            truth = jax.tree.map(np.asarray, evaluate(jnp.asarray(inputs["t"].astype(np.float64))))
+        return reference, truth
+
+    return outputs
+
+
+def table_site(module, arguments: dict):
+    """An exponential beta table's site: a draw of ROWS of its steps, FlaxDiff's float32 rates and P2
+    weights at them, and the float64 truth, its formulas on FlaxDiff's own float64 betas."""
+    scheduler = module.ExpNoiseScheduler(**arguments)
+    timesteps = arguments["timesteps"]
+    k, gamma = arguments.get("p2_loss_weight_k", 1), arguments.get("p2_loss_weight_gamma", 1)
+    bars = np.cumprod(1 - module.exp_beta_schedule(timesteps, 0.008, arguments.get("beta_end", 0.999)))
+    truth = {"sqrt_alpha_cumprod": np.sqrt(bars), "sqrt_one_minus_alpha_cumprod": np.sqrt(1 - bars),
+             "p2_loss_weights": (k + bars / (1 - bars)) ** -gamma}
+
+    def draw(seed):
+        return {"index": np.random.default_rng(seed).integers(0, timesteps, ROWS).astype(np.int32)}
+
+    def evaluate(inputs):
+        index = inputs["index"]
+        return ({name: np.asarray(getattr(scheduler, name))[index] for name in truth},
+                {name: values[index] for name, values in truth.items()})
+
+    return draw, evaluate
+
+
+def seeds(destination: Path) -> None:
+    """Every site over the seeds check 1 declares (`record_case`), with its provenance."""
+    from recorded_references import provenance, record_case, save
+
+    modules = schedulers()
+    # tests/ is on the path once recorded_references is imported.
+    from diffusion_support import flaxdiff_times
+
+    arrays = {}
+    for case, arguments in EXP.items():
+        arrays.update(record_case(case, *table_site(modules["exp"], arguments)))
+    continuous = modules["cosine"].CosineContinuousNoiseScheduler()
+
+    def rates(steps):
+        alpha, sigma = continuous.get_rates(steps, shape=(-1,))
+        return {"alpha": alpha, "sigma": sigma, "weight": continuous.get_schedule_weights(steps, shape=(-1,))}
+
+    arrays.update(record_case("cosine_continuous", time_draw, evaluated(rates)))
+    for case, arguments in GENERAL.items():
+        general = modules["cosine"].CosineGeneralNoiseScheduler(**arguments)
+
+        def grid(steps, general=general):
+            return {"sigma": general.get_sigmas(steps),
+                    "weight": general.get_schedule_weights(steps, shape=(-1,))}
+
+        # The evidence alone, over draws the test makes again (`flaxdiff_times`), as their outputs would
+        # take megabytes.
+        arrays.update(record_case(case, flaxdiff_times, evaluated(grid), store_inputs=False, summary=True))
+    save(destination, {**arrays, "provenance": provenance(
+        REPO, COMMIT, "cpu", f"python tools/flaxdiff_schedules_reference.py seeds {destination}")},
+        reference=f"{REPO} {COMMIT}", license="MIT")
+
+
 if __name__ == "__main__":
-    main(Path(sys.argv[1]))
+    if len(sys.argv) == 3 and sys.argv[1] == "seeds":
+        seeds(Path(sys.argv[2]))
+    else:
+        main(Path(sys.argv[1]))

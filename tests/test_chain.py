@@ -12,7 +12,6 @@ data or settings fails the run before its first stage trains.
 """
 
 import dataclasses
-import functools
 import json
 from pathlib import Path
 
@@ -179,46 +178,14 @@ def leaning(vocab: int, letter: int, eos: int) -> np.ndarray:
 
 
 def test_a_grpo_stage_scores_decoded_text_and_stops_at_the_tokenizer_eos(tmp_path):
-    """DPO, GRPO, then DPO on a bigram policy that draws "a" then EOS, or
-    EOS at once. Of the 8 * 4 completions the reward reads, each is "a" or
-    empty as the prompts' tokenizer decodes it, and both occur: EOS stopped
-    every one inside the four-token budget, where sampling past it would
-    have decoded EOS text or a second "a". GRPO trains on the differing
-    rewards, its reference is the first stage's final tree, and the last
-    stage's reference is GRPO's."""
-    tokenizer = tokenizer_for(str(TOKENIZER))
-    letter, = tokenizer.encode("a", add_special_tokens=False)
-    assert tokenizer.eos_id is not None
-    model = ToolPolicy(vocab_size=tokenizer.vocab_size, max_seq_len=12,
-                       logits=functools.partial(leaning, tokenizer.vocab_size, letter, tokenizer.eos_id))
-    read = []
-
-    def reward(text, record):
-        read.append(text)
-        return float(len(text))
-
-    # A source may state a field's shape as a tuple, as `Torch(known=)` passes it on; the stage reads
-    # the prompt's length from it as from the preset's list.
-    prompts = Memory([{"prompt": "hi"}] * 8).pipe(presets.prompts, str(TOKENIZER), max_prompt_len=8, batch=8,
-                                                  long="truncate").map(TupleShapes())
-    states = Recipe(model, optax.sgd(.1), jax.random.key(0), (
-        Stage(name="dpo", loss="dpo", data=pairs(), steps=1),
-        Stage(name="grpo", loss="grpo", data=prompts, steps=1, beta=.01, reward=reward, max_new_tokens=4),
-        Stage(name="aligned", loss="dpo", data=pairs(), steps=1),
-    ), str(tmp_path / "chain"), layout=LAYOUT).run()
-
-    assert len(read) == 8 * 4
-    assert set(read) == {"", "a"}
-    identical(states[1].ema, states[0].variables)
-    assert moved(states[1].variables, states[0].variables)
-    identical(states[2].ema, states[1].variables)
-
-
-def test_one_model_is_pretrained_tuned_and_reinforced_in_one_recipe(tmp_path):
-    """One bigram policy through pretraining on text, SFT on conversations and online GRPO, in one run
-    of the recipe, each stage in its own checkpoint directory and starting from the last one's final
-    tree: SFT's rows of the table no conversation trains hold pretraining's values, not the start's;
-    GRPO's reference is SFT's final tree, and it trains on rewards it reads from its own draws."""
+    """One bigram policy that draws "a" then EOS, or EOS at once, pretrained on text, tuned on
+    conversations, reinforced by GRPO and aligned by DPO in one run of the recipe, each stage in its
+    own checkpoint directory and starting from the last one's final tree. SFT's rows of the table no
+    conversation trains hold pretraining's values, not the start's. Of the 8 * 4 completions GRPO's
+    reward reads, each is "a" or empty as the prompts' tokenizer decodes it, and both occur: EOS
+    stopped every one inside the four-token budget, where sampling past it would have decoded EOS
+    text or a second "a". GRPO trains on the differing rewards, its reference is SFT's final tree,
+    and the last stage's reference is GRPO's."""
     tokenizer = tokenizer_for(str(TOKENIZER))
     letter, = tokenizer.encode("a", add_special_tokens=False)
     assert tokenizer.eos_id is not None
@@ -232,24 +199,30 @@ def test_one_model_is_pretrained_tuned_and_reinforced_in_one_recipe(tmp_path):
 
     text = Memory([{"text": "the quick brown fox jumps over the lazy dog"}] * 16).pipe(
         presets.lm, str(TOKENIZER), seq_len=8, batch=8)
+    # A source may state a field's shape as a tuple, as `Torch(known=)` passes it on; the stage reads
+    # the prompt's length from it as from the preset's list.
     prompts = Memory([{"prompt": "hi"}] * 8).pipe(presets.prompts, str(TOKENIZER), max_prompt_len=8, batch=8,
-                                                  long="truncate")
+                                                  long="truncate").map(TupleShapes())
     states = Recipe(model, optax.sgd(.1), jax.random.key(0), (
         Stage(name="pretraining", loss="pretrain", data=text, steps=1),
         Stage(name="sft", loss="sft", data=chat(tmp_path), steps=1),
         Stage(name="grpo", loss="grpo", data=prompts, steps=1, beta=.01, reward=reward, max_new_tokens=4),
+        Stage(name="aligned", loss="dpo", data=pairs(), steps=1),
     ), str(tmp_path / "chain"), layout=LAYOUT).run()
 
-    assert [path.name for path in sorted((tmp_path / "chain").iterdir())] == ["grpo", "pretraining", "sft"]
+    assert [path.name for path in sorted((tmp_path / "chain").iterdir())] == [
+        "aligned", "grpo", "pretraining", "sft"]
     pretrained, tuned = (np.asarray(state.variables["params"]["table"]) for state in states[:2])
     assert moved(states[0].variables, {"params": {"table": start}})
     assert moved(states[1].variables, states[0].variables)
     # A row pretraining moved and no conversation reaches holds its pretrained values after SFT.
     carried = np.all(tuned == pretrained, axis=1) & np.any(pretrained != start, axis=1)
     assert carried.any()
+    assert len(read) == 8 * 4
+    assert set(read) == {"", "a"}
     identical(states[2].ema, states[1].variables)
     assert moved(states[2].variables, states[1].variables)
-    assert len(read) == 8 * 4 and set(read) == {"", "a"}
+    identical(states[3].ema, states[2].variables)
 
 
 def test_a_mislinked_chain_is_refused_before_anything_trains(tmp_path):

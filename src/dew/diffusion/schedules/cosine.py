@@ -47,10 +47,10 @@ class CosineContinuousNoiseScheduler(ContinuousNoiseScheduler):
     """FlaxDiff's continuous cosine schedule, variance preserving: alpha = cos(pi t / 2) and
     sigma = sin(pi t / 2), each step weighted 1 / (1 + SNR), which is sigma^2. The arithmetic is
     FlaxDiff's `CosineContinuousNoiseScheduler` (flaxdiff/schedulers/cosine.py at 15c55b001),
-    operation for operation in float32."""
+    operation for operation, in float32 or a float64 run's float64 (`times`)."""
 
     def rates(self, t):
-        t = jnp.asarray(t, jnp.float32)
+        t = times(t)
         return jnp.cos((jnp.pi * t) / 2), jnp.sin((jnp.pi * t) / 2)
 
     def weight(self, t):
@@ -62,22 +62,37 @@ class CosineGeneralNoiseScheduler(GeneralizedNoiseScheduler):
     """FlaxDiff's tangent grid of sigmas, variance exploding: sigma(t) = tan(theta(t)) / kappa, theta
     moving linearly from atan(sigma_min / kappa) at t = 0 to atan(sigma_max / kappa) at t = 1, the
     angles of FlaxDiff's log-SNR bounds. With kappa 1 the grid runs from sigma_min to sigma_max; with
-    another it runs from sigma_min / kappa^2, as FlaxDiff's divides the tangent by kappa again. The
-    arithmetic is FlaxDiff's `CosineGeneralNoiseScheduler` (flaxdiff/schedulers/cosine.py at
-    15c55b001); its weight and model time are the EDM family's (`GeneralizedNoiseScheduler`)."""
+    another it runs from sigma_min / kappa^2 to sigma_max / kappa^2, as FlaxDiff's divides the tangent
+    by kappa again. The schedule's `sigma_min` and `sigma_max` are the grid's own ends, which a solver
+    keeps its sigmas inside (Heun's churn, `BrownianTree`); `nominal` holds the two arguments.
+
+    The arithmetic is FlaxDiff's `CosineGeneralNoiseScheduler` and the `GeneralizedNoiseScheduler`
+    it extends (flaxdiff/schedulers/cosine.py and common.py at 15c55b001), operation for operation:
+    each step weighted 1 + sigma^2 / sigma_max^2, its nominal sigma_max (`weight`), the model
+    conditioned on the step's progress in whole thousandths (`model_time`), and sigma_data 1, not
+    the EDM family's weight, log-sigma conditioning and 0.5. In float32, or a float64 run's float64
+    (`times`)."""
 
     def __init__(self, sigma_min: float = 0.02, sigma_max: float = 80.0, kappa: float = 1.0,
-                 sigma_data: float = 0.5):
-        super().__init__(sigma_min, sigma_max, sigma_data)
-        self.kappa = kappa
-        logsnr_max = 2 * (math.log(self.kappa) - math.log(self.sigma_max))
+                 sigma_data: float = 1.0):
+        self.kappa, self.nominal = kappa, (sigma_min, sigma_max)
+        logsnr_max = 2 * (math.log(self.kappa) - math.log(sigma_max))
         self.theta_max = math.atan(math.exp(-0.5 * logsnr_max))
-        logsnr_min = 2 * (math.log(self.kappa) - math.log(self.sigma_min))
+        logsnr_min = 2 * (math.log(self.kappa) - math.log(sigma_min))
         self.theta_min = math.atan(math.exp(-0.5 * logsnr_min))
+        super().__init__(math.tan(self.theta_min) / kappa, math.tan(self.theta_max) / kappa, sigma_data)
 
     def sigmas(self, t):
         return jnp.tan(self.theta_min + times(t) * (self.theta_max - self.theta_min)) / self.kappa
 
     def t_of_sigma(self, sigma):
-        return (jnp.arctan(jnp.asarray(sigma, jnp.float32) * self.kappa) - self.theta_min) / (
-            self.theta_max - self.theta_min)
+        return (jnp.arctan(times(sigma) * self.kappa) - self.theta_min) / (self.theta_max - self.theta_min)
+
+    def weight(self, t):
+        sigma = self.sigmas(t)
+        # FlaxDiff's expression as it writes it, 1 + sigma^2 / sigma_max^2 with sigma^2 as 1 / (1 + 1 / SNR).
+        return 1 + (1 / (1 + ((1 - sigma ** 2) / (sigma ** 2)))) / (self.nominal[1] ** 2)
+
+    def model_time(self, t):
+        # FlaxDiff's `transform_inputs`: the progress in whole thousandths, truncated as its int32 cast is.
+        return jnp.trunc(times(t) * 1000)

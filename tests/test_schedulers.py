@@ -10,6 +10,7 @@ tests/reference_error.py); a training draw's law is held by a
 Kolmogorov-Smirnov test; what is exact is held exactly.
 """
 
+import math
 from functools import partial
 from pathlib import Path
 
@@ -17,14 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    declared_seeds,
-    indexed_recording,
-    recording,
-)
+from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 from scipy import stats
 
 import dew.diffusion.schedules as schedulers
@@ -511,17 +505,19 @@ def test_presets_rebuild_from_their_fields(rng):
         registry.build("flow", shfit=3.0)
 
 
-@pytest.mark.parametrize("schedule", [EDMNoiseScheduler(), KarrasVENoiseScheduler()],
-                         ids=["edm", "karras"])
-def test_a_karras_schedule_keeps_a_float64_runs_times_in_float64(schedule):
-    """A float64 run's times stay float64 through a Karras schedule's sigmas and back
-    (`schedules.common.times`), as every other schedule keeps them: a float64 truth's noise rates,
-    loss weights and conditioning times are then float64's, not float32's widened."""
+@pytest.mark.parametrize("schedule", [EDMNoiseScheduler(), KarrasVENoiseScheduler(),
+                                      CosineGeneralNoiseScheduler(kappa=0.5)],
+                         ids=["edm", "karras", "flaxdiff-tangent"])
+def test_a_sigma_schedule_keeps_a_float64_runs_times_in_float64(schedule):
+    """A float64 run's times stay float64 through a Karras schedule's sigmas and back, and FlaxDiff's
+    tangent grid's (`schedules.common.times`), as every other schedule keeps them: a float64 truth's
+    noise rates, loss weights and conditioning times are then float64's, not float32's widened."""
     with jax.enable_x64(new_val=True):
         t = np.linspace(0.05, 0.95, 64) * schedule.T
         sigma = schedule.sigmas(jnp.asarray(t, jnp.float64))
         assert sigma.dtype == jnp.float64
         assert schedule.t_of_sigma(sigma).dtype == jnp.float64
+        assert schedule.weight(jnp.asarray(t, jnp.float64)).dtype == jnp.float64
         # Computed in float64, not in float32 and widened.
         narrow = schedule.sigmas(jnp.asarray(t, jnp.float32))
         assert narrow.dtype == jnp.float32
@@ -568,54 +564,135 @@ def flaxdiff_case(case: str) -> dict:
     return {**meta["exp"], **meta["general"]}[case]
 
 
+FLAXDIFF_SEEDS = Path(__file__).parent / "fixtures" / "flaxdiff_schedules_seeds.npz"
+FLAXDIFF_SEEDED = recording(FLAXDIFF_SEEDS)
+"""Each FlaxDiff site over check 1's seeds: FlaxDiff's float32 outputs and their float64 truth
+(`tools/flaxdiff_schedules_reference.py seeds`)."""
+
+
+def assert_on_par_with_flaxdiff(site: str, dew, *, summarized: bool = False) -> None:
+    """Check 1 of `dew(inputs)` against FlaxDiff's recorded outputs at `site`, each leaf on its own,
+    over the seeds its recording declares; or, `summarized`, against its recorded evidence alone, the
+    times drawn again (`flaxdiff_times`) and the truth Dew's own float64 path, held to the recorded
+    truth's sketch."""
+    from diffusion_support import flaxdiff_times
+
+    seeds = declared_seeds(FLAXDIFF_SEEDS)[site]
+    again = {"inputs_of": flaxdiff_times, "truth_fn": dew} if summarized else {}
+    draw, recorded, truth = indexed_recording(FLAXDIFF_SEEDED, site, seeds, **again)
+    assert_as_exact(lambda index, inputs: dew(inputs), recorded, draw, f"FlaxDiff {site}", seeds=seeds,
+                    truth_fn=truth)
+
+
 @pytest.mark.parametrize("case", ["exp/default", "exp/clipped"])
 def test_the_exponential_table_is_flaxdiffs_with_its_rates_and_weights(case):
     """FlaxDiff's exponential beta table, bit for bit as its arithmetic makes it (`exp_beta_schedule`,
     clipped at the schedule's own beta_end, not Diffusers' fixed 0.999), and the rates and P2 weights
-    Dew tabulates from it as near float64 as FlaxDiff's, which accumulates its table in float32."""
-    from dew.diffusion.schedules import exp_beta_schedule
-
+    Dew tabulates from it, each on par with FlaxDiff's, which accumulates its table in float32, at
+    the steps each seed draws."""
     arguments = flaxdiff_case(case)
     schedule = ExpNoiseScheduler(**arguments)
-    k, gamma = arguments.get("p2_loss_weight_k", 1), arguments.get("p2_loss_weight_gamma", 1)
     np.testing.assert_array_equal(np.asarray(schedule.betas, np.float32), FLAXDIFF[f"{case}/betas"])
-    betas = exp_beta_schedule(arguments["timesteps"], beta_end=arguments.get("beta_end", 0.999))
-    bars = np.cumprod(1 - betas)
-    truth = (np.sqrt(bars), np.sqrt(1 - bars), (k + bars / (1 - bars)) ** -gamma)
     names = ("sqrt_alpha_cumprod", "sqrt_one_minus_alpha_cumprod", "p2_loss_weights")
-    ours = tuple(np.asarray(getattr(schedule, name)) for name in names)
-    theirs = tuple(FLAXDIFF[f"{case}/{name}"] for name in names)
-    assert_as_exact_as_the_reference(ours, theirs, truth, f"FlaxDiff {case}")
+    tables = {name: jnp.asarray(getattr(schedule, name)) for name in names}
+    assert_on_par_with_flaxdiff(case, lambda inputs: {name: table[inputs["index"]]
+                                                      for name, table in tables.items()})
+
+
+def test_flaxdiffs_continuous_cosine_keeps_a_float64_runs_times_in_float64():
+    """FlaxDiff's continuous cosine computes a float64 run's rates in float64, as FlaxDiff's own follow
+    their times' dtype, not in float32 widened."""
+    schedule = CosineContinuousNoiseScheduler()
+    with jax.enable_x64(new_val=True):
+        t = np.linspace(0.05, 0.95, 64)
+        wide = schedule.rates(jnp.asarray(t, jnp.float64))
+        narrow = schedule.rates(jnp.asarray(t, jnp.float32))
+        assert {rate.dtype for rate in wide} == {jnp.dtype(jnp.float64)}
+        assert not np.array_equal(np.asarray(wide[1]), np.asarray(narrow[1], np.float64))
 
 
 def test_the_continuous_cosine_is_flaxdiffs_with_its_snr_weight():
     """FlaxDiff's continuous cosine, alpha = cos(pi t / 2) and sigma = sin(pi t / 2), weighted
-    1 / (1 + SNR), each as near float64 as FlaxDiff's own from no noise to all of it."""
-    schedule, t = CosineContinuousNoiseScheduler(), FLAXDIFF["times"]
-    wide = t.astype(np.float64)
-    alpha, sigma = np.cos(np.pi * wide / 2), np.sin(np.pi * wide / 2)
-    with np.errstate(divide="ignore"):
-        weight = 1 / (1 + alpha ** 2 / sigma ** 2)
-    ours = (*(np.asarray(rate) for rate in schedule.rates(t)), np.asarray(schedule.weight(t)))
-    theirs = tuple(FLAXDIFF[f"cosine_continuous/{name}"] for name in ("alpha", "sigma", "weight"))
-    assert_as_exact_as_the_reference(ours, theirs, (alpha, sigma, weight), "FlaxDiff continuous cosine")
+    1 / (1 + SNR): the rates and the weight each on par with FlaxDiff's, and at the ends exactly
+    float64's, no noise and a weight of 0 at t = 0, all noise and a weight of 1 at t = 1, as
+    FlaxDiff's are."""
+    schedule = CosineContinuousNoiseScheduler()
+
+    def rates(inputs):
+        alpha, sigma = schedule.rates(inputs["t"])
+        return {"alpha": alpha, "sigma": sigma, "weight": schedule.weight(inputs["t"])}
+
+    assert_on_par_with_flaxdiff("cosine_continuous", rates)
+    ends = jnp.asarray([0.0, 1.0], jnp.float32)
+    alpha, sigma = schedule.rates(ends)
+    assert alpha[0] == 1 and sigma[0] == 0 and sigma[1] == 1
+    np.testing.assert_array_equal(schedule.weight(ends), [0.0, 1.0])
+    np.testing.assert_array_equal(FLAXDIFF["cosine_continuous/weight"][[0, -1]], [0.0, 1.0])
 
 
-@pytest.mark.parametrize("case", ["cosine_general/default", "cosine_general/bounded"])
-def test_the_tangent_grid_is_flaxdiffs_and_inverts(case):
+FLAXDIFF_GRIDS = ["cosine_general/default", "cosine_general/bounded", "cosine_general/steep"]
+
+
+@pytest.mark.parametrize("case", FLAXDIFF_GRIDS)
+def test_the_tangent_grid_is_flaxdiffs_with_its_weight_and_conditioning(case):
     """FlaxDiff's tangent grid of sigmas, from sigma_min / kappa^2 as its divides the tangent by kappa
-    again, at its own bounds and at others: the sigmas and the rates (alpha 1) as near float64 as
-    FlaxDiff's."""
-    import math
+    again, at its own bounds and at others: the sigmas and the weight of its `GeneralizedNoiseScheduler`,
+    1 + sigma^2 / sigma_max^2, each on par with FlaxDiff's; alpha exactly 1; and the model conditioned
+    on FlaxDiff's whole thousandths of t, exactly its own at 33 times and 4096 drawn, the same
+    float32 product truncated as its int32 cast truncates it."""
+    schedule = CosineGeneralNoiseScheduler(**flaxdiff_case(case))
+    assert schedule.sigma_data == 1
+    def grid(inputs):
+        return {"sigma": schedule.sigmas(inputs["t"]), "weight": schedule.weight(inputs["t"])}
 
-    arguments = flaxdiff_case(case)
-    schedule, t = CosineGeneralNoiseScheduler(**arguments), FLAXDIFF["times"]
-    kappa = arguments.get("kappa", 1.0)
-    low = math.atan(arguments.get("sigma_min", 0.02) / kappa)
-    high = math.atan(arguments.get("sigma_max", 80.0) / kappa)
-    sigma = np.tan(low + t.astype(np.float64) * (high - low)) / kappa
-    signal, noise = schedule.rates(t)
-    assert_as_exact_as_the_reference(
-        (np.asarray(schedule.sigmas(t)), np.asarray(signal), np.asarray(noise)),
-        tuple(FLAXDIFF[f"{case}/{name}"] for name in ("sigma", "signal", "noise")),
-        (sigma, np.ones_like(sigma), sigma), f"FlaxDiff {case}")
+    assert_on_par_with_flaxdiff(case, grid, summarized=True)
+    t = FLAXDIFF["times"]
+    signal, _ = schedule.rates(t)
+    np.testing.assert_array_equal(signal, FLAXDIFF[f"{case}/signal"])
+    for times, name in ((t, "conditioning"), (FLAXDIFF["conditioning_times"], "conditioning_drawn")):
+        np.testing.assert_array_equal(schedule.model_time(times), FLAXDIFF[f"{case}/{name}"])
+
+
+TANGENT_INVERSE_SEEDS = {"cosine_general/default": 8, "cosine_general/bounded": 8, "cosine_general/steep": 8}
+"""Check 1's declared seeds for each tangent grid's time of a sigma, sized by `seeds_for`."""
+
+
+@pytest.mark.parametrize("case", FLAXDIFF_GRIDS)
+def test_the_tangent_grids_time_of_a_sigma_is_on_par_with_its_formula_rounded_in_float32(case):
+    """The tangent grid's inverse, (atan(kappa sigma) - theta_min) / (theta_max - theta_min), which
+    FlaxDiff leaves unwritten, on par with the same formula in NumPy's float32 at sigmas drawn
+    log-uniform over the grid (check 1, float64 the truth)."""
+    schedule = CosineGeneralNoiseScheduler(**flaxdiff_case(case))
+    t_of_sigma = jax.jit(schedule.t_of_sigma)
+    low, high = math.log(schedule.sigma_min), math.log(schedule.sigma_max)
+
+    def draw(seed):
+        return (np.exp(np.random.default_rng(seed).uniform(low, high, 4096)).astype(np.float32),)
+
+    @as_given
+    def reference(sigma):
+        kind = sigma.dtype.type
+        return ((np.arctan(sigma * kind(schedule.kappa)) - kind(schedule.theta_min))
+                / kind(schedule.theta_max - schedule.theta_min))
+
+    assert_as_exact(t_of_sigma, reference, draw, f"FlaxDiff {case} t_of_sigma",
+                    seeds=TANGENT_INVERSE_SEEDS[case])
+
+
+@pytest.mark.parametrize("kappa", [0.5, 2.0])
+def test_heuns_churn_stays_inside_the_tangent_grid_whatever_its_kappa(kappa):
+    """The tangent grid of nominal bounds 0.02 and 80 ends at 80 / kappa^2 (`sigma_max`, 320 at kappa
+    0.5 and 20 at kappa 2), the top a churn may raise a sigma to: a churn of the grid's top sigma is
+    refused, and one of the sigma at t = 0.99, raised by a tenth to about 102 at kappa 0.5 (past the
+    nominal 80) and 14 at kappa 2, runs."""
+    from types import SimpleNamespace
+
+    from dew.sampling import Heun
+
+    schedule = CosineGeneralNoiseScheduler(kappa=kappa)
+    assert schedule.nominal == (0.02, 80.0)
+    process, x = SimpleNamespace(sampler_schedule=schedule), jnp.zeros((1, 4), jnp.float32)
+    with pytest.raises(ValueError):
+        Heun(s_churn=0.2).init(x, jnp.asarray([1.0, 0.5, 0.0]), process, key=jax.random.key(0))
+    below = Heun(s_churn=0.2).init(x, jnp.asarray([0.99, 0.5, 0.0]), process, key=jax.random.key(0))
+    assert float(below) == np.float32(0.1)

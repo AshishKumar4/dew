@@ -24,8 +24,8 @@ Each row names what FlaxDiff provided, Dew's version of it, and the test that ho
 |---|---|---|
 | Linear, cosine, square-root, Karras VE and EDM schedules | `dew.diffusion.schedules`, and the `EDM`, `Karras`, `Cosine` and `Flow` presets in place of `get_diffusion_preset` | `tests/test_schedulers.py` (published beta tables, sigma grids, inversions) |
 | Flow matching, logit-normal draws, resolution shift | `FlowMatchingScheduler`, `Flow`, `ResolutionShift` | `tests/test_flow_matching.py` (SD3 and Flux losses and gradients) |
-| The exponential schedule | `published_betas(schedule="exp")` | The formula only; no test compares it with FlaxDiff's yet |
-| The continuous VP cosine and the tangent-grid cosine schedules | Not in Dew yet | |
+| The exponential schedule | `ExpNoiseScheduler` and `exp_beta_schedule`, its table clipped at its own `beta_end`; Diffusers' exponential table stays `published_betas(schedule="exp")` | `tests/test_schedulers.py`: the betas bit for bit, the rates and P2 weights on par with FlaxDiff's (`tools/flaxdiff_schedules_reference.py`) |
+| The continuous VP cosine and the tangent-grid cosine schedules | `CosineContinuousNoiseScheduler`; `CosineGeneralNoiseScheduler`, with FlaxDiff's weight, 1 + sigma^2 / sigma_max^2, its conditioning on whole thousandths of t and its sigma_data of 1. With a kappa other than 1 the grid ends at sigma_max / kappa^2, as FlaxDiff's does, and `sigma_min` and `sigma_max` name those ends, which solvers keep to; `nominal` holds the arguments | `tests/test_schedulers.py`: rates, sigmas and weights on par with FlaxDiff's, its conditioning exactly its own |
 | Epsilon, x0, v, velocity and EDM-preconditioned targets | `dew.diffusion.transforms` | `tests/test_predictors.py` |
 | DDPM, DDIM, Euler, Euler ancestral, Heun, RK4 and multistep DPM samplers | `dew.sampling.solvers` | `tests/test_samplers.py`; RK4 and multistep DPM against FlaxDiff's own latents and gradients |
 | Classifier-free guidance, also over an interval | `dew.sampling.guidance.CFG` | `tests/test_guidance.py` |
