@@ -581,8 +581,8 @@ def test_the_backward_reads_what_the_epilogues_derivative_reads():
 
 @runs("sm80")
 def test_forward_mode_through_the_kernels_gives_a_tangent():
-    """`jax.jvp` of the template through its kernels runs, its value and tangent in the output's dtype, the
-    tangent the portable arithmetic's (`generation.linear_tangent`)."""
+    """`jax.jvp` of the template through its kernels runs, its value and tangent in the output's dtype and
+    the tangent finite (`generation.linear_tangent`)."""
     x, w, ms, nw, b, u, s, _ = _draw(0)
     spec = CASES["norm and bias"]
     with generation.assumed("sm80"):
@@ -1207,11 +1207,6 @@ def selected(x, mask):
     return jnp.where(mask[:, None] > 0, x, jnp.zeros_like(x))
 
 
-def transposed_twice_nested(x, side):
-    """`shifted`, its transpose two jitted calls deep."""
-    return (_wide(x) + jax.jit(jax.jit(lambda s: s.T))(side)).astype(x.dtype)
-
-
 @runs("sm80")
 def test_an_integer_side_operand_takes_no_gradient():
     """A prologue selecting rows by an integer mask differentiates through the kernels, the mask's
@@ -1399,3 +1394,13 @@ def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_its_float64
     assert float(product.interpreted(declared, lhs, rhs, (((1,), (0,)), ((), ())))[0, 0]) == 1.0
 
 
+def test_a_declared_cell_compiles_nothing_for_the_template_it_prefers(monkeypatch, tmp_path):
+    """A declared cell's call (an A100's grouped kernel gradient, `grouped_matmul.DECLARED`), traced, keeps
+    no kernel report: no launch rests on the template it prefers, so the compiler's word on its tile is never
+    asked (`selection.preferring`; the word cost 1.5 s of an A100 trace, CONFIRMCOST1)."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    x, dy = jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16), jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
+    sizes = jnp.full((8,), 512, jnp.int32)
+    with generation.assumed("sm80"):
+        jax.jit(lambda x, dy: template.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16)).trace(x, dy)
+    assert not (tmp_path / "dew" / "kernel-reports").exists()

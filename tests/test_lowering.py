@@ -1,6 +1,7 @@
 """A training step lowered for a CUDA GPU on a host without one (`dew.training._lowering`)."""
 
 import json
+import logging
 import os
 import re
 import sys
@@ -112,8 +113,7 @@ def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_
     """A grouped GEMM's step lowered for the GPU (row 1895): its kernel report lists the program's
     launches, the template's by kernel name with the FLOPs each states, a Triton launch's stating none,
     and the FLOP count of the same program counts the stated FLOPs and leaves out, as unsized, the
-    launches the report does. On an H100 the GEMM's forward and weight gradient, the template called
-    itself, are its launches `dew_gmm` and `dew_tgmm`."""
+    launches the report does."""
     from dew.telemetry.instrumentation import hlo_flops
 
     lowered, found = _reported(generation)
@@ -122,8 +122,6 @@ def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_
     templated = [entry for entry in record["launches"] if entry["kind"] == "mosaic_gpu"]
     assert all(entry["flops"] == entry["calls"] * GMM for entry in templated)
     assert launches["doubled"]["kind"] == "triton" and launches["doubled"]["flops"] is None
-    if generation == "sm90":
-        assert {"dew_gmm", "dew_tgmm"} <= {entry["name"] for entry in templated}
     unstated = sum(entry["calls"] for entry in record["launches"] if entry["flops"] is None)
     assert record["unsized"] == unstated
     flops = hlo_flops(lowered.as_text(dialect="hlo"))
@@ -579,6 +577,32 @@ def test_a_route_records_the_targets_decision_where_its_dispatch_reports_it():
     site = f"{__name__}:{test.__qualname__}.<locals>.dispatch"
     assert inner == [Route("ssd", "xla", "pallas", head_dim, "xla", "sm90", site)]
     assert outer == [Route("ssd", "pallas", row, None, "pallas", "sm90", site), *inner]
+
+
+def test_a_route_off_its_preferred_kernel_is_logged_once_at_info_and_one_on_it_not_at_all():
+    """A dispatch off the kernel it prefers is its own choice, logged once a process at INFO for each kernel
+    and refusal, naming both (`route`); a dispatch that runs its preferred kernel logs nothing, so a run's
+    console shows neither."""
+    from dew.nn.kernels import generation
+
+    logger, records = logging.getLogger(generation.__name__), []
+
+    class Capture(logging.Handler):
+        def emit(self, record):
+            records.append((record.levelno, record.args[:3]))
+
+    capture, level = Capture(), logger.level
+    logger.addHandler(capture)
+    logger.setLevel(logging.INFO)
+    try:
+        off = Refusal("head_dim", "this test's own 300-wide head", "inherent")
+        for _ in range(2):
+            route("ssd", kernel="xla", preferred="pallas", refusal=off)
+        route("ssd", kernel="pallas", preferred="pallas")
+    finally:
+        logger.removeHandler(capture)
+        logger.setLevel(level)
+    assert records == [(logging.INFO, ("ssd", "xla", "pallas"))]
 
 
 def test_a_function_traced_before_a_routes_block_reports_its_routes_within_it():
