@@ -40,7 +40,7 @@ from dew.decision.calibration import softmax
 from dew.decision.images import Images
 from dew.decision.layout import JOINT_SEGMENTS
 from dew.interop import Pretrained
-from dew.nn.kernels.generation import measured_kernel
+from dew.nn.kernels.generation import triton_runs
 from dew.training.trainer import Trainer
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -273,7 +273,8 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path):
                     assert abs(value - expected[option]) <= 1e-4, (case, laid.name, option)
                 if answer["type"] != "noul":
                     assert answer["confidence"] == max(given.values())
-    if measured_kernel("gated_delta_rule", "xla") == "fla":
+    # The delta rule's forward runs on the port wherever Dew's Triton kernels run (`GATED_DELTA`).
+    if triton_runs():
         on_fla = ieee_fixture(TINY / "logits_fla.npz")
         reference = [on_fla[key] for key in keys]
     assert_as_exact_as_the_reference(joint_logits(decide), np.concatenate(reference), np.concatenate(truth),

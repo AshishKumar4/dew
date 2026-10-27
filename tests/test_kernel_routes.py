@@ -46,3 +46,12 @@ def test_a_decode_steps_routes_are_its_own_not_the_parameters_or_the_caches():
     attention = [route for route in kernel_routes.traced(config, "sm80", "decode")
                  if route.choice in ("attention", "decode")]
     assert len(attention) == config["num_hidden_layers"]
+
+
+def test_a_cell_whose_trace_took_no_kernel_choice_is_unexplained():
+    """A family's trace that reports no route at all (every choice deleted or bypassed) fails, named, as
+    any unexplained route does; a mode the family's layers rule out (`absent`) and a refusal its row names
+    stay explained."""
+    assert kernel_routes.unexplained({"family": "llama", "target": "sm80", "mode": "train", "routes": []})
+    assert not kernel_routes.unexplained({"family": "llama", "target": "sm80", "mode": "decode",
+                                          "absent": "its layers take no cache"})

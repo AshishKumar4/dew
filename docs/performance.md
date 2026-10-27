@@ -1148,8 +1148,9 @@ backend and `kernels.get_kernel("kernels-community/flash-attn3").flash_attn_func
 (`triton_runs`), measured faster than cuDNN on an RTX 4080 and as fast as FlashAttention-2 on an
 A100. On an H100 SXM at Llama-3.2-1B's attention (4 x 4096 tokens, 32 query heads over 8 of 64,
 causal, bf16, jax 0.11.2, tokamax 0.0.15) forward and backward took 4.44 ms on it, 2.78 on cuDNN and
-2.17 on FlashAttention-3, which a 1B FSDP step on two H100s spent 82 of 301 ms on. So sm90's row
-names flash for those heads (`attention_narrow`). The rows reproduce with `PYTHONPATH=src python
+2.17 on FlashAttention-3, which a 1B FSDP step on two H100s spent 82 of 301 ms on. So Hopper takes
+flash for those heads (attention's declared cell, `attention_kernels.DECLARED`), and a GPU of no routed
+Mosaic mainloop takes it first by legality. The rows reproduce with `PYTHONPATH=src python
 tools/benchmark_attention.py --implementations triton flash cudnn --sequence-lengths 4096
 --head-dims 64 --batch-size 4 --heads 32 --kv-groups 4 --causal True`.
 
@@ -1233,9 +1234,9 @@ SXM at batch 2 (Mistral 1), the RTX 4080 at batch 1, jax 0.11.2, median of 20:
 
 The 4080's backward takes no head over 192, so Gemma 3 stays off flash there. Flash's output and
 its query, key, value and sink gradients lie within tests/reference_error.py's rule of the xla
-kernel's from float64, batched and packed (tests/test_kernels.py), on all three GPUs. So the
-target rows of sm80, sm89 and sm90 name flash for `attention_window` and `attention_sinks`; sm120
-keeps its windows on cuDNN and its sinks on XLA until a G4 measures them. A packed or key-masked
+kernel's from float64, batched and packed (tests/test_kernels.py), on all three GPUs. So flash takes
+windows and sinks wherever it takes the call (`FLASH_SUPPORTS`), Hopper's by its declared cell and
+other GPUs' by legality, the template elsewhere on a family with a routed Mosaic mainloop. A packed or key-masked
 windowed call keeps its band on cuDNN, which takes the band's mask as a bias. Each row reproduces
 with `tools/benchmark_attention.py`, for example the MiMo row with `PYTHONPATH=src python
 tools/benchmark_attention.py --implementations xla flash --sequence-lengths 4096 --head-dims 192
@@ -1261,8 +1262,8 @@ and backward in ms, median of 20, jax 0.11.2:
 | A100 40GB, 16 | 24.65 | 3.94 | 6.69 | 157.13 |
 
 An empty sequence costs about 3.2 us on the H100 and 6.3 on the A100, so a cap of the row length
-loses to the mask, and 64 wins at every document count. The target rows of sm80 and sm90 name
-flash for `attention_packed`, and `flash_refusal` takes a packed call there when its
+loses to the mask, and 64 wins at every document count. So flash takes packed calls wherever it
+takes the call, and `flash_refusal` takes a packed call there when its
 `Coordinates.max_segments` is at most 64 (`FLASH_PACKED_SEGMENTS`). A packed read declares the most
 documents its windows hold: what its plan or memory read placed in one, or a streamed pack's
 `segments`; a streamed pack without one declares the row length, which stays on the mask. Decision
@@ -1647,7 +1648,7 @@ sm120, where it was measured; the row is what qualification reads), on any
 heads, dtypes, chunk sizes and mesh, with keys up to 256 wide in bf16 or
 fp16 and 128 in fp32 (`recurrence_chunk.fla_rule`). The XLA math stays for
 CPUs, TPUs, unmeasured GPUs, forward-mode traces, float64 and wider keys,
-and as the tests' oracle (`port_refusal` names each case).
+and as the tests' oracle (`recurrence_chunk.PORT_SUPPORTS` names each case).
 On a G4 the port's bf16 forward ran 1.32 and 1.18 ms at the 0.8B's (8 x
 3072 tokens, 16 key and 16 value heads of 128) and the 9B's (4 x 3072, 16
 and 32) shapes against fla's 2.66 and 2.37 (kernel lab `fwd` job,
@@ -2419,7 +2420,7 @@ The cache's validity, derived, 2026-10-04. Each attention cache stored a
 in order, so the mask always equalled the cursor's `filled_slots`. A decode
 step rewrote it in every layer, in 28 one-microsecond kernels, only to store
 it in the state passed to the next step. The mask is now derived where it is
-read (`dew.nn.attention.cached_validity`), in the attention, Llama 4, MLA,
+read (`dew.nn.kv_cache.cached_validity`), in the attention, Llama 4, MLA,
 the DSA pool and DeepSeek V4, and serving no longer places or zeroes it. The
 served tokens and log-probabilities are bitwise the same at 32, 64 and 128
 slots, and the device's busy time a run went from 1393.7 to 1388.3 ms at 32
@@ -3038,7 +3039,7 @@ other GPU.
 
 Each kernel's implementation is chosen in one place and keyed by hardware generation (`dew.nn.kernels.device_generation`: `sm80`, `sm86`, `sm89`, `v5e`, `v6e`, ...), and a generation without a measurement here runs the XLA path. `tools/benchmark_kernels.py` and `tools/benchmark_lm_head.py` reproduce the rows. Each row is one process with jax 0.11.1 and bf16 compute, on a Colab NVIDIA L4 (the RTX 4080's architecture, sm_89), a Colab TPU v6e-1, or, for the kernel-level rows, the local RTX 4080. The step rows come from `tools/benchmark_kernels.py step` (built on `tools/benchmark_step.py`'s trainer), with 30 timed steps after 5 warmup. lm-moe has 321.8M parameters with 8 experts and top-2 routing, and lm-dense has 359.8M; both run at sequence 1024. The batch is 4 (moe) and 1 (dense) on the L4, and 8 and 8 on the v6e. "before" is main at c1f7e2dd.
 
-A call that runs another kernel where a row here measured one fastest logs a warning, once a process for each kernel and reason, on the `dew` logger: `attention runs 'cudnn', not 'flash', the kernel measured fastest on sm80: dew_flash_attn is not installed` (`dew.nn.kernels.ran_kernel`). A change that sends calls off the measured kernel shows in a run's log, not only in its step time.
+A call that runs another kernel where a row here measured one fastest logs a warning, once a process for each kernel and reason, on the `dew` logger: `attention runs 'cudnn', not 'flash', the kernel measured fastest on sm80: dew_flash_attn is not installed` (`dew.nn.kernels.generation.route`). A change that sends calls off the measured kernel shows in a run's log, not only in its step time.
 
 ### The MoE grouped matmul: `KERNELS['grouped_matmul']`
 
@@ -3061,7 +3062,7 @@ The kernel-matrix rows time forward plus backward at jax 0.11.2, checked against
 
 I rejected a pure-JAX loop of dense per-tile products. On the RTX 4080 it was 2.2x faster than XLA for the projection alone (6.67 ms), but it doubled the step's temporaries (4.22 GiB against 2.17 at batch 1), and on the v6e it was 2.2x slower than XLA (1.71 ms against 0.79).
 
-The Pallas kernels are JAX's own `gmm` and `tgmm` from the jax-v0.11.2 source tree, vendored because no wheel ships them and called through a custom VJP. jax 0.11.2 deprecates the Pallas Triton backend they run on and warns at every lowering. They are the sm80 to sm90 path anyway, because JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma and fails to compile on the RTX 4080, tokamax's sm80 Mosaic config exceeds Ada's shared memory, and on an H100 tokamax's Mosaic GPU kernel only matched their forward (below). Dew does not silence the warning, so filtering it is up to you. On a mesh the kernels run inside `shard_map` on each device's share of the sorted rows. That path is checked for parity on an 8-device CPU mesh and not measured on multiple GPUs.
+The Pallas kernels are JAX's own `gmm` and `tgmm` from the jax-v0.11.2 source tree, vendored because no wheel ships them and run, with Dew's Mosaic GPU kernels on Hopper, through Dew's GEMM template, which differentiates them. jax 0.11.2 deprecates the Pallas Triton backend they run on and warns at every lowering. They are the sm80 to sm90 path anyway, because JAX's Mosaic GPU grouped matmul (`pallas/ops/gpu/ragged_dot_mgpu.py`) uses wgmma and fails to compile on the RTX 4080, tokamax's sm80 Mosaic config exceeds Ada's shared memory, and on an H100 tokamax's Mosaic GPU kernel only matched their forward (below). Dew does not silence the warning, so filtering it is up to you. On a mesh the kernels run inside `shard_map` on each device's share of the sorted rows. That path is checked for parity on an 8-device CPU mesh and not measured on multiple GPUs.
 
 On TPU, tokamax's `mosaic_tpu_v2` was within 1% of XLA on the step; tokamax's default dispatch picked its v1 kernel there, which is 13x slower, so Dew named the kernel. With XLA as fast or faster on a v6e at the step and at 128 experts, TPUs run XLA, and Dew has no tokamax grouped matmul.
 
@@ -3384,7 +3385,9 @@ Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell
 
 ### The Mamba-2 SSD scan: `ssd_kernel_runs`
 
-`tools/benchmark_ssd.py`, forward plus backward, batch 1, 8 heads of 64, state 128, jax 0.11.2:
+`tools/benchmark_ssd.py`, forward plus backward, batch 1, 8 heads of 64, state 128, jax 0.11.2. These
+were timed as the gradients alone, which let XLA drop the forward's readout (ledger 1574); the benchmark
+now times the scan's outputs with their VJP, and the rows wait on a re-measure:
 
 | device | chunk | length | XLA | Pallas kernel |
 |---|---|---|---|---|
