@@ -72,8 +72,8 @@ from dew.pool import joins_pool, pool_cluster
 from dew.registry import models
 from dew.telemetry.benchmark import carried
 from dew.telemetry.instrumentation import COLLECTIVES, model_flops_utilization
-from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.telemetry.profile import capture_options
+from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.training import Trainer
 from dew.training.memory import recompute_record
 from dew.training.runtime import prepare_process
@@ -545,8 +545,10 @@ def entered(within: str | None) -> contextlib.AbstractContextManager:
 
 
 def main(config: BenchmarkConfig) -> list[Row]:
-    if not config.peak_run:
-        # A step's compile seconds are a cold compile's, which no cached executable stands in for.
+    if not config.peak_run and not jax.config.jax_compilation_cache_dir:
+        # Run alone, a step's compile seconds are a cold compile's, which no cached executable stands in for.
+        # A caller that names its cache (JAX_COMPILATION_CACHE_DIR: perf_gate's per-tree cache, whose later
+        # rounds load what its first compiled) keeps it, and its own switch (JAX_ENABLE_COMPILATION_CACHE).
         jax.config.update("jax_enable_compilation_cache", val=False)
     # Before this process opens a backend, which would hold the device each case's peak process needs.
     measuring = not (joins_pool(None, pool_cluster(None)) or config.peak_run)
