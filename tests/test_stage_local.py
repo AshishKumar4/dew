@@ -89,8 +89,10 @@ def test_each_device_holds_one_stage_of_the_pipelined_run(stages):
     held = run.executable.memory_analysis().argument_size_in_bytes - bytes_on(batch, device)
     leaves = len(jax.tree.leaves(state))
     stage = outside + inside / stages
-    assert stage <= held <= stage + 8 * leaves, (held, inside, outside)
-    assert held == bytes_on(state, device)
+    # The executable's arguments and the placed state's own shards, each within a few bytes a leaf of
+    # one stage's share (the step takes its own scalars beside the state's).
+    for placed in (held, bytes_on(state, device)):
+        assert stage <= placed <= stage + 8 * leaves, (placed, inside, outside)
 
 
 OPTIMIZERS = {
