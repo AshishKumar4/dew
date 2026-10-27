@@ -114,7 +114,11 @@ WRAPPER_SEEDS = {"text": 8, "image": 8}
 def wrapper(tmp_path_factory):
     """A tiny Muse Glimmer wrapper as transformers saves one, every weight drawn away from its initial
     value, and its float32 and float64 models."""
+    import pathlib
+    import shutil
+
     from transformers import MuseGlimmerConfig, MuseGlimmerForConditionalGeneration
+    from transformers.models.muse_glimmer.image_processing_muse_glimmer import MuseGlimmerImageProcessor
 
     from tools.torch_precision import float64_twin
 
@@ -129,6 +133,13 @@ def wrapper(tmp_path_factory):
             parameter.add_(torch.randn_like(parameter) * 0.1)
     directory = tmp_path_factory.mktemp("muse-glimmer-wrapper")
     model.save_pretrained(directory)
+    # The processor a release ships beside it: the image processor's config, and a tokenizer, which
+    # `Processor.from_hf` never reads for given ids (a tiny fixture's).
+    MuseGlimmerImageProcessor(patch_size=VISION["patch_size"], temporal_patch_size=VISION["patch_temporal"],
+                              merge_size=VISION["merge_size"]).save_pretrained(directory)
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(pathlib.Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny" / name,
+                    directory / name)
     return directory, model, float64_twin(model)
 
 
