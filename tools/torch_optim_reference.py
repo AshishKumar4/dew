@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Write tests/fixtures/torch_optim/reference.npz: torch's schedulers over
 their steps and a grouped Adam run, for Dew's schedule records and
-`ParamGroup` (tests/test_optim_groups.py).
+`ParamGroup` (tests/test_optim_schedules.py).
 
 Schedules (torch 2.14, `torch.optim.lr_scheduler`), each the learning rate a
 scheduler gives before each of its steps, `<name>/lr`:
