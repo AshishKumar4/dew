@@ -1,5 +1,6 @@
 """Phi-3's fused GQA and LongRoPE against transformers 5.16.1."""
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -82,8 +83,10 @@ def test_a_kinds_longrope_rebuilds_the_cache_at_its_crossing_as_the_models_does(
     from dew.sampling.text import decode_ops, prefill_state
 
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
-    kinded = loaded.model.clone(rope_scaling=None, kinds={
-        **(loaded.model.kinds or {}), 'full_attention': LayerKind(rope_scaling=loaded.model.rope_scaling)})
+    kinds = dict(loaded.model.kinds or {})
+    kinded = loaded.model.clone(rope_scaling=None, kinds={**kinds, **{
+        kind: dataclasses.replace(kinds.get(kind, LayerKind()), rope_scaling=loaded.model.rope_scaling)
+        for kind in set(loaded.model.per_layer_types)}})
     generated = jnp.asarray(np.load(DIRECTORY / 'generated.npy'), jnp.int32)
 
     def walk(model):
