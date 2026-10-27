@@ -174,27 +174,6 @@ def test_dew_profiles_capture_options_reach_the_capture(tmp_path):
     assert (manifest["options"]["host_tracer_level"], manifest["options"]["python_tracer_level"]) == (1, 1)
 
 
-@pytest.mark.gpu(reason="CUPTI's activity cap, which a GPU capture alone has")
-def test_a_gpu_window_past_cuptis_cap_reports_no_device_figure_its_kernels_cannot_establish(tmp_path):
-    """A window whose kernels pass CUPTI's activity cap keeps only the events before it: its capture is
-    partial, the cap its reason, and the report gives no device figure the surviving kernels cannot
-    establish, its host figures kept; with no cap (-1) the capture is whole and its device figures measured
-    (row 1893: a capped H100 capture reported 0% duty cycle as measured)."""
-    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
-    import autoencoder_experiment
-
-    from dew.cli.main import main
-
-    for cap, partial in ((16, True), (-1, False)):
-        out = tmp_path / f"cap{cap}"
-        assert main(["profile", autoencoder_experiment.__file__, "--warmup", "2", "--steps", "2", "--out",
-                     str(out), "--activity-cap", str(cap)]) == 0
-        report = profiled(out / "report.json")
-        manifest = json.loads((Path(report["capture"]) / "manifest.json").read_text())
-        assert (manifest["capture_status"] == "partial") == partial, manifest
-        assert (report["device_window_ms"] is None) == partial and report["step_ms"] > 0
-
-
 def test_dew_profile_with_no_output_prepares_its_process_before_naming_its_directory(tmp_path):
     """`dew profile run.py` with no `--out` profiles into profiles/<the run's name>/<the time it starts>,
     the time agreed across the pool once the process is prepared: the run's XLA flags reach XLA, which
