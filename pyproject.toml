@@ -89,7 +89,7 @@ dew = "dew.cli.main:main"
 [project.optional-dependencies]
 # JAX owns its accelerator requirements; the core dependency pins its release.
 # FlashAttention-2 (kernels/flash_attn), which attention_impl 'auto' runs on an
-# A100 or an Ada GPU; its wheels are built for Linux x86_64 alone.
+# A100 or an Ada GPU; these extras install its wheels on Linux x86_64.
 cuda12 = ["jax[cuda12]",
           "dew-flash-attn-cu12~=0.3.6; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 cuda13 = ["jax[cuda13]",
