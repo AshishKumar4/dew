@@ -5,6 +5,19 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- FlaxDiff's exponential beta table and its continuous and tangent-grid cosine schedules:
+  `ExpNoiseScheduler`, `CosineContinuousNoiseScheduler` and `CosineGeneralNoiseScheduler`, each held to
+  FlaxDiff's own source over drawn steps.
+- `dew.io.promote` publishes a run only where it ranks among its sweep's or project's best by a summary
+  metric, aliased "best" in the registry where it ranks first; `trainer.promote` names the rule for a
+  configured run. `dew.pipeline("wandb:...")` loads a published run from a W&B run or the registry.
+- `NodePerturbation`, mixed into an objective, trains its model without backpropagation, by node
+  perturbation of every Dense and Embed output as Dust does, the rest by weight-space evolution
+  strategies; `Objective.unit_losses` states the units it credits.
+- `Residuals` objectives train on the mean square of their residuals, by the gradient or by damped
+  Gauss-Newton; `dew.nn.fourier.FourierPyramid` is a multi-resolution Fourier feature pyramid;
+  `examples/pinn_burgers.py` solves the self-similar Burgers profile in float64.
+
 - A tiled LM head's backward carries the state gradient over its vocabulary tiles as a compensated
   pair on every backend (`dew.nn.precision.paired_sum`), so its error is the tile products' own: on an
   H100 XLA took the plain sum's addition into each GEMM, which could then not split its sum, and the
