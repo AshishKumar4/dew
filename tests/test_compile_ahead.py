@@ -27,7 +27,7 @@ def fine_tune(mesh) -> Trainer:
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize("spec", [MeshSpec(fsdp=8), MeshSpec(data=8), MeshSpec(fsdp=4, tensor=2)],
+@pytest.mark.parametrize("spec", [MeshSpec(fsdp=8), MeshSpec(), MeshSpec(fsdp=4, tensor=2)],
                          ids=["fsdp8", "data8", "fsdp4_tensor2"])
 def test_a_step_compiled_ahead_for_eight_gpus_reads_and_writes_what_the_run_on_eight_devices_does(spec):
     """Compiled ahead for eight compile-only H100s, the step reads and writes on each device the bytes

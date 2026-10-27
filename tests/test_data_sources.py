@@ -684,7 +684,8 @@ def test_a_line_start_is_found_a_chunk_at_a_time_within_the_range_it_is_sought_i
 
     file = Counted(b"a" * 3_000_000 + b"\n" + b"b\n")
     assert _line_start(file, 1_000, 2_000) == 2_000
-    assert Counted.read_bytes < 1_000
+    # The byte before the range, which says whether a line starts at its first, and the range's own.
+    assert Counted.read_bytes == 2_000 - 1_000
     assert _line_start(file, 1_000) == 3_000_001
     assert _line_start(file, 3_000_001) == 3_000_001
 
