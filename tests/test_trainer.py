@@ -43,6 +43,7 @@ from affine_run import (
 )
 from flax.core import FrozenDict, freeze as frozen_dict
 from recording import Preempting, RecordingTracker
+from reference_error import as_given, assert_as_exact
 from steady_state import steady_state
 from token_support import write_token_corpus
 
@@ -971,6 +972,8 @@ runs = {"first": fit(1e-3, 2, root + "/run")}
 for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
     shutil.copytree(root + "/run", f"{root}/{name}")
     runs[name] = fit(peak, 3, f"{root}/{name}")
+for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
+    runs["fresh " + name] = fit(peak, 3, f"{root}/fresh {name}")
 print(json.dumps(runs))
 """
 
@@ -999,9 +1002,14 @@ def test_a_run_resumed_at_another_rate_steps_at_it_on_the_compiled_step(tmp_path
         np.testing.assert_allclose(fast - start, 2 * (slow - start), rtol=1e-5,
                                    atol=2 * np.spacing(np.abs(start).max()))
     if not grouped:
+        # A resumed step's rate is the one a run configured so from its start steps at, bit for bit: the
+        # same program reading the same rate operands.
         for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
+            assert runs[name]["rates"]["3"] == runs["fresh " + name]["rates"]["3"]
+            # And it is optax's schedule at that update, bit for bit: Dew's Cosine is optax's own pieces,
+            # the same float32 operations on the same operands.
             schedule = optax.warmup_cosine_decay_schedule(0.0, peak, 1, 8)
-            assert runs[name]["rates"]["3"] == pytest.approx(float(schedule(2)))
+            assert runs[name]["rates"]["3"] == float(schedule(2))
 
 
 def test_the_compiled_step_consumes_the_state_it_is_given():
@@ -2163,15 +2171,38 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
         opt_state=jax.tree.map(shape, state.opt_state, shardings.opt_state),
         key=shape(state.key, shardings.key))
 
-    from dew.objectives.base import Step
-
     compiled = trainer.compile(abstract, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
     batch = {"text": jnp.zeros((8, 5), jnp.int32)}
-    expected, _ = trainer.objective.scalar_loss(state.variables, batch,
-                              Step(state.microstep, jax.random.fold_in(state.key, state.step), None))
+    # The same step compiled from placed arrays of the same values: one program, so the step compiled
+    # from shapes alone computes its loss and its update bit for bit as it does.
+    placed, _, _ = trainer.place()
+    concrete = trainer.compile(placed, batch)
     advanced, loss, _, finite, _, _ = jax.block_until_ready(compiled(state, batch))
-    assert loss == pytest.approx(float(expected), rel=1e-6)
+    again, their_loss, _, _, _, _ = jax.block_until_ready(concrete(placed, batch))
+    assert np.array_equal(np.asarray(loss), np.asarray(their_loss))
+    assert all(np.array_equal(np.asarray(mine), np.asarray(theirs)) for mine, theirs in
+               zip(jax.tree.leaves(advanced.variables), jax.tree.leaves(again.variables), strict=True))
     assert int(advanced.step) == 1 and bool(finite)
+
+    # And its loss is the objective's own: the shape-compiled step against `scalar_loss` on drawn
+    # batches from a state placed afresh (check 1), each step on a copy of the state it consumes.
+    from dew.objectives.base import Step
+
+    fresh, _, _ = trainer.place()
+    key = Step(fresh.microstep, jax.random.fold_in(fresh.key, fresh.step), None)
+    weights = jax.device_get(fresh.variables)
+
+    def draw(seed):
+        return weights, np.random.default_rng([0x5E9, seed]).integers(0, 32, (8, 5)).astype(np.int32)
+
+    @as_given
+    def stepped(variables, text):
+        return compiled(jax.tree.map(jnp.copy, fresh), {"text": jnp.asarray(text)})[1]
+
+    def objective(variables, text):
+        return trainer.objective.scalar_loss(variables, {"text": text}, key)[0]
+
+    assert_as_exact(stepped, objective, draw, "the shape-compiled step's loss", seeds=8)
 
 
 def test_a_field_no_device_holds_stays_on_the_host_for_the_code_that_reads_it():

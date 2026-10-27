@@ -1600,7 +1600,8 @@ class OneCycle(ScheduleBase):
             return start * (0.5 * (1 + turned)) + stop * (0.5 * (1 - turned))
 
         def value(count) -> jax.Array:
-            step = jnp.minimum(jnp.asarray(count, jnp.float32), last)
+            # The default float: float32 in a run, float64 where a test reads the definition under x64.
+            step = jnp.minimum(jnp.asarray(count, float), last)
             return jnp.where(step <= rise, anneal(rates['init_value'], rates['peak_value'], step, rise),
                              anneal(rates['peak_value'], rates['end_value'], step - rise, last - rise))
 
