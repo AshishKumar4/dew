@@ -58,7 +58,8 @@ def _muse_text_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
         sandwich_norms=True, scale_offset=True, output_gate=True,
         attention_scale=_records.number(hf_config.get('qk_scale_factor', 3.87), 'qk_scale_factor')
         * head_dim ** -0.5,
-        embedding_norm=True,
+        # MuseGlimmerTextNormedEmbedding norms the lookup; media take their slots after it.
+        embedding_norm=True, embedding_norm_reads='lookup',
         norms={'attention_output_norm': {'eps': post_eps}, 'mlp_output_norm': {'eps': post_eps},
                'embedding_layernorm': {'scale': False}, 'norm': {'offset': False}},
         final_logit_softcap=_records.number(hf_config.get('final_logit_softcapping', 20.0),
@@ -87,7 +88,8 @@ def _muse_text_export(model: CausalTransformer) -> Mapping[str, object]:
 MUSE_GLIMMER_TEXT = DecoderFamily(
     ('muse_glimmer_text',),
     _muse_text_config,
-    lambda fields: bool(fields.output_gate and fields.sandwich_norms and fields.embedding_norm),
+    lambda fields: bool(fields.output_gate and fields.sandwich_norms and fields.embedding_norm
+                        and fields.embedding_norm_reads == 'lookup'),
     'muse_glimmer_text',
     'MuseGlimmerTextModel',
     _muse_text_export,

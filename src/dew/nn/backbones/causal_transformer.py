@@ -231,6 +231,11 @@ class CausalTransformer(nn.Module):
     epsilon or a weight of a norm's own."""
     embedding_norm: bool = False
     """Normalize token embeddings before the first block, as BLOOM and ModernBERT do."""
+    embedding_norm_reads: Literal['inputs', 'lookup'] = 'inputs'
+    """What `embedding_norm` normalizes: every input embedding, a caller's own and a media encoder's
+    among them, as BLOOM's and ModernBERT's embedding norms read their `inputs_embeds` ('inputs'); or
+    the table's lookup alone, before media take their slots, as Muse Glimmer's normed embedding module
+    does (`scaled_embeddings`, 'lookup')."""
     first_attention_norm: bool = True
     """Whether the first block norms its attention input. ModernBERT's first
     block reads the embedding norm's output as it is (modeling_modernbert.py,
@@ -1462,8 +1467,10 @@ class CausalTransformer(nn.Module):
     def scaled_embeddings(self, x):
         """Return the token embeddings `x` scaled the way the first layer reads them.
 
-        `x` is multiplied by sqrt(emb_features) when `embedding_scale` is set
-        (Gemma), then by `embedding_multiplier` (lm-engine, GraniteMoeHybrid).
+        `x` is normalized first where the norm reads the lookup alone
+        (`embedding_norm_reads`, Muse Glimmer), multiplied by
+        sqrt(emb_features) when `embedding_scale` is set (Gemma), then by
+        `embedding_multiplier` (lm-engine, GraniteMoeHybrid).
         The decoder, the multimodal wrapper and the Qwen-Image conditioner all
         scale here.
 
@@ -1474,6 +1481,8 @@ class CausalTransformer(nn.Module):
         """
         # Gemma's cast: modeling_gemma3.py:117. lm-engine's fp32 opmath:
         # mixins/dense/base.py at 45b6b57b.
+        if self.embedding_norm and self.embedding_norm_reads == 'lookup':
+            x = self.embedding_layernorm(x)
         if self.embedding_scale:
             x = (x * jnp.asarray(math.sqrt(self.emb_features),
                                  self.embed_tokens.embedding.dtype)).astype(x.dtype)
@@ -1666,7 +1675,7 @@ class CausalTransformer(nn.Module):
                 if start is not None:
                     places = places + start[:, None]
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
-        if self.embedding_norm:
+        if self.embedding_norm and self.embedding_norm_reads == 'inputs':
             x = self.embedding_layernorm(x)
         if self.embedding_dropout_rate:
             x = self.embedding_dropout(x, deterministic=not train)
@@ -2265,7 +2274,8 @@ class CausalTransformer(nn.Module):
     def recompute_more(self) -> Self | None:
         """One rung up `DECODER_REMAT`, past any rung that keeps nothing more of the names
         these layers mark than the rung above it (`MixerBase.marks`), whose step would
-        compile the same; None at the top or off the ladder."""
+        compile the same; None at the top, off the ladder, or where the top keeps what
+        this rung keeps, so no rung above holds less."""
         if self.remat not in DECODER_REMAT[:-1]:
             return None
         marked = self.marked_residuals()
@@ -2282,6 +2292,8 @@ class CausalTransformer(nn.Module):
         while (index < len(DECODER_REMAT) - 1
                and kept(DECODER_REMAT[index]) in (kept(self.remat), kept(DECODER_REMAT[index + 1]))):
             index += 1
+        if kept(DECODER_REMAT[index]) == kept(self.remat):
+            return None
         return self.clone(remat=DECODER_REMAT[index])
 
     @nn.nowrap
@@ -2296,14 +2308,20 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def marked_residuals(self) -> frozenset[str]:
         """The `RESIDUALS` this decoder's layers can mark: each layer's mixer kind's
-        (`MixerBase.marks`, every name where a kind does not say) and the MLP's."""
+        (`MixerBase.marks`, every name where a kind does not say) and, where a layer, its
+        gated cross-attention, a prediction depth or the drafter has a feed-forward, its
+        (`MLP_RESIDUALS`, the dense MLP's and the experts' alike)."""
         types = self.per_layer_types
-        mixers = [kind.mixer or self.mixer for kind in self.layer_kinds(types).values()]
+        kinds = self.layer_kinds(types)
+        mixers = [kind.mixer or self.mixer for kind in kinds.values()]
         if any(mixer is not None and mixer.marks() is None for mixer in mixers):
             return frozenset(RESIDUALS)
         default = AttentionMixer.residuals or ()
-        return frozenset(MLP_RESIDUALS).union(*(default if mixer is None else mixer.marks() or ()
-                                                for mixer in mixers))
+        feeds = (any(spec.routed or spec.width or spec.cross
+                     for spec in self._layer_specs(types, kinds, self.layer_mixer))
+                 or self.num_nextn_predict_layers or self.dspark is not None)
+        marked = (default if mixer is None else mixer.marks() or () for mixer in mixers)
+        return frozenset(MLP_RESIDUALS if feeds else ()).union(*marked)
 
     @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:

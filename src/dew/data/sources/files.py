@@ -225,15 +225,29 @@ def _record_start(file: BinaryIO, offset: int, kind: Format) -> int:
     return at
 
 
-def _line_start(file: BinaryIO, offset: int) -> int:
+_SCAN_BYTES = 1 << 20
+"""The bytes a search for a line start reads at a time (`_line_start`), so a record of any length is
+passed over in bounded memory."""
+
+
+def _line_start(file: BinaryIO, offset: int, stop: int | None = None) -> int:
     """Where the first line that starts at `offset` or after it starts in `file`, its end where none
-    does: a range of a file's bytes reads the lines that start in it."""
+    does: a range of a file's bytes reads the lines that start in it. With `stop`, the search reads
+    no byte at or past it and gives `stop` where no line starts before it, so a range's reader
+    passes over a long record's bytes within its own range alone, a chunk at a time."""
     if not offset:
         return 0
     file.seek(offset - 1)
-    if file.read(1) != b"\n":
-        file.readline()
-    return file.tell()
+    at = offset - 1
+    while stop is None or at < stop - 1:
+        chunk = file.read(_SCAN_BYTES if stop is None else min(_SCAN_BYTES, stop - 1 - at))
+        if not chunk:
+            return at
+        found = chunk.find(b"\n")
+        if found >= 0:
+            return at + found + 1
+        at += len(chunk)
+    return stop
 
 
 def _seek_lines(file: BinaryIO, offset: int) -> None:
@@ -699,10 +713,14 @@ class Files(Dataset):
                 step = self.shard_bytes if self.kind in ("jsonl", "text") else max(size, 1)
                 if step < 1:
                     raise ValueError("file shard_bytes must be positive")
-                shards.extend(
-                    Shard(self._shard_id(number, url, start), url, start, min(start + step, size))
-                    for start in range(0, size, step)
-                )
+                # Equal ranges of at least `step` bytes, so no range is a short tail a record ending
+                # in it covers whole: a range holds a record's start unless a record is longer than
+                # it, which its reader refuses (`_LineIterator`).
+                # An empty file holds no range.
+                parts = max(1, size // step) if size else 0
+                cuts = [size * part // parts for part in range(parts + 1)] if parts else []
+                shards.extend(Shard(self._shard_id(number, url, start), url, start, stop)
+                              for start, stop in itertools.pairwise(cuts))
         divisible = self.kind in ("jsonl", "text") and not any(
             infer_compression(url.lower()) for url in self.paths)
         return ShardManifest(tuple(shards), self._read_shard, self._subdivided if divisible else None)
@@ -1077,7 +1095,15 @@ class _LineIterator(grain.DatasetIterator):
         self._opened = True
         self.names = _header(self.file) if source.kind == "csv" else None
         if self.names is None and shard.start:
-            self.file.seek(_line_start(self.file, shard.start))
+            begin = _line_start(self.file, shard.start, shard.stop)
+            if shard.stop is not None and begin >= shard.stop:
+                raise ValueError(
+                    f"no line of {shard.uri} starts in its bytes {shard.start} to {shard.stop}: one "
+                    f"record runs through all {shard.stop - shard.start} of them, longer than "
+                    f"shard_bytes={source.shard_bytes}, and the range would read nothing. Read it with "
+                    "shard_bytes of at least its longest record, or provision it (`dew data "
+                    "provision`) to read it record by record")
+            self.file.seek(begin)
         self.records = _lines(source.kind, self.file, self.names, shard.stop)
 
     def __next__(self) -> Batch:

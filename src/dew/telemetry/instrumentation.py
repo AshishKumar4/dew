@@ -507,6 +507,10 @@ class HloInstruction:
     groups: tuple[tuple[int, ...], ...]
     """A collective's device groups, each the positions in the module's device assignment that
     take part together; empty where every device does, and for any other op (`_groups`)."""
+    element: str
+    """Its result's element type as HLO names it (`f32`, `bf16`); empty where its result is a tuple."""
+    dims: tuple[int, ...]
+    """Its result's dimensions: a tuple's first array's."""
 
 
 def reported_instruction(expression: str) -> HloInstruction | None:
@@ -566,7 +570,8 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
                                          tuple(instruction.operands), ops, instruction.recomputed, names,
                                          reads, flops, weights.get(called_as, 0.0), instruction.buffers,
-                                         instruction.shapes, instruction.groups)
+                                         instruction.shapes, instruction.groups, computation.elements[name],
+                                         instruction.dims)
     computations.clear()
     return found
 

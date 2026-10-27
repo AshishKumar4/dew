@@ -615,7 +615,18 @@ def _patched(node: ast.Call, table: dict[str, str]) -> str:
 def _seam(target: str) -> bool:
     """Does `target` leave the process: does it hold one of `SEAMS` as whole parts
     between its dots and underscores, so `dew.cli.tpu.time.sleep` and
-    `dew.interop.sources.snapshot` do and `dew.training.narrow.narrowed_paths` does not?"""
+    `dew.interop.sources.snapshot` do and `dew.training.narrow.narrowed_paths` does not?
+    A private attribute is its owner's: of a seam's owner it leaves the process as
+    the owner does (`dew._coordination.os._exit`), and of a first-party object it
+    never does, whatever it is named (`dew.checkpoints.Checkpoints._open`): it is the
+    code under test, and the boundary it reaches is observed there instead (an audit
+    hook, a process of its own)."""
+    owner, _, name = target.rpartition(".")
+    if name.startswith("_"):
+        # A seam's own private attribute: its owner a standard library module the target reaches by
+        # name, as `os` in `dew._coordination.os._exit`, where `Hub` in `...hub.Hub._selected` is not.
+        held = owner.rpartition(".")[2]
+        return held in sys.stdlib_module_names and _seam(owner)
     words = [word for word in re.split(r"[._]", target.lower()) if word]
     for seam in SEAMS:
         parts = [word for word in re.split(r"[._]", seam) if word]
@@ -956,6 +967,35 @@ def _errors(function: ast.FunctionDef | ast.AsyncFunctionDef,
     return frozenset(caught), frozenset(raised)
 
 
+RENDERINGS = frozenset({"plain", "table", "render", "renderable", "getvalue", "readouterr", "out", "err",
+                        "stdout", "stderr", "text"})
+"""The attributes and methods a rendering's text is read through (a rich Text's `plain`, a table's
+`table()`, captured output): the values SLOP011's layout rule reads (`_rendered`)."""
+
+
+def _rendered(expr: ast.expr) -> bool:
+    """Is `expr` a rendering's text: read through RENDERINGS, its lines (`.splitlines()`) or a str()
+    of something, as a parsed value (`json.loads`) is not?"""
+    while isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute) and expr.func.attr in (
+            "splitlines", "strip", "rstrip", "lstrip"):
+        expr = expr.func.value
+    if isinstance(expr, ast.Call):
+        if _named(expr.func) == "str":
+            return True
+        expr = expr.func
+    return isinstance(expr, ast.Attribute) and expr.attr in RENDERINGS
+
+
+def _laid_out(expr: ast.expr) -> bool:
+    """Is `expr` a rendering's layout spelled out: a string, or a list or tuple of strings, holding a
+    run of two or more spaces between its words, a frozen line of a table or panel whose spacing is
+    the snapshot (row 1878)? Its content claims are words, numbers and column ends, asserted as such."""
+    texts = [expr] if isinstance(expr, ast.Constant) else (
+        list(expr.elts) if isinstance(expr, ast.List | ast.Tuple) else [])
+    return any(isinstance(text, ast.Constant) and isinstance(text.value, str)
+               and re.search(r"\S {2,}\S", text.value) is not None for text in texts)
+
+
 def _worded(node: ast.AST, caught: Set[str], raised: Set[str]) -> bool:
     """Does `node` look for a sentence the source spells in a process's `stdout` or `stderr`, by
     `in`, `startswith`, `endswith` or `count`, or match a caught error's text (`str` or `repr` of
@@ -1002,6 +1042,13 @@ def wording(module: Module) -> Iterator[Finding]:
                     yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
                                   "looks for a sentence in an error's or a process's text; assert its "
                                   "type, its exit status or the value it reports")
+                elif (isinstance(node, ast.Compare) and len(node.ops) == 1
+                      and isinstance(node.ops[0], ast.Eq | ast.NotEq)
+                      and ((_laid_out(node.left) and _rendered(node.comparators[0]))
+                           or (_laid_out(node.comparators[0]) and _rendered(node.left)))):
+                    yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP011",
+                                  "freezes a rendering's spacing; assert its words, numbers and column "
+                                  "ends")
     held = _held(module.tree)
     for node, table in named:
         if isinstance(node, ast.expr) and _spelled_in_captured(node, held.get(id(node), frozenset())):

@@ -108,6 +108,7 @@ __all__ = [
     "ProjectionGroup",
     "ProjectsParameters",
     "QuantizesInputs",
+    "ReadsTrain",
     "Recomputing",
     "RematChoosing",
     "RequiresText",
@@ -222,6 +223,16 @@ class OutputTable:
         of tokens' vectors (a decision head's lexical prior) takes these."""
         rows = self.matrix if self.vocab_major else self.matrix.T
         return rows if self.scale is None else rows * self.scale[:, None]
+
+
+@runtime_checkable
+class ReadsTrain(Protocol):
+    """A module whose call takes `train`, for a stochastic layer of its own (a token mixer's or a
+    feed-forward's dropout, a vision tower's drop path): its owner passes `train` where `reads_train`
+    says the call reads it, whatever the module's family."""
+
+    @property
+    def reads_train(self) -> bool: ...
 
 
 @runtime_checkable
