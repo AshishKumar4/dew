@@ -1049,15 +1049,20 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({".github/workflows/ci.yml": "on: []\n"}, "off"),
     ({"Makefile": "all:\n"}, "off"),
     ({"CHANGELOG.md": "# Changes\n\n- an entry\n"}, "on"),
+    ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 400}\n'}, "on"),
+    ({".armada.json": '{"environment": {"base": "debian"}, "env": {"MODE": "2"}, "pool": 160}\n'}, "off"),
 ], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
-        "the test session", "a workflow", "a file no record places", "the changelog"])
+        "the test session", "a workflow", "a file no record places", "the changelog", "the pool",
+        "the environment's variables"])
 def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(
         ci, tmp_path, changed, policy):
     """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records
     place what changed, a tool among them, and every file runs ('off') for a change to what every test
-    process runs or reads, or to a file the records do not place."""
+    process runs or reads, or to a file the records do not place. .armada.json's pool decides where tasks
+    run, not what a test sees (owner, 2026-10-27: a pool change reran every file)."""
+    armada = '{"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}\n'
     for name, text in {"src/pkg/mod.py": "VALUE = 1\n", "pyproject.toml": "[project]\nname = 'x'\n",
-                       "locks/cpu.txt": "jax==1\n"}.items():
+                       "locks/cpu.txt": "jax==1\n", ".armada.json": armada}.items():
         (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
         (tmp_path / name).write_text(text)
     git(tmp_path, "init", "-q", "-b", "main")
@@ -1206,7 +1211,8 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
     """A file's green row is kept across a change its tests never meet, the plan's own code (ci.py, which
     runs outside every test process), or another test module; it runs again once what its test process
     runs or reads changes: a plugin loaded into it, a fixture, a Python file added that can change what an
-    import finds (a conftest.py, a top-level package under src/), or the process group it runs as."""
+    import finds (a conftest.py, a top-level package under src/), or the process group it runs as. A
+    fixture it never reads is no input of its (owner, 2026-10-27: one fixture re-recorded reran every row)."""
     (tmp_path / "tests/test_kept.py").write_text(
         "from pathlib import Path\n"
         "def test_kept():\n"
@@ -1218,14 +1224,51 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
                ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
-               ("tests/fixtures/data.json", "{}\n", 3), ("tests/conftest.py", "VALUE = 1\n", 4),
-               ("src/package/__init__.py", "", 5), ("tests/more/test_added.py", "VALUE = 2\n", 5),
-               ("tools/armada/child_groups.py", "# its process group\n", 6)]
+               ("tests/fixtures/data.json", "{}\n", 2), ("tests/conftest.py", "VALUE = 1\n", 3),
+               ("src/package/__init__.py", "", 4), ("tests/more/test_added.py", "VALUE = 2\n", 4),
+               ("tools/armada/child_groups.py", "# its process group\n", 5)]
     for path, text, runs in changes:
         if path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
             with (tmp_path / path).open("a") as file:
                 file.write(text)
+        assert run() == runs, path
+
+
+def test_a_fixture_reruns_its_readers_alone_and_a_pool_none(ci, tmp_path, monkeypatch, cache_worker):
+    """A fixture changed runs again the files that read it, and no other; so does a file beside one they
+    read, which a native reader may read with it (a tokenizer's tokenizer.json beside its config); a change
+    to .armada.json's pool reruns none, and to the variables its environment sets, every file (owner,
+    2026-10-27: one fixture re-recorded, and a pool change, each reran all 1,300 rows)."""
+    model = tmp_path / "tests/fixtures/model"
+    model.mkdir(parents=True)
+    for name, text in {"config.json": "{}\n", "weights.bin": "w\n"}.items():
+        (model / name).write_text(text)
+    (tmp_path / "tests/fixtures/other.json").write_text("{}\n")
+    armada = {"environment": {"base": "debian"}, "env": {"MODE": "1"}, "pool": 160}
+    (tmp_path / ".armada.json").write_text(json.dumps(armada))
+    reading = "Path('tests/fixtures/model/config.json').read_text()"
+    for name, reads in (("reader", reading), ("other", "None")):
+        (tmp_path / f"tests/test_{name}.py").write_text(
+            "from pathlib import Path\n"
+            f"def test_{name}():\n"
+            f"    with Path('runs-{name}').open('a') as runs: runs.write('x')\n"
+            f"    assert {reads} is not False\n")
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+
+    def run() -> list[int]:
+        rows = armada_task(ci, monkeypatch, verdict)
+        assert [row["exitCode"] for row in rows] == [0, 0]
+        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("reader", "other")]
+
+    changes = [(None, None, [1, 1]), ("tests/fixtures/model/config.json", '{"a": 1}\n', [2, 1]),
+               ("tests/fixtures/model/weights.bin", "w2\n", [3, 1]),
+               ("tests/fixtures/other.json", "[]\n", [3, 1]),
+               (".armada.json", json.dumps({**armada, "pool": 400}), [3, 1]),
+               (".armada.json", json.dumps({**armada, "pool": 400, "env": {"MODE": "2"}}), [4, 2])]
+    for path, text, runs in changes:
+        if path:
+            (tmp_path / path).write_text(text)
         assert run() == runs, path
 
 
