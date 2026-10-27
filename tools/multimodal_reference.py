@@ -491,10 +491,10 @@ if __name__ == "__main__":
         write_gemma4_unified_native()
         sys.exit()
     if sys.argv[1:2] == ["float64"]:
-        # Which references each family's test reads, and the checkpoint they were written from, are
-        # the test's own declaration (`FAMILIES`).
+        # Which references each family's test reads, and the checkpoint they were written from: the
+        # tests' declaration, data alone.
         sys.path.insert(0, str(ROOT.parents[1]))
-        from test_multimodal_model import FAMILIES
+        from multimodal_families import FAMILIES
 
         for family in sys.argv[2:] or FAMILIES:
             write_float64_truths(*FAMILIES[family])

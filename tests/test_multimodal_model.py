@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from multimodal_families import FAMILIES
 from reference_error import GateFailure, assert_as_exact_as_the_reference, float64_forward
 from safetensors.numpy import load_file
 
@@ -288,18 +289,6 @@ def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_pa
     trained = "model.vision_tower.patch_embedder.input_proj.weight"
     assert np.max(np.abs(after[trained] - before[trained])) > 1e-4
 
-
-
-FAMILIES = {
-    "gemma4": ("gemma4-native-tiny", "gemma4-native-tiny"),
-    "qwen35": ("qwen35-native-tiny", "qwen35-native-tiny"),
-    "llama4": ("llama4-native-tiny", "llama4-native-tiny"),
-    # Images and audio through the same prompt; the checkpoint and its
-    # processor are the audio fixture's, the references sit beside them.
-    "gemma3n": ("gemma3n-native-tiny", "gemma-3n-audio-tiny"),
-}
-"""Each family's directory of references, beside their float64 truths (tools/multimodal_reference.py
-float64), and the checkpoint they were written from."""
 
 
 def _one_layer_negated(gradient):
