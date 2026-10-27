@@ -1149,14 +1149,16 @@ def test_narrow_weights_step_on_float32_moments_as_float32_weights_do(optimizer,
     np.testing.assert_array_equal(np.asarray(narrow["w"], np.float32), np.asarray(wide["w"]))
 
 
+@pytest.mark.filterwarnings("error::numpy.exceptions.ComplexWarning")
 @pytest.mark.parametrize("state_dtype", ["float32", "bfloat16", "int8"])
 def test_adams_first_moment_keeps_a_complex_gradients_both_components(state_dtype):
     """Adam's first moment of a complex parameter is complex in every store, at a size the int8 store
     quantizes a real leaf at (16 by 256, past QUANTIZED_SIZE, its rows whole blocks), beside a real leaf
     of the same size it does quantize: a repeated gradient of 1+2j leaves the moment's imaginary part
     twice its real part to the bit, as each update scales both alike and a doubling rounds as its half
-    does, where a real store would drop it (row 1870, AT-05); the real leaf's moment is real."""
-    from dew.optim import OptimConfig, QuantizedMoments
+    does, where a real store would drop it (row 1870, AT-05); the real leaf's moment is real, and so is
+    the rate the tree steps at: no step casts a complex value to a real one."""
+    from dew.optim import OptimConfig, QuantizedMoments, learning_rate
 
     shape = (16, 256)
     params = {"w": jnp.full(shape, 0.5 + 0.5j, jnp.complex64), "v": jnp.full(shape, 0.5, jnp.float32)}
@@ -1174,6 +1176,8 @@ def test_adams_first_moment_keeps_a_complex_gradients_both_components(state_dtyp
     np.testing.assert_array_equal(held.imag, 2 * held.real)
     assert np.all(held.real > 0.18)
     assert not np.iscomplexobj(np.asarray(jax.tree.leaves(mu["v"])[0]))
+    # The rate the tree steps at is real, at its components' float32.
+    assert np.asarray(learning_rate(state)).dtype == np.float32
 
 
 def test_adams_default_first_moment_keeps_its_promoted_dtype():

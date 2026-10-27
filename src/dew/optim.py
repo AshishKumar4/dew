@@ -1057,7 +1057,10 @@ def scheduled_solver(make: Callable[..., optax.GradientTransformation], rate: fl
             b1=None if b1 is None else b1.schedule(steps))
 
     def init_fn(params):
-        return injected(at_least_fp32(optax.tree.dtype(params, 'highest'))).init(params)
+        # A rate is real: a complex tree's is its components' dtype, at least float32.
+        highest = optax.tree.dtype(params, 'highest')
+        real = jnp.finfo(highest).dtype if jnp.issubdtype(highest, jnp.complexfloating) else highest
+        return injected(at_least_fp32(real)).init(params)
 
     def update_fn(updates, state, params=None, **extra_args):
         return injected(state.hyperparams['learning_rate'].dtype).update(updates, state, params, **extra_args)
