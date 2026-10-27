@@ -38,7 +38,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import perturb, recording, saved_pipeline, tiny_qwen3_encoder
+from diffusers_reference_helpers import flux2_ids, perturb, recording, saved_pipeline, tiny_qwen3_encoder
 from reference_releases import RELEASES
 from torch_precision import float64, float64_twin
 
@@ -67,13 +67,6 @@ CASES: dict[str, Case] = {
     "unguided": Case({"guidance_embeds": False, "num_layers": 1, "num_single_layers": 3}),
     "narrow": Case({"mlp_ratio": 2.0, "eps": 1e-3, "out_channels": 4, "rope_theta": 10000}, grid=(2, 6)),
 }
-
-
-def ids(rows: int, columns: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """`Flux2Pipeline._prepare_text_ids` and `_prepare_latent_ids`."""
-    text = torch.cartesian_prod(torch.arange(1), torch.arange(1), torch.arange(1), torch.arange(TOKENS))
-    image = torch.cartesian_prod(torch.arange(1), torch.arange(rows), torch.arange(columns), torch.arange(1))
-    return text, image
 
 
 def widened_walk(walk, model) -> dict[str, np.ndarray]:
@@ -111,7 +104,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     context = torch.randn((batch, TOKENS, config["joint_attention_dim"]), generator=generator)
     times = torch.tensor([731.0, 42.0])
     guidance = torch.tensor(case.guidance) if config["guidance_embeds"] else None
-    text_ids, image_ids = ids(rows, columns)
+    text_ids, image_ids = flux2_ids(rows, columns, TOKENS)
     probe = torch.randn((batch, rows * columns, config.get("out_channels") or config["in_channels"]),
                         generator=generator)
 
