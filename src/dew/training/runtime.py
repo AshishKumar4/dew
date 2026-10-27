@@ -242,6 +242,9 @@ class PreemptionNotice:
     def __init__(self):
         self._pool = jax.distributed.is_initialized()
         self._signalled = False
+        # The notice's checks, each process's in step with its peers': the pool's sync points count
+        # them, so a run's cooldown branches ask between their own steps too (`reached`).
+        self._asked = 0
         self._previous: Callable[[int, types.FrameType | None], object] | int | None = None
         self._installed = False
         # Only the main thread may set a handler; a fit run on another thread
@@ -261,18 +264,21 @@ class PreemptionNotice:
     def _caught(self, _signum: int, _frame: types.FrameType | None) -> None:
         self._signalled = True
 
-    def reached(self, step: int) -> bool:
-        """Return whether to stop at `step`.
+    def reached(self) -> bool:
+        """Return whether to stop here, at this check.
 
-        In a pool, that is whether every process agreed to stop there, and a
-        pool without the preemption service never stops. A process outside a
-        pool stops once SIGTERM has arrived.
+        In a pool, that is whether every process agreed to stop at this check,
+        the sync point counting each check every process makes in step (each
+        step's, and each step of a cooldown branch), so it grows across a
+        run however its steps run; a pool without the preemption service
+        never stops. A process outside a pool stops once SIGTERM has arrived.
         """
         if not self._pool:
             return self._signalled
         if not preemption_service():
             return False
-        return multihost_utils.reached_preemption_sync_point(step)
+        self._asked += 1
+        return multihost_utils.reached_preemption_sync_point(self._asked)
 
 
 def run_timestamp() -> str:
