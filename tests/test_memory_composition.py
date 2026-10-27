@@ -600,3 +600,35 @@ def test_a_memory_layer_kind_records_and_rebuilds():
     variables = model.init(jax.random.key(0), ids)
     np.testing.assert_array_equal(np.asarray(rebuilt.apply(variables, ids)),
                                   np.asarray(model.apply(variables, ids)))
+
+
+def test_a_memory_draws_its_tokens_keys_from_a_typed_rbg_stream():
+    """A training forward whose streams are typed rbg keys, not the default threefry: the memory's
+    tokens' keys are rewrapped in their stream's own implementation on both its chunked prefill and its
+    token-by-token recurrent readout (ledger 1876 NN-01), so the adapter's dropout draws on them, the
+    same key drawing the same logits and another key others."""
+    from dew.lora import LoRA
+    from dew.objectives.base import training_rngs
+
+    model = decoder(layer("gated_linear_attention"))
+    lora = LoRA(rank=2, modules=("kernel",), dropout=0.5)
+    variables, ids = factor_draw(model, lora)(0)
+    adapted = lora.apply(model, model.init(jax.random.key(0), jnp.asarray(ids)), key=0).model
+
+    @jax.jit
+    def cached(rngs):
+        cache = adapted.apply(variables, ROWS, method=adapted.init_cache, mutable=["cache"])[1]
+        logits, cache = adapted.apply({**variables, **cache}, ids[:, :6], decode=True, mutable=["cache"],
+                                      rngs=rngs)
+        reads = [logits]
+        for t in range(6, LENGTH):
+            logits, cache = adapted.apply({**variables, **cache}, ids[:, t:t + 1], decode=True,
+                                          mutable=["cache"], rngs=rngs)
+            reads.append(logits)
+        return jnp.concatenate(reads, axis=1)
+
+    first, again, other = (np.asarray(cached(training_rngs(jax.random.key(seed, impl="rbg"))))
+                           for seed in (5, 5, 6))
+    assert np.isfinite(first).all()
+    np.testing.assert_array_equal(first, again)
+    assert not np.array_equal(first, other)
