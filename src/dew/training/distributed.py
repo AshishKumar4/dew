@@ -65,19 +65,25 @@ def ruled[Owner: Ruled, **Arguments, Result](
     return run
 
 
-def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
-    """What one device receives a second in an all-gather over `mesh`'s
-    `axis` of a `size`-byte result, with every group along the axis
-    gathering at once as a step's do: (N - 1) / N of the result over the
-    median of five gathers, after two that warm the collective. Every
-    process takes the pool's lowest figure, so every process decides from
-    the same number and compiles the same program; the slowest group bounds
-    the step anyway.
+HOST_LINK = 'host'
+"""The link between each device and its host's pinned memory, by the name a step's links give it beside
+its mesh axes' (`Trainer(links=...)`, `link_bandwidth`): what a plan's host offload moves its bytes over
+(`dew.training.planning.hides`)."""
+
+
+def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float | None:
+    """What one device of `mesh` moves a second over the link `axis`: over a mesh axis, what it
+    receives in an all-gather of a `size`-byte result (`_gathered`); over the host link (`HOST_LINK`),
+    what it moves to its host's pinned memory and back (`_round_tripped`), None where its devices
+    have no pinned host memory. Every process takes the pool's lowest figure, so every process
+    decides from the same number and compiles the same program; the slowest link bounds the step
+    anyway.
 
     `dew.nn.sharding.down_projection` reads the tensor axis's to decide
     whether a down-projection of the residual runs on each tensor shard's
-    own tokens, and `dew.nn.sharding.split_positions` the sequence axis's.
-    The default result, 256 MiB, of which a device receives at least half,
+    own tokens, `dew.nn.sharding.split_positions` the sequence axis's, and a
+    plan the host link's, to price an offload (`dew.training.planning.hides`).
+    The default size, 256 MiB, of which a device receives at least half,
     is the size of the collectives those decisions price where they matter
     (DeepSeek-V3's residual gradient over 16384 tokens is 235 MB in bf16),
     past the sizes where a collective's latency counts: on 4x RTX 3090 an
@@ -85,16 +91,31 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
     128 MiB.
 
     A pool keeps its figure beside the persistent compilation cache, by the
-    axis and the devices it spans, and a later pool on them takes it, a
+    link and the devices it spans, and a later pool on them takes it, a
     resume among them: the decisions from it shape the step, and a figure
     measured again moves by noise, across a threshold one time in some."""
     topology = link_topology(mesh, axis)
     record = _link_record(topology)
-    # Every process gathers, or none does: a pool measures unless each of its processes sees the figure,
+    # Every process measures, or none does: a pool measures unless each of its processes sees the figure,
     # kept for exactly this placement.
     if record is not None and all(from_every_process(
             record.exists() and json.loads(record.read_text()).get("topology") == topology)):
         return min(from_every_process(float(json.loads(record.read_text())["bytes_per_second"])))
+    measured = _round_tripped(mesh, size) if axis == HOST_LINK else _gathered(mesh, axis, size)
+    figures = [figure for figure in from_every_process(measured) if figure is not None]
+    if len(figures) < jax.process_count():
+        return None
+    moved = min(figures)
+    if record is not None and jax.process_index() == 0:
+        record.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(record, json.dumps({"topology": topology, "bytes_per_second": moved}))
+    return moved
+
+
+def _gathered(mesh: Mesh, axis: str, size: int) -> float:
+    """What one device receives a second in an all-gather over `mesh`'s `axis` of a `size`-byte
+    result, every group along the axis gathering at once as a step's do: (N - 1) / N of the result
+    over the median of five gathers, after two that warm the collective."""
     ways = mesh.shape[axis]
     count = size // 4 // ways * ways
     sharding = NamedSharding(mesh, P(axis))
@@ -104,11 +125,25 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
         lambda shard: jax.lax.all_gather(shard, axis, tiled=True), mesh=mesh,
         in_specs=P(axis), out_specs=P(), axis_names={axis}, check_vma=False))
     seconds = samples(gather, source, warmup=2, repeats=5)
-    received = min(from_every_process((ways - 1) / ways * count * 4 / statistics.median(seconds)))
-    if record is not None and jax.process_index() == 0:
-        record.parent.mkdir(parents=True, exist_ok=True)
-        write_atomically(record, json.dumps({"topology": topology, "bytes_per_second": received}))
-    return received
+    return (ways - 1) / ways * count * 4 / statistics.median(seconds)
+
+
+def _round_tripped(mesh: Mesh, size: int) -> float | None:
+    """What each device of `mesh` moves a second between its memory and its host's pinned memory: a
+    `size`-byte share of every device's, all at once as a step's offload moves them, to pinned host
+    memory and back, both ways over the median of five round trips after two that warm the path;
+    None where a device of this process has no pinned host memory (`Device.addressable_memories`)."""
+    if any("pinned_host" not in {memory.kind for memory in device.addressable_memories()}
+           for device in mesh.local_devices):
+        return None
+    count = size // 4 * mesh.size
+    sharding = NamedSharding(mesh, P(mesh.axis_names))
+    host = sharding.with_memory_kind("pinned_host")
+    source = jax.make_array_from_callback(
+        (count,), sharding, lambda index: np.zeros(sharding.shard_shape((count,)), np.float32))
+    seconds = samples(lambda array: jax.device_put(jax.device_put(array, host), sharding), source,
+                      warmup=2, repeats=5)
+    return 2 * count // mesh.size * 4 / statistics.median(seconds)
 
 
 def link_figures(bandwidths: Mapping[tuple[Mesh, str], float | None]) -> dict[str, JSON]:
