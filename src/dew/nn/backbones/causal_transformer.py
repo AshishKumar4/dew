@@ -71,7 +71,7 @@ from ..inputs import (
     coordinates_of,
     numbered_blocks,
 )
-from ..kv_cache import KVCache
+from ..kv_cache import DecodeCursor, KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mlp import MLPMixer
@@ -148,7 +148,7 @@ class CausalTransformer(nn.Module):
     fields and needs no subclass. The field comments name the family that sets
     each one. A classic GPT block is `norm_type='layer'`, `norm_bias`, an
     ungated `mlp`, `mlp_bias` and learned positions; the learned positions
-    advance from each decode row's cache cursor.
+    advance from each decode row's count of its real tokens (`DecodeCursor`).
 
     `layer_types` is the pattern, one kind per layer, and `kinds` says what
     each kind does. `kv_shared_layers` lists the layers that share by index: a
@@ -900,6 +900,7 @@ class CausalTransformer(nn.Module):
                 features=self.emb_features, dtype=self.dtype, name='embed_positions',
                 embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
                                 else nn.initializers.normal(self.initializer_range)))
+            self.decode_cursor = DecodeCursor()
         if ple:
             # The packed table every layer reads its own slice of
             # (modeling_gemma4.py, Gemma4TextModel): one row per token, a
@@ -1643,16 +1644,14 @@ class CausalTransformer(nn.Module):
                                      input_embeddings), RESIDUAL)
         if self.position_embedding == 'learned':
             # The tokens' places as every layer reads them (`Coordinates`), whichever fields the
-            # caller gave them in; a cached call's continue from its cache's cursor.
+            # caller gave them in; a cached call's continue from the model's own count of each row's
+            # real tokens (`DecodeCursor`), whatever mixer its first layer runs.
             tokens_at = coordinates_of(attention_metadata, *tokens.shape)
             places = tokens_at.positions
             if places is None:
                 valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
-                places = jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
-                # A first cached call finds no cursor yet: its tokens start the row.
-                start = self.layers[0].self_attn.get_variable('cache', 'cache_index') if decode else None
-                if start is not None:
-                    places = places + start[:, None]
+                places = (self.decode_cursor(valid) if decode
+                          else jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1)
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
         if self.embedding_norm:
             x = self.embedding_layernorm(x)
@@ -1780,7 +1779,7 @@ class CausalTransformer(nn.Module):
         injected = x
         shared = SharedPassView() if loop.shared_cache else None
         first_pass = run_block if shared is None else nn.map_variables(
-            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.first_out,
+            run_block, mapped_collections=WRITTEN, trans_in_fn=shared.first, trans_out_fn=shared.outside,
             mutable=True)
         x = first_pass(self, self.norm(x + injected) if loop.reinject else x, **dynamic)
         for step in range(1, loop.steps):

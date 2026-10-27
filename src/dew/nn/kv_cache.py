@@ -798,6 +798,19 @@ def cache_positions(module: nn.Module, batch: int, length: int, valid):
     return positions, allocated
 
 
+class DecodeCursor(nn.Module):
+    """A decoder's own count of each row's real tokens, the logical cursor a model-level reader
+    takes a cached call's places from (`cache_positions`): allocation-aware, so the call that
+    allocates the cache counts none, and kept whatever mixer a layer runs, a recurrent one that
+    keeps no cursor of its own included."""
+
+    @nn.compact
+    def __call__(self, valid) -> jax.Array:
+        """Each token's place `[B, S]` continuing its row's count, a padding slot -1; the count
+        advances by the call's real tokens (`valid`)."""
+        return cache_positions(self, *valid.shape, valid)[0]
+
+
 def cached_validity(module: nn.Module, length: int) -> jax.Array:
     """Which of `module`'s `length` cache slots hold a token, `[rows, length]`:
     those before the row's cursor, which `cache_positions` fills in order.
