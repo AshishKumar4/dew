@@ -1,6 +1,6 @@
 # Builds kernels/flash_attn's wheels, FlashAttention-2 for JAX, for each CUDA
-# major on x86_64 and on aarch64 (the GH200's Grace), on the CUDA toolkit's own
-# glibc-2.28 image; no GPU is needed to build.
+# major on x86_64 and on aarch64 (the GH200's Grace), through cuda-wheels.yml,
+# which kernels/cutlass's wheels share.
 # The wheels are this run's artifacts. It runs for a release tag or by hand: a
 # build takes about an hour, so a kernel change builds its wheel on a GPU node
 # or the PC while its lane works, and a branch push builds none.
@@ -28,59 +28,10 @@ permissions:
 
 jobs:
   wheel:
-    # Each CUDA major on both machines Dew's GPUs run beside: x86_64, and aarch64 for the Grace Hopper (GH200).
-    runs-on: ${{ matrix.machine == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
-    timeout-minutes: 300
-    strategy:
-      # One machine's build failing tells nothing of the others', which run to their ends.
-      fail-fast: false
-      matrix:
-        # Each CUDA major on each machine; `variants` names each major's project and environment, which
-        # the publish jobs take one a major.
-        machine: [x86_64, aarch64]
-        cuda: ["12.9.1", "13.0.0"]
-        include: &variants
-        - cuda: "12.9.1"
-          environment: pypi
-          project: dew-flash-attn-cu12
-        - cuda: "13.0.0"
-          environment: pypi-cu13
-          project: dew-flash-attn-cu13
-    container: nvidia/cuda:${{ matrix.cuda }}-devel-rockylinux8
-    defaults:
-      run:
-        shell: bash
-    steps:
-    - name: Install the build tools
-      # The image's GCC 8 is older than nvcc's C++17 needs.
-      run: |
-        dnf install -y -q git python3.12 python3.12-pip gcc-toolset-12-gcc-c++
-    - uses: actions/checkout@v4
-    - name: Install the Python build tools, through tools/pip.txt's pip
-      run: |
-        python3.12 -m pip install --quiet -r tools/pip.txt
-        python3.12 -m pip install --quiet cmake ninja twine
-    - name: The tag is the version the wheel carries
-      if: startsWith(github.ref, 'refs/tags/flash-attn-v')
-      run: |
-        version=$(sed -n 's/^version = "\(.*\)"$/\1/p' kernels/flash_attn/pyproject.toml)
-        test "$GITHUB_REF_NAME" = "flash-attn-v$version" || {
-          echo "the tag is $GITHUB_REF_NAME and kernels/flash_attn carries $version"; exit 1; }
-    - name: Build
-      env:
-        PYTHON: python3.12
-        # Four nvcc processes at once outgrow the arm runner's memory (killed, exit 137, on its first run);
-        # two fit it.
-        JOBS: ${{ matrix.machine == 'aarch64' && '2' || '4' }}
-      run: |
-        source /opt/rh/gcc-toolset-12/enable
-        sh kernels/flash_attn/build.sh
-    - name: Check the wheel as PyPI will
-      run: python3.12 -m twine check --strict kernels/flash_attn/dist/*.whl
-    - uses: actions/upload-artifact@v4
-      with:
-        name: dew-flash-attn-cuda${{ matrix.cuda }}-${{ matrix.machine }}
-        path: kernels/flash_attn/dist/*.whl
+    uses: ./.github/workflows/cuda-wheels.yml
+    with:
+      package: flash_attn
+      tag: flash-attn
 
   publish:
     needs: wheel
@@ -88,7 +39,14 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        include: *variants
+        # Each CUDA major's project and environment, one publish job a major.
+        include:
+        - cuda: "12"
+          environment: pypi
+          project: dew-flash-attn-cu12
+        - cuda: "13"
+          environment: pypi-cu13
+          project: dew-flash-attn-cu13
     environment:
       name: ${{ matrix.environment }}
       url: https://pypi.org/p/${{ matrix.project }}
@@ -97,7 +55,7 @@ jobs:
     steps:
     - uses: actions/download-artifact@v4
       with:
-        pattern: dew-flash-attn-cuda${{ matrix.cuda }}-*
+        pattern: dew-flash-attn-cuda${{ matrix.cuda }}.*-*
         merge-multiple: true
         path: dist/
     - name: The wheels are this project's, one a machine
