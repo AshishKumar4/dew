@@ -90,6 +90,22 @@ def prepare_process(wandb: Wandb | None = None,
     _log.info("Number of devices: %s", jax.device_count())
 
 
+def unprepared(multi_host: bool | None, xla_flags: str | None,
+               compilation_cache_dir: str | None) -> list[str]:
+    """Which of `prepare_process`'s options a run states that this process does not carry: a flag of
+    `xla_flags` its XLA_FLAGS lacks, a compilation cache JAX keeps elsewhere, a pool it is not in
+    (`multi_host=True`) or is in (False). Each acts before JAX opens a backend, so a run trained in a
+    process no `prepare_process` set up with them would run without them."""
+    missed = []
+    if xla_flags and not set(xla_flags.split()) <= set(os.environ.get('XLA_FLAGS', '').split()):
+        missed.append("xla_flags")
+    if compilation_cache_dir and jax.config.jax_compilation_cache_dir != compilation_cache_dir:
+        missed.append("compilation_cache_dir")
+    if multi_host is not None and jax.distributed.is_initialized() != multi_host:
+        missed.append("multi_host")
+    return missed
+
+
 def ready_process() -> None:
     """What every Dew run needs of its process and `import dew` leaves alone: Dew's log handler
     (`dew.logging.configure`), the persistent compilation cache under the user's cache directory
@@ -291,4 +307,4 @@ def run_timestamp() -> str:
     return broadcast_from_process_zero(datetime.now().strftime("%Y-%m-%d_%H:%M:%S"))
 
 
-__all__ = ["Preempted", "PreemptionNotice", "prepare_process", "run_timestamp"]
+__all__ = ["Preempted", "PreemptionNotice", "prepare_process", "run_timestamp", "unprepared"]
