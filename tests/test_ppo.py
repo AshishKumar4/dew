@@ -390,8 +390,13 @@ def ppo_equations(objective, options):
         weights = (effective if options.get("aggregation", "token-mean") == "token-mean"
                    else jnp.asarray(batch[SESSION_WEIGHTS_KEY]).astype(dtype) * keep * (effective != 0))
         mass = jax.lax.stop_gradient(jnp.sum(weights))
-        terms = jnp.where(weights != 0, surrogate + actor.beta * kl, 0) * weights
-        policy_loss = jnp.where(mass > 0, jnp.sum(terms) / jnp.where(mass > 0, mass, 1), 0)
+
+        def aggregated(values):
+            # verl's agg_loss: each term's weighted sum over the mass, zero where nothing is kept.
+            return jnp.where(mass > 0, jnp.sum(jnp.where(weights != 0, values, 0) * weights)
+                             / jnp.where(mass > 0, mass, 1), 0)
+
+        policy_loss = aggregated(surrogate) + actor.beta * aggregated(kl)
         values = objective.values(variables, batch).astype(dtype)
         returns, recorded = (jax.lax.stop_gradient(jnp.asarray(batch[key]).astype(dtype))
                              for key in (RETURNS_KEY, OLD_VALUES_KEY))

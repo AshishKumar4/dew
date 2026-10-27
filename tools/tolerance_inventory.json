@@ -289,10 +289,6 @@
    "comparisons": 20,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_hf_lifecycle.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_hf_opt.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
@@ -530,7 +526,7 @@
    "lane": "Training"
   },
   "tests/test_ppo.py": {
-   "comparisons": 17,
+   "comparisons": 13,
    "lane": "Models, Serving & RL"
   },
   "tests/test_precision_policy.py": {
@@ -588,10 +584,6 @@
   "tests/test_reporting.py": {
    "comparisons": 3,
    "lane": "Training"
-  },
-  "tests/test_rl_contracts.py": {
-   "comparisons": 3,
-   "lane": "Models, Serving & RL"
   },
   "tests/test_rl_surrogate.py": {
    "comparisons": 8,
