@@ -439,7 +439,7 @@ class CrossContext:
         """The context a call's `conditioning` carries under `CONTEXT` and `CONTEXT_LENGTHS`, as JAX
         arrays (`checked`)."""
         embeddings, lengths = cls.checked(conditioning, jnp)
-        return cls(embeddings, lengths.astype(jnp.int32))
+        return cls(jnp.asarray(embeddings), jnp.asarray(lengths, jnp.int32))
 
     @staticmethod
     def checked(conditioning: Mapping[str, jax.typing.ArrayLike], xp=np

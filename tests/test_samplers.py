@@ -971,4 +971,5 @@ def test_lms_walks_a_variance_exploding_grid_near_float32s_largest():
                       DirectPredictionTransform())
     latents = np.asarray(walk(LMS(2), process, ZeroEndpoint(), jnp.ones((1, 3), jnp.float32),
                               [1.0, 0.5, 0.25]))
-    np.testing.assert_allclose(latents, [np.full((1, 3), 0.5), np.full((1, 3), 0.25)], rtol=1e-6)
+    # Every step's arithmetic is exact in binary on this grid: the walk is the exact one.
+    np.testing.assert_array_equal(latents, [np.full((1, 3), 0.5), np.full((1, 3), 0.25)])

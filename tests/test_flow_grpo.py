@@ -1274,6 +1274,9 @@ def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
 
     transition = GaussianTransition(jnp.zeros((1, 1), jnp.float32), jnp.asarray([2.0 ** 126], jnp.float32))
     density = np.asarray(transition.log_prob(jnp.full((1, 1), 2.0 ** 64, jnp.float32)))
-    truth = -(2 + 0.5 * (math.log(2 * math.pi) + 126 * math.log(2)))
     assert np.isfinite(density).all()
-    np.testing.assert_allclose(density, [truth], rtol=4 * np.finfo(np.float32).eps)
+    # The density's float32 formula on the standardized square, 4, and its float64 value.
+    half_log = np.float32(0.5) * (np.log(np.float32(2 * math.pi)) + np.float32(126) * np.log(np.float32(2)))
+    truth = -(2 + 0.5 * (math.log(2 * math.pi) + 126 * math.log(2)))
+    assert_as_exact_as_the_reference(density, [-(np.float32(2) + half_log)], [truth],
+                                     "an overflowing residual")
