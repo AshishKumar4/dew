@@ -1132,6 +1132,28 @@ def test_a_cooldown_branch_ends_a_schedules_stage_where_a_run_decayed_there_does
     assert_same(parameters(branched), parameters(run(constant, 8)), "the run a branch left")
 
 
+def test_a_cooldown_branch_past_a_schedules_last_tokens_records_no_score(tmp_path):
+    """A schedule whose last stage ends its data at its tokens ends a cooldown branch's data there too:
+    a branch longer than the tokens left reads to that end and records no score, as a branch whose data
+    runs out does, and the run ends at its own end as one with no cooldown."""
+    from dew.training.cooldown import Cooldowns
+
+    first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
+    second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
+    data = schedule([(first, 30), (second, 30)]).batch(8)
+    held_out = Pipeline(Memory(Indexed(3, 16))).batch(8)
+
+    def run(tracker=None, cooldowns=None):
+        trainer = Trainer(TokenCounted(), optax.inject_hyperparams(optax.sgd)(learning_rate=0.5),
+                          key=jax.random.key(0), tracker=tracker, layout=Layout(min_shard=1, tolerance=1.0))
+        return trainer.fit(data, log_every=1, eval_every=1, validation=held_out, cooldowns=cooldowns)
+
+    tracker = RecordingTracker()
+    branched = run(tracker, Cooldowns(at=(1,), length=12, shape="linear"))
+    assert not any("cooldown_val/loss" in scalars for _, scalars in tracker.scalars)
+    assert_same(parameters(branched), parameters(run()), "the run a branch left")
+
+
 @pytest.mark.parametrize("accumulation", [1, 2])
 def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(tmp_path, accumulation):
     """A run on a schedule ends its first stage at the step whose commit brings the run's committed
