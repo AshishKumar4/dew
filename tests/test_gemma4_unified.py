@@ -158,8 +158,28 @@ def audio_rich(config, pair: dict[str, np.ndarray], seed: int) -> dict[str, np.n
                                                   np.float32)}
 
 
-def gradient_functions(source):
-    """Every trainable source parameter and every floating media input, in the native input layout."""
+BACKWARD_GROUPS = {
+    "late": ("logits", "parameter.model.language_model.norm.", "parameter.model.language_model.layers.3."),
+    "layer2": ("parameter.model.language_model.layers.2.",),
+    "layer1": ("parameter.model.language_model.layers.1.",),
+    "layer0": ("parameter.model.language_model.layers.0.",),
+    "embeddings": ("input.", "parameter.model.embed_", "parameter.model.language_model.embed_tokens."),
+    "vision": ("parameter.model.vision_embedder.",),
+}
+"""The recorded backward's leaves in groups, each a test of its own, by the prefixes of their names: every
+leaf in exactly one (`test_the_backward_groups_hold_every_recorded_leaf_once`). A group's program keeps
+its own gradients, so the backward stops where none of them reaches further, and its truth sketches its
+own leaves: each group's test computes and checks a part, the groups together every leaf."""
+
+
+def in_group(name: str, group: str) -> bool:
+    """Whether the observation `name` is one of `group`'s (`BACKWARD_GROUPS`)."""
+    return name.startswith(BACKWARD_GROUPS[group])
+
+
+def gradient_functions(source, group: str | None = None):
+    """Every trainable source parameter and every floating media input, in the native input layout; a
+    `group`'s alone where one is named (`BACKWARD_GROUPS`)."""
     native, reference, truth = source
     parameters = dict(reference.named_parameters())
     conversions = get_checkpoint_conversion_mapping(reference.config.model_type)
@@ -203,7 +223,7 @@ def gradient_functions(source):
         # example as an axis instead of judging each tiny example as a separate stochastic site.
         values["logits"] = logits[0]
         values.update({f"input.{name}": value for name, value in media.items()})
-        return values
+        return {name: value for name, value in values.items() if group is None or in_group(name, group)}
 
     @as_given
     def ours(inputs):
@@ -369,23 +389,54 @@ def cached_functions(source):
     return ours, lambda *args: theirs(reference, *args), oracle, draw
 
 
-@pytest.mark.parametrize(("site", "functions"), [("backward", gradient_functions),
-                                                 ("cached", cached_functions)])
+def recorded_leaves(stored) -> set[str]:
+    """The recorded backward's leaves, by the shapes it records of them."""
+    return {name.removeprefix("backward.shape.") for name in stored if name.startswith("backward.shape.")}
+
+
+def grouped(stored, group: str):
+    """The backward recording with `group`'s leaves alone: each per-leaf entry, its verdict seeds' and
+    its pilots', of a leaf in the group, and every entry no leaf names (its seeds, draws' digests,
+    provenance)."""
+    leaves = recorded_leaves(stored)
+
+    def kept(key):
+        rest = key.removeprefix("backward.").removeprefix("pilot.")
+        _, _, leaf = rest.partition(".")
+        return leaf not in leaves or in_group(leaf, group)
+
+    return {key: value for key, value in stored.items() if not key.startswith("backward.") or kept(key)}
+
+
+def test_the_backward_groups_hold_every_recorded_leaf_once():
+    """Every recorded backward leaf is in exactly one group, so the groups' tests check every leaf."""
+    leaves = recorded_leaves(recording(FIXTURE / "backward.npz"))
+    held = {leaf: [group for group in BACKWARD_GROUPS if in_group(leaf, group)] for leaf in leaves}
+    assert all(len(groups) == 1 for groups in held.values()), {
+        leaf: groups for leaf, groups in held.items() if len(groups) != 1}
+
+
+@pytest.mark.parametrize("group", BACKWARD_GROUPS)
+def test_unified_backward_follows_the_recorded_reference(source, group):
+    """The recorded backward's `group` of leaves: Dew's gradients against transformers' recorded float32
+    evidence from its recorded float64 truth over the recorded seeds (check 1), Dew's own float64 path
+    held to the recorded truth's sketch."""
+    ours, _, _, draw = gradient_functions(source, group)
+    stored = grouped(recording(FIXTURE / "backward.npz"), group)
+    with jax.enable_x64(new_val=True):
+        native = Pretrained.load(FIXTURE, dtype="float64", param_dtype="float64", attention_impl="reference")
+        native_truth = gradient_functions((native, source[1], source[2]), group)[0]
+    seeds = int(stored["backward.seeds"])
+    recorded_draw, reference, truth = indexed_recording(
+        stored, "backward", seeds, inputs_of=windows(lambda seed: draw(seed)[0], BACKWARD_WINDOW),
+        truth_fn=over_windows(native_truth))
+    assert_as_exact(as_given(lambda index, inputs: over_windows(ours)(inputs)), reference, recorded_draw,
+                    f"Gemma4 Unified recorded backward, {group}", seeds=seeds, truth_fn=truth)
+
+
+@pytest.mark.parametrize(("site", "functions"), [("cached", cached_functions)])
 def test_unified_runtime_observations_follow_the_reference(source, site, functions):
     ours, reference, truth, draw = functions(source)
-    if site == "backward":
-        stored = recording(FIXTURE / "backward.npz")
-        with jax.enable_x64(new_val=True):
-            native = Pretrained.load(FIXTURE, dtype="float64", param_dtype="float64",
-                                      attention_impl="reference")
-            native_truth = gradient_functions((native, source[1], source[2]))[0]
-        seeds = int(stored["backward.seeds"])
-        recorded_draw, reference, truth = indexed_recording(
-            stored, "backward", seeds, inputs_of=windows(lambda seed: draw(seed)[0], BACKWARD_WINDOW),
-            truth_fn=over_windows(native_truth))
-        assert_as_exact(as_given(lambda index, inputs: over_windows(ours)(inputs)), reference, recorded_draw,
-                        "Gemma4 Unified recorded backward", seeds=seeds, truth_fn=truth)
-        return
 
     def inputs_of(seed):
         inputs, continuation = draw(seed)
