@@ -133,6 +133,7 @@ def initials(model, optimizer, variables=None):
             with jax.enable_x64(new_val=False):
                 given = None if variables is None else variables(seed)
                 one = trainer(model, optimizer, MeshSpec(), 1, variables=given, key=seed)
+                one.validate(steps=STEPS)
                 made[seed] = one.initial_state()
         return made[seed]
     return initial
