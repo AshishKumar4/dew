@@ -743,7 +743,8 @@ def _differentiable(family: Family, forward: Callable, backward: Callable) -> Ca
 def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     """Each template mainloop as `(query, key, value, extra) -> out` at the form `options` names (`ACCURATE`,
     or none for the default), its derivative the mainloop's own backward (`_differentiable`); on an H100 the
-    Mosaic one's default form in both schedules, two launches and one (`FUSED`)."""
+    Mosaic one's default form in both schedules, its derived one (one launch where the call is hookless) and
+    deterministic mode's two launches (`TWO_LAUNCHES`)."""
     forward_options = {name: value for name, value in options.items() if name in ("natural", "scale")}
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
     mainloop = functools.partial(_differentiable, family)
@@ -770,21 +771,20 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     portable = mainloop(functools.partial(attention_portable.attend, **tiles, **forward_options),
                         functools.partial(attention_portable.backward, **tiles, **options))
     mainloops = {"triton": mainloop(triton_forward, triton_backward), "portable": portable}
-    def fused_backward(*operands):
-        with tuning.pinned({attention_mosaic.MosaicBackward: FUSED}):
+    def two_launch_backward(*operands):
+        with tuning.pinned({attention_mosaic.MosaicBackward: TWO_LAUNCHES}):
             return mosaic_backward(*operands)
 
     if ON_HOPPER and _mosaic_takes(family):
         mainloops["mosaic"] = mainloop(mosaic_forward, mosaic_backward)
         if not options and family.draw(0)[3] is None:
-            mainloops["mosaic fused"] = mainloop(mosaic_forward, fused_backward)
+            mainloops["mosaic two launches"] = mainloop(mosaic_forward, two_launch_backward)
     return mainloops
 
 
-FUSED = attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, family="wgmma")
-"""The Mosaic backward's one-launch schedule at the derived tiles (FUSEDFORM-h100's), the dK/dV program adding
-each tile's dQ under the first pass's D, which the fast form's default would take where it holds every family
-finite."""
+TWO_LAUNCHES = attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=False, family="wgmma")
+"""The Mosaic backward's two-launch schedule at the derived tiles, the dQ launch then the dK/dV one at the
+refined D: a hookless fast-form call's in deterministic mode, where its derived one is one launch."""
 
 
 ON_HOPPER = generation.device_generation() == "sm90"
@@ -873,19 +873,19 @@ def test_the_mosaic_mainloops_default_is_finite_where_the_reference_is_at_fp32s_
     _default_is_finite(family, "mosaic")
 
 
-FUSED_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].draw(0)[3] is None]
-"""The Mosaic families of no sinks or resumed state, the calls its one-launch backward takes
-(`MosaicBackward.legal`: the fast form's, a hookless call's)."""
+HOOKLESS_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].draw(0)[3] is None]
+"""The Mosaic families of no sinks or resumed state, whose fast-form backward derives one launch
+(`MosaicBackward.derived`)."""
 
 
 @pytest.mark.skipif(not ON_HOPPER, reason="runs the Mosaic mainloop compiled, on an H100")
 @pytest.mark.gpu(reason="runs the Mosaic mainloop compiled, on an H100")
-@pytest.mark.parametrize("family", FUSED_FAMILIES)
-def test_the_mosaic_one_launch_backward_is_finite_where_the_reference_is_at_fp32s_edges(family):
-    """The Mosaic backward in one launch (`FUSED`: the dK/dV program adding each tile's dQ under the first
-    pass's D), the fast form's, finite in the default form over every family it takes (`_default_is_finite`):
-    the default's condition beside check 1 on drawn inputs (`test_attention_mosaic`'s `fused` form)."""
-    _default_is_finite(family, "mosaic fused")
+@pytest.mark.parametrize("family", HOOKLESS_FAMILIES)
+def test_the_mosaic_two_launch_backward_is_finite_where_the_reference_is_at_fp32s_edges(family):
+    """The Mosaic backward in two launches (`TWO_LAUNCHES`), deterministic mode's for a hookless call, whose
+    derived backward is one launch (`test_the_mosaic_mainloops_default_is_finite_…`), finite in the default
+    form over every family it takes (`_default_is_finite`)."""
+    _default_is_finite(family, "mosaic two launches")
 
 
 @pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES
