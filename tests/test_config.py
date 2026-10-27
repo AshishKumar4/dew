@@ -661,3 +661,13 @@ def test_a_decision_run_chooses_its_head_by_its_subcommand():
     joint = DecisionRunConfig.cli(["--trainer.multi-host", "False", "head:joint-shape", "--head.layers", "2"])
     assert joint.head == JointShape(layers=2)
     assert DecisionRunConfig.cli(["--trainer.multi-host", "False"]).head is None
+
+
+def test_a_decision_run_trains_its_backbone_beside_its_context_layers_on_the_command_line():
+    """`--no-context-frozen` with `--context-layers` trains the backbone whole beside the blocks; by
+    default it holds frozen."""
+    from dew.decision.config import DecisionRunConfig
+
+    flags = ["--trainer.multi-host", "False", "--context-layers", "0", "1"]
+    assert DecisionRunConfig.cli(flags).context_frozen
+    assert not DecisionRunConfig.cli([*flags, "--no-context-frozen"]).context_frozen
