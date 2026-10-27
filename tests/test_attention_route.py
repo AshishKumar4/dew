@@ -602,11 +602,11 @@ def test_a_named_mainloop_runs_or_is_refused(named):
 
 
 def test_the_mainloop_is_the_shared_selectors_choice():
-    """The template's mainloop is an op of the shared selector (`attention_route.MAINLOOP`, `selection.select`),
-    one chooser for its preference, its named choice and its route: on a GPU Mosaic preferred, and where it
-    declines a pass the frozen Triton one runs, Mosaic's reason the refusal, its row the coverage the
-    roadmap tracks; where Triton refuses the spans too, the plain-JAX one; off a GPU the plain-JAX one,
-    no refusal (train 221's 1843)."""
+    """The template's mainloop is an op of the shared selector (`attention_route.MAINLOOP`,
+    `selection.select`), one chooser for its preference, its named choice and its route: on a GPU Mosaic
+    preferred, and where it declines a pass the frozen Triton one runs, Mosaic's reason the refusal, its row
+    the coverage the roadmap tracks; where Triton refuses the spans too, the plain-JAX one; off a GPU the
+    plain-JAX one, no refusal (train 221's 1843)."""
     from dew.nn.kernels import selection
 
     declined = attention_route._Pass(on_gpu=True, mosaic="a reason", triton=None)
@@ -616,9 +616,10 @@ def test_the_mainloop_is_the_shared_selectors_choice():
         "triton", "mosaic", "declined", "a reason")
     assert route.refusal.row
     with generation.routes():
-        assert selection.select(attention_route.MAINLOOP, attention_route._Pass(True, "a reason", "spans")
-                                ).kernel == "portable"
-        route = selection.select(attention_route.MAINLOOP, attention_route._Pass(False, None, None))
+        refused = attention_route._Pass(on_gpu=True, mosaic="a reason", triton="spans")
+        assert selection.select(attention_route.MAINLOOP, refused).kernel == "portable"
+        route = selection.select(attention_route.MAINLOOP, attention_route._Pass(on_gpu=False, mosaic=None,
+                                                                                 triton=None))
     assert (route.kernel, route.preferred, route.refusal) == ("portable", "portable", None)
 
 
