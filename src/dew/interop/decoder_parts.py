@@ -160,8 +160,9 @@ _INERT_FIELDS: Mapping[str | None, frozenset[str]] = {
     # the source repo names exporters write.
     None: frozenset({'transformers.js_config', 'unsloth_fixed', 'unsloth_version', 'name_or_path',
                      'model_name'}),
-    # nanotron's training flags, which SmolLM2 retains.
-    'llama': frozenset({'is_llama_config', 'rope_interleaved'}),
+    # nanotron's training flags, which SmolLM2 retains, and the embedding and residual dropout
+    # probabilities Megatron exports state (Nanbeige's), which LlamaModel never applies.
+    'llama': frozenset({'is_llama_config', 'rope_interleaved', 'embd_pdrop', 'resid_pdrop'}),
     # Qwen2.5's text configs state the multimodal rotary, which the qwen2
     # reference never applies.
     'qwen2': frozenset({'use_mrope'}),
@@ -933,6 +934,16 @@ def translate_family_config(hf_config: Mapping[str, object],
                 refuse(f"{alias}={value!r} beside {canonical}={spelled[canonical]!r}", "they name one field")
             spelled[canonical] = value
             used.add(alias)
+    for repeat, canonical in (family.repeated if own else {}).items():
+        if repeat in spelled:
+            # A rope field transformers 5 writes into rope_parameters is stated there.
+            nested = spelled.get('rope_parameters')
+            held = spelled.get(canonical, nested.get(canonical) if isinstance(nested, Mapping) else None)
+            if held is None or held != spelled[repeat]:
+                refuse(f"{repeat}={spelled[repeat]!r} beside {canonical}={held!r}",
+                       f"the reference reads {canonical} alone, and the release states {repeat} apart "
+                       "from it")
+            used.add(repeat)
     stated = {**(family.defaults if own else {}), **spelled}
     config = family.translate_config(stated, used)
     if family.padding_idx:
@@ -1855,6 +1866,12 @@ class DecoderFamily:
     aliases: Mapping[str, str] = field(default_factory=dict)
     """The config class's `attribute_map`: another spelling of a field, read as that field before
     `defaults` fill what neither spells."""
+    repeated: Mapping[str, str] = field(default_factory=dict)
+    """Fields a release repeats under another name that the config class neither declares nor reads,
+    each with the field it repeats: read where the release states that field at the same value, as the
+    reference computes from that field alone, and refused where it states another or none, where the
+    release's own code may read the repeat (Nanbeige's Llama configs repeat `intermediate_size` as
+    `ffn_hidden_size`)."""
     bidirectional: bool = False
     """The family's decoder attends both ways by construction, as the masked diffusion families'
     do (LLaDA's bidirectional bias, Dream's hard-coded is_causal=False, DiffusionGemma's decoder):

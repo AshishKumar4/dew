@@ -177,7 +177,11 @@ class Harbor:
             harness_exit = _harness_exit(trial.artifacts)
         except ValueError as error:
             return Judged(Status.INFRA_ERROR, detail=f"unreadable harness trajectory: {error}")
-        return outcome(json.loads(trial_result.read_text()), recorded, harness_exit=harness_exit)
+        try:
+            reported = json.loads(trial_result.read_text())
+        except json.JSONDecodeError as error:
+            return Judged(Status.INFRA_ERROR, detail=f"unreadable result.json: {error}")
+        return outcome(reported, recorded, harness_exit=harness_exit)
 
 
 def _harness_exit(trial: Path) -> str | None:

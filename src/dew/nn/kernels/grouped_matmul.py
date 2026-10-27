@@ -208,7 +208,7 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
         """tokamax's binding, its hooks stating the dtypes a kernel traces them at where the call left them
         unstated (a launch called itself): the prologue's at the tokens' and its side operands' dtypes, the
         epilogue's at the fp32 accumulator's and its side operands', as `templates.gemm` states them, so
-        every bound launch's hooks key alike (`traced`, `tuning.launch_text`)."""
+        every bound launch's hooks key alike (`traced`)."""
         ba = super().bind(*args, **kwargs)
         hooks = ba.arguments.get('hooks', NO_HOOKS)
         if not isinstance(hooks, Hooks):  # a stored launch's, already keyed (`traced`)
@@ -587,16 +587,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if family is None:
             return None
         rows, depth, width = self._generated_extents(ba)
-        # The derivation's tile, confirmed by the compiler (`Template.confirmed`); one it refutes steps the
-        # derivation down its own order, as one the model refused would.
-        def derive(allowed) -> mosaic_gpu.Tiles | None:
-            return mosaic_gpu.derived(family, rows=rows, depth=depth, width=width,
-                                      dtype=ba.arguments['tokens'].dtype,
-                                      multiprocessors=_multiprocessors(target),
-                                      holds=lambda tile: allowed(tile) and self.legal(ba, tile, target),
-                                      grouped=depth is not None)
-
-        return resources.confirmed_derivation(derive, lambda tile: self.confirmed(ba, tile, target))
+        return mosaic_gpu.derived(family, rows=rows, depth=depth, width=width,
+                                  dtype=ba.arguments['tokens'].dtype,
+                                  multiprocessors=_multiprocessors(target),
+                                  holds=lambda tile: self.legal(ba, tile, target), grouped=depth is not None)
 
     def neighbours(self, ba, config: mosaic_gpu.Tiles) -> tuple[mosaic_gpu.Tiles, ...]:
         # The derived tile with one of its choices moved a step either way: a stage more or fewer, the
@@ -1183,9 +1177,9 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
 
 DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
     ('mma.sync', 'grouped kernel_gradient'):
-        ('triton', "MWARPS4-a100 (00d05c0eb, A100, each tile's warps split to read its operands least, "
-                   "its tile confirmed by ptxas): the template's mma.sync tile 1.203x Triton's time, geomean "
-                   "of 6 grouped MoE rows (its input gradient 0.985x and forward 0.820x; MWARPS2 1.214x)"),
+        ('triton', "MWARPS2-a100 (08ceb321c, A100, each tile's warps split to read its operands least): the "
+                   "template's mma.sync tile 1.214x Triton's time, geomean of 6 grouped MoE rows (its input "
+                   "gradient 0.900x and forward 0.751x; MWARPS4, 00d05c0eb, 1.203x, 0.985x, 0.820x)"),
     ('mma.sync', 'dense forward'):
         ('xla', "DENSE1 (A100, 2d1bbd051, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
                 "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens"),

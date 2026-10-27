@@ -176,20 +176,6 @@ def shared_bytes(family: "Family", scope: Scope) -> int:
     return allocated(*sizes, *scratch) + max([0, *walks]) + BARRIER_BYTES * barriers
 
 
-def confirmed_derivation[T](derive: Callable[[Callable[[T], bool]], T | None],
-                           confirm: Callable[[T], bool]) -> T | None:
-    """The derivation's config confirmed by the compiler: `derive(allowed)` derives a config `allowed`
-    admits, `confirm(config)` asks the compiler (`report.confirmed`); a config it refutes is excluded and
-    the derivation runs again, so it steps down its own order, never a ranked one. None where the
-    derivation runs out."""
-    refuted: set = set()
-    while True:
-        config = derive(lambda config: config not in refuted)
-        if config is None or confirm(config):
-            return config
-        refuted.add(config)
-
-
 @dataclasses.dataclass(frozen=True)
 class Launch:
     """One launch a derivation plans (`plan`): its program's allocations at a ring depth (`scope`), its
