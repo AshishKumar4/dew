@@ -359,7 +359,7 @@ def ppo_equations(objective, options):
 
     def chains(values, mask, segments):
         """Each token's chain's total of `values` and count of trained tokens."""
-        ids = jnp.arange(int(segments.max()) + 1)
+        ids = jnp.arange(segments.shape[1] + 1)
         member = (segments[..., None] == ids) & (mask[..., None] != 0)
         totals = jnp.sum(jnp.where(member, values[..., None], 0), axis=1, keepdims=True)
         counts = jnp.sum(member, axis=1, keepdims=True).astype(values.dtype)
@@ -424,7 +424,9 @@ def test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged(o
     trainer, rollout = build_ppo(**options)
     objective = rollout.objective
     state = trainer.initial_state()
-    rolled = functools.cache(lambda seed: rollout(state, {"task_id": np.array([31], np.int32)},
+    # Sixteen prompts a draw: over one, the critic's bias gradient, a sum whose signs cancel, did not
+    # resolve within 512 seeds.
+    rolled = functools.cache(lambda seed: rollout(state, {"task_id": np.arange(16, dtype=np.int32)},
                                                   jax.random.key(seed)))
 
     def draw(seed):
