@@ -6,11 +6,12 @@ puts the other architectures' real parameter trees through `Trainer.fit`,
 where an unshardable or unsharded architecture shows.
 
 Each case trains two steps on the simulated 8-device CPU mesh, once as pure
-data parallelism (8x1) and once as data x fsdp (2x4), and checks what only a
-real fit can check: finite losses out of the compiled step, parameters and
-their optimizer moments genuinely split over the fsdp axis, the objective's
-evaluation running against the sharded EMA copy, and a checkpoint on disk
-afterwards.
+data parallelism (8x1) and once as data x fsdp (2x4), and a model whose stack
+of like blocks pipelines once more over two stages beside fsdp (2x2x2), and
+checks what only a real fit can check: finite losses out of the compiled step,
+parameters and their optimizer moments genuinely split over the fsdp axis, the
+objective's evaluation running against the sharded EMA copy, and a checkpoint
+on disk afterwards.
 """
 
 import functools
@@ -332,17 +333,18 @@ each gradient's own size, so where a gradient is zero in exact arithmetic
 full step whose sign no order of summation fixes."""
 
 
-def make_trainer(case: Case, tmp_path, fsdp, tracker=None, devices=None, optimizer=LINEAR):
+def make_trainer(case: Case, tmp_path, mesh: MeshSpec, tracker=None, devices=None, optimizer=LINEAR):
     """The trainer a recipe would build for this case: a registry model, the
-    real objective, a real optimizer, no wandb, over `devices` devices (all
-    by default)."""
+    real objective, a real optimizer, no wandb, on `mesh` over `devices`
+    devices (all by default)."""
     encoder = None if case.is_lm or case.is_jepa else StubText.from_pretrained(
         "stub", tokens=TEXT_TOKENS, features=TEXT_FEATURES, vocab=TEXT_VOCAB)
     model = models.build(case.architecture, **case.config)
     trainer = Trainer(
         make_objective(case, model, encoder), optimizer, key=jax.random.key(0),
-        mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY_SHARD),
-        checkpoints=Checkpoints(str(tmp_path / f"{case.name}-fsdp{fsdp}")), tracker=tracker)
+        mesh=mesh, layout=Layout(min_shard=TINY_SHARD),
+        checkpoints=Checkpoints(str(tmp_path / f"{case.name}-fsdp{mesh.fsdp}-stage{mesh.stage}")),
+        tracker=tracker)
     if devices is not None:
         trainer.device_mesh = trainer.mesh.build(jax.devices()[:devices])
     return trainer, encoder
@@ -362,14 +364,15 @@ def fsdp_leaves(tree):
     return [leaf for leaf in jax.tree.leaves(tree) if 'fsdp' in str(leaf.sharding.spec)]
 
 
-def run_case(case: Case, tmp_path, fsdp, devices=None, state=None, steps=2):
-    """One run of `steps` steps on the mesh over `devices` devices (all by
+def run_case(case: Case, tmp_path, mesh: MeshSpec, devices=None, state=None, steps=2):
+    """One run of `steps` steps on `mesh` over `devices` devices (all by
     default), from `state` (the trainer's own initial state by default),
     with everything the assertions read: the trainer, the state and the
     training losses."""
     seen = []
     tracker = RecordingTracker()
-    trainer, encoder = make_trainer(case, tmp_path / f"{devices}-{fsdp}-{steps}", fsdp, tracker, devices)
+    trainer, encoder = make_trainer(case, tmp_path / f"{devices}-{mesh.fsdp}-{mesh.stage}-{steps}", mesh,
+                                    tracker, devices)
     artifact, shape = expected_artifact(case)
     source = batches(case, encoder)
 
@@ -379,8 +382,9 @@ def run_case(case: Case, tmp_path, fsdp, devices=None, state=None, steps=2):
     state = trainer.fit(data, steps=steps, log_every=1, eval_every=1,
                         metrics=(Spread(seen, artifact),), preview=True, state=state)
 
-    assert dict(trainer.device_mesh.shape) == {"data": (devices or jax.device_count()) // fsdp, "expert": 1,
-                                               "fsdp": fsdp, "tensor": 1, "sequence": 1, "stage": 1}
+    assert dict(trainer.device_mesh.shape) == {
+        "data": (devices or jax.device_count()) // (mesh.fsdp * mesh.stage), "expert": 1, "fsdp": mesh.fsdp,
+        "tensor": 1, "sequence": 1, "stage": mesh.stage}
     assert int(state.step) == steps
     losses = [s["train/loss"] for _, s in tracker.scalars if "train/loss" in s]
     assert len(losses) == steps and all(np.isfinite(loss) for loss in losses), losses
@@ -509,7 +513,7 @@ def orbit(width: int):
     return orders
 
 
-def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exact: bool = False):
+def drawn_steps(case: Case, tmp_path, mesh: MeshSpec, devices, initial, steps: int, *, exact: bool = False):
     """`steps` steps of a layout over the batch a draw gives, from `initial` in the residual order
     it gives (`reordered`), every step on the same rows, as `run_case`'s `fit` takes them, the step
     compiled once for every draw at the plan fit takes, a frontier's first, untimed in Dew's tests
@@ -522,8 +526,8 @@ def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exa
     @as_given
     def stepped(raw, order):
         if not built:
-            trainer, _ = make_trainer(case, tmp_path / f"drawn-{devices}-{fsdp}-{steps}-{exact}", fsdp,
-                                      RecordingTracker(), devices)
+            directory = tmp_path / f"drawn-{devices}-{mesh.fsdp}-{mesh.stage}-{steps}-{exact}"
+            trainer, _ = make_trainer(case, directory, mesh, RecordingTracker(), devices)
             built.append(trainer)
         trainer = built[0]
         start = reordered(widened_state(initial) if exact else jax.tree.map(jnp.copy, initial), order)
@@ -570,16 +574,22 @@ def test_a_residual_order_is_the_same_decoder(case):
                                        roundings=roundings)
 
 
-LAYOUTS = {"8x1 data": 1, "2x4 fsdp": 4}
-"""Each layout a cell trains on, by its fsdp width over every device."""
+LAYOUTS = {"8x1 data": MeshSpec(), "2x4 fsdp": MeshSpec(fsdp=4), "2x2x2 stage": MeshSpec(fsdp=2, stage=2)}
+"""Each layout a cell trains on over every device, the rows over the axes it leaves to data."""
 
 LAYOUT_STEPS = (((1, "8x1 data"), (2, "2x4 fsdp")), ((1, "2x4 fsdp"), (2, "8x1 data")))
 """The pairs of step count and layout a case trains, alternating by case: each case meets each step
 count and each layout, and each step count meets each layout over the cases, as testing.md's
 settings pairwise asks."""
 
-LAYOUT_CELLS = [(case, steps, layout) for index, case in enumerate(CASES)
-                for steps, layout in LAYOUT_STEPS[index % 2]]
+PIPELINED = {"simple_dit": 1, "jepa_encoder": 2}
+"""The cases whose stack of like blocks splits into two stages (`decoder_stack.pipelines`), each with
+the steps it trains over them: the DiT's two blocks, the JEPA encoder's two beside its predictor's one,
+which runs whole on every stage."""
+
+LAYOUT_CELLS = [*((case, steps, layout) for index, case in enumerate(CASES)
+                  for steps, layout in LAYOUT_STEPS[index % 2]),
+                *((case, PIPELINED[case.name], "2x2x2 stage") for case in CASES if case.name in PIPELINED)]
 
 
 @pytest.mark.parametrize(("case", "steps", "layout"), LAYOUT_CELLS,
@@ -587,9 +597,10 @@ LAYOUT_CELLS = [(case, steps, layout) for index, case in enumerate(CASES)
                               for case, steps, layout in LAYOUT_CELLS])
 def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
     """One device and a layout, 8x1 data parallelism (every parameter
-    replicated, the batch split across every device) or 2x4 fsdp (the
+    replicated, the batch split across every device), 2x4 fsdp (the
     parameter tree split four ways, the optimizer's state and the EMA with
-    it), train the same steps from the same state: after `steps` steps (one,
+    it) or, for a model whose blocks pipeline, 2x2x2 stage (the blocks over
+    two stages beside two fsdp shards), train the same steps from the same state: after `steps` steps (one,
     or two, each case training each layout once and each step count once,
     `LAYOUT_STEPS`), the layout's variables, momentum and EMA are as near a
     float64 run as one device's are, over the cell's declared batches (check
@@ -599,7 +610,7 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     orders of magnitude. The steps check 1 draws are `fit`'s own on the
     run's batch, bit for bit, each compiled once for every draw. Adam's two
     moments and its count follow the parameters' placement too."""
-    trainer, encoder = make_trainer(case, tmp_path / "initial", 1, devices=1)
+    trainer, encoder = make_trainer(case, tmp_path / "initial", MeshSpec(), devices=1)
     initial = trainer.initial_state()
 
     def copied():
@@ -607,7 +618,7 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
         return jax.tree.map(jnp.copy, initial)
 
     width = residual_width(initial.variables) if case.is_lm else 0
-    one_step = drawn_steps(case, tmp_path, 1, 1, initial, 1)
+    one_step = drawn_steps(case, tmp_path, MeshSpec(), 1, initial, 1)
 
     def keyed(key):
         """A batch drawn from the key and, independently, an order of the residual stream's units
@@ -629,11 +640,11 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     draw = selection_margins.clearing(keyed, cleared) if selects(case) else keyed
 
     seeds = LAYOUT_SEEDS[case.name]
-    fsdp = LAYOUTS[layout]
-    _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied(), steps=steps)
-    _, state, _ = run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)
-    drawn = {"one device": drawn_steps(case, tmp_path, 1, 1, initial, steps),
-             layout: drawn_steps(case, tmp_path, fsdp, None, initial, steps)}
+    mesh = LAYOUTS[layout]
+    _, alone, _ = run_case(case, tmp_path, MeshSpec(), devices=1, state=copied(), steps=steps)
+    _, state, _ = run_case(case, tmp_path, mesh, state=copied(), steps=steps)
+    drawn = {"one device": drawn_steps(case, tmp_path, MeshSpec(), 1, initial, steps),
+             layout: drawn_steps(case, tmp_path, mesh, None, initial, steps)}
     # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
     # the cell's own batch in its own order, whatever selection margin a draw then asks.
     own = (next(batches(case, encoder)()), np.arange(width))
@@ -646,25 +657,25 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
                 mine, theirs = np.asarray(mine), np.asarray(theirs)
                 assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
                 assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
-    truth = drawn_steps(case, tmp_path, 1, 1, initial, steps, exact=True)
+    truth = drawn_steps(case, tmp_path, MeshSpec(), 1, initial, steps, exact=True)
     # A mixture's rows are judged over each draw's orbit of residual orders (`ORBIT`).
     orders = orbit(width) if case.is_lm and selection_margins.routes(case.config) else None
     assert_as_exact(drawn[layout], drawn["one device"], draw, f"{case.name} {layout}, {steps} step(s)",
                     seeds=seeds, truth_fn=truth, orders=orders)
-    if fsdp == 1:
+    if mesh.fsdp == 1:
         assert not fsdp_leaves(state.variables), "nothing may shard on a 1-wide fsdp axis"
         return
     sharded = fsdp_leaves(state.variables)
     assert sharded, "no parameter was sharded over the fsdp axis"
     for param in sharded:
-        assert param.addressable_shards[0].data.size == param.size // 4, \
-            "shard is not a quarter of the global parameter"
+        assert param.addressable_shards[0].data.size == param.size // mesh.fsdp, \
+            "shard is not the fsdp axis's part of the global parameter"
     # The optimizer's state and the EMA copy follow the params they track,
     # without the optimizer or the model ever describing a layout.
     param_specs = [leaf.sharding.spec for leaf in jax.tree.leaves(state.variables["params"])]
     assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(state.opt_state[0].trace)]
     assert {leaf.sharding.spec for leaf in jax.tree.leaves(state.ema)} <= set(param_specs)
-    adam = make_trainer(case, tmp_path / "adam", 4, optimizer=optax.adam(1e-3))[0].place()[0].opt_state[0]
+    adam = make_trainer(case, tmp_path / "adam", mesh, optimizer=optax.adam(1e-3))[0].place()[0].opt_state[0]
     for moment in (adam.mu, adam.nu):
         assert param_specs == [leaf.sharding.spec for leaf in jax.tree.leaves(moment)]
 
