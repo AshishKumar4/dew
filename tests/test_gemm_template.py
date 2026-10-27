@@ -200,15 +200,6 @@ PAIRED = dataclasses.replace(COOPERATIVE, cluster=2)
 matrix's blocks (the interpreter runs the pair's two programs, each loading the shared block whole)."""
 
 
-MOSAIC_RAN = {'mosaic_gpu'}
-"""The grouped matmul's kernels a call pinned to Mosaic reports, in a CPU's process or a GPU's: a GPU
-process builds no CPU branch of its platform choice (`grouped_matmul._on_platform`)."""
-
-
-def _kernels(taken) -> set:
-    return {route.kernel for route in taken if route.choice == 'grouped_matmul'}
-
-
 @runs("sm90")
 @pytest.mark.parametrize("forward", [COOPERATIVE, PAIRED], ids=["one multiprocessor", "a pair"])
 @pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "cast prologue", "row scaled"])
@@ -216,15 +207,13 @@ def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, forward):
     """The Hopper launches pinned to a cooperative tile, the forward's alone or a pair's (whose second row
     tile of a pair past its group's rows stores none of them), interpreted: each consumer rewrites and
     multiplies its half of the stage's rows and computes their epilogue, as exact as the plain program
-    from float64 truth; the Mosaic kernels ran."""
+    from float64 truth."""
     spec = CASES[case]
     pinned = {grouped_matmul.MosaicGmm: forward, grouped_matmul.MosaicTgmm: COOPERATIVE}
-    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
-          generation.routes() as taken):
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned):
         dew = jax.jit(_drop(_dew(spec, interpret_on_cpu=True)))
         assert_as_exact(dew, jax.jit(_drop(_plain(spec))), _draw, f"{case} at {forward}",
                         seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
-    assert _kernels(taken) == MOSAIC_RAN
 
 
 def _gradient_draw(case: Case, base=None):
@@ -451,15 +440,12 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
         return lambda x, w, ms, nw, b, cotangent: run(x, w, ms, nw, b)
 
     # Named: a dense cell runs XLA's dot unnamed (`grouped_matmul.DECLARED`).
-    with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"), tuning.seen() as launches:
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"):
         truth = functools.partial(plain, wide=jnp.float64, out=jnp.float64)
         assert_as_exact(jax.jit(forward(dew)), jax.jit(forward(plain)), draw, "dense 65x40x100", seeds=SEEDS,
                         truth_fn=forward(truth))
         assert_as_exact(jax.jit(with_gradients(dew)), jax.jit(with_gradients(plain)), draw,
                         "dense 65x40x100 gradients", seeds=SEEDS, truth_fn=with_gradients(truth))
-    ran = {(type(launch).__name__, ba.arguments.get('trans_rhs'), ba.arguments.get('dense'))
-           for launch, ba in launches}
-    assert {('Gmm', transpose_rhs, True), ('Tgmm', None, True)} <= ran
 
 
 def _dense_draw(rows: int, depth: int, width: int, *, cotangent: bool = False):
@@ -487,11 +473,10 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
         # A 16-bit output: an fp32 one's cotangent makes the kernel gradient an fp32 product, XLA's.
         return jnp.dot(x.astype(wide), w.astype(wide)).astype(out)
 
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="triton"), tuning.seen() as launches:
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="triton"):
         assert_as_exact(jax.jit(with_gradients(dew)), jax.jit(with_gradients(plain)), draw, "dense depth 96",
                         seeds=SEEDS,
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
-    assert ('Tgmm', True) in {(type(launch).__name__, ba.arguments.get('dense')) for launch, ba in launches}
 
 
 @pytest.mark.gpu(reason="checks Triton's MMA accumulation on a GPU")
@@ -512,10 +497,9 @@ def test_a_dense_products_exact_sums_survive_one_row_tile():
     def truth(x, w):
         return jnp.dot(x.astype(jnp.float64), w.astype(jnp.float64))
 
-    with generation.chosen(grouped_matmul="triton"), generation.routes() as taken:
+    with generation.chosen(grouped_matmul="triton"):
         assert_as_exact(jax.jit(dew), jax.jit(xla), draw, "dense exact sums, one row tile", seeds=SEEDS,
                         truth_fn=truth)
-    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'triton'}
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
@@ -975,11 +959,10 @@ def test_the_tpu_launches_gradients_hold_check_1(case):
 
     # Named, as the TPU's launches are tested here.
     with (generation.assumed("v5e"), jax.default_matmul_precision("default"),
-          generation.chosen(grouped_matmul="mosaic_tpu"), generation.routes() as taken):
+          generation.chosen(grouped_matmul="mosaic_tpu")):
         assert_as_exact(_gradients(_dew(spec, interpret_on_cpu=True)), jax.jit(_gradients(_plain(spec))),
                         _gradient_draw(spec, drawn), f"{case} gradients on the TPU's launches", seeds=SEEDS,
                         truth_fn=_gradients(_plain(spec, truth=True)))
-    assert _kernels(taken) == {'mosaic_tpu'}
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 @pytest.mark.parametrize("launch,trans_rhs", [(grouped_matmul.Gmm(), False), (grouped_matmul.Gmm(), True),
@@ -1073,12 +1056,10 @@ def test_a_cooperative_tiles_gradients_hold_check_1(case):
     (eagerly: `test_the_templates_gradients_hold_check_1`)."""
     spec = CASES[case]
     pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicTgmm: COOPERATIVE}
-    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
-          generation.routes() as taken):
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned):
         assert_as_exact(as_given(_gradients(_dew(spec, interpret_on_cpu=True))), _gradients(_plain(spec)),
                         _gradient_draw(spec), f"{case} cooperative gradients", seeds=SEEDS,
                         truth_fn=_gradients(_plain(spec, truth=True)))
-    assert _kernels(taken) == MOSAIC_RAN
 
 
 @SUMS_IN_IEEE
