@@ -24,9 +24,9 @@ from dew.nn.sharding import Link
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training import Trainer
-from dew.training.distributed import HOST_LINK
-from dew.training.planning import hides, offloaded
 
+HOST = "host"
+"""The host link's name among a run's links (`dew.training.distributed.HOST_LINK`)."""
 FAST = Link(bytes_per_second=1e18, flops_per_second=1e9)
 """A host link over which any step's state moves in less time than one FLOP takes at the stated peak."""
 SLOW = Link(bytes_per_second=1.0, flops_per_second=1e18)
@@ -40,7 +40,7 @@ def offloading(split=None, link=FAST, **fields):
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=SEQ, **fields)
     return one_device(Trainer(LMObjective(model, seq_len=SEQ, ema_decay=0.9), optax.adam(1e-3),
-                              key=jax.random.key(0), split=split, links={HOST_LINK: link}))
+                              key=jax.random.key(0), split=split, links={HOST: link}))
 
 
 def memory_kinds(tree):
@@ -49,7 +49,7 @@ def memory_kinds(tree):
 
 def asked(trainer):
     """The compiles the plan's search made, as (split, remat, host, fits, hidden)."""
-    return [(probe["split"], probe["remat"], probe["host"], probe["fits"], probe["hidden"])
+    return [(probe["split"], probe["remat"], probe.get("host"), probe["fits"], probe.get("hidden"))
             for probe in trainer.plan["probes"]]
 
 
@@ -70,7 +70,7 @@ def test_a_step_that_fits_only_without_its_state_on_the_device_keeps_it_in_host_
     free(monkeypatch, tight(monkeypatch))
     trainer = offloading()
     state = trained(trainer)
-    assert (trainer.plan["host"], trainer.plan["remat"]) == (OFFLOADED, None)
+    assert (trainer.plan.get("host"), trainer.plan["remat"]) == (OFFLOADED, None)
     searched = asked(trainer)
     assert all(not fits for _, remat, host, fits, _ in searched if host == [])
     assert (trainer.plan["split"], None, OFFLOADED, True, True) in searched
@@ -91,7 +91,7 @@ def test_a_state_offload_the_host_link_cannot_hide_is_taken_back_and_the_step_re
     free(monkeypatch, tight(monkeypatch))
     trainer = offloading(link=SLOW)
     state = trained(trainer)
-    assert trainer.plan["host"] == []
+    assert trainer.plan.get("host") == []
     assert (trainer.plan["remat"], trainer.plan["head_tile"]) != (None, None)
     assert any(host == OFFLOADED and hidden is False for _, _, host, _, hidden in asked(trainer))
     assert memory_kinds(state.opt_state) == {"device"}
@@ -105,6 +105,8 @@ def test_an_offloading_remat_rung_is_priced_by_the_residuals_it_keeps_in_host_me
     model = CausalTransformer(vocab_size=64, emb_features=64, num_layers=2, num_heads=2, mlp_features=128,
                               max_seq_len=64, remat="minimal")
     assert model.recompute_more().remat == REMAT_POLICIES["minimal_offloaded"]
+    from dew.training.planning import hides, offloaded
+
     mesh = Mesh(np.asarray(compile_only_gpus("sm90")), ("data",))
     whole = NamedSharding(mesh, P())
 
@@ -169,7 +171,7 @@ def test_a_step_with_its_state_in_host_memory_trains_what_one_with_it_on_the_dev
                            stepping(offloading(), initial, exact=True))
     free(monkeypatch, room)
     host(*draw(0))
-    assert offloads.plan["host"] == OFFLOADED
+    assert offloads.plan.get("host") == OFFLOADED
     free(monkeypatch, LIMIT)
     device(*draw(0))
     with jax.enable_x64(new_val=True):
