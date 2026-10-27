@@ -204,6 +204,28 @@ def test_a_fusion_that_reads_optimizer_state_is_the_optimizers(tmp_path):
     assert json.loads(out.read_text())["time"]["by_part_kind_ms"] == {"optimizer": {"elementwise": 3.0}}
 
 
+def test_a_line_every_layer_runs_is_summed_over_its_layers(tmp_path):
+    """A reduction each layer runs is one op a layer, too small alone to be a top op: the line that
+    wrote them is charged their sum, by kind, ahead of a larger op of its own."""
+    def cell(line: str) -> str:
+        # XProf's source cell: the op's frames, outermost last, in the title of its div.
+        return f"<div class='source-info-cell' title='/root/dew/src/{line}\n/usr/lib/jax/core.py:1'>x</div>"
+
+    cells = [("3", "input fusion", f"input_reduce_fusion.{layer}",
+              f"%input_reduce_fusion.{layer} = f32[8]{{0}} fusion(f32[8,64]{{1,0}} %p)", "jit(step)/reduce",
+              "1", 400.0, cell("dew/nn/norms.py:88")) for layer in range(4)]
+    cells.append(("3", "loop fusion", "loop_convert_fusion.9",
+                  "%loop_convert_fusion.9 = bf16[1024]{0} fusion(f32[1024]{0} %w)",
+                  "jit(step)/convert_element_type", "1", 1000.0, cell("dew/nn/precision.py:804")))
+    captured(tmp_path, cells, 311869.0)
+    dump = dumped(tmp_path, "module_0003.jit_step.sm_8.0_gpu_after_optimizations.txt", UPDATE)
+    out = tmp_path / "attribution.json"
+    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out)]) == 0
+    assert json.loads(out.read_text())["time"]["by_source_ms"] == [
+        {"kind": "reduce", "source": "dew/nn/norms.py:88", "ms": 1.6},
+        {"kind": "elementwise", "source": "dew/nn/precision.py:804", "ms": 1.0}]
+
+
 def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
     """Through the command: the step's time by kind and by part and kind, each op once."""
     times = {"flash backward": 6000.0, "Pallas recurrence": 2000.0, "transposing fusion": 1000.0,

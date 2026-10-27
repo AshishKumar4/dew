@@ -204,6 +204,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
     by_part: dict = defaultdict(lambda: defaultdict(float))
     by_kind: dict = defaultdict(float)
     by_part_kind: dict = defaultdict(lambda: defaultdict(float))
+    by_source: dict = defaultdict(float)
     gemms, layouts, everything = [], [], []
     fp8_gflop = 0.0
     for row in (row for row in rows if str(row.get("program_id")) == step):
@@ -223,6 +224,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         by_part[part][direction] += us
         by_kind[kind] += us
         by_part_kind[part][kind] += us
+        by_source[kind, source] += us
         # The compiled FLOPs over the measured time: the work done, counted from the op itself as the
         # step's FLOP count counts it. XProf's own rates are no measure of it: its model rate put a
         # cuBLAS weight-gradient GEMM of C6's Qwen3.5-0.8B at 550 TFLOP/s on an A100 (4x its work), and its
@@ -273,6 +275,10 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         "gemms_by_lost_time": sorted(gemms, key=lambda record: -record["lost_us"])[:25],
         "layout_moves": sorted(layouts, key=lambda record: -record["us"])[:25],
         "top_ops": sorted(everything, key=lambda record: -record["us"])[:40],
+        # A layer's op is one of as many as there are layers, each too small to be a top op: summed by
+        # the line that wrote it, the time a reduction or a convert costs every layer shows.
+        "by_source_ms": [{"kind": kind, "source": source, "ms": round(us / 1e3, 3)} for (kind, source), us
+                         in sorted(by_source.items(), key=lambda item: -item[1])[:40]],
         "xprof_steps": report_table(reports / "input_pipeline_analyzer.json", 1)[1][:8],
     }
     if model_flops:
