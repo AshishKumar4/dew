@@ -106,24 +106,21 @@ def test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid():
     assert drawn[0] == drawn[1] == drawn[2]
 
 
-CLAUSES, HYPOTHESES, INTENTS = 24, 6, 12
-"""The ragged rows' real options: one question of `CLAUSES`, `HYPOTHESES` of three and one of `INTENTS`.
-At 40, 6 and 24 a window was 1504 tokens and 13 questions of 40 slots deep, and the site's 512 draws took
-201-266 s on armada (ledger 1851); here 1240 tokens and 10 of 24, a draw and its two arms 0.16 s against
-0.24."""
+CLAUSES, HYPOTHESES = 24, 6
+"""The ragged rows' real options: one question of `CLAUSES` and `HYPOTHESES` of three. At three rows of 40,
+6 x 3 and 24 a window was 1504 tokens and 13 questions of 40 slots deep, and the site's 512 draws took 201-266
+s on armada (ledger 1851); at 24, 6 x 3 and 12, 1240 tokens, 0.45 s a draw with its float64 truth, 231.6 s
+at 512 (run-tests rows-memory-i); here two windows of short questions."""
 
 
 def ragged() -> list[Example]:
-    """Ragged rows: one question of `CLAUSES` options, `HYPOTHESES` of three and one of `INTENTS`. A
-    window's grid is its bound's questions times `CLAUSES` slots, more than the 128 (`OPTION_TILE`) its
-    real options compact into."""
-    clauses = Choice("Which clause?", [f"c{index}" for index in range(CLAUSES)])
-    hypotheses = {f"h{index}": Choice(f"Hypothesis {index}?", ["yes", "no", "unsaid"])
-                  for index in range(HYPOTHESES)}
-    intents = Choice("Which intent?", [f"i{index}" for index in range(INTENTS)])
-    return [Example("a clause on fees", {"clause": clauses}, {"clause": "c7"}),
-            Example("a contract", hypotheses, dict.fromkeys(hypotheses, "unsaid")),
-            Example("book a flight", {"intent": intents}, {"intent": "i3"})]
+    """Ragged rows, each in a window of its own: one question of `CLAUSES` options and `HYPOTHESES` of three,
+    their questions' text short. A window's grid is its bound's questions times `CLAUSES` slots, more than
+    the 128 (`OPTION_TILE`) its real options compact into."""
+    clauses = Choice("c?", [f"c{index}" for index in range(CLAUSES)])
+    hypotheses = {f"h{index}": Choice(f"h{index}?", ["y", "n", "u"]) for index in range(HYPOTHESES)}
+    return [Example("fees", {"clause": clauses}, {"clause": "c7"}),
+            Example("deal", hypotheses, dict.fromkeys(hypotheses, "u"))]
 
 
 OPTION_SEEDS = 512
@@ -210,7 +207,7 @@ def zeroed(tree):
 
 
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
-    """Rows of `CLAUSES`, `HYPOTHESES` x 3 and `INTENTS` real options packed into windows of a grid as
+    """Rows of `CLAUSES` and `HYPOTHESES` x 3 real options, ragged, packed into two windows of a grid as
     many questions deep as a window holds, which the packing compacts into the slots its bounds allow.
     The compaction is the joint head's alone (the backbone reads the rows' tokens, never their option
     slots), so the head is what check 1 holds: over draws of the backbone's states and of a cotangent
@@ -230,7 +227,7 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     owners = np.where(slotted["questions"], np.take_along_axis(slotted["segments"], starts, axis=1), 0)
     totals = [int(options[window][owners[window] == row].sum()) for window in range(len(options))
               for row in range(1, int(np.max(slotted["segments"][window])) + 1)]
-    assert sorted(totals) == sorted([CLAUSES, 3 * HYPOTHESES, INTENTS])
+    assert sorted(totals) == sorted([CLAUSES, 3 * HYPOTHESES])
     # A window's real options compact into the slots its bounds allow, a multiple of 128.
     capacity = -(-bounds.options // 128) * 128
     compact = laid_out(slotted, bounds.segments)
