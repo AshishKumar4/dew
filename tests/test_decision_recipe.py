@@ -367,9 +367,7 @@ def test_a_decision_corpus_of_one_file_reads_through_every_loading_worker(tmp_pa
     from dew.data.dataset import DataPartition
     from dew.decision.data import corpus
 
-    question = {"type": "choice", "instructions": "Which team?", "criteria": ["billing", "technical"]}
-    rows = [{"state": f"ticket {index}", "questions": {"team": question},
-             "answers": {"team": ["billing", "technical"][index % 2]}} for index in range(24)]
+    rows = [asked(f"ticket {index}", answers=["billing", "technical"][index % 2]) for index in range(24)]
     (tmp_path / "mixture.json").write_text(json.dumps({"weights": {"a": 1.0}, "slots": {"questions": 1,
                                                                                          "options": 2}}))
     (tmp_path / "a.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
