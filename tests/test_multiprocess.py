@@ -56,6 +56,7 @@ pytestmark = pytest.mark.mesh
 # tests/test_parallelism.py's tolerance for the same step on another topology.
 PARITY = {"rtol": 2e-4, "atol": 2e-5}
 
+
 # The preempted runs: nine steps, a checkpoint every three, killed two steps
 # past the first one.
 STEPS = 9
@@ -1141,8 +1142,8 @@ def test_a_pool_scores_a_diffusion_validation_pass(tmp_path):
     assert np.isfinite(score)
     # A metric that reads the whole field sees the global batch, not the rows
     # this rank happens to hold.
-    assert reports[0]["scores"]["val/global_mean"] == pytest.approx(
-        float(worker.global_images().mean()), rel=1e-6)
+    # The field is integers, so its sum is exact and its mean one division: the same number either way.
+    assert reports[0]["scores"]["val/global_mean"] == float(worker.global_images().mean())
 
     single = run_worker("validate", tmp_path / "single.json", steps=1)
     assert single["scores"]["val/clip_similarity"] == pytest.approx(
@@ -1226,8 +1227,7 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
     for report in reports:
         assert report["resident_addressable"] is False
         assert report["resident_tokens"] == report["direct_tokens"]
-        np.testing.assert_allclose(report["resident_behavior"], report["direct_behavior"],
-                                   rtol=1e-5, atol=1e-6)
+        np.testing.assert_array_equal(report["resident_behavior"], report["direct_behavior"])
     assert reports[0]["resident_tokens"] + reports[1]["resident_tokens"] == single["resident_tokens"]
     assert_same_parameters(dumped_params(tmp_path / "process0.json"),
                            dumped_params(tmp_path / "single.json"))
@@ -1285,7 +1285,8 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
     pooled = dumped_params(tmp_path / "pool" / "process0.json", ".update.npz")
     reference = dumped_params(tmp_path / "single.json", ".update.npz")
     scale = max(float(np.max(np.abs(leaf))) for leaf in reference.values())
-    assert scale == pytest.approx(single["update_scale"]) and scale > 1e-3
+    # The single run's own record of the scale it dumped.
+    assert scale == single["update_scale"] and scale > 1e-3
     assert relative_difference(pooled, reference) < 1e-4
 
     # A step that ignored validity is a different gradient, so the comparison
