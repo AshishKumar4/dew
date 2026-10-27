@@ -1,11 +1,14 @@
 """Schedule records and parameter groups against torch's schedulers and Adam.
 
 The references are tests/fixtures/torch_optim/reference.npz, which
-tools/torch_optim_reference.py writes with torch 2.14.1 on CPU. Dew computes
-in float32 and torch's schedulers in float64, so a schedule agrees to float32
-rounding of its value.
+tools/torch_optim_reference.py writes with torch 2.14.1 on CPU. torch's
+schedulers compute in float64, so a schedule is torch's where Dew's, run in
+float64, is the oracle's to its own float64 rounding (the gate's oracle rule,
+`assert_computes_the_oracle`): any other definition parts from it by orders of
+magnitude more.
 """
 
+import dataclasses
 from pathlib import Path
 
 import jax
@@ -13,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.optim import Cosine, Exponential, Linear, OneCycle, OptimConfig, ParamGroup, Power, stepped
 
@@ -21,68 +25,67 @@ EPOCHS, PER_EPOCH = 6, 2
 MOMENTUM = OneCycle(peak_value=0.85, init_value=0.95, end_value=0.95)
 """torch's Adam beta1 cycle under `OneCycleLR(cycle_momentum=True)`."""
 
-# float32 rounding of a value, two ulps of it. Near a cosine's end, where
-# `cos + 1` cancels, the error is instead an ulp or two of the peak, which
-# `atol` states per schedule as `ULPS * peak`.
-SCHEDULE_RTOL = 2e-6
-ULPS = 2.4e-7
 WEIGHT_DECAY = 1e-2
 """The reference run's kernel decay (tools/torch_optim_reference.py)."""
 
 
-def values(schedule, steps: int) -> np.ndarray:
-    built = schedule.schedule(steps)
-    return np.asarray([built(count) for count in range(steps)], np.float64)
+def assert_torchs(schedule, steps: int, torch_values, label: str) -> None:
+    """`schedule` over `steps` is torch's (`torch_values`, float64): Dew's run in float64 within the
+    float64 rounding of its own chain of operations (`chain_roundings`) of torch's."""
+    with jax.enable_x64(new_val=True):
+        built = schedule.schedule(steps)
+        computed = np.asarray([built(count) for count in range(steps)], np.float64)
+        roundings = chain_roundings(jax.make_jaxpr(built)(0))
+    assert_computes_the_oracle(computed, torch_values, label, roundings=roundings)
 
 
 def test_one_cycle_is_torchs_one_cycle_lr():
-    """Largest difference observed 4.8e-10 at a peak of 5e-3; the largest
-    relative one, 3.6e-6, is at the second-to-last step, where the cosine's
-    `cos + 1` cancels in float32."""
-    np.testing.assert_allclose(values(OneCycle(peak_value=5e-3), 40), TORCH["one_cycle/lr"],
-                               rtol=SCHEDULE_RTOL, atol=ULPS * 5e-3)
+    """Dew's one cycle at a peak of 5e-3, and one with its own start, end and
+    warmup share, is torch's OneCycleLR (`assert_torchs`)."""
+    assert_torchs(OneCycle(peak_value=5e-3), 40, TORCH["one_cycle/lr"], "one cycle")
     custom = OneCycle(peak_value=0.1, init_value=0.01, end_value=1e-4, warmup_fraction=0.25)
-    np.testing.assert_allclose(values(custom, 23), TORCH["one_cycle_custom/lr"],
-                               rtol=SCHEDULE_RTOL, atol=ULPS * 0.1)
+    assert_torchs(custom, 23, TORCH["one_cycle_custom/lr"], "a custom one cycle")
 
 
 def test_one_cycle_cycles_adams_b1_as_torch_does():
-    np.testing.assert_allclose(values(MOMENTUM, 40), TORCH["one_cycle/b1"], rtol=SCHEDULE_RTOL)
+    assert_torchs(MOMENTUM, 40, TORCH["one_cycle/b1"], "one cycle's b1")
 
 
 def test_exponential_is_torchs_exponential_lr_stepped_to_decay_steps_then_held():
     """The geometric decay from 12 to 0.23 over 10 steps, then 0.23 for the
     rest, plus the offset torch has no field for."""
-    np.testing.assert_allclose(values(Exponential(init_value=12.0, end_value=0.23, decay_steps=10), 16),
-                               TORCH["exponential/lr"], rtol=SCHEDULE_RTOL)
+    assert_torchs(Exponential(init_value=12.0, end_value=0.23, decay_steps=10), 16, TORCH["exponential/lr"],
+                  "exponential")
     decayed = Exponential(init_value=12.0, end_value=0.23, decay_steps=10, offset=0.27)
-    np.testing.assert_allclose(values(decayed, 16),
-                               TORCH["exponential/lr"] + 0.27, rtol=SCHEDULE_RTOL)
+    assert_torchs(decayed, 16, TORCH["exponential/lr"] + 0.27, "an offset exponential")
 
 
 def test_cosine_without_warmup_is_torchs_cosine_annealing():
-    np.testing.assert_allclose(values(Cosine(peak_value=0.1, warmup_steps=0), 15), TORCH["cosine/lr"],
-                               rtol=SCHEDULE_RTOL, atol=ULPS * 0.1)
+    assert_torchs(Cosine(peak_value=0.1, warmup_steps=0), 15, TORCH["cosine/lr"], "cosine")
 
 
 def test_every_holds_each_value_for_an_epoch_as_a_torch_scheduler_stepped_per_epoch():
     """A run of 40 epochs of 3 updates reads epoch e's value at each of its updates."""
-    held = values(OneCycle(peak_value=5e-3, every=3), 40 * 3)
-    np.testing.assert_allclose(held, np.repeat(TORCH["one_cycle/lr"], 3), rtol=SCHEDULE_RTOL,
-                               atol=ULPS * 5e-3)
+    assert_torchs(OneCycle(peak_value=5e-3, every=3), 40 * 3, np.repeat(TORCH["one_cycle/lr"], 3),
+                  "one cycle held three updates")
 
 
 def test_every_counts_the_schedules_fields_in_its_own_steps():
     """`decay_steps` counts epochs: the decay ends after 10 epochs of 4 updates."""
-    held = values(Exponential(init_value=12.0, end_value=0.23, decay_steps=10, every=4), 16 * 4)
-    np.testing.assert_allclose(held, np.repeat(TORCH["exponential/lr"], 4), rtol=SCHEDULE_RTOL)
+    assert_torchs(Exponential(init_value=12.0, end_value=0.23, decay_steps=10, every=4), 16 * 4,
+                  np.repeat(TORCH["exponential/lr"], 4), "exponential held four updates")
 
 
-def snn_delays_config() -> OptimConfig:
-    """SNN-delays' optimizer at the reference's size, as records only."""
+FLOAT64_MOMENTS = {"mu_dtype": "float64", "nu_dtype": "float64"}
+"""Adam's moments stored in float64, where a run stores them in float32 (`OptimConfig.state_dtype`):
+the same algorithm read in float64 for the oracle rule."""
+
+
+def snn_delays_config(**opts) -> OptimConfig:
+    """SNN-delays' optimizer at the reference's size, as records only; `opts` its optimizer's."""
     rate = OneCycle(peak_value=5e-3, every=PER_EPOCH)
     b1 = OneCycle(peak_value=0.85, init_value=0.95, end_value=0.95, every=PER_EPOCH)
-    return OptimConfig(optimizer="adam", param_groups=(
+    return OptimConfig(optimizer="adam", optimizer_opts=opts, param_groups=(
         ParamGroup("delays", ("delay",), schedule=Cosine(peak_value=0.1, warmup_steps=0, every=PER_EPOCH),
                    bounds=(0.0, 3.0)),
         ParamGroup("weights", ("kernel",), schedule=rate, b1=b1, weight_decay=WEIGHT_DECAY),
@@ -105,33 +108,24 @@ def run(solver: optax.GradientTransformation, initial, grads) -> dict[str, list[
     return trace
 
 
-def torch_run():
-    names = ("kernel", "scale", "delay")
-    initial = {name: jnp.asarray(TORCH[f"initial/{name}"]) for name in names}
-    grads = {name: jnp.asarray(TORCH[f"grads/{name}"]) for name in names}
-    return initial, grads, {name: TORCH[f"params/{name}"] for name in names}
-
-
-# optax computes Adam's bias corrections `1 - b ** t` in float32 and torch in
-# float64. At b2 = 0.999 that is a relative error of 1.3e-5 in the second
-# moment's correction and 6.4e-6 in each step, so a group's bound is that
-# error over twelve steps of its largest rate, with room for rounding. Run in
-# float64, Dew's positions are within 4.6e-7 of torch's float32 ones.
-PARAMETER_ATOL = {"kernel": 1e-6, "scale": 1e-6, "delay": 1e-5}
+NAMES = ("kernel", "scale", "delay")
 
 
 def test_grouped_adam_is_torchs_adam_with_param_groups_a_momentum_cycle_and_a_clamp():
     """Twelve updates over six epochs: Adam with coupled weight decay and
     the beta1 cycle on the kernel, the cycle alone on the scale, and the
-    clamped positions on a cosine from 0.1, against torch's two Adams and
-    their schedulers. Largest differences observed: 3.6e-7 on the kernel,
-    1.2e-7 on the scale and 5.0e-6 on the positions, whose rate is twenty
-    times higher."""
-    initial, grads, expected = torch_run()
-    trace = run(snn_delays_config().build(EPOCHS * PER_EPOCH), initial, grads)
-    for name, reference in expected.items():
-        np.testing.assert_allclose(np.stack(trace[name]), reference, rtol=0, atol=PARAMETER_ATOL[name],
-                                   err_msg=name)
+    clamped positions on a cosine from 0.1, are torch's two Adams and their
+    schedulers: Dew's run in float64 is torch's (`params/`, float64) to the
+    float64 rounding of its own chain of operations (the oracle rule)."""
+    with jax.enable_x64(new_val=True):
+        initial = {name: jnp.asarray(TORCH[f"initial/{name}"], jnp.float64) for name in NAMES}
+        grads = {name: jnp.asarray(TORCH[f"grads/{name}"], jnp.float64) for name in NAMES}
+        solver = snn_delays_config(**FLOAT64_MOMENTS).build(EPOCHS * PER_EPOCH)
+        trace = run(solver, initial, grads)
+        roundings = chain_roundings(jax.make_jaxpr(
+            lambda initial, grads: run(solver, initial, grads))(initial, grads))
+    for name in NAMES:
+        assert_computes_the_oracle(np.stack(trace[name]), TORCH[f"params/{name}"], name, roundings=roundings)
 
 
 def test_a_bounded_group_clamps_its_parameters_and_no_others():
@@ -145,7 +139,23 @@ def test_a_bounded_group_clamps_its_parameters_and_no_others():
     moved = stepped(params, updates, initial, state)
     # The clamp is exact: the bounds themselves, where the step overshot them.
     np.testing.assert_array_equal(moved["delay"], [0.0, 3.0])
-    np.testing.assert_allclose(moved["kernel"], [-0.45, 3.45], rtol=1e-5)
+    # The kernel takes Adam's first step unclamped, 0.5 * g / (|g| + 1e-8) off: Dew's step in float64 is
+    # that formula's to its own float64 rounding (the oracle rule).
+    with jax.enable_x64(new_val=True):
+        wide = {name: jnp.asarray(value, jnp.float64) for name, value in params.items()}
+        widened = {name: jnp.asarray(value, jnp.float64) for name, value in grads.items()}
+        read = dataclasses.replace(config, optimizer_opts=FLOAT64_MOMENTS).build(1)
+
+        def step(params, grads):
+            first = read.init(params)
+            updates, state = read.update(grads, first, params)
+            return stepped(params, updates, first, state)
+        kernel = np.asarray(step(wide, widened)["kernel"])
+        roundings = chain_roundings(jax.make_jaxpr(step)(wide, widened))
+    # From the float32 parameters and gradients the step read, widened.
+    start, gradient = np.asarray(wide["kernel"]), np.asarray(widened["kernel"])
+    adam = start - 0.5 * gradient / (np.abs(gradient) + 1e-8)
+    assert_computes_the_oracle(kernel, adam, "the unbounded kernel", roundings=roundings)
 
 
 @pytest.mark.parametrize("schedule", [

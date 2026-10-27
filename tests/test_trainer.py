@@ -841,6 +841,8 @@ runs = {"first": fit(1e-3, 2, root + "/run")}
 for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
     shutil.copytree(root + "/run", f"{root}/{name}")
     runs[name] = fit(peak, 3, f"{root}/{name}")
+for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
+    runs["fresh " + name] = fit(peak, 3, f"{root}/fresh {name}")
 print(json.dumps(runs))
 """
 
@@ -869,9 +871,11 @@ def test_a_run_resumed_at_another_rate_steps_at_it_on_the_compiled_step(tmp_path
         np.testing.assert_allclose(fast - start, 2 * (slow - start), rtol=1e-5,
                                    atol=2 * np.spacing(np.abs(start).max()))
     if not grouped:
-        for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
-            schedule = optax.warmup_cosine_decay_schedule(0.0, peak, 1, 8)
-            assert runs[name]["rates"]["3"] == pytest.approx(float(schedule(2)))
+        # A resumed step's rate is the one a run configured so from its start steps at, bit for bit: the
+        # same program reading the same rate operands.
+        for name in ("slow", "fast"):
+            assert runs[name]["rates"]["3"] == runs["fresh " + name]["rates"]["3"]
+        assert runs["fast"]["rates"]["3"] != runs["slow"]["rates"]["3"]
 
 
 def test_the_compiled_step_consumes_the_state_it_is_given():
@@ -2033,14 +2037,17 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
         opt_state=jax.tree.map(shape, state.opt_state, shardings.opt_state),
         key=shape(state.key, shardings.key))
 
-    from dew.objectives.base import Step
-
     compiled = trainer.compile(abstract, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
     batch = {"text": jnp.zeros((8, 5), jnp.int32)}
-    expected, _ = trainer.objective.scalar_loss(state.variables, batch,
-                              Step(state.microstep, jax.random.fold_in(state.key, state.step), None))
+    # The same step compiled from placed arrays of the same values: one program, so the step compiled
+    # from shapes alone computes its loss and its update bit for bit as it does.
+    placed, _, _ = trainer.place()
+    concrete = trainer.compile(placed, batch)
     advanced, loss, _, finite, _, _ = jax.block_until_ready(compiled(state, batch))
-    assert loss == pytest.approx(float(expected), rel=1e-6)
+    again, their_loss, _, _, _, _ = jax.block_until_ready(concrete(placed, batch))
+    assert np.array_equal(np.asarray(loss), np.asarray(their_loss))
+    assert all(np.array_equal(np.asarray(mine), np.asarray(theirs)) for mine, theirs in
+               zip(jax.tree.leaves(advanced.variables), jax.tree.leaves(again.variables), strict=True))
     assert int(advanced.step) == 1 and bool(finite)
 
 
