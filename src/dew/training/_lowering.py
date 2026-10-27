@@ -32,6 +32,7 @@ host, so attention traces its XLA path.
 from __future__ import annotations
 
 import json
+import math
 import pickle
 from collections import Counter
 from dataclasses import dataclass
@@ -148,14 +149,15 @@ class Lowered(SystemExit):
         self.kernels = triton_kernels(lowered)
         self.compiled = None
         if compiled:
-            # Compiled for devices this host is not, its executable cannot load back here: the
-            # persistent cache would write one no later compile of it reads, so it is off meanwhile.
-            cached = jax.config.jax_enable_compilation_cache
-            jax.config.update("jax_enable_compilation_cache", val=False)
+            # Compiled for devices this host is not, its executable cannot load back here, so the
+            # persistent cache writes it no entry, which a later compile of it here could not read:
+            # JAX writes an entry for a compile at least this long (it decides at each write).
+            floor = jax.config.jax_persistent_cache_min_compile_time_secs
+            jax.config.update("jax_persistent_cache_min_compile_time_secs", val=math.inf)
             try:
                 self.compiled = lowered.compile()
             finally:
-                jax.config.update("jax_enable_compilation_cache", val=cached)
+                jax.config.update("jax_persistent_cache_min_compile_time_secs", val=floor)
 
     @property
     def memory(self) -> dict[str, int]:

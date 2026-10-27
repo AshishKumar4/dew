@@ -627,7 +627,7 @@ def test_a_run_compiled_for_a_tpu_topology_keeps_its_executable_beside_its_check
     shapes, its host fields set aside, before anything is placed, and saves the executable, with each
     device's memory and work, in its checkpoint directory."""
     from dew.checkpoints import Checkpoints
-    from dew.data import Loader
+    from dew.data.dataset import Loader
     from dew.training._lowering import Lowered
 
     def batches(partition):
