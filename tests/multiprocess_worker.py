@@ -243,11 +243,13 @@ def online_pipeline(records: int, address: str, *, shared: bool, epochs: int | N
     return catalog.filter_map(*fetched).shuffle(0).repeat(epochs)
 
 
-def online_loader(records: int, workers: int, address: str, *, shared: bool):
-    """`elastic_loader` over records fetched from the pool's server (`online_pipeline`)."""
+def online_loader(records: int, workers: int, address: str, *, shared: bool, replicated: bool = False):
+    """`elastic_loader` over records fetched from the pool's server (`online_pipeline`), each share's
+    fetched by every process where the read is `replicated` (`Pipeline.elastic`)."""
     from dew.data.compile import compile
 
-    return compile(online_pipeline(records, address, shared=shared).batch(BATCH), seed=0,
+    chain = online_pipeline(records, address, shared=shared).batch(BATCH)
+    return compile(chain.elastic() if replicated else chain, seed=0,
                    loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
 
 
@@ -688,7 +690,8 @@ def mode_fit(args) -> dict:
     restored_step, restored = restored_state(trainer)
     rows = BATCH // args.processes
     if args.online:
-        open_train = online_loader(args.records, args.workers, args.online, shared=args.shared)
+        open_train = online_loader(args.records, args.workers, args.online, shared=args.shared,
+                                   replicated=args.replicated)
     elif args.elastic:
         open_train = elastic_loader(args.records, args.workers)
     else:
@@ -2404,6 +2407,8 @@ def parse_args(argv=None):
                                          "(`online_loader`)")
     parser.add_argument("--refusal", action="store_true",
                         help="fit reports the ValueError it is refused with instead of raising it")
+    parser.add_argument("--replicated", action="store_true",
+                        help="the online records read elastically, every process reading every share")
     parser.add_argument("--shared", action="store_true",
                         help="each process fetches its own share of the shuffled catalog (`online_pipeline`)")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")

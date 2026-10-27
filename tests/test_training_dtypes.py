@@ -49,6 +49,38 @@ def test_repeated_token_gradients_accumulate_in_master_precision(dtype):
     np.testing.assert_array_equal(gradient, expected)
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_token_lookup_takes_forward_mode_and_nested_derivatives(dtype):
+    """The lookup under `jax.jvp` and `jax.linearize` with respect to its table takes the gather's own
+    tangent, bit for bit, where its custom VJP alone refused forward mode (row 1869, audit NN-06), and forward
+    over reverse is the gather's own; its gradient still accumulates in the table's dtype (the test above)."""
+    model = TokenEmbedding(5, 3, dtype=dtype)
+    ids = jnp.asarray([[0, 4, 4, 2]], jnp.int32)
+    table = model.init(jax.random.key(6), ids)["params"]["embedding"]
+    direction = jax.random.normal(jax.random.key(7), table.shape, table.dtype)
+
+    def lookup(table):
+        return model.apply({"params": {"embedding": table}}, ids)
+
+    def gathered(table):
+        return table[ids].astype(dtype)
+
+    found = jax.jit(lambda t: jax.jvp(lookup, (t,), (direction,)))(table)
+    want = jax.jit(lambda t: jax.jvp(gathered, (t,), (direction,)))(table)
+    jax.tree.map(np.testing.assert_array_equal, found, want)
+    linearized = jax.jit(lambda t: jax.linearize(lookup, t)[1](direction))(table)
+    np.testing.assert_array_equal(linearized, want[1])
+
+    def nested(fn):
+        def loss(table):
+            return jnp.sum(fn(table).astype(jnp.float32) ** 2)
+
+        return jax.jit(lambda t: jax.jvp(jax.grad(loss), (t,), (direction,))[1])(table)
+
+    # Both scatter-add the rows in the table's dtype, in the ids' order.
+    np.testing.assert_array_equal(nested(lookup), nested(gathered))
+
+
 @pytest.mark.parametrize("vocab, padding_idx", [(5, 0), (5, 4), (5, -1), (5, -5), (1, 0), (1, -1)])
 def test_a_padding_rows_lookups_train_it_no_more_than_torchs(vocab, padding_idx):
     """`padding_idx` leaves the row its id names untrained by every lookup of it, as torch's

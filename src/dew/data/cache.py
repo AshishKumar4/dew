@@ -856,34 +856,39 @@ class _CachedIter(grain.IterDataset):
         self.published, self.input_parent = published, parent
 
     def __iter__(self) -> grain.DatasetIterator:
-        # A shard keeps its iterator's state either way, so a fill resumes onto its published generation.
-        # A shard the generation holds under another ID (another mount, a stream cut into more shards
-        # than it has) runs its steps and writes nothing, so the key holds no rows under its IDs. The
-        # writer opens before the shard's input does, so a writer the cache refuses leaves no input open.
+        return _CachedIterator(self.input_parent.__iter__(), self.writer, self.shard, self.transform)
+
+    def writer(self) -> _Writer | _Published | _Computed:
+        """Where its shard's records are written or read. A shard keeps its iterator's state either
+        way, so a fill resumes onto its published generation. A shard the generation holds under
+        another ID (another mount, a stream cut into more shards than it has) runs its steps and
+        writes nothing, so the key holds no rows under its IDs."""
         published = self.published
-        writer = (_opened_writer(self.cache, self.key) if published is None
-                  else published if published.generation.holds((self.shard.id, 0))
-                  else _Computed())
-        with ExitStack() as opening:
-            opening.callback(writer.close)
-            parent = self.input_parent.__iter__()
-            opening.pop_all()
-        return _CachedIterator(parent, writer, self.shard, self.transform)
+        return (_opened_writer(self.cache, self.key) if published is None
+                else published if published.generation.holds((self.shard.id, 0))
+                else _Computed())
 
 
 class _CachedIterator(grain.DatasetIterator):
     def __init__(
         self,
         parent: grain.DatasetIterator,
-        writer: _Writer | _Published | _Computed,
+        opens: Callable[[], _Writer | _Published | _Computed],
         shard: Shard,
         transform: Transform | None,
     ):
         super().__init__(parent)
-        self.parent, self.writer, self.shard, self.transform = parent, writer, shard, transform
+        self.parent, self.opens, self.shard, self.transform = parent, opens, shard, transform
+        self.writer: _Writer | _Published | _Computed | None = None
         self.ordinal = 0
 
     def __next__(self):
+        # The writer opens with the first record, so building the iterator reads no storage: Grain
+        # builds a worker pool's iterators in this process for their first state, inside the
+        # construction of a thread prefetch over the pool, which a refusal raised there leaves half
+        # built for the collector to close (grain 0.2.18, ThreadPrefetchDatasetIterator.__init__).
+        if self.writer is None:
+            self.writer = self.opens()
         try:
             value = next(self.parent)
         except StopIteration:
@@ -906,7 +911,5 @@ class _CachedIterator(grain.DatasetIterator):
 
     def close(self) -> None:
         self.parent.close()
-        self.writer.close()
-
-    def metrics(self) -> CacheStats:
-        return self.writer.metrics()
+        if self.writer is not None:
+            self.writer.close()

@@ -741,7 +741,6 @@ def test_epochs_under_a_ramp_read_that_many_passes_of_records():
     data = ramped(Loader(train=lambda partition: iter(()), val=None, records=64, batch=16), ramp)
     batches = [stage.batch for stage in ramp.stages(16)]
     assert (data.epoch_steps(1), data.epoch_steps(2)) == (6, 10) and batches == [8, 16]
-    assert 4 * 8 + 6 * 16 == 2 * 64
 
 
 @pytest.mark.parametrize(("records", "steps"), [(5, 3), (16, 8), (17, 9), (40, 14), (41, 15)])

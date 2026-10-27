@@ -29,8 +29,8 @@ from jax.custom_derivatives import SymbolicZero
 from dew.nn.precision import at_least_fp32
 
 __all__ = ["cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative", "label_entry",
-           "log_probs", "probabilities", "rescaled", "segment_log_partition", "soft_cross_entropy",
-           "target_loss"]
+           "log_probs", "partition", "probabilities", "rescaled", "segment_log_partition",
+           "soft_cross_entropy", "target_loss"]
 
 
 def widened(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -71,17 +71,36 @@ def _probabilities_tangent(primals, tangents):
 
 def cross_entropy(logits: jax.Array, labels: jax.Array, where: jax.Array | None = None) -> jax.Array:
     """`-log p[labels]` over the last axis, `labels` of `logits.shape[:-1]`: the log partition less the
-    label's logit, as Optax takes it, which reads the label's logit without building the normalized
-    row. Its derivative is Barron, Gnanapragasam and Tschannen's (arXiv:2610.31642, eq. 7): each other
-    class's probability, and at the label minus their sum, so the row's derivative sums to zero. The
-    label's `p - 1` collapses to 0 once its margin over the other classes passes the dtype's precision
-    (eq. 4; 16.6 in float32), while the others' probabilities stay until they underflow."""
+    label's logit, each taken from the row's maximum (`target_loss`), which reads the label's logit
+    without building the normalized row. Optax's `softmax_cross_entropy_with_integer_labels` subtracts
+    the label's logit from the whole log partition, maximum included, which rounds at the logits'
+    magnitude rather than the loss's: mamba-tiny's drawn tokens' raw scores sat 1.47 times as far from
+    float64 as `log_softmax`'s, and 1.00 times so taken here. Its derivative is Barron, Gnanapragasam
+    and Tschannen's (arXiv:2610.31642, eq. 7): each other class's probability, and at the label minus
+    their sum, so the row's derivative sums to zero. The label's `p - 1` collapses to 0 once its margin
+    over the other classes passes the dtype's precision (eq. 4; 16.6 in float32), while the others'
+    probabilities stay until they underflow."""
     return _label_loss(widened(logits, where), labels)
+
+
+def partition(logits: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Each row's maximum over the last axis, the sum of its exponentials scaled to it, and those
+    exponentials: the terms every whole-row label loss takes its log partition from (`target_loss`;
+    `cross_entropy`, `dew.objectives.lm.chunked`'s whole head).
+
+    The maximum is finite, as `jax.nn.logsumexp` takes one: an infinite maximum shifts by 0, so a row
+    holding +inf scores +inf, and an all -inf row's partition is -inf, never inf - inf.
+    """
+    largest = jnp.max(logits, axis=-1)
+    peak = jnp.where(jnp.isfinite(largest), largest, 0)
+    shifted = jnp.exp(logits - peak[..., None])
+    return peak, jnp.sum(shifted, axis=-1), shifted
 
 
 @jax.custom_jvp
 def _label_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
-    return optax.softmax_cross_entropy_with_integer_labels(logits, labels)
+    peak, mass, _ = partition(logits)
+    return target_loss(peak, mass, jnp.take_along_axis(logits, labels[..., None], axis=-1)[..., 0])
 
 
 @_label_loss.defjvp

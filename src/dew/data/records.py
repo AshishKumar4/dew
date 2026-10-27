@@ -24,7 +24,7 @@ from typing import Literal, TypeGuard, Union
 
 import numpy as np
 
-from dew._records import JSON, integer, json_value, numbers, record
+from dew._records import JSON, boolean, integer, json_value, numbers, record
 from dew.batch import Batch
 from dew.data.dataset import Loading
 from dew.data.pipeline import Dataset, Mixture, Phases, Piped, Pipeline, Stage
@@ -258,6 +258,7 @@ def _chain(pipeline: Pipeline) -> dict[str, JSON]:
         "name": pipeline.name,
         "read": pipeline.mode,
         "loading": None if loading is None else _typed(loading, Loading, "loading"),
+        **({"elastic": True} if pipeline._elastic else {}),
         "stages": stages,
     }
 
@@ -439,6 +440,7 @@ def _read_chain(written: Mapping[str, object]) -> Pipeline:
         name=None if chain.get("name") is None else str(chain["name"]),
         mode=_read_mode(chain.get("read")),
         _loading=None if loading is None else from_record(Loading, json_value(loading, "loading")),
+        _elastic=boolean(chain.get("elastic", False), "chain elastic"),
     )
 
 
