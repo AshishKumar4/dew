@@ -326,9 +326,8 @@ def cu_seqlens(begins: jax.Array, sequences: int, firsts: jax.Array | None = Non
     scan over the flattened tokens, whose split over a mesh XLA runs a token
     a loop iteration (row 1897)."""
     rows, length = begins.shape
-    if firsts is None:
-        firsts = document_firsts(begins, -(-sequences // rows))
-    placed = jnp.where(firsts < length, firsts + jnp.arange(rows, dtype=jnp.int32)[:, None] * length,
+    given = document_firsts(begins, -(-sequences // rows)) if firsts is None else firsts
+    placed = jnp.where(given < length, given + jnp.arange(rows, dtype=jnp.int32)[:, None] * length,
                        rows * length).reshape(-1)
     starts = jnp.sort(placed)[:sequences]
     starts = jnp.pad(starts, (0, sequences - starts.shape[0]), constant_values=rows * length)
@@ -696,9 +695,10 @@ def _continued_layout(value: Coordinates, valid: jax.Array, width: int) -> Coord
     starts = None if value.starts is None else jnp.concatenate(
         [value.starts, jnp.zeros((len(value.starts), width), value.starts.dtype)], axis=1)
     # No document starts in the response: each row's firsts stand, past its last now `width` further.
-    length = None if value.starts is None else value.starts.shape[1]
-    firsts = None if value.firsts is None else jnp.where(value.firsts < length, value.firsts,
-                                                         length + width)
+    firsts = value.firsts
+    if firsts is not None and value.starts is not None:
+        length = value.starts.shape[1]
+        firsts = jnp.where(firsts < length, firsts, length + width)
     return replace(value, valid=continued(value.valid, _response_validity),
                    positions=continued(value.positions, _response_positions),
                    segments=continued(value.segments, _response_document), starts=starts, firsts=firsts,

@@ -345,8 +345,7 @@ def _operations(lowered: jax.stages.Lowered) -> list[Operation]:
     found: list[Operation] = []
 
     def typed(values) -> tuple:
-        tensors = [ir.RankedTensorType(value.type) for value in values
-                   if ir.RankedTensorType.isinstance(value.type)]
+        tensors = [value.type for value in values if isinstance(value.type, ir.RankedTensorType)]
         return tuple((tuple(tensor.shape), str(tensor.element_type)) for tensor in tensors)
 
     def visit(operation: ir.Operation) -> ir.WalkResult:
@@ -355,7 +354,7 @@ def _operations(lowered: jax.stages.Lowered) -> list[Operation]:
         if "call_target_name" in attributes:
             target = ir.StringAttr(attributes["call_target_name"]).value
         elif "callee" in attributes:
-            target = ir.FlatSymbolRefAttr(attributes["callee"]).value
+            target = attributes["callee"].value
         found.append((operation.name, target, typed(operation.operands), typed(operation.results)))
         return ir.WalkResult.ADVANCE
 
