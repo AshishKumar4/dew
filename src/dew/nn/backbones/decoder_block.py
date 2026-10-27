@@ -487,9 +487,9 @@ there and 149.4 ms at 'minimal_with_conv', for 1.1 GB more at its peak,
 docs/performance.md); 'minimal_with_conv' keeps the conv alone. A decoder
 without a recurrence skips both, as it would compile 'minimal''s step.
 'minimal_offloaded' keeps 'minimal''s residuals in pinned host memory and
-recomputes what 'minimal' does, which a plan keeps only where moving them
-hides behind the step's compute (`dew.training.planning.hides`), else it
-recomputes the MLP's products too. A
+recomputes what 'minimal' does; a plan that keeps it is timed against the
+first rung above it that keeps everything on the device
+(`dew.training.planning.FitSearch`). A
 decoder's own remat is where it starts, and it moves up one rung at a time
 (`CausalTransformer.recompute_more`),
 past a rung that keeps nothing more of its layers' names than the next, never

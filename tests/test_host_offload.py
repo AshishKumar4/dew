@@ -1,109 +1,186 @@
 """The plan's host offload (`dew.training.planning.FitSearch`): where a step does not fit its devices, the
 plan keeps the optimizer state and the EMA in its host's pinned memory before it recomputes anything,
-and a remat rung that keeps its residuals there stands before the next that recomputes them, each only
-where the bytes it moves, over the host link, take no longer than the step's FLOPs at the device's peak
-(`hides`).
+and a remat rung that keeps its residuals there stands before the next that recomputes them. A plan
+that offloads meets the first plan that keeps everything on the device: a run that times its plans
+keeps the offload only where it runs clearly faster, and one that times none keeps the device-resident
+plan wherever one fits.
 
 A CPU device has the pinned host memory and no accounting of it apart from its own (tests/
 test_host_placement.py), so the plan's choice is held here on budgets the devices report
-(`test_plan.free`) and links the run states (`Trainer(links=...)`); what an offloading remat rung keeps
-in host memory is read off a step compiled for a compile-only H100, whose compiler accounts for it."""
+(`test_plan.free`) and timings the test states; what an offloading remat rung keeps in host memory is
+read off a step compiled for a compile-only H100, whose compiler accounts for it."""
+
+import dataclasses
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from kernel_compile import compile_only_gpus
 from reference_error import as_given, assert_as_exact
 from test_host_placement import memory_kinds
 from test_layout_validation import step_loss
-from test_plan import LIMIT, ROWS, SEQ, free, needs, one_device, trained
+from test_plan import BATCH, LIMIT, ROWS, SEQ, free, needs, one_device, token_files, trained, windows
 
+from dew.checkpoints import Checkpoints
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
-from dew.nn.sharding import Link
 from dew.objectives.lm import LMObjective
 from dew.training import Trainer
 
-HOST = "host"
-"""The host link's name among a run's links (`dew.training.distributed.HOST_LINK`)."""
-FAST = Link(bytes_per_second=1e18, flops_per_second=1e9)
-"""A host link over which any step's state moves in less time than one FLOP takes at the stated peak."""
-SLOW = Link(bytes_per_second=1.0, flops_per_second=1e18)
-"""A host link over which no step's state moves in the time its FLOPs take."""
 OFFLOADED = ["opt_state", "ema"]
 
 
-def offloading(split=None, link=FAST, **fields):
-    """A one-layer decoder trained by Adam with an EMA, both of which the plan may keep in host memory,
-    over a host `link` the run states."""
-    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+def offloading(split=None, seq_len=SEQ, checkpoints=None, **fields):
+    """A decoder whose parameters outweigh its activations, two MLPs 1024 wide, trained by Adam with an
+    EMA: its optimizer state and EMA, three times the parameters, are what the plan may keep in host
+    memory."""
+    model = CausalTransformer(vocab_size=64, emb_features=64, num_layers=2, num_heads=2, mlp_features=1024,
                               max_seq_len=SEQ, **fields)
-    return one_device(Trainer(LMObjective(model, seq_len=SEQ, ema_decay=0.9), optax.adam(1e-3),
-                              key=jax.random.key(0), split=split, links={HOST: link}))
+    return one_device(Trainer(LMObjective(model, seq_len=seq_len, ema_decay=0.9), optax.adam(1e-3),
+                              key=jax.random.key(0), split=split, checkpoints=checkpoints))
 
 
-def offload_probes(trainer):
-    """The compiles the plan's search made, as (split, remat, host, fits, hidden)."""
-    return [(probe["split"], probe["remat"], probe.get("host"), probe["fits"], probe.get("hidden"))
-            for probe in trainer.plan["probes"]]
+def searched(trainer):
+    """The compiles the plan's search made, as (remat, host, fits)."""
+    return [(probe["remat"], probe.get("host"), probe["fits"]) for probe in trainer.plan["probes"]]
+
+
+def least_need(monkeypatch, remat=None, corpus=None) -> int:
+    """The least a plan at `remat` with the state on the device needs to read BATCH, or the windows of
+    `corpus` a run fits on (`windows`): its most microbatches, one a row, under whichever head its rung
+    takes needs least, whole, tiled or tiled with its gradient in the backward (`recompute_more`)."""
+    def at(steps: int) -> int:
+        """The need with the head `steps` rungs along: whole, tiled, then its gradient in the backward."""
+        trainer = (offloading(split=ROWS, remat=remat) if corpus is None
+                   else offloading(split=8, remat=remat, seq_len=4))
+        for step in (trainer.objective.tile_head, trainer.objective.unfuse_head)[:steps]:
+            step()
+        return needs(monkeypatch, trainer, None if corpus is None else (
+            lambda: trainer.fit(windows(corpus), steps=1, checkpoint_every=None)))
+    return min(at(steps) for steps in range(3))
+
+
+def device_bound(monkeypatch, corpus=None) -> int:
+    """Room for no plan that keeps the state on the device: a byte less than the least any needs, at
+    the ladder's last remat rung."""
+    return least_need(monkeypatch, "full", corpus) - 1
+
+
+def test_a_step_that_fits_only_with_its_state_in_host_memory_keeps_it_there(monkeypatch):
+    """With room for no plan that keeps the state on the device, the plan keeps the optimizer state and
+    the EMA in host memory before it recomputes anything, after every rung of its device-resident search
+    missed, and the run trains from there with them in pinned host memory and the parameters on the
+    device."""
+    free(monkeypatch, device_bound(monkeypatch))
+    trainer = offloading()
+    state = trained(trainer)
+    assert (trainer.plan["host"], trainer.plan["remat"]) == (OFFLOADED, None)
+    compiles = searched(trainer)
+    assert not any(fits for _, host, fits in compiles if host == [])
+    assert {remat for remat, host, _ in compiles if host == []} >= {None, "minimal", "full"}
+    assert memory_kinds(state.opt_state) == memory_kinds(state.ema) == {"pinned_host"}
+    assert memory_kinds(state.variables) == {"device"}
 
 
 def tight(monkeypatch) -> int:
-    """Room for no split of the step with its optimizer state and EMA on the device, the most
-    microbatches taking the least, and for the most microbatches recomputing at 'minimal'."""
-    least, recomputing = needs(monkeypatch, offloading(split=ROWS)), needs(
-        monkeypatch, offloading(split=ROWS, remat="minimal"))
+    """Room for no plan with the state on the device and no recomputation, and for the most
+    microbatches at 'minimal': both an offload and a recomputation fit."""
+    least, recomputing = least_need(monkeypatch), needs(monkeypatch, offloading(split=ROWS, remat="minimal"))
     assert recomputing < least, (recomputing, least)
     return least - 1
 
 
-def test_a_step_that_fits_only_without_its_state_on_the_device_keeps_it_in_host_memory(monkeypatch):
-    """With room for no split while the optimizer state and the EMA sit on the device, the plan keeps
-    them in host memory before it recomputes anything, over a host link that moves them in less time
-    than the step's FLOPs take, and the run trains from there with them in pinned host memory. Its
-    checkpoint's rung says so, and a trainer that takes that rung places them there."""
+@pytest.mark.parametrize("seconds, host, remat", [
+    ([[0.2, 0.21], [0.1, 0.12]], OFFLOADED, None), ([[0.1, 0.12], [0.2, 0.21]], [], "minimal"),
+    ([[0.2, 0.3], [0.1, 0.25]], [], "minimal"), (None, [], "minimal")],
+    ids=["offload-faster", "recompute-faster", "within-spread", "untimed"])
+def test_a_plan_that_offloads_is_timed_against_the_first_that_keeps_the_state_on_the_device(
+        monkeypatch, seconds, host, remat):
+    """Where both an offload with no recomputation and a recomputation with the state on the device fit,
+    the search compiles both, the device-resident plan first, and the run times them: the offload is kept
+    only where its every sample beats the other's (`faster`). A compile that times nothing keeps the
+    device-resident plan without timing."""
     free(monkeypatch, tight(monkeypatch))
     trainer = offloading()
-    state = trained(trainer)
-    assert (trainer.plan.get("host"), trainer.plan["remat"]) == (OFFLOADED, None)
-    searched = offload_probes(trainer)
-    assert all(not fits for _, remat, host, fits, _ in searched if host == [])
-    assert (trainer.plan["split"], None, OFFLOADED, True, True) in searched
+    state, _, _ = trainer.place()
+    timed = []
+    step = trainer.compile(state, BATCH, None if seconds is None else (
+        lambda steps: (timed.append(len(steps)), seconds)[1]))
+    assert timed == ([] if seconds is None else [2])
+    assert (trainer.plan["host"], trainer.plan["remat"]) == (host, remat)
+    if seconds is not None:
+        assert [(plan["host"], plan["remat"]) for plan in trainer.plan["timed"]] == [
+            ([], "minimal"), (OFFLOADED, None)]
+    state, loss, *_ = step(state, BATCH)
+    assert np.isfinite(float(loss))
+    assert memory_kinds(state.opt_state) == {"pinned_host" if host else "device"}
+
+
+def device_bytes() -> int:
+    """The bytes this process's live arrays hold in device memory."""
+    return sum(array.nbytes for array in jax.live_arrays() if array.sharding.memory_kind == "device")
+
+
+@pytest.mark.parametrize("shared", [False, True], ids=["own-buffers", "ema-is-the-parameters"])
+def test_moving_the_state_to_host_memory_releases_the_device_bytes_the_plan_counted(shared):
+    """The fit check counts a field the plan moves to host memory as the bytes the move releases
+    (`rehomed`), and the move (`placed_as`) releases exactly those before the step runs: the device's
+    live bytes fall by them, each moved source deleted. An EMA that is the parameters' own arrays shares
+    their buffers, which the parameters still hold: it is copied to host memory, neither deleted nor
+    counted."""
+    from dew.training.distributed import placed_as, rehomed
+
+    trainer = offloading()
+    state, _, _ = trainer.place()
+    if shared:
+        state = dataclasses.replace(state, ema=state.variables["params"])
+    trainer.layout = trainer.layout.keeping(OFFLOADED)
+    shardings = trainer.shardings(state)
+    moments, ema = jax.tree.leaves(state.opt_state), jax.tree.leaves(state.ema)
+    counted = rehomed(state, shardings)
+    assert counted == -sum(leaf.nbytes for leaf in moments + ([] if shared else ema))
+    before = device_bytes()
+    moved = placed_as(state, shardings)
+    assert device_bytes() == before + counted
+    assert all(leaf.is_deleted() for leaf in moments)
+    assert all(leaf.is_deleted() is not shared for leaf in ema)
+    assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(state.variables))
+    assert memory_kinds(moved.opt_state) == memory_kinds(moved.ema) == {"pinned_host"}
+
+
+def test_a_run_whose_plan_kept_its_state_in_host_memory_resumes_from_its_checkpoint(tmp_path, monkeypatch):
+    """A run whose plan kept the optimizer state and the EMA in host memory saves them there, and a run
+    of the same configuration resumes from that checkpoint: it restores them where the run kept them, the
+    devices holding them no more, and trains on at the rung the checkpoint names."""
+    corpus = token_files(tmp_path)
+    directory = str(tmp_path / "run")
+    room = device_bound(monkeypatch, corpus)
+    free(monkeypatch, room)
+    first = offloading(seq_len=4, checkpoints=Checkpoints(directory))
+    saved = first.fit(windows(corpus), steps=2, checkpoint_every=2)
+    assert first.plan["host"] == OFFLOADED
+    # The resumed run's devices hold no moments and no EMA: what the first plan freed is free from the start.
+    free(monkeypatch, room + sum(leaf.nbytes for leaf in jax.tree.leaves((saved.opt_state, saved.ema))))
+    resumed = offloading(seq_len=4, checkpoints=Checkpoints(directory))
+    state = resumed.fit(windows(corpus), steps=3, checkpoint_every=None)
+    assert int(state.step) == 3
+    assert (resumed.plan["host"], resumed.plan["remat"]) == (OFFLOADED, first.plan["remat"])
     assert memory_kinds(state.opt_state) == memory_kinds(state.ema) == {"pinned_host"}
-    assert memory_kinds(state.variables) == {"device"}
-
-    resumed = offloading()
-    resumed._resume_rung(trainer._checkpoint_rung())
-    placed, _, _ = resumed.place()
-    assert resumed.layout.host == tuple(OFFLOADED)
-    assert memory_kinds(placed.opt_state) == memory_kinds(placed.ema) == {"pinned_host"}
 
 
-def test_a_state_offload_the_host_link_cannot_hide_is_taken_back_and_the_step_recomputes(monkeypatch):
-    """Over a host link too slow to move the optimizer state and the EMA in the time the step's FLOPs
-    take, the plan compiles their offload, finds it exposed, takes it back and climbs the ladder: the
-    run keeps its state on the device and recomputes."""
-    free(monkeypatch, tight(monkeypatch))
-    trainer = offloading(link=SLOW)
-    state = trained(trainer)
-    assert trainer.plan.get("host") == []
-    assert (trainer.plan["remat"], trainer.plan["head_tile"]) != (None, None)
-    assert any(host == OFFLOADED and hidden is False for _, _, host, _, hidden in offload_probes(trainer))
-    assert memory_kinds(state.opt_state) == {"device"}
-
-
-def test_an_offloading_remat_rung_is_priced_by_the_residuals_it_keeps_in_host_memory():
+def test_an_offloading_remat_rung_keeps_its_residuals_in_host_temporaries():
     """A decoder climbs from 'minimal' to 'minimal_offloaded', which keeps 'minimal''s residuals in
-    pinned host memory. Compiled for a compile-only H100, its step keeps them in host temporaries where
-    'minimal''s keeps none, and what it moves, written in the forward and read back in the backward,
-    hides behind its FLOPs over a fast host link and not over a slow one (`hides`)."""
+    pinned host memory. Compiled for a compile-only H100, its step keeps host temporaries where
+    'minimal''s keeps none: what the device-resident search reads to refuse the rung
+    (`keeps_host_temporaries`)."""
+    from dew.training.planning import keeps_host_temporaries
+
     model = CausalTransformer(vocab_size=64, emb_features=64, num_layers=2, num_heads=2, mlp_features=128,
                               max_seq_len=64, remat="minimal")
     assert model.recompute_more().remat == REMAT_POLICIES["minimal_offloaded"]
-    from dew.training.planning import hides, offloaded
-
     mesh = Mesh(np.asarray(compile_only_gpus("sm90")), ("data",))
     whole = NamedSharding(mesh, P())
 
@@ -117,13 +194,8 @@ def test_an_offloading_remat_rung_is_priced_by_the_residuals_it_keeps_in_host_me
         gradient = jax.jit(lambda params, batch: jax.grad(step_loss(objective, placed, batch))(params))
         return gradient.trace(placed["params"], batch).lower().compile()
 
-    kept, offloading_step = compiled("minimal"), compiled("minimal_offloaded")
-    assert kept.memory_analysis().host_temp_size_in_bytes == 0
-    temporaries = offloading_step.memory_analysis().host_temp_size_in_bytes
-    assert temporaries > 0
-    moved = offloaded(None, (), temporaries)
-    assert moved == 2 * temporaries
-    assert hides(moved, offloading_step, FAST) and not hides(moved, offloading_step, SLOW)
+    assert not keeps_host_temporaries(compiled("minimal"))
+    assert keeps_host_temporaries(compiled("minimal_offloaded"))
 
 
 STEP_SEEDS = 8
@@ -153,7 +225,7 @@ def test_a_step_with_its_state_in_host_memory_trains_what_one_with_it_on_the_dev
     """Over drawn token rows, a step whose plan keeps the optimizer state and the EMA in host memory
     leaves the variables, the moments and the EMA on par with a step that keeps them on the device,
     both measured from the step in float64 (check 1): where the state sits is no arithmetic."""
-    room = tight(monkeypatch)
+    room = device_bound(monkeypatch)
     initial = offloading().initial_state()
 
     def draw(seed):
@@ -165,7 +237,7 @@ def test_a_step_with_its_state_in_host_memory_trains_what_one_with_it_on_the_dev
                            stepping(offloading(), initial, exact=True))
     free(monkeypatch, room)
     host(*draw(0))
-    assert offloads.plan.get("host") == OFFLOADED
+    assert offloads.plan["host"] == OFFLOADED
     free(monkeypatch, LIMIT)
     device(*draw(0))
     with jax.enable_x64(new_val=True):

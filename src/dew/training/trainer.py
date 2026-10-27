@@ -41,7 +41,7 @@ from dew._coordination import (
     agreed_same,
     broadcast_from_process_zero,
 )
-from dew._records import JSON, boolean, json_value, record, strings
+from dew._records import JSON, boolean, json_value, record
 from dew.batch import FROZEN, Batch, Variables, owned_dicts, select
 from dew.checkpoints import Checkpoints, Ranking
 from dew.cleanup import attempted
@@ -84,7 +84,7 @@ from dew.distributed.placement import (
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes, batch_axes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
-from dew.nn.kernels.generation import assumed, backend, gpu_mesh, measured_kernel
+from dew.nn.kernels.generation import assumed, backend, gpu_mesh, gpu_target, measured_kernel
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     Link,
@@ -134,7 +134,6 @@ from dew.training.budget import Pause, Plateau, run_length, run_steps, run_token
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
-    HOST_LINK,
     check_batch,
     check_stream,
     link_bandwidth,
@@ -143,9 +142,9 @@ from dew.training.distributed import (
     microbatch,
     microbatch_shapes,
     offloadable,
-    peak_flops,
     placed_as,
     placed_start,
+    recorded_host,
     rehomed,
     resumed_link_figures,
     ruled,
@@ -182,10 +181,10 @@ from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.observe import Observe
 from dew.training.planning import (
     Candidate,
+    FitSearch,
     Planned,
     Timer,
     faster,
-    plan_step,
     read_whole,
     settled,
     splits,
@@ -597,6 +596,9 @@ class Trainer(Generic[Loss, Effects]):
         resume = None if checkpoints is None else agreed_same("newest checkpoint", lambda: checkpoints.latest)
         if checkpoints is not None and resume is not None:
             abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
+            # The state restores where the run it continues kept it, the fields its plan kept in host memory
+            # there too, which the checkpoint's placement records.
+            self.layout = self.layout.keeping(recorded_host(checkpoints.rung(resume)))
         shardings, _ = self._validated(abstract)
         return Start(initializer, key, abstract, through, resume, shardings)
 
@@ -729,7 +731,7 @@ class Trainer(Generic[Loss, Effects]):
             fields.get("xla_defaults", False), "rung xla_defaults"
         )
         self._narrow = self._narrow and boolean(fields.get("narrow", True), "rung narrow")
-        self.layout = self.layout.keeping(strings(fields.get("host", []), "rung host"))
+        self.layout = self.layout.keeping(recorded_host(rung))
         self._resumed_rung = self._rung()
 
 
@@ -837,26 +839,31 @@ class Trainer(Generic[Loss, Effects]):
         return dataclasses.replace(state, accumulation=pending)
 
     def _links(self, mesh: Mesh) -> dict[str, Link]:
-        """The links of `mesh`'s tensor and sequence axes, those it splits, for one trace (`_link`)."""
-        return {axis: self._link(mesh, axis) for axis in (TENSOR_AXIS, SEQUENCE_AXIS)
-                if mesh.shape.get(axis, 1) > 1}
-
-    def _link(self, mesh: Mesh, axis: str) -> Link:
-        """`mesh`'s link `axis`, a mesh axis or the host link (`HOST_LINK`): as the run states it
-        (`links`), else its bandwidth (`link_bandwidth`) beside the fastest device's peak (`peak_flops`),
-        on which the FLOPs a decision saves take the least time. Every process lists the mesh's devices
-        alike and `link_bandwidth` agrees one figure across the pool, so every process decides alike
-        and compiles the same program. Each is measured once per mesh, and not at all for a device the
-        peak table does not name (a CPU's among them), where it decides nothing; a resumed run takes the
-        figure its checkpoint traced with, on this very placement."""
-        if axis in self._stated_links:
-            stated = self._stated_links[axis]
-            return Link(stated.bytes_per_second, stated.flops_per_second)
-        peak = peak_flops(mesh)
-        if (mesh, axis) not in self._bandwidths:
-            self._bandwidths[mesh, axis] = None if peak is None else (
-                self._resumed_links.get(link_topology(mesh, axis)) or link_bandwidth(mesh, axis))
-        return Link(self._bandwidths[mesh, axis], peak)
+        """The links of `mesh`'s tensor and sequence axes, those it splits,
+        for one trace. Every process lists the mesh's devices alike and
+        `link_bandwidth` agrees one figure across the pool, so every process
+        decides alike and compiles the same program. The peak is the fastest
+        device's, on which the FLOPs a spread saves take the least time. Each
+        axis's bandwidth is measured once per mesh, and not at all for a
+        device the peak table does not name (a CPU's among them), where it
+        decides nothing; a link the run states (`links`) is taken as stated."""
+        devices = list(mesh.devices.flat)
+        peaks = [peak for device in devices if (peak := gpu_target(device.device_kind).bf16_peak) is not None]
+        peak = max(peaks) if len(peaks) == len(devices) else None
+        links = {}
+        for axis in (TENSOR_AXIS, SEQUENCE_AXIS):
+            if mesh.shape.get(axis, 1) == 1:
+                continue
+            if axis in self._stated_links:
+                stated = self._stated_links[axis]
+                links[axis] = Link(stated.bytes_per_second, stated.flops_per_second)
+                continue
+            if (mesh, axis) not in self._bandwidths:
+                # A resumed run takes the figure its checkpoint traced with, on this very placement.
+                self._bandwidths[mesh, axis] = None if peak is None else (
+                    self._resumed_links.get(link_topology(mesh, axis)) or link_bandwidth(mesh, axis))
+            links[axis] = Link(self._bandwidths[mesh, axis], peak)
+        return links
 
     @contextlib.contextmanager
     def _traced_on(self, mesh: Mesh | AbstractMesh,
@@ -987,7 +994,7 @@ class Trainer(Generic[Loss, Effects]):
     def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
                  timed: Callable[[list[CompiledStep]], list[list[float]]] | None,
                  ) -> tuple[Planned, StepFlops | None]:
-        """The plan `compile` reads `batch` in (`plan_step`), from the run's splits (`splits`), the
+        """The plan `compile` reads `batch` in (`FitSearch`), from the run's splits (`splits`), the
         faster by `timed` of a frontier of two, with `plan` its record and the objective at its rung,
         and a microbatch's FLOPs (`plan_flops`). A plan recorded beside the compilation cache
         (`recorded_rung`) is the first candidate, kept untimed; `resumed` is a checkpoint's rung."""
@@ -1011,18 +1018,18 @@ class Trainer(Generic[Loss, Effects]):
         if self._rung() != before:
             _log.warning("taking an earlier run's plan; delete %s to decide again", record_path)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
-        plans, probes = plan_step(
+        search = FitSearch(
             lower, lambda candidate: step_compiler_options(
                 self.objective, device_tokens(self.objective, candidate.micro, shards),
                 FROZEN in candidate.prepared.variables, mesh.devices.size),
-            candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
-            objective=self.objective, mesh=mesh, xla_defaults=self._xla_defaults, narrow=self._narrow,
-            base=None if self._base_rung is None else self._base_rung[1], resumed=resumed,
-            # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
-            frontier=timed is not None and recorded is None and resumed is None, host=self.layout.host,
+            self.objective, mesh, self._xla_defaults, self._narrow,
+            None if self._base_rung is None else self._base_rung[1], resumed, self.layout.host,
             # The run's first plan places its state once for every shape (`placed_as`).
-            offloadable=() if self._shape_rungs else offloadable(state, self.layout.host),
-            link=lambda: self._link(mesh, HOST_LINK))
+            () if self._shape_rungs else offloadable(state, self.layout.host))
+        plans, probes = search.plans(
+            candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
+            # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
+            frontier=timed is not None and recorded is None and resumed is None)
         seconds = timed([self._runner(plan, mesh) for plan in plans]) if len(plans) > 1 and timed else []
         # Every process runs the plan process zero timed clearly faster (`faster`).
         planned = plans[broadcast_from_process_zero(faster(seconds) if seconds else 0)]
@@ -1604,7 +1611,7 @@ class Trainer(Generic[Loss, Effects]):
         """`Layout.validate` of the whole state the run's steps keep between them reading `batch`'s
         shapes (a marked batch, as the stream gives it) in `split` microbatches: `state` with the
         accumulation its window pools. The narrow copies are left out: the plan's first rung drops
-        them where the step does not fit with them (`dew.training.planning.plan_step`)."""
+        them where the step does not fit with them (`dew.training.planning.FitSearch`)."""
         device, _ = split_fields(batch)
         with self._traced_on(self.device_mesh) as schedule:
             _, _, whole = self._prepared(state, microbatch_shapes(device, split), schedule,

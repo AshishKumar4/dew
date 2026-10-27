@@ -21,14 +21,13 @@ from flax import linen as nn
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
-from dew._records import JSON, number, record
+from dew._records import JSON, number, record, strings
 from dew.batch import EXAMPLE_ROWS, Batch, Variables
 from dew.data.dataset import Checkpointable, DataPartition, RampedStream, rows_of, stream_identity
 from dew.distributed.batches import Signature
 from dew.distributed.placement import Layout, Placement, link_topology
 from dew.files import write_atomically
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
-from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import microbatched
 from dew.objectives.base import Initializer
 from dew.state import TrainState, apart, together
@@ -67,25 +66,19 @@ def ruled[Owner: Ruled, **Arguments, Result](
     return run
 
 
-HOST_LINK = 'host'
-"""The link between each device and its host's pinned memory, by the name a step's links give it beside
-its mesh axes' (`Trainer(links=...)`, `link_bandwidth`): what a plan's host offload moves its bytes over
-(`dew.training.planning.hides`)."""
-
-
-def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float | None:
-    """What one device of `mesh` moves a second over the link `axis`: over a mesh axis, what it
-    receives in an all-gather of a `size`-byte result (`_gathered`); over the host link (`HOST_LINK`),
-    what it moves to its host's pinned memory and back (`_round_tripped`), None where its devices
-    have no pinned host memory. Every process takes the pool's lowest figure, so every process
-    decides from the same number and compiles the same program; the slowest link bounds the step
-    anyway.
+def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
+    """What one device receives a second in an all-gather over `mesh`'s
+    `axis` of a `size`-byte result, with every group along the axis
+    gathering at once as a step's do: (N - 1) / N of the result over the
+    median of five gathers, after two that warm the collective. Every
+    process takes the pool's lowest figure, so every process decides from
+    the same number and compiles the same program; the slowest group bounds
+    the step anyway.
 
     `dew.nn.sharding.down_projection` reads the tensor axis's to decide
     whether a down-projection of the residual runs on each tensor shard's
-    own tokens, `dew.nn.sharding.split_positions` the sequence axis's, and a
-    plan the host link's, to price an offload (`dew.training.planning.hides`).
-    The default size, 256 MiB, of which a device receives at least half,
+    own tokens, and `dew.nn.sharding.split_positions` the sequence axis's.
+    The default result, 256 MiB, of which a device receives at least half,
     is the size of the collectives those decisions price where they matter
     (DeepSeek-V3's residual gradient over 16384 tokens is 235 MB in bf16),
     past the sizes where a collective's latency counts: on 4x RTX 3090 an
@@ -93,31 +86,16 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float | None:
     128 MiB.
 
     A pool keeps its figure beside the persistent compilation cache, by the
-    link and the devices it spans, and a later pool on them takes it, a
+    axis and the devices it spans, and a later pool on them takes it, a
     resume among them: the decisions from it shape the step, and a figure
     measured again moves by noise, across a threshold one time in some."""
     topology = link_topology(mesh, axis)
     record = _link_record(topology)
-    # Every process measures, or none does: a pool measures unless each of its processes sees the figure,
+    # Every process gathers, or none does: a pool measures unless each of its processes sees the figure,
     # kept for exactly this placement.
     if record is not None and all(from_every_process(
             record.exists() and json.loads(record.read_text()).get("topology") == topology)):
         return min(from_every_process(float(json.loads(record.read_text())["bytes_per_second"])))
-    measured = _round_tripped(mesh, size) if axis == HOST_LINK else _gathered(mesh, axis, size)
-    figures = [figure for figure in from_every_process(measured) if figure is not None]
-    if len(figures) < jax.process_count():
-        return None
-    moved = min(figures)
-    if record is not None and jax.process_index() == 0:
-        record.parent.mkdir(parents=True, exist_ok=True)
-        write_atomically(record, json.dumps({"topology": topology, "bytes_per_second": moved}))
-    return moved
-
-
-def _gathered(mesh: Mesh, axis: str, size: int) -> float:
-    """What one device receives a second in an all-gather over `mesh`'s `axis` of a `size`-byte
-    result, every group along the axis gathering at once as a step's do: (N - 1) / N of the result
-    over the median of five gathers, after two that warm the collective."""
     ways = mesh.shape[axis]
     count = size // 4 // ways * ways
     sharding = NamedSharding(mesh, P(axis))
@@ -127,34 +105,11 @@ def _gathered(mesh: Mesh, axis: str, size: int) -> float:
         lambda shard: jax.lax.all_gather(shard, axis, tiled=True), mesh=mesh,
         in_specs=P(axis), out_specs=P(), axis_names={axis}, check_vma=False))
     seconds = samples(gather, source, warmup=2, repeats=5)
-    return (ways - 1) / ways * count * 4 / statistics.median(seconds)
-
-
-def _round_tripped(mesh: Mesh, size: int) -> float | None:
-    """What each device of `mesh` moves a second between its memory and its host's pinned memory: a
-    `size`-byte share of every device's, all at once as a step's offload moves them, to pinned host
-    memory and back, both ways over the median of five round trips after two that warm the path;
-    None where a device of this process has no pinned host memory (`Device.addressable_memories`)."""
-    if any("pinned_host" not in {memory.kind for memory in device.addressable_memories()}
-           for device in mesh.local_devices):
-        return None
-    count = size // 4 * mesh.size
-    sharding = NamedSharding(mesh, P(mesh.axis_names))
-    host = sharding.with_memory_kind("pinned_host")
-    source = jax.make_array_from_callback(
-        (count,), sharding, lambda index: np.zeros(sharding.shard_shape((count,)), np.float32))
-    seconds = samples(lambda array: jax.device_put(jax.device_put(array, host), sharding), source,
-                      warmup=2, repeats=5)
-    return 2 * count // mesh.size * 4 / statistics.median(seconds)
-
-
-def peak_flops(mesh: Mesh) -> float | None:
-    """The fastest dense bf16 peak among `mesh`'s devices (`gpu_target(...).bf16_peak`), on which the
-    FLOPs a link's decision saves take the least time; None where the peak table does not name every
-    one of them."""
-    peaks = [peak for device in mesh.devices.flat
-             if (peak := gpu_target(device.device_kind).bf16_peak) is not None]
-    return max(peaks) if len(peaks) == mesh.devices.size else None
+    received = min(from_every_process((ways - 1) / ways * count * 4 / statistics.median(seconds)))
+    if record is not None and jax.process_index() == 0:
+        record.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(record, json.dumps({"topology": topology, "bytes_per_second": received}))
+    return received
 
 
 OFFLOADABLE = ("opt_state", "ema")
@@ -169,33 +124,69 @@ def offloadable(state: TrainState, host: tuple[str, ...]) -> tuple[str, ...]:
                  if field not in host and jax.tree.leaves(getattr(state, field)))
 
 
+def recorded_host(rung: JSON) -> tuple[str, ...]:
+    """The state's fields a checkpoint's rung (`Trainer._checkpoint_rung`) kept in host memory."""
+    return () if rung is None else tuple(strings(record(rung, "rung").get("host", []), "rung host"))
+
+
 def _memory(sharding) -> str:
     return sharding.memory_kind or "device"
 
 
+def _buffers(leaf) -> set[int]:
+    """The device buffers `leaf` holds, none for a leaf that holds no array."""
+    if not isinstance(leaf, jax.Array) or leaf.is_deleted():
+        return set()
+    return {shard.data.unsafe_buffer_pointer() for shard in leaf.addressable_shards}
+
+
+def _rehoming(state: TrainState, shardings: Placement[TrainState]):
+    """Each leaf of `state`'s `OFFLOADABLE` fields that `shardings` places in another memory, with its field,
+    target and whether moving it releases its source: a leaf that leaves the device and shares no buffer
+    with a leaf that stays where it is (an EMA that is the parameters' own arrays), whose bytes the
+    device then gets back."""
+    moving, staying = [], set()
+    for field in (field.name for field in dataclasses.fields(state)):
+        leaves = jax.tree.leaves(getattr(state, field))
+        targets = jax.tree.leaves(getattr(shardings, field)) if field in OFFLOADABLE else [None] * len(leaves)
+        for leaf, target in zip(leaves, targets, strict=True):
+            if target is not None and _memory(leaf.sharding) != _memory(target):
+                moving.append((field, leaf, target))
+            else:
+                staying |= _buffers(leaf)
+    return [(field, leaf, target, _memory(target) != "device" and not _buffers(leaf) & staying)
+            for field, leaf, target in moving]
+
+
 def rehomed(state: TrainState, shardings: Placement[TrainState]) -> int:
     """The bytes each device gains where `state`'s `OFFLOADABLE` fields move to the memory `shardings`
-    places them in: positive for a field it brings from host memory, negative for one it moves there,
-    which the fit check counts beside the step (`dew.training.planning.Candidate.held`)."""
+    places them in (`placed_as`): a field it brings from host memory, positive, and one it moves there,
+    negative for the sources the move releases alone, which the fit check counts beside the step
+    (`dew.training.planning.Candidate.held`)."""
     gained = 0
-    for field in OFFLOADABLE:
-        placed = jax.tree.leaves(getattr(shardings, field))
-        for leaf, sharding in zip(jax.tree.leaves(getattr(state, field)), placed, strict=True):
-            before, after = _memory(leaf.sharding), _memory(sharding)
-            if before != after:
-                gained += math.prod(sharding.shard_shape(leaf.shape)) * leaf.dtype.itemsize * (
-                    1 if after == "device" else -1)
+    for _, leaf, sharding, released in _rehoming(state, shardings):
+        held = math.prod(sharding.shard_shape(leaf.shape)) * leaf.dtype.itemsize
+        gained += held if _memory(sharding) == "device" else -held if released else 0
     return gained
 
 
 def placed_as(state: TrainState, shardings: Placement[TrainState]) -> TrainState:
     """`state` with each of its `OFFLOADABLE` fields in the memory `shardings` places it in, moved only
     where it is elsewhere: a plan that keeps one in host memory, or no longer does, moves it at its
-    first step, and every later step finds it there."""
-    moved = {field: jax.device_put(getattr(state, field), getattr(shardings, field)) for field in OFFLOADABLE
-             if (leaves := jax.tree.leaves(getattr(state, field)))
-             and _memory(leaves[0].sharding) != _memory(jax.tree.leaves(getattr(shardings, field))[0])}
-    return dataclasses.replace(state, **moved) if moved else state
+    first step, and every later step finds it there. A source the move releases (`rehomed`) is deleted
+    once its copy has landed, so the device holds the step's room before the step runs; the step takes
+    over the state it is given anyway (`Trainer.compile`)."""
+    rehoming = _rehoming(state, shardings)
+    if not rehoming:
+        return state
+    fields = {field for field, *_ in rehoming}
+    moved = {field: jax.device_put(getattr(state, field), getattr(shardings, field), may_alias=False)
+             for field in fields}
+    jax.block_until_ready(moved)
+    for _, leaf, _, released in rehoming:
+        if released:
+            leaf.delete()
+    return dataclasses.replace(state, **moved)
 
 
 def link_figures(bandwidths: Mapping[tuple[Mesh, str], float | None]) -> dict[str, JSON]:
