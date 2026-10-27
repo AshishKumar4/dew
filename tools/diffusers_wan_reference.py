@@ -162,7 +162,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
 
 def output_root(destination: str) -> Path:
 
-    require("diffusers")
+    require("diffusers-0.34")
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
