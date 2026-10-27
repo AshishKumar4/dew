@@ -226,9 +226,10 @@ def cached_round_trips(round_trip, cases, workspace) -> Callable[[str], object]:
 
 def parameter_loss(objective, variables, batch, step) -> Callable:
     """`objective`'s reduced loss of `batch` at `step` as a function of the parameters alone, the rest
-    of `variables` held: the function a reference's SGD step differentiates."""
+    of `variables` held: the function a reference's SGD step differentiates. Its statistics are read as
+    the trainer reads them (`Objective._loss`), whether or not the loss returns an `Aux` beside them."""
     def loss(params):
-        statistics, _ = objective.loss({**variables, "params": params}, batch, step)
+        statistics, _ = objective._loss({**variables, "params": params}, batch, step)
         return objective.reduce_loss(statistics)[0]
 
     return loss

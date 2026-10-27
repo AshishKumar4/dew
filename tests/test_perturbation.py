@@ -23,6 +23,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from model_support import parameter_loss
 from reference_error import as_given, assert_as_exact, seeds_for
 from scipy import stats
 
@@ -115,15 +116,9 @@ def rows(sample: tuple[int, ...], seed: int = 0, count: int = 16) -> dict[str, n
 
 def gradient(objective, variables, batch, key) -> dict:
     """The derivative of the objective's reduced loss in its trained parameters, as the trainer asks for
-    it of one microbatch (`Objective._loss` reads its statistics): the estimate, for a perturbing
-    objective."""
-    step = Step(jnp.asarray(0), key, None)
-
-    def reduced(params):
-        stats, _ = objective._loss({**variables, "params": params}, batch, step)
-        return objective.reduce_loss(stats)[0]
-
-    return jax.grad(reduced)(variables["params"])
+    it of one microbatch (`parameter_loss`): the estimate, for a perturbing objective."""
+    return jax.grad(parameter_loss(objective, variables, batch, Step(jnp.asarray(0), key, None)))(
+        variables["params"])
 
 
 def estimated(objective, variables, batch) -> dict:
