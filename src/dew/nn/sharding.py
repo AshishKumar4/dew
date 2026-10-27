@@ -690,7 +690,8 @@ def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> Lo
     stacked, keys = (0, (names,)) if layers is None else (layers[1], (parameter_path(layers[0][0]), names))
     held = _BOXED.get()
     axes = next((found for key in keys
-                 if (found := held.get(key) or held.get(("params", *key)) or declared.get(key)) is not None), None)
+                 if (found := held.get(key) or held.get(("params", *key)) or declared.get(key)) is not None),
+                None)
     if axes is None:
         return None
     if ndim - stacked > len(axes):
