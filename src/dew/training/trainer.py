@@ -1073,7 +1073,7 @@ class Trainer(Generic[Loss, Effects]):
             objective=self.objective, mesh=mesh, xla_defaults=self._xla_defaults, narrow=self._narrow,
             base=None if self._base_rung is None else self._base_rung[1], resumed=resumed,
             # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
-            frontier=timed is not None and timed.frontier and recorded is None and resumed is None)
+            frontier=timed is not None and recorded is None and resumed is None)
         seconds = timed([self._runner(plan, mesh) for plan in plans]) if len(plans) > 1 and timed else []
         # Every process runs the plan process zero timed clearly faster (`faster`).
         planned = plans[broadcast_from_process_zero(faster(seconds) if seconds else 0)]
@@ -2145,8 +2145,7 @@ class Trainer(Generic[Loss, Effects]):
         a timed trial steps on too.
         """
         state = self._staged(state, run.current)
-        # Dew's tests keep a frontier's first plan in a fit (`UNTIMED_FRONTIER`), a test setting.
-        timer = Timer(state, batch, frontier=not untimed_frontier())
+        timer = Timer(state, batch)
         signature = batch_signature(batch)
         if signature not in compiled:
             self._read_taken(run)
@@ -2155,7 +2154,9 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
             with region("compile"):
-                compiled[signature] = (self.compile(state, batch, timer), self.step_flops)
+                # Dew's tests keep a frontier's first plan (`UNTIMED_FRONTIER`), a test setting.
+                compiled[signature] = (self.compile(state, batch, None if untimed_frontier() else timer),
+                                       self.step_flops)
             seconds = time.perf_counter() - began
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}

@@ -14,7 +14,7 @@ from flax import linen as nn
 
 import dew.config
 import dew.nn.backbones
-from dew.checkpoints import RUN_FILE, Resume
+from dew.checkpoints import RUN_FILE
 from dew.config import RunConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
@@ -332,7 +332,7 @@ def test_a_run_that_must_start_afresh_refuses_a_directory_that_holds_one_before_
     """`trainer.resume="never"` trains a fresh run directory and refuses one that holds a checkpoint, on
     every rank, before the run's record is written over that run's; `resume="require"` refuses a
     directory that holds none to continue, so a job that must continue never trains from scratch."""
-    def run(resume: Resume, steps: int = 1) -> RunConfig:
+    def run(resume, steps: int = 1) -> RunConfig:
         return RunConfig(trainer=TrainerConfig(steps=steps, resume=resume, checkpoint_dir=str(tmp_path),
                                                eval_every=None, checkpoint_every=None))
 

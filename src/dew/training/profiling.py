@@ -145,7 +145,9 @@ class ProfileReport:
         from dew.telemetry.instrumentation import collective, reported_instruction
         from dew.telemetry.profile import report_table
 
-        logged = dict(LocalTracker(run / "tracking").scalars())[warmup + steps]
+        # The window's log, and any score the run's end logged under its last step beside it.
+        logged = {name: value for step, scalars in LocalTracker(run / "tracking").scalars()
+                  if step == warmup + steps for name, value in scalars.items()}
         records = (run / "tracking" / "records.jsonl").read_text().splitlines()
         compiles = [entry["value"]["seconds"] for entry in map(json.loads, records)
                     if entry["type"] == "StepCompiled"]
