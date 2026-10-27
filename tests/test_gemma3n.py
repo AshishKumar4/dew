@@ -404,9 +404,16 @@ def test_the_dense_decoders_gradient_is_the_references():
             _, gradients = torch_with_gradients(run)(held[dtype], one)
         return {name: gradients[name] for name in names}
 
-    assert_as_exact(differentiated, as_given(lambda *inputs: reference(torch.float32, *inputs)), draw,
-                    "the dense decoder's gradient", seeds=DENSE_SEEDS,
-                    truth_fn=lambda *inputs: reference(torch.float64, *inputs), orders=orders)
+    # The reference on one thread: its tiny steps gain nothing from more, and Dew's program, dispatched
+    # before it runs, takes the host's other cores meanwhile.
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        assert_as_exact(differentiated, as_given(lambda *inputs: reference(torch.float32, *inputs)), draw,
+                        "the dense decoder's gradient", seeds=DENSE_SEEDS,
+                        truth_fn=lambda *inputs: reference(torch.float64, *inputs), orders=orders)
+    finally:
+        torch.set_num_threads(threads)
 
 
 @pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
