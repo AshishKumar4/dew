@@ -659,3 +659,16 @@ def test_a_trainers_cadences_may_be_shares_of_the_run_on_the_command_line():
         with pytest.raises((ValueError, SystemExit)):
             LMRunConfig.cli([*flags, "--trainer.multi-host", "False"])
 
+
+
+def test_a_run_branches_into_the_cooldowns_its_command_line_names():
+    """`--trainer.cooldowns.at` and its length and shape choose a run's cooldown branches, which its
+    record holds and reads back."""
+    from dew.config.lm import LMRunConfig
+    from dew.training.cooldown import Cooldowns
+
+    run = LMRunConfig.cli(["--trainer.cooldowns.at", "20%", "40%", "--trainer.cooldowns.length", "10%",
+                           "--trainer.cooldowns.shape", "linear", "--trainer.multi-host", "False"])
+    assert run.trainer.cooldowns == Cooldowns(at=("20%", "40%"), length="10%", shape="linear")
+    assert LMRunConfig.from_dict(run.to_dict()).trainer.cooldowns == run.trainer.cooldowns
+    assert LMRunConfig.cli(["--trainer.multi-host", "False"]).trainer.cooldowns is None

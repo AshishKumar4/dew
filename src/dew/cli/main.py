@@ -56,10 +56,9 @@ class Export:
         run = SavedRun.pinned(self.run, self.step, self.trust)
         task = run.objective.saved_task
         if task is not None and issubclass(task, ReleasedTask):
-            task.from_run(run.directory, ema=self.ema, step=run.step).save_pretrained(self.destination)
+            task.from_saved(run, ema=self.ema).save_pretrained(self.destination)
         else:
-            loaded = Pretrained.from_run(run.directory, ema=self.ema, step=run.step, trust=self.trust)
-            loaded.save(self.destination)
+            Pretrained.from_saved(run, ema=self.ema).save(self.destination)
         emit(f"exported {self.run} to {self.destination}")
         return 0
 

@@ -8,6 +8,7 @@ import dataclasses
 import datetime
 import math
 import time
+import types
 from collections.abc import Iterator, Mapping, Sequence
 
 import jax
@@ -23,12 +24,13 @@ from dew.data.dataset import Closeable, DataPartition, Loader, PhasedStream, Rea
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature
 from dew.distributed.placement import MeshSpec, Placement
-from dew.objectives.base import Initializer, Metric, TrainingScalar
+from dew.objectives.base import Initializer, Metric, Objective, TrainingScalar
 from dew.optim import OptimConfig
 from dew.state import TrainState
 from dew.telemetry.profile import region
-from dew.training.budget import Plateau, every_step, recorded
+from dew.training.budget import Pause, Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Tokens
+from dew.training.cooldown import Branch
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Interval, Taken, TokenClock
 from dew.training.observe import Observe
@@ -104,6 +106,8 @@ class FitPlan:
     """Every validation split by name, its metrics and cadence resolved."""
     summaries: tuple[Summary, ...] = ()
     """The scalars each step whose evaluations score every split they weigh forms (`Summary`)."""
+    branches: tuple[Branch, ...] = ()
+    """The run's cooldown branches (`dew.training.cooldown`)."""
     declared: Mapping[str, tuple[Metric | Summary, ...]] = dataclasses.field(default_factory=dict)
     """Every score the fit declares, by split (`declarations`)."""
     observe: Observe | None = None
@@ -128,12 +132,13 @@ class FitPlan:
 
     def horizon(self, real: int) -> int | None:
         """The least count of committed tokens past `real` at which something this plan reads of the
-        clock changes: its budget, its pause, the next multiple of each cadence of tokens, or the end
-        of a schedule's stage. None where nothing it reads does."""
+        clock changes: its budget, its pause, the next multiple of each cadence of tokens, a cooldown
+        branch's tokens, or the end of a schedule's stage. None where nothing it reads does."""
         cadences = (self.log_every, self.eval_every, self.checkpoint_every, self.local_every,
                     *(suite.every for suite in self.suites.values()))
         nexts = [(real // every.every + 1) * every.every for every in cadences if isinstance(every, Tokens)]
-        ends = (self.tokens, self.pause[1], *(self.dataset.token_ends or ()), *nexts)
+        branches = [branch.at.every for branch in self.branches if isinstance(branch.at, Tokens)]
+        ends = (self.tokens, self.pause[1], *(self.dataset.token_ends or ()), *nexts, *branches)
         return min((end for end in ends if end is not None and end > real), default=None)
 
     def committed(self, interval: Interval, clock: TokenClock) -> int:
@@ -215,13 +220,15 @@ class FitPlan:
         suites = {f"{name}.every": recorded(suite.every) for name, suite in self.suites.items()
                   if suite.every != self.eval_every}
         local = {} if self.local_every is None else {"local_every": recorded(self.local_every)}
+        if self.branches:
+            local["cooldowns.at"] = [branch.recorded() for branch in self.branches]
         return {"log_every": recorded(self.log_every), "eval_every": recorded(self.eval_every),
                 "checkpoint_every": recorded(self.checkpoint_every), **local, **suites,
                 **{f"warmup_steps.{name}": value for name, value in warmups.items()}}
 
     def plateaued(self, run: FitRun, scores: Mapping[str, float]) -> bool:
-        """Whether the run's `Plateau` stops it at its current step on these `scores`, its count of
-        evaluations without improvement kept in the checkpoint's control (`FitRun.stop_control`)."""
+        """Whether the run's `Plateau` stops it at this step's `scores`: its count of evaluations
+        without improvement held in the run's control, so a resume counts on (`Checkpoints.control`)."""
         stop = self.stop
         if stop is None:
             return False
@@ -296,7 +303,7 @@ class FitRun:
     """The suites `evaluation` scored at its step, which a run whose stream ends there scores once."""
     ahead: tuple[Batch | None] | None = None
     """The next batch, or None for the stream's end, read before the step that takes it, where a
-    save had to know whether the run ends there (`Trainer._ends_here`)."""
+    save had to know whether the run ends there (`ends_here`)."""
     best: HeldBest = dataclasses.field(default_factory=HeldBest)
     """The log taken at the latest logging step and not yet read."""
     stepped: tuple[jax.Array, dict[str, jax.Array], jax.Array] | None = None
@@ -305,6 +312,26 @@ class FitRun:
     reads: dict[Signature, tuple[bool, ...]] = dataclasses.field(default_factory=dict)
     """Which leaves of a batch of each signature its compiled step reads
     (`step_reads`), which the prefetcher alone places."""
+    compiled: dict[Signature, tuple] = dataclasses.field(default_factory=dict)
+    """The step compiled for each batch signature the run met, with its measured FLOPs
+    (`Trainer._compiled_for`), which its cooldown branches step too."""
+    cooling: Mapping[str, object] | None = None
+    """The cooldown branch the run is to run at its current step before it reads on, resolved
+    (`dew.training.cooldown.Pending`): one its checkpoints kept unfinished, as the pool agreed it, or
+    one due at its last step, which runs after the step's final save (`Trainer._wind_down`)."""
+
+    def ends_here(self, interval: Interval) -> bool:
+        """Whether a stream that may run out has, so this step is the run's last: its next batch is
+        read now, agreed as every such read is, and kept for the step that takes it (`ahead`), the
+        position the step saves taken before it. A run whose stream is closed (`Trainer._wind_down`)
+        ends on this step without another read, and an endless stream never ends here otherwise."""
+        if self.ahead is None and self.train is None:
+            return True
+        if self.endless:
+            return False
+        if self.ahead is None:
+            self.ahead = (waited_read(self, interval, agree=True),)
+        return self.ahead[0] is None
 
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:
@@ -335,6 +362,60 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
     if batch is None and not run.current:
         raise ValueError("the training data holds no batch to train on")
     return batch
+
+
+def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, stop, scored,
+                                 checkpoint_every, *, steps: int | None, tokens: int | None,
+                                 accumulation: int, checkpointed: bool):
+    """A fit's best selection and its stop policy over `objective`: a `Plateau` with its metric bound
+    to the objective, or the step and tokens a `Pause` of a run of `steps` and `tokens`, updates of
+    `accumulation`, ends it at (`Pause.at`), which needs the run `checkpointed` to resume from."""
+    if isinstance(checkpoint_every, datetime.timedelta) and checkpoint_every.total_seconds() <= 0:
+        raise ValueError("checkpoint_every duration must be positive")
+    if isinstance(stop, Pause) and not checkpointed:
+        raise ValueError("a Pause ends a run its checkpoint resumes, and this trainer has no "
+                         "checkpointer; pass Checkpoints(directory)")
+    pause = stop.at(steps, tokens, accumulation) if isinstance(stop, Pause) else (None, None)
+    plateau = stop if isinstance(stop, Plateau) else None
+    raw = (
+        ()
+        if best is None
+        else tuple(best)
+        if isinstance(best, Sequence) and not isinstance(best, str)
+        else (best,)
+    )
+
+    def owned(choice):
+        if isinstance(choice, types.MethodType):
+            if choice.__name__ == 'loss' and choice.__self__ is objective:
+                return objective.scalars.loss
+            raise TypeError("a training selector must be this objective's loss or declared scalar")
+        if isinstance(choice, TrainingScalar) and choice.owner is not objective:
+            raise ValueError("training scalar belongs to a different objective")
+        if isinstance(choice, Best):
+            source = choice._source
+            if source is None and (choice.metric.startswith('train/') or choice.split == 'train'):
+                source = objective.scalars[choice.metric.removeprefix('train/')]
+            return dataclasses.replace(choice, _source=owned(source) if source is not None else None)
+        return choice
+
+    selection = tuple(
+        (chosen if isinstance(chosen, Best) else Best(chosen)).resolved(scored)
+        for chosen in (owned(Best(choice) if isinstance(choice, str) else choice) for choice in raw)
+    )
+    labels = [(choice.split, choice.metric) for choice in selection
+              if isinstance(choice._source, (Metric, TrainingScalar))]
+    if len(labels) != len(set(labels)):
+        raise ValueError("select each metric once; one Best.top already keeps all its winners")
+    if plateau is not None:
+        metric = owned(plateau.metric)
+        if not isinstance(metric, (Metric, TrainingScalar, Summary)):
+            raise TypeError(
+                "Plateau selects a declared metric object or summary, not a Best policy or score function"
+            )
+        stopping = Best(metric, mode=plateau.mode, split=plateau.split).resolved(scored)
+        plateau = dataclasses.replace(plateau, metric=metric, mode=stopping.mode, split=stopping.split)
+    return selection, plateau, pause
 
 
 def first_batch(loader: Loader, mesh: Mesh) -> Batch:

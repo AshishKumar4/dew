@@ -47,6 +47,7 @@ import numpy as np
 import tyro
 from jax.typing import ArrayLike
 
+import dew
 from dew.artifacts import uint8_pixels
 from dew.inference import TextToImage
 from dew.quantization import Quantization
@@ -156,7 +157,7 @@ def main(config: Config) -> None:
     if Path(config.model).is_dir():
         pipe = TextToImage.from_run(config.model, dtype=config.dtype)
     else:
-        pipe = TextToImage.from_pretrained(config.model, revision=config.revision, dtype=config.dtype)
+        pipe = dew.pipeline(config.model, revision=config.revision, dtype=config.dtype)
     row = {"device": jax.devices()[0].device_kind, "dtype": config.dtype, "precision": config.precision,
            "float": list(config.float)}
     try:

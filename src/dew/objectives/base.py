@@ -61,7 +61,7 @@ if TYPE_CHECKING:
     from dew.data.text import Tokenizer
     from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.images import TextToImage
-    from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
+    from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, SavedRun, TextGeneration
     from dew.inputs import InputSpec
     from dew.nn.autoencoders import AutoEncoder
     from dew.nn.backbones.decoder_stack import DecoderBank
@@ -550,14 +550,16 @@ class EMASpec:
 class SavedTask(Protocol):
     """The task class a saved run of an objective loads as (`Objective.saved_task`).
 
-    It is a class whose `from_run` builds the task from a run directory.
-    Dew's tasks (`TextToImage`, `TextGeneration`, `BlockGeneration`,
-    `MaskedGeneration`) are such classes, and a plugin can supply its own."""
+    It is a class whose `from_saved` builds the task from a run's pinned checkpoint
+    (`dew.inference.tasks.SavedRun`), which `dew.pipeline` and `dew export` pin once; deriving
+    from `dew.inference.tasks.SavedRunTask` adds `from_run`, which loads one from a run directory.
+    Dew's tasks (`TextToImage`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `Decide`)
+    are such classes, and a plugin can supply its own."""
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self: ...
+    def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
+                   layout: Layout | None = None, dtype: DTypeLike | None = None,
+                   param_dtype: DTypeLike | None = None) -> Self: ...
 
 
 @runtime_checkable

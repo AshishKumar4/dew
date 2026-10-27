@@ -227,6 +227,57 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
     assert min(seen[1:]) >= SIZING_FROM
 
 
+def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references():
+    """With the owner's library arm (`library_fn`), Dew is held within PARITY of the larger of the
+    reference's error and the library arm's, seed by seed, on the leaves the exception covers: a Dew
+    1.7 times the reference's error passes beside a library arm 1.8 times it, fails without it, fails
+    at 3 times (past the library arm's own by 1.67), and fails on a leaf the exception does not cover;
+    a library arm without its ledger row or its leaves is refused, as is one in NumPy the gate would
+    compile. Null runs judge as the site does."""
+    from reference_error import null_runs
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return rng.standard_normal(4096), *(1e-7 * rng.standard_normal(4096) for _ in range(3))
+
+    def arm(scale, noise):
+        @as_given
+        def run(x, mine, theirs, library):
+            value = x + scale * {"mine": mine, "theirs": theirs, "library": library}[noise]
+            return {"covered": value, "other": value}
+        return run
+
+    @as_given
+    def truth(x, *_):
+        return {"covered": x, "other": x}
+
+    reference, library, both = arm(1.0, "theirs"), arm(1.8, "library"), ["['covered']", "['other']"]
+    assert_as_exact(arm(1.7, "mine"), reference, draw, "library arm", seeds=16, truth_fn=truth,
+                    library_fn=library, library_row=1543, library_leaves=both)
+    with pytest.raises(GateFailure):
+        assert_as_exact(arm(1.7, "mine"), reference, draw, "no library arm", seeds=16, truth_fn=truth)
+    with pytest.raises(GateFailure):
+        assert_as_exact(arm(3.0, "mine"), reference, draw, "past the library", seeds=16, truth_fn=truth,
+                        library_fn=library, library_row=1543, library_leaves=both)
+    with pytest.raises(GateFailure) as failed:
+        assert_as_exact(arm(1.7, "mine"), reference, draw, "one leaf", seeds=16, truth_fn=truth,
+                        library_fn=library, library_row=1543, library_leaves=["['covered']"])
+    assert {finding.leaf for finding in failed.value.findings} == {"one leaf['other']"}
+    for unnamed in ({"library_leaves": both}, {"library_row": 1543}, {"library_row": 1543,
+                                                                      "library_leaves": ["['third']"]}):
+        with pytest.raises(ValueError):
+            assert_as_exact(arm(1.7, "mine"), reference, draw, "unrecorded", seeds=16, truth_fn=truth,
+                            library_fn=library, **unnamed)
+    with pytest.raises(TypeError):
+        assert_as_exact(arm(1.7, "mine"), reference, draw, "a NumPy library arm", seeds=16, truth_fn=truth,
+                        library_fn=lambda x, *_: {"covered": np.full(np.shape(x), 1 / 3),
+                                                  "other": np.full(np.shape(x), 1 / 3)},
+                        library_row=1543, library_leaves=both)
+    verdicts = null_runs(reference, draw, "library arm", seeds=16, runs=2, truth_fn=truth,
+                         dew_fn=arm(1.7, "mine"), paired=True, library_fn=library, library_leaves=both)
+    assert [(verdict, stage) for verdict, stage, _ in verdicts] == [("pass", 1), ("pass", 1)], verdicts
+
+
 def test_a_reference_compiled_with_options_of_its_own_runs_as_given():
     """A reference compiled with compiler options of its own (a trainer step's, `as_a_step`) runs as
     given: the gate would nest it in its own jit, which a jit with options of its own refuses (row
@@ -239,6 +290,10 @@ def test_a_reference_compiled_with_options_of_its_own_runs_as_given():
 
     mine, theirs = _arms(doubled, as_given(own))
     assert theirs.as_given and not getattr(mine, "without_ynn", False)
+    # Unmarked, the gate nests it in its own jit, which a jit with options of its own refuses.
+    _, nested = _arms(doubled, own)
+    with pytest.raises(ValueError):
+        nested(np.ones(4, np.float32))
     assert_as_exact(doubled, as_given(own),
                     lambda seed: (np.random.default_rng(seed).standard_normal(64).astype(np.float32),),
                     "a reference with options", seeds=8)

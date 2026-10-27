@@ -251,6 +251,35 @@ def test_cache_identity_and_clean_revision_are_required(refused):
     assert _key().key != _key(revision="changed").key
 
 
+def test_a_remote_generation_of_more_shards_than_its_mirror_holds_reads_every_record(tmp_path):
+    """A generation's replay keeps as many shards' readers open as Loading's read threads, the room a
+    remote transport's mirror is sized for (`ShardReaders`): a generation of more shards than that, a
+    record each, read by index end to end through one mirror directory of exactly that many shards,
+    reads every record, each idle reader's mirror released before the next shard's opens."""
+    from dew.data.dataset import Loading
+
+    readers, count = Loading().threads, Loading().threads + 4
+    with moto_bucket("cache") as (bucket, options):
+        url = f"s3://{bucket}/cache"
+        cache, key = Cache(url, storage_options=options, shard_bytes=1), _key()
+        source = Memory([{"id": index} for index in range(count)])
+        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
+        for index in range(len(rows)):
+            rows[index]
+        rows.finish()
+        rows.close()
+        cache.publish(key, source)
+        sizes = [entry["bytes"] for entry in cache.generation(key).manifest["shards"].values()]
+        assert len(sizes) > readers
+        mirror = {"dewcache": {"cache_storage": str(tmp_path / "mirror")}}
+        mirrored = Cache(url, storage_options={**options, **mirror}, mirror_bytes=readers * max(sizes))
+        generation = mirrored.generation(key)
+        assert [generation[index] for index in range(len(generation))] == [
+            {"id": index} for index in range(count)
+        ]
+        generation.close()
+
+
 def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
     import fsspec
 
