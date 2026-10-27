@@ -40,7 +40,6 @@ from dew.distributed.host import transfer
 from dew.inference.banks import (
     assembled,
     bank_sharding,
-    bank_sites,
     banked,
     entry_tree,
     in_namespace,
@@ -50,6 +49,7 @@ from dew.inference.banks import (
     without_banks,
 )
 from dew.mesh import batch_axes
+from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.backbones.layer_plan import layer_index
 from dew.nn.kernels.options import Option, program
 from dew.training.memory import device_tokens, step_compiler_options
@@ -191,10 +191,12 @@ class HostExecution:
     accelerator, runs the loss there, and hands back a pullback. It keeps no
     state of its own between attempts.
     """
-    def __init__(self, objective, layout, accelerator, cpu, device: tuple[DeviceStep, ...] = ()):
+    def __init__(self, objective, layout, accelerator, cpu, sites: tuple[DecoderBank, ...],
+                 device: tuple[DeviceStep, ...] = ()):
         self.objective, self.layout = objective, layout
         self.accelerator, self.cpu = accelerator, cpu
-        self.sites = bank_sites(objective) if objective.bank_sites else ()
+        # The trainer's banks over the state it owns (`Trainer._bank_sites`), the runs its frozen banks keep.
+        self.sites = sites
         self.device = device
         self.unstack = functools.partial(program(logical, static_argnames="sites"), sites=self.sites)
 

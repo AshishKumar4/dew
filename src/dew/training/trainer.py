@@ -38,7 +38,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
-from dew.batch import FROZEN, Batch, Variables, owned_dicts, select
+from dew.batch import FROZEN, Batch, Variables, owned_dicts, select, thaw
 from dew.checkpoints import Checkpoints, Ranking
 from dew.cleanup import attempted
 from dew.data.compile import fitted
@@ -615,7 +615,7 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master and FROZEN in abstract.variables:
             abstract = dataclasses.replace(abstract, variables={
                 **abstract.variables, FROZEN: self._banked_frozen(
-                    abstract.variables[FROZEN],
+                    abstract.variables,
                     lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         share = DataPartition.of(self.device_mesh) if positioned else None
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share)
@@ -741,22 +741,26 @@ class Trainer(Generic[Loss, Effects]):
         from dew.training.execution import resident
         rows = self.layout.shardings(
             self.state_mesh, dataclasses.replace(state, variables={FROZEN: frozen}, accumulation=None))
-        return resident(rows.variables[FROZEN], self.bank_sites, self.device_mesh)
+        return resident(rows.variables[FROZEN], self._bank_sites({**state.variables, FROZEN: frozen}),
+                        self.device_mesh)
 
-    @functools.cached_property
-    def bank_sites(self):
-        """List the objective's declared layer stacks, which a host layout streams as banks."""
+    def _bank_sites(self, variables):
+        """The objective's declared layer stacks over the state's `variables` as its model reads them, the
+        frozen leaves back in `params` (`thaw`), which a host layout streams as banks: their runs end
+        where the model's rows differ (`CausalTransformer.bank_sites`), so the frozen banks, the
+        execution's snapshot and the model's own scan agree on every run."""
         from dew.inference.banks import bank_sites
-        return bank_sites(self.objective) if self.objective.bank_sites else ()
+        store = thaw(variables)
+        return bank_sites(self.objective, store) if self.objective.bank_sites(store) else ()
 
-    def _banked_frozen(self, tree, stack, release=None):
-        """Stack each scanned run's shared leaves of `tree` into one bank
+    def _banked_frozen(self, variables, stack, release=None):
+        """Stack each scanned run's shared leaves of the frozen collection of `variables` into one bank
         (`dew.inference.banks.banked`).
 
         That is the shape a placement and a checkpoint template take, and the
         arrays the state holds."""
         from dew.inference.banks import banked
-        return banked(tree, self.bank_sites, stack, release)
+        return banked(variables[FROZEN], self._bank_sites(variables), stack, release)
 
     def _placed_host(self, initializer, key, shardings: Placement[TrainState]) -> TrainState:
         """A fresh CPU-owned state, its leaves streamed into place one at a time.
@@ -775,7 +779,8 @@ class Trainer(Generic[Loss, Effects]):
         with jax.default_device(self.state_mesh.local_devices[0]):
             state = self.initial_state(initializer, key)
             if FROZEN in state.variables:
-                check_bank_pool(bank_bytes(state.variables[FROZEN], self.bank_sites), self.device_mesh)
+                check_bank_pool(bank_bytes(state.variables[FROZEN], self._bank_sites(state.variables)),
+                                self.device_mesh)
                 # A scanned run's frozen rows become its bank here and the bank lands where it stays
                 # resident before the next is stacked, so the host holds one bank in transit, not the
                 # stack; the rows' pages are let go as it lands and the held tree holds the placed bank
@@ -800,7 +805,7 @@ class Trainer(Generic[Loss, Effects]):
                         node = node.get(component) if isinstance(node, dict) else None
                     if isinstance(node, dict) and keys[-1] in node:
                         node[keys[-1]] = bank
-                frozen = self._banked_frozen(state.variables[FROZEN], stack, release)
+                frozen = self._banked_frozen(state.variables, stack, release)
                 state = dataclasses.replace(state, variables={**state.variables, FROZEN: frozen})
         params = stream(state.variables, shardings.variables, held)
         ema = None if state.ema is None else stream(state.ema, shardings.ema)
@@ -1228,7 +1233,8 @@ class Trainer(Generic[Loss, Effects]):
         from dew.distributed.host import transfer
         from dew.training.execution import HostExecution
         cpu = self.state_mesh
-        execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu, device=self._device)
+        execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu,
+                                  self._bank_sites(state.variables), device=self._device)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with self._traced_on(cpu) as schedule:
             shapes = self._loss_shape(state, cpu_batch)
@@ -2404,7 +2410,8 @@ class Trainer(Generic[Loss, Effects]):
         key = state.key
         if self.host_master:
             from dew.training.execution import HostExecution
-            execution = HostExecution(self.objective, self.layout, mesh, self.state_mesh)
+            execution = HostExecution(self.objective, self.layout, mesh, self.state_mesh,
+                                      self._bank_sites(state.variables))
             with jax.set_mesh(self.state_mesh):
                 params, averaged = execution.snapshot(params), execution.snapshot(averaged)
             key = execution.on_accelerator(key)

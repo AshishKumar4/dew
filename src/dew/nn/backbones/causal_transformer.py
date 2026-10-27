@@ -36,7 +36,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
-from dew.batch import Coordinates, coordinates as build_coordinates, merge, shifted_span
+from dew.batch import Coordinates, Variables, coordinates as build_coordinates, merge, shifted_span
 from dew.mesh import LayoutRefused, row_axes
 from dew.nn.continuum import Continuum, ContinuumLevel
 from dew.nn.dense import Dense
@@ -630,17 +630,21 @@ class CausalTransformer(nn.Module):
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
 
-    @property
-    def bank_sites(self) -> tuple[DecoderBank, ...]:
-        """Where this decoder's layer stack is stored: scanned runs, or one layer per bank.
+    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
+        """Where this decoder's layer stack is stored in `store`, the variables its banks are drawn
+        from: scanned runs, or one layer per bank.
 
         `groups` already records which of the two it is. A scanned stack
         declares its runs and a plain loop declares one-layer runs, and
         `run_stack` fetches a one-layer run the same way it fetches a longer
-        one. `scanned` records whether those fetches are sequenced, which a host
-        layout requires.
+        one. A run ends where the store's rows differ (`StackView.layer_structures`:
+        layers a checkpoint quantizes differently, or adapts in part), so an
+        unbound decoder plans its runs from the store's shapes as a decoder
+        bound to them reads them. `scanned` records whether those fetches are
+        sequenced, which a host layout requires.
         """
-        bound = self if self.scope is not None else self.bind({})
+        bound = self if self.scope is not None else self.bind(jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store))
         return (DecoderBank((), StackView(bound.groups), scanned=self.scan_layers),)
 
     def layer_kinds(self, types: Sequence[str]) -> dict[str, "ResolvedKind"]:

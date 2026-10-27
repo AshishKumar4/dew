@@ -51,7 +51,7 @@ def test_a_trees_banks_spread_back_into_its_rows():
     # A leaf one row holds alone, as a frozen collection under a partial freeze does.
     tree["layers_1"] = {**tree["layers_1"], "extra": np.ones(3, np.float32)}
     released = []
-    packed = banked(tree, bank_sites(model), lambda rows, path: np.stack(rows),
+    packed = banked(tree, bank_sites(model, {"params": variables}), lambda rows, path: np.stack(rows),
                     lambda namespace, index, keys, bank: released.append((index, keys)))
     groups = {name: layers for name in packed
               if (layers := group_layers(name)) is not None and len(layers) > 1}
