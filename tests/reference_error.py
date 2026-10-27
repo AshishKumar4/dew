@@ -1046,6 +1046,8 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
     trees are held alike first: Dew's, the reference's (a recorded one's leaves `RecordedLeaf`) and
     both truths the same leaves at the same paths, and each leaf the shape of its truth, so no leaf is
     paired with another's truth or compared through broadcasting."""
+    # Every leaf on the host in one transfer a tree, not one a leaf (`leaf_summary` reads them on the host).
+    dew, reference, truth, their_truth = jax.device_get((dew, reference, truth, their_truth))
     paths = _leaf_paths(truth)
     for name, tree in (("dew", dew), ("the reference", reference), ("the reference's truth", their_truth)):
         if _leaf_paths(tree) != paths:
