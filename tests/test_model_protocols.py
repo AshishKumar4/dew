@@ -620,7 +620,7 @@ GRADIENT_COVERING: dict[str, tuple[str, int]] = {
     "hybrid stacks": ("qwen35-tiny", 8),
     "vision towers": ("gemma4-unified-native-tiny", 8),
     "hyper-connections": ("deepseek-v4-tiny", 32),
-    "attention residuals": ("causal_transformer+attention_residuals", 8),
+    "attention residuals": ("causal_transformer+attention_residuals", 32),
     "looped (Dory)": ("dory-tiny", 64),
     "diffusion language models": ("dream-tiny", 8),
     "per-layer inputs and AltUp (Gemma 3n)": ("causal_transformer+gemma3n", 32),
