@@ -143,6 +143,7 @@ class Lowered(SystemExit):
         from jax.experimental.serialize_executable import serialize
 
         saved = epath.Path(path)
+        saved.parent.mkdir(parents=True, exist_ok=True)
         saved.write_bytes(pickle.dumps(serialize(self._compiled())))
         saved.with_name(saved.name + ".json").write_text(json.dumps(
             {"target": self.generation, "memory": self.memory, "cost": self.cost}, indent=1))
