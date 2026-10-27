@@ -804,8 +804,10 @@ class GatedDeltaNet(nn.Module):
                 # queries and keys on their own heads and beta beside them. A
                 # held history can make the convolved operands vary where the
                 # projections did not, so the route is asked again of them.
+                # The batch's documents' firsts, built once with it (`Coordinates.firsts`).
                 return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
-                                              starts=starts, max_segments=tokens.max_segments)
+                                              starts=starts, max_segments=tokens.max_segments,
+                                              firsts=tokens.firsts)
             # One key head serves `per_v` value heads, the reference's `repeat_interleave`.
             query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
             if stepped and held is not None:
