@@ -198,15 +198,14 @@ def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_row
     over the store, and a streamed one alike."""
     from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
 
-    from dew.decision import DecisionObjective, Noul, StateFirstLayout, decisions
+    from dew.decision import DecisionObjective, Example, Noul, StateFirstLayout, decisions
 
     layout = StateFirstLayout(max_len=128)
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=128), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout)
     asked = {"first": Noul("Is it on?"), "second": Noul("Is it off?")}
     answers = {"first": "true", "second": "false"}
-    records = [{"state": f"state {index}", "questions": asked, "answers": answers}
-               for index in range(RECORDS)]
+    records = [{"example": Example(f"state {index}", asked, answers)} for index in range(RECORDS)]
     shuffled = {"seed": 3} if read == "memory" else {"seed": 3, "window": RECORDS}
     loader = compile(Pipeline(Memory(records)).pipe(decisions).shuffle(**shuffled).batch(BATCH), read=read,
                      objective=objective.data(), examples=EXAMPLES)
