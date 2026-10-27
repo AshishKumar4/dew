@@ -580,9 +580,42 @@ RUNG_SEEDS = 8
 an A100, where a rung's checkpoint barriers change the forward program."""
 ZEROS_DRAWN = load("layout_parity").zeros_drawn
 """A parameter tree with each all-zero leaf drawn (tools/layout_parity.py)."""
-GRADIENT_SEEDS = 8
-"""Check 1's declared seeds for a rung's gradient against the model's, each parameter its own leaf,
-sized paired by `seeds_for` on armada."""
+GRADIENT_COVERING: dict[str, tuple[str, int]] = {
+    "dense attention": ("causal_transformer", 8),
+    "GQA and latent attention": ("causal_transformer+mla", 8),
+    "MoE router": ("causal_transformer+moe", 8),
+    "linear and recurrent mixers": ("mamba2-tiny", 8),
+    "hybrid stacks": ("qwen35-tiny", 8),
+    "vision towers": ("gemma4-unified-native-tiny", 8),
+    "hyper-connections": ("deepseek-v4-tiny", 32),
+    "looped (Dory)": ("dory-tiny", 64),
+    "diffusion language models": ("dream-tiny", 8),
+    "per-layer inputs and AltUp (Gemma 3n)": ("causal_transformer+gemma3n", 64),
+    "image and video diffusion transformers": ("simple_dit", 8),
+}
+"""The architecture classes whose top remat rung's gradient holds check 1 against the model's, each by one
+member, the gate's covering (TartPenguin, ledger 1385), with the seeds `seeds_for` sized it at, paired, on
+armada. Each member stands for the others of its class:
+
+- dense attention: gpt-neo, gptj, falcon, phi, phi3, starcoder2, gpt-bigcode, olmo3-yarn, gemma3-native,
+  k2-horizon, modernbert;
+- GQA and latent attention: deepseek-v3, deepseek-v32, deepseek-v41, kimi-k25, mimo-v2-flash,
+  causal_transformer+deepseek_v2;
+- MoE router: mixtral, granitemoe, qwen38-moe, qwen35-moe-native, gemma4-moe, minimax-m2-fp8, llama4,
+  nemotron-h-moe-latent, causal_transformer+gemma4_moe, +glm4_moe, +gpt_oss and +llama4;
+- linear and recurrent mixers: nemotron-h, kimi-linear;
+- hybrid stacks: qwen35-native, qwen35-blocks, causal_transformer+qwen35, glm5-next;
+- vision towers: gemma4-tiny-mm, gemma3n-vision, llama4-native, kimi-k3;
+- hyper-connections: deepseek-v41;
+- looped (Dory): none other;
+- diffusion language models: llada2, diffusion-gemma-sft, diffusion-gemma-workflow;
+- per-layer inputs and AltUp: gemma3n-vision;
+- image and video diffusion transformers: hybrid_dit, simple_mmdit, simple_udit, video_dit,
+  hierarchical_mmdit.
+
+Every other model's top rung holds its forward to check 1 alone."""
+GRADIENT_SEEDS = dict(GRADIENT_COVERING.values())
+"""Each covering member's declared seeds for its gradient."""
 
 
 def _redrawn(inputs, seed: int):
@@ -600,14 +633,15 @@ def _redrawn(inputs, seed: int):
     return jax.tree.map(leaf, inputs)
 
 
-def _climbs_and_restores(model, variables, inputs, **apply) -> None:
+def _climbs_and_restores(name: str, model, variables, inputs, **apply) -> None:
     """Each rung holds less than the one below it, and its top rung steps the
     forward the model does: the top rung's checkpoint makes its forward another
     program, which check 1 holds against the model's from the model's float64
     twin over drawn inputs. Its backward recomputes, which can round apart
     (gemma2-tiny's gradients by up to 1.2e-4, kimi-k3-tiny's 8.3e-3 of 10.8;
-    test_decoder_remat.py found the same), so the gradients hold check 1 too,
-    each parameter its own leaf. Both are taken over the variables with every
+    test_decoder_remat.py found the same), so a covering class's member
+    (`GRADIENT_COVERING`) holds its gradients to check 1 too, each parameter
+    its own leaf. Both are taken over the variables with every
     all-zero leaf drawn (tools/layout_parity.py's `zeros_drawn`): a zero output
     projection or an identity modulation, as a fresh DiT holds them, would
     leave its trunk's gradient zero and a wrong recomputed backward unseen.
@@ -658,15 +692,16 @@ def _climbs_and_restores(model, variables, inputs, **apply) -> None:
     assert_as_exact(lambda *inputs: _call(top, variables, inputs, **apply),
                     lambda *inputs: _call(model, variables, inputs, **apply), draw, f"forward at {record}",
                     seeds=RUNG_SEEDS, truth_fn=forward_truth)
-    assert_as_exact(stepped(top), stepped(model), draw, f"gradient at {record}", seeds=GRADIENT_SEEDS,
-                    truth_fn=gradient_truth)
+    if name in GRADIENT_SEEDS:
+        assert_as_exact(stepped(top), stepped(model), draw, f"gradient at {record}",
+                        seeds=GRADIENT_SEEDS[name], truth_fn=gradient_truth)
     assert top.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written
 
 
 @pytest.mark.parametrize("name", PATHS)
 def test_a_checkpoints_remat_rungs_step_as_it_does(name):
     source, read = loaded(name), reads(name, "float32")
-    _climbs_and_restores(source.model, source.variables, (read.tokens,), method="logits")
+    _climbs_and_restores(name, source.model, source.variables, (read.tokens,), method="logits")
 
 
 CONTINUUM_SEEDS = 8
@@ -745,7 +780,7 @@ def test_an_architectures_remat_rungs_step_as_it_does(case):
     ladder, decoders and DiT stacks, at its size there."""
     model = models.build(case.architecture, **case.config)
     inputs = _inputs(case)
-    _climbs_and_restores(model, model.init(jax.random.key(0), *inputs), inputs)
+    _climbs_and_restores(case.name, model, model.init(jax.random.key(0), *inputs), inputs)
 
 
 def _packed(variables, groups) -> dict:
@@ -995,3 +1030,10 @@ def test_a_denoiser_reads_the_text_interval_and_time_it_declares(architecture, r
                       for scale, unit in ((16.0, 1.0), (2.0, 8.0)))
         assert not np.array_equal(fast, jnp.zeros_like(fast))
         np.testing.assert_array_equal(fast, slow)
+
+
+def test_the_gradient_covering_names_tested_models():
+    """Each covering member is a model the remat tests run, so no class is covered by a name that tests
+    nothing."""
+    tested = {*PATHS, *(case.name for case in RECOMPUTED)}
+    assert {member for member, _ in GRADIENT_COVERING.values()} <= tested
