@@ -34,6 +34,9 @@ dependencies = [
     "einops",
     # dew.nn.engram draws its bucket primes with sympy.nextprime.
     "sympy",
+    # dew.nn.kv_cache's Hadamard rotation (scipy.linalg.hadamard) and dew.nn.mlp's
+    # Gaussian cutoff (scipy.special.erfinv); jax already depends on scipy.
+    "scipy",
     # dew.data.dataset's close budget holds grain's worker kill timeout
     # (GRAIN_KILL_SECONDS); 0.2.18 is the release that was tested.
     "grain>=0.2.18,<0.3",
@@ -363,6 +366,11 @@ filterwarnings = [
     # Qwix 0.1.8 aliases a flax name flax removed; scoped to qwix so the same
     # warning from dew's own code still fails the run.
     'ignore:.VariableState. was removed:DeprecationWarning:qwix',
+    # jaxlib 0.12.0.1 builds the native type of a trace event's stats with no __module__ the first time a
+    # process reads one, and CPython warns of it in the reading frame, dew.telemetry.trace's: raised there,
+    # the error above aborts the process natively. Shown, not raised, for that message in that module
+    # alone; it goes once jaxlib gives the type a module.
+    'default:builtin type event_stats has no __module__ attribute:DeprecationWarning:dew\.telemetry\.trace',
 ]
 
 [tool.coverage.run]

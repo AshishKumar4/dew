@@ -52,6 +52,29 @@ def test_speculation_reproduces_the_greedy_walk_on_a_real_model(kind):
                                    np.asarray(scores)[np.arange(2), chosen], atol=3e-6, rtol=0)
 
 
+def test_speculation_over_a_longrope_rebuild_is_refused_by_name_and_greedy_decoding_runs():
+    """A LongRoPE crossing rebuilds the trunk's prefix alone (`cache_rebuild_position`), never a
+    prediction depth's cache, so speculating over such a model is refused by name before it decodes,
+    where the rebuild's cache and the depths' did not match and tracing it failed; the same model
+    decodes the greedy walk across the crossing, its cache rebuilt at the switch of factors."""
+    from dew.nn.rope import LongRopeScaling
+
+    model = predictor(rope_scaling=LongRopeScaling(short_factor=(1.0, 1.0, 1.0, 1.0),
+                                                   long_factor=(2.0, 3.0, 4.0, 5.0),
+                                                   original_max_position_embeddings=6))
+    prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
+    params = model.init(jax.random.key(0), prompts)
+    with pytest.raises(ValueError):
+        generate(model, params, prompts, 6, key=jax.random.key(1), sampling=Sampling(temperature=0),
+                 strategy=Speculative(block=3))
+    drawn = generate(model, params, prompts, 6, key=jax.random.key(1), sampling=Sampling(temperature=0))
+    walked = np.asarray(prompts)
+    for _ in range(6):
+        scores = np.asarray(model.apply(params, jnp.asarray(walked))[:, -1])
+        walked = np.concatenate([walked, scores.argmax(-1)[:, None].astype(np.int32)], axis=1)
+    np.testing.assert_array_equal(np.asarray(drawn.tokens), walked)
+
+
 def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():
     """A block commits its tokens in order, so an EOS drawn at the second of
     three candidates is emitted with its likelihoods and every later slot of

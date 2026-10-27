@@ -183,9 +183,10 @@ jobs:
     runs-on: ubuntu-latest
     # The suite runs on armada (.armada.json, tools/armada/ci.py): both
     # Pythons as tasks of about five minutes each on Dew's own armada
-    # deployment, on at most 160 containers: with the gangs' 12, a run holds
-    # 172 of the deployment's 216 (its 864-vCPU fleet cap) and leaves the rest
-    # to the lanes' own jobs.
+    # deployment, on at most 375 containers (armada's most for one run): with
+    # the gangs' 12, a run holds 387 of the deployment's 725 (its 2900-vCPU
+    # fleet cap, the account's 3000 less the site's) and leaves the rest to the
+    # lanes' own jobs.
     # A straggler at the end runs again (task.speculative). Tasks share XLA's
     # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
     # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets.
@@ -215,9 +216,10 @@ jobs:
     # every fifth publish, in the background (ci/full-whole-*): both run no
     # gangs, which every train runs, and each takes a bounded share of the
     # fleet (`BACKGROUND_POOL`), so a train never waits on them and its gangs
-    # find their containers: 172 for a train, 24 for a base promote and 20
-    # for the whole suite fill the 216. On so few containers a whole suite
-    # takes longer, so these two have a longer deadline.
+    # find their containers: 387 for a train, 48 for a base promote and 48
+    # for the whole suite leave the rest of the 725 to the lanes' runs (at
+    # most 96 each). On fewer containers a whole suite takes longer, so these
+    # two have a longer deadline.
     concurrency:
       group: >-
         ${{ (startsWith(github.ref_name, 'ci/full-whole-') && 'armada-whole')
@@ -246,8 +248,8 @@ jobs:
         DEW_TEST_CACHE: ${{ needs.scope.outputs.policy }}
         PROVEN: ${{ needs.proven.outputs.run }}
         BACKGROUND_POOL: >-
-          ${{ (startsWith(github.ref_name, 'ci/full-whole-') && '20')
-          || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && '24') || '' }}
+          ${{ (startsWith(github.ref_name, 'ci/full-whole-') && '48')
+          || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && '48') || '' }}
       run: |
         armada=armada
         # The test cache's policy, as the scope job read it.
