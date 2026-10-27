@@ -1182,11 +1182,10 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
 
 
 DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('mma.sync', 'grouped input_gradient'):
-        ('triton', "CONSUMERS3 (b1241ba7b, A100, two programs a multiprocessor): the template's mma.sync "
-                   "tile 1.239x Triton's time, geomean of 6 grouped MoE rows (its forward 0.828x)"),
     ('mma.sync', 'grouped kernel_gradient'):
-        ('triton', "CONSUMERS3: 1.358x Triton's time, geomean of 6 grouped rows"),
+        ('triton', "MWARPS4-a100 (00d05c0eb, A100, each tile's warps split to read its operands least, "
+                   "its tile confirmed by ptxas): the template's mma.sync tile 1.203x Triton's time, geomean "
+                   "of 6 grouped MoE rows (its input gradient 0.985x and forward 0.820x; MWARPS2 1.214x)"),
     ('mma.sync', 'dense forward'):
         ('xla', "DENSE1 (A100, 2d1bbd051, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
                 "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens"),
