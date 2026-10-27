@@ -1083,12 +1083,14 @@ def _handoff(stages: Sequence[Stage], start: int, *, marked: bool) -> int:
 
 def _elastic_cut(stages: Sequence[Stage]) -> int:
     """Where an elastic read's own rows begin (`_Build.elastic_batches`): after the last step before
-    the batch that is not a `Map` of each record alone (or a `Prefetch`, which reads none ahead
-    there). Every reader runs the steps before it over the whole order, as each of them decides
-    which rows there are (a filter, an expansion, a pack), which draws they take or what their place
-    gives them, which only the whole order states; a map after them computes a row from it alone."""
-    return max((at + 1 for at, stage in enumerate(stages) if not isinstance(stage, (Map, Prefetch))),
-               default=0)
+    the batch that is not a `Map` of each record alone, one record for one (or a `Prefetch`, which
+    reads none ahead there). Every reader runs the steps before it over the whole order, as each of
+    them decides which rows there are (a filter, a map that rejects records, an expansion, a pack),
+    which draws they take or what their place gives them, which only the whole order states; a map
+    after them computes a row from it alone."""
+    def one_for_one(stage: Stage) -> bool:
+        return isinstance(stage, Prefetch) or (isinstance(stage, Map) and not stage.rejects)
+    return max((at + 1 for at, stage in enumerate(stages) if not one_for_one(stage)), default=0)
 
 
 class _InputOrder(pygrain.IterDataset):

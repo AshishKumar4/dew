@@ -1704,7 +1704,8 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
     Only a stream whose position is a global record count can ramp. The ramp
     cuts that order into other steps, and the count it saves has to be the
     records it handed over. A stream that batches its own records reports a
-    shard offset and is refused, by name.
+    shard offset and is refused, by name, as is an elastic read, whose
+    position is its order's, not a record count the ramp's steps cut.
     """
     # An impossible schedule fails here, not mid-run. Moving its stages to update boundaries
     # (`Ramp.stages`' window) cannot make one impossible, so this checks the schedule as given.
@@ -1720,7 +1721,9 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
             )
         if isinstance(stream, Resumable):
             state = stream.get_state()
-            if isinstance(state, bytes) and position.translates(state):
+            # A global record count alone: an elastic read's position is the order's, which the
+            # ramp's steps, cut from a global order, do not save or restore (`RampedStream`).
+            if isinstance(state, bytes) and position.decode(state) is not None:
                 return RampedStream(stream, ramp.stages(dataset.batch, partition.window), partition,
                                     tail=dataset.tail, order_records=dataset.order_records)
         if isinstance(stream, Closeable):
