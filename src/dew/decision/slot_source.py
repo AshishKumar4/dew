@@ -55,18 +55,23 @@ def _attention(overrides: Mapping[str, object]) -> Mapping[str, object]:
     return _records.record(overrides.get("attention", {}), "modeling_overrides.attention")
 
 
-def reads_blocks(config: Mapping[str, object], overrides: Mapping[str, object] | None) -> bool:
+def reads_blocks(config: Mapping[str, object], overrides: Mapping[str, object] | None, *,
+                 text_only: bool = False) -> bool:
     """Whether a backbone loaded from `config` under the load's `overrides` reads each of a row's blocks
     whole on some layer kind of its text, as the attention its `modeling_overrides` declares, the
-    load's over the checkpoint's (`with_overrides`), a wrapper's own over its `text_config`'s as its
-    language model reads them (`decoders.language_model_config`): its decision rows then lie in blocks.
-    A checkpoint reading its own media in blocks declares none."""
+    load's over the checkpoint's (`with_overrides`): a wrapper's language model reads its own scope's
+    kinds over its `text_config`'s, each kind the nearer scope names, and a wrapper's language model
+    loaded alone (`text_only`) the wrapper's scope in place of its text's where it states one
+    (`decoders.language_model_config`). Its decision rows then lie in blocks. A checkpoint reading its
+    own media in blocks declares none."""
     built = with_overrides(config, overrides)
-    declared = built.get("modeling_overrides")
     text = built.get("text_config")
-    if declared is None and isinstance(text, Mapping):
-        declared = text.get("modeling_overrides")
-    return "block_bidirectional" in _attention(_records.record(declared or {}, "modeling_overrides")).values()
+    nested = _attention(_records.record(text.get("modeling_overrides", {}) if isinstance(text, Mapping)
+                                        else {}, "text_config.modeling_overrides"))
+    own = built.get("modeling_overrides")
+    stated = _attention(_records.record(own or {}, "modeling_overrides"))
+    attention = stated if text_only and own is not None else {**nested, **stated}
+    return "block_bidirectional" in attention.values()
 
 
 def _full_attention(overrides: Mapping[str, object]) -> str:

@@ -471,11 +471,12 @@ def test_a_backbone_reading_its_own_media_in_blocks_keeps_a_joint_layout():
     assert isinstance(objective.layout, JointLayout)
 
 
-@pytest.mark.parametrize("scope", ["wrapper", "text_config"])
+@pytest.mark.parametrize("scope", ["wrapper", "text_config", "beside-another-kind"])
 def test_a_checkpoint_declaring_block_attention_lays_a_fresh_heads_rows_in_blocks(tmp_path, scope):
     """A checkpoint whose own config declares its full-attention layers block-bidirectional
-    (`modeling_overrides`), at the wrapper's scope or its `text_config`'s, lays a fresh head's rows in
-    blocks for them, with no run option asking it, as the run's `--source.attention` would."""
+    (`modeling_overrides`), at the wrapper's scope or its `text_config`'s, there beside a wrapper scope
+    naming another kind, lays a fresh head's rows in blocks for them, with no run option asking it,
+    as the run's `--source.attention` would."""
     import shutil
 
     declared = tmp_path / "declared"
@@ -483,6 +484,8 @@ def test_a_checkpoint_declaring_block_attention_lays_a_fresh_heads_rows_in_block
     config = json.loads((declared / "config.json").read_text())
     stated = config if scope == "wrapper" else config["text_config"]
     stated["modeling_overrides"] = {"attention": {"full_attention": "block_bidirectional"}}
+    if scope == "beside-another-kind":
+        config["modeling_overrides"] = {"attention": {"linear_attention": "causal"}}
     (declared / "config.json").write_text(json.dumps(config))
     default = Fitted(data=TICKETS)
     trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
