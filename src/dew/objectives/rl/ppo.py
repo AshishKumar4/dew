@@ -16,6 +16,7 @@ from dew.distributed.batches import shard_batch
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
+from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import HiddenStates
 from dew.objectives.base import (
     OMITTED,
@@ -59,7 +60,8 @@ RETURNS_KEY = "returns"
 
 
 class ValueHead(nn.Module):
-    """Projects a decoder's hidden states to one float32 value per position.
+    """Projects a decoder's hidden states to one value per position, at least float32: a bf16 or
+    float32 backbone's in float32, a float64 twin's in float64.
 
     Packed rows pass their chains' `segment_ids` and `positions`, so no
     hidden state sees another chain.
@@ -79,7 +81,7 @@ class ValueHead(nn.Module):
         hidden = self.backbone.hidden_states(
             tokens, train=False, segment_ids=segment_ids, positions=positions
         )
-        return Dense(1, dtype=jnp.float32, name="value")(hidden)[..., 0]
+        return Dense(1, dtype=at_least_fp32(hidden.dtype), name="value")(hidden)[..., 0]
 
 
 @dataclass(frozen=True)
