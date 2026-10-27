@@ -158,8 +158,10 @@ def test_narrow_rows_take_their_narrow_factor_and_wider_rows_row_factor():
     for width in (1, 2, 3, 8):
         factor = NARROW_FACTORS.get(width, ROW_FACTOR)
         for worst, fails in ((0.99 * factor, False), (1.01 * factor, True)):
-            draws = _Draws(["leaf"], np.ones((8, 1)), np.ones((8, 1)), np.tile([[[worst, 1.0]]], (8, 1, 1)),
-                           [[NO_ZERO_ROWS]] * 8, np.ones((8, 1), bool), (width,))
+            # The draws hold each worst row by its log (`_log_over`).
+            draws = _Draws(["leaf"], np.ones((8, 1)), np.ones((8, 1)),
+                           np.tile([[[np.log(worst), 0.0]]], (8, 1, 1)), [[NO_ZERO_ROWS]] * 8,
+                           np.ones((8, 1), bool), (width,))
             over, _ = _judgement(draws, "leaf")
             assert bool(over) == fails, (width, worst)
 

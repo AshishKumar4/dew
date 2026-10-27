@@ -11,7 +11,7 @@ import contextlib
 import dataclasses
 import tempfile
 from collections.abc import Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import grain.python as grain
 import numpy as np
@@ -128,6 +128,8 @@ class DecodeVideo(grain.MapTransform):
     to: str = "video"
     rejects: bool = True
     """Whether a clip that does not decode is dropped (`filter_map`) rather than an error."""
+    external: ClassVar[bool] = True
+    """A video a record names by path is read from storage (`dew.data.pipeline.External`)."""
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """`frames` RGB frames at `fps`, each a `size` square, under `to`."""

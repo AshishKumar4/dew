@@ -1,6 +1,6 @@
 """The float64 gate's arithmetic on a kernel's graph (src/dew/nn/kernels/graph.py): each element's
 distance from float64 with the node's sentinel and NaN rules, and the permutation of a node's summed
-axis that is its orbit (tests/reference_error.py `assert_graph_as_exact`).
+axis that is its orbit (tests/reference_ensemble.py `assert_graph_as_exact`).
 
 No asserted test relies on the gate's attention key-sum nodes (a denominator or an accumulator summed
 over keys) until ledger row 758 closes: equally exact key sums are flagged at every stage on some

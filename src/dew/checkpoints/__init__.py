@@ -72,7 +72,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 from dew import _records, position
 from dew._coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
 from dew._hashing import fmix32
-from dew._records import JSON, duration, json_value, share
+from dew._records import JSON, duration, json_value, record, share
 from dew.batch import PARAMETER_ROOTS, Variables
 from dew.cleanup import attempted
 from dew.files import write_atomically
@@ -86,6 +86,7 @@ if TYPE_CHECKING:
     from flax.training.dynamic_scale import DynamicScale
 
     from dew.data.dataset import DataPartition
+    from dew.inference.tasks import SavedRun
     from dew.registry import ModelConfig
     from dew.state import Accumulation, TrainState
 
@@ -106,6 +107,9 @@ deleted. The step names it relative to the run directory, so a copied run
 still restores."""
 
 RUN_FILE = "run.json"
+COOLDOWN_FILE = "cooldown.json"
+"""The cooldown branch a run began at a step and has not finished (`Checkpoints.cooldown`), kept beside
+the step's checkpoint, which it outlives: a resume from that step runs it first."""
 """The one file at the root of every run directory, beside its steps, that
 makes it a run: what `dew.pipeline` looks for, locally and on the Hub, and
 what `dew.io.publish` ships with a step. A run built from a config holds the
@@ -1052,6 +1056,25 @@ class Checkpoints:
             record = {**PYTHON_RUN, "reasons": list(self._reasons)}
             write_atomically(root / RUN_FILE, json.dumps(record, indent=2, sort_keys=True))
 
+    def cooldown(self, step: int) -> Mapping[str, object] | None:
+        """The cooldown branch the run began at `step` and has not finished, as it was resolved there
+        (`dew.training.cooldown`); None where none is (`COOLDOWN_FILE`)."""
+        path = epath.Path(self.directory) / COOLDOWN_FILE
+        pending = record(json.loads(path.read_text()), COOLDOWN_FILE) if path.exists() else None
+        return pending if pending is not None and pending.get("step") == step else None
+
+    def cooling(self, pending: Mapping[str, object] | None) -> None:
+        """Keep `pending` as the cooldown branch the run has begun, or with None that it has none
+        unfinished; process zero writes it, beside the steps (`cooldown`)."""
+        if jax.process_index() != 0:
+            return
+        path = epath.Path(self.directory) / COOLDOWN_FILE
+        if pending is None:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(path, json.dumps(dict(pending), sort_keys=True))
+
     def artifact(self, step: int | str | None = None) -> JSON:
         """Return the selected step's inference declaration.
 
@@ -1971,9 +1994,18 @@ class Averaged:
 
 def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None = None,
              ema: bool | None = None, mesh=None, layout=None, trust: Sequence[str] = ()) -> Averaged:
-    """The fp32 mean of `runs`' effective weights, each run's at `step` (its latest where None) and
-    `ema` as its loaders read them (its average where None and it keeps one): a model soup of runs
-    trained apart from one start, any objective's.
+    """The fp32 mean of `runs`' effective weights, each run's at `step` (its latest where None, pinned
+    as `SavedRun.pinned` pins it, with `trust`) and `ema` as its loaders read them (`averaged_pinned`)."""
+    from dew.inference.tasks import SavedRun
+
+    return averaged_pinned([SavedRun.pinned(str(epath.Path(run)), step, trust) for run in runs], ema=ema,
+                           mesh=mesh, layout=layout)
+
+
+def averaged_pinned(runs: Sequence[SavedRun], *, ema: bool | None = None, mesh=None, layout=None) -> Averaged:
+    """The fp32 mean of the pinned `runs`' effective weights (`SavedRun.pinned`), each read with `ema`
+    as its loaders read it (its average where None and it keeps one): a model soup of runs trained
+    apart from one start, any objective's.
 
     A run's weights are its model's tree (`SavedRun.variables`, read onto `mesh` as `layout`
     places it, as a run's loaders take them) in fp32 with its frozen leaves back in `params`, a LoRA
@@ -1986,7 +2018,7 @@ def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None =
     the host in fp32 (`_taken`), one run's shards beside it at a time, a subnormal kept as float64's
     mean rounds it where a device may flush it, and assembles its leaves as the first run's are
     placed: a pool averages runs no one process holds whole. An integer or boolean leaf must agree
-    across the runs. `trust` is as `SavedRun.pinned` takes it."""
+    across the runs."""
     if len(runs) < 2:
         raise ValueError(f"an average is of two or more runs, got {len(runs)}")
     from dew._coordination import agreed
@@ -1995,7 +2027,7 @@ def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None =
     means: list = []
     structure, firsts, model, read = None, [], None, []
     for count, run in enumerate(runs, start=1):
-        tree, base, entry = _effective_weights(str(epath.Path(run)), step, ema, mesh, layout, trust)
+        tree, base, entry = _effective_weights(run, ema, mesh, layout)
         if model is not None and base != model:
             raise ValueError(f"the run in {entry[0]} trains another model than {read[0][0]}'s, so their "
                              "weights are not one model's to average")
@@ -2058,19 +2090,19 @@ def _mean_of(mean, taken, count: int, directory: str, first: str):
                                    for index, block in mean.shards.items()})
 
 
-def _effective_weights(directory: str, step: int | str | None, ema: bool | None, mesh, layout,
-                       trust: Sequence[str]) -> tuple[Variables, ModelConfig, tuple[str, int, bool]]:
-    """The run in `directory`'s model tree as `averaged` takes it, its model record with any adapter
+def _effective_weights(run: SavedRun, ema: bool | None, mesh, layout
+                       ) -> tuple[Variables, ModelConfig, tuple[str, int, bool]]:
+    """The pinned run's model tree as `averaged_pinned` takes it, its model record with any adapter
     merged away, and its directory, step and average read: the adapter's factors merged where the
     recorded model's tree is (`Objective._recorded_part`), beside any part its record leaves out, and
     the frozen leaves back in `params` (`thaw`). What the merge holds goes as this returns."""
     from dew.batch import part, thaw
-    from dew.inference.tasks import SavedRun, saved_model
+    from dew.inference.tasks import saved_model
     from dew.lora import Adapter, AdapterRecord, recorded_adapter
     from dew.objectives.base import joined
 
-    run = SavedRun.pinned(directory, step, trust)
-    pinned, objective, config = run.step, run.objective, saved_model(run.record, None)
+    directory, pinned, objective = run.directory, run.step, run.objective
+    config = saved_model(run.record, None)
     tree = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=jnp.float32)
     adapter = recorded_adapter(config.wrappers)
     if adapter is not None:
