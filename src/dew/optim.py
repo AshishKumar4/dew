@@ -594,6 +594,17 @@ def _bias_corrected(moment, decay, count):
     return optax.tree.bias_correction(moment, decay, count)
 
 
+def moment_dtype(param, dtype):
+    """The dtype a first moment of `param` is stored in under a requested `dtype`: the parameter's own
+    where None, and for a complex parameter the complex type that holds `dtype`'s values in each
+    component (complex64 for float32 or narrower), so its imaginary part is never dropped."""
+    if dtype is None:
+        return None
+    if jnp.issubdtype(jnp.asarray(param).dtype, jnp.complexfloating):
+        return jnp.promote_types(dtype, jnp.complex64)
+    return dtype
+
+
 def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
                   nesterov: bool = False, nu_dtype=None) -> optax.GradientTransformation:
     """`optax.scale_by_adam` (optax 0.2.8) with its bias corrections formed in double
@@ -605,8 +616,11 @@ def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
     nu_dtype = None if nu_dtype is None else jax.dtypes.canonicalize_dtype(nu_dtype)
 
     def init_fn(params):
+        # A complex parameter's first moment keeps both components (`moment_dtype`); its second, of the
+        # gradient's squared magnitude, is real.
         return optax.ScaleByAdamState(count=jnp.zeros([], jnp.int32),
-                                      mu=optax.tree.zeros_like(params, dtype=mu_dtype),
+                                      mu=jax.tree.map(lambda p: jnp.zeros_like(p, moment_dtype(p, mu_dtype)),
+                                                      params),
                                       nu=optax.tree.zeros_like(params, dtype=nu_dtype))
 
     def update_fn(updates, state, params=None):
@@ -626,7 +640,7 @@ def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
         nu_hat = _bias_corrected(nu, b2, count)
         scaled = jax.tree.map(lambda m, v: None if m is None else m / (jnp.sqrt(v + eps_root) + eps),
                               mu_hat, nu_hat, is_leaf=lambda leaf: leaf is None)
-        return scaled, optax.ScaleByAdamState(count=count, mu=optax.tree.cast(mu, mu_dtype),
+        return scaled, optax.ScaleByAdamState(count=count, mu=optax.tree.cast_like(mu, state.mu),
                                               nu=optax.tree.cast_like(nu, state.nu))
 
     return optax.GradientTransformation(init_fn, update_fn)
@@ -689,12 +703,31 @@ def bf16_moments(b1: float, b2: float, eps: float, eps_root: float,
     would lose every increment of the second moment smaller than half its bf16 spacing, which at b2 =
     0.999 is most of them; a stochastic rounding keeps each one in expectation. The moments are trees of
     the parameters' shapes, so sharding and checkpoints read them as they read fp32 state."""
+    def zeros(params, signed: bool):
+        # A complex parameter's first moment is kept whole (`_complex_moment`).
+        return jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, _complex_moment(leaf, signed) or jnp.bfloat16),
+                            params)
+
+    def encoded(moment, part, signed, salt):
+        return moment.astype(part.dtype) if _is_complex(part) else stochastic_round_bf16(moment, salt)
+
     return _stored_moments(b1, b2, eps, eps_root, nesterov, _Store(
-        zeros=lambda params, signed: jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, jnp.bfloat16), params),
+        zeros=zeros,
         parts=lambda structure, moment: structure.flatten_up_to(moment),
-        decoded=lambda part, signed: part.astype(jnp.float32),
-        encoded=lambda moment, part, signed, salt: stochastic_round_bf16(moment, salt),
+        decoded=lambda part, signed: part if _is_complex(part) else part.astype(jnp.float32),
+        encoded=encoded,
         whole=lambda structure, parts: structure.unflatten(parts)))
+
+
+def _is_complex(leaf) -> bool:
+    return jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.complexfloating)
+
+
+def _complex_moment(leaf, signed: bool):
+    """complex64 for a complex parameter's first moment (`signed`), whose imaginary part a real store would
+    drop, kept whole by every reduced store; None otherwise. Its second moment, of the gradient's squared
+    magnitude, is real and stored as any."""
+    return jnp.complex64 if signed and _is_complex(leaf) else None
 
 
 def dynamic_map(*, signed: bool) -> np.ndarray:
@@ -741,13 +774,15 @@ def int8_moments(b1: float, b2: float, eps: float, eps_root: float, nesterov: bo
     maps = {signed: jnp.asarray(dynamic_map(signed=signed)) for signed in (True, False)}
 
     def held(leaf) -> bool:
-        return leaf.size >= QUANTIZED_SIZE and leaf.ndim > 0 and leaf.shape[-1] % block == 0
+        # A complex parameter's moments are kept whole (`_complex_moment`).
+        return (leaf.size >= QUANTIZED_SIZE and leaf.ndim > 0 and leaf.shape[-1] % block == 0
+                and not _is_complex(leaf))
 
     def zeros(params, signed: bool) -> QuantizedMoments:
         zero = _zero_code(dynamic_map(signed=signed))
         return QuantizedMoments(
             jax.tree.map(lambda leaf: jnp.full(leaf.shape, zero, jnp.uint8) if held(leaf)
-                         else jnp.zeros(leaf.shape, jnp.float32), params),
+                         else jnp.zeros(leaf.shape, _complex_moment(leaf, signed) or jnp.float32), params),
             jax.tree.map(lambda leaf: jnp.zeros((*leaf.shape[:-1], leaf.shape[-1] // block), jnp.float32)
                          if held(leaf) else None, params))
 

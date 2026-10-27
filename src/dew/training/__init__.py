@@ -5,6 +5,7 @@
 only when a `WandbTracker` logs.
 """
 
+from dew.averaging import ema_update
 from dew.checkpoints import Checkpoints, Keep
 from dew.distributed.placement import Layout, MeshSpec
 from dew.objectives.base import Aux, EMASpec, Metric, Objective, Step
@@ -18,7 +19,6 @@ from .runtime import Preempted, prepare_process, run_timestamp
 from .selection import Best
 from .tracker import LocalTracker, MLflowTracker, TensorBoardTracker, Tracker, Trackers, Wandb, WandbTracker
 from .trainer import Rollout, Trainer
-from dew.averaging import ema_update
 
 __all__ = ["Aux", "Best", "Checkpoints", "Cooldowns", "EMASpec", "EvalSuite", "Evaluation", "Keep",
            "Layout", "LocalTracker", "MLflowTracker", "MeshSpec", "Metric", "Objective", "Observe", "Pause",

@@ -1147,3 +1147,25 @@ def test_narrow_weights_step_on_float32_moments_as_float32_weights_do(optimizer,
     wide, _ = solver.update(jax.tree.map(lambda leaf: leaf.astype(jnp.float32), gradient),
                             solver.init(wide_weights), wide_weights)
     np.testing.assert_array_equal(np.asarray(narrow["w"], np.float32), np.asarray(wide["w"]))
+
+
+@pytest.mark.parametrize("state_dtype", ["float32", "bfloat16", "int8"])
+def test_adams_first_moment_keeps_a_complex_gradients_both_components(state_dtype):
+    """Adam's first moment of a complex parameter is complex in every store, so a repeated gradient of
+    1+2j at b1 = 0.9 leaves it at 0.19+0.38j after two updates, as complex arithmetic does, not
+    0.19+0.20j with its imaginary part dropped and re-read: its imaginary part twice its real part to
+    the bit, as each update scales both alike and a doubling rounds as its half does (row 1870, AT-05)."""
+    from dew.optim import OptimConfig
+
+    params = {"w": jnp.full((4,), 0.5 + 0.5j, jnp.complex64)}
+    optimizer = OptimConfig(optimizer="adam", learning_rate=1e-3, state_dtype=state_dtype).build(None)
+    state = optimizer.init(params)
+    gradient = {"w": jnp.full((4,), 1 + 2j, jnp.complex64)}
+    for _ in range(2):
+        _, state = optimizer.update(gradient, state, params)
+    moments = [node for node in jax.tree.leaves(state, is_leaf=lambda node: hasattr(node, "mu"))
+               if hasattr(node, "mu")]
+    mu = np.asarray(jax.tree.leaves(moments[0].mu)[0])
+    assert np.iscomplexobj(mu)
+    np.testing.assert_array_equal(mu.imag, 2 * mu.real)
+    assert np.all(mu.real > 0.18)

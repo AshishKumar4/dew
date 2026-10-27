@@ -95,6 +95,27 @@ def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, a
                 if "train/tokens" in scalars] == logged
 
 
+def test_an_optimizer_that_holds_updates_back_moves_no_clock_average_or_tokens_until_it_applies_one():
+    """optax.MultiSteps over two calls applies one update every two steps, and the calls between apply
+    none: after three steps the run has made one update, its EMA stands where the second step left it,
+    and its committed tokens are the first two steps' 16, the third's 8 waiting for the update that
+    applies them (`TrainState.deferred`); with the fourth they commit (row 1870, AT-01)."""
+    def run(steps):
+        tracker = RecordingTracker()
+        state = make_trainer(objective=TokenRegression(), optimizer=optax.MultiSteps(optax.sgd(0.1), 2),
+                             tracker=tracker).fit(dataset(), steps=steps, log_every=1)
+        return state, [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars]
+
+    two, _ = run(2)
+    three, logged = run(3)
+    four, counted = run(4)
+    assert (int(two.updates), int(three.updates), int(four.updates)) == (1, 1, 2)
+    for after_two, after_three in zip(jax.tree.leaves(two.ema), jax.tree.leaves(three.ema), strict=True):
+        np.testing.assert_array_equal(np.asarray(after_two), np.asarray(after_three))
+    assert logged == [0, 16, 16]
+    assert counted == [0, 16, 16, 32]
+
+
 def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
     state = make_trainer(objective=TokenRegression()).fit(dataset(), steps=2, tokens=30)
     assert int(state.step) == 2
