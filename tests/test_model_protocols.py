@@ -60,7 +60,7 @@ import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import float64_twin
-from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, widened
+from reference_error import as_given, assert_as_exact, widened
 from test_architectures import CASES as ARCHITECTURES, MASK, TEXT_FEATURES, TEXT_TOKENS, VOCAB
 from tiny_models import build_model, tiny_inputs
 
@@ -544,21 +544,6 @@ def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name)
                     truth_fn=_scored(float64_twin(model), widened(variables), wide=True, **call))
 
 
-def _flat(tree) -> np.ndarray:
-    return np.concatenate([np.ravel(np.asarray(leaf, np.float64)) for leaf in jax.tree.leaves(tree)])
-
-
-def as_exact(dew, reference, truth, label: str) -> None:
-    """`dew` the reference's bits, or where they differ as exact as the
-    reference (tests/reference_error.py) from `truth()`, the float64 twin."""
-    if all(np.array_equal(np.asarray(mine), np.asarray(theirs))
-           for mine, theirs in zip(jax.tree.leaves(dew), jax.tree.leaves(reference), strict=True)):
-        return
-    with jax.enable_x64(new_val=True):
-        wanted = truth()
-    assert_as_exact_as_the_reference(_flat(dew), _flat(reference), _flat(wanted), label)
-
-
 def _call(model, variables, inputs, **apply) -> jax.Array:
     """A forward without dropout, whose float64 twin would draw other masks:
     a token model's logits, a denoiser's output."""
@@ -592,6 +577,9 @@ def _rungs(model) -> list:
 RUNG_SEEDS = 8
 """Check 1's declared seeds for a rung's forward against the model's, sized paired by `seeds_for` on
 an A100, where a rung's checkpoint barriers change the forward program."""
+GRADIENT_SEEDS = 8
+"""Check 1's declared seeds for a rung's gradient against the model's, each parameter its own leaf,
+sized paired by `seeds_for` on armada."""
 
 
 def _redrawn(inputs, seed: int):
@@ -636,23 +624,34 @@ def _climbs_and_restores(model, variables, inputs, **apply) -> None:
             assert restored == records[max(low, high)], (records[low], records[high], restored)
     assert all(rung.restore_recompute("no rung").recompute_record() == record
                for rung, record in zip(rungs, records, strict=True))
-    _, gradient_tree = _stepped(model, variables, inputs, **apply)
-    truth = functools.cache(
-        lambda: _stepped(float64_twin(model), widened(variables), widened(inputs), **apply)[1])
     written = model.apply(variables, *inputs, mutable=True, **apply)[1].keys()
+    twin, wide_variables = float64_twin(model), widened(variables)
+
     # Applied as the step applies them: some models read their ids on the host.
     def forward_truth(*inputs):
         with jax.enable_x64(new_val=True):
-            wide = _call(float64_twin(model), widened(variables), widened(inputs), **apply)
+            wide = _call(twin, wide_variables, widened(inputs), **apply)
             return np.asarray(wide, np.float64)
 
+    def stepped(rung):
+        return lambda *inputs: _stepped(rung, variables, inputs, **apply)[1]
+
+    def gradient_truth(*inputs):
+        with jax.enable_x64(new_val=True):
+            return jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
+                                _stepped(twin, wide_variables, widened(inputs), **apply)[1])
+
     top = rungs[-1]
-    stepped = _stepped(top, variables, inputs, **apply)
+    record = top.recompute_record()
+
+    def draw(seed):
+        return _redrawn(inputs, seed)
+
     assert_as_exact(lambda *inputs: _call(top, variables, inputs, **apply),
-                    lambda *inputs: _call(model, variables, inputs, **apply),
-                    lambda seed: _redrawn(inputs, seed), f"forward at {top.recompute_record()}",
+                    lambda *inputs: _call(model, variables, inputs, **apply), draw, f"forward at {record}",
                     seeds=RUNG_SEEDS, truth_fn=forward_truth)
-    as_exact(stepped[1], gradient_tree, truth, f"gradient at {top.recompute_record()}")
+    assert_as_exact(stepped(top), stepped(model), draw, f"gradient at {record}", seeds=GRADIENT_SEEDS,
+                    truth_fn=gradient_truth)
     assert top.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written
 
 
