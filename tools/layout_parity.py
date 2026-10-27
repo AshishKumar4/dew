@@ -302,19 +302,23 @@ def zoo() -> dict[str, Any]:
 
 
 def _placed_zoo(dense: dict[str, object], moe: dict[str, object]) -> dict[str, dict[str, object]]:
-    """The zoo's decoders a layout places apart (`zoo`), built on its `dense` and `moe` ones: the
-    expert exchange under a capacity, whose buckets hold what each device's sequences keep, one round,
-    so its program splits evenly (dropless, it also compiles the rounds a skewed routing needs, which
-    a static count of the step's FLOPs reads whether or not they run); DeepSeek's class, a dense first
-    layer before routed ones, each layer reading its own per-layer input (Gemma's), which a pipeline
-    runs on every stage, slicing the inputs past it; and Gemma 3n's, the last two layers reading the
-    keys and values the fourth stored, which a pipeline runs on every stage."""
+    """The zoo's decoders a layout places apart (`zoo`), built on its `dense` and `moe` ones.
+
+    The expert exchange runs under a capacity, whose buckets hold what each
+    device's sequences keep, one round, so its program splits evenly;
+    dropless, it also compiles the rounds a skewed routing needs, which a
+    static count of the step's FLOPs reads whether or not they run.
+    DeepSeek's class puts a dense first layer before eight routed ones, each
+    layer reading its own per-layer input (Gemma's): a pipeline runs the
+    dense layer on every stage and slices the inputs past it, each of four
+    stages scanning two. Gemma 3n's has its last two layers read the keys
+    and values the fourth stored, which a pipeline runs on every stage."""
     mixture = moe["mixture"]
     assert isinstance(mixture, dict)
     return {
         "moe_exchange": {**moe, "mixture": {**mixture, "dispatch": "exchange", "capacity_factor": 2.0}},
-        "routed_tail": {**dense, "num_layers": 5, "per_layer_input_dim": 8,
-                        "mixture": {**mixture, "layers": (1, 2, 3, 4)}},
+        "routed_tail": {**dense, "num_layers": 9, "per_layer_input_dim": 8,
+                        "mixture": {**mixture, "layers": tuple(range(1, 9))}},
         "shared_tail": {**dense, "num_layers": 6, "kv_shared_layers": (4, 5)},
     }
 
