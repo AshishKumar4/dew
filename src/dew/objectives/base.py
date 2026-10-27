@@ -855,16 +855,16 @@ class Objective(ABC, Generic[Loss, Effects]):
         if modules:
             (self.model,) = modules
 
-    @property
-    def bank_sites(self) -> tuple[DecoderBank, ...]:
-        """The scanned layer stacks this objective runs, which a host layout streams as banks.
+    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
+        """The scanned layer stacks this objective runs, which a host layout streams as banks, as they
+        lie in `store`, the variables the banks are drawn from.
 
         Each site names a decoder's namespace below every variables
-        collection, and its `StackView`, as the model declares them. An
-        objective without a layer stack returns an empty tuple, and all its
-        variables are entry variables. Only the execution snapshot uses
-        these banks; the variables and optimizer trees the trainer keeps
-        never take them on.
+        collection, and its `StackView`, as the model declares them over the
+        store's rows. An objective without a layer stack returns an empty
+        tuple, and all its variables are entry variables. Only the execution
+        snapshot uses these banks; the variables and optimizer trees the
+        trainer keeps never take them on.
         """
         return ()
 

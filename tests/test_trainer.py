@@ -972,7 +972,8 @@ runs = {"first": fit(1e-3, 2, root + "/run")}
 for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
     shutil.copytree(root + "/run", f"{root}/{name}")
     runs[name] = fit(peak, 3, f"{root}/{name}")
-for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
+# Fresh runs at each configuration, the ungrouped run's bit-for-bit baselines.
+for name, peak in () if grouped else (("slow", 4e-3), ("fast", 8e-3)):
     runs["fresh " + name] = fit(peak, 3, f"{root}/fresh {name}")
 print(json.dumps(runs))
 """
@@ -1485,6 +1486,29 @@ def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume
     assert Checkpoints(str(tmp_path / "run")).cooldown(8) is None
     cooldown_run(stable, 8, 1, again, cooldowns, tmp_path)
     assert not any("cooldown_val/loss" in scalars for _, scalars in again.scalars)
+
+
+def test_a_cooldown_of_a_run_without_a_token_schedule_reads_nothing_from_the_devices_a_step(monkeypatch):
+    """A branch of a run with no token schedule asks the devices for nothing between its steps: a
+    branch three times as long reads from the devices as often as a short one, its tokens left
+    uncounted on the host, as the run's own steps leave them."""
+    from dew.optim import Linear
+    from dew.training.cooldown import Cooldowns
+
+    stable, reads = Linear(2.0 ** -4, decay_start=64, decay_steps=128), []
+    fetched = jax.device_get
+
+    def counted(tree):
+        reads.append(1)
+        return fetched(tree)
+
+    monkeypatch.setattr(jax, "device_get", counted)
+    per_branch = []
+    for length in (2, 6):
+        reads.clear()
+        cooldown_run(stable, 8, 1, cooldowns=Cooldowns(at=(2,), length=length, shape="linear"))
+        per_branch.append(len(reads))
+    assert per_branch[0] == per_branch[1]
 
 
 def test_a_cooldown_resolves_its_points_and_lengths_as_shares_of_the_run():

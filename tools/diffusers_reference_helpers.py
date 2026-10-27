@@ -149,3 +149,11 @@ def tiny_qwen3_encoder(source: Path, tok, *, hidden_size: int, layers: int, seed
     model = Qwen3ForCausalLM(Qwen3Config(**config)).eval()
     perturb(torch.Generator().manual_seed(seed + 6), 0.05, model)
     return model
+
+
+def flux2_ids(rows: int, columns: int, tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """`Flux2Pipeline._prepare_text_ids` and `_prepare_latent_ids`: the four-axis ids the pipeline lays
+    out for a text of `tokens` and a latent of `rows` by `columns` positions."""
+    text = torch.cartesian_prod(torch.arange(1), torch.arange(1), torch.arange(1), torch.arange(tokens))
+    image = torch.cartesian_prod(torch.arange(1), torch.arange(rows), torch.arange(columns), torch.arange(1))
+    return text, image

@@ -33,6 +33,21 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
+  "hf/gpt2-tiny/logits_f64.npy": {
+   "tool": "tools/classic_gpt_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
+   "note": "--float64 gpt2-tiny: the stored weights' float64 twin (torch_precision.float64_twin) on the fixture's ids."
+  },
+  "hf/gpt-neox-tiny/logits_f64.npy": {
+   "tool": "tools/classic_gpt_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
+   "note": "--float64 gpt-neox-tiny: the stored weights' float64 twin (torch_precision.float64_twin) on the fixture's ids."
+  },
+  "hf/opt-tiny/logits_f64.npy": {
+   "tool": "tools/classic_gpt_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
+   "note": "--float64 opt-tiny: the stored weights' float64 twin (torch_precision.float64_twin) on the fixture's ids."
+  },
   "hf/phi3-tiny/padded_logits.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
@@ -1103,7 +1118,7 @@
     },
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],

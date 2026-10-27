@@ -177,8 +177,13 @@ def build(module, seed: int, widen: bool = False):
     """The toy Transformer in fp32, or fp64 when `widen`, with its fp32
     weights drawn and each hash row a fresh permutation of the experts
     truncated to the top-k, so a token takes two distinct experts."""
+    from torch_precision import float64
+
     torch.manual_seed(seed)
-    net = module.Transformer(module.ModelArgs(**TINY))
+    # Built inside the shared `float64` when widened, so every value its constructor computes is
+    # float64's; the run's own widening (`v41.widened`) is the caller's.
+    with float64() if widen else contextlib.nullcontext():
+        net = module.Transformer(module.ModelArgs(**TINY))
     net = net.double() if widen else net.float()
     generator = torch.Generator().manual_seed(seed)
     for name, tensor in net.named_parameters():

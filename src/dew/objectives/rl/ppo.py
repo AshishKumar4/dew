@@ -16,6 +16,7 @@ from dew.distributed.batches import shard_batch
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
+from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import HiddenStates
 from dew.objectives.base import (
     OMITTED,
@@ -59,7 +60,8 @@ RETURNS_KEY = "returns"
 
 
 class ValueHead(nn.Module):
-    """Projects a decoder's hidden states to one float32 value per position.
+    """Projects a decoder's hidden states to one value per position, at least float32: a bf16 or
+    float32 backbone's in float32, a float64 twin's in float64.
 
     Packed rows pass their chains' `segment_ids` and `positions`, so no
     hidden state sees another chain.
@@ -79,7 +81,7 @@ class ValueHead(nn.Module):
         hidden = self.backbone.hidden_states(
             tokens, train=False, segment_ids=segment_ids, positions=positions
         )
-        return Dense(1, dtype=jnp.float32, name="value")(hidden)[..., 0]
+        return Dense(1, dtype=at_least_fp32(hidden.dtype), name="value")(hidden)[..., 0]
 
 
 @dataclass(frozen=True)
@@ -204,7 +206,7 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         return self.actor.build_task(part(variables, "policy"), processor=processor)
 
     def values(self, variables: Variables, batch: Mapping[str, object]) -> jax.Array:
-        """Return the critic's float32 value of each packed id's prefix, placed by `onto_ids`.
+        """Return the critic's value of each packed id's prefix, at least float32, placed by `onto_ids`.
 
         A critic that does not return one value per input position raises
         `ValueError`.
@@ -225,7 +227,7 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
             qk = gathered.get("qk", {})
         if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
-        return onto_ids(batch, values.astype(jnp.float32)), qk
+        return onto_ids(batch, values.astype(at_least_fp32(values.dtype))), qk
 
     def loss(self, variables: Variables, batch, step: Step) -> tuple[PPOStatistics, Aux[Variables]]:
         """Return independent statistics for the actor and the clipped value error.
