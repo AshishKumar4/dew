@@ -170,8 +170,20 @@ BLOOM_CONFIG = ('bloom-560m', 'bigscience/bloom-560m', 'ac2ae5fab2ce3f9f40dc79b5
 BLOOMZ_CONFIG = ('bloomz-560m', 'bigscience/bloomz-560m', 'a2845d7e13dd12efae154a9f1c63fcc2e0cc4b05')
 
 
-TRANSFORMERS_REVISION = "93c8b7b485963a10800c91f55304db6be211c2bd"
-"""The transformers commit (v5.16.1) the fixtures are recorded against."""
+TRANSFORMERS_REVISIONS = {"5.16.1": "93c8b7b485963a10800c91f55304db6be211c2bd",
+                          "5.17.0": "856157a2f3e9594954310df18fdccc31ffddebe9"}
+"""Each transformers release fixtures here are recorded against, by its tag's commit."""
+
+
+def transformers_record() -> dict[str, str]:
+    """The installed transformers as a fixture's source.json records it, its version and that release's
+    commit (`TRANSFORMERS_REVISIONS`): one release, never a version beside another's commit."""
+    import transformers
+
+    version = transformers.__version__
+    if version not in TRANSFORMERS_REVISIONS:
+        raise SystemExit(f"transformers {version} has no recorded commit in TRANSFORMERS_REVISIONS")
+    return {"version": version, "revision": TRANSFORMERS_REVISIONS[version]}
 
 
 def write_config(directory: Path, config: dict) -> None:
@@ -183,13 +195,12 @@ def write_provenance(directory: Path, repo: str | None = None, **more) -> None:
     """`directory`'s source.json: the release `repo` names at its current
     revision where one is named, the transformers it was recorded with and
     `more`."""
-    import transformers
     from huggingface_hub import model_info
 
     released = {} if repo is None else {"released": {"repo": repo, "revision": model_info(repo).sha}}
     (directory / "source.json").write_text(json.dumps({
         **released,
-        "transformers": {"version": transformers.__version__, "revision": TRANSFORMERS_REVISION},
+        "transformers": transformers_record(),
         **more,
     }, indent=1) + "\n")
 
@@ -614,8 +625,6 @@ def write_nemotron_h(*, moe: bool = False, latent: bool = False) -> None:
     MoE uses nonzero selection bias, two routing groups and an ungated shared
     expert; the latent case leaves top-k weights unnormalized.
     """
-    from torch_precision import float64, float64_twin
-
     torch.manual_seed(0)
     name = "nemotron-h-moe-latent-tiny" if latent else "nemotron-h-moe-tiny" if moe else "nemotron-h-tiny"
     config = NemotronHConfig(
@@ -636,12 +645,7 @@ def write_nemotron_h(*, moe: bool = False, latent: bool = False) -> None:
         config._experts_implementation = "eager"
     model = NemotronHForCausalLM(config)
     write_tiny(name, model, seed=2024)
-    directory = FIXTURES / name
-    ids = torch.from_numpy(np.load(directory / "input_ids.npy")).long()
-    wide = float64_twin(model)
-    with float64(), torch.no_grad():
-        truth = wide(input_ids=ids, use_cache=False).logits.double().numpy()
-    np.save(directory / "logits_f64.npy", truth)
+    directory = write_float64_logits(name, model)
     write_provenance(directory, seed=2024)
     (directory / "model.safetensors").chmod(0o644)
 
