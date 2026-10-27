@@ -5,7 +5,8 @@ layout facts alone (`Family`: mosaic_sm90's wgmma; mma.sync's and tcgen05's to c
 its own mainloop, product dependencies and launch DAG; only these primitives are shared.
 
 A launch takes each warpgroup's role (`roles`: a producer issuing the loads beside consumers computing where
-the family's roles split the register file, `Family.consumers`), persistent over the multiprocessors. The
+the family's roles split the register file, `Family.consumers`), persistent over the multiprocessors, a pair
+of them a cluster where they share one operand's blocks (multicast: `ring`'s, `Family.streams`'). The
 consumers meet (`meet`) where one consumer's writes to shared memory are the other's operand, and a tile's
 rows reach global memory through `store_rows`, whose stores have static extents however many rows a tile
 holds. The derivation's shared steps are here too (`held_rows`, `deepest`, `band`, `program_shared`).
@@ -43,6 +44,15 @@ def compiler_params(*, approx_math: bool = False) -> plgpu.CompilerParams:
     rather than share it."""
     return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math,
                                 reduction_scratch_bytes=0)
+
+
+CLUSTER = "cluster"
+"""The axis a launch's cluster of programs runs along (`Family.kernel`'s `cluster`)."""
+
+
+def cluster_index(cluster: int) -> jax.Array | int:
+    """This program's index among its cluster's `cluster` programs (`CLUSTER`): 0 alone."""
+    return lax.axis_index(CLUSTER) if cluster > 1 else 0
 
 
 def meet(halves) -> None:
@@ -207,7 +217,13 @@ class Ring:
     (`release`). The counter runs across a persistent kernel's tiles, so a tile's first loads reuse the
     slots the last tile left, and each tile may take its own number of steps (a causal tile's trip range):
     a slot is free for its first fill and, after, once every consumer released it; the producer drains the
-    ring after its last load (`drain`). Allocated with `ring`, its slot count the allocation's own."""
+    ring after its last load (`drain`). Allocated with `ring`, its slot count the allocation's own.
+
+    A ring a cluster's programs share (`ring`'s `multicast`) takes each step's block once between them:
+    every program's producer loads the same view, its share of the block multicast into each program's slot,
+    and each program's load barrier awaits the whole block. A release arrives at each program's barrier, so
+    a slot is free once every consumer of every program has released it (CUTLASS's PipelineTmaAsync), and
+    the producer's drain holds its program until the others' last releases have reached it."""
     smem: Ref
     full: state_types.AbstractRef
     consumed: state_types.AbstractRef
@@ -217,6 +233,13 @@ class Ring:
         """The ring's slots: its allocation's leading dimension."""
         return int(self.smem.shape[0])
 
+    @property
+    def multicast(self) -> tuple | None:
+        """The cluster axes the ring's loads are multicast along: its release barrier's, a cluster's (`ring`);
+        None where the ring is its program's own."""
+        dtype = self.consumed.dtype
+        return dtype.collective_axes if isinstance(dtype, plgpu_core.ClusterBarrierType) else None
+
     def slot(self, counter):
         """The slot step `counter` (traced, or a Python int) uses."""
         return counter % self.stages
@@ -225,7 +248,7 @@ class Ring:
         """The producer's load of step `counter` from `view`, once its slot is free."""
         slot = self.slot(counter)
         pl.when(counter >= self.stages)(lambda: plgpu.barrier_wait(self.consumed.at[slot]))
-        plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot])
+        plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot], collective_axes=self.multicast)
 
     def acquire(self, counter):
         """A consumer's wait for step `counter`'s load: its slot. Each load is waited for once (a wait takes
@@ -252,12 +275,15 @@ class Ring:
             pl.when(step >= 0)(lambda step=step: plgpu.barrier_wait(self.consumed.at[self.slot(step)]))
 
 
-def ring(block: tuple, dtype, stages: int, *, consumers: int = 1) -> dict:
+def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, multicast: bool = False) -> dict:
     """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype`, a load barrier
-    each, and a release barrier each that `consumers` arrive at. `Ring(**allocated)` once scoped."""
-    return {'smem': plgpu.SMEM((stages, *block), dtype),
-            'full': plgpu.Barrier(num_barriers=stages),
-            'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
+    each, and a release barrier each that `consumers` arrive at, with `multicast` the `consumers` of each
+    program of the cluster (`CLUSTER`), whose programs share the ring's blocks. `Ring(**allocated)` once
+    scoped."""
+    consumed = (plgpu.ClusterBarrier(collective_axes=(CLUSTER,), num_arrivals=consumers, num_barriers=stages)
+                if multicast else plgpu.Barrier(num_arrivals=consumers, num_barriers=stages))
+    return {'smem': plgpu.SMEM((stages, *block), dtype), 'full': plgpu.Barrier(num_barriers=stages),
+            'consumed': consumed}
 
 
 PRODUCER_REGISTERS = 40
@@ -348,16 +374,18 @@ def deepest[C](make: Callable[[int], C], holds: Callable[[C], bool], most: int) 
 
 
 def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
-         group_row_tiles: int | None = None) -> int:
+         group_row_tiles: int | None = None, *, cluster: int = 1) -> int:
     """The planar snake's column tiles a band for a wave of one program a multiprocessor sharing its
     blocks in the L2 (`grid_block_n`): the power of two, at most `column_tiles`, nearest below the band
     that reads each operand fewest times from the device. The rows' and the columns' blocks balanced
     (a wave as near a square of output tiles as their sides allow: √(programs · rows / columns)) or,
     where the rows split into groups of `group_row_tiles` row tiles each, wider while a wave still spans
     each group's row tiles whole (programs over a group's row tiles), whose columns' blocks it then
-    reads once a group."""
-    balanced = math.sqrt(multiprocessors * block_m / block_n)
-    spanning = multiprocessors / group_row_tiles if group_row_tiles else 0.0
+    reads once a group. A cluster of `cluster` multiprocessors is one program, its tile `cluster` row
+    tiles (`group_row_tiles` counts a group's clusters' tiles)."""
+    programs, rows = multiprocessors // cluster, block_m * cluster
+    balanced = math.sqrt(programs * rows / block_n)
+    spanning = programs / group_row_tiles if group_row_tiles else 0.0
     return 1 << (max(1, min(int(max(balanced, spanning)), column_tiles)).bit_length() - 1)
 
 
@@ -501,6 +529,11 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds
     the stages a generated tile takes; a GPU's own (`generation.shared_budget`) bounds the tiles its
     launches keep."""
+    cluster: int = 1
+    """The programs a cluster of the family's launch takes where they read a block in common (`kernel`'s
+    `cluster`), each loading its share of the block multicast into every one's shared memory (`streams`'
+    `multicast`): TMA multicast's pair; 1 where a load reaches its own program's shared memory alone
+    (cp.async's)."""
 
     def programs(self, consumers: int) -> int:
         """The most programs of one launch a multiprocessor's registers hold at once, each `consumers`
@@ -570,10 +603,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
+               interpret: bool, approx_math: bool = True, name: str | None = None,
+               cluster: int = 1) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own, with
         `approx_math` the hardware's approximate exponential and reciprocal (`compiler_params`), named
-        `name` where given (Mosaic names its kernel and its compile reports by it)."""
+        `name` where given (Mosaic names its kernel and its compile reports by it); each of `grid`'s
+        programs a cluster of `cluster` along `CLUSTER` (at most the family's `cluster`)."""
 
     @abc.abstractmethod
     def scoped(self, body, *allocations, streams) -> None:
@@ -586,9 +621,11 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         family streams from a role of its own."""
 
     @abc.abstractmethod
-    def streams(self, blocks: dict, stages: int, consumers: int) -> Allocated:
+    def streams(self, blocks: dict, stages: int, consumers: int,
+                multicast: tuple[str, ...] = ()) -> Allocated:
         """The scoped allocations of a stream of each `blocks[name]` `(shape, dtype)` in `stages` slots read
-        by `consumers` (`opened` once scoped)."""
+        by `consumers` (`opened` once scoped), each stream `multicast` names one the programs of a cluster
+        share, loaded once between them (`kernel`'s `cluster`)."""
 
     @abc.abstractmethod
     def opened(self, allocated: Allocated, views: dict | None = None) -> Opened:
@@ -612,7 +649,8 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         they start), and `store(output, value, ref, place)` stores a consumer's `value` of output `output`
         (`outputs`' `(shape, dtype)`) to `ref` at `place`, `store_rows`' `(row_start, first, stored,
         column, most)`. The family owns the loads, the step counter across tiles, the streams' drain, the
-        outputs' staging and the stores' completion."""
+        outputs' staging and the stores' completion. A cluster's programs run the same tiles: where a stream
+        is multicast (`streams`), `schedule` gives each of them the same `active`, `steps` and view of it."""
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
@@ -789,11 +827,15 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return consumers + 1
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
+               interpret: bool, approx_math: bool = True, name: str | None = None,
+               cluster: int = 1) -> Callable:
+        if cluster > self.cluster:
+            raise ValueError(f"{self.name} launches a cluster of at most {self.cluster}, not {cluster}")
+        clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             num_threads=consumers + 1, thread_name="wg",
                             compiler_params=compiler_params(approx_math=approx_math),
-                            interpret=interpreted(interpret), kernel_name=name)
+                            interpret=interpreted(interpret), kernel_name=name, **clustered)
 
     def scoped(self, body, *allocations, streams) -> None:
         pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
@@ -802,8 +844,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def roles(self, consumers: int, consumer, producer) -> None:
         roles(lax.axis_index("wg"), consumers, consumer, producer)
 
-    def streams(self, blocks: dict, stages: int, consumers: int) -> dict:
-        return {name: ring(shape, dtype, stages, consumers=consumers)
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = ()) -> dict:
+        return {name: ring(shape, dtype, stages, consumers=consumers, multicast=name in multicast)
                 for name, (shape, dtype) in blocks.items()}
 
     def opened(self, allocated: dict, views: dict | None = None) -> dict[str, Ring]:

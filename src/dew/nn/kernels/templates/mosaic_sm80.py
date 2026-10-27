@@ -159,9 +159,10 @@ class Mma(mosaic.Family):
         return plgpu.Layout.MMA_RHS(self.dtype, m_warps=self.m_warps)
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
-        # Its one warpgroup is its consumer, no producer beside it.
-        _one(consumers)
+               interpret: bool, approx_math: bool = True, name: str | None = None,
+               cluster: int = 1) -> Callable:
+        # Its one warpgroup is its consumer, no producer beside it, and no cluster.
+        _one(consumers, clustered=cluster > 1)
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             compiler_params=plgpu.CompilerParams(approx_math=approx_math),
                             interpret=mosaic.interpreted(interpret), kernel_name=name)
@@ -174,8 +175,8 @@ class Mma(mosaic.Family):
         del producer
         consumer(0)
 
-    def streams(self, blocks: dict, stages: int, consumers: int):
-        _one(consumers)
+    def streams(self, blocks: dict, stages: int, consumers: int, multicast: tuple[str, ...] = ()):
+        _one(consumers, clustered=bool(multicast))
         return Pipeline(blocks, stages)
 
     def opened(self, allocated, views: dict | None = None):
@@ -362,8 +363,10 @@ class Mma(mosaic.Family):
         del pending
 
 
-def _one(consumers: int) -> None:
-    """mma.sync's programs take one compute warpgroup (`Mma.consumers`) and no producer."""
-    if consumers != Mma.consumers:
-        raise NotImplementedError(f"an mma.sync program takes one consumer warpgroup, not {consumers}")
+def _one(consumers: int, *, clustered: bool = False) -> None:
+    """mma.sync's programs take one compute warpgroup (`Mma.consumers`), no producer, and no cluster
+    (`clustered`: cp.async loads its own program's shared memory alone)."""
+    if consumers != Mma.consumers or clustered:
+        raise NotImplementedError(f"an mma.sync program takes one consumer warpgroup, not {consumers}, and "
+                                  "no cluster")
 

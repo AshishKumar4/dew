@@ -129,7 +129,8 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out(tiles):
 def test_the_hopper_grouped_matmuls_lower_for_an_h100_at_their_tile_and_a_narrow_pin(launch, trans_rhs):
     """The tile each Mosaic GPU launch derives at an expert layer's shapes (`Template.derived`), and the
     narrowest cooperative tile a pin may name there, of another block shape and schedule, lower for an
-    H100 on the CPU, as a GPU session's compile would, over rows no multiple of 8. The interpreter takes
+    H100 on the CPU, as a GPU session's compile would, over rows no multiple of 8; the forward's on a pair
+    of multiprocessors and on one (its matrix's blocks multicast between the pair). The interpreter takes
     kernels Mosaic GPU's layout inference and TMA descriptors refuse; the GPU's tile gate runs each one
     (test_moe_precision)."""
     # Rows not a multiple of 8, which a TMA descriptor tiles by.
@@ -148,7 +149,12 @@ def test_the_hopper_grouped_matmuls_lower_for_an_h100_at_their_tile_and_a_narrow
         ba, target = launch.bind(*args, **options), generation.gpu_target()
         derived, narrow = launch.derived(ba, target), mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2)
         assert launch.legal(ba, narrow, target) and derived != narrow
-        for config in (derived, narrow):
+        # The forward's rows, 256 a group, span two of its row tiles: a pair (`mosaic_gpu.derived`).
+        pairs = 1 if isinstance(launch, grouped_matmul.MosaicTgmm) else 2
+        assert derived is not None and derived.cluster == pairs
+        paired = dataclasses.replace(narrow, cluster=pairs)
+        assert launch.legal(ba, paired, target)
+        for config in {derived, narrow, paired}:
             jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
 

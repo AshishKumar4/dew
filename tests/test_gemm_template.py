@@ -193,7 +193,11 @@ def test_the_template_holds_check_1_with_its_hooks(generation_name, case):
 
 
 COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2)
-"""A tile two consumer warpgroups compute, on one multiprocessor (the interpreter models no cluster)."""
+"""A tile two consumer warpgroups compute, on one multiprocessor."""
+
+PAIRED = dataclasses.replace(COOPERATIVE, cluster=2)
+"""`COOPERATIVE` on a pair of multiprocessors a cluster, the forward's two row tiles of a group sharing its
+matrix's blocks (the interpreter runs the pair's two programs, each loading the shared block whole)."""
 
 
 MOSAIC_RAN = {'mosaic_gpu'}
@@ -206,17 +210,19 @@ def _kernels(taken) -> set:
 
 
 @runs("sm90")
+@pytest.mark.parametrize("forward", [COOPERATIVE, PAIRED], ids=["one multiprocessor", "a pair"])
 @pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "cast prologue", "row scaled"])
-def test_a_cooperative_tile_holds_check_1_with_its_hooks(case):
-    """The Hopper launches pinned to a cooperative tile, interpreted: each consumer rewrites and multiplies
-    its half of the stage's rows and computes their epilogue, as exact as the plain program from float64
-    truth; the Mosaic kernels ran."""
+def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, forward):
+    """The Hopper launches pinned to a cooperative tile, the forward's alone or a pair's (whose second row
+    tile of a pair past its group's rows stores none of them), interpreted: each consumer rewrites and
+    multiplies its half of the stage's rows and computes their epilogue, as exact as the plain program
+    from float64 truth; the Mosaic kernels ran."""
     spec = CASES[case]
-    pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicTgmm: COOPERATIVE}
+    pinned = {grouped_matmul.MosaicGmm: forward, grouped_matmul.MosaicTgmm: COOPERATIVE}
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
           generation.routes() as taken):
         dew = jax.jit(_drop(_dew(spec, interpret_on_cpu=True)))
-        assert_as_exact(dew, jax.jit(_drop(_plain(spec))), _draw, f"{case} cooperative",
+        assert_as_exact(dew, jax.jit(_drop(_plain(spec))), _draw, f"{case} at {forward}",
                         seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
     assert _kernels(taken) == MOSAIC_RAN
 
@@ -1215,21 +1221,27 @@ def test_a_pin_names_only_a_config_the_launchs_kernel_takes():
                          if isinstance(op, launch)}
 
 
-def test_a_launch_takes_no_pair():
-    """The bundle's rings stream to one multiprocessor: no launch derives a pair, and a pair pinned on the
-    forward is refused rather than launched."""
+@pytest.mark.parametrize("trans_rhs", [False, True], ids=["forward", "input gradient"])
+def test_the_forward_pairs_a_groups_row_tiles_where_its_rows_span_two(trans_rhs):
+    """On an H100 the forward and the input gradient derive a pair of multiprocessors a cluster
+    (`mosaic.Family.cluster`) where a group averages a row tile's rows, each multiprocessor's tile and
+    stages as alone, and one multiprocessor where it averages fewer; an A100's mma.sync bundle takes no
+    cluster at any rows. Each derived tile is legal."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    args = (bf16((ROWS, DEPTH)), bf16((3, DEPTH, WIDTH)), jax.ShapeDtypeStruct((3,), jnp.int32))
+    groups, depth, width = 8, 2048, 1536
     launch = grouped_matmul.MosaicGmm()
-    with generation.assumed("sm90"):
-        compiled = launch.space(launch.bind(*args, out_dtype="bfloat16", trans_rhs=False, interpret=False))
-    assert compiled and not any(tile.cluster == 2 for tile in compiled)
-    with pytest.raises(ValueError):
-        mosaic_gpu.gmm(jnp.zeros((ROWS, DEPTH), jnp.bfloat16), jnp.zeros((3, DEPTH, WIDTH), jnp.bfloat16),
-                       jnp.asarray([100, 100, 107]), tiles=mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2,
-                                                                             cluster=2),
-                       transpose_rhs=False, out_dtype=jnp.bfloat16, multiprocessors=2,
-                       interpret=grouped_matmul.INTERPRETED)
+    derived = {}
+    for name, rows in (("sm90", 8 * 512), ("sm90", 8 * 100), ("sm80", 8 * 512)):
+        with generation.assumed(name):
+            target = generation.gpu_target()
+            ba = launch.bind(bf16((rows, width if trans_rhs else depth)), bf16((groups, depth, width)),
+                             jax.ShapeDtypeStruct((groups,), jnp.int32), out_dtype="bfloat16",
+                             trans_rhs=trans_rhs, interpret=False)
+            derived[name, rows] = launch.derived(ba, target)
+            assert launch.legal(ba, derived[name, rows], target)
+    paired, alone = derived["sm90", 8 * 512], derived["sm90", 8 * 100]
+    assert (paired.cluster, alone.cluster, derived["sm80", 8 * 512].cluster) == (2, 1, 1)
+    assert (paired.block_m, paired.block_n, paired.stages) == (alone.block_m, alone.block_n, alone.stages)
 
 
 def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():

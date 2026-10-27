@@ -599,16 +599,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """Whether `config` runs the call on `target` (`Template.legal`): of the launch's family there, in
         its granularity (whole roles of rows for each consumer, whole column units, one of its depths, at
-        most its consumers, one multiprocessor a tile) with a ring of two stages at least (a walk keeping
-        one step's products in flight holds its slot while the next step's loads fill another), its blocks
-        dividing the call's extents, and a one-dimensional side operand's block, copied untiled, at most
-        one copy's extent along its axis (`mosaic.Family.copy_extent`)."""
+        most its consumers, at most the programs its registers hold) with a ring of two stages at least (a
+        walk keeping one step's products in flight holds its slot while the next step's loads fill
+        another), its blocks dividing the call's extents, its cluster at most the family's
+        (`mosaic.Family.cluster`), and a one-dimensional side operand's block, copied untiled, at most one
+        copy's extent along its axis (`mosaic.Family.copy_extent`). A cluster's legality is each
+        multiprocessor's: its staged bytes and registers are a tile's alone."""
         family = self._family(ba, target)
-        if family is None or config.family != family.name or not self._divides(ba, config):
+        if (family is None or config.family != family.name or config.cluster > family.cluster
+                or not self._divides(ba, config)):
             return False
         dtype = ba.arguments['tokens'].dtype
         if (config.warpgroups > family.consumers or config.programs > family.programs(config.warpgroups)
-                or config.cluster != 1 or config.stages < 2
+                or config.stages < 2
                 or config.block_m % (family.role_rows * config.warpgroups)
                 or config.block_n % family.column_unit(dtype) or config.block_k not in family.depths(dtype)):
             return False
@@ -682,8 +685,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def _launched(self, config: mosaic_gpu.Tiles, interpret: bool) -> int:
         """The programs the persistent kernel launches: the tile's programs on each multiprocessor
-        (`Tiles.programs`); the interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret)."""
-        return 1 if interpret else _multiprocessors(generation.gpu_target()) * config.programs
+        (`Tiles.programs`); the interpreter runs one cluster (jax/_src/pallas/mosaic_gpu/interpret), one
+        program alone or a pair's two (`Tiles.cluster`)."""
+        return config.cluster if interpret else _multiprocessors(generation.gpu_target()) * config.programs
 
 
 @dataclasses.dataclass(frozen=True)
@@ -739,11 +743,12 @@ class MosaicTgmm(_Mosaic):
         return rows % config.block_m == 0 and width % config.block_n == 0
 
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
-        """`_Mosaic.legal`, a family whose products read registers loading its transposed stage in whole
-        roles of rows (the step, `block_k`: a 32-row stage failed to cast to the 64-row layout, ns-regs2),
-        and with `exact_sums` a second fp32 accumulator, the running sum beside a step's, in each
-        consumer's live set (`mosaic.tile_registers`) within its family's registers."""
-        if not super().legal(ba, config, target):
+        """`_Mosaic.legal` on one multiprocessor a tile (`mosaic_gpu.tgmm` takes no pair), a family whose
+        products read registers loading its transposed stage in whole roles of rows (the step, `block_k`: a
+        32-row stage failed to cast to the 64-row layout, ns-regs2), and with `exact_sums` a second fp32
+        accumulator, the running sum beside a step's, in each consumer's live set (`mosaic.tile_registers`)
+        within its family's registers."""
+        if config.cluster != 1 or not super().legal(ba, config, target):
             return False
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
         if family.operands_in_registers and config.block_k % family.role_rows:
