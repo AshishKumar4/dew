@@ -1209,6 +1209,19 @@ def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_pa
                 indexed_recording({**stored, "site.truth.y": truth.astype(narrow)}, "site", seeds)
 
 
+def _squared_case(first: int):
+    """A recording test's draw, 64 normal fp32 values a seed from `first` on, and its evaluation: the
+    reference's `x x - 1` in fp32 beside its float64 truth."""
+    def draw(seed):
+        return {"x": np.random.default_rng(first + seed).normal(size=(64,)).astype(np.float32)}
+
+    def evaluate(inputs):
+        x = inputs["x"]
+        return {"y": x * x - np.float32(1)}, {"y": x.astype(np.float64) ** 2 - 1}
+
+    return draw, evaluate
+
+
 @pytest.mark.parametrize("proxy", [True, False])
 def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path, proxy):
     """tools/recorded_references.py records a reference over the seeds its own recording resolves, and
@@ -1217,12 +1230,7 @@ def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path
 
     recorder = load("recorded_references")
 
-    def draw(seed):
-        return {"x": np.random.default_rng(100 + seed).normal(size=(64,)).astype(np.float32)}
-
-    def evaluate(inputs):
-        x = inputs["x"]
-        return {"y": x * x - np.float32(1)}, {"y": x.astype(np.float64) ** 2 - 1}
+    draw, evaluate = _squared_case(100)
 
     def squared(inputs):
         return {"y": inputs["x"] * inputs["x"] - 1}
@@ -1275,12 +1283,7 @@ def test_a_recording_keeps_the_confirmed_count_where_the_proxy_planned_more():
 
     recorder = load("recorded_references")
 
-    def draw(seed):
-        return {"x": np.random.default_rng(200 + seed).normal(size=(64,)).astype(np.float32)}
-
-    def evaluate(inputs):
-        x = inputs["x"]
-        return {"y": x * x - np.float32(1)}, {"y": x.astype(np.float64) ** 2 - 1}
+    draw, evaluate = _squared_case(200)
 
     def one_element(inputs):
         return {"y": jnp.sum(inputs["x"] * inputs["x"])[None]}
@@ -1308,12 +1311,7 @@ def test_a_recording_of_outputs_alone_draws_its_inputs_again(tmp_path):
 
     recorder = load("recorded_references")
 
-    def draw(seed):
-        return {"x": np.random.default_rng(300 + seed).normal(size=(64,)).astype(np.float32)}
-
-    def evaluate(inputs):
-        x = inputs["x"]
-        return {"y": x * x - np.float32(1)}, {"y": x.astype(np.float64) ** 2 - 1}
+    draw, evaluate = _squared_case(300)
 
     def squared(inputs):
         return {"y": inputs["x"] * inputs["x"] - 1}
