@@ -1893,11 +1893,22 @@ def float64_forward(module, variables, *args, **kwargs):
     (`float64_terms`): the module computing in float64 over its variables
     widened, integer inputs as they are, `kwargs` given as they are. A
     reference's float64 truth written elsewhere (a fixture's) is sized by
-    these terms, what Dew's own float64 sums add."""
+    these terms, what Dew's own float64 sums add.
+
+    Only `module`'s own `dtype` is widened: a module holding another (a
+    multimodal wrapper's language model) that keeps its own dtype computes
+    that part in it, so an output that is not float64 is refused, and such a
+    model is passed widened whole (`ModelConfig.with_dtype`)."""
     with jax.enable_x64(new_val=True):
         wide = module.clone(dtype=jnp.float64)
-        return float64_terms(lambda held, *given: wide.apply(held, *given, **kwargs),
-                             *widened((variables, *args)))
+        outputs, terms = float64_terms(lambda held, *given: wide.apply(held, *given, **kwargs),
+                                       *widened((variables, *args)))
+    narrow = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(outputs)
+                     if jnp.issubdtype(leaf.dtype, jnp.floating) and leaf.dtype != jnp.float64})
+    if narrow:
+        raise ValueError(f"{type(module).__name__} widened to float64 still gives {', '.join(narrow)} "
+                         "outputs: a module it holds keeps its own dtype; widen the whole model")
+    return outputs, terms
 
 
 def float64_terms(fn, *args):

@@ -13,7 +13,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Replaying, dataset
-from reference_error import assert_as_exact, over_windows, windows, with_gradients
+from reference_error import assert_as_exact, over_windows, widened, windows, with_gradients
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.continuum import ContinuumLevel
@@ -67,8 +67,9 @@ three, past gradient descent's 2 (the configurations below it peak at 1.64), and
 by up to 10^4 over its windows, so one draw's error is too heavy-tailed for its paired ratio to narrow
 within 512 seeds: each seed pools this many independent draws. The corner's one-token window (growth
 to 10^13 over eleven steps) and its outer gradient do not narrow by pooling (at 128 draws a seed the
-documents gradient's interval still spans [0.45, 1.95] around a ratio below 1), and await the gate's
-rule for a draw's conditioning (ledger)."""
+documents gradient's interval still spans [0.45, 1.95] around a ratio below 1): ledger 1714 holds their
+end-to-end contracts open, and the one-token window's error each window adds is held from the level
+the window starts at (`test_each_window_steps_from_its_level_as_the_literal_loop`)."""
 
 
 def corner(rate: float, scale: float, window: int) -> bool:
@@ -95,12 +96,14 @@ def drawn_variables(seed: int, model: CausalTransformer = MODEL, scale: float = 
     return jax.tree.map(lambda leaf: (scale * rng.standard_normal(leaf.shape)).astype(np.float32), shapes)
 
 
-def equation_71(model, variables, hidden, targets, weights, fields, adaptation: ChunkAdaptation):
+def equation_71(model, variables, hidden, targets, weights, fields, adaptation: ChunkAdaptation, *,
+                levels: bool = False):
     """Equation 71 read literally, token by token along each row: a run of a document's real tokens
     starts from the level's start; each real token reads its window's level, and at the first real
     token of the run's next window the level steps by `rate` times the summed gradient of the window's
     weighted next-token losses; a padding slot reads the level open at it and weighs nothing. A slot is
-    real where the mask marks it and its document is not 0, as every reader of rows takes it. The
+    real where the mask marks it and its document is not 0, as every reader of rows takes it. With
+    `levels`, also the level each token reads. The
     losses are each token's log-softmax, apart from Dew's own cross entropy."""
     params = variables["params"]
     start = params["continuum"]
@@ -142,7 +145,8 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
         loss, pull = jax.vjp(lambda at: token_loss(at, state, target), level)
         (gradient,) = pull(jnp.where(here_real, weight, 0).astype(loss.dtype))
         summed = jax.tree.map(jnp.add, summed, gradient)
-        return (level, summed, count + here_real, opened, document, begun), loss
+        read = (loss, level) if levels else loss
+        return (level, summed, count + here_real, opened, document, begun), read
 
     def row_losses(row_hidden, row_targets, row_weights, row_real, row_documents):
         first = (start, zeros, jnp.int32(0), jnp.int32(-1), jnp.int32(0), jnp.zeros((), bool))
@@ -151,6 +155,31 @@ def equation_71(model, variables, hidden, targets, weights, fields, adaptation: 
         return losses
 
     return jax.vmap(row_losses)(hidden, targets, weights, real, documents)
+
+
+LOCAL_SEEDS = 8
+"""Check 1's declared seeds for the windows started from their float64 levels (`seeds_for`, paired)."""
+
+
+def local_segments(seed: int, window: int, rate: float, scale: float = 0.5):
+    """A draw's windows each started where the literal loop in float64 stands (`equation_71`'s levels),
+    rounded to float32: every window of a one-document row with one after it, its tokens and the next
+    window's, each its own row with its own level, so a window's error starts from no other window's."""
+    variables, hidden, targets, weights = draw(seed, scale=scale)
+    adaptation = ChunkAdaptation(window=window, rate=rate)
+    with jax.enable_x64(new_val=True):
+        loop = jax.jit(lambda *inputs: equation_71(MODEL, *inputs, {}, adaptation, levels=True)[1])
+        levels = jax.device_get(loop(*widened((variables, hidden, targets, weights))))
+    picked = [(row, first) for row in range(len(targets)) for first in range(0, LENGTH - window, window)]
+
+    def segment(value, row, first):
+        return value[row, first:first + 2 * window]
+
+    each = jax.tree.map(lambda leaf: np.broadcast_to(leaf, (len(picked), *leaf.shape)).copy(), variables)
+    each["params"]["continuum"] = jax.tree.map(
+        lambda leaf: np.stack([np.asarray(leaf[row, first], np.float32) for row, first in picked]), levels)
+    return (each, *(np.stack([segment(value, row, first) for row, first in picked])
+                    for value in (hidden, targets, weights)))
 
 
 LAYOUTS = ("documents", "packed", "padded")
@@ -290,6 +319,32 @@ def test_training_differentiates_through_every_step(kind, rate, scale):
     arms = pooled(differentiated(dew), differentiated(reference), gradient_draw, rate, scale, 3)
     assert_as_exact(*arms, f"the gradient through the windows' steps over {kind}, rate {rate}, scale {scale}",
                     seeds=GRADIENT_SEEDS[kind, rate, scale])
+
+
+def test_each_window_steps_from_its_level_as_the_literal_loop():
+    """At the corner's one-token window (0.5 N(0, 1) weights stepped by a half), each window and the
+    next, started from the level the literal loop in float64 stands at there rounded to float32
+    (`local_segments`), on par with the literal loop from the same level (check 1): the error a window
+    and its step add, the amplification across windows cancelled. Supplemental evidence; ledger 1714
+    holds the corner's end-to-end and outer-gradient contracts open. Validated over 12 runs of 16 seeds:
+    a logsumexp twin of the loop passed 11, Dew 12, and a Dew 1.6 times the loop's error or stepping 2^-10
+    off its rate failed all 12."""
+    adaptation = ChunkAdaptation(window=1, rate=0.5)
+
+    def scored(scores):
+        def one(variables, hidden, targets, weights):
+            return scores(variables, hidden[None], targets[None], weights[None])[0]
+        return jax.jit(jax.vmap(one))
+
+    def dew(variables, hidden, targets, weights):
+        return adapted_scores(MODEL, variables, hidden, targets, weights, {}, adaptation, predict=False,
+                              logits=False).losses
+
+    def reference(variables, hidden, targets, weights):
+        return equation_71(MODEL, variables, hidden, targets, weights, {}, adaptation)
+
+    assert_as_exact(scored(dew), scored(reference), lambda seed: local_segments(seed, 1, 0.5),
+                    "each one-token window from its float64 level at the corner", seeds=LOCAL_SEEDS)
 
 
 def test_a_level_at_its_start_is_the_identity():

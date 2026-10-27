@@ -752,7 +752,13 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable, *,
     def _(primals, tangents):
         output, saved = produced(*primals)
         # `saved` reaches only `pulled`, whose tangent reads the operands' instead.
-        return (output, saved), (jax.jvp(portable, primals, tangents)[1], jax.tree.map(jnp.zeros_like, saved))
+        return (output, saved), (jax.jvp(portable, primals, tangents)[1], jax.tree.map(tangent_zero, saved))
+
+    def tangent_zero(leaf):
+        # A leaf with no tangent space (a bool mask, an index) takes float0's zero, as JAX requires of it.
+        if jnp.issubdtype(leaf.dtype, jnp.inexact):
+            return jnp.zeros_like(leaf)
+        return np.zeros(leaf.shape, jax.dtypes.float0)
 
     @functools.partial(jax.custom_jvp, nondiff_argnums=(3,))
     def pulled(saved, operands, cotangent, live):

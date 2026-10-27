@@ -1264,3 +1264,41 @@ def test_a_transitions_kl_and_its_derivatives_hold_at_each_reviewed_input(case):
                            _kl_truth(*inputs), _kl_bounds(*inputs), case)
 
 
+
+
+def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
+    """A residual of 2**64 under a variance of 2**126: its square passes float32's largest, its square
+    over the variance is 4, and the density is finite as the reference's is, the half-Mahalanobis term
+    taken range-safe as the KL takes it (ledger 1874)."""
+    from dew.sampling.flow import GaussianTransition
+
+    transition = GaussianTransition(jnp.zeros((1, 1), jnp.float32), jnp.asarray([2.0 ** 126], jnp.float32))
+    density = np.asarray(transition.log_prob(jnp.full((1, 1), 2.0 ** 64, jnp.float32)))
+    assert np.isfinite(density).all()
+    # The density's float32 formula on the standardized square, 4, and its float64 value.
+    half_log = np.float32(0.5) * (np.log(np.float32(2 * math.pi)) + np.float32(126) * np.log(np.float32(2)))
+    truth = -(2 + 0.5 * (math.log(2 * math.pi) + 126 * math.log(2)))
+    assert_as_exact_as_the_reference(density, [-(np.float32(2) + half_log)], [truth],
+                                     "an overflowing residual")
+    # Differentiable at every order, as the plain density: at unit variance its Hessian in the mean is -I.
+    unit = GaussianTransition(jnp.zeros((1, 3), jnp.float32), jnp.ones((1,), jnp.float32))
+    def density(mean):
+        return GaussianTransition(mean, unit.variance).log_prob(jnp.ones((1, 3), jnp.float32)).sum()
+
+    for second in (jax.jacfwd(jax.jacrev(density)), jax.jacrev(jax.jacfwd(density))):
+        np.testing.assert_array_equal(np.asarray(second(unit.mean)).reshape(3, 3), -np.eye(3))
+    # Finite wherever the term is: a residual of 2**64 under unit variance, half its square 2**127, and
+    # a value of 2**127 beside a mean of -2**127 under float32's largest variance.
+    for value, mean, variance, term in ((2.0 ** 64, 0.0, 1.0, 2.0 ** 127),
+                                        (2.0 ** 127, -(2.0 ** 127), float(np.finfo(np.float32).max),
+                                         2.0 ** 255 / float(np.finfo(np.float32).max))):
+        edge = GaussianTransition(jnp.full((1, 1), mean, jnp.float32), jnp.asarray([variance], jnp.float32))
+        density = edge.log_prob(jnp.full((1, 1), value, jnp.float32))
+        truth = -(term + 0.5 * (math.log(2 * math.pi) + math.log(variance)))
+        # The term rounds once, a quotient of powers of two over a significand, and the log terms fall
+        # below its last place: the float32 rounding of the float64 density.
+        np.testing.assert_array_equal(np.asarray(density), [np.float32(truth)])
+        # Its derivative in the mean is finite there too, the residual over the variance.
+        slope = jax.grad(lambda centre, edge=edge, value=value: edge.replace(mean=centre).log_prob(
+            jnp.full((1, 1), value, jnp.float32)).sum())(edge.mean)
+        np.testing.assert_array_equal(np.asarray(slope), [[np.float32((value - mean) / variance)]])
