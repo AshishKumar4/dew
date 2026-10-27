@@ -63,14 +63,15 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     checked refused and its gradient on the mainloop's rule (`on_the_mainloop`)."""
     hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
 
+    # Plain functions: the gate compiles both arms alike (`reference_error._arms`).
     def compiled(fn):
         def traced(*arguments):
             with recomputing(REMATS[remat]):
                 return with_gradients(restarted(fn, case))(*arguments)
 
-        return jax.jit(traced)
+        return traced
 
-    truth = jax.jit(with_gradients(restarted(functools.partial(token_by_token, hooks), case)))
+    truth = with_gradients(restarted(functools.partial(token_by_token, hooks), case))
     reference = truth if dtype == jnp.float32 else compiled(functools.partial(chunk_on, 'fla', hooks))
     on = on_the_mainloop(hooks, case, dtype)
     if on is None:
