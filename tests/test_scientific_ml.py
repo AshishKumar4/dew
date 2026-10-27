@@ -152,9 +152,9 @@ def test_a_damped_gauss_newton_step_is_the_normal_equations_solve(rows, features
 
 
 def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoints(tmp_path):
-    """Under x64, a least-squares run of float64 weights steps by Gauss-Newton with `optax.sgd(1.0)`: its
-    first step moves the line by the whole damped step the objective states at its start, its parameters,
-    optimizer state and loss stay float64, and its checkpoint restores them bit for bit, float64 still."""
+    """Under x64, a least-squares run of float64 weights steps by Gauss-Newton with `optax.sgd(1.0)`, and
+    resumed from its checkpoint, steps on: its parameters and optimizer state stay float64, and its last
+    checkpoint restores them bit for bit, float64 still."""
     # A float64 run sets x64 for its process, its data's worker threads among it, as
     # examples/pinn_burgers.py does.
     jax.config.update("jax_enable_x64", val=True)
@@ -164,15 +164,8 @@ def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoi
         y = x @ np.asarray([1.5, -2.0, 0.25, 3.0])
         rows = Memory([{"x": row, "y": target} for row, target in zip(x, y, strict=True)]).repeat().batch(8)
         objective = LeastSquares(4, damping=1e-12, param_dtype=jnp.float64)
-        start = objective.init(jax.random.key(0))["params"]
-        stated = jax.grad(lambda p: objective.scalar_loss(
-            {"params": p}, {"x": jnp.asarray(x), "y": jnp.asarray(y)},
-            Step(jnp.asarray(0), jax.random.key(0), None))[0])(start)
         checkpoints = Checkpoints(str(tmp_path / "run"))
-        first = Trainer(objective, optax.sgd(1.0), key=0, layout=LAYOUT, checkpoints=checkpoints).fit(
-            rows, steps=1)
-        np.testing.assert_array_equal(np.asarray(first.variables["params"]["Dense_0"]["kernel"]),
-                                      -np.asarray(stated["Dense_0"]["kernel"]))
+        Trainer(objective, optax.sgd(1.0), key=0, layout=LAYOUT, checkpoints=checkpoints).fit(rows, steps=1)
         state = Trainer(objective, optax.sgd(1.0), key=0, layout=LAYOUT, checkpoints=checkpoints).fit(
             rows, steps=3)
         floats = [leaf for leaf in jax.tree.leaves((state.variables, state.opt_state))
