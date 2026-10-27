@@ -38,7 +38,8 @@ from reference_error import (
     truth_sketch,
 )
 
-__all__ = ["merge_shards", "provenance", "record_case", "record_reference", "record_shard", "save"]
+__all__ = ["merge_shards", "provenance", "record_case", "record_reference", "record_shard", "save",
+           "with_pilots"]
 
 
 def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
@@ -174,18 +175,27 @@ def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict
         raise ValueError(f"{label}: {confirmed} seeds resolve, and their redraw needs {kept} seeds; the "
                          f"shards hold {len(drawn)}")
     result = _finished(label, joined, confirmed)
-    if pilots:
-        held = _joined(label, pilots, SIZING_FROM)
-        pilot = _kept(label, held, len(held[f"{label}.drawn"]))
-        whole = {key for key in result if _whole(label, key)}
-        if {key for key in pilot if _whole(label, key)} != whole or any(
-                not np.array_equal(pilot[key], result[key]) for key in whole):
-            raise ValueError(f"{label}: the pilots' leaves are not the verdict's in name, shape and dtype")
-        result.update({f"{label}.pilot.{key.removeprefix(f'{label}.')}": value for key, value in pilot.items()
-                       if not _whole(label, key)})
-    print(f"{label}: declared {confirmed} seeds; merged {kept} draws' evidence"
-          + (f" and {len(held[f'{label}.drawn'])} pilots" if pilots else ""), flush=True)
-    return result
+    print(f"{label}: declared {confirmed} seeds; merged {kept} draws' evidence", flush=True)
+    return with_pilots(label, result, pilots) if pilots else result
+
+
+def with_pilots(label: str, recording: Mapping[str, np.ndarray],
+                shards: Sequence[Mapping[str, np.ndarray]]) -> dict[str, np.ndarray]:
+    """`recording`, a summarized one (`record_case`'s summary or `merge_shards`'), with the pilots of
+    `shards` (`record_shard` over seeds from SIZING_FROM on): joined in order from SIZING_FROM, every one
+    kept, under `<label>.pilot.`, their leaves the recording's in name, shape and dtype. A recording that
+    holds pilots already is refused, as are pilots that leave a seed out of their run."""
+    if f"{label}.pilot.input_digest" in recording:
+        raise ValueError(f"{label}: the recording holds pilots already")
+    held = _joined(label, shards, SIZING_FROM)
+    pilot = _kept(label, held, len(held[f"{label}.drawn"]))
+    whole = {key for key in recording if _whole(label, key)}
+    if {key for key in pilot if _whole(label, key)} != whole or any(
+            not np.array_equal(pilot[key], recording[key]) for key in whole):
+        raise ValueError(f"{label}: the pilots' leaves are not the verdict's in name, shape and dtype")
+    print(f"{label}: with {len(held[f'{label}.drawn'])} pilots", flush=True)
+    return {**recording, **{f"{label}.pilot.{key.removeprefix(f'{label}.')}": value
+                            for key, value in pilot.items() if not _whole(label, key)}}
 
 
 def _joined(label: str, shards: Sequence[Mapping[str, np.ndarray]], first: int) -> dict[str, np.ndarray]:

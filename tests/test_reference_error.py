@@ -969,6 +969,13 @@ def test_a_recording_with_pilot_shards_sizes_paired_on_them_as_the_live_draws_do
         straddling = recorder.record_shard("site", draw, evaluate, range(SIZING_FROM - 1, SIZING_FROM + 1))
         with pytest.raises(ValueError):
             recorder.merge_shards("site", [*shards, straddling])
+        # Pilots joined onto a recording made whole before them are the pilots merged with its shards.
+        joined = recorder.with_pilots("site", whole, shards[::2])
+        assert joined.keys() == merged.keys()
+        for key, value in merged.items():
+            np.testing.assert_array_equal(joined[key], value, err_msg=key)
+        with pytest.raises(ValueError):
+            recorder.with_pilots("site", joined, shards[::2])
 
         seeds = int(merged["site.seeds"])
         drawn, reference, truth = indexed_recording(merged, "site", seeds, inputs_of=draw, truth_fn=product)
