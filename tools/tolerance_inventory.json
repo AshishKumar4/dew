@@ -90,7 +90,7 @@
    "lane": "Training"
   },
   "tests/test_clip_metrics.py": {
-   "comparisons": 10,
+   "comparisons": 8,
    "lane": "Training"
   },
   "tests/test_codecs.py": {
@@ -466,7 +466,7 @@
    "lane": "Kernels"
   },
   "tests/test_mtp.py": {
-   "comparisons": 9,
+   "comparisons": 3,
    "lane": "Training"
   },
   "tests/test_multimodal_model.py": {
@@ -474,7 +474,7 @@
    "lane": "Kernels"
   },
   "tests/test_multiprocess.py": {
-   "comparisons": 21,
+   "comparisons": 18,
    "lane": "Training"
   },
   "tests/test_muse_glimmer.py": {
