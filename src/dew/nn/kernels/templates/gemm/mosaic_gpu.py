@@ -54,7 +54,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90, resources
-from dew.nn.kernels.templates.gemm import rows_padded
+from dew.nn.kernels.templates.gemm import cost, rows_padded
 
 FAMILY: mosaic.Family = mosaic_sm90.WGMMA
 """Hopper's warpgroup MMA bundle, a wgmma tile's (`family_of`)."""
@@ -489,9 +489,12 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                       streams=family.streams(blocks, tiles.stages, consumers,
                                              multicast=('matrix',) if pair > 1 else ()))
 
-    kernel = family.kernel(body, out_type=tuple(jax.ShapeDtypeStruct((m, n), dtype) for dtype in dtypes),
+    out_type = tuple(jax.ShapeDtypeStruct((m, n), dtype) for dtype in dtypes)
+    kernel = family.kernel(body, out_type=out_type,
                            grid=(multiprocessors // pair,), grid_names=("programs",), consumers=consumers,
-                           interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair)
+                           interpret=interpret, approx_math=False, name="dew_gmm", cluster=pair,
+                           cost=cost(2 * m * n * k, lhs, rhs, *prologue_operands, *epilogue_operands,
+                                      *out_type))
     return kernel(table, lhs, rhs, *prologue_operands, *epilogue_operands)
 
 
@@ -693,9 +696,11 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
         family.scoped(scope, *allocations.staged,
                       streams=family.streams(allocations.blocks, tiles.stages, consumers))
 
-    kernel = family.kernel(body, out_type=jax.ShapeDtypeStruct((g, m, n), out_dtype),
+    out_type = jax.ShapeDtypeStruct((g, m, n), out_dtype)
+    kernel = family.kernel(body, out_type=out_type,
                            grid=(multiprocessors,), grid_names=("programs",), consumers=consumers,
-                           interpret=interpret, approx_math=False, name="dew_tgmm")
+                           interpret=interpret, approx_math=False, name="dew_tgmm",
+                           cost=cost(2 * lhs.shape[0] * m * n, lhs, rhs, *prologue_operands, out_type))
     return kernel(*groups, lhs, rhs, *prologue_operands)
 
 

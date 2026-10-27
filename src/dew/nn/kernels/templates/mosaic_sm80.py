@@ -161,12 +161,12 @@ class Mma(mosaic.Family):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1) -> Callable:
+               cluster: int = 1, cost: pl.CostEstimate | None = None) -> Callable:
         # Its one warpgroup is its consumer, no producer beside it, and no cluster.
         _one(consumers, clustered=cluster > 1)
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             compiler_params=plgpu.CompilerParams(approx_math=approx_math),
-                            interpret=mosaic.interpreted(interpret), kernel_name=name)
+                            interpret=mosaic.interpreted(interpret), kernel_name=name, cost_estimate=cost)
 
     def scoped(self, body, *allocations, streams) -> None:
         pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)

@@ -499,11 +499,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1) -> Callable:
+               cluster: int = 1, cost: pl.CostEstimate | None = None) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own, with
         `approx_math` the hardware's approximate exponential and reciprocal (`compiler_params`), named
         `name` where given (Mosaic names its kernel and its compile reports by it); each of `grid`'s
-        programs a cluster of `cluster` along `CLUSTER` (at most the family's `cluster`)."""
+        programs a cluster of `cluster` along `CLUSTER` (at most the family's `cluster`); its `cost`, the
+        work it states to XLA and to Dew's FLOP count (the custom call's `cost_estimate_json`)."""
 
     @abc.abstractmethod
     def scoped(self, body, *allocations, streams) -> None:
@@ -723,14 +724,15 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None,
-               cluster: int = 1) -> Callable:
+               cluster: int = 1, cost: pl.CostEstimate | None = None) -> Callable:
         if cluster > self.cluster:
             raise ValueError(f"{self.name} launches a cluster of at most {self.cluster}, not {cluster}")
         clustered = {'cluster': (cluster,), 'cluster_names': (CLUSTER,)} if cluster > 1 else {}
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             num_threads=consumers + 1, thread_name="wg",
                             compiler_params=compiler_params(approx_math=approx_math),
-                            interpret=interpreted(interpret), kernel_name=name, **clustered)
+                            interpret=interpreted(interpret), kernel_name=name, cost_estimate=cost,
+                            **clustered)
 
     def scoped(self, body, *allocations, streams) -> None:
         pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,

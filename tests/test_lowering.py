@@ -37,7 +37,7 @@ from dew.nn.kernels.generation import (
     triton_runs,
 )
 from dew.nn.kernels.templates import bundles
-from dew.training._lowering import triton_kernels
+from dew.training._lowering import kernel_report, triton_kernels
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -96,6 +96,110 @@ def chosen(generation: str, probe: str) -> set[tuple[str, str]]:
             if (choice, kernel) in FAMILIES and FAMILIES[choice, kernel][0] == probe}
 
 
+GMM = 2 * 256 * 128 * 128
+"""The multiply-adds of each grouped product of the step `_reported` lowers: forward, input and weight
+gradients of 256 rows by 128 by 128."""
+
+
+def _reported(generation: str):
+    """A grouped GEMM's forward and backward beside a Triton kernel, lowered on this CPU for `generation`'s
+    GPU, with the routes its dispatches reported (`routes`)."""
+    from dew.nn.kernels.templates.gemm import template
+
+    def step(x, w, sizes):
+        def loss(x, w):
+            return template.gemm(x, w, sizes, out_dtype=jnp.bfloat16).astype(jnp.float32).sum()
+
+        return jax.grad(loss, argnums=(0, 1))(x, w), _doubled(x)
+
+    x, w = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh), routes() as found:
+        lowered = jax.jit(step).trace(x, w, sizes).lower(lowering_platforms=("cuda",))
+    return lowered, found
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_steps_kernel_report_names_its_launches_and_the_flop_count_sizes_them_as_it_does(generation):
+    """A grouped GEMM's step lowered for the GPU (row 1895): its kernel report joins the dispatches' routes
+    with the program's launches, the template's by kernel name with the FLOPs each states, a Triton
+    launch's stating none, and the FLOP count of the same program counts the stated FLOPs and leaves out,
+    as unsized, the launches the report does. On an H100 the GEMM's forward and weight gradient are the
+    template's launches, `dew_gmm` and `dew_tgmm`, which its routes alone do not show."""
+    from dew.telemetry.instrumentation import hlo_flops
+
+    lowered, found = _reported(generation)
+    record = kernel_report(found, lowered).record()
+    taken = {(entry["choice"], entry["kernel"]) for entry in record["routes"]}
+    assert ("grouped_matmul", "mosaic_gpu") in taken
+    launches = {entry["name"]: entry for entry in record["launches"]}
+    templated = [entry for entry in record["launches"] if entry["kind"] == "mosaic_gpu"]
+    assert all(entry["flops"] == entry["calls"] * GMM for entry in templated)
+    assert launches["doubled"]["kind"] == "triton" and launches["doubled"]["flops"] is None
+    if generation == "sm90":
+        assert {"dew_gmm", "dew_tgmm"} <= {entry["name"] for entry in templated}
+    unstated = sum(entry["calls"] for entry in record["launches"] if entry["flops"] is None)
+    assert record["unsized"] == unstated
+    flops = hlo_flops(lowered.as_text(dialect="hlo"))
+    assert flops is not None
+    assert (flops.hardware, flops.unsized) == (sum(entry["flops"] for entry in templated), unstated)
+
+
+def test_a_cutlass_grouped_gemm_is_sized_by_its_shapes_and_an_unknown_call_is_unsized():
+    """dew_cutlass's grouped GEMMs, lowered for the GPU, count each token row's product once in the FLOP
+    count and in the kernel report; a custom call nothing sizes counts as an unsized launch in both."""
+    from dew.telemetry.instrumentation import hlo_flops
+
+    tokens, kernel = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 64),
+                                                                                          jnp.bfloat16)
+    cotangent, sizes = jax.ShapeDtypeStruct((256, 64), jnp.bfloat16), jax.ShapeDtypeStruct((2,), jnp.int32)
+
+    def step(tokens, kernel, cotangent, sizes):
+        out = jax.ffi.ffi_call("dew_cutlass_grouped_gemm", jax.ShapeDtypeStruct((256, 64), jnp.bfloat16))(
+            tokens, kernel, sizes, transpose_w=False)
+        gradient = jax.ffi.ffi_call("dew_cutlass_grouped_gemm_k", jax.ShapeDtypeStruct(
+            (2, 128, 64), jnp.bfloat16))(tokens, cotangent, sizes)
+        unknown = jax.ffi.ffi_call("an_unknown_kernel", jax.ShapeDtypeStruct((256, 64), jnp.bfloat16))(out)
+        return unknown, gradient
+
+    lowered = jax.jit(step).trace(tokens, kernel, cotangent, sizes).lower(lowering_platforms=("cuda",))
+    record = kernel_report((), lowered).record()
+    assert [(entry["kind"], entry["name"], entry["calls"]) for entry in record["launches"]] == [
+        (None, "an_unknown_kernel", 1), ("grouped_gemm", "dew_cutlass_grouped_gemm", 1),
+        ("grouped_gemm", "dew_cutlass_grouped_gemm_k", 1)]
+    assert record["unsized"] == 1
+    flops = hlo_flops(lowered.as_text(dialect="hlo"))
+    assert flops is not None
+    assert (flops.hardware, flops.unsized) == (2 * 2 * 256 * 128 * 64, 1)
+
+
+def test_a_tpu_grouped_gemm_states_its_cost_to_the_flop_count():
+    """The TPU grouped GEMM's two launches, lowered for a TPU on this CPU, state their products'
+    FLOPs (`templates.gemm.cost`), which the kernel report and the FLOP count both read."""
+    from dew.nn.kernels.templates.gemm import mosaic_tpu
+    from dew.telemetry.instrumentation import hlo_flops
+
+    blocks = mosaic_tpu.Blocks(128, 128, 128)
+    lhs, rhs = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128),
+                                                                                    jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+
+    def step(lhs, rhs, sizes):
+        out = mosaic_tpu.gmm(lhs, rhs, sizes, blocks=blocks, transpose_rhs=False, out_dtype=jnp.bfloat16)
+        return out, mosaic_tpu.tgmm(lhs, out, sizes, blocks=blocks, out_dtype=jnp.bfloat16)
+
+    with assumed("v6e"):
+        lowered = jax.jit(step).trace(lhs, rhs, sizes).lower(lowering_platforms=("tpu",))
+    record = kernel_report((), lowered).record()
+    assert [(entry["kind"], entry["name"], entry["flops"]) for entry in record["launches"]] == [
+        ("mosaic_tpu", "dew_gmm", GMM), ("mosaic_tpu", "dew_tgmm", GMM)]
+    assert record["unsized"] == 0
+    flops = hlo_flops(lowered.as_text(dialect="hlo"))
+    assert flops is not None
+    assert (flops.hardware, flops.unsized) == (2 * GMM, 0)
+
+
 def test_every_pallas_choice_a_row_names_has_a_lowering_probe():
     """A Pallas kernel KERNELS chooses for some GPU is one this file lowers for that GPU on a CPU: a new
     row needs its kernels in FAMILIES, so no Triton lowering first runs in a GPU session's compile."""
@@ -133,7 +237,7 @@ def _step_lowered(generation: str):
     """A bf16 Qwen 3.5 hybrid's language-model training step (tests/fixtures/hf/qwen35-tiny: three gated
     delta net layers and one attention layer, its delta nets' heads 32 wide, a power of two as a real
     model's and the short conv's kernels take), lowered for `generation` from abstract state as
-    tools/kernel_picks.py lowers one (`Trainer(lower_for=...)`)."""
+    tools/kernel_picks.py lowers one (`Trainer(lower_for=...)`): the `Lowered` its dry run raises."""
     import optax
 
     from dew.interop.hf_decoders import translate_config
@@ -152,7 +256,7 @@ def _step_lowered(generation: str):
     with pytest.raises(Lowered) as lowered:
         # A row for each of the host's devices, which the trainer's data axis splits.
         trainer.compile(state, {"text": jax.ShapeDtypeStruct((jax.device_count(), 129), jnp.int32)})
-    return lowered.value.lowered
+    return lowered.value
 
 
 @pytest.mark.parametrize("generation", GPUS)
@@ -161,10 +265,18 @@ def test_a_hybrid_language_model_step_lowers_for_the_gpu_with_every_kernel_its_g
     kernels, those of every Pallas choice the generation's row names for a step's layers (the norms and
     SwiGLU), and the gated delta rule's training kernels (`recurrence_chunk.GATED_DELTA`, no row read):
     the recurrence template's Mosaic launches on a warpgroup-MMA GPU, whose training cell it takes, no
-    Triton kernel among them, else the port's, so none was interpreted or refused there."""
+    Triton kernel among them, else the port's, so none was interpreted or refused there. The dry run's
+    kernel report (row 1895) names the recurrence's dispatch and the template's launches beside the
+    Triton ones, which an H100 step's listing once lacked."""
     delta = set() if family(generation) == 'wgmma' else FAMILIES['gated_delta_rule', 'fla'][1]
     expected = SHORT_CONV | delta | set().union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
-    assert set(triton_kernels(_step_lowered(generation))) == expected
+    raised = _step_lowered(generation)
+    assert set(triton_kernels(raised.lowered)) == expected
+    record = raised.kernels.record()
+    assert "gated_delta_rule" in {entry["choice"] for entry in record["routes"]}
+    templated = [entry for entry in record["launches"] if entry["kind"] == "mosaic_gpu"]
+    assert bool(templated) == (family(generation) == 'wgmma')
+    assert {entry["name"] for entry in record["launches"] if entry["kind"] == "triton"} == expected
 
 
 @pytest.mark.parametrize("bound", [None, 64], ids=["undeclared", "declared"])

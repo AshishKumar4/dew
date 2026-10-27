@@ -98,6 +98,9 @@ def test_fit_records_requests_not_durability_and_leaves_tracker_borrowed(tmp_pat
     memory = entries[1]['value']['memory']
     assert memory['analysis']['temp'] >= 0 and memory['analysis']['argument'] > 0
     assert [device['id'] for device in memory['devices']] == [device.id for device in jax.local_devices()]
+    # The step's kernel report (row 1895) is in its plan: a CPU's regression step launches no kernel.
+    kernels = entries[1]['value']['plan']['kernels']
+    assert (kernels['launches'], kernels['unsized']) == ([], 0)
     assert entries[-1]['value']['status'] == 'completed'
 
 
