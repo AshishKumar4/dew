@@ -163,7 +163,17 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         passes = self.schema_in_context or self.model.context_encoder == "backbone"
         if not passes or "context_lengths" not in batch:
             return None
-        return np.asarray(batch["context_lengths"])
+        return self._row_contexts(batch)
+
+    def _row_contexts(self, batch: Batch) -> np.ndarray:
+        """Each packed row's own context length, in the order `real_lengths` counts the rows: its tokens
+        of the window's context (`context_segments`), or a window of one row's whole context."""
+        if "context_segments" not in batch:
+            return np.asarray(batch["context_lengths"])
+        segments = np.asarray(batch["segments"])
+        contexts = np.asarray(batch["context_segments"])
+        return np.concatenate([np.bincount(owned, minlength=int(window.max()) + 1)[1:]
+                               for window, owned in zip(segments, contexts, strict=True)])
 
     def _context_flops(self, model, batch: Batch) -> float:
         """The backbone's forward over each row's context, where it reads one in a pass of its own."""
@@ -171,13 +181,13 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         return 0.0 if lengths is None else counted_flops(model.backbone, lengths)
 
     def _cross_flops(self, model, batch: Batch) -> float:
-        """The backbone's cross-attention work over each window row's context: none where rows carry
-        none. A conditioned window holds one row (`bounds`), so its rows are the windows."""
+        """The backbone's cross-attention work over each packed row's own context (`_row_contexts`):
+        none where rows carry none."""
         if "context_lengths" not in batch:
             return 0.0
         backbone = model.backbone
         assert isinstance(backbone, CrossAttending)
-        return backbone.cross_flops(self.real_lengths(batch), np.asarray(batch["context_lengths"]))
+        return backbone.cross_flops(self.real_lengths(batch), self._row_contexts(batch))
 
     def _head_flops(self, model, batch: Batch) -> float:
         """Forward and training work read the same layout geometry and head capability."""
