@@ -30,7 +30,7 @@ from dew.data import Loading, presets
 from dew.data.compile import compile
 from dew.data.sources.tokens import TokenFiles
 from dew.diffusion.discrete import MDLM
-from dew.distributed.placement import Layout, MeshSpec
+from dew.distributed.placement import Layout, MeshSpec, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
@@ -39,7 +39,7 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers
-from dew.state import TrainState
+from dew.state import TrainState, apart
 from dew.training import Trainer
 from dew.training.distributed import microbatch
 from dew.training.memory import climb_to, recompute_more, rung_record
@@ -476,6 +476,43 @@ def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_und
     assert not (tmp_path / "pgle").exists()
 
 
+def test_a_borrowed_compile_under_autopgle_profiles_beside_the_state_only_where_the_devices_hold_both(
+        monkeypatch):
+    """Under AutoPGLE a compile given no trials profiles its step on a copy of the state beside the
+    caller's, which it never steps. With room for the step and its state alone, it is refused before it
+    copies anything, where trials that own the state (`fit`'s), which step it and restore it, profile at
+    that room; with room for the copy too, it profiles and leaves the devices holding the caller's state
+    alone, the copy freed."""
+    need = needs(monkeypatch, lm())
+    state, _, _ = lm().place()
+    copy = placed_bytes(apart(state)[0])
+
+    def copies(state) -> int:
+        """The arrays the backend holds shaped as the state's widest moving leaf, its own among them."""
+        widest = max(jax.tree.leaves(apart(state)[0]), key=lambda leaf: leaf.size)
+        return sum(live.shape == widest.shape and live.dtype == widest.dtype and not live.is_deleted()
+                   for live in jax.live_arrays())
+
+    free(monkeypatch, need + copy // 2)
+    with autopgle(2):
+        refused = lm()
+        state, _, _ = refused.place()
+        held = copies(state)
+        with pytest.raises(RuntimeError):
+            refused.compile(state, BATCH)
+        assert copies(state) == held
+        owned = lm()
+        stepped(owned, trials=functools.partial(Trials, batch=BATCH))
+        assert owned.plan["pgle"] == {"runs": 2, "bytes": 0}
+        free(monkeypatch, need + 2 * copy)
+        borrowed = lm()
+        state, _, _ = borrowed.place()
+        held = copies(state)
+        borrowed.compile(state, BATCH)
+        assert borrowed.plan["pgle"] == {"runs": 2, "bytes": 0}
+        assert copies(state) == held and not any(leaf.is_deleted() for leaf in jax.tree.leaves(state))
+
+
 def regression_steps(x, *, pgle: bool):
     """The losses of four steps of SGD on `Regression` over `x`'s rows, eight a step, and its weights
     after them, the step compiled ahead and, with `pgle`, guided by a profile of its first runs."""
@@ -764,9 +801,9 @@ def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monke
 @pytest.mark.parametrize("owned", [True, False], ids=["owned", "borrowed"])
 def test_trials_step_a_copy_of_the_state_and_hand_back_a_fresh_one(owned):
     """A frontier's timing runs each step on a trial of the state as it stood: trials that own the state
-    (`fit`'s) step it and delete it, trials that borrow it (a compile given none) step a copy beside it
-    and leave it as it is; either hands back a copy of the state as it was, so the run trains on from
-    where it stood."""
+    (`fit`'s) step it and delete it, handing back a copy as it was; trials that borrow it (a compile given
+    none) step a copy beside it and hand back the state itself, as it is. Either way the run trains on
+    from where it stood."""
     trainer = lm(split=1)
     state, _, _ = trainer.place()
     step = trainer.compile(state, BATCH)

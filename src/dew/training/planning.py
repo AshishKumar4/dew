@@ -31,7 +31,7 @@ from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
-from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes
+from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import RECORD, Objective
@@ -355,8 +355,9 @@ class Trials:
     (`run`): a frontier's timing (`seconds`), where `frontier` asks for it, and AutoPGLE's profile of the
     plan admitted (`profiled`). A state the trials own (`owned`, `fit`'s) is stepped by the first trial
     and deleted, each later trial stepping a fresh copy from the host, so the devices hold one state at a
-    time; one they borrow (a compile given none, `Trainer.compile`) is never stepped, each trial stepping a
-    copy beside it. `state` is then a copy as it stood, for the run to go on from."""
+    time, and `state` is then a copy as it stood, for the run to go on from. One they borrow (a compile
+    given none, `Trainer.compile`) is never stepped and stays `state`: each trial steps a copy beside it,
+    freed as the trial ends, for which the devices must hold room (`profiled`)."""
     state: TrainState
     batch: Batch
     owned: bool = True
@@ -371,15 +372,15 @@ class Trials:
         moving, frozen = apart(self.state)
         if self.restored is None:
             self.restored = snapshot(moving)
-            if not self.owned:
-                moving = self.restored()
-        outcome = trial(together(moving, frozen))
+        stepped = moving if self.owned else self.restored()
+        outcome = trial(together(stepped, frozen))
         # What the trial did not donate of the state it stepped is freed too, so nothing holds a
         # reference to a state handed to a trial, on any backend.
-        for leaf in jax.tree.leaves(moving):
+        for leaf in jax.tree.leaves(stepped):
             if not leaf.is_deleted():
                 leaf.delete()
-        self.state = together(self.restored(), frozen)
+        if self.owned:
+            self.state = together(self.restored(), frozen)
         return outcome
 
     def seconds(self, steps: Sequence[Callable]) -> list[list[float]]:
@@ -393,9 +394,21 @@ class Trials:
         first, untraced, so what a step builds at its first call (its window, its narrow copies) is built
         and the trace holds the executable alone; empty on a backend XLA profiles none of. A process holds
         one profiling session at a time, so a capture of the caller's own running (`dew.Profiler`) is
-        refused (`PGLE_CAPTURE`), as a fit's window is under AutoPGLE."""
+        refused (`PGLE_CAPTURE`), as a fit's window is under AutoPGLE. Borrowed trials first hold the
+        admitted step to room for the copy they step beside the caller's state, refused where there is
+        none."""
         if active_profile() is not None:
             raise RuntimeError(PGLE_CAPTURE)
+        if not self.owned:
+            # The copy a borrowed trial steps sits beside the caller's state, which the plan admitted alone.
+            copy = placed_bytes(apart(self.state)[0])
+            fit, headroom = step_fits(planned.executable, mesh, planned.candidate.held + copy)
+            if not fit:
+                raise RuntimeError(
+                    "AutoPGLE (jax_enable_pgle) profiles a step compiled with no trials on a copy of the "
+                    f"state beside the caller's, which needs {-(headroom or 0)} bytes more than its tightest "
+                    "device has; compile it with Trials(state, batch), which steps the state itself as fit "
+                    "does, and step on from trials.state")
 
         def profile(state: TrainState) -> bytes:
             stepped, *_ = step(state, self.batch)

@@ -964,10 +964,10 @@ class Trainer(Generic[Loss, Effects]):
         state's window holds; later shapes climb the ladder alone. A plan that
         splits or spans devices, left open and unrecorded, is timed on `trials` (`fit`'s, `Trials`)
         against the batch whole a rung up where they ask for it, and the faster kept. Where JAX's AutoPGLE
-        is on (`jax_enable_pgle`), the plan admitted runs its first runs on a trial, `trials`' or a copy
-        of the state beside it where none are given, and its program compiles again guided by their
-        profile (`Planned.guided`), the executable it replaces released with its program
-        (`Planned.released`).
+        is on (`jax_enable_pgle`), the plan admitted runs its first runs on a trial, `trials`' or, where
+        none are given, a copy of the state beside it, refused where the devices hold no room for it
+        (`Trials.profiled`), and its program compiles again guided by their profile (`Planned.guided`),
+        the executable it replaces released with its program (`Planned.released`).
         """
         if self.lower_for is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
