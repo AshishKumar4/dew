@@ -1381,39 +1381,65 @@ def test_a_cadence_may_be_a_share_of_the_run(tmp_path, written, expected):
 
 
 def cooldown_run(schedule, steps: int, accumulation: int, tracker=None, cooldowns=None,
-                 directory=None) -> TrainState:
+                 directory=None, rollout=None) -> TrainState:
     """Regression on AdamW at `schedule` for `steps`, scored once at its end, with any `cooldowns`,
-    checkpointed in `directory` where one is given."""
-    trainer = make_trainer(directory, tracker=tracker, accumulation=accumulation,
+    checkpointed in `directory` where one is given, its batches through any `rollout`."""
+    trainer = make_trainer(directory, tracker=tracker, accumulation=accumulation, rollout=rollout,
                            optimizer=OptimConfig(optimizer="adamw", learning_rate=schedule))
     return trainer.fit(dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps,
                        cooldowns=cooldowns)
 
 
+class NoisedTargets:
+    """A rollout whose batch is its state's and key's: the targets moved by noise its key draws, scaled
+    by its state's step, noting every step it is called at."""
+
+    def __init__(self):
+        self.steps: list[int] = []
+
+    def __call__(self, state, batch, key):
+        self.steps.append(int(state.step))
+        noise = np.asarray(jax.random.normal(key, np.shape(batch["y"])), np.float32)
+        return {**batch, "y": np.asarray(batch["y"]) + np.float32(0.01) * (1 + int(state.step)) * noise}
+
+
+@pytest.mark.parametrize("rollout", [False, True], ids=["batches", "rollout"])
 @pytest.mark.parametrize("accumulation", [1, 2])
-def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the_run_as_it_was(accumulation):
+def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the_run_as_it_was(
+        accumulation, rollout):
     """A linear cooldown of four updates from the fourth of a warmup-stable-decay run is the run whose
     decay begins there: the branch's `cooldown_val/loss`, recorded at the step it branched from, is that
     run's final `val/loss` bit for bit (its rates, 2^-4 times 1, 3/4, 1/2 and 1/4, exact), and the run
-    it branched from ends where a run with no cooldown ends, its parameters bit for bit."""
+    it branched from ends where a run with no cooldown ends, its parameters bit for bit. With a rollout
+    whose batches are its states' and keys' (`NoisedTargets`), the branch trains on what the rollout
+    draws from the branch's own states, as the decayed run trains on what it draws from its own, and
+    the run draws from its states again from the step it branched at."""
     from dew.optim import Linear
     from dew.telemetry.records import FitStarted
     from dew.training.cooldown import Cooldowns
 
     peak, at = 2.0 ** -4, 4 * accumulation
     stable = Linear(peak, decay_start=64, decay_steps=128)
-    tracker = RecordingTracker()
+    tracker, drawn = RecordingTracker(), NoisedTargets() if rollout else None
     branched = cooldown_run(stable, 3 * at, accumulation, tracker,
-                            Cooldowns(at=(at,), length=at, shape="linear"))
+                            Cooldowns(at=(at,), length=at, shape="linear"), rollout=drawn)
     cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
               if "cooldown_val/loss" in scalars}
     decayed = RecordingTracker()
-    cooldown_run(Linear(peak, decay_start=4, decay_steps=8), 2 * at, accumulation, decayed)
+    cooldown_run(Linear(peak, decay_start=4, decay_steps=8), 2 * at, accumulation, decayed,
+                 rollout=NoisedTargets() if rollout else None)
     finals = [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars]
     assert cooled == {at: finals[-1]}
+    if drawn is not None:
+        assert drawn.steps == [*range(at), *range(at, 2 * at), *range(at, 3 * at)]
+        # The branch trains on the rollout's batches, not the stream's: the run with none scores otherwise.
+        unrolled = RecordingTracker()
+        cooldown_run(stable, 3 * at, accumulation, unrolled, Cooldowns(at=(at,), length=at, shape="linear"))
+        assert {step: scalars["cooldown_val/loss"] for step, scalars in unrolled.scalars
+                if "cooldown_val/loss" in scalars} != cooled
     started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
     assert started.cadences["cooldowns.at"] == [at]
-    plain = cooldown_run(stable, 3 * at, accumulation)
+    plain = cooldown_run(stable, 3 * at, accumulation, rollout=NoisedTargets() if rollout else None)
     for ours, theirs in zip(jax.tree.leaves(branched.variables), jax.tree.leaves(plain.variables),
                             strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))

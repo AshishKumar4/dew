@@ -34,6 +34,9 @@ dependencies = [
     "einops",
     # dew.nn.engram draws its bucket primes with sympy.nextprime.
     "sympy",
+    # dew.nn.kv_cache's Hadamard rotation (scipy.linalg.hadamard) and dew.nn.mlp's
+    # Gaussian cutoff (scipy.special.erfinv); jax already depends on scipy.
+    "scipy",
     # dew.data.dataset's close budget holds grain's worker kill timeout
     # (GRAIN_KILL_SECONDS); 0.2.18 is the release that was tested.
     "grain>=0.2.18,<0.3",

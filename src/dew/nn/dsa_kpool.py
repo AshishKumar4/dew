@@ -229,10 +229,10 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
     def setup(self):
         if self.qk_rope_head_dim or self.rotary:
             raise ValueError("the k-pool layer has no rope head: qk_rope_head_dim=0 and rotary=False")
-        if not self.causal or self.yarn is not None or self.index_shared:
+        if not self.causal or self.rope_scaling is not None or self.index_shared:
             raise ValueError(
                 "the k-pool layer attends causally, with no rope to scale and an indexer of its own: "
-                "causal=True, yarn=None and index_shared=False")
+                "causal=True, rope_scaling=None and index_shared=False")
         heads, width = self.index_n_heads, self.index_head_dim
         if self.q_lora_rank is None or heads is None or width is None or self.index_topk is None:
             raise ValueError(
@@ -375,4 +375,5 @@ class KPoolSparseAttentionMixer(MixerBase):
             dtype=ctx.dtype,
             precision=ctx.precision,
             attention_impl=ctx.attention_impl,
-            force_fp32_for_softmax=ctx.force_fp32_for_softmax)
+            force_fp32_for_softmax=ctx.force_fp32_for_softmax,
+            kv_cache=ctx.kv_cache)

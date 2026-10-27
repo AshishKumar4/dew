@@ -22,14 +22,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.batch import merge
 from dew.mesh import STAGE_AXIS, LayoutRefused, row_axes
 
 from ..hyper_connections import Carried
-from ..kv_cache import CURSOR
 from ..mla import INDEXER_COLLECTION
 from ..moe import ROUTER_COLLECTION
 from ..sharding import microbatched, microbatches, pipeline_stage, pipeline_stages
@@ -147,7 +145,7 @@ class Loop:
     `shared_cache` every pass reads and writes its layers' one entry, each
     pass overwriting the step's keys and values the pass before wrote, so
     a step's earlier tokens read the last pass's (Dory's last-loop cache):
-    a pass's cursor starts where the first pass's started (`SharedPassView`).
+    each pass starts from the cache as the step entered it (`SharedPassView`).
     """
     steps: int
     step_norm: bool = True
@@ -176,49 +174,28 @@ class Loop:
                 raise ValueError("the exit gate reads the whole stack's output; its loop is the whole stack")
 
 
-type Cursors = Mapping[tuple[str, ...], object]
-"""A cache tree's cursors (`dew.nn.kv_cache.CURSOR`), by their paths."""
-
-
 @dataclasses.dataclass
 class SharedPassView:
     """The passes of a `Loop` with `shared_cache` over its block's own cache entries, which every
-    pass reads and writes. The first pass's cursors are recorded as it finds them (`first`) and as
-    it leaves them (`first_out`). A later pass sees every entry as the pass before left it but the
-    cursors, which start where the first pass's started, so it writes the step's keys and values
-    over the last pass's (`inside`), and it leaves the cursors as the first pass left them
-    (`outside`): a pass that allocates the cache advances none (`cache_positions`), and the later
-    ones, finding it allocated, must not either."""
-    before: Cursors = dataclasses.field(default_factory=dict)
-    after: Cursors = dataclasses.field(default_factory=dict)
+    pass reads and writes. Each later pass starts from the cache as the first pass found it
+    (`first`), every entry: its cursors where the first pass's started, so it writes the step's keys
+    and values over the last pass's, and each recurrent mixer's state, convolution tail and memory
+    as the step entered them, so it takes the step's tokens once rather than again after the pass
+    before took them. A pass that allocates the cache finds none, so the later ones allocate too and
+    advance nothing (`cache_positions`). The step leaves the cache as its last pass did."""
+    entering: Mapping | None = None
 
     def first(self, variables: Mapping[str, Mapping]) -> dict:
-        self.before = _cursors(variables)
-        return dict(variables)
-
-    def first_out(self, variables: Mapping[str, Mapping]) -> dict:
-        self.after = _cursors(variables)
+        self.entering = variables.get('cache')
         return dict(variables)
 
     def inside(self, variables: Mapping[str, Mapping]) -> dict:
-        return _with_cursors(variables, {**self.after, **self.before})
+        rest = {collection: tree for collection, tree in variables.items() if collection != 'cache'}
+        return rest if self.entering is None else {**rest, 'cache': self.entering}
 
-    def outside(self, variables: Mapping[str, Mapping]) -> dict:
-        return _with_cursors(variables, self.after)
-
-
-def _cursors(variables: Mapping[str, Mapping]) -> Cursors:
-    flat = flatten_dict(variables.get('cache', {}))
-    return {path: leaf for path, leaf in flat.items() if path[-1] == CURSOR}
-
-
-def _with_cursors(variables: Mapping[str, Mapping], cursors: Cursors) -> dict:
-    """`variables` with each cache cursor `cursors` names replaced."""
-    cache = variables.get('cache')
-    if cache is None:
+    @staticmethod
+    def outside(variables: Mapping[str, Mapping]) -> dict:
         return dict(variables)
-    placed = {path: cursors.get(path, leaf) for path, leaf in flatten_dict(cache).items()}
-    return {**variables, 'cache': unflatten_dict(placed)}
 
 
 @dataclasses.dataclass
