@@ -16,6 +16,7 @@ from reference_error import assert_as_exact
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.selection import selected
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mixers.mamba2 import Mamba2
 from dew.nn.precision import float32_einsum
@@ -539,3 +540,14 @@ def test_the_portable_rule_takes_nested_differentiation(packed):
     found, want = jax.jit(lambda: nested(rule))(), jax.jit(lambda: nested(math))()
     assert all(bool(jnp.all(jnp.isfinite(x))) for x in found)
     np.testing.assert_array_equal(found[2], want[2])
+
+
+def test_the_tpu_scan_is_refused_under_forward_mode():
+    """A rated scan the TPU's Pallas scan tiles takes it in reverse mode alone: traced for `jax.jvp`
+    (`FORWARD_MODE`), its custom VJP giving no tangent, the scan selector refuses it and the portable math's
+    scan, whose tangent is its own, takes the call (row 1869, audit K2)."""
+    reverse, forward = (recurrence_chunk.ScanCase(reverse=mode, varying=False, dtype=np.dtype(jnp.float32),
+                                                  widths=(16, 16, 64), tpu='tpu') for mode in (True, False))
+    tpu = recurrence_chunk.SCAN.kernel('tpu')
+    assert not tpu.failed(reverse) and tpu.failed(forward)
+    assert selected(recurrence_chunk.SCAN, forward).name == 'xla'

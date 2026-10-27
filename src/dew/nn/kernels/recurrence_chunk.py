@@ -1127,13 +1127,16 @@ two of at least 16, the smallest block Triton's dot takes (a call's head and sta
 `_rated_scan`); and a GPU Dew's Triton kernels run on, any of them."""
 
 TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
+    Requirement('forward_mode', lambda case: case.reverse,
+                "forward_mode_attention traces for jax.jvp, which the TPU scan's custom VJP gives no "
+                "tangent: the portable math's scan takes it (row 1869, audit K2)", row=INHERENT),
     Requirement('geometry', lambda case: case.tpu is not None,
                 lambda case: "the TPU's Pallas scan takes a float32 scan on a TPU over power-of-two widths "
                              "and a chunk its program holds, not head width {}, state {} and chunk {}"
                              .format(*case.widths), row=INHERENT),
 )
-"""What the TPU's Pallas scan (`dew.nn.kernels.ssd`) needs: its tiling over the geometry
-(`ssd_kernel_runs`)."""
+"""What the TPU's Pallas scan (`dew.nn.kernels.ssd`) needs: reverse mode alone (its custom VJP gives no
+tangent) and its tiling over the geometry (`ssd_kernel_runs`)."""
 
 
 def scan_case(x, B, chunk_size: int, *, tpu: bool = True) -> ScanCase:
