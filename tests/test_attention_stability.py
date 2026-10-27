@@ -742,7 +742,8 @@ def _differentiable(family: Family, forward: Callable, backward: Callable) -> Ca
 
 def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     """Each template mainloop as `(query, key, value, extra) -> out` at the form `options` names (`ACCURATE`,
-    or none for the default), its derivative the mainloop's own backward (`_differentiable`)."""
+    or none for the default), its derivative the mainloop's own backward (`_differentiable`); on an H100 the
+    Mosaic one's default form in both schedules, two launches and one (`FUSED`)."""
     forward_options = {name: value for name, value in options.items() if name in ("natural", "scale")}
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
     mainloop = functools.partial(_differentiable, family)
@@ -769,9 +770,21 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     portable = mainloop(functools.partial(attention_portable.attend, **tiles, **forward_options),
                         functools.partial(attention_portable.backward, **tiles, **options))
     mainloops = {"triton": mainloop(triton_forward, triton_backward), "portable": portable}
+    def fused_backward(*operands):
+        with tuning.pinned({attention_mosaic.MosaicBackward: FUSED}):
+            return mosaic_backward(*operands)
+
     if ON_HOPPER and _mosaic_takes(family):
         mainloops["mosaic"] = mainloop(mosaic_forward, mosaic_backward)
+        if not options and family.draw(0)[3] is None:
+            mainloops["mosaic fused"] = mainloop(mosaic_forward, fused_backward)
     return mainloops
+
+
+FUSED = attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=True, family="wgmma")
+"""The Mosaic backward's one-launch schedule at the derived tiles (FUSEDFORM-h100's), the dK/dV program adding
+each tile's dQ under the first pass's D, which the fast form's default would take where it holds every family
+finite."""
 
 
 ON_HOPPER = generation.device_generation() == "sm90"
@@ -858,6 +871,21 @@ def test_the_mosaic_mainloops_default_is_finite_where_the_reference_is_at_fp32s_
     (`algebra.walked_launches`), finite in the default form over every family it takes (its legality rule,
     `attention_mosaic.refused`: bf16 operands in its backward, hooks it lowers; `_default_is_finite`)."""
     _default_is_finite(family, "mosaic")
+
+
+FUSED_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].draw(0)[3] is None]
+"""The Mosaic families of no sinks or resumed state, the calls its one-launch backward takes
+(`MosaicBackward.legal`: the fast form's, a hookless call's)."""
+
+
+@pytest.mark.skipif(not ON_HOPPER, reason="runs the Mosaic mainloop compiled, on an H100")
+@pytest.mark.gpu(reason="runs the Mosaic mainloop compiled, on an H100")
+@pytest.mark.parametrize("family", FUSED_FAMILIES)
+def test_the_mosaic_one_launch_backward_is_finite_where_the_reference_is_at_fp32s_edges(family):
+    """The Mosaic backward in one launch (`FUSED`: the dK/dV program adding each tile's dQ under the first
+    pass's D), the fast form's, finite in the default form over every family it takes (`_default_is_finite`):
+    the default's condition beside check 1 on drawn inputs (`test_attention_mosaic`'s `fused` form)."""
+    _default_is_finite(family, "mosaic fused")
 
 
 @pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES
@@ -954,13 +982,13 @@ def test_a_negative_scale_past_the_folds_reach_keeps_a_finite_logit_finite(scale
     weight to NaN, so the fold bounds the factor's magnitude (`algebra.Forward.base2`) and such a call stays
     natural. Each template mainloop's output is the value and its gradients are finite, as the
     reference's are."""
-    family = Family(lambda seed: None, np.ones((1, 1, 1, 1), bool))
-
     def first(fill, *shape):
         return jnp.zeros(shape, jnp.float32).at[..., 0].set(fill)
 
     product = 3e38 / abs(scale) if abs(scale) > 1 else 3e38
     query, key, value, dout = (first(fill, 1, 1, 1, 16) for fill in (product, 1.0, 2.0, 1.0))
+    # Its one draw the call itself, which the mainloops' legality reads (`_mosaic_takes`).
+    family = Family(lambda seed: (query, key, value, None, dout), np.ones((1, 1, 1, 1), bool))
     spans = template.spans(1, 1, 1)
     _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, scale=scale), query, key, value)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in pull(dout)), "the reference's gradients"
