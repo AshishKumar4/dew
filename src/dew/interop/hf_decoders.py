@@ -329,6 +329,9 @@ def _muse_glimmer_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wr
     # MuseGlimmerConfig's placeholders where a config leaves them out (configuration_muse_glimmer.py:194).
     image = _defaulted_token_id(hf_config, used, "image_token_id", 200092)
     video = _records.integer(hf_config.get("video_token_id", 200091), "video_token_id")
+    # MuseGlimmerModel embeds both placeholders as token zero, filled or not (modeling_muse_glimmer.py's
+    # forward); its language model alone (`text_only`) reads its own config and looks them up.
+    text["embedding_zero_ids"] = (image, video)
     return _wrapper_fields("muse_glimmer", used, text, tower, projector, image, None, video=video)
 
 

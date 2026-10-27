@@ -342,8 +342,10 @@ class MultimodalTransformer(DecoderWrapper):
             )
         else:
             decoder_tokens = jnp.where(media, 0, tokens)
+        # The decoder's own lookup (`token_embeddings`), so a placeholder no media fills reads as its
+        # decoder reads it.
         embeddings = self.language_model.scaled_embeddings(
-            self.language_model.embed_tokens(decoder_tokens))
+            self.language_model.token_embeddings(decoder_tokens))
         if self.family == "gemma3n":
             embedders = [self.conditioner.projector]
             if self.audio is not None:

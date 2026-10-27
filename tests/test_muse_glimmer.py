@@ -132,33 +132,40 @@ def wrapper(tmp_path_factory):
     return directory, model, float64_twin(model)
 
 
+def packed_image(image) -> dict[str, np.ndarray]:
+    """`image` `[1, 3, H, W]` as the image processor packs it: its patch vectors and its grid."""
+    from transformers.models.muse_glimmer.image_processing_muse_glimmer import MuseGlimmerImageProcessor
+
+    packed, _, _ = MuseGlimmerImageProcessor.patchify(None, torch.from_numpy(np.asarray(image)),
+                                                      VISION["patch_size"], VISION["patch_temporal"])
+    side = IMAGE_SIDE // VISION["patch_size"]
+    return {"pixel_values": packed[0].numpy(), "image_grid_thw": np.asarray([[1, side, side]])}
+
+
 def wrapper_logits(model, ids, image=None):
     """`model`'s logits over `ids` `[1, S]`, its image `[1, 3, H, W]` packed as the image processor
-    packs one where given; a float64 model run inside `float64`."""
+    packs one where given (`packed_image`); a float64 model run inside `float64`."""
     import contextlib
-
-    from transformers.models.muse_glimmer.image_processing_muse_glimmer import MuseGlimmerImageProcessor
 
     from tools.torch_precision import float64
 
     dtype = next(model.parameters()).dtype
     media = {}
     if image is not None:
-        packed, _, _ = MuseGlimmerImageProcessor.patchify(None, torch.from_numpy(image), VISION["patch_size"],
-                                                          VISION["patch_temporal"])
-        side = IMAGE_SIDE // VISION["patch_size"]
-        media = {"pixel_values": packed[0].to(dtype), "image_grid_thw": torch.tensor([[1, side, side]])}
+        packed = packed_image(image)
+        media = {"pixel_values": torch.from_numpy(packed["pixel_values"]).to(dtype),
+                 "image_grid_thw": torch.from_numpy(packed["image_grid_thw"])}
     with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
         return {"logits": model(input_ids=torch.from_numpy(np.asarray(ids)).long(), **media).logits.numpy()}
 
 
 def test_a_muse_glimmer_wrapper_loads_whole_and_computes_its_logits(wrapper):
     """The wrapper loads as its trunk, adapter, projection and decoder, each released tensor mapped and
-    exported bit for bit, and its logits over drawn ids, and over drawn images placed among them, are
-    on par with transformers' float32 ones from its float64 ones (check 1); its language model alone
-    (`text_only`) computes its text logits bit for bit (ledger 1883)."""
-    import jax
-    import jax.numpy as jnp
+    exported bit for bit, and its logits over drawn ids, an unfilled video placeholder among them, and
+    over drawn images placed among them, each image packed as the image processor packs it and read
+    by the source's processor (`Processor.from_hf`), are on par with transformers' float32 ones from
+    its float64 ones (check 1); its language model alone (`text_only`) computes the wrapper's text
+    logits bit for bit on ids without placeholders (ledger 1883)."""
     from reference_error import as_given, assert_as_exact
 
     directory, reference, truth = wrapper
@@ -173,26 +180,29 @@ def test_a_muse_glimmer_wrapper_loads_whole_and_computes_its_logits(wrapper):
     def drawn(seed, *, with_image):
         rng = np.random.default_rng([0x1883, seed])
         ids = rng.integers(3, IMAGE_TOKEN, (1, 20)).astype(np.int32)
+        # A video placeholder no video fills, which the wrapper embeds as token zero.
+        ids[0, 2] = IMAGE_TOKEN + 1
         if not with_image:
             return (ids,)
         ids[0, 5:9] = IMAGE_TOKEN
         return ids, rng.random((1, 3, IMAGE_SIDE, IMAGE_SIDE)).astype(np.float32)
 
+    @as_given
     def ours(ids, image=None):
-        # The image's soft tokens take its placeholders in order, each slot the index of its feature.
-        placeholder = jnp.asarray(ids) == IMAGE_TOKEN
-        media = {} if image is None else {
-            "image_indices": jnp.where(placeholder, jnp.cumsum(placeholder, axis=-1) - 1, -1),
-            "conditioning": {"pixel_values": jnp.asarray(image)[:, None]}}
-        return {"logits": loaded.model.apply(loaded.variables, jnp.asarray(ids), **media)}
+        # The processor's packing, read by the source's processor (`Processor.from_hf`).
+        values = {"input_ids": np.asarray(ids), "attention_mask": np.ones(np.shape(ids), bool)}
+        if image is not None:
+            values.update(packed_image(image))
+        batch = loaded.processor.from_hf(values)
+        return {"logits": loaded.model.apply(loaded.variables, batch.tokens, **batch.kwargs())}
 
     for label, with_image in (("text", False), ("image", True)):
-        assert_as_exact(jax.jit(ours), as_given(lambda *inputs: wrapper_logits(reference, *inputs)),
+        assert_as_exact(ours, as_given(lambda *inputs: wrapper_logits(reference, *inputs)),
                         lambda seed, with_image=with_image: drawn(seed, with_image=with_image),
                         f"Muse Glimmer {label}", seeds=WRAPPER_SEEDS[label],
                         truth_fn=as_given(lambda *inputs: wrapper_logits(truth, *inputs)))
 
     text = Pretrained.load(str(directory), dtype="float32", attention_impl="reference", text_only=True)
-    ids = drawn(0, with_image=False)[0]
+    ids = np.random.default_rng(0x1883).integers(3, IMAGE_TOKEN, (1, 20)).astype(np.int32)
     np.testing.assert_array_equal(np.asarray(text.model.apply(text.variables, ids)),
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))

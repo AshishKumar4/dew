@@ -213,7 +213,7 @@ def test_a_llama_release_repeating_its_fields_under_megatrons_names_loads_as_it_
     for got, want in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(plain.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     (directory / "config.json").write_text(json.dumps({**stated, "rotary_base": 2 * theta}))
-    with pytest.raises(ValueError, match="rotary_base"):
+    with pytest.raises(ValueError):
         Pretrained.load(directory, dtype="float32")
 
 

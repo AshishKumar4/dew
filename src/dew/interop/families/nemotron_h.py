@@ -179,16 +179,18 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
                  "routed_scaling_factor", "n_group", "topk_group", "norm_topk_prob"))
     heads = integer("num_attention_heads", 32)
     kv_heads = hf_config.get(field("num_key_value_heads"), 8)
-    return native_fields(CausalTransformer)(
+    config = native_fields(CausalTransformer)(
         vocab_size=integer("vocab_size", 131072), emb_features=integer("hidden_size", 4096),
         num_layers=len(layers), num_heads=heads,
         num_kv_heads=heads if kv_heads is None else _records.integer(kv_heads, "num_key_value_heads"),
         head_dim=integer("head_dim", 128), mlp_features=0, qk_norm=False, scale_after_cast=False,
         max_seq_len=integer("max_position_embeddings", 4096),
         norm_eps=_records.number(hf_config.get(field("layer_norm_epsilon"), 1e-5), "layer_norm_epsilon"),
-        tie_embeddings=flag("tie_word_embeddings", default=False), layer_types=layers, kinds=kinds,
+        tie_embeddings=flag("tie_word_embeddings", default=False), layer_types=layers,
         num_nextn_predict_layers=depths, mtp_layer_type=step[0] if step else None,
         mtp_feedforward_type=step[1] if len(step) == 2 else None)
+    config['kinds'] = kinds
+    return config
 
 
 def _prediction_step(hf_config: Mapping[str, object]) -> tuple[str, ...]:

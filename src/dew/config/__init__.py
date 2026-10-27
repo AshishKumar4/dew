@@ -346,7 +346,8 @@ class SourceOptions:
     def keywords(self) -> "SourceOptionsKeywords":
         """`Pretrained.load`'s keywords for what a run builds of its source. With `weights=False` beside
         them a load is the run's base as the run builds it, its config and its variables' shapes, read
-        from the source's config and weight headers alone, no weight downloaded: a check that a base
+        from the source's config and safetensors headers alone, no weight downloaded (a release of
+        PyTorch pickles alone, whose shapes no header states, is read whole): a check that a base
         loads under a run's options, on a disk too small for its weights."""
         return {"text_only": self.text_only, "prediction_depths": self.prediction_depths,
                 "modeling_overrides": self.overrides()}
