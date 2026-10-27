@@ -1373,11 +1373,12 @@ EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "re
             "filelock.", "multiprocessing.", "concurrent.futures.ProcessPoolExecutor.", "os.kill.",
             "os.killpg.", "os.waitpid.", "os.waitid.", "os.fork.", "os.posix_spawn.", "jax.distributed.",
             "dew.cleanup.signal_group.", "dew.cleanup.exit_code.", "dew.cleanup.groups_ended.",
-            "dew.cleanup.end_group.", "dew.cleanup.process_group.",
+            "dew.cleanup.end_group.", "dew.cleanup.process_group.", "dew.data.storage.Store.",
             "IPython.display.display.", "IPython.display.update_display.", "IPython.display.clear_output.")
 """What leaves the process: a subprocess, the network, a remote service, another process (a
 notebook's frontend, which IPython's display functions publish to over the kernel's socket; its
-representations, such as `HTML`, are built in the process; a process group `dew.cleanup` signals)."""
+representations, such as `HTML`, are built in the process; a process group `dew.cleanup` signals; an
+object `dew.data.storage.Store` reads and writes conditionally, which other processes share)."""
 
 
 WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}

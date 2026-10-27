@@ -1435,7 +1435,7 @@ class RunConfig:
                     dew.io.publish(step, _artifact_name(name), tracker=wandb_tracker)
                 if (rule := trainer.promote) is not None and wandb_tracker is not None:
                     dew.io.promote(step, rule.collection, tracker=wandb_tracker, metric=rule.metric,
-                                   mode=rule.mode, top=rule.top)
+                                   mode=rule.mode, top=rule.top, lease=rule.lease_at(trainer.checkpoint_dir))
 
             agreed("checkpoint publishing", publish_checkpoint)
             return state

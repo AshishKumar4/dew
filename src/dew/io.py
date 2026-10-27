@@ -9,9 +9,13 @@ or the registry, which `dew.pipeline("wandb:...")` loads in one call.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+import json
 import math
-from collections.abc import Mapping, Sequence
+import time
+import uuid
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Literal
 
 import jax
@@ -115,30 +119,100 @@ def ranked(run, metric: str, *, mode: Literal["min", "max"],
     return sorted(held, key=lambda other: score_of(other, metric), reverse=mode == "max")
 
 
+LEASE_POLL_SECONDS = 1.0
+"""How often a promoter waiting on another's lease reads it again."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Lease:
+    """The one promoter at a time of a registry collection (`promote`), held at `url`, an object at any
+    URL `dew.data.storage.Store` writes conditionally (a shared directory's file, a bucket's object),
+    which every promoter of the collection names: for at most `hold` seconds, after which another may
+    take it over, as from a promoter that died holding it, and waited on for at most `wait` seconds."""
+
+    url: str
+    hold: float = 300.0
+    wait: float = 900.0
+
+
+@contextlib.contextmanager
+def leased(lease: Lease) -> Iterator[Callable[[], None]]:
+    """Hold `lease`, taken by a compare-and-swap of its object (`Store.put_if_absent`, `put_if_match`)
+    where it is absent, released or past its hold, else read again every `LEASE_POLL_SECONDS` until it is,
+    up to its `wait`, then TimeoutError: the library's one wait on a promotion's boundary. Yields a check
+    a holder calls before each write it makes under the lease, which raises once less than half its hold
+    remains, so no write starts that another holder could follow. Released on the way out, an error
+    included; a holder that dies keeps it until its hold passes."""
+    from dew.data.storage import PreconditionFailed, Store
+
+    store, holder = Store(lease.url), uuid.uuid4().hex
+    deadline = time.monotonic() + lease.wait
+    while True:
+        try:
+            found = store.get_versioned()
+        except FileNotFoundError:
+            found = None
+        held = None if found is None else json.loads(found.data)
+        now = time.time()
+        if held is None or held["holder"] is None or held["until"] <= now:
+            until = now + lease.hold
+            record = json.dumps({"holder": holder, "until": until}).encode()
+            try:
+                version = (store.put_if_absent(record) if found is None
+                           else store.put_if_match(record, found.version))
+                break
+            except PreconditionFailed:
+                continue  # another promoter took it between the read and the write
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"the promotion lease {lease.url} stayed held for {lease.wait:.0f} s, by "
+                               f"{held['holder']} until {held['until']:.0f}")
+        time.sleep(LEASE_POLL_SECONDS)
+
+    def live() -> None:
+        if time.time() > until - lease.hold / 2:
+            raise TimeoutError(f"the promotion lease {lease.url} has less than half its {lease.hold:.0f} s "
+                               "hold left; promote again")
+
+    try:
+        yield live
+    finally:
+        try:
+            store.put_if_match(json.dumps({"holder": None, "until": 0.0}).encode(), version)
+        except PreconditionFailed as taken:
+            raise RuntimeError(f"the promotion lease {lease.url} was taken over before its holder "
+                               "released it: a holder outlived its hold") from taken
+
+
 @dataclasses.dataclass(frozen=True)
 class Promotion:
     """What a configured run is ranked by before it publishes (`promote`): its summary's `metric`, lower
     better under "min", among the best `top` of its sweep's or project's runs, published into the registry
     collection `collection`, which every run of the sweep shares, so its `best` alias follows the sweep's
-    winner (`dew.pipeline("wandb:wandb-registry-model/<collection>:best")`)."""
+    winner (`dew.pipeline("wandb:wandb-registry-model/<collection>:best")`). `lease` is the URL of the
+    collection's lease (`Lease`), which every promoter of it names: by default beside the runs'
+    checkpoints, which a sweep's trials share (`lease_at`)."""
 
     metric: str
     collection: str
     mode: Literal["min", "max"] = "min"
     top: int = 5
+    lease: str | None = None
 
     def __post_init__(self) -> None:
         if self.top < 1:
             raise ValueError(f"a promotion ranks a run among the best top, at least one; got {self.top}")
 
+    def lease_at(self, checkpoints: str) -> Lease:
+        """The collection's lease: `lease`, else `<checkpoints>/<collection>.promotion-lease`."""
+        return Lease(self.lease or f"{checkpoints.rstrip('/')}/{self.collection}.promotion-lease")
 
-def crowned(name: str, metric: str, *, mode: Literal["min", "max"]):
-    """The version of the registry collection `name` that holds `BEST`, once it is the collection's best
-    by the `metric` its versions' metadata records (`publish`), the earliest of a tie, a version of no
-    finite score never. Each promoter moves the alias where it reads it misplaced and reads the collection
-    again, until it reads it in place: whoever moves it last reads every version linked before, and a
-    version linked after is its own promoter's to read, so no stale ranking holds the alias at the end,
-    however promoters of one collection interleave."""
+
+def crown(name: str, metric: str, *, mode: Literal["min", "max"]):
+    """Put the registry collection `name`'s `BEST` alias on its best version by the `metric` its
+    versions' metadata records (`publish`), the earliest of a tie, a version of no finite score never,
+    from one fresh read of the collection, and return that version, or None for a collection of no
+    scored version. One write, which the promoter holding the collection's lease makes (`promote`): no
+    other promoter publishes or crowns between its read and its write."""
     import wandb
 
     def score(version) -> float:
@@ -146,29 +220,30 @@ def crowned(name: str, metric: str, *, mode: Literal["min", "max"]):
         assert value is not None, "a version without a score is never ranked"
         return value if mode == "min" else -value
 
-    while True:
-        versions = [version for version in wandb.Api().artifacts("model", f"{REGISTRY}/{name}")
-                    if scored(version.metadata.get(metric)) is not None]
-        if not versions:
-            return None
-        best = min(versions, key=lambda version: (score(version), int(version.version.removeprefix("v"))))
-        if BEST in best.aliases:
-            return best
+    versions = [version for version in wandb.Api().artifacts("model", f"{REGISTRY}/{name}")
+                if scored(version.metadata.get(metric)) is not None]
+    if not versions:
+        return None
+    best = min(versions, key=lambda version: (score(version), int(version.version.removeprefix("v"))))
+    if BEST not in best.aliases:
         best.aliases.append(BEST)
         best.save()
+    return best
 
 
-def promote(directory: str, name: str, *, tracker: WandbTracker, metric: str,
+def promote(directory: str, name: str, *, tracker: WandbTracker, metric: str, lease: Lease,
             mode: Literal["min", "max"] = "min", top: int = 5,
             filters: Mapping[str, object] | None = None):
     """Publish the checkpoint step at `directory` into the registry collection `name` (`publish`), its
     score recorded as its metadata, where the tracker's run ranks among the best `top` of the runs it is
     compared with (`ranked`) by its summary's `metric`, as FlaxDiff's trainer promoted its sweeps' runs, and
-    move the collection's `BEST` alias to its best version (`crowned`). A run tied with another ranks
-    below it, so a promotion needs a strictly better score. Returns the logged artifact, or None where the
-    run ranks below the best `top`, which publishes nothing and leaves the checkpoint where it is; only
-    process zero compares and publishes, and it returns None everywhere else. Raises ValueError for a run
-    whose summary holds no finite score: a diverged run never takes the alias."""
+    put the collection's `BEST` alias on its best version (`crown`). Publishing and crowning happen under
+    the collection's `lease`, one promoter at a time, so each crown reads every version published before
+    it and no promoter's write follows another's on a stale read. A run tied with another ranks below
+    it, so a promotion needs a strictly better score. Returns the logged artifact, or None where the run
+    ranks below the best `top`, which publishes nothing and leaves the checkpoint where it is; only process
+    zero compares and publishes, and it returns None everywhere else. Raises ValueError for a run whose
+    summary holds no finite score: a diverged run never takes the alias."""
     Promotion(metric, name, mode, top)
     if jax.process_index() != 0:
         return None
@@ -181,8 +256,11 @@ def promote(directory: str, name: str, *, tracker: WandbTracker, metric: str,
     ahead = sum(better(score_of(other, metric)) for other in ranked(run, metric, mode=mode, filters=filters))
     if ahead >= top:
         return None
-    logged = publish(directory, name, tracker=tracker, metadata={metric: value})
-    crowned(name, metric, mode=mode)
+    with leased(lease) as live:
+        live()
+        logged = publish(directory, name, tracker=tracker, metadata={metric: value})
+        live()
+        crown(name, metric, mode=mode)
     return logged
 
 

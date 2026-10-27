@@ -12,7 +12,10 @@ here from antithetic pairs, which cancel the reward's baseline. A layer's weight
 product of that estimate with the layer's input from the clean forward, summed over units, as
 backpropagation forms it, and an embedding's is the estimate scattered into the rows its ids read. Every
 other parameter (a norm's scale, a mixing scalar, an expert's weights) is estimated by two-sided
-weight-space evolution strategies, rewarded by the whole objective.
+weight-space evolution strategies, rewarded by the whole objective, and so is each use of a site's
+parameter that no layer call makes: a vocabulary head the loss reads as a matrix and contracts itself
+(`AffineHead.output_table`), a tied embedding's, whose matrix is jittered in that read alone and whose
+estimate is added to the lookup's, so a vocabulary row the batch only predicts is estimated too.
 
 `NodePerturbation`, mixed into any objective over a Flax model,
 
@@ -58,8 +61,8 @@ from dew._distributions import counter_key
 from dew.batch import Batch, Variables, leaves_by_path
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32, float32_einsum
-from dew.nn.protocols import RematChoosing
-from dew.objectives.base import Objective, Step, stream
+from dew.nn.protocols import OutputTable, RematChoosing, head_table
+from dew.objectives.base import Aux, Objective, Step, _has_aux, stream
 
 NOISE = jnp.float32
 """The dtype every jitter is drawn in, whatever its site's: a float64 twin of a run draws what the run
@@ -80,6 +83,30 @@ class Site:
     shape: tuple[int, ...]
     dtype: jnp.dtype
     contracted: tuple[int, ...] = ()
+
+
+@dataclasses.dataclass(frozen=True)
+class TableUse:
+    """One read of a model's vocabulary head as a matrix (`AffineHead.output_table`), which a loss
+    contracts itself rather than calling a layer: the unbound module that read it, so the read can be
+    taken again over other parameters, and the matrix's shape and dtype."""
+
+    module: nn.Module
+    shape: tuple[int, ...]
+    dtype: jnp.dtype
+
+
+def _reads_table(context, output) -> bool:
+    """Whether a call reads a vocabulary head as a matrix (`AffineHead.output_table`)."""
+    return context.method_name == "output_table" and isinstance(output, OutputTable)
+
+
+def _table(context, output) -> TableUse | None:
+    """The head read a call is, or None (`_reads_table`)."""
+    if not _reads_table(context, output):
+        return None
+    unbound, _ = context.module.unbind()
+    return TableUse(unbound, tuple(output.matrix.shape), output.matrix.dtype)
 
 
 def _kind(context) -> str | None:
@@ -126,15 +153,14 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
         super().__init__(*args, **kwargs)
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        base = super().loss
         if not step.training:
-            return base(variables, batch, step)
+            return super().loss(variables, batch, step)
         held = {name: value for name, value in variables.items() if name != "params"}
 
         @jax.custom_vjp
         def estimated(params, rest):
             others, held_batch, held_step = rest
-            return base({**others, "params": params}, held_batch, held_step)
+            return self._scored({**others, "params": params}, held_batch, held_step)
 
         def forward(params, rest):
             return estimated(params, rest), (params, rest)
@@ -142,12 +168,18 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
         def backward(saved, cotangent):
             params, rest = saved
             others, held_batch, held_step = rest
-            stats = cotangent[0] if isinstance(cotangent, tuple) else cotangent
+            stats, _ = cotangent
             # None: the variables held, the batch and the step take no cotangent.
             return self.estimate(params, others, held_batch, held_step, stats), None
 
         estimated.defvjp(forward, backward)
         return estimated(variables["params"], (held, batch, step))
+
+    def _scored(self, variables: Variables, batch: Batch, step: Step) -> tuple[LossT, Aux[EffectsT]]:
+        """The objective's own statistics and `Aux` for `batch`, the `Aux` empty where it returns none
+        (`_has_aux`): statistics that are themselves a tuple stay whole."""
+        scored = super().loss(variables, batch, step)
+        return scored if _has_aux(scored) else (scored, Aux[EffectsT](metrics={}))
 
     def estimate(self, params: Variables, held: Variables, batch: Batch, step: Step, cotangent) -> Variables:
         """The estimated derivative in every trained parameter of the statistics' inner product with
@@ -155,12 +187,15 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
         estimating = self._forward_only()
         variables = {**held, "params": params}
         sites: list[Site] = []
+        tables: list[TableUse] = []
 
         def captured(next_fun, args, kwargs, context):
             output = next_fun(*args, **kwargs)
-            site = _site(context, args, kwargs, output)
+            site, table = _site(context, args, kwargs, output), _table(context, output)
             if site is not None:
                 sites.append(site)
+            if table is not None:
+                tables.append(table)
             return output
 
         flat = leaves_by_path(params)
@@ -173,7 +208,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
                              "model that maps, scans or rematerializes its layers outside its remat policy "
                              "(nn.scan, jax.vmap or nn.remat in its call) hides from it; build the model "
                              "with its layers unrolled") from escaped
-        gradients = self._remaining(estimating, variables, batch, step, cotangent, flat, gradients)
+        gradients = self._remaining(estimating, variables, batch, step, cotangent, flat, gradients, tables)
         return jax.tree_util.tree_map_with_path(
             lambda path, leaf: gradients[tuple(entry.key for entry in path)].astype(leaf.dtype), params)
 
@@ -195,7 +230,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
         units = self.scored_units(variables, batch, step)
         if units is not None:
             return units
-        stats, _ = self._loss(variables, batch, step)
+        stats, _ = self._scored(variables, batch, step)
         return stats, None
 
     def _update_key(self, step: Step, name: str) -> jax.Array:
@@ -311,32 +346,64 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
         return {"embedding": rows.astype(table.dtype)}
 
     def _remaining(self, estimating, variables, batch, step, cotangent, flat: dict[Path, jax.Array],
-                   gradients: dict[Path, jax.Array]) -> dict[Path, jax.Array]:
-        """Every trained parameter's gradient: the sites', and two-sided weight-space evolution strategies'
-        for the parameters no site holds, rewarded by the statistics' whole change, the update's draws."""
+                   gradients: dict[Path, jax.Array], tables: list[TableUse]) -> dict[Path, jax.Array]:
+        """Every trained parameter's gradient: the sites', and two-sided weight-space evolution
+        strategies', rewarded by the statistics' whole change under the update's draws, for each parameter
+        no site holds, all its uses at once, and for each use of a site's parameter that no site calls,
+        a vocabulary head the loss reads as a matrix (`TableUse`): its matrix jittered in that read alone,
+        and the estimate taken back to the parameters the read takes it from, added to the sites'
+        estimate of their other uses, a tied embedding's lookup among them."""
         others = [path for path in flat if path not in gradients]
-        if not others:
+        if not others and not (tables and gradients):
             return gradients
         key = self._update_key(step, "node-perturbation/weights")
+        shapes = [flat[path].shape for path in others] + [table.shape for table in tables]
+        dtypes = [flat[path].dtype for path in others] + [table.dtype for table in tables]
 
         def noise(index: int, draw: jax.Array) -> jax.Array:
-            drawn = jax.random.normal(jax.random.fold_in(jax.random.fold_in(key, index), draw),
-                                      flat[others[index]].shape, NOISE)
-            return drawn.astype(flat[others[index]].dtype)
+            drawn = jax.random.normal(jax.random.fold_in(jax.random.fold_in(key, index), draw), shapes[index],
+                                      NOISE)
+            return drawn.astype(dtypes[index])
 
         def moved(sign: float, draw: jax.Array):
             point = {path: flat[path] + jnp.asarray(sign * self.weight_sigma, flat[path].dtype)
                      * noise(index, draw) for index, path in enumerate(others)}
             params = jax.tree_util.tree_map_with_path(
                 lambda path, leaf: point.get(tuple(entry.key for entry in path), leaf), variables["params"])
-            return estimating._statistics_and_shares({**variables, "params": params}, batch, step)
+            read = iter(range(len(others), len(shapes)))
+
+            def jitter(next_fun, args, kwargs, context):
+                output = next_fun(*args, **kwargs)
+                if not _reads_table(context, output):
+                    return output
+                drawn = noise(next(read), draw)
+                return output.replace(matrix=output.matrix + jnp.asarray(sign * self.weight_sigma,
+                                                                          drawn.dtype) * drawn)
+
+            with nn.intercept_methods(jitter):
+                return estimating._statistics_and_shares({**variables, "params": params}, batch, step)
 
         def draw(sums, index):
             whole, _, _ = self._rewards(moved(1.0, index), moved(-1.0, index), cotangent)
             return [total + jnp.asarray(whole, total.dtype) / (2 * self.weight_sigma)
                     * noise(at, index).astype(total.dtype) for at, total in enumerate(sums)], None
 
-        sums, _ = jax.lax.scan(draw, [jnp.zeros(flat[path].shape, at_least_fp32(flat[path].dtype))
-                                      for path in others], jnp.arange(self.weight_draws))
-        return {**gradients, **{path: total / self.weight_draws for path, total in zip(others, sums,
-                                                                                         strict=True)}}
+        sums, _ = jax.lax.scan(draw, [jnp.zeros(shape, at_least_fp32(dtype)) for shape, dtype in
+                                      zip(shapes, dtypes, strict=True)], jnp.arange(self.weight_draws))
+        estimates = [total / self.weight_draws for total in sums]
+        sited = dict(gradients)
+        for table, estimate in zip(tables, estimates[len(others):], strict=True):
+            # The read is the parameters' re-layout (a tied embedding as it is, a kernel through its
+            # adapter), so its pullback takes the matrix's estimate to theirs without the model's backward.
+            def matrix(trained, table=table) -> jax.Array:
+                read = head_table(table.module, {**variables, "params": trained})
+                assert read is not None, "the head read its matrix in the clean pass"
+                return read.matrix
+
+            _, back = jax.vjp(matrix, variables["params"])
+            (taken,) = back(estimate.astype(table.dtype))
+            # A parameter no site holds has its every use in its own estimate below already.
+            for path, value in leaves_by_path(taken).items():
+                if path in gradients:
+                    sited[path] = sited[path] + value.astype(sited[path].dtype)
+        return {**sited, **dict(zip(others, estimates[:len(others)], strict=True))}

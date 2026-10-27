@@ -1284,14 +1284,15 @@ class LMObjective(TokenScorer):
         return not self._warmup
 
     def scored_units(self, variables: Variables, batch: Batch,
-                     step: Step) -> tuple[Ratio | RoutedStatistics, jax.Array]:
+                     step: Step) -> tuple[Ratio | RoutedStatistics, jax.Array] | None:
         """The loss's statistics, scored as `loss` scores them (its mode, its draws, its configured
         terms), with each token's share of the prediction's total, `[B, seq_len]`: its counted cross
         entropy and z-loss, the prediction depths' terms at the position that predicts them, and the
         indexer's KL at its query, each weighted as the total weighs it. The router terms of a routed
-        decoder are statistics of their own."""
+        decoder are statistics of their own. None in an indexer's warm-up, whose KL is no token's
+        prediction: its whole statistics credit every unit."""
         if self._warmup:
-            raise ValueError("the indexer warm-up scores no token, so it has no units")
+            return None
         statistics, _, scores = self._scored_loss(variables, batch, step, train=step.training)
         width = at_least_fp32(scores.losses.dtype)
         weights = scores.weights.astype(width)

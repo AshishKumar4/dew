@@ -180,32 +180,30 @@ def gauss_newton_arm(rows: int, features: int, accumulation: int):
     return stepped
 
 
-def test_an_accumulated_gauss_newton_update_solves_its_whole_batch_once():
-    """An update of a least-squares objective read in two microbatches of an accumulation window takes
-    one damped Gauss-Newton step of its whole batch: each microbatch states its normal equations, the
-    trainer pools them, and the one solve's step is on par with the whole batch's own update from the
-    float64 solve (check 1). A solve per microbatch, averaged, would be another step: for the rows (1, 1)
-    and (2, 0) at damping 1, -1/4 where the batch's is -1/6."""
-    rows, features = 64, 8
+UPDATES = {"primal": (64, 8, 2), "short-microbatches": (64, 16, 8), "dual": (32, 64, 4)}
+"""Each accumulated update the Gauss-Newton parity reads: its rows, its weights and its microbatches.
+Two microbatches of 32 rows over 8 weights; eight of 8 rows over 16 weights, each microbatch shorter
+than the weights though the update is not; four of 8 rows over 64 weights, the update itself shorter."""
+
+
+@pytest.mark.parametrize("update", sorted(UPDATES))
+def test_an_accumulated_gauss_newton_update_solves_its_whole_batch_once(update):
+    """An update of a least-squares objective read in microbatches of an accumulation window takes one
+    damped Gauss-Newton step of its whole batch, its microbatches' shape aside: each states its part of
+    the update's system, its normal equations where the update's residuals are at least its weights,
+    whatever its own rows, and its rows of the dual's where they are fewer, the trainer pools them, and
+    the one solve's step is on par with the whole batch's own update from the float64 solve (check 1). A
+    solve per microbatch, averaged, would be another step: for the rows (1, 1) and (2, 0) at damping 1,
+    -1/4 where the batch's is -1/6."""
+    rows, features, parts = UPDATES[update]
     draw = least_squares_draw(rows, features, 0x6B)
 
     # The weights start at zero, so the step's weights are the solve's step, negated.
     exact = as_given(lambda x, y: -solved(x.astype(np.float64), y.astype(np.float64), 1e-3))
-    pooled, whole = gauss_newton_arm(rows, features, 2), gauss_newton_arm(rows, features, 1)
-    label = "accumulated gauss-newton"
+    pooled, whole = gauss_newton_arm(rows, features, parts), gauss_newton_arm(rows, features, 1)
+    label = f"accumulated gauss-newton {update}"
     assert_as_exact(pooled, whole, draw, label, truth_fn=exact,
                     seeds=seeds_for(whole, draw, label, truth_fn=exact, dew_fn=pooled))
-
-
-def test_a_pooled_update_of_fewer_residuals_than_weights_is_refused():
-    """An update of 16 rows and 64 weights read in two microbatches would take the dual step, whose Gram
-    matrix of the update's rows its microbatches' do not sum to: it is refused, where read whole it steps."""
-    generator = np.random.default_rng(4)
-    x, y = generator.normal(size=(16, 64)).astype(np.float32), generator.normal(size=16).astype(np.float32)
-    whole = gauss_newton_arm(16, 64, 1)(x, y)
-    assert whole.shape == (64,) and np.isfinite(whole).all()
-    with pytest.raises(ValueError):
-        gauss_newton_arm(16, 64, 2)(x, y)
 
 
 def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoints(tmp_path):
