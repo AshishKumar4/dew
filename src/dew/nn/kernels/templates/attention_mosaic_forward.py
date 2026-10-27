@@ -86,23 +86,32 @@ def guarded_columns(family: mosaic.Family, value_width: int, dtype) -> int:
     return min(value_width, family.column_unit(dtype))
 
 
-def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype) -> Tiles | None:
-    """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): its consumers and
-    query blocks, and the widest of the family's key extents (`extents`) that divides the plain key tile, so
-    the plain launch's padded keys are whole tiles of it, whose live set a consumer's registers hold
-    (`resources.live_registers`): its shifted and unshifted sums of `columns` value columns fp32 carried,
-    beside a step's logits and weights fp32 and the two products the step forms (`algebra.stepped`). None
-    where none fits: the plain launch is then illegal at `tiles` (`MosaicForward.legal`)."""
-    budget = family.registers(tiles.consumers)
-    rows = tiles.block_q
-    carried = [(rows, columns, jnp.float32)] * 2
+GUARD_ROWS = 4
+"""The row statistics a guarded walk carries beside a plain one's maximum and denominator (`algebra.Guard`:
+each row's shift, reach, unshifted denominator and liveness), each held by the four threads an accumulator
+row spans, two rows a thread: a `[block_q, 4]` fp32 tile's words a statistic (`guarded_tiles`)."""
 
-    def held(block: int) -> bool:
+
+def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype) -> Tiles | None:
+    """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): its query blocks, the
+    widest of the family's key extents (`extents`) that divides the plain key tile, so the plain launch's
+    padded keys are whole tiles of it, and the most of the plain launch's consumers, whose live set a
+    consumer's registers hold (`resources.live_registers`): its shifted and unshifted sums of `columns` value
+    columns fp32 and its rows' statistics (`GUARD_ROWS`) carried, beside a step's logits and weights fp32
+    and the two products the step forms (`algebra.stepped`). Uncounted, the statistics left 64 x 64 on two
+    consumers spilling 20 bytes a thread at heads 128 and 256 wide (ptxas, sm90a). None where none fits:
+    the plain launch is then illegal at `tiles` (`MosaicForward.legal`)."""
+    rows = tiles.block_q
+    carried = [(rows, columns, jnp.float32)] * 2 + [(rows, 4 * GUARD_ROWS, jnp.float32)]
+
+    def held(block: int, consumers: int) -> bool:
         stepped = [(rows, block, jnp.float32)] * 2 + [(rows, columns, jnp.float32)] * 2
-        return resources.live_registers(family, carried, stepped) <= budget
+        return resources.live_registers(family, carried, stepped) <= family.registers(consumers)
 
     blocks = [block for block in extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
-    return next((dataclasses.replace(tiles, block_k=block) for block in blocks if held(block)), None)
+    candidates = (dataclasses.replace(tiles, block_k=block, consumers=consumers)
+                  for consumers in range(tiles.consumers, 0, -1) for block in blocks)
+    return next((candidate for candidate in candidates if held(candidate.block_k, candidate.consumers)), None)
 
 
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
