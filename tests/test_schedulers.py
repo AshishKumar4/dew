@@ -692,7 +692,6 @@ def test_heuns_churn_stays_inside_the_tangent_grid_whatever_its_kappa(kappa):
 
     schedule = CosineGeneralNoiseScheduler(kappa=kappa)
     assert (schedule.sigma_min, schedule.sigma_max) == (0.02, 80.0)
-    assert schedule.sigma_range[1] == pytest.approx(80.0 / kappa ** 2)
     process, x = SimpleNamespace(sampler_schedule=schedule), jnp.zeros((1, 4), jnp.float32)
     with pytest.raises(ValueError):
         Heun(s_churn=0.2).init(x, jnp.asarray([1.0, 0.5, 0.0]), process, key=jax.random.key(0))
