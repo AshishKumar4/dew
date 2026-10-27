@@ -15,9 +15,9 @@ pointer arithmetic does. The memories the chunks enter are stored where they pas
 (`Sequences`), so however many documents a row packs, they take no more slots than its chunks, a
 row's own and one of zeros.
 
-Each kernel is a launch the tuner times (`dew.nn.kernels.tuning.KernelOp`) over the tiles fla's own
-autotuner lists for it that fit the GPU's block (its `SPACES`), fla's picks for 99 KB GPUs its
-heuristic (its `PICKS`); `dew.nn.kernels.recurrence_chunk.fla_rule` shapes any other call to them.
+Each kernel is a launch (`dew.nn.kernels.tuning.KernelOp`) whose tiles are fla's own picks, for an
+A100's block and for 99 KB GPUs' (its `PICKS`); `dew.nn.kernels.recurrence_chunk.fla_rule` shapes any
+other call to them.
 """
 
 import dataclasses
@@ -29,7 +29,7 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import recurrence
+from dew.nn.kernels import recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
     Sequences,
@@ -43,9 +43,7 @@ from dew.nn.kernels.chunked_launch import (
     _picks,
     _row,
     _rows,
-    _spaces,
     _span,
-    _tiles,
     read_rows,
     sequences,
     slots,
@@ -57,15 +55,14 @@ RCP_LN2 = 1 / math.log(2)
 decay in base 2 and exponentiate with exp2; the prefix converts in float64 (`recurrence.cumulated`)."""
 
 WIDEST = 128
-"""The widest values each of the port's calls takes: its spaces are proven at the 0.8B's and 9B's
+"""The widest values each of the port's calls takes: its tiles are proven at the 0.8B's and 9B's
 128-wide heads; wider values split into more heads."""
 
 WIDEST_KEYS = 256
 """The widest 16-bit keys the port takes, fla's own bound (chunk_delta_h.py's four 64-wide blocks of
-the memory); keys cannot split. Its heuristics run there (`ChunkBwdDhu.WIDE_KEYS_PICK` the one
-narrower than the 128-wide pick); its spaces' larger configs may not fit a GPU's block, which the
-tuner drops. fp32 keys take at most WIDEST: at 256 an A100's fp32 forward h needs 172,292 shared
-bytes at its narrowest tile (CPU compile)."""
+the memory); keys cannot split. Its picks run there (`ChunkBwdDhu.WIDE_KEYS_PICK` the one narrower
+than the 128-wide pick). fp32 keys take at most WIDEST: at 256 an A100's fp32 forward h needs 172,292
+shared bytes at its narrowest tile (CPU compile)."""
 
 
 def _pairs(rows, columns):
@@ -123,18 +120,9 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
 
 
-def _tril_inverse(diagonal, index):
-    """`(I + D)^-1` of a strictly lower square block `D`, row by row: fla's forward substitution
-    (chunk_fwd.py's solve, chunk_intra.py's for Kimi's delta attention). `index` is the block's
-    `arange` of rows, which the caller's other masks share."""
-    sub = diagonal.shape[0]
-    inverse = -diagonal
-    for i in range(2, sub):
-        row = jnp.sum(jnp.where((index == i)[:, None], -diagonal, 0.0), axis=0)
-        row = jnp.where(index < i, row, 0.0)
-        row = row + jnp.sum(row[:, None] * inverse, axis=0)
-        inverse = jnp.where((index == i)[:, None], row[None, :], inverse)
-    return inverse + (index[:, None] == index[None, :])
+_tril_inverse = algebra.tril_inverse
+"""`(I + D)^-1` of a strictly lower square block, row by row: fla's forward substitution (chunk_fwd.py's
+solve, chunk_intra.py's for Kimi's delta attention), the algebra's (`recurrence_algebra.tril_inverse`)."""
 
 
 def _kkt_solve_kernel(chunk_ref, k_ref, g_ref, beta_ref, a_ref, *, chunk: int, aligned: bool,
@@ -200,7 +188,6 @@ class KktSolve(_Launch):
 
     NAME = "kkt_solve"
     KEYS, VALUES = 'k', None
-    SPACES = _spaces(_tiles([(32, 0), (64, 0)], (1, 2, 4), (2, 3, 4)))
     PICKS = _picks(Tiles(64, 0, 1, 3))
 
     def _fwd(self, k: jax.Array, g: jax.Array, beta: jax.Array, chunk_spans: jax.Array,
@@ -276,7 +263,6 @@ class RecomputeWU(_Launch):
 
     NAME = "recompute_w_u"
     KEYS, VALUES = 'k', 'v'
-    SPACES = _spaces(_tiles([(64, 64)], (2, 4, 8), (2, 3, 4)))
     PICKS = _picks(Tiles(64, 64, 2, 4))
 
     def _fwd(self, k: jax.Array, v: jax.Array, beta: jax.Array, a: jax.Array, g: jax.Array,
@@ -388,8 +374,6 @@ class ChunkFwdH(_Launch):
 
     NAME = "chunk_fwd_h"
     KEYS, VALUES = 'k', 'u'
-    SPACES = _spaces(_tiles([(0, 32), (0, 64)], (2, 4), (2, 3, 4)),
-                     _tiles([(0, 32), (0, 64)], (2, 4), (1, 2)))
     # fla's stages for devices under an A100's shared memory (chunk_delta_h.py:43-44), with two warps.
     PICKS = _picks(Tiles(0, 32, 4, 3), small=Tiles(0, 32, 2, 2), wide_fp32=Tiles(0, 64, 4, 2),
                    small_fp32=Tiles(0, 64, 2, 1))
@@ -462,8 +446,8 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
     it leaves into, `dh`, at that memory's slot (`Sequences`), then
     `dv2 = dv + (k dh) exp2(g_last - g)` (dh cast to k's dtype), then
     `dh = dh exp2(g_last) + scale (q exp2(g))^T do - w^T dv2`: the gated queries fp32 as two parts
-    of `do`'s dtype (`_split_dot`), where fla takes one TF32 product at the same cost, and dv2 cast
-    to w's dtype for its product, as fla casts it.
+    of `do`'s dtype (`_split_dot`), where fla takes one TF32 product at the same cost, its terms summed
+    from the chunk's last token, and dv2 cast to w's dtype for its product, as fla casts it.
     `per_key` is fla's USE_GK branch: `g_ref` `[T, K]` decays the gradient's rows by `exp2(g_last)`,
     and neither `dv2` nor the queries, which carry their own decay, are gated; the query product
     stays in q's dtype. A row's last sequence starts from the final
@@ -488,16 +472,34 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
             slot = jnp.where(r > 0, base + n + 1, left)
             for i in range(slices):
                 dh_ref[slot, pl.ds(i * 64, 64), :] = grad[i].astype(dh_ref.dtype)
+            # The chunk's tokens last first (an exchange of rows, its products exact: one nonzero term
+            # a row, bf16x6's three parts of an fp32 value its 24 bits, which one product of IEEE
+            # fp32 would compile to FMA loops on sm80): the readout's terms summed from the chunk's
+            # last token, the smallest first, as the portable math sums them
+            # (`recurrence_algebra.remembered`), where summed from the first the initial memory's
+            # gradient sat 2.3 to 2.4 times its distance from float64 (tests/test_fla_kda.py).
+            index = jnp.arange(chunk)
+            exchange = (index[:, None] + index[None, :] == chunk - 1).astype(jnp.float32)
+
+            def reversed_rows(x):
+                x = x.astype(jnp.float32)
+                if exact:
+                    return _dot(exchange, x, exact=True)
+                return jnp.dot(exchange, x, precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32_X6,
+                               preferred_element_type=jnp.float32)
+
             out_grad = read(do_ref)
             dv = sum(_dot(read(k_ref, pl.ds(i * 64, 64)), grad[i].astype(k_ref.dtype), exact=exact)
                      for i in range(slices))
             final = begin + taken - 1
             queries = [read(q_ref, pl.ds(i * 64, 64)) for i in range(slices)]
+            last_first = reversed_rows(out_grad)
             if per_key:
                 dv = dv + read(dv_ref).astype(jnp.float32)
                 kept = [jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
                         for i in range(slices)]
-                read_out = [_dot(query.T, out_grad.astype(query.dtype), exact=exact) for query in queries]
+                read_out = [_dot(reversed_rows(query).astype(query.dtype).T, last_first.astype(query.dtype),
+                                 exact=exact) for query in queries]
             else:
                 gate = _gates(g_ref, begin, taken, chunk)
                 last = _row(g_ref, final)
@@ -505,7 +507,8 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
                       + read(dv_ref).astype(jnp.float32))
                 decay = jnp.exp2(gate)[:, None]
                 kept = [jnp.exp2(last)] * slices
-                read_out = [_split_dot((query.astype(jnp.float32) * decay).T, out_grad, exact=exact)
+                read_out = [_split_dot(reversed_rows(query.astype(jnp.float32) * decay).T,
+                                       last_first.astype(out_grad.dtype), exact=exact)
                             for query in queries]
             write_rows(_rows(dv2_ref, begin, chunk), taken, dv)
 
@@ -527,20 +530,19 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
 class ChunkBwdDhu(_Launch):
     """`chunk_bwd_dhu`'s launch (tuning.KernelOp)."""
 
+    revision: int = 2
+
     NAME = "chunk_bwd_dhu"
     KEYS, VALUES = 'k', 'do'
-    SPACES = _spaces(_tiles([(0, 32), (0, 64)], (2, 4), (1, 2, 3)),
-                     _tiles([(0, 32), (0, 64)], (2, 4), (1, 2)))
     # Measured at Qwen3.5-0.8B's shape (8 x 3072, 16 heads of 128, bf16), CUPTI, 2026-10-13: 0/64/4/3
     # 1.09 ms on an A100 and 0.315 on an H100, the fastest on both. One stage for fp32: three took
     # 254,984 bytes of an A100's 166,912 (c58); fla's blocks for 99 KB devices (chunk_delta_h.py:352-353).
     PICKS = _picks(Tiles(0, 64, 4, 3), small=Tiles(0, 64, 4, 1), wide_fp32=Tiles(0, 64, 4, 1),
                    small_fp32=Tiles(0, 32, 4, 1))
     WIDE_KEYS_PICK = Tiles(0, 64, 4, 1)
-    """The heuristic past `WIDEST` keys, one of `SPACES`: the memory gradient is held a 64-key slice at a
-    time, so 256-wide keys stage twice 128-wide ones', and the pick's three stages took 271,368 shared
-    bytes of an A100's 166,912 and an H100's 232,448 in 16 bits (2026-10-21); one stage ran on both. The
-    tuner measures the whole space there, dropping a config a GPU's block cannot hold."""
+    """The heuristic past `WIDEST` keys: the memory gradient is held a 64-key slice at a time, so
+    256-wide keys stage twice 128-wide ones', and the pick's three stages took 271,368 shared bytes of
+    an A100's 166,912 and an H100's 232,448 in 16 bits (2026-10-21); one stage ran on both."""
 
     def _get_heuristics_config(self, ba) -> Tiles:
         if ba.arguments['k'].shape[-1] > WIDEST:
@@ -642,7 +644,6 @@ class ChunkBwdDvLocal(_Launch):
 
     NAME = "chunk_bwd_dv_local"
     KEYS, VALUES = 'k', 'do'
-    SPACES = _spaces(_tiles([(64, 64), (128, 128)], (2, 4, 8), (2, 3, 4)))
     PICKS = _picks(Tiles(64, 64, 2, 3))
 
     def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, do: jax.Array,
@@ -784,8 +785,6 @@ class ChunkBwdDqkwg(_Launch):
 
     NAME = "chunk_bwd_dqkwg"
     KEYS, VALUES = 'k', 'v'
-    SPACES = _spaces(_tiles([(64, 64), (64, 128), (128, 64), (128, 128)], (2, 4, 8), (1, 2)),
-                     _tiles([(64, 64), (64, 128), (128, 64), (128, 128)], (2, 4, 8), (1,)))
     # One stage elsewhere: its loop over a key head's value heads holds every block of a head, and a
     # second stage stages the next head's whole, past an RTX's 99 KB at the 9B's two heads a key.
     # Measured at Qwen3.5-0.8B's shape, CUPTI, 2026-10-13: 128/128/8/1 1.33 ms on an A100 (64/64/4/1
@@ -957,7 +956,6 @@ class PrepareWyReprBwd(_Launch):
 
     NAME = "prepare_wy_repr_bwd"
     KEYS, VALUES = 'k', 'v'
-    SPACES = _spaces(_tiles([(32, 32), (64, 64)], (2, 4, 8), (1, 2, 3)))
     # Eight warps for fp32 on every GPU: at TF32x3 four took ptxas 40 s on sm80 and 66 s on sm89, eight
     # 17 s; one stage on a 99 KB block, whose looped blocks stage the next one, 102,400 bytes at two
     # (sm89).
@@ -1061,7 +1059,6 @@ class ChunkFwdO(_Launch):
 
     NAME = "chunk_fwd_o"
     KEYS, VALUES = 'k', 'v'
-    SPACES = _spaces(frozenset({Tiles(128, 128, 8, 3), Tiles(64, 64, 4, 3), Tiles(32, 32, 2, 3)}))
     PICKS = _picks(Tiles(128, 128, 8, 3))
 
     def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, h: jax.Array, g: jax.Array,

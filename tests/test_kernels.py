@@ -26,7 +26,8 @@ from dew.nn import kernels
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention, weighted_values
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.kernels.selection import KernelRefused
-from dew.nn.precision import FP32_SUMS
+from dew.nn.kernels.templates import attention as template
+from dew.nn.precision import FP32_SUMS, at_least_fp32
 
 pytestmark = pytest.mark.kernel
 
@@ -857,6 +858,24 @@ def test_cpu_fp32_attention_rounds_closer_to_float64_than_jax_nn():
     assert mine <= 0.75 * theirs, (mine, theirs)
 
 
+@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the setting is a CPU's")
+@pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
+def test_a_cpu_takes_the_reference_attention_under_the_test_setting_alone(wide, monkeypatch):
+    """'auto' and 'xla' on a CPU take the reference path in a process running Dew's test setting
+    (`WIDE_CPU_ARITHMETIC`), whose fp32 sums jax.nn's xla kernel would run below, and jax.nn's xla
+    kernel in a library process, which sets nothing, as on any platform: no CPU veto of its own."""
+    from dew.nn.attention import resolve_implementation
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC
+
+    if wide:
+        monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    else:
+        monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    query = jnp.zeros((2, 16, 4, 8), jnp.float32)
+    for implementation in ("auto", "xla"):
+        assert resolve_implementation(implementation, query, query) == ("reference" if wide else "xla")
+
+
 @pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
 def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
     """fp32 reference attention over 300 keys, whose products a CPU sums in float64
@@ -918,9 +937,14 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
     `dot_product_attention` handed the key heads repeated over their group and
     its probability product (`weighted_values`), bitwise: in each compute dtype,
     the softmax forced to fp32 or not, an fp32 bias wider than half-precision
-    logits, a causal mask and a probability draw from the same key. Both sum
-    their fp32 products as XLA does (`FP32_SUMS`), the reference path's own
-    float64 sums on a CPU being the policy's (tests/test_cpu_accumulation.py)."""
+    logits and a causal mask. Its probability draw is Dew's own (row 1521: the
+    keep bits every route draws from one rng, `template.dropout_keep`, so a
+    route never changes which weights drop) and its multiplier Dew's (row 1533:
+    1 / (1 - rate) rounded once in at least fp32), applied where flax applies
+    its own: flax's weights (`dot_product_attention_weights`) under Dew's keep
+    mask and multiplier, then the value product. Both sum their fp32 products
+    as XLA does (`FP32_SUMS`), the reference path's own float64 sums on a CPU
+    being the policy's (tests/test_cpu_accumulation.py)."""
     keys = jax.random.split(jax.random.key(0), 5)
     query = jax.random.normal(keys[0], (2, 6, 4, 8), dtype)
     key, value = (jax.random.normal(drawn, (2, 6, 2, 8), dtype) for drawn in keys[1:3])
@@ -929,11 +953,15 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
     with jax.default_matmul_precision(FP32_SUMS):
         ours = scaled_dot_product_attention(query, key, value, implementation="reference", causal=True,
                                             bias=bias, force_fp32_for_softmax=forced, **drop)
-        theirs = nn.dot_product_attention(
-            query, jnp.repeat(key, 2, axis=2), jnp.repeat(value, 2, axis=2), bias=bias,
-            mask=jnp.tril(jnp.ones((6, 6), bool))[None, None], broadcast_dropout=False,
-            force_fp32_for_softmax=forced, qk_attn_weights_einsum=jnp.einsum,
-            attn_weights_value_einsum=weighted_values, **drop)
+        weights = nn.dot_product_attention_weights(
+            query, jnp.repeat(key, 2, axis=2), bias=bias, mask=jnp.tril(jnp.ones((6, 6), bool))[None, None],
+            force_fp32_for_softmax=forced, einsum=jnp.einsum)
+        if dropout_rate:
+            wide = at_least_fp32(dtype)
+            keep = template.dropout_keep(template.dropout_seed(keys[4]), dropout_rate, weights.shape)
+            scale = jnp.asarray(1.0 / (1.0 - dropout_rate), wide)
+            weights = (weights.astype(wide) * jnp.where(keep, scale, 0)).astype(dtype)
+        theirs = weighted_values('...hqk,...khd->...qhd', weights, jnp.repeat(value, 2, axis=2))
     np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
@@ -1052,7 +1080,7 @@ def eligibility_call(dtype, head_dim, causal, window=None, documents=None, max_s
 
 
 @pytest.mark.gpu(reason="each requirement is held to the kernel it declares, on this GPU")
-@pytest.mark.parametrize("kernel", ["flash", "triton", "cudnn", "xla"])
+@pytest.mark.parametrize("kernel", ["flash", "triton", "cudnn", "xla", "template"])
 @pytest.mark.parametrize("call", eligibility_cases(),
                          ids=lambda call: "-".join(f"{name}={value}" for name, value in call.items()))
 def test_a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, call,
@@ -1084,64 +1112,61 @@ def test_a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, ca
         assert np.all(np.isfinite(run()))
 
 
-@pytest.mark.parametrize("generation_name, narrow", [("sm80", "flash"), ("sm86", "flash"),
-                                                     ("sm90", "flash"), ("sm89", "triton")])
-def test_narrow_heads_take_the_kernel_their_target_measured_fastest(generation_name, narrow):
-    """A causal bf16 call of 64-wide heads prefers its GPU row's narrow-heads kernel
-    ('attention_narrow'): the FA wheel where it was measured fastest, an A10, an A100 and an H100
-    (`generation.TARGETS`), tokamax's Triton kernel where the row names none. FlashAttention's own row
-    requirement reads the same row, so where the wheel holds code for the GPU the preference is the
-    route, an A10's narrow heads included where its attention row names none."""
-    from dew.nn.attention import attention_case, resolve_implementation
-    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
+@pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm89", "sm90"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_a_bf16_call_takes_flash_on_its_cell_or_by_legality(generation_name, head_dim):
+    """A causal bf16 call takes FlashAttention on every GPU it measured fastest on: Hopper's by its declared
+    cell (`attention_kernels.DECLARED`), its refusal naming the template it sets aside and the receipt; a GPU
+    of no routed Mosaic mainloop (mma.sync's) as the op's first kernel by legality, no table row
+    preferring another (bible §4)."""
+    from dew.nn.attention import resolve_implementation
     from dew.nn.kernels import generation
 
-    query = jnp.zeros((2, 128, 4, 64), jnp.bfloat16)
+    query = jnp.zeros((2, 128, 4, head_dim), jnp.bfloat16)
     with generation.assumed(generation_name), generation.routes() as found:
         resolve_implementation("auto", query, query, causal=True)
-        refused = {refusal.code for refusal in kernel_refusals(
-            ATTENTION, narrow, attention_case(query, query, causal=True))}
     (route,) = [route for route in found if route.choice == "attention"]
-    assert route.preferred == narrow
-    # The row qualifies the preferred kernel: only host facts (backend, wheel) may turn it down here.
-    assert "row" not in refused
+    assert route.kernel == "flash"
+    if generation_name == "sm90":
+        assert route.preferred == "template" and route.refusal.code == "old_route"
+    else:
+        assert route.preferred == "flash" and route.refusal is None
 
 
 @pytest.mark.parametrize("dtype, kept", [(jnp.float16, False), (jnp.bfloat16, True)])
 def test_an_fp16_call_leaves_the_triton_route_as_a_declared_gap(dtype, kept):
-    """A causal call of 16-wide heads where an L4's row prefers tokamax's Triton kernel: an fp16 one is
-    refused by its dtype, whose dQ that kernel narrows before the scale the route applies outside it
-    (row 1676, `triton_attention`), and the next kernel takes it; a bf16 one keeps it."""
-    from dew.nn.attention import attention_case, resolve_implementation
+    """A causal call of 16-wide heads that prefers tokamax's Triton kernel: an fp16 one is refused by its
+    dtype, whose dQ that kernel narrows before the scale the route applies outside it (row 1676,
+    `triton_attention`), and the next kernel takes it; a bf16 one keeps it."""
+    from dew.nn.attention import attention_case
     from dew.nn.attention_kernels import ATTENTION, kernel_refusals
     from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import select
 
     query = jnp.zeros((2, 128, 4, 16), dtype)
-    with generation.assumed("sm89"), generation.routes() as found:
-        resolve_implementation("auto", query, query, causal=True)
-        refused = {refusal.code for refusal in kernel_refusals(
-            ATTENTION, "triton", attention_case(query, query, causal=True))}
-    (route,) = [route for route in found if route.choice == "attention"]
+    with generation.assumed("sm89"), generation.routes():
+        case = attention_case(query, query, causal=True)
+        refused = {refusal.code for refusal in kernel_refusals(ATTENTION, "triton", case)}
+        route = select(ATTENTION, case, "triton", insist=False)
     assert ("fp16" not in refused) == kept
     assert (route.kernel == "triton") == kept
 
 
 @pytest.mark.parametrize("head_dim, kept", [(8, False), (16, True)])
 def test_heads_narrower_than_the_triton_kernel_computes_take_the_next_kernel(head_dim, kept):
-    """A causal bf16 call of narrow heads prefers tokamax's Triton kernel where its GPU's row names it
-    for them, an L4's: 8-wide heads, which that kernel computes wrong (`TRITON_NARROWEST`), are refused
-    by their width and the next kernel takes the call; 16-wide heads keep it."""
-    from dew.nn.attention import attention_case, resolve_implementation
+    """A causal bf16 call of narrow heads that prefers tokamax's Triton kernel: 8-wide heads, which that
+    kernel computes wrong (`TRITON_NARROWEST`), are refused by their width and the next kernel takes the
+    call; 16-wide heads keep it."""
+    from dew.nn.attention import attention_case
     from dew.nn.attention_kernels import ATTENTION, kernel_refusals
     from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import select
 
     query = jnp.zeros((2, 128, 4, head_dim), jnp.bfloat16)
-    with generation.assumed("sm89"), generation.routes() as found:
-        resolve_implementation("auto", query, query, causal=True)
-        refused = {refusal.code for refusal in kernel_refusals(
-            ATTENTION, "triton", attention_case(query, query, causal=True))}
-    (route,) = [route for route in found if route.choice == "attention"]
-    assert route.preferred == "triton"
+    with generation.assumed("sm89"), generation.routes():
+        case = attention_case(query, query, causal=True)
+        refused = {refusal.code for refusal in kernel_refusals(ATTENTION, "triton", case)}
+        route = select(ATTENTION, case, "triton", insist=False)
     assert ("head_dim" not in refused) == kept
     assert (route.kernel == "triton") == kept
 

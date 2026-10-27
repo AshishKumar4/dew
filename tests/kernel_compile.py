@@ -11,8 +11,11 @@ everything else.
 
 import contextlib
 import functools
+import json
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -138,6 +141,8 @@ environment, so one scope at a time sets and restores them."""
 REGISTERS = re.compile(r"Used (\d+) registers")
 SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
 SMEM = re.compile(r"smem_scratch_bytes=(\d+)")
+KERNEL_COUNTER = re.compile(r"_\d+$")
+"""The counter Mosaic GPU appends to a kernel's name in its reports' file names."""
 TMEM_USED = re.compile(r"tmem_scratch_cols=(\d+), tmem_collective_scratch_cols=(\d+)")
 
 
@@ -162,15 +167,21 @@ def mosaic_kernels(directory: str) -> list[dict]:
     """Each Mosaic GPU kernel's report in `directory`: its shared bytes and tensor memory columns (Mosaic's
     resource estimate), its registers a thread and its spilled bytes (ptxas's), or `unread`, what a
     report lacks: either report without the other, or a field neither states, is no evidence the kernel
-    is within its resources."""
+    is within its resources. A case's reports are paired by the kernel's name less the counter Mosaic
+    appends (`KERNEL_COUNTER`), which JAX 0.12 numbers apart for the two reports; a case names each kernel
+    once."""
     kernels = []
     reports = Path(directory)
-    names = {path.name.removesuffix(".resources.txt") for path in reports.glob("*.resources.txt")}
-    names |= {path.name.removesuffix(".ptxas") for path in reports.glob("*.ptxas")}
-    for name in sorted(names):
-        resources, ptxas = reports / f"{name}.resources.txt", reports / f"{name}.ptxas"
-        text = resources.read_text() if resources.exists() else ""
-        log = ptxas.read_text() if ptxas.exists() else ""
+    named: dict[str, dict[str, Path]] = {}
+    for kind, suffix in (("resources", ".resources.txt"), ("ptxas", ".ptxas")):
+        for path in reports.glob(f"*{suffix}"):
+            found = named.setdefault(KERNEL_COUNTER.sub("", path.name.removesuffix(suffix)), {})
+            # Paired by name: a case that compiles a name twice would pair the wrong reports.
+            assert kind not in found, f"a case compiled {path.name} and {found[kind].name}: name them apart"
+            found[kind] = path
+    for name, found in sorted(named.items()):
+        text = found["resources"].read_text() if "resources" in found else ""
+        log = found["ptxas"].read_text() if "ptxas" in found else ""
         shared, tmem = SMEM.search(text), TMEM_USED.search(text)
         registers, spills = REGISTERS.findall(log), SPILLS.findall(log)
         unread = [field for field, found in (("shared bytes", shared), ("tensor memory columns", tmem),
@@ -183,12 +194,51 @@ def mosaic_kernels(directory: str) -> list[dict]:
     return kernels
 
 
+OWN_PROCESS = "DEW_MOSAIC_RECORDS"
+"""Where a test re-run in a process of its own (`compile_mosaic_kernels`) writes its records."""
+
+_BINARY_CAPABILITY: list[tuple[int, int]] = []
+"""The compute capability this process's Mosaic GPU binary pass is registered with: the first kernel's it
+compiled. jaxlib registers the pass once a process and assembles every later kernel for that capability
+(custom_call.cc's GetPassPipeline; an sm_90a kernel after an sm80 one fails in ptxas, 'SM version
+specified by .target is higher than default SM version assumed', and an sm80 kernel after an sm90 one is
+assembled for sm90). Production compiles for one GPU a process; the gates compile for several."""
+
+
 def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     """Each Mosaic GPU case (`name`, `call()` giving the kernel and abstract operands) compiled as
     `compile_kernels` compiles Triton's, for a compile-only device of the CUDA `generation`, with Mosaic's
     own reports on (`mosaic_dumps`): its name, the generation's shared-memory and tensor-memory limits
     (`GpuTarget.tmem_columns`, 0 where it has none), and each of its kernels' report (`mosaic_kernels`),
-    or the error."""
+    or the error. In a process that compiled Mosaic kernels for another capability (`_BINARY_CAPABILITY`)
+    the calling test runs again in a process of its own, and these are its records there."""
+    wanted = capability(generation)
+    if _BINARY_CAPABILITY and _BINARY_CAPABILITY[0] != wanted and OWN_PROCESS not in os.environ:
+        return _compiled_apart()
+    _BINARY_CAPABILITY[:] = _BINARY_CAPABILITY or [wanted]
+    found = _compiled_here(cases, generation)
+    if OWN_PROCESS in os.environ:
+        Path(os.environ[OWN_PROCESS]).write_text(json.dumps(found))
+    return found
+
+
+def _compiled_apart() -> list[dict]:
+    """The records the calling test's `compile_mosaic_kernels` call gives in a pytest process of its own, its
+    first Mosaic GPU compile its generation's."""
+    test = os.environ["PYTEST_CURRENT_TEST"].rsplit(" ", 1)[0]
+    with tempfile.TemporaryDirectory(prefix="dew-mosaic-apart-") as directory:
+        records = Path(directory) / "records.json"
+        ran = subprocess.run([sys.executable, "-m", "pytest", test, "-q", "-p", "no:cacheprovider"],
+                             cwd=Path(__file__).parent.parent, env={**os.environ, OWN_PROCESS: str(records)},
+                             capture_output=True, text=True, check=False)
+        if not records.exists():
+            raise RuntimeError(f"{test} gave no records in a process of its own:\n"
+                               f"{(ran.stdout + ran.stderr)[-3000:]}")
+        return json.loads(records.read_text())
+
+
+def _compiled_here(cases, generation: str) -> list[dict]:
+    """`compile_mosaic_kernels`' records, compiled in this process."""
     found: list[dict] = []
     for case in cases:
         with tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory, mosaic_dumps(directory):
@@ -241,7 +291,7 @@ def compile_tpu_kernels(cases, generation: str) -> list[dict]:
     mesh = _tpu_device(generation)
     replicated = NamedSharding(mesh, PartitionSpec())
     # The generation assumed as well as its mesh, so a kernel's facts are its target's
-    # (`dew.nn.attention.splash_block_sizes`' scoped VMEM).
+    # (`dew.nn.kernels.splash.block_sizes`' scoped VMEM).
     found: list[dict] = []
     for case in cases:
         record: dict = {"name": case.name, "generation": generation}
@@ -254,5 +304,8 @@ def compile_tpu_kernels(cases, generation: str) -> list[dict]:
                 lowered = jax.jit(fn).trace(*placed).lower()
             lowered.compile()
         except Exception as error:  # A case that does not lower or compile is its own failure.
-            record["error"] = f"{type(error).__name__}: {str(error)[-800:]}"
+            # Mosaic TPU's refusal leads with its reason and ends with diagnostics: both ends kept.
+            text = str(error)
+            text = text if len(text) <= 1600 else f"{text[:800]} ... {text[-800:]}"
+            record["error"] = f"{type(error).__name__}: {text}"
     return found

@@ -66,13 +66,13 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
     return functools.partial(_pinned, launch, tiles, **kwargs), operands[kernel]
 
 
-def kernel_cases(target: str) -> Iterator[KernelCase]:
-    """Each kernel pinned to the tiles `target` runs it with unmeasured (its launch's `PICKS`, the reverse
-    recurrence's `WIDE_KEYS_PICK` past `WIDEST` keys) for both dtypes at each shape, and the reverse
+def kernel_cases(target: str, dtypes: tuple[str, ...] = ("bfloat16", "float32")) -> Iterator[KernelCase]:
+    """Each kernel pinned to the tiles `target` runs it with (its launch's `PICKS`, the reverse
+    recurrence's `WIDE_KEYS_PICK` past `WIDEST` keys) for each of `dtypes` at each shape, and the reverse
     cumsum, for the compile test."""
     with generation.assumed(target):
         wide = chunked_launch._wide()
-    for dtype in ("bfloat16", "float32"):
+    for dtype in dtypes:
         launches = [*vars(fla_gdn).values(), *vars(recurrence).values()]
         for launch in (x for x in launches if isinstance(x, chunked_launch._Launch)):
             for shape_name, shape in COMPILED_SHAPES.items():
@@ -320,7 +320,7 @@ KDA_TRAINING = (1, 4096, 32, 128)
 
 def kda_training_cases() -> Iterator[KernelCase]:
     """The port's forward and backward in bf16 through the rule's VJP: at the training shape, and with
-    keys of 256, the widest 16-bit keys `port_refusal` hands it (`fla_gdn.WIDEST_KEYS`)."""
+    keys of 256, the widest 16-bit keys the port takes (`fla_gdn.WIDEST_KEYS`)."""
     batch, length, heads, width = KDA_TRAINING
 
     def case(name, width, columns, heads):
@@ -353,9 +353,9 @@ CONV_SHAPES = {
 }
 
 
-def _conv_case(name, shape, parts, out, bias, valid, packed, pin=None) -> KernelCase:
+def _conv_case(name, shape, parts, out, bias, valid, packed) -> KernelCase:
     """Both kernels through the conv's VJP over bf16 rows `shape` into `parts` in `out`, each launch at
-    its `pin` (`tuning.pinned`), else its heuristic."""
+    its config."""
     def call():
         x = jax.ShapeDtypeStruct((*shape, sum(width for width, _ in parts)), jnp.bfloat16)
         weights = jax.ShapeDtypeStruct((x.shape[-1], 4), jnp.float32)
@@ -368,8 +368,7 @@ def _conv_case(name, shape, parts, out, bias, valid, packed, pin=None) -> Kernel
                 out_ = short_conv.conv(x, weights, shift, kept, segments, parts, activation=True,
                                        eps=1e-6, dtype=jnp.dtype(out), interpret=False)
                 return sum(jnp.sum(piece.astype(jnp.float32)) for piece in out_)
-            with tuning.pinned(pin or {}):
-                return jax.grad(loss, argnums=(0, 1, 2))(x, weights, shift)
+            return jax.grad(loss, argnums=(0, 1, 2))(x, weights, shift)
         return grads, (x, weights, shift, kept, segments)
     return KernelCase(name, call)
 
@@ -384,15 +383,3 @@ def conv_training_cases() -> Iterator[KernelCase]:
     for packed in (False, True):
         yield _conv_case("mamba/packed" if packed else "mamba", (8, 3072), ((3072, None),), jnp.float32,
                          bias=True, valid=False, packed=packed)
-
-
-def conv_config_cases() -> Iterator[KernelCase]:
-    """Each config of each launch's space (`short_conv.TILES`, `short_conv.WALKS`), pinned, through the
-    9B's packed delta conv, the widest pieces a training shape gives."""
-    shape, parts = CONV_SHAPES["9b"]
-    spaces = ((short_conv.ConvForward, short_conv.TILES), (short_conv.ConvBackward, short_conv.WALKS))
-    for op, space in spaces:
-        for config in sorted(space, key=dataclasses.astuple):
-            flags = "-".join(str(value) for value in dataclasses.astuple(config))
-            yield _conv_case(f"9b/packed/{op.__name__}/{flags}", shape, parts, jnp.bfloat16, bias=False,
-                             valid=False, packed=True, pin={op: config})

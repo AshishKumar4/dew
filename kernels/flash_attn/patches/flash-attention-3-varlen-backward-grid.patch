@@ -27,7 +27,7 @@ index 656f2d4..23824f5 100644
 -      Is_causal,
 -      flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, Is_causal && Deterministic /*SPT*/>,
 -      flash::SingleTileScheduler<Varlen, false /*Split*/, false /*PackGQA*/, kBlockN>>;
-+      CompactVarlen, flash::VarlenBlockScheduler<kBlockN>,
++      CompactVarlen, flash::VarlenBlockScheduler<kBlockN, Is_causal /*L2 sections*/>,
 +      std::conditional_t<
 +          Is_causal,
 +          flash::SingleTileBwdLPTScheduler<Varlen, kBlockN, Is_causal && Deterministic /*SPT*/>,
@@ -193,7 +193,7 @@ index 3dbb6a0..efbd370 100644
 +}
 +
 +// The `block_idx`-th block of the padded block space (varlen_num_blocks) as (bidb, block within the
-+// sequence), or (-1, 0) in a gap or past the batch: a binary search over cu_seqlens for the last
++// sequence), or (-1, 0) before the first sequence, in a gap or past the batch: a binary search over cu_seqlens for the last
 +// sequence starting at or before it. Without cu_seqlens, the sequences hold seqlen_static rows'
 +// blocks each.
 +template <int kBlock>
@@ -217,7 +217,7 @@ index 3dbb6a0..efbd370 100644
 +    block = block_idx % blocks;
 +    seqlen = bidb < num_batch ? (seqused ? seqused[bidb] : seqlen_static) : 0;
 +  }
-+  return block < cute::ceil_div(seqlen, kBlock) ? cute::make_tuple(bidb, block) : cute::make_tuple(-1, 0);
++  return 0 <= block && block < cute::ceil_div(seqlen, kBlock) ? cute::make_tuple(bidb, block) : cute::make_tuple(-1, 0);
 +}
 +
  template <bool Varlen, int kBlock> struct SeqlenInfo {
@@ -235,15 +235,19 @@ index 241eaed..6b21459 100644
  #include "utils.h"
  
  namespace flash {
-@@ -137,6 +138,86 @@ public:
+@@ -137,6 +138,104 @@ public:
  
  ///////////////////////////////////////////////////////////////////////////////
  
 +// One tile a CTA over a varlen batch's padded block space (varlen_num_blocks), whose gaps find no
 +// tile. A grid of num_batch * ceil_div(max_seqlen, kBlock) instead launches a CTA for every
 +// (sequence, block) pair, and a kernel whose shared memory fits one CTA an SM runs the early exits
-+// of every empty pair one wave at a time.
-+template<int kBlock>
++// of every empty pair one wave at a time. The tiles keep the order of the schedulers it stands for:
++// with L2Sections (a causal launch, SingleTileBwdLPTScheduler's) the heads in sections whose queries,
++// cotangents and dQ accumulators fit L2 together, heads fastest within a section; without (a full
++// launch, SingleTileScheduler's) each head's blocks in turn, blocks fastest. Heads fastest over every
++// head took up to 2.1 times as long (d256, 4 x 16k uniform, full; H100, 2026-10-26).
++template<int kBlock, bool L2Sections>
 +class VarlenBlockScheduler {
 +
 +public:
@@ -251,14 +255,25 @@ index 241eaed..6b21459 100644
 +    using SharedStorage = int;
 +
 +    struct Params {
-+        int const num_blocks, num_head, num_batch, seqlen;
++        int const num_blocks, num_head, num_batch, seqlen, section;
 +        int const* const cu_seqlens;
 +        int const* const seqused;
 +    };
 +
 +    static Params
 +    to_underlying_arguments(TileSchedulerArguments const& args) {
-+        return {args.num_blocks, args.num_head, args.num_batch, args.seqlen, args.cu_seqlens, args.seqused};
++        // SingleTileBwdLPTScheduler's section, a power of two of heads (the backward passes seqlen_q as
++        // args.seqlen_k); one head without L2Sections.
++        int section = 1;
++        if constexpr (L2Sections) {
++            long long const size_one_head =
++                long(args.seqlen_k) * long(args.headdim + args.headdim_v) * long(args.element_size)
++                + long(args.seqlen_k) * long(args.headdim) * sizeof(float);
++            int const size_l2 = 40 * 1024 * 1024;  // upstream's, for Q, dO and dQaccum
++            section = size_l2 < size_one_head ? 1 : 1 << (31 - cutlass::clz(int(size_l2 / size_one_head)));
++        }
++        return {args.num_blocks, args.num_head, args.num_batch, args.seqlen,
++                section < args.num_head ? section : args.num_head, args.cu_seqlens, args.seqused};
 +    }
 +
 +    static dim3
@@ -292,12 +307,15 @@ index 241eaed..6b21459 100644
 +    CUTLASS_DEVICE
 +    WorkTileInfo
 +    get_initial_work(Params const& params) const {
-+        // The heads of one block are neighbours, so the query heads of a key head read its K and V
-+        // tile while it is in L2.
-+        int const bidh = int(blockIdx.x) % params.num_head;
-+        auto const coord = varlen_block_coord<kBlock>(int(blockIdx.x) / params.num_head, params.num_batch,
-+                                                      params.cu_seqlens, params.seqused, params.seqlen);
-+        return {get<1>(coord), bidh, get<0>(coord)};
++        // A section's heads, the last section's the heads left, fastest; then the blocks; then the sections.
++        int const tile = int(blockIdx.x);
++        int const first_head = tile / (params.section * params.num_blocks) * params.section;
++        int const heads = params.num_head - first_head < params.section ? params.num_head - first_head
++                                                                         : params.section;
++        int const within = tile - first_head * params.num_blocks;
++        auto const coord = varlen_block_coord<kBlock>(within / heads, params.num_batch, params.cu_seqlens,
++                                                      params.seqused, params.seqlen);
++        return {get<1>(coord), first_head + within % heads, get<0>(coord)};
 +    }
 +
 +    CUTLASS_DEVICE
