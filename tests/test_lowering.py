@@ -300,6 +300,108 @@ def test_a_mamba2_layer_lowers_its_ssd_scan_on_each_shard_of_a_tpu_mesh():
         assert "tensor<1x128x4x64xf32>" in call or "tensor<1x4x128x64xf32>" in call, call
 
 
+Shapes = set[tuple[int, ...]]
+
+
+def _packed_step(rows: int, devices: int) -> tuple[jax.stages.Lowered, Shapes]:
+    """A bf16 gated delta net's forward and gradient over `rows` rows of 128 tokens, each three packed
+    documents, its token coordinates built in the step as a trainer builds them once a batch
+    (`dew.batch.coordinates`), lowered for an assumed H100 over an abstract mesh of `devices` splitting its
+    rows (the recurrence template takes the H100's training cell), and its parameters' shapes."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata, MixerCall
+    from dew.nn.linear import GatedDeltaNet
+
+    layer = GatedDeltaNet(256, 1, 2, 128, 128, dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((rows, 128, 256), jnp.bfloat16)
+    segments = np.repeat(np.searchsorted([40, 100], np.arange(128), side="right")[None] + 1, rows, axis=0)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+
+    def loss(variables, x, segments):
+        metadata = AttentionMetadata(coordinates=coordinates(segments=segments, max_segments=3))
+        return jnp.asarray(layer.apply(variables, x, MixerCall(metadata=metadata))).astype(jnp.float32).sum()
+
+    device = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90").abstract_device
+    mesh = AbstractMesh((devices,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    given = jax.ShapeDtypeStruct(segments.shape, jnp.int32)
+    with assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        traced = jax.jit(jax.value_and_grad(loss)).trace(variables, x, given)
+    shapes = {_squeezed(leaf.shape) for leaf in jax.tree.leaves(variables)}
+    return traced.lower(lowering_platforms=("cuda",)), shapes
+
+
+Operation = tuple[str, str, tuple, tuple]
+"""A lowered operation: its name, its callee or custom call's target, and its operands' and results'
+`(shape, element type)`."""
+
+
+def _operations(lowered: jax.stages.Lowered) -> list[Operation]:
+    """Every operation of a lowered program in program order (its StableHLO module's walk, as
+    `dew.training._lowering.triton_calls` reads it)."""
+    from jax.extend.mlir import ir
+
+    found: list[Operation] = []
+
+    def typed(values) -> tuple:
+        tensors = [value.type for value in values if isinstance(value.type, ir.RankedTensorType)]
+        return tuple((tuple(tensor.shape), str(tensor.element_type)) for tensor in tensors)
+
+    def visit(operation: ir.Operation) -> ir.WalkResult:
+        attributes = operation.attributes
+        target = ""
+        if "call_target_name" in attributes:
+            target = ir.StringAttr(attributes["call_target_name"]).value
+        elif "callee" in attributes:
+            target = attributes["callee"].value
+        found.append((operation.name, target, typed(operation.operands), typed(operation.results)))
+        return ir.WalkResult.ADVANCE
+
+    module = lowered.compiler_ir(dialect="stablehlo")
+    assert module is not None
+    with module.context:
+        module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
+    return found
+
+
+def _squeezed(shape) -> tuple[int, ...]:
+    """`shape` without its unit dimensions: a gradient's sum may reduce a parameter reshaped so (the short
+    conv's `[512, 1, 4]` weight as `[512, 4]`)."""
+    return tuple(size for size in shape if size != 1)
+
+
+COLLECTIVES = ("stablehlo.all_reduce", "stablehlo.all_gather", "stablehlo.all_to_all",
+               "stablehlo.reduce_scatter", "stablehlo.collective_permute")
+
+
+def test_a_packed_recurrence_runs_on_each_devices_own_rows():
+    """A packed gated delta net on a mesh splitting its rows runs on each device's rows, as its lowered GPU
+    program states it: lowered for an H100 over two devices and two rows, its recurrence template's Mosaic
+    GPU calls are one device's over one row, operand for operand (`recurrence_chunk.template_rule`, a
+    per-shard map); no scan (a cumsum, a reduce window) runs along the batch's flattened tokens, whose split
+    over a mesh XLA's GPU partitioner expands into a loop a token (the packed documents' offsets come from
+    the batch's `Coordinates.firsts`, a sort of each row's slots); and its only collectives are its
+    parameters' gradients' sums. On the whole batch every device of a 2xH100 FSDP run ran the
+    template on the global rows, and each layer's offsets took 97 loops of a token an iteration (row 1897,
+    bible 7's multi-device lowering). The final executable's loops need a GPU's compile; this proves their
+    cause absent from the program it compiles."""
+    (sharded, parameters), (local, _) = _packed_step(rows=2, devices=2), _packed_step(rows=1, devices=1)
+    operations = _operations(sharded)
+
+    def mosaic(operations: list[Operation]) -> list[tuple]:
+        return [(operands, results) for name, target, operands, results in operations
+                if name == "stablehlo.custom_call" and target.startswith("mosaic_gpu")]
+
+    assert mosaic(operations) and mosaic(operations) == mosaic(_operations(local))
+    scanned = [operands for name, target, operands, _ in operations
+               if name == "stablehlo.reduce_window" or (name == "func.call" and target.startswith("cumsum"))]
+    assert scanned and all(2 * 128 not in shape for operand in scanned for shape, _ in operand), scanned
+    reduced = {_squeezed(shape) for name, _, _, results in operations if name in COLLECTIVES
+               for shape, _ in results}
+    assert reduced <= parameters, (reduced, parameters)
+
+
 @pytest.mark.parametrize("generation, cores", [
     ("sm80", False), ("sm86", False), ("sm89", True), ("sm90", True), ("sm100", True), ("sm120", True),
     ("v6e", False), ("cpu", False)])

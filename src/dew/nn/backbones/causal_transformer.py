@@ -36,7 +36,14 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
-from dew.batch import Coordinates, Variables, coordinates as build_coordinates, merge, shifted_span
+from dew.batch import (
+    Coordinates,
+    Variables,
+    coordinates as build_coordinates,
+    merge,
+    shifted_span,
+    with_firsts,
+)
 from dew.mesh import LayoutRefused
 from dew.nn.continuum import Continuum, ContinuumLevel
 from dew.nn.dense import Dense
@@ -1755,7 +1762,8 @@ class CausalTransformer(nn.Module):
                 and context is None):
             return None
         return AttentionMetadata(
-            coordinates=coordinates, image_groups=image_groups, block_groups=block_groups,
+            # The packed documents' firsts built once a step, every layer reading them (`with_firsts`).
+            coordinates=with_firsts(coordinates), image_groups=image_groups, block_groups=block_groups,
             rotary_positions=rotary_positions, pairwise_mask=pairwise_mask, key_positions=key_positions,
             key_runs=key_runs, token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids,
             media=media_mask,
