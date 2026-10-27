@@ -744,6 +744,27 @@ def test_a_step_after_a_filter_runs_on_the_thread_that_ran_the_steps_before_it()
     assert all(row["after"] == row["before"] != threading.get_ident() for row in rows)
 
 
+@pytest.mark.parametrize("workers", [8, 16])
+def test_a_dropping_read_starts_every_loading_worker_before_its_first_batch(workers):
+    """A read whose steps drop records reads in workers that hand on a marker for each record they
+    drop, through a flat map that asks Grain's interleave of its workers for its position before it
+    reads, which left each worker's process to start at its first turn, after the one before it
+    had read: 30 workers on an A100 host read their first two minutes at 73 rows/s. Every worker's
+    process has started by the time the read hands on its first batch."""
+    import multiprocessing
+
+    chain = Pipeline(source(64)).shuffle(1).repeat().filter(odd_id).batch(8)
+    reader = compile(chain, read="indexed", loading=Loading(workers=workers, threads=1, read_buffer=1),
+                     seed=0).train(DataPartition())
+    try:
+        next(reader)
+        started = [child for child in multiprocessing.active_children()
+                   if child.name.startswith("grain-process-prefetch")]
+        assert len(started) == workers
+    finally:
+        reader.close()
+
+
 def test_worker_processes_read_a_global_order_in_the_batches_one_process_reads():
     """Each worker reads whole batches of an indexed order by index, and the
     reader interleaves them back into the order one process reads."""
@@ -778,6 +799,30 @@ def test_automatic_loading_starts_no_more_workers_than_the_hosts_cpus_and_memory
     finally:
         reader.close()
     assert workers <= 2
+
+
+@pytest.mark.parametrize("limited", ["own", "parent"])
+def test_a_cgroups_reclaimable_page_cache_is_room_for_automatic_loading(tmp_path, limited):
+    """Under a cgroup's memory limit, the page cache its kernel reclaims first is room: a run that read
+    1.5 GiB of its corpus into cache, charged to its cgroup of 2 GiB with 1.9 GiB in use, still has
+    1.6 GiB, where counting the cache as taken left 0.1 GiB, room for no loading worker. The cgroup's
+    CPU quota of two bounds the CPUs as its affinity does, and a limit on the container's cgroup
+    binds the process's own cgroup beneath it, unlimited, as much as one on its own."""
+    from dew.data.dataset import Host
+
+    own = tmp_path / "session"
+    own.mkdir()
+    limits = tmp_path if limited == "parent" else own
+    for level in (tmp_path, own):
+        (level / "cpu.max").write_text("max 100000\n")
+        (level / "memory.max").write_text("max\n")
+    (limits / "cpu.max").write_text("200000 100000\n")
+    (limits / "memory.max").write_text(f"{2 * 2**30}\n")
+    (limits / "memory.current").write_text(f"{int(1.9 * 2**30)}\n")
+    (limits / "memory.stat").write_text(f"anon {int(0.4 * 2**30)}\ninactive_file {int(1.5 * 2**30)}\n")
+    host = Host.current(own, root=tmp_path)
+    assert host.cpus == min(2, len(os.sched_getaffinity(0)))
+    assert host.memory == 2 * 2**30 - int(1.9 * 2**30) + int(1.5 * 2**30)
 
 
 def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_the_memory():
