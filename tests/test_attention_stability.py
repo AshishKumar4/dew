@@ -954,13 +954,13 @@ def test_a_negative_scale_past_the_folds_reach_keeps_a_finite_logit_finite(scale
     weight to NaN, so the fold bounds the factor's magnitude (`algebra.Forward.base2`) and such a call stays
     natural. Each template mainloop's output is the value and its gradients are finite, as the
     reference's are."""
-    family = Family(lambda seed: None, np.ones((1, 1, 1, 1), bool))
-
     def first(fill, *shape):
         return jnp.zeros(shape, jnp.float32).at[..., 0].set(fill)
 
     product = 3e38 / abs(scale) if abs(scale) > 1 else 3e38
     query, key, value, dout = (first(fill, 1, 1, 1, 16) for fill in (product, 1.0, 2.0, 1.0))
+    # Its one draw the call itself, which the mainloops' legality reads (`_mosaic_takes`).
+    family = Family(lambda seed: (query, key, value, None, dout), np.ones((1, 1, 1, 1), bool))
     spans = template.spans(1, 1, 1)
     _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, scale=scale), query, key, value)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in pull(dout)), "the reference's gradients"
