@@ -290,11 +290,41 @@ def test_a_hub_url_reads_a_repository_or_the_files_it_names(monkeypatch, url, fo
         assert resolved.url == url and resolved.format == format
 
 
-@pytest.mark.parametrize("url", ["hf://datasets/owner/data/export", "hf://datasets/owner/data@pinned/exports/run/"])
+@pytest.mark.parametrize(("url", "revision"), [
+    pytest.param("hf://datasets/owner/data@refs/convert/parquet", "refs/convert/parquet",
+                 id="parquet-conversion"),
+    pytest.param("hf://datasets/owner/data@refs/pr/3/", "refs/pr/3", id="pull-request"),
+    pytest.param("hf://datasets/owner/data@feature%2Fx", "feature/x", id="branch-with-a-slash"),
+    pytest.param("hf://owner/data@v1", "v1", id="tag-without-type"),
+])
+def test_a_hub_url_reads_its_repository_at_a_revision_holding_a_slash(monkeypatch, url, revision):
+    """An hf:// URL's revision runs from its `@` to the path after it, as the Hub's own URLs spell
+    one: a reference of the Hub's (its Parquet conversion, a pull request) whole, and a branch whose
+    name holds a `/` with it spelled `%2F`. Such a URL names the repository at that revision, where
+    the slashes it holds read as a path below the repository and its files were read instead."""
+    from huggingface_hub import HfFileSystem
+
+    from dew.data.sources import Hub, source
+
+    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
+    resolved = source(url)
+    assert type(resolved) is Hub
+    assert (resolved.repo, resolved.revision) == ("owner/data", revision)
+
+
+@pytest.mark.parametrize("url", [
+    pytest.param("hf://datasets/owner/data/export", id="directory"),
+    pytest.param("hf://datasets/owner/data@pinned/exports/run/", id="directory-at-a-revision"),
+    pytest.param("hf://datasets/owner/data@refs/convert/parquet/default/train",
+                 id="directory-of-the-conversion"),
+    pytest.param("hf://datasets/owner/data@feature/x", id="directory-at-a-branch"),
+])
 def test_a_hub_path_below_its_repository_reads_as_the_files_there(monkeypatch, url):
     """An hf:// URL of a directory in a repository, such as an export's (`export` commits one there),
     is read as its files, whose manifest names their record format, never as a repository of that
-    name: no suffix names its format, as none names a repository's."""
+    name: no suffix names its format, as none names a repository's. A revision ends at the first `/`
+    past its `@` unless it is a reference of the Hub's, so `@feature/x` is the directory `x` at the
+    branch `feature`, as `HfFileSystem` reads it."""
     from huggingface_hub import HfFileSystem
 
     from dew.data.sources import Files, source

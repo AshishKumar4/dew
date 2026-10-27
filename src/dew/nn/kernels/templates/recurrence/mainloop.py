@@ -1716,7 +1716,12 @@ def gradients(q, k, v, g, beta, h0, do, dfinal, *, tiles: Tiles, starts=None,
     # `after` from each token to the chunk's end, `leaving` from its start to before it.
     after, leaving = (x.sum(0).reshape(heads, chunks, CHUNK) for x in (after, leaving))
     after = after + after_w.reshape(heads, chunks, CHUNK)
-    ranges = jnp.flip(jnp.cumsum(jnp.flip(after, -1), -1), -1) + jnp.cumsum(leaving, -1) - leaving
+    # `leaving`'s sum before each token, never its own term added and taken away: a token's own `leaving` is
+    # order one where the terms before it are `exp(-30)`'s under steep decays, which the sum rounded away
+    # (an H100's decay gradient under decays near zero 140 times the port's distance from float64, whose
+    # `leaving` enters its strictly lower pairs, fla `chunk_bwd_dqkwg`; SE-numerics-h100-fd61e11eeb).
+    before = jnp.concatenate((jnp.zeros_like(leaving[..., :1]), jnp.cumsum(leaving[..., :-1], -1)), -1)
+    ranges = jnp.flip(jnp.cumsum(jnp.flip(after, -1), -1), -1) + before
     dg = ((decay_pairs + decay_w).reshape(heads, chunks, CHUNK) + ranges
           + (memory * jnp.exp2(ending))[..., None])
     dg, dbeta = dg.reshape(heads, rows).T, dbeta.T
