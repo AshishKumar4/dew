@@ -943,8 +943,9 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
         return RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=True, dtype=dtype)
     sizes, rows = row_errors(reference, truth)
     sized = sizes > 0
-    own = (np.sqrt(np.mean(np.square(truth.reshape(-1, truth.shape[-1])), axis=1)) if truth.ndim >= 2
-           else np.zeros(0))
+    # Each row's own size by the arithmetic its errors take (`_scaled_rms`), so an arm exactly zero on a
+    # row is exactly its size from it.
+    own = _scaled_rms(truth.reshape(-1, truth.shape[-1])) if truth.ndim >= 2 else np.zeros(0)
     logged = float(np.max(_log_over(rows[sized], sizes[sized]))) if sized.any() else LOG_ZERO
     return RecordedLeaf(float(np.mean(np.square(reference - truth))),
                         float(np.max(_over(rows[sized], sizes[sized]))) if sized.any() else 0.0,
@@ -1064,10 +1065,13 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     `leaf_summary`: their mean squared errors, their worst sized rows, the rows of float64 zero with
     both arms' errors on them (`ZeroRows`, pooled over the run's seeds by `pooled_zero_rows`), and
     whether every value was finite. A row the truth sizes zero (below RESOLUTION of its leaf)
-    is one of float64 zero unless a live reference measures it: its error there below the row's own
-    float64 RMS, so it carries the row better than zero would. That is an engineering definition of a
-    measured row, not a proof of float64's accuracy on it; a sum that cancels to float64's residue is
-    never measured so, and a product far below its leaf, which float64 holds to its own precision, is.
+    is one of float64 zero unless a live reference measures it: its error there at most half the row's
+    own float64 RMS, so it holds the row's leading binary digit, which zero, an error of the whole RMS,
+    does not. That is an engineering definition of a measured row, not a proof of float64's accuracy on
+    it; a sum that cancels to float64's residue is never measured so, a reference exactly zero there
+    least of all (ledger 1831: a residue row's tie of error and size measured it, and Dew's ordinary
+    rounding there read 1e8 of the row), and a product far below its leaf, which float64 holds to its
+    own precision, is.
     A measured row is judged at its own size as any row is, its error over its size entering both worst
     rows: against the reference's worst row over the leaf, which holds it with less power than the zero
     rows' rule held it against the reference's own error on it. Both arms are classified alike, from the
@@ -1088,7 +1092,7 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     worst, their_worst, zero = mine.log_worst, theirs.log_worst, []
     for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True):
         size = sizes.get(at, 0.0)
-        if at_zero[at] < size:
+        if at_zero[at] <= size / 2:
             worst = max(worst, float(_log_over(error, size)))
             their_worst = max(their_worst, float(_log_over(at_zero[at], size)))
         else:
