@@ -250,17 +250,15 @@ class GRPOObjective(TokenScorer):
         """Read a packed batch onto its own `[rows, width]` grid.
 
         The old policy is `old_log_probs` when a rescoring or the sampler
-        supplied it, and the recorded behavior otherwise.
+        supplied it, and the recorded behavior otherwise. The rollout's columns
+        are read at the policy's precision, at least fp32, so a float64 twin's
+        terms are its own float64 and a run's its float32.
         """
-        mask = jnp.asarray(batch[RESPONSE_MASK_KEY], jnp.float32)
+        shape = jnp.shape(batch[RESPONSE_MASK_KEY])
         for key in (ADVANTAGES_KEY, BEHAVIOR_LOG_PROBS_KEY, OLD_LOG_PROBS_KEY, SESSION_WEIGHTS_KEY):
-            if key in batch and jnp.shape(batch[key]) != mask.shape:
+            if key in batch and jnp.shape(batch[key]) != shape:
                 raise ValueError(f"{key} has shape {jnp.shape(batch[key])}; a packed column has "
-                                 f"the shape of {IDS_KEY}, {mask.shape}")
-        behavior = jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], jnp.float32)
-        proximal = OLD_LOG_PROBS_KEY in batch
-        old = jnp.asarray(batch[OLD_LOG_PROBS_KEY], jnp.float32) if proximal else behavior
-        weights = batch.get(SESSION_WEIGHTS_KEY)
+                                 f"the shape of {IDS_KEY}, {shape}")
         # `packed_log_probs` is the scoring seam a subclass may replace; the QK
         # collection MuonClip reads and the routers the balance reads come from the
         # same live forward when asked for.
@@ -270,10 +268,16 @@ class GRPOObjective(TokenScorer):
             qk, sown = scores.qk, scores.routing
         else:
             policy, qk, sown = self.packed_log_probs(params, batch), None, None
+        dtype = at_least_fp32(policy.dtype)
+        mask = jnp.asarray(batch[RESPONSE_MASK_KEY], dtype)
+        behavior = jnp.asarray(batch[BEHAVIOR_LOG_PROBS_KEY], dtype)
+        proximal = OLD_LOG_PROBS_KEY in batch
+        old = jnp.asarray(batch[OLD_LOG_PROBS_KEY], dtype) if proximal else behavior
+        weights = batch.get(SESSION_WEIGHTS_KEY)
         return _Terms(policy, old, behavior,
-                      jnp.asarray(batch[ADVANTAGES_KEY], jnp.float32), mask,
+                      jnp.asarray(batch[ADVANTAGES_KEY], dtype), mask,
                       jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32),
-                      None if weights is None else jnp.asarray(weights, jnp.float32), proximal, qk, sown)
+                      None if weights is None else jnp.asarray(weights, dtype), proximal, qk, sown)
 
     def loss(self, variables, batch, step):
         """Compute the policy surrogate over the trainable tokens, plus the KL to the reference.
@@ -294,7 +298,7 @@ class GRPOObjective(TokenScorer):
         # as verl's compute_policy_loss_bypass_mode does.
         proximal = terms.old if terms.proximal else jax.lax.stop_gradient(terms.policy)
         metrics: dict[str, jax.Array] = {}
-        keep = jnp.ones_like(mask, jnp.float32)
+        keep = jnp.ones_like(mask)
         for name, band, geometric in (("sequence", self.sequence_mask, False),
                                       ("geometric", self.geometric_mask, True)):
             if band is not None:
@@ -372,7 +376,7 @@ class GRPOObjective(TokenScorer):
         over its session's trainable count, the batch's own `session_weights`;
         rejected sequences drop out of the numerator and the mass alike.
         """
-        effective = effective.astype(jnp.float32)
+        effective = effective.astype(at_least_fp32(terms.policy.dtype))
         if self.aggregation == "token-mean":
             return effective
         if terms.session_weights is None:

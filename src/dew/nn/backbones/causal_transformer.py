@@ -36,7 +36,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
-from dew.batch import Coordinates, coordinates as build_coordinates, merge, shifted_span
+from dew.batch import Coordinates, Variables, coordinates as build_coordinates, merge, shifted_span
 from dew.mesh import LayoutRefused
 from dew.nn.continuum import Continuum, ContinuumLevel
 from dew.nn.dense import Dense
@@ -113,9 +113,11 @@ from .decoder_stack import (
     PipelineStage,
     SharedPassView,
     StackView,
+    StageSplit,
     microbatch_count,
     run_pipeline,
     run_stack,
+    split_stages,
 )
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, layer_index, scan_groups
 
@@ -630,17 +632,21 @@ class CausalTransformer(nn.Module):
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
 
-    @property
-    def bank_sites(self) -> tuple[DecoderBank, ...]:
-        """Where this decoder's layer stack is stored: scanned runs, or one layer per bank.
+    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
+        """Where this decoder's layer stack is stored in `store`, the variables its banks are drawn
+        from: scanned runs, or one layer per bank.
 
         `groups` already records which of the two it is. A scanned stack
         declares its runs and a plain loop declares one-layer runs, and
         `run_stack` fetches a one-layer run the same way it fetches a longer
-        one. `scanned` records whether those fetches are sequenced, which a host
-        layout requires.
+        one. A run ends where the store's rows differ (`StackView.layer_structures`:
+        layers a checkpoint quantizes differently, or adapts in part), so an
+        unbound decoder plans its runs from the store's shapes as a decoder
+        bound to them reads them. `scanned` records whether those fetches are
+        sequenced, which a host layout requires.
         """
-        bound = self if self.scope is not None else self.bind({})
+        bound = self if self.scope is not None else self.bind(jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(jnp.shape(leaf), jnp.result_type(leaf)), store))
         return (DecoderBank((), StackView(bound.groups), scanned=self.scan_layers),)
 
     def layer_kinds(self, types: Sequence[str]) -> dict[str, "ResolvedKind"]:
@@ -749,16 +755,28 @@ class CausalTransformer(nn.Module):
         return sites
 
     @nn.nowrap
-    def _layer_flops(self, lengths, counter) -> float:
+    def _layer_counts(self, lengths, counter) -> list[float]:
+        """Each layer's work by `counter`, over the passes a call runs it."""
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
         mixer = self.layer_mixer
         specs = self._layer_specs(types, kinds, mixer)
         factories = self.feedforward_factories()
-        total = 0.0
-        for index in range(self.num_layers):
-            block = self._block(specs, mixer, factories, self.wiring, index, f'layers_{index}')
-            total += self.layer_passes(index) * counter(block, lengths)
+        return [self.layer_passes(index) * counter(
+                    self._block(specs, mixer, factories, self.wiring, index, f'layers_{index}'), lengths)
+                for index in range(self.num_layers)]
+
+    @nn.nowrap
+    def replicated_flops(self, stages: int, lengths) -> float:
+        """The work of the layers a pipeline of `stages` runs on every stage rather than once
+        (`stage_split`): those before and after the run its stages repeat."""
+        split = self.stage_split(stages)
+        counts = self._layer_counts(lengths, counted_flops)
+        return sum(counts[:split.prefix]) + sum(counts[self.num_layers - split.suffix:])
+
+    @nn.nowrap
+    def _layer_flops(self, lengths, counter) -> float:
+        total = sum(self._layer_counts(lengths, counter))
         if self.per_layer_input_dim:
             total += projection_flops(lengths, *self.projections()['per_layer_model_projection'])
         if self.loop is not None and self.loop.exit_gate:
@@ -1805,9 +1823,11 @@ class CausalTransformer(nn.Module):
         loops carry one residual dtype, so the stream enters in the dtype it
         settles in (`residual_dtype`). A store built bank by bank
         (`dew.inference.banks`) already holds one array per run, and the view
-        leaves it alone. A pipeline raises `LayoutRefused` for `decode` and
-        for a banked store. With `residual_in_fp32` the stream enters widened,
-        so every sublayer's output adds to it in fp32 whichever loop runs.
+        leaves it alone. A pipeline runs the layers its stages repeat
+        (`split_stages`) and the layers before and after them on every stage,
+        and raises `LayoutRefused` for `decode` and for a banked store. With
+        `residual_in_fp32` the stream enters widened, so every sublayer's output
+        adds to it in fp32 whichever loop runs.
         """
         if self.residual_in_fp32 and isinstance(x, Carried):
             x = x._replace(streams=x.streams.astype(at_least_fp32(x.streams.dtype)))
@@ -1838,36 +1858,10 @@ class CausalTransformer(nn.Module):
             if span is not None and banked:
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                     f"by run holds whole runs; {list(banked)} arrived banked")
-            view = StackView(self.groups if span is None else spanned, banked=banked)
+            view, split = (StackView(self.groups if span is None else spanned, banked=banked),
+                           StageSplit(0, self.num_layers, 0))
         else:
-            if span is not None:
-                raise LayoutRefused(f"a loop over layers {span} runs part of the stack, which a pipeline "
-                                    "over the stage axis cuts into stages of its own; run it on one stage")
-            if decode:
-                raise LayoutRefused(
-                    "decoding appends one token at a time to the cache, which no "
-                    "pipeline over the stage axis runs; decode outside jax.set_mesh")
-            if banked:
-                raise LayoutRefused(
-                    f"a pipeline over the stage axis stacks every stage's copy of a "
-                    f"layer, which a store already banked by run cannot be reshaped "
-                    f"into; {list(banked)} arrived banked. Place the weights per layer "
-                    f"for a pipeline, or run the stack whole")
-            if isinstance(x, Carried):
-                raise ValueError(
-                    "Single-Pass mHC carries each sublayer's collapse beside the streams, "
-                    "which the pipeline's microbatch buffers do not hold; run the stack whole")
-            count = self.stage_layers(stages)
-            batch_axis = 1 if self.altup is not None else 0
-            count_microbatches = microbatch_count(x.shape[batch_axis])
-            view = StackView(
-                scan_groups(self.scan_keys[:count], self.bank_layers) if self.scan_layers
-                else tuple((index, 1) for index in range(count)),
-                stages=stages, microbatches=count_microbatches,
-                # What enters the loop is read on every iteration; what the
-                # loop creates (the routers' sowing) comes out per iteration.
-                broadcast=tuple(name for name, tree in self.variables.items() if tree),
-                batch_axis=batch_axis)
+            view, split = self._pipelined(x, stages, decode=decode, banked=banked, span=span)
         dtype = self.residual_dtype(
             x, train=train, decode=decode, per_layer_input=per_layer_input,
             attention_metadata=attention_metadata)
@@ -1875,7 +1869,55 @@ class CausalTransformer(nn.Module):
         x = x._replace(streams=x.streams.astype(dtype)) if isinstance(x, Carried) else x.astype(dtype)
         run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
                                trans_out_fn=view.unstack, init=False, mutable=True)
-        return run(self, view, x, train, decode, per_layer_input, attention_metadata)
+        # The layers outside the run the stages repeat (none on one stage) run on every stage, as the
+        # plain loop runs them, around the pipeline; a provider among them fills the store a later one
+        # reads.
+        store = {} if self._provides else None
+
+        def outside(x, first: int, last: int):
+            return x if first == last else run_stack(
+                self.layers, self.block, self.specs, tuple((index, 1) for index in range(first, last)), x,
+                train=train, decode=False, kv_store=store, per_layer_input=per_layer_input,
+                attention_metadata=attention_metadata)
+
+        x = outside(x, 0, split.prefix)
+        x = run(self, view, x, train, decode, per_layer_input, attention_metadata)
+        return outside(x, self.num_layers - split.suffix, self.num_layers)
+
+    def _pipelined(self, x, stages: int, *, decode: bool, banked: tuple[str, ...],
+                   span: tuple[int, int] | None) -> tuple[StackView, StageSplit]:
+        """The view a pipeline over `stages` runs the stack's repeated run through, and how the stack
+        splits around it (`split_stages`); `LayoutRefused` where the call or the store cannot pipeline."""
+        if span is not None:
+            raise LayoutRefused(f"a loop over layers {span} runs part of the stack, which a pipeline "
+                                "over the stage axis cuts into stages of its own; run it on one stage")
+        if decode:
+            raise LayoutRefused(
+                "decoding appends one token at a time to the cache, which no "
+                "pipeline over the stage axis runs; decode outside jax.set_mesh")
+        if banked:
+            raise LayoutRefused(
+                f"a pipeline over the stage axis stacks every stage's copy of a "
+                f"layer, which a store already banked by run cannot be reshaped "
+                f"into; {list(banked)} arrived banked. Place the weights per layer "
+                f"for a pipeline, or run the stack whole")
+        if isinstance(x, Carried):
+            raise ValueError(
+                "Single-Pass mHC carries each sublayer's collapse beside the streams, "
+                "which the pipeline's microbatch buffers do not hold; run the stack whole")
+        split = split_stages(self.specs, stages)
+        batch_axis = 1 if self.altup is not None else 0
+        count_microbatches = microbatch_count(x.shape[batch_axis])
+        start, count = split.prefix, split.per_stage
+        view = StackView(
+            scan_groups(self.scan_keys[start:start + count], self.bank_layers) if self.scan_layers
+            else tuple((index, 1) for index in range(count)),
+            stages=stages, microbatches=count_microbatches,
+            # What enters the loop is read on every iteration; what the
+            # loop creates (the routers' sowing) comes out per iteration.
+            broadcast=tuple(name for name, tree in self.variables.items() if tree),
+            batch_axis=batch_axis, offset=start)
+        return view, split
 
     def banked_collections(self) -> tuple[str, ...]:
         """Return the collections whose layer subtrees the store holds as banks.
@@ -1977,32 +2019,12 @@ class CausalTransformer(nn.Module):
                 variables[collection] = held
         return variables
 
-    def stage_layers(self, stages: int) -> int:
-        """Return the number of layers per stage when the stack splits into `stages`.
-
-        Every stage runs one program, so layer `j` of every stage must match
-        layer `j` of the first stage in kind, feed-forward, width and KV role.
-        A pattern that does not repeat every `num_layers / stages` layers raises
-        `LayoutRefused`, and the error names the first pair that differs.
-        """
-        if self.num_layers % stages:
-            raise LayoutRefused(
-                f"{self.num_layers} layers do not split into {stages} stages of "
-                f"equal length; set stage to a divisor of num_layers")
-        count = self.num_layers // stages
-        for index, spec in enumerate(self.specs):
-            first = self.specs[index % count]
-            if spec == first:
-                continue
-            differing = [field.name for field in dataclasses.fields(LayerSpec)
-                         if getattr(spec, field.name) != getattr(first, field.name)]
-            raise LayoutRefused(
-                f"layer {index} differs from layer {index % count} in "
-                f"{', '.join(differing)}, so stage {index // count} cannot run the "
-                f"first stage's program; a pipeline of {stages} stages needs the "
-                f"layer pattern to repeat every {count} layers, which means a "
-                f"mixture, a layer_types pattern and a K/V sharing that do")
-        return count
+    @nn.nowrap
+    def stage_split(self, stages: int) -> StageSplit:
+        """How the stack runs over `stages` pipeline stages (`split_stages`): the layers before and
+        after the run its stages repeat run on every stage."""
+        types = self.per_layer_types
+        return split_stages(self._layer_specs(types, self.layer_kinds(types), self.layer_mixer), stages)
 
     @property
     def _provides(self) -> bool:
@@ -2026,8 +2048,9 @@ class CausalTransformer(nn.Module):
             self,
             view,
             x,
-            lambda module: PipelineStage(block=module.block, specs=module.specs[:view.per_stage],
-                                         groups=view.groups, train=train, name='stages'),
+            lambda module: PipelineStage(block=module.block,
+                                         specs=module.specs[view.offset:view.offset + view.per_stage],
+                                         groups=view.groups, train=train, offset=view.offset, name='stages'),
             layered=per_layer_input,
             rows=attention_metadata,
         )

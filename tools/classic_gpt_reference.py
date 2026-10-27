@@ -1,7 +1,9 @@
 """Generate classic decoder fixtures and check small released checkpoints in fp32.
 
 Run with PYTHONPATH=src. --fixture writes a tiny same-weight reference;
---checkpoint compares the public loader and cached greedy decoding on real weights.
+--float64 writes a written fixture's float64 logits (`logits_f64.npy`), the
+truth the float64 rule reads, from its stored weights; --checkpoint compares
+the public loader and cached greedy decoding on real weights.
 """
 
 import argparse
@@ -37,6 +39,20 @@ def write_fixture(family):
     model = AutoModelForCausalLM.from_config(config, attn_implementation='eager')
     write_device_tiny(f'{family}-tiny', model, 'cuda',
                       f'PYTHONPATH=src python tools/classic_gpt_reference.py --fixture --family {family}')
+
+
+FLOAT64_FIXTURES = ('gpt2-tiny', 'opt-tiny', 'gpt-neox-tiny')
+"""The classic fixtures whose float64 logits --float64 writes: GPT-2's and OPT's written here, and
+GPT-NeoX's (tools/gpt_neox_reference.py), read from their stored weights alike."""
+
+
+def write_float64(fixture):
+    """`fixture`'s float64 logits on its ids, from its stored weights (`write_float64_logits`)."""
+    from hf_reference import FIXTURES, write_float64_logits
+
+    model = AutoModelForCausalLM.from_pretrained(FIXTURES / fixture, dtype=torch.float32,
+                                                 attn_implementation='eager').eval()
+    print(write_float64_logits(fixture, model), flush=True)
 
 
 def check_checkpoint(checkpoint, output, revision):
@@ -81,6 +97,7 @@ def check_checkpoint(checkpoint, output, revision):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--fixture', action='store_true')
+    parser.add_argument('--float64', choices=FLOAT64_FIXTURES, nargs='+')
     parser.add_argument('--family', choices=('gpt2', 'opt'), default='gpt2')
     parser.add_argument('--checkpoint')
     parser.add_argument('--revision', help='the commit --checkpoint is pinned at')
@@ -88,6 +105,8 @@ def main():
     args = parser.parse_args()
     if args.fixture:
         write_fixture(args.family)
+    for fixture in args.float64 or ():
+        write_float64(fixture)
     if args.checkpoint:
         if args.revision is None:
             parser.error('--checkpoint is checked at a pinned --revision')

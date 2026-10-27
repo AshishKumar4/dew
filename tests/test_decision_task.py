@@ -450,19 +450,36 @@ def test_an_objective_from_a_calibrated_task_validates_without_its_temperatures(
     assert not np.array_equal(np.concatenate(plain), np.concatenate([found for _, _, found in tempered]))
 
 
-def test_an_example_refuses_an_answer_its_question_cannot_give():
+@pytest.mark.parametrize("kind, question, gold", [
+    ("answers", "urgency", "legal"),
+    ("answers", "urgency", 4),
+    ("answers", "urgency", 2.0),
+    ("answers", "urgency", True),
+    ("targets", "unasked", [0.5, 0.5]),
+    ("answers", "department", "billing"),
+    ("targets", "department", [0.5, 0.5]),
+    ("targets", "department", [0.9, 0.3, -0.2]),
+    ("targets", "department", [0.6, 0.3, 0.3]),
+    ("targets", "department", {"billing": 0.6, "legal": 0.4}),
+    ("targets", "department", 0.6),
+], ids=["an-option-it-does-not-offer", "an-index-past-its-options", "a-float", "a-bool",
+        "a-target-for-a-question-it-does-not-ask", "an-answer-beside-a-target", "a-target-of-another-length",
+        "a-negative-chance", "chances-that-do-not-sum-to-one", "a-target-keyed-by-options-it-does-not-offer",
+        "a-target-of-one-number"])
+def test_an_example_refuses_gold_that_scores_no_option_of_its_question(kind, question, gold):
+    """A row's gold names an option of a question the row asks: an answer by its key or its index, a
+    target a distribution over every option, in the question's order or keyed by option, and one or the
+    other for a question. The row trains on that gold, and the same row with one answer or target
+    changed so it scores no option of its question, or a question it does not ask, is refused rather
+    than trained with its gold dropped or scored against an option it does not offer."""
+    questions = CASES["quickstart"]["questions"]
+    row = {"state": "x", "questions": questions, "answers": {"urgency": 2},
+           "targets": {"department": {"technical": 0.25, "billing": 0.5, "sales": 0.25}}}
+    valid = Example.of(row)
+    assert valid.labels() == {"department": 0, "urgency": 2}
+    np.testing.assert_array_equal(valid.distribution("department"), [0.5, 0.25, 0.25])
     with pytest.raises(ValueError):
-        Example.of({"state": "x", "questions": CASES["quickstart"]["questions"],
-                    "answers": {"department": "legal"}})
-
-
-def test_an_example_refuses_a_target_for_a_question_it_does_not_ask():
-    """A row's target, like its answer, names a question the row asks; one
-    naming another question is refused rather than dropped, which would
-    train the row as asked and unscored."""
-    with pytest.raises(ValueError):
-        Example.of({"state": "x", "questions": CASES["quickstart"]["questions"],
-                    "targets": {"unasked": [0.5, 0.5]}})
+        Example.of({**row, kind: {**row[kind], question: gold}})
 
 
 def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
