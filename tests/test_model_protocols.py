@@ -63,6 +63,7 @@ from model_support import float64_twin
 from reference_error import as_given, assert_as_exact, widened
 from test_architectures import CASES as ARCHITECTURES, MASK, TEXT_FEATURES, TEXT_TOKENS, VOCAB
 from tiny_models import build_model, tiny_inputs
+from tool_support import load
 
 from dew.interop import Pretrained, hf_decoders
 from dew.lora import LoRA
@@ -577,6 +578,8 @@ def _rungs(model) -> list:
 RUNG_SEEDS = 8
 """Check 1's declared seeds for a rung's forward against the model's, sized paired by `seeds_for` on
 an A100, where a rung's checkpoint barriers change the forward program."""
+ZEROS_DRAWN = load("layout_parity").zeros_drawn
+"""A parameter tree with each all-zero leaf drawn (tools/layout_parity.py)."""
 GRADIENT_SEEDS = 8
 """Check 1's declared seeds for a rung's gradient against the model's, each parameter its own leaf,
 sized paired by `seeds_for` on armada."""
@@ -603,8 +606,12 @@ def _climbs_and_restores(model, variables, inputs, **apply) -> None:
     program, which check 1 holds against the model's from the model's float64
     twin over drawn inputs. Its backward recomputes, which can round apart
     (gemma2-tiny's gradients by up to 1.2e-4, kimi-k3-tiny's 8.3e-3 of 10.8;
-    test_decoder_remat.py found the same), so the gradients are the model's
-    bits or as exact as them. A rung's record restores it from any rung below
+    test_decoder_remat.py found the same), so the gradients hold check 1 too,
+    each parameter its own leaf. Both are taken over the variables with every
+    all-zero leaf drawn (tools/layout_parity.py's `zeros_drawn`): a zero output
+    projection or an identity modulation, as a fresh DiT holds them, would
+    leave its trunk's gradient zero and a wrong recomputed backward unseen.
+    A rung's record restores it from any rung below
     it and moves no rung above it, and the top rung runs over the model's
     variables, every collection where it was.
 
@@ -624,6 +631,7 @@ def _climbs_and_restores(model, variables, inputs, **apply) -> None:
             assert restored == records[max(low, high)], (records[low], records[high], restored)
     assert all(rung.restore_recompute("no rung").recompute_record() == record
                for rung, record in zip(rungs, records, strict=True))
+    variables = {**variables, "params": ZEROS_DRAWN(variables["params"], jax.random.key(7))}
     written = model.apply(variables, *inputs, mutable=True, **apply)[1].keys()
     twin, wide_variables = float64_twin(model), widened(variables)
 
