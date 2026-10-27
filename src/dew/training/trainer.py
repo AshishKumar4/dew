@@ -1156,15 +1156,13 @@ class Trainer(Generic[Loss, Effects]):
 
     def _lowered_for(self, state: TrainState, batch: Batch, generation: str, devices: Mesh | None = None
                      ) -> tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]:
-        """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered
-        for one (`dew.training._lowering`), on whatever devices this process has, and the options its
-        compile there takes (`step_options`) where it is lowered over `devices`.
-
-        It traces on an abstract mesh of that GPU's devices, from which JAX's Pallas lowering reads the
-        GPU, or on `devices`, compile-only GPUs that XLA compiles it for (`dew.training.ahead`), at the
-        base rung and the plan's first split: a run that does not fit splits its batch or recomputes
-        more, no other kernel. A CPU-owned state's step realizes its parameters on the host as it
-        runs, and is not lowered."""
+        """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for
+        one (`dew.training._lowering`) on this process's devices, and, lowered over `devices`, the
+        options its compile there takes (`step_options`). It traces on an abstract mesh of that GPU's
+        devices, from which JAX's Pallas lowering reads the GPU, or on `devices`, compile-only GPUs
+        XLA compiles it for (`dew.training.ahead`), at the base rung and the plan's first split: a
+        run that does not fit splits its batch or recomputes more, no other kernel. A CPU-owned
+        state's step realizes its parameters on the host as it runs, and is not lowered."""
         if self.host_master:
             raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
                              "the variables on the host")
