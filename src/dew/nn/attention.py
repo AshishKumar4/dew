@@ -1589,7 +1589,9 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
         segment_ids=segment_ids, max_segments=max_segments, lengths=lengths, starts=starts,
         block_groups=block_groups, image_groups=image_groups, key_valid=key_valid, key_runs=key_runs,
-        places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed, dropout_places=dropout_places)
+        places=places, dropout_rate=dropout_rate, dropout_seed=dropout_seed, dropout_places=dropout_places,
+        wide_logits=xla_logits(implementation, resolved, query, key,
+                               folded=folds(query, key, bias, mask, causal, sliding_window)))
     live = visible_rows(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids, lengths,
                         starts, block_groups=block_groups, image_groups=image_groups, key_valid=key_valid,
                         key_runs=key_runs,
@@ -1647,8 +1649,9 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                       force_fp32_for_softmax, causal, sliding_window, mask, masked, softcap,
                       segment_ids, max_segments, lengths, starts, block_groups=None, image_groups=None,
                       key_valid=None, key_runs=None, places=None, dropout_rate=0.0, dropout_seed=None,
-                      dropout_places=None):
-    """Run one whole-sequence attention call on the kernel `attention_kernel` resolved.
+                      dropout_places=None, wide_logits=False):
+    """Run one whole-sequence attention call on the kernel `attention_kernel` resolved, the reference
+    path's logits widened where `wide_logits` (`xla_logits`).
 
     `masked` is `mask` with the key `lengths` and `starts` in it. Splash takes sinks, a
     softcap and packed segment ids itself, flash takes the ids as its packed sequences given
@@ -1692,7 +1695,7 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
                                    dtype=dtype, precision=precision,
                                    force_fp32_for_softmax=force_fp32_for_softmax,
                                    dropout_rate=dropout_rate, dropout_seed=dropout_seed,
-                                   dropout_places=dropout_places)
+                                   dropout_places=dropout_places, wide_logits=wide_logits)
 
     # The decode kernel and the template read key starts as their own spans; elsewhere they are the mask.
     if implementation not in ('decode', 'template'):
@@ -1736,17 +1739,27 @@ def _xla_kernel_narrows(query) -> bool:
 
 def _xla_kernel_rounds_off(query, key, *, folded: bool) -> bool:
     """Whether jax.nn's xla attention would multiply this call off the arithmetic it names, so 'auto'
-    and 'xla' take the reference path, whose products are `bf16_dot_general`'s exact ones: a bf16 query
-    on a GPU whose query-key or probability-value product has a side of one, a one-query decode's or
-    a one-key read's, unless the call is `folded` (`folds`), whose products are Dew's already
-    (`folded_attention`). jax.nn names XLA's BF16_BF16_F32 algorithm for those dots, and on an A100 XLA
-    computes a dot under it with bf16 operands and a side of one off round-to-nearest-even at its ties,
-    where bf16 operands and no algorithm, the reference path's, were exact at every shape (node
-    receipts SF-a100-tie-probe3 and 4, row 1550). Every GPU takes the reference path for them, as its
-    products are right on each. A probability-value product's other side is the value's width, which
-    the call's case does not read; a one-wide value head is no model's."""
+    and 'xla' take the reference path with jax.nn's own logits (`xla_logits`): a bf16 query on a GPU
+    whose query-key product has a side of one, a one-query decode's or a one-key read's, unless the
+    call is `folded` (`folds`), whose products are Dew's already (`folded_attention`). jax.nn names XLA's
+    BF16_BF16_F32 algorithm for that product, and an A100 computes a dot under it with a side of one
+    off round-to-nearest-even at its ties, where the same bf16 values widened to fp32, as the
+    reference path's wide logits take them, multiply exactly (node receipts SF-a100-tie-probe3 and 4,
+    row 1550). jax.nn names no algorithm for the probability-value product, whose bf16 operands were
+    exact at every shape. Every GPU takes the reference path for these calls, as its products are
+    right on each."""
     return (query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not folded
             and 1 in (query.shape[-3], key.shape[-3]))
+
+
+def xla_logits(implementation, resolved: str, query, key, *, folded: bool) -> bool:
+    """Whether a call named 'auto' or 'xla' that the reference path takes for jax.nn's xla kernel, as it
+    would compute a bf16 call off the arithmetic it names (`_xla_kernel_narrows`,
+    `_xla_kernel_rounds_off`), computes its logits as jax.nn's do: in fp32 from the query and keys
+    widened, scaled after the product (`reference_attention`'s `wide_logits`), so no logit a bf16
+    product would round past its range leaves the softmax a NaN where jax.nn's is finite."""
+    return (implementation in ('auto', 'xla') and resolved == 'reference' and query.dtype == jnp.bfloat16
+            and (_xla_kernel_narrows(query) or _xla_kernel_rounds_off(query, key, folded=folded)))
 
 
 def _xla_kernel_widens_less() -> bool:

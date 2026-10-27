@@ -373,32 +373,48 @@ GPUS = [name for name in generation.TARGETS if name.startswith("sm")]
 
 @pytest.mark.parametrize("target", GPUS)
 def test_a_bf16_attention_with_a_side_of_one_runs_dews_products_on_every_gpu(target):
-    """jax.nn's xla attention names BF16_BF16_F32 for a bf16 query on a GPU, and an A100 computes a dot
-    under it with a side of one off round-to-nearest-even (row 1550). So on every GPU a bf16 call named
-    'xla' whose queries or keys are one, a grouped decode step's or a one-key read's, runs the
-    reference path, its output the reference path's to the bit, forward and backward; one of more
-    queries and keys, an fp32 one and a folded one keep jax.nn's kernel or the folded form."""
+    """jax.nn's xla attention names BF16_BF16_F32 for a bf16 query's query-key product on a GPU, and an
+    A100 computes a dot under it with a side of one off round-to-nearest-even (row 1550). So on every
+    GPU a bf16 call named 'xla' whose queries or keys are one, a grouped decode step's or a one-key
+    read's, runs the reference path with jax.nn's own logits, fp32 from the widened query and keys and
+    scaled after the product (`xla_logits`): its output and gradients are that path's to the bit, and
+    a call whose product of bf16 values passes bf16's range, finite in fp32 as jax.nn computes it,
+    stays finite. One of more queries and keys, an fp32 one and a folded one keep jax.nn's kernel or
+    the folded form, except on a GPU before sm80, which has no BF16_BF16_F32 at all and takes the
+    reference path for every bf16 call (`_xla_kernel_narrows`)."""
+    from dew.nn.attention import reference_attention
+
     rng = np.random.default_rng(0)
 
     def drawn(queries, keys, dtype=jnp.bfloat16, kv_heads=KV_HEADS):
         return tuple(jnp.asarray(rng.standard_normal(shape), dtype) for shape in (
             (2, queries, HEADS, WIDTH), (2, keys, kv_heads, WIDTH), (2, keys, kv_heads, WIDTH)))
 
-    def attended(named, query, key, value):
-        return with_gradients(lambda query, key, value: scaled_dot_product_attention(
-            query, key, value, implementation=named))(query, key, value, jnp.ones_like(query))
+    def attended(attend, query, key, value):
+        return with_gradients(attend)(query, key, value, jnp.ones_like(query))
+
+    def named(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation="xla")
+
+    def widened(query, key, value):
+        return reference_attention(query, key, value, wide_logits=True)
 
     with generation.assumed(target):
+        bf16 = generation.bf16_dot_runs()
         for queries, keys in ((1, 12), (5, 1)):
             call = drawn(queries, keys)
             assert attention.resolve_implementation("xla", *call[:2]) == "reference", (queries, keys)
-            for named, reference in zip(attended("xla", *call), attended("reference", *call), strict=True):
-                np.testing.assert_array_equal(np.asarray(named, np.float32),
-                                              np.asarray(reference, np.float32))
-        assert attention.resolve_implementation("xla", *drawn(4, 12)[:2]) == "xla"
+            for ours, theirs in zip(attended(named, *call), attended(widened, *call), strict=True):
+                np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(theirs, np.float32))
+        # 181 * 2^56 times 181 * 2^57 is past bf16's range and inside fp32's.
+        query, key, value = (jnp.full((1, 1, 1, 1), scale, jnp.bfloat16) for scale in (181 * 2.0 ** 56,
+                                                                                      181 * 2.0 ** 57, 1.0))
+        assert np.all(np.isfinite(np.asarray(named(query, key, value), np.float32)))
+        held = "xla" if bf16 else "reference"
+        assert attention.resolve_implementation("xla", *drawn(4, 12)[:2]) == held
         assert attention.resolve_implementation("xla", *drawn(1, 12, jnp.float32)[:2]) == "xla"
         # A decode step of the query's own heads folds (`folded_attention`), its products Dew's.
-        assert attention.resolve_implementation("xla", *drawn(1, 12, kv_heads=HEADS)[:2]) == "xla"
+        assert attention.resolve_implementation("xla", *drawn(1, 12, kv_heads=HEADS)[:2]) == held
 
 
 def test_the_selector_refuses_a_mask_and_a_bias_by_their_inherent_limits():
