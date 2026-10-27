@@ -558,8 +558,11 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # A transposed matrix (the input gradient's) is loaded a step deep and sliced in registers
         # (`mosaic_sm80.Mma.products`, `resources.tile_registers`).
         transposed = bool(ba.arguments.get('trans_rhs', False))
-        plain = resources.tile_registers(family, config.warpgroups, block, dtype, transposed=transposed)
-        if ba.arguments['hooks'].prologue is None:
+        hooks = ba.arguments['hooks']
+        stored = hooks.out_dtypes or (ba.arguments['out_dtype'],)
+        plain = resources.tile_registers(family, config.warpgroups, block, dtype, transposed=transposed,
+                                         stored=stored)
+        if hooks.prologue is None:
             return plain
         # The rows' stage a consumer rewrites: its share of a product's rows by the step, or of a kernel
         # gradient's depth by the step's rows, `block_m` by `block_k` over the consumers either way.
@@ -782,7 +785,8 @@ class MosaicTgmm(_Mosaic):
         dtype = ba.arguments['tokens'].dtype
         block = (config.block_m, config.block_n, config.block_k)
         running = -(-config.block_m * config.block_n // config.warpgroups // resources.THREADS)
-        return (resources.tile_registers(family, config.warpgroups, block, dtype) + running
+        return (resources.tile_registers(family, config.warpgroups, block, dtype,
+                                         stored=(ba.arguments['out_dtype'],)) + running
                 <= family.registers(config.warpgroups))
 
     @staticmethod

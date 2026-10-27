@@ -86,6 +86,7 @@ class Mma(mosaic.Family):
     bounded_loads = False
     role_rows = 4 * 16
     operands_in_registers = True
+    stores_through_registers = True
 
     @classmethod
     def for_tile(cls, dtype, rows: int, columns: int) -> "Mma":
