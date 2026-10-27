@@ -30,12 +30,27 @@ from dew.objectives.rl import EpisodeStatus
 
 def alive(pid):
     """Whether `pid` still runs. A zombie has ended: it waits only for its reaper, which for an orphan may
-    be a child subreaper that reaps when its own job ends, as a GPU node's job runner does."""
+    be a child subreaper that reaps when its own job ends, as a GPU node's job runner does. A process
+    reaped between the stat file's open and its read has ended too: the read fails with ESRCH
+    (`test_a_process_reaped_while_its_stat_is_read_reads_as_gone`)."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def test_a_process_reaped_while_its_stat_is_read_reads_as_gone():
+    """The race `alive` meets when a worker is reaped as it polls: the stat file opened while the process
+    runs, then read after it is reaped, fails with ESRCH, not FileNotFoundError (train 229's
+    `test_parent_death_kills_the_worker`, ledger 1927)."""
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    with open(f"/proc/{child.pid}/stat") as stat:
+        child.kill()
+        child.wait()
+        with pytest.raises(ProcessLookupError):
+            stat.read()
+    assert not alive(child.pid)
 
 
 def wait_gone(pids, seconds=5.):
