@@ -370,6 +370,37 @@ def test_a_program_that_launches_no_triton_kernel_gives_no_evidence(generation_n
     assert failures(compile_kernels([case], generation_name))
 
 
+def test_each_triton_call_needs_a_launch_of_its_own():
+    """A program's Triton calls, one named as another begins and one made twice, compiled for a compile-only
+    A100: with every launch line XLA writes, the gate reads their shared bytes; without one of the two
+    `probe` launches, or without `probe_headroom`'s, it has no evidence (row 1381), where matching a launch
+    by a name's prefix took one launch for both calls."""
+    from jax.experimental import pallas as pl
+    from kernel_compile import _compiled, triton_evidence
+
+    def double(x_ref, o_ref):
+        o_ref[...] = x_ref[...] * 2
+
+    def program(x):
+        shape = jax.ShapeDtypeStruct(x.shape, x.dtype)
+
+        def call(name, operand):
+            return pl.pallas_call(double, out_shape=shape, name=name)(operand)
+        return call("probe", call("probe_headroom", call("probe", x)) + 1)
+
+    operand = jax.ShapeDtypeStruct((16, 128), jnp.float32)
+    compiled = _compiled(support.KernelCase("probe", lambda: (program, (operand,))), "sm80", {})
+    assert compiled is not None
+    thunks, programs = compiled
+    assert "shared" in triton_evidence(programs, thunks)
+    for missing, said in ((" probe grid", "probe"), (" probe_headroom grid", "probe_headroom")):
+        lines = "\n".join(thunks).splitlines()
+        dropped = next(index for index, line in enumerate(lines) if missing in line)
+        without = ["\n".join(lines[:dropped] + lines[dropped + 1:])]
+        assert triton_evidence(programs, without) == {
+            "error": f"no launch of its own states the shared bytes of {said}"}
+
+
 def test_records_a_failed_process_of_their_own_wrote_are_refused():
     """A test that compiles Mosaic GPU kernels after another capability's runs again in a pytest process of
     its own (`kernel_compile.compiled_apart`), whose records are written before its own checks and teardown:

@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections import Counter
 from pathlib import Path
 
 import jax
@@ -119,19 +120,28 @@ def compile_kernels(cases, generation: str) -> list[dict]:
         if sequences is None:
             continue
         thunks, programs = sequences
-        calls = sorted({name for text in programs for name in TRITON_CALL.findall(text)})
-        # Each Triton call's shared bytes from its own launch line, never XLA's fusions': a call none states,
-        # or a program that calls no Triton kernel, is no evidence its kernel compiled within its block
-        # (row 1381).
-        launched = {call: [int(size) for text in thunks for name, size in KERNEL.findall(text)
-                           if name.startswith(call)] for call in calls}
-        unlaunched = [call for call, sizes in launched.items() if not sizes]
-        if not calls or unlaunched:
-            record["error"] = (f"no launch states the shared bytes of {', '.join(unlaunched)}" if calls
-                               else "XLA's program calls no Triton kernel")
-            continue
-        record["shared"] = max(max(sizes) for sizes in launched.values())
+        record.update(triton_evidence(programs, thunks))
     return found
+
+
+def triton_evidence(programs: list[str], thunks: list[str]) -> dict:
+    """What XLA's optimized `programs` and thunk sequences (`thunks`) say of a program's Triton kernels: the
+    largest shared bytes a call launches with, or why they say nothing. Each Triton call (an HLO custom call,
+    named by its kernel) states its shared bytes in a launch line of its own, named exactly as the call is:
+    XLA's own fusions launch as custom kernels too, and one kernel's name can begin another's
+    (attention_forward, attention_forward_headroom). A call with no launch line of its own, or a program that
+    calls no Triton kernel, is no evidence its kernel compiled within its block (row 1381)."""
+    calls = Counter(name for text in programs for name in TRITON_CALL.findall(text))
+    launches: dict[str, list[int]] = {}
+    for text in thunks:
+        for name, size in KERNEL.findall(text):
+            launches.setdefault(name, []).append(int(size))
+    if not calls:
+        return {"error": "XLA's program calls no Triton kernel"}
+    unlaunched = sorted(name for name, count in calls.items() if len(launches.get(name, ())) < count)
+    if unlaunched:
+        return {"error": f"no launch of its own states the shared bytes of {', '.join(unlaunched)}"}
+    return {"shared": max(size for name in calls for size in launches[name])}
 
 
 def _compiled(case, generation: str, record: dict) -> tuple[list[str], list[str]] | None:
