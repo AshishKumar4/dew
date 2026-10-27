@@ -46,7 +46,7 @@ from process_support import (
 from token_support import Corpus, write_token_corpus
 
 from dew.checkpoints import FROZEN_STORE
-from dew.position import ENVELOPE, REPLICATED
+from dew.position import ENVELOPE
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -766,6 +766,8 @@ def replicated_flags(run_dir: Path, address: str, steps: int) -> dict:
 @pytest.fixture(scope="module")
 def replicated_checkpoint(tmp_path_factory, online_server):
     """Two processes' elastic fit over a filtered online stream, saved after `POOL_STEPS` steps."""
+    from dew.position import REPLICATED
+
     directory = tmp_path_factory.mktemp("replicated-checkpoint")
     reports = run_pool("fit", directory / "out", 2, **replicated_flags(directory / "run", online_server,
                                                                        POOL_STEPS))
