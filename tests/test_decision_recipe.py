@@ -2,10 +2,12 @@
 
 import csv
 import dataclasses
+import hashlib
 import json
 from collections.abc import Mapping
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from dew.config import RunConfig
@@ -205,22 +207,155 @@ def test_a_relabelled_table_reads_its_new_labels_not_the_store_s_class_names():
     assert options(renamed) == (["x", "y"], ["x", "y", "x", "y"])
 
 
-def test_a_decision_mixture_states_its_weights_and_the_manifest_that_made_it(tmp_path):
-    """`mixture` mixes the corpora of a positive weight and states, through the chain's facts, the
-    weights it mixes them by and the manifest it read, which a run's summary reports."""
-    from dew.decision.data import mixture
+TEAM = {"type": "choice", "instructions": "Which team?", "criteria": ["billing", "technical"]}
 
-    question = {"type": "choice", "instructions": "Which team?", "criteria": ["billing", "technical"]}
-    row = {"state": "charged twice", "questions": {"team": question}, "answers": {"team": "billing"}}
-    manifest = {"weights": {"a": 2.0, "b": 1.0, "c": 0.0}, "slots": {"questions": 1, "options": 2}}
-    (tmp_path / "mixture.json").write_text(json.dumps(manifest))
-    for name in ("a.jsonl", "a.held.jsonl", "b.jsonl", "c.jsonl"):
-        (tmp_path / name).write_text(json.dumps(row) + "\n")
-    train, held = mixture(str(tmp_path))
-    facts = train.facts()
-    assert facts["mixture_weights"] == {"a": 2.0, "b": 1.0}
-    assert facts["mixture_made"] == manifest
+
+def asked(state: str, **gold) -> dict:
+    """A row asking which team takes `state`, with its `answers` or `targets` for that question."""
+    stated = {kind: {"team": value} for kind, value in gold.items()}
+    return {"state": state, "questions": {"team": TEAM}, **stated}
+
+
+ROWS = {
+    "tickets/0": [asked("charged twice", answers="billing"), asked("site down", answers="technical")],
+    "tickets/1": [asked("refund please", targets={"technical": 0.25, "billing": 0.75}),
+                  asked("error 500", answers=1)],
+    "tickets.held": [asked("billed again", answers="billing"), asked("login broken", answers="technical")],
+    "billing": [asked("invoice wrong", answers="billing"), asked("double charge", answers=0)],
+    "legacy": [asked("fax broken", answers="technical")],
+}
+"""A decision mixture's files by their names in its directory, each a JSONL file of these rows: the
+`tickets` corpus's two training shards and its held rows, and the `billing` and `legacy` corpora."""
+
+
+def decision_mixture(root: Path) -> dict:
+    """The mixture directory `root` of `ROWS`, every corpus of weight one, and its manifest: `tickets`
+    trains on its two shards, which one index of their rows lists, and holds out its held file; the
+    others train on their one file, as a corpus the manifest lists no shards of does. Beside it, the
+    sha256 of the canonical source manifest it was made from, which a descriptor replacing it names."""
+    facts = {}
+    for name, rows in ROWS.items():
+        path = root / f"{name}.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+        facts[name] = {"path": f"{name}.jsonl", "bytes": path.stat().st_size,
+                       "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    # The shards' one index: each shard's own offsets (`Files.provision`) under its place in the list.
+    offsets = []
+    for number, name in enumerate(("tickets/0", "tickets/1")):
+        Files(str(root / f"{name}.jsonl"), format="jsonl").provision()
+        listed = np.load(root / f"{name}.index.npy")
+        listed["shard"] = number
+        offsets.append(listed)
+    np.save(root / "tickets" / "train.index.npy", np.concatenate(offsets), allow_pickle=False)
+    shards = [facts["tickets/0"], facts["tickets/1"]]
+    index = {"path": "tickets/train.index.npy",
+             "bytes": (root / "tickets" / "train.index.npy").stat().st_size}
+    manifest = {"weights": {"tickets": 1.0, "billing": 1.0, "legacy": 1.0},
+                "slots": {"questions": 1, "options": 2},
+                "files": {"tickets": {"train": {"sha256": "".join(shard["sha256"] for shard in shards),
+                                                "shards": shards, "index": index},
+                                      "held": {"sha256": facts["tickets.held"]["sha256"]}},
+                          "billing": {"train": {"sha256": facts["billing"]["sha256"]}},
+                          "legacy": {"train": {"sha256": facts["legacy"]["sha256"]}}}}
+    (root / "mixture.json").write_text(json.dumps(manifest))
+    (root / "manifest.sha256").write_text(hashlib.sha256(b"the canonical source manifest").hexdigest() + "\n")
+    return manifest
+
+
+def replacing(root: Path, manifest: dict, name: str, **changes) -> str:
+    """A descriptor at `name` beside `root` that replaces its manifest by `manifest` with `changes`,
+    naming the canonical manifest `root`'s was made from; its URL."""
+    provenance = {"original_manifest_sha": (root / "manifest.sha256").read_text().strip()}
+    path = root.parent / name
+    path.write_text(json.dumps({"provenance": provenance, **manifest, **changes}))
+    return str(path)
+
+
+def test_a_decision_run_fine_tunes_on_a_mixture_by_the_weights_its_descriptor_and_the_run_state(tmp_path):
+    """A decision run trains on a mixture directory's corpora by the weights of the descriptor that
+    replaces its manifest, and the run's own over them (`mixture`): the shards its index lists, a
+    corpus's one file, none of no weight, each row the example it states. Its summary reports the
+    weights it mixed by and the manifest that made them, and the held rows of the corpora that have
+    any validate it."""
+    from dew.data.compile import iterate
+    from dew.decision import mixture
+
+    manifest = decision_mixture(tmp_path / "mixture")
+    descriptor = replacing(tmp_path / "mixture", manifest, "descriptor.json",
+                           weights={"tickets": 3.0, "billing": 1.0, "legacy": 0.0})
+    train, held = mixture(str(tmp_path / "mixture"), weights={"billing": 2.0}, descriptor=descriptor)
     assert held is not None
+    assert [row["example"].state for row in iterate(held, read="memory")] == ["billed again", "login broken"]
+
+    def loaded(rows):
+        return rows.read("memory").batch(8).loading(Loading(workers=0))
+
+    config = DecisionRunConfig.cli([
+        "--pretrained", str(TINY), "--trainer.name", "mixed",
+        "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+        "--trainer.steps", "2", "--trainer.eval-every", "2", "--trainer.log-every", "1",
+        "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
+        "--model.dtype", "float32"],
+        default=DecisionRunConfig(data=loaded(train), validation=loaded(held)))
+    config.run()
+    tracking = tmp_path / "runs" / "mixed" / "tracking"
+    recorded = [json.loads(line) for line in (tracking / "records.jsonl").read_text().splitlines()]
+    [summary] = [entry["value"]["summary"] for entry in recorded if entry["type"] == "RunRecord"]
+    assert summary["mixture"] == {"tickets": 3.0, "billing": 2.0}
+    assert summary["made"] == json.loads(Path(descriptor).read_text())
+    logged = [json.loads(line) for line in (tracking / "scalars.jsonl").read_text().splitlines()]
+    assert any("val/loss" in row["scalars"] for row in logged)
+    with pytest.raises(ValueError):
+        mixture(str(tmp_path / "mixture"), weights={"tickets": 0.0, "billing": 0.0}, descriptor=descriptor)
+
+
+def test_a_benchmark_reads_one_corpus_split_whatever_its_weight_under_the_descriptor_that_pins_it(tmp_path):
+    """`corpus` reads one corpus's split as a decision run reads it, whatever its weight: the shards its
+    manifest lists, in their order, through the index of their rows, each row the example it states, a
+    target keyed by option in its question's order; a corpus's one held file; no such split, None. A
+    descriptor of the directory reads alike, and one that names another canonical manifest, or changes a
+    corpus's raw rows, is refused."""
+    from dew.data.compile import iterate
+    from dew.decision import corpus
+
+    root = tmp_path / "mixture"
+    manifest = decision_mixture(root)
+    pinned = replacing(root, manifest, "descriptor.json",
+                       weights={"tickets": 1.0, "billing": 0.0, "legacy": 0.0})
+    for descriptor in (None, pinned):
+        shards = corpus(str(root), "tickets", "train", descriptor=descriptor)
+        assert shards is not None
+        examples = [row["example"] for row in iterate(shards, read="indexed")]
+        assert [example.state for example in examples] == [
+            row["state"] for row in ROWS["tickets/0"] + ROWS["tickets/1"]]
+        assert [example.labels()["team"] for example in examples] == [0, 1, 0, 1]
+        assert examples[2].targets == {"team": (0.75, 0.25)}
+        for name, split, rows in (("tickets", "held", ROWS["tickets.held"]),
+                                  ("billing", "train", ROWS["billing"])):
+            read = corpus(str(root), name, split, descriptor=descriptor)
+            assert read is not None
+            assert [row["example"].state for row in iterate(read, read="memory")] == [
+                row["state"] for row in rows]
+        assert corpus(str(root), "billing", "held", descriptor=descriptor) is None
+    elsewhere = replacing(root, manifest, "elsewhere.json", provenance={"original_manifest_sha": "0" * 64})
+    files = json.loads(json.dumps(manifest["files"]))
+    files["billing"]["train"]["sha256"] = "0" * 64
+    rewritten = replacing(root, manifest, "rewritten.json", files=files)
+    for refused in (elsewhere, rewritten):
+        with pytest.raises(ValueError):
+            corpus(str(root), "tickets", "train", descriptor=refused)
+
+
+def test_a_tables_float_labels_name_their_options_by_their_text():
+    """A flat table whose label column holds floats, over options it is given, names the option of a
+    label's text, as a string label does, and not the option at an index."""
+    from dew.data.compile import iterate
+
+    rows = [{"text": f"rating {index}", "label": (0.5, 1.5)[index % 2]} for index in range(4)]
+    examples = [row["example"] for row in iterate(Memory(rows).pipe(decisions, options=("1.5", "0.5")),
+                                                  read="memory")]
+    assert [example.labels()["label"] for example in examples] == [1, 0, 1, 0]
 
 
 def test_a_named_validation_split_reads_the_source_s_own_split():
