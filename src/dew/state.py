@@ -11,7 +11,7 @@ from flax.training.dynamic_scale import DynamicScale
 
 from dew.batch import FROZEN, Batch, Variables, merge
 
-__all__ = ["CHECKPOINTED", "LATER_FIELDS", "MODEL_STATE", "Accumulation", "TrainState"]
+__all__ = ["CHECKPOINTED", "MODEL_STATE", "Accumulation", "TrainState"]
 
 
 @struct.dataclass
@@ -93,11 +93,6 @@ class TrainState:
     scale: DynamicScale | None
     window_size: jax.Array
     accumulation: Accumulation | None = None
-    deferred: jax.Array | None = None
-    """The real tokens of the updates an optimizer that accumulates its own gradients (optax.MultiSteps)
-    has taken and not yet applied, two uint32 words (`_TokenCount`), committed with the update that
-    applies them (`dew.optim.emitted`); None for an optimizer that applies every update it makes, and
-    for an objective that counts no tokens."""
     compute: Variables | None = struct.field(default=None,
                                              metadata={'checkpointed': False, 'variables': True})
     """The lower-precision copies of the parameters that the forward pass reads, such as bf16 copies
@@ -124,11 +119,6 @@ CHECKPOINTED = tuple(field.name for field in dataclasses.fields(TrainState)
                      if field.metadata.get('checkpointed', True))
 """The train-state fields a checkpoint holds, by their names; a field its
 declaration marks `checkpointed=False` is rebuilt on resume."""
-
-LATER_FIELDS = frozenset({"deferred"})
-"""The checkpointed fields a checkpoint written before them lacks, which a resume of it takes from the
-run's own state: `deferred`, as Dew counted every update's tokens as it was made before the field
-held any back, so none is deferred in such a checkpoint."""
 
 MODEL_STATE = ("step", "microstep", "updates", "variables", "ema")
 """The train-state fields that say which model a step holds, its counters, variables and EMA:

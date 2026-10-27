@@ -95,33 +95,6 @@ def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, a
                 if "train/tokens" in scalars] == logged
 
 
-def test_an_optimizer_that_holds_updates_back_moves_no_clock_average_or_tokens_until_it_applies_one():
-    """optax.MultiSteps over two calls applies one update every two steps, and the calls between apply
-    none, as two microbatches an update do: after three steps the run has made one update, its EMA
-    stands where the second step left it, and each step commits the tokens a run of two microbatches
-    an update commits (`accumulation=2`), none where the update is held back and both steps' with the
-    update that applies them (`TrainState.deferred`), step for step (row 1870, AT-01)."""
-    def run(steps, **settings):
-        tracker = RecordingTracker()
-        state = make_trainer(objective=TokenRegression(), tracker=tracker, **settings).fit(
-            dataset(), steps=steps, log_every=1)
-        return state, [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars]
-
-    held = optax.MultiSteps(optax.sgd(0.1), 2).gradient_transformation()
-    two, _ = run(2, optimizer=held)
-    three, _ = run(3, optimizer=held)
-    four, deferred = run(4, optimizer=held)
-    _, accumulated = run(4, optimizer=optax.sgd(0.1), accumulation=2)
-    assert (int(two.updates), int(three.updates), int(four.updates)) == (1, 1, 2)
-    for after_two, after_three in zip(jax.tree.leaves(two.ema), jax.tree.leaves(three.ema), strict=True):
-        np.testing.assert_array_equal(np.asarray(after_two), np.asarray(after_three))
-    # The update that applies the held-back step moves the average.
-    pairs = zip(jax.tree.leaves(three.ema), jax.tree.leaves(four.ema), strict=True)
-    assert any(not np.array_equal(np.asarray(held), np.asarray(moved)) for held, moved in pairs)
-    assert deferred == accumulated
-    assert deferred[0] == deferred[2] == 0 < deferred[1] < deferred[3]
-
-
 def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
     state = make_trainer(objective=TokenRegression()).fit(dataset(), steps=2, tokens=30)
     assert int(state.step) == 2

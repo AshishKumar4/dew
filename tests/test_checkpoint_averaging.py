@@ -182,3 +182,6 @@ def test_a_complex_leaf_averages_each_component_and_stays_complex():
     averaged_leaf = _taken(one, other, 2, "run", "first")
     assert averaged_leaf.dtype == np.complex64
     assert averaged_leaf.tolist() == [1 + 2j, 2 - 1j]
+    # A complex scalar keeps its shape.
+    scalar = _taken(_on_host(np.complex64(1 + 2j)), _on_host(np.complex64(3 - 4j)), 2, "run", "first")
+    assert scalar.shape == () and complex(scalar) == 2 - 1j

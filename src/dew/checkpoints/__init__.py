@@ -786,8 +786,8 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
             f"({' and '.join(RETIRED_RATE)}), which Dew's optimizer no longer forms: it holds the "
             "schedule's own rate fields (dew.optim.RateState), so a run cannot resume it. Resume it "
             "with the Dew that wrote it, or start a fresh run from its weights in a directory of its own.")
-    from dew.state import CHECKPOINTED, LATER_FIELDS
-    missing = set(CHECKPOINTED).difference(stored) - LATER_FIELDS
+    from dew.state import CHECKPOINTED
+    missing = set(CHECKPOINTED).difference(stored)
     if missing:
         raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
     if (metadata["scale"] is None) != (template.scale is None):
@@ -1739,9 +1739,9 @@ class Checkpoints:
 
     def accumulation_template(self, step: int):
         """Return the persisted pending-array shapes, without reading their values."""
-        from dew.state import CHECKPOINTED, LATER_FIELDS, Accumulation
+        from dew.state import CHECKPOINTED, Accumulation
         metadata = _item_metadata(self._step_metadata(step, local=step == self._local_latest()))
-        missing = set(CHECKPOINTED).difference(metadata.keys()) - LATER_FIELDS
+        missing = set(CHECKPOINTED).difference(metadata.keys())
         if missing:
             raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
         pending = metadata["accumulation"]
@@ -1828,10 +1828,8 @@ class Checkpoints:
                     lambda path, leaf: _from_delta_planes(leaf, weights[path])
                     if path in deltas else leaf, restored['ema'])
         else:
-            from dew.state import CHECKPOINTED, LATER_FIELDS
-            # A field a checkpoint written before it lacks keeps the run's own (`LATER_FIELDS`).
-            state_tree = {name: getattr(template, name) for name in CHECKPOINTED
-                          if name in metadata or name not in LATER_FIELDS} \
+            from dew.state import CHECKPOINTED
+            state_tree = {name: getattr(template, name) for name in CHECKPOINTED} \
                 if not isinstance(template, Mapping) else dict(template)
             held = _held_apart(state_tree, frozen)
             if from_local:
@@ -2143,8 +2141,9 @@ def _taken(held: np.ndarray, leaf: np.ndarray, count: int, directory: str, first
     `held * (1 - 1/count) + leaf / count` where they differ, whose terms cannot. A complex leaf's real
     and imaginary parts are each so averaged. An integer or boolean leaf must equal `held`."""
     if jnp.issubdtype(held.dtype, jnp.complexfloating):
-        real, imaginary = (_taken(np.ascontiguousarray(part(held)), np.ascontiguousarray(part(leaf)), count,
-                                  directory, first) for part in (np.real, np.imag))
+        # Each component as a real leaf of the same shape, a scalar's included.
+        real, imaginary = (_taken(np.array(part(held)), np.array(part(leaf)), count, directory, first)
+                           for part in (np.real, np.imag))
         averaged = real.astype(np.complex64)
         averaged.imag = imaginary
         return averaged

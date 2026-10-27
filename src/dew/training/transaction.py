@@ -41,7 +41,7 @@ from dew.objectives.base import (
     recorded_metrics,
     with_projected,
 )
-from dew.optim import clips_qk, emitted, stepped
+from dew.optim import clips_qk, stepped
 from dew.state import Accumulation, TrainState, apart, together
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
@@ -515,20 +515,18 @@ class Transaction:
             # rescale, a bounded group's clamp) acts on them (`stepped`).
             params = {**current.variables, "params": self.objective.projected(
                 stepped(stored, update, current.opt_state, opt_state), updated=True)}
-            # An update the optimizer holds back (optax.MultiSteps) moves no clock, average or effect.
-            applied = emitted(opt_state)
             if self.aux_shape.effects is not None:
-                params = _chosen(applied, write_back(params, self.objective.apply_effects(
-                    params, self.effects_tree.unflatten(effects))), params)
+                params = write_back(params, self.objective.apply_effects(
+                    params, self.effects_tree.unflatten(effects)))
             averaged = current.ema
             if self.objective.ema is not None:
                 if averaged is None:
                     raise ValueError("the objective declares EMA but the state carries none")
-                averaged = _chosen(self.objective.averages(current.updates) & applied,
+                averaged = _chosen(self.objective.averages(current.updates),
                                    ema_update(averaged, params, self.objective.ema.decay(current.updates)),
                                    averaged)
             return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
-                                       updates=current.updates + applied.astype(current.updates.dtype))
+                                       updates=current.updates + 1)
 
         if current.scale is None:
             return apply(current), native_finite, norm
@@ -639,17 +637,9 @@ class Transaction:
             advanced = dataclasses.replace(advanced, compute=narrowed(advanced.variables, self.copies))
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
-        # An update the optimizer holds back commits nothing yet: its tokens wait, as the state's
-        # `deferred`, for the update that applies them (`emitted`).
-        applied = emitted(advanced.opt_state)
-        counted = due & accepted & applied
-        zeros = jnp.zeros((2,), jnp.uint32)
-        if state.deferred is not None:
-            carried = _TokenCount.add(state.deferred, held)
-            waiting = jnp.where(due & accepted & ~applied, carried, jnp.where(counted, zeros, state.deferred))
-            advanced, held = dataclasses.replace(advanced, deferred=waiting), carried
+        counted = due & accepted
         return advanced, loss, aux, Committed(jnp.where(counted, norm, 0.), counted.astype(jnp.int32),
-                                              jnp.where(counted, held, zeros))
+                                              jnp.where(counted, held, jnp.zeros((2,), jnp.uint32)))
 
     def step(self, *, realize=None, host=False):
         """Build the function that runs one attempt over the shared phases.

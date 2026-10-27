@@ -640,8 +640,10 @@ def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
         nu_hat = _bias_corrected(nu, b2, count)
         scaled = jax.tree.map(lambda m, v: None if m is None else m / (jnp.sqrt(v + eps_root) + eps),
                               mu_hat, nu_hat, is_leaf=lambda leaf: leaf is None)
-        return scaled, optax.ScaleByAdamState(count=count, mu=optax.tree.cast_like(mu, state.mu),
-                                              nu=optax.tree.cast_like(nu, state.nu))
+        # A requested dtype is each leaf's own (`moment_dtype`): a complex leaf's first moment stays
+        # complex. None keeps the promoted moment, as Optax's does.
+        mu = mu if mu_dtype is None else optax.tree.cast_like(mu, state.mu)
+        return scaled, optax.ScaleByAdamState(count=count, mu=mu, nu=optax.tree.cast_like(nu, state.nu))
 
     return optax.GradientTransformation(init_fn, update_fn)
 
@@ -924,32 +926,6 @@ class PowerProfilesState(NamedTuple):
     inner: optax.OptState
 
 
-def _deferring(opt_state: optax.OptState) -> list[optax.MultiStepsState]:
-    """The states in `opt_state` of wrappers that accumulate their gradients over several calls."""
-    def deferring(node) -> bool:
-        return isinstance(node, optax.MultiStepsState)
-
-    return [node for node in jax.tree.leaves(opt_state, is_leaf=deferring) if deferring(node)]
-
-
-def defers(opt_state: optax.OptState) -> bool:
-    """Whether the optimizer whose state is `opt_state` holds some updates back (optax.MultiSteps),
-    applying several calls' gradients as one update (`emitted`)."""
-    return bool(_deferring(opt_state))
-
-
-def emitted(opt_state: optax.OptState) -> jax.Array:
-    """Whether the call that left the optimizer's state `opt_state` applied an update: false where a
-    wrapper that accumulates its gradients (optax.MultiSteps) held it back and returned zeros, as its
-    state's `mini_step`, the calls it holds, is not back at 0; true for an optimizer that applies every
-    update it makes. The update count, the EMA, an objective's post-step effects, the committed tokens
-    and `power_profiles`' averages advance on applied updates alone."""
-    held = _deferring(opt_state)
-    if not held:
-        return jnp.asarray(a=True)
-    return jnp.all(jnp.stack([jnp.asarray(state.mini_step) == 0 for state in held]))
-
-
 def power_profiles(solver: optax.GradientTransformation,
                    stds: Sequence[float]) -> optax.GradientTransformationExtraArgs:
     """`solver`, keeping one power-function average of the parameters it
@@ -957,8 +933,7 @@ def power_profiles(solver: optax.GradientTransformation,
     (`dew.averaging`).
 
     Update t keeps (1 - 1/t)^(γ + 1) of each average and blends in the rest
-    of the parameters it just made (Karras et al. 2024, Eq. 127); a call `solver`
-    holds back (optax.MultiSteps, `emitted`) neither counts nor moves them. The
+    of the parameters it just made (Karras et al. 2024, Eq. 127). The
     averages ride in the optimizer state, so they are sharded, placed and
     skipped on a rejected step exactly as its moments are. Each checkpoint
     is also the snapshot of its step (`Checkpoints.profile_steps`), retained
@@ -983,13 +958,9 @@ def power_profiles(solver: optax.GradientTransformation,
             raise ValueError("power_profiles averages the parameters, so its update needs them")
         updates, inner = solver.update(updates, state.inner, params, **extra_args)
         produced = stepped(params, updates, state.inner, inner)
-        # Only an update `solver` applies counts and moves the averages (`emitted`).
-        applied = emitted(inner)
-        averages = tuple(jax.tree.map(lambda new, old: jnp.where(applied, new, old), ema_update(
-            average, produced, powered_decay(state.powers[index])(state.updates)), average)
-            for index, average in enumerate(state.averages))
-        return updates, PowerProfilesState(state.updates + applied.astype(state.updates.dtype), state.stds,
-                                           state.powers, averages, inner)
+        averages = tuple(ema_update(average, produced, powered_decay(state.powers[index])(state.updates))
+                         for index, average in enumerate(state.averages))
+        return updates, PowerProfilesState(state.updates + 1, state.stds, state.powers, averages, inner)
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
