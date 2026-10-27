@@ -35,6 +35,7 @@ from dew.nn.kernels.generation import (
     runtime_facts,
     triton_runs,
 )
+from dew.telemetry import instrumentation
 from dew.training._lowering import custom_calls, kernel_report, triton_kernels
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -463,14 +464,16 @@ def _operations(lowered: jax.stages.Lowered) -> list[Operation]:
     return found
 
 
+def _collective(name: str) -> str | None:
+    """The collective a lowered operation `name` is (`instrumentation.collective`, its StableHLO dialect's
+    name in HLO's spelling), None for any other."""
+    return instrumentation.collective(name.removeprefix("stablehlo.").replace("_", "-"))
+
+
 def _squeezed(shape) -> tuple[int, ...]:
     """`shape` without its unit dimensions: a gradient's sum may reduce a parameter reshaped so (the short
     conv's `[512, 1, 4]` weight as `[512, 4]`)."""
     return tuple(size for size in shape if size != 1)
-
-
-COLLECTIVES = ("stablehlo.all_reduce", "stablehlo.all_gather", "stablehlo.all_to_all",
-               "stablehlo.reduce_scatter", "stablehlo.collective_permute")
 
 
 def test_a_packed_recurrence_runs_on_each_devices_own_rows():
@@ -495,7 +498,7 @@ def test_a_packed_recurrence_runs_on_each_devices_own_rows():
     scanned = [operands for name, target, operands, _ in operations
                if name == "stablehlo.reduce_window" or (name == "func.call" and target.startswith("cumsum"))]
     assert scanned and all(2 * 128 not in shape for operand in scanned for shape, _ in operand), scanned
-    reduced = {_squeezed(shape) for name, _, _, results in operations if name in COLLECTIVES
+    reduced = {_squeezed(shape) for name, _, _, results in operations if _collective(name)
                for shape, _ in results}
     assert reduced <= parameters, (reduced, parameters)
 
