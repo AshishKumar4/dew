@@ -242,10 +242,10 @@ class MosaicForward(_Mainloop[Tiles]):
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
         """Its tiles from the facts (`_derived`): each consumer a unit of queries, the key tile the largest
-        its registers and the block hold, two stages; the family's consumers taking turns on the plain
-        forward, whose softmax runs under the other's products, and one on the training forward, whose
-        split sums and kept anchor row issue its products back to back (TRAINC-h100: 4.13 against 2.39 ms
-        causal, 6.90 against 4.30 full, at 64 x 64 with two consumers and one)."""
+        its registers and the block hold, two stages; the family's consumers taking turns, a step's softmax
+        running under the other's products, the training forward's too (its anchored walk's step is the
+        plain one's, TWOPASS4-h100: 1.05 ms at 64 x 64 on two consumers against 1.41 at 64 x 128 on one,
+        causal llama-d128 2 x 4096 on an H100 PCIe)."""
         family = self._family(ba, target)
         if family is None:
             return None
@@ -255,8 +255,7 @@ class MosaicForward(_Mainloop[Tiles]):
             return Tiles(rows, walked, 2, consumers, family.name)
 
         return _derived(family, query.dtype, query.shape[1], key.shape[1], tiles,
-                        lambda config: self.legal(ba, config, target),
-                        overlapped=not ba.arguments.get("residuals"))
+                        lambda config: self.legal(ba, config, target), overlapped=True)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The program's shared memory (`_forward_allocations`, `_staged`), at the call's widths as the launch

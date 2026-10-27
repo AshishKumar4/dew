@@ -191,7 +191,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
             status, rows, anchors, others = _launch(q, k, v, spans_of, hooked, None, spec=form, hooks=hooks,
                                                     tiles=tiles, family=family, training=True,
                                                     interpret=interpret, anchors=found)
-            split = Split(jnp.swapaxes(others, 1, 2), rows[2], rows[3], rows[4])
+            split = Split(others, rows[2], rows[3], rows[4])
             # Each row's anchor's value row (`[B, H, Qp, Dv]`): its key head's at its key, gathered.
             batch, kv_heads, keys_count = v.shape[0], v.shape[2], v.shape[1]
             kv_of = jnp.arange(q.shape[2]) // (q.shape[2] // kv_heads)
@@ -483,7 +483,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     `training`, at the
     `anchors` a peak walk found, its status and residuals (`_Residuals`) and no output: the rows
     `[5, B, H, Qp]` fp32 (maxima, denominators, the anchor's own weight, the other keys' weights' sum and
-    their shift), the anchor keys `[B, H, Qp]` int32 and the split sums `[B, Qp, H, Dv]` fp32. A peak walk
+    their shift), the anchor keys `[B, H, Qp]` int32 and the split sums `[B, H, Qp, Dv]` fp32, in `Split`'s
+    layout, each block's rows one contiguous slab. A peak walk
     (`peaks`) reads the keys alone and gives each row's keys' largest logit `[B, H, Qp]` fp32 in the walk's
     units and its anchor key `[B, H, Qp]` int32 (`_peak_consumer`)."""
     batch, queries, heads, width = query.shape
@@ -540,7 +541,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
             if training:
                 rows_ref, keys_ref, others_ref = outputs
                 residuals = _Residuals(tuple(rows_ref.at[place, *state_rows] for place in range(5)),
-                                       keys_ref.at[state_rows], others_ref.at[rows], stages[0].at[index])
+                                       keys_ref.at[state_rows], others_ref.at[state_rows],
+                                       stages[0].at[index])
             else:
                 out_view = outputs[0].at[rows]
             _consumer(program, spec, index, q_ref.at[rows], out_view, status, q_smem.at[index],
@@ -566,7 +568,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     elif training:
         out_type = (status_type, jax.ShapeDtypeStruct((5, batch, heads, queries), jnp.float32),
                     jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32),
-                    jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), jnp.float32))
+                    jax.ShapeDtypeStruct((batch, heads, queries, value.shape[-1]), jnp.float32))
     else:
         out_type = (status_type, jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), out_dtype))
     approx_math = approximate(hooks, (block_q, block_k), value.shape[-1], differentiated=False)
