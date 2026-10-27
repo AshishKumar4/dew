@@ -613,7 +613,7 @@ GRADIENT_COVERING: dict[str, tuple[str, int]] = {
     "attention residuals": ("kimi-k3-tiny", 8),
     "looped (Dory)": ("dory-tiny", 64),
     "diffusion language models": ("dream-tiny", 8),
-    "per-layer inputs and AltUp (Gemma 3n)": ("causal_transformer+gemma3n", 64),
+    "per-layer inputs and AltUp (Gemma 3n)": ("causal_transformer+gemma3n", 32),
     "image and video diffusion transformers": ("simple_dit", 8),
 }
 """The architecture classes whose top remat rung's gradient holds check 1 against the model's, each by one
