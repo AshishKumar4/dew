@@ -233,8 +233,11 @@ class WeightLayout:
         """The source tensor, built from its leaves and brought to contiguous host storage."""
         leaves = self._leaves(variables, scalar_mode)
         # A single transposed bfloat16 kernel copies at 0.15 GiB/s on the RTX 3090 box's CPU;
-        # transposing on its device before the contiguous host copy reaches several GiB/s.
+        # transposing on its device before the contiguous host copy reaches several GiB/s. Only a leaf
+        # already on a device: a host leaf (an export gathered home) transposes where it is, never copied
+        # to the accelerator and back, which would need it to fit there.
         device_transpose = (len(leaves) == 1 and self.transpose is not None
+                            and isinstance(leaves[0], jax.Array)
                             and jax.dtypes.canonicalize_dtype(leaves[0].dtype) == leaves[0].dtype)
         value = np.ascontiguousarray(self._source(leaves, on_host=not device_transpose)).reshape(self.shape)
         return value if self.dtype is None else value.astype(self.dtype)
