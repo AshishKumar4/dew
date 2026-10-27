@@ -1013,6 +1013,37 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
     return scaled
 
 
+def _integer_convolution_on_cuda[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array]:
+    """Qwix's quantized convolution `op` with an integer product computed in float32 on CUDA.
+
+    Qwix 0.1.8 convolves two integer operands into an int32 accumulator
+    (`qarray.get_accumulator_and_result_type`), which XLA:GPU hands cuDNN as
+    an s8 x s8 -> s32 convolution that it cannot run (an A100 and an H100,
+    jax 0.12: a JaxRuntimeError at the cuDNN call). On CUDA the operands'
+    integer values convolve as float32 instead: each product of two int8
+    values is exact in float32, and their sums are exact while they stay
+    under 2**24, every contraction of up to 1040 terms (a 3x3 kernel over
+    115 input channels), past which each rounds once. Every other platform
+    convolves the integers as Qwix does."""
+    qwix = _qwix()
+
+    def integer(arg) -> bool:
+        return isinstance(arg, qwix.QArray) and jnp.issubdtype(arg.qvalue.dtype, jnp.integer)
+
+    def convolved(lhs, rhs, *args: P.args, **kwargs: P.kwargs) -> jax.Array:
+        if not (integer(lhs) and integer(rhs)):
+            return op(lhs, rhs, *args, **kwargs)
+
+        def in_float32(lhs, rhs):
+            widened = (dataclasses.replace(arg, qvalue=arg.qvalue.astype(jnp.float32)) for arg in (lhs, rhs))
+            return op(*widened, *args, **kwargs)
+
+        return jax.lax.platform_dependent(lhs, rhs, cuda=in_float32,
+                                          default=lambda lhs, rhs: op(lhs, rhs, *args, **kwargs))
+
+    return convolved
+
+
 @functools.cache
 def _grouped_convolution_gradient() -> type:
     """Qwix's quantized-training provider with Dew's gradient for a grouped
@@ -1270,7 +1301,8 @@ def _serving_provider() -> type:
             super().__init__(
                 rules, _dot_general_fn=_scaled_in_float32(qwix.dot_general),
                 _einsum_fn=_scaled_in_float32(qwix.einsum),
-                _conv_general_dilated_fn=_scaled_in_float32(qwix.conv_general_dilated))
+                _conv_general_dilated_fn=_scaled_in_float32(
+                    _integer_convolution_on_cuda(qwix.conv_general_dilated)))
 
         def _recorded(self, op: str, weight) -> bool:
             """Whether `weight` is a stored quantized kernel that reaches `op` with no rule matching
