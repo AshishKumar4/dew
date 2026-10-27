@@ -16,6 +16,7 @@ from reference_error import assert_as_exact
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.selection import selected
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mixers.mamba2 import Mamba2
 from dew.nn.precision import float32_einsum
@@ -434,19 +435,27 @@ def test_a_call_runs_its_products_kernels_apart():
     np.testing.assert_array_equal(grad, jnp.full(3, 3.0))
 
 
+def portable_draw(seed: int, rows: int, packed: bool) -> tuple:
+    """A small delta-rule call's operands `(query, key, value, g, beta)` (a decay a head), its document
+    starts where `packed`, and a direction the shape of each operand: the portable rule's
+    differentiation tests' draw."""
+    keys = jax.random.split(jax.random.key(seed), 7)
+    length, heads, width = 37, 2, 8
+    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) for k in keys[:3])
+    g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
+    starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
+    operands = (query, key, value, g, beta)
+    return operands, starts, tuple(jax.random.normal(keys[6], x.shape) for x in operands)
+
+
 @pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
 def test_the_portable_rule_recomputes_its_memory_where_the_rung_names_it(packed):
     """Under a remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`,
     'delta_memory'), the portable rule (`chunk_delta_rule`, a CPU's route) keeps its operands alone and
     computes its memory again in its backward, as the port and the template drop theirs: its residuals
     hold fewer bytes than the kept rule's, its gradients the kept rule's bit for bit."""
-    keys = jax.random.split(jax.random.key(7), 6)
-    rows, length, heads, width = 2, 37, 2, 8
-    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) for k in keys[:3])
-    g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
-    starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
-    operands = (query, key, value, g, beta)
+    operands, starts, _ = portable_draw(7, 2, packed)
 
     def loss(*operands):
         out, final = recurrence_chunk.chunk_delta_rule(*operands, chunk_size=CHUNK, starts=starts)
@@ -464,3 +473,78 @@ def test_the_portable_rule_recomputes_its_memory_where_the_rung_names_it(packed)
     again = jax.jit(jax.grad(recomputed, argnums=range(5)))(*operands)
     for want, got in zip(kept, again, strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+@pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
+def test_the_portable_rule_takes_forward_mode_at_its_public_seam(packed):
+    """`chunk_delta_rule` (a CPU's route, the portable math) under a plain `jax.jvp` and `jax.linearize`,
+    with no forward-mode context: their tangents the chunked math's own, the forward mode of the same
+    computation, bit for bit, and its gradient still its reverse rule's (`_chunk_delta_backward`), the
+    custom VJP's that refused a plain `jax.jvp` before (row 1834)."""
+    operands, starts, directions = portable_draw(11, 1, packed)
+    rows, _, heads, width = operands[0].shape
+
+    def rule(*operands):
+        return recurrence_chunk.chunk_delta_rule(*operands, chunk_size=CHUNK, starts=starts)
+
+    def math(*operands):
+        state, delta = jnp.zeros((rows, heads, width, width)), True
+        return recurrence_chunk._chunk_delta_rule(*operands, state, CHUNK, starts, delta, width ** -0.5,
+                                                  jnp.dtype(jnp.float32))
+
+    found = jax.jit(lambda *a: jax.jvp(rule, a, directions))(*operands)
+    want = jax.jit(lambda *a: jax.jvp(math, a, directions))(*operands)
+    jax.tree.map(np.testing.assert_array_equal, found, want)
+    linearized = jax.jit(lambda *a: jax.linearize(rule, *a)[1](*directions))(*operands)
+    jax.tree.map(np.testing.assert_array_equal, linearized, want[1])
+    cotangent = jax.tree.map(jnp.ones_like, found[0])
+    gradient = jax.grad(lambda *a: sum(jnp.vdot(x, c) for x, c in zip(rule(*a), cotangent, strict=True)),
+                        argnums=range(5))(*operands)
+    assert all(bool(jnp.all(jnp.isfinite(x))) for x in gradient)
+
+
+@pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
+def test_the_portable_rule_takes_nested_differentiation(packed):
+    """`chunk_delta_rule` under forward over reverse (`jax.jvp` of `jax.grad`), reverse over forward
+    (`jax.grad` of `jax.jvp`) and two forwards (`jax.jvp` of `jax.jvp`), which raised before (rows 1861: its
+    saved bool resets took a bool tangent, not float0's; 1862: its pullback gave six cotangents of seven
+    operands): each runs and is finite, and two forwards, the chunked math's tangent both times, are the
+    math's own bit for bit."""
+    (query, key, value, g, beta), starts, (direction, *_) = portable_draw(13, 1, packed)
+    rows, _, heads, width = query.shape
+
+    def rule(query):
+        return recurrence_chunk.chunk_delta_rule(query, key, value, g, beta, chunk_size=CHUNK, starts=starts)
+
+    def math(query):
+        state, delta = jnp.zeros((rows, heads, width, width)), True
+        return recurrence_chunk._chunk_delta_rule(query, key, value, g, beta, state, CHUNK, starts, delta,
+                                                  width ** -0.5, jnp.dtype(jnp.float32))
+
+    def loss(fn, query):
+        out, final = fn(query)
+        return jnp.sum(out ** 2) + jnp.sum(final ** 2)
+
+    def tangent(fn, query):
+        return jax.jvp(functools.partial(loss, fn), (query,), (direction,))[1]
+
+    def nested(fn):
+        forward_over_reverse = jax.jvp(jax.grad(functools.partial(loss, fn)), (query,), (direction,))[1]
+        reverse_over_forward = jax.grad(functools.partial(tangent, fn))(query)
+        twice = jax.jvp(functools.partial(tangent, fn), (query,), (direction,))[1]
+        return forward_over_reverse, reverse_over_forward, twice
+
+    found, want = jax.jit(lambda: nested(rule))(), jax.jit(lambda: nested(math))()
+    assert all(bool(jnp.all(jnp.isfinite(x))) for x in found)
+    np.testing.assert_array_equal(found[2], want[2])
+
+
+def test_the_tpu_scan_is_refused_under_forward_mode():
+    """A rated scan the TPU's Pallas scan tiles takes it in reverse mode alone: traced for `jax.jvp`
+    (`FORWARD_MODE`), its custom VJP giving no tangent, the scan selector refuses it and the portable math's
+    scan, whose tangent is its own, takes the call (row 1869, audit K2)."""
+    reverse, forward = (recurrence_chunk.ScanCase(reverse=mode, varying=False, dtype=np.dtype(jnp.float32),
+                                                  widths=(16, 16, 64), tpu='tpu') for mode in (True, False))
+    tpu = recurrence_chunk.SCAN.kernel('tpu')
+    assert not tpu.failed(reverse) and tpu.failed(forward)
+    assert selected(recurrence_chunk.SCAN, forward).name == 'xla'

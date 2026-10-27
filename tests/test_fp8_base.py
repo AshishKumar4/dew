@@ -530,6 +530,7 @@ import numpy as np
 from dew import cache
 from dew.nn.kernels.generation import device_generation
 from dew.quantization import frozen_fp8_leaves, frozen_fp8_product, measured_fp8_sites
+from dew.telemetry.instrumentation import hlo_instructions
 
 if not cache.measures_picks():
     print(json.dumps(None))
@@ -547,9 +548,10 @@ def step(x, cotangent, *leaves):
 
 x = jnp.asarray(rng.standard_normal((8192, 4096)), jnp.bfloat16)
 cotangent = jnp.asarray(rng.standard_normal((8192, 12288)), jnp.bfloat16)
-text = jax.jit(step).lower(x, cotangent, *leaves).compile().as_text()
+program = hlo_instructions(jax.jit(step).lower(x, cotangent, *leaves).compile().as_text())
+gemms = sum(instruction.target == "__cublas$lt$matmul$f8" for instruction in program.values())
 print(json.dumps({"sites": list(measured.frozen_fp8), "measured_on": measured.measured_on,
-                  "generation": device_generation(), "fp8_gemms": text.count("__cublas$lt$matmul$f8")}))
+                  "generation": device_generation(), "fp8_gemms": gemms}))
 """
 """The qualification, run by a process of its own (`fresh`): the suite's deterministic ops keep its
 own process from measuring (`dew.cache.keeps_picks`)."""

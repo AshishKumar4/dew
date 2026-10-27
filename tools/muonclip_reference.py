@@ -65,16 +65,18 @@ group (`_clip_scale`)."""
 HIDDEN, HEAD_DIM = 16, 4
 
 
-def clip_scale(s_max: jax.Array, tau: float) -> jax.Array:
-    """Per-head rescale `gamma`: `min(1, tau / s)` where the head exceeded
-    the threshold, 1.0 elsewhere, including heads whose every logit is
-    non-positive. MaxText's formula reads `minimum(1, tau / (s + 1e-6))`,
-    which goes negative for such a head; Dew clips nothing there instead,
-    since logits below zero need no bounding."""
+def clip_scale(s_max: jax.Array, tau: float, guard: float = 1e-6) -> jax.Array:
+    """Per-head rescale `gamma`: `min(1, tau / (s + guard))` where the head
+    exceeded the threshold, 1.0 elsewhere, including heads whose every logit
+    is non-positive. The guard is MaxText's 1e-6 by default (its latent clip
+    reads `minimum(1, tau / (s + 1e-6))`, which goes negative for such a
+    head; Dew clips nothing there instead, since logits below zero need no
+    bounding), and 0 for the paper's and Megatron Core's grouped clip,
+    `min(1, tau / s)`."""
     s_max = jnp.asarray(s_max)
     # At least float32, as the clip computes it; a float64 truth's maxima stay float64.
     s_max = s_max.astype(jnp.promote_types(s_max.dtype, jnp.float32))
-    return jnp.where(s_max > 0, jnp.minimum(1.0, tau / (s_max + 1e-6)), 1.0)
+    return jnp.where(s_max > 0, jnp.minimum(1.0, tau / (s_max + guard)), 1.0)
 
 
 def clip_qk_kernel(kernel: jax.Array, scale: jax.Array, heads: int) -> jax.Array:

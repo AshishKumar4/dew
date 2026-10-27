@@ -10,17 +10,17 @@ for compile-only GPUs on this CPU (tests/kernel_compile.py), whose partitioner s
 shares as a GPU does, where XLA:CPU sums it whole.
 """
 
-import math
+
+from collections.abc import Sequence
 
 import jax
-import jax.experimental.topologies as topologies
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
 from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from kernel_compile import target_config
+from kernel_compile import compile_only_gpus
 from model_support import TINY_DECODER
 from sharded import collective_axes
 from test_parallelism import BoxedReadout
@@ -28,7 +28,7 @@ from token_support import repeated_token_batch, token_rows
 
 from dew.data.dataset import Loader
 from dew.distributed.placement import placed_shapes
-from dew.mesh import DEFAULT_RULES, MESH_AXES, LayoutRefused, mesh_axes
+from dew.mesh import DEFAULT_RULES, LayoutRefused, mesh_axes
 from dew.nn.kernels.generation import assumed
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -47,9 +47,11 @@ BATCH = 8
 TINY_SHARD = 256
 
 
-def native():
-    """A mesh of its own axes: a replica axis beside two fsdp levels, all three splitting the rows."""
-    return Mesh(np.asarray(jax.devices()[:8]).reshape(2, 2, 2), ("replica", "zero", "zero2"))
+def native(devices: Sequence | None = None) -> Mesh:
+    """A mesh of its own axes over eight `devices`, this process's first by default: a replica axis
+    beside two fsdp levels, all three splitting the rows."""
+    return Mesh(np.asarray(jax.devices()[:8] if devices is None else devices).reshape(2, 2, 2),
+                ("replica", "zero", "zero2"))
 
 
 NATIVE = Layout(rules={"embed": ("zero", "zero2"), "mlp": "zero", "heads": "zero", "kv": "zero",
@@ -130,36 +132,20 @@ PLACEMENT = ("all-gather", "all-reduce", "reduce-scatter")
 attention's or an expert dispatch's exchange) and a pipeline's hand-offs."""
 
 
-def gpus(generation: str, count: int, shape: tuple[int, ...], names: tuple[str, ...]) -> Mesh:
-    """A mesh of `names` over `count` compile-only GPUs of the CUDA `generation`, none attached."""
-    topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=target_config(generation),
-                                            topology=f"1x1x{count}")
-    return Mesh(np.asarray(topology.devices[:count]).reshape(shape), names)
-
-
-def spec_mesh(spec: MeshSpec, count: int):
-    """`spec`'s mesh over `count` devices, its data axis the devices the others leave."""
-    sizes = {"expert": spec.expert, "fsdp": spec.fsdp, "tensor": spec.tensor, "sequence": spec.sequence,
-             "stage": spec.stage}
-    sizes = {"data": count // math.prod(sizes.values()), **sizes}
-    return lambda generation: gpus(generation, count, tuple(sizes[axis] for axis in MESH_AXES), MESH_AXES)
-
-
 GPU_STEPS = {
     # The 8-GPU wave's rows (ledger 1306): eight A100s over fsdp alone and beside two tensor shards,
     # four H100s over fsdp alone and two beside two tensor shards. Then the sequence axis holding
     # the state in shares (ledger 156), alone on two H100s and beside fsdp, the stage axis's
-    # hand-offs beside fsdp, and a native mesh's own axes.
-    "a100_fsdp8": ("sm80", spec_mesh(MeshSpec(fsdp=8), 8), Layout(min_shard=TINY_SHARD)),
-    "a100_fsdp4_tensor2": ("sm80", spec_mesh(MeshSpec(fsdp=4, tensor=2), 8), Layout(min_shard=TINY_SHARD)),
-    "h100_fsdp4": ("sm90", spec_mesh(MeshSpec(fsdp=4), 4), Layout(min_shard=TINY_SHARD)),
-    "h100_fsdp2_tensor2": ("sm90", spec_mesh(MeshSpec(fsdp=2, tensor=2), 4), Layout(min_shard=TINY_SHARD)),
-    "h100_sequence2": ("sm90", spec_mesh(MeshSpec(sequence=2), 2), Layout(min_shard=TINY_SHARD)),
-    "h100_fsdp2_sequence2": ("sm90", spec_mesh(MeshSpec(fsdp=2, sequence=2), 4),
-                             Layout(min_shard=TINY_SHARD)),
-    "h100_fsdp2_stage2": ("sm90", spec_mesh(MeshSpec(fsdp=2, stage=2), 4), Layout(min_shard=TINY_SHARD)),
-    "a100_native": ("sm80", lambda generation: gpus(generation, 8, (2, 2, 2), ("replica", "zero", "zero2")),
-                    NATIVE),
+    # hand-offs beside fsdp, and a native mesh's own axes. Each builds its mesh over that many
+    # compile-only GPUs of the generation (`compile_only_gpus`).
+    "a100_fsdp8": ("sm80", 8, MeshSpec(fsdp=8).build, Layout(min_shard=TINY_SHARD)),
+    "a100_fsdp4_tensor2": ("sm80", 8, MeshSpec(fsdp=4, tensor=2).build, Layout(min_shard=TINY_SHARD)),
+    "h100_fsdp4": ("sm90", 4, MeshSpec(fsdp=4).build, Layout(min_shard=TINY_SHARD)),
+    "h100_fsdp2_tensor2": ("sm90", 4, MeshSpec(fsdp=2, tensor=2).build, Layout(min_shard=TINY_SHARD)),
+    "h100_sequence2": ("sm90", 2, MeshSpec(sequence=2).build, Layout(min_shard=TINY_SHARD)),
+    "h100_fsdp2_sequence2": ("sm90", 4, MeshSpec(fsdp=2, sequence=2).build, Layout(min_shard=TINY_SHARD)),
+    "h100_fsdp2_stage2": ("sm90", 4, MeshSpec(fsdp=2, stage=2).build, Layout(min_shard=TINY_SHARD)),
+    "a100_native": ("sm80", 8, native, NATIVE),
 }
 
 
@@ -171,8 +157,8 @@ def test_a_gpu_step_runs_the_collectives_its_layout_plans(case):
     their own share of a batch and hold the state in shares (fsdp's rows, sequence's positions, a
     native mesh's fsdp levels), the placement's collectives are the report's: it gathers each
     weight whole and sums each gradient into its shares, which a sequence axis's report left out."""
-    generation, mesh_of, layout = GPU_STEPS[case]
-    mesh = mesh_of(generation)
+    generation, count, build, layout = GPU_STEPS[case]
+    mesh = build(compile_only_gpus(generation, count))
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
     objective, optimizer = LMObjective(model, SEQ_LEN), optax.adam(1e-3)
     variables = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))

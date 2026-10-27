@@ -899,11 +899,12 @@ class Server:
         cross-attention layers cache (`CrossAttention.context_length`)."""
         assert self.cross is not None
         cross, features, dtype = self.cross
-        given = CrossContext.from_conditioning({CONTEXT: jnp.asarray(embeddings), **(
-            {} if lengths is None else {CONTEXT_LENGTHS: jnp.asarray(lengths)})})
-        tokens = np.asarray(given.embeddings, dtype)
+        # Checked where it is, on the host: admission places the batch (`_admit`), never the request.
+        given, counts, _ = CrossContext.checked({CONTEXT: embeddings, **(
+            {} if lengths is None else {CONTEXT_LENGTHS: lengths})}, np)
+        tokens = np.asarray(given, dtype)
         # The count as given, before the cache's int32 holds it, where a wider one would wrap.
-        counted = np.asarray(given.lengths if lengths is None else lengths)
+        counted = np.asarray(counts)
         if tokens.shape[0] != 1 or tokens.shape[-1] != features:
             raise ValueError(f"a request's context is one row of {features}-wide tokens, got {tokens.shape}")
         length = int(counted.reshape(-1)[0])

@@ -418,6 +418,11 @@ class MobileNetV5Encoder(nn.Module):
         self.selected = frozenset(indices)
         _padding(args.pad_type, 3)
 
+    @property
+    def reads_train(self) -> bool:
+        """Whether its call takes `train` (`ReadsTrain`): it drops paths while training."""
+        return bool(self.construction.drop_path_rate)
+
     @nn.compact
     def __call__(self, pixel_values, train: bool = False):
         args = self.construction

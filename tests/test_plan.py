@@ -5,13 +5,12 @@ the update pools the same rows, the clocks count the same steps, and a
 resumed run reads its batches as the run it continues did.
 """
 
-import re
-
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from sharded import collectives
 from token_support import write_token_corpus
 
 from dew import cache
@@ -185,8 +184,8 @@ def test_a_microbatch_moves_no_row_between_devices():
     batch = jax.device_put(jnp.arange(32).reshape(16, 2), rows)
     sliced = jax.jit(lambda batch, part: jax.lax.with_sharding_constraint(
         microbatch(batch, part, 2), rows), in_shardings=(rows, replicated))
-    text = sliced.lower(batch, jax.device_put(jnp.int32(1), replicated)).compile().as_text()
-    assert not re.search(r"all-gather|all-to-all|collective-permute|all-reduce", text), text
+    moved = collectives(sliced.lower(batch, jax.device_put(jnp.int32(1), replicated)).compile().as_text())
+    assert not moved, moved
 
 
 def one_device(trainer):
