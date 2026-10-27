@@ -57,21 +57,31 @@ class MostlyKept:
         return row if rng.random() < 0.75 else Rejected("drawn out")
 
 
-def read(chain, drawn: bool):
-    """`chain`'s records in batches of 8, read from memory, each drawn in or out by the run's data
-    seed where `drawn` (`MostlyKept`)."""
-    kept = chain.random_filter_map(MostlyKept()) if drawn else chain
-    return kept.batch(8).read("memory").loading(Loading(workers=0))
+@dataclasses.dataclass(frozen=True)
+class Dimmed:
+    """An image dimmed by a factor its record draws (`presets.images`' `augment`): what a batch's
+    pixels hold is then the run's data seed's."""
+
+    identity = "dimmed@1"
+
+    def __call__(self, row, rng: np.random.Generator):
+        image = np.asarray(row["image"])
+        return {**row, "image": (image * rng.uniform(0.5, 1.0)).astype(image.dtype)}
+
+
+def read(chain):
+    return chain.read("memory").loading(Loading(workers=0))
 
 
 def lm(root: Path, drawn: bool) -> RunConfig:
     corpus = write_token_files(root / "tokens", 40 * SEQ, 8 * SEQ)
 
-    def windows(path):
-        return read(TokenFiles(path).pipe(presets.lm, None, seq_len=SEQ, batch=None, pack=None), drawn)
+    def windows(path, *, drawn: bool):
+        chain = TokenFiles(path).pipe(presets.lm, None, seq_len=SEQ, batch=None, pack=None)
+        return read((chain.random_filter_map(MostlyKept()) if drawn else chain).batch(8))
     return LMRunConfig(model=ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1,
                                                                 "num_heads": 2, "dtype": "float32"}),
-                       data=windows(corpus.train), validation=windows(corpus.val))
+                       data=windows(corpus.train, drawn=drawn), validation=windows(corpus.val, drawn=False))
 
 
 def decision(root: Path, drawn: bool) -> RunConfig:
@@ -84,11 +94,13 @@ def decision(root: Path, drawn: bool) -> RunConfig:
         writer.writerows(tickets)
     train, held = Files(str(table), format="csv").holdout(0.25)
 
-    def asked(rows):
-        return read(rows.pipe(decisions, question="team"), drawn)
+    def asked(rows, *, drawn: bool):
+        chain = rows.pipe(decisions, question="team").read("memory")
+        kept = chain.random_filter_map(MostlyKept()) if drawn else chain
+        return kept.batch(8).loading(Loading(workers=0))
     return DecisionRunConfig(pretrained=str(TINY_LAYA), model=ModelConfig("causal_transformer",
                                                                           {"dtype": "float32"}),
-                             data=asked(train), validation=asked(held))
+                             data=asked(train, drawn=drawn), validation=asked(held, drawn=False))
 
 
 def pictures():
@@ -99,12 +111,14 @@ def diffusion(root: Path, drawn: bool) -> RunConfig:
     del root
     train, held = pictures()
 
-    def captioned(rows):
-        return read(rows.pipe(presets.images, 4, batch=None, caption=image_steps.caption()), drawn)
+    def captioned(rows, *, drawn: bool):
+        return read(rows.pipe(presets.images, 4, batch=8, caption=image_steps.caption(),
+                              augment=Dimmed() if drawn else False))
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
                                          "num_heads": 2}),
-        data=captioned(train), validation=captioned(held), preset=Flow(), val_metrics=(),
+        data=captioned(train, drawn=drawn), validation=captioned(held, drawn=False), preset=Flow(),
+        val_metrics=(),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 2}))
 
@@ -113,14 +127,14 @@ def jepa(root: Path, drawn: bool) -> RunConfig:
     del root
     train, held = pictures()
 
-    def patched(rows):
-        return read(rows.pipe(presets.images, 16, batch=None), drawn)
+    def patched(rows, *, drawn: bool):
+        return read(rows.pipe(presets.images, 16, batch=8, augment=Dimmed() if drawn else False))
     return JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
                                            "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
                                            "attention_impl": "xla"}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
-        data=patched(train), validation=patched(held))
+        data=patched(train, drawn=drawn), validation=patched(held, drawn=False))
 
 
 KINDS = {"lm": lm, "decision": decision, "diffusion": diffusion, "jepa": jepa}
