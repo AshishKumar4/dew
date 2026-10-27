@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import textwrap
@@ -323,6 +324,50 @@ def _experts_lowered(generation: str, implementation: str):
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         return jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
+
+
+COLLECTIVES = re.compile(r"stablehlo\.(all_gather|all_reduce|all_to_all|reduce_scatter|collective_permute|"
+                         r"collective_broadcast)")
+"""The collectives a lowered program states itself (a `shard_map`'s; XLA's partitioner adds its own later)."""
+
+KERNEL_CALL = re.compile(r"stablehlo\.custom_call @(?:mosaic_gpu_v2|__gpu\$xla\.gpu\.triton)\(.*")
+"""A Pallas kernel's call in a lowered program's text, to the line's end, where its signature is."""
+
+
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_an_expert_layers_kernels_take_each_devices_own_rows_on_a_two_device_mesh(generation):
+    """Bible §7 (owner, 10-27): an expert layer's forward and backward, lowered for the GPU on an abstract
+    two-device mesh that splits its tokens (MoE's global dispatch, a `shard_map` holding them as the
+    residual stream does), runs every grouped GEMM launch, the template's or an old route's, on its own
+    device's rows: half the layer's 768 slots, never all of them. The program's only collective is the
+    reduction of the replicated experts' gradients over the data axis, which data parallelism names."""
+    from jax.sharding import AbstractMesh, AxisType
+
+    from dew.nn.moe import ExpertMLP
+
+    tokens, top = 384, 2
+    experts = ExpertMLP(num_experts=8, hidden_features=128, out_features=64, dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((tokens, 64), jnp.bfloat16)
+    indices = jnp.asarray(np.arange(tokens * top).reshape(tokens, top) % 8, jnp.int32)
+    weights = jnp.full((tokens, top), 0.5, jnp.float32)
+    variables = jax.eval_shape(lambda: experts.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype), weights,
+                                                    indices))
+
+    def loss(variables, x):
+        return experts.apply(variables, x, weights, indices).astype(jnp.float32).sum()
+
+    mesh = gpu_mesh(AbstractMesh((2,), ("data",), axis_types=(AxisType.Auto,)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh), routes() as taken:
+        lowered = jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=("cuda",))
+    text = lowered.as_text()
+    calls = [found.group(0) for found in KERNEL_CALL.finditer(text)]
+    assert {route.kernel for route in taken if route.choice == "grouped_matmul"} & {"mosaic_gpu", "triton"}
+    # Each call's signature, after its config: the first dimension of every operand and result of rank two
+    # or more.
+    signatures = [call.rsplit(" : ", 1)[-1] for call in calls]
+    rows = [int(shape) for signature in signatures for shape in re.findall(r"tensor<(\d+)x\d+", signature)]
+    assert calls and max(rows) < tokens * top <= 2 * max(rows), (max(rows), calls)
+    assert set(COLLECTIVES.findall(text)) <= {"all_reduce"}
 
 
 @pytest.mark.parametrize("generation", GPUS)
