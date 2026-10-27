@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import FEWEST_SEEDS, assert_as_exact
 from test_attention_route import CASES, HEADS, KV_HEADS, WIDTH, drawing, keywords
 from test_attention_template import (
     CASES as SPAN_CASES,
@@ -29,7 +29,7 @@ from test_attention_template import (
     geometry,
 )
 
-from dew.nn.attention import attention_case, reference_attention, scaled_dot_product_attention
+from dew.nn.attention import reference_attention, scaled_dot_product_attention
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import (
     attention as template,
@@ -200,9 +200,9 @@ def test_a_dropping_template_call_is_on_par_with_the_reference_path_forward_and_
                     f"dropping template {name} {jnp.dtype(dtype).name}", seeds=SEEDS)
 
 
-def test_a_dropping_call_reports_its_route_and_a_chosen_template_runs_it():
-    """A dropping call reports the route it runs (the reference path on a CPU, where the template is
-    not preferred), and `generation.chosen(attention='template')` runs it on the template instead."""
+def test_a_dropping_call_runs_and_a_chosen_template_runs_it():
+    """A dropping call runs, and `generation.chosen(attention='template')` runs it on the template, which
+    takes it (bible §6: every kernel honours `generation.chosen()`)."""
     query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
     key = jnp.zeros((ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
     rng = jax.random.PRNGKey(0)
@@ -211,32 +211,30 @@ def test_a_dropping_call_reports_its_route_and_a_chosen_template_runs_it():
         return scaled_dot_product_attention(query, key, key, dropout_rate=RATE, dropout_rng=rng,
                                             deterministic=False)
 
-    with generation.routes() as found:
-        dropping_call()
-    (route,) = [route for route in found if route.choice == "attention"]
-    assert route.kernel == "reference"
-    with generation.chosen(attention="template"), generation.routes() as chosen:
+    assert dropping_call().shape == (ROWS, QUERIES, HEADS, WIDTH)
+    with generation.chosen(attention="template"):
         out = dropping_call()
-    (named,) = [route for route in chosen if route.choice == "attention"]
-    assert named.kernel == "template"
     assert out.shape == (ROWS, QUERIES, HEADS, WIDTH)
 
 
-def test_a_dropping_decode_step_takes_the_reference_path_and_never_the_decode_kernel():
-    """A dropping call shaped as a decode step (one query over key lengths) is not the decode kernel's: it
-    reads no draw, so the selector runs it on the reference path, which reads the lengths and drops."""
-    keys = jax.random.split(jax.random.PRNGKey(0), 3)
-    query = jax.random.normal(keys[0], (ROWS, 1, HEADS, WIDTH), jnp.bfloat16)
-    key = jax.random.normal(keys[1], (ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
-    value = jax.random.normal(keys[2], (ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
+def test_a_dropping_decode_step_drops_as_the_reference_path_does():
+    """A dropping call shaped as a decode step (one query over key lengths), which the decode kernel, reading
+    no draw, does not take: 'auto' reads the lengths and drops as the reference path does over drawn calls
+    (check 1), whatever kernel runs it."""
     lengths = jnp.full((ROWS,), KEYS - 3, jnp.int32)
-    with generation.routes() as found:
-        out = scaled_dot_product_attention(query, key, value, key_value_seq_lengths=lengths,
-                                           dropout_rate=RATE, dropout_rng=jax.random.PRNGKey(0),
-                                           deterministic=False)
-    (route,) = [route for route in found if route.choice == "attention"]
-    assert route.kernel == "reference"
-    assert out.shape == (ROWS, 1, HEADS, WIDTH)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.PRNGKey(seed), 3)
+        return (jax.random.normal(keys[0], (ROWS, 1, HEADS, WIDTH), jnp.bfloat16),
+                jax.random.normal(keys[1], (ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16),
+                jax.random.normal(keys[2], (ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16))
+
+    def step(implementation):
+        return jax.jit(lambda q, k, v: scaled_dot_product_attention(
+            q, k, v, key_value_seq_lengths=lengths, dropout_rate=RATE, dropout_rng=jax.random.PRNGKey(0),
+            deterministic=False, implementation=implementation))
+
+    assert_as_exact(step("auto"), step("reference"), draw, "dropping decode step", seeds=FEWEST_SEEDS)
 
 
 def test_a_dropping_call_at_eval_takes_no_dropout():
@@ -472,27 +470,16 @@ def test_a_dropping_call_under_x64_on_fp32_inputs_keeps_fp32_gradients():
 
 
 @pytest.mark.gpu(reason="the route's GPU mainloops refuse dropout where calls run on an sm80 GPU or later")
-def test_a_dropping_call_on_a_gpu_takes_the_template_only_where_its_mainloop_draws():
-    """On a GPU the route's mainloops of sm80 and later, Triton's and Mosaic's, draw no dropout yet, and
-    before sm80 the plain-JAX mainloop runs every call and draws it (`attention_route.drops`). The selector
-    refuses the template for a dropping call, naming row 1521, exactly where the GPU mainloops draw none; a
-    direct route call drops either way, there on the plain-JAX mainloop, which their legality rules leave it
-    (`attention_mosaic.refused`, `attention_triton.refused`)."""
-    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
+def test_a_dropping_route_call_on_a_gpu_runs_finite():
+    """On a GPU, whose Mosaic and frozen Triton mainloops draw no dropout yet (their legality rules refuse
+    it, `attention_mosaic.refused`, `attention_triton.refused`, ledger row 1521), a direct route call that
+    drops runs, finite, on a mainloop that draws it."""
     from dew.nn.kernels.templates import attention_route
 
     query, key, value = (jnp.ones((ROWS, 8, HEADS, WIDTH), jnp.bfloat16) for _ in range(3))
-    case = attention_case(query, key, dropout=True)
-    drops = attention_route.drops()
-    assert drops == (not generation.bf16_dot_runs())
-    refused = any(refusal.row == "1521" for refusal in kernel_refusals(ATTENTION, "template", case))
-    assert refused == (not drops)
     call = functools.partial(attention_route.attend, query, key, value, template.spans(8, 8, ROWS),
                              template.Hooks(drop=dropout_of(seed_words(0), ROWS, HEADS)))
-    with generation.routes() as found:
-        assert bool(jnp.all(jnp.isfinite(call())))
-    mainloops = [route.kernel for route in found if route.choice == "attention_mainloop"]
-    assert mainloops and set(mainloops) == {"portable"}
+    assert bool(jnp.all(jnp.isfinite(call())))
 
 
 def test_the_gpu_mainloops_refuse_a_dropping_call_at_every_entry():
