@@ -1293,6 +1293,8 @@ def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
                                         (2.0 ** 127, -(2.0 ** 127), float(np.finfo(np.float32).max),
                                          2.0 ** 255 / float(np.finfo(np.float32).max))):
         edge = GaussianTransition(jnp.full((1, 1), mean, jnp.float32), jnp.asarray([variance], jnp.float32))
-        density = float(edge.log_prob(jnp.full((1, 1), value, jnp.float32))[0])
+        density = edge.log_prob(jnp.full((1, 1), value, jnp.float32))
         truth = -(term + 0.5 * (math.log(2 * math.pi) + math.log(variance)))
-        assert np.isfinite(density) and abs(density - truth) <= 4 * np.spacing(np.float32(abs(truth)))
+        # The term rounds once, a quotient of powers of two over a significand, and the log terms fall
+        # below its last place: the float32 rounding of the float64 density.
+        np.testing.assert_array_equal(np.asarray(density), [np.float32(truth)])

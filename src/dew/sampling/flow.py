@@ -101,33 +101,6 @@ class GaussianTransition:
                          jnp.where(variance == 0, deterministic, jnp.nan))
 
 
-def _half_mahalanobis(value: jax.Array, mean: jax.Array, variance: jax.Array) -> jax.Array:
-    """`|value - mean|**2 / (2 variance)` per row, one variance a row, as half the squared standardized
-    residual: the value, the mean and the deviation are first scaled by a power of two that takes the
-    row's largest of them below one (two normal factors, so no factor flushes), the residual formed and
-    divided by the deviation there, so it is finite wherever the term is: a residual of 2**64 under unit
-    variance (2**127), a value of 2**127 beside a mean of -2**127. The scale is a constant of the row's
-    magnitudes, so the derivatives are the plain formula's at every order."""
-    deviation = jnp.sqrt(variance)
-    axes = tuple(range(1, value.ndim))
-    largest = jax.lax.stop_gradient(jnp.maximum(
-        jnp.maximum(jnp.max(jnp.abs(value), axis=axes), jnp.max(jnp.abs(mean), axis=axes)), deviation))
-    exponent = jnp.frexp(jnp.where(largest > 0, largest, 1))[1]
-    first = jnp.ldexp(jnp.ones_like(largest), -(exponent // 2))
-    second = jnp.ldexp(jnp.ones_like(largest), -(exponent - exponent // 2))
-
-    def scaled(x):
-        return x * expand(first, x) * expand(second, x)
-
-    # A deviation far below the row's largest scales to below float32's least normal, which a device may
-    # flush: the least normal holds a zero residual at zero, any other past float32's largest as the
-    # term itself is.
-    spread = deviation * first * second
-    spread = jnp.where(spread > 0, spread, jnp.finfo(spread.dtype).tiny)
-    standardized = (scaled(value) - scaled(mean)) / expand(spread, value)
-    return 0.5 * jnp.square(standardized).sum(axis=axes)
-
-
 def _exponent(x: jax.Array) -> jax.Array:
     """Each `|x|`'s binary exponent `e`, `2**e <= |x| < 2**(e + 1)` where `x` is a normal number, read
     from its bits: a zero, or a subnormal, which XLA:CPU reads as zero, gives the least normal's less
@@ -290,6 +263,29 @@ def _kl_pullback(saved, operands, cotangent):
 def _measured(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> tuple[jax.Array, tuple]:
     """`_divergence`, with nothing its reverse mode keeps (`linear_tangent`'s `forward`)."""
     return _divergence(mean, reference, variance), ()
+
+
+@jax.custom_jvp
+def _half_mahalanobis(value: jax.Array, mean: jax.Array, variance: jax.Array) -> jax.Array:
+    """`|value - mean|**2 / (2 variance)` per row, the density's quadratic term, as the KL forms it
+    (`_divergence`): the plain float32 formula bit for bit wherever it stays in range, and finite
+    wherever the term is (a residual of 2**64 under a variance of 2**126; a value of 2**127 beside a
+    mean of -2**127). Its derivatives are the plain formula's at every order (`_half_mahalanobis_jvp`)."""
+    return _divergence(value, mean, variance)
+
+
+@_half_mahalanobis.defjvp
+def _half_mahalanobis_jvp(primals, tangents):
+    """The plain formula's tangent, `sum((value - mean) * (t_value - t_mean)) / variance - term * t_variance
+    / variance`, its residual formed as the term's is (`_differences`), restored where it is read. It is
+    linear in the tangents, so reverse mode transposes it, and a function of the primals the term is, so
+    it differentiates again."""
+    value, mean, variance = primals
+    along_value, along_mean, along_variance = tangents
+    term = _half_mahalanobis(value, mean, variance)
+    residual = _scaled(*_differences(value, mean))
+    moved = (residual * (along_value - along_mean)).sum(axis=tuple(range(1, value.ndim)))
+    return term, moved / variance - term * along_variance / variance
 
 
 _gaussian_kl = linear_tangent(_measured, _kl_pullback, _directional)
