@@ -135,6 +135,30 @@ def test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names(tmp_path):
                         modeling_overrides={"attention": {"linear_attention": "block_bidirectional"}})
 
 
+def test_a_nemotron_hybrids_attention_layers_read_blocks_where_an_override_names_them(tmp_path):
+    """Nemotron-H's attention kind reads its blocks under a block-bidirectional override, as a
+    Nemotron 3.5 Lightning run asks of it, its Mamba kind the release's, and without groups the plain
+    release's logits bitwise; the saved model states the override and reloads reading blocks
+    (ledger 1883)."""
+    from dew.interop import Pretrained
+
+    plain = Pretrained.load(HF / "nemotron-h-tiny", dtype="float32", attention_impl="xla")
+    blocked = Pretrained.load(HF / "nemotron-h-tiny", dtype="float32", attention_impl="xla",
+                              modeling_overrides=BLOCKED)
+    assert blocked.model.kind_of("full_attention").mixer.bidirectional_blocks
+    assert blocked.model.kind_of("linear_attention") == plain.model.kind_of("linear_attention")
+    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, blocked.model.vocab_size)
+    np.testing.assert_array_equal(np.asarray(blocked.model.apply(blocked.variables, ids)),
+                                  np.asarray(plain.model.apply(plain.variables, ids)))
+    read = blocked.model.apply(blocked.variables, ids, block_groups=jnp.asarray(BLOCKS))
+    blocked.save(tmp_path / "saved")
+    assert json.loads((tmp_path / "saved" / "config.json").read_text())["modeling_overrides"] == BLOCKED
+    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids,
+                                                                  block_groups=jnp.asarray(BLOCKS))),
+                                  np.asarray(read))
+
+
 def test_a_layer_that_reads_no_groups_stays_causal():
     """Block and image groups reach every layer, and a layer whose kind reads neither computes what it
     computes without them, bitwise."""

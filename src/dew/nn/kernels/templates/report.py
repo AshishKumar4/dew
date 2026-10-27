@@ -6,6 +6,7 @@ program around it, with a device or a compile-only one. The CPU suite's resource
 
 import contextlib
 import dataclasses
+import hashlib
 import os
 import re
 import threading
@@ -23,20 +24,25 @@ TENSOR_MEMORY = re.compile(r"tmem_scratch_cols=(\d+), tmem_collective_scratch_co
 KERNEL_COUNTER = re.compile(r"_\d+$")
 """The counter Mosaic GPU appends to a kernel's name in its reports' file names, which JAX 0.12 numbers
 apart for a kernel's two reports."""
+DUMP_NAME = re.compile(r'mosaic_gpu\.dump_basename = "[^"]*"')
+"""The one attribute of Mosaic's module dump that names the dump (its counter) rather than the module."""
 
 
 @dataclasses.dataclass(frozen=True)
 class Report:
     """One Mosaic GPU kernel's reports: its name, the shared bytes and tensor memory columns it asks for
     (Mosaic's resource estimate), its registers a thread and its spilled bytes (ptxas's, the most over the
-    kernel's functions), and what the reports left `unread`: either report without the other, or a field
-    neither states, is no evidence the kernel is within its resources."""
+    kernel's functions), what the reports left `unread`: either report without the other, or a field
+    neither states, is no evidence the kernel is within its resources; and its `module`, the digest of
+    Mosaic's module after layout inference less its dump's name, which two compiles of one module share:
+    Mosaic compiles a module once a process, so a later compile of it reports no ptxas run of its own."""
     kernel: str
     shared: int | None
     tmem: int | None
     registers: int | None
     spilled: int | None
     unread: tuple[str, ...] = ()
+    module: str | None = None
 
     def failure(self, shared_limit: int, tmem_limit: int) -> str | None:
         """Why the kernel is not within a multiprocessor's `shared_limit` bytes and `tmem_limit` tensor memory
@@ -68,10 +74,11 @@ def reported(directory: str):
 
 
 def reports(directory: str) -> list[Report]:
-    """Each kernel's `Report` in `directory`, its two reports paired by the kernel's name less the counter
-    Mosaic appends (`KERNEL_COUNTER`); the compiles a directory holds name each kernel once."""
+    """Each kernel's `Report` in `directory`, its reports and module dump paired by the kernel's name less the
+    counter Mosaic appends (`KERNEL_COUNTER`); the compiles a directory holds name each kernel once."""
     named: dict[str, dict[str, Path]] = {}
-    for kind, suffix in (("resources", ".resources.txt"), ("ptxas", ".ptxas")):
+    for kind, suffix in (("resources", ".resources.txt"), ("ptxas", ".ptxas"),
+                         ("module", ".after_layout_inference.txt")):
         for path in Path(directory).glob(f"*{suffix}"):
             found = named.setdefault(KERNEL_COUNTER.sub("", path.name.removesuffix(suffix)), {})
             # Paired by name: compiles that name a kernel twice would pair the wrong reports.
@@ -85,8 +92,10 @@ def reports(directory: str) -> list[Report]:
         registers, spills = REGISTERS.findall(log), SPILLS.findall(log)
         unread = tuple(field for field, read in (("shared bytes", shared), ("tensor memory columns", tmem),
                                                  ("registers", registers), ("spills", spills)) if not read)
+        module = found.get("module")
         found_reports.append(Report(
             name, int(shared.group(1)) if shared else None, sum(map(int, tmem.groups())) if tmem else None,
             max(map(int, registers), default=None),
-            max((int(stores) + int(loads) for stores, loads in spills), default=None), unread))
+            max((int(stores) + int(loads) for stores, loads in spills), default=None), unread,
+            hashlib.sha256(DUMP_NAME.sub("", module.read_text()).encode()).hexdigest() if module else None))
     return found_reports

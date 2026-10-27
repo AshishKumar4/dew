@@ -409,7 +409,7 @@ class Plan:
     """A mixture's members, each what it reads and runs as one digest under its key, and its own
     stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
     resume reads of a member that joined or left (`check`)."""
-    version: ClassVar[int] = 6
+    version: ClassVar[int] = 7
 
     def record(self) -> dict[str, JSON]:
         return {

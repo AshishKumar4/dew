@@ -21,6 +21,7 @@ from tuned import each_config
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates import product, resources
 from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, mosaic_tpu, template, triton_dense
+from dew.training._lowering import custom_calls, triton_kernels
 
 pytestmark = pytest.mark.kernel
 
@@ -977,10 +978,10 @@ def test_a_cuda_call_naming_xla_runs_its_program(generation_name):
     sizes = jnp.asarray([128, 128], jnp.int32)
     with (generation.assumed(generation_name), generation.chosen(grouped_matmul="xla"),
           generation.routes() as taken, tuning.seen() as launches):
-        text = jax.jit(lambda x, w: template.gemm(x, w, sizes, out_dtype=jnp.bfloat16)).trace(x, w).lower(
-            lowering_platforms=("cuda",)).as_text()
+        lowered = jax.jit(lambda x, w: template.gemm(x, w, sizes, out_dtype=jnp.bfloat16)).trace(x, w).lower(
+            lowering_platforms=("cuda",))
     assert _kernels(taken) == {"xla"} and not list(launches)
-    assert "mosaic_gpu" not in text and "triton" not in text
+    assert not custom_calls(lowered), custom_calls(lowered)
 
 
 @runs("v5e")
@@ -1066,7 +1067,7 @@ def test_the_hooked_dense_launches_lower_for_cuda(launch, trans_rhs, generation_
         for config in sorted(covering, key=repr):
             lowered = jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
-            assert name in lowered.as_text()
+            assert name in triton_kernels(lowered)
 
 
 def test_mosaic_takes_only_the_hooks_its_lowering_has_rules_for():
@@ -1492,7 +1493,7 @@ def test_a_paired_dense_product_lowers_for_cuda(generation_name):
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
     with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(paired).trace(*args).lower(lowering_platforms=("cuda",))
-    assert "pallas_triton_dense_dot" in lowered.as_text()
+    assert "pallas_triton_dense_dot" in triton_kernels(lowered)
 
 
 def test_a_paired_product_without_an_epilogue_is_refused():

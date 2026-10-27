@@ -59,7 +59,7 @@ class _File:
     base (or on another such), the functions of it that return a module and those that promote a
     parameter (`_promoter`), and the nodes built inside a float64 context."""
 
-    def __init__(self, tree: ast.Module, parent: Sequence[str], name: str = "", reached=None):
+    def __init__(self, tree: ast.Module, parent: Sequence[str], name: str, reached):
         self.tables = {id(node): table for node, table in scopes.scoped(tree.body, {}, list(parent))}
         # Each call's scope, where `reached` (lint_slop's `_Calls.reached`) reads which of the file's
         # functions it calls, lexically, as the tolerance lint does.
@@ -88,41 +88,33 @@ class _File:
                         self.guards.setdefault(id(inner), set()).add(test)
         classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
         self.classes: set[str] = set()
-        # Every definition of a name, for a file read without a resolver: a call is read as any of them.
-        self.functions: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                self.functions.setdefault(node.name, []).append(node)
+        # The file's function definitions; a call reaches them through `reached`, where it is made.
+        functions = [node for node in ast.walk(tree)
+                     if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
         # The definitions that return a module, and those that promote a parameter, by identity.
         self.factories: set[int] = set()
-        self.promoters = {id(function): found for defined in self.functions.values() for function in defined
-                          if (found := _promoter(function))}
+        self.promoters = {id(function): found for function in functions if (found := _promoter(function))}
         grown = True
         while grown:
             before = (len(self.classes), len(self.factories))
             self.classes |= {node.name for node in classes if any(
                 self._constructs(base) or (isinstance(base, ast.Name) and base.id in self.classes)
                 for base in node.bases)}
-            for defined in self.functions.values():
-                for function in defined:
-                    returned: list[bool] = []
-                    _modules(self, function.body, {}, returns=returned,
-                             parameters=scopes.arguments(function))
-                    if any(returned):
-                        self.factories.add(id(function))
+            for function in functions:
+                returned: list[bool] = []
+                _modules(self, function.body, {}, returns=returned, parameters=scopes.arguments(function))
+                if any(returned):
+                    self.factories.add(id(function))
             grown = (len(self.classes), len(self.factories)) != before
 
     def resolved(self, node: ast.expr) -> str:
         return scopes.resolved(node, self.tables.get(id(node), {}))
 
     def called(self, call: ast.Call) -> list[ast.AST]:
-        """The file's functions a bare-named `call` reaches: through the resolver, lexically, where the
-        file is read with one, else every definition of the name."""
+        """The file's functions a bare-named `call` reaches, lexically (`reached`)."""
         if not isinstance(call.func, ast.Name):
             return []
-        if self.reached is not None:
-            return list(self.reached(self.scope_of.get(id(call)), call))
-        return list(self.functions.get(call.func.id, []))
+        return list(self.reached(self.scope_of.get(id(call)), call))
 
     def _widened(self, block: ast.With | ast.AsyncWith) -> tuple[str, list[ast.stmt]]:
         """The statements of a `with` block that run inside a float64 context, and the condition that
@@ -422,7 +414,7 @@ def _scopes(body: Sequence[ast.stmt]) -> Iterator[ast.FunctionDef | ast.AsyncFun
             yield from _scopes(node.body)
 
 
-def promotions(tree: ast.Module, parent: Sequence[str], name: str = "", reached=None) -> Iterator[ast.Call]:
+def promotions(tree: ast.Module, parent: Sequence[str], name: str, reached) -> Iterator[ast.Call]:
     """Every promotion of a module to float64 in a file (the module's docstring), in code order: `name`
     the file's own dotted name, `reached` lint_slop's `_Calls.reached`, which reads a call's function
     where the call is made."""
