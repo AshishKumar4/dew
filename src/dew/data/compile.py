@@ -414,8 +414,8 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
 
 
 def _expands(stage: Stage) -> bool:
-    """Whether `stage` is an objective's step that makes, or before it binds may make, several rows of
-    a source example (`FlatMap.examples`, `Configured.examples`)."""
+    """Whether `stage` is an objective's step that makes, or once it binds will make, several rows of a
+    source example (`FlatMap.examples`, `Configured.examples`)."""
     return isinstance(stage, (FlatMap, Configured)) and stage.examples
 
 
@@ -1106,8 +1106,8 @@ def _objective_records(
     rows of a source example marked as one (`FlatMap.examples`)."""
     def staged(step) -> Stage:
         if isinstance(step, Configured):
-            # One that may expand records binds to an expansion that carries the mark (`_bind`).
-            return step if step.one_to_one else dataclasses.replace(step, examples=True)
+            # One stated to expand records binds to an expansion that carries the mark (`_bind`).
+            return dataclasses.replace(step, examples=True) if step.expands else step
         stage = record_stage(step)
         return dataclasses.replace(stage, examples=True) if isinstance(stage, FlatMap) else stage
     return pipeline._then(*(staged(step) for step in steps))
@@ -1120,7 +1120,7 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
     steps = objective.train if train else objective.evaluate
     random = next((index for index, step in enumerate(steps)
                    if isinstance(step, (pygrain.RandomMapTransform, Expansion))
-                   or (isinstance(step, Configured) and (step.random or not step.one_to_one))), len(steps))
+                   or (isinstance(step, Configured) and (step.random or step.expands))), len(steps))
     prefix = dataclasses.replace(objective, train=objective.train[:random],
                                  evaluate=objective.evaluate[:random])
     branch = objective_steps(pipeline, prefix, train=train, read=read)

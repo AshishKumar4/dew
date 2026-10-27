@@ -169,7 +169,7 @@ def test_an_examples_budget_counts_examples_before_the_objective_expands_them(ex
 
     ids = np.arange(1, RECORDS + 1, dtype=np.int32)
     shuffled = {"seed": 3} if read == "memory" else {"seed": 3, "window": RECORDS}
-    expansion = Configured(lambda facts: Questioned(), needs=()) if configured else Questioned()
+    expansion = Configured(lambda facts: Questioned(), needs=(), expands=True) if configured else Questioned()
     loader = compile(Pipeline(Memory({"id": ids})).shuffle(**shuffled).batch(BATCH), read=read,
                      objective=ObjectiveData(train=(expansion,)), examples=examples)
     read = ids_read(loader, loader.example_steps(examples), "id")
@@ -178,6 +178,37 @@ def test_an_examples_budget_counts_examples_before_the_objective_expands_them(ex
     assert all(count % (record % 3 + 1) == 0 for record, count in read.items())
     assert sorted(count // (record % 3 + 1) for record, count in read.items()) == sorted(
         [passes + 1] * rest + [passes] * (RECORDS - rest) if passes else [1] * rest)
+
+
+class Evens:
+    """An objective's filter of the odd records, which it states it drops (`rejects`)."""
+
+    rejects = True
+
+    def map(self, element):
+        from dew.data.pipeline import Rejected
+
+        return element if int(element["id"]) % 2 == 0 else Rejected("odd")
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_an_examples_budget_counts_the_examples_an_objectives_filter_keeps_given_or_configured(read):
+    """A run bounded to `examples` reads that many examples an objective's filter keeps, the filter
+    given as a step or as a configured one that binds to it alike: its kept examples, each even, the
+    bound reaching past the five a pass keeps."""
+    from dew.data.pipeline import Configured, ObjectiveData
+
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    shuffled = {"seed": 3} if read == "memory" else {"seed": 3, "window": RECORDS}
+
+    def kept(step) -> collections.Counter:
+        loader = compile(Pipeline(Memory({"id": ids})).shuffle(**shuffled).batch(BATCH), read=read,
+                         objective=ObjectiveData(train=(step,)), examples=7)
+        return ids_read(loader, loader.example_steps(7), "id")
+
+    given = kept(Evens())
+    assert sum(given.values()) == 7 and all(record % 2 == 0 for record in given)
+    assert kept(Configured(lambda facts: Evens(), needs=())) == given
 
 
 def test_an_examples_budget_over_a_mixture_counts_each_corpus_examples_whatever_its_rows():

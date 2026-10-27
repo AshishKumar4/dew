@@ -171,10 +171,12 @@ class Configured:
     reads before it binds; binding it to a step that drops or expands records is refused.
     `measures` measures a fact it needs over each store it reads, in a memory read: the whole store,
     below any holdout, so the parts a run trains and scores on agree; a store's own statement of it
-    gives way to the measure, and a mixture's step binds the largest of its stores'. `examples` marks
-    an objective's step that may make several rows of each source example, as one not `one_to_one`
-    may: it runs after the chain's record order, a run's `examples=` bound stands before it, and the
-    step it binds to, an expansion, carries the mark (`FlatMap.examples`)."""
+    gives way to the measure, and a mixture's step binds the largest of its stores'. `random` and
+    `expands` state what the step it binds to is, before it binds: a random map's, and an expansion's
+    of a record into several (`Expansion`); binding to another is refused. An objective's step that
+    expands is marked as one that makes several rows of each source example (`examples`, set where the
+    objective places it): it runs after the chain's record order, a run's `examples=` bound stands
+    before it, and the expansion it binds to carries the mark (`FlatMap.examples`)."""
 
     factory: Callable[[Mapping[str, object]], RecordStep | pygrain.RandomMapTransform | Expansion]
     needs: tuple[str, ...]
@@ -182,6 +184,7 @@ class Configured:
     random: bool = False
     one_to_one: bool = False
     measures: Measure | None = None
+    expands: bool = False
     examples: bool = False
 
 
