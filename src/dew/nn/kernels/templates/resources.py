@@ -174,3 +174,55 @@ def shared_bytes(family: "Family", scope: Scope) -> int:
         sizes += after
     scratch = [family.reduction_scratch] if scope.reduces and family.reduction_scratch else []
     return allocated(*sizes, *scratch) + max([0, *walks]) + BARRIER_BYTES * barriers
+
+
+@dataclasses.dataclass(frozen=True)
+class Launch:
+    """One launch a derivation plans (`plan`): its program's allocations at a ring depth (`scope`), its
+    consumer roles, the registers a consumer thread of it holds (`live_registers`, `tile_registers`), and
+    the fewest and most stages it streams at (`floor`: two keep one stage loading beside the one consumed;
+    `most`: deeper rings cover no latency a GPU's loads have)."""
+    scope: Callable[[int], Scope]
+    consumers: int
+    registers: int
+    floor: int = 2
+    most: int = 8
+
+
+@dataclasses.dataclass(frozen=True)
+class LaunchPlan:
+    """A launch's plan: its ring depth, the programs a multiprocessor runs of it, and its shared bytes."""
+    stages: int
+    programs: int
+    shared: int
+
+
+def plan(launches, family: "Family", target, *, programs: int | None = None) -> tuple[LaunchPlan, ...] | None:
+    """Each of `launches`' plan on `target` (a GPU's, or the one a CPU process states), or None where any
+    launch holds at no plan: within its family's registers (`Family.registers`), the most programs a
+    multiprocessor holds of it (`Family.programs`, or `programs` where the caller fixes the residency)
+    whose share of its shared memory (`program_shared`) holds the launch at its `floor`, then the deepest
+    ring that share holds at that residency, so stages never trade away a program. Each launch plans at
+    its own residency and depth; a template's legality is that every launch holds."""
+    from dew.nn.kernels import generation
+
+    block = generation.shared_budget(target)
+    plans = []
+    for launch in launches:
+        if launch.registers > family.registers(launch.consumers):
+            return None
+        residencies = range(family.programs(launch.consumers), 0, -1) if programs is None else (programs,)
+        found = None
+        for held in residencies:
+            share = program_shared(block, held)
+            if shared_bytes(family, launch.scope(launch.floor)) > share:
+                continue
+            stages = launch.floor
+            while stages < launch.most and shared_bytes(family, launch.scope(stages + 1)) <= share:
+                stages += 1
+            found = LaunchPlan(stages, held, shared_bytes(family, launch.scope(stages)))
+            break
+        if found is None:
+            return None
+        plans.append(found)
+    return tuple(plans)
