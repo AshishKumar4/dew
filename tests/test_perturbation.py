@@ -294,14 +294,15 @@ def test_an_indexer_warmup_trains_its_indexer_alone_without_backpropagation():
         jax.random.key(1))
     assert jax.tree.structure(estimate) == jax.tree.structure(start["params"])
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(estimate))
-    state = Trainer(objective, optax.adam(1e-2), key=0, layout=LAYOUT).fit(
-        Memory([{"text": row} for row in tokens]).repeat().batch(8), steps=2)
-    for moved, held in zip(jax.tree.leaves(state.variables["params"]), jax.tree.leaves(start["params"]),
+    trainer = Trainer(objective, optax.adam(1e-2), key=0, layout=LAYOUT)
+    initial = jax.tree.map(np.asarray, trainer.initial_state().variables)
+    state = trainer.fit(Memory([{"text": row} for row in tokens]).repeat().batch(8), steps=2)
+    for moved, held in zip(jax.tree.leaves(state.variables["params"]), jax.tree.leaves(initial["params"]),
                            strict=True):
-        assert not np.array_equal(np.asarray(moved), np.asarray(held))
-    for kept, held in zip(jax.tree.leaves(state.variables[FROZEN]), jax.tree.leaves(start[FROZEN]),
+        assert not np.array_equal(np.asarray(moved), held)
+    for kept, held in zip(jax.tree.leaves(state.variables[FROZEN]), jax.tree.leaves(initial[FROZEN]),
                           strict=True):
-        np.testing.assert_array_equal(np.asarray(kept), np.asarray(held))
+        np.testing.assert_array_equal(np.asarray(kept), held)
 
 
 def test_a_routed_decoder_trains_its_composite_statistics_without_backpropagation():
