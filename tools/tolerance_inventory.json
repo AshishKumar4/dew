@@ -506,7 +506,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_packed_grpo.py": {
-   "comparisons": 5,
+   "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
   "tests/test_packed_rollouts.py": {

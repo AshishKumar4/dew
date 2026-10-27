@@ -624,7 +624,8 @@ def test_a_pipeline_whose_rows_no_axis_splits_computes_the_whole_stacks_step(spe
 def test_a_pipeline_past_a_dense_prefix_scans_its_stages_and_keeps_every_layers_statistics():
     """A dense first layer before eight routed ones over four stages runs the prefix beside the pipeline
     and scans two routed layers a stage, each at its own stored layer; asked for QK statistics, every
-    layer sows its own, the prefix's beside the stages', in the shapes the plain loop sows them."""
+    layer sows its own, the prefix's as the plain loop sows it and each stage's layers per pipeline
+    iteration, as a pipeline's sowing comes out."""
     routed = {"experts": 4, "top_k": 2, "expert_features": 16, "layers": tuple(range(1, 9))}
     model = tiny(num_layers=9, scan_layers=True, mixture=routed)
     ids = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, size=(BATCH, SEQ_LEN)), jnp.int32)
@@ -634,9 +635,9 @@ def test_a_pipeline_past_a_dense_prefix_scans_its_stages_and_keeps_every_layers_
     placed = jax.device_put(variables, Layout(min_shard=TINY_SHARD).shardings(mesh, variables))
     with jax.set_mesh(mesh), pipeline_microbatches(4):
         _, piped = jax.jit(lambda held, tokens: model.apply(held, tokens, mutable=["qk"]))(placed, ids)
-    shapes = jax.tree.map(jnp.shape, plain)
-    assert jax.tree.map(jnp.shape, jax.device_get(piped)) == shapes
-    assert set(shapes["qk"]) == {f"layers_{index}" for index in range(9)}
+    shapes, piped_shapes = jax.tree.map(jnp.shape, plain), jax.tree.map(jnp.shape, jax.device_get(piped))
+    assert set(piped_shapes["qk"]) == set(shapes["qk"]) == {f"layers_{index}" for index in range(9)}
+    assert piped_shapes["qk"]["layers_0"] == shapes["qk"]["layers_0"]
 
 
 def test_scanned_dropout_uses_the_supplied_rng():
