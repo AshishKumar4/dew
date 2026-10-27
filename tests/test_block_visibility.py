@@ -22,6 +22,7 @@ from reference_error import assert_as_exact
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import generation
 from dew.nn.mixers import AttentionMixer
+from dew.nn.visibility import block_ends, block_starts
 
 LENGTH = 8
 
@@ -66,11 +67,12 @@ or an image its window cuts."""
 @pytest.mark.parametrize("layout", LAYOUTS.values(), ids=list(LAYOUTS))
 def test_a_block_layer_reads_the_keys_the_block_causal_rule_keeps(layout):
     """A layer reading block groups computes what it computes over an explicit mask of the rule's keys
-    (`attention_pairwise_mask`), its logits and its QK-Clip maxima alike: both run the reference path over
-    the same keys, so they agree bitwise, and a key added or dropped moves them. The rule keeps keys a
-    causal mask does not, so the groups are read."""
+    (`attention_pairwise_mask`), its logits and its QK-Clip maxima alike: both run xla's kernel over the
+    same keys, the one named on every backend, so they agree bitwise, and a key added or dropped moves
+    them. The rule keeps keys a causal mask does not, so the groups are read. (The fused kernels' own
+    parity over these spans is the template's and the route's tests'.)"""
     kinds, fields, rule = layout
-    decoder = model(**kinds)
+    decoder = model(**kinds).clone(attention_impl="xla")
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
     params = decoder.init(jax.random.key(1), ids)
     segment_ids, attention_mask, block_groups, image_groups = (
@@ -248,6 +250,24 @@ def test_a_non_causal_kind_reading_blocks_keeps_its_kernel(without_deterministic
     assert routes(block_groups=jnp.asarray(BLOCKS)) == plain
 
 
+WINDOWED_BLOCKS = {"sliding_attention": {"window": 2, "mixer": AttentionMixer(bidirectional_blocks=True)}}
+
+
+@pytest.mark.parametrize("kinds", [{"full_attention": {}}, WINDOWED_BLOCKS], ids=["full", "window-blocks"])
+def test_padding_inside_a_row_reaches_the_fused_kernel_as_its_keys_validity(kinds):
+    """A call with padding inside its rows hands the kernel its real keys and, under a window, the places
+    the window counts, rather than a mask it builds: a layer naming the template runs it, where the template
+    refuses a mask by its inherent limit (so a mask built here would raise)."""
+    decoder = model(**kinds).clone(dtype=jnp.bfloat16, attention_impl="template")
+    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
+    params = decoder.clone(attention_impl="xla").init(jax.random.key(1), ids)
+    blocks = jnp.asarray(WINDOWED) if kinds is WINDOWED_BLOCKS else None
+    with generation.assumed("sm80"), generation.routes() as found:
+        jax.eval_shape(lambda params, ids: decoder.apply(params, ids, attention_mask=jnp.asarray(GAPS),
+                                                         block_groups=blocks), params, ids)
+    assert {route.kernel for route in found if route.choice == "attention"} == {"template"}
+
+
 def test_a_server_keeps_a_block_layers_prefill_apart():
     """A server's mixed step reads each row's cache as a decode step does, which carries no groups, so a
     model with a kind reading blocks or images keeps its prompts' prefill in a forward of its own."""
@@ -293,3 +313,13 @@ def test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_
     assert_as_exact(lambda params, ids: rolled(params, ids)[:, 3:], full(wrapper),
                     model_draw(wrapper, (2, 12), VOCAB), "multimodal cached blocks", seeds=CACHED_SEEDS,
                     truth_fn=full(wide))
+
+
+def test_a_blocks_bounds_are_its_runs_first_token_and_one_past_its_last():
+    """`block_starts` and `block_ends`: each token's run of equal ids starts at its first token and ends one
+    past its last, a run of -1 as any other."""
+    groups = jnp.asarray([[-1, 0, 0, -1, -1, 3, 3, 3], [5, 5, 5, 5, 1, 1, 1, 1]], jnp.int32)
+    np.testing.assert_array_equal(np.asarray(block_starts(groups)),
+                                  [[0, 1, 1, 3, 3, 5, 5, 5], [0, 0, 0, 0, 4, 4, 4, 4]])
+    np.testing.assert_array_equal(np.asarray(block_ends(groups)),
+                                  [[1, 3, 3, 5, 5, 8, 8, 8], [4, 4, 4, 4, 8, 8, 8, 8]])

@@ -25,8 +25,18 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from dew.nn.precision import L2NORM_EPS, compensated_add, l2norm
+from dew.nn.precision import (
+    L2NORM_EPS,
+    at_least_fp32,
+    compensated_add,
+    float32_einsum,
+    float32_products,
+    l2norm,
+    products_dtype,
+    stochastic_bf16,
+)
 
+from ..sharding import explicit_spec
 from . import chunked_launch, norm_swiglu, short_conv, tuning
 from .generation import INHERENT, Refusal, triton_runs
 
@@ -72,8 +82,10 @@ class Hooks:
     `rated`: the write gate times the head's `rate` (Mamba's discretization, `A dt` with `dt` the
     write gate), a value kind defined on a contraction, `rate <= 0` and the write gate `>= 0`, which
     its callers hold and a port may take as given (mamba_ssm's kernels clamp each decay to at most
-    one); a skip `D v`, and the epilogue. The chunked op (`recurrence_chunk.chunk`) takes the same
-    form."""
+    one); a skip `D v`, and the epilogue; and `floor`, the least log decay a token a layer declares
+    (Kimi delta attention's `lower_bound`, -5), which a decay a key dimension's factored chunk form reads
+    as its range's bound (`recurrence_algebra.factored_range`). The chunked op (`recurrence_chunk.chunk`)
+    takes the same form."""
     conv: Conv | None = None
     l2norm: bool = False
     scale: float | None = None
@@ -84,6 +96,7 @@ class Hooks:
     rated: bool = False
     skip: bool = False
     output: OutputNorm | None = None
+    floor: float | None = None
 
     @property
     def gated_write(self) -> bool:
@@ -105,29 +118,34 @@ def round_to_bf16(state, key, value):
     smaller than half a bf16 step still moves the state on average, where
     rounding to nearest would hold it. The noise is a hash of the value's
     bits and the token's `key` `[..., Dk]` and `value` `[..., Dv]`, so it is
-    deterministic and differs from token to token."""
+    deterministic and differs from token to token (`precision.stochastic_bf16`, its rounding)."""
     bits = jax.lax.bitcast_convert_type(state, jnp.uint32)
     salt = (jax.lax.bitcast_convert_type(key, jnp.uint32)[..., :, None] * jnp.uint32(0x9E3779B1)
             + jax.lax.bitcast_convert_type(value, jnp.uint32)[..., None, :] * jnp.uint32(0x85EBCA77))
     mixed = bits ^ salt
     mixed = (mixed ^ (mixed >> 16)) * jnp.uint32(0x7FEB352D)
     mixed = (mixed ^ (mixed >> 15)) * jnp.uint32(0x846CA68B)
-    mixed = mixed ^ (mixed >> 16)
-    rounded = (bits + (mixed & jnp.uint32(0xFFFF))) & jnp.uint32(0xFFFF0000)
-    return jax.lax.bitcast_convert_type(rounded, jnp.float32).astype(jnp.bfloat16)
+    return stochastic_bf16(state, mixed ^ (mixed >> 16))
 
 
-def update(state, query, key, value, decay, write, *, delta: bool):
+def update(state, query, key, value, decay, write, *, delta: bool, in_kernel: bool = False):
     """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` per key dimension `[...,
     Dk]` (`exp(g)`) and `write` the write gate, broadcast against the values `[..., Dv]`: its output
     `[..., Dv]` and the updated state.
     Both readouts are products with the old state, `(q decay)^T S + (q . k) d` with `d = write (v -
     (k decay)^T S)` under the delta rule and `write v` without it, so one pass over the state serves
-    them and the write."""
+    them and the write. `q . k` is a product (`float32_einsum`), summed as Dew sums one, not a reduction
+    whose order XLA chooses by the shape it is batched at: under a skip that cancels it (`(q . k) write`
+    against `D`), a reduction a token at a time and the same in the portable rule's batched adjoint
+    rounded a last bit apart, which put the portable gradient's cancelled row 4.9 times the token
+    recurrence's distance from float64 (test_recurrence_stability's rated site under resets on chunk
+    edges, seed 6). A kernel's body (`in_kernel`, the fused step's) sums it in its own registers, where
+    Pallas's Triton lowering takes no platform-dependent product."""
     read_query = jnp.sum((query * decay)[..., :, None] * state, axis=-2)
     corrected = value - jnp.sum((key * decay)[..., :, None] * state, axis=-2) if delta else value
     written = corrected * write
-    out = read_query + jnp.sum(query * key, axis=-1, keepdims=True) * written
+    score = (jnp.sum(query * key, axis=-1) if in_kernel else float32_einsum('...d,...d->...', query, key))
+    out = read_query + score[..., None] * written
     return out, state * decay[..., :, None] + key[..., :, None] * written[..., None, :]
 
 
@@ -288,8 +306,38 @@ def log_gates(hooks: Hooks, given: dict, work):
 
 
 def skipped(hooks: Hooks, out, value, given: dict, work):
-    """An output `[..., Hv, Dv]` in `work` with the skip `D v` added where the hooks have one."""
-    return out + given['skip'].astype(work)[:, None] * value.astype(work) if hooks.skip else out
+    """An output `[..., Hv, Dv]` in `work` with the skip `D v` added where the hooks have one (`_skip`)."""
+    return out + _skip(given['skip'].astype(work), value.astype(work)) if hooks.skip else out
+
+
+@jax.custom_vjp
+def _skip(skip, value):
+    """`D v` of the skip `D` `[Hv]` and values `[..., Hv, Dv]`, whose gradient in `D` sums every token's and
+    value's product as a product (at `float32_products`' precision) rather than one reduction over them
+    all: XLA:CPU's reduction, without YNNPACK's fusions, summed a chunked call's `B S Dv` products in turn,
+    2.1 times the token-by-token recurrence's distance from float64 (Mamba2's rated decay,
+    test_recurrence_stability after the gate compiled both arms without them)."""
+    return skip[:, None] * value
+
+
+def _skip_forward(skip, value):
+    return _skip(skip, value), (skip, value)
+
+
+def _skip_backward(residual, grad):
+    skip, value = residual
+    # Rows an Explicit axis splits contract into `D`'s own placement, which JAX cannot infer from a
+    # contraction over a split dimension (a data-parallel layout's hybrid, test_parallelism_matrix).
+    placed = explicit_spec(value)
+    stated = (None if placed is None
+              else jax.sharding.NamedSharding(placed.mesh, jax.typeof(skip).sharding.spec))
+    leading = 'abcdefg'[:value.ndim - 2]
+    summed = jnp.einsum(f'{leading}hv,{leading}hv->h', grad, value, out_sharding=stated,
+                        precision=float32_products(products_dtype(grad, value)))
+    return summed.astype(skip.dtype), (grad * skip[:, None]).astype(value.dtype)
+
+
+_skip.defvjp(_skip_forward, _skip_backward)
 
 
 def normed(hooks: Hooks, out, given: dict, work):
@@ -320,7 +368,7 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     given = read(hooks, operands)
     state = given['state']
     operand = given['token' if hooks.conv is not None else 'value'].dtype
-    work = jnp.promote_types(jnp.promote_types(operand, state.dtype), jnp.float32)
+    work = at_least_fp32(jnp.promote_types(operand, state.dtype))
     key_width = state.shape[2]
     query, key, value, history = _prologue(hooks, given, work)
     decay, write = _gates(hooks, given, work, key_width)
@@ -393,7 +441,7 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
             write_gate = scalar('beta') if hooks.gated_write else jnp.ones((1,), jnp.float32)
         decay = jnp.broadcast_to(decay, key.shape)
         out, updated = update(state_ref[...].astype(jnp.float32), query, key, value, decay, write_gate,
-                              delta=hooks.delta)
+                              delta=hooks.delta, in_kernel=True)
         if hooks.skip:
             out = out + scalar('skip') * value
         if hooks.output is not None:
@@ -487,10 +535,9 @@ class Launch:
 
 
 WARPS = Launch(0, 8)
-"""The launch without a measurement over a whole head."""
+"""The launch over a whole head."""
 COLUMNS = Launch(32, 8)
-"""The launch without a measurement over value columns: 32 a program, 16 to 64 measured within 3% on
-an RTX 4080."""
+"""The launch over value columns: 32 a program, 16 to 64 measured within 3% on an RTX 4080."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -499,8 +546,14 @@ class StepLaunch(tuning.KernelOp):
     it interprets."""
 
     config_cls: ClassVar[type[Launch]] = Launch
+
     ROWS: ClassVar[tuple[str, ...]] = ('active', 'query', 'key', 'value', 'token', 'held', 'log_decay',
                                        'gate', 'beta', 'z', 'state')
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        """Normal floats and every row active, so a timed launch steps each row's state and history."""
+        return [jnp.ones(spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.integer) else array
+                for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
 
     def _fwd(self, active: jax.Array, state: jax.Array, query: jax.Array | None, key: jax.Array | None,
              value: jax.Array | None, token: jax.Array | None, held: jax.Array | None, taps: jax.Array | None,
@@ -519,7 +572,7 @@ class StepLaunch(tuning.KernelOp):
         key_heads = (_pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
                      if hooks.conv is not None else given['query'].shape[1])
 
-        # A hook that reads a whole head has only whole-head configs in its space (`_whole`).
+        # A hook that reads a whole head takes a whole-head config (`_whole`).
         block = config.block or value_width
 
         def whole(array):
@@ -580,18 +633,19 @@ class StepLaunch(tuning.KernelOp):
             return WARPS
         return dataclasses.replace(COLUMNS, block=min(COLUMNS.block, ba.arguments['state'].shape[-1]))
 
-    def _get_autotuning_configs(self, ba) -> set[Launch]:
-        whole = {Launch(0, warps) for warps in (4, 8, 16)}
-        if _whole(ba.kwargs['hooks']):
-            return whole
+    def pinnable(self, ba, config) -> bool:
+        # A program's block of value columns: a whole head where a hook reads one (`_whole`), else a whole
+        # head or a block dividing the state's width.
         width = ba.arguments['state'].shape[-1]
-        return whole | {Launch(block, warps) for block in (16, 32, 64) for warps in (4, 8)
-                        if width % block == 0}
+        return isinstance(config, Launch) and (
+            config.block == 0 or (not _whole(ba.kwargs['hooks']) and 0 < config.block <= width
+                                  and width % config.block == 0))
 
-    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        """Normal floats and every row active, so a timed launch steps each row's state and history."""
-        return [jnp.ones(spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.integer) else array
-                for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
+    def unpinnable(self, ba, config) -> str:
+        if not isinstance(config, Launch):
+            return super().unpinnable(ba, config)
+        return ("its block of value columns is neither the whole head a hook here reads whole nor a block "
+                "dividing the state's width")
 
 
 def _whole(hooks: Hooks) -> bool:
@@ -627,7 +681,7 @@ def _one_tap(hooks: Hooks, conv: Conv, operands: Step, given: dict, dtype):
     token = given['token']
     rows, (value_heads, key_width, value_width) = token.shape[0], given['state'].shape[1:]
     key_heads = _pieces(hooks, value_heads, key_width, value_width, token.shape[-1])
-    work = jnp.promote_types(token.dtype, jnp.float32)
+    work = at_least_fp32(token.dtype)
     pre = token.astype(work) * given['taps'][:, 0].astype(work)
     convolved = pre if conv.activation is None else pre * jax.nn.sigmoid(pre)
     query, key, value = jnp.split(convolved, [key_heads * key_width, 2 * key_heads * key_width], axis=-1)
@@ -658,7 +712,7 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     if 'log_decay' in given and hooks.decay == 'scalar':
         given['log_decay'] = given['log_decay'].reshape(rows, -1)
     named = jnp.dtype(operand if dtype is None else dtype).name
-    # Positional, None where a hook is off: the tuner keys a launch by its positional arrays.
+    # Positional, None where a hook is off.
     state, *history, out = StepLaunch()(flags, *(given.get(name) for name in OPERANDS), hooks=hooks,
                                         dtype=named, interpret=not triton_runs())
     return out, history[0] if history else None, state
@@ -701,10 +755,10 @@ def _cumsum_kernel(chunk_ref, s_ref, o_ref, *, chunk: int, aligned: bool, scale:
 class ChunkLocalCumsum(chunked_launch._Launch):
     """`cumulated`'s launch (tuning.KernelOp), fla's `chunk_local_cumsum`."""
 
+    revision: int = 2
+
     NAME = "cumulated"
     KEYS, VALUES = None, None
-    revision: int = 2
-    SPACES = chunked_launch._spaces(chunked_launch._tiles([(0, 0)], (1, 2, 4, 8), (1,)))
     PICKS = chunked_launch._picks(chunked_launch.Tiles(0, 0, 2, 1))
 
     def _fwd(self, g: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int,

@@ -290,6 +290,21 @@ def test_a_hub_url_reads_a_repository_or_the_files_it_names(monkeypatch, url, fo
         assert resolved.url == url and resolved.format == format
 
 
+@pytest.mark.parametrize("url", ["hf://datasets/owner/data/export", "hf://datasets/owner/data@pinned/exports/run/"])
+def test_a_hub_path_below_its_repository_reads_as_the_files_there(monkeypatch, url):
+    """An hf:// URL of a directory in a repository, such as an export's (`export` commits one there),
+    is read as its files, whose manifest names their record format, never as a repository of that
+    name: no suffix names its format, as none names a repository's."""
+    from huggingface_hub import HfFileSystem
+
+    from dew.data.sources import Files, source
+
+    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
+    resolved = source(url)
+    assert type(resolved) is Files
+    assert resolved.url == url
+
+
 @pytest.mark.parametrize("format", ["jsonl", "parquet"])
 def test_hub_native_shards_keep_the_requested_revision(monkeypatch, format):
     from types import SimpleNamespace

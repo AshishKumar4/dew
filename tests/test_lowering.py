@@ -19,23 +19,24 @@ from jax.sharding import Mesh
 from dew.nn.kernels.generation import (
     PALLAS_CHOICES,
     TARGETS,
-    UNCLASSIFIED,
     GpuTarget,
     Refusal,
     Route,
+    architecture,
     assumed,
     chosen as kernel_choices,
     device_generation,
+    family,
     fp8_tensor_cores,
     gpu_mesh,
     gpu_target,
     measured_kernel,
-    refused,
     route,
     routes,
     runtime_facts,
     triton_runs,
 )
+from dew.nn.kernels.templates import bundles
 from dew.training._lowering import triton_kernels
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -157,9 +158,12 @@ def _step_lowered(generation: str):
 @pytest.mark.parametrize("generation", GPUS)
 def test_a_hybrid_language_model_step_lowers_for_the_gpu_with_every_kernel_its_generation_chooses(generation):
     """A Qwen 3.5 hybrid's training step, lowered on this CPU for the GPU, calls the short conv's
-    kernels and those of every Pallas choice the generation's row names for a step's layers (the
-    norms, SwiGLU and the gated delta rule's port), so none was interpreted or refused there."""
-    expected = SHORT_CONV.union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
+    kernels, those of every Pallas choice the generation's row names for a step's layers (the norms and
+    SwiGLU), and the gated delta rule's training kernels (`recurrence_chunk.GATED_DELTA`, no row read):
+    the recurrence template's Mosaic launches on a warpgroup-MMA GPU, whose training cell it takes, no
+    Triton kernel among them, else the port's, so none was interpreted or refused there."""
+    delta = set() if family(generation) == 'wgmma' else FAMILIES['gated_delta_rule', 'fla'][1]
+    expected = SHORT_CONV | delta | set().union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
     assert set(triton_kernels(_step_lowered(generation))) == expected
 
 
@@ -212,11 +216,13 @@ def _experts_lowered(generation: str, implementation: str):
 @pytest.mark.parametrize("generation", GPUS)
 def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generation_chooses(generation):
     """'auto' runs the grouped matmul's kernels on every GPU generation, each forward and backward
-    launch of each projection the implementation its cost model picks there (its route says which):
-    Triton's on a GPU without warpgroup MMA, whose two kernels lower, and on Hopper Triton's only where
-    a launch runs it, Mosaic GPU's lowering as no Triton kernel. The experts' SiLU product takes the
-    fused SwiGLU where the row names it, forward and backward, as every fused kernel is differentiated
-    through its portable arithmetic (`generation.linear_tangent`)."""
+    launch of each projection the route its cell takes there (its route says which): the template's
+    Mosaic GPU launch, or the old route `grouped_matmul.DECLARED` lists. On an Ampere-class GPU the
+    forward runs Mosaic GPU's and the gradients Triton's, whose two kernels lower; on one whose family has
+    no bundle (`bundles.of`: consumer Blackwell's) Triton's runs all three; on Hopper Triton's runs only
+    where a launch runs it, Mosaic GPU's lowering as no Triton kernel. The experts'
+    SiLU product takes the fused SwiGLU where the row names it, forward and backward, as every fused
+    kernel is differentiated through its portable arithmetic (`generation.linear_tangent`)."""
     with routes() as taken:
         lowered = _experts_lowered(generation, 'auto')
     # The layer's own launches, as traced for `generation`; its initialization runs on the CPU.
@@ -226,7 +232,8 @@ def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generati
     assert kernels and kernels <= {'triton', 'mosaic_gpu'}
     lowered_grouped = set(triton_kernels(lowered)) & grouped
     if not gpu_target(generation).wgmma:
-        assert kernels == {'triton'} and lowered_grouped == grouped
+        bundled = bundles.of(generation, jnp.bfloat16) is not None
+        assert kernels == ({'mosaic_gpu', 'triton'} if bundled else {'triton'}) and lowered_grouped == grouped
     assert bool(lowered_grouped) == ('triton' in kernels)
     swiglu = set().union(*(FAMILIES[key][1] for key in chosen(generation, "step") if key[0] == 'swiglu'))
     assert set(triton_kernels(lowered)) - grouped == swiglu
@@ -258,9 +265,10 @@ def _mamba2_lowered(generation: str):
 @pytest.mark.parametrize("generation", GPUS)
 def test_a_mamba2_layer_lowers_for_the_gpu_with_the_ssd_scan_its_generation_chooses(generation):
     """A Mamba-2 layer, its launches settled as the trainer settles them, lowers to the short conv's
-    kernels and, where the row names the port for the scan, mamba_ssm's fourteen ported kernels; where
-    it does not, to none of them. Its unweighted norm takes the fused RMSNorm where the row names it."""
-    expected = SHORT_CONV.union(*(FAMILIES[key][1] for key in chosen(generation, "mamba2")))
+    kernels and mamba_ssm's fourteen ported kernels, which take the scan on any GPU Dew's Triton kernels
+    run on (`recurrence_chunk.SCAN`, no row read). Its unweighted norm takes the fused RMSNorm where the
+    row names it."""
+    expected = SHORT_CONV | FAMILIES['ssd', 'pallas'][1]
     expected |= set().union(*(FAMILIES[key][1] for key in chosen(generation, "step") if key[0] == "rms_norm"))
     assert set(triton_kernels(_mamba2_lowered(generation))) == expected
 
@@ -300,14 +308,44 @@ def test_fp8_tensor_cores_are_a_fact_of_the_compute_capability(generation, cores
     assert fp8_tensor_cores(generation) is cores
 
 
+@pytest.mark.parametrize("generation, claimed", [
+    ("sm75", None), ("sm80", "mma.sync"), ("sm86", "mma.sync"), ("sm87", "mma.sync"),
+    ("sm89", "mma.sync"), ("sm90", "wgmma"), ("sm100", "tcgen05"), ("sm103", "tcgen05"),
+    ("sm110", "tcgen05"), ("sm120", "mma.sync"), ("sm121", "mma.sync"), ("sm70", None), ("sm60", None),
+    ("v5e", "tpu"), ("cpu", None)])
+def test_a_generations_instruction_family_is_its_compute_capabilitys(generation, claimed):
+    """The family a template's mainloop claims comes from the compute capability alone, a GPU the table
+    names or not (sm87, sm110 and sm121 it does not); a Turing GPU (no bf16 MMA), one before it or a CPU
+    is in none."""
+    assert family(generation) == claimed
+
+
+def test_an_unseen_member_of_a_family_takes_its_familys_facts_and_its_own_device_attributes():
+    """A Blackwell GPU no row names (sm110) ranks as the family's: its tensor rates, tensor memory and
+    model latency are tcgen05's, and its L2 bandwidth is the family's bytes a multiprocessor a clock over
+    the multiprocessors and clock its device reports, so the cost model ranks its configs."""
+    from dew.nn.kernels.templates import cost
+
+    target = GpuTarget("sm110", "an unseen Blackwell", 227 * 1024, multiprocessors=20, clock_hz=1.5e9,
+                       memory_bandwidth=273e9)
+    blackwell = architecture("sm100")
+    assert blackwell is not None
+    assert (target.tensor_rates, target.tmem_columns, target.wgmma) == (blackwell.tensor_rates, 512, False)
+    assert target.load_latency == blackwell.load_latency
+    assert target.l2_bandwidth == blackwell.l2_bytes_per_clock * 20 * 1.5e9
+    assert cost.seconds(cost.Cost(programs=40, device_bytes=1e6, program_flops=1e9), target) > 0
+
+
 def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
     """A CUDA device of a generation no row names (a B200, sm100) takes its multiprocessors and its
     block's shared memory from the device, and Hopper's warpgroup MMA from its capability, 9.0 alone,
     so a launch sized by them sizes itself rather than taking a default for want of a row."""
     blackwell = runtime_facts(GpuTarget("sm100", "NVIDIA B200"), SimpleNamespace(
-        compute_capability="10.0", core_count=148, shared_memory_per_block_optin=232448, local_hardware_id=0))
+        compute_capability="10.0", core_count=148, shared_memory_per_block_optin=232448, local_hardware_id=0,
+        device_kind="NVIDIA B200"))
     hopper = runtime_facts(GpuTarget("sm90", "NVIDIA H100 80GB HBM3"), SimpleNamespace(
-        compute_capability="9.0", core_count=132, shared_memory_per_block_optin=232448, local_hardware_id=0))
+        compute_capability="9.0", core_count=132, shared_memory_per_block_optin=232448, local_hardware_id=0,
+        device_kind="NVIDIA H100 80GB HBM3"))
     assert (blackwell.multiprocessors, blackwell.shared_limit, blackwell.wgmma) == (148, 232448, False)
     assert (hopper.multiprocessors, hopper.shared_limit, hopper.wgmma) == (132, 232448, True)
 
@@ -459,26 +497,21 @@ def test_a_call_the_dispatch_sends_off_flash_is_logged_at_info_and_a_float32_cal
 def test_a_route_records_the_targets_decision_where_its_dispatch_reports_it():
     """`route` records a dispatch's decision in every `routes` block open, an inner block's in the
     outer's too, as the target decides it: its generation within `assumed`, the kernel the row or
-    `chosen` prefers, a refusal's stable code (`refused`, the first check that fails) or a text's
-    `UNCLASSIFIED`, what the host ran, and the reporting function."""
+    `chosen` prefers, a refusal's stable code and the row that tracks it, what the host ran, and the
+    reporting function."""
     def dispatch(kernel, refusal=None, ran=None):
         return route("ssd", kernel=kernel, refusal=refusal, ran=ran)
 
     with assumed("sm90"), routes() as outer:
         assert dispatch("pallas").kernel == "pallas"
         row = measured_kernel("ssd", "pallas")
+        head_dim = Refusal("head_dim", "a 320-wide head", "inherent")
         with kernel_choices(ssd="pallas"), routes() as inner:
-            refusal = refused((True, "dtype", "a bf16 call"), (False, "head_dim", "a 320-wide head"),
-                              (False, "window_mask", "a window"))
-            dispatch("xla", refusal, ran="xla")
-            dispatch("xla", "a reason in text")
+            dispatch("xla", head_dim, ran="xla")
     test = test_a_route_records_the_targets_decision_where_its_dispatch_reports_it
     site = f"{__name__}:{test.__qualname__}.<locals>.dispatch"
-    head_dim, text = Refusal("head_dim", "a 320-wide head"), Refusal(UNCLASSIFIED, "a reason in text")
-    assert inner == [Route("ssd", "xla", "pallas", head_dim, "xla", "sm90", site),
-                     Route("ssd", "xla", "pallas", text, "xla", "sm90", site)]
+    assert inner == [Route("ssd", "xla", "pallas", head_dim, "xla", "sm90", site)]
     assert outer == [Route("ssd", "pallas", row, None, "pallas", "sm90", site), *inner]
-    assert refused((True, "dtype", "a bf16 call")) is None
 
 
 def test_a_dispatch_sending_a_call_off_its_preferred_kernel_reports_the_route(without_deterministic_ops):

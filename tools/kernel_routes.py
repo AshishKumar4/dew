@@ -15,12 +15,11 @@ defaults for the model_type (its flagship sizes), the fixture's hidden width res
 derives its head width from it. A family transformers has no config for keeps its fixture's widths, and
 its cells say so.
 
-A route is generic where `kernel != preferred`. One whose refusal carries a row (a selector requirement's,
-`Refusal.row`) or whose code its kernel's `SUPPORTS` declares is a tracked gap, named by its roadmap or
-ledger row, or inherent where no implementation of the kernel lifts it; one whose code is `UNCLASSIFIED`
-comes from a site that gives its refusal as text alone; any other is undeclared. A mixer that refuses a
-mode's cache layout (`MixerRefused` for `kv_cache`) is a gap where `LAYOUT_GAPS` names its row. The
-markdown lists the gaps, the unclassified and the undeclared first.
+A route is generic where `kernel != preferred`. Its refusal is a selector requirement's
+(`dew.nn.kernels.selection`), which names the roadmap or ledger row that tracks lifting it, a tracked
+gap, or inherent where no implementation of the kernel lifts it (`Refusal.row`); one that names neither
+is undeclared. A mixer that refuses a mode's cache layout (`MixerRefused` for `kv_cache`) is a gap where
+`LAYOUT_GAPS` names its row. The markdown lists the gaps and the undeclared first.
 
     python tools/kernel_routes.py trace --families qwen3,llama OUT.json    # named families
     python tools/kernel_routes.py trace --shard 3/16 OUT.json              # every 16th from the 4th
@@ -32,7 +31,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import functools
-import importlib
 import json
 import os
 import sys
@@ -155,27 +153,13 @@ def fixture(name: str, present: dict[str, Path]) -> Path | None:
     return next((present[kind] for kind in types if kind in present), None)
 
 
-def _supports(route) -> str | None:
-    """The row the route's refusal carries (`Refusal.row`, a selector requirement's), else the one the
-    refusing kernel's `SUPPORTS` names for its code, or None."""
-    if route.refusal is None:
-        return None
-    if route.refusal.row is not None:
-        return route.refusal.row
-    module = importlib.import_module(route.site.split(":")[0])
-    supports = getattr(module, "SUPPORTS", {})
-    return supports.get(route.refusal.code) if isinstance(supports, dict) else None
-
-
 def verdict(route) -> str:
-    """'kernel', 'gap: <row>', 'inherent', 'unclassified' or 'undeclared' (see the module docstring)."""
-    from dew.nn.kernels.generation import INHERENT, UNCLASSIFIED
+    """'kernel', 'gap: <row>', 'inherent' or 'undeclared' (see the module docstring)."""
+    from dew.nn.kernels.generation import INHERENT
 
     if route.kernel == route.preferred:
         return "kernel"
-    if route.refusal is not None and route.refusal.code == UNCLASSIFIED:
-        return "unclassified"
-    row = _supports(route)
+    row = None if route.refusal is None else route.refusal.row
     if row == INHERENT:
         return INHERENT
     return f"gap: {row}" if row else "undeclared"
@@ -357,12 +341,15 @@ def refused(refusal: dict) -> str:
 
 def unexplained(cell: dict) -> list[str]:
     """What of `cell` no row or reason explains: a route off its kernel with no row or inherent
-    refusal, a mixer's refusal no `LAYOUT_GAPS` row names, a mode refused otherwise, no fixture; a mode
-    the family's layers rule out (`absent`) is explained."""
+    refusal, a trace that took no kernel choice at all, a mixer's refusal no `LAYOUT_GAPS` row names, a mode
+    refused otherwise, no fixture; a mode the family's layers rule out (`absent`) is explained."""
     if "routes" in cell:
+        if not cell["routes"]:
+            return [f"{cell.get('family')} on {cell.get('target')} ({cell.get('mode')}): its trace took no "
+                    "kernel choice, so no route is judged (an empty inventory, ledger 1380)"]
         return [f"{route['choice']} at {route['site']}: {route['kernel']} for {route['preferred']}, "
                 f"{route['verdict']}" for route in cell["routes"]
-                if route["verdict"] in ("undeclared", "unclassified")]
+                if route["verdict"] == "undeclared"]
     if "refused" in cell:
         return [] if cell["refused"]["row"] else [refused(cell["refused"])]
     return [] if "absent" in cell else [cell["error"]]
