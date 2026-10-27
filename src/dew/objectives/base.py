@@ -779,6 +779,12 @@ class Objective(ABC, Generic[Loss, Effects]):
             lambda leaf, index=index: leaf[index:index + 1] if np.ndim(leaf) and np.shape(leaf)[0] == rows
             else leaf, batch))) for index in range(rows)], np.int64)
 
+    def unit_losses(self, variables: Variables, batch: Batch, step: Step) -> jax.Array | None:
+        """The loss of each unit of `batch` this objective's loss sums, [B] for an example's, [B, T] for a
+        token's, which a method that credits each unit by its own loss reads (`dew.objectives.perturbation`);
+        None where the objective states none, whose whole loss credits every unit."""
+        return None
+
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real row (or packed-segment) lengths, read before device placement.
 

@@ -12,7 +12,8 @@ its gradient (`Objective.with_gradients`), so `optax.sgd(1.0)` takes it whole an
 with it. The Jacobian and its solve are formed whole for each microbatch on each device, so the step fits
 a model whose residuals times parameters fit there: a PINN's, not a language model's. A window of
 microbatches steps by their directions' mean, each weighted by its rows, as the trainer pools any
-gradient. A float64 run (`jax.enable_x64` and float64 parameters) solves in float64, where Gauss-Newton
+gradient. A float64 run (x64 set for the process, `jax.config.update("jax_enable_x64", True)`, which
+its data's worker threads read too, and float64 parameters) solves in float64, where Gauss-Newton
 reaches residuals near float64's roundoff that first-order steps do not.
 """
 

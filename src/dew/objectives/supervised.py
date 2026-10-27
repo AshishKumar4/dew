@@ -90,6 +90,13 @@ class Supervised(Objective[Ratio]):
                                             mutable=held, method="__call__", **mode)
         return self._scored(outputs, batch, dict(updates) if held else None)
 
+    def unit_losses(self, variables: Variables, batch: Batch, step: Step) -> jax.Array:
+        """Each example's loss, the model run as `loss` runs it, its collections left as they are."""
+        mode = {} if self.mode is None else {self.mode: step.training}
+        rngs = model_rngs(step.key, training=step.training)
+        outputs = self.model.apply(variables, batch[self.sample.key], rngs=rngs, method="__call__", **mode)
+        return self.criterion(outputs, batch)
+
     def _scored(self, outputs: Outputs, batch: Batch, updates: Variables | None) -> tuple[Ratio, Aux]:
         losses = self.criterion(outputs, batch)
         if jnp.ndim(losses) == 0:

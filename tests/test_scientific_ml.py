@@ -64,7 +64,7 @@ def test_a_pyramid_reads_each_grid_at_its_own_points_and_scales_its_levels():
     """At a level's grid points the interpolant is the grid itself, and each level's features are scaled by
     `level_scale` to its index and all by `global_scale`: a pyramid of grids of two and four points read at
     0 and 1/2 gives the coarse grid's points times 1000 and the fine grid's even points times 1000 * 0.3,
-    on par with NumPy's float32 products from their float64 values (check 1)."""
+    on par with NumPy's float32 interpolants scaled alike, from those grid values (check 1)."""
     pyramid = FourierPyramid((2, 4), features=3, global_scale=1000.0, level_scale=0.3)
 
     def draw(seed):
@@ -76,11 +76,14 @@ def test_a_pyramid_reads_each_grid_at_its_own_points_and_scales_its_levels():
         return pyramid.apply({"params": {"level_0": coarse, "level_1": fine}}, jnp.asarray([[0.0], [0.5]]))
 
     def scaled(coarse, fine, dtype):
-        return np.concatenate([coarse.astype(dtype) * dtype(1000),
-                               fine[::2].astype(dtype) * dtype(1000 * 0.3)], axis=-1)
+        points = np.asarray([0.0, 0.5], dtype)
+        return np.concatenate([spectral(coarse.astype(dtype), points, 0) * dtype(1000),
+                               spectral(fine.astype(dtype), points, 0) * dtype(1000 * 0.3)], axis=-1)
 
     numpy = as_given(lambda coarse, fine: scaled(coarse, fine, np.float32))
-    exact = as_given(lambda coarse, fine: scaled(coarse, fine, np.float64))
+    # At its grid points a level's interpolant is the grid itself.
+    exact = as_given(lambda coarse, fine: np.concatenate(
+        [coarse.astype(np.float64) * 1000, fine[::2].astype(np.float64) * 1000 * 0.3], axis=-1))
     label = "pyramid at its grid points"
     assert_as_exact(jax.jit(dews), numpy, draw, label, seeds=seeds_for(numpy, draw, label, truth_fn=exact),
                     truth_fn=exact)
@@ -152,7 +155,10 @@ def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoi
     """Under x64, a least-squares run of float64 weights steps by Gauss-Newton with `optax.sgd(1.0)`: its
     first step moves the line by the whole damped step the objective states at its start, its parameters,
     optimizer state and loss stay float64, and its checkpoint restores them bit for bit, float64 still."""
-    with jax.enable_x64(new_val=True):
+    # A float64 run sets x64 for its process, its data's worker threads among it, as
+    # examples/pinn_burgers.py does.
+    jax.config.update("jax_enable_x64", val=True)
+    try:
         generator = np.random.default_rng(3)
         x = generator.normal(size=(8, 4))
         y = x @ np.asarray([1.5, -2.0, 0.25, 3.0])
@@ -178,3 +184,5 @@ def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoi
                                strict=True):
             assert left.dtype == np.float64
             np.testing.assert_array_equal(left, np.asarray(right))
+    finally:
+        jax.config.update("jax_enable_x64", val=False)
