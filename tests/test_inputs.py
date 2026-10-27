@@ -238,12 +238,13 @@ def test_a_feed_forward_reads_blocks_of_its_own_size_from_the_layers_metadata():
 def test_packed_offsets_come_from_the_batchs_document_firsts(seed):
     """A packed batch's `cu_seqlens` (`dew.nn.inputs.cu_seqlens`) are each sequence's first token over the
     flattened tokens in order, every row's first token one, the sequences past them empty at the end: the
-    same from the batch's `Coordinates.firsts`, built once with it, from the starts alone, and as the
-    tokens marked in order would give them (row 1897: a scan over the flattened tokens ran a token a loop
-    iteration on a mesh); and a request's continued and sliced coordinates keep firsts that read so."""
+    same from the batch's `Coordinates.firsts`, built once a step (a traced step's `coordinates`, a host
+    batch's at the model's entry, `with_firsts`), from the starts alone, and as the tokens marked in order
+    would give them (row 1897: a scan over the flattened tokens ran a token a loop iteration on a mesh);
+    and a request's sliced coordinates drop firsts that no longer index its slots."""
     import jax.numpy as jnp
 
-    from dew.batch import coordinates
+    from dew.batch import coordinates, with_firsts
     from dew.nn.inputs import ModelInputs, cu_seqlens
 
     rng = np.random.default_rng(seed)
@@ -261,7 +262,8 @@ def test_packed_offsets_come_from_the_batchs_document_firsts(seed):
     np.testing.assert_array_equal(cu_seqlens(tokens.starts, sequences, tokens.firsts), want)
     np.testing.assert_array_equal(cu_seqlens(tokens.starts, sequences), want)
     host = coordinates(segments=segments, max_segments=documents, xp=np)
-    np.testing.assert_array_equal(host.firsts, tokens.firsts)
+    assert host.firsts is None
+    np.testing.assert_array_equal(with_firsts(host).firsts, tokens.firsts)
 
     request = ModelInputs(tokens=jnp.zeros((rows, length), jnp.int32), token_fields={"coordinates": tokens})
     sliced = request.slice_tokens(0, length - 3).token_fields["coordinates"]

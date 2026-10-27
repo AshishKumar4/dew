@@ -140,10 +140,12 @@ class Coordinates:
     a layer's fast path reads as a static fact. `firsts` `[B, D]` are each
     row's documents' first slots in order, the row's first slot among them,
     `S` past its last (`document_firsts`): the packed documents' coordinates
-    every varlen kernel reads (`dew.nn.inputs.cu_seqlens`), built once with
-    the batch, never by a layer: each layer's own scan over the batch's
-    flattened tokens, which a mesh splits, ran one token a loop iteration on
-    a 2xH100 run (row 1897). `max_segments` bounds the documents a row holds
+    every varlen kernel reads (`dew.nn.inputs.cu_seqlens`), built once a
+    step, never by a layer: by `coordinates` in a traced step, and for a batch
+    a host built (whose fields stay its loader's) by the model's entry
+    (`with_firsts`); each layer's own scan over the batch's flattened tokens,
+    which a mesh splits, ran one token a loop iteration on a 2xH100 run (row
+    1897). `max_segments` bounds the documents a row holds
     (the packer's static plan, else the row length) and `right_padded` says
     every row's real tokens come first.
     """
@@ -201,9 +203,18 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
         positions = xp.where(real, document_ranks(real, starts, xp=xp), 0)
     positions = None if positions is None else xp.asarray(positions, np.int32)
     max_segments = (1 if segments is None else length) if max_segments is None else max_segments
-    firsts = None if starts is None else document_firsts(starts, max_segments + 1, xp=xp)
+    # The documents' firsts in a traced step; a host's batch keeps its loader's fields (`with_firsts`).
+    firsts = None if starts is None or xp is np else document_firsts(starts, max_segments + 1)
     return Coordinates(positions, segments, valid, starts, firsts, max_segments=max_segments,
                        right_padded=right_padded)
+
+
+def with_firsts(tokens: Coordinates | None) -> Coordinates | None:
+    """`tokens` with their documents' firsts (`Coordinates.firsts`), built from their starts where a host
+    built them without: a model's entry calls it once a step, its layers reading them."""
+    if tokens is None or tokens.starts is None or tokens.firsts is not None:
+        return tokens
+    return replace(tokens, firsts=document_firsts(jnp.asarray(tokens.starts), tokens.max_segments + 1))
 
 
 def document_firsts(starts, documents: int, *, xp=jnp):
