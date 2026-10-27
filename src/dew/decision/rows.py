@@ -343,8 +343,10 @@ class Fit(pygrain.MapTransform):
         """Grouped examples' rows as one unit, which the packer places in one window: each example's
         rows as the layout lays them out, with the example's index (`FittedUnit`), a row of each of its
         labelled and grouped questions under a layout of a question a row, its one row under a joint
-        layout. A unit with no labelled question, or that no window holds (its tokens, rows or
-        questions past the window's), is rejected."""
+        layout. A unit with no labelled question is rejected. One that no window holds (its tokens,
+        rows or questions past the window's), or one of whose examples fits no row, trains its examples
+        apart (`_apart`), as rows of their own that no consistency term ties: its labelled examples that
+        fit are kept, where a unit dropped whole dropped them with it."""
         if self.context_length is not None:
             raise ValueError("a backbone that reads context packs one row a window, so rows that train "
                              "together do not fit one; train them without context or without groups")
@@ -360,14 +362,14 @@ class Fit(pygrain.MapTransform):
                      {name: question for name, question in example.questions.items() if name in named})
             fitted = self._rows(example, asked)
             if isinstance(fitted, Rejected):
-                return fitted
+                return self._apart(grouped)
             rows.extend((index, row) for row in fitted)
         length = sum(self._longest(row) for _, row in rows)
         questions = sum(len(row.names) for _, row in rows)
         bounds = self.bounds
         if length > self.layout.max_len or (bounds is not None and (len(rows) > bounds.segments
                                                                     or questions > bounds.questions)):
-            return Rejected("unfit")
+            return self._apart(grouped)
         options = max(len(grouped.examples[index].questions[name].options)
                       for index, row in rows for name in row.names)
         return {"decision_unit": FittedUnit(grouped, tuple(rows)), "_dew_length": length,

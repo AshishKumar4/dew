@@ -392,7 +392,9 @@ class TrainerConfig:
     """
     examples: int | None = None
     """The run length as the first this many records of the data, each read once, counted before
-    they are packed (`Trainer.fit`'s `examples`); `steps` or `epochs` set it instead."""
+    they are packed and before an objective makes several of each (a decision layout's row a
+    question), so it counts examples (`Trainer.fit`'s `examples`); `steps` or `epochs` set it
+    instead."""
     stop: Annotated[Pause, tyro.conf.subcommand("pause")] | None = None
     """End the run at a fraction of its length, to resume it later as if it had never stopped
     (`Pause`): `--trainer.stop.fraction 0.5`."""

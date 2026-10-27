@@ -207,12 +207,14 @@ def test_grouped_examples_without_a_consistency_term_are_their_examples_rows():
         np.testing.assert_array_equal(np.asarray(grouped[name]), np.asarray(alone[name]), err_msg=name)
 
 
-def test_grouped_examples_without_a_consistency_term_keep_the_examples_that_fit():
-    """Without a consistency term an example of grouped examples that no row holds is left out as it
-    would be alone, and its siblings' rows are kept."""
+@pytest.mark.parametrize("grouped", [False, True], ids=["apart", "consistency"])
+def test_grouped_examples_keep_the_examples_that_fit(grouped):
+    """An example of grouped examples that no row holds is left out as it would be alone, and its
+    siblings' rows are kept: without a consistency term, and with one, whose unit no window then holds
+    whole, so its examples train apart, as rows of their own, not dropped with it."""
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=LAYOUT.max_len), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=LAYOUT)
-    fit = Fit(LAYOUT, TOKENIZER, SPECIALS, objective.model.head, context_length=None, grouped=False)
+    fit = Fit(LAYOUT, TOKENIZER, SPECIALS, objective.model.head, context_length=None, grouped=grouped)
     fits = Example("the customer was charged twice", {"billing": Noul("Is this about billing?")},
                    {"billing": "true"})
     unfit = Example("the client paid two times", {"charge": Noul("Is this a charging problem? " * 400)},
@@ -255,7 +257,8 @@ def test_grouped_examples_read_from_their_own_rows_fields(asked):
 def test_a_unit_is_budgeted_for_the_options_its_training_adds():
     """A unit's rows are budgeted at the length the training encoding may give them: with a "none of
     the above" added beside each answered choice (`none_of_the_above`), two rows that fit a window as
-    they are no longer do, and the unit is rejected rather than packed past the window."""
+    they are no longer do, and the unit trains its two examples apart, a row each, rather than packed
+    past the window or dropped."""
     layout = StateFirstLayout(max_len=256)
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=256), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout, consistency=0.5)
@@ -268,7 +271,9 @@ def test_a_unit_is_budgeted_for_the_options_its_training_adds():
     fitted = plain.map({"example": pair})
     assert not isinstance(fitted, Rejected) and "decision_unit" in fitted
     augmented = dataclasses.replace(plain, none_of_the_above=1.0)
-    assert augmented.map({"example": pair}) == Rejected("unfit")
+    apart = augmented.map({"example": pair})
+    assert not isinstance(apart, Rejected) and "decision_unit" not in apart
+    assert [row["decision"].example for row in QuestionRows().flat_map(apart)] == list(pair.examples)
 
 
 def _trimmed_pair() -> tuple[GroupedExamples, int]:

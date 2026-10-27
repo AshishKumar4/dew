@@ -379,10 +379,14 @@ def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
     return dataclasses.replace(windows, stages=(*windows.stages, *pipeline.stages[at:]))
 
 
-def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
+def _bounded(pipeline: Pipeline, examples: int, expansions: Sequence[object] = ()) -> Pipeline:
     """`pipeline`'s training read bounded to its first `examples` records as they reach the first
     stage that packs or windows them, or its batch where none does: the records the objective's
-    steps make, not the windows a pack lays them in. A repeat without end goes before the bound
+    steps make, not the windows a pack lays them in. Where the objective expands each record into
+    several (`expansions`, its steps that do: a decision layout's rows a question), the bound counts
+    examples, the records before those steps, each row its share of one (`FlatMap.examples`,
+    `Limit.examples`), so `examples` means as many examples whatever the layout makes of each. A
+    repeat without end goes before the bound
     where none is written, so the records may span passes, and the batch keeps the short one the
     bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`).
     Refuses a bound it cannot place: a repeat with a count before it, or any repeat after it, the
@@ -404,10 +408,30 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
             isinstance(stage, Repeat) for stage in pipeline.stages[at:]):
         raise ValueError(f"{_name(pipeline)} repeats with a count, or after the records it packs or batches, "
                          f"which a bound of {examples} examples would cut or repeat; leave the repeat out")
-    bound = (Limit(examples),) if repeats else (Repeat(None), Limit(examples))
+    pipeline, shared = _shared(pipeline, expansions)
+    limit = Limit(examples, examples=shared)
+    bound = (limit,) if repeats else (Repeat(None), limit)
     batch = dataclasses.replace(pipeline.stages[batched], drop_remainder=False)
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *bound, *pipeline.stages[at:batched],
                                                  batch, *pipeline.stages[batched + 1:]))
+
+
+def _shared(pipeline: Pipeline, expansions: Sequence[object]) -> tuple[Pipeline, bool]:
+    """`pipeline` with each stage that applies one of `expansions`, in it or the corpora it mixes,
+    counting the records it makes as shares of the one it read (`FlatMap.examples`), and whether any
+    does."""
+    found = False
+
+    def marked(child: Pipeline) -> Pipeline:
+        nonlocal found
+        stages = []
+        for stage in child.stages:
+            if isinstance(stage, FlatMap) and any(stage.step is step for step in expansions):
+                stage, found = dataclasses.replace(stage, examples=True), True
+            stages.append(stage)
+        return with_children(dataclasses.replace(child, stages=tuple(stages)), marked)
+
+    return marked(pipeline), found
 
 
 def _lays_out(pipeline: Pipeline) -> bool:
@@ -681,7 +705,9 @@ def _staged(
     if not any(isinstance(stage, BatchStage) for stage in branches[0].stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
     if examples is not None and written is None:
-        branches = (_bounded(branches[0], examples), *branches[1:])
+        expansions = [] if objective is None else [step for step in objective.train
+                                                   if isinstance(step, Expansion)]
+        branches = (_bounded(branches[0], examples, expansions), *branches[1:])
     original = branches[0]
     train, *scored = _made(branches, read, (counts, validation_counts)[: len(branches)], training=True)
     validation = scored[0] if scored else None

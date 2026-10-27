@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Annotated, ClassVar
 
 import jax
@@ -249,7 +250,7 @@ class DecisionRunConfig(DecoderRunConfig):
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
                                                       summary=summary, after=after, validation=held))
 
-    def _fresh_head(self, start, blocked: bool, budgets: Budgets) -> dict[str, object]:
+    def _fresh_head(self, start, blocked: bool, budgets: Budgets) -> Mapping[str, object]:
         """The head a fresh backbone `start` reads and its rows' layout: the joint schema head, the
         letter readout of its own logits (`Letters`), its labels named by the backbone's tokenizer, or
         Laya's head, over the layout their rows take, in blocks where `blocked` (`_fresh_layout`)."""

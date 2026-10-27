@@ -146,6 +146,49 @@ def test_an_examples_budget_counts_documents_before_they_are_packed():
     assert read == {token: count * token for token, count in reached.items()}
 
 
+class Questioned:
+    """An objective's expansion of each record into `id % 3 + 1` rows, one a question, as a decision
+    layout of a question a row makes of an example (`dew.decision.rows.QuestionRows`)."""
+
+    def flat_map(self, element):
+        return tuple({"id": element["id"], "question": np.int32(question)}
+                     for question in range(int(element["id"]) % 3 + 1))
+
+
+@pytest.mark.parametrize("examples", [7, 23])
+def test_an_examples_budget_counts_examples_before_the_objective_expands_them(examples):
+    """An objective that makes each record several rows (a question a row) is bounded by its examples,
+    not its rows: the read bounded to `examples` records holds every row of each example the bound
+    reaches, as many times as it reaches it, and ends, whatever number of rows each example makes."""
+    from dew.data.pipeline import ObjectiveData
+
+    ids = np.arange(1, RECORDS + 1, dtype=np.int32)
+    loader = compile(Pipeline(Memory({"id": ids})).shuffle(3).batch(BATCH),
+                     objective=ObjectiveData(train=(Questioned(),)), examples=examples)
+    read = ids_read(loader, loader.example_steps(examples), "id")
+    passes, rest = divmod(examples, RECORDS)
+    assert sum(count / (record % 3 + 1) for record, count in read.items()) == examples
+    assert all(count % (record % 3 + 1) == 0 for record, count in read.items())
+    assert sorted(count // (record % 3 + 1) for record, count in read.items()) == sorted(
+        [passes + 1] * rest + [passes] * (RECORDS - rest) if passes else [1] * rest)
+
+
+def test_an_examples_budget_over_a_mixture_counts_each_corpus_examples_whatever_its_rows():
+    """Two corpora mixed, whose examples the objective makes one row and three rows each: the bound
+    counts examples, each row its share of its own, so the rows it reads make as many examples as it is
+    bounded to, to within the last one it ends on, not as many rows."""
+    from dew.data import mix
+    from dew.data.pipeline import ObjectiveData
+
+    one = Pipeline(Memory({"id": np.full(RECORDS, 3, np.int32)})).repeat()
+    three = Pipeline(Memory({"id": np.full(RECORDS, 2, np.int32)})).repeat()
+    loader = compile(mix([one, three], weights=[0.5, 0.5]).batch(BATCH),
+                     objective=ObjectiveData(train=(Questioned(),)), examples=EXAMPLES)
+    read = ids_read(loader, loader.example_steps(EXAMPLES), "id")
+    examples = read[3] + read[2] / 3
+    assert EXAMPLES <= examples < EXAMPLES + 1
+
+
 def test_an_examples_run_trains_each_record_once_under_the_schedule_its_plan_sizes():
     """An examples run takes the steps its data plan counts, sizes its schedule's horizon from them and
     trains on each record as many times as the bound reaches it: its losses and weight match SGD on

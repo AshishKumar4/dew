@@ -114,6 +114,29 @@ def test_a_noul_asks_yes_first_with_the_releases_descriptions(qwen):
                                                         "question yes?")
 
 
+def test_labels_named_by_none_take_the_names_their_tokenizer_spells_as_one_token(qwen):
+    """Labels that name none (`Labels.spelled`) take the first of `LABEL_NAMES` whose variants the
+    tokenizer spells as one token each, past the names it spells as two, so they letter as many
+    options as it can, where `LABEL_NAMES` in order would stop at its first name of two tokens; more
+    than it spells as one are refused."""
+    from dew.decision.layout import LABEL_NAMES
+
+    labels = Labels()
+    one = [name for name in LABEL_NAMES if len(qwen.encode(f" {name}", add_special_tokens=False)) == 1]
+    skipped = next(index for index, name in enumerate(LABEL_NAMES) if name not in one)
+    count = skipped + 3
+    spelled = labels.spelled(qwen, count)
+    assert spelled.names == tuple(one[:count])
+    decoded = [qwen.decode(list(ids)) for ids in spelled.ids(qwen, count)]
+    assert decoded == [f" {name}" for name in one[:count]]
+    with pytest.raises(ValueError):
+        labels.ids(qwen, count)
+    with pytest.raises(ValueError):
+        labels.spelled(qwen, len(one) + 1)
+    named = Labels(names=("A", "B"))
+    assert named.spelled(qwen, 2) == named
+
+
 def test_more_options_than_letters_ask_for_one_label_their_structures_indented(qwen):
     """A choice of more options than letters asks for one label, by the cue past them, each line under
     the layout's own label; a structured description and a structured state are indented JSON."""

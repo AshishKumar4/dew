@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import fractions
 import functools
 import hashlib
 import logging
@@ -82,6 +83,7 @@ from dew.data.mixing import (
     token_weights,
 )
 from dew.data.pipeline import (
+    EXAMPLE_SHARE,
     Artifact,
     Batched,
     BatchStage,
@@ -274,6 +276,12 @@ def _outputs(
             counts.expanded(outputs)
         if not outputs:
             return (Rejected("empty_expansion"),)
+        if stage.examples:
+            # Each record is its share of the example it was made of (`EXAMPLE_SHARE`).
+            parts, whole = _share(element)
+            share = (parts, whole * len(outputs))
+            return tuple(_counted(element, output if isinstance(output, (bytes, Rejected)) or output is None
+                                  else {**output, EXAMPLE_SHARE: share}) for output in outputs)
         return tuple(_counted(element, output) for output in outputs)
     if isinstance(stage, RandomMap):
         if rng is None:
@@ -297,10 +305,13 @@ def _outputs(
 
 
 def _counted(given: Record, output: Record) -> Record:
-    """`output` as `recounted` carries the targets counted on `given`, where both are records."""
+    """`output` as `recounted` carries the targets counted on `given`, where both are records, and the
+    share of an example `given` is (`EXAMPLE_SHARE`), which a step that made `output` anew left out."""
     if (given is None or output is None or isinstance(given, (bytes, Rejected))
             or isinstance(output, (bytes, Rejected))):
         return output
+    if EXAMPLE_SHARE in given and EXAMPLE_SHARE not in output:
+        output = {**output, EXAMPLE_SHARE: given[EXAMPLE_SHARE]}
     return recounted(given, output)
 
 
@@ -827,6 +838,55 @@ def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
     # windows do (`packed_window`), so Grain writes no copy of them for the rest.
     return packer(documents, length_struct=sizes, num_packing_bins=stage.bins, shuffle_bins=False,
                   max_sequences_per_bin=stage.segments, meta_features=stage.fields[1:])
+
+
+def _share(element: Mapping[str, object]) -> tuple[int, int]:
+    """The share of an example `element` is (`EXAMPLE_SHARE`): one where it carries none."""
+    parts, whole = integers(element.get(EXAMPLE_SHARE, (1, 1)), "an example share")
+    return parts, whole
+
+
+class _Examples(pygrain.IterDataset):
+    """`records` until `count` examples' worth of them have passed, each record its share of an example
+    (`EXAMPLE_SHARE`, one where it carries none) and handed on without it: a run's `examples=` bound
+    over the records an objective expands each example into (`Limit.examples`), so it reads as many
+    examples whatever its layout makes of each. Records of one example a mixture interleaves with
+    another's pass as they come, so the bound ends at most a record or two of a few examples short of
+    whole, its count of `count` examples exact."""
+
+    def __init__(self, records: pygrain.IterDataset, count: int):
+        super().__init__(records)
+        self._records, self._count = records, count
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return _ExamplesIterator(iter(self._records), self._count)
+
+
+class _ExamplesIterator(pygrain.DatasetIterator):
+    def __init__(self, records: pygrain.DatasetIterator, count: int):
+        super().__init__(records)
+        self._records, self._count, self._read = records, count, fractions.Fraction(0)
+
+    def __next__(self) -> Record:
+        if self._read >= self._count:
+            raise StopIteration
+        record = next(self._records)
+        if isinstance(record, Rejected) or not isinstance(record, Mapping):
+            return record
+        self._read += fractions.Fraction(*_share(record))
+        return {name: value for name, value in record.items() if name != EXAMPLE_SHARE}
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"records": self._records.get_state(),
+                "read": [self._read.numerator, self._read.denominator]}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        numerator, denominator = integers(state["read"], "an example bound's examples read")
+        self._read = fractions.Fraction(numerator, denominator)
+        self._records.set_state(record(state["records"], "example bound's records"))
+
+    def close(self) -> None:
+        self._records.close()
 
 
 class _Ruled(pygrain.IterDataset):
@@ -1408,6 +1468,8 @@ class _Build:
         if isinstance(stage, Repeat):
             certain = not any(_drops(written) for written in pipeline.stages[:at])
             return _repeated(rows, stage.epochs, _name(pipeline), self.loading, certain=certain)
+        if isinstance(stage, Limit) and stage.examples:
+            return _Examples(_as_iter(rows, self.loading), stage.count)
         if isinstance(stage, (Shuffle, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):
             return _reordered(stage, rows)
         if isinstance(stage, Shuffle) and stage.window is not None:
