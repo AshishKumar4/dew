@@ -125,7 +125,8 @@ def test_an_offloading_remat_rung_keeps_its_residuals_in_host_temporaries():
 
 
 STEP_SEEDS = 8
-"""The offloading rung's step's check-1 seeds, sized paired by `seeds_for` on armada."""
+"""The offloading rung's step's check-1 seeds, sized paired by `seeds_for` on armada (run-tests
+rows-memory-probe11-85ab1203f); the site runs on no GPU tier."""
 
 
 def stepping(trainer, initial, *, exact: bool = False):
