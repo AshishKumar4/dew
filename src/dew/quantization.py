@@ -1043,51 +1043,53 @@ def _integer_convolution_on_cuda(op: Callable[..., jax.Array]) -> Callable[..., 
     return convolved
 
 
+def _qt_operand(operand, config, dimension_numbers, *, for_lhs: bool):
+    """`operand` quantized as Qwix's training forward quantizes it (0.1.8
+    `conv_general_qt_fwd`'s `_quantize_operand`), or as it is where its
+    configuration quantizes nothing."""
+    conv_general = _qwix("qwix._src.core.conv_general")
+    qarray = _qwix("qwix._src.core.qarray")
+    numerics = _qwix("qwix._src.core.numerics")
+    side = "lhs" if for_lhs else "rhs"
+    qtype = getattr(config, f"{side}_qtype")
+    if not (qtype and numerics.should_quantize(operand.dtype)):
+        return operand
+    method = getattr(config, f"{side}_calibration_method")
+    how = conv_general.get_how_to_quantize(dimension_numbers=dimension_numbers, for_lhs=for_lhs,
+                                           qtype=qtype, calibration_method=method)
+    if getattr(config, f"{side}_disable_channelwise_axes"):
+        how = dataclasses.replace(how, channelwise_axes=[])
+    calibration = qarray.calibrate(operand, how)
+    if (collect := getattr(config, f"{side}_collect_quant_stat")) is not None:
+        calibration = collect(calibration)
+    scale, zero_point = qarray.compute_scale_zero_point(calibration, qtype)
+    return qarray.quantize_with_scale_zero_point(operand, qtype, scale, zero_point)
+
+def _qt_forward(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
+                feature_group_count, batch_group_count, out_sharding):
+    """Qwix's training forward with the integer convolution XLA:GPU runs
+    (`_integer_convolution_on_cuda`): the product and the quantized operands
+    the backward reads."""
+    conv_general = _qwix("qwix._src.core.conv_general")
+    integer_convolution = _integer_convolution_on_cuda(conv_general.conv_general_dilated)
+    numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
+    operands = (_qt_operand(lhs, config, numbers, for_lhs=True),
+                _qt_operand(rhs, config, numbers, for_lhs=False))
+    return integer_convolution(*operands, window_strides, padding, lhs_dilation, rhs_dilation, numbers,
+                               feature_group_count, batch_group_count, out_sharding), operands
+
+
 @functools.cache
 def _grouped_convolution_gradient() -> type:
     """Qwix's quantized-training provider with Dew's quantized convolution;
     importing Qwix here keeps it optional."""
     qwix = _qwix()
-    conv_general = _qwix("qwix._src.core.conv_general")
-    qarray = _qwix("qwix._src.core.qarray")
-    numerics = _qwix("qwix._src.core.numerics")
-    integer_convolution = _integer_convolution_on_cuda(conv_general.conv_general_dilated)
-
-    def quantized(operand, config, dimension_numbers, *, for_lhs: bool):
-        """`operand` quantized as Qwix's training forward quantizes it (0.1.8
-        `conv_general_qt_fwd`'s `_quantize_operand`), or as it is where its
-        configuration quantizes nothing."""
-        side = "lhs" if for_lhs else "rhs"
-        qtype = getattr(config, f"{side}_qtype")
-        if not (qtype and numerics.should_quantize(operand.dtype)):
-            return operand
-        method = getattr(config, f"{side}_calibration_method")
-        how = conv_general.get_how_to_quantize(dimension_numbers=dimension_numbers, for_lhs=for_lhs,
-                                               qtype=qtype, calibration_method=method)
-        if getattr(config, f"{side}_disable_channelwise_axes"):
-            how = dataclasses.replace(how, channelwise_axes=[])
-        calibration = qarray.calibrate(operand, how)
-        if (collect := getattr(config, f"{side}_collect_quant_stat")) is not None:
-            calibration = collect(calibration)
-        scale, zero_point = qarray.compute_scale_zero_point(calibration, qtype)
-        return qarray.quantize_with_scale_zero_point(operand, qtype, scale, zero_point)
-
-    def forward(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
-                feature_group_count, batch_group_count, out_sharding):
-        """Qwix's training forward with the integer convolution XLA:GPU runs
-        (`_integer_convolution_on_cuda`): the product and the quantized operands
-        the backward reads."""
-        numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
-        operands = (quantized(lhs, config, numbers, for_lhs=True),
-                    quantized(rhs, config, numbers, for_lhs=False))
-        return integer_convolution(*operands, window_strides, padding, lhs_dilation, rhs_dilation, numbers,
-                                   feature_group_count, batch_group_count, out_sharding), operands
 
     @functools.partial(jax.custom_vjp, nondiff_argnums=tuple(range(2, 11)))
     def grouped_conv_qt(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
                         dimension_numbers, feature_group_count, batch_group_count, out_sharding):
-        return forward(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
-                       dimension_numbers, feature_group_count, batch_group_count, out_sharding)[0]
+        return _qt_forward(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
+                           dimension_numbers, feature_group_count, batch_group_count, out_sharding)[0]
 
     def straight_through(config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                          feature_group_count, batch_group_count, out_sharding, residuals, g):
@@ -1105,7 +1107,7 @@ def _grouped_convolution_gradient() -> type:
         _, transpose = jax.vjp(convolve, *operands)
         return transpose(g)
 
-    grouped_conv_qt.defvjp(forward, straight_through)
+    grouped_conv_qt.defvjp(_qt_forward, straight_through)
 
     class GroupedConvolutionGradient(qwix.QtProvider):
         """Differentiates a quantized grouped convolution, which Qwix's
