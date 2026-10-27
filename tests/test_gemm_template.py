@@ -1448,6 +1448,17 @@ def swiglu(gate, up):
 PAIRED_TILE = grouped_matmul.Tile(64, 128, 64, 4, 2)
 
 
+def test_a_grouped_call_no_cooperative_tile_holds_derives_one_consumer_alone():
+    """Where no two-consumer tile holds a grouped call, its derivation falls back to one consumer, which
+    runs on one multiprocessor: a pair is two consumers' (`mosaic_gpu.Tiles`), so the fallback derives a
+    tile rather than refusing one it built."""
+    from dew.nn.kernels.templates import mosaic_sm90
+
+    tile = mosaic_gpu.derived(mosaic_sm90.WGMMA, rows=512, depth=2048, width=1536, dtype=jnp.bfloat16,
+                              multiprocessors=132, holds=lambda tile: tile.warpgroups == 1, grouped=True)
+    assert tile is not None and (tile.warpgroups, tile.cluster) == (1, 1)
+
+
 def test_a_paired_product_is_its_two_products_combined_bitwise():
     """The two-source dense kernel (one `lhs` tile, two matrices, two accumulators) at a tile is the same
     kernel's two plain products at that tile, their fp32 accumulators combined by the same epilogue in
