@@ -722,3 +722,18 @@ def test_a_decoder_reads_a_context_of_its_own_tokens_by_its_table_or_its_own_pas
         encode_context(model.with_cross_attention(None), variables, tokens, lengths, encoder="table")
     with pytest.raises(ValueError):
         encode_context(model, variables, tokens, lengths, encoder="other")
+
+
+def test_a_served_requests_host_context_is_checked_on_the_host():
+    """A request whose context is host NumPy is checked where it is at submit, nothing of it copied to
+    a device and back before admission places the batch (ledger 1875), and draws what the same
+    request on the device draws."""
+    bound = served_task()
+    given = request(0)
+    host = ModelInputs(np.asarray(given.tokens), conditioning={
+        name: np.asarray(value) for name, value in given.conditioning.items()})
+    server = Server.from_task(bound, slots=2, capacity=128)
+    with jax.transfer_guard_host_to_device("disallow_explicit"):
+        ticket = server.submit(host, BUDGETS[0], key=0)
+    server.run()
+    assert_same_generation(ticket.result(), bound(given, BUDGETS[0], key=0))

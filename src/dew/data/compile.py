@@ -584,7 +584,7 @@ def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, traini
     """The build a reader of a prepared `branch` reads it by, in batches of `batch`: training's, or a
     scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise."""
     lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
-    return _Build(read, loading, seed, batch, lowered, training=training)
+    return _Build(read, loading, seed, batch, lowered, training=training, elastic=branch._elastic)
 
 
 @compiling
@@ -995,6 +995,12 @@ def _training_reader(
     partition.rows(build.batch)
     if plan.volatile and partition.readers > 1:
         raise ValueError("volatile pipeline requires one reader per share until its bytes are persisted")
+    if plan.volatile and build.elastic and partition.count > 1:
+        # Every share reads an elastic order's prefix whole on its own (`_elastic_cut`), so a source
+        # whose rows can differ between reads (a fetch that drops failed records) orders them apart.
+        raise ValueError(f"an elastic read's {partition.count} shares each read its whole order, which this "
+                         "pipeline's volatile source can read differently on each; persist its bytes first "
+                         "(`Pipeline.cache`), or read it without `.elastic()`")
     _one_shape(host, partition)
     opened: Iterator[Batch]
     if build.global_order:
@@ -1007,9 +1013,12 @@ def _training_reader(
             endless=build.lowering.endless,
         )
     else:
+        if build.elastic:
+            _refuse_inelastic(pipeline, build)
         own_plan = dataclasses.replace(
             plan,
-            topology={
+            # An elastic read's order is one reader's at any count, its position every reader's.
+            topology={"elastic": True} if build.elastic else {
                 "shares": partition.count,
                 "share": partition.index,
                 "workers": _workers(pipeline, build.loading),
@@ -1028,9 +1037,27 @@ def _training_reader(
             resume,
             stop_seconds=build.loading.stop_seconds,
             endless=build.lowering.endless,
+            replicated=build.elastic,
         )
         statistics.observe(opened)
     return _Host(opened, host) if host else opened
+
+
+def _refuse_inelastic(pipeline: Pipeline, build: _Build) -> None:
+    """Refuse an elastic read (`Pipeline.elastic`) streamed in loading workers, which read a stream's
+    shards each its own, so its order and position would hold only at their count; or whose batch
+    is a token budget's, which takes no fixed share of rows. Indexed, its workers read its inputs
+    in their order (`dew.data.lowering._InputOrder`)."""
+    written = any(isinstance(stage, Workers) for stage in _steps(pipeline))
+    if (_workers(pipeline, build.loading) or written) and build.read == "streamed":
+        raise ValueError(
+            f"{pipeline.name or 'this chain'} is read elastically and streamed, and loading workers read a "
+            "stream's shards each their own, so its order would change with their count: read it by "
+            "index (`.read(\"indexed\")`), or with Loading(workers=0) (elastic streams in workers are "
+            "ledger row 1896)")
+    if any(isinstance(stage, TokenBudget) for stage in pipeline.stages):
+        raise ValueError("an elastic read keeps a share of each batch's rows, and a token budget's batch "
+                         "holds no fixed count of them; batch it by rows")
 
 
 def _validation_reader(

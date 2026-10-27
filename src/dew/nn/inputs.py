@@ -21,6 +21,7 @@ from dew.batch import (
     VALIDITY_FIELD,
     Coordinates,
     coordinates,
+    document_firsts,
     document_ranks,
     document_starts,
     padded_rows,
@@ -31,7 +32,7 @@ from dew.batch import (
     with_validity,
 )
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS
-from dew.nn.sharding import rows_like
+from dew.nn.sharding import explicit_spec, rows_like
 
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -214,12 +215,18 @@ class ModelInputs:
                 f"token_fields cannot contain {sorted(reserved.intersection(self.token_fields))}"
             )
         for name, value in self.token_fields.items():
-            # A field may be a tree of arrays, as `coordinates` is; each of its arrays is token-aligned.
-            for leaf in jax.tree.leaves(value):
+            # A field may be a tree of arrays; `coordinates` states which of its arrays run along the tokens
+            # (`Coordinates.TOKEN_ALIGNED`), its documents' firsts one entry a document.
+            aligned = value.tokens() if isinstance(value, Coordinates) else value
+            for leaf in jax.tree.leaves(aligned):
                 if leaf.ndim < 2 or leaf.shape[:2] != self.tokens.shape:
                     raise ValueError(
                         f"token field {name!r} must start with {self.tokens.shape}, got {leaf.shape}"
                     )
+            if isinstance(value, Coordinates) and value.firsts is not None and (
+                    value.firsts.shape[0] != self.tokens.shape[0]):
+                raise ValueError(f"token field {name!r}'s documents' firsts must have batch size "
+                                 f"{self.tokens.shape[0]}, got {value.firsts.shape}")
         for name, value in self.conditioning.items():
             if value.ndim < 1 or value.shape[0] != self.tokens.shape[0]:
                 raise ValueError(f"conditioning {name!r} must have batch size {self.tokens.shape[0]}")
@@ -235,11 +242,15 @@ class ModelInputs:
     def slice_tokens(self, start: int | None = None, stop: int | None = None) -> ModelInputs:
         """Slice the tokens and token fields to slots `start:stop`; media features keep their indices."""
         selection = slice(start, stop)
-        # A field may be a tree of arrays, as `coordinates` is; each of its arrays is sliced alike.
-        return replace(self,
-            tokens=self.tokens[:, selection],
-            token_fields={name: jax.tree.map(lambda leaf: leaf[:, selection], value)
-                          for name, value in self.token_fields.items()})
+        # A field may be a tree of arrays, each sliced alike; `coordinates` slices its token-aligned ones
+        # (`Coordinates.along_tokens`).
+        def sliced(value):
+            if isinstance(value, Coordinates):
+                return value.along_tokens(lambda leaf: leaf[:, selection])
+            return jax.tree.map(lambda leaf: leaf[:, selection], value)
+
+        return replace(self, tokens=self.tokens[:, selection],
+                       token_fields={name: sliced(value) for name, value in self.token_fields.items()})
 
     def align_left(self, left_padding: jax.Array) -> ModelInputs:
         """Rotate each row so its real tokens start at slot 0 and its `left_padding` slots move to the end.
@@ -254,9 +265,14 @@ class ModelInputs:
         def shift(value: jax.Array) -> jax.Array:
             return rotate_rows(value, left_padding)
 
+        def shifted(value):
+            # `coordinates` rotates its token-aligned arrays (`Coordinates.along_tokens`).
+            if isinstance(value, Coordinates):
+                return value.along_tokens(shift)
+            return jax.tree.map(shift, value)
+
         return replace(self, tokens=shift(self.tokens),
-                            token_fields={name: jax.tree.map(shift, value)
-                                          for name, value in self.token_fields.items()})
+                            token_fields={name: shifted(value) for name, value in self.token_fields.items()})
 
     def kwargs(self) -> dict[str, jax.Array | Mapping[str, jax.Array]]:
         """Return the keyword arguments for a native model call, without the tokens.
@@ -282,7 +298,7 @@ class ModelInputs:
         if tokens.ndim != 2 or tokens.shape[0] != self.tokens.shape[0]:
             raise ValueError(f"a response is [{self.tokens.shape[0]}, W] token ids, got {tokens.shape}")
         known = {**RESPONSE_FIELDS, **(rules or {})}
-        unruled = sorted(set(self.token_fields) - set(known) - {COORDINATES_FIELD})
+        unruled = unruled_fields(self.token_fields, rules)
         if unruled:
             raise ValueError(f"token fields {unruled} have no rule for a response's slots; "
                              "name one in `rules`")
@@ -307,14 +323,26 @@ def rotate_rows(values: jax.Array, shifts: jax.Array) -> jax.Array:
     return jnp.take_along_axis(values, slots.reshape(slots.shape + (1,) * (values.ndim - 2)), axis=1)
 
 
-def cu_seqlens(begins: jax.Array, sequences: int) -> jax.Array:
+def cu_seqlens(begins: jax.Array, sequences: int, firsts: jax.Array | None = None) -> jax.Array:
     """The cumulative offsets of the varlen sequences over the `[B * S]`
     tokens of `begins` `[B, S]`, which marks each sequence's first token: a
     kernel's `cu_seqlens` `[sequences + 1]`, the sequences past the marked
-    ones empty at the end. Every row's first token begins one."""
+    ones empty at the end. Every row's first token begins one. They come from
+    each row's documents' first slots, the batch's `firsts`
+    (`Coordinates.firsts`) where given, offset by their rows and sorted: no
+    scan over the flattened tokens, whose split over a mesh XLA runs a token
+    a loop iteration (row 1897)."""
     rows, length = begins.shape
-    first = begins.at[:, 0].set(True).reshape(-1)
-    starts = jnp.nonzero(first, size=sequences, fill_value=rows * length)[0]
+    given = document_firsts(begins, -(-sequences // rows)) if firsts is None else firsts
+    split = explicit_spec(given)
+    if split is not None:
+        # A batch's few documents, whole on each device, as the kernels read the offsets.
+        whole = jax.sharding.NamedSharding(split.mesh, jax.sharding.PartitionSpec())
+        given = jax.sharding.reshard(given, whole)
+    placed = jnp.where(given < length, given + jnp.arange(rows, dtype=jnp.int32)[:, None] * length,
+                       rows * length).reshape(-1)
+    starts = jnp.sort(placed)[:sequences]
+    starts = jnp.pad(starts, (0, sequences - starts.shape[0]), constant_values=rows * length)
     return jnp.concatenate([starts, jnp.full((1,), rows * length, starts.dtype)]).astype(jnp.int32)
 
 
@@ -436,7 +464,17 @@ class CrossContext:
 
     @classmethod
     def from_conditioning(cls, conditioning: Mapping[str, jax.Array]) -> CrossContext:
-        """The context a call's `conditioning` carries under `CONTEXT` and `CONTEXT_LENGTHS`.
+        """The context a call's `conditioning` carries under `CONTEXT` and `CONTEXT_LENGTHS`, as JAX
+        arrays (`checked`)."""
+        embeddings, lengths = cls.checked(conditioning, jnp)
+        return cls(jnp.asarray(embeddings), jnp.asarray(lengths, jnp.int32))
+
+    @staticmethod
+    def checked(conditioning: Mapping[str, jax.typing.ArrayLike], xp=np
+                ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
+        """The context and its lengths a call's `conditioning` carries under `CONTEXT` and
+        `CONTEXT_LENGTHS`, as arrays of `xp` (NumPy's on the host, where a server admits a request;
+        JAX's), each row's length its context's width where none is given, in the dtype given.
 
         Raises ValueError for any other entry, for a context that is not
         `[B, C, features]` floats, and for lengths that are not one integer
@@ -446,18 +484,18 @@ class CrossContext:
         if unknown or CONTEXT not in conditioning:
             raise ValueError(f"a decoder's conditioning is {CONTEXT!r} and optionally {CONTEXT_LENGTHS!r}, "
                              f"got {sorted(conditioning)}")
-        embeddings = jnp.asarray(conditioning[CONTEXT])
+        embeddings = xp.asarray(conditioning[CONTEXT])
         if embeddings.ndim != 3 or not jnp.issubdtype(embeddings.dtype, jnp.floating):
             raise ValueError(f"a context is [B, C, features] floats, got "
                              f"{embeddings.dtype}{embeddings.shape}")
         lengths = conditioning.get(CONTEXT_LENGTHS)
         if lengths is None:
-            lengths = jnp.full(embeddings.shape[:1], embeddings.shape[1], jnp.int32)
-        lengths = jnp.asarray(lengths)
+            lengths = xp.full(embeddings.shape[:1], embeddings.shape[1], np.int32)
+        lengths = xp.asarray(lengths)
         if lengths.shape != embeddings.shape[:1] or not jnp.issubdtype(lengths.dtype, jnp.integer):
             raise ValueError(f"context lengths are one integer per row, [{embeddings.shape[0]}], "
                              f"got {lengths.dtype}{lengths.shape}")
-        return cls(embeddings, lengths.astype(jnp.int32))
+        return embeddings, lengths
 
 
 @struct.dataclass
@@ -678,9 +716,14 @@ def _continued_layout(value: Coordinates, valid: jax.Array, width: int) -> Coord
 
     starts = None if value.starts is None else jnp.concatenate(
         [value.starts, jnp.zeros((len(value.starts), width), value.starts.dtype)], axis=1)
+    # No document starts in the response: each row's firsts stand, past its last now `width` further.
+    firsts = value.firsts
+    if firsts is not None and value.starts is not None:
+        length = value.starts.shape[1]
+        firsts = jnp.where(firsts < length, firsts, length + width)
     return replace(value, valid=continued(value.valid, _response_validity),
                    positions=continued(value.positions, _response_positions),
-                   segments=continued(value.segments, _response_document), starts=starts,
+                   segments=continued(value.segments, _response_document), starts=starts, firsts=firsts,
                    right_padded=False)
 
 
@@ -695,6 +738,14 @@ RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
     "block_groups": _response_text,
 }
 """How each token field Dew's processors write continues into a response."""
+
+
+def unruled_fields(fields: Mapping[str, object],
+                   rules: Mapping[str, FieldExtension] | None = None) -> list[str]:
+    """The token fields with no rule for a response's slots, by name: neither in `RESPONSE_FIELDS` nor
+    in `rules`. A request's `Coordinates` continue by their own fields' rules (`_continued_layout`).
+    What every extension of a request (`ModelInputs.extended`, masked generation) admits."""
+    return sorted(set(fields) - set(RESPONSE_FIELDS) - set(rules or ()) - {COORDINATES_FIELD})
 
 
 def next_position(fields: Mapping[str, jax.Array], valid: jax.Array) -> jax.Array | None:

@@ -40,6 +40,7 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import scipy.linalg
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
@@ -151,12 +152,18 @@ class KVCache:
 def quantize(values: jax.Array, dtype: KVDtype) -> tuple[jax.Array, jax.Array]:
     """`values` `[..., head_dim]` in `dtype`, and the float32 scale per vector.
 
-    The scale maps the vector's absmax to the format's largest value; an
-    all-zero vector keeps scale one so it dequantizes to zeros.
+    The scale maps the vector's absmax to the format's largest value. A vector
+    whose scale would not be a normal float32 (all zeros, or an absmax below
+    the format's largest times float32's least normal, 448 * 2**-126 for
+    float8) keeps scale one, so its codes are the format's rounding of the
+    values themselves, zeros, and it dequantizes to them: a subnormal scale
+    divides to codes no dequantize recovers, or flushes to zero where the
+    device flushes subnormals.
     """
     wide = values.astype(jnp.float32)
     amax = jnp.max(jnp.abs(wide), axis=-1)
-    scale = jnp.where(amax > 0, amax / _LIMITS[dtype], 1.0)
+    scaled_amax = amax / _LIMITS[dtype]
+    scale = jnp.where(scaled_amax >= jnp.finfo(jnp.float32).tiny, scaled_amax, 1.0)
     scaled = wide / scale[..., None]
     if dtype == "int8":
         return jnp.clip(jnp.rint(scaled), -127, 127).astype(jnp.int8), scale
@@ -172,10 +179,7 @@ def hadamard(size: int) -> jax.Array:
     if size < 1 or size & (size - 1):
         raise ValueError(f"an int8 KV cache rotates keys by a Hadamard matrix, which needs a "
                          f"power-of-two head_dim; got {size}. quantized='float8_e4m3fn' takes any width")
-    matrix = jnp.ones((1, 1), jnp.float32)
-    while matrix.shape[0] < size:
-        matrix = jnp.block([[matrix, matrix], [matrix, -matrix]])
-    return matrix / math.sqrt(size)
+    return jnp.asarray(scipy.linalg.hadamard(size), jnp.float32) / math.sqrt(size)
 
 
 def rotated(values: jax.Array, rotation: jax.Array) -> jax.Array:
@@ -414,6 +418,12 @@ class KVStore:
         return jax.vmap(stored, in_axes=(1, 0, 0, 0), out_axes=1)(
             grouped(pool, 1, groups), grouped(page, 0, groups), grouped(safe % size, 0, groups),
             grouped(values.astype(pool.dtype), 0, groups)).reshape(pool.shape)
+
+    def plain(self, keys: jax.Array) -> jax.Array:
+        """Return keys read back in the store's rotation `[..., head_dim]` in their own basis: for keys a
+        projection expands before any query meets them (a latent attention's latents), or that serve as
+        values too (DeepSeek V4's shared head), where no query is rotated into their basis."""
+        return keys if self.rotation is None else rotated(keys, self.rotation.T)
 
     def read(self) -> tuple[jax.Array, jax.Array]:
         return self._read("cached_key", "key_scale"), self._read("cached_value", "value_scale")
@@ -792,6 +802,20 @@ def cache_positions(module: nn.Module, batch: int, length: int, valid):
     if allocated:
         index.value = index.value + jnp.sum(valid, axis=1, dtype=jnp.int32)
     return positions, allocated
+
+
+class DecodeCursor(nn.Module):
+    """A decoder's own count of each row's real tokens, the logical cursor a model-level reader
+    takes a cached call's places from (`cache_positions`): allocation-aware, so the call that
+    allocates the cache counts none, and kept whatever mixer a layer runs, a recurrent one that
+    keeps no cursor of its own included."""
+
+    @nn.compact
+    def __call__(self, valid) -> jax.Array:
+        """Each token's place `[B, S]` continuing its row's count, a padding slot -1; the count
+        advances by the call's real tokens (`valid`)."""
+        batch, length = valid.shape
+        return cache_positions(self, batch, length, valid)[0]
 
 
 def cached_validity(module: nn.Module, length: int) -> jax.Array:

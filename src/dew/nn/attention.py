@@ -2281,8 +2281,9 @@ class BasicTransformerBlock(nn.Module):
     norm and no residual, which the UNets' stages do by default.
     `qkv_bias` is the attentions' (`NormalAttention`). `dropout_rate` drops
     each attention's output, inside the feed-forward and the block's output,
-    as diffusers' `BasicTransformerBlock` does in training; `approximate_gelu`
-    is the feed-forward's GELU (`geglu_feed_forward`).
+    as diffusers' Flax `FlaxBasicTransformerBlock` does in training (its
+    PyTorch block drops no residual stream); `approximate_gelu` is the
+    feed-forward's GELU (`geglu_feed_forward`).
     """
     query_dim: int
     heads: int = 4

@@ -13,7 +13,6 @@ logits moves at least one bit of them.
 
 import functools
 import math
-import re
 from pathlib import Path
 
 import jax
@@ -39,6 +38,7 @@ from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 from dew.nn.mixers import AttentionMixer
 from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling
+from dew.telemetry.instrumentation import hlo_instructions
 
 VOCAB = 37
 SEQ = 12
@@ -56,7 +56,8 @@ SEEDS = {'decode': 16, 'kernels': 16, 'window kernels': 8, 'softcap': 32, 'route
          'grouped': 32, 'sliding decode': 16, 'hybrid decode': 512, 'sandwich': 8, 'packed alone': 16,
          'metadata': 128, 'packed kernels': 16, 'bf16 head': 8, 'strict head': 8, 'norm gradient': 8,
          'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'packed cudnn': 8,
-         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 64}
+         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 64,
+         'learned hybrid decode': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, and the GPU
 sites on an A100): the most any of a site's cases took."""
 
@@ -352,12 +353,13 @@ def test_a_cached_prompt_reads_its_cache_through_flash_where_its_wheel_runs(rng,
     params = model.init(rng, ids)
     prompt = ids[:, :6]
     made, step = decode_steps(model)
-    compiled = step.lower(params, made(params, prompt.shape[0]), prompt).compile().as_text()
+    compiled = hlo_instructions(step.lower(params, made(params, prompt.shape[0]), prompt).compile().as_text())
     probe = jnp.zeros((1, 8, 1, 64), jnp.bfloat16)
     failed = ATTENTION.kernel('flash').failed(attention_case(probe, probe))
     flash = not {requirement.code for requirement in failed} & {'not_installed', 'binary_arch'}
     # FlashAttention-2's and -3's packed calls (dew_flash_attn's custom-call targets).
-    assert bool(re.search(r'dew_flash3?_mha_varlen_fwd', compiled)) == flash
+    packed = {'dew_flash_mha_varlen_fwd', 'dew_flash3_mha_varlen_fwd'}
+    assert bool(packed & {instruction.target for instruction in compiled.values()}) == flash
     assert_as_exact(lambda params, prompt: step(params, made(params, prompt.shape[0]), prompt)[0],
                     applied(model.clone(attention_impl='xla')), drawn(model, length=6), "cached prefill",
                     seeds=SEEDS['cached prefill'], truth_fn=applied(float64(model)))
@@ -526,14 +528,23 @@ def test_sliding_attention_decode_matches_the_full_sequence():
 def hybrid(**overrides):
     """Qwen3.5's stack at toy size: three gated-delta-net layers, one gated
     full-attention layer with a partial rotary."""
-    return tiny(num_layers=4, num_kv_heads=2, head_dim=8, output_gate=True,
-                partial_rotary_factor=0.5,
-                layer_types=('linear_attention',) * 3 + ('full_attention',),
-                kinds={'linear_attention': {'mixer': {
-                    'class': 'gated_delta_net', 'fields': {'linear_num_key_heads': 2,
-                    'linear_num_value_heads': 4, 'linear_key_head_dim': 6,
-                    'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}}},
-                **overrides)
+    return tiny(**{'num_layers': 4, 'num_kv_heads': 2, 'head_dim': 8, 'output_gate': True,
+                   'partial_rotary_factor': 0.5,
+                   'layer_types': ('linear_attention',) * 3 + ('full_attention',),
+                   'kinds': {'linear_attention': {'mixer': {
+                       'class': 'gated_delta_net', 'fields': {'linear_num_key_heads': 2,
+                       'linear_num_value_heads': 4, 'linear_key_head_dim': 6,
+                       'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}}},
+                   **overrides})
+
+
+def test_learned_positions_continue_from_the_models_own_count_whatever_its_first_layer(rng):
+    """Learned positions read a cached call's places from the model's own count of each row's real
+    tokens (`DecodeCursor`), whatever mixer its first layer runs: Qwen3.5's stack, whose first layers
+    are gated delta nets that keep no cursor, decodes on par with its full pass (check 1), where every
+    cached step read position 0 off a first layer with no cursor (audit NN-A5)."""
+    model = hybrid(position_embedding='learned', partial_rotary_factor=None)
+    decoded_against_full(model, 4, "learned hybrid decode", SEEDS['learned hybrid decode'], batch=16)
 
 
 def test_a_yarn_layer_refuses_a_proportional_partial_rotary(rng):

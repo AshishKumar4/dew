@@ -4,6 +4,25 @@ Work to complete or qualify, grouped by area. Numbers and identifiers in bracket
 
 Correctness, contract gaps and duplicated paths come first. After those close, measure single-GPU training on every supported accelerator, then multiple GPUs and hosts. The target is 50–60% or more real-token MFU on each workload that matters; a result below 50% gets a profile and fixes for its three largest losses. Higher utilization targets and new model breadth follow that work. [Performance](performance.md) holds measurements; [design records](design/architecture.md) hold contracts.
 
+## Codebase audit themes
+
+A full audit of `main` on 2026-10-27, each finding re-checked by a second reviewer, grouped by shared cause so each theme lands as one change.
+
+- Check every kernel config against its template's legality before launch, whatever its source, and size every row-bearing operand from the launch plan so no legal tile reads past it. [1866]
+- Decide attention's mainloop for the target being compiled, not the host, and return the empty result for a zero-capacity call before decode launches. [1867]
+- Give positions, cache cursors and rotary origins one owner every layer reads: learned positions, shared-pass loops, DeepSeek V4's windows and compressed keys, every rotary policy, scan-ordered patches, Z-Image's tables and masked diffusion's coordinates. [1868]
+- Give Dew's reverse-only custom derivatives a forward mode through the shared linear-derivative boundary, and keep forward-mode calls off reverse-only kernels. [1869]
+- Advance EMA, effects and token clocks only on emitted optimizer updates, keep complex leaves complex in optimizer state and weight averages, and move the averaging math below training. [1870]
+- Record and verify the content a saved plan actually read: Hub configs, remote shards, completed stages and processor files. [1871]
+- Admit everything fit takes at one boundary: every training and validation signature checked, native Grain datasets and arrays, keys made after process setup, predictors built from the effective encoder. [1872]
+- Keep every record field through assembly, with one packing algorithm through Grain's extension. [1873]
+- Stay finite wherever the reference is finite in guidance, flow densities, sigma solvers and float8 cache scales. [1874]
+- Keep placement, formats and failure classes at the interop and serving boundaries: FP8 publication, host-only exports, harness failures, host-side admission. [1875]
+- Compose nn modules on their shared owners and match their sources: the conditional UNet's dropout, typed memory keys, the towers' training mode, one feed-forward. [1876]
+- Make the off-GPU resource gate fail without evidence: one validator, and records only from a child that succeeded. [1877]
+- Prove behaviour through the shared gates: no prose or whitespace pins, no mocks of Dew internals, learning judged by independent runs. [1878]
+- Answer each decision question's tournament on its own finalists. [1879]
+
 ## Models and interop
 
 - One cross-attention block for every consumer: the language model's gated adapter, the decision model and diffusion conditioning compose the same block and its cache instead of parallel copies. [1629]
@@ -208,7 +227,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Keep numerical results keyed by CPU model and qualify CPU-dependent rounding against the reference on that same class. [478]
 - Establish and triage a daily GPU baseline before it replaces batch qualification. Reproduce reference autotune picks in their recorders and qualify FP8 on suitable hardware. [558, 568, TTC-1]
 - Qualify H100, newer-GPU, TPU and paged-decode shard routes at runtime; compile and interpret checks leave those obligations open.
-- The float64 gate is the owner's (2026-10-20): check 1 holds each leaf's RMS error and its worst row within 1.5× the reference's, both measured from float64 truth, over drawn seeds, with no floor. Check 2 holds every element within a certified roundoff bound for Dew's own operation. Both sit behind one assertion, `assert_as_exact`, with `assert_moves` for checks that a change has an effect. [560, 649, 719, 793, 827]
+- The float64 gate is the owner's (2026-10-20): check 1 holds each leaf's RMS error within 1.5× the reference's and its worst row within the calibrated row factors testing.md states (owner, 2026-10-27), both measured from float64 truth, over drawn seeds, with no floor. Check 2 holds every element within a certified roundoff bound for Dew's own operation. Both sit behind one assertion, `assert_as_exact`, with `assert_moves` for checks that a change has an effect. [560, 649, 719, 793, 827]
 - One gate generation. The one-draw rule moves to 1.5×, a conversion tool moves the mechanical sites, and the lanes convert the rest file by file. The old assertion families are then deleted, and the tolerance inventory goes to zero. [650, 668–670, 676, 682, 705, 712, 844, 1305]
 - Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients and Z-Image's padded flow. [833, 837]
 - Replace test-policy violations with observable lifecycle and reference behavior:
