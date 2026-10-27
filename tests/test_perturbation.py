@@ -165,7 +165,9 @@ def test_a_language_models_units_are_its_tokens_next_token_losses():
     variables = objective.init(jax.random.key(0))
 
     def draw(seed):
-        return (np.random.default_rng([0x10, seed]).integers(0, 13, (4, 7)).astype(np.int32),)
+        tokens = np.random.default_rng([0x10, seed]).integers(1, 13, (4, 7)).astype(np.int32)
+        tokens[:, -2:] = 0  # each row ends in padding, whose targets count nothing
+        return (tokens,)
 
     def dews(tokens):
         step = Step(jnp.asarray(0), jax.random.key(0), None)
