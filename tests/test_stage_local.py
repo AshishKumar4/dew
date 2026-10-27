@@ -5,6 +5,8 @@ of Dew's optimizers and their per-layer rules (check 1 against float64); a check
 every layer as one device's would and resumes onto another stage count; and an optax transformation
 that may read a stacked leaf whole is refused by name."""
 
+import dataclasses
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -122,19 +124,28 @@ def draw(seed):
 
 
 def initials(model, optimizer, variables=None):
-    """Each seed's own initial state, one device's (`Trainer.initial_state`), its parameters drawn by
-    the seed's key, or `variables(seed)`: no draw starts where another does, so what one fixed state
-    rounds alike on every draw (an Adam step's few near-tied gradients) is no factor every draw
-    shares. Each seed's is made once, outside float64, for every arm that starts from it."""
+    """Each seed's own initial state: one device's (`Trainer.initial_state`), its variables and EMA
+    drawn again by the seed's key, or `variables(seed)`, its optimizer state the one every draw starts
+    from, which no rule here reads parameter values to make. No draw starts where another does, so
+    what one fixed state rounds alike on every draw (an Adam step's few near-tied gradients) is no
+    factor every draw shares. Each seed's is made once, outside float64, by one compiled draw."""
+    with jax.enable_x64(new_val=False):
+        one = trainer(model, optimizer, MeshSpec(), 1, variables=None if variables is None else variables(0))
+        one.validate(steps=STEPS)
+        start = one.initial_state()
+    init = jax.jit(model.init)
     made = {}
 
     def initial(seed: int):
         if seed not in made:
             with jax.enable_x64(new_val=False):
-                given = None if variables is None else variables(seed)
-                one = trainer(model, optimizer, MeshSpec(), 1, variables=given, key=seed)
-                one.validate(steps=STEPS)
-                made[seed] = one.initial_state()
+                drawn = (init(jax.random.key(seed), jnp.zeros((1, SEQ), jnp.int32)) if variables is None
+                         else variables(seed))
+                # The run's own tree and dtypes, which a draw of the same model holds.
+                drawn = jax.tree.map(lambda held, new: jnp.asarray(new, held.dtype), start.variables, drawn)
+                ema = None if start.ema is None else {name: jax.tree.map(jnp.copy, drawn[name])
+                                                      for name in start.ema}
+                made[seed] = dataclasses.replace(start, variables=drawn, ema=ema)
         return made[seed]
     return initial
 
