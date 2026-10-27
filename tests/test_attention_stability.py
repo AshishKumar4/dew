@@ -812,8 +812,7 @@ def assert_finite(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> None
 
 
 ACCURATE_ARMS = [(family, name) for family in TEMPLATE_FAMILIES
-                 for name in ("triton", "portable",
-                              *(["mosaic"] if ON_HOPPER and _mosaic_takes(FAMILIES[family]) else []))]
+                 for name in _mainloops(FAMILIES[family], ACCURATE)]
 """Each template family beside each mainloop that takes it in the accurate form (`_mainloops`): a case of
 its own, so none holds a CPU task past the suite's target (row 1849)."""
 
