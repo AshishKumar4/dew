@@ -10,10 +10,10 @@
 set -eu
 # Every lock resolves for the oldest supported Python, so the interpreter running this changes nothing.
 RESOLVED=2026-10-12T00:00:00Z
-# Dew's own FlashAttention wheels resolve as they stood when 0.3.4 was published, past the pins the
+# Dew's own FlashAttention wheels resolve as they stood when 0.3.6 was published, past the pins the
 # locks hold (-P); nothing else moves. jax itself, which constraints.txt pins to one build of Dew's package
 # index, takes no date: that index's static pages give no upload times, which a date would need.
-FLASH=2026-10-17T18:46:06Z
+FLASH=2026-10-27T07:29:32Z
 # jaxlib and its CUDA plugins resolve as they stood when 0.12.0.1 was published, which the jax build Dew
 # carries its patches on pins exactly; nothing else moves.
 JAXLIB=2026-10-21T22:00:00Z
