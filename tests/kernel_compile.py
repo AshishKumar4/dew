@@ -25,7 +25,7 @@ import jax.experimental.topologies as topologies
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
+from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
 from dew.training.ahead import compile_only_gpus
 
 REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")

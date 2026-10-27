@@ -2079,18 +2079,7 @@ class Checkpoints:
                     lambda path, leaf: _from_delta_planes(leaf, weights[path])
                     if path in deltas else leaf, restored['ema'])
         elif from_local and self._lost(step):
-            from dew.state import CHECKPOINTED
-            state_tree = {name: getattr(template, name) for name in CHECKPOINTED} \
-                if not isinstance(template, Mapping) else dict(template)
-            held = _held_apart(state_tree, frozen)
-            self._check_recovered(step, state_tree)
-            # The EMA is stored as byte planes of its difference from the weights, checked as such.
-            checked = dict(state_tree)
-            if checked.get('ema') is not None:
-                checked['ema'], _ = _plane_template(checked['ema'], _ema_deltas(snapshot))
-            _refuse_reshaped(checked, metadata, where)
-            # This process's shards come from the replicas (`_from_replicas`); it holds none of them.
-            restored = jax.tree.map(_zeros, state_tree)
+            restored, held = self._lost_shards(step, template, frozen, snapshot, metadata, where)
         else:
             from dew.state import CHECKPOINTED
             state_tree = {name: getattr(template, name) for name in CHECKPOINTED} \
@@ -2135,16 +2124,9 @@ class Checkpoints:
             if targets:
                 restored = {**restored, 'ema': self._averages(checkpointer, step, metadata, restored,
                                                               targets, deltas)}
-        recovery = self._recovery
-        if from_local and template is not None and recovery is not None and recovery[0] == step:
-            _, holders, grid = recovery
-            restored = dict(restored)
-            table = restored.pop('position', None)
-            restored = _from_replicas(restored, grid, holders)
-            if 'position' in stored and not mapping and share is not None:
-                # The first holder's table, which holds every process's row (`gather_positions`).
-                restored['position'] = _from_table_record(self._from_holder(
-                    holders, lambda: _table_record(jax.tree.map(np.asarray, dict(table or {})))))
+        if from_local and template is not None:
+            restored = self._recovered(step, dict(restored),
+                                       positioned='position' in stored and not mapping and share is not None)
         restored = self._with_frozen(dict(restored), frozen, held)
         table = None if mapping else restored.pop('position', None)
         saved = None if table is None or share is None else read_position(table, where, share)
@@ -2216,6 +2198,38 @@ class Checkpoints:
                 f"layout and process count it was written with. Resume with those, or "
                 f"delete {self.local_directory} to resume from the persistent checkpoint "
                 f"at step {self._open().latest_step()} in {self.directory}.")
+
+    def _lost_shards(self, step: int, template, frozen, snapshot: _StepFacts, metadata,
+                     where: str) -> tuple[dict, dict | None]:
+        """What a process that lost its copy of local `step` restores before its replicas give it
+        their shards (`_recovered`): zeros where its template places each leaf, the template checked
+        against what the processes holding the step wrote; and the frozen trees held apart."""
+        from dew.state import CHECKPOINTED
+        state_tree = {name: getattr(template, name) for name in CHECKPOINTED} \
+            if not isinstance(template, Mapping) else dict(template)
+        held = _held_apart(state_tree, frozen)
+        self._check_recovered(step, state_tree)
+        # The EMA is stored as byte planes of its difference from the weights, checked as such.
+        checked = dict(state_tree)
+        if checked.get('ema') is not None:
+            checked['ema'], _ = _plane_template(checked['ema'], _ema_deltas(snapshot))
+        _refuse_reshaped(checked, metadata, where)
+        return jax.tree.map(_zeros, state_tree), held
+
+    def _recovered(self, step: int, restored: dict, *, positioned: bool) -> dict:
+        """`restored`, local `step` as each process read it, each shard the first holder's where some
+        process lost its copy (`_from_replicas`), and its position table the first holder's where
+        `positioned`, which holds every process's row (`gather_positions`); as it is otherwise."""
+        recovery = self._recovery
+        if recovery is None or recovery[0] != step:
+            return restored
+        _, holders, grid = recovery
+        table = restored.pop('position', None)
+        restored = _from_replicas(restored, grid, holders)
+        if positioned:
+            restored['position'] = _from_table_record(self._from_holder(
+                holders, lambda: _table_record(jax.tree.map(np.asarray, dict(table or {})))))
+        return restored
 
     def _check_recovered(self, step: int, state_tree: Mapping[str, StateLeaf]) -> None:
         """Refuse a local step this process lost where this run places the state otherwise than the

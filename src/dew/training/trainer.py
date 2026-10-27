@@ -1190,7 +1190,7 @@ class Trainer(Generic[Loss, Effects]):
                 return traced.lower(lowering_platforms=('cuda',)), None
             shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
             tokens, frozen = device_tokens(self.objective, micro, shards), FROZEN in prepared.variables
-            return traced.lower(), step_compiler_options(self.objective, tokens, frozen, mesh.devices.size)
+            return traced.lower(), step_compiler_options(self.objective, tokens, frozen, devices.devices.size)
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
