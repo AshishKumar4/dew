@@ -71,7 +71,7 @@ class _SpatialAttention(nn.Module):
                 + self.stage.depth * block.cross_flops(lengths, context_lengths, text_features))
 
     @nn.compact
-    def __call__(self, x, context, *, train=False):
+    def __call__(self, x, context):
         residual = x
         x = GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
         batch, height, width, channels = x.shape
@@ -94,7 +94,7 @@ class _SpatialAttention(nn.Module):
 
         def run(blocks, x, context):
             for block in blocks:
-                x = block(x, context, train=train)
+                x = block(x, context)
             return x
 
         # The level's transformers are like blocks, which a stage axis that
@@ -175,7 +175,7 @@ class _Level(nn.Module):
                     norm_epsilon=self.attention_norm_epsilon,
                     approximate_gelu=self.approximate_gelu,
                     name=f"attention_{index}",
-                ), x, context, train=train)
+                ), x, context)
             outputs.append(x)
         if self.resize:
             if self.direction == "up":
@@ -327,7 +327,7 @@ class UNet2DCondition(nn.Module):
                 norm_epsilon=self.attention_norm_epsilon,
                 approximate_gelu=self.approximate_gelu,
                 name="middle_attention",
-            ), x, context, train=train)
+            ), x, context)
             x = operations.residual(ResidualBlock(
                 stage.features,
                 norm_groups=self.norm_groups,
