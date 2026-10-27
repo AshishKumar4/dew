@@ -132,21 +132,27 @@ def update(state, query, key, value, decay, write, *, delta: bool, in_kernel: bo
     """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` per key dimension `[...,
     Dk]` (`exp(g)`) and `write` the write gate, broadcast against the values `[..., Dv]`: its output
     `[..., Dv]` and the updated state.
-    Both readouts are products with the old state, `(q decay)^T S + (q . k) d` with `d = write (v -
-    (k decay)^T S)` under the delta rule and `write v` without it, so one pass over the state serves
-    them and the write. `q . k` is a product (`float32_einsum`), summed as Dew sums one, not a reduction
-    whose order XLA chooses by the shape it is batched at: under a skip that cancels it (`(q . k) write`
-    against `D`), a reduction a token at a time and the same in the portable rule's batched adjoint
-    rounded a last bit apart, which put the portable gradient's cancelled row 4.9 times the token
+    Under the delta rule both readouts are products with the old state, `(q decay)^T S + (q . k) d` with
+    `d = write (v - (k decay)^T S)`, so one pass over the state serves them and the write; without it the
+    output reads the updated state, `q^T S'` (row 1859). `q . k` is a product (`float32_einsum`), summed
+    as Dew sums one, not a reduction whose order XLA chooses by the shape it is batched at: under a skip
+    that cancels it (`(q . k) write` against `D`), a reduction a token at a time and the same in the
+    portable rule's batched adjoint rounded a last bit apart, which put the portable gradient's cancelled
+    row 4.9 times the token
     recurrence's distance from float64 (test_recurrence_stability's rated site under resets on chunk
     edges, seed 6). A kernel's body (`in_kernel`, the fused step's) sums it in its own registers, where
     Pallas's Triton lowering takes no platform-dependent product."""
-    read_query = jnp.sum((query * decay)[..., :, None] * state, axis=-2)
     corrected = value - jnp.sum((key * decay)[..., :, None] * state, axis=-2) if delta else value
     written = corrected * write
+    updated = state * decay[..., :, None] + key[..., :, None] * written[..., None, :]
+    if not delta:
+        # Without the delta rule the output reads the updated state, `q^T S'`, as the recurrence states it:
+        # `(q . k) (write v)` overflowed where `q^T S'` stays finite (`q . k` past fp32's largest at keys
+        # and queries of 2^80 against a write of 2^-80, row 1859).
+        return jnp.sum(query[..., :, None] * updated, axis=-2), updated
+    read_query = jnp.sum((query * decay)[..., :, None] * state, axis=-2)
     score = (jnp.sum(query * key, axis=-1) if in_kernel else float32_einsum('...d,...d->...', query, key))
-    out = read_query + score[..., None] * written
-    return out, state * decay[..., :, None] + key[..., :, None] * written[..., None, :]
+    return read_query + score[..., None] * written, updated
 
 
 def _held(updated, key, value, dtype):

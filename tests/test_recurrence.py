@@ -280,3 +280,17 @@ def test_the_skip_takes_forward_and_reverse_mode():
     # Its reverse rule's gradient held to float64 by test_recurrence_stability's rated sites.
     gradient = jax.jit(jax.grad(lambda d: jnp.sum(skipped(d, value) * value)))(skip)
     assert gradient.shape == skip.shape and bool(jnp.all(jnp.isfinite(gradient)))
+
+
+def test_a_step_without_the_delta_rule_reads_its_updated_state():
+    """Without the delta rule a token's output is `q^T S'` of the updated state (`recurrence.update`): finite
+    where the one-pass form's `(q . k) (write v)` overflowed, fp32 keys and queries of 2^80 over 32 state
+    channels against a write of 2^-80 from a zero state (row 1859), and on par with the float64 recurrence."""
+    channels, width = 32, 4
+    query = key = jnp.full((1, channels), 2.0 ** 80, jnp.float32)
+    value = jnp.full((1, width), 2.0 ** -80, jnp.float32)
+    state = jnp.zeros((1, channels, width), jnp.float32)
+    decay, write = jnp.full((1, channels), jnp.exp(-1.0), jnp.float32), jnp.ones((1, 1), jnp.float32)
+    out, updated = recurrence.update(state, query, key, value, decay, write, delta=False)
+    assert bool(jnp.all(jnp.isfinite(out))) and bool(jnp.all(jnp.isfinite(updated)))
+    np.testing.assert_array_equal(out, jnp.full((1, width), channels * 2.0 ** 80, jnp.float32))
