@@ -78,6 +78,7 @@ def test_a_plan_whose_residuals_go_to_host_memory_is_timed_against_the_first_tha
     timed = []
     step = trainer.compile(state, BATCH, None if seconds is None else (
         lambda steps: (timed.append(len(steps)), seconds)[1]))
+    assert OFFLOADED in {probe["remat"] for probe in trainer.plan["probes"]}
     assert timed == ([] if seconds is None else [2])
     assert trainer.plan["remat"] == remat
     if seconds is not None:
