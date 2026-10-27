@@ -282,7 +282,7 @@ class ModelInputs:
         if tokens.ndim != 2 or tokens.shape[0] != self.tokens.shape[0]:
             raise ValueError(f"a response is [{self.tokens.shape[0]}, W] token ids, got {tokens.shape}")
         known = {**RESPONSE_FIELDS, **(rules or {})}
-        unruled = sorted(set(self.token_fields) - set(known) - {COORDINATES_FIELD})
+        unruled = unruled_fields(self.token_fields, rules)
         if unruled:
             raise ValueError(f"token fields {unruled} have no rule for a response's slots; "
                              "name one in `rules`")
@@ -695,6 +695,14 @@ RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
     "block_groups": _response_text,
 }
 """How each token field Dew's processors write continues into a response."""
+
+
+def unruled_fields(fields: Mapping[str, object],
+                   rules: Mapping[str, FieldExtension] | None = None) -> list[str]:
+    """The token fields with no rule for a response's slots, by name: neither in `RESPONSE_FIELDS` nor
+    in `rules`. A request's `Coordinates` continue by their own fields' rules (`_continued_layout`).
+    What every extension of a request (`ModelInputs.extended`, masked generation) admits."""
+    return sorted(set(fields) - set(RESPONSE_FIELDS) - set(rules or ()) - {COORDINATES_FIELD})
 
 
 def next_position(fields: Mapping[str, jax.Array], valid: jax.Array) -> jax.Array | None:
