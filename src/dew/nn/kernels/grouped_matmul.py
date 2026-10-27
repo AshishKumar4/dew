@@ -1101,9 +1101,9 @@ def _multiprocessors(target: generation.GpuTarget) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class GroupedCase:
-    """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run where
-    the call does (`placed`: a GPU's, or a CPU's interpreting them; the template's dispatch runs in the
-    branch its platform places), whether they see its operands whole (`whole`,
+    """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run on its
+    target (`placed`: a GPU of sm80 on, or a TPU; the template's dispatch runs in the branch its platform
+    places), whether they see its operands whole (`whole`,
     `dew.nn.sharding.seen_whole`), the `product` it declares, its `rows`, its launches bound to it
     (`call`) and the `kind` of call it is ('grouped forward', 'dense input_gradient', 'grouped
     kernel_gradient exact', as `gmm_call` and `tgmm_call` state it), which with the device's instruction
@@ -1125,9 +1125,7 @@ _Need = selection.Requirement[GroupedCase]
 """A requirement of a `GroupedCase`."""
 
 SUPPORTS = (
-    _Need('capability', lambda case: case.placed,
-          "the kernels need a GPU of sm80 or later, or a CPU interpreting them where the call asks",
-          row=INHERENT),
+    _Need('capability', lambda case: case.placed, "the kernels need a GPU of sm80 or later", row=INHERENT),
     _Need('placement', lambda case: case.whole,
           "a mesh axis splits the operands, or a shard_map that checks varying axes holds them, and the "
           "kernels see whole arrays", row='ledger 1306'),
@@ -1207,18 +1205,22 @@ alone (`DECLARED_ONLY`). Every implementation shares the template's signature, s
 own arguments, `_GMMS`' for a product, `_TGMMS`' for a kernel gradient."""
 
 
-def grouped_case(launches, arguments, options, *, product: Product, whole: bool,
-                 placed: bool = True) -> GroupedCase:
+def grouped_case(launches, arguments, options, *, product: Product, whole: bool) -> GroupedCase:
     """The `GroupedCase` of `launches` called with `arguments` and `options` (`gmm_call`, `tgmm_call`),
     its kind of call as they state it: a kernel gradient (exactly summed or not) from `tgmm_call`'s
-    launches, an input gradient or a forward from `gmm_call`'s, dense or grouped."""
+    launches, an input gradient or a forward from `gmm_call`'s, dense or grouped; and whether the kernels
+    run on its target (`placed`): a CUDA GPU's only from compute capability 8.0 (`generation.BF16_GPU`,
+    JAX's bound for its Pallas lowerings: a T4 fails to compile them), any other target's its own launches
+    judge."""
     if launches is _TGMMS:
         made = 'kernel_gradient exact' if options['exact_sums'] else 'kernel_gradient'
     else:
         made = 'input_gradient' if options['trans_rhs'] else 'forward'
     kind = f"{'dense' if options['dense'] else 'grouped'} {made}"
-    return GroupedCase(placed, whole, product, arguments[0].shape[0],
-                       base.call(launches, *arguments, **options), kind)
+    call = base.call(launches, *arguments, **options)
+    cuda = generation.capability(call.target.generation)
+    placed = cuda is None or cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
+    return GroupedCase(placed, whole, product, arguments[0].shape[0], call, kind)
 
 
 def launched(launches, arguments, options, *, product: Product, whole: bool):
