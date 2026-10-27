@@ -162,6 +162,7 @@ def compile_ahead(trainer: Trainer, batch: Batch) -> AheadOfTime:
         raise ValueError(f"XLA states no memory of the step it compiled for {generation}")
     return AheadOfTime(
         generation, len(devices), dict(trainer.device_mesh.shape), executable, (in_tree, out_tree),
-        flops=step_flops(compiled), argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
+        flops=step_flops(compiled),
+        argument_bytes=memory.argument_size_in_bytes, output_bytes=memory.output_size_in_bytes,
         alias_bytes=memory.alias_size_in_bytes, temp_bytes=memory.temp_size_in_bytes,
         code_bytes=memory.generated_code_size_in_bytes)
