@@ -83,11 +83,17 @@ def _device(generation: str) -> Mesh:
     return Mesh(np.array(topology.devices[:1]), ("data",))
 
 
+def refused(record: dict) -> bool:
+    """Whether a compiled record failed as a program: its error, or shared bytes past its block's limit
+    (a Triton kernel's, or XLA's refusal of a block, which a Mosaic GPU program states only then)."""
+    return "error" in record or ("shared" in record and record["shared"] > record["limit"])
+
+
 def failures(found: list[dict]) -> list[str]:
     """Each compiled record's failure, if any: its error, or its shared bytes past its block's limit."""
     return [f"{record['name']}: {record['error']}" if "error" in record else
             f"{record['name']}: {record['shared']} shared bytes, limit {record['limit']}"
-            for record in found if "error" in record or not record["shared"] <= record["limit"]]
+            for record in found if refused(record)]
 
 
 def compile_kernels(cases, generation: str) -> list[dict]:
@@ -97,38 +103,53 @@ def compile_kernels(cases, generation: str) -> list[dict]:
     kernels launch with (the most of any; those XLA refused, where it refused one), or the error.
 
     A cheap first filter: a kernel that does not compile or takes more shared memory than its GPU's
-    block holds fails here as it would there, before a GPU is paid for."""
-    mesh = _device(generation)
-    replicated = NamedSharding(mesh, PartitionSpec())
+    block holds fails here as it would there, before a GPU is paid for. A program whose thunk sequence
+    launches no Triton kernel fails too: nothing states its kernel's shared bytes."""
     found: list[dict] = []
     for case in cases:
         record: dict = {"name": case.name, "generation": generation,
-                        "limit": gpu_target(generation).shared_limit, "shared": 0}
+                        "limit": gpu_target(generation).shared_limit}
         found.append(record)
-        fn, args = case.call()
-        placed = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated)
-                              if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, args)
-        try:
-            with assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)):
-                lowered = jax.jit(fn).trace(*placed).lower()
-        except Exception as error:  # A case that does not lower is its own failure.
-            record["error"] = f"it does not lower: {str(error)[-800:]}"
+        sequences = _compiled(case, generation, record)
+        if sequences is None:
             continue
-        # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
-        # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
-        with tempfile.TemporaryDirectory(prefix="dew-compile-") as dump:
-            try:
-                lowered.compile(compiler_options={"xla_dump_to": dump})
-            except jax.errors.JaxRuntimeError as error:
-                refused = REFUSED.search(str(error))
-                if refused is None:
-                    record["error"] = f"XLA does not compile it: {str(error)[-800:]}"
-                else:
-                    record["shared"] = int(refused.group(1))
-                continue
-            sequences = [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")]
-        record["shared"] = max((int(size) for text in sequences for size in KERNEL.findall(text)), default=0)
+        launched = [int(size) for text in sequences for size in KERNEL.findall(text)]
+        if not launched:
+            # No launch line is no evidence the case's kernel compiled within its block (row 1381).
+            record["error"] = "XLA's thunk sequence launches no Triton kernel: none states its shared bytes"
+            continue
+        record["shared"] = max(launched)
     return found
+
+
+def _compiled(case, generation: str, record: dict) -> list[str] | None:
+    """`case` lowered as on the CUDA `generation` (`assumed`, `gpu_mesh`) and compiled by XLA for a
+    compile-only device of it: XLA's thunk sequences, or None, `record` holding why: the error, or the
+    shared bytes of a block XLA refused."""
+    mesh = _device(generation)
+    replicated = NamedSharding(mesh, PartitionSpec())
+    fn, args = case.call()
+    placed = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated)
+                          if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, args)
+    try:
+        with assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)):
+            lowered = jax.jit(fn).trace(*placed).lower()
+    except Exception as error:  # A case that does not lower is its own failure.
+        record["error"] = f"it does not lower: {str(error)[-800:]}"
+        return None
+    # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
+    # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
+    with tempfile.TemporaryDirectory(prefix="dew-compile-") as dump:
+        try:
+            lowered.compile(compiler_options={"xla_dump_to": dump})
+        except jax.errors.JaxRuntimeError as error:
+            refused = REFUSED.search(str(error))
+            if refused is None:
+                record["error"] = f"XLA does not compile it: {str(error)[-800:]}"
+            else:
+                record["shared"] = int(refused.group(1))
+            return None
+        return [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")]
 
 
 MOSAIC_DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
@@ -224,15 +245,17 @@ def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
 
 def compiled_apart() -> list[dict]:
     """The records the calling test's `compile_mosaic_kernels` call gives in a pytest process of its own, its
-    first Mosaic GPU compile its generation's."""
+    first Mosaic GPU compile its generation's: read only from a process that passed, as its records are
+    written before its test's own checks and teardown, which a nonzero exit says failed (row 1877)."""
     test = os.environ["PYTEST_CURRENT_TEST"].rsplit(" ", 1)[0]
     with tempfile.TemporaryDirectory(prefix="dew-mosaic-apart-") as directory:
         records = Path(directory) / "records.json"
         ran = subprocess.run([sys.executable, "-m", "pytest", test, "-q", "-p", "no:cacheprovider"],
                              cwd=Path(__file__).parent.parent, env={**os.environ, OWN_PROCESS: str(records)},
                              capture_output=True, text=True, check=False)
-        if not records.exists():
-            raise RuntimeError(f"{test} gave no records in a process of its own:\n"
+        if ran.returncode != 0 or not records.exists():
+            raise RuntimeError(f"{test} in a process of its own exited {ran.returncode}"
+                               f"{'' if records.exists() else ', its records unwritten'}:\n"
                                f"{(ran.stdout + ran.stderr)[-3000:]}")
         return json.loads(records.read_text())
 
@@ -241,8 +264,12 @@ def _compiled_here(cases, generation: str) -> list[dict]:
     """`compile_mosaic_kernels`' records, compiled in this process."""
     found: list[dict] = []
     for case in cases:
+        # The program's own record (its error, or XLA's refusal of its block), its Mosaic kernels' reports the
+        # evidence of their resources: a Triton launch line is none of theirs.
+        record: dict = {"name": case.name, "generation": generation,
+                        "limit": gpu_target(generation).shared_limit}
         with tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory, mosaic_dumps(directory):
-            [record] = compile_kernels([case], generation)
+            _compiled(case, generation, record)
             record["kernels"] = mosaic_kernels(directory)
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         found.append(record)
@@ -256,7 +283,7 @@ def mosaic_failures(found: list[dict]) -> list[str]:
     spilling registers."""
     failed = failures(found)
     for record in found:
-        if "error" in record or not record["shared"] <= record["limit"]:
+        if refused(record):
             continue
         if not record["kernels"]:
             failed.append(f"{record['name']}: no Mosaic GPU kernel compiled")
