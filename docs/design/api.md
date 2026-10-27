@@ -154,7 +154,7 @@ state = trainer.fit(data, steps=100_000, log_every=100, eval_every=2_000,
                     checkpoint_every=5_000, metrics=(metrics["fid"](), metrics["clip_score"]()))
 ```
 
-The trainer keeps what `CONTRIBUTING.md:9` gives it: mesh, compiled step, EMA, checkpoints, logging. The compiled step is `objective_trainer.py:237-299` with `Step` in place of positional `ema_params` and `rng`, plus the `Aux.variables` write-back. `fit` is step-based; `steps = data.epoch_steps(epochs)` is a recipe's line, counting the step an epoch's short last batch takes where its order reads on (`Loader.tail`). Publishing becomes `dew.io.publish(checkpoints.latest(), ...)`, called by a recipe after `fit`. Validation exceptions propagate (fixed in `6b747dc`).
+The trainer keeps what `CONTRIBUTING.md:9` gives it: mesh, compiled step, EMA, checkpoints, logging. The compiled step is `objective_trainer.py:237-299` with `Step` in place of positional `ema_params` and `rng`, plus the `Aux.variables` write-back. `fit` is step-based; `steps = data.epoch_steps(epochs)` is a recipe's line, counting the step an epoch's short last batch takes where its order reads on (`Loader.tail`). Publishing becomes `dew.io.publish(checkpoints.latest(), ...)`, called by a recipe after `fit`; `dew.io.promote` publishes only a run that ranks among its sweep's or project's best by a summary metric, and `dew.pipeline("wandb:...")` loads a published run back from a W&B run or the registry. Validation exceptions propagate (fixed in `6b747dc`).
 
 ```python
 class Tracker(Protocol):

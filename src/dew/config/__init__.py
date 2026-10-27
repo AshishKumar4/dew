@@ -57,6 +57,7 @@ from dew.data.pipeline import Dataset, ObjectiveData
 from dew.distributed.placement import Layout, MeshSpec
 from dew.files import write_atomically
 from dew.inputs import Field
+from dew.io import Promotion
 from dew.lora import LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import OptimConfig
@@ -464,6 +465,10 @@ class TrainerConfig:
     """
     publish: bool = False
     """Publish the final checkpoint to W&B; requires `wandb` and `checkpoint_final`."""
+    promote: Promotion | None = None
+    """Publish the final checkpoint to W&B only where the run ranks among its sweep's or project's best by
+    a summary metric, "best" in the registry where it ranks first (`dew.io.promote`); requires `wandb` and
+    `checkpoint_final`, and takes the place of `publish`."""
     multi_host: bool | None = None
     """Whether to join the JAX process pool.
 
@@ -525,8 +530,12 @@ class TrainerConfig:
             raise ValueError("--trainer.batch-ramp grows row batches and cannot use a token budget")
         if self.split is not None and self.split < 1:
             raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
-        if self.publish and (self.wandb is None or not self.checkpoint_final):
-            raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
+        if (self.publish or self.promote is not None) and (self.wandb is None or not self.checkpoint_final):
+            raise ValueError("trainer.publish and trainer.promote require trainer.wandb and "
+                             "trainer.checkpoint_final")
+        if self.publish and self.promote is not None:
+            raise ValueError("trainer.promote publishes where the run ranks; trainer.publish always does: "
+                             "set one")
         run_length(self.steps, self.epochs, self.tokens, self.examples, required=False)
         if isinstance(self.log_every, str) and not is_share(self.log_every):
             raise ValueError(f"--trainer.log-every is steps or a share such as 1%, not {self.log_every!r}")
@@ -1417,11 +1426,15 @@ class RunConfig:
             if after is not None:
                 after(state, checkpoints.directory)
             def publish_checkpoint() -> None:
-                """Upload the checkpoint the run ended on, where a tracker takes one."""
+                """Upload the checkpoint the run ended on, where a tracker takes one: always under
+                `publish`, where the run ranks under `promote`."""
+                # fit wrote the step it ended on, so that checkpoint is the run's.
+                step = checkpoints.path(int(state.step))
                 if trainer.publish and wandb_tracker is not None:
-                    # fit wrote the step it ended on, so that checkpoint is the run's.
-                    dew.io.publish(checkpoints.path(int(state.step)), _artifact_name(name),
-                                   tracker=wandb_tracker)
+                    dew.io.publish(step, _artifact_name(name), tracker=wandb_tracker)
+                if trainer.promote is not None and wandb_tracker is not None:
+                    dew.io.promote(step, _artifact_name(name), tracker=wandb_tracker,
+                                   **dataclasses.asdict(trainer.promote))
 
             agreed("checkpoint publishing", publish_checkpoint)
             return state
