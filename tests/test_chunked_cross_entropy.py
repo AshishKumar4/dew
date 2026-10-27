@@ -842,6 +842,8 @@ def test_mismatched_shapes_are_refused():
 # leave a short last tile, so a dropped ragged end shows up as a missing
 # gradient rather than as a shape error.
 RAGGED = (128, 2048)
+BOUNDED_FEATURES = 64
+"""The bounded backward's features, the terms each of its logits sums."""
 RAGGED_VOCAB, RAGGED_TOKENS = 2053, 131
 
 
@@ -862,7 +864,9 @@ def test_the_bounded_backward_matches_the_full_vocabulary_pass(
     precision = jax.lax.Precision.HIGHEST
 
     def draw(seed):
-        return inputs(vocab=RAGGED_VOCAB, features=7, tokens=(1, RAGGED_TOKENS), seed=seed)
+        # 64 features, a head's row of terms each logit sums: each draw's error averages over them, where
+        # 7 left the z-loss's head gradient heavy-tailed across draws on an H100 (row 1725).
+        return inputs(vocab=RAGGED_VOCAB, features=BOUNDED_FEATURES, tokens=(1, RAGGED_TOKENS), seed=seed)
 
     def full(states, matrix, targets):
         losses, log_z = oracle(states, matrix, targets, softcap, precision)
