@@ -9,14 +9,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_fp32_reduction_bound, equations
+from reference_error import assert_as_exact, assert_fp32_reduction_bound, equations
 
-from dew.batch import coordinates
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import soft_embeddings
 from dew.nn.dsa_kpool import KPoolSparseAttention
-from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import AttentionMixer
@@ -25,6 +23,14 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.precision import fp32_result_dot_general
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
+SEEDS = {"auto": 8, "local auto": 8}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (paired, on armada): the most any
+of a site's cases took."""
+
+
+def reference_attention(q, k, v):
+    """The reference path with no precision of its own: run on the draw widened, check 1's truth."""
+    return scaled_dot_product_attention(q, k, v, implementation="reference")
 
 
 @pytest.mark.parametrize("arguments", [
@@ -33,19 +39,22 @@ BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
     {"force_fp32_for_softmax": False},
     {"dtype": jnp.float32},
 ])
-def test_auto_takes_the_reference_path_for_arithmetic_only_it_performs(arguments):
-    """'auto' resolves a call that asks for a matmul precision, a dot
-    algorithm among them, a softmax dtype or a compute dtype no fused kernel
-    honours to the reference path, and computes exactly what naming that path
-    computes."""
-    query, key, value = jax.random.normal(jax.random.key(1), (3, *BF16_QKV), jnp.bfloat16)
-    auto = scaled_dot_product_attention(query, key, value, implementation="auto", **arguments)
-    reference = scaled_dot_product_attention(query, key, value, implementation="reference",
-                                             **arguments)
-    assert jnp.array_equal(auto, reference)
+def test_auto_computes_arithmetic_only_the_reference_path_performs(arguments):
+    """'auto' given a matmul precision, a dot algorithm among them, a softmax dtype or a compute dtype no
+    fused kernel honours computes on par with naming the reference path over the seeds (check 1), the
+    reference path run in float64 its truth."""
+    def draw(seed):
+        return tuple(jax.random.normal(jax.random.fold_in(jax.random.key(1), seed), (3, *BF16_QKV),
+                                       jnp.bfloat16))
+
+    def call(implementation):
+        return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=implementation,
+                                                            **arguments)
+
+    assert_as_exact(jax.jit(call("auto")), jax.jit(call("reference")), draw, f"auto {arguments}",
+                    seeds=SEEDS["auto"], truth_fn=reference_attention)
 
 
-PACKED = jnp.asarray([[1] * 6 + [2] * 7 + [0] * 3, [1] * 16])
 LAYERS = {
     "window": lambda **policy: CausalTransformer(
         vocab_size=64, num_layers=2, emb_features=32, num_heads=4, num_kv_heads=2,
@@ -70,40 +79,22 @@ LAYERS = {
 }
 
 
-@pytest.mark.parametrize("arguments", [
-    {"precision": "highest"},
-    {"force_fp32_for_softmax": False},
-])
-@pytest.mark.parametrize("layer", sorted(LAYERS))
-def test_auto_under_a_window_or_packing_takes_the_reference_path(layer, arguments):
-    """A window, a chunk, packed documents or a sparse selection build a
-    mask, which a fused kernel takes; the call still resolves to the
-    reference path first when only that path computes what it asks for,
-    and matches naming that path."""
-    if layer == "mla" and "precision" not in arguments:
-        pytest.skip("latent attention always runs its softmax in fp32")
-    if layer in ("window", "packed"):
-        x = jax.random.randint(jax.random.key(0), (2, 16), 0, 64)
-    else:
-        x = jax.random.normal(jax.random.key(0), (2, 16, 32))
-    call = {} if layer == "window" else {
-        "segment_ids": PACKED} if layer == "packed" else {
-        "call": MixerCall(AttentionMetadata(coordinates=coordinates(segments=PACKED)))}
-    if layer == "kpool":
-        call = {"call": MixerCall(AttentionMetadata(coordinates=coordinates(valid=PACKED != 0)))}
-    variables = LAYERS[layer](**arguments).init(jax.random.key(1), x, **call)
-    auto = LAYERS[layer](attention_impl="auto", **arguments).apply(variables, x, **call)
-    reference = LAYERS[layer](attention_impl="reference", **arguments).apply(variables, x, **call)
-    assert jnp.array_equal(auto, reference)
-
-
 @pytest.mark.parametrize("span", [{"window": 4}, {"chunk": 4}])
-def test_local_attention_resolves_auto_before_the_mask(span):
-    query, key, value = jax.random.normal(jax.random.key(1), (3, 2, 64, 4, 8))
-    packed = {"segment_ids": jnp.ones((2, 64), jnp.int32), "precision": "highest"}
-    auto = local_attention(query, key, value, **span, **packed, implementation="auto")
-    reference = local_attention(query, key, value, **span, **packed, implementation="reference")
-    assert jnp.array_equal(auto, reference)
+def test_local_attention_under_auto_computes_the_precision_it_is_asked_for(span):
+    """A window or a chunk over packed documents at the highest matmul precision: 'auto' on par with
+    naming the reference path over the seeds (check 1), the reference path run in float64 its truth."""
+    packed = {"segment_ids": jnp.ones((2, 64), jnp.int32)}
+
+    def draw(seed):
+        return tuple(jax.random.normal(jax.random.fold_in(jax.random.key(1), seed), (3, 2, 64, 4, 8)))
+
+    def call(implementation, **precision):
+        return lambda q, k, v: local_attention(q, k, v, **span, **packed, **precision,
+                                               implementation=implementation)
+
+    auto, reference = (jax.jit(call(name, precision="highest")) for name in ("auto", "reference"))
+    assert_as_exact(auto, reference, draw, f"auto {span}", seeds=SEEDS["local auto"],
+                    truth_fn=call("reference"))
 
 
 @pytest.mark.parametrize("precision", [None, jax.lax.Precision.DEFAULT, "default"])

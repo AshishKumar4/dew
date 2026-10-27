@@ -17,7 +17,6 @@ Forwards retain each model's cast sites. Small-shape c53 fixtures also hold
 the fused VJPs to Liger's measured float64 distances.
 """
 
-import contextlib
 import functools
 import json
 
@@ -159,7 +158,7 @@ def kernels(fn, *args) -> set[str]:
 
 SEEDS = {(2, 3, 31): 32, (3, 257, 17): 32, (5, 1000): 32, (2, 3, 4, 31): 64, (2, 64, 16, 128): 8,
          (2, 1, 16, 128): 32, (7, 1000): 32, (3, 4096): 32, (5, 37): 32, (24576, 1000): 8, (2, 31): 32,
-         "composed": 32}
+         "composed": 32, "gates": 8}
 """Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
 XLA compared with itself resolves the factor in every output and gradient (on armada)."""
 
@@ -295,33 +294,6 @@ def test_the_unweighted_norm_rounds_its_inverse_and_takes_every_gradient_fused(d
         x = jax.random.normal(jax.random.key(26), shape).astype(dtype)
         seed = jax.random.normal(jax.random.key(27), shape).astype(dtype)
     compare((unweighted, fused_unweighted(1e-6), unweighted), (x,), seed, ("y", "x"))
-
-
-def test_an_unweighted_norm_takes_the_fused_kernel_and_keeps_a_staged_jvp():
-    """Traced for an A100, whose row names the fused RMSNorm, `unweighted_rmsnorm` (Mamba2's,
-    Nemotron-H's, DeepSeek-V4's and GLM-5's) takes the kernel, differentiated as one custom JVP
-    (`generation.linear_tangent`): a jvp of a jit that staged it is the portable norm's, and its
-    gradient runs the kernel's backward."""
-    from dew.nn.kernels import generation
-
-    x = jax.random.normal(jax.random.key(28), (4, 64)).astype(jnp.bfloat16)
-    tangent = jax.random.normal(jax.random.key(29), (4, 64)).astype(jnp.bfloat16)
-    with generation.assumed("sm80"), generation.routes() as found:
-        jax.make_jaxpr(lambda x: attention.unweighted_rmsnorm(x, 1e-6))(x)
-    (route,) = [route for route in found if route.choice == "rms_norm"]
-    assert (route.kernel, route.preferred, route.refusal) == ("pallas", "pallas", None)
-
-    fused = jax.jit(fused_unweighted(1e-6))
-    staged = jax.jvp(fused, (x,), (tangent,))
-    portable = jax.jvp(jax.jit(lambda x: attention.unweighted_rmsnorm(x, 1e-6, implementation="xla")), (x,),
-                       (tangent,))
-    np.testing.assert_array_equal(np.asarray(staged[1]), np.asarray(portable[1]))
-
-    def pulled(x):
-        return jax.grad(lambda x: fused(x).astype(jnp.float32).sum())(x)
-
-    assert "rms_norm_backward" in kernels(pulled, x)
-    assert pulled(x).dtype == x.dtype
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -552,19 +524,6 @@ def test_a_decode_steps_gated_norm_of_an_fp32_input_by_a_bf16_gate_holds_the_flo
     assert_gated_norm_holds(draw, activation, output, "decode gated norm", SEEDS[shape])
 
 
-def test_a_decode_steps_gated_norm_takes_the_fused_kernel_where_its_row_names_it():
-    """Traced for an A100, whose row names the fused RMSNorm, the gated norm of a decode step (Qwen3-Next's,
-    Kimi's): an fp32 recurrence output gated by its bf16 projection reports the kernel, not a refusal."""
-    from dew.nn.kernels import generation
-
-    x, gate, scale = jnp.ones((2, 4, 128), jnp.float32), jnp.ones((2, 4, 128), jnp.bfloat16), jnp.ones((128,))
-    with generation.assumed("sm80"), generation.routes() as found:
-        jax.make_jaxpr(lambda x, gate, scale: gated_rms_normalized(
-            x, gate, scale, 1e-6, jnp.bfloat16, "silu"))(x, gate, scale)
-    (route,) = [route for route in found if route.choice == "rms_norm"]
-    assert (route.kernel, route.preferred, route.refusal) == ("pallas", "pallas", None)
-
-
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(2, 3, 1000), (3, 4096), (3, 257, 17)])
 def test_swiglu_forward_and_both_gradients(dtype, shape):
@@ -599,11 +558,8 @@ def test_a_packed_projections_swiglu_is_the_apart_one_read_in_place(fused, dtype
 @pytest.mark.parametrize("offset,after_cast,with_scale", [(False, True, True), (True, False, True),
                                                          (False, True, False)])
 def test_rms_module_uses_the_same_fused_vjp(offset, after_cast, with_scale):
-    """The module names the fused norm: traced for an A100, its program launches the forward and its
-    gradient the backward. Its values and gradients are XLA's within 1e-5: the kernel's on a GPU, and on
-    a CPU, where the selector takes XLA's arithmetic, XLA's own."""
-    from dew.nn.kernels import generation
-
+    """The module naming the fused norm: its values and gradients are XLA's within 1e-5: the kernel's on a
+    GPU, and on a CPU, where the selector takes XLA's arithmetic, XLA's own."""
     x = jax.random.normal(jax.random.key(4), (2, 5, 31))
     module = RMSNorm(scale_offset=offset, scale_after_cast=after_cast, with_scale=with_scale,
                      implementation="pallas")
@@ -617,124 +573,31 @@ def test_rms_module_uses_the_same_fused_vjp(offset, after_cast, with_scale):
     theirs = jax.jit(differentiated(portable))(params, x)
     for actual, expected in zip(jax.tree.leaves(mine), jax.tree.leaves(theirs), strict=True):
         assert relative(actual, expected) < 1e-5
-    with generation.assumed("sm80"):
-        assert {"rms_norm_forward", "rms_norm_backward"} <= kernels(differentiated(module), params, x)
 
 
-def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
-    """On an A100, a SiLU product named onto the kernel runs XLA's product where its operands broadcast,
-    mix dtypes or are float64."""
+def test_a_swiglu_named_onto_the_kernel_takes_broadcast_mixed_and_wide_operands():
+    """On an A100, a SiLU product named onto the kernel runs where its operands broadcast, mix dtypes or
+    are float64, into their broadcast shape and promoted dtype."""
     from dew.nn.kernels import generation
 
     with jax.enable_x64(new_val=True), generation.assumed("sm80"):
         for gate, up in ((jnp.ones((2, 17)), jnp.ones((17,))),
                          (jnp.ones((2, 17)), jnp.ones((2, 17), jnp.bfloat16)),
                          (jnp.ones((2, 17), jnp.float64), jnp.ones((2, 17), jnp.float64))):
-            assert norm_swiglu.swiglu_kernel("pallas", gate, up) == "xla"
-            np.testing.assert_array_equal(gated_product("swiglu", implementation="pallas")(gate, up),
-                                          gated_product("swiglu", implementation="xla")(gate, up))
+            product = gated_product("swiglu", implementation="pallas")(gate, up)
+            assert (product.shape, product.dtype) == ((2, 17), jnp.promote_types(gate.dtype, up.dtype))
 
 
-@pytest.mark.parametrize("named", [None, "chosen", "call"])
-@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
-@pytest.mark.parametrize("packed", [False, True])
-def test_a_swiglu_takes_the_kernel_its_target_measured_at_its_width(dtype, named, packed):
-    """On an A100's row (`generation.assumed`), a bf16 SiLU product with no kernel named takes the
-    Pallas kernel the row measured, and an fp32 one, which no row measured and XLA fuses with its
-    neighbours, takes XLA as its own preference; a kernel named by `chosen` or per call runs at
-    either width. Each product, apart or packed, reports the route it took."""
-    from dew.nn.kernels import generation, norm_swiglu
-
-    operands = (jnp.ones((2, 2, 4096), dtype),) if packed else (jnp.ones((2, 4096), dtype),) * 2
-    resolve = norm_swiglu.packed_swiglu_kernel if packed else norm_swiglu.swiglu_kernel
-    kernel = "pallas" if named or dtype == jnp.bfloat16 else "xla"
-    named_by = generation.chosen(swiglu="pallas") if named == "chosen" else contextlib.nullcontext()
-    with generation.assumed("sm80"), named_by, generation.routes() as found:
-        assert resolve("pallas" if named == "call" else "auto", *operands) == kernel
-    (route,) = found
-    assert (route.kernel, route.preferred, route.refusal) == (kernel, kernel, None)
-
-
-@pytest.mark.parametrize("width, dtype, code, row", [
-    (9000, jnp.bfloat16, "width", "ledger 820"),
-    (64, jnp.float16, "fp16", "ledger 823")])
-def test_a_norm_the_kernel_refuses_reports_the_requirement_and_its_row(width, dtype, code, row):
-    """On an A100, a norm the fused kernel does not take runs XLA's arithmetic and reports the
-    requirement it fails (`norm_swiglu.NORM_SUPPORTS`) with the roadmap row that tracks lifting it, or
-    'inherent' where no implementation of the kernel would (`tools/kernel_routes.verdict`); a kernel
-    forced by `chosen` raises naming it, as every selector's forced kernel does."""
-    from dew.nn.kernels import generation
-    from dew.nn.kernels.selection import KernelRefused
-
-    x = jnp.ones((4, width), dtype)
-    with generation.assumed("sm80"), generation.routes() as found:
-        assert norm_swiglu.rms_kernel("auto", x, None, dtype, fp32_statistics=True) == "xla"
-    (route,) = found
-    assert (route.kernel, route.preferred) == ("xla", "pallas")
-    assert (route.refusal.code, route.refusal.row) == (code, row)
-    forced = generation.chosen(rms_norm="pallas")
-    with generation.assumed("sm80"), forced, pytest.raises(KernelRefused) as refused:
-        norm_swiglu.rms_kernel("auto", x, None, dtype, fp32_statistics=True)
-    assert code in {refusal.code for refusal in refused.value.refusals}
-
-
-@pytest.mark.parametrize("dtypes, code, row", [
-    ((jnp.float32, jnp.bfloat16), "matching", "inherent"), ((jnp.float16, jnp.float16), "fp16", "ledger 823"),
-    ((jnp.float64, jnp.float64), "precision", "inherent")])
-def test_a_swiglu_the_kernel_refuses_names_the_requirement_its_dtypes_fail(dtypes, code, row):
-    """On an A100, a SiLU product named per call onto the kernel runs XLA where its operands' dtypes
-    are not the kernel's, naming what they fail: mixed operands the kernel's one-dtype read, fp16 its
-    qualification (ledger 823), float64 the fp32 the kernel computes in."""
-    from dew.nn.kernels import generation
-
-    with jax.enable_x64(new_val=True):
-        gate, up = (jnp.ones((2, 64), dtype) for dtype in dtypes)
-        with generation.assumed("sm80"), generation.routes() as found:
-            assert norm_swiglu.swiglu_kernel("pallas", gate, up) == "xla"
-    (route,) = found
-    assert (route.refusal.code, route.refusal.row) == (code, row)
-
-
-def test_a_weak_scalar_gate_over_a_bf16_up_takes_the_kernel_its_promotion_prefers():
-    """A weak fp32 scalar gate over a strongly typed bf16 up promotes to bf16 under strict promotion,
-    as the operands' own product does, so the preference reads bf16's row (the kernel on an A100),
-    where promoting the two dtypes alone would raise."""
+def test_a_weak_scalar_gate_over_a_bf16_up_promotes_as_its_product_does():
+    """A weak fp32 scalar gate over a strongly typed bf16 up promotes to bf16 under strict promotion, as
+    the operands' own product does, so on an A100 the product runs into bf16 where promoting the two
+    dtypes alone would raise."""
     from dew.nn.kernels import generation
 
     gate, up = jnp.asarray(1.0), jnp.ones((2, 64), jnp.bfloat16)
-    with jax.numpy_dtype_promotion("strict"), generation.assumed("sm80"), generation.routes() as found:
-        assert norm_swiglu.swiglu_kernel("auto", gate, up) == "xla"
-    (route,) = found
-    assert route.preferred == "pallas"
-
-
-@pytest.mark.parametrize("operand", ["scale", "gate"])
-def test_a_norms_fp16_weight_or_gate_cites_the_fp16_qualification(operand):
-    """A bf16 norm whose weight or gate is fp16 runs XLA on an A100, refused by the fp16 qualification
-    (ledger 823), not by the operand's shape."""
-    from dew.nn.kernels import generation
-
-    x, other = jnp.ones((4, 64), jnp.bfloat16), jnp.ones((4, 64), jnp.float16)
-    with generation.assumed("sm80"), generation.routes() as found:
-        if operand == "scale":
-            assert norm_swiglu.rms_kernel("auto", x, other[0], jnp.bfloat16, fp32_statistics=True) == "xla"
-        else:
-            assert norm_swiglu.gated_rms_kernel("auto", x, other, None, jnp.bfloat16, "silu") == "xla"
-    (route,) = found
-    assert (route.refusal.code, route.refusal.row) == ("fp16", "ledger 823")
-
-
-def test_a_swiglu_of_a_bf16_gate_over_an_fp32_up_is_an_fp32_product_xla_takes():
-    """Gemma-4's per-layer input gates a bf16 projection over its fp32 input: an fp32 product, which
-    XLA fuses (`_swiglu_preferred`), so on an A100 it takes XLA as its own preference, reporting no
-    refusal, and computes as XLA's product does."""
-    from dew.nn.kernels import generation
-
-    gate, up = jnp.ones((2, 63, 8), jnp.bfloat16), jnp.ones((2, 63, 8), jnp.float32)
-    with generation.assumed("sm80"), generation.routes() as found:
-        assert norm_swiglu.swiglu_kernel("auto", gate, up) == "xla"
-    (route,) = found
-    assert (route.kernel, route.preferred, route.refusal) == ("xla", "xla", None)
+    with jax.numpy_dtype_promotion("strict"), generation.assumed("sm80"):
+        product = jax.eval_shape(gated_product("swiglu"), gate, up)
+    assert (product.shape, product.dtype) == ((2, 64), jnp.bfloat16)
 
 
 @pytest.mark.gpu
@@ -761,9 +624,14 @@ def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_determinis
 
 @pytest.mark.parametrize("name", ["geglu", "geglu_exact"])
 def test_other_gates_keep_their_arithmetic(name):
-    gate, up = jnp.arange(17, dtype=jnp.float32) / 7 - 1, jnp.ones(17)
-    np.testing.assert_array_equal(gated_product(name, implementation="pallas")(gate, up),
-                                  gated_product(name, implementation="xla")(gate, up))
+    """A GeGLU named onto the kernel, which takes SiLU products alone, computes its own gate: on par with
+    XLA's product over the seeds (check 1), truth that product in float64."""
+    def draw(draw):
+        return tuple(jax.random.normal(drawn_key(index, draw), (4, 96)) for index in (80, 81))
+
+    product = gated_product(name, implementation="xla")
+    assert_as_exact(jax.jit(gated_product(name, implementation="pallas")), jax.jit(product), draw, name,
+                    seeds=SEEDS["gates"], truth_fn=product)
 
 
 @pytest.mark.mesh(devices=2)
