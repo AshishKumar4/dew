@@ -360,6 +360,21 @@ class LazyTensors(Mapping[str, np.ndarray]):
         return len(self.specs)
 
 
+class PayloadUnread(LookupError):
+    """A tensor's values were asked of a load that reads none (`Pretrained.load(weights=False)`), which
+    holds each stored tensor's shape and dtype alone: whatever asked computes on values it was not
+    given, and reads the shapes instead (`tensor_specs`)."""
+
+
+def unread(specs: Mapping[str, jax.ShapeDtypeStruct]) -> LazyTensors:
+    """`specs`' tensors as a load without its weights holds them: their shapes and dtypes, and no value,
+    reading one raising `PayloadUnread`."""
+    def refuse(name: str) -> np.ndarray:
+        raise PayloadUnread(f"{name}: a load without its weights reads no tensor's values, its shape and "
+                            f"dtype alone ({specs[name].shape} {specs[name].dtype})")
+    return LazyTensors(specs, refuse)
+
+
 def tensor_specs(tensors: Mapping[str, np.ndarray]) -> Mapping[str, jax.ShapeDtypeStruct]:
     """Stored shape and dtype metadata without reading deferred tensor values."""
     return (tensors.specs if isinstance(tensors, LazyTensors)

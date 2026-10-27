@@ -421,9 +421,10 @@ def test_a_runs_base_loads_without_its_weights_under_the_runs_source_options():
 
 @pytest.mark.parametrize("name", ["hf/gpt2-tiny", "codecs/modelopt/tiny", "codecs/nvfp4_qdq/e4m3"])
 def test_a_load_without_its_weights_builds_what_a_load_with_them_builds(name):
-    """A checkpoint loaded without its weights is the model a load with them builds, its variables the
-    same shapes and dtypes: GPT-2's legacy causal buffers and a quantized release's scales are read as
-    stored, which the load checks and decodes from (ledger 1918)."""
+    """A checkpoint loaded without its weights is the source a load with them reads, its config and
+    model the same, its variables the same shapes and dtypes, from the stored tensors' shapes alone:
+    no reader decodes a value it was not given (GPT-2's legacy causal buffers, a quantized release's
+    weights and scales), as none is read (ledger 1918, 1904)."""
     import jax
 
     from dew.interop import Pretrained
@@ -431,6 +432,7 @@ def test_a_load_without_its_weights_builds_what_a_load_with_them_builds(name):
     directory = Path(__file__).resolve().parent / "fixtures" / name
     shapes = Pretrained.load(directory, dtype="float32", weights=False)
     loaded = Pretrained.load(directory, dtype="float32")
-    assert shapes.model == loaded.model
+    # The model's printed fields, which hold a quantized release's scales as arrays that compare by value.
+    assert shapes.config == loaded.config and repr(shapes.model) == repr(loaded.model)
     assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables) == jax.tree.map(
         lambda leaf: (leaf.shape, leaf.dtype), loaded.variables)
