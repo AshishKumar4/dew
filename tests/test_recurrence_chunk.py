@@ -464,3 +464,37 @@ def test_the_portable_rule_recomputes_its_memory_where_the_rung_names_it(packed)
     again = jax.jit(jax.grad(recomputed, argnums=range(5)))(*operands)
     for want, got in zip(kept, again, strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+@pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
+def test_the_portable_rule_takes_forward_mode_at_its_public_seam(packed):
+    """`chunk_delta_rule` (a CPU's route, the portable math) under a plain `jax.jvp` and `jax.linearize`,
+    with no forward-mode context: their tangents the chunked math's own, the forward mode of the same
+    computation, bit for bit, and its gradient still its reverse rule's (`_chunk_delta_backward`), the
+    custom VJP's that refused a plain `jax.jvp` before (row 1834)."""
+    keys = jax.random.split(jax.random.key(11), 7)
+    rows, length, heads, width = 1, 37, 2, 8
+    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) for k in keys[:3])
+    g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
+    starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
+    operands = (query, key, value, g, beta)
+    directions = tuple(jax.random.normal(keys[6], x.shape) for x in operands)
+
+    def rule(*operands):
+        return recurrence_chunk.chunk_delta_rule(*operands, chunk_size=CHUNK, starts=starts)
+
+    def math(*operands):
+        state, delta = jnp.zeros((rows, heads, width, width)), True
+        return recurrence_chunk._chunk_delta_rule(*operands, state, CHUNK, starts, delta, width ** -0.5,
+                                                  jnp.dtype(jnp.float32))
+
+    found = jax.jit(lambda *a: jax.jvp(rule, a, directions))(*operands)
+    want = jax.jit(lambda *a: jax.jvp(math, a, directions))(*operands)
+    jax.tree.map(np.testing.assert_array_equal, found, want)
+    linearized = jax.jit(lambda *a: jax.linearize(rule, *a)[1](*directions))(*operands)
+    jax.tree.map(np.testing.assert_array_equal, linearized, want[1])
+    cotangent = jax.tree.map(jnp.ones_like, found[0])
+    gradient = jax.grad(lambda *a: sum(jnp.vdot(x, c) for x, c in zip(rule(*a), cotangent, strict=True)),
+                        argnums=range(5))(*operands)
+    assert all(bool(jnp.all(jnp.isfinite(x))) for x in gradient)
