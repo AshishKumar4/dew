@@ -1167,12 +1167,12 @@ DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
     ('mma.sync', 'dense kernel_gradient'):
         ('xla', "DENSE1 (A100, one program a multiprocessor): Mosaic 1.964x, Triton 1.735x XLA's dot"),
     ('wgmma', 'grouped forward'):
-        ('cutlass', "ALIGNED-route-h100 (ff53d3f39, H100 PCIe, each group's tiles at its first row): the "
-                    "template 1.049x CUTLASS's time, geomean of 7 grouped MoE rows (worst 1.23x, kimi-linear "
-                    "gate_up; R7B's 1.146x before)"),
+        ('cutlass', "PAIR1-h100 (c771912a6, H100 SXM, a pair of multiprocessors a cluster multicasting each "
+                    "group's matrix): the template 1.019x CUTLASS's time, geomean of 7 grouped MoE rows "
+                    "(worst 1.18x, deepseek-v3 down; 0.951x its unpaired time)"),
     ('wgmma', 'grouped input_gradient'):
-        ('cutlass', "ALIGNED-route-h100: 1.119x CUTLASS's time, geomean of 7 grouped rows (worst 1.33x; "
-                    "R7B's 1.237x before)"),
+        ('cutlass', "PAIR1-h100: 1.018x CUTLASS's time, geomean of 7 grouped rows (worst 1.05x; 0.918x "
+                    "its unpaired time)"),
     ('wgmma', 'dense forward'):
         ('xla', "DENSE1 (H100, 2d1bbd051): Mosaic 1.067x and Triton 1.616x XLA's dot (cuBLAS), geomean of "
                 "10 projections at 8192 tokens"),
