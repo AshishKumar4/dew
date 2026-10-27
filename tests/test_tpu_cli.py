@@ -651,7 +651,8 @@ def test_setup_from_source_syncs_installs_and_checks_every_workers_devices(fake,
     assert [call[4:6] for call in only(fake.gcloud_calls(), "scp")] == [
         [str(config_dir() / "setup-slice.sh"), "you@slice:~/dew-setup.sh"]]
     ran = commands(fake, "ssh")
-    assert ran.count("bash ~/dew-setup.sh") == 2 and sum("jax.device_count" in command for command in ran) == 2
+    assert ran.count("bash ~/dew-setup.sh") == 2
+    assert sum("jax.device_count" in command for command in ran) == 2
     fake.offer("slice", "us-central2-b", devices="8 8")
     assert run("setup", "slice") == 1
 
@@ -660,11 +661,10 @@ def test_train_syncs_starts_the_recipe_on_every_worker_and_follows_worker_zero(f
     fake.offer("slice", "us-central2-b")
     assert run("train", "slice", "--job", "j1", "--", "recipes/lm/train.py", "--steps", "3") == 0
     ran = commands(fake, "ssh")
-    started = [command for command in ran if "nohup" in command]
-    assert len(started) == 2
-    assert all("cd ~/tree && python recipes/lm/train.py --steps 3 --trainer.multi-host True" in command
-               for command in started)
-    assert ran[-1].startswith("tail -f -n 200 ") and ran[-1].endswith("j1/worker-0.log")
+    recipe = "python recipes/lm/train.py --steps 3 --trainer.multi-host True"
+    assert [command for command in ran if "nohup" in command] == [
+        tpu_setup.detached(recipe, "j1", index, home_dir="tree") for index in (0, 1)]
+    assert ran[-1] == tpu_setup.tail("j1", 0, follow=True)
     with pytest.raises(SystemExit):
         run("train", "slice")
 
