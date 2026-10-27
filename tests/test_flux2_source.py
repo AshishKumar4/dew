@@ -88,7 +88,7 @@ def flux2_arms(source, arrays, record, name):
     import torch
     from diffusers import Flux2Transformer2DModel
 
-    from tools.diffusers_flux2_reference import ids
+    from tools.diffusers_reference_helpers import flux2_ids
     from tools.torch_precision import float64
 
     model, params, layouts = load(source, name)
@@ -139,7 +139,7 @@ def flux2_arms(source, arrays, record, name):
     weights = {id(module): {key: value.detach().numpy() for key, value in module.named_parameters()}
                for module in (narrow, wide)}
     # The pipeline's four-axis ids, as the fixture's walk laid them out for its text and latent.
-    text_ids, image_ids = ids(rows, columns)
+    text_ids, image_ids = flux2_ids(rows, columns, fixture["context"].shape[1])
 
     def reference_walk(module, drawn):
         dtype = torch.from_numpy(np.asarray(drawn["latent"])).dtype
