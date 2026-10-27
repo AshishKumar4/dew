@@ -20,14 +20,12 @@ from dew.nn.kernels.recurrence_chunk import Chunk, recomputing
 pytestmark = pytest.mark.kernel
 
 INTERPRETED_GRADIENT = {('a ragged length', 'bf16', 'kept'), ('a ragged length', 'bf16', 'recomputed'),
-                        ('a ragged length', 'fp32', 'kept'), ('one sequence', 'bf16', 'kept')}
+                        ('a ragged length', 'fp32', 'kept'), ('one sequence', 'bf16', 'kept'),
+                        ('packed documents', 'bf16', 'kept')}
 """The gradient's cases the CPU interprets: the fast backward's launches over a ragged chunk, two key blocks
-and two key heads' groups, its forward's memories kept and recomputed, and an fp32 call's adjoint (the
-portable math's). Interpreted, the whole grid took 5.4 times these (7828 against 1452 seconds). Packed
-documents' gradient is the GPU tier's: interpreted it took 352 s, past the suite's 240-second split, and
-narrower draws left its log decay unresolved within 40 seeds (row 1850); the CPU interprets their forward
-(tests/test_recurrence_mosaic.py) and reads their backward decision
-(tests/test_recurrence_template_stability.py's resets on chunk edges)."""
+and two key heads' groups, packed documents, its forward's memories kept and recomputed, and an fp32
+call's adjoint (the portable math's). Interpreted, the whole grid took 5.4 times these (7828 against 1452
+seconds)."""
 
 GRADIENT_CASES = [case for case, shape in SHAPES.items() if not shape.get('per_key')]
 """The cases whose gradient the mainloop takes: a decay a head's (the gated delta rule's)."""
