@@ -41,10 +41,10 @@ jobs:
       matrix:
         # Each CUDA major's project and environment, one publish job a major.
         include:
-        - cuda: "12.9.1"
+        - cuda: "12"
           environment: pypi
           project: dew-flash-attn-cu12
-        - cuda: "13.0.0"
+        - cuda: "13"
           environment: pypi-cu13
           project: dew-flash-attn-cu13
     environment:
@@ -55,7 +55,7 @@ jobs:
     steps:
     - uses: actions/download-artifact@v4
       with:
-        pattern: dew-flash-attn-cuda${{ matrix.cuda }}-*
+        pattern: dew-flash-attn-cuda${{ matrix.cuda }}.*-*
         merge-multiple: true
         path: dist/
     - name: The wheels are this project's, one a machine
