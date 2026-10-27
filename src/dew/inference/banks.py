@@ -766,12 +766,12 @@ def _bank_placement(placement: Placement, shapes: Variables, stacked: bool) -> P
 
 
 class BankedModel(Protocol):
-    @property
-    def bank_sites(self) -> tuple[DecoderBank, ...]: ...
+    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]: ...
 
 
-def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
-    """Return the model's declared stacks, deduplicated by canonical namespace.
+def bank_sites(model: BankedModel, store: Variables) -> tuple[DecoderBank, ...]:
+    """Return the model's declared stacks over `store`, the variables (or their shapes) the banks are
+    drawn from, deduplicated by canonical namespace.
 
     Two readers of one physical scope declare the same site, so a shared
     decoder is packed once. Conflicting views of a namespace, overlapping
@@ -779,7 +779,7 @@ def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
     before any value is read.
     """
     owners: dict[tuple[str, ...], DecoderBank] = {}
-    for site in model.bank_sites:
+    for site in model.bank_sites(store):
         if any(not isinstance(name, str) or not name or "/" in name for name in site.namespace):
             raise ValueError("decoder namespaces must contain nonempty module names")
         previous = owners.get(site.namespace)
@@ -878,8 +878,8 @@ def _bank_plan(model: BankedModel, source: LayerBanks, mesh: MeshSpec | Mesh | N
         device_mesh as resolve_mesh,
     )
 
-    sites = bank_sites(model)
     shapes = source.shapes()
+    sites = bank_sites(model, shapes)
     for site in sites:
         _check_shapes(shapes, site)
     device_mesh = resolve_mesh(DefaultMesh() if mesh is None else mesh)

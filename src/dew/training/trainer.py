@@ -258,6 +258,7 @@ class Trainer(Generic[Loss, Effects]):
         lower_for: str | None = None,
         tune_kernels: bool = False,
         record: bool = False,
+        links: Mapping[str, Link] | None = None,
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -280,6 +281,7 @@ class Trainer(Generic[Loss, Effects]):
         `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its
         derived config. `record` makes each step return in its metrics what each evaluation, replays
         too, sampled or passed as a boundary (`taken_record`).
+        `links` states an axis's `Link` by name in place of measuring it (`_links`).
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -297,17 +299,14 @@ class Trainer(Generic[Loss, Effects]):
         self._loss_scale = loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         self.checkpoints = checkpoints
-        self.tracker = tracker
-        self.step = step
-        self.rollout = rollout
-        self.tune_kernels = tune_kernels
+        self.tracker, self.step, self.rollout = tracker, step, rollout
         if record and step is not None:
             raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
                              "build them with Step(record=True)")
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
-        self.lower_for = lower_for
+        self.lower_for, self.tune_kernels = lower_for, tune_kernels
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
         # `fit` keeps them beside each step. The program is the step as handed to XLA, before GSPMD partitions
         # it, and the executable the step as compiled, whose memory analysis a benchmark reads.
@@ -326,6 +325,7 @@ class Trainer(Generic[Loss, Effects]):
         # The links the last compiled step decided its projections by, which say whether one spread over
         # each axis (`dew.nn.sharding.Link`), and each mesh axis's measured bandwidth.
         self.links: dict[str, Link] = {}
+        self._stated_links = dict(links or {})
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
         self._refusal: str | None = None
@@ -624,7 +624,7 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master and FROZEN in abstract.variables:
             abstract = dataclasses.replace(abstract, variables={
                 **abstract.variables, FROZEN: self._banked_frozen(
-                    abstract.variables[FROZEN],
+                    abstract.variables,
                     lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
         share = DataPartition.of(self.device_mesh) if positioned else None
         state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share)
@@ -747,25 +747,21 @@ class Trainer(Generic[Loss, Effects]):
         leaves = jax.tree.leaves(frozen)
         if leaves and all(isinstance(leaf, jax.Array) for leaf in leaves):
             return jax.tree.map(lambda leaf: leaf.sharding, frozen)
-        from dew.training.execution import resident
+        from dew.training.execution import resident, stack_sites
         rows = self.layout.shardings(
             self.state_mesh, dataclasses.replace(state, variables={FROZEN: frozen}, accumulation=None))
-        return resident(rows.variables[FROZEN], self.bank_sites, self.device_mesh)
+        sites = stack_sites(self.objective, {**state.variables, FROZEN: frozen})
+        return resident(rows.variables[FROZEN], sites, self.device_mesh)
 
-    @functools.cached_property
-    def bank_sites(self):
-        """List the objective's declared layer stacks, which a host layout streams as banks."""
-        from dew.inference.banks import bank_sites
-        return bank_sites(self.objective) if self.objective.bank_sites else ()
-
-    def _banked_frozen(self, tree, stack, release=None):
-        """Stack each scanned run's shared leaves of `tree` into one bank
+    def _banked_frozen(self, variables, stack, release=None):
+        """Stack each scanned run's shared leaves of the frozen collection of `variables` into one bank
         (`dew.inference.banks.banked`).
 
         That is the shape a placement and a checkpoint template take, and the
         arrays the state holds."""
         from dew.inference.banks import banked
-        return banked(tree, self.bank_sites, stack, release)
+        from dew.training.execution import stack_sites
+        return banked(variables[FROZEN], stack_sites(self.objective, variables), stack, release)
 
     def _placed_host(self, initializer, key, shardings: Placement[TrainState]) -> TrainState:
         """A fresh CPU-owned state, its leaves streamed into place one at a time.
@@ -779,12 +775,13 @@ class Trainer(Generic[Loss, Effects]):
         returned to the two device sets anyway.
         """
         from dew.distributed.host import evict, place_leaf, stream, transfer
-        from dew.training.execution import bank_bytes, check_bank_pool
+        from dew.training.execution import bank_bytes, check_bank_pool, stack_sites
         held = self.objective.held_variables()
         with jax.default_device(self.state_mesh.local_devices[0]):
             state = self.initial_state(initializer, key)
             if FROZEN in state.variables:
-                check_bank_pool(bank_bytes(state.variables[FROZEN], self.bank_sites), self.device_mesh)
+                sites = stack_sites(self.objective, state.variables)
+                check_bank_pool(bank_bytes(state.variables[FROZEN], sites), self.device_mesh)
                 # A scanned run's frozen rows become its bank here and the bank lands where it stays
                 # resident before the next is stacked, so the host holds one bank in transit, not the
                 # stack; the rows' pages are let go as it lands and the held tree holds the placed bank
@@ -809,7 +806,7 @@ class Trainer(Generic[Loss, Effects]):
                         node = node.get(component) if isinstance(node, dict) else None
                     if isinstance(node, dict) and keys[-1] in node:
                         node[keys[-1]] = bank
-                frozen = self._banked_frozen(state.variables[FROZEN], stack, release)
+                frozen = self._banked_frozen(state.variables, stack, release)
                 state = dataclasses.replace(state, variables={**state.variables, FROZEN: frozen})
         params = stream(state.variables, shardings.variables, held)
         ema = None if state.ema is None else stream(state.ema, shardings.ema)
@@ -908,22 +905,25 @@ class Trainer(Generic[Loss, Effects]):
         `link_bandwidth` agrees one figure across the pool, so every process
         decides alike and compiles the same program. The peak is the fastest
         device's, on which the FLOPs a spread saves take the least time. Each
-        axis's bandwidth is measured once per mesh, and not at all on a CPU
-        mesh or for a device the peak table does not name, where it decides
-        nothing."""
+        axis's bandwidth is measured once per mesh, and not at all for a
+        device the peak table does not name (a CPU's among them), where it
+        decides nothing; a link the run states (`links`) is taken as stated."""
         devices = list(mesh.devices.flat)
         peaks = [peak for device in devices if (peak := gpu_target(device.device_kind).bf16_peak) is not None]
         peak = max(peaks) if len(peaks) == len(devices) else None
-        platform = devices[0].platform
         links = {}
         for axis in (TENSOR_AXIS, SEQUENCE_AXIS):
             if mesh.shape.get(axis, 1) == 1:
                 continue
+            if axis in self._stated_links:
+                stated = self._stated_links[axis]
+                links[axis] = Link(stated.bytes_per_second, stated.flops_per_second)
+                continue
             if (mesh, axis) not in self._bandwidths:
                 # A resumed run takes the figure its checkpoint traced with, on this very placement.
-                self._bandwidths[mesh, axis] = None if platform == 'cpu' or peak is None else (
+                self._bandwidths[mesh, axis] = None if peak is None else (
                     self._resumed_links.get(link_topology(mesh, axis)) or link_bandwidth(mesh, axis))
-            links[axis] = Link(self._bandwidths[mesh, axis], peak, platform)
+            links[axis] = Link(self._bandwidths[mesh, axis], peak)
         return links
 
     @contextlib.contextmanager
@@ -1219,9 +1219,10 @@ class Trainer(Generic[Loss, Effects]):
 
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
         from dew.distributed.host import transfer
-        from dew.training.execution import HostExecution
+        from dew.training.execution import HostExecution, stack_sites
         cpu = self.state_mesh
-        execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu, device=self._device)
+        execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu,
+                                  stack_sites(self.objective, state.variables), device=self._device)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with self._traced_on(cpu) as schedule:
             shapes = self._loss_shape(state, cpu_batch)
@@ -2448,8 +2449,9 @@ class Trainer(Generic[Loss, Effects]):
         averaged = with_ema(state.variables, self._fetched(state, shardings).ema)
         key = state.key
         if self.host_master:
-            from dew.training.execution import HostExecution
-            execution = HostExecution(self.objective, self.layout, mesh, self.state_mesh)
+            from dew.training.execution import HostExecution, stack_sites
+            execution = HostExecution(self.objective, self.layout, mesh, self.state_mesh,
+                                      stack_sites(self.objective, state.variables))
             with jax.set_mesh(self.state_mesh):
                 params, averaged = execution.snapshot(params), execution.snapshot(averaged)
             key = execution.on_accelerator(key)

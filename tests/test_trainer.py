@@ -842,7 +842,8 @@ runs = {"first": fit(1e-3, 2, root + "/run")}
 for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
     shutil.copytree(root + "/run", f"{root}/{name}")
     runs[name] = fit(peak, 3, f"{root}/{name}")
-for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
+# Fresh runs at each configuration, the ungrouped run's bit-for-bit baselines.
+for name, peak in () if grouped else (("slow", 4e-3), ("fast", 8e-3)):
     runs["fresh " + name] = fit(peak, 3, f"{root}/fresh {name}")
 print(json.dumps(runs))
 """

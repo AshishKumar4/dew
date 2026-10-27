@@ -669,7 +669,7 @@ def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
             scanned, prompt_length=4, num_canvases=2, variables=loaded.variables,
             stop_gradient_from_denoiser_to_encoder=detached)
 
-    (site,) = objective().bank_sites
+    (site,) = objective().bank_sites(loaded.variables)
     assert site.namespace == ("text",)
     resident = updated(objective(), batch, DEVICE, optimizer=optax.sgd(.001))
     host = updated(objective(), batch, HOST, optimizer=optax.sgd(.001))
