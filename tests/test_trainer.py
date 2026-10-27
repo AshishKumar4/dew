@@ -2055,18 +2055,19 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
     assert int(advanced.step) == 1 and bool(finite)
 
     # And its loss is the objective's own: the shape-compiled step against `scalar_loss` on drawn
-    # batches from the same placed state (check 1), each step on a copy of the state it consumes.
+    # batches from a state placed afresh (check 1), each step on a copy of the state it consumes.
     from dew.objectives.base import Step
 
-    key = Step(state.microstep, jax.random.fold_in(state.key, state.step), None)
-    weights = jax.device_get(state.variables)
+    fresh, _, _ = trainer.place()
+    key = Step(fresh.microstep, jax.random.fold_in(fresh.key, fresh.step), None)
+    weights = jax.device_get(fresh.variables)
 
     def draw(seed):
         return weights, np.random.default_rng([0x5E9, seed]).integers(0, 32, (8, 5)).astype(np.int32)
 
     @as_given
     def stepped(variables, text):
-        return compiled(jax.tree.map(jnp.copy, state), {"text": jnp.asarray(text)})[1]
+        return compiled(jax.tree.map(jnp.copy, fresh), {"text": jnp.asarray(text)})[1]
 
     def objective(variables, text):
         return trainer.objective.scalar_loss(variables, {"text": text}, key)[0]
