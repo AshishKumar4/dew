@@ -1,4 +1,4 @@
-"""EDM's and EDM2's training losses, for tests/fixtures/edm_loss/loss.npz.
+"""EDM's and EDM2's training losses, for tests/fixtures/edm_loss/seeds.npz.
 
 The references are NVlabs' own loss classes and preconditioners, read at the
 pinned commits the sampler and network fixtures use and executed as
@@ -14,12 +14,14 @@ preconditioners wrap is an affine stand-in, F(x, c_noise) = a x + b c_noise
 + c with a per channel, set as EDMPrecond's `model_type` and as Precond's
 `unet`; the loss's two `torch.randn` draws (the standard normal behind each
 training sigma, and the noise before it is scaled by sigma) return stored
-draws; and there are no labels or augmentation. What lands: the inputs, the
-stand-in and logvar-head weights, and each loss's training sigmas,
-per-element loss and the gradient of its mean in the network's output and
-in the logvar head's weight, computed as published in float32 and by its
-float64 twin (the float32 casts retargeted), whose distance from the first
-is the float32 run's rounding.
+draws; and there are no labels or augmentation. What lands, over the seeds
+check 1 draws (`record_case`, tools/recorded_references.py): each loss's
+training sigmas, per-element loss and the gradient of its mean in the
+network's output and in the logvar head's weight, computed as published in
+float32 and by its float64 twin (the float32 casts retargeted), whose
+distance from the first is the float32 run's rounding. A seed's inputs, the
+stand-in and logvar-head weights among them, are a seeded NumPy draw
+(`draw`) the test makes again.
 
     python tools/edm_loss_reference.py
 """
@@ -38,7 +40,7 @@ from torch_precision import replaced
 
 EDM = "008a4e5316c8e3bfe61a62f874bddba254295afb"
 EDM2 = "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc"
-FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "edm_loss" / "loss.npz"
+FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "edm_loss" / "seeds.npz"
 IMAGES, CHANNELS, SIZE, LOGVAR_CHANNELS = 6, 3, 4, 16
 TINY_UNET = {"model_channels": 8, "channel_mult": [1], "num_blocks": 1, "attn_resolutions": []}
 """Precond builds a U-Net it is then given the stand-in in place of; a tiny one."""
@@ -113,48 +115,69 @@ def run(loss, net, network, arrays: dict, dtype) -> dict[str, np.ndarray]:
     return out
 
 
-def main() -> None:
-    stub_torch_utils()
-    generator = np.random.default_rng(3)
-    arrays = {
+def draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's inputs: images, the standard normals behind the training sigmas, the noise, the
+    stand-in's weights, and the logvar head's Fourier features and weight as MPFourier and MPConv
+    initialize them (2 pi N(0, 1) frequencies, 2 pi U(0, 1) phases, an N(0, 1) weight)."""
+    generator = np.random.default_rng([0xED, seed])
+    return {
         "images": generator.uniform(-1, 1, (IMAGES, CHANNELS, SIZE, SIZE)).astype(np.float32),
         "normals": generator.standard_normal(IMAGES).astype(np.float32),
         "noise": generator.standard_normal((IMAGES, CHANNELS, SIZE, SIZE)).astype(np.float32),
         "a": generator.normal(0.5, 0.2, CHANNELS).astype(np.float32),
-        "b": np.asarray(0.3, np.float32), "c": np.asarray(-0.1, np.float32),
+        "b": np.float32(generator.normal(0.3, 0.1)), "c": np.float32(generator.normal(-0.1, 0.1)),
+        "logvar/freqs": (2 * np.pi * generator.standard_normal(LOGVAR_CHANNELS)).astype(np.float32),
+        "logvar/phases": (2 * np.pi * generator.uniform(0, 1, LOGVAR_CHANNELS)).astype(np.float32),
+        "logvar/weight": generator.standard_normal((1, LOGVAR_CHANNELS)).astype(np.float32),
     }
+
+
+def main() -> None:
+    from recorded_references import provenance, record_case, save
+
+    stub_torch_utils()
     torch.manual_seed(5)
-    edm2_32 = published("NVlabs/edm2", EDM2, "training/networks_edm2.py", "float32")
-    head = edm2_32.Precond(SIZE, CHANNELS, 0, use_fp16=False, logvar_channels=LOGVAR_CHANNELS, **TINY_UNET)
-    arrays.update({"logvar/freqs": head.logvar_fourier.freqs.numpy(),
-                   "logvar/phases": head.logvar_fourier.phases.numpy(),
-                   "logvar/weight": head.logvar_linear.weight.detach().numpy()})
-    for dtype, tail in ((torch.float32, ""), (torch.float64, "_f64")):
+    built = {}
+    for dtype in (torch.float32, torch.float64):
         name = str(dtype).removeprefix("torch.")
         networks = published("NVlabs/edm", EDM, "training/networks.py", name)
         networks.Affine = functools.partial(Affine, dtype)
-        net = networks.EDMPrecond(SIZE, CHANNELS, model_type="Affine")
-        losses = published("NVlabs/edm", EDM, "training/loss.py", name, keep={"EDMLoss"})
         edm2 = published("NVlabs/edm2", EDM2, "training/networks_edm2.py", name)
-        precond = edm2.Precond(SIZE, CHANNELS, 0, use_fp16=False, logvar_channels=LOGVAR_CHANNELS,
-                               **TINY_UNET).eval()
-        precond.unet = Affine(dtype)
-        loop = published("NVlabs/edm2", EDM2, "training/training_loop.py", name, keep={"EDM2Loss"})
-        with torch.no_grad():
-            for model in (net.model, precond.unet):
-                for parameter in ("a", "b", "c"):
-                    getattr(model, parameter).copy_(torch.tensor(arrays[parameter], dtype=dtype))
-            precond.logvar_fourier.freqs.copy_(torch.tensor(arrays["logvar/freqs"], dtype=dtype))
-            precond.logvar_fourier.phases.copy_(torch.tensor(arrays["logvar/phases"], dtype=dtype))
-            precond.logvar_linear.weight.copy_(torch.tensor(arrays["logvar/weight"], dtype=dtype))
-        precond.to(dtype)
-        for key, value in run(losses.EDMLoss(), net, net.model, arrays, dtype).items():
-            arrays[f"edm/{key}{tail}"] = value
-        for key, value in run(loop.EDM2Loss(), precond, precond.unet, arrays, dtype).items():
-            arrays[f"edm2/{key}{tail}"] = value
-    FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE, **arrays)
-    print(f"{FIXTURE}: {sorted(arrays)}")
+        built[dtype] = (networks, published("NVlabs/edm", EDM, "training/loss.py", name, keep={"EDMLoss"}),
+                        edm2, published("NVlabs/edm2", EDM2, "training/training_loop.py", name,
+                                        keep={"EDM2Loss"}))
+
+    def evaluated(inputs, which):
+        results = []
+        for dtype in (torch.float32, torch.float64):
+            networks, losses, edm2, loop = built[dtype]
+            net = networks.EDMPrecond(SIZE, CHANNELS, model_type="Affine")
+            precond = edm2.Precond(SIZE, CHANNELS, 0, use_fp16=False, logvar_channels=LOGVAR_CHANNELS,
+                                   **TINY_UNET).eval()
+            precond.unet = Affine(dtype)
+            with torch.no_grad():
+                for model in (net.model, precond.unet):
+                    for parameter in ("a", "b", "c"):
+                        getattr(model, parameter).copy_(torch.tensor(inputs[parameter], dtype=dtype))
+                precond.logvar_fourier.freqs.copy_(torch.tensor(inputs["logvar/freqs"], dtype=dtype))
+                precond.logvar_fourier.phases.copy_(torch.tensor(inputs["logvar/phases"], dtype=dtype))
+                precond.logvar_linear.weight.copy_(torch.tensor(inputs["logvar/weight"], dtype=dtype))
+            precond.to(dtype)
+            if which == "edm":
+                results.append(run(losses.EDMLoss(), net, net.model, inputs, dtype))
+            else:
+                results.append(run(loop.EDM2Loss(), precond, precond.unet, inputs, dtype))
+        return tuple(results)
+
+    arrays = {}
+    for which in ("edm", "edm2"):
+        arrays.update(record_case(which, draw, lambda inputs, which=which: evaluated(inputs, which),
+                                  store_inputs=False))
+    written = save(FIXTURE, {**arrays, "provenance": provenance(
+        "NVlabs/edm, NVlabs/edm2", f"{EDM}, {EDM2}", "cpu", "python tools/edm_loss_reference.py",
+        torch=torch.__version__)}, reference="NVlabs/edm, NVlabs/edm2",
+        license="CC BY-NC-SA 4.0 (results only)")
+    print(f"{written}: {sorted(arrays)}")
 
 
 if __name__ == "__main__":
