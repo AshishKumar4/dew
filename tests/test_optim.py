@@ -527,9 +527,7 @@ def test_a_query_group_clips_as_megatron_clips_it(case):
         params = {"attn": {proj: {"kernel": kernel} for proj, kernel in kernels.items()}}
         stats = {"attn": {"max_logits": (max_logits[None],), "kv_heads": jnp.asarray(width // head_dim),
                           "head_dim": jnp.asarray(head_dim)}}
-        initial = tx.init(params)
-        updates, state = tx.update(jax.tree.map(jnp.zeros_like, params), initial, params, qk_stats=stats)
-        moved = stepped(params, updates, initial, state)["attn"]
+        moved = clip_step(tx, stats)(params, jax.tree.map(jnp.zeros_like, params))["attn"]
         return {proj: leaf["kernel"] for proj, leaf in moved.items()}
 
     with jax.enable_x64(new_val=True):
@@ -668,9 +666,8 @@ def test_the_latent_branches_match_maxtext():
         def clipped(flat, max_logits, proj=proj, case=case):
             params = {'l': {'m': {proj: {'kernel': flat}}}}
             stats = {'l': {'m': {'max_logits': (max_logits,), 'qk_nope': jnp.asarray(case['qk_nope'])}}}
-            initial = tx.init(params)
-            updates, state = tx.update(jax.tree.map(jnp.zeros_like, params), initial, params, qk_stats=stats)
-            return stepped(params, updates, initial, state)['l']['m'][proj]['kernel']
+            moved = clip_step(tx, stats)(params, jax.tree.map(jnp.zeros_like, params))
+            return moved['l']['m'][proj]['kernel']
 
         with jax.enable_x64(new_val=True):
             flat = jnp.asarray(param.reshape(len(param), -1), jnp.float64)

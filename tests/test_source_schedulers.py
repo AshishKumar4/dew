@@ -221,7 +221,7 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
     def dew(initial):
         _, walked = sample(denoise, jnp.asarray(initial), solver=schedule.solver, key=0,
                            times=times, final_denoise=False, record=lambda x, state, denoised: x)
-        return {"latents": np.stack([np.asarray(latent) for latent in walked])}
+        return {f"step {index}": np.asarray(latent) for index, latent in enumerate(walked)}
 
     precision = load("diffusers_wan_reference")
 
@@ -247,7 +247,8 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
                 x = source.step(prediction, time, x).prev_sample
                 if kind != "KDPM2Discrete" or index % 2 == 1 or index == len(source.timesteps) - 1:
                     latents.append(x.numpy().copy())
-        return {"latents": np.stack(latents)}
+        # A leaf a step, so each step is judged on its own, as the walk records it.
+        return {f"step {index}": latent for index, latent in enumerate(latents)}
 
     reference = as_given(lambda initial: source_walk(np.asarray(initial, np.float32), torch.float32))
     truth = as_given(lambda initial: source_walk(np.asarray(initial), torch.float64))
