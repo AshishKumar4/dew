@@ -13,6 +13,21 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   `dew.nn.precision`, beside the float32 algorithm it dispatches to; `dew.inputs.unit_range` and
   `dew.nn.mp.mp_silu` divide through it, where XLA took their division by a constant as a product
   with its rounded reciprocal.
+- `dew.pipeline` is the one loader of a run published to the Hub: `TextToImage.from_pretrained` and the
+  text tasks' `from_pretrained`, which pulled a run and loaded it with `from_run`, are gone; call
+  `dew.pipeline(repo, revision=...)`, which pulls the run at the commit its metadata resolves and picks
+  its task from the run's record. A saved run is pinned once: each task builds from the pinned run with
+  `from_saved`, which `dew.pipeline`, `dew export` and a model soup (`dew.checkpoints.averaged_pinned`)
+  call on the run they pinned, and `from_run` pins a directory and calls it. A plugin's saved task
+  (`Objective.saved_task`) implements `from_saved`; deriving from `dew.inference.tasks.SavedRunTask`
+  gives it `from_run` too.
+- A server prefilling in pieces prefills a prefix block, or any group a layer reads whole, in one piece
+  where the cut would split it, its members adjacent or not, where it refused a block longer than `chunk`.
+  A served prompt carries its own image and block groups (`block_groups`, `image_groups`), slotted beside
+  its tokens and kept in its row's cache, its own blocks standing over a prefix run's as `generate` keeps
+  them; a prefix page is shared only between prompts that agree on their groups and their tokens up to
+  the last grouped one. Disk banks read a
+  family whose packed tensors split into views of themselves, fused experts among them.
 - Every outer program Dew compiles goes through one seam (`dew.nn.kernels.options.program`): an image
   task's encode, noise and solver start, a bank's stacking, an autoencoder's encode and decode, LPIPS's
   and FID's networks and a host step's unstack, so two loads of one module share its programs. The seam

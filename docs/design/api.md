@@ -271,8 +271,8 @@ Same table and the same `logical_axes` and `_mesh_spec` machinery (`training/dis
 ### 3.10 Inference
 
 ```python
-pipe = inference.TextToImage.from_run("runs/flowers")            # manifest and checkpoint, EMA by default
-pipe = inference.TextToImage.from_pretrained("user/flowers-dit")  # hub export, same manifest
+pipe = inference.TextToImage.from_run("runs/flowers")  # manifest and checkpoint, EMA by default
+pipe = dew.pipeline("user/flowers-dit")                # hub export, same manifest
 images = pipe(["a water lily", "a sunflower"], steps=40, guidance=4.0, sampler=samplers.Heun(), key=key)
 text = generate(model, params, prompt, 300, key=key, sampling=Sampling(temperature=0.8)).tokens
 ```

@@ -79,6 +79,7 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from dew.distributed.placement import Layout, MeshSpec
+    from dew.inference.tasks import SavedRun
     from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
     from dew.nn.cross_attention import CrossAttention
@@ -270,13 +271,20 @@ class Pretrained:
     @classmethod
     def from_run(cls, directory: str | Path, *, step: int | str | None = None,
                  ema: bool | None = None, trust: Sequence[str] = ()) -> Self:
-        """Return a trained run's selected checkpoint, rebuilt from the run's own inference record,
-        in the layout of the architecture the record names. `trust` names the packages outside
-        Dew the record may import (`TextGeneration.from_run`)."""
+        """Return a trained run's selected checkpoint, its latest or `step`, rebuilt from the run's
+        own inference record (`from_saved`). `trust` names the packages outside Dew the record may
+        import (`TextGeneration.from_run`)."""
+        from dew.inference.tasks import SavedRun
+
+        return cls.from_saved(SavedRun.pinned(str(directory), step, trust), ema=ema)
+
+    @classmethod
+    def from_saved(cls, run: SavedRun, *, ema: bool | None = None) -> Self:
+        """Return the pinned checkpoint `run` (`SavedRun.pinned`), rebuilt from the run's own inference
+        record, in the layout of the architecture the record names."""
         from dew.inference.tasks import (
             BlockSettings,
             MaskedSettings,
-            SavedRun,
             TaskSettings,
             TextSettings,
             saved_model,
@@ -284,7 +292,6 @@ class Pretrained:
         )
         from dew.registry import models
 
-        run = SavedRun.pinned(str(directory), step, trust)
         model_config = saved_model(run.record, None)
         model = model_config.build()
         variables = run.variables(ema=ema)
@@ -327,7 +334,7 @@ class Pretrained:
             raise TypeError(f"{type(model).__name__} has no maintained exported bundle layout; "
                             "load diffusion runs with TextToImage.from_run")
         if not isinstance(bundle, cls):
-            raise TypeError(f"{directory} is a {type(bundle).__name__} source, not a {cls.__name__}; "
+            raise TypeError(f"{run.directory} is a {type(bundle).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(bundle).__name__}.from_run or Pretrained.from_run")
         return bundle.bound(model, variables)
 
@@ -1459,7 +1466,8 @@ def _native_route(config: Mapping[str, object]) -> DecoderRoute | WrapperRoute |
 
 def _lazy_route(config: Mapping[str, object]) -> DecoderRoute | WrapperRoute:
     """The route of a source read one tensor at a time (`native_backbone`): an unquantized registered
-    decoder or its media wrapper, of a family whose preparation leaves its tensors as they are stored.
+    decoder or its media wrapper, of a family whose preparation leaves its tensors as they are stored, or
+    splits a packed one into views of it (`Packed.viewed`).
     Any other source is refused on its config, before any weight is read or any verification runs."""
     if source_quantization(config) is not None:
         raise ValueError("a lazy read takes unquantized safetensors; a whole-model codec is not bounded")
@@ -1469,9 +1477,13 @@ def _lazy_route(config: Mapping[str, object]) -> DecoderRoute | WrapperRoute:
             text = _records.text(route.wrapper["text_model_type"] if isinstance(route, WrapperRoute)
                                  else config["model_type"], "model_type")
             entry = decoders.family_entry(text)
-            if entry.prepare is not decoder_parts.DecoderFamily.prepare or entry.packed:
-                raise ValueError(f"a lazy read takes a family whose tensors translate as they are stored; "
-                                 f"{text}'s preparation can materialize checkpoint weights")
+            # A packed tensor split into views of itself stays unread until a row is placed; a preparation,
+            # or parts interleaved in runs, copies it at translation.
+            if (entry.prepare is not decoder_parts.DecoderFamily.prepare
+                    or not all(packing.viewed for packing in entry.packed)):
+                raise ValueError(f"a lazy read takes a family whose tensors translate as they are stored or "
+                                 f"split into views of themselves; {text}'s preparation or interleaved "
+                                 f"packing copies checkpoint weights")
             return route
         case _:
             raise ValueError(f"a lazy read takes a registered native decoder or its media wrapper, not "

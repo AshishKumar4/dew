@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.batch import coordinates, document_starts
+from dew.batch import BLOCKS_FIELD, coordinates, document_starts
 
 
 def windowed(query, key, window: int, *, causal: bool):
@@ -115,6 +115,15 @@ def served_blocks(real, prefix: int | Literal["prompt"]):
     if prefix != "prompt" and (real.sum(axis=1) < prefix).any():
         raise ValueError(f"a prompt under prefix {prefix} needs {prefix} real tokens in every row")
     return prompt_blocks(real, prefix, xp=np)
+
+
+def with_served_blocks(fields: dict, real, prefix: int | Literal["prompt"] | None) -> dict:
+    """`fields` with the blocks a prefix run makes of the prompts whose real tokens are `real`
+    (`served_blocks`) where they carry none: a request's own blocks stand, as a batch's do in training.
+    Every serving path takes its blocks here (`generate`, `Server`)."""
+    if prefix is None or BLOCKS_FIELD in fields:
+        return fields
+    return {**fields, BLOCKS_FIELD: served_blocks(real, prefix)}
 
 
 def block_starts(groups):
