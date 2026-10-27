@@ -4,11 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from os import PathLike, fspath
-from pathlib import PurePosixPath
+
+from huggingface_hub import HfUri, parse_hf_uri
 
 from .base import Read, Shard, ShardManifest, Source
 from .concatenate import Concatenate
-from .files import Files, Format, _inferred
+from .files import Files, Format
 from .grain import from_grain
 from .hf import from_hf
 from .hub import Hub
@@ -36,11 +37,10 @@ def source(
         if url.startswith("tfds://"):
             name, _, version = url[7:].partition(":")
             resolved = TFDS(name=name, version=version or None, split=split or "train")
-        elif url.startswith("hf://") and format is None and _repository(url):
+        elif url.startswith("hf://") and format is None and (repository := _repository(url)) is not None:
             # A repository's own URL; a path in it (a file, a glob, a committed export's directory),
             # or any URL given a format, is read as files.
-            repo, _, revision = url.removeprefix("hf://").removeprefix("datasets/").rstrip("/").partition("@")
-            resolved = Hub(repo=repo, revision=revision or None, split=split or "train")
+            resolved = Hub(repo=repository.id, revision=repository.revision, split=split or "train")
         else:
             files = Files(url, format=format)
             committed = files.committed
@@ -60,12 +60,15 @@ def source(
     return resolved
 
 
-def _repository(url: str) -> bool:
-    """Whether an hf:// URL names a dataset repository itself, `owner/name[@revision]`, rather than
-    a path in it: a file, a glob or a directory, such as a committed export's (`dew.data.sinks`),
-    which its manifest names the record format of, whatever its suffix spells."""
-    path = PurePosixPath(url.removeprefix("hf://").removeprefix("datasets/"))
-    return len(path.parts) <= 2 and "*" not in url and _inferred(url) is None
+def _repository(url: str) -> HfUri | None:
+    """The dataset repository an hf:// URL names itself, `owner/name[@revision]`, or None where it
+    names a path in one: a file, a glob or a directory, such as a committed export's
+    (`dew.data.sinks`), which its manifest names the record format of, whatever its suffix spells.
+    The URL is parsed as `HfFileSystem` reads it (`parse_hf_uri`): its revision runs from the `@`
+    to the path after it, a reference of the Hub's own whole (`refs/convert/parquet`,
+    `refs/pr/3`), and a `/` in a branch's name is spelled `%2F`."""
+    parsed = parse_hf_uri("hf://datasets/" + url.removeprefix("hf://").removeprefix("datasets/"))
+    return None if parsed.path_in_repo else parsed
 
 
 __all__ = [
