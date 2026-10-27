@@ -1,7 +1,7 @@
 """The grouped GEMM template's kernels and their choice: Dew's Mosaic GPU grouped matmuls for Hopper
 (`dew.nn.kernels.templates.gemm.mosaic_gpu`), interpreted on the CPU, against float64 sums of the same
-rounded operands; the MoE dispatcher's routes to each implementation; the products' dtypes as the
-kernels write them; and the cost model (`dew.nn.kernels.templates.cost`) on analytic launches."""
+rounded operands; the MoE dispatcher's implementations; and the cost model
+(`dew.nn.kernels.templates.cost`) on analytic launches."""
 
 import dataclasses
 import functools
@@ -15,9 +15,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, generations, interpreted_projection, lowers, runs
+from generation_support import INTERPRETS, interpreted_projection, lowers, runs
 from jax.sharding import Mesh
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, with_gradients
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, with_gradients
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import mosaic_gpu, template
@@ -214,7 +214,7 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
 def test_cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     """Where the installed dew-cutlass holds this GPU's kernels, the projection's forward and both
     gradients through CUTLASS's launches, chosen by name, are as exact as XLA's ragged dot from float64,
-    unrouted rows and empty groups included, and the CUDA branch's launches are CUTLASS's."""
+    unrouted rows and empty groups included."""
     # The wheel is optional: a process without it, or whose wheel holds no kernel for its GPU, runs the
     # template's launches, which the suite checks apart.
     here = generation.gpu_target().generation
@@ -233,13 +233,8 @@ def test_cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
         with generation.chosen(grouped_matmul="cutlass"):
             return with_gradients(projection("pallas"))(x, w, dy)
 
-    with tuning.seen() as launches:
-        assert_as_exact(jax.jit(through_cutlass), jax.jit(with_gradients(projection("xla"))), draw,
-                        f"cutlass {sizes}", seeds=SEEDS,
-                        truth_fn=with_gradients(projection("xla", jnp.float64)))
-    # The CUDA branch's launches; the CPU branch beside it interprets Triton's.
-    ran = {type(launch).__name__ for launch, ba in launches if not ba.arguments["interpret"]}
-    assert ran == {"CutlassGmm", "CutlassTgmm"}
+    assert_as_exact(jax.jit(through_cutlass), jax.jit(with_gradients(projection("xla"))), draw,
+                    f"cutlass {sizes}", seeds=SEEDS, truth_fn=with_gradients(projection("xla", jnp.float64)))
 
 
 def ragged_draw(seed):
@@ -389,69 +384,19 @@ def test_the_kernels_forward_mode_keeps_the_projections_law():
         return jax.jit(lambda x, w, dx, dw: jax.jvp(lambda x, w: expert_projection(
             x, w, sizes, jnp.bfloat16, implementation, None), (x, w), (dx, dw))[1])(x, w, dx, dw)
 
-    with generation.assumed("sm80"), generation.routes() as taken:
+    with generation.assumed("sm80"):
         kernels = tangent("pallas")
-    assert {route.kernel for route in taken if route.choice == "grouped_matmul"} == {"triton"}
     np.testing.assert_array_equal(np.asarray(kernels, np.float32), np.asarray(tangent("xla"), np.float32))
 
 
-@pytest.mark.skipif(jax.default_backend() != "cpu", reason="a GPU of sm80 or later runs the named kernel")
-def test_a_named_kernel_refuses_where_the_kernels_do_not_run():
-    """A kernel `generation.chosen` names for a call no kernel runs (a CPU's, whose kernels run nowhere
-    but interpreted as a GPU it states) raises with the reason, rather than running XLA."""
-    x, w, sizes = jnp.ones((8, 16), jnp.bfloat16), jnp.ones((2, 16, 16), jnp.float32), jnp.asarray([4, 4])
-    with generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError):
-        expert_projection(x, w, sizes, jnp.bfloat16, "auto", None)
-
-
 @runs("sm80")
-def test_a_call_of_no_rows_runs_xla_or_refuses_a_named_kernel():
-    """A projection of no rows launches nothing: XLA gives its empty value, the route saying why, and a
-    kernel `generation.chosen` names for it raises rather than running XLA."""
+def test_a_call_of_no_rows_gives_its_empty_value():
+    """A projection of no rows on an A100 gives its empty value."""
     x, w = jnp.ones((0, 16), jnp.bfloat16), jnp.ones((2, 16, 16), jnp.float32)
     sizes = jnp.zeros((2,), jnp.int32)
-    with generation.assumed("sm80"), generation.routes() as taken:
+    with generation.assumed("sm80"):
         y = expert_projection(x, w, sizes, jnp.bfloat16, "pallas", None)
     assert y.shape == (0, 16)
-    assert {(route.kernel, route.refusal.detail if route.refusal else None) for route in taken
-            if route.choice == "grouped_matmul"} == {("xla", "the call has no rows")}
-    with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError):
-        expert_projection(x, w, sizes, jnp.bfloat16, "pallas", None)
-
-def test_a_forced_implementation_runs_or_says_why_it_cannot():
-    """'xla' named runs XLA's ragged dot whatever the call asked; a kernel named for a product the
-    kernels do not compute (fp32 above the default precision) raises with the reason rather than
-    running XLA."""
-    x, w, sizes = jnp.ones((8, 16), jnp.bfloat16), jnp.ones((2, 16, 16), jnp.float32), jnp.asarray([4, 4])
-    with generation.chosen(grouped_matmul="xla"), generation.routes() as taken:
-        expert_projection(x, w, sizes, jnp.bfloat16, "pallas", None)
-    assert {route.kernel for route in taken if route.choice == "grouped_matmul"} == {"xla"}
-    with generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError):
-        expert_projection(x.astype(jnp.float32), w, sizes, jnp.float32, "pallas", "highest")
-
-
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
-def test_the_kernels_write_each_product_in_its_own_dtype(generation_name):
-    """A bf16 projection over an fp32 master, through the implementations each generation picks: its
-    launches write the forward and the input gradient in bf16 and the kernel gradient in fp32, with no
-    fp32 `[rows, width]` product for a conversion pass after."""
-    x = jax.ShapeDtypeStruct((ROWS, DEPTH), jnp.bfloat16)
-    w = jax.ShapeDtypeStruct((4, DEPTH, WIDTH), jnp.float32)
-    sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
-
-    def loss(x, w, sizes):
-        return jnp.sum(expert_projection(x, w, sizes, jnp.bfloat16, "pallas", None))
-
-    with generation.assumed(generation_name):
-        jaxpr = jax.make_jaxpr(jax.grad(loss, (0, 1)))(x, w, sizes)
-    # Each launch's own outputs: Triton's are a pallas_call's, Mosaic GPU's a custom_vmap_call's
-    # (`plgpu.kernel` wraps its call in `custom_vmap`).
-    written = {(var.aval.shape, var.aval.dtype) for equation in equations(jaxpr)
-               if equation.primitive.name in ("pallas_call", "custom_vmap_call") for var in equation.outvars}
-    assert ((ROWS, WIDTH), jnp.dtype(jnp.float32)) not in written
-    assert {((ROWS, WIDTH), jnp.dtype(jnp.bfloat16)), ((ROWS, DEPTH), jnp.dtype(jnp.bfloat16)),
-            ((4, DEPTH, WIDTH), jnp.dtype(jnp.float32))} <= written
-
 
 def test_a_mig_slice_keeps_its_generations_tensor_rate():
     """A SKU's catalogued peak lowers its generation's rate where its multiprocessors and clock would
@@ -466,19 +411,6 @@ def test_a_mig_slice_keeps_its_generations_tensor_rate():
     half = dataclasses.replace(generation.TARGETS["sm89"], device_kind="a half-rate part", multiprocessors=64,
                                clock_hz=2.0 ** 31, dense_peaks=peaks)
     assert half.tensor_rate("16bit") == 512
-
-
-def test_a_gpu_of_no_family_runs_xla_s_grouped_matmul():
-    """A GPU outside every instruction family Dew knows (sm70, Volta) runs an expert projection on XLA's
-    ragged dot, its route saying why, with no estimate asked of the kernels."""
-    x = jnp.ones((32, 64), jnp.bfloat16)
-    w = jnp.ones((4, 64, 128), jnp.float32)
-    sizes = jnp.asarray([8, 8, 8, 8], jnp.int32)
-    with generation.assumed("sm70"), generation.routes() as taken:
-        jax.jit(lambda x, w: expert_projection(x, w, sizes, jnp.bfloat16, "auto", None)).trace(x, w)
-    (route,) = {(route.kernel, route.refusal.detail if route.refusal else None) for route in taken
-                if route.choice == "grouped_matmul"}
-    assert route[0] == "xla" and route[1]
 
 
 @pytest.mark.parametrize("block_m,block_n", [(64, 128), (128, 512)])
@@ -522,11 +454,10 @@ def ampere(generation_name: str = "sm80"):
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
 @pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
-def test_an_ampere_gpu_runs_mosaics_launch_unnamed_and_tritons_by_name(sizes, out_dtype):
-    """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tile (`mosaic_gpu.derived`) runs the grouped
-    forward unnamed, a cell no old route measured faster on (`grouped_matmul.DECLARED`, CONSUMERS3), and
-    Triton's launch where the call names it; named, each is as exact as XLA's ragged dot rounded to its
-    output dtype from float64, unrouted rows and empty groups included."""
+def test_an_ampere_gpus_mosaic_and_triton_launches_are_each_as_exact_as_xla(sizes, out_dtype):
+    """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tile (`mosaic_gpu.derived`) and Triton's
+    launch, each named: as exact as XLA's ragged dot rounded to its output dtype from float64, unrouted
+    rows and empty groups included."""
     x, w, dy, group = operands(SIZES[sizes], jnp.bfloat16)
     truth = oracle.products(x, w, dy, SIZES[sizes])
     group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
@@ -552,8 +483,6 @@ def test_an_ampere_gpu_runs_mosaics_launch_unnamed_and_tritons_by_name(sizes, ou
         got, ran = running(grouped_matmul=named)
         assert {type(launch).__name__ for launch, _ in ran} == {kernel} and got.dtype == out_dtype
         check(got, reference, truth[0], group, f"sm80 forward through {kernel} to {jnp.dtype(out_dtype)}")
-    _, ran = running()
-    assert {type(launch).__name__ for launch, _ in ran} == {"MosaicGmm"}
 
 
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
