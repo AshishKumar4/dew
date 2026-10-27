@@ -318,6 +318,23 @@ def _hub_header(name: str, revision: str, file: str) -> dict[str, tuple[list[int
     return {tensor_name: (list(tensor.shape), tensor.dtype) for tensor_name, tensor in header.tensors.items()}
 
 
+def stored_tensors(source: SourceReference, root: Path) -> LazyTensors | None:
+    """`source`'s weight tensors at the snapshot `root` (`snapshot(weights=False)`) as their shapes and
+    dtypes, read from their safetensors headers (`StoredWeights.specs`), a Hub source's over HTTP, no
+    weight downloaded unless a tensor is read: what a load without its weights translates. None for a
+    checkpoint of PyTorch pickles alone, whose shapes no header states, which a load reads whole.
+    Raises FileNotFoundError where a header cannot be read (offline, never read online)."""
+    stored = StoredWeights(source.name, root, source.subfolder or "")
+    if not stored.files(""):
+        return None
+    held = stored.specs("")
+    if held is None:
+        raise FileNotFoundError(f"{source.name} at {root.name}: its weights' headers were never read "
+                                "online, and offline they are read from the files alone; load it online "
+                                "once, or with its weights")
+    return stored.tensors(held)
+
+
 @dataclass(frozen=True)
 class StoredWeights:
     """A source's weight files, read by their headers and fetched by name: what a

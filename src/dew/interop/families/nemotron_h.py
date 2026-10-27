@@ -15,6 +15,7 @@ transformers 5.16.1 ignores them.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
@@ -80,7 +81,9 @@ def matches(model: CausalTransformer) -> bool:
                 return False
         elif name in ("mlp", "moe") and isinstance(mixer, MLPMixer) and mixer.activation == "relu2":
             continue
-        elif name != "full_attention" or mixer != AttentionMixer(nope=True):
+        elif name != "full_attention" or not isinstance(mixer, AttentionMixer) or dataclasses.replace(
+                mixer, bidirectional_blocks=False) != AttentionMixer(nope=True):
+            # A block-bidirectional override is the config's own (`modeling_overrides`).
             return False
     return True
 
@@ -146,7 +149,9 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     mlp = MLPMixer(intermediate_size=integer("intermediate_size", 21504),
                    activation=activation, use_bias=flag("mlp_bias", default=False))
     built = set(layers) | set(step)
-    kinds = {name: LayerKind(mixer=mixer) for name, mixer in (
+    # Records, as every family's kinds are, which a release's modeling overrides then read
+    # (`modeling_overrides`).
+    kinds = {name: native_fields(LayerKind)(mixer=mixer) for name, mixer in (
         ("linear_attention", mamba), ("full_attention", AttentionMixer(nope=True)), ("mlp", mlp))
         if name in built}
     if "moe" in built:
@@ -160,7 +165,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
             expert_features=integer("moe_intermediate_size", 7688),
             shared_features=integer("moe_shared_expert_intermediate_size", 7688) or mlp.intermediate_size,
             latent_features=None if latent is None else _records.integer(latent, "moe_latent_size"))
-        kinds["moe"] = LayerKind(mixer=MLPMixer(
+        kinds["moe"] = native_fields(LayerKind)(mixer=MLPMixer(
             intermediate_size=mixture.expert_features or mlp.intermediate_size,
             activation=activation, mixture=mixture))
     # Init, cache, unused attention knobs, and MoE-only fields change no dense eval forward.
