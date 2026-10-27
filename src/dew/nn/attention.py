@@ -1734,6 +1734,21 @@ def _xla_kernel_narrows(query) -> bool:
         query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not bf16_dot_runs())
 
 
+def _xla_kernel_rounds_off(query, key, *, folded: bool) -> bool:
+    """Whether jax.nn's xla attention would multiply this call off the arithmetic it names, so 'auto'
+    and 'xla' take the reference path, whose products are `bf16_dot_general`'s exact ones: a bf16 query
+    on a GPU whose query-key or probability-value product has a side of one, a one-query decode's or
+    a one-key read's, unless the call is `folded` (`folds`), whose products are Dew's already
+    (`folded_attention`). jax.nn names XLA's BF16_BF16_F32 algorithm for those dots, and on an A100 XLA
+    computes a dot under it with bf16 operands and a side of one off round-to-nearest-even at its ties,
+    where bf16 operands and no algorithm, the reference path's, were exact at every shape (node
+    receipts SF-a100-tie-probe3 and 4, row 1550). Every GPU takes the reference path for them, as its
+    products are right on each. A probability-value product's other side is the value's width, which
+    the call's case does not read; a one-wide value head is no model's."""
+    return (query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not folded
+            and 1 in (query.shape[-3], key.shape[-3]))
+
+
 def _xla_kernel_widens_less() -> bool:
     """Whether jax.nn's xla attention would run this call below the arithmetic its process asks of a CPU,
     so 'auto' and 'xla' take the reference path: a CPU under Dew's test setting (`WIDE_CPU_ARITHMETIC`),
@@ -1753,6 +1768,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
+    folded = folds(query, key, bias, mask, causal, sliding_window)
     case = AttentionCase(
         queries=q_len, keys=kv_len, heads=query.shape[-2], kv_heads=key.shape[-2],
         head_dim=query.shape[-1], dtype=jnp.dtype(query.dtype), key_dtype=jnp.dtype(key.dtype),
@@ -1767,8 +1783,9 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         mask=mask is not None, bias=bias is not None,
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
-        narrows=_xla_kernel_narrows(query) or _xla_kernel_widens_less(),
-        folds=folds(query, key, bias, mask, causal, sliding_window),
+        narrows=(_xla_kernel_narrows(query) or _xla_kernel_rounds_off(query, key, folded=folded)
+                 or _xla_kernel_widens_less()),
+        folds=folded,
         splash_mask=False, shards=sequence_shards(), dropout=dropout)
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
     # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement

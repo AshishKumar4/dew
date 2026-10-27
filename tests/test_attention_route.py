@@ -368,6 +368,39 @@ def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean(name):
     np.testing.assert_array_equal(np.asarray(blocked), np.asarray(masked))
 
 
+GPUS = [name for name in generation.TARGETS if name.startswith("sm")]
+
+
+@pytest.mark.parametrize("target", GPUS)
+def test_a_bf16_attention_with_a_side_of_one_runs_dews_products_on_every_gpu(target):
+    """jax.nn's xla attention names BF16_BF16_F32 for a bf16 query on a GPU, and an A100 computes a dot
+    under it with a side of one off round-to-nearest-even (row 1550). So on every GPU a bf16 call named
+    'xla' whose queries or keys are one, a grouped decode step's or a one-key read's, runs the
+    reference path, its output the reference path's to the bit, forward and backward; one of more
+    queries and keys, an fp32 one and a folded one keep jax.nn's kernel or the folded form."""
+    rng = np.random.default_rng(0)
+
+    def drawn(queries, keys, dtype=jnp.bfloat16, kv_heads=KV_HEADS):
+        return tuple(jnp.asarray(rng.standard_normal(shape), dtype) for shape in (
+            (2, queries, HEADS, WIDTH), (2, keys, kv_heads, WIDTH), (2, keys, kv_heads, WIDTH)))
+
+    def attended(named, query, key, value):
+        return with_gradients(lambda query, key, value: scaled_dot_product_attention(
+            query, key, value, implementation=named))(query, key, value, jnp.ones_like(query))
+
+    with generation.assumed(target):
+        for queries, keys in ((1, 12), (5, 1)):
+            call = drawn(queries, keys)
+            assert attention.resolve_implementation("xla", *call[:2]) == "reference", (queries, keys)
+            for named, reference in zip(attended("xla", *call), attended("reference", *call), strict=True):
+                np.testing.assert_array_equal(np.asarray(named, np.float32),
+                                              np.asarray(reference, np.float32))
+        assert attention.resolve_implementation("xla", *drawn(4, 12)[:2]) == "xla"
+        assert attention.resolve_implementation("xla", *drawn(1, 12, jnp.float32)[:2]) == "xla"
+        # A decode step of the query's own heads folds (`folded_attention`), its products Dew's.
+        assert attention.resolve_implementation("xla", *drawn(1, 12, kv_heads=HEADS)[:2]) == "xla"
+
+
 def test_the_selector_refuses_a_mask_and_a_bias_by_their_inherent_limits():
     """A call with neither takes the route. The same call with a mask, or with a bias, is refused for that one
     thing as an inherent limit, and a call that names the route raises for it: the template reads validity
