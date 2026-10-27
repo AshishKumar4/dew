@@ -90,8 +90,11 @@ class _Config:
 
 
 def _on_gpu() -> bool:
-    """Whether calls run on a GPU of sm80 or later, where the Triton mainloop runs (`bf16_dot_runs`)."""
-    return generation.gpu_placed() and generation.bf16_dot_runs()
+    """Whether calls are chosen for a GPU of sm80 or later, where the GPU mainloops run (`bf16_dot_runs`):
+    the target's backend (`generation.backend`), which an assumed GPU answers for, so a step a Trainer or an
+    AOT lowering traces under `generation.assumed` compiles the mainloop the GPU runs, not the host's (audit
+    K5: the host's placement, `gpu_placed`, sent such a step to the plain-JAX mainloop)."""
+    return generation.backend() == 'gpu' and generation.bf16_dot_runs()
 
 
 DROPS_NOT = ("the template's GPU mainloops draw no probability dropout yet (the Triton mainloop is frozen, "
