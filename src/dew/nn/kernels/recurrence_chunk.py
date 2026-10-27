@@ -359,7 +359,13 @@ def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
 
     def token(state, query, key, value, g, beta, reset):
         state = jnp.where(reset[..., None, None], 0.0, state)
-        return recurrence.update(state, query, key, value, jnp.exp(g), beta[..., None], delta=delta)
+        # A decay a head broadcast over the keys before the update, as the token-by-token recurrence's
+        # (`recurrence._gates`): its gradient then sums each key's paths first, where a `[..., 1]` decay's
+        # took one reduction over every key and value, 3.3 times the recurrence's distance from float64
+        # (test_recurrence_mosaic_gradient's ragged fp32 case, after the gate compiled both arms without
+        # YNNPACK's fusions).
+        decay = jnp.broadcast_to(jnp.exp(g), key.shape)
+        return recurrence.update(state, query, key, value, decay, beta[..., None], delta=delta)
 
     def replay(state, inputs):
         _, final = token(state, *inputs)
