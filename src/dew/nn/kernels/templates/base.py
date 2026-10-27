@@ -126,8 +126,10 @@ class Template[Config: Hashable](tuning.KernelOp):
         if (known := _CONFIRMATIONS.get((call, target.generation))) is not None:
             return known
 
+        from jax.core import Tracer
+
         def array(leaf) -> bool:
-            return isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct, jax.core.Tracer))
+            return isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct, Tracer))
 
         leaves, tree = jax.tree.flatten((ba.args, ba.kwargs), is_leaf=array)
         places = [index for index, leaf in enumerate(leaves) if array(leaf)]

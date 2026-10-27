@@ -4,6 +4,7 @@ asks for), written for each kernel Mosaic compiles while they are on (`reported`
 program around it, with a device or a compile-only one. The CPU suite's resource gates read them
 (tests/kernel_compile.py), as a derivation does to confirm what it planned."""
 
+import concurrent.futures
 import contextlib
 import contextvars
 import dataclasses
@@ -119,11 +120,11 @@ def target_config(generation_name: str) -> str:
     multiprocessors, clock and bandwidth; CUDA's per-capability limits for the rest. The fields past
     the capability and shared memory only steer XLA's own fusions, never a Triton kernel's code."""
     target, version = generation.gpu_target(generation_name), generation.capability(generation_name)
-    facts = (target.shared_limit, target.multiprocessors, target.clock_hz, target.memory_bandwidth)
-    if version is None or any(fact is None for fact in facts):
+    shared, multiprocessors = target.shared_limit, target.multiprocessors
+    clock, bandwidth = target.clock_hz, target.memory_bandwidth
+    if version is None or shared is None or multiprocessors is None or clock is None or bandwidth is None:
         raise ValueError(f"no CUDA target states {generation_name!r}'s compile facts")
     major, minor = version
-    shared, multiprocessors, clock, bandwidth = facts
     return f"""gpu_device_info {{
   threads_per_block_limit: 1024
   threads_per_warp: 32
@@ -257,7 +258,16 @@ def _exported(fn: Callable, args, generation_name: str):
     """`fn` at `args` exported for CUDA as the `generation_name` GPU lowers it, on an abstract device that
     states its compute capability (sm90's too, which `generation.gpu_mesh` leaves unstated; the module is
     the same, STATEDCC1), so Mosaic GPU checks a kernel's shared memory against that GPU's, not an
-    attached GPU's of another capability (an A100's 166912 bytes for an H100's kernel, MWARPS3-a100)."""
+    attached GPU's of another capability (an A100's 166912 bytes for an H100's kernel, MWARPS3-a100). It
+    traces in a thread of its own, a trace of its own outside the caller's: a launch confirmed inside a
+    `shard_map` (an expert layer's) sits on a mesh of the map's devices, which no one-device mesh may
+    replace, and its export reports no route into the caller's (`generation.routes`)."""
+    with concurrent.futures.ThreadPoolExecutor(1, thread_name_prefix="dew-confirm") as apart:
+        return apart.submit(_exported_alone, fn, args, generation_name).result()
+
+
+def _exported_alone(fn: Callable, args, generation_name: str):
+    """`_exported`'s body, in its own thread."""
     mesh = compile_device(generation_name)
     placed = [jax.ShapeDtypeStruct(arg.shape, arg.dtype, sharding=NamedSharding(mesh, PartitionSpec()))
               for arg in args]
@@ -291,7 +301,7 @@ def _compiled(exported, generation_name: str, directory: str) -> tuple[Report, .
             if (refused := REFUSED.search(str(error))) is None:
                 raise
             return (Report("refused", int(refused.group(1)), 0, None, None, ("its compile",)),)
-        return reports(directory)
+        return tuple(reports(directory))
 
 
 def _compiled_apart(exported, generation_name: str, directory: str) -> tuple[Report, ...]:
