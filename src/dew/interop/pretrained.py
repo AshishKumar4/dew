@@ -1886,7 +1886,9 @@ def _kept_tensors(tensors: Mapping[str, np.ndarray], config: Mapping[str, object
             depth = decoders.source_depths(verified.translate(config, tuple(tensors), family), family)
         case _:
             return tensors
-    return {name: tensor for name, tensor in tensors.items() if (held := depth(name)) is None or held < kept}
+    specs = tensor_specs(tensors)
+    kept_specs = {name: spec for name, spec in specs.items() if (held := depth(name)) is None or held < kept}
+    return LazyTensors(kept_specs, tensors.__getitem__)
 
 
 def _load_native_source(source: sources.SourceReference, root: Path, *,
@@ -1933,6 +1935,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len,
                                        admission=route.admitted, weights=weights)
         return replace(loaded, variables=placed(loaded.variables)), False
+    if tensors is None and not weights:
+        tensors = sources.stored_tensors(source, root)
     if tensors is None:
         root = source.weights(root)
         directory = source.directory(root)

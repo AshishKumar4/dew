@@ -231,10 +231,15 @@ def config_from_mamba_ssm(config: Mapping[str, object]) -> Mapping[str, object]:
             "bos_token_id": 0, "pad_token_id": 0, "eos_token_id": 0}
 
 
-def tensors_from_mamba_ssm(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Rename a mamba_ssm state dict to the port's names.
+def tensors_from_mamba_ssm(tensors: Mapping[str, np.ndarray]) -> Mapping[str, np.ndarray]:
+    """Rename a mamba_ssm state dict to the port's names, each tensor read only when it is read.
 
     `Mamba2Model.load_hook` (modeling_mamba2.py) is the whole rename:
     `embedding.` becomes `embeddings.` wherever a name holds it.
     """
-    return {name.replace("embedding.", "embeddings."): tensor for name, tensor in tensors.items()}
+    from dew.interop.safetensors_io import LazyTensors, tensor_specs
+
+    specs = tensor_specs(tensors)
+    names = {name.replace("embedding.", "embeddings."): name for name in specs}
+    return LazyTensors({renamed: specs[name] for renamed, name in names.items()},
+                       lambda renamed: tensors[names[renamed]])

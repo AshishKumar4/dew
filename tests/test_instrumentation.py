@@ -428,6 +428,21 @@ def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move
         "all-gather": (1, 64 * 32 * 4), "all-reduce": (1, 16 * 4)}
 
 
+def test_an_instructions_result_is_read_as_its_element_type_and_dimensions():
+    """A compiled program that rounds an f32 array to bf16 reads an f32 parameter of the array's
+    dimensions and makes a bf16 result of them; a tuple's result names no element type."""
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    x = jnp.ones((3, 5), jnp.float32)
+    text = jax.jit(lambda x: (x.astype(jnp.bfloat16), jnp.sum(x))).lower(x).compile().as_text()
+    instructions = hlo_instructions(text).values()
+    results = {(instruction.op, instruction.element, instruction.dims) for instruction in instructions}
+    assert ("parameter", "f32", (3, 5)) in results
+    assert any(element == "bf16" and dims == (3, 5) for _, element, dims in results), results
+    tuples = [element for op, element, _ in results if op == "tuple"]
+    assert tuples and not any(tuples), results
+
+
 def test_a_collectives_bytes_are_as_xla_sizes_its_sub_byte_and_packed_results():
     """An XLA dump's all-gather of int4 arrays: one per byte unpacked, a scalar's included, and two per
     byte where the layout packs them (`E(4)`), each rounded up to a whole byte."""
