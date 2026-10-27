@@ -474,6 +474,26 @@ class Keyed(Regression):
         return base * factor, aux
 
 
+def test_a_run_that_must_continue_refuses_to_start_afresh_and_one_that_must_not_refuses_to_continue(tmp_path):
+    """`fit(resume="require")` continues the latest checkpoint and refuses a directory with none, or a
+    run given its own state=, so a job that must continue never trains from scratch; `resume="never"`
+    trains a fresh directory and refuses one that holds a run, leaving that run's checkpoints as they
+    were, which the run that must continue then continues."""
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path).fit(dataset(), steps=2, resume="require")
+    assert int(make_trainer(tmp_path).fit(dataset(), steps=2, resume="never").step) == 2
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path).fit(dataset(), steps=4, resume="never")
+    given = make_trainer(tmp_path)
+    with pytest.raises(ValueError):
+        given.fit(dataset(), steps=4, resume="require", state=given.initial_state())
+    continued = make_trainer(tmp_path).fit(dataset(), steps=4, resume="require")
+    whole = make_trainer().fit(dataset(), steps=4)
+    for actual, expected in zip(jax.tree.leaves(continued.variables), jax.tree.leaves(whole.variables),
+                                strict=True):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
 def test_a_resumed_run_continues_the_key_stream(tmp_path):
     """A resume continues fold_in(run_key, step) where it stopped.
 

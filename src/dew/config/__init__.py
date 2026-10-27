@@ -48,7 +48,7 @@ from dew import registry
 from dew._coordination import agree_process_phase, agreed
 from dew._records import JSON, duration, is_share, record, recorded_duration
 from dew.cache import dew_cache_dir
-from dew.checkpoints import RUN_FILE, Checkpoints, Keep
+from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
 from dew.data.compile import fitted
@@ -360,6 +360,9 @@ class TrainerConfig:
     checkpoint_dir: str = "./checkpoints"
     keep: Annotated[int | Keep, _keep_argument()] = Keep.latest
     """The number of latest checkpoints kept, besides the best one (`Keep`'s own default)."""
+    resume: Resume = "auto"
+    """Whether the run continues its directory's latest checkpoint: where there is one, "require" for a
+    job that must not start afresh, or "never" for one that must not continue another (`Trainer.fit`)."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """The metric name and ranking policy; None selects validation loss or training loss."""
     update_tokens: int | None = None
@@ -1358,9 +1361,10 @@ class RunConfig:
             local = _local_tracker(checkpoints.directory, name)
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
             def check_resumed() -> None:
-                """Refuse a checkpoint of another run under the name, on every rank."""
+                """Refuse a checkpoint of another run under the name, or a directory `resume` refuses
+                (`Checkpoints.resumed`), on every rank, before the record is written over it."""
                 saved = epath.Path(checkpoints.directory) / RUN_FILE
-                if checkpoints.latest is not None and saved.exists():
+                if checkpoints.resumed(trainer.resume) is not None and saved.exists():
                     self.check_resume(json.loads(saved.read_text()))
 
             def record_run() -> None:
@@ -1395,7 +1399,7 @@ class RunConfig:
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 checkpoint_final=trainer.checkpoint_final,
                 metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
-                best=trainer.best_policies(), stop=trainer.stop,
+                best=trainer.best_policies(), stop=trainer.stop, resume=trainer.resume,
                 # A run that names no metrics and validates no split has no suite to score.
                 validation=validation if suites is None else suites or None, summaries=self.val_summaries,
             )

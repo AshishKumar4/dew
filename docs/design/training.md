@@ -160,7 +160,7 @@ Trainer(objective, opt, key=0,
         checkpoints=Checkpoints("gs://runs/lm-1b", keep=Keep(latest=2, every=10_000)))
 ```
 
-- A run with a checkpoint directory resumes automatically from its latest checkpoint: parameters, optimizer state, step, RNG and each data share's position. Resume is exact on the same mesh.
+- A run with a checkpoint directory resumes automatically from its latest checkpoint: parameters, optimizer state, step, RNG and each data share's position. Resume is exact on the same mesh. `fit(resume=)` makes the choice explicit: `"require"` refuses a directory with nothing to continue, for a job that must not silently start fresh, and `"never"` refuses one that already holds a run (`Checkpoints.resumed`); a run configuration takes it as `trainer.resume` and refuses before its record is written.
 - A checkpoint directory belongs to one run. A fresh run takes a new directory; a directory holding another run's checkpoints refuses to resume, naming what differs.
 - A resumed run skips loading pretrained weights it is about to overwrite, and its first step hits the compile cache.
 - A resumed `OptimConfig` run steps at the rate it configures, not the checkpoint's: its schedule's rate fields are set over the restored state (`dew.optim.with_rates`). An optimizer state written before Dew held those fields, its rate a scale times a schedule's shape, is refused by name.

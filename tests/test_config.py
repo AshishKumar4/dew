@@ -14,6 +14,7 @@ from flax import linen as nn
 
 import dew.config
 import dew.nn.backbones
+from dew.checkpoints import RUN_FILE, Resume
 from dew.config import RunConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
@@ -325,6 +326,24 @@ def test_a_run_can_disable_final_checkpoint_saving(tmp_path):
     data = Loader(lambda partition: batches(), None, None, 8)
     assert int(run.train(Regression(), data, name="no-final").step) == 1
     assert Checkpoints(str(tmp_path / "no-final")).latest is None
+
+
+def test_a_run_that_must_start_afresh_refuses_a_directory_that_holds_one_before_writing_its_record(tmp_path):
+    """`trainer.resume="never"` trains a fresh run directory and refuses one that holds a checkpoint, on
+    every rank, before the run's record is written over that run's; `resume="require"` refuses a
+    directory that holds none to continue, so a job that must continue never trains from scratch."""
+    def run(resume: Resume, steps: int = 1) -> RunConfig:
+        return RunConfig(trainer=TrainerConfig(steps=steps, resume=resume, checkpoint_dir=str(tmp_path),
+                                               eval_every=None, checkpoint_every=None))
+
+    data = Loader(lambda partition: batches(), None, None, 8)
+    with pytest.raises(ValueError):
+        run("require").train(Regression(), data, name="kept")
+    assert int(run("never").train(Regression(), data, name="kept").step) == 1
+    record = (tmp_path / "kept" / RUN_FILE).read_bytes()
+    with pytest.raises(ValueError):
+        run("never", steps=2).train(Regression(), data, name="kept")
+    assert (tmp_path / "kept" / RUN_FILE).read_bytes() == record
 
 
 def test_publishing_requires_a_final_checkpoint_policy():

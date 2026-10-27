@@ -32,14 +32,13 @@ import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
-from flax.training.early_stopping import EarlyStopping
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import FROZEN, Batch, Variables, owned_dicts, select
-from dew.checkpoints import Checkpoints, Ranking
+from dew.checkpoints import Checkpoints, Ranking, Resume
 from dew.cleanup import attempted
 from dew.data.compile import fitted
 from dew.data.dataset import (
@@ -574,12 +573,12 @@ class Trainer(Generic[Loss, Effects]):
         """
         return self._placed(self._started(), positioned=True)
 
-    def _started(self) -> Start:
+    def _started(self, resume: Resume = "auto") -> Start:
         """What placing the state reads before it places anything: the objective's held tree and
         the key, resolved once, so that the shapes and the values are the same inputs through the
         same overridable method and the objective is asked for what it holds exactly once; the
-        state's shapes; the checkpoint a run resumes from, the one every process agrees; and the
-        placement of the state, once its checks pass (`_validated`)."""
+        state's shapes; the checkpoint a run resumes from as `resume` says (`Checkpoints.resumed`), the
+        one every process agrees; and the placement of the state, once its checks pass (`_validated`)."""
         initializer, key = self.objective.initializer, self.key
         if self.host_master:
             from dew.distributed.host import transfer
@@ -588,11 +587,12 @@ class Trainer(Generic[Loss, Effects]):
         checkpoints = self.checkpoints
         # Each process lists the checkpoints itself, and on a shared filesystem one listing can lag
         # another's: every process resumes from one step or none does.
-        resume = None if checkpoints is None else agreed_same("newest checkpoint", lambda: checkpoints.latest)
-        if checkpoints is not None and resume is not None:
-            abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
+        step = (None if checkpoints is None
+                else agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume)))
+        if checkpoints is not None and step is not None:
+            abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(step))
         shardings, _ = self._validated(abstract)
-        return Start(initializer, key, abstract, through, resume, shardings)
+        return Start(initializer, key, abstract, through, step, shardings)
 
     def _placed(self, start: Start, *, positioned: bool
                 ) -> tuple[TrainState, Placement[TrainState], bytes | None]:
@@ -1273,20 +1273,23 @@ class Trainer(Generic[Loss, Effects]):
         state: TrainState | None = None,
         observe: Observe | None = None,
         device_prefetch: int = PREFETCH_DEPTH,
+        resume: Resume = "auto",
     ) -> TrainState:
-        """Train until the step or real-token cap is reached, resuming the latest checkpoint.
+        """Train until the step or real-token cap is reached, resuming the latest checkpoint as `resume` says.
 
-        An explicit `state` is the run's initial state, in place of initializing one and of restoring a
-        checkpoint (a float64 truth's widened copy of another run's, say), not a continuation, which is a
-        checkpoint's alone: its input reader starts at the position `dataset` supplies.
+        `resume="auto"` continues the checkpointer's latest checkpoint where it holds one and otherwise
+        starts afresh; "require" refuses to start afresh, for a job that must continue, and "never" refuses
+        a directory that already holds a run (`Checkpoints.resumed`). An explicit `state` is the run's
+        initial state, in place of initializing one and of restoring a checkpoint (a float64 truth's widened
+        copy of another run's, say), not a continuation, which is a checkpoint's alone: its input reader
+        starts at the position `dataset` supplies.
 
         Every `log_every` steps, the tracker receives the loss, the objective's metrics and the throughput.
 
-        `tokens` stops at the first microbatch that reaches this real-token
-        budget, from the same counter as `train/tokens`, persisted in checkpoints.
-        Padding never counts. With both caps the first reached ends the run;
-        with `steps=None`, a decaying schedule needs its own step horizon. `examples`
-        trains on the chain's first records, each once (`Loader.example_steps`).
+        `tokens` stops at the first microbatch that reaches this real-token budget, from the same counter
+        as `train/tokens`, persisted in checkpoints. Padding never counts. With both caps the first reached
+        ends the run; with `steps=None`, a decaying schedule needs its own step horizon. `examples` trains
+        on the chain's first records, each once (`Loader.example_steps`).
 
         Every `eval_every` steps, and at the end, the validation split is scored. The objective's
         artifacts go to the tracker and to `metrics`, whose reductions are logged as `val/<name>`.
@@ -1295,33 +1298,29 @@ class Trainer(Generic[Loss, Effects]):
         `<name>/<metric>`. Each of `summaries` weighs those scores into one, `evaluation/summary/<name>`,
         formed at a step that scored every split it weighs, which `best` and `Plateau` rank by.
 
-        `restore_best=True` returns the model the run ranked best: the final
-        state with the counters, variables and EMA of the best step
-        (`MODEL_STATE`), read from its best checkpoint, a weights-only one
-        included, or without `Checkpoints` from the copy it held
-        (`HeldBest`). Its optimizer state and the rest stay the final step's,
-        so it is the best model, not a point to resume training from, which
-        the run's checkpoints are.
+        `restore_best=True` returns the model the run ranked best: the final state with the counters,
+        variables and EMA of the best step (`MODEL_STATE`), read from its best checkpoint, a weights-only
+        one included, or without `Checkpoints` from the copy it held (`HeldBest`). Its optimizer state and
+        the rest stay the final step's, so it is the best model, not a point to resume training from.
 
         Every `checkpoint_every` steps (or "5%", `FitPlan.cadences`), the state and data position are written;
         `checkpoint_final=True` also writes the final state, independently of that cadence. A
         duration is checked at each `log_every` step, so they are written at the first log step
         after that much time, and every `checkpoints.local_every` steps to the local directory.
 
-        A preemption notice (a scheduler's SIGTERM; `PreemptionNotice`) stops the run
-        at the next step every process agrees on. That step's state and data position
-        are written, the final validation is skipped, and fit raises `Preempted`,
-        which ends the program with status 143 unless caught. Run it again and fit
-        resumes from there.
+        A preemption notice (a scheduler's SIGTERM; `PreemptionNotice`) stops the run at the next step every
+        process agrees on. That step's state and data position are written, the final validation is
+        skipped, and fit raises `Preempted`, which ends the program with status 143 unless caught. Run it
+        again and fit resumes from there.
 
-        Previews are generated only when `preview=True` and a tracker receives them;
-        scalar reporting never triggers preview work. `observe` takes values of the
-        state at a cadence of its own while the run trains (`Observe`). `device_prefetch` training
-        batches are placed on the devices ahead of the step, which the step's memory plan holds room for.
+        Previews are generated only when `preview=True` and a tracker receives them; scalar reporting never
+        triggers preview work. `observe` takes values of the state at a cadence of its own while the run
+        trains (`Observe`). `device_prefetch` training batches are placed on the devices ahead of the step,
+        which the step's memory plan holds room for.
 
-        The process is readied first (`dew.training.runtime.ready_process`), as
-        `prepare_process` readies it: a program that never called that gets Dew's
-        log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
+        The process is readied first (`dew.training.runtime.ready_process`), as `prepare_process` readies
+        it: a program that never called that gets Dew's log handler, and one whose JAX opened on the CPU
+        beside an NVIDIA GPU stops.
         """
         # A schedule whose last stage ends its data bounds the run as tokens= does (`run_tokens`).
         run_length(steps, epochs, tokens, examples, required=False)
@@ -1356,7 +1355,7 @@ class Trainer(Generic[Loss, Effects]):
                 held_best=restore_best and checkpoints is None, observe=observe, summaries=tuple(summaries),
                 declared=declared,
             )
-            trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
+            trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state, resume)
             # The state a checkpoint would hold: the step rebuilds its narrow copies.
             trained = dataclasses.replace(trained, compute=None)
             # Whether this fit trained or found the run complete, and inside
@@ -1382,7 +1381,7 @@ class Trainer(Generic[Loss, Effects]):
     def _training_loop(self, plan: FitPlan, run: FitRun, profiler: Profiler | None,
                        tracer: Profiler | None, profile: ProfileWindow | None,
                        checkpoints: Checkpoints | None,
-                       initial: TrainState | None = None) -> TrainState:
+                       initial: TrainState | None = None, resume: Resume = "auto") -> TrainState:
         """Place the state, dispatch the numerical steps and finish their loop
         before resource cleanup. Returns the final state, the placed one for a
         run already complete, its last checkpoint written, so nothing ran.
@@ -1390,7 +1389,7 @@ class Trainer(Generic[Loss, Effects]):
         The loop is the state's one holder: each step donates the state it is
         handed, and a reference kept past that, as fit's own once was, holds
         an array whose buffers the step consumed."""
-        current, position, placed, abstract = self._starting(run, initial)
+        current, position, placed, abstract = self._starting(run, initial, resume)
         run.last_checkpoint = time.perf_counter()
         interval = Interval.resumed(run.stop_control, last_saved=(
             current if checkpoints is not None and checkpoints.latest is not None else None))
@@ -1526,14 +1525,20 @@ class Trainer(Generic[Loss, Effects]):
         run.other += time.perf_counter() - paused
         return self._reported_outcome(error, run)
 
-    def _starting(self, run: FitRun, initial: TrainState | None
+    def _starting(self, run: FitRun, initial: TrainState | None, resume: Resume
                   ) -> tuple[int, bytes | None, Callable[[], tuple[TrainState, Placement[TrainState]]],
                              TrainState | None]:
         """Where `fit` starts, before it places anything: the step, the data position a resume reads
         alone (`Checkpoints.position`), so the data opens where the run left it, the placement still
         to make, and the state's shapes it checks first. A supplied `initial` state is placed as it
-        is given, its shapes already placed."""
+        is given, its shapes already placed: no continuation, which `resume="require"` refuses, and
+        under "never" into a directory that holds no run either."""
         checkpoints = self.checkpoints
+        if resume == "require" and (checkpoints is None or initial is not None):
+            raise ValueError("resume='require' continues the checkpointer's latest checkpoint, which a "
+                             "trainer with no checkpointer, or a run given its state=, starts without")
+        if initial is not None and checkpoints is not None and resume == "never":
+            agreed_same("newest checkpoint", lambda: checkpoints.resumed(resume))
         if initial is not None:
             # A supplied state's trees are held as dicts too (`initial_state`), its optimizer's and
             # accumulation's mirrors of the parameters with them.
@@ -1541,7 +1546,7 @@ class Trainer(Generic[Loss, Effects]):
             shardings, _ = self._validated(initial)
             supplied = jax.device_put(initial, shardings)
             return int(supplied.step), None, lambda: (supplied, shardings), None
-        start = self._started()
+        start = self._started(resume)
         if checkpoints is not None and checkpoints.latest is not None:
             run.stop_control = checkpoints.control(checkpoints.latest)
         if checkpoints is None or start.resume is None:
@@ -1827,7 +1832,7 @@ class Trainer(Generic[Loss, Effects]):
             run.best.offer(ranking, dataclasses.replace(state, compute=None))
         winners = checkpoints._candidates(ranking) if (
             evaluation_due and checkpoints is not None and (plan.checkpoint_every or plan.best)) else ()
-        if not run.stopped and scores and self._plateau(plan, run, scores):
+        if not run.stopped and scores and plan.plateaued(run, scores):
             self._take(plan, run, interval, state, unlogged=True)
             run.stopped = True
             run.stop_control['stop_reason'] = 'validation plateau'
@@ -1982,38 +1987,6 @@ class Trainer(Generic[Loss, Effects]):
             stopping = Best(metric, mode=plateau.mode, split=plateau.split).resolved(scored)
             plateau = dataclasses.replace(plateau, metric=metric, mode=stopping.mode, split=stopping.split)
         return selection, plateau, pause
-
-    @staticmethod
-    def _plateau(plan: FitPlan, run: FitRun, scores: Mapping[str, float]) -> bool:
-        stop = plan.stop
-        if stop is None:
-            return False
-        assert isinstance(stop.metric, (Metric, TrainingScalar, Summary)), (
-            "fit binds the stopping selector before stepping"
-        )
-        name = f'{stop.split}/{stop.metric.name}'
-        if name not in scores:
-            return False
-        value = scores[name] if stop.mode == 'min' else -scores[name]
-        if not math.isfinite(value):
-            return False
-        key = f'plateau:{name}'
-        held = run.stop_control.get(key)
-        rule = {'mode': stop.mode, 'evals': stop.evals, 'min_delta': stop.min_delta}
-        if held is not None and held.get('rule') != rule:
-            raise ValueError(
-                "Plateau policy differs from the resumed checkpoint; resume with the same stopping rule"
-            )
-        if held is not None and held.get('step') == run.current:
-            return held['bad'] >= stop.evals
-        # Flax's recurrence, which stops at its `patience`-th bad evaluation past the first.
-        stopping = EarlyStopping(min_delta=stop.min_delta, patience=stop.evals - 1)
-        if held is not None:
-            stopping = stopping.replace(best_metric=held['best'], patience_count=held['bad'])
-        stopping = stopping.update(value)
-        run.stop_control[key] = {'best': stopping.best_metric, 'bad': stopping.patience_count,
-                                 'step': run.current, 'rule': rule}
-        return stopping.should_stop
 
     def _warm_evaluations(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState]) -> None:
         """Compile the programs the run's evaluations run beside a step's compile, where any runs
