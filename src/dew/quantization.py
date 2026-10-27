@@ -1013,19 +1013,84 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
     return scaled
 
 
+def _integer_convolution_on_cuda(op: Callable[..., jax.Array]) -> Callable[..., jax.Array]:
+    """Qwix's quantized convolution `op` with an integer product computed in float32 on CUDA.
+
+    Qwix 0.1.8 convolves two integer operands into an int32 accumulator
+    (`qarray.get_accumulator_and_result_type`), and XLA:GPU runs no s8 x s8 -> s32
+    convolution at any precision (UNIMPLEMENTED on an A100, jax 0.12) while it
+    runs s8 x s8 -> f32. On CUDA the operands' integer values convolve as float32
+    instead: each product of two int8 codes is exact in float32, at most 2**14 in
+    magnitude (Qwix's symmetric int8 reaches -128), so every contraction of up to
+    1024 terms sums exactly, and a longer one rounds only where a partial sum passes
+    2**24, which int32 would have held exactly. Every other platform convolves the
+    integers as Qwix does."""
+    qwix = _qwix()
+
+    def integer(arg) -> bool:
+        return isinstance(arg, qwix.QArray) and jnp.issubdtype(arg.qvalue.dtype, jnp.integer)
+
+    def convolved(lhs, rhs, *args, **kwargs) -> jax.Array:
+        if not (integer(lhs) and integer(rhs)):
+            return op(lhs, rhs, *args, **kwargs)
+
+        def in_float32(lhs, rhs):
+            widened = (dataclasses.replace(arg, qvalue=arg.qvalue.astype(jnp.float32)) for arg in (lhs, rhs))
+            return op(*widened, *args, **kwargs)
+
+        return jax.lax.platform_dependent(lhs, rhs, cuda=in_float32,
+                                          default=lambda lhs, rhs: op(lhs, rhs, *args, **kwargs))
+
+    return convolved
+
+
+def _qt_operand(operand, config, dimension_numbers, *, for_lhs: bool):
+    """`operand` quantized as Qwix's training forward quantizes it (0.1.8
+    `conv_general_qt_fwd`'s `_quantize_operand`), or as it is where its
+    configuration quantizes nothing."""
+    conv_general = _qwix("qwix._src.core.conv_general")
+    qarray = _qwix("qwix._src.core.qarray")
+    numerics = _qwix("qwix._src.core.numerics")
+    side = "lhs" if for_lhs else "rhs"
+    qtype = getattr(config, f"{side}_qtype")
+    if not (qtype and numerics.should_quantize(operand.dtype)):
+        return operand
+    method = getattr(config, f"{side}_calibration_method")
+    how = conv_general.get_how_to_quantize(dimension_numbers=dimension_numbers, for_lhs=for_lhs,
+                                           qtype=qtype, calibration_method=method)
+    if getattr(config, f"{side}_disable_channelwise_axes"):
+        how = dataclasses.replace(how, channelwise_axes=[])
+    calibration = qarray.calibrate(operand, how)
+    if (collect := getattr(config, f"{side}_collect_quant_stat")) is not None:
+        calibration = collect(calibration)
+    scale, zero_point = qarray.compute_scale_zero_point(calibration, qtype)
+    return qarray.quantize_with_scale_zero_point(operand, qtype, scale, zero_point)
+
+def _qt_forward(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
+                feature_group_count, batch_group_count, out_sharding):
+    """Qwix's training forward with the integer convolution XLA:GPU runs
+    (`_integer_convolution_on_cuda`): the product and the quantized operands
+    the backward reads."""
+    conv_general = _qwix("qwix._src.core.conv_general")
+    integer_convolution = _integer_convolution_on_cuda(conv_general.conv_general_dilated)
+    numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
+    operands = (_qt_operand(lhs, config, numbers, for_lhs=True),
+                _qt_operand(rhs, config, numbers, for_lhs=False))
+    return integer_convolution(*operands, window_strides, padding, lhs_dilation, rhs_dilation, numbers,
+                               feature_group_count, batch_group_count, out_sharding), operands
+
+
 @functools.cache
 def _grouped_convolution_gradient() -> type:
-    """Qwix's quantized-training provider with Dew's gradient for a grouped
-    convolution; importing Qwix here keeps it optional."""
+    """Qwix's quantized-training provider with Dew's quantized convolution;
+    importing Qwix here keeps it optional."""
     qwix = _qwix()
-    conv_general_qt = _qwix("qwix._src.core.conv_general_qt")
 
     @functools.partial(jax.custom_vjp, nondiff_argnums=tuple(range(2, 11)))
     def grouped_conv_qt(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
                         dimension_numbers, feature_group_count, batch_group_count, out_sharding):
-        return conv_general_qt.conv_general_qt_fwd(
-            lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
-            feature_group_count, batch_group_count, out_sharding)[0]
+        return _qt_forward(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
+                           dimension_numbers, feature_group_count, batch_group_count, out_sharding)[0]
 
     def straight_through(config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                          feature_group_count, batch_group_count, out_sharding, residuals, g):
@@ -1043,7 +1108,7 @@ def _grouped_convolution_gradient() -> type:
         _, transpose = jax.vjp(convolve, *operands)
         return transpose(g)
 
-    grouped_conv_qt.defvjp(conv_general_qt.conv_general_qt_fwd, straight_through)
+    grouped_conv_qt.defvjp(_qt_forward, straight_through)
 
     class GroupedConvolutionGradient(qwix.QtProvider):
         """Differentiates a quantized grouped convolution, which Qwix's
@@ -1052,11 +1117,15 @@ def _grouped_convolution_gradient() -> type:
         the kernel's grouped shape, which only fits one group, so `jax.grad`
         raised for the hybrid DiT's depthwise convolutions.
 
-        The forward is Qwix's. The backward is the one Qwix computes for an
+        The forward is Qwix's with the integer convolution XLA:GPU runs
+        (`_integer_convolution_on_cuda`), for an ungrouped convolution too:
+        Qwix's own convolves its int8 operands into int32, which an A100 and
+        an H100 cannot run. The backward is the one Qwix computes for an
         ungrouped convolution with float gradients: the float convolution's
         transpose at the dequantized operands the forward computed with,
         here JAX's own, which handles groups. Qwix's quantized gradients
-        (`bwd_qtype`) for a grouped convolution are refused.
+        (`bwd_qtype`) run Qwix's own convolution, refused on a GPU, and for a
+        grouped convolution everywhere.
 
         An ungrouped convolution with quantized activations quantizes its
         float32 operands and returns the input's dtype, so Qwix scales its
@@ -1084,12 +1153,17 @@ def _grouped_convolution_gradient() -> type:
                 return super().conv_general_dilated(
                     lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                     feature_group_count, batch_group_count, precision, preferred_element_type, out_sharding)
-            if feature_group_count == 1:
+            if feature_group_count == 1 and rule.bwd_qtype is not None:
+                if backend() == "gpu":
+                    raise ValueError(
+                        "Qwix 0.1.8's quantized gradients of a convolution (bwd_qtype) convolve two int8 "
+                        "operands into an int32 accumulator, which XLA:GPU cannot run (UNIMPLEMENTED on "
+                        "an A100); leave bwd_qtype unset, whose float gradients Dew computes")
                 return super().conv_general_dilated(
                     lhs.astype(jnp.float32), rhs.astype(jnp.float32), window_strides, padding, lhs_dilation,
                     rhs_dilation, dimension_numbers, feature_group_count, batch_group_count, precision,
                     preferred_element_type, out_sharding).astype(lhs.dtype)
-            if rule.bwd_qtype is not None:
+            if feature_group_count > 1 and rule.bwd_qtype is not None:
                 raise ValueError(
                     "Qwix 0.1.8 cannot compute the quantized gradients of a grouped convolution, so Dew "
                     "refuses bwd_qtype for one; leave bwd_qtype unset, or leave the convolution out of "
@@ -1098,9 +1172,17 @@ def _grouped_convolution_gradient() -> type:
             if rule.tile_size:
                 raise ValueError("subchannel is not supported for conv_general_dilated.")
             rule, op_id = self._get_current_rule_and_op_id("conv_general_dilated")
-            return grouped_conv_qt(lhs, rhs, self._create_conv_general_qt_config(rule, op_id, lhs, rhs),
-                                   window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
-                                   feature_group_count, batch_group_count, out_sharding)
+            if feature_group_count == 1:
+                # Quantized from float32 and returned in the input's dtype, so the 8-bit product is
+                # scaled in float32 (the class docstring).
+                lhs, rhs, dtype = lhs.astype(jnp.float32), rhs.astype(jnp.float32), lhs.dtype
+            else:
+                dtype = None
+            config = self._create_conv_general_qt_config(rule, op_id, lhs, rhs)
+            convolved = grouped_conv_qt(lhs, rhs, config, window_strides, padding, lhs_dilation,
+                                        rhs_dilation, dimension_numbers, feature_group_count,
+                                        batch_group_count, out_sharding)
+            return convolved if dtype is None else convolved.astype(dtype)
 
     return GroupedConvolutionGradient
 
@@ -1270,7 +1352,8 @@ def _serving_provider() -> type:
             super().__init__(
                 rules, _dot_general_fn=_scaled_in_float32(qwix.dot_general),
                 _einsum_fn=_scaled_in_float32(qwix.einsum),
-                _conv_general_dilated_fn=_scaled_in_float32(qwix.conv_general_dilated))
+                _conv_general_dilated_fn=_scaled_in_float32(
+                    _integer_convolution_on_cuda(qwix.conv_general_dilated)))
 
         def _recorded(self, op: str, weight) -> bool:
             """Whether `weight` is a stored quantized kernel that reaches `op` with no rule matching
