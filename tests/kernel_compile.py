@@ -214,7 +214,7 @@ def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     the calling test runs again in a process of its own, and these are its records there."""
     wanted = capability(generation)
     if _BINARY_CAPABILITY and _BINARY_CAPABILITY[0] != wanted and OWN_PROCESS not in os.environ:
-        return _compiled_apart()
+        return compiled_apart()
     _BINARY_CAPABILITY[:] = _BINARY_CAPABILITY or [wanted]
     found = _compiled_here(cases, generation)
     if OWN_PROCESS in os.environ:
@@ -222,7 +222,7 @@ def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     return found
 
 
-def _compiled_apart() -> list[dict]:
+def compiled_apart() -> list[dict]:
     """The records the calling test's `compile_mosaic_kernels` call gives in a pytest process of its own, its
     first Mosaic GPU compile its generation's."""
     test = os.environ["PYTEST_CURRENT_TEST"].rsplit(" ", 1)[0]
