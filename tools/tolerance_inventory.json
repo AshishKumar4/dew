@@ -253,10 +253,6 @@
    "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_gguf.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_gpt_oss.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
@@ -466,7 +462,7 @@
    "lane": "Training"
   },
   "tests/test_multimodal_model.py": {
-   "comparisons": 12,
+   "comparisons": 11,
    "lane": "Kernels"
   },
   "tests/test_multiprocess.py": {
@@ -571,10 +567,6 @@
   },
   "tests/test_reference_runs.py": {
    "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_released_checkpoints.py": {
-   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_reporting.py": {

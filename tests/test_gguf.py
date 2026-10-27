@@ -201,10 +201,14 @@ def test_tensors_are_the_ones_transformers_reads(tmp_path, architecture, qtype):
 
 def test_load_pretrained_reads_the_file_and_its_tokenizer(tmp_path):
     """The whole load: logits against transformers over the same GGUF, and the
-    tokenizer the file carries, since the directory ships none. The directory
+    tokenizer the file carries, since the directory ships none: Dew's logits as
+    exact as transformers' (`assert_as_exact_as_the_reference`), the truth
+    transformers' float64 twin of the same dequantized weights. The directory
     also ships a diffusion pipeline's index, and the selected file is still
     what loads; a second payload selector beside it is refused."""
     from transformers import AutoModelForCausalLM
+
+    from tools.torch_precision import float64, float64_twin
 
     rng = np.random.default_rng(0)
     write_gguf(tmp_path / "model.gguf", "llama", gguf.GGMLQuantizationType.Q8_0,
@@ -220,11 +224,13 @@ def test_load_pretrained_reads_the_file_and_its_tokenizer(tmp_path):
     reference.set_attn_implementation("eager")
     ids = rng.integers(0, VOCAB, (2, 12))
     ours = np.asarray(pretrained.model.apply(pretrained.variables, ids), np.float32)
+    given = torch.from_numpy(ids)
     with torch.no_grad():
-        theirs = reference(input_ids=torch.from_numpy(ids)).logits.numpy()
-
-    # Twice the measured 6.2e-6 (CPU), logits of magnitude 4: fp32 rounding.
-    np.testing.assert_allclose(ours, theirs, atol=1.3e-5, rtol=0)
+        theirs = reference(input_ids=given).logits.numpy()
+        with float64():
+            wide = float64_twin(reference)(input_ids=given).logits.numpy()
+    _, terms = float64_forward(pretrained.model, pretrained.variables, ids)
+    assert_as_exact_as_the_reference(ours, theirs, wide, "the file's logits", terms=terms)
     assert pretrained.processor is not None, "the file's tokenizer did not become the processor"
     tokens = np.asarray(pretrained.processor("Hello, GGUF").tokens)
     # The file's merges reached the processor: "llo" is the second merge's product.

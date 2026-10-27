@@ -2,44 +2,18 @@
 
 SmolLM2-135M and Qwen3-0.6B are revision-pinned below. Dew and Transformers
 5.16.1 load the same snapshot in float32; the Torch reference stays on CPU.
-The GPU run uses the suite's highest matmul precision. Lowering precision to
-TF32 made four Qwen cases fail at the unchanged bounds.
+The GPU run uses the suite's highest matmul precision.
 
-`LOGITS` is per checkpoint because the fp32 forward residual is per
-checkpoint, and it is not 1e-4. What sets it, measured on these two
-revisions over the prompts below:
-
-                  CPU fp32   GPU fp32   fp64, both sides widened
-  SmolLM2-135M    1.469e-4   1.590e-4   2.149e-13
-  Qwen3-0.6B      7.820e-5   3.586e-4   2.487e-13
-
-The last column is the exactness proof, and it says the arithmetic is the
-same arithmetic. Both implementations deliberately pin several operations to
-fp32 whatever the model's compute dtype: the rotary tables
-(`dew.nn.rope.rotary_freqs`, `modeling_llama.py:108-125`), RMSNorm
-(`dew.nn.attention.RMSNorm`, `modeling_llama.py:62-67`) and the attention
-softmax (`flax/linen/attention.py:143-144`, `modeling_llama.py:208`). Widen
-exactly those on both sides, run the trunk in double, and the two agree to
-2e-13, five decimal orders inside 1e-4: rope, norm epsilon, attention
-scaling, grouped-query repetition and the gated MLP are not merely close,
-they are the same operators. The ids are identical too, which
-`test_the_load_hands_back_the_checkpoints_own_tokenizer` asserts.
-
-What remains in fp32 is therefore rounding, not a difference, and no change
-to dew drives it under 1e-4. The residual stream of these checkpoints
-carries massive activations, peaking near 19279 for SmolLM2 and 6560 for
-Qwen3, where one fp32 ulp is already 1.95e-3 and 4.88e-4; the measured
-per-layer residuals sit at one to four of those ulps, and the final norm and
-unembedding carry that into logits of magnitude 36.1 and 20.7 as a few tens
-of eps. TF32 is not the cause either: the CPU lane has no TF32 at all and
-lands within 1.1x (SmolLM2) and 4.6x (Qwen3) of the GPU lane, both lanes
-being accumulation order over the same operators.
-
-The bounds below are the tightest the numerics support, each about twice its
-checkpoint's worst measured lane. That leaves room for a backend
-reassociating a sum without leaving room for a wrong operator: an eps-scale
-bug in any operation above moves these residuals by orders of magnitude, not
-by a factor of two.
+Each numeric comparison holds Dew to transformers by the accuracy gate's
+reference rule (`assert_as_exact_as_the_reference`): Dew's fp32 result as near
+the float64 truth as transformers' fp32 result over the same ids, mask and
+positions, the truth transformers' float64 twin of the same weights
+(`tools.torch_precision.float64_twin`), each logit sized by Dew's own float64
+terms. No bound is fitted to a measured residual: these checkpoints' residual
+streams carry massive activations (near 19279 for SmolLM2 and 6560 for
+Qwen3), so their fp32 logits round by tens of eps, and the rule scales with
+whatever the reference's own rounding is, where a wrong operator moves Dew
+by orders of magnitude.
 
 Each prompt is tokenized individually, then the public numeric-input seam
 assembles padded rows. This does not exercise raw-text batch padding when
@@ -75,7 +49,6 @@ PROMPTS = ("The Cascade Range runs from northern California through Oregon and W
 SEQ = 32
 NEW_TOKENS = 12
 RATE = 1e-4
-TOKEN_LOSS = 5e-3
 
 
 pytestmark = pytest.mark.network
@@ -90,8 +63,7 @@ def stop_ids(generation_config) -> tuple[int, ...] | None:
 
 @pytest.fixture(scope="module", params=list(CHECKPOINTS), ids=list(CHECKPOINTS))
 def checkpoint(request):
-    """Which pinned checkpoint the case runs on: the key into `CHECKPOINTS`
-    and `LOGITS`, since the forward residual is a property of the weights."""
+    """Which pinned checkpoint the case runs on: the key into `CHECKPOINTS`."""
     return request.param
 
 
@@ -241,10 +213,11 @@ def test_the_released_logits_match_transformers_on_the_same_ids(
 
 
 def test_the_objectives_token_scores_are_the_references_cross_entropy(
-        batch, reference, scoring):
+        batch, reference, scoring, checkpoint):
     """`LMObjective.evaluate` is the shifted cross entropy of the reference's
-    own logits, position by position, and the fill it is handed counts for
-    nothing."""
+    own logits, position by position, as exact as the reference's
+    (`assert_as_exact_as_the_reference`, the truth the cross entropy of its
+    float64 twin's logits), and the fill it is handed counts for nothing."""
     import torch
 
     inputs, _, _ = batch
@@ -253,15 +226,19 @@ def test_the_objectives_token_scores_are_the_references_cross_entropy(
     scores = objective.evaluate(variables, {"text": jnp.asarray(rows)},
                                 Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None))
     losses, weights = np.asarray(scores.losses), np.asarray(scores.weights)
-    expected = torch.nn.functional.cross_entropy(
-        torch.from_numpy(reference_logits(reference, rows[:, :-1])).transpose(1, 2),
-        torch.from_numpy(rows[:, 1:].astype(np.int64)), reduction="none").numpy()
+    targets = torch.from_numpy(rows[:, 1:].astype(np.int64))
 
+    def cross_entropy(logits):
+        return torch.nn.functional.cross_entropy(torch.from_numpy(logits).transpose(1, 2), targets,
+                                                 reduction="none").numpy()
+
+    expected = cross_entropy(reference_logits(reference, rows[:, :-1]))
+    truth = cross_entropy(wide_logits(reference, rows[:, :-1]))
     counted = weights > 0
     # Every real token but each row's first is a target; the fill is not.
     assert int(counted.sum()) == int(valid.sum()) - rows.shape[0]
-    difference = float(np.max(np.abs(losses[counted] - expected[counted])))
-    assert difference < TOKEN_LOSS, f"max |token loss difference| {difference:.3e}"
+    assert_as_exact_as_the_reference(losses[counted], expected[counted], truth[counted],
+                                     f"{checkpoint} token losses")
 
 
 def test_greedy_generation_draws_the_references_greedy_continuation(bundle, batch, reference):

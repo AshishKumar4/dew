@@ -29,6 +29,7 @@ from dew.nn.inputs import ModelInputs
 from dew.nn.mixers.attention import AttentionMixer
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.registry import ModelConfig
 from dew.sampling.text import Sampling
 from dew.training import Layout, MeshSpec, Trainer
 
@@ -379,9 +380,9 @@ def family_source(request):
 def test_training_reaches_the_gemma3n_vision_drop_path():
     """`train` reaches Gemma 3n's MobileNet through the wrapper: with a
     drop-path rate the training forward depends on the dropout key, without
-    one nothing else in the model draws, and evaluation still reads the
-    reference logits."""
-    loaded, inputs, directory = _family("gemma3n")
+    one nothing else in the model draws, and evaluation is the model without
+    the rate, bit for bit."""
+    loaded, inputs, _ = _family("gemma3n")
     dropping = loaded.model.clone(vision=dataclasses.replace(loaded.model.vision, drop_path_rate=0.4))
 
     def forward(model, train, seed):
@@ -395,10 +396,8 @@ def test_training_reaches_the_gemma3n_vision_drop_path():
     first = forward(dropping, train=True, seed=1)
     np.testing.assert_array_equal(first, forward(dropping, train=True, seed=1))
     assert np.max(np.abs(first - forward(dropping, train=True, seed=2))[valid]) > 1e-3
-    expected = np.load(directory / "logits.npy")
-    np.testing.assert_allclose(
-        forward(dropping, train=False, seed=1)[valid], expected[valid], atol=1e-4, rtol=0
-    )
+    np.testing.assert_array_equal(forward(dropping, train=False, seed=1),
+                                  forward(loaded.model, train=False, seed=1))
 
 
 @pytest.fixture(scope="module", params=["gemma-3n-audio-tiny", "gemma-4-audio-tiny"])
@@ -560,8 +559,10 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
         )[valid]
 
     def terms(model):
-        """Each valid logit's float64 terms over `model`'s step, which size its row's rounding."""
-        _, sized = float64_forward(model.model, model.variables, inputs.tokens, **inputs.kwargs())
+        """Each valid logit's float64 terms over `model`'s step, which size its row's rounding: the
+        whole model widened, its language model and towers with the wrapper."""
+        wide = ModelConfig.from_model(model.model).with_dtype("float64").build()
+        _, sized = float64_forward(wide, model.variables, inputs.tokens, **inputs.kwargs())
         return np.asarray(sized)[valid]
 
     restored, output = trained(gradient, tmp_path / "trained")
