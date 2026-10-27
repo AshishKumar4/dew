@@ -272,6 +272,30 @@ def compiled_apart() -> list[dict]:
         return json.loads(records.read_text())
 
 
+PTXAS_REPORTS: dict[tuple[str, int], set[tuple[int, int]]] = {}
+"""Each Mosaic GPU kernel's ptxas report this process read, its registers and spilled bytes, by the
+kernel's name and shared bytes: Mosaic compiles a module once a process, so a later case of the same
+module states its resources and not ptxas's (`inherited`)."""
+
+
+def inherited(kernel: dict) -> dict:
+    """`kernel`'s record (`mosaic_kernels`) with its registers and spills where ptxas reported them: its
+    own, which this process keeps (`PTXAS_REPORTS`), or, where Mosaic compiled its module before in this
+    process and so ran no ptxas, the one report this process read of a kernel of its name and shared
+    bytes. A kernel with no such report, or several that differ, keeps them unread."""
+    ptxas = {"registers", "spills"}
+    key = (kernel["kernel"], kernel["shared"])
+    if not ptxas & set(kernel["unread"]):
+        PTXAS_REPORTS.setdefault(key, set()).add((kernel["registers"], kernel["spilled"]))
+        return kernel
+    earlier = PTXAS_REPORTS.get(key, set())
+    if kernel["shared"] is None or len(earlier) != 1:
+        return kernel
+    ((registers, spilled),) = earlier
+    return {**kernel, "registers": registers, "spilled": spilled, "ptxas": "an earlier compile's",
+            "unread": [field for field in kernel["unread"] if field not in ptxas]}
+
+
 def _compiled_here(cases, generation: str) -> list[dict]:
     """`compile_mosaic_kernels`' records, compiled in this process."""
     found: list[dict] = []
@@ -282,7 +306,7 @@ def _compiled_here(cases, generation: str) -> list[dict]:
                         "limit": gpu_target(generation).shared_limit}
         with tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory, mosaic_dumps(directory):
             _compiled(case, generation, record)
-            record["kernels"] = mosaic_kernels(directory)
+            record["kernels"] = [inherited(kernel) for kernel in mosaic_kernels(directory)]
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         found.append(record)
     return found
