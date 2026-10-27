@@ -82,7 +82,7 @@ from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages
 from dew.training.budget import Pause, budget_tokens, run_length, run_steps
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Summary
-from dew.training.profiling import ProfileWindow
+from dew.training.profiling import ProfileReport, ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
 from dew.training.selection import Best
@@ -1274,6 +1274,27 @@ class RunConfig:
         name = trainer.name or (f"{'run' if stated is None else objectives.label(stated.name)}-"
                                 f"{_chain_label(prepared.run.data)}/date-{run_timestamp()}")
         return prepared.train(name)
+
+    def profile(self, directory: str, *, warmup: int = 20, steps: int = 10) -> ProfileReport:
+        """Train this run afresh under `directory` for `warmup` steps, then a window of `steps` more traced
+        (`ProfileWindow`), the warmup rounded up to whole windows so the window is one log interval, with
+        no checkpoint, validation split, stop or W&B sink, and report where the window's steps spent
+        their time (`ProfileReport`), beside XProf's own reports. The run's own directory is left as it
+        is. Raises ValueError for a directory that holds this run's profile already."""
+        name = self.trainer.name or "profile"
+        if (Path(directory) / name / "tracking").exists():
+            raise ValueError(f"{directory} holds a profile of {name} already; give the profile a directory "
+                             "of its own")
+        warmup = -(-warmup // steps) * steps
+        window = os.path.join(directory, "capture")
+        trainer = dataclasses.replace(
+            self.trainer, name=name, checkpoint_dir=directory, resume="never", steps=warmup + steps,
+            epochs=None, tokens=None, examples=None, stop=None, log_every=steps, eval_every=None,
+            checkpoint_every=None, checkpoint_final=False, wandb=None, publish=False,
+            profile=ProfileWindow(window, steps, warmup))
+        dataclasses.replace(self, trainer=trainer, validation=None).run()
+        return ProfileReport.read(Path(directory) / name, Path(window), warmup=warmup, steps=steps,
+                                  devices=jax.local_device_count())
 
     def recorded(self, objective: Objective[Loss, Effects]) -> Self:
         """Return this config as the record of the run that trains `objective`.

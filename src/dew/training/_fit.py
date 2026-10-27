@@ -19,7 +19,7 @@ from dew._coordination import agreed_next
 from dew._records import JSON
 from dew.batch import Batch
 from dew.checkpoints import Checkpoints
-from dew.data.dataset import DataPartition, Loader, PhasedStream, Reader
+from dew.data.dataset import Closeable, DataPartition, Loader, PhasedStream, Reader
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature
 from dew.distributed.placement import MeshSpec, Placement
@@ -334,6 +334,21 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
         interval.waited += time.perf_counter() - asked
     if batch is None and not run.current:
         raise ValueError("the training data holds no batch to train on")
+    return batch
+
+
+def first_batch(loader: Loader, mesh: Mesh) -> Batch:
+    """The first batch `loader`'s training stream gives this process's share of `mesh`, the stream then
+    closed: what an objective that names its input alone reads the shape off (`Objective.shaped`), once,
+    before the run opens its stream where it starts."""
+    stream = loader.train(DataPartition.of(mesh))
+    try:
+        batch = next(iter(stream), None)
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    if batch is None:
+        raise ValueError("the training data holds no batch to read the model's input shape off")
     return batch
 
 

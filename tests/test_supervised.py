@@ -12,8 +12,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from affine_run import Affine, dataset
+import pytest
+from affine_run import BATCH, Affine, dataset
 from flax import linen as nn
+from recording import RecordingTracker
 
 from dew.batch import VALID_ROWS
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
@@ -45,6 +47,43 @@ def test_a_plain_flax_model_trains_on_a_loss_function():
     before, _ = objective.scalar_loss(start.variables, batch(), STEP)
     after, _ = objective.scalar_loss(state.variables, batch(), STEP)
     assert after < before / 4
+
+
+def test_a_model_named_by_its_input_field_alone_takes_the_shape_its_data_gives():
+    """`Supervised(model, loss, inputs="x")` names the field alone: the run reads its first batch once,
+    before the model initializes, and the objective declares the shape that batch holds, as an explicit
+    spec would, and trains as the run given that spec does. A state placed before any run has read the
+    data is refused."""
+    declared = Trainer(Supervised(Affine(), squared, inputs=INPUTS), optax.sgd(0.1), key=0).fit(
+        dataset(), steps=3)
+    named = Supervised(Affine(), squared, inputs="x")
+    with pytest.raises(ValueError):
+        Trainer(named, optax.sgd(0.1), key=0).place()
+    state = Trainer(named, optax.sgd(0.1), key=0).fit(dataset(), steps=3)
+    assert named.inputs == INPUTS
+    for leaf, expected in zip(jax.tree.leaves(state.variables), jax.tree.leaves(declared.variables),
+                              strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(expected))
+
+
+def affine_work(batch):
+    """Training `Affine` on a batch: a row's forward is 3 x 2 multiply-adds, two FLOPs each, and its
+    backward twice that."""
+    return 3 * 2 * 3 * 2 * len(batch["x"])
+
+
+def test_a_model_dew_holds_no_count_for_reports_the_work_its_objective_declares():
+    """`Supervised(work=)` declares a batch's analytical training FLOPs for a model Dew holds no count
+    for: the run logs it as each step's train/flops, the numerator train/mfu reads where the device's
+    peak is known; without it the run logs no count, never the compiled program's."""
+    def logged(work) -> list[float | None]:
+        tracker = RecordingTracker()
+        Trainer(Supervised(Affine(), squared, inputs=INPUTS, work=work), optax.sgd(0.1), key=0,
+                tracker=tracker).fit(dataset(), steps=2, log_every=1)
+        return [scalars.get("train/flops") for _, scalars in tracker.scalars if "train/loss" in scalars]
+
+    assert logged(affine_work) == [affine_work(batch(BATCH))] * 2
+    assert logged(None) == [None, None]
 
 
 def finite_inputs(call):

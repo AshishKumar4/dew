@@ -322,9 +322,13 @@ class Timer:
     """Times a frontier's steps on `batch` from `state` (`step_seconds`):
     the first steps the state itself, which it then deletes, and each later
     one a fresh copy from the host, so the devices hold one state at a time.
-    `state` is then a fresh copy for the run to go on from."""
+    `state` is then a fresh copy for the run to go on from. `frontier` says
+    whether a plan's frontier is timed at all, which Dew's tests keep untimed
+    in a fit (`UNTIMED_FRONTIER`); a step it profiles (`profiled`) is profiled
+    either way."""
     state: TrainState
     batch: Batch
+    frontier: bool = True
 
     def __call__(self, steps: Sequence[Callable]) -> list[list[float]]:
         # The frozen tree is no step's to change or donate, and the objective's held tree shares it: it

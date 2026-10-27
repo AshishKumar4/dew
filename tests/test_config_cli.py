@@ -117,6 +117,31 @@ def test_a_python_run_whose_chain_is_unrecorded_trains_from_dew_train(tmp_path):
         RunConfig.load(str(tmp_path / "runs" / "unrecorded_run"))
 
 
+def test_dew_profile_trains_a_run_afresh_and_reports_where_its_window_spent_the_time(tmp_path):
+    """`dew profile run.py --warmup 2 --steps 2` trains the run afresh in a directory of its own, writing
+    no checkpoint, traces the two steps after its warmup and writes the report of the window, one log
+    interval: its step and input-wait times, the step's compile, and the device time XProf attributes to
+    its ops or why it attributes none, beside the capture's own reports. A second profile into the same
+    directory is refused."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    import autoencoder_experiment
+
+    from dew.checkpoints import Checkpoints
+    from dew.cli.main import main
+
+    out = tmp_path / "profile"
+    command = ["profile", autoencoder_experiment.__file__, "--warmup", "2", "--steps", "2", "--out", str(out)]
+    assert main(command) == 0
+    report = json.loads((out / "report.json").read_text())
+    assert (report["steps"], report["warmup"]) == (2, 2)
+    assert report["step_ms"] > 0 and report["input_wait_ms"] >= 0 and report["compile_s"] > 0
+    assert (report["device_ms"] is None) == (report["attribution"] is not None)
+    assert (Path(report["capture"]) / "reports").is_dir()
+    assert Checkpoints(str(out / "autoencoder_experiment")).latest is None
+    with pytest.raises(ValueError):
+        main(command)
+
+
 @pytest.mark.parametrize("built", ["in Python", "as a run states them"])
 def test_a_run_trainer_fit_trains_directly_says_why_no_record_rebuilds_it(tmp_path, built):
     """A run that `Trainer.fit` trains directly writes a run.json no record rebuilds, naming each part

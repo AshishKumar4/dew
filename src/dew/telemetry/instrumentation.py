@@ -518,6 +518,12 @@ class HloInstruction:
     take part together; empty where every device does, and for any other op (`_groups`)."""
 
 
+def reported_instruction(expression: str) -> HloInstruction | None:
+    """The one instruction `expression` writes, as a row of XProf's hlo_stats holds it
+    (`hlo_op_expression`, cut short), read as a module of it alone; None where it writes none."""
+    return next(iter(hlo_instructions(f"ENTRY %row () -> () {{\n  {expression}\n}}").values()), None)
+
+
 def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
     """Every instruction of the module in `text` (`compiled.as_text()`, or an XLA
     dump's after-optimizations HLO, whole or as its lines) by name, read by the
