@@ -665,7 +665,7 @@ def test_the_tangent_grids_time_of_a_sigma_is_on_par_with_its_formula_rounded_in
     log-uniform over the grid (check 1, float64 the truth)."""
     schedule = CosineGeneralNoiseScheduler(**flaxdiff_case(case))
     t_of_sigma = jax.jit(schedule.t_of_sigma)
-    low, high = math.log(schedule.sigma_min), math.log(schedule.sigma_max)
+    low, high = (math.log(bound) for bound in schedule.sigma_range)
 
     def draw(seed):
         return (np.exp(np.random.default_rng(seed).uniform(low, high, 4096)).astype(np.float32),)

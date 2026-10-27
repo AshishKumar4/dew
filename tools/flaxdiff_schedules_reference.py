@@ -134,7 +134,9 @@ def table_site(module, arguments: dict):
              "p2_loss_weights": (k + bars / (1 - bars)) ** -gamma}
 
     def draw(seed):
-        return {"index": np.random.default_rng(seed).integers(0, timesteps, ROWS).astype(np.int32)}
+        # Every step of the table, as the table's comparison read it whole, and a seed's ROWS more.
+        drawn = np.random.default_rng(seed).integers(0, timesteps, ROWS)
+        return {"index": np.concatenate([np.arange(timesteps), drawn]).astype(np.int32)}
 
     def evaluate(inputs):
         index = inputs["index"]
