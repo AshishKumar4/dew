@@ -156,15 +156,18 @@ class Questioned:
                      for question in range(int(element["id"]) % 3 + 1))
 
 
+@pytest.mark.parametrize("read", ["memory", "streamed"])
 @pytest.mark.parametrize("examples", [7, 23])
-def test_an_examples_budget_counts_examples_before_the_objective_expands_them(examples):
+def test_an_examples_budget_counts_examples_before_the_objective_expands_them(examples, read):
     """An objective that makes each record several rows (a question a row) is bounded by its examples,
     not its rows: the read bounded to `examples` records holds every row of each example the bound
-    reaches, as many times as it reaches it, and ends, whatever number of rows each example makes."""
+    reaches, as many times as it reaches it, and ends, whatever number of rows each example makes, in a
+    memory read and a streamed one alike."""
     from dew.data.pipeline import ObjectiveData
 
     ids = np.arange(1, RECORDS + 1, dtype=np.int32)
-    loader = compile(Pipeline(Memory({"id": ids})).shuffle(3).batch(BATCH),
+    shuffled = {"seed": 3} if read == "memory" else {"seed": 3, "window": RECORDS}
+    loader = compile(Pipeline(Memory({"id": ids})).shuffle(**shuffled).batch(BATCH), read=read,
                      objective=ObjectiveData(train=(Questioned(),)), examples=examples)
     read = ids_read(loader, loader.example_steps(examples), "id")
     passes, rest = divmod(examples, RECORDS)
@@ -190,12 +193,11 @@ def test_an_examples_budget_over_a_mixture_counts_each_corpus_examples_whatever_
     assert read[3] + read[2] // 3 == EXAMPLES
 
 
-@pytest.mark.parametrize("read", ["memory", "streamed"])
-def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_rows_each_makes(read):
+def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_rows_each_makes():
     """A decision objective lays an example out as a row a question: an examples budget over examples
     of two questions each reads exactly that many source examples, two rows each, its windows holding
-    twice as many rows as the budget's examples, in a memory read, whose objective steps start eagerly
-    over the store, and a streamed one alike."""
+    twice as many rows as the budget's examples, in the memory read decision rows take, whose objective
+    steps start eagerly over the store."""
     from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
 
     from dew.decision import DecisionObjective, Example, Noul, StateFirstLayout, decisions
@@ -206,8 +208,7 @@ def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_row
     asked = {"first": Noul("Is it on?"), "second": Noul("Is it off?")}
     answers = {"first": "true", "second": "false"}
     records = [{"example": Example(f"state {index}", asked, answers)} for index in range(RECORDS)]
-    shuffled = {"seed": 3} if read == "memory" else {"seed": 3, "window": RECORDS}
-    loader = compile(Pipeline(Memory(records)).pipe(decisions).shuffle(**shuffled).batch(BATCH), read=read,
+    loader = compile(Pipeline(Memory(records)).pipe(decisions).shuffle(3).batch(BATCH), read="memory",
                      objective=objective.data(), examples=EXAMPLES)
     rows = 0
     for batch in itertools.islice(loader.train(DataPartition()), loader.example_steps(EXAMPLES)):
