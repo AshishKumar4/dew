@@ -232,3 +232,12 @@ def test_a_unit_scale_guides_to_the_conditional_prediction_exactly():
     still = (jnp.ones((1, 1), jnp.float32), jnp.zeros((1, 1), jnp.float32), jnp.zeros((1,), jnp.float32))
     _, moved = jax.jvp(guide, (largest, -largest, jnp.ones((1,), jnp.float32)), still)
     np.testing.assert_array_equal(np.asarray(moved), [[1.0]])
+    # Both predictions moved alike by float32's largest power of two keep the guided one moving by it.
+    alike = (largest, largest, jnp.zeros((1,), jnp.float32))
+    _, moved = jax.jvp(guide, (jnp.ones((1, 1)), jnp.ones((1, 1)), jnp.full((1,), 2.0)), alike)
+    np.testing.assert_array_equal(np.asarray(moved), [[2.0 ** 127]])
+    # The least normal predictions of opposite sign keep the scale's derivative, their normal difference.
+    least = jnp.asarray([[2.0 ** -126]], jnp.float32)
+    scaled = (jnp.zeros((1, 1)), jnp.zeros((1, 1)), jnp.ones((1,)))
+    _, moved = jax.jvp(guide, (least, -least, jnp.ones((1,), jnp.float32)), scaled)
+    np.testing.assert_array_equal(np.asarray(moved), [[2.0 ** -125]])

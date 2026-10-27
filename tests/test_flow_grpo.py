@@ -1298,3 +1298,7 @@ def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
         # The term rounds once, a quotient of powers of two over a significand, and the log terms fall
         # below its last place: the float32 rounding of the float64 density.
         np.testing.assert_array_equal(np.asarray(density), [np.float32(truth)])
+        # Its derivative in the mean is finite there too, the residual over the variance.
+        slope = jax.grad(lambda centre, edge=edge, value=value: edge.replace(mean=centre).log_prob(
+            jnp.full((1, 1), value, jnp.float32)).sum())(edge.mean)
+        np.testing.assert_array_equal(np.asarray(slope), [[np.float32((value - mean) / variance)]])

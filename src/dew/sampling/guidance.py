@@ -158,11 +158,14 @@ def _guided_jvp(primals, tangents):
     conditional the value selects would leave the scale's out."""
     conditional, unconditional, scale = primals
     along_conditional, along_unconditional, along_scale = tangents
-    # The scale's direction over the predictions' halves, exact powers of two, so the difference of two
-    # finite predictions of opposite sign stays finite where the scale does not move.
-    spread = 0.5 * conditional - 0.5 * unconditional
-    return _guided(*primals), (scale * along_conditional + (1 - scale) * along_unconditional
-                               + 2 * (spread * along_scale))
+    # The predictions' direction in the affine order, the conditional's own at a unit scale.
+    predicted = jnp.where(scale == 1, along_conditional,
+                          along_unconditional + scale * (along_conditional - along_unconditional))
+    # The scale's: the predictions' difference, halved first only where it would pass float32's largest,
+    # so two finite predictions of opposite sign stay finite where the scale does not move.
+    wide = jnp.maximum(jnp.abs(conditional), jnp.abs(unconditional)) > jnp.finfo(conditional.dtype).max / 2
+    spread = jnp.where(wide, 0.5 * conditional - 0.5 * unconditional, conditional - unconditional)
+    return _guided(*primals), predicted + jnp.where(wide, 2, 1) * (spread * along_scale)
 
 
 @struct.dataclass
