@@ -435,19 +435,27 @@ def test_a_call_runs_its_products_kernels_apart():
     np.testing.assert_array_equal(grad, jnp.full(3, 3.0))
 
 
+def portable_draw(seed: int, rows: int, packed: bool) -> tuple:
+    """A small delta-rule call's operands `(query, key, value, g, beta)` (a decay a head), its document
+    starts where `packed`, and a direction the shape of each operand: the portable rule's
+    differentiation tests' draw."""
+    keys = jax.random.split(jax.random.key(seed), 7)
+    length, heads, width = 37, 2, 8
+    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) for k in keys[:3])
+    g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
+    starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
+    operands = (query, key, value, g, beta)
+    return operands, starts, tuple(jax.random.normal(keys[6], x.shape) for x in operands)
+
+
 @pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
 def test_the_portable_rule_recomputes_its_memory_where_the_rung_names_it(packed):
     """Under a remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`,
     'delta_memory'), the portable rule (`chunk_delta_rule`, a CPU's route) keeps its operands alone and
     computes its memory again in its backward, as the port and the template drop theirs: its residuals
     hold fewer bytes than the kept rule's, its gradients the kept rule's bit for bit."""
-    keys = jax.random.split(jax.random.key(7), 6)
-    rows, length, heads, width = 2, 37, 2, 8
-    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) for k in keys[:3])
-    g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
-    starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
-    operands = (query, key, value, g, beta)
+    operands, starts, _ = portable_draw(7, 2, packed)
 
     def loss(*operands):
         out, final = recurrence_chunk.chunk_delta_rule(*operands, chunk_size=CHUNK, starts=starts)
@@ -473,14 +481,8 @@ def test_the_portable_rule_takes_forward_mode_at_its_public_seam(packed):
     with no forward-mode context: their tangents the chunked math's own, the forward mode of the same
     computation, bit for bit, and its gradient still its reverse rule's (`_chunk_delta_backward`), the
     custom VJP's that refused a plain `jax.jvp` before (row 1834)."""
-    keys = jax.random.split(jax.random.key(11), 7)
-    rows, length, heads, width = 1, 37, 2, 8
-    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) for k in keys[:3])
-    g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
-    starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
-    operands = (query, key, value, g, beta)
-    directions = tuple(jax.random.normal(keys[6], x.shape) for x in operands)
+    operands, starts, directions = portable_draw(11, 1, packed)
+    rows, _, heads, width = operands[0].shape
 
     def rule(*operands):
         return recurrence_chunk.chunk_delta_rule(*operands, chunk_size=CHUNK, starts=starts)
@@ -508,13 +510,8 @@ def test_the_portable_rule_takes_nested_differentiation(packed):
     saved bool resets took a bool tangent, not float0's; 1862: its pullback gave six cotangents of seven
     operands): each runs and is finite, and two forwards, the chunked math's tangent both times, are the
     math's own bit for bit."""
-    keys = jax.random.split(jax.random.key(13), 7)
-    rows, length, heads, width = 1, 37, 2, 8
-    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) for k in keys[:3])
-    g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
-    starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
-    direction = jax.random.normal(keys[6], query.shape)
+    (query, key, value, g, beta), starts, (direction, *_) = portable_draw(13, 1, packed)
+    rows, _, heads, width = query.shape
 
     def rule(query):
         return recurrence_chunk.chunk_delta_rule(query, key, value, g, beta, chunk_size=CHUNK, starts=starts)
