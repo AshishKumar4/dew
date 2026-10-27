@@ -252,6 +252,10 @@ class FlatMap:
     step: ExpandStep
     identity: str | None = None
     configured: Bound | None = None
+    examples: bool = False
+    """Whether this is an objective's step that makes several rows of each source example (a decision
+    layout's row a question): a corpus counts its source examples before it (`Accepted`), and a run's
+    `examples=` bound stands before it (`dew.data.compile._bounded`)."""
 
 
 @dataclasses.dataclass(frozen=True)

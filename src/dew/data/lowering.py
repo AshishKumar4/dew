@@ -424,7 +424,8 @@ def _run(
                 break
             drawn = True
         if isinstance(stage, FlatMap):
-            if drawn or (indexed and run):
+            # A corpus counts its source examples before an objective's step makes rows of them.
+            if drawn or (indexed and run) or (stage.examples and run):
                 break
             counted = True
         elif not marked and _drops(stage):
@@ -1351,7 +1352,7 @@ class _Build:
         marked = self.lowering.cache is not None and (self.read == "streamed" or not self.lowering.one_to_one)
         marked = marked or any(_drops(stage) for stage in pipeline.stages[:consumed])
         carried = _carried(pipeline, consumed, marked=marked) if pooled and pool is not None else -1
-        ran = consumed
+        ran, counting = consumed, _counts_own_rows(pipeline)
         for index, stage in enumerate(pipeline.stages[consumed:], start=consumed):
             if index < ran:
                 continue
@@ -1368,6 +1369,11 @@ class _Build:
                 continue
             if isinstance(stage, Workers) and pool is not None:
                 continue
+            if isinstance(stage, FlatMap) and stage.examples and not self.global_order and counting:
+                # The corpus's counts are of its source examples: they are taken before an objective's
+                # step makes rows of them (`FlatMap.examples`), and not again after.
+                rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
+                counting = False
             if isinstance(stage, _RECORD):
                 # The record steps from here run as one operator (`_run`), up to where the workers
                 # hand their rows on.
@@ -1395,7 +1401,7 @@ class _Build:
                 rows = self.stage(rows, stage, pipeline, partition, index)
         if carried == len(pipeline.stages) and pool is not None:
             rows = self.handed(rows, pipeline, partition, pool)
-        if not self.global_order and _counts_own_rows(pipeline):
+        if not self.global_order and counting:
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
         return rows
 

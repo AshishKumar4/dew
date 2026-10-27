@@ -379,10 +379,10 @@ def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
     return dataclasses.replace(windows, stages=(*windows.stages, *pipeline.stages[at:]))
 
 
-def _bounded(pipeline: Pipeline, examples: int, expansions: Sequence[Expansion] = ()) -> Pipeline:
+def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
     """`pipeline`'s training read bounded to its first `examples` source examples: the records as they
-    reach the first of the objective's steps that makes several rows of one (`expansions`, which run
-    after the chain's own record order, `_objective_branch`), or where none does, the first stage that
+    reach the first of the objective's steps that makes several rows of one (`FlatMap.examples`, which
+    run after the chain's own record order, `_objective_branch`), or where none does, the first stage that
     packs or windows them, or its batch: never the rows an objective makes of an example or the windows
     a pack lays them in. A repeat without end goes before the bound
     where none is written, so the records may span passes, and the batch keeps the short one the
@@ -401,7 +401,7 @@ def _bounded(pipeline: Pipeline, examples: int, expansions: Sequence[Expansion] 
     if batched == len(pipeline.stages):
         return pipeline
     at = next((index for index, stage in enumerate(pipeline.stages[:batched])
-               if isinstance(stage, (Pack, Windows)) or _expands(stage, expansions)), batched)
+               if isinstance(stage, (Pack, Windows)) or _expands(stage)), batched)
     repeats = [stage for stage in pipeline.stages[:at] if isinstance(stage, Repeat)]
     if any(stage.epochs is not None for stage in repeats) or any(
             isinstance(stage, Repeat) for stage in pipeline.stages[at:]):
@@ -413,10 +413,9 @@ def _bounded(pipeline: Pipeline, examples: int, expansions: Sequence[Expansion] 
                                                  batch, *pipeline.stages[batched + 1:]))
 
 
-def _expands(stage: Stage, expansions: Sequence[Expansion]) -> bool:
-    """Whether `stage` applies one of the objective's `expansions`, which make several rows of an
-    example."""
-    return isinstance(stage, FlatMap) and any(stage.step is expansion for expansion in expansions)
+def _expands(stage: Stage) -> bool:
+    """Whether `stage` is an objective's step that makes several rows of a source example."""
+    return isinstance(stage, FlatMap) and stage.examples
 
 
 def _lays_out(pipeline: Pipeline) -> bool:
@@ -552,9 +551,7 @@ def _prepared(
             for branch, scored in zip(branches, held, strict=True)
         )
     if examples is not None and training:
-        expansions = [] if objective is None else [step for step in objective.train
-                                                   if isinstance(step, Expansion)]
-        branches = (_bounded(branches[0], examples, expansions), *branches[1:])
+        branches = (_bounded(branches[0], examples), *branches[1:])
     if any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch)):
         def stored(branch: Pipeline) -> bool:
             return any(len(source.records(read)) for _, source in _leaves(branch))
@@ -1104,8 +1101,14 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
 def _objective_records(
     pipeline: Pipeline, steps: Sequence[RecordStep | pygrain.RandomMapTransform | Expansion | Configured]
 ) -> Pipeline:
-    """Append objective record steps at the caller's preparation boundary."""
-    return pipeline._then(*(step if isinstance(step, Configured) else record_stage(step) for step in steps))
+    """Append objective record steps at the caller's preparation boundary, each step that makes several
+    rows of a source example marked as one (`FlatMap.examples`)."""
+    def staged(step) -> Stage:
+        if isinstance(step, Configured):
+            return step
+        stage = record_stage(step)
+        return dataclasses.replace(stage, examples=True) if isinstance(stage, FlatMap) else stage
+    return pipeline._then(*(staged(step) for step in steps))
 
 
 def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bool, read: Read) -> Pipeline:
