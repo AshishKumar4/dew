@@ -29,13 +29,13 @@
 # collective in it is no runtime conditional, on which XLA:CPU's devices
 # diverged (ledger 1545); and a block's Mosaic GPU warpgroups each taking their
 # own share of the reduction scratch; and a Mosaic GPU MMA's warp split stated
-# per operation (m_warps), which Ampere's GEMM tiles split 2 x 2 need; and a
-# Mosaic GPU kernel's debug info left out of the persistent cache key, so the
-# same kernel compiled from two checkouts keys alike; and a compile-only Mosaic
-# GPU target held to its own default shared memory limit; and a transformation
-# keeping a wide dtype its trace already holds, while a Python type asked of a
-# wide value still narrows as a user's request. Every CI and development install
-# takes this one build.
+# per operation (m_warps), for Ampere GEMM tiles that split their warps 2 x 2;
+# and a Mosaic GPU kernel's debug info left out of the persistent cache key, so
+# the same kernel compiled from two checkouts keys alike; and a compile-only
+# Mosaic GPU target held to its own default shared memory limit; and a
+# transformation keeping a wide dtype its trace already holds, while a Python
+# type asked of a wide value still narrows as a user's request. Every CI and
+# development install takes this one build.
 # Return to a release once one ships the fixes.
 # BEGIN package index (site/scripts/gen_install.py)
 --extra-index-url https://pypi.dewml.dev/simple

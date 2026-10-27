@@ -113,7 +113,7 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - Mosaic GPU and Pallas Mosaic GPU lower `ceil` and `floor`, which a template's Mosaic kernel that rounds a value needs on an H100.
 - Pallas Mosaic GPU lowers `add_any` and `integer_pow` of every integer exponent, which the Mosaic attention backward under a score hook needs: a hook's transposed pullback sums its cotangents, and a temperature's backward raises it to the power -2.
 - Mosaic GPU's layout inference solves groups of unknowns that no constraint relates separately, so sm80's `mma.sync` GEMM tiles find their layouts.
-- A Mosaic GPU MMA may state its warpgroup's warp split (`plgpu.mma(..., m_warps=...)`), which Ampere's GEMM tiles that split their warps 2 x 2 need.
+- A Mosaic GPU MMA may state its warpgroup's warp split (`plgpu.mma(..., m_warps=...)`), for Ampere GEMM tiles that split their warps 2 x 2.
 - A platform-dependent conditional whose lowering keeps one branch lowers that branch inline, so a collective inside it is not a runtime conditional; on the CPU, devices diverged on such a conditional.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
