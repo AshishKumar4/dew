@@ -620,6 +620,20 @@ def test_a_call_traced_for_an_assumed_hopper_runs_its_mosaic_mainloop():
     assert [route.kernel for route in found if route.choice == "attention_mainloop"] == ["mosaic"] * 2
 
 
+def test_a_dropping_call_traced_for_an_assumed_gpu_runs_the_plain_jax_mainloop():
+    """A call that drops attention weights, traced for an H100 (`generation.assumed`): Mosaic declines it and
+    the frozen Triton mainloop refuses its dropout (`attention_triton.refused`), so the plain-JAX mainloop,
+    which draws it, runs it, where the route had chosen Triton by its spans alone and raised (review)."""
+    spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
+    query, key, value, _, _ = drawing(QUERIES, KEYS, jnp.bfloat16, sinks=False)(0)
+    drop = template.Dropout(jnp.asarray([1, 2], jnp.uint32), jnp.arange(ROWS, dtype=jnp.int32),
+                            jnp.arange(HEADS, dtype=jnp.int32), 0.25)
+    with generation.assumed("sm90"), generation.routes() as found:
+        jax.jit(lambda q, k, v: attention_route.attend(q, k, v, spans, template.Hooks(drop=drop))).trace(
+            query, key, value)
+    assert [route.kernel for route in found if route.choice == "attention_mainloop"] == ["portable"]
+
+
 def test_the_mainloop_is_the_shared_selectors_choice():
     """The template's mainloop is an op of the shared selector (`attention_route.MAINLOOP`,
     `selection.select`), one chooser for its preference, its named choice and its route: on a GPU Mosaic
