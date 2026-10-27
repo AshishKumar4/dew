@@ -2317,8 +2317,17 @@ class CausalTransformer(nn.Module):
 
     @property
     def cache_rebuild_position(self) -> int | None:
-        scaling = self.rope_scaling
-        return scaling.original_max_position_embeddings if isinstance(scaling, LongRopeScaling) else None
+        """Where LongRoPE's factors switch from short to long, past which cached keys go stale: the
+        original length of every trunk layer's LongRoPE, its kind's or the model's (`kind_of`), None
+        where no layer takes LongRoPE. Kinds that switch at different lengths are refused, since a cache
+        rebuilds at one."""
+        originals = {kind.rope_scaling.original_max_position_embeddings
+                     for kind in map(self.kind_of, set(self.per_layer_types))
+                     if isinstance(kind.rope_scaling, LongRopeScaling)}
+        if len(originals) > 1:
+            raise ValueError(f"layer kinds switch LongRoPE's factors at {sorted(originals)} tokens; a cache "
+                             "rebuilds its keys at one")
+        return next(iter(originals), None)
 
     @nn.nowrap
     def block_chunks(self) -> tuple[int | None, ...]:

@@ -51,7 +51,15 @@ from dew.nn.kernels import generation
 from dew.nn.kv_cache import KVCache
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.precision import FP32_SUMS
-from dew.nn.rope import YarnScaling, rotary_freqs, yarn_attention_factor, yarn_inv_freq, yarn_query_scale
+from dew.nn.rope import (
+    LongRopeScaling,
+    RopeScaling,
+    YarnScaling,
+    rotary_freqs,
+    yarn_attention_factor,
+    yarn_inv_freq,
+    yarn_query_scale,
+)
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, MeshSpec, Trainer
@@ -101,7 +109,7 @@ def mla_module(settings: dict, max_seq_len: int = 64,
         v_head_dim=settings["v_head_dim"],
         rope_theta=float(settings["rope_theta"]),
         rope_interleave=settings.get("rope_interleave", True),
-        yarn=yarn_of(settings),
+        rope_scaling=yarn_of(settings),
         norm_eps=float(settings["rms_norm_eps"]),
         attention_bias=bool(settings["attention_bias"]),
         index_topk=settings.get("index_topk"),
@@ -491,6 +499,30 @@ def test_a_decoder_on_the_mla_kind_runs_the_reference_block(name):
     assert jnp.array_equal(inside, standalone)
     logits = model.apply(variables, jnp.arange(14, dtype=jnp.int32).reshape(2, 7))
     assert logits.shape == (2, 7, 37)
+
+
+@pytest.mark.parametrize("scaling", [
+    RopeScaling(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=4),
+    LongRopeScaling(short_factor=(1.0, 1.5, 2.0, 2.5), long_factor=(3.0, 4.0, 5.0, 6.0),
+                    original_max_position_embeddings=4)], ids=["llama3", "longrope"])
+def test_the_mla_kind_rotates_by_the_models_rope_scaling(scaling):
+    """A model's Llama 3.1 or LongRoPE scaling reaches its latent attention as
+    it reaches its ordinary attention (`MixerContext.rotary_scaling`): the
+    kind's layer computes, bit for bit, what the standalone block given that
+    scaling computes, where a kind that forwarded YaRN alone rotated at the
+    plain frequencies (audit NN-04). The seven positions pass LongRoPE's four,
+    so it reads its long factors."""
+    settings = CONFIG["v3"]
+    tensors = fixture("mla_v3")
+    model = mla_model(settings, yarn=None, rope_scaling=scaling)
+    variables = model.init(jax.random.key(0), jnp.zeros((2, 7), jnp.int32))
+    layer = variables["params"]["layers_0"]
+    variables = {**variables, "params": {
+        **variables["params"], "layers_0": {**layer, "self_attn": block_variables(tensors)["params"]}}}
+    hidden = jnp.asarray(tensors["hidden"])
+    inside = model.apply(variables, hidden, method=lambda m, x: m.layers[0].self_attn(x))
+    standalone = mla_module(settings).clone(rope_scaling=scaling).apply(block_variables(tensors), hidden)
+    np.testing.assert_array_equal(inside, standalone)
 
 
 # --------------------------------------------------------------------------

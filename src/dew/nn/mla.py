@@ -37,7 +37,7 @@ from dew.nn.attention import (
 from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
-from dew.nn.inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of, document_reach
 from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
 
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
@@ -51,7 +51,15 @@ from dew.nn.precision import (
     float32_dot_general,
     float32_einsum,
 )
-from dew.nn.rope import YarnScaling, deinterleaved, rotary_freqs, rotate, yarn_query_scale
+from dew.nn.rope import (
+    LongRopeScaling,
+    Scaling,
+    YarnScaling,
+    deinterleaved,
+    rotary_freqs,
+    rotate,
+    yarn_query_scale,
+)
 from dew.nn.sharding import RESIDUAL, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import (
     index_agreements,
@@ -291,9 +299,10 @@ class MultiHeadLatentAttention(nn.Module):
     """DeepSeek's multi-head latent attention, dense or sparse.
 
     decode=True runs against the cache like the standard mixer; `positions` and
-    `segment_ids` behave as there. `yarn`, the layer's YaRN ramp, transforms
-    `rope_theta`, the layer's base, and its mscale pre-scales the query; the
-    mixer resolves both through `MixerContext`. The two latent norms are the model's RMSNorm, as the
+    `segment_ids` behave as there. `rope_scaling`, the layer's one rope scaling
+    (`MixerContext.rotary_scaling`: YaRN, Llama 3.1's ramp or LongRoPE),
+    transforms `rope_theta`, the layer's base, at every rotation it makes, and
+    a YaRN ramp's mscale pre-scales the query. The two latent norms are the model's RMSNorm, as the
     reference builds them from the layer's one norm class.
 
     `index_n_heads` and `index_head_dim` put the indexer beside the attention
@@ -325,7 +334,7 @@ class MultiHeadLatentAttention(nn.Module):
     causal: bool = True
     rope_theta: float = 10000.0
     rope_interleave: bool = True
-    yarn: YarnScaling | None = None
+    rope_scaling: Scaling | None = None
     # DeepSeek and GLM norm the latents at RMSNorm's 1e-6 default whatever
     # the trunk's rms_norm_eps says (modeling_deepseek_v3.py:392,404,
     # modeling_glm_moe_dsa.py:349,361).
@@ -484,11 +493,11 @@ class MultiHeadLatentAttention(nn.Module):
         """The softmax-scale ratio the query carries into the kernel.
 
         The kernel scales by `1 / sqrt(qk_head_dim)` itself; YaRN's mscale
-        rides on the query, so a plain rope carries exactly 1.0.
+        rides on the query, so any other rope carries exactly 1.0.
         """
-        if self.yarn is None:
+        if not isinstance(self.rope_scaling, YarnScaling):
             return 1.0
-        return yarn_query_scale(self.yarn)
+        return yarn_query_scale(self.rope_scaling)
 
     def _queries(self, x, place: LogicalAxes):
         """`[B, S, H, nope+rope]` queries and the residual the indexer reads,
@@ -519,7 +528,7 @@ class MultiHeadLatentAttention(nn.Module):
         latent, rot = jnp.split(compressed, [self.kv_lora_rank], axis=-1)
         return constrain(self.kv_a_layernorm(latent), RESIDUAL), constrain(rot, RESIDUAL)
 
-    def _rotated(self, q_rot, rot, positions):
+    def _rotated(self, q_rot, rot, positions, reach=None):
         """Rotate the query's and the latent's rope heads at `positions`.
 
         Returns the rotated pair and the angles, which the indexer rotates
@@ -530,8 +539,8 @@ class MultiHeadLatentAttention(nn.Module):
         if not self.rotary:
             return q_rot, rot, None, None
         freqs_cos, freqs_sin = rotary_freqs(
-            positions, self.qk_rope_head_dim, self.rope_theta, rope_scaling=self.yarn,
-            dtype=at_least_fp32(q_rot.dtype))
+            positions, self.qk_rope_head_dim, self.rope_theta, rope_scaling=self.rope_scaling,
+            dtype=at_least_fp32(q_rot.dtype), reach=reach)
         return (_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin),
                 _rotate(self.rope_interleave, rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :],
                 freqs_cos, freqs_sin)
@@ -578,7 +587,11 @@ class MultiHeadLatentAttention(nn.Module):
             causal = False
         else:
             positions = jnp.arange(length) if positions is None else jnp.asarray(positions)
-            q_rot, rot, freqs_cos, freqs_sin = self._rotated(q_rot, rot, positions)
+            # Under LongRoPE a packed document picks its factors by its own furthest place
+            # (`document_reach`), so it rotates as it does alone.
+            reach = (document_reach(segment_ids, valid, positions)
+                     if isinstance(self.rope_scaling, LongRopeScaling) and segment_ids is not None else None)
+            q_rot, rot, freqs_cos, freqs_sin = self._rotated(q_rot, rot, positions, reach)
             if segment_ids is not None:
                 inside = document_mask(segment_ids)[:, None]
                 mask = inside
@@ -840,8 +853,8 @@ class MLAMixer(MixerBase):
     """The `mla` kind: DeepSeek's latent attention under the reference's names.
 
     `mixer={"name": "mla", "fields": {...}}` takes a DeepSeek config.json's fields, so
-    translation renames nothing. The rope base and its YaRN ramp are the layer's
-    (`MixerContext.rope_theta` and `yarn`, the model's or its kind's). The context's GQA
+    translation renames nothing. The rope base and its scaling are the layer's
+    (`MixerContext.rope_theta` and `rotary_scaling`, the model's or its kind's). The context's GQA
     geometry and `qk_norm` are not read (the latent norms are always present).
     A `kv_shared` layer is GLM's IndexShare layer, which shares its provider's
     selection and so needs the kind to select. Dials this cannot honour (a
@@ -896,7 +909,7 @@ class MLAMixer(MixerBase):
             causal=ctx.causal,
             rope_theta=ctx.rope_theta,
             rope_interleave=self.rope_interleave,
-            yarn=ctx.yarn,
+            rope_scaling=ctx.rotary_scaling(),
             scale_offset=ctx.scale_offset,
             scale_after_cast=ctx.scale_after_cast,
             attention_bias=ctx.attention_bias,
