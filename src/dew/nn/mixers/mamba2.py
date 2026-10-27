@@ -22,7 +22,7 @@ in at least fp32 as the reference casts its operands. The decode step is
 holds both to the reference's numbers.
 
 On a GPU whose target row names it the chunked scan is mamba_ssm's own
-kernels (`dew.nn.kernels.mamba_ssd`, `recurrence_chunk.ssd_port_refusal` names where not),
+kernels (`dew.nn.kernels.mamba_ssd`, `recurrence_chunk.SCAN` names where not),
 which multiply `x`, `B` and `C` in their own dtype into fp32 sums as
 mamba_ssm does; on a TPU whose tiling covers the geometry `dew.nn.kernels.ssd`'s
 Pallas kernel; elsewhere the template's portable math, chosen at trace time.
@@ -65,7 +65,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
-from dew.nn.kernels.generation import measured_kernel
+from dew.nn.kernels.generation import triton_runs
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY, Chunk, chunk
 from dew.nn.linear import DepthwiseConv1d, causal_conv1d, held_conv1d, held_scan, real_tail
@@ -114,7 +114,7 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     `at_least_fp32` of the operands' common dtype, the output unrounded for what a caller adds to it
     (the earlier shards' state, `_ssd`). `starts` `[B, S]` marks packed documents' first tokens,
     whose entering state drops. The op runs it on mamba_ssm's kernels where their port takes the
-    call (`recurrence_chunk.ssd_port_refusal`), on `x`, `B` and `C` in their common dtype; else in
+    call (`recurrence_chunk.SCAN`), on `x`, `B` and `C` in their common dtype; else in
     `at_least_fp32` of it, on the TPU's Pallas kernel where it takes the geometry, else the portable
     math.
     """
@@ -478,10 +478,11 @@ class Mamba2Mixer(MixerBase):
 
     @property
     def keeps_triton_gemm(self) -> bool:
-        """Where the scan runs on XLA (the GPU's target row names no port), its
-        small batched dots gain from the fusions, 7.7% on an A100; on the
-        port a Mamba-2 130M step ran 3% faster without them."""
-        return measured_kernel('ssd', 'xla') != 'pallas'
+        """Where the scan runs on XLA (no GPU Dew's Triton kernels run on, the
+        port's, `recurrence_chunk.SCAN`), its small batched dots gain from the
+        fusions, 7.7% on an A100; on the port a Mamba-2 130M step ran 3% faster
+        without them."""
+        return not triton_runs()
 
     num_heads: int = 128
     head_dim: int = 64

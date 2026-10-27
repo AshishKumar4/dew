@@ -197,7 +197,7 @@ def fla_decay_parts(q, k, v, g, beta, h0, do, dht, starts=None, chunk: int = CHU
     last_decay = jnp.exp(last - gc)
     leaving = k * last_decay
     kept = jnp.ones((1, 1, gc.shape[2], 1, 1), gc.dtype)
-    entered, corrected, _ = recurrence_chunk.xla_chunk_states(k, w, u, gc, last_decay, h0, kept)
+    entered, corrected, _ = recurrence_chunk.xla_chunk_states(k, w, u, gated, last_decay, h0, kept)
     daqk = jnp.where(lower, do @ jnp.swapaxes(corrected, -1, -2), 0.0)
     local = jnp.swapaxes(aqk, -1, -2) @ do
 

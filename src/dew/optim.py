@@ -35,7 +35,7 @@ import tyro
 from dew._hashing import fmix32
 from dew._records import share
 from dew.mesh import LogicalAxes
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, stochastic_bf16
 from dew.nn.sharding import declarations, declared_axes
 from dew.registry import JsonDict, from_record, record_argument, schedules, to_record
 
@@ -571,14 +571,11 @@ def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
     is split or carried, and nothing is read from memory. jax.random.bits
     (threefry) made the whole update 1.75x slower than fp32 state on a TPU
     v6e and 1.05x on an L4; this costs a few integer ops per element. NaN
-    stays NaN.
+    stays NaN (`precision.stochastic_bf16`, its rounding).
     """
     x = x.astype(jnp.float32)
     index = jax.lax.iota(jnp.uint32, x.size).reshape(x.shape)
-    noise = fmix32(index * jnp.uint32(0x9E3779B1) + seed.astype(jnp.uint32)) & jnp.uint32(0xFFFF)
-    bits = jax.lax.bitcast_convert_type(x, jnp.uint32)
-    rounded = jax.lax.bitcast_convert_type((bits + noise) & jnp.uint32(0xFFFF0000), jnp.float32)
-    return jnp.where(jnp.isnan(x), x, rounded).astype(jnp.bfloat16)
+    return stochastic_bf16(x, fmix32(index * jnp.uint32(0x9E3779B1) + seed.astype(jnp.uint32)))
 
 
 def _bias_corrected(moment, decay, count):

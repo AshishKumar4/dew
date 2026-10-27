@@ -9,6 +9,7 @@ import pytest
 from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt_oss" / "attention.npz"
 
@@ -55,9 +56,9 @@ def test_sinks_a_softcap_and_dropout_compose_on_one_reference_path(dropout_rate)
         sink = jnp.broadcast_to(sinks[None, :, None, None], (2, 4, 6, 1))
         weights = jax.nn.softmax(jnp.concatenate([logits, sink], -1), axis=-1)[..., :-1]
         if dropout_rate:
-            # The draw keeps the units a float32 run keeps, in every precision (`dew.nn.dropout`).
-            kept = jax.random.bernoulli(rng, jnp.float32(1 - dropout_rate), weights.shape)
-            weights = weights * kept / (1 - dropout_rate)
+            keep = dropout_keep(dropout_seed(rng), dropout_rate, weights.shape)
+            scale = jnp.asarray(1.0 / (1.0 - dropout_rate), weights.dtype)
+            weights = weights * jnp.where(keep, scale, 0)
         truth = jnp.einsum("bhqk,bkhd->bqhd", weights, value[:, :, group])
         assert_computes_the_oracle(
             np.asarray(attend(query, key, value, sinks)), np.asarray(truth), "sinks, softcap and dropout",

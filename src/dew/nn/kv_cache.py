@@ -1,8 +1,8 @@
 """How a decode cache stores its keys and values: dense or paged, full precision or quantized.
 
-`dew.nn.attention.open_kv_cache` keeps the cursor and the compact slot
-positions. A `KVCache` value names the storage layout behind them, and
-`KVStore` reads and writes that storage inside one attention module.
+`open_kv_cache` keeps the cursor and the compact slot positions. A `KVCache`
+value names the storage layout behind them, and `KVStore` reads and writes
+that storage inside one attention module.
 
 Dense storage is one `[rows, capacity, kv_heads, head_dim]` block per row.
 Paged storage is one pool `[kv_heads, pages, page_size, head_dim]` shared by
@@ -43,13 +43,13 @@ import jax.numpy as jnp
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
-from dew.mesh import logical_spec, mesh_axes
+from dew.mesh import LayoutRefused, logical_spec, mesh_axes
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, backend
-from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Requirement
+from dew.nn.kernels.selection import Kernel, Op, Requirement, selected
 from dew.nn.precision import float32_einsum
 from dew.nn.scatter import DROPPED
-from dew.nn.sharding import manual_map
+from dew.nn.sharding import manual_map, sequence_shards
 
 KVDtype = Literal["int8", "float8_e4m3fn"]
 """The storage formats a quantized cache takes."""
@@ -57,7 +57,7 @@ KVDtype = Literal["int8", "float8_e4m3fn"]
 TABLE = "page_table"
 """A paged cache's per-row page table, `[rows, capacity // page_size]`."""
 CURSOR = "cache_index"
-"""The per-row count of tokens a cache holds (`attention.cache_positions`)."""
+"""The per-row count of tokens a cache holds (`cache_positions`)."""
 POSITION = "next_position"
 """A wrapper's per-row next position, past the last its row holds (`dew.nn.inputs.next_position`),
 which for a text row is its cursor's count of tokens."""
@@ -511,9 +511,8 @@ class KVStore:
         """
         case = self.case(query, value_dim=self.head_dim, softcap=softcap, arithmetic=False, named='auto',
                          windowed=starts is not None, sinks=sinks is not None)
-        kernel = 'triton' if backend() == "gpu" else 'tpu'
-        if failed := PAGED.kernel(kernel).failed(case):
-            raise KernelRefused(PAGED.choice, kernel, [requirement.refusal(case) for requirement in failed])
+        # The device's paged kernel, named: one its requirements turn down raises.
+        selected(PAGED, case, 'triton' if backend() == "gpu" else 'tpu')
 
         def local(query, key, value, lengths, table, *extras):
             # The optional operands as `decode` gave them: the window's starts, then the sinks.
@@ -776,6 +775,67 @@ def gather_cache_rows(cache, rows):
         raise ValueError("beam search and speculative decoding regroup cache rows, which a "
                          "paged cache's shared pool cannot do; decode them with a dense cache")
     return jax.tree.map(lambda leaf: jnp.take(leaf, rows, axis=0), cache)
+
+
+def cache_positions(module: nn.Module, batch: int, length: int, valid):
+    """Allocate compact cache slots for real tokens, independently per row.
+
+    A row's tokens fill its slots in order, so the cursor alone says which
+    hold one (`cached_validity`)."""
+    valid = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
+    if valid.shape != (batch, length):
+        raise ValueError(f"cache validity must be {(batch, length)}, got {valid.shape}")
+    allocated = module.has_variable("cache", "cache_index")
+    index = module.variable("cache", "cache_index", jnp.zeros, (batch,), jnp.int32)
+    positions = index.value[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
+    positions = jnp.where(valid, positions, -1)
+    if allocated:
+        index.value = index.value + jnp.sum(valid, axis=1, dtype=jnp.int32)
+    return positions, allocated
+
+
+def cached_validity(module: nn.Module, length: int) -> jax.Array:
+    """Which of `module`'s `length` cache slots hold a token, `[rows, length]`:
+    those before the row's cursor, which `cache_positions` fills in order.
+
+    Derived where it is read rather than stored beside the cursor, so a
+    decode step writes no `[rows, capacity]` copy of it a layer: 28 kernels
+    a step on Qwen3-0.6B, 0.6% of a 32-slot serving step on an RTX 4080
+    (docs/performance.md)."""
+    return filled_slots(module.get_variable("cache", "cache_index"), length)
+
+
+_DEFAULT_LAYOUT = KVCache()
+
+
+def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = _DEFAULT_LAYOUT,
+                  value_dim: int | None = None, places: bool = False, groups: tuple[str, ...] = ()):
+    """Fixed-size K/V with a cursor and cached validity for each batch row.
+
+    Returns [B, S] compact slot positions and a writer. Invalid tokens have
+    position -1 and do not advance the cursor. The allocation-only call leaves
+    every row empty. The writer returns full cache arrays, including unused
+    slots which the caller excludes with `cached_validity`. `layout` chooses the
+    storage behind the slots, dense or paged, full or quantized
+    (`dew.nn.kv_cache`); the slots and the cursor are the same for all. Values
+    are `value_dim` wide, None for the keys' width. `places` also keeps each
+    token's place beside its key (`dew.nn.kv_cache.Append.places`), and
+    `groups` its groups of the fields named (`Append.groups`).
+    """
+    shards = sequence_shards()
+    if shards > 1:
+        raise LayoutRefused(
+            f"decoding is not supported under a sequence axis of {shards}: the KV "
+            "cache holds whole sequences. Generate on a mesh with sequence=1.")
+    if max_seq_len is None:
+        raise ValueError("decoding needs max_seq_len for its fixed-capacity cache")
+    batch, length, heads, head_dim = key.shape
+    if valid is None and length > max_seq_len:
+        raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
+    store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype, value_dim=value_dim,
+                         places=places, groups=groups)
+    positions, allocated = cache_positions(module, batch, length, valid)
+    return positions, Append(store, positions, allocated)
 
 
 __all__ = ["Append", "KVCache", "KVStore"]
