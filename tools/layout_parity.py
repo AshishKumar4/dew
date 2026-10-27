@@ -493,25 +493,24 @@ def compiled_step(case, fields: dict[str, int], batch, *, one_device: bool = Fal
     step = trainer.compile(state, data)
     compiled = {"flops_per_device": trainer.step_flops and trainer.step_flops.hardware,
                 "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
-                "replicated": replicated_share(trainer.objective.model, fields.get("stage", 1), batch)}
+                "replicated": replicated_share(case, trainer.objective, fields.get("stage", 1))}
     return state, data, step, compiled
 
 
-def replicated_share(model, stages: int, batch) -> float:
-    """The share of `model`'s forward work over `batch`'s rows a pipeline of `stages` runs on every
-    stage (`replicated_flops`); none without a pipeline, and none for a model with no decoder to
-    pipeline, whose work the even split then judges whole."""
-    import jax
+def replicated_share(case, objective, stages: int) -> float:
+    """The share of `objective`'s model's forward work over the case's rows a pipeline of `stages`
+    runs on every stage (`replicated_flops`); none without a pipeline, and none for a model with no
+    decoder to pipeline, whose work the even split then judges whole."""
     import numpy as np
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.wrapping import DecoderWrapper
 
-    if stages == 1 or not isinstance(model, (CausalTransformer, DecoderWrapper)):
+    model = next(iter(objective.program_key()), None)
+    if stages == 1 or model is None or not isinstance(model.module, (CausalTransformer, DecoderWrapper)):
         return 0.0
-    rows, length = np.shape(jax.tree.leaves(batch)[0])[:2]
-    lengths = np.full(rows, length)
-    return model.replicated_flops(stages, lengths) / model.model_flops(lengths)
+    lengths = np.full(case.batch_size, case.seq_len)
+    return model.module.replicated_flops(stages, lengths) / model.module.model_flops(lengths)
 
 
 def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool = False,
