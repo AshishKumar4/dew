@@ -280,6 +280,44 @@ def test_a_remote_generation_of_more_shards_than_its_mirror_holds_reads_every_re
         generation.close()
 
 
+def test_a_remote_shard_is_checked_whole_where_its_reader_opens_it(tmp_path):
+    """A remote generation's shard is read from the mirror's pinned copy, which its reader opens and
+    checks whole against the size and digest its manifest commits, so the records it reads are
+    decoded alone. A shard object replaced since its commit by another shard's valid bytes is refused
+    (OSError) as its reader opens, before any record of it is read, where a record-by-record check
+    would find it only by a record's digest; the shards beside it read as they were."""
+    import fsspec
+
+    with moto_bucket("cache") as (bucket, options):
+        url = f"s3://{bucket}/cache"
+        cache, key = Cache(url, storage_options=options, shard_bytes=1), _key()
+        source = Memory([{"id": index} for index in range(3)])
+        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
+        for index in range(len(rows)):
+            rows[index]
+        rows.finish()
+        rows.close()
+        cache.publish(key, source)
+        generation = cache.generation(key)
+        shards = sorted(generation.manifest["shards"])
+        root = generation.manifest["root"]
+        fs = fsspec.filesystem("s3", **options)
+        fs.pipe(f"{root.removeprefix('s3://')}/{shards[0]}",
+                fs.cat(f"{root.removeprefix('s3://')}/{shards[1]}"))
+        generation.close()
+        mirror = {"dewcache": {"cache_storage": str(tmp_path / "mirror")}}
+        replayed = Cache(url, storage_options={**options, **mirror}).generation(key)
+        read = {}
+        for index in range(len(replayed)):
+            try:
+                read[index] = replayed[index]
+            except OSError:
+                read[index] = None
+        replayed.close()
+    assert sorted(value["id"] for value in read.values() if value is not None) == [1, 2]
+    assert list(read.values()).count(None) == 1
+
+
 def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
     import fsspec
 

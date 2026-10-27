@@ -25,7 +25,7 @@ from dew.data.sources.base import Read, Shard, ShardManifest, Source, _indexed_m
 from dew.data.sources.codec import decode, encode, encoded_fingerprint, fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords, ShardReaders
-from dew.data.storage import Store, Versioned, local
+from dew.data.storage import Store, Versioned
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache
@@ -469,24 +469,27 @@ class Generation:
     @cached_property
     def _shards(self) -> ShardReaders[str]:
         # As many shards' readers stay open as a read's threads, the room the transport's mirror holds
-        # (`ShardReaders`): a local shard is checked whole (its size and digest) as its reader opens,
-        # which stands for every record that reader reads (`outputs`), and checked again only once it
-        # reopens.
+        # (`ShardReaders`): a shard whose reader reads a file, local or the mirror's pinned copy, is
+        # checked whole (its size and digest) as its reader opens, which stands for every record that
+        # reader reads (`outputs`), and checked again only once it reopens.
         def opened(path: str) -> ArrayRecords:
             root = Store(self.manifest["root"], self.storage_options)
-            if self._local:
-                # Checked in place, the file its reader reads.
-                _checked(root, self.manifest["shards"][path])
-            return ArrayRecords((root.child(path).url,), self.storage_options)
+            reader = ArrayRecords((root.child(path).url,), self.storage_options)
+            with ExitStack() as opening:
+                opening.callback(reader.close)
+                if reader.held(self.manifest["shards"][path]):
+                    self._held.add(path)
+                opening.pop_all()
+            return reader
 
         return ShardReaders(opened)
 
     @cached_property
-    def _local(self) -> bool:
-        """Whether its shards are local files, which a reader reads as they were checked whole as it
-        opened them (`_shards`); a remote shard's reader reads an object the check did not, so each
-        record it reads is checked against its digest (`outputs`)."""
-        return local(Store(self.manifest["root"], self.storage_options).resolve()[0])
+    def _held(self) -> set[str]:
+        """The shards whose readers read bytes checked whole as they opened (`ArrayRecords.held`); a
+        record of any other, one read through its service (GCS), is checked against its digest as it
+        is read (`outputs`)."""
+        return set()
 
     def __getstate__(self) -> Mapping[str, object]:
         return {"url": self.url, "storage_options": self.storage_options, "_definition": self._definition,
@@ -547,7 +550,7 @@ class Generation:
         if not isinstance(payload, bytes):
             raise ValueError(f"committed cache record is not bytes: {self.url}")
         values = _decode_outputs(payload)
-        if not self._local and fingerprint(values) != digest:
+        if shard not in self._held and fingerprint(values) != digest:
             raise ValueError(f"committed cache completion is corrupt for {row_key}")
         return values
 

@@ -13,7 +13,7 @@ import grain.python as grain
 
 from dew.batch import Batch
 from dew.data.dataset import Loading, Ranges
-from dew.data.storage import Store, local, on_gcs
+from dew.data.storage import Store, local, matching, object_info, on_gcs
 
 from .codec import decode
 
@@ -121,15 +121,36 @@ class ArrayRecords:
     def ranges(self) -> Ranges:
         return Ranges(self.counts or ())
 
+    def held(self, committed: Mapping[str, object]) -> bool:
+        """Check the bytes a reader of one object reads against the size and digest `committed` states
+        (`matching`), refusing other bytes (OSError): the local file, or the mirror's copy its pin
+        holds, which no writer replaces while it is pinned. False, and nothing read, where the reader
+        reads the object through its service (GCS), whose bytes it cannot hold to one check."""
+        (url,) = self.urls
+        _ = self.reader  # Its opening records what it reads (`_snapshots`).
+        (snapshot,) = self._snapshots
+        if snapshot is None:
+            return False
+        if isinstance(snapshot, str):
+            with open(snapshot, "rb") as file:
+                matching(object_info(file), committed, url)
+        else:
+            matching(object_info(snapshot), committed, url)
+        return True
+
     @cached_property
     def reader(self):
         paths = []
+        # What each object's reader reads, for `held`: a local file's path, a mirror's pin, or None.
+        self._snapshots: list[str | io.BufferedReader | None] = []
         for url in self.urls:
             fs, path = Store(url, self.storage_options).resolve()
             if local(fs):
                 paths.append(path)
+                self._snapshots.append(path)
             elif on_gcs(fs):
                 paths.append("gs://" + path)
+                self._snapshots.append(None)
             else:
                 fs, path = Store(url, self.storage_options).cached().resolve()
                 pin = fs.open(path, "rb")
@@ -141,6 +162,7 @@ class ArrayRecords:
                     )
                 self._pins.append(pin)
                 paths.append(pin.name)
+                self._snapshots.append(pin)
         return grain.ArrayRecordDataSource(paths)
 
     def __len__(self) -> int:
