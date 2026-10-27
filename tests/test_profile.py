@@ -269,3 +269,17 @@ def test_a_profile_counts_overlapped_collectives_once_and_the_gaps_as_idle():
     text = report.text()
     assert f"device idle   {2.5:10.2f} ms" in text and "The largest share of a step: compute, 67%." in text
     assert device_figures([[], []], steps=2)["device_idle_ms"] is None
+
+
+def test_a_capture_that_holds_less_than_its_run_says_why():
+    """A capture's status comes from what its trace holds (row 1893): a local device with no kernel track, or
+    as many GPU activity events as CUPTI's cap (within the buffer CUPTI drops whole), is a partial capture
+    with its reason; a full one has none. A CPU run, with no device track to hold, is never partial."""
+    from dew.telemetry.profile import held_back, missing_tracks
+
+    assert missing_tracks({"/device:GPU:0": 19160, "/device:GPU:1": 18800}, 2, 2_097_152) == []
+    assert missing_tracks({"/device:GPU:0": 7451}, 2, 2_097_152) == [
+        "1 of 2 local devices have no kernel track in the trace"]
+    [capped] = missing_tracks({"/device:GPU:0": 1987}, 1, 2000)
+    assert capped.startswith("CUPTI's activity cap of 2000 events reached (1987 kept)")
+    assert held_back(Path("absent"), {"backend": "cpu", "device_kinds": ["cpu"]}) == []
