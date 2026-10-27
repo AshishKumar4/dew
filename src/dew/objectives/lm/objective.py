@@ -893,6 +893,21 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             return hidden, {}
         return hidden
 
+    def unit_losses(self, variables: Variables, batch: Batch, step: Step) -> jax.Array:
+        """Each target's next-token cross entropy, [B, seq_len], zero at a pad target: the units a node
+        perturbation credits (`dew.objectives.perturbation`), from the model's whole logits (its own call),
+        so the head is a layer it reads. Rows of token ids alone: packed or chat rows are refused."""
+        tokens = batch[TEXT_KEY]
+        packed = any(name.startswith(f"{TEXT_KEY}_") for name in batch)
+        if not isinstance(tokens, jax.Array | np.ndarray) or packed:
+            raise ValueError("unit losses read rows of token ids alone, not packed, chat or media rows")
+        inputs, targets = self._rows(jnp.asarray(tokens))
+        logits = self.model.apply(variables, inputs)
+        logits = logits.astype(at_least_fp32(logits.dtype))
+        picked = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
+        losses = jax.nn.logsumexp(logits, axis=-1) - picked
+        return losses if self.pad_id is None else jnp.where(targets == self.pad_id, 0, losses)
+
     def per_token_log_probs(self, params: Variables, tokens: jax.Array | ModelInputs, *,
                             left_padding: jax.Array | None = None) -> jax.Array:
         """Score raw policy likelihoods aligned to next-token targets.

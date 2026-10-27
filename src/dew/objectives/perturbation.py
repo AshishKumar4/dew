@@ -33,6 +33,7 @@ efficiency for its GPT and are not here: every site is jittered in every draw.
 from __future__ import annotations
 
 import dataclasses
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -61,16 +62,19 @@ def _flat(tree) -> dict[tuple[str, ...], jax.Array]:
 
 
 def _kind(context) -> str | None:
-    """How a call maps its input, or None for a call no site reads."""
+    """How a call maps its input, or None for a call no site reads: a `Dense` and a `DenseGeneral` that
+    batches no axes (`batch_dims`) contract the input's trailing axes with their kernel."""
     module, method = context.module, context.method_name
     if isinstance(module, nn.Dense) and method == "__call__":
+        return "dense"
+    if isinstance(module, nn.DenseGeneral) and method == "__call__" and not module.batch_dims:
         return "dense"
     if isinstance(module, nn.Embed) and method in ("__call__", "attend"):
         return "embed" if method == "__call__" else "attend"
     return None
 
 
-class NodePerturbation(Objective[Ratio]):
+class NodePerturbation(Objective[Any, Any]):
     """Trains the objective it is mixed into without backpropagation (the module's docstring):
 
         class Forward(NodePerturbation, Supervised):
@@ -178,10 +182,17 @@ class NodePerturbation(Objective[Ratio]):
         held = _flat(variables["params"])
         if site.kind == "dense":
             kernel = held[(*site.path, "kernel")]
-            gradient = {"kernel": float32_einsum("...i,...o->io", site.inputs.astype(error.dtype),
-                                                 error).astype(kernel.dtype)}
+            # The input is [*units, *read], the error [*units, *written] and the kernel [*read, *written]: the
+            # units' axes, which the input and the error share, are summed over.
+            leading = (site.inputs.ndim + error.ndim - kernel.ndim) // 2
+            letters = "abcdefghijklmnopqrstuvwxyz"
+            units, read = letters[:leading], letters[leading:site.inputs.ndim]
+            written = letters[site.inputs.ndim:site.inputs.ndim + error.ndim - leading]
+            gradient = {"kernel": float32_einsum(f"{units}{read},{units}{written}->{read}{written}",
+                                                 site.inputs.astype(error.dtype), error).astype(kernel.dtype)}
             if (*site.path, "bias") in held:
-                gradient["bias"] = jnp.sum(error.reshape(-1, error.shape[-1]), 0).astype(kernel.dtype)
+                bias = held[(*site.path, "bias")]
+                gradient["bias"] = jnp.sum(error.reshape(-1, *bias.shape), 0).astype(bias.dtype)
             return gradient
         table = held[(*site.path, "embedding")]
         if site.kind == "attend":

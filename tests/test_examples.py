@@ -507,3 +507,15 @@ def test_pinn_burgers_smoke_trains_the_profile_in_float64_and_reports_its_residu
     metrics = json.loads((out / "metrics.json").read_text())
     assert metrics["steps"] == 20 and np.isfinite(metrics["pde_mse"])
     assert np.isfinite(metrics["log10_max_residual"])
+
+
+@pytest.mark.parametrize("method", ["perturbation", "backprop"])
+def test_forward_only_lm_smoke_trains_a_decoder_with_and_without_backpropagation(tmp_path, method):
+    """A two-layer decoder of Dust's layout on random rows, by node perturbation and by backpropagation:
+    each run writes its training and validation losses, finite, for every step and every evaluation."""
+    out = tmp_path / method
+    smoke("forward_only_lm", out, "--method", method)
+    curves = json.loads((out / "curves.json").read_text())
+    assert curves["method"] == method and curves["steps"] == 4
+    assert [step for step, _ in curves["train"]] == [1, 2, 3, 4] and curves["val"]
+    assert np.isfinite([loss for _, loss in curves["train"] + curves["val"]]).all()
