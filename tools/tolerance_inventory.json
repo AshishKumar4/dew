@@ -90,7 +90,7 @@
    "lane": "Training"
   },
   "tests/test_clip_metrics.py": {
-   "comparisons": 10,
+   "comparisons": 8,
    "lane": "Training"
   },
   "tests/test_codecs.py": {
@@ -146,7 +146,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_decoding_components.py": {
-   "comparisons": 8,
+   "comparisons": 5,
    "lane": "Training"
   },
   "tests/test_decoding_strategies.py": {
@@ -253,10 +253,6 @@
    "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_gguf.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_gpt_oss.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
@@ -306,7 +302,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_image_metrics.py": {
-   "comparisons": 5,
+   "comparisons": 3,
    "lane": "Training"
   },
   "tests/test_inference.py": {
@@ -462,15 +458,15 @@
    "lane": "Kernels"
   },
   "tests/test_mtp.py": {
-   "comparisons": 9,
+   "comparisons": 3,
    "lane": "Training"
   },
   "tests/test_multimodal_model.py": {
-   "comparisons": 18,
+   "comparisons": 11,
    "lane": "Kernels"
   },
   "tests/test_multiprocess.py": {
-   "comparisons": 21,
+   "comparisons": 18,
    "lane": "Training"
   },
   "tests/test_muse_glimmer.py": {
@@ -565,16 +561,8 @@
    "comparisons": 8,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_records.py": {
-   "comparisons": 1,
-   "lane": "Training"
-  },
   "tests/test_reference_runs.py": {
    "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_released_checkpoints.py": {
-   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_reporting.py": {
@@ -691,10 +679,6 @@
   },
   "tests/test_vision.py": {
    "comparisons": 19,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_vllm_interop.py": {
-   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_wan_vae.py": {

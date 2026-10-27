@@ -954,8 +954,9 @@ class Dataset:
         share; the maps written after that step run on its own rows alone, on its read threads. So
         its rows are a one-reader run's, and its position, the same on every reader, resumes on any
         count, as HF's `split_dataset_by_node` reads a stream on every node; each reader reads the
-        steps before those maps over every record. It reads without loading workers (ledger row
-        1837)."""
+        steps before those maps over every record. Read by index, its loading workers read its
+        inputs in their order (`dew.data.lowering._InputOrder`), so their count is no part of its
+        position either; streamed, it reads without them (ledger row 1896)."""
         return dataclasses.replace(self._chain(), _elastic=True)
 
     def loading(self, loading: Loading) -> Pipeline:

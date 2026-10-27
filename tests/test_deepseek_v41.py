@@ -37,7 +37,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import FACTOR, distance
+from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 
 from dew.batch import coordinates
 from dew.interop import Pretrained
@@ -45,6 +45,8 @@ from dew.interop.hf_decoders import families, translate_config, translate_wrappe
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
+from dew.nn.kv_cache import KVCache
+from dew.nn.rope import LongRopeScaling, RopeScaling
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
 from tools.deepseek_v41_numerics import QUANTIZERS, unquantized, vision_bundle, vision_run
@@ -234,6 +236,82 @@ def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(sourc
     assert distance(logits[:, pad:], TRUTH["logits"]) <= FACTOR * rounding("logits")
 
 
+def test_an_interior_gap_leaves_every_window_on_its_rows_real_tokens(source):
+    """Uncached, three padding slots inside each row leave each real token's sliding window counting
+    its row's real tokens (`counted_places`), as a cache's slots count them, and its compressed windows
+    and n-grams on them: the real tokens' logits are as exact as the reference's of the rows without the
+    gap (`assert_as_exact_as_the_reference`, the truth its float64 run), where a window counted by index
+    let the gap crowd out the keys before it (audit NN-02)."""
+    loaded, plain, reference = source
+    ids, at, gap = jnp.asarray(reference["input_ids"]), 5, 3
+    tokens = jnp.concatenate([ids[:, :at], jnp.zeros((ids.shape[0], gap), ids.dtype), ids[:, at:]], axis=1)
+    slots = jnp.arange(tokens.shape[1])
+    real = (slots < at) | (slots >= at + gap)
+    logits = plain.apply(loaded.variables, tokens, attention_mask=jnp.broadcast_to(real, tokens.shape))
+    assert_as_exact_as_the_reference(logits[:, real], reference["logits"], TRUTH["logits"], "an interior gap")
+
+
+SHIFT = 8
+"""How far the shifted rows' given positions sit past their indices: a multiple of every compression
+rate, so a query that read entries by its given place would see SHIFT // rate windows of later tokens."""
+
+
+def test_shifted_positions_compute_the_unshifted_rows_logits(source):
+    """Uncached, positions given SHIFT past the tokens' indices: every rotation is relative, each
+    compressed entry is visible by its window's tokens' ranks and rotates at its window's first given
+    place, where its queries rotate (`window_origins`), so the logits are as exact as the reference's
+    of the rows at their indices (`assert_as_exact_as_the_reference`, the truth its float64 run);
+    entries visible by the given places showed each query windows of later tokens, and entries rotated
+    at zero-based origins sat SHIFT away from their queries (audit NN-03)."""
+    loaded, plain, reference = source
+    ids = jnp.asarray(reference["input_ids"])
+    positions = jnp.broadcast_to(jnp.arange(ids.shape[1]) + SHIFT, ids.shape)
+    logits = plain.apply(loaded.variables, ids, positions=positions)
+    assert_as_exact_as_the_reference(logits, reference["logits"], TRUTH["logits"], "shifted positions")
+
+
+def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(source):
+    """Cached, a prompt at positions SHIFT past its indices, then the rest of each row one token at a
+    time: each compressed entry rotates at its window's first given place, which the cache carries
+    across the calls a window spans (`append_windows`), so every step's logits are as exact as the
+    reference's of the rows at their indices (`assert_as_exact_as_the_reference`, the truth its float64
+    run), where entries rotated at their slots sat SHIFT away from their queries (audit NN-03)."""
+    from dew.sampling.text import decode_ops, prefill_state
+
+    loaded, plain, reference = source
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+    ops = decode_ops(plain, loaded.variables, 0, None)
+    positions = jnp.broadcast_to(jnp.arange(prompt) + SHIFT, (ids.shape[0], prompt))
+    inputs = ModelInputs(ids[:, :prompt], {"positions": positions})
+    state, _ = prefill_state(plain, loaded.variables, inputs, ops)
+    steps = [np.asarray(state.logits)]
+    for column in range(prompt, ids.shape[1]):
+        state = ops.advance(state, ids[:, column], jnp.ones(ids.shape[0], bool))
+        steps.append(np.asarray(state.logits))
+    assert_as_exact_as_the_reference(np.stack(steps, axis=1), reference["logits"][:, prompt - 1:],
+                                     TRUTH["logits"][:, prompt - 1:], "a shifted cached walk")
+
+
+def test_a_llama3_ramp_reaches_every_layer_and_longrope_is_refused(source):
+    """V4's layers take the model's one rope scaling (`MixerContext.rotary_scaling`), each kind's own
+    in its place where the kind gives one (`kind_of`), as the compressed kinds give their YaRN ramp: a
+    Llama 3.1 ramp makes the decoder compute otherwise than the unscaled one, where the layers
+    forwarded YaRN alone, rotated at the plain frequencies and left the logits bit for bit the same.
+    LongRoPE, whose factors a call's reach picks and which the compressed entries do not see, is
+    refused by name (audit NN-04)."""
+    loaded, plain, reference = source
+    ids = jnp.asarray(reference["input_ids"])
+    ramp = RopeScaling(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0,
+                       original_max_position_embeddings=4)
+    scaled, unscaled = (plain.clone(yarn=None, rope_scaling=scaling).apply(loaded.variables, ids)
+                        for scaling in (ramp, None))
+    assert not np.array_equal(scaled, unscaled)
+    longrope = LongRopeScaling(short_factor=(1.0,) * 4, long_factor=(2.0,) * 4,
+                               original_max_position_embeddings=4)
+    with pytest.raises(ValueError):
+        plain.clone(yarn=None, rope_scaling=longrope).apply(loaded.variables, ids)
+
+
 def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
     """Uncached, DSpark drafts after a context whose padding `valid` marks, after it in one row and
     before it in the other, as after the context alone: its real positions keep their ranks, the
@@ -299,6 +377,52 @@ def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
         _, logits, _ = plain.apply(loaded.variables, whole, drawn[row:row + 1], decode=False,
                                    method="draft")
         assert distance(jnp.stack(scored, 1)[row], logits[0]) <= 2 * FACTOR * rounding("draft_logits")
+
+
+@pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
+def test_a_paged_window_cache_decodes_what_the_compact_cache_decodes(source, quantized):
+    """The tiny V4.1 checkpoint's window cache takes the decoder's layout: paged, it draws the compact
+    cache's greedy tokens at the same format, full precision and quantized, its compressors' entries,
+    buffers and index keys kept compact beside it."""
+    loaded, plain, reference = source
+    prompts = jnp.asarray(reference["input_ids"])[:, :7]
+
+    def decoded(layout: KVCache) -> np.ndarray:
+        return np.asarray(generate(plain.with_kv_cache(layout), loaded.variables, prompts, 9,
+                                   key=jax.random.key(1), sampling=Sampling(temperature=0)).tokens)
+
+    np.testing.assert_array_equal(decoded(KVCache(quantized=quantized, page_size=4)),
+                                  decoded(KVCache(quantized=quantized)))
+
+
+@pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
+def test_a_paged_drafting_cache_drafts_what_the_compact_cache_drafts(source, quantized):
+    """The DSpark drafter's window cache takes the decoder's layout: after a prefill and a verified
+    stretch recorded into it, a paged cache drafts the compact cache's logits at the same format, bit
+    for bit, its context written as the stage's keys and values and read back in their basis."""
+    from dew.sampling.text import decode_ops, prefill_state
+
+    loaded, plain, reference = source
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+
+    def drafted(layout: KVCache) -> np.ndarray:
+        model = plain.with_kv_cache(layout)
+        ops = decode_ops(model, loaded.variables, 0, 0)
+        state, _ = prefill_state(model, loaded.variables, ModelInputs(ids[:, :prompt]), ops)
+        keep = jnp.arange(3)[None, :] < jnp.asarray([3, 1])[:, None]
+        state, _, context = ops.verify(state, ids[:, prompt:prompt + 3], keep)
+        state = ops.record(state, context, keep)
+        scored = []
+
+        def choose(index, logits):
+            scored.append(logits)
+            return jnp.argmax(logits, axis=-1)
+
+        ops.draft(state, ids[:, prompt + 3], choose)
+        return np.asarray(jnp.stack(scored, 1))
+
+    np.testing.assert_array_equal(drafted(KVCache(quantized=quantized, page_size=4)),
+                                  drafted(KVCache(quantized=quantized)))
 
 
 def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers():

@@ -184,6 +184,8 @@ def gradient_functions(source):
 
     @jax.jit
     def native_observations(batch, probe):
+        """One row's observations, the program a user's step on that row runs: its logits, every
+        parameter's gradient in its source layout and every floating media input's gradient."""
         floating = {name: value for name, value in batch.conditioning.items()
                     if jnp.issubdtype(value.dtype, jnp.floating)}
 
@@ -195,24 +197,25 @@ def gradient_functions(source):
 
         (_, logits), (gradient, media) = jax.value_and_grad(loss, (0, 1), has_aux=True)(
             native.variables["params"], floating)
-        return logits, gradient, media
+        values = {f"parameter.{name}": layout.source_array({"params": gradient})
+                  for name, layout in bindings.values()}
+        # Real token rows are the forward contract; parameter Jacobians retain each independent
+        # example as an axis instead of judging each tiny example as a separate stochastic site.
+        values["logits"] = logits[0]
+        values.update({f"input.{name}": value for name, value in media.items()})
+        return values
 
-    @jax.jit
+    @as_given
     def ours(inputs):
+        """Each row's program over its own length (`native_observations`), compiled once a length
+        rather than once a window's lengths, and the rows' observations collected on the device, every
+        row dispatched before any is read."""
         observed = []
         for row in range(inputs["input/input_ids"].shape[0]):
             prefix = f"native/{row}/"
             fields = unflatten_dict({name.removeprefix(prefix): value for name, value in inputs.items()
                                      if name.startswith(prefix)}, sep="/")
-            single = ModelInputs(**fields)
-            logits, gradient, media = native_observations(single, inputs[f"probe/{row}"])
-            values = {f"parameter.{name}": layout.source_array({"params": gradient})
-                       for name, layout in bindings.values()}
-            # Real token rows are the forward contract; parameter Jacobians retain each independent
-            # example as an axis instead of judging each tiny example as a separate stochastic site.
-            values["logits"] = logits[0]
-            values.update({f"input.{name}": value for name, value in media.items()})
-            observed.append(values)
+            observed.append(native_observations(ModelInputs(**fields), inputs[f"probe/{row}"]))
         return collect(observed, jnp)
 
     def theirs(model, given, *, wide=False):
@@ -260,10 +263,11 @@ def gradient_functions(source):
         inputs = {name: np.concatenate([pair[name] for pair in pairs]) for name in pairs[0]}
         probe = np.random.default_rng([0xBACC, seed]).standard_normal(
             (*inputs["input_ids"].shape, reference.config.text_config.vocab_size), np.float32)
-        batch = native.processor.from_hf(inputs)
+        # Host arrays, which the rows are sliced from on the host.
+        batch = jax.tree.map(np.asarray, native.processor.from_hf(inputs))
         given = {f"input/{name}": value for name, value in inputs.items()}
         for row, mask in enumerate(inputs["attention_mask"]):
-            single = batch.take_rows(jnp.asarray([row])).slice_tokens(0, int(mask.sum()))
+            single = batch.take_rows(np.asarray([row])).slice_tokens(0, int(mask.sum()))
             fields = {"tokens": single.tokens, "token_fields": dict(single.token_fields),
                       "conditioning": dict(single.conditioning)}
             given.update({f"native/{row}/{name}": np.asarray(value)

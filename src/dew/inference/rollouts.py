@@ -73,6 +73,11 @@ class InfrastructureError(RuntimeError):
     """
 
 
+INFRASTRUCTURE = (InfrastructureError, OSError)
+"""What a rollout's external boundary, not its code, fails with (`InfrastructureError`, any `OSError`):
+what a session source, a reward or a harness trial turns into an `INFRA_ERROR` session."""
+
+
 FINISH_REASONS = frozenset({"stop", "tool_calls", "length", "abort"})
 """How a model call ended: on an EOS id or a stop string (`stop`), on a tool call the harness reads
 (`tool_calls`), at its budget or a criterion that truncates it (`length`), or cut off (`abort`)."""

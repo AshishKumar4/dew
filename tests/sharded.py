@@ -30,7 +30,8 @@ from jax.sharding import NamedSharding, PartitionSpec
 from reference_error import as_given, assert_as_exact, without_ynn
 
 from dew.distributed.placement import parameter_axes
-from dew.telemetry.instrumentation import collective, custom_call_kind, hlo_instructions
+from dew.telemetry.instrumentation import custom_call_kind, hlo_instructions
+from dew.telemetry.trace import collective
 
 
 def split_axes(tree) -> set[str]:

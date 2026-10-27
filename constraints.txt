@@ -6,33 +6,30 @@
 # release has yet, built from AshishKumar4/jax's branch
 # v0.12.0.1-cache-key-pool-fingerprints and served by Dew's package index: a
 # Pallas Triton kernel's key without its source locations (jax-ml/jax#41502),
-# which two checkouts need to share one compiled kernel; and linear_call's
-# batching rule, an all-unmapped call left unmapped, and the JVP of its
-# residuals and constants, which the experts' fused SwiGLU route needs; and the
-# device-to-host transfer guard held on a CPU array's implicit host read (float,
-# item, np.asarray, its buffer) as on an accelerator's copy, which a steady
-# state's guard needs on the CPU suite (tests/steady_state.py); and Pallas
-# Triton's 16-bit float division and erf_inv, through float32 and correctly
-# rounded, which a GEMM template prologue dividing in bfloat16 needs on CUDA;
-# and a custom_vjp call (and Mosaic GPU's custom_jvp call) lowered in a Pallas
-# Triton or Mosaic GPU kernel as its primal function, which a template's score
-# hook through a jax.custom_vjp needs; and Mosaic GPU's MMA accumulator relaid
-# out to a 16-bit MMA's left operand in registers, and an abstract device's
-# compute capability, which Mosaic GPU lowers for, which the templates' Mosaic
-# kernels need on sm80; and the persistent compilation cache keyed by the host's
-# CPU for a CPU program and by jax's own build for every program, so neither
-# another CPU nor another build over one jaxlib reads a program it cannot run;
-# and ceil and floor lowered in Mosaic GPU and Pallas Mosaic GPU, which a
-# template's Mosaic kernel rounding a value needs on an H100; and add_any and
-# integer_pow of every integer exponent lowered in Pallas Mosaic GPU, which the
-# Mosaic attention backward under a score hook needs; and Mosaic GPU's layout
-# inference solving unrelated unknowns apart, which sm80's mma.sync GEMM tiles
-# need; and a platform-dependent conditional that keeps one branch lowered
-# inline, so a collective in it is no runtime conditional, on which XLA:CPU's
-# devices diverged (ledger 1545); and a block's Mosaic GPU warpgroups each
-# taking their own share of the reduction scratch; and linear_call lowered where
-# a trace requires low primitives, which the TPU GEMM launches' gradients need
-# on 0.12; and Mosaic GPU's emit_pipeline run collectively over a thread axis;
+# which two checkouts need to share one compiled kernel; and the device-to-host
+# transfer guard held on a CPU array's implicit host read (float, item,
+# np.asarray, its buffer) as on an accelerator's copy, which a steady state's
+# guard needs on the CPU suite (tests/steady_state.py); and Pallas Triton's
+# 16-bit float division and erf_inv, through float32 and correctly rounded,
+# which a GEMM template prologue dividing in bfloat16 needs on CUDA; and a
+# custom_vjp call (and Mosaic GPU's custom_jvp call) lowered in a Pallas Triton
+# or Mosaic GPU kernel as its primal function, which a template's score hook
+# through a jax.custom_vjp needs; and Mosaic GPU's MMA accumulator relaid out to
+# a 16-bit MMA's left operand in registers, and an abstract device's compute
+# capability, which Mosaic GPU lowers for, which the templates' Mosaic kernels
+# need on sm80; and the persistent compilation cache keyed by the host's CPU for
+# a CPU program and by jax's own build for every program, so neither another CPU
+# nor another build over one jaxlib reads a program it cannot run; and ceil and
+# floor lowered in Mosaic GPU and Pallas Mosaic GPU, which a template's Mosaic
+# kernel rounding a value needs on an H100; and add_any and integer_pow of every
+# integer exponent lowered in Pallas Mosaic GPU, which the Mosaic attention
+# backward under a score hook needs; and Mosaic GPU's layout inference solving
+# unrelated unknowns apart, which sm80's mma.sync GEMM tiles need; and a
+# platform-dependent conditional that keeps one branch lowered inline, so a
+# collective in it is no runtime conditional, on which XLA:CPU's devices
+# diverged (ledger 1545); and a block's Mosaic GPU warpgroups each taking their
+# own share of the reduction scratch; and a Mosaic GPU MMA's warp split stated
+# per operation (m_warps), for Ampere GEMM tiles that split their warps 2 x 2;
 # and a Mosaic GPU kernel's debug info left out of the persistent cache key, so
 # the same kernel compiled from two checkouts keys alike; and a compile-only
 # Mosaic GPU target held to its own default shared memory limit; and a
@@ -43,7 +40,7 @@
 # BEGIN package index (site/scripts/gen_install.py)
 --extra-index-url https://pypi.dewml.dev/simple
 # END package index
-jax==0.12.0.1.post27
+jax==0.12.0.1.post28
 
 # The CA bundle requests, httpx and the Hub verify TLS with: 2026.10.19 dropped emSign ECC Root CA - G3,
 # whose intermediates' private keys were compromised in October 2026 (tests/test_trust_store.py).
