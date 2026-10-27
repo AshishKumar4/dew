@@ -206,17 +206,20 @@ def trained(run: RunConfig, root: Path, name: str, **fields):
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_key_data_seed_mesh_and_adapter_reach_what_it_trains(kind, tmp_path):
-    """From Python, a kind's run trains under each option it states: another `trainer.key` draws
-    other parameters, another `data_seed` reads another first batch from parameters drawn alike, its
-    mesh and layout split a parameter over its fsdp shards, and a `lora` trains its factors over a
+    """From Python, a kind's run trains under each option it states: another `trainer.key` is another
+    run key in its state, and draws other parameters where the kind draws them fresh (a decision run
+    reads its release's), another `data_seed` reads another first batch from parameters drawn alike,
+    its mesh and layout split a parameter over its fsdp shards, and a `lora` trains its factors over a
     frozen base."""
     run = KINDS[kind](tmp_path, drawn=True)
     base, first = trained(run, tmp_path, "base", trainer={"key": 1})
     keyed, _ = trained(run, tmp_path, "keyed", trainer={"key": 2})
     _, reordered = trained(run, tmp_path, "seeded", trainer={"key": 1}, data_seed=5)
     held = [np.asarray(leaf) for leaf in jax.tree.leaves(base.variables["params"])]
-    assert any(not np.array_equal(mine, np.asarray(theirs))
-               for mine, theirs in zip(held, jax.tree.leaves(keyed.variables["params"]), strict=True))
+    assert not np.array_equal(jax.random.key_data(base.key), jax.random.key_data(keyed.key))
+    drawn = any(not np.array_equal(mine, np.asarray(theirs))
+                for mine, theirs in zip(held, jax.tree.leaves(keyed.variables["params"]), strict=True))
+    assert drawn is (kind != "decision")
     assert first["train/loss"] != reordered["train/loss"]
     assert any(len(leaf.sharding.device_set) > 1 and not leaf.sharding.is_fully_replicated
                for leaf in jax.tree.leaves(base.variables["params"]))
