@@ -903,9 +903,10 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             raise ValueError("unit losses read rows of token ids alone, not packed, chat or media rows")
         inputs, targets = self._rows(jnp.asarray(tokens))
         logits = self.model.apply(variables, inputs)
-        logits = logits.astype(at_least_fp32(logits.dtype))
-        picked = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
-        losses = jax.nn.logsumexp(logits, axis=-1) - picked
+        # The log-softmax shifts by the row's largest logit before it subtracts, so a large logit cancels
+        # in the shift rather than in the loss.
+        log_probs = jax.nn.log_softmax(logits.astype(at_least_fp32(logits.dtype)), axis=-1)
+        losses = -jnp.take_along_axis(log_probs, targets[..., None], axis=-1)[..., 0]
         return losses if self.pad_id is None else jnp.where(targets == self.pad_id, 0, losses)
 
     def per_token_log_probs(self, params: Variables, tokens: jax.Array | ModelInputs, *,
