@@ -801,8 +801,15 @@ class StackView:
             if name not in held:
                 continue
             shape = self.stacked_shape(count)
-            rows = jax.tree_util.tree_map_with_path(
-                lambda path, leaf, shape=shape: tuple(cut(path, leaf, shape)), held.pop(name))
+
+            def rows_of(path, leaf, shape=shape, layers=layers):
+                rows = tuple(cut(path, leaf, shape))
+                if len(rows) != len(layers):
+                    raise ValueError(f"{jax.tree_util.keystr(path)} of shape {np.shape(leaf)} under a run "
+                                     f"stacked {shape} cuts into {len(rows)} rows, not its {len(layers)} "
+                                     "layers'")
+                return rows
+            rows = jax.tree_util.tree_map_with_path(rows_of, held.pop(name))
             for index, layer in enumerate(layers):
                 tree[layer] = jax.tree.map(lambda cuts, index=index: cuts[index], rows,
                                            is_leaf=lambda node: isinstance(node, tuple))

@@ -658,7 +658,11 @@ def declarations(tree) -> dict[Suffix, LogicalAxes]:
         elif (module := _matching(_OWNERS, names[:-1])) is not None:
             axes = _OWNERS[module][0]
             factor = names[-1] in LOW_RANK_FACTORS
-            table[names] = factor_axes(axes, names[-1], np.ndim(leaf)) if factor else axes
+            # A stage-local run's factor stacks its layers' over leading dimensions its kernel's
+            # declaration names none of (`stacked_layers`).
+            layers = stacked_layers(path)
+            ndim = np.ndim(leaf) - (0 if layers is None else layers[1])
+            table[names] = factor_axes(axes, names[-1], ndim) if factor else axes
     return table
 
 

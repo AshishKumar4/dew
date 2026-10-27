@@ -120,6 +120,18 @@ def draw(seed):
     return (token_rows(VOCAB, BATCH, SEQ + 1, seed=seed)["text"],)
 
 
+def wide(state):
+    """`state` as a float64 truth's inputs (`widened`), its PRNG keys as they are."""
+    return jax.tree.map(lambda leaf: leaf if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key)
+                        else widened(leaf), state)
+
+
+def on_host(tree):
+    """`tree`'s arrays on the host, a PRNG key as its key data."""
+    return jax.device_get(jax.tree.map(lambda leaf: jax.random.key_data(leaf) if jax.dtypes.issubdtype(
+        leaf.dtype, jax.dtypes.prng_key) else leaf, tree))
+
+
 def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variables=None, exact: bool = False):
     """`STEPS` steps of `model` from `initial` on the batch a draw gives, over `mesh`, its step
     compiled once for every draw, returning the variables, optimizer state and EMA as a checkpoint
@@ -134,7 +146,7 @@ def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variable
             built.append(trainer(held, optimizer, mesh, devices, variables=variables))
             built[0].validate(steps=STEPS)
         steps = built[0]
-        state, _ = steps.staging.supplied(widened(initial) if exact else jax.tree.map(jnp.copy, initial),
+        state, _ = steps.staging.supplied(wide(initial) if exact else jax.tree.map(jnp.copy, initial),
                                           steps.shardings)
         batch = shard_batch(steps.device_mesh, {"text": tokens})
         if len(built) == 1:
@@ -258,7 +270,7 @@ def test_a_stage_local_checkpoint_resumes_on_two_stages_and_on_one(tmp_path):
     whole, trained = fit(tmp_path / "whole", STAGED, 8, 2)
     fit(tmp_path / "halted", STAGED, 8, 1)
     _, resumed = fit(tmp_path / "halted", STAGED, 8, 2)
-    leaves = (jax.tree.leaves(jax.device_get(state)) for state in (resumed, trained))
+    leaves = (jax.tree.leaves(on_host(state)) for state in (resumed, trained))
     for mine, theirs in zip(*leaves, strict=True):
         np.testing.assert_array_equal(mine, theirs)
 
