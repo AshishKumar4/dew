@@ -35,7 +35,7 @@ from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention
-from dew.nn.protocols import RematChoosing, block_chunks_of
+from dew.nn.protocols import RematChoosing
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig, import_path, record_argument
 from dew.state import TrainState
@@ -220,7 +220,7 @@ class DecisionRunConfig(DecoderRunConfig):
             head = derived.get("head", DecisionHead)
             # Lettered rows lie one question to a row, as the backbone's order asks.
             layout = _fresh_layout(start.model.causal, head.one_question or labels is not None, budgets)
-            derived["layout"] = _laid(layout, bool(block_chunks_of(start.model)), labels)
+            derived["layout"] = _laid(layout, self.source.blocked, labels)
         objective = self.objective.build(backbone=start, **derived)
         assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
         summary: dict[str, object] = {"pretrained": self.pretrained}
@@ -273,10 +273,10 @@ def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets) -> Layout:
 
 
 def _laid(layout: Layout, blocked: bool, labels: Labels | None) -> Layout:
-    """A fresh head's `layout` with its rows in blocks where the backbone reads blocks whole
-    (`blocked`, `block_chunks_of`, as the load's overrides or the checkpoint's own made it) and
-    lettered by `labels` where the run reads letters; a layout whose rows can do neither, a joint row
-    of every question, is refused."""
+    """A fresh head's `layout` with its rows in blocks where the run asks its backbone to read each of a
+    row's blocks whole (`blocked`, `SourceOptions.blocked`), not where a checkpoint reads its own media
+    so, and lettered by `labels` where the run reads letters; a layout whose rows can do neither, a
+    joint row of every question, is refused."""
     stated = {**({"blocks": True} if blocked else {}), **({} if labels is None else {"labels": labels})}
     if stated and not isinstance(layout, QuestionLayout):
         raise ValueError(f"{type(layout).__name__} lays every question in one row, which lies in no blocks "

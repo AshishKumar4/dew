@@ -343,6 +343,13 @@ class SourceOptions:
         """The `modeling_overrides` these options state, None where they state none."""
         return None if self.attention is None else {"attention": dict(self.attention)}
 
+    @property
+    def blocked(self) -> bool:
+        """Whether these options ask a layer kind to read each of a row's blocks whole, so the rows a
+        run lays out lie in blocks for it; a checkpoint's own block reading, of its media say, asks
+        nothing of the run's rows."""
+        return "block_bidirectional" in (self.attention or {}).values()
+
 
 class SourcePlacement(TypedDict, total=False):
     """Where a run reads the source it starts from: `Pretrained.load`'s keywords
