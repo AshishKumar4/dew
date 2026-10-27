@@ -24,7 +24,7 @@ from dew.batch import Batch
 from dew.data.dataset import Closeable
 from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
-from dew.data.sources.files import Format, _arrow_filesystem
+from dew.data.sources.files import Format, _arrow_filesystem, declared_format
 from dew.data.steps.text import count_rules, stated_rules
 from dew.data.storage import ObjectRef, Store, commit_export
 
@@ -238,6 +238,10 @@ def export(
         raise ValueError("export rows_per_shard must be positive")
     if not isinstance(format, Writer) and format not in ("parquet", "array_record"):
         raise ValueError(f"unknown export format {format!r}")
+    if isinstance(format, Writer):
+        # A record format `Files` reads: the manifest commits it once (`put_if_absent`), and an
+        # export committed under a format no reader opens could never be read or written again there.
+        declared_format(format.format, f"export writer {format!r}")
     if format != "parquet" and partitioning is not None:
         raise ValueError("only a Parquet export has partition columns; a writer of its own lays out its own")
     if url.startswith("hf://"):
