@@ -408,8 +408,10 @@ def _dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
     """`kernel` where the call lowers for CUDA, interpreted on the CPU where asked, `portable` elsewhere
     (`grouped_matmul._on_platform`). Evaluated eagerly, `platform_dependent` knows its platform and runs
     its branch alone, so a CPU's would skip the selection the kernel's branch makes (its routes, a named
-    kernel's refusal); an eager call is traced as a jit traces it, every branch selecting, by a function
-    of its own, so no cached trace stands in for a later call's choices."""
+    kernel's refusal): an eager call is first traced abstractly as a jit traces it, every branch
+    selecting, then runs its platform's branch eagerly, op by op as any eager call does: run under a jit
+    of its own (83d19a780), a quantized block's reload no longer computed its logits bit for bit
+    (test_wrapped_runs)."""
     branches, default = grouped_matmul._on_platform(kernel, portable, interpret_on_cpu)
 
     def dispatched(*operands):
@@ -417,6 +419,6 @@ def _dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
 
     from jax.core import Tracer
 
-    if any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
-        return dispatched(*operands)
-    return jax.jit(dispatched)(*operands)
+    if not any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
+        jax.eval_shape(dispatched, *operands)
+    return dispatched(*operands)
