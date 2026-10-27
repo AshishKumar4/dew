@@ -610,12 +610,10 @@ def test_a_gpu_hosts_cpu_runs_the_seams_its_placement_chooses(without_determinis
 def test_other_gates_keep_their_arithmetic(name):
     """A GeGLU named onto the kernel, which takes SiLU products alone, computes its own gate: on par with
     XLA's product over the seeds (check 1), truth that product in float64."""
-    def draw(draw):
-        return tuple(jax.random.normal(drawn_key(index, draw), (4, 96)) for index in (80, 81))
-
     product = gated_product(name, implementation="xla")
-    assert_as_exact(jax.jit(gated_product(name, implementation="pallas")), jax.jit(product), draw, name,
-                    seeds=SEEDS["gates"], truth_fn=product)
+    assert_as_exact(jax.jit(gated_product(name, implementation="pallas")), jax.jit(product),
+                    functools.partial(fused_operands, "swiglu", jnp.float32), name, seeds=SEEDS["gates"],
+                    truth_fn=product)
 
 
 @pytest.mark.mesh(devices=2)

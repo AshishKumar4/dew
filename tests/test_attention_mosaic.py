@@ -48,15 +48,15 @@ ALL_HOOKS_SEEDS = 32
 BACKWARD_HOOKS = [name for name in SCORE_HOOKS if name != "row-indexed"]
 """The backward's score hooks: every one the backward differentiates (`test_attention_triton.SCORE_HOOKS`) but
 the hook indexed off the query's coordinates' column, which forms a unit axis the mainloop refuses
-(`attention_mosaic_program.unlowered`, ledger row 1428)."""
+(`attention_mosaic_program.unlowered`, ledger row 1428): `test_a_hook_that_forms_a_unit_axis_is_refused`."""
 FORWARD_HOOKS = {**{name: (SCORE_HOOKS[name], False) for name in BACKWARD_HOOKS},
                  "gate": ((), True),
                  "all": (("softcap", "custom", "sinks", "alibi", "temperature", "key", "tile"), True)}
 """The forward's hooks: each score hook the backward differentiates (`test_attention_triton.SCORE_HOOKS`:
 every kind of parameter, the initial state as sinks or a resumed partial, a hook through a custom VJP), an
 output gate, and all at once; each `(score hooks, gate)`. The hook indexed off the query's coordinates'
-column forms a unit axis, which the mainloop refuses (`attention_mosaic_program.unlowered`, ledger row
-1428)."""
+column forms a unit axis, which the mainloop refuses (`attention_mosaic_program.unlowered`, ledger row 1428):
+`test_a_hook_that_forms_a_unit_axis_is_refused`."""
 HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False),
               "bfloat16-natural": (jnp.bfloat16, True), "float16-natural": (jnp.float16, True)}
 """The hooked forward's dtypes and forms: the fold and natural logits over both 16-bit dtypes."""
@@ -613,6 +613,19 @@ def test_the_backward_is_on_par_from_the_triton_mainloops_residuals_interpreted(
     (`attention_route`), under the interpreter."""
     _check_backward("causal", SHAPES["interpreted"], form=form, interpret=True,
                     residuals_from=attention_triton.forward)
+
+
+def test_a_hook_that_forms_a_unit_axis_is_refused():
+    """The hook indexed off the query's coordinates' column (`q_pos[:, :1]`) forms a `[bq, 1]` array, which
+    Mosaic GPU's layout inference takes no operation on: the mainloop, called on it, refuses it before any
+    launch rather than compute it (ledger row 1428)."""
+    queries, keys = core_geometry(CASES["causal"])
+    spans = template.spans(queries, keys, ROWS, causal=True)
+    query, key, value, _ = _drawn((ROWS, queries, 4, 2), jnp.bfloat16, width=64, keys=keys)(0)
+    with pytest.raises(NotImplementedError), _device(interpret=True):
+        attention_mosaic.forward(query, key, value, spans,
+                                 template.Hooks(score_hooks(("indexed",), queries, keys, 64)[0]),
+                                 interpret=True)
 
 
 @INTERPRETS

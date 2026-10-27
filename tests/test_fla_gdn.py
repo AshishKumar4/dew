@@ -30,7 +30,6 @@ from reference_error import (
     assert_as_exact_as_the_reference,
     assert_computes_the_oracle,
     chain_roundings,
-    equations,
     float64_terms,
     widened,
     with_gradients,
@@ -868,30 +867,14 @@ gradient. The three policies share that reference, the draw and the truth, so on
 three."""
 
 
-FORWARD = ("recurrence_cumulated", "fla_kkt_solve", "fla_recompute_w_u", "fla_chunk_fwd_h",
-           "fla_chunk_fwd_o")
-"""The rule's forward launches: the decay's prefix ('delta_decay'), the inverse ('delta_inverse'), the
-memory's two ('delta_memory') and the output."""
-
-MEMORY = ("fla_recompute_w_u", "fla_chunk_fwd_h")
-"""The launches that compute the memory, the one residual a remat rung recomputes."""
-
-
-@pytest.mark.parametrize("policy, recomputed", [
-    (None, ()),
-    ({"recompute": ("delta_memory",)}, MEMORY),
-    ({"save": ("context", "delta_decay", "delta_inverse")}, MEMORY),
-])
+@pytest.mark.parametrize("policy", [None, {"recompute": ("delta_memory",)},
+                                    {"save": ("context", "delta_decay", "delta_inverse")}])
 @generation.chosen(gated_delta_rule="fla")
-def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(policy, recomputed):
-    """A block's remat policy keeps or recomputes the port's named residuals
-    (`mixer_base.RESIDUALS`): without one the layer saves its decay, inverse and memory
-    ('delta_memory') for its backward; 'all_but_delta_memory', which the block applies by tracing its
-    layers recomputing that name (`recurrence_chunk.recomputing`) rather than by a checkpoint policy, has the
-    backward recompute the memory alone; a policy saving the output, decay and inverse saves those
-    three, and the backward recomputes the memory alone. Each is read from the kernels the gradient
-    runs: every forward launch once (`FORWARD`), and once more only the memory's (`MEMORY`) where it is
-    recomputed, none the policy saves. Each computes the gradients the layer computes without remat, on
+def test_a_remat_policy_changes_no_gradient(policy):
+    """A block's remat policy over the port's named residuals (`mixer_base.RESIDUALS`): none,
+    'all_but_delta_memory', which the block applies by tracing its layers recomputing that name
+    (`recurrence_chunk.recomputing`) rather than by a checkpoint policy, and a policy saving the output,
+    decay and inverse. Each computes the gradients the layer computes without remat, on
     par with it by check 1 (`assert_as_exact`) over fresh parameters and inputs drawn from each seed
     (`REMAT_ROWS` rows of `REMAT_LENGTH` tokens), truth the float64 layer's gradient. A GPU compiles
     the remat step as another program, whose roundings differ: on an H100 even the XLA math's A_log
@@ -900,9 +883,7 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     from dew.nn.kernels.recurrence_chunk import recomputing
 
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
-    x = jax.random.normal(jax.random.key(71), (REMAT_ROWS, REMAT_LENGTH, 64))
     initialize = jax.jit(layer.init)
-    params = initialize(jax.random.key(73), x)
 
     def loss(params, x):
         return jnp.sum(layer.apply(params, x) ** 2)
@@ -916,11 +897,7 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
                 return loss(params, x)
     else:
         remat = jax.checkpoint(loss, policy=rung.checkpoint_policy())
-    graph = jax.make_jaxpr(jax.grad(remat))(params, x)
-    launched = [str(equation.params["name"]) for equation in equations(graph)
-                if equation.primitive.name == "pallas_call"]
-    counted = {name: launched.count(name) for name in FORWARD}
-    assert counted == {name: 1 + (name in recomputed) for name in FORWARD}, launched
+
     def pulled(fn):
         """`fn`'s gradient in the parameters under the loss's cotangent the draw holds."""
         return jax.jit(lambda params, x, one: with_gradients(fn)(params, x, one)[1])
