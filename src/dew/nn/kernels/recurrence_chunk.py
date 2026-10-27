@@ -532,13 +532,11 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     state, starts = operands.state, operands.starts
     epilogue = hooks.skip or hooks.output is not None
     if mainloop is not None:
-        from .templates.recurrence import template
-
         if mainloop != 'mosaic':
             raise ValueError(f"no {mainloop!r} mainloop: the recurrence template's is 'mosaic'")
         # Unrounded where an epilogue follows, as on the portable math.
-        out, final = template.MOSAIC(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                                     scale=scale, delta=hooks.delta, wide=epilogue, floor=hooks.floor)
+        out, final = template_rule(query, key, value, g, beta, state, starts, max_segments=max_segments,
+                                   scale=scale, delta=hooks.delta, wide=epilogue, floor=hooks.floor)
         out = recurrence.skipped(hooks, out, value, given, work)
     elif hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
         # Each of its routes adds the skip, the port in its kernels.
@@ -551,10 +549,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
 
         def run(kernel, query, key, value, g, beta, state, starts):
             if kernel == 'mosaic_gpu':
-                from .templates.recurrence import template
-
-                return template.MOSAIC(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                                       scale=scale, wide=epilogue, floor=hooks.floor)
+                return template_rule(query, key, value, g, beta, state, starts, max_segments=max_segments,
+                                     scale=scale, wide=epilogue, floor=hooks.floor)
             if kernel == 'fla':
                 # Unrounded where an epilogue follows, as on the portable math.
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
@@ -775,12 +771,43 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     if documents is not None:
         # The kernels start each row from its memory; a first token that begins a document drops it.
         state = jnp.where(starts[:, 0, None, None, None], 0.0, state)
-    rows, heads = grouped_heads(value.shape, key.shape[2])
-    P = jax.sharding.PartitionSpec
-    four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
+    four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
     return manual_map(functools.partial(_blocked_rule, documents=documents, scale=scale, wide=wide),
-                      (four, four, four, P(*four[:g.ndim]), three, memory, P(rows, None)),
+                      (four, four, four, decays, three, memory, resets),
                       (four, memory))(query, key, value, g, beta, state, starts)
+
+
+def _shard_specs(shape: tuple[int, ...], key_heads: int, decay_ndim: int) -> tuple:
+    """A delta rule's per-shard placement (`manual_map`) over values of `shape` reading `key_heads`: the
+    `[B, T, H, D]` operands', the write gate's `[B, T, H]`, the memory's `[B, H, Dk, Dv]`, the decay's (a
+    head's or a key dimension's), and the documents' starts' `[B, T]`: rows where the rules split them, and
+    value heads with the key heads they read where the head split divides the key heads (`grouped_heads`),
+    the time axis whole."""
+    rows, heads = grouped_heads(shape, key_heads)
+    P = jax.sharding.PartitionSpec
+    four = P(rows, None, heads, None)
+    return four, P(rows, None, heads), P(rows, heads, None, None), P(*four[:decay_ndim]), P(rows, None)
+
+
+def template_rule(query, key, value, g, beta, state=None, starts=None, **options):
+    """The recurrence template's op (`templates.recurrence.template.MOSAIC`, `mosaic_rule`) on each shard
+    (`manual_map`), placed as `fla_rule`: its tiles derived from each shard's shapes, its forward and its
+    gradient on each device's own rows. Called on the whole batch, every device of a 2xH100 FSDP run ran
+    its launches on the global batch, layer 0's solve over 4 rows for its 2, beside 40 GB of gathers a
+    microbatch (row 1897). `options` are the op's (`max_segments`, `scale`, `delta`, `wide`, `floor`)."""
+    from .templates.recurrence import template
+
+    four, three, memory, decays, resets = _shard_specs(value.shape, key.shape[2], g.ndim)
+    optional = [(state, memory), (starts, resets)]
+    operands = (query, key, value, g, beta, *(x for x, _ in optional if x is not None))
+    specs = (four, four, four, decays, three, *(spec for x, spec in optional if x is not None))
+
+    def local(query, key, value, g, beta, *given):
+        given = iter(given)
+        state, starts = (None if x is None else next(given) for x, _ in optional)
+        return template.MOSAIC(query, key, value, g, beta, state, starts, **options)
+
+    return manual_map(local, specs, (four, memory))(*operands)
 
 
 def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
