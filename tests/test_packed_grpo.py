@@ -10,8 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import widened
-from tool_support import load
+from reference_error import assert_as_exact, widened
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step
@@ -32,7 +31,6 @@ from dew.objectives.rl.sessions import (
     advantages,
     pack,
 )
-from dew.rl import k3_kl
 
 VOCAB = 16
 WIDTH = 24
@@ -94,115 +92,46 @@ def _loss(objective, params, batch, reference):
     return objective.loss(params, batch, step)[0].mean()[0]
 
 
-FLOOR_FACTOR = load("layout_parity").FLOOR_FACTOR
-"""layout_parity's rule: how far a run may sit from its reference, in
-multiples of the rounding measured for it."""
-
-
 def _step(objective, params, batch, reference):
     """The loss and its gradient."""
     value, gradients = jax.value_and_grad(lambda p: _loss(objective, p, batch, reference))(params)
     return {"loss": value, "gradients": gradients}
 
 
-def _token_contributions(objective, params, batch, reference, trainable):
-    """The N weighted trainable-token contributions to this fixture's loss.
-
-    The fixture has token-mean aggregation and no behavior corrections.
-    Keeping contributions separate lets jacrev measure each gradient leaf's
-    sum of absolute token contributions, including leaves whose sum cancels.
-    """
-    terms = objective._terms(params, batch)
-    policy, _ = objective._policy_terms(terms, terms.mask)
-    kl = k3_kl(terms.policy, objective.packed_log_probs(reference, batch))
-    weighted = jnp.where(terms.mask != 0, policy + objective.beta * kl, 0) * terms.mask
-    return weighted.reshape(-1)[trainable] / jnp.sum(terms.mask)
-
-
-def _fp64_reference(objective, params, batch, reference):
-    """Reference, legitimate row-reorder spread and the final contraction's magnitudes."""
-    exact = _step(objective, params, batch, reference)
-    rows = np.arange(batch[IDS_KEY].shape[0])
-    orders = (rows[::-1], np.concatenate((rows[::2], rows[1::2])))
-    reordered = [_step(objective, params, {key: np.asarray(value)[order] for key, value in batch.items()},
-                       reference) for order in orders]
-    trainable = np.flatnonzero(np.asarray(batch[RESPONSE_MASK_KEY]).reshape(-1))
-
-    def contributions(parameters):
-        return _token_contributions(objective, parameters, batch, reference, trainable)
-
-    tokens = contributions(params)
-    jacobian = jax.jacrev(contributions)(params)
-    magnitudes = {"loss": jnp.sum(jnp.abs(tokens)),
-                  "gradients": jax.tree.map(lambda leaf: jnp.sum(jnp.abs(leaf), axis=0), jacobian)}
-    return exact, reordered, magnitudes, trainable.size
-
-
-def _assert_fp64_layout_envelope(candidate, reference, reordered, magnitudes, terms):
-    """An empirical parity convention, with a derived final-contraction floor.
-
-    Both layouts and the reorderings run the same fp64 reference-attention
-    graph. FLOOR_FACTOR=4 is layout_parity's existing convention: up to four
-    times the largest leaf deviation measured from legitimate reference
-    reorderings (reverse and even/odd rows). This is an empirical envelope,
-    not a worst-case bound on all upstream arithmetic or all possible ISAs.
-
-    Its floor is arithmetic-derived. Each loss/gradient entry is a sum of N
-    trainable-token contributions; here N=28. With fp64 unit roundoff u=2^-53,
-    a contraction of N products has error <= gamma_N sum(abs(products)),
-    gamma_N=N*u/(1-N*u), for ANY reduction order (one product and at most
-    N-1 adds per scalar path). Two contractions differ by at most twice it.
-    jacrev supplies those signed token gradients before their final sum,
-    so the leaf's magnitude is max_entry sum(abs(token gradients)), not
-    max_entry abs(net gradient), matching layout_parity's per-leaf max norm.
-    The positive magnitude reduction is inflated by 1/(1-gamma_(N-1)) for
-    its own rounding. No fp32 error or eps64/eps32 scaling enters the rule:
-    such scaling is invalid under cancellation, and the fp32 XLA attention
-    and fp64 reference attention do not even have the same operation graph.
-    """
-    u = np.finfo(np.float64).eps / 2
-    gamma = terms * u / (1 - terms * u)
-    magnitude_gamma = (terms - 1) * u / (1 - (terms - 1) * u)
-    reordered_leaves = [jax.tree.leaves(value) for value in reordered]
-    for index, ((path, expected), actual, magnitude) in enumerate(zip(
-        jax.tree.leaves_with_path(reference), jax.tree.leaves(candidate),
-        jax.tree.leaves(magnitudes), strict=True,
-    )):
-        expected, actual, magnitude = (np.asarray(x, np.float64) for x in (expected, actual, magnitude))
-        spread = max(float(np.max(np.abs(np.asarray(leaves[index]) - expected)))
-                     for leaves in reordered_leaves)
-        floor = 2 * gamma * float(np.max(magnitude)) / (1 - magnitude_gamma)
-        bound = max(FLOOR_FACTOR * spread, floor)
-        difference = float(np.max(np.abs(actual - expected)))
-        assert difference <= bound, (
-            f"{jax.tree_util.keystr(path)}: max error {difference:.3e}, "
-            f"max envelope {bound:.3e} (fp64 reorder spread {spread:.3e}, N={terms})")
+PACKED_SEEDS = 128
+"""Check 1's declared seeds for the packed step against the per-call step, sized by `seeds_for` paired:
+the two arms run one model over the same calls, so they share their upstream rounding."""
 
 
 @pytest.mark.parametrize("policy_loss", ["ppo", "cispo"])
-def test_packed_grpo_equals_per_call_grpo_on_the_unmerged_chains(policy_loss):
-    """Packing preserves the per-call loss and gradients within the fp64
-    layout envelope. See _assert_fp64_layout_envelope for its measured spread
-    and arithmetic-derived floor. Everything runs on CPU, since a TPU has
-    no float64."""
+def test_packed_grpo_computes_per_call_grpo_on_the_unmerged_chains(policy_loss):
+    """Packing preserves the per-call loss and gradients: the fp32 objective over the packed rows is on
+    par with it over one row a call (check 1), each drawn policy and its reference 0.9 of it, the truth
+    the per-call step in float64. Everything runs on CPU, since a TPU has no float64."""
     rollouts = _rollouts()
     packed = pack(rollouts, WIDTH)
     assert packed[IDS_KEY].shape[0] < sum(len(rollout.calls) for rollout in rollouts)
     assert packed[SEGMENT_IDS_KEY].max() >= 2, "rows share chains"
     packed[OLD_LOG_PROBS_KEY] = packed[BEHAVIOR_LOG_PROBS_KEY]
     unmerged = _per_call(rollouts)
+    objective = GRPOObjective(_model(), WIDTH - 1, beta=0.1, policy_loss=policy_loss)
+    twin = GRPOObjective(_model(jnp.float64, attention_impl="reference"), WIDTH - 1, beta=0.1,
+                         policy_loss=policy_loss)
+
+    # One compiled initializer: an eager one compiles every initializer op anew for each seed.
+    initialize = jax.jit(objective.init)
+
+    def draw(seed):
+        params = initialize(jax.random.key(seed))
+        return params, jax.tree.map(lambda leaf: leaf * 0.9, params)
+
+    def truth(params, reference):
+        return _step(twin, params, jax.tree.map(jnp.asarray, widened(unmerged)), reference)
 
     with jax.default_device(jax.devices("cpu")[0]):
-        objective = GRPOObjective(_model(), WIDTH - 1, beta=0.1, policy_loss=policy_loss)
-        params = objective.init(jax.random.key(1))
-        reference = jax.tree.map(lambda leaf: leaf * 0.9, params)
-        with jax.enable_x64():
-            twin = GRPOObjective(_model(jnp.float64, attention_impl="reference"), WIDTH - 1,
-                                 beta=0.1, policy_loss=policy_loss)
-            exact, reordered, magnitudes, terms = _fp64_reference(
-                twin, widened(params), widened(unmerged), widened(reference))
-            packed_exact = _step(twin, widened(params), widened(packed), widened(reference))
-    _assert_fp64_layout_envelope(packed_exact, exact, reordered, magnitudes, terms)
+        assert_as_exact(lambda params, reference: _step(objective, params, packed, reference),
+                        lambda params, reference: _step(objective, params, unmerged, reference),
+                        draw, f"packed {policy_loss}", seeds=PACKED_SEEDS, truth_fn=truth)
 
 
 def test_packed_log_probs_score_each_id_with_its_own_calls_prefix():

@@ -247,10 +247,9 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
                              tokenizer=recorded_tokenizer(self.processor),
                              processor=recorded_processor(self.processor))
 
-    @property
-    def bank_sites(self) -> tuple[DecoderBank, ...]:
-        """The shared text stack, as the training model declares it."""
-        return self.training_model.bank_sites
+    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
+        """The shared text stack, as the training model declares it over `store`."""
+        return self.training_model.bank_sites(store)
 
     def held_variables(self) -> Variables | None:
         """The SFT source this objective starts from, its split kept, read as

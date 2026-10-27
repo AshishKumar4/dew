@@ -48,7 +48,7 @@ from flax.core.scope import Variable
 from flax.typing import Dtype, PrecisionLike
 from jax.extend.core import Literal, primitives
 
-from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, Coordinates, coordinates, real_slots
+from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, Coordinates, Variables, coordinates, real_slots
 from dew.distributed.placement import Layout
 from dew.interop import sources, verify
 from dew.interop.decoder_parts import context_lengths
@@ -1118,8 +1118,7 @@ class TorchCausalLM(nn.Module):
     """The position past which cached keys go stale, LongRoPE's original context, where the source's
     rotary switches tables there (`functional_rotaries`), or None (`Serving.cache_rebuild_position`)."""
 
-    @property
-    def bank_sites(self) -> tuple[DecoderBank, ...]:
+    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
         return ()
 
     @property

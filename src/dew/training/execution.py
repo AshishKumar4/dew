@@ -50,6 +50,7 @@ from dew.inference.banks import (
     without_banks,
 )
 from dew.mesh import batch_axes
+from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.backbones.layer_plan import layer_index
 from dew.nn.kernels.options import Option, program
 from dew.training.memory import device_tokens, step_compiler_options
@@ -70,6 +71,15 @@ def _in_stack(path: tuple[str, ...], sites) -> bool:
                and len(path) > len(site.namespace)
                and layer_index(path[len(site.namespace)]) is not None
                for site in sites)
+
+
+def stack_sites(objective, variables) -> tuple[DecoderBank, ...]:
+    """The objective's declared layer stacks over `variables` as its model reads them, the frozen leaves
+    back in `params` (`thaw`), which a host layout streams as banks: their runs end where the model's
+    rows differ (`CausalTransformer.bank_sites`), so the frozen banks, the execution's snapshot and the
+    model's own scan agree on every run."""
+    store = thaw(variables)
+    return bank_sites(objective, store) if objective.bank_sites(store) else ()
 
 
 def bank_bytes(tree, sites) -> int:
@@ -191,10 +201,12 @@ class HostExecution:
     accelerator, runs the loss there, and hands back a pullback. It keeps no
     state of its own between attempts.
     """
-    def __init__(self, objective, layout, accelerator, cpu, device: tuple[DeviceStep, ...] = ()):
+    def __init__(self, objective, layout, accelerator, cpu, sites: tuple[DecoderBank, ...],
+                 device: tuple[DeviceStep, ...] = ()):
         self.objective, self.layout = objective, layout
         self.accelerator, self.cpu = accelerator, cpu
-        self.sites = bank_sites(objective) if objective.bank_sites else ()
+        # The trainer's banks over the state it owns (`stack_sites`), the runs its frozen banks keep.
+        self.sites = sites
         self.device = device
         self.unstack = functools.partial(program(logical, static_argnames="sites"), sites=self.sites)
 
