@@ -30,6 +30,12 @@ def odd(row) -> bool:
     return bool(int(row["id"]) % 2)
 
 
+def unthird(row) -> bool:
+    """Keeps a record whose id three does not divide: some of every share's, at two or four shares,
+    where a share of every other record read per share would keep none and read on forever."""
+    return bool(int(row["id"]) % 3)
+
+
 @dataclasses.dataclass(frozen=True)
 class Squared:
     """The record's id squared, and the thread that squared it."""
@@ -41,7 +47,7 @@ class Squared:
 def stream(records: int = 96, *, elastic: bool = True, epochs: int | None = None) -> Pipeline:
     """A shuffled stream whose filter and draw make it a per-share order, then a map of each row."""
     chain = (Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(records))))
-             .shuffle(5).repeat(epochs).filter(odd).random_map(WideDraw()).map(Squared()).batch(BATCH))
+             .shuffle(5).repeat(epochs).filter(unthird).random_map(WideDraw()).map(Squared()).batch(BATCH))
     return chain.elastic() if elastic else chain
 
 
