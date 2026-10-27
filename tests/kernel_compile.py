@@ -9,7 +9,7 @@ included. A host without the plugin fails here rather than skip. A GPU's tests a
 everything else.
 """
 
-import contextlib
+import dataclasses
 import functools
 import json
 import os
@@ -17,7 +17,6 @@ import re
 import subprocess
 import sys
 import tempfile
-import threading
 from pathlib import Path
 
 import jax
@@ -26,6 +25,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
+from dew.nn.kernels.templates import report
 
 THREADS_PER_MULTIPROCESSOR = {(8, 0): 2048, (9, 0): 2048, (10, 0): 2048}
 """Resident threads a multiprocessor holds by compute capability, 1536 on the others the targets name
@@ -131,67 +131,10 @@ def compile_kernels(cases, generation: str) -> list[dict]:
     return found
 
 
-MOSAIC_DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
-"""Mosaic GPU's own compile reports (ptxas's register and spill counts, its resource estimate), written
-under `MOSAIC_GPU_DUMP_TO` for each kernel compiled while they are set: Mosaic compiles its kernels, to
-PTX and through ptxas, when XLA compiles the program around them, device or none."""
-DUMPING = threading.RLock()
-"""Held while Mosaic's reports are on (`mosaic_dumps`): the dump settings are the process's
-environment, so one scope at a time sets and restores them."""
-REGISTERS = re.compile(r"Used (\d+) registers")
-SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
-SMEM = re.compile(r"smem_scratch_bytes=(\d+)")
-KERNEL_COUNTER = re.compile(r"_\d+$")
-"""The counter Mosaic GPU appends to a kernel's name in its reports' file names."""
-TMEM_USED = re.compile(r"tmem_scratch_cols=(\d+), tmem_collective_scratch_cols=(\d+)")
-
-
-@contextlib.contextmanager
-def mosaic_dumps(directory: str):
-    """Mosaic GPU's reports (`MOSAIC_DUMPS`) on, into `directory`, for the compiles in the block, under
-    `DUMPING` from before the settings are read to after they are restored."""
-    with DUMPING:
-        before = {name: os.environ.get(name) for name in (*MOSAIC_DUMPS, "MOSAIC_GPU_DUMP_TO")}
-        os.environ.update(MOSAIC_DUMPS, MOSAIC_GPU_DUMP_TO=directory)
-        try:
-            yield
-        finally:
-            for name, value in before.items():
-                if value is None:
-                    os.environ.pop(name, None)
-                else:
-                    os.environ[name] = value
-
-
 def mosaic_kernels(directory: str) -> list[dict]:
-    """Each Mosaic GPU kernel's report in `directory`: its shared bytes and tensor memory columns (Mosaic's
-    resource estimate), its registers a thread and its spilled bytes (ptxas's), or `unread`, what a
-    report lacks: either report without the other, or a field neither states, is no evidence the kernel
-    is within its resources. A case's reports are paired by the kernel's name less the counter Mosaic
-    appends (`KERNEL_COUNTER`), which JAX 0.12 numbers apart for the two reports; a case names each kernel
-    once."""
-    kernels = []
-    reports = Path(directory)
-    named: dict[str, dict[str, Path]] = {}
-    for kind, suffix in (("resources", ".resources.txt"), ("ptxas", ".ptxas")):
-        for path in reports.glob(f"*{suffix}"):
-            found = named.setdefault(KERNEL_COUNTER.sub("", path.name.removesuffix(suffix)), {})
-            # Paired by name: a case that compiles a name twice would pair the wrong reports.
-            assert kind not in found, f"a case compiled {path.name} and {found[kind].name}: name them apart"
-            found[kind] = path
-    for name, found in sorted(named.items()):
-        text = found["resources"].read_text() if "resources" in found else ""
-        log = found["ptxas"].read_text() if "ptxas" in found else ""
-        shared, tmem = SMEM.search(text), TMEM_USED.search(text)
-        registers, spills = REGISTERS.findall(log), SPILLS.findall(log)
-        unread = [field for field, found in (("shared bytes", shared), ("tensor memory columns", tmem),
-                                             ("registers", registers), ("spills", spills)) if not found]
-        kernels.append({"kernel": name, "unread": unread,
-                        "shared": int(shared.group(1)) if shared else None,
-                        "tmem": sum(map(int, tmem.groups())) if tmem else None,
-                        "registers": max(map(int, registers), default=None),
-                        "spilled": max((int(stores) + int(loads) for stores, loads in spills), default=None)})
-    return kernels
+    """Each Mosaic GPU kernel's report in `directory` (`report.reports`), as a record a test's process of its
+    own writes back as JSON (`compile_mosaic_kernels`)."""
+    return [dataclasses.asdict(found) for found in report.reports(directory)]
 
 
 OWN_PROCESS = "DEW_MOSAIC_RECORDS"
@@ -208,7 +151,7 @@ assembled for sm90). Production compiles for one GPU a process; the gates compil
 def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     """Each Mosaic GPU case (`name`, `call()` giving the kernel and abstract operands) compiled as
     `compile_kernels` compiles Triton's, for a compile-only device of the CUDA `generation`, with Mosaic's
-    own reports on (`mosaic_dumps`): its name, the generation's shared-memory and tensor-memory limits
+    own reports on (`report.reported`): its name, the generation's shared-memory and tensor-memory limits
     (`GpuTarget.tmem_columns`, 0 where it has none), and each of its kernels' report (`mosaic_kernels`),
     or the error. In a process that compiled Mosaic kernels for another capability (`_BINARY_CAPABILITY`)
     the calling test runs again in a process of its own, and these are its records there."""
@@ -241,7 +184,7 @@ def _compiled_here(cases, generation: str) -> list[dict]:
     """`compile_mosaic_kernels`' records, compiled in this process."""
     found: list[dict] = []
     for case in cases:
-        with tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory, mosaic_dumps(directory):
+        with tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory, report.reported(directory):
             [record] = compile_kernels([case], generation)
             record["kernels"] = mosaic_kernels(directory)
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
@@ -261,14 +204,9 @@ def mosaic_failures(found: list[dict]) -> list[str]:
         if not record["kernels"]:
             failed.append(f"{record['name']}: no Mosaic GPU kernel compiled")
         for kernel in record.get("kernels", ()):
-            where = f"{record['name']} {kernel['kernel']}"
-            if kernel["unread"]:
-                failed.append(f"{where}: its reports state no {', '.join(kernel['unread'])}")
-            elif not (kernel["shared"] <= record["limit"] and kernel["tmem"] <= record["tmem_limit"]
-                      and kernel["spilled"] == 0):
-                failed.append(f"{where}: {kernel['shared']} shared bytes (limit {record['limit']}), "
-                              f"{kernel['tmem']} tensor memory columns (limit {record['tmem_limit']}), "
-                              f"{kernel['spilled']} bytes spilled")
+            found = report.Report(**{**kernel, "unread": tuple(kernel["unread"])})
+            if (why := found.failure(record["limit"], record["tmem_limit"])) is not None:
+                failed.append(f"{record['name']} {found.kernel}: {why}")
     return failed
 
 
