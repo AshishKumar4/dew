@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 
 from dew import _records
@@ -115,10 +115,11 @@ def resolved(pending: Pending, accumulation: int) -> tuple[int, str]:
     return steps, _records.text(pending["shape"], "cooldown shape")
 
 
-def schedule_ended(token_ends: Sequence[int | None] | None, committed: int) -> bool:
+def schedule_ended(token_ends: Sequence[int | None] | None, committed: Callable[[], int]) -> bool:
     """Whether a branch's `committed` tokens reached the end of a schedule whose last stage ends its
-    data at its tokens (`dew.data.pipeline.schedule`), as the run's own budget ends it there."""
-    return token_ends is not None and token_ends[-1] is not None and committed >= token_ends[-1]
+    data at its tokens (`dew.data.pipeline.schedule`), as the run's own budget ends it there; the count,
+    read from the devices, is asked only of such a schedule."""
+    return token_ends is not None and token_ends[-1] is not None and committed() >= token_ends[-1]
 
 
 def decay(shape: str, update: int, updates: int) -> float:
