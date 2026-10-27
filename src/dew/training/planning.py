@@ -4,11 +4,10 @@ the rung of the fit ladder it compiles at (`Trainer.compile`).
 A step that does not fit its devices whole is read in microbatches, an even
 split of every row shard's own rows, before it recomputes anything:
 recomputing costs every token, where a smaller microbatch at the same rung
-costs little. Before it recomputes, it keeps the optimizer state and the EMA
-in its host's pinned memory, and a remat rung that keeps its residuals there
-stands before the next that recomputes them; a plan that offloads is timed
-against the first that keeps everything on the device, and the faster kept
-(`FitSearch`). Compiles are the measurement, XLA's memory analysis of each candidate against
+costs little. A remat rung that keeps its residuals in pinned host memory
+stands before the next that recomputes them; a plan at it is timed against
+the first that keeps them on the device, and the faster kept (`FitSearch`).
+Compiles are the measurement, XLA's memory analysis of each candidate against
 each device's free bytes (`dew.training.memory`), and the search bounds how
 many a step takes.
 """
@@ -27,7 +26,7 @@ import jax.numpy as jnp
 from jax.sharding import AbstractMesh, Mesh
 
 from dew._coordination import from_every_process
-from dew._records import JSON, strings
+from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
@@ -218,9 +217,7 @@ class Probe:
         tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
                 else ", the head tiled, its gradient in the backward")
         defaults = ", XLA's default options" if self.rung["xla_defaults"] else ""
-        host = strings(self.rung["host"], "rung host")
-        held = f", {' and '.join(host)} in host memory" if host else ""
-        return f"{self.split} x {self.rows} rows at remat {self.rung['remat']!r}{tile}{defaults}{held}"
+        return f"{self.split} x {self.rows} rows at remat {self.rung['remat']!r}{tile}{defaults}"
 
 
 def unplanned(probes: Sequence[Probe]) -> str:
@@ -409,10 +406,10 @@ def keeps_host_temporaries(executable: jax.stages.Compiled) -> bool:
 @dataclasses.dataclass
 class FitSearch[LossT, EffectsT]:
     """A step's search over the fit ladder (`planned`): the first of the run's split candidates (`splits`)
-    and the objective's rungs to fit the devices, each lowered by `lower` at the objective's rung,
-    `narrow` and the state's fields in host memory once, compiled under its `options` or XLA's defaults
-    on the half rung above, the head at the run's tile `base` at each remat rung (`recompute_more`).
-    It holds what it lowered, compiled and measured, and where on the ladder it stands.
+    and the objective's rungs to fit the devices, each lowered by `lower` at the objective's rung and
+    `narrow` once, compiled under its `options` or XLA's defaults on the half rung above, the head at the
+    run's tile `base` at each remat rung (`recompute_more`). It holds what it lowered, compiled and
+    measured, and where on the ladder it stands.
 
     The first rung climbed drops the narrow copies, which a plan above it, the frontier's too, takes
     back where its rung and split fit with them. A split missing at a rung with a half rung
@@ -421,17 +418,19 @@ class FitSearch[LossT, EffectsT]:
     checkpoint's rung, is warned of where it misses; where nothing fits it raises with the closest
     candidate's numbers.
 
-    `host` is the state's fields the step keeps in its host's pinned memory, the run's layout's own
-    first (`own`). Past XLA's defaults at the first rung the ladder adds `offloadable`, the optimizer
-    state and the EMA, and keeps them there up the ladder, which also holds remat rungs whose
-    residuals go to host memory (`minimal_offloaded`). Every compile asks memory alone, which falls
-    with the split. A plan that offloads what the run's own rung keeps on the device meets the first
-    plan that keeps everything there (`resident`), searched from the rung the offload began at: a copy
-    hides only behind the compute that does not wait on it, which no count of FLOPs says, so where the
-    run times its plans (`frontier`) the two are timed and the offload kept only where it runs clearly
-    faster (`faster`), and where it times none the resident plan stands wherever one fits. The objective
-    is left at the last plan's rung."""
-    lower: Callable[[int, bool, tuple[str, ...]], Candidate]
+    A remat rung above the run's own that keeps its residuals in pinned host memory
+    (`minimal_offloaded`) moves them over the host link through the step, which a copy hides only
+    behind the compute that does not wait on it, and no count of FLOPs says how much. So a plan at it
+    meets the first plan above it that keeps them on the device (`resident`): where the run times its
+    plans (`frontier`) the two are timed and the offload kept only where it runs clearly faster
+    (`faster`), and where it times none the resident plan stands wherever one fits. The objective is
+    left at the last plan's rung.
+
+    The optimizer state and the EMA get no such rung: XLA:GPU holds them whole on the device for the
+    update wherever they rest between steps, so keeping them on the host frees nothing at a step's peak
+    (a decoder's step on an A100 peaked at 8.427 GB either way, node receipt TL-a100-offload-1338-c);
+    a run keeps them there by its layout (`Layout.host`) alone."""
+    lower: Callable[[int, bool], Candidate]
     options: Callable[[Candidate], jax.stages.CompilerOptions | None]
     objective: Objective[LossT, EffectsT]
     mesh: Mesh
@@ -439,8 +438,6 @@ class FitSearch[LossT, EffectsT]:
     narrow: bool
     base: tuple[int, int] | None
     resumed: JSON
-    host: tuple[str, ...] = ()
-    offloadable: tuple[str, ...] = ()
     probes: list[Probe] = dataclasses.field(default_factory=list)
     refusals: list[RuntimeError] = dataclasses.field(default_factory=list)
     lowered: dict[tuple[int, str], Candidate] = dataclasses.field(default_factory=dict)
@@ -451,23 +448,20 @@ class FitSearch[LossT, EffectsT]:
     fitted: tuple[Candidate, jax.stages.Compiled] | None = None
     dropped: str | None = None
     """The rung (`rung`) the narrow copies were dropped at."""
-    began: tuple[tuple, tuple[int, int] | None, bool, bool] | None = None
-    """The rung the ladder's offload began at, as the objective's modules, head tile and fusion and the
-    narrow copies, which the resident search starts above."""
     resident: bool = False
-    """Whether the search refuses every offload the run's own rung does not hold."""
+    """Whether the search refuses every rung that keeps residuals in host memory."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh)
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
         self.required = compiler_options(*self.objective.towers()) or None
-        self.own, self.own_remat = self.host, self.remat_rung()
+        self.own_remat = self.remat_rung()
 
     def plans(self, candidates: Sequence[int], first: int, frontier: bool
               ) -> tuple[list[Planned], tuple[Probe, ...]]:
         """The plans to time, the first kept where none is timed, with every compile made: the ladder's
         first of `candidates` from `candidates[first]`, and its rival where `frontier` asks. A plan that
-        offloads comes after the first that keeps the state and the residuals on the device
+        keeps residuals in host memory comes after the first above it that keeps them on the device
         (`on_device`), and gives way to it where nothing is timed. Another plan's rival, where it opens
         a frontier (`opens_frontier`), reads the batch whole a remat rung up (`remat_more`), the head
         tiled and unfused, above any rung that dropped the copies."""
@@ -494,32 +488,26 @@ class FitSearch[LossT, EffectsT]:
         return plans, tuple(self.probes)
 
     def offloads(self, executable: jax.stages.Compiled) -> bool:
-        """Whether the plan at the current rung, compiled as `executable`, keeps in host memory what the
-        run's own rung keeps on the device: a field of the state, or the residuals of a remat rung above
-        the run's own."""
-        return self.host != self.own or (self.remat_rung() != self.own_remat
-                                         and keeps_host_temporaries(executable))
+        """Whether the plan at the current rung, compiled as `executable`, keeps residuals in host memory
+        at a remat rung above the run's own."""
+        return self.remat_rung() != self.own_remat and keeps_host_temporaries(executable)
 
     def on_device(self, candidates: Sequence[int]) -> Planned | None:
-        """The first plan above the rung the offload began at that keeps the state where the run's layout
-        does and no residual in host memory, None where none fits."""
-        assert self.began is not None or self.host == self.own
-        if self.began is not None:
-            modules, tile, fused, self.narrow = self.began
-            self.objective.substitute(list(modules))
-            self.objective.restore_head(tile, fused=fused)
-        self.host, self.resident, self.xla_defaults, self.fitted = self.own, True, False, None
+        """The first plan at a remat rung above the current one that keeps its residuals on the device,
+        its head at the run's tile, None where none fits."""
+        self.resident, self.xla_defaults, self.fitted = True, False, None
         self.lowered.clear()
-        if not self.onward(lambda: recompute_more(self.objective, self.base)):
+        if not self.onward(lambda: remat_more(self.objective)):
             return None
-        _log.info("the step fits with part of its state in host memory; searching the first plan that keeps "
-                  "it on the devices to set against it")
+        self.objective.restore_head(self.base, fused=True)
+        _log.info("the step fits with residuals in host memory under remat %r; searching the first plan "
+                  "that keeps them on the devices to set against it", recompute_record(self.objective))
         split = planned(candidates, 0, self.fits, self.climb,
                         lambda split: self.forecast.likely(self.rung(), split))
         return None if split is None or self.fitted is None else self.found(split)
 
     def current(self) -> dict[str, JSON]:
-        return rung_record(self.objective, self.xla_defaults, narrow=self.narrow, host=self.host)
+        return rung_record(self.objective, self.xla_defaults, narrow=self.narrow)
 
     def rung(self) -> str:
         return json.dumps(self.current(), sort_keys=True)
@@ -550,7 +538,7 @@ class FitSearch[LossT, EffectsT]:
     def fits_here(self, split: int) -> bool:
         key = (split, self.rung())
         if key not in self.lowered:
-            self.lowered[key] = self.lower(split, self.narrow, self.host)
+            self.lowered[key] = self.lower(split, self.narrow)
         candidate = self.lowered[key]
         self.chosen = self.required if self.xla_defaults else self.options(candidate)
         executable = compiled_if_it_fits(candidate.program, self.chosen, self.refusals)
@@ -583,12 +571,6 @@ class FitSearch[LossT, EffectsT]:
             return True
         self.xla_defaults = False
         self.lowered.clear()
-        # The state's offload costs no recomputation: it stands before the first remat rung, and stays.
-        if self.offloadable and not self.resident and self.began is None:
-            self.began = (tuple(entry.module for entry in self.objective.program_key()),
-                          head_tile_of(self.objective), head_fused_of(self.objective), self.narrow)
-            self.host = (*self.own, *self.offloadable)
-            return True
         return self.onward(lambda: recompute_more(self.objective, self.base))
 
     def found(self, split: int) -> Planned:

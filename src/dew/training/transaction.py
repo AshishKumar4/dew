@@ -148,6 +148,11 @@ def recorded(evaluations: list[tuple[Evaluated, jax.Array]], ran: jax.Array) -> 
                     evaluated=ran)
 
 
+COMMIT_FIELDS = ("opt_state", "ema")
+"""The state's fields a resident step reads only as it commits, past its gradient: the optimizer state, and
+the EMA but where the objective reads it in its forward (`Transaction.fetch`)."""
+
+
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
     """The variables tree with the averaged leaves in place of the live ones."""
     return None if ema is None else merge(params, ema)
@@ -369,10 +374,14 @@ class Transaction:
         replay. `copies` names the parameters the forward reads through the
         state's narrow copies, which the commit rewrites (`dew.training.narrow`). `record` makes each
         evaluation return what its `Step.sample` and `Step.boundary` calls produced (`recorded`).
-        `fetch` brings the fields a resident step's state keeps in host memory to the device
-        (`Trainer._fetched`): the step reads them only once its gradient is ready, as the commit does,
-        so the device holds them through the update and not through the forward and backward, but for
-        an EMA the objective reads in its forward.
+        `fetch` brings the fields of `COMMIT_FIELDS` a resident step's state keeps in host memory to the
+        device (`Trainer._fetched`): the step reads them only once its gradient is ready, as the commit
+        does, so the device holds them through the update and not through the forward and backward, but
+        for an EMA the objective reads in its forward. Fetched at the step's start, an A100 held them
+        through both: a plain Adam step's peak rose from 2.483 GB to 3.020 GB with its state in host
+        memory, and fetched past the gradient it is 2.483 GB again (node receipt TL-a100-offload-1338-c,
+        hostmem.json). XLA:GPU still holds the whole state for the update, so keeping it on the host
+        frees nothing at a step's peak: a Dew decoder's step peaked at 8.427 GB either way.
         """
         self.fetch = (lambda state: state) if fetch is None else fetch
         self.record = record
@@ -780,8 +789,9 @@ class Transaction:
                 # barrier with the gradient, so the device takes them only past it.
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
-                _, kept = jax.lax.optimization_barrier((gradient, (state.opt_state, state.ema)))
-                fetched = self.fetch(dataclasses.replace(state, opt_state=kept[0], ema=kept[1]))
+                _, kept = jax.lax.optimization_barrier((gradient, {field: getattr(state, field)
+                                                                  for field in COMMIT_FIELDS}))
+                fetched = self.fetch(dataclasses.replace(state, **kept))
                 return finish(fetched, batch, aux, pending, gradient, attempt, tokens)
             moving, held = apart(state)
             advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,

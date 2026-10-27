@@ -207,19 +207,16 @@ def recompute_record[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> 
 
 
 def rung_record[LossT, EffectsT](objective: Objective[LossT, EffectsT], xla_defaults: bool, *,
-                                 narrow: bool, host: Sequence[str] = ()) -> dict[str, JSON]:
+                                 narrow: bool) -> dict[str, JSON]:
     """The rung of the fit ladder a step compiles at, as a checkpoint records
     it: the objective's head tile and whether that head is fused, its trained
     modules' remat (`recompute_record`), whether the step keeps XLA's
-    default options, the half rung above each, whether it reads the
+    default options, the half rung above each, and whether it reads the
     parameters through narrow copies (`dew.training.narrow`), the ladder's
-    first rung, and the state's fields it keeps in its host's pinned memory
-    (`Layout.host`, which the plan's offload extends). Each decides the
-    program a step runs."""
+    first rung. Each decides the program a step runs."""
     tile = head_tile_of(objective)
     return {'head_tile': None if tile is None else list(tile), 'head_fused': head_fused_of(objective),
-            'remat': recompute_record(objective), 'xla_defaults': xla_defaults, 'narrow': narrow,
-            'host': list(host)}
+            'remat': recompute_record(objective), 'xla_defaults': xla_defaults, 'narrow': narrow}
 
 
 def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0) -> int | None:

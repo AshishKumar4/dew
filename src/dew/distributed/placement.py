@@ -464,11 +464,6 @@ class Layout:
         object.__setattr__(self, "host", host)
         object.__setattr__(self, "host_parameters", tuple(self.host_parameters))
 
-    def keeping(self, fields: Sequence[str]) -> Layout:
-        """This layout with `fields` of `HOST_RESIDENT` kept in pinned host memory beside its own."""
-        kept = (field for field in fields if field not in self.host)
-        return dataclasses.replace(self, host=(*self.host, *kept))
-
     @property
     def axis_rules(self) -> LogicalAxisRules:
         """The rules as the (name, axes) pairs flax reads, in precedence order,

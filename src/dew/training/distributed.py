@@ -5,7 +5,6 @@ is `dew.distributed.placement`'s."""
 
 from __future__ import annotations
 
-import dataclasses
 import functools
 import hashlib
 import json
@@ -21,7 +20,7 @@ from flax import linen as nn
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import from_every_process
-from dew._records import JSON, number, record, strings
+from dew._records import JSON, number, record
 from dew.batch import EXAMPLE_ROWS, Batch, Variables
 from dew.data.dataset import Checkpointable, DataPartition, RampedStream, rows_of, stream_identity
 from dew.distributed.batches import Signature
@@ -110,83 +109,6 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
         record.parent.mkdir(parents=True, exist_ok=True)
         write_atomically(record, json.dumps({"topology": topology, "bytes_per_second": received}))
     return received
-
-
-OFFLOADABLE = ("opt_state", "ema")
-"""The state's fields a plan may keep in its host's pinned memory (`dew.training.planning.FitSearch`), each
-fetched for the update and written back after it, as `Layout.host` keeps them."""
-
-
-def offloadable(state: TrainState, host: tuple[str, ...]) -> tuple[str, ...]:
-    """The fields of `state` a plan may move to its host's pinned memory: those of `OFFLOADABLE` it
-    holds that `host`, a layout's, keeps on the device."""
-    return tuple(field for field in OFFLOADABLE
-                 if field not in host and jax.tree.leaves(getattr(state, field)))
-
-
-def recorded_host(rung: JSON) -> tuple[str, ...]:
-    """The state's fields a checkpoint's rung (`Trainer._checkpoint_rung`) kept in host memory."""
-    return () if rung is None else tuple(strings(record(rung, "rung").get("host", []), "rung host"))
-
-
-def _memory(sharding) -> str:
-    return sharding.memory_kind or "device"
-
-
-def _buffers(leaf) -> set[int]:
-    """The device buffers `leaf` holds, none for a leaf that holds no array."""
-    if not isinstance(leaf, jax.Array) or leaf.is_deleted():
-        return set()
-    return {shard.data.unsafe_buffer_pointer() for shard in leaf.addressable_shards}
-
-
-def _rehoming(state: TrainState, shardings: Placement[TrainState]):
-    """Each leaf of `state`'s `OFFLOADABLE` fields that `shardings` places in another memory, with its field,
-    target and whether moving it releases its source: a leaf that leaves the device and shares no buffer
-    with a leaf that stays where it is (an EMA that is the parameters' own arrays), whose bytes the
-    device then gets back."""
-    moving, staying = [], set()
-    for field in (field.name for field in dataclasses.fields(state)):
-        leaves = jax.tree.leaves(getattr(state, field))
-        targets = jax.tree.leaves(getattr(shardings, field)) if field in OFFLOADABLE else [None] * len(leaves)
-        for leaf, target in zip(leaves, targets, strict=True):
-            if target is not None and _memory(leaf.sharding) != _memory(target):
-                moving.append((field, leaf, target))
-            else:
-                staying |= _buffers(leaf)
-    return [(field, leaf, target, _memory(target) != "device" and not _buffers(leaf) & staying)
-            for field, leaf, target in moving]
-
-
-def rehomed(state: TrainState, shardings: Placement[TrainState]) -> int:
-    """The bytes each device gains where `state`'s `OFFLOADABLE` fields move to the memory `shardings`
-    places them in (`placed_as`): a field it brings from host memory, positive, and one it moves there,
-    negative for the sources the move releases alone, which the fit check counts beside the step
-    (`dew.training.planning.Candidate.held`)."""
-    gained = 0
-    for _, leaf, sharding, released in _rehoming(state, shardings):
-        held = math.prod(sharding.shard_shape(leaf.shape)) * leaf.dtype.itemsize
-        gained += held if _memory(sharding) == "device" else -held if released else 0
-    return gained
-
-
-def placed_as(state: TrainState, shardings: Placement[TrainState]) -> TrainState:
-    """`state` with each of its `OFFLOADABLE` fields in the memory `shardings` places it in, moved only
-    where it is elsewhere: a plan that keeps one in host memory, or no longer does, moves it at its
-    first step, and every later step finds it there. A source the move releases (`rehomed`) is deleted
-    once its copy has landed, so the device holds the step's room before the step runs; the step takes
-    over the state it is given anyway (`Trainer.compile`)."""
-    rehoming = _rehoming(state, shardings)
-    if not rehoming:
-        return state
-    fields = {field for field, *_ in rehoming}
-    moved = {field: jax.device_put(getattr(state, field), getattr(shardings, field), may_alias=False)
-             for field in fields}
-    jax.block_until_ready(moved)
-    for _, leaf, _, released in rehoming:
-        if released:
-            leaf.delete()
-    return dataclasses.replace(state, **moved)
 
 
 def link_figures(bandwidths: Mapping[tuple[Mesh, str], float | None]) -> dict[str, JSON]:

@@ -134,7 +134,6 @@ from dew.training.budget import Pause, Plateau, run_length, run_steps, run_token
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
-    OFFLOADABLE,
     check_batch,
     check_stream,
     link_bandwidth,
@@ -142,11 +141,7 @@ from dew.training.distributed import (
     marked,
     microbatch,
     microbatch_shapes,
-    offloadable,
-    placed_as,
     placed_start,
-    recorded_host,
-    rehomed,
     resumed_link_figures,
     ruled,
     stage_microbatches,
@@ -199,6 +194,7 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, rankings
 from dew.training.tracker import Tracker
 from dew.training.transaction import (
+    COMMIT_FIELDS,
     Committed,
     Transaction,
     compact_qk,
@@ -598,9 +594,6 @@ class Trainer(Generic[Loss, Effects]):
         resume = None if checkpoints is None else agreed_same("newest checkpoint", lambda: checkpoints.latest)
         if checkpoints is not None and resume is not None:
             abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
-            # The state restores where the run it continues kept it, the fields its plan kept in host memory
-            # there too, which the checkpoint's placement records.
-            self.layout = self.layout.keeping(recorded_host(checkpoints.rung(resume)))
         shardings, _ = self._validated(abstract)
         return Start(initializer, key, abstract, through, resume, shardings)
 
@@ -663,19 +656,17 @@ class Trainer(Generic[Loss, Effects]):
         the step keeps XLA's default options, the half rung `compile` climbs
         to before the next. A checkpoint records it, since each decides the
         program a step runs."""
-        return rung_record(self.objective, self._xla_defaults, narrow=self._narrow, host=self.layout.host)
+        return rung_record(self.objective, self._xla_defaults, narrow=self._narrow)
 
     def _checkpoint_rung(self) -> JSON:
         """The rung a checkpoint records: the run's own, which every newly met
         shape starts from (`_rung`'s fields as the first compile found them),
         and under `shapes` the rung each shape compiled at, by its layout
-        (`batch_layout`). The split is the state's (`window_size`), its fields in host memory the
-        run's, every shape's (`placed_as`), and its link figures by placement (`link_figures`), a
-        resume's own there."""
+        (`batch_layout`). The split is the state's (`window_size`), and its
+        link figures by placement (`link_figures`), a resume's own there."""
         base = self._rung() if self._base_rung is None else self._base_rung[3]
         links = link_figures(self._bandwidths)
-        return {**base, 'host': list(self.layout.host), 'shapes': dict(self._shape_rungs),
-                **({'links': links} if links else {})}
+        return {**base, 'shapes': dict(self._shape_rungs), **({'links': links} if links else {})}
 
     def _resume_rung(self, rung: JSON) -> None:
         """Take a checkpoint's rung (`_checkpoint_rung`): the objective climbs
@@ -733,7 +724,6 @@ class Trainer(Generic[Loss, Effects]):
             fields.get("xla_defaults", False), "rung xla_defaults"
         )
         self._narrow = self._narrow and boolean(fields.get("narrow", True), "rung narrow")
-        self.layout = self.layout.keeping(recorded_host(rung))
         self._resumed_rung = self._rung()
 
 
@@ -968,7 +958,6 @@ class Trainer(Generic[Loss, Effects]):
 
         def run(current, batch):
             with self._traced_on(mesh):
-                current = placed_as(current, candidate.shardings)
                 # Each shape plans its copies (`_at_base_rung`), and a step reads the state with its own.
                 if not candidate.copies:
                     current = dataclasses.replace(current, compute=None)
@@ -1006,8 +995,7 @@ class Trainer(Generic[Loss, Effects]):
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
         shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
 
-        def lower(split: int, narrow: bool, host: tuple[str, ...]) -> Candidate:
-            self.layout = dataclasses.replace(self.layout, host=host)
+        def lower(split: int, narrow: bool) -> Candidate:
             rung = {**self._rung(), 'narrow': narrow, 'split': split}
             return self._candidate(state, batch, schedule, placement, replicated, split, narrow,
                                    recorded_launches(recorded, rung))
@@ -1026,9 +1014,7 @@ class Trainer(Generic[Loss, Effects]):
                 self.objective, device_tokens(self.objective, candidate.micro, shards),
                 FROZEN in candidate.prepared.variables, mesh.devices.size),
             self.objective, mesh, self._xla_defaults, self._narrow,
-            None if self._base_rung is None else self._base_rung[1], resumed, self.layout.host,
-            # The run's first plan places its state once for every shape (`placed_as`).
-            () if self._shape_rungs else offloadable(state, self.layout.host))
+            None if self._base_rung is None else self._base_rung[1], resumed)
         plans, probes = search.plans(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
             # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
@@ -1042,7 +1028,6 @@ class Trainer(Generic[Loss, Effects]):
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
         self._xla_defaults, self._narrow = planned.xla_defaults, planned.narrow
-        self.layout = dataclasses.replace(self.layout, host=tuple(planned.rung['host']))
         chosen = {**self._rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
@@ -1065,12 +1050,11 @@ class Trainer(Generic[Loss, Effects]):
         prepared = placed_shapes(prepared, shardings)
         # The check reads the state's arguments as already on the devices. The copies and accumulators
         # `run` builds on the first call are not yet, so they count with the prefetched batches beside
-        # the step, a ramp stage's window too, which `run` builds beside the last, already resident; a
-        # field the plan moves to or from host memory counts as it moves (`rehomed`).
+        # the step, a ramp stage's window too, which `run` builds beside the last, already resident.
         last = state.accumulation
         rebuilt = last is not None and not last.replays(prepared.accumulation)
         built = [(prepared.compute, state.compute), (prepared.accumulation, None if rebuilt else last)]
-        held = prefetched_bytes(batch, placement, self._prefetch) + rehomed(state, shardings) + placed_bytes(
+        held = prefetched_bytes(batch, placement, self._prefetch) + placed_bytes(
             [field for field, kept in built if kept is None and field is not None])
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
@@ -1105,7 +1089,7 @@ class Trainer(Generic[Loss, Effects]):
         objective's held tree) holds, and no output copies them."""
         # The transaction brings the optimizer state and the EMA to the device once its gradient is ready
         # (`Transaction.fetch`); a custom step, and every other field, reads them from its start.
-        late = () if self.step is not None else OFFLOADABLE
+        late = () if self.step is not None else COMMIT_FIELDS
         body = self._step_body(shapes, copies, split, lambda state: self._fetched(state, shardings, late))
         moving, frozen = apart(shardings)
 
