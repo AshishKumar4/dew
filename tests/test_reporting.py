@@ -1,9 +1,17 @@
 """Reporting persists real results and releases owned sinks on failures."""
 
+import errno
 import io
 import json
 import math
+import os
+import pty
+import re
+import selectors
+import subprocess
+import sys
 from contextlib import nullcontext
+from pathlib import Path
 
 import jax
 import numpy as np
@@ -251,6 +259,103 @@ def test_mlflow_takes_a_metric_named_in_free_text_under_a_name_it_accepts(tmp_pa
         tracker.log({"": 1.0}, 1)
         with pytest.raises(ValueError):
             tracker.log({mlflow_name(""): 2.0}, 2)
+
+
+WARNED = '''
+import logging
+import sys
+
+import jax
+import optax
+
+sys.path.insert(0, "tests")
+from affine_run import Regression, batches
+
+from dew.data.dataset import Loader
+from dew.training import Trainer
+
+
+def warned(when):
+    try:
+        raise ValueError(f"{when} raised")
+    except ValueError as error:
+        logging.getLogger("dew.training").warning("%s warned", when, exc_info=error)
+
+
+class Tracker:
+    """A tracker whose first report a Dew warning with its traceback follows, mid-run."""
+
+    def __init__(self):
+        self.logged = 0
+
+    def log(self, scalars, step):
+        self.logged += 1
+        if self.logged == 1:
+            warned("mid-run")
+
+    def artifact(self, value, step):
+        pass
+
+    def close(self):
+        pass
+
+
+Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0), tracker=Tracker()).fit(
+    Loader(lambda partition: batches(), None, None, 8), steps=2, log_every=1)
+warned("after-the-run")
+'''
+
+
+def drained(*descriptors: int) -> list[str]:
+    """What was written to the other end of each of `descriptors`, read until every writer closed it,
+    without a terminal's control sequences."""
+    held = {descriptor: bytearray() for descriptor in descriptors}
+    selector = selectors.DefaultSelector()
+    for descriptor in descriptors:
+        selector.register(descriptor, selectors.EVENT_READ)
+    while selector.get_map():
+        events = selector.select(timeout=300)
+        assert events, 'the run wrote nothing for 300 s'
+        for key, _ in events:
+            try:
+                chunk = os.read(key.fd, 1 << 16)
+            except OSError as error:
+                # A terminal's reader gets EIO once the last writer closed it.
+                if error.errno != errno.EIO:
+                    raise
+                chunk = b''
+            if chunk:
+                held[key.fd] += chunk
+            else:
+                selector.unregister(key.fd)
+    # CSI sequences, OSC sequences (a link) and carriage returns: what styles and redraws a line.
+    control = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\r')
+    return [control.sub('', held[descriptor].decode()) for descriptor in descriptors]
+
+
+@pytest.mark.parametrize('stderr', ['terminal', 'pipe'])
+def test_a_warning_mid_run_prints_above_the_live_panel_once_with_its_traceback(stderr):
+    """A run on a terminal draws its live panel there, and a Dew warning mid-run, with its traceback,
+    prints once above the panel: through Dew's styled handler, whose traceback is drawn once and not
+    formatted into the line too, where stderr is a terminal, and through the plain one where it is
+    not. Once the run ends the warning goes to stderr again, and the panel's terminal has none."""
+    tests = Path(__file__).resolve().parent
+    shown, writer = pty.openpty()
+    errors, error_writer = pty.openpty() if stderr == 'terminal' else os.pipe()
+    environment = {**os.environ, 'JAX_PLATFORMS': 'cpu', 'TERM': 'xterm-256color',
+                   'PYTHONPATH': os.pathsep.join(filter(None, (str(tests.parent / 'src'),
+                                                               os.environ.get('PYTHONPATH'))))}
+    with subprocess.Popen([sys.executable, '-c', WARNED], stdin=subprocess.DEVNULL, stdout=writer,
+                          stderr=error_writer, cwd=tests.parent, env=environment) as run:
+        os.close(writer)
+        os.close(error_writer)
+        terminal, written = drained(shown, errors)
+        assert run.wait(timeout=300) == 0, written[-3000:]
+    os.close(shown)
+    os.close(errors)
+    for text, when, elsewhere in ((terminal, 'mid-run', written), (written, 'after-the-run', terminal)):
+        assert (text.count(f'{when} warned'), text.count(f'ValueError: {when} raised')) == (1, 1), text
+        assert f'{when} warned' not in elsewhere
 
 
 def test_the_panel_shows_the_metrics_its_last_interval_reported():
@@ -525,78 +630,3 @@ def test_a_journals_plot_draws_training_beside_validation_each_at_its_own_steps(
     tracker.close()
     written = sorted(path.name for path in (tmp_path / "run").glob("*.svg"))
     assert len(written) == 4 and len({name.rpartition("-")[0] for name in written}) == 3
-
-
-TERMINAL = """
-import logging
-import sys
-
-sys.path.insert(0, "tests")
-from affine_run import fit_one_step
-from rich.console import Console
-
-from dew.logging import display_console
-
-fit_one_step()
-log = logging.getLogger("dew.terminal")
-log.warning("marker-before")
-try:
-    raise ValueError("marker-exception")
-except ValueError:
-    log.exception("marker-traceback")
-with display_console(Console(file=sys.stdout, force_terminal=True, soft_wrap=True)):
-    log.warning("marker-during")
-log.warning("marker-after")
-"""
-
-
-def test_a_run_in_a_terminal_logs_on_rich_handlers_and_the_panel_takes_them():
-    """A run whose stderr is a pseudo-terminal installs Dew's rich stderr handler: its records go to
-    that terminal, a record with a traceback drawn as rich draws one, in its panel; while the live
-    panel shows, its console takes the handler's records (`display_console`), here the run's stdout,
-    and hands them back after. Each marker reaches the one destination it should, once."""
-    import os
-    import pty
-    import selectors
-    import subprocess
-    import sys
-    import time
-
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, (os.path.join(root, "src"),
-                                                                     os.environ.get("PYTHONPATH")))),
-           "COLUMNS": "200", "TERM": "xterm-256color"}
-    leader, follower = pty.openpty()
-    child = subprocess.Popen([sys.executable, "-c", TERMINAL], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.PIPE, stderr=follower, env=env, cwd=root)
-    os.close(follower)
-    terminal, deadline = [], time.monotonic() + 300
-    try:
-        with selectors.DefaultSelector() as waiting:
-            waiting.register(leader, selectors.EVENT_READ)
-            while time.monotonic() < deadline:
-                if not waiting.select(timeout=max(deadline - time.monotonic(), 0)):
-                    continue
-                try:
-                    chunk = os.read(leader, 1 << 16)
-                except OSError:
-                    # The terminal closes, as the child exits, with EIO.
-                    break
-                if not chunk:
-                    break
-                terminal.append(chunk)
-        assert child.stdout is not None
-        stdout = child.stdout.read().decode(errors="replace")
-        assert child.wait(timeout=max(deadline - time.monotonic(), 1)) == 0
-    finally:
-        if child.poll() is None:
-            child.kill()
-            child.wait()
-        os.close(leader)
-    stderr = b"".join(terminal).decode(errors="replace")
-    markers = ("marker-before", "marker-traceback", "marker-after", "marker-during")
-    assert [stderr.count(marker) for marker in markers] == [1, 1, 1, 0]
-    assert [stdout.count(marker) for marker in markers] == [0, 0, 0, 1]
-    # The traceback's exception, drawn in rich's panel, which a plain stream handler's text has no
-    # frame for.
-    assert "marker-exception" in stderr and "\u256d" in stderr and "\u2570" in stderr
