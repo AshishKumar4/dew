@@ -8,15 +8,12 @@ set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a f
 
 import dataclasses
 import functools
-import math
 from collections.abc import Callable, Sequence
 from typing import ClassVar, Literal, overload
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 import tokamax
-from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.devices import deterministic_ops_requested
 from dew.nn.kernels import generation
@@ -87,21 +84,6 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
             if fits(config):
                 return config
     return None
-
-
-def _staged(allocations) -> int:
-    """The shared memory a program's `allocations` take, as `Family.scoped` takes them (`plgpu.SMEM` arrays
-    and `plgpu.Barrier`s, its streams' allocations among them, nested in sequences and mappings): every
-    array rounded up to the toolkit's alignment (`resources.allocated`), then every barrier
-    (`resources.BARRIER_BYTES`), as JAX's Pallas Mosaic GPU lowering lays a kernel's arrays out and its
-    barriers after them."""
-    arrays, barriers = [], 0
-    for allocation in jax.tree.leaves(allocations):
-        if isinstance(allocation, plgpu.Barrier):
-            barriers += int(np.prod(allocation.num_barriers))
-        else:
-            arrays.append(math.prod(allocation.shape) * jnp.dtype(allocation.dtype).itemsize)
-    return resources.allocated(*arrays) + resources.BARRIER_BYTES * barriers
 
 
 @dataclasses.dataclass(frozen=True)
@@ -259,14 +241,15 @@ class MosaicForward(_Mainloop[Tiles]):
                         lambda config: self.legal(ba, config, target), overlapped=True)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
-        """The program's shared memory (`_forward_allocations`, `_staged`), at the call's widths as the launch
-        stages them (`_width`)."""
+        """The program's shared memory (`_forward_allocations`, `resources.shared_bytes`), at the call's
+        widths as the launch stages them (`_width`)."""
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
         width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
         steps = _padded(query.shape[1], key.shape[1], config)[1] // config.block_k
-        return _staged(_forward_allocations(family, config, width, value_width, query.dtype,
-                                            bool(ba.arguments.get("residuals")), min(config.stages, steps)))
+        allocations = _forward_allocations(family, config, width, value_width, query.dtype,
+                                           bool(ba.arguments.get("residuals")), min(config.stages, steps))
+        return resources.shared_bytes(family, resources.Scope(program=allocations))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
@@ -450,20 +433,20 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                      target: generation.GpuTarget) -> int:
         """The larger of its launches' programs' shared memory (`_dq_allocations`, `_dkv_allocations`,
-        `_staged`); a fused backward's dK/dV program's alone."""
+        `resources.shared_bytes`); a fused backward's dK/dV program's alone."""
         family = bundle_of(config, ba.arguments["query"].dtype)
         query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
         dtype = query.dtype
         width, value_width = (_width(array.shape[-1], family, dtype) for array in (query, value))
         padded_q, padded_k = _padded(query.shape[1], key.shape[1], config)
-        dkv = _staged(_dkv_allocations(family, config, width, value_width, dtype,
-                                       parts=_parts(self.accurate, dtype),
-                                       stages=min(config.stages, padded_q // config.block_q)))
-        if config.fused:
-            return dkv
-        dq = _staged(_dq_allocations(family, config, width, value_width, dtype,
-                                     min(config.stages, padded_k // config.block_k)))
-        return max(dq, dkv)
+        launches = [_dkv_allocations(family, config, width, value_width, dtype,
+                                     parts=_parts(self.accurate, dtype),
+                                     stages=min(config.stages, padded_q // config.block_q))]
+        if not config.fused:
+            launches.append(_dq_allocations(family, config, width, value_width, dtype,
+                                            min(config.stages, padded_k // config.block_k)))
+        return max(resources.shared_bytes(family, resources.Scope(program=allocations))
+                   for allocations in launches)
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
