@@ -75,7 +75,7 @@ def test_a_head_that_serves_as_keys_and_values_is_kept_once_where_its_layout_sto
     def kept(holder):
         cache = holder.init(jax.random.key(0), keys, keys)["cache"]
         read, written = holder.apply({"cache": cache}, keys, keys, mutable=["cache"])
-        return read, sum(leaf.nbytes for leaf in jax.tree.leaves(written))
+        return read, sum(np.asarray(leaf).nbytes for leaf in jax.tree.leaves(written))
 
     (shared, shared_bytes), (separate, separate_bytes) = (kept(Holder(layout, keys_as_values=flag))
                                                          for flag in (True, False))
