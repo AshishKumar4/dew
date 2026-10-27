@@ -42,6 +42,8 @@ jobs:
     permissions:
       actions: read
       contents: read
+      # Main's push reads the land queue's proof of the tip it graded green (.github/actions/proven).
+      statuses: read
     outputs:
       run: ${{ steps.find.outputs.run }}
     steps:
