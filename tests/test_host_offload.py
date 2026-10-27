@@ -5,7 +5,7 @@ where it runs clearly faster, and one that times none keeps the device-resident 
 where none fits, the offload stands.
 
 A CPU's compiler keeps no host temporaries apart from its own, so the search's choice is held here on the
-memory a test's analysis reports at each rung (`fitting`), with host temporaries at the offloading rung as
+memory a test's analysis reports at each rung (`fitting_at`), with host temporaries at the offloading rung as
 an A100's and a compile-only H100's compiler report them
 (`test_an_offloading_remat_rung_keeps_its_residuals_in_host_temporaries`); the A100 runs it for real (node
 receipts TL-a100-offload-1338-*)."""
@@ -31,7 +31,7 @@ from dew.training import Trainer
 OFFLOADED = "minimal_offloaded"
 
 
-def decoder(remat=None, split=1, dtype=jnp.float32):
+def offload_decoder(remat=None, split=1, dtype=jnp.float32):
     """A one-layer decoder trained by Adam, its batch read in `split` microbatches."""
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=SEQ, remat=remat, dtype=dtype)
@@ -39,7 +39,7 @@ def decoder(remat=None, split=1, dtype=jnp.float32):
                               split=split))
 
 
-def fitting(monkeypatch, trainer, rungs):
+def fitting_at(monkeypatch, trainer, rungs):
     """Every device reports all of LIMIT free, and XLA's memory analysis reports, as a GPU's compiler does,
     temporaries no device holds at the remat rungs not named in `rungs`, and host temporaries at the
     offloading rung: the search's choice, not the CPU's memory, is what the test holds."""
@@ -72,8 +72,8 @@ def test_a_plan_whose_residuals_go_to_host_memory_is_timed_against_the_first_tha
     offloading plan and then the first above it that keeps its residuals on the device, and the run times
     them, the device-resident plan first: the offload is kept only where its every sample beats the
     other's (`faster`). A compile that times nothing keeps the device-resident plan without timing."""
-    trainer = decoder()
-    fitting(monkeypatch, trainer, {OFFLOADED, "save_dot_except_mlp", "full"})
+    trainer = offload_decoder()
+    fitting_at(monkeypatch, trainer, {OFFLOADED, "save_dot_except_mlp", "full"})
     state, _, _ = trainer.place()
     timed = []
     step = trainer.compile(state, BATCH, None if seconds is None else (
@@ -91,8 +91,8 @@ def test_a_plan_whose_residuals_go_to_host_memory_stands_where_no_plan_keeps_the
     """Where 'minimal_offloaded' alone fits, the search finds no plan above it that keeps the residuals on
     the device, the head whole, tiled or tiled with its gradient in the backward, and keeps the offload
     untimed."""
-    trainer = decoder()
-    fitting(monkeypatch, trainer, {OFFLOADED})
+    trainer = offload_decoder()
+    fitting_at(monkeypatch, trainer, {OFFLOADED})
     state, _, _ = trainer.place()
     trainer.compile(state, BATCH, lambda steps: pytest.fail(f"{len(steps)} plans timed, one fits"))
     assert (trainer.plan["remat"], trainer.plan["timed"]) == (OFFLOADED, None)
@@ -153,15 +153,15 @@ def test_a_step_with_its_residuals_in_host_memory_trains_what_one_keeping_them_o
     """Over drawn token rows, a step at 'minimal_offloaded', its residuals in host memory, leaves the
     variables and the moments on par with a step that saves every residual on the device, both measured
     from the step in float64 (check 1): where a residual waits is no arithmetic."""
-    initial = decoder().initial_state()
+    initial = offload_decoder().initial_state()
 
     def draw(seed):
         rng = np.random.default_rng(seed)
         return (rng.integers(0, 64, (ROWS, SEQ + 1)).astype(np.int32),)
 
-    offloading = decoder(remat=OFFLOADED)
-    host, device = stepping(offloading, initial), stepping(decoder(), initial)
-    truth = stepping(decoder(dtype=jnp.float64), initial, exact=True)
+    offloading = offload_decoder(remat=OFFLOADED)
+    host, device = stepping(offloading, initial), stepping(offload_decoder(), initial)
+    truth = stepping(offload_decoder(dtype=jnp.float64), initial, exact=True)
     host(*draw(0))
     assert offloading.plan["remat"] == OFFLOADED
     device(*draw(0))
