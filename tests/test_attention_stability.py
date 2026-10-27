@@ -811,19 +811,25 @@ def assert_finite(dew_fn, reference_fn, draw, label: str, *, seeds: int) -> None
                                     "values not finite where the reference's are")
 
 
-@pytest.mark.parametrize("family", TEMPLATE_FAMILIES)
-def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family):
-    """Each template mainloop's output and query, key and value gradients in the accurate form
-    (`ACCURATE`), check 1 over the family's draws; a row that sees nothing, zero."""
+ACCURATE_ARMS = [(family, name) for family in TEMPLATE_FAMILIES
+                 for name in ("triton", "portable",
+                              *(["mosaic"] if ON_HOPPER and _mosaic_takes(FAMILIES[family]) else []))]
+"""Each template family beside each mainloop that takes it in the accurate form (`_mainloops`): a case of
+its own, so none holds a CPU task past the suite's target (row 1849)."""
+
+
+@pytest.mark.parametrize(("family", "name"), ACCURATE_ARMS)
+def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, name):
+    """A template mainloop's output and query, key and value gradients in the accurate form (`ACCURATE`),
+    check 1 over the family's draws; a row that sees nothing, zero."""
     seeds, family = SEEDS[family], FAMILIES[family]
     draw = _cast(family, family.draw)
     reference = as_given(jax.jit(with_gradients(_reference(family, anchored=False))))
     truth = with_gradients(_reference(family, anchored=True))
-    for name, mainloop in _mainloops(family, ACCURATE).items():
-        label = f"{name} accurate {family.dtype}"
-        differentiated = jax.jit(with_gradients(mainloop))
-        assert_as_exact(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth)
-        _held_empty(family, differentiated(*draw(0)), label)
+    label = f"{name} accurate {family.dtype}"
+    differentiated = jax.jit(with_gradients(_mainloops(family, ACCURATE)[name]))
+    assert_as_exact(differentiated, reference, draw, label, seeds=seeds, truth_fn=truth)
+    _held_empty(family, differentiated(*draw(0)), label)
 
 
 def _default_is_finite(family_name: str, mainloop_name: str) -> None:

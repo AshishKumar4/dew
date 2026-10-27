@@ -804,8 +804,9 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
                                          f"paged decode kernel, natural {natural}, {config}")
 
 
+@pytest.mark.parametrize("kernel", ["dense", "natural", "paged"])
 @pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])
-def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
+def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(target, kernel):
     """The dense kernel under a decode step's attention and its gradient, in bf16 and fp32 at
     Qwen3.5-0.8B's widths (4 query positions over 2 key heads of 256, a 1024-slot cache), and the
     paged kernel at Qwen3-0.6B's (16 query heads over 8 of 128) with pages of 16 and 32 keys over 1024
@@ -813,7 +814,8 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
     every GPU here, lowered for each GPU on this CPU and compiled by Triton
     within its block's shared memory; and the dense kernel in the accurate form (`natural`), raw without
     sinks and scaled with them, which the interpreted suite lowers for no GPU. A first filter: the A100
-    runs them; the H100 and the RTX PRO 6000 have this check alone."""
+    runs them; the H100 and the RTX PRO 6000 have this check alone. Each kernel a case of its own, so none
+    holds a CPU task past the suite's target (row 1849: 420 to 460 s a GPU together)."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_kernels, failures
 
@@ -870,6 +872,7 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
     cases += [KernelCase(f"paged/{size}/{splits}",
                          lambda size=size, splits=splits: pinned(lambda: paged(size), paged_op, splits))
               for size in (16, 32) for splits in decode_attention.SPLITS]
+    cases = [case for case in cases if case.name.startswith(f"{kernel}/")]
     found = compile_kernels(cases, target)
     assert len(found) == len(cases)
     assert not failures(found), "\n".join(failures(found))
