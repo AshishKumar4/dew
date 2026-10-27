@@ -9,7 +9,8 @@ row, and a packed row's padding (segment id 0), which `document_mask` keeps
 from every key. Each implementation is held to the float64 attention of
 tests/attention_oracle.py, which defines such a row as zero: in fp32 by
 tests/reference_error.py's rule, as the fp32 reference attention is, and in
-bf16 to the tolerance the Splash tests hold bf16 to.
+bf16 to the tolerance the Splash tests hold bf16 to. A row whose own key is
+cut but whose block runs on reads its block's later keys (`block_groups`).
 """
 
 import contextlib
@@ -30,6 +31,7 @@ from attention_oracle import (
 from reference_error import assert_as_exact_as_the_reference
 from test_attention_splash import TOLERANCE
 
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.precision import FP32_SUMS
 
 
@@ -99,3 +101,33 @@ def test_a_row_that_sees_no_key_reads_nothing_on_the_fused_gpu_kernels(implement
     for name, mine, want in zip(("output", "query", "key", "value"), found, truth, strict=True):
         assert np.abs(mine - want).max() <= TOLERANCE[jnp.bfloat16] * np.abs(want).max(), (
             f"{implementation} {case} {name}")
+
+
+@pytest.mark.parametrize("implementation", ["reference", "xla", "template"])
+def test_a_row_its_key_starts_empty_reads_its_blocks_later_keys(implementation):
+    """A causal row whose own key the key starts cut sees none of its own, and its whole block's later keys
+    revive it, on every implementation: in the first row a two-token block over starts of 1, whose first
+    query reads the second key alone; in the second, starts of 2 under a block of tokens 1 and 2, whose
+    first query reads key 2 alone, and a first query no block holds, which reads nothing. A row reading one
+    key is that key's value exactly."""
+    query, key, value = qkv((2, 4, 2, 8), jnp.float32)
+    groups = jnp.asarray([[0, 0, -1, -1], [-1, 1, 1, -1]], jnp.int32)
+    out = np.asarray(scaled_dot_product_attention(query, key, value, causal=True,
+                                                  key_value_seq_starts=jnp.asarray([1, 2], jnp.int32),
+                                                  block_groups=groups, implementation=implementation))
+    np.testing.assert_array_equal(out[0, 0], np.asarray(value)[0, 1])
+    np.testing.assert_array_equal(out[1, 1], np.asarray(value)[1, 2])
+    np.testing.assert_array_equal(out[1, 0], 0)
+
+
+@pytest.mark.parametrize("implementation", ["reference", "xla", "template"])
+def test_a_row_whose_window_holds_no_valid_key_reads_nothing(implementation):
+    """Key validity can empty a causal window: a row whose window of two holds only invalid keys reads
+    exactly zero on every implementation, and a row beside it that holds one reads that key's value."""
+    query, key, value = qkv((1, 6, 2, 8), jnp.float32)
+    valid = jnp.asarray([[1, 1, 0, 0, 1, 0]], bool)
+    out = np.asarray(scaled_dot_product_attention(query, key, value, causal=True, sliding_window=2,
+                                                  key_valid=valid, implementation=implementation))
+    np.testing.assert_array_equal(out[0, 3], 0)
+    np.testing.assert_array_equal(out[0, 2], np.asarray(value)[0, 1])
+    np.testing.assert_array_equal(out[0, 5], np.asarray(value)[0, 4])

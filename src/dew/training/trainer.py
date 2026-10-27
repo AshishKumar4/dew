@@ -269,10 +269,9 @@ class Trainer(Generic[Loss, Effects]):
         `microbatches` is how many a pipelined step feeds through the mesh's stage axis, a
         multiple of its size; None feeds one a stage. `lower_for`, a CUDA generation, lowers
         the first step for it in place of compiling it (`dew.training._lowering.Lowered`).
-        `tune_kernels` measures each Pallas launch of a step that has no config measured on this GPU,
-        where the process has the GPU to itself (`dew.nn.kernels.tuning.tune`); without it such a
-        launch runs the nearest measured shape's config or its heuristic. `record` makes each step return in
-        its metrics what each evaluation, replays too, sampled or passed as a boundary (`taken_record`).
+        `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its
+        derived config. `record` makes each step return in its metrics what each evaluation, replays
+        too, sampled or passed as a boundary (`taken_record`).
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -1114,12 +1113,11 @@ class Trainer(Generic[Loss, Effects]):
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
         lower = functools.partial(jitted.lower, *apart(prepared), batch, part)
-        if launches is None or self.tune_kernels:
-            lowered, launches = tuning.tune(lower, measure=self.tune_kernels)
+        if self.tune_kernels:
+            lowered, launches = tuning.tune(lower, measure=True)
         else:
-            # The lowering reads the launch configs the record settled.
-            tuning.settled(launches)
-            lowered = lower()
+            # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
+            lowered, launches = lower(), launches or "[]"
         return Candidate(micro, shapes, copies, shardings, prepared, held, lowered, launches)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int,

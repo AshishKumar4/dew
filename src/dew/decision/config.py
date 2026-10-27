@@ -35,7 +35,7 @@ from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention
-from dew.nn.protocols import RematChoosing, block_chunks_of
+from dew.nn.protocols import RematChoosing
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig, import_path, record_argument
 from dew.state import TrainState
@@ -177,6 +177,7 @@ class DecisionRunConfig(DecoderRunConfig):
         derived = {}
         if self.context_layers is not None:
             derived["context_encoder"] = self.context_encoder
+        from dew.decision.slot_source import reads_blocks
         from dew.decision.sources import PretrainedDecision
 
         frozen = self.lora is not None or (self.context_layers is not None and self.context_frozen)
@@ -184,6 +185,8 @@ class DecisionRunConfig(DecoderRunConfig):
                                 dtype=dtype, param_dtype=self.param_dtype, attention_impl=attention_impl,
                                 **self.source_keywords(frozen=frozen))
         release = isinstance(start, PretrainedDecision)
+        # Whether a fresh head's rows lie in blocks, as the loaded checkpoint and the run declare it.
+        blocked = not release and reads_blocks(start.config, self.source.overrides())
         if release and self.head is not None:
             raise ValueError("--head draws a head over a fresh backbone; a decision release reads with "
                              "its own")
@@ -220,7 +223,7 @@ class DecisionRunConfig(DecoderRunConfig):
             head = derived.get("head", DecisionHead)
             # Lettered rows lie one question to a row, as the backbone's order asks.
             layout = _fresh_layout(start.model.causal, head.one_question or labels is not None, budgets)
-            derived["layout"] = _laid(layout, bool(block_chunks_of(start.model)), labels)
+            derived["layout"] = _laid(layout, blocked, labels)
         objective = self.objective.build(backbone=start, **derived)
         assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
         summary: dict[str, object] = {"pretrained": self.pretrained}
@@ -273,10 +276,11 @@ def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets) -> Layout:
 
 
 def _laid(layout: Layout, blocked: bool, labels: Labels | None) -> Layout:
-    """A fresh head's `layout` with its rows in blocks where the backbone reads blocks whole
-    (`blocked`, `block_chunks_of`, as the load's overrides or the checkpoint's own made it) and
-    lettered by `labels` where the run reads letters; a layout whose rows can do neither, a joint row
-    of every question, is refused."""
+    """A fresh head's `layout` with its rows in blocks where its backbone's text reads each of a row's
+    blocks whole, as the checkpoint's attention and the run's `--source.attention` declare it
+    (`blocked`, `reads_blocks`), not where a checkpoint reads its own media so, and lettered by
+    `labels` where the run reads letters; a layout whose rows can do neither, a joint row of every
+    question, is refused."""
     stated = {**({"blocks": True} if blocked else {}), **({} if labels is None else {"labels": labels})}
     if stated and not isinstance(layout, QuestionLayout):
         raise ValueError(f"{type(layout).__name__} lays every question in one row, which lies in no blocks "

@@ -12,7 +12,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import attention_terms, exact_attention, float64_weights
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, assert_fp32_reduction_bound
+from reference_error import (
+    FEWEST_SEEDS,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_fp32_reduction_bound,
+)
 
 from dew.nn.attention import attention_case, scaled_dot_product_attention, with_key_lengths
 from dew.nn.attention_kernels import DECODE, kernel_refusals
@@ -61,12 +66,12 @@ def test_folded_attention_is_jax_nn_attention(dtype, heads):
 
 
 ON_GPU = jax.default_backend() == "gpu"
-"""Whether the kernels compile for this host's GPU; elsewhere they run interpreted, their spaces an
-A100's (`on_the_gpu`)."""
+"""Whether the kernels compile for this host's GPU; elsewhere they run interpreted, sized as on an
+A100 (`on_the_gpu`)."""
 
 
 def on_the_gpu():
-    """The host's own GPU, or elsewhere an A100's resources, which size the kernels' spaces."""
+    """The host's own GPU, or elsewhere an A100's resources, which size the kernels' launches."""
     from dew.nn.kernels.generation import assumed
 
     return contextlib.nullcontext() if ON_GPU else assumed("sm80")
@@ -106,14 +111,12 @@ def spanned(starts, lengths, capacity):
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 def test_the_decode_kernel_reads_each_row_to_its_length_at_every_config(dtype, windowed):
     """`dew.nn.kernels.decode_attention` reads each row's keys up to its length, from its start where
-    a window gives one, block by block, in each config of its space (`tuning.pinned`: one slice a row,
-    or more whose fp32 sums XLA combines), and is within tests/reference_error.py's rule of jax.nn's
-    xla attention under the same keys' mask against float64. Compiled
+    a window gives one, block by block, at each slice count it may take (`SPLITS`, `tuning.pinned`:
+    one slice a row, or more whose fp32 sums XLA combines), and is within tests/reference_error.py's
+    rule of jax.nn's xla attention under the same keys' mask against float64. Compiled
     on a GPU at the default precision, which the GPU lane otherwise sets to the highest
     (tests/lane_environment.py), its fp32 products must be fp32 ones, held to jax.nn's at fp32
     precision; Triton's default is one TF32 product. Elsewhere it runs interpreted."""
-    from tuned import each_config
-
     from dew.nn.kernels import decode_attention, tuning
 
     arrays, truth = dense_case(dtype, windowed)
@@ -130,12 +133,7 @@ def test_the_decode_kernel_reads_each_row_to_its_length_at_every_config(dtype, w
         plain = jax.nn.dot_product_attention(*arrays[:3], mask=jnp.asarray(spanned(starts, arrays[3],
                                                                                    arrays[1].shape[1])),
                                              implementation='xla')
-    with on_the_gpu():
-        found = each_config(decode_attention.DecodeAttention, attend, *arrays)
-    if not ON_GPU:
-        assert [config.splits for config in found] == list(decode_attention.SPLITS)
-    assert len(found) > 1
-    for config in found:
+    for config in map(decode_attention.Split, decode_attention.SPLITS):
         pin = tuning.pinned({decode_attention.DecodeAttention: config})
         with on_the_gpu(), pin, jax.default_matmul_precision("default"):
             out = jax.jit(attend)(*arrays)
@@ -158,19 +156,33 @@ def grouped_case(dtype):
     return query, key, value, lengths
 
 
+def grouped_draw(dtype):
+    """`grouped_case`'s shapes drawn afresh by seed, check 1's draws: its queries, keys and values (the keys
+    at its 0.3 scale) over its rows' lengths."""
+    (query, key, _, _) = grouped_case(dtype)
+
+    def draw(seed):
+        rng = np.random.default_rng(1000 + seed)
+        return (jnp.asarray(rng.normal(size=query.shape), dtype),
+                jnp.asarray(rng.normal(size=key.shape) * 0.3, dtype),
+                jnp.asarray(rng.normal(size=key.shape), dtype))
+
+    return draw
+
+
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("hooks", [{"sinks": True}, {"softcap": True}, {"sinks": True, "softcap": True}],
                          ids=["sinks", "softcap", "both"])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
-def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, hooks):
+def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, hooks, natural):
     """Sinks (one value-free logit a query head in each row's softmax) and a logit softcap
     (`cap · tanh(logit / cap)`) inside the decode kernel, over query heads grouped on their key heads:
-    each row read to its length at each config of its space, the sink carried by the first slice alone
+    each row read to its length at each slice count it may take, the sink carried by the first slice alone
     so the combine counts it once, within tests/reference_error.py's rule of the reference path's
     attention over the same keys, against float64 (`exact_attention`). The idle row of one key keeps
-    its sink's share. The dispatch takes such a call to the decode kernel where it runs (`decodes`),
-    and the tuner times its launch on the sinks too (`timed`)."""
-    from tuned import each_config, launches, timed
-
+    its sink's share. The dispatch takes such a call to the decode kernel where it runs (`decodes`). In
+    both forms of the exponent, the fold and the accurate one (`natural`); each slice count held to
+    check 1 over fresh draws of the case's shapes (`grouped_draw`)."""
     from dew.nn.attention import reference_attention
     from dew.nn.attention_kernels import decodes
     from dew.nn.kernels import decode_attention, tuning
@@ -184,32 +196,34 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
         assert decodes(case)
         assert kernel_refusals(DECODE, "decode", case) == [] or not ON_GPU
     read = spanned(jnp.zeros_like(lengths), lengths, key.shape[1])
-    with jax.enable_x64(new_val=True):
-        wide = [None if x is None else jnp.asarray(np.asarray(x, np.float64))
-                for x in (query, key, value, sinks)]
-        truth = np.asarray(exact_attention(*wide, softcap=softcap, mask=read))
-    # The decode kernel interprets on this CPU what a GPU computes: its reference sums as the target
-    # does (fp32), not as the CPU's policy does.
-    with jax.default_matmul_precision(FP32_SUMS):
-        plain = reference_attention(query, key, value, mask=jnp.asarray(read), sinks=sinks, softcap=softcap)
+
+    def reference(query, key, value):
+        # The decode kernel interprets on this CPU what a GPU computes: its reference sums as the target
+        # does (fp32), not as the CPU's policy does.
+        with jax.default_matmul_precision(FP32_SUMS):
+            return reference_attention(query, key, value, mask=jnp.asarray(read), sinks=sinks,
+                                       softcap=softcap)
+
+    def truth(query, key, value):
+        wide = None if sinks is None else jnp.asarray(np.asarray(sinks, np.float64))
+        return exact_attention(query, key, value, wide, softcap=softcap, mask=read)
 
     def attend(query, key, value, lengths):
         return decode_attention.attend(query, key, value, lengths, softcap=softcap, sinks=sinks,
-                                       interpret=not ON_GPU)
+                                       natural=natural, interpret=not ON_GPU)
 
-    with on_the_gpu():
-        found = each_config(decode_attention.DecodeAttention, attend, *arrays)
-        [launch] = launches(attend, *arrays)
-        # The tuner's operands keep the sinks, which the launch reads after the rows' spans.
-        assert np.asarray(timed(launch), np.float32).shape[-1] == key.shape[-1]
-    assert len(found) > 1
-    for config in found:
-        pin = tuning.pinned({decode_attention.DecodeAttention: config})
-        with on_the_gpu(), pin, jax.default_matmul_precision("default"):
-            out = jax.jit(attend)(*arrays)
-        assert out.shape == plain.shape and out.dtype == plain.dtype
-        assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
-                                         f"decode kernel with {sorted(hooks)}, {config}")
+    for config in map(decode_attention.Split, decode_attention.SPLITS):
+        def pinned(query, key, value, config=config):
+            pin = tuning.pinned({decode_attention.DecodeAttention: config})
+            with pin, jax.default_matmul_precision("default"):
+                return attend(query, key, value, lengths)
+
+        with on_the_gpu():
+            out = jax.jit(pinned)(query, key, value)
+            assert out.shape == reference(query, key, value).shape and out.dtype == query.dtype
+            assert_as_exact(jax.jit(pinned), jax.jit(reference), grouped_draw(dtype),
+                            f"decode kernel with {sorted(hooks)}, natural {natural}, {config}",
+                            seeds=FEWEST_SEEDS, truth_fn=truth)
 
 
 SINK_SEEDS = 256
@@ -281,54 +295,11 @@ def test_a_gpt_oss_decode_step_reads_its_sinks_in_the_decode_kernels(target, mod
     assert {route.kernel for route in seen if route.choice == choice} == {kernel}
 
 
-def test_the_decode_kernels_launches_are_the_tuners():
-    """The dense and paged kernels' launches, traced as the tuner reads a program, are its ops, each
-    timed with every row reading its whole capacity (`KernelOp.operands`): the dense spans the
-    cache's, the paged table naming the pool's pages in turn and its spans the table's, so the
-    timed launch computes the attention over every key, as jax.nn's xla attention does over the same
-    operands, against float64."""
-    from tuned import launches, timed
-
-    from dew.nn.kernels import decode_attention
-
-    arrays, _ = dense_case(jnp.bfloat16)
-    paged, _ = paged_case(16)
-    with on_the_gpu():
-        found = launches(lambda *a: decode_attention.attend(*a, interpret=not ON_GPU), *arrays)
-        found += launches(lambda *a: decode_attention.attend_paged(*a, interpret=not ON_GPU), *paged)
-    assert [type(ba.op) for ba in found] == [decode_attention.DecodeAttention,
-                                             decode_attention.PagedDecodeAttention]
-    for ba in found:
-        specs = [leaf for leaf in jax.tree.leaves((ba.args, ba.kwargs))
-                 if isinstance(leaf, jax.ShapeDtypeStruct)]
-        operands = ba.op.operands(specs, 0)
-        with on_the_gpu():
-            out = np.asarray(timed(ba), np.float32)
-        if type(ba.op) is decode_attention.DecodeAttention:
-            query, key, value, spans = operands
-            np.testing.assert_array_equal(np.asarray(spans), [[0, key.shape[1]]] * key.shape[0])
-        else:
-            # A key head's query heads, [rows, kv_heads, QUERIES, D], are its query positions.
-            grouped, key_pages, value_pages, table, spans = operands
-            (rows, per_row), (kv_heads, count, page_size, width) = table.shape, key_pages.shape
-            np.testing.assert_array_equal(np.asarray(table),
-                                          (np.arange(rows * per_row) % count).reshape(rows, per_row))
-            np.testing.assert_array_equal(np.asarray(spans), [[0, per_row * page_size]] * rows)
-            key, value = (jnp.moveaxis(pages[:, table].reshape(kv_heads, rows, -1, width), 0, 2)
-                          for pages in (key_pages, value_pages))
-            query, out = jnp.moveaxis(grouped, 2, 1), np.moveaxis(out, 2, 1)
-        with jax.enable_x64(new_val=True):
-            wide = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value))
-            truth = np.asarray(exact_attention(*wide))
-        plain = jax.nn.dot_product_attention(query, key, value, implementation='xla')
-        assert_as_exact_as_the_reference(out, np.asarray(plain, np.float32), truth, type(ba.op).__name__)
-
-
-def test_a_launch_without_a_pick_takes_a_config_of_its_keys_space():
+def test_a_launch_reads_its_slices_at_its_rows_next_power_of_two():
     """33 rows of 2 key heads over 1024 keys, traced as on an A100 (108 multiprocessors) on any host:
-    the key counts 64 rows, whose 128 programs fill most of the GPU, so its space holds one slice
-    alone, and the launch takes it without a pick, though its own 66 programs would have taken 8."""
-    from tuned import launches
+    the launch reads its slices at 64 rows (`decode_attention._rows`), whose 128 programs fill most of
+    the GPU, so it takes one slice, though its own 66 programs would have taken 8."""
+    from tuned import taken
 
     from dew.nn.kernels import decode_attention
     from dew.nn.kernels.generation import assumed
@@ -337,11 +308,9 @@ def test_a_launch_without_a_pick_takes_a_config_of_its_keys_space():
     cache = jax.ShapeDtypeStruct((33, 1024, 2, 256), jnp.bfloat16)
     lengths = jax.ShapeDtypeStruct((33,), jnp.int32)
     with assumed("sm80"):
-        (ba,) = launches(lambda *a: decode_attention.attend(*a, interpret=not ON_GPU), query, cache, cache,
-                         lengths)
-        keyed = ba.op.keyed(ba)
-        assert keyed.autotuning_configs == {decode_attention.Split(1)}
-        assert ba.heuristics_config in keyed.autotuning_configs
+        assert taken(decode_attention.DecodeAttention,
+                     lambda *a: decode_attention.attend(*a, interpret=not ON_GPU), query, cache, cache,
+                     lengths) == [decode_attention.Split(1)]
     assert decode_attention._heuristic(66, 32, 108) == decode_attention.Split(8)
 
 
@@ -358,10 +327,14 @@ def test_a_launch_without_a_measurement_fills_six_programs_a_multiprocessor(proc
     from dew.nn.kernels import decode_attention
 
     assert decode_attention._heuristic(programs, steps, processors) == decode_attention.Split(splits)
-    # The space holds the heuristic's pick, and no slices where the programs fill the GPU.
+    # The slices it may take hold the heuristic's, and none past one where the programs fill the GPU.
     space = decode_attention._space(programs, steps, processors)
     assert decode_attention.Split(splits) in space
     assert (space == {decode_attention.Split(1)}) == (not processors or programs >= 0.8 * processors)
+    # An opt-in tuning run times the heuristic's and the counts of its space either side, each of which
+    # the kernel's tests hold to the gate at every config of the space.
+    variants = decode_attention._variants(programs, steps, processors)
+    assert variants[0] == decode_attention.Split(splits) and set(variants) <= space and len(variants) <= 3
 
 
 def decode_step(lengths):
@@ -393,7 +366,8 @@ def test_a_decode_step_traced_with_x64_on_runs_the_decode_kernel():
         mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
         with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
             lowered = jax.jit(attended).trace(query, key, key).lower(lowering_platforms=("cuda",))
-    assert triton_kernels(lowered) == {"decode_attention": 1}
+    # The decode kernel, and its guarded launch, which runs only where the plain one overflowed.
+    assert triton_kernels(lowered) == {"decode_attention": 1, "decode_attention_headroom": 1}
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
@@ -415,7 +389,8 @@ def test_attention_the_decode_kernel_takes_lowers_for_the_gpu_differentiated_in_
                            lambda *arrays: jax.jvp(loss, arrays, arrays)):
         with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
             lowered = jax.jit(differentiated).trace(query, key, key).lower(lowering_platforms=("cuda",))
-        assert triton_kernels(lowered) == {"decode_attention": 1}
+        # The decode kernel, and its guarded launch, which runs only where the plain one overflowed.
+        assert triton_kernels(lowered) == {"decode_attention": 1, "decode_attention_headroom": 1}
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
@@ -437,7 +412,8 @@ def test_a_grouped_query_in_its_own_layout_reaches_the_decode_kernel(generation)
     mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(attend).trace(query, key, key).lower(lowering_platforms=("cuda",))
-    assert triton_kernels(lowered) == {"decode_attention": 1}
+    # The decode kernel, and its guarded launch, which runs only where the plain one overflowed.
+    assert triton_kernels(lowered) == {"decode_attention": 1, "decode_attention_headroom": 1}
 
 
 @pytest.mark.parametrize("implementation", ["xla", "reference"])
@@ -676,7 +652,8 @@ def test_a_grouped_query_over_one_key_head_reaches_the_decode_kernel_on_each_ten
     mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:2]), ("tensor",)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(attend).trace(query, key, key).lower(lowering_platforms=("cuda",))
-    assert triton_kernels(lowered) == {"decode_attention": 1}
+    # The decode kernel, and its guarded launch, which runs only where the plain one overflowed.
+    assert triton_kernels(lowered) == {"decode_attention": 1, "decode_attention_headroom": 1}
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
@@ -791,15 +768,16 @@ def paged_case(page_size, windowed=False):
     return arrays, (key, value, starts, truth)
 
 
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("windowed", [False, True], ids=["prefix", "window"])
 @pytest.mark.parametrize("page_size", [16, 32])
-def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_config(page_size, windowed):
+def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_config(page_size, windowed,
+                                                                                  natural):
     """`decode_attention.attend_paged` reads a row's pages through its table to the row's length, from
-    its start where a window gives one, in each config of its space, and is within
+    its start where a window gives one, at each slice count it may take (`SPLITS`), and is within
     tests/reference_error.py's rule of jax.nn's xla attention over the gathered rows under the same
-    keys' mask against float64, compiled on a GPU and interpreted elsewhere."""
-    from tuned import each_config
-
+    keys' mask against float64, compiled on a GPU and interpreted elsewhere, in both forms of the
+    exponent (`natural`)."""
     from dew.nn.kernels import decode_attention, tuning
     from dew.nn.kv_cache import PAGED, PagedCase
 
@@ -813,22 +791,17 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
         assert PAGED.kernel("triton").failed(case) == []
 
     def attend(*arrays):
-        return decode_attention.attend_paged(*arrays, interpret=not ON_GPU)
+        return decode_attention.attend_paged(*arrays, natural=natural, interpret=not ON_GPU)
 
     plain = jax.nn.dot_product_attention(query[:, None], key, value,
                                          mask=jnp.asarray(spanned(starts, lengths, key.shape[1])),
                                          implementation='xla')[:, 0]
-    with on_the_gpu():
-        found = each_config(decode_attention.PagedDecodeAttention, attend, *arrays)
-    if not ON_GPU:
-        assert [config.splits for config in found] == list(decode_attention.SPLITS)
-    assert len(found) > 1
-    for config in found:
+    for config in map(decode_attention.Split, decode_attention.SPLITS):
         with on_the_gpu(), tuning.pinned({decode_attention.PagedDecodeAttention: config}):
             out = jax.jit(attend)(*arrays)
         assert out.shape == plain.shape and out.dtype == plain.dtype
         assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
-                                         f"paged decode kernel, {config}")
+                                         f"paged decode kernel, natural {natural}, {config}")
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])
@@ -838,8 +811,9 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
     paged kernel at Qwen3-0.6B's (16 query heads over 8 of 128) with pages of 16 and 32 keys over 1024
     keys a row, each at every slice count (`tuning.pinned`), which their 8 rows' 32 steps take on
     every GPU here, lowered for each GPU on this CPU and compiled by Triton
-    within its block's shared memory. A first filter: the A100 runs them; the H100 and the RTX PRO
-    6000 have this check alone."""
+    within its block's shared memory; and the dense kernel in the accurate form (`natural`), raw without
+    sinks and scaled with them, which the interpreted suite lowers for no GPU. A first filter: the A100
+    runs them; the H100 and the RTX PRO 6000 have this check alone."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_kernels, failures
 
@@ -866,6 +840,16 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
             return jax.value_and_grad(loss, argnums=(0, 1, 2))(query, key, value)
         return step, (query, cache, cache, lengths)
 
+    def natural(sinks: bool):
+        lengths = jax.ShapeDtypeStruct((8,), jnp.int32)
+        query = jax.ShapeDtypeStruct((8, 4, 2, 256), jnp.bfloat16)
+        cache = jax.ShapeDtypeStruct((8, 1024, 2, 256), jnp.bfloat16)
+        held = jnp.asarray(SINKS[:2], jnp.float32) if sinks else None
+
+        def attend(query, key, value, lengths):
+            return decode_attention.attend(query, key, value, lengths, sinks=held, natural=True)
+        return attend, (query, cache, cache, lengths)
+
     def paged(page_size):
         per_row = 1024 // page_size
         pages = jax.ShapeDtypeStruct((8, 8 * per_row + 3, page_size, 128), jnp.bfloat16)
@@ -873,11 +857,15 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
                                                jax.ShapeDtypeStruct((8, per_row), jnp.int32),
                                                jax.ShapeDtypeStruct((8,), jnp.int32))
 
-    # Every slice count the kernels' spaces hold, each a program shape of its own.
+    # Every slice count the kernels may take, each a program shape of its own.
     cases = [KernelCase(f"dense/{jnp.dtype(dtype).name}/{splits}",
                         lambda dtype=dtype, splits=splits: pinned(lambda: dense(dtype),
                                                                   decode_attention.DecodeAttention, splits))
              for dtype in (jnp.bfloat16, jnp.float32) for splits in decode_attention.SPLITS]
+    cases += [KernelCase(f"natural/{'sinks' if sinks else 'raw'}/{splits}",
+                         lambda sinks=sinks, splits=splits: pinned(lambda: natural(sinks),
+                                                                   decode_attention.DecodeAttention, splits))
+              for sinks in (False, True) for splits in decode_attention.SPLITS]
     paged_op = decode_attention.PagedDecodeAttention
     cases += [KernelCase(f"paged/{size}/{splits}",
                          lambda size=size, splits=splits: pinned(lambda: paged(size), paged_op, splits))
@@ -974,7 +962,7 @@ def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask
     def truth(query, key, value):
         return exact_attention(query, key, value, keep=np.asarray(mask))
 
-    with chosen(attention="flash", attention_packed="flash", attention_window="flash"):
+    with chosen(attention="flash"):
         case = attention_case(query, key, causal=True, sliding_window=window, segment_ids=documents,
                               max_segments=1)
         assert kernel_refusals(ATTENTION, "flash", case) == []
@@ -995,12 +983,12 @@ def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask
 
 @pytest.mark.parametrize("width", [128, 96])
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
-def test_a_bf16_decode_step_routes_to_the_kernel_its_generation_measured_fastest(generation, width,
-                                                                                without_deterministic_ops):
+def test_a_bf16_decode_step_routes_to_the_decode_kernel_first(generation, width, without_deterministic_ops):
     """A bf16 decode step of 16 query heads over 8 key heads, traced through the public attention for a
-    GPU: an A100 runs the decode kernel its row prefers (`generation.TARGETS`' sm80 'decode', from the DCU
-    receipt), and hands a width it does not take (96) on to cuDNN; an H100 runs cuDNN, its default. Out
-    of the cuda lane's deterministic ops, which refuse cuDNN (`without_deterministic_ops`)."""
+    GPU: an A100 and an H100 run the decode kernel, the template's decode mainloop and its default (no cell
+    declares cuDNN: on an A100 it measured 1.57 times as fast in geometric mean, `generation.TARGETS`'
+    note), and hand a width it does not take (96) on to cuDNN by legality. Out of the cuda lane's
+    deterministic ops, which refuse cuDNN (`without_deterministic_ops`)."""
     from dew.nn.kernels.generation import assumed
 
     query = jnp.zeros((2, 1, 16, width), jnp.bfloat16)
@@ -1010,6 +998,5 @@ def test_a_bf16_decode_step_routes_to_the_kernel_its_generation_measured_fastest
         jax.make_jaxpr(lambda q, k, v: scaled_dot_product_attention(q, k, v, key_value_seq_lengths=lengths))(
             query, key, key)
     [route] = [route for route in found if route.choice == "decode"]
-    preferred = "decode" if generation == "sm80" else "cudnn"
-    assert (route.preferred, route.kernel) == (preferred, preferred if width == 128 else "cudnn")
-    assert (route.refusal is None) == (route.kernel == preferred)
+    assert (route.preferred, route.kernel) == ("decode", "decode" if width == 128 else "cudnn")
+    assert (route.refusal is None) == (route.kernel == "decode")
