@@ -744,6 +744,27 @@ def test_a_step_after_a_filter_runs_on_the_thread_that_ran_the_steps_before_it()
     assert all(row["after"] == row["before"] != threading.get_ident() for row in rows)
 
 
+@pytest.mark.parametrize("workers", [8, 16])
+def test_a_dropping_read_starts_every_loading_worker_before_its_first_batch(workers):
+    """A read whose steps drop records reads in workers that hand on a marker for each record they
+    drop, through a flat map that asks Grain's interleave of its workers for its position before it
+    reads, which left each worker's process to start at its first turn, after the one before it
+    had read: 30 workers on an A100 host read their first two minutes at 73 rows/s. Every worker's
+    process has started by the time the read hands on its first batch."""
+    import multiprocessing
+
+    chain = Pipeline(source(64)).shuffle(1).repeat().filter(odd_id).batch(8)
+    reader = compile(chain, read="indexed", loading=Loading(workers=workers, threads=1, read_buffer=1),
+                     seed=0).train(DataPartition())
+    try:
+        next(reader)
+        started = [child for child in multiprocessing.active_children()
+                   if child.name.startswith("grain-process-prefetch")]
+        assert len(started) == workers
+    finally:
+        reader.close()
+
+
 def test_worker_processes_read_a_global_order_in_the_batches_one_process_reads():
     """Each worker reads whole batches of an indexed order by index, and the
     reader interleaves them back into the order one process reads."""
