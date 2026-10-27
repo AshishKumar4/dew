@@ -123,10 +123,13 @@ def traced_steps(capture: Path) -> tuple[int, ...]:
 
     steps = set()
     for trace in capture.glob("plugins/profile/*/*.xplane.pb"):
-        for plane in jax.profiler.ProfileData.from_file(str(trace)).planes:
+        # The planes, lines and events are views into the trace's data, which is held while they are read.
+        data = jax.profiler.ProfileData.from_file(str(trace))
+        for plane in data.planes:
             for line in plane.lines:
-                steps.update(int(str(value)) for event in line.events if event.name == "train"
-                             for name, value in event.stats if name == "step_num")
+                for event in line.events:
+                    if event.name == "train":
+                        steps.update(int(str(value)) for name, value in event.stats if name == "step_num")
     return tuple(sorted(steps))
 
 
