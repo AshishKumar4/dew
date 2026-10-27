@@ -9,6 +9,7 @@ every run.
 """
 
 import dataclasses
+import re
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import ClassVar, TypeGuard
 
@@ -138,8 +139,11 @@ class Template[Config: Hashable](tuning.KernelOp):
             args, kwargs = jax.tree.unflatten(tree, filled)
             return configured(*args, **kwargs)
 
+        # The launch's text keys its reports across processes where it names nothing by its address.
+        named = repr((configured, memo[2:]))
         # A call that compiles no Mosaic GPU kernel (a product of no depth) has nothing to refute.
-        found = report.confirmed(launch, abstract, target.generation)
+        found = report.confirmed(launch, abstract, target.generation,
+                                 call=None if re.search(r" at 0x[0-9a-fA-F]+", named) else named)
         held = all(entry.failure(self.program_shared(config, target), target.tmem_columns or 0) is None
                    for entry in found)
         _CONFIRMATIONS[memo] = held

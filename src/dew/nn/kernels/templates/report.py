@@ -176,6 +176,19 @@ def toolchain() -> str:
     return f"jax {jax.__version__}, jaxlib {lib.version_str}, {version}"
 
 
+@functools.cache
+def source() -> str:
+    """A digest of Dew's own source, each module of the package by its path: what a call's kernels are
+    built from beside the toolchain, so reports keyed by the call (`confirmed`'s `call`) hold for this code
+    alone."""
+    package = Path(cache.__file__).parent
+    digest = hashlib.sha256()
+    for path in sorted(package.rglob("*.py")):
+        digest.update(f"{path.relative_to(package)}\n".encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 _CONFIRMED: dict[str, tuple[Report, ...]] = {}
 _CONFIRMING = contextvars.ContextVar("dew_confirming", default=False)
 
@@ -185,42 +198,65 @@ def confirming() -> bool:
     return _CONFIRMING.get()
 
 
-def confirmed(fn: Callable, args, generation_name: str, *,
+def confirmed(fn: Callable, args, generation_name: str, *, call: str | None = None,
               compile: Callable | None = None) -> tuple[Report, ...]:
     """The reports of `fn`'s Mosaic GPU kernels at abstract `args`, compiled for the CUDA `generation_name`
     by the compiler that GPU runs: the compiler's word on a derived config. `fn` is exported for CUDA as
     that GPU lowers it (`jax.export`) and its module, with the generation and the toolchain (`toolchain`),
     keys the reports, which persist under Dew's cache (`cache.dew_cache_dir`), so a kernel compiles for
-    this once per toolchain, the same reports whatever process asks. A process on that GPU compiles here,
+    this once per toolchain, the same reports whatever process asks. `call`, a text naming the launch
+    whole (its kernel, config, operands and static arguments, `Template.confirmed`), keys them too, with
+    Dew's source (`source`), so a process that has them finds them without exporting (0.9 s of a first
+    trace at an A100's grouped forward, CONFIRMCOST1). A process on that GPU compiles here,
     so Mosaic GPU's own cache of the kernel serves the program's compile; any other compiles in a process
     of its own, whose first Mosaic GPU compile is the generation's (Mosaic GPU's binary pass keeps a
     process's first capability: tests/kernel_compile.py). A compile XLA refuses for its shared memory
     reports it (`Report.unread`); any other failure raises. `compile(exported, generation_name, directory)`
     compiles where none is cached (by default here on the generation's GPU, else in a process of its own)."""
+    named = None if call is None else _digest(call, generation_name, toolchain(), source())
+    if named is not None and (found := _stored(named)) is not None:
+        return found
     with tempfile.TemporaryDirectory(prefix="dew-confirm-") as directory:
         # Mosaic GPU states a kernel's resources as it lowers it, and ptxas its registers as it compiles.
         with reported(directory):
             exported = _exported(fn, args, generation_name)
-        key = hashlib.sha256("\n".join((_located_nowhere(str(exported.mlir_module())), generation_name,
-                                         toolchain())).encode())
-        digest = key.hexdigest()
-        if digest in _CONFIRMED:
-            return _CONFIRMED[digest]
-        path = Path(cache.dew_cache_dir()) / "kernel-reports" / f"{digest}.json"
-        if path.exists():
-            found = tuple(Report(**{**entry, "unread": tuple(entry["unread"])})
-                          for entry in json.loads(path.read_text()))
-            _CONFIRMED[digest] = found
-            return found
-        if compile is None:
-            compile = _compiled_here if _local(generation_name) else _compiled_apart
-        found = compile(exported, generation_name, directory)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        written = path.with_suffix(f".{os.getpid()}.tmp")
-        written.write_text(json.dumps([dataclasses.asdict(entry) for entry in found]))
-        written.replace(path)
+        digest = _digest(_located_nowhere(str(exported.mlir_module())), generation_name, toolchain())
+        if (found := _stored(digest)) is None:
+            if compile is None:
+                compile = _compiled_here if _local(generation_name) else _compiled_apart
+            found = compile(exported, generation_name, directory)
+            _store(digest, found)
+    if named is not None:
+        _store(named, found)
+    return found
+
+
+def _digest(*parts: str) -> str:
+    """The key of a confirmation's reports: `parts`' digest."""
+    return hashlib.sha256("\n".join(parts).encode()).hexdigest()
+
+
+def _stored(digest: str) -> tuple[Report, ...] | None:
+    """The reports kept under `digest`, this process's or Dew's cache's, None where neither has them."""
+    if digest in _CONFIRMED:
+        return _CONFIRMED[digest]
+    path = Path(cache.dew_cache_dir()) / "kernel-reports" / f"{digest}.json"
+    if not path.exists():
+        return None
+    found = tuple(Report(**{**entry, "unread": tuple(entry["unread"])})
+                  for entry in json.loads(path.read_text()))
     _CONFIRMED[digest] = found
     return found
+
+
+def _store(digest: str, found: tuple[Report, ...]) -> None:
+    """Keep `found` under `digest`, in this process and in Dew's cache, whole or not at all."""
+    path = Path(cache.dew_cache_dir()) / "kernel-reports" / f"{digest}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    written = path.with_suffix(f".{os.getpid()}.tmp")
+    written.write_text(json.dumps([dataclasses.asdict(entry) for entry in found]))
+    written.replace(path)
+    _CONFIRMED[digest] = found
 
 
 def _located_nowhere(module: str) -> str:

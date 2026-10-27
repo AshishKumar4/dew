@@ -6,6 +6,10 @@ kernels write them; and the cost model (`dew.nn.kernels.templates.cost`) on anal
 import dataclasses
 import functools
 import itertools
+import os
+import subprocess
+import sys
+import textwrap
 
 import jax
 import jax.numpy as jnp
@@ -682,3 +686,40 @@ def test_a_kernels_reports_are_compiled_once_per_toolchain(monkeypatch, tmp_path
         assert report.confirmed(call, args, "sm80", compile=compile) == found
     assert compiled == ["sm80"]
     assert len(list((tmp_path / "dew" / "kernel-reports").glob("*.json"))) == 1
+
+
+def test_a_launch_named_whole_finds_its_reports_in_a_later_process_without_exporting(monkeypatch, tmp_path):
+    """Reports confirmed for a launch named whole (`report.confirmed`'s `call`) serve a later process under
+    the same cache by that name, with Dew's source and the toolchain (`report.source`, `report.toolchain`):
+    it neither traces the launch to export it nor compiles it."""
+    from dew.nn.kernels.templates import report
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    found = (report.Report("dew_gmm", 1024, 0, 128, 0),)
+    args = (jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16),
+            jax.ShapeDtypeStruct((2,), jnp.int32))
+    with generation.assumed("sm80"):
+        launch = grouped_matmul.MosaicGmm()
+        tile = launch.derived(launch.bind(*args, interpret=True, out_dtype="bfloat16", trans_rhs=False),
+                              generation.gpu_target())
+
+        def call(x, w, sizes):
+            return launch.replace(config=tile)(x, w, sizes, interpret=False, out_dtype="bfloat16",
+                                               trans_rhs=False)
+
+        assert report.confirmed(call, args, "sm80", call="a launch", compile=lambda *_: found) == found
+    later = textwrap.dedent("""
+        import jax, jax.numpy as jnp
+        from dew.nn.kernels.templates import report
+
+        def refused(*_):
+            raise AssertionError("traced or compiled again")
+
+        args = (jax.ShapeDtypeStruct((256, 128), jnp.bfloat16),
+                jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2,), jnp.int32))
+        print([entry.kernel for entry in report.confirmed(refused, args, "sm80", call="a launch",
+                                                          compile=refused)])
+    """)
+    done = subprocess.run([sys.executable, "-c", later], env=dict(os.environ), capture_output=True, text=True,
+                          check=False)
+    assert (done.returncode, done.stdout.strip()) == (0, "['dew_gmm']"), done.stderr[-2000:]
