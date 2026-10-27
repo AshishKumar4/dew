@@ -523,6 +523,94 @@ def test_a_decision_run_builds_its_source_as_its_source_options_say():
     assert paths and not any("mtp_" in path or "vision" in path or "visual" in path for path in paths)
 
 
+def test_a_decision_run_reads_letters_as_its_letter_readout():
+    """`head:letters` reads each option as the fresh backbone's own logit at its label's token, at the
+    answer cue of a row lettered as its labels letter it, as a slot release reads it: the run's head
+    is the letter readout of its labels' token ids under the objective's tokenizer, and its rows a
+    question to a row, lettered by those labels alone, each bare letter one token of the fixture's
+    byte-level vocabulary. A question of more options than the head holds labels is refused."""
+    from dew.data.dataset import DataPartition
+    from dew.decision.config import Letters
+    from dew.decision.head import LabelReadout
+    from dew.decision.layout import Labels, QuestionLayout
+    from dew.decision.objective import tokenizer_of
+    from dew.interop import Pretrained
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    labels = Labels(variants=("{}",))
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer,
+                              head=Letters(labels=labels, count=4))
+    objective, _ = run.prepare().train("x")
+    head, layout = objective.model.head, objective.layout
+    tokenizer = tokenizer_of(Pretrained.load(str(QWEN), dtype="float32").text_processor)
+    assert tokenizer is not None
+    assert isinstance(head, LabelReadout) and head.label_ids == labels.ids(tokenizer, 4)
+    assert isinstance(layout, QuestionLayout)
+    assert layout.labels == dataclasses.replace(labels, names=labels.names_for(4))
+    with pytest.raises(ValueError):
+        _, few = dataclasses.replace(run, head=Letters(labels=labels, count=2)).prepare().train("x")
+        next(iter(few.train(DataPartition())))
+
+
+def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_where_asked():
+    """`--no-context-frozen` trains the backbone whole beside its context layers' blocks, a full
+    fine-tune, where by default it holds frozen and the blocks train alone: the objective's held tree
+    then splits off no frozen backbone, every backbone weight trained. With LoRA the adapter trains
+    beside the blocks over its frozen base; without context layers the flag is refused."""
+    from model_support import flat_tree
+
+    from dew.decision.objective import DecisionObjective
+    from dew.lora import LoRA
+    from dew.nn.cross_attention import crossing
+    from dew.objectives.base import FROZEN
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, context_layers=(0,),
+                              context_length=16)
+    frozen, _ = run.prepare().train("x")
+    assert isinstance(frozen, DecisionObjective) and frozen.variables is not None
+    assert all(crossing(path) for path in flat_tree(frozen.variables["params"]["backbone"]))
+    assert "backbone" in frozen.variables[FROZEN]
+    whole, _ = dataclasses.replace(run, context_frozen=False).prepare().train("x")
+    assert isinstance(whole, DecisionObjective) and whole.variables is not None
+    assert FROZEN not in whole.variables
+    trained = flat_tree(whole.variables["params"]["backbone"])
+    assert any(crossing(path) for path in trained) and any(not crossing(path) for path in trained)
+    adapted, _ = dataclasses.replace(run, context_frozen=False,
+                                     lora=LoRA(rank=2, modules=("q_proj",))).prepare().train("x")
+    assert isinstance(adapted, DecisionObjective) and adapted.variables is not None
+    held = flat_tree(adapted.variables["params"]["backbone"])
+    assert any(crossing(path) for path in held) and any("lora_A" in path for path in held)
+    assert "backbone" in adapted.variables[FROZEN]
+    with pytest.raises(ValueError):
+        dataclasses.replace(run, context_frozen=False, context_layers=None).prepare()
+
+
+def test_a_decision_run_lays_its_rows_in_blocks_its_source_reads_whole():
+    """`--source.attention full_attention block_bidirectional` loads the backbone's full-attention
+    layers reading blocks (`Pretrained.load`'s `modeling_overrides`), and the run's rows lie in blocks
+    for them to read; a joint row of every question lies in none, and is refused."""
+    from dew.config import SourceOptions
+    from dew.decision.config import JointShape
+    from dew.interop import Pretrained
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    source = SourceOptions(text_only=True, attention={"full_attention": "block_bidirectional"})
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, source=source)
+    objective, _ = run.prepare().train("x")
+    assert objective.model.backbone.kind_of("full_attention").mixer.bidirectional_blocks
+    assert objective.layout.blocks
+    plain, _ = dataclasses.replace(run, source=SourceOptions(text_only=True)).prepare().train("x")
+    release = Pretrained.load(str(QWEN), dtype="float32", text_only=True).model
+    assert plain.model.backbone.kind_of("full_attention") == release.kind_of("full_attention")
+    assert not plain.layout.blocks
+    with pytest.raises(ValueError):
+        dataclasses.replace(run, head=JointShape()).prepare()
+
+
 def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():
     """A decision run that trains an adapter over a source reads the source onto its trainer's mesh
     (`TrainerConfig.source_placement`), as an LM run does: its objective's frozen base is device
