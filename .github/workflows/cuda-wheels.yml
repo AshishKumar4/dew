@@ -1,0 +1,73 @@
+# Builds one of kernels/'s CUDA packages' wheels for each CUDA major on x86_64 and on aarch64 (the GH200's
+# Grace), on the CUDA toolkit's own glibc-2.28 image; no GPU is needed to build. The wheels are the calling run's
+# artifacts, named dew-<tag>-cuda<CUDA version>-<machine>. On a release tag <tag>-v<version>, the build checks that
+# the tag is the version kernels/<package>/pyproject.toml carries; every build checks its wheel as PyPI will. Called
+# by each package's workflow (flash-attn.yml, cutlass.yml), whose own publish jobs upload the wheels: PyPI's
+# trusted publishing names the calling workflow's file and environment, and the publish jobs run no code from the
+# repository.
+
+name: CUDA wheels
+
+on:
+  workflow_call:
+    inputs:
+      package:
+        description: The package's directory under kernels/.
+        type: string
+        required: true
+      tag:
+        description: The release tag's prefix, <tag>-v<version>, and the artifacts' name.
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    # Each CUDA major on both machines Dew's GPUs run beside: x86_64, and aarch64 for the Grace Hopper (GH200).
+    runs-on: ${{ matrix.machine == 'aarch64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 300
+    strategy:
+      # One machine's build failing tells nothing of the others', which run to their ends.
+      fail-fast: false
+      matrix:
+        # Each CUDA major on each machine.
+        machine: [x86_64, aarch64]
+        cuda: ["12.9.1", "13.0.0"]
+    container: nvidia/cuda:${{ matrix.cuda }}-devel-rockylinux8
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Install the build tools
+      # The image's GCC 8 is older than nvcc's C++17 needs.
+      run: |
+        dnf install -y -q git python3.12 python3.12-pip gcc-toolset-12-gcc-c++
+    - uses: actions/checkout@v4
+    - name: Install the Python build tools, through tools/pip.txt's pip
+      run: |
+        python3.12 -m pip install --quiet -r tools/pip.txt
+        python3.12 -m pip install --quiet cmake ninja twine
+    - name: The tag is the version the wheel carries
+      if: startsWith(github.ref, format('refs/tags/{0}-v', inputs.tag))
+      run: |
+        version=$(sed -n 's/^version = "\(.*\)"$/\1/p' kernels/${{ inputs.package }}/pyproject.toml)
+        test "$GITHUB_REF_NAME" = "${{ inputs.tag }}-v$version" || {
+          echo "the tag is $GITHUB_REF_NAME and kernels/${{ inputs.package }} carries $version"; exit 1; }
+    - name: Build
+      env:
+        PYTHON: python3.12
+        # Four nvcc processes at once outgrow the arm runner's memory (killed, exit 137, on its first run);
+        # two fit it.
+        JOBS: ${{ matrix.machine == 'aarch64' && '2' || '4' }}
+      run: |
+        source /opt/rh/gcc-toolset-12/enable
+        sh kernels/${{ inputs.package }}/build.sh
+    - name: Check the wheel as PyPI will
+      run: python3.12 -m twine check --strict kernels/${{ inputs.package }}/dist/*.whl
+    - uses: actions/upload-artifact@v4
+      with:
+        name: dew-${{ inputs.tag }}-cuda${{ matrix.cuda }}-${{ matrix.machine }}
+        path: kernels/${{ inputs.package }}/dist/*.whl
+
