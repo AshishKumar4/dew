@@ -429,25 +429,24 @@ def test_a_served_memory_computes_the_quantized_memory_from_its_stored_w0():
     each head's W_0 quantized, the steps starting from the float it decodes to (`decoded_stored`), and
     rounds every product of the moving weights as quantized training does (`moving_weights`): the
     served decoder, and the same tree after a round trip through the host, computes bit for bit what
-    quantized training (`Quantization.apply`) computes over the decoded W_0. Serving the projections
-    alone computes what quantized training of them computes."""
+    quantized training (`Quantization.apply`) computes from the stored W_0. Its projections, which no
+    step moves, serve as quantized training computes them from their float weights."""
     pytest.importorskip("qwix")
     from dew.quantization import Annotated, Quantization, decoded_stored, quantize_for_serving
 
     model = decoder()
     ids = jax.random.randint(jax.random.key(1), (ROWS, LENGTH), 0, 37)
     variables = model.init(jax.random.key(0), ids)
-    for patterns in ((INNER,), (r".*self_attn/[qkvo]_proj",)):
+    for patterns, moving in (((INNER,), True), ((r".*self_attn/[qkvo]_proj",), False)):
         spec = Quantization(patterns=patterns)
         served, held = quantize_for_serving(model, variables, spec, ids)
-        stored = [leaf for leaf in jax.tree.leaves(held, is_leaf=lambda leaf: isinstance(leaf, Annotated))
-                  if isinstance(leaf, Annotated)]
-        assert stored
+        assert any(isinstance(leaf, Annotated)
+                   for leaf in jax.tree.leaves(held, is_leaf=lambda leaf: isinstance(leaf, Annotated)))
         logits = np.asarray(served.apply(held, ids))
         reloaded = jax.tree.map(jnp.asarray, jax.device_get(held))
         np.testing.assert_array_equal(np.asarray(served.apply(reloaded, ids)), logits)
-        decoded = {**variables, "params": decoded_stored(held)["params"]}
-        np.testing.assert_array_equal(logits, np.asarray(spec.apply(model).apply(decoded, ids)))
+        start = {**variables, "params": decoded_stored(held)["params"]} if moving else variables
+        np.testing.assert_array_equal(logits, np.asarray(spec.apply(model).apply(start, ids)))
 
 
 def test_a_qwix_quantized_linear_memory_leaves_the_recurrence():
