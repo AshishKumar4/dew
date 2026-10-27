@@ -22,6 +22,7 @@ from dew.decision.layout import (
     DecisionInputs,
     JointLayout,
     Layout,
+    QuestionLayout,
     Specials,
     default_layout,
 )
@@ -59,7 +60,7 @@ if TYPE_CHECKING:
 _SCORE = KINDS.index(Score)
 
 
-def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
+def tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
     """The tokenizer a loaded model's text processor encodes with: a run's
     own, or a checkpoint's Hugging Face tokenizer, alone or inside a
     multimodal processor, read from the directory it was loaded from, at the
@@ -242,7 +243,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
             case Adapter() | Source():
                 module, held = backbone.model, joined({"backbone": backbone.variables})
                 if isinstance(backbone, Source):
-                    tokenizer = tokenizer or _tokenizer_of(backbone.text_processor)
+                    tokenizer = tokenizer or tokenizer_of(backbone.text_processor)
             case _:
                 module = backbone
         if variables is not OMITTED:
@@ -258,6 +259,9 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         if head is None:
             width, dtype = DecisionModel.head_size(module)
             head = DecisionHead(width, dtype=dtype)
+        if isinstance(layout, QuestionLayout) and layout.labels is not None:
+            # A head that reads labels and was drawn with none reads the layout's, by this tokenizer.
+            head = head.labelled(layout.labels, tokenizer)
         self.model = DecisionModel(module, head, context_encoder or "table")
         if layout is None:
             if not isinstance(module, TokenModel):
