@@ -221,8 +221,15 @@ def gradient_functions(source):
             rows.append((ModelInputs(**fields), inputs[f"probe/{row}"]))
         if any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(inputs)):
             return collect([native_observations(*row) for row in rows], jnp)
+        # Each thread under the caller's precision, which JAX holds per thread (the truth's float64).
+        wide = jax.config.jax_enable_x64
+
+        def observe(row):
+            with jax.enable_x64(wide):
+                return jax.device_get(native_observations(*row))
+
         with ThreadPoolExecutor(len(os.sched_getaffinity(0))) as pool:
-            observed = list(pool.map(lambda row: jax.device_get(native_observations(*row)), rows))
+            observed = list(pool.map(observe, rows))
         return collect(observed, np)
 
     def theirs(model, given, *, wide=False):
