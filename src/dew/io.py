@@ -81,11 +81,12 @@ def ranked(run, metric: str, *, mode: Literal["min", "max"],
     import wandb
 
     api = wandb.Api()
-    sweep = getattr(run, "sweep_id", None)
+    sweep = run.sweep_id
     if sweep is not None and filters is not None:
         raise ValueError("a sweep's runs are its own set; filters select among a project's runs")
     path = f"{run.entity}/{run.project}"
-    others = api.sweep(f"{path}/{sweep}").runs if sweep is not None else api.runs(path, filters=filters)
+    others = (api.sweep(f"{path}/{sweep}").runs if sweep is not None
+              else api.runs(path, filters=None if filters is None else dict(filters)))
     scored = [other for other in others if other.id != run.id and metric in other.summary]
     return sorted(scored, key=lambda other: other.summary[metric], reverse=mode == "max")
 
