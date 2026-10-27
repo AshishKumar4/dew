@@ -1854,7 +1854,9 @@ def kernel_for_materialized_mask(implementation: str, query, key, *, dtype=None,
     cuDNN's fixed window at 75.8 ms and 4.99 GiB
     (docs/concepts/language_models.md). A call the xla kernel hands off goes to
     the reference path as its requirements say (`attention_kernels.XLA_SUPPORTS`),
-    an explicit 'cudnn' among them, which runs here as xla.
+    an explicit 'cudnn' among them, which runs here as xla. A bf16 call it hands
+    off for its arithmetic alone (`xla_logits`) stays named 'xla', so the call's
+    own dispatch makes the same handoff and keeps jax.nn's fp32 logits.
     """
     masked = 'xla' if implementation in ('auto', 'cudnn') else implementation
     if masked != 'xla':
@@ -1862,7 +1864,10 @@ def kernel_for_materialized_mask(implementation: str, query, key, *, dtype=None,
     case = dataclasses.replace(attention_case(query, key, dtype=dtype, precision=precision,
                                               force_fp32_for_softmax=force_fp32_for_softmax, named='xla'),
                                mask=True, folds=False)
-    return selected(ATTENTION, case, 'xla').name
+    chosen = selected(ATTENTION, case, 'xla').name
+    arithmetic = query.dtype == jnp.bfloat16 and (
+        _xla_kernel_narrows(query) or _xla_kernel_rounds_off(query, key, folded=False))
+    return 'xla' if chosen == 'reference' and arithmetic else chosen
 
 
 def cudnn_takes_mask(implementation: str, query, *, softcap=None, sinks: bool = False) -> bool:

@@ -406,10 +406,13 @@ def test_a_bf16_attention_with_a_side_of_one_runs_dews_products_on_every_gpu(tar
             assert attention.resolve_implementation("xla", *call[:2]) == "reference", (queries, keys)
             for ours, theirs in zip(attended(named, *call), attended(widened, *call), strict=True):
                 np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(theirs, np.float32))
-        # 181 * 2^56 times 181 * 2^57 is past bf16's range and inside fp32's.
-        query, key, value = (jnp.full((1, 1, 1, 1), scale, jnp.bfloat16) for scale in (181 * 2.0 ** 56,
-                                                                                      181 * 2.0 ** 57, 1.0))
-        assert np.all(np.isfinite(np.asarray(named(query, key, value), np.float32)))
+        # 181 * 2^56 times 181 * 2^57 is past bf16's range and inside fp32's: a grouped decode step of it,
+        # which folds nothing and is handed off, attends its one key, whose softmax weight is exactly 1.
+        query = jnp.full((1, 1, HEADS, 1), 181 * 2.0 ** 56, jnp.bfloat16)
+        key = jnp.full((1, 1, KV_HEADS, 1), 181 * 2.0 ** 57, jnp.bfloat16)
+        value = jnp.ones((1, 1, KV_HEADS, 1), jnp.bfloat16)
+        assert attention.resolve_implementation("xla", query, key) == "reference"
+        np.testing.assert_array_equal(np.asarray(named(query, key, value), np.float32), 1.0)
         held = "xla" if bf16 else "reference"
         assert attention.resolve_implementation("xla", *drawn(4, 12)[:2]) == held
         assert attention.resolve_implementation("xla", *drawn(1, 12, jnp.float32)[:2]) == "xla"
