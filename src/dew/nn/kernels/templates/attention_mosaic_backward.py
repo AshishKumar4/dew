@@ -28,6 +28,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _streamed,
     _views_of,
     approximate,
+    stated,
 )
 
 
@@ -263,7 +264,9 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
     out = family.kernel(
         entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
-        interpret=walk.interpret, approx_math=walk.approx_math, name="attention_dq")(
+        interpret=walk.interpret, approx_math=walk.approx_math, name="attention_dq",
+        # dQ's product, the model's this launch owns (`stated`): its `S` and `dP` recomputed.
+        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, width, query, key, value, dout))(
             query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
     dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])
     return dq, keyed, rows
@@ -443,7 +446,11 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         entry, out_type=(gradient, gradient, *(grad_shapes[kind] for kind in graded)),
         grid=(heads, keys_padded // pair, batch), grid_names=("heads", "k_tiles", "batch"),
         consumers=consumers, interpret=walk.interpret, approx_math=walk.approx_math,
-        name="attention_dkv_fused" if walk.fused else "attention_dkv")
+        name="attention_dkv_fused" if walk.fused else "attention_dkv",
+        # The model's products this launch owns (`stated`): dK's, dV's and dP's, and dQ's where it adds it;
+        # its `S` recomputed.
+        cost=stated(walk.spec, batch, heads, walk.spec.queries or queries,
+                    (2 if walk.fused else 1) * width + 2 * value_width, query, key, value, dout))
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
     if not walk.fused:
         return launch(*operands)

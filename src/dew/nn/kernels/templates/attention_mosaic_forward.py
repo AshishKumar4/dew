@@ -52,6 +52,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     bundle_of,
     extents,
     refused,
+    stated,
 )
 
 
@@ -131,7 +132,8 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     def launch(form: algebra.Forward, live: jax.Array | None):
         if live is None:
             status, out = _launch(q, k, v, spans_of, hooked, None, spec=form, hooks=hooks, tiles=tiles,
-                                  family=family, training=False, interpret=interpret)
+                                  family=family, training=False, interpret=interpret,
+                                  counted=form.natural == spec.natural)
             return out, status[0], status[1] > 0
         unit = guarded_columns(family, v.shape[-1], v.dtype)
         guarded = guarded_tiles(family, tiles, unit, v.dtype)
@@ -195,11 +197,12 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
 
     def launch(form: algebra.Forward, live: jax.Array | None):
         if live is None:
+            counted = form.natural == spec.natural
             found = _launch(q, k, v, spans_of, hooked, None, spec=form, hooks=hooks, tiles=tiles,
-                            family=family, training=False, interpret=interpret, peaks=True)
+                            family=family, training=False, interpret=interpret, peaks=True, counted=counted)
             status, rows, anchors, others = _launch(q, k, v, spans_of, hooked, None, spec=form, hooks=hooks,
                                                     tiles=tiles, family=family, training=True,
-                                                    interpret=interpret, anchors=found)
+                                                    interpret=interpret, anchors=found, counted=counted)
             split = Split(others, rows[2], rows[3], rows[4])
             # Each row's anchor's value row (`[B, H, Qp, Dv]`): its key head's at its key, gathered.
             batch, kv_heads, keys_count = v.shape[0], v.shape[2], v.shape[1]
@@ -485,7 +488,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
 def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Guard | None, *,
             spec: algebra.Forward, hooks: Hooks, tiles: Tiles, family: mosaic.Family, training: bool,
             interpret: bool, columns: int | None = None, peaks: bool = False,
-            anchors: tuple[jax.Array, jax.Array] | None = None, out_dtype=None):
+            anchors: tuple[jax.Array, jax.Array] | None = None, out_dtype=None, counted: bool = False):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its rows' status `[2, B,
     H, Qp]` fp32, their maxima in the walk's units and 1 where their weighted values overflowed
     (`algebra.walked_launches`), and its output `[B, Qp, H, Dv]` in `out_dtype` (the query's by default). In
@@ -585,6 +588,12 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     kind = "peaks" if peaks else "training" if training else "forward"
     name = (f"attention_{kind}{'_natural' if spec.natural else ''}"
             f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
+    # The model's products this launch owns (`stated`): the forward's two, a peak walk's `Q K^T` and a
+    # training walk's `P V` (its `Q K^T` recomputed); a rerun (a guarded launch, the fold's natural walk)
+    # none, as the FLOP count bounds a conditional by every branch, which would count the call twice.
+    widths = width if peaks else value.shape[-1] if training else width + value.shape[-1]
+    cost = (stated(spec, batch, heads, spec.queries or queries, widths, query, key, value) if counted
+            else pl.CostEstimate(flops=0, transcendentals=0, bytes_accessed=0))
     return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair, batch),
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers, interpret=interpret,
-                         approx_math=approx_math, name=name)(query, key, value, *leaves)
+                         approx_math=approx_math, name=name, cost=cost)(query, key, value, *leaves)
