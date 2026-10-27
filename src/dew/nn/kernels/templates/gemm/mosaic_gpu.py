@@ -116,12 +116,15 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
     docs/design/kernel-templates.md §7). `holds(tile)` is the launch's legality on the device (its
     staged bytes within a block, its registers within a consumer's: `Template.legal`).
 
-    - Shape: of the output tiles its consumers' registers hold (rows in whole roles, `mosaic.held_rows`,
-      `mosaic.tile_registers`; columns dividing the call's width in its column unit, at most the family's
-      one product's, `Family.widest_product`), the one loading its operands fewest times a FLOP
-      ((rows + columns) / (rows x columns): the squarest of the largest), the wider on a tie, which writes
-      its output in longer runs. mma.sync's one consumer so takes 128 x 128 over 64 x 256, whose four
-      warps, splitting its rows, each read the columns' block whole: 1.7x the shared memory a FLOP.
+    - Shape: the tile loading its operands fewest times a FLOP within its consumers' registers: an
+      accumulator of `mosaic.held_area` elements A reads them 1/rows + 1/columns times a FLOP, least at
+      rows = columns = sqrt(A). So the rows are sqrt(A) in whole roles (no more than the call's, below);
+      the columns the widest dividing the call's width in its column unit, at most the family's one
+      product's (`Family.widest_product`), that A holds at those rows; the rows then the most its
+      registers hold at those columns (`mosaic.held_rows`). mma.sync's one consumer so takes 128 x 128
+      where it took 64 x 256, whose four warps, splitting its rows, each read the columns' block whole:
+      1.7x the shared memory a FLOP (SHAPE1-a100: 0.887 of its time). A tile its registers or a block
+      cannot stage busy (`holds`, `mosaic.tile_registers`) gives way to the next narrower or shorter one.
     - Consumers: as many roles as the family has (`Family.consumers`), a warpgroup each, or one where
       rows a tile must divide (not grouped) take no whole role for each, or where no tile of them holds.
     - Programs: the most a multiprocessor runs at once that the family's registers hold at those
@@ -150,10 +153,19 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
         role = family.role_rows * consumers
         shared = mosaic.program_shared(family.most_shared, programs)
         most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
-        shapes = sorted(((block_m, block_n) for block_n in columns
-                         for block_m in range(min(most_rows, mosaic.held_rows(family, consumers, block_n)), 0,
-                                              -role)),
-                        key=lambda shape: (-shape[0] * shape[1] / (shape[0] + shape[1]), -shape[1]))
+        if not columns:
+            return None
+        area = mosaic.held_area(family, consumers)
+        side = max(role, min(most_rows, math.isqrt(area) // role * role))
+        widest = next((block_n for block_n in columns if block_n * side <= area), columns[-1])
+
+        def held(block_n: int) -> int:
+            return min(most_rows, mosaic.held_rows(family, consumers, block_n))
+
+        # The derived shape, then each narrower or shorter one a tile that stages too shallow gives way to.
+        first = [(held(widest), widest)] if held(widest) >= role else []
+        shapes = [*first, *((block_m, block_n) for block_n in columns if block_n <= widest
+                            for block_m in range(held(block_n), 0, -role) if (block_m, block_n) not in first)]
         fallback = None
         for block_m, block_n in shapes:
             band = mosaic.band(multiprocessors * programs, block_m, block_n, width // block_n,
