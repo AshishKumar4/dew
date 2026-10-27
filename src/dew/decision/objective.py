@@ -260,8 +260,10 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
             width, dtype = DecisionModel.head_size(module)
             head = DecisionHead(width, dtype=dtype)
         if isinstance(layout, QuestionLayout) and layout.labels is not None:
-            # A head that reads labels and was drawn with none reads the layout's, by this tokenizer.
-            head = head.labelled(layout.labels, tokenizer)
+            # A head that reads labels and was drawn with none reads the layout's, by this tokenizer, the
+            # one its rows are laid out by, which names them where the layout names none.
+            head, labels = head.labelled(layout.labels, tokenizer)
+            layout = dataclasses.replace(layout, labels=labels)
         self.model = DecisionModel(module, head, context_encoder or "table")
         if layout is None:
             if not isinstance(module, TokenModel):

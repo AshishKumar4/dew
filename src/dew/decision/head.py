@@ -75,11 +75,11 @@ class Head(nn.Module):
         return None
 
     @nn.nowrap
-    def labelled(self, labels: Labels, tokenizer: Tokenizer) -> "Head":
-        """The head reading `labels` as `tokenizer` spells them, where it reads labels and was drawn
-        before its tokenizer was known, with no ids (a run's letter readout, `LabelReadout`); itself
-        otherwise."""
-        return self
+    def labelled(self, labels: Labels, tokenizer: Tokenizer) -> tuple["Head", Labels]:
+        """The head reading `labels` as `tokenizer` spells them, and the labels as named, where it reads
+        labels and was drawn before its tokenizer was known, with no ids (a run's letter readout,
+        `LabelReadout`); itself and `labels` otherwise."""
+        return self, labels
 
     @nn.nowrap
     def validate_rows(self, rows: Sequence[Encoded]) -> None:
@@ -513,12 +513,15 @@ class LabelReadout(Head):
     table's or `dtype` where wider.
 
     A row's labels are the head's, its first as many as the question has options (`validate_rows`);
-    option slots past the labels, a batch's padding, read -inf."""
+    option slots past the labels, a batch's padding, read -inf. A head drawn with no ids reads `count`
+    labels, named where its tokenizer is known: the layout's own names, or where they name none, the
+    first `count` its tokenizer spells as one token each (`labelled`, `Labels.spelled`)."""
 
     features: int
     label_ids: tuple[tuple[int, ...], ...]
     untied: bool = False
     dtype: Dtype | None = None
+    count: int = 0
     reads_labels: ClassVar[bool] = True
 
     @nn.nowrap
@@ -526,12 +529,14 @@ class LabelReadout(Head):
         return None if self.untied else self.label_ids
 
     @nn.nowrap
-    def labelled(self, labels: Labels, tokenizer: Tokenizer) -> "LabelReadout":
+    def labelled(self, labels: Labels, tokenizer: Tokenizer) -> tuple["LabelReadout", Labels]:
         if self.label_ids:
-            return self
-        if labels.names is None:
-            raise ValueError("a letter readout drawn with no label ids reads labels that name their count")
-        return self.clone(label_ids=labels.ids(tokenizer, len(labels.names)))
+            return self, labels
+        if labels.names is None and not self.count:
+            raise ValueError("a letter readout drawn with no label ids reads labels that name their count, "
+                             "or a count of labels its tokenizer names")
+        named = labels.spelled(tokenizer, self.count)
+        return self.clone(label_ids=named.ids(tokenizer, len(named.names or ()))), named
 
     @nn.nowrap
     def validate_rows(self, rows: Sequence[Encoded]) -> None:

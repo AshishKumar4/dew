@@ -3,6 +3,7 @@ runs out before its length."""
 
 import collections
 import dataclasses
+import itertools
 
 import jax.numpy as jnp
 import numpy as np
@@ -175,8 +176,8 @@ def test_an_examples_budget_counts_examples_before_the_objective_expands_them(ex
 
 def test_an_examples_budget_over_a_mixture_counts_each_corpus_examples_whatever_its_rows():
     """Two corpora mixed, whose examples the objective makes one row and three rows each: the bound
-    counts examples, each row its share of its own, so the rows it reads make as many examples as it is
-    bounded to, to within the last one it ends on, not as many rows."""
+    counts examples before the objective makes rows of them, so the rows it reads are exactly as many
+    examples' rows as it is bounded to, each example's rows whole."""
     from dew.data import mix
     from dew.data.pipeline import ObjectiveData
 
@@ -185,8 +186,33 @@ def test_an_examples_budget_over_a_mixture_counts_each_corpus_examples_whatever_
     loader = compile(mix([one, three], weights=[0.5, 0.5]).batch(BATCH),
                      objective=ObjectiveData(train=(Questioned(),)), examples=EXAMPLES)
     read = ids_read(loader, loader.example_steps(EXAMPLES), "id")
-    examples = read[3] + read[2] / 3
-    assert EXAMPLES <= examples < EXAMPLES + 1
+    assert read[2] % 3 == 0
+    assert read[3] + read[2] // 3 == EXAMPLES
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_rows_each_makes(read):
+    """A decision objective lays an example out as a row a question: an examples budget over examples
+    of two questions each reads exactly that many source examples, two rows each, its windows holding
+    twice as many rows as the budget's examples, in a memory read, whose objective steps start eagerly
+    over the store, and a streamed one alike."""
+    from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
+
+    from dew.decision import DecisionObjective, Noul, StateFirstLayout, decisions
+
+    layout = StateFirstLayout(max_len=128)
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=128), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout)
+    asked = {"first": Noul("Is it on?"), "second": Noul("Is it off?")}
+    answers = {"first": "true", "second": "false"}
+    records = [{"state": f"state {index}", "questions": asked, "answers": answers}
+               for index in range(RECORDS)]
+    loader = compile(Pipeline(Memory(records)).pipe(decisions).shuffle(3).batch(BATCH), read=read,
+                     objective=objective.data(), examples=EXAMPLES)
+    windows = [np.asarray(batch["segments"]) for batch in
+               itertools.islice(loader.train(DataPartition()), loader.example_steps(EXAMPLES))]
+    rows = sum(len(set(window[window > 0].tolist())) for batch in windows for window in batch)
+    assert rows == 2 * EXAMPLES
 
 
 def test_an_examples_run_trains_each_record_once_under_the_schedule_its_plan_sizes():

@@ -486,12 +486,12 @@ class Labels:
         return self.names[:count]
 
     def spelled(self, encoder: Tokenizer, count: int) -> "Labels":
-        """These labels named for `encoder`: their own `names` where set, else the first `count` of
+        """These labels named for `encoder`: themselves where they name their own, else the first `count` of
         `LABEL_NAMES` whose every variant `encoder` spells as one token, skipping those it spells as
         two (Qwen3.5 spells " BQ" as two, and 570 of the 702 as one), so a run letters as many options
         as its tokenizer can. Fewer than `count` such names is refused."""
         if self.names is not None:
-            return dataclasses.replace(self, names=self.names_for(count))
+            return self
         same = _same(encoder)
         named = [name for name in LABEL_NAMES
                  if all(len(_piece(same, variant.format(name))) == 1 for variant in self.variants)]

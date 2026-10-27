@@ -31,7 +31,7 @@ from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
 from dew.decision.laya import LAYA
 from dew.decision.layout import Framing, Labels, Layout, QuestionLayout, RowSegment, Schema, default_layout
 from dew.decision.model import DecisionModel
-from dew.decision.objective import DecisionObjective, tokenizer_of
+from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
@@ -260,14 +260,10 @@ class DecisionRunConfig(DecoderRunConfig):
             head = JointSchemaHead(hidden_size=width, dtype=head_dtype, **dataclasses.asdict(self.head))
         elif isinstance(self.head, Letters):
             # Its ids are its labels' under the objective's tokenizer, which lays the rows out too and
-            # names the labels it spells as one token each.
-            encoder = tokenizer_of(start.text_processor)
-            if encoder is None:
-                raise ValueError("the letter readout names its labels by the backbone's tokenizer, and "
-                                 "this checkpoint loads none")
-            labels = self.head.labels.spelled(encoder, self.head.count)
-            width, head_dtype = DecisionModel.head_size(start.model)
-            head = LabelReadout(features=width, label_ids=(), untied=self.head.untied, dtype=head_dtype)
+            # names the labels it spells as one token each where they name none (`LabelReadout.count`).
+            labels, (width, head_dtype) = self.head.labels, DecisionModel.head_size(start.model)
+            head = LabelReadout(features=width, label_ids=(), untied=self.head.untied, dtype=head_dtype,
+                                count=self.head.count)
         # Lettered rows lie one question to a row, as the backbone's order asks.
         one_question = (DecisionHead if head is None else head).one_question or labels is not None
         layout = _fresh_layout(start.model.causal, one_question, budgets, blocked, labels)

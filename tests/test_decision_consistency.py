@@ -171,10 +171,11 @@ def test_examples_grouped_across_rows_train_in_one_window_and_agree_as_one_group
                                   np.asarray(apart[0]))
 
 
-def test_a_unit_no_window_holds_is_rejected_and_one_without_a_label_is_too():
-    """A unit of rows the packer places whole: past a window's tokens it is rejected as unfit, and with
-    no labelled question as unlabelled; an example's own groups under a layout of a question a row are
-    such a unit, where the run once refused them."""
+def test_a_unit_no_window_holds_trains_its_examples_apart_and_one_without_a_label_is_rejected():
+    """A unit of rows the packer places whole: past a window's tokens its examples train apart, each a
+    row of its own that fits alone, none dropped for its group, and with no labelled question it is
+    rejected as unlabelled; an example's own groups under a layout of a question a row are such a unit,
+    where the run once refused them."""
     layout = StateFirstLayout(max_len=512)
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=512), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout, consistency=0.5)
@@ -186,7 +187,9 @@ def test_a_unit_no_window_holds_is_rejected_and_one_without_a_label_is_too():
                                          {"billing": "true"}) for _ in range(3)),
                            groups=(Group("billing", {f"{index}.billing": {"true": "yes", "false": "no"}
                                                      for index in range(3)}),))
-    assert isinstance(fit.map({"example": long}), Rejected)
+    apart = fit.map({"example": long})
+    assert not isinstance(apart, Rejected) and "decision_unit" not in apart
+    assert [row["decision"].example for row in QuestionRows().flat_map(apart)] == list(long.examples)
     unlabelled = dataclasses.replace(PARAPHRASED, examples=tuple(
         dataclasses.replace(example, answers={}) for example in PARAPHRASED.examples))
     assert fit.map({"example": unlabelled}) == Rejected("unlabelled")
@@ -327,7 +330,8 @@ def test_a_unit_the_fit_holds_fits_its_window_however_training_draws_its_options
         layout = layout_of(window)
         fitted = Fit(layout, TOKENIZER, SPECIALS, model.head, context_length=None, grouped=True,
                      none_of_the_above=rate).map({"example": pair})
-        if isinstance(fitted, Rejected):
+        # A window too short for the unit at its longest trains its rows apart, or none where none fits.
+        if isinstance(fitted, Rejected) or "decision_unit" not in fitted:
             continue
         held.append(window)
         encoding = Encoding(layout, TOKENIZER, SPECIALS, width=width, none_of_the_above=rate, grouped=True)

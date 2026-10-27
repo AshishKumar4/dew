@@ -252,16 +252,6 @@ class FlatMap:
     step: ExpandStep
     identity: str | None = None
     configured: Bound | None = None
-    examples: bool = False
-    """Whether each record it makes is a part of the one it read, an example a run's `examples=`
-    bound counts whole (`Limit.examples`): an objective's rows of an example (a decision row a
-    question), each its share of it (`EXAMPLE_SHARE`)."""
-
-
-EXAMPLE_SHARE = "_dew_example_share"
-"""The share of an example a record is, `(1, parts)` as two ints, where an expansion that counts its
-records as parts of the example it read (`FlatMap.examples`) made it; a record that carries none is
-one example."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -395,9 +385,6 @@ class Workers:
 @dataclasses.dataclass(frozen=True)
 class Limit:
     count: int
-    examples: bool = False
-    """Whether `count` counts examples, each record its share of one (`EXAMPLE_SHARE`), the read ending
-    once that many examples' records have passed, rather than records."""
 
 
 class DeviceStep:
