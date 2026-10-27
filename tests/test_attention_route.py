@@ -581,6 +581,25 @@ def test_the_template_reports_the_mainloop_each_pass_runs():
     assert reported == [("portable", "portable", None)] * 2
 
 
+@pytest.mark.parametrize("named", ["portable", "mosaic", "triton"])
+def test_a_named_mainloop_runs_or_is_refused(named):
+    """`generation.chosen(attention_mainloop=...)` runs the mainloop it names on every template pass: on a
+    CPU the plain-JAX one runs, and Mosaic's and Triton's, which run on a GPU alone, are refused by name
+    (`selection.KernelRefused`), none silently replaced (train 217's K3)."""
+    from dew.nn.kernels import selection
+
+    with jax.default_device(jax.devices("cpu")[0]):
+        query, key, value, sinks, dout = drawing(QUERIES, KEYS, jnp.float32, sinks=True)(0)
+        traced = jax.jit(pulled("template", CASES["causal"]))
+        with generation.chosen(attention_mainloop=named), generation.routes() as found:
+            if named != "portable":
+                with pytest.raises(selection.KernelRefused, match=named):
+                    traced.trace(query, key, value, sinks, dout)
+                return
+            traced.trace(query, key, value, sinks, dout)
+    assert [route.kernel for route in found if route.choice == "attention_mainloop"] == [named] * 2
+
+
 def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output_hook():
     """`attend` runs a score hook and the initial state, and refuses an output hook of its own: its backward
     takes the output before one, so the caller applies it."""
