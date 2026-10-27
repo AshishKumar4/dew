@@ -280,8 +280,8 @@ type Budgets = dict[str, int | bool | Framing | Labels | tuple[RowSegment, ...] 
 """A run's budgets of a row's layout, by the layout's field names (`_budgeted`)."""
 
 
-def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets, blocked: bool,
-                  labels: Labels | None) -> Layout:
+def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets, blocked: bool = False,
+                  labels: Labels | None = None) -> Layout:
     """The layout a fresh head reads (`default_layout`), with the run's `budgets`, its rows in blocks
     where its backbone's text reads each of a row's blocks whole, as the checkpoint's attention and the
     run's `--source.attention` declare it (`blocked`, `reads_blocks`), not where a checkpoint reads its

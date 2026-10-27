@@ -207,11 +207,14 @@ def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_row
     answers = {"first": "true", "second": "false"}
     records = [{"state": f"state {index}", "questions": asked, "answers": answers}
                for index in range(RECORDS)]
-    loader = compile(Pipeline(Memory(records)).pipe(decisions).shuffle(3).batch(BATCH), read=read,
+    shuffled = {"seed": 3} if read == "memory" else {"seed": 3, "window": RECORDS}
+    loader = compile(Pipeline(Memory(records)).pipe(decisions).shuffle(**shuffled).batch(BATCH), read=read,
                      objective=objective.data(), examples=EXAMPLES)
-    windows = [np.asarray(batch["segments"]) for batch in
-               itertools.islice(loader.train(DataPartition()), loader.example_steps(EXAMPLES))]
-    rows = sum(len(set(window[window > 0].tolist())) for batch in windows for window in batch)
+    rows = 0
+    for batch in itertools.islice(loader.train(DataPartition()), loader.example_steps(EXAMPLES)):
+        # A short last batch is filled with windows it marks as no rows of its own (`VALID_ROWS`).
+        real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["segments"]), bool)), bool)
+        rows += sum(len(set(window[window > 0].tolist())) for window in np.asarray(batch["segments"])[real])
     assert rows == 2 * EXAMPLES
 
 
