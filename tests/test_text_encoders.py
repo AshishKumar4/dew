@@ -96,11 +96,16 @@ def image_draw(directory_or_repo, shape):
 
 @functools.cache
 def reference_clip(source, dtype):
-    """transformers' CLIPModel over `source`'s weights at `dtype`, float64 built under `float64`."""
+    """transformers' CLIPModel over `source`'s weights at `dtype`, float64's the float32 one's twin
+    (`float64_twin`), built under `float64`."""
+    import torch
     from transformers import CLIPModel as ReferenceCLIP
 
-    with precision(dtype):
-        return ReferenceCLIP.from_pretrained(str(source), attn_implementation="eager").to(dtype).eval()
+    from tools.torch_precision import float64_twin
+
+    if dtype == torch.float64:
+        return float64_twin(reference_clip(source, torch.float32))
+    return ReferenceCLIP.from_pretrained(str(source), attn_implementation="eager").to(dtype).eval()
 
 
 def precision(dtype):
