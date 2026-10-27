@@ -779,10 +779,14 @@ class Objective(ABC, Generic[Loss, Effects]):
             lambda leaf, index=index: leaf[index:index + 1] if np.ndim(leaf) and np.shape(leaf)[0] == rows
             else leaf, batch))) for index in range(rows)], np.int64)
 
-    def unit_losses(self, variables: Variables, batch: Batch, step: Step) -> jax.Array | None:
-        """The loss of each unit of `batch` this objective's loss sums, [B] for an example's, [B, T] for a
-        token's, which a method that credits each unit by its own loss reads (`dew.objectives.perturbation`);
-        None where the objective states none, whose whole loss credits every unit."""
+    def scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, jax.Array] | None:
+        """The statistics `loss` returns for `batch`, without its `Aux`, by the loss's own path (its
+        configured terms, its mode and its model's draws under `step`), with each unit's share of their
+        first leaf (a `Ratio`'s total, a routed decoder's prediction total): `[B]` for an example's,
+        `[B, T]` for a token's, the shares summing to that leaf. A method that credits each unit by its
+        own loss reads them (`dew.objectives.perturbation`). None, the default, where the objective states
+        no units, whose whole statistics credit every unit; the model's other collections are left as they
+        are."""
         return None
 
     def real_lengths(self, batch: Batch) -> np.ndarray:

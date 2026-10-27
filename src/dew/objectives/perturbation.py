@@ -9,21 +9,35 @@ layer's output,
     g_t = 1 / (2 K sigma) sum_draws (l_t(y + sigma a) - l_t(y - sigma a)) a_t,
 
 here from antithetic pairs, which cancel the reward's baseline. A layer's weight gradient is then the
-outer product of that estimate with the layer's input from the clean forward, summed over units,
-G = sum_t x_t g_t^T, as backpropagation forms it, and an embedding's is the estimate scattered into the
-rows its ids read. Every other parameter (a norm's scale, a mixing scalar, a convolution's kernel) is
-estimated by two-sided weight-space evolution strategies, rewarded by the whole loss.
+product of that estimate with the layer's input from the clean forward, summed over units, as
+backpropagation forms it, and an embedding's is the estimate scattered into the rows its ids read. Every
+other parameter (a norm's scale, a mixing scalar, an expert's weights) is estimated by two-sided
+weight-space evolution strategies, rewarded by the whole objective.
 
-`NodePerturbation`, mixed into any objective over a Flax model (`class Forward(NodePerturbation,
-Supervised)`), does this: it reads every `nn.Dense` and `nn.Embed` call (`flax.linen.intercept_methods`),
-a subclass of either among them, and credits each unit of an output by the objective's own loss of that
-unit (`Objective.unit_losses`, a supervised model's examples) where the output's leading axes are the
-units', else by the whole loss. An objective whose units' losses read other units' outputs, a causal
-model's tokens, would credit a token's jitter by its own token's loss alone, as Dust's direct draws do,
-leaving out what the jitter changes in later tokens' losses: a lower-variance estimate, biased by that. No
-derivative of the model is taken: the estimate is the loss's stated gradient (`Objective.with_gradients`),
-which the trainer applies as it applies `jax.grad`'s. A model that maps or scans its layers (`nn.scan`,
-`jax.vmap` inside its call) hides their calls' values from a capture outside them, and is refused.
+`NodePerturbation`, mixed into any objective over a Flax model,
+
+    class ForwardLM(NodePerturbation, LMObjective): ...
+    ForwardLM(model, seq_len, draws=256, sigma=0.1)
+
+does this for the objective's own loss: its value is the objective's, its statistics tree the objective's
+(a `Ratio`, a routed decoder's `RoutedStatistics`), and only its derivative in the trained parameters is
+estimated. The estimate is taken where the trainer asks for that derivative, under the cotangent the
+trainer's reduction gives the statistics, pooled over the update's microbatches where it pools them, so
+each statistic is weighted as the reduction weighs it and every denominator stays out. Each unit of the
+first statistic is credited by its own share (`Objective.scored_units`: a supervised model's examples, a
+language model's tokens with their configured terms) where a site's output's leading axes are the units',
+and every other statistic's change, a router's balance term, is credited to every unit. Units that read
+other units' outputs, a causal model's tokens, are credited by their own share alone, as Dust's direct
+draws are: a lower-variance estimate, biased by what a jitter changes in later tokens.
+
+Every pass reads the step's own draws (dropout, routing noise), and the model's other collections are
+left as the clean loss leaves them. Each jitter is drawn in float32 and cast to its site's output dtype,
+and the cast draw is both the jitter and what its reward multiplies. A site whose output's leading axis is
+the batch's rows draws each example's jitter by its place among the update's examples (`Step.sample`),
+and every other draw, a weight's or an unbatched site's, by the update's key, so a split or accumulated
+update estimates what its batch whole does. A model that chooses its remat (`RematChoosing`) is estimated
+without it, which a forward-only pass never needs; one that maps or scans its layers (`nn.scan`,
+`jax.vmap` in its call) hides their calls' values from a capture outside them, and is refused.
 
 Dust's own tuning, a draw budget per layer group, the attention internals scored through the attention
 output's estimate, the head jittered on cached logits a vocabulary slab at a time, are the paper's
@@ -32,169 +46,271 @@ efficiency for its GPT and are not here: every site is jittered in every draw.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
-from typing import Any
+import string
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn, traverse_util
+import numpy as np
+from flax import linen as nn
 
-from dew.batch import Batch, Variables
-from dew.nn.precision import float32_einsum
-from dew.objectives.base import Objective, Ratio, Step
+from dew._distributions import counter_key
+from dew.batch import Batch, Variables, leaves_by_path
+from dew.data.dataset import rows_of
+from dew.nn.precision import at_least_fp32, float32_einsum
+from dew.nn.protocols import RematChoosing
+from dew.objectives.base import Objective, Step, stream
+
+NOISE = jnp.float32
+"""The dtype every jitter is drawn in, whatever its site's: a float64 twin of a run draws what the run
+draws, and a bfloat16 site jitters by the draw cast to bfloat16."""
+
+Path = tuple[str, ...]
 
 
 @dataclasses.dataclass(frozen=True)
 class Site:
-    """One `Dense` or `Embed` call of the model: its module's path, how it maps (`kind`: "dense", "embed"
-    or "attend"), its input and the shape of its output in the clean forward."""
+    """One `Dense`, `DenseGeneral` or `Embed` call of the model in the clean forward: its module's path,
+    how it maps (`kind`: "dense", "embed" or "attend"), its input, its output's shape and dtype, and a
+    dense call's contracted input axes, normalized, in the order its kernel's leading axes take them."""
 
-    path: tuple[str, ...]
+    path: Path
     kind: str
     inputs: jax.Array
     shape: tuple[int, ...]
-
-
-def _flat(tree) -> dict[tuple[str, ...], jax.Array]:
-    """Every leaf of a tree of mappings, by the path of its keys (each a `DictKey`)."""
-    return {tuple(str(key.key) for key in path if isinstance(key, jax.tree_util.DictKey)): leaf
-            for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
+    dtype: jnp.dtype
+    contracted: tuple[int, ...] = ()
 
 
 def _kind(context) -> str | None:
-    """How a call maps its input, or None for a call no site reads: a `Dense` and a `DenseGeneral` that
-    batches no axes (`batch_dims`) contract the input's trailing axes with their kernel."""
+    """How a call maps its input, or None for a call no site reads: a `Dense`, and a `DenseGeneral` that
+    batches no axes (`batch_dims`), contract input axes with their kernel."""
     module, method = context.module, context.method_name
-    if isinstance(module, nn.Dense) and method == "__call__":
-        return "dense"
-    if isinstance(module, nn.DenseGeneral) and method == "__call__" and not module.batch_dims:
-        return "dense"
+    if method == "__call__" and isinstance(module, nn.Dense | nn.DenseGeneral):
+        return None if isinstance(module, nn.DenseGeneral) and module.batch_dims else "dense"
     if isinstance(module, nn.Embed) and method in ("__call__", "attend"):
         return "embed" if method == "__call__" else "attend"
     return None
 
 
-class NodePerturbation(Objective[Any, Any]):
-    """Trains the objective it is mixed into without backpropagation (the module's docstring):
+def _site(context, args, kwargs, output) -> Site | None:
+    """The site a call is, or None (`_kind`)."""
+    kind = _kind(context)
+    if kind is None:
+        return None
+    module = context.module
+    inputs = args[0] if args else next(iter(kwargs.values()))
+    contracted: tuple[int, ...] = ()
+    if kind == "dense":
+        rank = jnp.ndim(inputs)
+        axes = (-1,) if isinstance(module, nn.Dense) else (
+            tuple(module.axis) if isinstance(module.axis, tuple | list) else (module.axis,))
+        contracted = tuple(axis % rank for axis in axes)
+    return Site(tuple(module.path), kind, inputs, tuple(jnp.shape(output)), jnp.result_type(output),
+                contracted)
 
-        class Forward(NodePerturbation, Supervised):
-            draws = 256
 
-    is `Supervised` with its loss's gradient estimated by `draws` antithetic pairs of output jitters of
-    scale `sigma` a step, and `weight_draws` pairs of weight jitters of scale `weight_sigma` for the
-    parameters no `Dense` or `Embed` call holds. Everything else, the model, its data and its saved task, is
-    the objective's own, which comes after this class in the bases."""
+def _zero_cotangents(tree):
+    """The zero cotangent of every leaf of `tree`: float0 for an integer or a key."""
+    def zero(leaf):
+        if jnp.issubdtype(jnp.result_type(leaf), jnp.inexact):
+            return jnp.zeros_like(leaf)
+        return np.zeros(jnp.shape(leaf), jax.dtypes.float0)
+    return jax.tree.map(zero, tree)
 
-    draws: int = 64
-    sigma: float = 0.2
-    weight_draws: int = 8
-    weight_sigma: float = 0.03
+
+class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
+    """Trains the objective it is mixed into without backpropagation (the module's docstring), by `draws`
+    antithetic pairs of output jitters of scale `sigma` a step, and `weight_draws` pairs of weight jitters
+    of scale `weight_sigma` for the parameters no site holds. Everything else, the model, its data and its
+    saved task, is the objective's own, whose constructor takes the other arguments."""
+
+    def __init__(self, *args, draws: int = 64, sigma: float = 0.2, weight_draws: int = 8,
+                 weight_sigma: float = 0.03, **kwargs):
+        if draws < 1 or weight_draws < 1:
+            raise ValueError("node perturbation draws at least one pair of each kind of jitter")
+        self.draws, self.sigma = draws, sigma
+        self.weight_draws, self.weight_sigma = weight_draws, weight_sigma
+        super().__init__(*args, **kwargs)
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        stats = super().loss(variables, batch, step)
-        stats, aux = stats if isinstance(stats, tuple) else (stats, None)
+        base = super().loss
         if not step.training:
-            return stats if aux is None else (stats, aux)
-        if self.draws < 1 or self.weight_draws < 1:
-            raise ValueError("node perturbation draws at least one pair of each kind of jitter")
-        rule = self.estimate(variables, batch, step)
-        ruled = self.with_gradients(stats, jax.tree.unflatten(jax.tree.structure(stats), [rule, None]),
-                                    variables["params"])
-        return ruled if aux is None else (ruled, aux)
+            return base(variables, batch, step)
+        held = {name: value for name, value in variables.items() if name != "params"}
 
-    def units(self, variables: Variables, batch: Batch, step: Step) -> jax.Array:
-        """The losses each jitter is credited by: the objective's units' (`unit_losses`), or its total."""
-        units = self.unit_losses(variables, batch, step)
-        if units is not None:
-            return units
-        stats = super().loss(variables, batch, step)
-        stats = stats[0] if isinstance(stats, tuple) else stats
-        if not isinstance(stats, Ratio):
-            raise TypeError("node perturbation credits a jitter by a loss: an objective whose statistics are "
-                            "no Ratio states its units (`Objective.unit_losses`)")
-        return stats.total
+        @jax.custom_vjp
+        def estimated(params, rest):
+            others, held_batch, held_step = rest
+            return base({**others, "params": params}, held_batch, held_step)
 
-    def estimate(self, variables: Variables, batch: Batch, step: Step) -> Variables:
-        """The estimated derivative of the units' summed loss in every trained parameter, in their tree."""
+        def forward(params, rest):
+            return estimated(params, rest), (params, rest)
+
+        def backward(saved, cotangent):
+            params, rest = saved
+            others, held_batch, held_step = rest
+            stats = cotangent[0] if isinstance(cotangent, tuple) else cotangent
+            return self.estimate(params, others, held_batch, held_step, stats), _zero_cotangents(rest)
+
+        estimated.defvjp(forward, backward)
+        return estimated(variables["params"], (held, batch, step))
+
+    def estimate(self, params: Variables, held: Variables, batch: Batch, step: Step, cotangent) -> Variables:
+        """The estimated derivative in every trained parameter of the statistics' inner product with
+        `cotangent`, in the parameters' tree: what the trainer's reduction asks for."""
+        estimating = self._forward_only()
+        variables = {**held, "params": params}
         sites: list[Site] = []
 
         def captured(next_fun, args, kwargs, context):
             output = next_fun(*args, **kwargs)
-            kind = _kind(context)
-            if kind is not None:
-                sites.append(Site(tuple(context.module.path), kind, args[0], tuple(jnp.shape(output))))
+            site = _site(context, args, kwargs, output)
+            if site is not None:
+                sites.append(site)
             return output
 
+        flat = leaves_by_path(params)
         try:
             with nn.intercept_methods(captured):
-                clean = self.units(variables, batch, step)
-            gradients = self._sited(variables, batch, step, sites, clean)
+                estimating._statistics_and_shares(variables, batch, step)
+            gradients = self._sited(estimating, variables, batch, step, sites, cotangent, flat)
         except jax.errors.UnexpectedTracerError as escaped:
             raise ValueError("node perturbation reads each Dense and Embed call's input and output, which a "
-                             "model that maps or scans its layers (nn.scan, jax.vmap in its call) hides from "
-                             "it; build the model with its layers unrolled") from escaped
-        return self._remaining(variables, batch, step, gradients)
+                             "model that maps, scans or rematerializes its layers outside its remat policy "
+                             "(nn.scan, jax.vmap or nn.remat in its call) hides from it; build the model "
+                             "with its layers unrolled") from escaped
+        gradients = self._remaining(estimating, variables, batch, step, cotangent, flat, gradients)
+        return jax.tree_util.tree_map_with_path(
+            lambda path, leaf: gradients[tuple(entry.key for entry in path)].astype(leaf.dtype), params)
 
-    def _jittered(self, variables, batch, step, sites: list[Site], key: jax.Array, sign: float) -> jax.Array:
-        """The units' losses with every site's output jittered by `sign` sigma times its draw from `key`."""
-        index = iter(range(len(sites)))
+    def _forward_only(self) -> NodePerturbation:
+        """This objective with every module that chooses its remat (`RematChoosing`) built without it: a
+        forward-only pass recomputes nothing, and a capture reads the values a remat would hide."""
+        entries = self.program_key()
+        plain = [entry.module.with_remat(None) if isinstance(entry.module, RematChoosing) else entry.module
+                 for entry in entries]
+        estimating = copy.copy(self)
+        if any(module is not entry.module for module, entry in zip(plain, entries, strict=True)):
+            estimating.substitute(plain)
+        return estimating
 
-        def jittered(next_fun, args, kwargs, context):
-            output = next_fun(*args, **kwargs)
-            if _kind(context) is None:
-                return output
-            noise = jax.random.normal(jax.random.fold_in(key, next(index)), jnp.shape(output), output.dtype)
-            return output + sign * self.sigma * noise
+    def _statistics_and_shares(self, variables: Variables, batch: Batch,
+                               step: Step) -> tuple[LossT, jax.Array | None]:
+        """The objective's statistics and its units' shares of their first leaf (`scored_units`), or no
+        shares where it states none."""
+        units = self.scored_units(variables, batch, step)
+        if units is not None:
+            return units
+        stats, _ = self._loss(variables, batch, step)
+        return stats, None
 
-        with nn.intercept_methods(jittered):
-            return self.units(variables, batch, step)
+    def _update_key(self, step: Step, name: str) -> jax.Array:
+        """The update's key for the draws `name` names, the same for every microbatch the update pools."""
+        return jax.random.fold_in(counter_key(step.key if step.example_key is None else step.example_key),
+                                  stream(name))
 
-    def _sited(self, variables, batch, step, sites: list[Site], clean: jax.Array
-               ) -> dict[tuple[str, ...], jax.Array]:
-        """Each site's parameters' estimated gradient, summed over the calls of each module, flat by path."""
-        def credited(change: jax.Array, shape: tuple[int, ...]) -> jax.Array:
-            # A unit's own change where the output's leading axes are the units', else the whole loss's.
-            if shape[:change.ndim] != change.shape:
-                change = jnp.sum(change)
-            return change.reshape(change.shape + (1,) * (len(shape) - change.ndim))
+    def _noise(self, step: Step, index: int, site: Site, draw: jax.Array, rows: int) -> jax.Array:
+        """Site `index`'s jitter at `draw`, drawn in `NOISE` and cast to the site's output dtype: each
+        example's own where the output's leading axis is the batch's rows, else the update's."""
+        if site.shape[:1] == (rows,):
+            # Each draw of the scan is its own; a recorder or witness of the step keeps the loss's own.
+            def normal(key, shape, dtype):
+                return jax.random.normal(jax.random.fold_in(key, draw), shape, dtype)
 
-        def draw(errors, key):
-            plus = self._jittered(variables, batch, step, sites, key, 1.0)
-            minus = self._jittered(variables, batch, step, sites, key, -1.0)
-            change = (plus - minus) / (2 * self.sigma)
-            return [error + credited(change, site.shape) * jax.random.normal(
-                jax.random.fold_in(key, index), site.shape, error.dtype)
-                for index, (error, site) in enumerate(zip(errors, sites, strict=True))], None
+            quiet = dataclasses.replace(step, recorder=None, witness=None)
+            noise = quiet.sample(f"node-perturbation/site/{index}", normal, site.shape[1:], dtype=NOISE,
+                                 rows=rows)
+        else:
+            key = jax.random.fold_in(jax.random.fold_in(self._update_key(step, "node-perturbation/sites"),
+                                                        index), draw)
+            noise = jax.random.normal(key, site.shape, NOISE)
+        return noise.astype(site.dtype)
 
-        dtype = jnp.result_type(clean, jnp.float32)
-        keys = jax.random.split(jax.random.fold_in(step.key, 0x5D57), self.draws)
-        errors, _ = jax.lax.scan(draw, [jnp.zeros(site.shape, dtype) for site in sites], keys)
-        gradients: dict[tuple[str, ...], jax.Array] = {}
+    def _rewards(self, plus, minus, cotangent) -> tuple[jax.Array, jax.Array | None, jax.Array]:
+        """A pair's change in the statistics' inner product with `cotangent` (`whole`), each unit's
+        change in its share of the first statistic (`units`, None without shares), and the other
+        statistics' change (`rest`), each over twice the jitter's scale."""
+        (above, shared_above), (below, shared_below) = plus, minus
+        weights = jax.tree.leaves(cotangent)
+        changes = [jnp.sum(jnp.asarray(weight, at_least_fp32(jnp.result_type(high))) * (high - low))
+                   for weight, high, low in zip(weights, jax.tree.leaves(above), jax.tree.leaves(below),
+                                                strict=True)
+                   if jnp.issubdtype(jnp.result_type(high), jnp.inexact)]
+        whole = sum(changes[1:], changes[0])
+        if shared_above is None or shared_below is None:
+            return whole, None, whole
+        first = jnp.asarray(weights[0], shared_above.dtype)
+        units = first * (shared_above - shared_below)
+        return whole, units, whole - changes[0]
+
+    def _sited(self, estimating, variables, batch, step, sites: list[Site], cotangent,
+               flat: dict[Path, jax.Array]) -> dict[Path, jax.Array]:
+        """Each site's parameters' estimated gradient, summed over the calls of each module, by path."""
+        rows = rows_of(batch)
+
+        def jittered(sign: float, draw: jax.Array):
+            index = iter(range(len(sites)))
+
+            def jitter(next_fun, args, kwargs, context):
+                output = next_fun(*args, **kwargs)
+                if _kind(context) is None:
+                    return output
+                at = next(index)
+                noise = self._noise(step, at, sites[at], draw, rows)
+                return output + jnp.asarray(sign * self.sigma, noise.dtype) * noise
+
+            with nn.intercept_methods(jitter):
+                return estimating._statistics_and_shares(variables, batch, step)
+
+        def credited(whole, units, rest, site: Site, dtype) -> jax.Array:
+            # A unit's own change where the output's leading axes are the units', else the whole change.
+            if units is None or site.shape[:units.ndim] != units.shape:
+                return jnp.asarray(whole, dtype)
+            change = (units + rest).astype(dtype)
+            return change.reshape(change.shape + (1,) * (len(site.shape) - change.ndim))
+
+        def draw(errors, index):
+            whole, units, rest = self._rewards(jittered(1.0, index), jittered(-1.0, index), cotangent)
+            return [error + credited(whole, units, rest, site, error.dtype) / (2 * self.sigma)
+                    * self._noise(step, at, site, index, rows).astype(error.dtype)
+                    for at, (error, site) in enumerate(zip(errors, sites, strict=True))], None
+
+        errors, _ = jax.lax.scan(draw, [jnp.zeros(site.shape, at_least_fp32(site.dtype)) for site in sites],
+                                 jnp.arange(self.draws))
+        gradients: dict[Path, jax.Array] = {}
         for site, error in zip(sites, errors, strict=True):
-            for name, value in self._reassembled(variables, site, error / self.draws).items():
-                where = ("params", *site.path, name)
+            for name, value in self._reassembled(flat, site, error / self.draws).items():
+                where = (*site.path, name)
                 gradients[where] = value + gradients[where] if where in gradients else value
         return gradients
 
     @staticmethod
-    def _reassembled(variables, site: Site, error: jax.Array) -> dict[str, jax.Array]:
-        """A site's parameters' gradient from its output's estimated error, as backpropagation forms it."""
-        held = _flat(variables["params"])
+    def _reassembled(flat: dict[Path, jax.Array], site: Site, error: jax.Array) -> dict[str, jax.Array]:
+        """A site's trained parameters' gradient from its output's estimated error, as backpropagation forms
+        it: none for a module whose weights are not trained (a frozen base under an adapter)."""
         if site.kind == "dense":
-            kernel = held[(*site.path, "kernel")]
-            # The input is [*units, *read], the error [*units, *written] and the kernel [*read, *written]: the
-            # units' axes, which the input and the error share, are summed over.
-            leading = (site.inputs.ndim + error.ndim - kernel.ndim) // 2
-            letters = "abcdefghijklmnopqrstuvwxyz"
-            units, read = letters[:leading], letters[leading:site.inputs.ndim]
-            written = letters[site.inputs.ndim:site.inputs.ndim + error.ndim - leading]
-            gradient = {"kernel": float32_einsum(f"{units}{read},{units}{written}->{read}{written}",
-                                                 site.inputs.astype(error.dtype), error).astype(kernel.dtype)}
-            if (*site.path, "bias") in held:
-                bias = held[(*site.path, "bias")]
+            if (*site.path, "kernel") not in flat:
+                return {}
+            kernel = flat[(*site.path, "kernel")]
+            # The input's free axes, in order, lead the output and the features follow; the kernel is the
+            # contracted axes, in the order the call names them, then the features (`lax.dot_general`).
+            letters = string.ascii_letters
+            rank = site.inputs.ndim
+            read = letters[:rank]
+            free = "".join(read[axis] for axis in range(rank) if axis not in site.contracted)
+            features = letters[rank:rank + error.ndim - len(free)]
+            gradient = {"kernel": float32_einsum(
+                f"{read},{free}{features}->{''.join(read[axis] for axis in site.contracted)}{features}",
+                site.inputs.astype(error.dtype), error).astype(kernel.dtype)}
+            if (*site.path, "bias") in flat:
+                bias = flat[(*site.path, "bias")]
                 gradient["bias"] = jnp.sum(error.reshape(-1, *bias.shape), 0).astype(bias.dtype)
             return gradient
-        table = held[(*site.path, "embedding")]
+        if (*site.path, "embedding") not in flat:
+            return {}
+        table = flat[(*site.path, "embedding")]
         if site.kind == "attend":
             return {"embedding": float32_einsum("...v,...d->vd", error,
                                                 site.inputs.astype(error.dtype)).astype(table.dtype)}
@@ -202,31 +318,33 @@ class NodePerturbation(Objective[Any, Any]):
             error.reshape(-1, table.shape[-1]))
         return {"embedding": rows.astype(table.dtype)}
 
-    def _remaining(self, variables, batch, step, gradients: dict[tuple[str, ...], jax.Array]) -> Variables:
+    def _remaining(self, estimating, variables, batch, step, cotangent, flat: dict[Path, jax.Array],
+                   gradients: dict[Path, jax.Array]) -> dict[Path, jax.Array]:
         """Every trained parameter's gradient: the sites', and two-sided weight-space evolution strategies'
-        for the parameters no site holds, rewarded by the units' summed loss."""
-        held = _flat({"params": variables["params"]})
-        others = [path for path in held if path not in gradients]
-        if others:
-            def total(point: dict) -> jax.Array:
-                moved = traverse_util.unflatten_dict({**held, **point})
-                return jnp.sum(self.units({**variables, **moved}, batch, step))
+        for the parameters no site holds, rewarded by the statistics' whole change, the update's draws."""
+        others = [path for path in flat if path not in gradients]
+        if not others:
+            return gradients
+        key = self._update_key(step, "node-perturbation/weights")
 
-            def draw(sums, key):
-                noise = {path: jax.random.normal(jax.random.fold_in(key, index), held[path].shape,
-                                                 jnp.result_type(held[path], jnp.float32))
-                         for index, path in enumerate(others)}
+        def noise(index: int, draw: jax.Array) -> jax.Array:
+            drawn = jax.random.normal(jax.random.fold_in(jax.random.fold_in(key, index), draw),
+                                      flat[others[index]].shape, NOISE)
+            return drawn.astype(flat[others[index]].dtype)
 
-                def at(sign: float) -> dict:
-                    return {path: held[path] + sign * self.weight_sigma * noise[path] for path in others}
-                change = (total(at(1.0)) - total(at(-1.0))) / (2 * self.weight_sigma)
-                return {path: sums[path] + change * noise[path] for path in others}, None
+        def moved(sign: float, draw: jax.Array):
+            point = {path: flat[path] + jnp.asarray(sign * self.weight_sigma, flat[path].dtype)
+                     * noise(index, draw) for index, path in enumerate(others)}
+            params = jax.tree_util.tree_map_with_path(
+                lambda path, leaf: point.get(tuple(entry.key for entry in path), leaf), variables["params"])
+            return estimating._statistics_and_shares({**variables, "params": params}, batch, step)
 
-            keys = jax.random.split(jax.random.fold_in(step.key, 0xE5), self.weight_draws)
-            zeros = {path: jnp.zeros(held[path].shape, jnp.result_type(held[path], jnp.float32))
-                     for path in others}
-            sums, _ = jax.lax.scan(draw, zeros, keys)
-            gradients = {**gradients, **{path: (sums[path] / self.weight_draws).astype(held[path].dtype)
-                                         for path in others}}
-        return traverse_util.unflatten_dict(gradients)["params"]
+        def draw(sums, index):
+            whole, _, _ = self._rewards(moved(1.0, index), moved(-1.0, index), cotangent)
+            return [total + jnp.asarray(whole, total.dtype) / (2 * self.weight_sigma)
+                    * noise(at, index).astype(total.dtype) for at, total in enumerate(sums)], None
 
+        sums, _ = jax.lax.scan(draw, [jnp.zeros(flat[path].shape, at_least_fp32(flat[path].dtype))
+                                      for path in others], jnp.arange(self.weight_draws))
+        return {**gradients, **{path: total / self.weight_draws for path, total in zip(others, sums,
+                                                                                         strict=True)}}

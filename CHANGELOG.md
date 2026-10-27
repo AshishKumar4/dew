@@ -5,12 +5,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
-- `dew.io.promote` publishes a run only where it ranks among its sweep's or project's best by a summary
-  metric, aliased "best" in the registry where it ranks first; `trainer.promote` names the rule for a
-  configured run. `dew.pipeline("wandb:...")` loads a published run from a W&B run or the registry.
+- `dew.io.promote` publishes a run only where it ranks among its sweep's or project's best by a finite
+  summary metric, into a registry collection the sweep shares, and keeps that collection's "best" alias on
+  its best version; `trainer.promote` names the rule and the collection for a configured run. `dew.pipeline("wandb:...")` loads a published run from a W&B run or the registry.
 - `NodePerturbation`, mixed into an objective, trains its model without backpropagation, by node
-  perturbation of every Dense and Embed output as Dust does, the rest by weight-space evolution
-  strategies; `Objective.unit_losses` states the units it credits.
+  perturbation of every Dense, DenseGeneral and Embed output as Dust does, the rest by weight-space
+  evolution strategies, pooled over a split or accumulated update as its gradient is;
+  `Objective.scored_units` states the units it credits.
 - `Residuals` objectives train on the mean square of their residuals, by the gradient or by damped
   Gauss-Newton; `dew.nn.fourier.FourierPyramid` is a multi-resolution Fourier feature pyramid;
   `examples/pinn_burgers.py` solves the self-similar Burgers profile in float64.

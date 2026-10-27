@@ -467,7 +467,8 @@ class TrainerConfig:
     """Publish the final checkpoint to W&B; requires `wandb` and `checkpoint_final`."""
     promote: Promotion | None = None
     """Publish the final checkpoint to W&B only where the run ranks among its sweep's or project's best by
-    a summary metric, "best" in the registry where it ranks first (`dew.io.promote`); requires `wandb` and
+    a summary metric, into the registry collection the promotion names, which every run of a sweep
+    shares, its "best" alias on the collection's best version (`dew.io.promote`); requires `wandb` and
     `checkpoint_final`, and takes the place of `publish`."""
     multi_host: bool | None = None
     """Whether to join the JAX process pool.
@@ -1432,9 +1433,9 @@ class RunConfig:
                 step = checkpoints.path(int(state.step))
                 if trainer.publish and wandb_tracker is not None:
                     dew.io.publish(step, _artifact_name(name), tracker=wandb_tracker)
-                if trainer.promote is not None and wandb_tracker is not None:
-                    dew.io.promote(step, _artifact_name(name), tracker=wandb_tracker,
-                                   **dataclasses.asdict(trainer.promote))
+                if (rule := trainer.promote) is not None and wandb_tracker is not None:
+                    dew.io.promote(step, rule.collection, tracker=wandb_tracker, metric=rule.metric,
+                                   mode=rule.mode, top=rule.top)
 
             agreed("checkpoint publishing", publish_checkpoint)
             return state

@@ -3,10 +3,17 @@
 The estimate is the loss's gradient in expectation where the loss is quadratic in each layer's output
 and every unit's loss reads its own output alone: an antithetic pair's reward is then exactly the
 derivative along its jitter. Over many independent steps' keys, the estimates are the gradient JAX
-computes in expectation: a t-test rejects in no coordinate. A run trains with no
-derivative of its model taken, which a layer that refuses its backward proves, and a model whose
-layers are mapped hides their calls from the capture and is refused.
+computes in expectation, whatever layout a dense call contracts and in bfloat16 sites as in float32:
+Student's t-test rejects in no coordinate. A language model's estimate is its configured objective's,
+a z-loss among its terms, and a routed decoder's statistics take theirs. An update read in two
+microbatches estimates what its batch whole does, each example's jitter its own. A run trains with no
+derivative of its model taken, a batch norm's statistics kept as the clean loss keeps them, a
+rematerialized decoder estimated as its unrolled twin is, and a model whose layers are mapped is refused.
+The estimator's settings are its constructor's, which a run's record holds.
 """
+
+import dataclasses
+import json
 
 import jax
 import jax.numpy as jnp
@@ -17,28 +24,30 @@ from flax import linen as nn
 from reference_error import as_given, assert_as_exact, seeds_for
 from scipy import stats
 
+from dew.config import ObjectiveConfig
 from dew.data import Memory
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.objectives.perturbation import NodePerturbation
-from dew.objectives.supervised import Supervised
+from dew.objectives.routing import ExpertBalance
+from dew.objectives.supervised import CrossEntropy, Supervised
 from dew.training import Layout, Trainer
 
 LAYOUT = Layout(min_shard=1, tolerance=1.0)
-INPUTS = InputSpec(Field("x", (3,)))
+ESTIMATES = 256
+"""Independent steps' estimates a test of the estimator's expectation averages."""
 
 
 def squared(outputs, batch):
-    """Each example's squared error against its target."""
-    return jnp.sum(jnp.square(outputs - batch["y"]), -1)
+    """Each example's squared error against its target, averaged over any axes between."""
+    return jnp.sum(jnp.square(outputs.astype(jnp.float32) - batch["y"]), -1)
 
 
 class Forward(NodePerturbation, Supervised):
-    """`Supervised` trained by node perturbation, 64 pairs a step."""
-
-    draws = 64
+    """`Supervised` trained by node perturbation."""
 
 
 @jax.custom_vjp
@@ -58,83 +67,284 @@ forward_only.defvjp(_refused, _backward)
 
 
 class Linear(nn.Module):
-    """Two Dense layers with no nonlinearity between them, and a scale no Dense holds; with
-    `refuse_backward`, a model whose derivative raises."""
+    """Two Dense layers with no nonlinearity between them, and a scale no Dense holds, computed in
+    `dtype`; with `refuse_backward`, a model whose derivative raises."""
 
     refuse_backward: bool = False
+    dtype: jnp.dtype | None = None
 
     @nn.compact
     def __call__(self, x):
-        hidden = nn.Dense(4)(x)
-        out = nn.Dense(2)(hidden) * self.param("scale", nn.initializers.ones, ())
+        hidden = nn.Dense(4, dtype=self.dtype)(x)
+        out = nn.Dense(2, dtype=self.dtype)(hidden) * self.param("scale", nn.initializers.ones, ())
         return forward_only(out) if self.refuse_backward else out
 
 
 class General(nn.Module):
-    """A DenseGeneral to two heads of three, then one that contracts both axes, as attention's projections
-    are laid out, and a scale no layer holds."""
+    """Two DenseGeneral layers: the first contracts the input axes `axis` names, which need be neither
+    trailing nor in order, the second the rest, and a scale no layer holds."""
+
+    axis: tuple[int, ...]
 
     @nn.compact
     def __call__(self, x):
-        heads = nn.DenseGeneral((2, 3))(x)
-        return nn.DenseGeneral(2, axis=(-2, -1))(heads) * self.param("scale", nn.initializers.ones, ())
+        first = nn.DenseGeneral(4, axis=self.axis)(x)
+        rest = tuple(range(-first.ndim + 1, 0))
+        return nn.DenseGeneral(2, axis=rest)(first) * self.param("scale", nn.initializers.ones, ())
 
 
-SITES = {"dense": (Linear, ("Dense_0", "Dense_1")),
-         "dense-general": (General, ("DenseGeneral_0", "DenseGeneral_1"))}
+SITES = {
+    "dense": (Linear, (3,), ("Dense_0", "Dense_1")),
+    "bfloat16-sites": (lambda: Linear(dtype=jnp.bfloat16), (3,), ("Dense_0", "Dense_1")),
+    "trailing-general": (lambda: General(axis=(-2, -1)), (3, 5), ("DenseGeneral_0", "DenseGeneral_1")),
+    "inner-axis-general": (lambda: General(axis=(1,)), (3, 5, 2), ("DenseGeneral_0", "DenseGeneral_1")),
+    "reordered-general": (lambda: General(axis=(3, 1)), (3, 5, 2), ("DenseGeneral_0", "DenseGeneral_1")),
+}
+"""Each model the expectation test estimates, its per-example input shape and its dense layers."""
 
 
-def rows(seed: int = 0) -> dict[str, np.ndarray]:
-    generator = np.random.default_rng(seed)
-    x = generator.normal(size=(16, 3)).astype(np.float32)
-    return {"x": x, "y": (x @ generator.normal(size=(3, 2))).astype(np.float32)}
+def rows(sample: tuple[int, ...], seed: int = 0, count: int = 16) -> dict[str, np.ndarray]:
+    """`count` examples of `sample`'s shape and a target of two features each."""
+    generator = np.random.default_rng([0x50, seed])
+    x = generator.normal(size=(count, *sample)).astype(np.float32)
+    return {"x": x, "y": generator.normal(size=(count, 2)).astype(np.float32)}
+
+
+def gradient(objective, variables, batch, key) -> dict:
+    """The derivative of the objective's reduced loss in its trained parameters, as the trainer asks for
+    it of one microbatch: the estimate, for a perturbing objective."""
+    step = Step(jnp.asarray(0), key, None)
+
+    def reduced(params):
+        loss = objective.loss({**variables, "params": params}, batch, step)
+        return objective.reduce_loss(loss[0] if isinstance(loss, tuple) else loss)[0]
+
+    return jax.grad(reduced)(variables["params"])
+
+
+def estimated(objective, variables, batch) -> dict:
+    """`ESTIMATES` independent steps' estimates, stacked on a leading axis."""
+    keys = jax.random.split(jax.random.key(1), ESTIMATES)
+    return jax.vmap(jax.jit(lambda key: gradient(objective, variables, batch, key)))(keys)
+
+
+def rejected(drawn, exact) -> float:
+    """The least p-value of Student's one-sample t-test of the draws against `exact`, coordinate by
+    coordinate: a correct estimator's falls below one in a billion in no coordinate."""
+    return float(stats.ttest_1samp(np.asarray(drawn, np.float64), np.asarray(exact, np.float64)).pvalue.min())
 
 
 @pytest.mark.parametrize("layers", sorted(SITES))
 def test_the_estimate_is_the_gradient_in_expectation(layers):
-    """Over 256 steps' keys, each estimate of 64 antithetic pairs, the estimates of two Dense layers'
-    kernels and biases, or of two DenseGeneral layers' laid out as attention's projections are, and of the
-    scale weight-space jitters estimate, are `jax.grad`'s in expectation: Student's t-test does not reject
-    at one in a billion in any coordinate."""
-    model, names = SITES[layers]
-    objective = Forward(model(), squared, inputs=INPUTS)
+    """Over 256 steps' keys, each estimate of 64 antithetic pairs, the estimates of two dense layers'
+    kernels and biases, whatever input axes a DenseGeneral contracts and in whatever order, and of the
+    scale weight-space jitters estimate, are `jax.grad`'s in expectation, in bfloat16 sites as in float32
+    ones (each jitter drawn once and cast, the cast draw both jittering and credited): the t-test does not
+    reject at one in a billion in any coordinate."""
+    model, sample, names = SITES[layers]
+    objective = Forward(model(), squared, inputs=InputSpec(Field("x", sample)), draws=64)
+    plain = Supervised(model(), squared, inputs=InputSpec(Field("x", sample)))
     variables = objective.init(jax.random.key(0))
-    batch = {name: jnp.asarray(value) for name, value in rows().items()}
-
-    def estimate(key):
-        return objective.estimate(variables, batch, Step(jnp.asarray(0), key, None))
-
-    estimates = jax.vmap(jax.jit(estimate))(jax.random.split(jax.random.key(1), 256))
-
-    def summed(params):
-        return jnp.sum(squared(objective.model.apply({"params": params}, batch["x"]), batch))
-
-    truth = jax.grad(summed)(variables["params"])
+    batch = {name: jnp.asarray(value) for name, value in rows(sample).items()}
+    estimates = estimated(objective, variables, batch)
+    truth = gradient(plain, variables, batch, jax.random.key(0))
     for path in (*((name, leaf) for name in names for leaf in ("kernel", "bias")), ("scale",)):
         drawn, exact = estimates, truth
         for key in path:
             drawn, exact = drawn[key], exact[key]
-        # A one-sample t-test of the estimates against the gradient, coordinate by coordinate.
-        tested = stats.ttest_1samp(np.asarray(drawn, np.float64), np.asarray(exact, np.float64))
-        assert tested.pvalue.min() > 1e-9, path
+        assert rejected(drawn, exact) > 1e-9, path
+
+
+class TokenLocal(nn.Module):
+    """A language model each of whose next-token logits reads its own token alone, through an embedding,
+    a Dense layer and a Dense head, so a token's jitter changes its own loss alone."""
+
+    vocab_size: int = 13
+    max_seq_len: int = 8
+
+    @nn.compact
+    def logits(self, tokens, *, train: bool = False, **fields):
+        hidden = nn.tanh(nn.Dense(8)(nn.Embed(self.vocab_size, 8)(tokens)))
+        return nn.Dense(self.vocab_size)(hidden).astype(jnp.float32)
+
+    def __call__(self, tokens, train: bool = False, **fields):
+        return self.logits(tokens, train=train)
+
+
+class ForwardLM(NodePerturbation, LMObjective):
+    """A language model trained by node perturbation."""
+
+
+def text(seed: int = 0) -> dict[str, jax.Array]:
+    """Eight rows of seven ids, two of each row's last targets padding."""
+    tokens = np.random.default_rng([0x10, seed]).integers(1, 13, (8, 7)).astype(np.int32)
+    tokens[:, -2:] = 0
+    return {"text": jnp.asarray(tokens)}
+
+
+def test_a_language_models_estimate_is_its_configured_objectives():
+    """A language model of a z-loss of 0.5 and a pad id, every token's loss its own token's: the
+    estimates of its embedding, layer and head are its configured objective's gradient in expectation
+    (the t-test rejects in no coordinate), and the z-loss reaches them: the gradient without it is
+    rejected in some coordinate of the head."""
+    model = TokenLocal()
+    objective = ForwardLM(model, seq_len=6, z_loss=0.5, pad_id=0, draws=64, sigma=0.05)
+    variables = objective.init(jax.random.key(0))
+    batch = text()
+    estimates = estimated(objective, variables, batch)
+    truth = gradient(LMObjective(model, seq_len=6, z_loss=0.5, pad_id=0), variables, batch, jax.random.key(0))
+    without = gradient(LMObjective(model, seq_len=6, pad_id=0), variables, batch, jax.random.key(0))
+    for name, leaf in (("Embed_0", "embedding"), ("Dense_0", "kernel"), ("Dense_0", "bias"),
+                       ("Dense_1", "kernel"), ("Dense_1", "bias")):
+        assert rejected(estimates[name][leaf], truth[name][leaf]) > 1e-9, (name, leaf)
+    assert rejected(estimates["Dense_1"]["bias"], without["Dense_1"]["bias"]) < 1e-9
+
+
+def test_a_routed_decoder_trains_its_composite_statistics_without_backpropagation():
+    """A decoder of four routed experts and an expert-balance term, whose statistics are a prediction's
+    and the routers' own: node perturbation estimates their derivative, the parameters' own tree, finite,
+    and a run trains two steps."""
+    model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2, num_kv_heads=1,
+                              mlp_features=32, max_seq_len=16, dtype="float32",
+                              mixture={"experts": 4, "top_k": 2, "bias": True})
+    objective = ForwardLM(model, seq_len=8, balance=ExpertBalance(balance_rate=0.01, aux_loss_alpha=0.001),
+                          draws=2)
+    variables = objective.init(jax.random.key(0))
+    batch = {"text": jnp.asarray(np.random.default_rng(5).integers(1, 32, (8, 9)), jnp.int32)}
+    estimate = jax.jit(lambda key: gradient(objective, variables, batch, key))(jax.random.key(1))
+    assert jax.tree.structure(estimate) == jax.tree.structure(variables["params"])
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(estimate))
+    rows = Memory([{"text": row} for row in np.asarray(batch["text"])]).repeat().batch(8)
+    state = Trainer(objective, optax.adam(1e-2), key=0, layout=LAYOUT).fit(rows, steps=2)
+    assert int(state.step) == 2
+
+
+def test_a_rematerialized_decoder_is_estimated_as_its_unrolled_twin():
+    """A decoder whose layers recompute everything in their backward (`remat="full"`) is estimated from
+    its forward alone, the remat a forward-only pass never needs left out, so its capture reads every
+    layer's input: the estimate is its unrolled twin's, bit for bit."""
+    def estimate(remat):
+        model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
+                                  mlp_features=32, max_seq_len=8, dtype="float32", remat=remat)
+        objective = ForwardLM(model, seq_len=6, draws=2)
+        variables = objective.init(jax.random.key(0))
+        return jax.jit(lambda key: gradient(objective, variables, text(), key))(jax.random.key(1))
+
+    for full, unrolled in zip(jax.tree.leaves(estimate(REMAT_POLICIES["full"])),
+                              jax.tree.leaves(estimate(None)), strict=True):
+        np.testing.assert_array_equal(np.asarray(full), np.asarray(unrolled))
+
+
+def pooled_estimate(objective, params, batch, parts: int) -> dict:
+    """The estimate of an update of `batch`'s rows read in `parts` microbatches, as the trainer pools
+    them: each example drawn by its place among the update's eight (`Step.example_index`), the parts'
+    statistics summed, and each part's pullback under the pooled reduction's cotangent, summed."""
+    count = len(batch["x"])
+    size, update = count // parts, jax.random.key(7)
+    pulled = []
+    for part in range(parts):
+        piece = jax.tree.map(lambda value, part=part: value[part * size:(part + 1) * size], batch)
+        step = Step(jnp.asarray(0), jax.random.key(part), None, example_key=update,
+                    example_index=jnp.arange(part * size, (part + 1) * size, dtype=jnp.int32),
+                    example_count=count)
+        pulled.append(jax.vjp(lambda trained, piece=piece, step=step:
+                              objective.loss({"params": trained}, piece, step)[0], params))
+    statistics = jax.tree.map(lambda *leaves: sum(leaves[1:], leaves[0]), *[stats for stats, _ in pulled])
+    _, back = jax.vjp(lambda pooled: objective.reduce_loss(pooled)[0], statistics)
+    (cotangent,) = back(jnp.ones((), jnp.result_type(statistics.total)))
+    gradients = [pullback(cotangent)[0] for _, pullback in pulled]
+    return jax.tree.map(lambda *leaves: sum(leaves[1:], leaves[0]), *gradients)
+
+
+def test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does():
+    """Eight examples read whole and in two microbatches of four, pooled as the trainer pools them: each
+    example jitters by its place among the update's examples, and its pullback reads the pooled
+    reduction, so the two estimates are on par, the split's from the whole's float64 estimate of the same
+    jitters (check 1). Drawn by the attempt's key, the halves would jitter otherwise."""
+    objective = Forward(Linear(), squared, inputs=InputSpec(Field("x", (3,))), draws=16)
+    params = objective.init(jax.random.key(0))["params"]
+
+    def draw(seed):
+        batch = rows((3,), seed, count=8)
+        return batch["x"], batch["y"]
+
+    def estimate(parts):
+        def run(x, y):
+            return pooled_estimate(objective, jax.tree.map(jnp.asarray, params), {"x": x, "y": y}, parts)
+        return as_given(jax.jit(run))
+
+    def truth(x, y):
+        with jax.enable_x64(new_val=True):
+            wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params)
+            return jax.tree.map(np.asarray, pooled_estimate(objective, wide, {"x": jnp.asarray(x),
+                                                                                "y": jnp.asarray(y)}, 1))
+
+    whole, split = estimate(1), estimate(2)
+    label = "node perturbation in two microbatches"
+    assert_as_exact(split, whole, draw, label, truth_fn=truth,
+                    seeds=seeds_for(whole, draw, label, truth_fn=truth, dew_fn=split))
 
 
 def test_a_run_trains_without_differentiating_its_model():
     """A run of a model whose backward raises trains by node perturbation for 40 steps, moving every
     parameter, the scale no Dense holds among them, where the same objective by backpropagation fails at
-    its first step: no derivative of the model is taken. (That the steps descend is the estimate's
-    expectation, held above.)"""
-    data = rows()
+    its first step: no derivative of the model is taken."""
+    data = rows((3,))
     batches = Memory([{"x": x, "y": y} for x, y in zip(data["x"], data["y"], strict=True)]).repeat().batch(16)
+    inputs = InputSpec(Field("x", (3,)))
     refusing = Linear(refuse_backward=True)
     with pytest.raises(RuntimeError):
-        Trainer(Supervised(refusing, squared, inputs=INPUTS), optax.sgd(0.01), key=0, layout=LAYOUT).fit(
+        Trainer(Supervised(refusing, squared, inputs=inputs), optax.sgd(0.01), key=0, layout=LAYOUT).fit(
             batches, steps=1)
-    objective = Forward(refusing, squared, inputs=INPUTS)
+    objective = Forward(refusing, squared, inputs=inputs)
     start = objective.init(jax.random.key(0))
     state = Trainer(objective, optax.sgd(0.01), key=0, layout=LAYOUT).fit(batches, steps=40)
     for moved, held in zip(jax.tree.leaves(state.variables), jax.tree.leaves(start), strict=True):
         assert not np.array_equal(np.asarray(moved), np.asarray(held))
+
+
+class Normed(nn.Module):
+    """A Dense layer, a batch norm and a classifier of three classes, its norm training under `train`."""
+
+    @nn.compact
+    def __call__(self, x, train: bool = False):
+        hidden = nn.BatchNorm(use_running_average=not train)(nn.Dense(4)(x))
+        return nn.Dense(3)(hidden)
+
+
+def labelled() -> Memory:
+    generator = np.random.default_rng(9)
+    x = generator.normal(size=(16, 3)).astype(np.float32)
+    return Memory([{"x": row, "label": np.int32(index % 3)} for index, row in enumerate(x)])
+
+
+def test_a_batch_norms_statistics_are_kept_as_the_clean_loss_keeps_them():
+    """A classifier with a batch norm, trained by node perturbation in its training mode: its jittered
+    passes open the norm's statistics as its loss opens them, and the step keeps the clean loss's, so
+    after one step they are backpropagation's, bit for bit, from the same first batch."""
+    def trained(objective_class):
+        objective = objective_class(Normed(), CrossEntropy(labels="label"),
+                                    inputs=InputSpec(Field("x", (3,))), mode="train")
+        return Trainer(objective, optax.sgd(0.01), key=0, layout=LAYOUT).fit(
+            labelled().repeat().batch(16), steps=1)
+
+    perturbed, backpropagated = trained(Forward), trained(Supervised)
+    for kept, expected in zip(jax.tree.leaves(perturbed.variables["batch_stats"]),
+                              jax.tree.leaves(backpropagated.variables["batch_stats"]), strict=True):
+        np.testing.assert_array_equal(np.asarray(kept), np.asarray(expected))
+
+
+def test_a_runs_record_holds_its_estimators_settings():
+    """A forward-only objective's draws and jitter scales are its constructor's arguments: a run's record
+    states the ones it sets, defaults the rest, and builds them again from its JSON."""
+    config = ObjectiveConfig("test_perturbation:Forward", {"loss": CrossEntropy(labels="label"),
+                                                           "inputs": InputSpec(Field("x", (3,))),
+                                                           "draws": 7, "sigma": 0.1})
+    again = ObjectiveConfig(**json.loads(json.dumps(dataclasses.asdict(config))))
+    assert again.defaults["weight_draws"] == 8 and again.defaults["weight_sigma"] == 0.03
+    built = again.build(model=Normed())
+    assert isinstance(built, Forward)
+    assert (built.draws, built.sigma, built.weight_draws, built.weight_sigma) == (7, 0.1, 8, 0.03)
 
 
 class Mapped(nn.Module):
@@ -148,67 +358,8 @@ class Mapped(nn.Module):
 def test_a_model_that_maps_its_layers_is_refused():
     """A Dense under `nn.vmap` is called inside the map, where a capture outside cannot read it: the
     estimate is refused, naming the unrolled model it needs."""
-    objective = Forward(Mapped(), squared, inputs=INPUTS)
+    objective = Forward(Mapped(), squared, inputs=InputSpec(Field("x", (3,))))
     variables = objective.init(jax.random.key(0))
-    batch = {name: jnp.asarray(value) for name, value in rows().items()}
+    batch = {name: jnp.asarray(value) for name, value in rows((3,)).items()}
     with pytest.raises(ValueError):
-        objective.estimate(variables, batch, Step(jnp.asarray(0), jax.random.key(0), None))
-
-
-def test_a_language_models_units_are_its_tokens_next_token_losses():
-    """A decoder's unit losses are each target's next-token cross entropy from its own logits, zero at a
-    pad target: on par with optax's float32 cross entropy of the same logits, from their float64 one
-    (check 1)."""
-    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                              mlp_features=32, max_seq_len=8, dtype="float32")
-    objective = LMObjective(model, seq_len=6, pad_id=0)
-    variables = objective.init(jax.random.key(0))
-
-    def draw(seed):
-        tokens = np.random.default_rng([0x10, seed]).integers(1, 13, (4, 7)).astype(np.int32)
-        tokens[:, -2:] = 0  # each row ends in padding, whose targets count nothing
-        return (tokens,)
-
-    def dews(tokens):
-        step = Step(jnp.asarray(0), jax.random.key(0), None)
-        return objective.unit_losses(variables, {"text": tokens}, step)
-
-    def logits(tokens):
-        return model.apply(variables, jnp.asarray(tokens[:, :-1]))
-
-    @jax.jit
-    def optaxs(tokens):
-        losses = optax.losses.softmax_cross_entropy_with_integer_labels(logits(tokens), tokens[:, 1:])
-        return jnp.where(tokens[:, 1:] == 0, 0, losses)
-
-    def exact(tokens):
-        wide, targets = np.asarray(logits(tokens), np.float64), tokens[:, 1:]
-        shifted = wide - wide.max(-1, keepdims=True)
-        losses = np.log(np.exp(shifted).sum(-1)) - np.take_along_axis(shifted, targets[..., None], -1)[..., 0]
-        return np.where(targets == 0, 0.0, losses)
-
-    label = "lm unit losses"
-    truth = as_given(exact)
-    assert_as_exact(jax.jit(dews), optaxs, draw, label, seeds=seeds_for(optaxs, draw, label, truth_fn=truth),
-                    truth_fn=truth)
-
-
-class ForwardLM(NodePerturbation, LMObjective):
-    """A language model trained by node perturbation, two pairs a step."""
-
-    draws = 2
-
-
-def test_a_decoder_trains_without_backpropagation_every_parameter_estimated():
-    """A one-layer decoder trained by node perturbation for three steps moves every parameter: its
-    embedding, attention and MLP projections and head by their outputs' jitters, its norms' scales by
-    weight-space jitters."""
-    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                              mlp_features=32, max_seq_len=8, dtype="float32", tie_embeddings=False)
-    rows = (np.arange(16 * 7, dtype=np.int32) % 13).reshape(16, 7)
-    batches = Memory([{"text": row} for row in rows]).repeat().batch(8)
-    objective = ForwardLM(model, seq_len=6)
-    start = objective.init(jax.random.key(0))
-    state = Trainer(objective, optax.adam(1e-2), key=0, layout=LAYOUT).fit(batches, steps=3)
-    for moved, held in zip(jax.tree.leaves(state.variables), jax.tree.leaves(start), strict=True):
-        assert not np.array_equal(np.asarray(moved), np.asarray(held))
+        gradient(objective, variables, batch, jax.random.key(0))

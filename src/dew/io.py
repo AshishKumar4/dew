@@ -10,10 +10,12 @@ or the registry, which `dew.pipeline("wandb:...")` loads in one call.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Mapping, Sequence
 from typing import Literal
 
 import jax
+import numpy as np
 from etils import epath
 
 from dew.checkpoints import frozen_entries, is_uri
@@ -23,7 +25,7 @@ REGISTRY = "wandb-registry-model"
 
 
 def publish(directory: str, name: str, *, tracker: WandbTracker,
-            aliases: Sequence[str] = ()):
+            aliases: Sequence[str] = (), metadata: Mapping[str, object] | None = None):
     """Log the checkpoint step directory at `directory` as a model artifact of
     the tracker's run, laid out as its run directory is, and link it into the
     W&B model registry under `name`.
@@ -34,7 +36,8 @@ def publish(directory: str, name: str, *, tracker: WandbTracker,
     `dew.checkpoints.FROZEN_STORE` entries the step records, each at its place
     in the run directory, so a download is a run directory `from_run` and
     `Checkpoints.restore` read. The artifact carries 'latest' and `aliases`;
-    the registry link carries `aliases`.
+    the registry link carries `aliases`, and the artifact `metadata`, which a registry's versions are
+    ranked by (`promote`).
 
     Only process zero publishes, and it returns None everywhere else: every
     process holds the same checkpoint, so a second upload would duplicate
@@ -49,7 +52,7 @@ def publish(directory: str, name: str, *, tracker: WandbTracker,
 
     import wandb
 
-    artifact = wandb.Artifact(name=name, type="model")
+    artifact = wandb.Artifact(name=name, type="model", metadata=dict(metadata or {}))
     path = epath.Path(directory)
     run = path.parent
     files = sorted((entry for entry in run.iterdir() if entry.is_file()), key=lambda entry: entry.name)
@@ -72,12 +75,33 @@ def publish(directory: str, name: str, *, tracker: WandbTracker,
     return logged
 
 
+BEST = "best"
+"""The alias a registry collection's best version holds (`promote`)."""
+
+
+def scored(value: float | int | str | None) -> float | None:
+    """`value` as a score a ranking reads, None where it is none: a NaN, an infinity, or no number (a
+    summary's number, a NumPy scalar among them)."""
+    if isinstance(value, bool) or not isinstance(value, int | float | np.integer | np.floating):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def score_of(run, metric: str) -> float:
+    """A ranked run's finite score (`ranked` keeps no other)."""
+    value = scored(run.summary.get(metric))
+    assert value is not None, "a ranked run holds a finite score"
+    return value
+
+
 def ranked(run, metric: str, *, mode: Literal["min", "max"],
            filters: Mapping[str, object] | None = None) -> list:
     """The other finished and running W&B runs `run` is compared with, best first by the `metric` their
-    summaries hold, those that hold none left out: the runs of its sweep where it is one's, else those of
-    its project that W&B's run `filters` select (a MongoDB-style query, `{"config.dataset": "flowers"}`,
-    as `wandb.Api().runs` reads it). `mode` is "min" where lower is better."""
+    summaries hold, those that hold no finite score left out (`scored`): the runs of its sweep where it is
+    one's, else those of its project that W&B's run `filters` select (a MongoDB-style query,
+    `{"config.dataset": "flowers"}`, as `wandb.Api().runs` reads it). `mode` is "min" where lower is
+    better."""
     import wandb
 
     api = wandb.Api()
@@ -87,16 +111,19 @@ def ranked(run, metric: str, *, mode: Literal["min", "max"],
     path = f"{run.entity}/{run.project}"
     others = (api.sweep(f"{path}/{sweep}").runs if sweep is not None
               else api.runs(path, filters=None if filters is None else dict(filters)))
-    scored = [other for other in others if other.id != run.id and metric in other.summary]
-    return sorted(scored, key=lambda other: other.summary[metric], reverse=mode == "max")
+    held = [other for other in others if other.id != run.id and scored(other.summary.get(metric)) is not None]
+    return sorted(held, key=lambda other: score_of(other, metric), reverse=mode == "max")
 
 
 @dataclasses.dataclass(frozen=True)
 class Promotion:
     """What a configured run is ranked by before it publishes (`promote`): its summary's `metric`, lower
-    better under "min", among the best `top` of its sweep's or project's runs."""
+    better under "min", among the best `top` of its sweep's or project's runs, published into the registry
+    collection `collection`, which every run of the sweep shares, so its `best` alias follows the sweep's
+    winner (`dew.pipeline("wandb:wandb-registry-model/<collection>:best")`)."""
 
     metric: str
+    collection: str
     mode: Literal["min", "max"] = "min"
     top: int = 5
 
@@ -105,27 +132,58 @@ class Promotion:
             raise ValueError(f"a promotion ranks a run among the best top, at least one; got {self.top}")
 
 
+def crowned(name: str, metric: str, *, mode: Literal["min", "max"]):
+    """The version of the registry collection `name` that holds `BEST`, once it is the collection's best
+    by the `metric` its versions' metadata records (`publish`), the earliest of a tie, a version of no
+    finite score never. Each promoter moves the alias where it reads it misplaced and reads the collection
+    again, until it reads it in place: whoever moves it last reads every version linked before, and a
+    version linked after is its own promoter's to read, so no stale ranking holds the alias at the end,
+    however promoters of one collection interleave."""
+    import wandb
+
+    def score(version) -> float:
+        value = scored(version.metadata.get(metric))
+        assert value is not None, "a version without a score is never ranked"
+        return value if mode == "min" else -value
+
+    while True:
+        versions = [version for version in wandb.Api().artifacts("model", f"{REGISTRY}/{name}")
+                    if scored(version.metadata.get(metric)) is not None]
+        if not versions:
+            return None
+        best = min(versions, key=lambda version: (score(version), int(version.version.removeprefix("v"))))
+        if BEST in best.aliases:
+            return best
+        best.aliases.append(BEST)
+        best.save()
+
+
 def promote(directory: str, name: str, *, tracker: WandbTracker, metric: str,
             mode: Literal["min", "max"] = "min", top: int = 5,
             filters: Mapping[str, object] | None = None):
-    """Publish the checkpoint step at `directory` as `name` (`publish`) where the tracker's run ranks among
-    the best `top` of the runs it is compared with (`ranked`) by its summary's `metric`, aliased "best" in
-    the registry where it ranks first, as FlaxDiff's trainer promoted its sweeps' runs. A run tied with
-    another ranks below it, so a promotion needs a strictly better score. Returns the logged artifact, or
-    None where the run ranks below the best `top`, which publishes nothing and leaves the checkpoint where
-    it is; only process zero compares and publishes, and it returns None everywhere else."""
-    Promotion(metric, mode, top)
+    """Publish the checkpoint step at `directory` into the registry collection `name` (`publish`), its
+    score recorded as its metadata, where the tracker's run ranks among the best `top` of the runs it is
+    compared with (`ranked`) by its summary's `metric`, as FlaxDiff's trainer promoted its sweeps' runs, and
+    move the collection's `BEST` alias to its best version (`crowned`). A run tied with another ranks
+    below it, so a promotion needs a strictly better score. Returns the logged artifact, or None where the
+    run ranks below the best `top`, which publishes nothing and leaves the checkpoint where it is; only
+    process zero compares and publishes, and it returns None everywhere else. Raises ValueError for a run
+    whose summary holds no finite score: a diverged run never takes the alias."""
+    Promotion(metric, name, mode, top)
     if jax.process_index() != 0:
         return None
     run = tracker.run
-    if metric not in run.summary:
-        raise ValueError(f"the run's summary holds no {metric!r} to rank it by; log it before promoting")
-    value = run.summary[metric]
+    value = scored(run.summary.get(metric))
+    if value is None:
+        raise ValueError(f"the run's summary holds no finite {metric!r} to rank it by, "
+                         f"{run.summary.get(metric)!r}; log one before promoting")
     better = (lambda score: score <= value) if mode == "min" else (lambda score: score >= value)
-    ahead = sum(better(other.summary[metric]) for other in ranked(run, metric, mode=mode, filters=filters))
+    ahead = sum(better(score_of(other, metric)) for other in ranked(run, metric, mode=mode, filters=filters))
     if ahead >= top:
         return None
-    return publish(directory, name, tracker=tracker, aliases=("best",) if ahead == 0 else ())
+    logged = publish(directory, name, tracker=tracker, metadata={metric: value})
+    crowned(name, metric, mode=mode)
+    return logged
 
 
 def downloaded(reference: str, *, root: str | None = None) -> str:

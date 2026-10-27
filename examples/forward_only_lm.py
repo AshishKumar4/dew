@@ -100,8 +100,8 @@ def main(config: Config) -> dict:
     decoder = model(config.smoke)
     seq_len = decoder.max_seq_len
     if config.method == "perturbation":
-        objective = ForwardLM(decoder, seq_len=seq_len)
-        objective.draws, objective.sigma = (2 if config.smoke else config.draws), config.sigma
+        objective = ForwardLM(decoder, seq_len=seq_len, draws=2 if config.smoke else config.draws,
+                              sigma=config.sigma)
         rate = config.lr
     elif config.method == "backprop":
         objective, rate = LMObjective(decoder, seq_len=seq_len), config.backprop_lr

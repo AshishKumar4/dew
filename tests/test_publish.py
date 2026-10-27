@@ -6,6 +6,7 @@ it happens once per run, not once per process, and a checkpoint directory
 that is a bucket URI is referenced, not uploaded, with the run spec beside it.
 """
 
+import dataclasses
 import shutil
 import sys
 import types
@@ -195,13 +196,56 @@ def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_pat
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
 
 
-class RankedRun(Run):
-    """A W&B run as `promote` reads it: where it lives, its summary and, in a sweep, the sweep's id."""
+class Version:
+    """A version of a registry collection, as `wandb.Api().artifacts` lists it: its metadata, its name
+    within the collection and its aliases, which `save` writes back."""
 
-    def __init__(self, summary, *, sweep_id=None, id="current"):
+    def __init__(self, registry, artifact, version: int, aliases):
+        self.registry, self.artifact, self.metadata = registry, artifact, dict(artifact.metadata)
+        self.version, self.aliases = f"v{version}", list(aliases)
+
+    def save(self):
+        # The registry holds an alias on one version of a collection: saving it moves it here.
+        for other in self.registry.collection(self):
+            if other is not self:
+                other.aliases = [alias for alias in other.aliases if alias not in self.aliases]
+
+
+class Registry:
+    """W&B's model registry, its collections by path, each of the versions linked to it in order."""
+
+    def __init__(self):
+        self.collections: dict[str, list[Version]] = {}
+
+    def link(self, artifact, path, aliases):
+        versions = self.collections.setdefault(path, [])
+        version = Version(self, artifact, len(versions), aliases)
+        versions.append(version)
+        version.save()
+
+    def collection(self, version):
+        return next(versions for versions in self.collections.values() if version in versions)
+
+    def best(self, path):
+        """The metadata of the one version of `path` that holds the best alias."""
+        (holder,) = [version for version in self.collections[path] if "best" in version.aliases]
+        return holder.metadata
+
+
+class RankedRun(Run):
+    """A W&B run as `promote` reads it: where it lives, its summary and, in a sweep, the sweep's id;
+    what it links reaches `registry`."""
+
+    def __init__(self, summary, *, sweep_id=None, id="current", registry=None):
         super().__init__()
         self.summary, self.sweep_id, self.id = summary, sweep_id, id
         self.entity, self.project = "team", "flowers"
+        self.registry = registry
+
+    def link_artifact(self, artifact, target_path, aliases):
+        super().link_artifact(artifact, target_path, aliases)
+        if self.registry is not None:
+            self.registry.link(artifact, target_path, aliases)
 
 
 class Other:
@@ -215,9 +259,13 @@ class Api:
     """`wandb.Api`, holding the project's runs, a sweep's and the artifacts published, by their paths:
     what `ranked` lists and what `downloaded` fetches, each download wandb's own (`downloaded`)."""
 
-    def __init__(self, project, sweeps, published, target):
+    def __init__(self, project, sweeps, published, target, registry=None):
         self.project, self.sweeps, self.published, self.target = project, sweeps, published, target
+        self.registry = Registry() if registry is None else registry
         self.asked = []
+
+    def artifacts(self, type, path):
+        return list(self.registry.collections.get(path, []))
 
     def runs(self, path, filters=None):
         self.asked.append(("runs", path, filters))
@@ -242,29 +290,17 @@ class Api:
         return types.SimpleNamespace(type=logged.type, download=download)
 
 
-def test_a_sweeps_best_run_is_promoted_to_the_registry_and_loads_in_one_call_from_it(tmp_path, monkeypatch):
-    """FlaxDiff's W&B workflow on a tiny LM run. `promote` ranks the run by its summary's metric among
-    the best three of its project's runs (those whose summary holds the metric) or of its sweep's: ranked
-    first it publishes, aliased "best" in the registry; second, it publishes with no alias; past the
-    third, or tied with the third, it publishes nothing. A configured run's `trainer.promote` names the
-    rule and requires its W&B sink. `dew.pipeline("wandb:...")` then loads the promoted run in one call,
-    from the registry by its alias and from the W&B run by its path, as the task the run directory itself
-    loads: its continuation is the run's, token for token."""
+def tiny_run(tmp_path):
+    """A tiny LM run's directory, trained two steps, and the step it ended on."""
     import numpy as np
     import optax
-    import wandb as library
 
-    import dew
-    from dew.config import TrainerConfig
     from dew.data import Loading, Memory
     from dew.data.compile import compile
-    from dew.io import Promotion
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
-    from dew.sampling import Sampling
-    from dew.training import Trainer, Wandb
+    from dew.training import Trainer
 
-    monkeypatch.setenv("WANDB_MODE", "offline")
     model = CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                               max_seq_len=16, dtype="float32", attention_impl="xla")
     rows = [{"text": (np.arange(9, dtype=np.int32) + index) % 16} for index in range(8)]
@@ -274,35 +310,51 @@ def test_a_sweeps_best_run_is_promoted_to_the_registry_and_loads_in_one_call_fro
         compile(Memory(rows).shuffle(0).repeat().batch(8), read="memory",
                 loading=Loading(workers=0, threads=1, read_buffer=1)), steps=2, log_every=100)
     checkpoints.wait()
-    step = checkpoints.path(2)
+    return run, checkpoints.path(2)
+
+
+def test_a_sweeps_best_run_is_promoted_to_the_registry_and_loads_in_one_call_from_it(tmp_path, monkeypatch):
+    """FlaxDiff's W&B workflow on a tiny LM run. `promote` ranks the run by its summary's metric among
+    the best three of its project's runs (those whose summary holds a finite score) or of its sweep's:
+    within the three it publishes into the registry collection, its score its metadata, and the
+    collection's best alias rests on its best version; past the third, or tied with the third, it
+    publishes nothing. `dew.pipeline("wandb:...")` then loads the promoted run in one call, from the
+    registry by its alias and from the W&B run by its path, as the task the run directory itself loads:
+    its continuation is the run's, token for token."""
+    import numpy as np
+    import wandb as library
+
+    import dew
+    from dew.sampling import Sampling
+
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    run, step = tiny_run(tmp_path)
     project = [Other("a", {"val/loss": 1.0}), Other("b", {"val/loss": 2.0}), Other("c", {"val/loss": 3.0}),
-               Other("d", {}), Other("current", {"val/loss": 0.1})]
+               Other("d", {}), Other("e", {"val/loss": float("nan")}), Other("current", {"val/loss": 0.1})]
     published = {}
     api = Api(project, {"team/flowers/sweep": project[1:3]}, published, tmp_path / "download")
     monkeypatch.setattr(library, "Api", lambda: api)
 
     def promoted(value, *, sweep_id=None, top=3):
         tracker = Tracker()
-        tracker.run = RankedRun({"val/loss": value}, sweep_id=sweep_id)
+        tracker.run = RankedRun({"val/loss": value}, sweep_id=sweep_id, registry=api.registry)
         logged = dew.io.promote(str(step), "tiny", tracker=tracker, metric="val/loss", top=top)
         return logged, tracker.run.linked
 
     first, linked = promoted(0.5)
-    assert isinstance(first, library.Artifact) and linked == [(first, "wandb-registry-model/tiny", ("best",))]
+    assert isinstance(first, library.Artifact) and linked == [(first, "wandb-registry-model/tiny", ())]
+    assert api.registry.best("wandb-registry-model/tiny") == {"val/loss": 0.5}
     second, linked = promoted(1.5)
     assert second is not None and linked == [(second, "wandb-registry-model/tiny", ())]
+    assert api.registry.best("wandb-registry-model/tiny") == {"val/loss": 0.5}
     assert promoted(2.5, top=2) == (None, []) and promoted(3.0) == (None, [])
     assert api.asked[-1] == ("runs", "team/flowers", None)
     # In a sweep the run is ranked among the sweep's runs alone, ahead of both.
-    swept, linked = promoted(1.5, sweep_id="sweep", top=1)
-    assert swept is not None and linked[0][2] == ("best",)
-    assert api.asked[-1] == ("sweep", "team/flowers/sweep")
-    with pytest.raises(ValueError):
-        TrainerConfig(steps=1, promote=Promotion("val/loss"))
-    configured = TrainerConfig(steps=1, wandb=Wandb(project="flowers"), promote=Promotion("val/loss", top=2))
-    assert configured.promote == Promotion("val/loss", top=2)
+    swept, _ = promoted(0.25, sweep_id="sweep", top=1)
+    assert swept is not None and api.asked[-1] == ("sweep", "team/flowers/sweep")
+    assert api.registry.best("wandb-registry-model/tiny") == {"val/loss": 0.25}
 
-    published.update({("wandb-registry-model/tiny", "best"): first, "team/flowers/current": [first]})
+    published.update({("wandb-registry-model/tiny", "best"): swept, "team/flowers/current": [swept]})
     prompt = np.arange(1, 5, dtype=np.int32)[None, :]
     greedy = Sampling(temperature=0)
     own = dew.pipeline(str(run))(prompt, 4, key=0, sampling=greedy).tokens
@@ -311,3 +363,109 @@ def test_a_sweeps_best_run_is_promoted_to_the_registry_and_loads_in_one_call_fro
         loaded = dew.pipeline(source)
         np.testing.assert_array_equal(np.asarray(loaded(prompt, 4, key=0, sampling=greedy).tokens),
                                       np.asarray(own))
+
+
+@pytest.mark.parametrize("mode", ["min", "max"])
+def test_a_run_of_no_finite_score_is_never_promoted(tmp_path, monkeypatch, mode):
+    """A diverged run, its summary's score NaN or infinite, is refused before it publishes, in either
+    ranking mode, and a competitor of no finite score ranks nowhere: the registry's best stays the
+    finite run's."""
+    import wandb as library
+
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    _, step = tiny_run(tmp_path)
+    api = Api([Other("diverged", {"val/loss": float("nan")})], {}, {}, tmp_path / "download")
+    monkeypatch.setattr(library, "Api", lambda: api)
+
+    def promoted(value):
+        tracker = Tracker()
+        tracker.run = RankedRun({"val/loss": value}, registry=api.registry)
+        return dew.io.promote(str(step), "tiny", tracker=tracker, metric="val/loss", mode=mode, top=1)
+
+    assert promoted(2.0) is not None
+    for broken in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError):
+            promoted(broken)
+    assert api.registry.best("wandb-registry-model/tiny") == {"val/loss": 2.0}
+    assert len(api.registry.collections["wandb-registry-model/tiny"]) == 1
+
+
+class SlowRun(RankedRun):
+    """A run whose registry link waits on `meanwhile`, which runs before the link lands: another
+    promoter's whole promotion, between this one's ranking and its link."""
+
+    def __init__(self, summary, *, meanwhile, **fields):
+        super().__init__(summary, **fields)
+        self.meanwhile = meanwhile
+
+    def link_artifact(self, artifact, target_path, aliases):
+        self.meanwhile()
+        super().link_artifact(artifact, target_path, aliases)
+
+
+def test_promoters_that_interleave_leave_the_best_alias_on_the_best_version(tmp_path, monkeypatch):
+    """Two runs promoting into one collection, the first ranked best before the second exists and slow
+    to link, so the second ranks, publishes and moves the alias in between: the first, finishing on its
+    stale ranking, reads the collection again and leaves the alias where the better score holds it.
+    Assigning it from the first's ranking would take it from the better run."""
+    import wandb as library
+
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    _, step = tiny_run(tmp_path)
+    api = Api([], {}, {}, tmp_path / "download")
+    monkeypatch.setattr(library, "Api", lambda: api)
+
+    def promoted(run):
+        tracker = Tracker()
+        tracker.run = run
+        return dew.io.promote(str(step), "shared", tracker=tracker, metric="val/loss", top=3)
+
+    def fast():
+        assert promoted(RankedRun({"val/loss": 1.0}, id="fast", registry=api.registry)) is not None
+
+    assert promoted(SlowRun({"val/loss": 2.0}, id="slow", registry=api.registry, meanwhile=fast)) is not None
+    assert len(api.registry.collections["wandb-registry-model/shared"]) == 2
+    assert api.registry.best("wandb-registry-model/shared") == {"val/loss": 1.0}
+
+
+def test_a_sweeps_configured_trials_promote_into_their_shared_collection(tmp_path, monkeypatch):
+    """Two trials of a sweep, each a run of its own name and directory, configured to promote into one
+    registry collection (`Promotion.collection`): the second, better than the first, takes the
+    collection's best alias, which a downstream `dew.pipeline` follows. A promotion with no W&B sink is
+    refused."""
+    import autoencoder_experiment
+    import wandb as library
+
+    from dew.config import TrainerConfig
+    from dew.io import Promotion
+    from dew.training import Wandb
+
+    with pytest.raises(ValueError):
+        TrainerConfig(steps=1, promote=Promotion("trial/score", "flowers"))
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    project: list = []
+    api = Api(project, {}, {}, tmp_path / "download")
+    monkeypatch.setattr(library, "Api", lambda: api)
+
+    class Trial(TrackedRun):
+        def __init__(self, name, score):
+            super().__init__()
+            self.summary = {"trial/score": score}
+            self.id, self.sweep_id, self.entity, self.project = name, None, "team", "flowers"
+
+        def link_artifact(self, artifact, target_path, aliases):
+            super().link_artifact(artifact, target_path, aliases)
+            api.registry.link(artifact, target_path, aliases)
+
+    built = autoencoder_experiment.run()
+    for name, score in (("trial-0", 2.0), ("trial-1", 1.0)):
+        trial = Trial(name, score)
+        monkeypatch.setattr(library, "init", lambda trial=trial, **_: trial)
+        trainer = dataclasses.replace(built.trainer, name=name, steps=2, checkpoint_every=None,
+                                      checkpoint_final=True, checkpoint_dir=str(tmp_path / "runs"),
+                                      wandb=Wandb(project="flowers", offline=True),
+                                      promote=Promotion("trial/score", "flowers"))
+        dataclasses.replace(built, trainer=trainer, validation=None).run()
+        project.append(Other(name, {"trial/score": score}))
+    assert len(api.registry.collections["wandb-registry-model/flowers"]) == 2
+    assert api.registry.best("wandb-registry-model/flowers") == {"trial/score": 1.0}
