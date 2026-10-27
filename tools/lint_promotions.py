@@ -136,8 +136,9 @@ class _File:
                 return ast.dump(node.test)
             return None
         called = self.resolved(node.func) if isinstance(node, ast.Call) else ""
-        if called in self.defined:
-            called = f"{self.name}.{called}"
+        own = isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in self.defined
+        if not called and own:
+            called = f"{self.name}.{node.func.id}"
         return "" if any(called == path or called.endswith("." + path) for path in WIDE) else None
 
     def built_wide(self, node: ast.AST) -> bool:
