@@ -27,6 +27,7 @@ rounding into a whole step's difference.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import types
@@ -35,6 +36,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from reference_source import fetched, stub_torch_utils
+from torch_precision import float64
 
 COMMIT = "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc"
 SOURCE = f"https://raw.githubusercontent.com/NVlabs/edm2/{COMMIT}/training/networks_edm2.py"
@@ -51,8 +53,11 @@ CONFIG = {"img_resolution": 8, "img_channels": 3, "label_dim": 4, "model_channel
 def networks(dtype: str) -> types.ModuleType:
     """The published module, with the two `torch_utils` names it imports,
     computing in `dtype`: float32 as published, and its float64 twin with the
-    float32 casts it makes retargeted, whose distance from the first is the
-    rounding error a float32 evaluation makes."""
+    float32 casts it makes retargeted (its norms' `vector_norm(dtype=...)`
+    among them, which the shared `float64` context does not widen), whose
+    distance from the first is the rounding error a float32 evaluation makes.
+    The twin is built inside `float64`, so its constructor computes in
+    float64 too."""
     stub_torch_utils()
     module = types.ModuleType("networks_edm2")
     source = fetched(SOURCE)
@@ -68,7 +73,8 @@ def main() -> None:
         for value in net.parameters():
             if value.ndim == 0:
                 value.copy_(torch.randn(()) * 0.5 + 1.0)
-    exact = twin.UNet(**CONFIG).eval().double()
+    with float64():
+        exact = twin.UNet(**CONFIG).eval()
     exact.load_state_dict({name: value.double() for name, value in net.state_dict().items()})
     generator = torch.Generator().manual_seed(1)
     x, noise_labels, text = (torch.randn(*shape, generator=generator)
@@ -107,7 +113,8 @@ def train() -> None:
     for name, value in initial.state_dict().items():
         arrays[f"weights/{name}"] = value.numpy()
     for precision, module, dtype in (("fp32", published, torch.float32), ("fp64", twin, torch.float64)):
-        net = module.UNet(**CONFIG).train().to(dtype)
+        with float64() if dtype == torch.float64 else contextlib.nullcontext():
+            net = module.UNet(**CONFIG).train().to(dtype)
         net.load_state_dict({name: value.to(dtype) for name, value in initial.state_dict().items()})
         optimizer = torch.optim.SGD(net.parameters(), **SGD)
         labels = twin.normalize(text.double()).to(dtype) / np.sqrt(CONFIG["label_dim"])
