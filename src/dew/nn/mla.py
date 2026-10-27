@@ -705,7 +705,7 @@ class MultiHeadLatentAttention(nn.Module):
                 q_rot, rot,
                 positions if logical_positions is None else logical_positions)
             latent, rot = append(latent[:, :, None], rot[:, :, None])
-            latent, rot = append.plain(latent)[:, :, 0], rot[:, :, 0]
+            latent, rot = append.store.plain(latent)[:, :, 0], rot[:, :, 0]
             key, value = self._expand(latent, rot)
             mask = self._visible(positions, key.shape[1])
             query_basis = None

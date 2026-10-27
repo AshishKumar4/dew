@@ -413,6 +413,12 @@ class KVStore:
             grouped(pool, 1, groups), grouped(page, 0, groups), grouped(safe % size, 0, groups),
             grouped(values.astype(pool.dtype), 0, groups)).reshape(pool.shape)
 
+    def plain(self, keys: jax.Array) -> jax.Array:
+        """Return keys read back in the store's rotation `[..., head_dim]` in their own basis: for keys a
+        projection expands before any query meets them (a latent attention's latents), or that serve as
+        values too (DeepSeek V4's shared head), where no query is rotated into their basis."""
+        return keys if self.rotation is None else rotated(keys, self.rotation.T)
+
     def read(self) -> tuple[jax.Array, jax.Array]:
         return self._read("cached_key", "key_scale"), self._read("cached_value", "value_scale")
 
@@ -732,13 +738,6 @@ class Append:
         """Return `query` `[..., head_dim]` in the basis that the stored keys are in."""
         rotation = self.store.rotation
         return query if rotation is None else rotated(query, rotation)
-
-    def plain(self, keys: jax.Array) -> jax.Array:
-        """Return keys read back in the store's rotation `[..., head_dim]` in their own basis: for keys a
-        projection expands before any query meets them (a latent attention's latents), where `query`
-        has no query to rotate."""
-        rotation = self.store.rotation
-        return keys if rotation is None else rotated(keys, rotation.T)
 
     def places(self, places: jax.Array) -> jax.Array:
         """Store the call's token places beside its keys and return every slot's, `[rows, capacity]`.

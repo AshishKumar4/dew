@@ -62,7 +62,7 @@ from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.documents import document_mask
 from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
-from dew.nn.kv_cache import KVCache, cache_positions, cached_validity, open_kv_cache, write_cache
+from dew.nn.kv_cache import KVCache, KVStore, cache_positions, cached_validity, open_kv_cache, write_cache
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from dew.nn.mla import IndexerFront
 from dew.nn.precision import at_least_fp32, float32_dot_general
@@ -731,7 +731,7 @@ class DeepseekV4Attention(FakeQuantizing):
         if cache is not None and append is not None:
             slots = cache[0]
             stored, values = append(keys[:, :, None], keys[:, :, None])
-            keys, values = append.plain(stored)[:, :, 0], values[:, :, 0]
+            keys, values = append.store.plain(stored)[:, :, 0], values[:, :, 0]
             allowed = causal_attention_mask(
                 slots, keys.shape[1], self.sliding_window,
                 key_valid=cached_validity(self, keys.shape[1]))[:, 0]
@@ -818,16 +818,19 @@ class DSparkAttention(DeepseekV4Attention):
         main = store.get(DRAFT_CONTEXT)
         batch = x.shape[0]
         if decode:
-            cached_key = self.variable('cache', 'cached_key', jnp.zeros,
-                                       (batch, self.max_seq_len, self.head_dim), x.dtype)
+            # The target's context in the window cache's layout, one shared head as its keys and values;
+            # a call without context reads it and writes nothing.
+            held = KVStore.open(self, self.kv_cache, batch, self.max_seq_len, 1, self.head_dim, x.dtype)
             if main is not None:
                 slots, allocated = cache_positions(self, batch, main.shape[1], store.get(DRAFT_VALID))
                 if allocated:
-                    cached_key.value = write_cache(cached_key.value, self._window_keys(
+                    written = self._window_keys(
                         main, *rotary_freqs(slots, self.rope_dim, self.rope_theta, rope_scaling=self.yarn,
                                             dtype=at_least_fp32(main.dtype)),
-                        down_projection(main, self.head_dim)), slots)
-            main_keys = cached_key.value
+                        down_projection(main, self.head_dim))[:, :, None]
+                    held.write(written, written, slots)
+            main_keys, main_values = held.read()
+            main_keys, main_values = held.plain(main_keys)[:, :, 0], main_values[:, :, 0]
             last = jnp.asarray(self.get_variable('cache', 'cache_index')) - 1
             places, real = jnp.arange(main_keys.shape[1])[None], None
         elif main is None:
@@ -843,6 +846,7 @@ class DSparkAttention(DeepseekV4Attention):
                                                               rope_scaling=self.yarn,
                                                               dtype=at_least_fp32(main.dtype)),
                                           down_projection(main, self.head_dim))
+            main_values = main_keys
             last = jnp.broadcast_to(places[:, -1], (batch,))
         length = x.shape[1]
         if length == 0:
@@ -858,8 +862,10 @@ class DSparkAttention(DeepseekV4Attention):
         allowed = jnp.concatenate([
             jnp.broadcast_to(window[:, None], (batch, length, main_keys.shape[1])),
             jnp.ones((batch, length, length), bool)], axis=-1)
-        keys = jnp.concatenate([main_keys, self._window_keys(x, cos, sin, place)], axis=1)
-        return self._attend(query, keys, keys, allowed, cos, sin)
+        drafted = self._window_keys(x, cos, sin, place)
+        keys = jnp.concatenate([main_keys, drafted], axis=1)
+        values = jnp.concatenate([main_values, drafted], axis=1)
+        return self._attend(query, keys, values, allowed, cos, sin)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -920,10 +926,6 @@ class DeepseekV4Mixer(MixerBase):
             raise ValueError("a deepseek_v4 layer attends a sliding window, not a chunk")
         if ctx.kv_shared and self.compressor != 'csa2':
             raise ValueError("of the deepseek_v4 kinds only CSA2 shares its entries across layers")
-        if attention is DSparkAttention:
-            ctx.refuse("deepseek_v4", {"kv_cache": ctx.kv_cache != KVCache()},
-                       "a DSpark stage keeps the target's context in a window cache of its own, which "
-                       "takes no kv_cache layout")
         ctx.refuse("deepseek_v4", ctx.policies(),
                    "its attention keeps sinks of its own, softmaxes in fp32 and projects out through "
                    "grouped low-rank heads, without a softcap, value scale, bias or dropout")
@@ -952,7 +954,7 @@ class DeepseekV4Mixer(MixerBase):
             candidate_block_size=self.candidate_block_size,
             query_norm=self.query_norm,
             kv_qat=self.kv_qat,
-            **({} if attention is DSparkAttention else {"kv_cache": ctx.kv_cache}),
+            kv_cache=ctx.kv_cache,
             norm_eps=ctx.norm_eps,
             dtype=ctx.dtype,
             precision=ctx.precision)
