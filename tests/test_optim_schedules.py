@@ -24,12 +24,6 @@ EPOCHS, PER_EPOCH = 6, 2
 MOMENTUM = OneCycle(peak_value=0.85, init_value=0.95, end_value=0.95)
 """torch's Adam beta1 cycle under `OneCycleLR(cycle_momentum=True)`."""
 
-# float32 rounding of a value, two ulps of it. Near a cosine's end, where
-# `cos + 1` cancels, the error is instead an ulp or two of the peak, which
-# `atol` states per schedule as `ULPS * peak`. OneCycle pins its step to float32,
-# so its float64 run is float32's and the oracle rule cannot read it.
-SCHEDULE_RTOL = 2e-6
-ULPS = 2.4e-7
 WEIGHT_DECAY = 1e-2
 """The reference run's kernel decay (tools/torch_optim_reference.py)."""
 
@@ -50,18 +44,15 @@ def assert_torchs(schedule, steps: int, torch_values, label: str) -> None:
 
 
 def test_one_cycle_is_torchs_one_cycle_lr():
-    """Largest difference observed 4.8e-10 at a peak of 5e-3; the largest
-    relative one, 3.6e-6, is at the second-to-last step, where the cosine's
-    `cos + 1` cancels in float32."""
-    np.testing.assert_allclose(values(OneCycle(peak_value=5e-3), 40), TORCH["one_cycle/lr"],
-                               rtol=SCHEDULE_RTOL, atol=ULPS * 5e-3)
+    """Dew's one cycle at a peak of 5e-3, and one with its own start, end and
+    warmup share, is torch's OneCycleLR (`assert_torchs`)."""
+    assert_torchs(OneCycle(peak_value=5e-3), 40, TORCH["one_cycle/lr"], "one cycle")
     custom = OneCycle(peak_value=0.1, init_value=0.01, end_value=1e-4, warmup_fraction=0.25)
-    np.testing.assert_allclose(values(custom, 23), TORCH["one_cycle_custom/lr"],
-                               rtol=SCHEDULE_RTOL, atol=ULPS * 0.1)
+    assert_torchs(custom, 23, TORCH["one_cycle_custom/lr"], "a custom one cycle")
 
 
 def test_one_cycle_cycles_adams_b1_as_torch_does():
-    np.testing.assert_allclose(values(MOMENTUM, 40), TORCH["one_cycle/b1"], rtol=SCHEDULE_RTOL)
+    assert_torchs(MOMENTUM, 40, TORCH["one_cycle/b1"], "one cycle's b1")
 
 
 def test_exponential_is_torchs_exponential_lr_stepped_to_decay_steps_then_held():
@@ -79,9 +70,8 @@ def test_cosine_without_warmup_is_torchs_cosine_annealing():
 
 def test_every_holds_each_value_for_an_epoch_as_a_torch_scheduler_stepped_per_epoch():
     """A run of 40 epochs of 3 updates reads epoch e's value at each of its updates."""
-    held = values(OneCycle(peak_value=5e-3, every=3), 40 * 3)
-    np.testing.assert_allclose(held, np.repeat(TORCH["one_cycle/lr"], 3), rtol=SCHEDULE_RTOL,
-                               atol=ULPS * 5e-3)
+    assert_torchs(OneCycle(peak_value=5e-3, every=3), 40 * 3, np.repeat(TORCH["one_cycle/lr"], 3),
+                  "one cycle held three updates")
 
 
 def test_every_counts_the_schedules_fields_in_its_own_steps():
