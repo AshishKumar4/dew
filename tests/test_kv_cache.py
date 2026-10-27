@@ -47,8 +47,7 @@ class Holder(nn.Module):
         store = KVStore.open(self, self.layout, rows, tokens, heads, width, self.dtype,
                              keys_as_values=self.keys_as_values)
         if self.has_variable("cache", "written"):
-            store.write(key, None if self.keys_as_values else value,
-                        jnp.broadcast_to(jnp.arange(tokens), (rows, tokens)))
+            store.write(key, value, jnp.broadcast_to(jnp.arange(tokens), (rows, tokens)))
         self.variable("cache", "written", lambda: True)
         return store.read()
 
@@ -61,24 +60,27 @@ def stored(layout, keys, values=None, dtype=jnp.float32):
     return holder.apply({"cache": cache}, keys, values, mutable=["cache"])[0]
 
 
-@pytest.mark.parametrize("layout", [KVCache(), KVCache(page_size=4)], ids=["dense", "paged"])
-def test_a_head_that_serves_as_keys_and_values_is_kept_once(layout):
+@pytest.mark.parametrize(("layout", "once"), [(KVCache(), True), (KVCache(page_size=4), True),
+                                             (KVCache(quantized="float8_e4m3fn"), True),
+                                             (KVCache(quantized="int8"), False)],
+                         ids=["dense", "paged", "float8", "int8"])
+def test_a_head_that_serves_as_keys_and_values_is_kept_once_where_its_layout_stores_it_as_given(layout, once):
     """A store whose values are its keys (DeepSeek V4's window head and its drafter's context,
-    `keys_as_values`) reads back what a store holding the head twice reads, keys and values alike,
-    from half the bytes, where both were allocated and written (ledger 1921)."""
+    `keys_as_values`) reads back what a store holding the head twice reads, keys and values alike, and
+    holds fewer bytes where its layout stores keys as given, full precision or float8, where both were
+    allocated and written (ledger 1921); int8's keys are rotated, not the values' layout, so it keeps
+    both (`KVCache.key_rotation`)."""
     keys = jax.random.normal(jax.random.key(0), (2, 8, 1, 16))
 
     def kept(holder):
         cache = holder.init(jax.random.key(0), keys, keys)["cache"]
         read, written = holder.apply({"cache": cache}, keys, keys, mutable=["cache"])
-        payload = sum(written["cache"][name].nbytes for name in ("cached_key", "cached_value")
-                      if name in written["cache"])
-        return read, payload
+        return read, sum(leaf.nbytes for leaf in jax.tree.leaves(written))
 
-    (once, once_bytes), (twice, twice_bytes) = (kept(Holder(layout, keys_as_values=shared))
-                                                for shared in (True, False))
-    jax.tree.map(np.testing.assert_array_equal, once, twice)
-    assert 2 * once_bytes == twice_bytes
+    (shared, shared_bytes), (separate, separate_bytes) = (kept(Holder(layout, keys_as_values=flag))
+                                                         for flag in (True, False))
+    jax.tree.map(np.testing.assert_array_equal, shared, separate)
+    assert (shared_bytes < separate_bytes) == once and shared_bytes <= separate_bytes
 
 
 def outlier_keys(seed=0):

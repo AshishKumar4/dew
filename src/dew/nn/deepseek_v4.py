@@ -733,7 +733,8 @@ class DeepseekV4Attention(FakeQuantizing):
         cache = None
         append = None
         if decode:
-            # The window's shared key head is the attention cache's keys and its values, one head kept once.
+            # The window's shared key head is the attention cache's keys and its values, one head, kept once
+            # where the layout stores it as given (`keys_as_values`).
             shape = jax.ShapeDtypeStruct((batch, length, 1, self.head_dim), x.dtype)
             slots, append = open_kv_cache(self, shape, self.max_seq_len, valid=valid, layout=self.kv_cache,
                                           keys_as_values=True)
@@ -765,9 +766,8 @@ class DeepseekV4Attention(FakeQuantizing):
         values = keys
         if cache is not None and append is not None:
             slots = cache[0]
-            # Read back in its own basis, the head is the keys and the values both.
-            _, values = append(keys[:, :, None], None)
-            keys = values = values[:, :, 0]
+            stored, values = append(keys[:, :, None], keys[:, :, None])
+            keys, values = append.store.plain(stored)[:, :, 0], values[:, :, 0]
             allowed = causal_attention_mask(
                 slots, keys.shape[1], self.sliding_window,
                 key_valid=cached_validity(self, keys.shape[1]))[:, 0]
@@ -858,8 +858,9 @@ class DSparkAttention(DeepseekV4Attention):
         main = store.get(DRAFT_CONTEXT)
         batch = x.shape[0]
         if decode:
-            # The target's context in the window cache's layout, one shared head kept once as its keys and
-            # values; a call without context reads it and writes nothing.
+            # The target's context in the window cache's layout, one shared head as its keys and values,
+            # kept once where the layout stores it as given; a call without context reads it and writes
+            # nothing.
             held = KVStore.open(self, self.kv_cache, batch, self.max_seq_len, 1, self.head_dim, x.dtype,
                                 keys_as_values=True)
             if main is not None:
@@ -869,9 +870,9 @@ class DSparkAttention(DeepseekV4Attention):
                         main, *rotary_freqs(slots, self.rope_dim, self.rope_theta,
                                             rope_scaling=self.rope_scaling, dtype=at_least_fp32(main.dtype)),
                         down_projection(main, self.head_dim))[:, :, None]
-                    held.write(written, None, slots)
-            _, main_values = held.read()
-            main_keys = main_values = main_values[:, :, 0]
+                    held.write(written, written, slots)
+            main_keys, main_values = held.read()
+            main_keys, main_values = held.plain(main_keys)[:, :, 0], main_values[:, :, 0]
             last = jnp.asarray(self.get_variable('cache', 'cache_index')) - 1
             places, real = jnp.arange(main_keys.shape[1])[None], None
         elif main is None:

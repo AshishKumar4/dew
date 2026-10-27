@@ -305,8 +305,9 @@ class KVStore:
     dequantized and with the keys in the stored rotation. A slot that no token
     has reached holds whatever its page last held, and the caller's validity
     mask excludes it. A store whose values are its keys (`keys_as_values`, a
-    head that serves as both) keeps them once and reads its values back as the
-    keys in their own basis (`plain`).
+    head that serves as both) keeps them once where its keys are stored as
+    given, with no rotation, and reads them back as its values; a rotated
+    layout's keys are not its values' layout, so it keeps both.
     """
 
     module: nn.Module
@@ -324,14 +325,16 @@ class KVStore:
         """Declare the module's cache variables, allocating them on first use, and return the store.
 
         Values are `value_dim` wide, None for the keys' `head_dim`, or are the keys themselves where
-        `keys_as_values`, which allocates no storage of their own. `places`
+        `keys_as_values` and the layout stores keys as given (no rotation), which allocates no storage
+        of their own. `places`
         also keeps each token's place beside its key (`Append.places`), and
         `groups` each token's group of the fields it names (`GROUPS`,
         `Append.groups`), -1 where none has been written. A paged
         layout raises `ValueError` when `capacity` is not a multiple of
         `page_size`, or when `rows` does not split into the pool's groups.
         """
-        store = cls(module, layout, rows, kv_heads, head_dim, jnp.dtype(dtype), keys_as_values)
+        once = keys_as_values and layout.key_rotation(head_dim) is None
+        store = cls(module, layout, rows, kv_heads, head_dim, jnp.dtype(dtype), once)
         layout.key_rotation(head_dim)
         storage = layout.storage(dtype)
         if layout.page_size is None:
@@ -361,8 +364,8 @@ class KVStore:
 
     @property
     def payloads(self) -> tuple[tuple[str, str], ...]:
-        """The leaves the store keeps, each beside its scale's: the keys', and the values' unless they are
-        the keys (`keys_as_values`)."""
+        """The leaves the store keeps, each beside its scale's: the keys', and the values' unless the keys
+        serve as them, stored as given (`keys_as_values`)."""
         keys, values = ("cached_key", "key_scale"), ("cached_value", "value_scale")
         return (keys,) if self.keys_as_values else (keys, values)
 
@@ -376,8 +379,8 @@ class KVStore:
     def _put(self, name: str, value: jax.Array) -> None:
         self.module.put_variable("cache", name, value)
 
-    def write(self, key: jax.Array, value: jax.Array | None, positions: jax.Array) -> None:
-        """Store `key` and `value` at `positions`; a store whose values are its keys takes no `value`."""
+    def write(self, key: jax.Array, value: jax.Array, positions: jax.Array) -> None:
+        """Store `key` and `value` at `positions`, `value` once where it is the keys (`payloads`)."""
         rotation = self.rotation
         if rotation is not None:
             key = rotated(key, rotation)
@@ -431,7 +434,7 @@ class KVStore:
 
     def read(self) -> tuple[jax.Array, jax.Array]:
         keys = self._read("cached_key", "key_scale")
-        return keys, self.plain(keys) if self.keys_as_values else self._read("cached_value", "value_scale")
+        return keys, keys if self.keys_as_values else self._read("cached_value", "value_scale")
 
     def write_places(self, places: jax.Array, positions: jax.Array) -> None:
         """Keep the tokens' `places` `[rows, tokens]` at their slots `positions`, where their keys go."""
@@ -543,7 +546,8 @@ class KVStore:
 
         given = () if starts is None else (starts,)
         sunk = () if sinks is None else (sinks,)
-        arrays = (query, self._get("cached_key"), self._get("cached_value"), lengths, self._get(TABLE),
+        pools = [self._get(name) for name, _ in self.payloads]
+        arrays = (query, pools[0], pools[-1], lengths, self._get(TABLE),
                   *given, *sunk)
         queries = logical_spec(DECODE_QUERY, query.shape)
         # A spec leaves off trailing whole dimensions.
@@ -741,7 +745,7 @@ class Append:
     positions: jax.Array
     allocated: bool
 
-    def __call__(self, key: jax.Array, value: jax.Array | None) -> tuple[jax.Array, jax.Array]:
+    def __call__(self, key: jax.Array, value: jax.Array) -> tuple[jax.Array, jax.Array]:
         if self.allocated:
             self.store.write(key, value, self.positions)
         return self.store.read()
