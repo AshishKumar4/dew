@@ -161,3 +161,21 @@ def test_a_reload_under_concurrent_requests_pairs_each_answer_with_one_tasks_wei
     for body, response in answered:
         assert response.status_code == 200
         assert response.json() == json.loads(json.dumps(alone[response.json()["model"]].systemone(body)))
+
+
+def test_the_served_weights_are_restored_in_the_dtype_they_serve_in(example):
+    """The endpoint restores a task's weights in the dtype it serves in unless told another, so a run
+    trained in float32 takes the memory it is served in (ledger 1889): its leaves' dtypes are a
+    bfloat16 load's, and a stated storage dtype holds."""
+    import jax
+
+    def dtypes(decide):
+        return jax.tree.map(lambda leaf: leaf.dtype, decide.variables)
+
+    tiny = str(FIXTURES / "tiny")
+    served = example.loaded(example.Options(model=tiny, dtype="bfloat16"))
+    narrow = Decide.from_pretrained(tiny, dtype="bfloat16", param_dtype="bfloat16")
+    wide = Decide.from_pretrained(tiny, dtype="bfloat16", param_dtype="float32")
+    assert dtypes(served) == dtypes(narrow) != dtypes(wide)
+    stated = example.loaded(example.Options(model=tiny, dtype="bfloat16", param_dtype="float32"))
+    assert dtypes(stated) == dtypes(wide)
