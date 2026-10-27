@@ -201,3 +201,18 @@ def test_a_measure_is_finite_where_the_evidence_is_finite_even_past_float64s_lar
     pooled = pooled_zero_rows([rows, rows])
     assert pooled and all(np.isfinite(value) for row in pooled for value in row[1:]), pooled
 
+
+def test_a_worse_row_past_float64s_largest_quotient_measures_larger():
+    """A row's error over its size is judged and measured by its log (`_log_over`), so two quotients
+    past float64's largest, 1e310 and 1e311, keep their order: a candidate ten times worse is not
+    matched to its parent's failure."""
+    from reference_error import rows_over
+
+    truth = np.asarray([[1e-160, 1e-160], [1e-148, 1e-148]])
+    reference = truth + np.asarray([[1e140, 1e140], [1e152, 1e152]])
+
+    def measure(error):
+        dew = truth + np.asarray([[error, error], [1e152, 1e152]])
+        return {rule: value for rule, value, _ in rows_over(dew, reference, truth)}["row"]
+
+    assert np.isfinite(measure(1e150)) and measure(1e151) > measure(1e150) + 2
