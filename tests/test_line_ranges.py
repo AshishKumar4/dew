@@ -11,6 +11,15 @@ import pytest
 from dew.data.sources import Files
 
 
+def test_an_empty_file_holds_no_range_beside_one_that_holds_records(tmp_path):
+    """An empty file is cut into no range, as a file of no bytes holds no record, and the store's
+    other file is cut into its own."""
+    (tmp_path / "empty.jsonl").write_text("")
+    (tmp_path / "rows.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(3)))
+    shards = Files(str(tmp_path), shard_bytes=10).manifest().shards
+    assert shards and all(shard.uri.endswith("rows.jsonl") for shard in shards)
+
+
 def test_a_files_byte_ranges_are_equal_and_never_shorter_than_its_shard_bytes(tmp_path):
     """A JSON-lines file is cut into equal ranges of at least shard_bytes, so no short tail range
     lies wholly inside the record that ends the file: 40 records of about 30 bytes cut at 100 bytes

@@ -716,8 +716,9 @@ class Files(Dataset):
                 # Equal ranges of at least `step` bytes, so no range is a short tail a record ending
                 # in it covers whole: a range holds a record's start unless a record is longer than
                 # it, which its reader refuses (`_LineIterator`).
+                # An empty file holds no range.
                 parts = max(1, size // step) if size else 0
-                cuts = [size * part // parts for part in range(parts + 1)]
+                cuts = [size * part // parts for part in range(parts + 1)] if parts else []
                 shards.extend(Shard(self._shard_id(number, url, start), url, start, stop)
                               for start, stop in itertools.pairwise(cuts))
         divisible = self.kind in ("jsonl", "text") and not any(
