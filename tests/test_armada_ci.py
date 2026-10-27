@@ -1412,8 +1412,9 @@ def proven_step(tmp_path: Path, ref: str, runs: str, statuses: str) -> str:
     (tmp_path / "statuses").write_text(statuses)
     output = tmp_path / "output"
     subprocess.run(["bash", "-c", step["run"]], check=True, capture_output=True, text=True,
-                   env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "RUNS": str(tmp_path / "runs"),
-                        "STATUSES": str(tmp_path / "statuses"), "GITHUB_OUTPUT": str(output),
+                   env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
+                        "RUNS": str(tmp_path / "runs"), "STATUSES": str(tmp_path / "statuses"),
+                        "GITHUB_OUTPUT": str(output),
                         "GITHUB_REPOSITORY": "AshishKumar4/dew", "GITHUB_SHA": "a" * 40, "GITHUB_REF": ref,
                         "GITHUB_SERVER_URL": "https://github.com", "WORKFLOW": "ci.yml"})
     return output.read_text().strip().removeprefix("run=")
