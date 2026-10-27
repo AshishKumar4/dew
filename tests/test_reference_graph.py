@@ -1,4 +1,4 @@
-"""The source-aware gate (tests/reference_error.py `assert_graph_as_exact`, src/dew/nn/kernels/graph.py):
+"""The source-aware gate (tests/reference_ensemble.py `assert_graph_as_exact`, src/dew/nn/kernels/graph.py):
 an RMS norm and dense attention as graphs of the values they round and hold, their backward from the
 common forward's saved values and a fixed cotangent, held node by node on common parents.
 
@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_graph_as_exact
+from reference_ensemble import assert_graph_as_exact
 
 from dew.nn.kernels.graph import Graph, Node, Pointwise, Sum
 
