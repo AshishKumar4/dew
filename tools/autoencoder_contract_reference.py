@@ -37,7 +37,7 @@ import torch
 from diffusers import AutoencoderKL
 from diffusers.models.autoencoders import vae as diffusers_vae
 from reference_source import saved_fixture
-from torch_precision import widened
+from torch_precision import float64_twin, widened
 
 ROOT = Path(__file__).resolve().parents[1]
 TINY = ROOT / "tests" / "fixtures" / "vae" / "sd3-tiny"
@@ -99,8 +99,9 @@ def main():
     arrays: dict[str, np.ndarray] = {"frames": frames, "moments": moments}
     with torch.no_grad():
         single = walk(model, frames, moments, torch.float32)
+        wide = float64_twin(model)
         with widened():
-            truth = walk(model, frames, moments, torch.float64)
+            truth = walk(wide, frames, moments, torch.float64)
     arrays.update({f"fp32.{key}": value for key, value in single.items()})
     arrays.update({f"fp64.{key}": value for key, value in truth.items()})
     meta = {"diffusers": __import__("diffusers").__version__, "torch": torch.__version__,

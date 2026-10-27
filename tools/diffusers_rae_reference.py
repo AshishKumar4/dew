@@ -171,6 +171,7 @@ def from_published(cls, repo: str, revision: str):
 
 def published(destination: str) -> None:
     from diffusers import AutoencoderRAE
+    from torch_precision import float64, float64_twin
 
     def walk(model, dtype):
         grid = model.config.encoder_input_size // model.config.encoder_patch_size
@@ -187,7 +188,9 @@ def published(destination: str) -> None:
     for name, (repo, revision) in PUBLISHED.items():
         model = from_published(AutoencoderRAE, repo, revision)
         single = walk(model, torch.float32)
-        exact = walk(model.double(), torch.float64)
+        # Built and run inside `float64`, so the decoder table its constructor recomputes is float64's.
+        with float64():
+            exact = walk(from_published(AutoencoderRAE, repo, revision), torch.float64)
         for key, value, rounded in zip(("latent", "pixels"), exact, single, strict=True):
             arrays[f"{name}.{key}"] = value
             arrays[f"{name}.{key}.float32_gap"] = np.float64(gap(rounded, value))
@@ -198,9 +201,11 @@ def published(destination: str) -> None:
     model = Dinov2Model.from_pretrained(DINOV2[0], revision=DINOV2[1]).eval()
     mean, std = (np.asarray(value, np.float32).reshape(1, 3, 1, 1) for value in IMAGENET)
     pixels = torch.from_numpy((smooth_image(224) - mean) / std)
+    wide = float64_twin(model)
     with torch.no_grad():
         single = model(pixels).last_hidden_state[:, 1:, :LATENT_CHANNELS].numpy()
-        exact = model.double()(pixels.double()).last_hidden_state[:, 1:, :LATENT_CHANNELS].numpy()
+        with float64():
+            exact = wide(pixels.double()).last_hidden_state[:, 1:, :LATENT_CHANNELS].numpy()
     arrays["dinov2_plain.tokens"] = exact
     arrays["dinov2_plain.tokens.float32_gap"] = np.float64(gap(single, exact))
     print("dinov2_plain", float(arrays["dinov2_plain.tokens.float32_gap"]))
