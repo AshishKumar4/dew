@@ -333,9 +333,9 @@ def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
 
 def _row_tokens(pipeline: Pipeline) -> int | None:
     """The tokens each row of `pipeline` holds, as its last record step or layout declaring them
-    states (`TokenGeometry`), or its corpora alike."""
+    states (`TokenGeometry`), a source that reads them laid out first, or its corpora alike."""
     steps = (stage.step if isinstance(stage, (Map, RandomMap)) else stage for stage in pipeline.stages)
-    declared = [step for step in steps if isinstance(step, TokenGeometry)]
+    declared = [step for step in (pipeline.source, *steps) if isinstance(step, TokenGeometry)]
     if declared:
         return declared[-1].max_length
     if nested := children(pipeline):
@@ -1076,8 +1076,10 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
     laid = max(layouts, default=0)
     at = laid + _until(pipeline.stages[laid:], boundary)
     suffix = pipeline.stages[at:]
-    # Rows the chain lays out hold the length it gives them, which the objective's geometry gives way to.
-    geometry = () if layouts or objective.geometry is None else (objective.geometry,)
+    # Rows the chain lays out hold the length it gives them, which the objective's geometry gives way to:
+    # a pack's or windows', or a source's that reads them laid out (a planned pack, a store's windows).
+    laid_out = layouts or isinstance(pipeline.source, TokenGeometry)
+    geometry = () if laid_out or objective.geometry is None else (objective.geometry,)
     pipeline = _objective_records(dataclasses.replace(pipeline, stages=pipeline.stages[:at]),
                                   (*(objective.train if train else objective.evaluate), *geometry))
     return dataclasses.replace(pipeline, stages=(*pipeline.stages, *suffix))
