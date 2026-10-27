@@ -47,6 +47,11 @@ Scope is per rule, because the rules are not all about the same thing:
 - SLOP021 is about every file: a private attribute of JAX's own objects
   (`JAX_PRIVATE`) is read nowhere (Dew reads no other library's private
   attributes), whose public way the finding names.
+- SLOP022 is about every file outside `src/<package>`, where the torch
+  float64 truths are: a torch module is never promoted to float64 after its
+  construction, which keeps what its constructor computed in float32; its
+  twin is built inside tools/torch_precision.py's `float64`
+  (`lint_promotions`).
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -92,6 +97,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import lint_promotions as promotion_rules
 import lint_scopes as scopes
 import lint_tolerances as tolerance_rules
 from forked import forked_map
@@ -2007,6 +2013,13 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
     yield from walked
 
 
+def promotions(module: Module) -> Iterator[Finding]:
+    """SLOP022: a torch module promoted to float64 after its construction (`promotion_rules`)."""
+    for call in promotion_rules.promotions(module.tree, _parent(module)):
+        yield Finding(module.relative, call.lineno, call.col_offset + 1, "SLOP022",
+                      promotion_rules.message(call))
+
+
 def _checkout(module: Module) -> Path:
     return Path(module.path.as_posix().removesuffix(module.relative))
 
@@ -2050,7 +2063,7 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
     `models`, the package's index, or this file's own without one."""
     rules = (*CONTRACT_RULES, *UNIVERSAL_RULES) if module.is_source else UNIVERSAL_RULES
     rules = (*rules, mocks, wording, skips) if module.relative.startswith("tests/") else (*rules, patches)
-    rules = (*rules, tolerances)
+    rules = (*rules, tolerances) if module.is_source else (*rules, tolerances, promotions)
     findings = [finding for rule in rules for finding in rule(module)]
     if module.is_source:
         findings += boundaries(module, models or ModelIndex.build([module]))
