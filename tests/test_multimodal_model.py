@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from reference_error import GateFailure, assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew.batch import coordinates
@@ -289,37 +290,15 @@ def test_gemma4_standardization_buffers_are_frozen_by_real_adamw_training(tmp_pa
 
 
 FAMILIES = {
-    # family: (references, checkpoint, forward error, pixel-gradient error, post-SGD error)
-    "gemma4": ("gemma4-native-tiny", "gemma4-native-tiny", 1.34e-5, 2.04e-6, 1.43e-5),
-    "qwen35": ("qwen35-native-tiny", "qwen35-native-tiny", 3.46e-5, 2.69e-6, 5.28e-5),
-    "llama4": ("llama4-native-tiny", "llama4-native-tiny", 6.76e-6, 5.4e-8, 1.22e-5),
+    "gemma4": ("gemma4-native-tiny", "gemma4-native-tiny"),
+    "qwen35": ("qwen35-native-tiny", "qwen35-native-tiny"),
+    "llama4": ("llama4-native-tiny", "llama4-native-tiny"),
     # Images and audio through the same prompt; the checkpoint and its
     # processor are the audio fixture's, the references sit beside them.
-    "gemma3n": ("gemma3n-native-tiny", "gemma-3n-audio-tiny", 1.95e-6, 2.39e-7, 2.31e-5),
+    "gemma3n": ("gemma3n-native-tiny", "gemma-3n-audio-tiny"),
 }
-ORDER_MARGIN = 3
-"""How many of the reference's own CUDA-vs-CPU spreads Dew's post-SGD logits
-may move by on another fp32 reduction order. The spread comes from the
-gradient, not the updated forward: Gemma 3n's vision tower scales each block
-by a per-channel layer-scale gamma, whose gradient sums over every spatial
-position with heavy cancellation, so the summation order moves those
-gradients by 2-4e-5 relative (stages_1.blocks_0's alone moves the updated
-logits 9.5e-5), while the updated forward itself moves 2.9e-6 across
-backends. The reference moves 7.5e-5 between its CPU and CUDA runs
-(post_sgd_spread.json, written by tools/multimodal_reference.py
-gemma3n-spread, TF32 off). The margin is chosen, not derived: Dew's XLA
-order moves the logits 1.68e-4 from Dew's CPU run, 2.2 spreads, measured on
-an RTX 4080 and an A100 (which agree to 2e-6); a TPU's order is unmeasured."""
-
-
-def _post_sgd_bound(family: str, directory: Path) -> float:
-    """The post-SGD logit bound: 1e-4 where the reference's order spread is
-    below the implementation error, else Dew's CPU error against the
-    reference plus ORDER_MARGIN of the reference's CUDA-vs-CPU spread."""
-    spread = directory / "post_sgd_spread.json"
-    if not spread.is_file():
-        return 1e-4
-    return FAMILIES[family][4] + ORDER_MARGIN * json.loads(spread.read_text())["cuda_vs_cpu"]
+"""Each family's directory of references, beside their float64 truths (tools/multimodal_reference.py
+float64), and the checkpoint they were written from."""
 
 
 def _one_layer_negated(gradient):
@@ -379,7 +358,7 @@ def _family(family: str):
     """A family's loaded checkpoint, its actual processor's inputs and its
     references' directory."""
     pytest.importorskip("torchvision", reason="the vision extra supplies the actual processors")
-    references, checkpoint, *_ = FAMILIES[family]
+    references, checkpoint = FAMILIES[family]
     directory = FIXTURE.parent / references
     source = FIXTURE.parent / checkpoint
     loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
@@ -509,21 +488,22 @@ def test_source_processor_forward_and_cached_generation_match_reference(family_s
     Gemma3n's MobileNet features, hard vocabulary ranges, fixed audio slots
     and per-layer input masking beside its conformer audio.
 
-    FP32 valid-logit errors are recorded in FAMILIES at tolerance 1e-4; each
-    family's characteristic slip must fail the same assertion.
+    The valid logits are as exact as the reference's (`assert_as_exact_as_the_reference`), the truth
+    its float64 twin's; each family's characteristic slip fails the same rule.
     """
     family, loaded, inputs, directory = family_source
     np.testing.assert_array_equal(inputs.tokens, np.load(directory / "input_ids.npy"))
     logits = jax.jit(lambda variables: loaded.model.apply(
         variables, inputs.tokens, **inputs.kwargs()))(loaded.variables)
     valid = np.asarray(inputs.token_fields["attention_mask"])
-    expected = np.load(directory / "logits.npy")
-    np.testing.assert_allclose(np.asarray(logits)[valid], expected[valid], atol=1e-4, rtol=0)
-    np.testing.assert_array_equal(np.asarray(logits)[valid].argmax(-1), expected[valid].argmax(-1))
+    expected, truth = np.load(directory / "logits.npy"), np.load(directory / "logits_f64.npy")
+    assert_as_exact_as_the_reference(np.asarray(logits)[valid], expected[valid], truth[valid],
+                                     f"{family} logits")
     wrong_inputs = _wrong_inputs(family, inputs)
     wrong = loaded.model.apply(loaded.variables, wrong_inputs.tokens, **wrong_inputs.kwargs())
-    with pytest.raises(AssertionError):
-        np.testing.assert_allclose(np.asarray(wrong)[valid], expected[valid], atol=1e-4, rtol=0)
+    with pytest.raises(GateFailure):
+        assert_as_exact_as_the_reference(np.asarray(wrong)[valid], expected[valid], truth[valid],
+                                         f"{family} logits of a slip")
     generated = loaded.text_generation()(inputs, 3, key=jax.random.key(1), sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(generated.tokens[:, -3:], np.load(directory / "continuation.npy"))
 
@@ -531,9 +511,11 @@ def test_source_processor_forward_and_cached_generation_match_reference(family_s
 def test_source_backward_trained_export_and_frozen_buffers_match_reference(family_source, tmp_path):
     """Loss, pixel gradient and all-parameter SGD against the reference backward.
 
-    Recorded errors are in FAMILIES; the post-SGD logits are held to
-    `_post_sgd_bound`, which must still fail one layer's gradient with its
-    sign flipped. The trained model exports under the
+    The loss, the pixel gradient and the post-SGD logits are each as exact as the
+    reference's (`assert_as_exact_as_the_reference`), the truth the reference's float64 twin taking
+    the same step, and the rule still fails one layer's gradient with its sign flipped. Whatever
+    order a backend sums Gemma 3n's layer-scale gradients in moves Dew's error and the reference's
+    alike, so no margin for it is chosen. The trained model exports under the
     source's tensor names and reloads to the reference's updated logits; every
     non-parameter collection (Gemma4's standardization and clipping buffers)
     survives training bitwise. Qwen3.5's root tie_word_embeddings=False
@@ -554,14 +536,18 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
     value, (gradient, pixels) = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))(
         loaded.variables["params"], inputs.conditioning["pixel_values"])
     expected = json.loads((directory / "training.json").read_text())
-    np.testing.assert_allclose(value, expected["loss"], atol=1e-5, rtol=0)
-    np.testing.assert_allclose(_real_pixels(inputs, pixels), np.load(directory / "pixel_gradient.npy"),
-                               atol=1e-5, rtol=1e-4)
+    truth = json.loads((directory / "training_f64.json").read_text())
+    assert_as_exact_as_the_reference(np.asarray(value), np.asarray(expected["loss"]),
+                                     np.asarray(truth["loss"]), f"{family} loss")
+    assert_as_exact_as_the_reference(_real_pixels(inputs, pixels),
+                                     np.load(directory / "pixel_gradient.npy"),
+                                     np.load(directory / "pixel_gradient_f64.npy"),
+                                     f"{family} pixel gradient")
     optimizer = optax.sgd(expected["learning_rate"])
     params = loaded.variables["params"]
     valid = np.asarray(inputs.token_fields["attention_mask"])
     reference = np.load(directory / "updated_logits.npy")[valid]
-    bound = _post_sgd_bound(family, directory)
+    updated = np.load(directory / "updated_logits_f64.npy")[valid]
 
     def trained(gradient, destination):
         updates, _ = optimizer.update(gradient, optimizer.init(params), params)
@@ -574,10 +560,11 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
         )[valid]
 
     restored, output = trained(gradient, tmp_path / "trained")
-    np.testing.assert_allclose(output, reference, atol=bound, rtol=0)
-    # The bound still catches one layer's gradient with its sign flipped.
+    assert_as_exact_as_the_reference(output, reference, updated, f"{family} post-SGD logits")
+    # The rule still catches one layer's gradient with its sign flipped.
     _, slipped = trained(_one_layer_negated(gradient), tmp_path / "slipped")
-    assert np.max(np.abs(slipped - reference)) > bound
+    with pytest.raises(GateFailure):
+        assert_as_exact_as_the_reference(slipped, reference, updated, f"{family} post-SGD logits of a slip")
     for collection, tree in restored.variables.items():
         if collection != "params":
             for actual, original in zip(jax.tree.leaves(tree),
