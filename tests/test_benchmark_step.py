@@ -116,6 +116,6 @@ def test_a_released_decoders_case_trains_its_committed_shape_under_the_optimizer
     assert (model.num_layers, model.loop.steps) == (released["num_hidden_layers"],
                                                     released["n_recurrent_loops"])
     moments = trainer.optimizer.init({"kernel": jnp.zeros((4, 4), jnp.float32)})
-    assert jnp.bfloat16 in {leaf.dtype for leaf in jax.tree.leaves(moments)}
+    assert jnp.dtype(jnp.bfloat16) in {leaf.dtype for leaf in jax.tree.leaves(moments)}
     row = tool.measure(case, config, None)
     assert row["finite"] and np.isfinite(row["loss"])
