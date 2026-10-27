@@ -131,7 +131,9 @@ def test_the_template_forward_stays_finite_under_aligned_keys_interpreted():
 
 @pytest.mark.parametrize('regime', REGIMES)
 def test_the_template_gradient_takes_the_fast_backward_where_its_launches_hold(regime):
-    """Off a GPU, the template's gradient over each regime's draw takes its fast backward, its launches held
-    at the call's derived tiles by the interpreted bundle (`fast_backward`)."""
+    """The template's gradient over each regime's draw takes its fast backward where its launches hold at the
+    call's derived tiles (`fast_backward`): off a GPU by the interpreted bundle, on a warpgroup-MMA GPU by
+    its own; on an mma.sync GPU they do not, and the port's gradient runs."""
     operands, _ = cotangents(HOOKS, regime, 0)
-    assert fast_backward(restarting(lambda given: given, regime)(bf16(operands)))
+    fast = generation.family(generation.device_generation()) != 'mma.sync'
+    assert fast_backward(restarting(lambda given: given, regime)(bf16(operands))) == fast
