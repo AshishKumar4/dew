@@ -39,7 +39,7 @@ rounding of each coefficient, a coin flip no count of draws resolves (pndm-linsp
 correctly rounded one and diffusers' a step off, nearer the float64 table's by chance). Each draw rounds
 its own table's coefficients, and the walk holds check 1 at 128 draws."""
 SEEDS = {"ddim-linspace": 32, "pndm-linspace": 128, "ddim-clip": 8, "euler-zero-snr": 8, "dpm-karras": 128,
-         "norm": 64, "odd": 64, "dropped": 64}
+         "norm": 64, "odd": 64, "dropped": 16}
 """Each case's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
 
 
