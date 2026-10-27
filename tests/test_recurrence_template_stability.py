@@ -137,3 +137,24 @@ def test_the_template_gradient_takes_the_fast_backward_where_its_launches_hold(r
     operands, _ = cotangents(HOOKS, regime, 0)
     fast = generation.family(generation.device_generation()) != 'mma.sync'
     assert fast_backward(restarting(lambda given: given, regime)(bf16(operands))) == fast
+
+
+def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpreted():
+    """The fast backward's log decay gradient, interpreted, as near float64 as the port's under decays near
+    zero on a draw: a chunk's ranges sum each token's terms before it (`mainloop.gradients`), never a token's
+    own order-one term added and taken away, which rounded away the `exp(-30)` terms before it (65 to 169
+    times the port's distance on three draws, the H100's check 1 140 times, SE-numerics-h100-fd61e11eeb;
+    0.98 to 1.00 times after)."""
+    regime = 'decays near zero'
+    operands, (out, final) = cotangents(HOOKS, regime, 0)
+    drawn = (bf16(operands), (out.astype(jnp.bfloat16), final))
+    template = with_gradients(functools.partial(chunk, HOOKS, mainloop='mosaic'))
+    port = with_gradients(functools.partial(chunk_on, 'fla', HOOKS))
+    with jax.enable_x64(new_val=True):
+        exact = jax.jit(with_gradients(functools.partial(token_by_token, HOOKS)))(*widened(drawn))
+
+    def distance(fn) -> float:
+        leaf = np.asarray(jax.jit(fn)(*drawn)[1].log_decay, np.float64)
+        return float(np.sqrt(np.mean((leaf - np.asarray(exact[1].log_decay)) ** 2)))
+
+    assert distance(template) <= 2 * distance(port), (distance(template), distance(port))
