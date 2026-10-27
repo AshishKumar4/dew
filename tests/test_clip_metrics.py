@@ -71,7 +71,8 @@ def test_clip_score_over_images_and_prompts_is_the_metric_number():
     score = CLIPScore(str(CLIP_TINY)).score(images, prompts)
 
     pooled = metric.finalize(metric(ImageGrid(generated), batch))
-    assert score == pytest.approx(pooled, abs=1e-9), f"{score} against {pooled}"
+    # `score` sums the way a pass does, batch by batch: one batch's set is the metric's number exactly.
+    assert score == pooled, f"{score} against {pooled}"
     expected = np.mean(100.0 * np.maximum(cosine, 0.0))
     assert abs(score - expected) < CLIP_SCORE_TOLERANCE, f"{score} against {expected}"
 
@@ -105,7 +106,8 @@ def test_each_images_clip_score_is_a_term_of_the_sets():
     np.testing.assert_allclose(each, 100.0 * np.maximum(cosine, 0.0), atol=CLIP_SCORE_TOLERANCE)
     # A batch of another size compiles its own kernels, which round the last digit apart.
     np.testing.assert_allclose(metric.scores(images, prompts, batch_size=3), each, rtol=1e-6)
-    assert metric.score(images, prompts) == pytest.approx(each.mean(), abs=1e-9)
+    # One batch: the score is its terms' sum over their count, the mean of them exactly.
+    assert metric.score(images, prompts) == each.mean()
     assert metric.scores(images[::-1], prompts[::-1])[::-1] == pytest.approx(each, abs=1e-9)
 
 

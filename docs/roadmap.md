@@ -221,7 +221,6 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
   - Printed programs and assertion-only pins in the remaining lanes' files, Training's done: [709, 710].
 - Make float32 numpy references independent of the worker's OpenBLAS kernels, which round differently on x86-64-v3 and v4, without pinning the weaker one. [744]
 - Dew requires its own JAX build, installed from pypi.dewml.dev, with no stock-JAX routes or version gates. The fork AshishKumar4/jax follows upstream releases and carries Dew's Python-only patch stack: the compilation cache-key fixes, the CPU host-read guard, Pallas Triton's 16-bit floats and the Mosaic GPU fixes. Each build is published only after its full stack check passes.
-- Move Dew's custom derivatives off `linear_call`, which JAX deprecated, onto hijax's public `HiPrim`: one linear primitive whose transpose runs the backward kernel, so reverse mode still runs Dew's kernels at every order, and the six fork patches that grow `linear_call` are deleted. [713, 714, 731, 732, 743, 1690]
 - Judge layout parity through the shared gate, its own order policy and floor deleted. [793]
 - Judge an image model's layout parity under a sequence split, where its gradients' sums over spatial positions reassociate (edm2's sequence-split cell). [827]
 - Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790]
