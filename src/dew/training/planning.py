@@ -4,9 +4,13 @@ the rung of the fit ladder it compiles at (`Trainer.compile`).
 A step that does not fit its devices whole is read in microbatches, an even
 split of every row shard's own rows, before it recomputes anything:
 recomputing costs every token, where a smaller microbatch at the same rung
-costs little. Compiles are the measurement, XLA's memory analysis of each
-candidate against each device's free bytes (`dew.training.memory`), and the
-search bounds how many a step takes.
+costs little. Before it recomputes, it keeps the optimizer state and the EMA
+in its host's pinned memory, and a remat rung that keeps its residuals there
+stands before the next that recomputes them, each only where the bytes it
+moves hide behind the step's compute over the host link (`hides`).
+Compiles are the measurement, XLA's memory analysis of each candidate against
+each device's free bytes (`dew.training.memory`), and the search bounds how
+many a step takes.
 """
 
 from __future__ import annotations
@@ -27,12 +31,14 @@ from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.host import snapshot
-from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes
+from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes, placed_bytes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options
+from dew.nn.sharding import Link
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.benchmark import samples
+from dew.telemetry.instrumentation import step_flops
 from dew.training.distributed import batch_divisor
 from dew.training.memory import (
     compiled_if_it_fits,
@@ -188,7 +194,9 @@ class Probe:
     """One compile of a plan's search (`planned`): the split, the rows of
     its microbatch and the rung (`rung_record`) it compiled at, and what
     the fit check read, this process's tightest headroom and XLA's
-    temporaries and arguments, None where none were read."""
+    temporaries and arguments, None where none were read, and whether the
+    bytes the plan's offload moves hide behind the step's compute (`hides`),
+    None where it offloads nothing."""
     split: int
     rows: int
     rung: Mapping[str, JSON]
@@ -196,25 +204,30 @@ class Probe:
     headroom: int | None
     temp: int | None
     argument: int | None
+    hidden: bool | None = None
 
     @classmethod
     def read(cls, split: int, candidate: Candidate, rung: Mapping[str, JSON], fit: bool,
-             headroom: int | None, executable: jax.stages.Compiled | None) -> Probe:
+             headroom: int | None, executable: jax.stages.Compiled | None, hidden: bool | None) -> Probe:
         """The compile of `candidate` at `rung`, its memory as XLA reads it where it compiled."""
         stats = None if executable is None else executable.memory_analysis()
         return cls(split, rows_of(candidate.micro), rung, fit, headroom,
                    None if stats is None else int(stats.temp_size_in_bytes),
-                   None if stats is None else int(stats.argument_size_in_bytes))
+                   None if stats is None else int(stats.argument_size_in_bytes), hidden)
 
     def record(self) -> dict[str, JSON]:
         return {"split": self.split, "rows": self.rows, **self.rung, "fits": self.fits,
-                "headroom": self.headroom, "temp": self.temp, "argument": self.argument}
+                "headroom": self.headroom, "temp": self.temp, "argument": self.argument,
+                "hidden": self.hidden}
 
     def named(self) -> str:
         tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
                 else ", the head tiled, its gradient in the backward")
         defaults = ", XLA's default options" if self.rung["xla_defaults"] else ""
-        return f"{self.split} x {self.rows} rows at remat {self.rung['remat']!r}{tile}{defaults}"
+        held = f", {' and '.join(self.rung['host'])} in host memory" if self.rung["host"] else ""
+        exposed = ", its offload exposed" if self.hidden is False else ""
+        return (f"{self.split} x {self.rows} rows at remat {self.rung['remat']!r}"
+                f"{tile}{defaults}{held}{exposed}")
 
 
 def unplanned(probes: Sequence[Probe]) -> str:
@@ -392,123 +405,207 @@ def opens_frontier(split: int, whole: int, mesh: Mesh) -> bool:
     return split != whole or mesh.devices.size > 1
 
 
-def plan_step[LossT, EffectsT](
-        lower: Callable[[int, bool], Candidate],
-        options: Callable[[Candidate], jax.stages.CompilerOptions | None],
-        candidates: Sequence[int], first: int, *, objective: Objective[LossT, EffectsT], mesh: Mesh,
-        xla_defaults: bool, narrow: bool, base: tuple[int, int] | None, resumed: JSON,
-        frontier: bool) -> tuple[list[Planned], tuple[Probe, ...]]:
-    """The first of `candidates` (`splits`) and the objective's rungs to fit the devices (`planned`), each
-    lowered by `lower` at the objective's rung and `narrow` once, compiled under its `options` or XLA's
-    defaults on the half rung above, the head at the run's tile `base` at each remat rung (`recompute_more`).
-    The first rung climbed drops the narrow copies, which a plan above it, the frontier's too, takes back
-    where its rung and split fit with them. A split missing at a rung with a half rung (`remat_half`) is
-    compiled there, the plan staying where it fits; climbing and the frontier pass every half rung asked
-    (`onward`). Each compile's measure (`Forecast`) orders the splits; `resumed`, a checkpoint's rung, is
-    warned of where it misses; where nothing fits it raises with the closest candidate's numbers. Where the
-    plan opens a frontier (`opens_frontier`) and `frontier` asks, the batch whole a remat rung up
-    (`remat_more`), the head tiled and unfused, follows where it fits, above any rung that dropped the
-    copies. Each compile made comes beside the plans; the objective is left at the last plan's rung."""
-    probes: list[Probe] = []
-    refusals: list[RuntimeError] = []
-    lowered: dict[tuple[int, str], Candidate] = {}
-    halves: set[str] = set()  # the remat rungs (`recompute_record`) the search has asked as half rungs
-    forecast, factor = Forecast(), temporaries_factor(mesh)
+def offloaded(prepared: TrainState, fields: Sequence[str], temporaries: int) -> int:
+    """The bytes each device moves a call to and from its host's pinned memory for a plan's offload:
+    each of `fields` of the state, as `prepared` places it, fetched before the update and written
+    back after it, and `temporaries`, what XLA keeps in host memory through the step (an offloading
+    remat rung's residuals), written in the forward and read back in the backward."""
+    return 2 * (sum(placed_bytes(getattr(prepared, field)) for field in fields) + temporaries)
+
+
+def hides(moved: int, executable: jax.stages.Compiled, link: Link | None) -> bool:
+    """Whether `moved` bytes over the host `link` take no longer than the step's FLOPs at its device's
+    peak (`step_flops`, `Link.flops_per_second`), the least time they take at any utilisation: where
+    they do, XLA's latency-hiding scheduler can overlap the transfer with them
+    (`dew.training.memory.COLLECTIVES`), so the plan offloads only there. A link that states no
+    bandwidth or no peak, or a step whose FLOPs no count gives, hides nothing.
+
+    MaxText and NVIDIA's JAX-Toolbox offload the optimizer state and remat residuals as a run's own
+    choice (`optimizer_memory_host_offload`, the `*_offloaded` remat policies), over the same memory
+    kinds and checkpoint policies; here the plan chooses, priced by the host link it measures."""
+    if link is None or link.bytes_per_second is None or link.flops_per_second is None:
+        return False
+    flops = step_flops(executable)
+    return flops is not None and moved / link.bytes_per_second <= flops.hardware / link.flops_per_second
+
+
+@dataclasses.dataclass
+class Search:
+    """One plan's search over the fit ladder (`plan_step`): what it lowered, compiled and measured, and
+    where on the ladder it stands, from the rung `objective`, `xla_defaults`, `narrow` and `host` give.
+
+    `host` is the state's fields the step keeps in its host's pinned memory, the run's layout's first
+    (`own`); `offloadable` is those the ladder may move there, its rung past XLA's defaults and before
+    the next remat rung, kept up the ladder only where some compile there hid what it moves (`hides`,
+    over the host `link`, read once a compile is priced). An offload the run's own rung holds is the
+    run's choice, never priced; the ladder's own are: its state fields, and the temporaries XLA keeps in
+    host memory at a remat rung above the run's own (an offloading rung's residuals)."""
+    lower: Callable[[int, bool, tuple[str, ...]], Candidate]
+    options: Callable[[Candidate], jax.stages.CompilerOptions | None]
+    objective: Objective
+    mesh: Mesh
+    xla_defaults: bool
+    narrow: bool
+    base: tuple[int, int] | None
+    resumed: JSON
+    host: tuple[str, ...] = ()
+    offloadable: tuple[str, ...] = ()
+    link: Callable[[], Link | None] = lambda: None
+    probes: list[Probe] = dataclasses.field(default_factory=list)
+    refusals: list[RuntimeError] = dataclasses.field(default_factory=list)
+    lowered: dict[tuple[int, str], Candidate] = dataclasses.field(default_factory=dict)
+    halves: set[str] = dataclasses.field(default_factory=set)
+    """The remat rungs (`recompute_record`) the search has asked as half rungs."""
+    forecast: Forecast = dataclasses.field(default_factory=Forecast)
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled] | None = None
-    dropped: str | None = None  # the rung (`rung`) the narrow copies were dropped at
-    # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
-    required = compiler_options(*objective.towers()) or None
+    dropped: str | None = None
+    """The rung (`rung`) the narrow copies were dropped at."""
+    hid: bool = False
+    """Whether a compile at the ladder's state offload hid what it moves."""
 
-    def current() -> dict[str, JSON]:
-        return rung_record(objective, xla_defaults, narrow=narrow)
+    def __post_init__(self):
+        self.factor = temporaries_factor(self.mesh)
+        # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
+        self.required = compiler_options(*self.objective.towers()) or None
+        self.own, self.own_remat = self.host, self.remat_rung()
 
-    def rung() -> str:
-        return json.dumps(current(), sort_keys=True)
+    def current(self) -> dict[str, JSON]:
+        return rung_record(self.objective, self.xla_defaults, narrow=self.narrow, host=self.host)
 
-    def remat_rung() -> str:
-        return json.dumps(recompute_record(objective), sort_keys=True)
+    def rung(self) -> str:
+        return json.dumps(self.current(), sort_keys=True)
 
-    def onward(step: Callable[[], bool]) -> bool:
+    def remat_rung(self) -> str:
+        return json.dumps(recompute_record(self.objective), sort_keys=True)
+
+    def onward(self, step: Callable[[], bool]) -> bool:
         """`step` the objective up its ladder past every half rung the search has asked, each missed."""
         moved = step()
-        while moved and remat_rung() in halves:
+        while moved and self.remat_rung() in self.halves:
             moved = step()
         return moved
 
-    def fits(split: int) -> bool:
-        if fits_here(split):
+    def fits(self, split: int) -> bool:
+        if self.fits_here(split):
             return True
-        missed, held = rung(), remat_half(objective)
-        forecast.half_of[missed] = None if held is None else rung()
+        missed, held = self.rung(), remat_half(self.objective)
+        self.forecast.half_of[missed] = None if held is None else self.rung()
         if held is None:
             return False
-        halves.add(remat_rung())
-        if fits_here(split):
+        self.halves.add(self.remat_rung())
+        if self.fits_here(split):
             return True
-        objective.substitute(held)
+        self.objective.substitute(held)
         return False
 
-    def fits_here(split: int) -> bool:
-        nonlocal resumed, chosen, fitted
-        key = (split, rung())
-        if key not in lowered:
-            lowered[key] = lower(split, narrow)
-        candidate = lowered[key]
-        chosen = required if xla_defaults else options(candidate)
-        executable = compiled_if_it_fits(candidate.program, chosen, refusals)
-        fit, headroom = step_fits(executable, mesh, candidate.held)
-        probes.append(Probe.read(split, candidate, current(), fit, headroom, executable))
-        forecast.read(rung(), split, executable, headroom, factor)
-        if fit:
+    def fits_here(self, split: int) -> bool:
+        key = (split, self.rung())
+        if key not in self.lowered:
+            self.lowered[key] = self.lower(split, self.narrow, self.host)
+        candidate = self.lowered[key]
+        self.chosen = self.required if self.xla_defaults else self.options(candidate)
+        executable = compiled_if_it_fits(candidate.program, self.chosen, self.refusals)
+        fit, headroom = step_fits(executable, self.mesh, candidate.held)
+        hidden = None if executable is None else self.hidden(candidate, executable)
+        self.probes.append(Probe.read(split, candidate, self.current(), fit and hidden is not False,
+                                      headroom, executable, hidden))
+        self.forecast.read(self.rung(), split, executable, headroom, self.factor)
+        if fit and hidden is not False:
             assert executable is not None
-            fitted = candidate, executable
-        elif resumed is not None:
+            self.fitted = candidate, executable
+            return True
+        if self.resumed is not None:
             _log.warning("the step does not fit the devices at the rung its checkpoint trained on (%s); from "
-                         "here the resumed run computes otherwise than the run it continues", resumed)
-            resumed = None
-        return fit
+                         "here the resumed run computes otherwise than the run it continues", self.resumed)
+            self.resumed = None
+        return False
 
-    def climb() -> bool:
-        nonlocal xla_defaults, narrow, dropped
+    def hidden(self, candidate: Candidate, executable: jax.stages.Compiled) -> bool | None:
+        """Whether what the ladder's own offload moves a call hides behind the step's compute (`hides`),
+        None where it offloads nothing."""
+        stats = executable.memory_analysis()
+        temporaries = (0 if stats is None or self.remat_rung() == self.own_remat
+                       else int(getattr(stats, "host_temp_size_in_bytes", 0)))
+        moved = offloaded(candidate.prepared, [field for field in self.host if field not in self.own],
+                          temporaries)
+        if not moved:
+            return None
+        hidden = hides(moved, executable, self.link())
+        self.hid = self.hid or (hidden and self.host != self.own)
+        return hidden
+
+    def climb(self) -> bool:
         # The first rung drops the narrow copies, two bytes a parameter held all run for 1-2% of a step.
-        if narrow and any(candidate.copies for candidate in lowered.values()):
-            narrow = False
-            dropped = rung()
-            lowered.clear()
+        if self.narrow and any(candidate.copies for candidate in self.lowered.values()):
+            self.narrow = False
+            self.dropped = self.rung()
+            self.lowered.clear()
             return True
         # XLA's default options, but `required`, are the half rung above the step's own where those
         # are another program: the Triton GEMM fusions they keep can take fewer temporaries (sm89).
-        if not xla_defaults and chosen != required:
-            xla_defaults = True
+        if not self.xla_defaults and self.chosen != self.required:
+            self.xla_defaults = True
             return True
-        xla_defaults = False
-        lowered.clear()
-        return onward(lambda: recompute_more(objective, base))
+        self.xla_defaults = False
+        self.lowered.clear()
+        # The state's offload, which costs nothing where it hides, stands before any recomputation, and
+        # stays up the ladder only where it hid.
+        if self.offloadable and self.host == self.own:
+            self.host = (*self.own, *self.offloadable)
+            return True
+        if not self.hid:
+            self.host = self.own
+        return self.onward(lambda: recompute_more(self.objective, self.base))
 
-    def found(split: int) -> Planned:
-        nonlocal narrow, fitted
-        if not narrow and dropped not in (None, rung()):
+    def found(self, split: int) -> Planned:
+        if not self.narrow and self.dropped not in (None, self.rung()):
             # A rung above the copies' may recompute the casts they save: a plan keeps them where it fits.
-            kept, narrow = fitted, True
-            if not fits_here(split):
-                fitted, narrow = kept, False
-        assert fitted is not None
-        modules = tuple(entry.module for entry in objective.program_key())
-        return Planned(split, *fitted, xla_defaults, narrow, current(), modules, head_tile_of(objective),
-                       head_fused_of(objective))
+            kept, self.narrow = self.fitted, True
+            if not self.fits_here(split):
+                self.fitted, self.narrow = kept, False
+        assert self.fitted is not None
+        modules = tuple(entry.module for entry in self.objective.program_key())
+        return Planned(split, *self.fitted, self.xla_defaults, self.narrow, self.current(), modules,
+                       head_tile_of(self.objective), head_fused_of(self.objective))
 
-    split = planned(candidates, first, fits, climb, lambda split: forecast.likely(rung(), split))
-    if split is None or fitted is None:
-        raise RuntimeError(unplanned(probes)) from (refusals[-1] if refusals else None)
-    plans = [found(split)]
-    if frontier and opens_frontier(split, candidates[0], mesh) and onward(lambda: remat_more(objective)):
+
+def plan_step[LossT, EffectsT](
+        lower: Callable[[int, bool, tuple[str, ...]], Candidate],
+        options: Callable[[Candidate], jax.stages.CompilerOptions | None],
+        candidates: Sequence[int], first: int, *, objective: Objective[LossT, EffectsT], mesh: Mesh,
+        xla_defaults: bool, narrow: bool, base: tuple[int, int] | None, resumed: JSON,
+        frontier: bool, host: tuple[str, ...] = (), offloadable: tuple[str, ...] = (),
+        link: Callable[[], Link | None] = lambda: None) -> tuple[list[Planned], tuple[Probe, ...]]:
+    """The first of `candidates` (`splits`) and the objective's rungs to fit the devices (`planned`), each
+    lowered by `lower` at the objective's rung, `narrow` and the state's fields in host memory once,
+    compiled under its `options` or XLA's defaults on the half rung above, the head at the run's tile
+    `base` at each remat rung (`recompute_more`). The first rung climbed drops the narrow copies, which a
+    plan above it, the frontier's too, takes back where its rung and split fit with them. Past XLA's
+    defaults the `offloadable` fields of the state go to host memory before the next remat rung, where
+    what they move hides behind the step (`Search`). A split missing at a rung with a half rung
+    (`remat_half`) is compiled there, the plan staying where it fits; climbing and the frontier pass every
+    half rung asked (`onward`). Each compile's measure (`Forecast`) orders the splits; `resumed`, a
+    checkpoint's rung, is warned of where it misses; where nothing fits it raises with the closest
+    candidate's numbers. Where the plan opens a frontier (`opens_frontier`) and `frontier` asks, the
+    batch whole a remat rung up (`remat_more`), the head tiled and unfused, follows where it fits, above
+    any rung that dropped the copies. Each compile made comes beside the plans; the objective is left at
+    the last plan's rung."""
+    search = Search(lower, options, objective, mesh, xla_defaults, narrow, base, resumed, host, offloadable,
+                    link)
+    split = planned(candidates, first, search.fits, search.climb,
+                    lambda split: search.forecast.likely(search.rung(), split))
+    if split is None or search.fitted is None:
+        raise RuntimeError(unplanned(search.probes)) from (search.refusals[-1] if search.refusals else None)
+    plans = [search.found(split)]
+    if (frontier and opens_frontier(split, candidates[0], mesh)
+            and search.onward(lambda: remat_more(objective))):
         objective.tile_head()
         objective.unfuse_head()
-        xla_defaults, narrow = False, narrow and dropped is None
-        lowered.clear()
+        search.xla_defaults, search.narrow = False, search.narrow and search.dropped is None
+        search.lowered.clear()
         _log.info("timing the plan against its batch whole at remat %r, %s", recompute_record(objective),
-                     "the head tiled" if head_tile_of(objective) is not None else "the whole logits kept")
-        if fits(candidates[0]):
-            plans.append(found(candidates[0]))
-    return plans, tuple(probes)
+                  "the head tiled" if head_tile_of(objective) is not None else "the whole logits kept")
+        if search.fits(candidates[0]):
+            plans.append(search.found(candidates[0]))
+    return plans, tuple(search.probes)
