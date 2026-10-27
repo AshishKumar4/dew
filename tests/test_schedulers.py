@@ -17,7 +17,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    declared_seeds,
+    indexed_recording,
+    recording,
+)
 from scipy import stats
 
 import dew.diffusion.schedules as schedulers
@@ -33,8 +40,11 @@ from dew.diffusion import (
     presets,
 )
 from dew.diffusion.schedules import (
+    CosineContinuousNoiseScheduler,
+    CosineGeneralNoiseScheduler,
     CosineNoiseScheduler,
     EDMNoiseScheduler,
+    ExpNoiseScheduler,
     FlowMatchingScheduler,
     KarrasVENoiseScheduler,
     LinearNoiseScheduler,
@@ -55,6 +65,9 @@ SCHEDULES = [
     (CosineNoiseScheduler, partial(CosineNoiseScheduler, 1000), DISCRETE_STEPS, "vp"),
     (LinearNoiseScheduler, partial(LinearNoiseScheduler, 1000), DISCRETE_STEPS, "vp"),
     (SqrtContinuousNoiseScheduler, SqrtContinuousNoiseScheduler, CONTINUOUS_STEPS, "vp"),
+    (ExpNoiseScheduler, partial(ExpNoiseScheduler, 1000), DISCRETE_STEPS, "vp"),
+    (CosineContinuousNoiseScheduler, CosineContinuousNoiseScheduler, CONTINUOUS_STEPS, "vp"),
+    (CosineGeneralNoiseScheduler, CosineGeneralNoiseScheduler, CONTINUOUS_STEPS, "ve"),
     (
         KarrasVENoiseScheduler,
         partial(KarrasVENoiseScheduler, sigma_max=80, rho=7, sigma_data=0.5),
@@ -538,3 +551,71 @@ def test_the_edm_schedules_time_of_a_sigma_is_on_par_with_its_correctly_rounded_
 
     assert_as_exact(t_of_sigma, reference, draw, "EDM t_of_sigma", seeds=T_OF_SIGMA_SEEDS)
 
+
+
+# --------------------------------------------------------------- FlaxDiff's schedules
+
+
+FLAXDIFF = dict(np.load(Path(__file__).parent / "fixtures" / "flaxdiff_schedules.npz"))
+"""FlaxDiff's own tables, rates, sigmas and weights, in float32 (tools/flaxdiff_schedules_reference.py)."""
+
+
+def flaxdiff_case(case: str) -> dict:
+    """A case of the FlaxDiff fixture, its arguments as the tool built it."""
+    import json
+
+    meta = json.loads(bytes(FLAXDIFF["meta"]))
+    return {**meta["exp"], **meta["general"]}[case]
+
+
+@pytest.mark.parametrize("case", ["exp/default", "exp/clipped"])
+def test_the_exponential_table_is_flaxdiffs_with_its_rates_and_weights(case):
+    """FlaxDiff's exponential beta table, bit for bit as its arithmetic makes it (`exp_beta_schedule`,
+    clipped at the schedule's own beta_end, not Diffusers' fixed 0.999), and the rates and P2 weights
+    Dew tabulates from it as near float64 as FlaxDiff's, which accumulates its table in float32."""
+    from dew.diffusion.schedules import exp_beta_schedule
+
+    arguments = flaxdiff_case(case)
+    schedule = ExpNoiseScheduler(**arguments)
+    k, gamma = arguments.get("p2_loss_weight_k", 1), arguments.get("p2_loss_weight_gamma", 1)
+    np.testing.assert_array_equal(np.asarray(schedule.betas, np.float32), FLAXDIFF[f"{case}/betas"])
+    betas = exp_beta_schedule(arguments["timesteps"], beta_end=arguments.get("beta_end", 0.999))
+    bars = np.cumprod(1 - betas)
+    truth = (np.sqrt(bars), np.sqrt(1 - bars), (k + bars / (1 - bars)) ** -gamma)
+    names = ("sqrt_alpha_cumprod", "sqrt_one_minus_alpha_cumprod", "p2_loss_weights")
+    ours = tuple(np.asarray(getattr(schedule, name)) for name in names)
+    theirs = tuple(FLAXDIFF[f"{case}/{name}"] for name in names)
+    assert_as_exact_as_the_reference(ours, theirs, truth, f"FlaxDiff {case}")
+
+
+def test_the_continuous_cosine_is_flaxdiffs_with_its_snr_weight():
+    """FlaxDiff's continuous cosine, alpha = cos(pi t / 2) and sigma = sin(pi t / 2), weighted
+    1 / (1 + SNR), each as near float64 as FlaxDiff's own from no noise to all of it."""
+    schedule, t = CosineContinuousNoiseScheduler(), FLAXDIFF["times"]
+    wide = t.astype(np.float64)
+    alpha, sigma = np.cos(np.pi * wide / 2), np.sin(np.pi * wide / 2)
+    with np.errstate(divide="ignore"):
+        weight = 1 / (1 + alpha ** 2 / sigma ** 2)
+    ours = (*(np.asarray(rate) for rate in schedule.rates(t)), np.asarray(schedule.weight(t)))
+    theirs = tuple(FLAXDIFF[f"cosine_continuous/{name}"] for name in ("alpha", "sigma", "weight"))
+    assert_as_exact_as_the_reference(ours, theirs, (alpha, sigma, weight), "FlaxDiff continuous cosine")
+
+
+@pytest.mark.parametrize("case", ["cosine_general/default", "cosine_general/bounded"])
+def test_the_tangent_grid_is_flaxdiffs_and_inverts(case):
+    """FlaxDiff's tangent grid of sigmas, from sigma_min / kappa^2 as its divides the tangent by kappa
+    again, at its own bounds and at others: the sigmas and the rates (alpha 1) as near float64 as
+    FlaxDiff's."""
+    import math
+
+    arguments = flaxdiff_case(case)
+    schedule, t = CosineGeneralNoiseScheduler(**arguments), FLAXDIFF["times"]
+    kappa = arguments.get("kappa", 1.0)
+    low = math.atan(arguments.get("sigma_min", 0.02) / kappa)
+    high = math.atan(arguments.get("sigma_max", 80.0) / kappa)
+    sigma = np.tan(low + t.astype(np.float64) * (high - low)) / kappa
+    signal, noise = schedule.rates(t)
+    assert_as_exact_as_the_reference(
+        (np.asarray(schedule.sigmas(t)), np.asarray(signal), np.asarray(noise)),
+        tuple(FLAXDIFF[f"{case}/{name}"] for name in ("sigma", "signal", "noise")),
+        (sigma, np.ones_like(sigma), sigma), f"FlaxDiff {case}")

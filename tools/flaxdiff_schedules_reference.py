@@ -43,8 +43,8 @@ FILES = {
     "exp": "42439005dd48a876710af7cae67c98fdbd07e7aea8d59ac828e34f721d86d683",
 }
 TIMES = np.linspace(0, 1, 33, dtype=np.float32)
-EXP = {"exp/default": {"timesteps": 1000}, "exp/clipped": {"timesteps": 8, "beta_end": 0.5,
-                                                            "p2_loss_weight_k": 2, "p2_loss_weight_gamma": 0.5}}
+EXP = {"exp/default": {"timesteps": 1000},
+       "exp/clipped": {"timesteps": 8, "beta_end": 0.5, "p2_loss_weight_k": 2, "p2_loss_weight_gamma": 0.5}}
 GENERAL = {"cosine_general/default": {}, "cosine_general/bounded": {"sigma_min": 0.002, "sigma_max": 160.0,
                                                                      "kappa": 0.5}}
 
@@ -73,8 +73,9 @@ def main(destination: Path) -> None:
     continuous = modules["cosine"].CosineContinuousNoiseScheduler()
     steps = jnp.asarray(TIMES)
     alpha, sigma = continuous.get_rates(steps, shape=(-1,))
+    weight = continuous.get_schedule_weights(steps, shape=(-1,))
     arrays.update({"cosine_continuous/alpha": np.asarray(alpha), "cosine_continuous/sigma": np.asarray(sigma),
-                   "cosine_continuous/weight": np.asarray(continuous.get_schedule_weights(steps, shape=(-1,)))})
+                   "cosine_continuous/weight": np.asarray(weight)})
     for case, arguments in GENERAL.items():
         general = modules["cosine"].CosineGeneralNoiseScheduler(**arguments)
         signal, noise = general.get_rates(steps, shape=(-1,))
