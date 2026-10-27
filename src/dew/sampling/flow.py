@@ -74,15 +74,15 @@ class GaussianTransition:
         if value.shape != mean.shape:
             raise ValueError("a transition density scores one next state per mean")
         safe_variance = jnp.where(variance > 0, variance, 1)
-        error = jnp.square(value - mean).sum(axis=tuple(range(1, value.ndim)))
         dimensions = math.prod(value.shape[1:])
         # The form of JAX's isotropic `multivariate_normal.logpdf` (a scalar covariance): log(2 pi) and
         # the log variance summed apart, so a variance near float32's largest does not overflow 2 pi
         # times it. Each row has its own variance, which that function would take one row at a time.
-        # Halved after the sum, the density itself: a draw's error over its own variance is its
-        # chi-squared count, which no transition's draw takes near float32's largest.
-        log_prob = -0.5 * (error / safe_variance
-                           + dimensions * (jnp.log(2 * math.pi) + jnp.log(safe_variance)))
+        # The half-Mahalanobis term is the KL's range-safe |value - mean|**2 / (2 variance)
+        # (`_gaussian_kl`), with its derivatives: a residual of 2**64 over a variance of 2**126 squares
+        # past float32's largest, where its standardized square is 4.
+        log_prob = -(_gaussian_kl(value, mean, safe_variance)
+                     + 0.5 * dimensions * (jnp.log(2 * math.pi) + jnp.log(safe_variance)))
         return jnp.where(variance > 0, log_prob, jnp.nan)
 
     def kl(self, reference_mean: ArrayLike) -> jax.Array:

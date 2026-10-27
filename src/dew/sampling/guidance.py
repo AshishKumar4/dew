@@ -138,8 +138,12 @@ def guide(conditional: jax.Array, unconditional: jax.Array, scale) -> jax.Array:
     """Classifier-free guidance's affine combination, unconditional + scale (conditional -
     unconditional), of two predictions of one sample: `scale` one value, or one per row. Every
     guidance here combines through it: the samplers' (CFG, CFG++, autoguidance's weaker model in
-    the unconditional's place) and the distillations' teacher targets."""
-    return unconditional + expand(scale, conditional) * (conditional - unconditional)
+    the unconditional's place) and the distillations' teacher targets. At a unit scale, which a step
+    outside its guidance interval takes, it is the conditional prediction exactly, as the sources
+    return it unguided there: the affine form would round it through their difference (float32's
+    1 against 2**30 gives 0)."""
+    scale = expand(scale, conditional)
+    return jnp.where(scale == 1, conditional, unconditional + scale * (conditional - unconditional))
 
 
 @struct.dataclass
