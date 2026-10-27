@@ -1867,14 +1867,17 @@ def test_a_step_compiles_from_its_arrays_shapes_before_they_are_placed():
         opt_state=jax.tree.map(shape, state.opt_state, shardings.opt_state),
         key=shape(state.key, shardings.key))
 
-    from dew.objectives.base import Step
-
     compiled = trainer.compile(abstract, {"text": jax.ShapeDtypeStruct((8, 5), jnp.int32)})
     batch = {"text": jnp.zeros((8, 5), jnp.int32)}
-    expected, _ = trainer.objective.scalar_loss(state.variables, batch,
-                              Step(state.microstep, jax.random.fold_in(state.key, state.step), None))
+    # The same step compiled from placed arrays of the same values: one program, so the step compiled
+    # from shapes alone computes its loss and its update bit for bit as it does.
+    placed, _, _ = trainer.place()
+    concrete = trainer.compile(placed, batch)
     advanced, loss, _, finite, _, _ = jax.block_until_ready(compiled(state, batch))
-    assert loss == pytest.approx(float(expected), rel=1e-6)
+    again, their_loss, _, _, _, _ = jax.block_until_ready(concrete(placed, batch))
+    assert np.array_equal(np.asarray(loss), np.asarray(their_loss))
+    assert all(np.array_equal(np.asarray(mine), np.asarray(theirs)) for mine, theirs in
+               zip(jax.tree.leaves(advanced.variables), jax.tree.leaves(again.variables), strict=True))
     assert int(advanced.step) == 1 and bool(finite)
 
 

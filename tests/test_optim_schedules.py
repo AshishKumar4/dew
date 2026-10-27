@@ -1,9 +1,11 @@
 """Schedule records and parameter groups against torch's schedulers and Adam.
 
 The references are tests/fixtures/torch_optim/reference.npz, which
-tools/torch_optim_reference.py writes with torch 2.14.1 on CPU. Dew computes
-in float32 and torch's schedulers in float64, so a schedule agrees to float32
-rounding of its value.
+tools/torch_optim_reference.py writes with torch 2.14.1 on CPU. torch's
+schedulers compute in float64, so a schedule is torch's where Dew's, run in
+float64, is the oracle's to its own float64 rounding (the gate's oracle rule,
+`assert_computes_the_oracle`): any other definition parts from it by orders of
+magnitude more.
 """
 
 from pathlib import Path
@@ -13,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.optim import Cosine, Exponential, Linear, OneCycle, OptimConfig, ParamGroup, Power, stepped
 
@@ -23,7 +26,8 @@ MOMENTUM = OneCycle(peak_value=0.85, init_value=0.95, end_value=0.95)
 
 # float32 rounding of a value, two ulps of it. Near a cosine's end, where
 # `cos + 1` cancels, the error is instead an ulp or two of the peak, which
-# `atol` states per schedule as `ULPS * peak`.
+# `atol` states per schedule as `ULPS * peak`. OneCycle pins its step to float32,
+# so its float64 run is float32's and the oracle rule cannot read it.
 SCHEDULE_RTOL = 2e-6
 ULPS = 2.4e-7
 WEIGHT_DECAY = 1e-2
@@ -33,6 +37,16 @@ WEIGHT_DECAY = 1e-2
 def values(schedule, steps: int) -> np.ndarray:
     built = schedule.schedule(steps)
     return np.asarray([built(count) for count in range(steps)], np.float64)
+
+
+def assert_torchs(schedule, steps: int, torch_values, label: str) -> None:
+    """`schedule` over `steps` is torch's (`torch_values`, float64): Dew's run in float64 within the
+    float64 rounding of its own chain of operations (`chain_roundings`) of torch's."""
+    with jax.enable_x64(new_val=True):
+        built = schedule.schedule(steps)
+        computed = np.asarray([built(count) for count in range(steps)], np.float64)
+        roundings = chain_roundings(jax.make_jaxpr(built)(0))
+    assert_computes_the_oracle(computed, torch_values, label, roundings=roundings)
 
 
 def test_one_cycle_is_torchs_one_cycle_lr():
@@ -53,16 +67,14 @@ def test_one_cycle_cycles_adams_b1_as_torch_does():
 def test_exponential_is_torchs_exponential_lr_stepped_to_decay_steps_then_held():
     """The geometric decay from 12 to 0.23 over 10 steps, then 0.23 for the
     rest, plus the offset torch has no field for."""
-    np.testing.assert_allclose(values(Exponential(init_value=12.0, end_value=0.23, decay_steps=10), 16),
-                               TORCH["exponential/lr"], rtol=SCHEDULE_RTOL)
+    assert_torchs(Exponential(init_value=12.0, end_value=0.23, decay_steps=10), 16, TORCH["exponential/lr"],
+                  "exponential")
     decayed = Exponential(init_value=12.0, end_value=0.23, decay_steps=10, offset=0.27)
-    np.testing.assert_allclose(values(decayed, 16),
-                               TORCH["exponential/lr"] + 0.27, rtol=SCHEDULE_RTOL)
+    assert_torchs(decayed, 16, TORCH["exponential/lr"] + 0.27, "an offset exponential")
 
 
 def test_cosine_without_warmup_is_torchs_cosine_annealing():
-    np.testing.assert_allclose(values(Cosine(peak_value=0.1, warmup_steps=0), 15), TORCH["cosine/lr"],
-                               rtol=SCHEDULE_RTOL, atol=ULPS * 0.1)
+    assert_torchs(Cosine(peak_value=0.1, warmup_steps=0), 15, TORCH["cosine/lr"], "cosine")
 
 
 def test_every_holds_each_value_for_an_epoch_as_a_torch_scheduler_stepped_per_epoch():
@@ -74,8 +86,8 @@ def test_every_holds_each_value_for_an_epoch_as_a_torch_scheduler_stepped_per_ep
 
 def test_every_counts_the_schedules_fields_in_its_own_steps():
     """`decay_steps` counts epochs: the decay ends after 10 epochs of 4 updates."""
-    held = values(Exponential(init_value=12.0, end_value=0.23, decay_steps=10, every=4), 16 * 4)
-    np.testing.assert_allclose(held, np.repeat(TORCH["exponential/lr"], 4), rtol=SCHEDULE_RTOL)
+    assert_torchs(Exponential(init_value=12.0, end_value=0.23, decay_steps=10, every=4), 16 * 4,
+                  np.repeat(TORCH["exponential/lr"], 4), "exponential held four updates")
 
 
 def snn_delays_config() -> OptimConfig:

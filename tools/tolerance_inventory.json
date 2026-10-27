@@ -494,7 +494,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_optim_schedules.py": {
-   "comparisons": 12,
+   "comparisons": 8,
    "lane": "Training"
   },
   "tests/test_optional_ema.py": {
@@ -670,7 +670,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_trainer.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Training"
   },
   "tests/test_training_dtypes.py": {
