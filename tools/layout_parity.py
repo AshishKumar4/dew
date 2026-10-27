@@ -197,7 +197,9 @@ def zoo() -> dict[str, Any]:
     split repeats each row's conditioning on every shard by design, which the FLOPs bound would
     count against a row of only a few patches. The last two MoE models and DiffusionGemma keep their
     released configs' routing and layer kinds. The layers a sequence axis
-    splits differently come too: latent attention (MLA), a window (12 rows:
+    splits differently come too: a dense layer before routed ones and a tail
+    sharing the keys and values one layer stored, which a pipeline runs on
+    every stage, latent attention (MLA), a window (12 rows:
     a sequence split two ways reads it from one neighbour, four ways through
     the exchange), Mamba-2 alone, Mamba-1 alone, and packed rows of three
     documents whose boundaries fall inside the shards, in the dense decoder,
@@ -272,6 +274,8 @@ def zoo() -> dict[str, Any]:
         "moe": Case("causal_transformer", moe, **lm),
         "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
+        **{name: Case("causal_transformer", config, **lm)
+           for name, config in _placed_zoo(dense, moe).items()},
         "nemotron_h": Case("causal_transformer", nemotron_h, **lm),
         "nemotron_h_moe": Case("causal_transformer", _nemotron_h_moe(), orders=True, **lm),
         "window": Case("causal_transformer", window, **lm),
@@ -294,6 +298,28 @@ def zoo() -> dict[str, Any]:
                       "num_heads": 4, "image_size": 16, "patch_size": 8}},
             "projector": {"class": "gemma", "fields": {"text_width": 64, "patches_per_side": 2,
                           "tokens_per_side": 2}}}, **lm),
+    }
+
+
+def _placed_zoo(dense: dict[str, object], moe: dict[str, object]) -> dict[str, dict[str, object]]:
+    """The zoo's decoders a layout places apart (`zoo`), built on its `dense` and `moe` ones.
+
+    The expert exchange runs under a capacity, whose buckets hold what each
+    device's sequences keep, one round, so its program splits evenly;
+    dropless, it also compiles the rounds a skewed routing needs, which a
+    static count of the step's FLOPs reads whether or not they run.
+    DeepSeek's class puts a dense first layer before eight routed ones, each
+    layer reading its own per-layer input (Gemma's): a pipeline runs the
+    dense layer on every stage and slices the inputs past it, each of four
+    stages scanning two. Gemma 3n's has its last two layers read the keys
+    and values the fourth stored, which a pipeline runs on every stage."""
+    mixture = moe["mixture"]
+    assert isinstance(mixture, dict)
+    return {
+        "moe_exchange": {**moe, "mixture": {**mixture, "dispatch": "exchange", "capacity_factor": 2.0}},
+        "routed_tail": {**dense, "num_layers": 9, "per_layer_input_dim": 8,
+                        "mixture": {**mixture, "layers": tuple(range(1, 9))}},
+        "shared_tail": {**dense, "num_layers": 6, "kv_shared_layers": (4, 5)},
     }
 
 
@@ -405,6 +431,9 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     import jax
     import optax
 
+    from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
+    from dew.nn.kernels.generation import gpu_target
+    from dew.nn.sharding import Link
     from dew.training import Layout, MeshSpec, Trainer
 
     class Drawn(Trainer):
@@ -428,10 +457,15 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
                 lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), held))
             return jax.device_put(jax.tree.map(lambda leaf: leaf.copy(), held), shardings), shardings, None
 
+    # Devices the peak table does not name (a CPU's) measure no link, so no projection would spread
+    # over them; the layouts state one fast enough that every projection that can spread does, as
+    # it would over NVLink, so the matrix holds the spread path wherever it runs.
+    unmeasured = gpu_target(jax.devices()[0].device_kind).bf16_peak is None
+    links = {axis: Link(1e15, 1e12) for axis in (TENSOR_AXIS, SEQUENCE_AXIS)} if unmeasured else None
     trainer = Drawn(bench.build_objective(case), optax.chain(stash(), optax.adam(1e-3)),
                       key=jax.random.key(0), **bench.trainer_mesh(fields),
                       layout=Layout(min_shard=case.fsdp_min_param_size, tolerance=1.0),
-                      accumulation=accumulation, checkpoints=None, tracker=None)
+                      accumulation=accumulation, checkpoints=None, tracker=None, links=links)
     if one_device:
         trainer.device_mesh = MeshSpec().build([jax.local_devices()[0]])
     elif devices is not None:
@@ -467,8 +501,25 @@ def compiled_step(case, fields: dict[str, int], batch, *, one_device: bool = Fal
     data = placed(batch, trainer.device_mesh)
     step = trainer.compile(state, data)
     compiled = {"flops_per_device": trainer.step_flops and trainer.step_flops.hardware,
-                "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()}}
+                "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
+                "replicated": replicated_share(case, trainer.objective, fields.get("stage", 1))}
     return state, data, step, compiled
+
+
+def replicated_share(case, objective, stages: int) -> float:
+    """The share of `objective`'s model's forward work over the case's rows a pipeline of `stages`
+    runs on every stage (`replicated_flops`); none without a pipeline, and none for a model with no
+    decoder to pipeline, whose work the even split then judges whole."""
+    import numpy as np
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.wrapping import DecoderWrapper
+
+    model = next(iter(objective.program_key()), None)
+    if stages == 1 or model is None or not isinstance(model.module, (CausalTransformer, DecoderWrapper)):
+        return 0.0
+    lengths = np.full(case.batch_size, case.seq_len)
+    return model.module.replicated_flops(stages, lengths) / model.module.model_flops(lengths)
 
 
 def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool = False,
@@ -773,13 +824,15 @@ def rounding_limit(dtype: str) -> float:
     return float(jnp.finfo(dtype).eps) ** 0.5
 
 
-def flops_bound(fields: Mapping[str, int]) -> float:
+def flops_bound(fields: Mapping[str, int], replicated: float = 0.0) -> float:
     """The FLOPs a layout's devices may compute together over one device's:
     an even split, and a pipeline of S stages and M microbatches holds each
-    stage's work for M + S - 1 microbatches' time (GPipe's bubble), times
-    FLOPS_SLACK."""
+    stage's work for M + S - 1 microbatches' time (GPipe's bubble) and runs
+    the `replicated` share of the model's work, its layers outside the run
+    the stages repeat (`CausalTransformer.replicated_flops`), on every stage,
+    times FLOPS_SLACK."""
     stages, microbatches = fields.get("stage", 1), fields.get("microbatches", 1)
-    return (microbatches + stages - 1) / microbatches * FLOPS_SLACK
+    return ((1 - replicated) * (microbatches + stages - 1) / microbatches + replicated * stages) * FLOPS_SLACK
 
 
 def widest_floor(floors: dict[str, float], dtype: str) -> str:
@@ -998,7 +1051,7 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
             if compiled['flops_per_device'] and ref_compiled['flops_per_device']:
                 row['flops_ratio'] = (compiled['flops_per_device'] * math.prod(compiled['mesh'].values())
                                       / ref_compiled['flops_per_device'])
-                row['flops_bound'] = flops_bound(LAYOUTS[name])
+                row['flops_bound'] = flops_bound(LAYOUTS[name], compiled['replicated'])
                 if row['status'] == 'works' and row['flops_ratio'] > row['flops_bound']:
                     row['status'] = 'REDUNDANT'
             rows.append(row)
@@ -1134,7 +1187,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                     # Above one when devices compute what one device need not.
                     size = math.prod(compiled["mesh"].values())
                     row["flops_ratio"] = compiled["flops_per_device"] * size / judge.flops_per_device
-                    row["flops_bound"] = flops_bound(LAYOUTS[name])
+                    row["flops_bound"] = flops_bound(LAYOUTS[name], compiled["replicated"])
                     if row["status"] == "works" and row["flops_ratio"] > row["flops_bound"]:
                         row["status"] = "REDUNDANT"
             except LayoutRefused as refusal:

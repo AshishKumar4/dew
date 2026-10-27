@@ -79,7 +79,7 @@ class TorchBankWeights(Mapping):
         expected = model.state_dict()
         owners = {}
         shapes = source.shapes()
-        for site in bundle.model.bank_sites:
+        for site in bundle.model.bank_sites(shapes):
             for first, count in site.view.groups:
                 for index in range(first, first + count):
                     layer = at_layer(one_layer(shapes, index, namespace=site.namespace), index,
