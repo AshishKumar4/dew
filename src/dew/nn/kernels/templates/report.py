@@ -5,11 +5,27 @@ program around it, with a device or a compile-only one. The CPU suite's resource
 (tests/kernel_compile.py), as a derivation does to confirm what it planned."""
 
 import contextlib
+import contextvars
 import dataclasses
+import functools
+import hashlib
+import json
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import threading
+from collections.abc import Callable
 from pathlib import Path
+
+import jax
+import jax.experimental.topologies as topologies
+import numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+from dew import cache
+from dew.nn.kernels import generation
 
 DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
 """The settings that turn Mosaic GPU's reports on, written under `MOSAIC_GPU_DUMP_TO`."""
@@ -90,3 +106,192 @@ def reports(directory: str) -> list[Report]:
             max(map(int, registers), default=None),
             max((int(stores) + int(loads) for stores, loads in spills), default=None), unread))
     return found_reports
+
+
+THREADS_PER_MULTIPROCESSOR = {(8, 0): 2048, (9, 0): 2048, (10, 0): 2048}
+"""Resident threads a multiprocessor holds by compute capability, 1536 on the others the targets name
+(CUDA C++ Programming Guide, "Technical Specifications per Compute Capability")."""
+
+
+def target_config(generation_name: str) -> str:
+    """The `gpu_device_info` XLA compiles for, from the CUDA `generation`'s target
+    (`generation.TARGETS`): its compute capability, the shared memory a block may opt into, its
+    multiprocessors, clock and bandwidth; CUDA's per-capability limits for the rest. The fields past
+    the capability and shared memory only steer XLA's own fusions, never a Triton kernel's code."""
+    target, version = generation.gpu_target(generation_name), generation.capability(generation_name)
+    facts = (target.shared_limit, target.multiprocessors, target.clock_hz, target.memory_bandwidth)
+    if version is None or any(fact is None for fact in facts):
+        raise ValueError(f"no CUDA target states {generation_name!r}'s compile facts")
+    major, minor = version
+    shared, multiprocessors, clock, bandwidth = facts
+    return f"""gpu_device_info {{
+  threads_per_block_limit: 1024
+  threads_per_warp: 32
+  shared_memory_per_block: 49152
+  shared_memory_per_core: {shared + 1024}
+  threads_per_core_limit: {THREADS_PER_MULTIPROCESSOR.get((major, minor), 1536)}
+  core_count: {multiprocessors}
+  fpus_per_core: {64 if (major, minor) == (8, 0) else 128}
+  block_dim_limit_x: 2147483647
+  block_dim_limit_y: 65535
+  block_dim_limit_z: 65535
+  memory_bandwidth: {int(bandwidth)}
+  clock_rate_ghz: {clock / 1e9}
+  shared_memory_per_block_optin: {shared}
+  cuda_compute_capability {{
+    major: {major}
+    minor: {minor}
+  }}
+  registers_per_core_limit: 65536
+  registers_per_block_limit: 65536
+}}
+platform_name: "CUDA"
+device_description_str: "{target.device_kind}"
+"""
+
+
+@functools.cache
+def compile_device(generation_name: str) -> Mesh:
+    """A one-device mesh of a compile-only device of the CUDA `generation_name` (`target_config`): XLA's CUDA
+    backend compiles for it with no GPU attached, through the compiler the GPU itself runs."""
+    topology = topologies.get_topology_desc("dew-compile", "cuda", topology="1x1x1",
+                                            target_config=target_config(generation_name))
+    return Mesh(np.array(topology.devices[:1]), ("data",))
+
+
+REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
+"""XLA's refusal of a kernel whose shared memory a block of the GPU does not hold."""
+
+
+@functools.cache
+def toolchain() -> str:
+    """The compilers a report depends on: JAX's and jaxlib's versions and ptxas's own version line, which
+    Mosaic GPU runs (JAX's CUDA path, `jax._src.lib.cuda_path`)."""
+    from jax._src import lib
+
+    ptxas = Path(lib.cuda_path or "") / "bin" / "ptxas"
+    found = subprocess.run([str(ptxas), "--version"], capture_output=True, text=True, check=False) \
+        if ptxas.exists() else None
+    version = found.stdout.strip().splitlines()[-1] if found and found.stdout.strip() else "no ptxas"
+    return f"jax {jax.__version__}, jaxlib {lib.version_str}, {version}"
+
+
+_CONFIRMED: dict[str, tuple[Report, ...]] = {}
+_CONFIRMING = contextvars.ContextVar("dew_confirming", default=False)
+
+
+def confirming() -> bool:
+    """Whether this trace is a confirmation's own (`confirmed`), whose kernel takes the config it is given."""
+    return _CONFIRMING.get()
+
+
+def confirmed(fn: Callable, args, generation_name: str, *,
+              compile: Callable | None = None) -> tuple[Report, ...]:
+    """The reports of `fn`'s Mosaic GPU kernels at abstract `args`, compiled for the CUDA `generation_name`
+    by the compiler that GPU runs: the compiler's word on a derived config. `fn` is exported for CUDA as
+    that GPU lowers it (`jax.export`) and its module, with the generation and the toolchain (`toolchain`),
+    keys the reports, which persist under Dew's cache (`cache.dew_cache_dir`), so a kernel compiles for
+    this once per toolchain, the same reports whatever process asks. A process on that GPU compiles here,
+    so Mosaic GPU's own cache of the kernel serves the program's compile; any other compiles in a process
+    of its own, whose first Mosaic GPU compile is the generation's (Mosaic GPU's binary pass keeps a
+    process's first capability: tests/kernel_compile.py). A compile XLA refuses for its shared memory
+    reports it (`Report.unread`); any other failure raises. `compile(exported, generation_name, directory)`
+    compiles where none is cached (by default here on the generation's GPU, else in a process of its own)."""
+    with tempfile.TemporaryDirectory(prefix="dew-confirm-") as directory:
+        # Mosaic GPU states a kernel's resources as it lowers it, and ptxas its registers as it compiles.
+        with reported(directory):
+            exported = _exported(fn, args, generation_name)
+        key = hashlib.sha256("\n".join((_located_nowhere(str(exported.mlir_module())), generation_name,
+                                         toolchain())).encode())
+        digest = key.hexdigest()
+        if digest in _CONFIRMED:
+            return _CONFIRMED[digest]
+        path = Path(cache.dew_cache_dir()) / "kernel-reports" / f"{digest}.json"
+        if path.exists():
+            found = tuple(Report(**{**entry, "unread": tuple(entry["unread"])})
+                          for entry in json.loads(path.read_text()))
+            _CONFIRMED[digest] = found
+            return found
+        if compile is None:
+            compile = _compiled_here if _local(generation_name) else _compiled_apart
+        found = compile(exported, generation_name, directory)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        written = path.with_suffix(f".{os.getpid()}.tmp")
+        written.write_text(json.dumps([dataclasses.asdict(entry) for entry in found]))
+        written.replace(path)
+    _CONFIRMED[digest] = found
+    return found
+
+
+def _located_nowhere(module: str) -> str:
+    """`module`'s text without its source locations, which name where the launch was traced from and
+    change nothing it compiles to."""
+    return re.sub(r"^#loc\d* = .*$\n?", "", re.sub(r" loc\(#loc\d*\)", "", module), flags=re.M)
+
+
+def _exported(fn: Callable, args, generation_name: str):
+    """`fn` at `args` exported for CUDA as the `generation_name` GPU lowers it."""
+    mesh = compile_device(generation_name)
+    placed = [jax.ShapeDtypeStruct(arg.shape, arg.dtype, sharding=NamedSharding(mesh, PartitionSpec()))
+              for arg in args]
+    token = _CONFIRMING.set(True)
+    try:
+        with generation.assumed(generation_name), \
+                jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, generation_name)):
+            return jax.export.export(jax.jit(fn), platforms=("cuda",))(*placed)
+    finally:
+        _CONFIRMING.reset(token)
+
+
+def _local(generation_name: str) -> bool:
+    """Whether this process runs on a GPU of `generation_name`, for which it compiles its own kernels."""
+    if jax.default_backend() != "gpu":
+        return False
+    found = generation._compute_capability(jax.local_devices()[0])
+    return found is not None and tuple(int(part) for part in found.split(".")) == \
+        generation.capability(generation_name)
+
+
+def _compiled_here(exported, generation_name: str, directory: str) -> tuple[Report, ...]:
+    """`exported`'s kernels' reports, compiled in this process into `directory` (beside the resource
+    estimates its lowering stated there): on its own GPU, or (in a process of its own, `_compiled_apart`)
+    for a compile-only device of `generation_name`."""
+    local = _local(generation_name)
+    mesh = None if local else compile_device(generation_name)
+    placed = [jax.ShapeDtypeStruct(aval.shape, aval.dtype,
+                                   **({} if local else {"sharding": NamedSharding(mesh, PartitionSpec())}))
+              for aval in exported.in_avals]
+    with reported(directory):
+        try:
+            with contextlib.ExitStack() as stack:
+                if not local:
+                    stack.enter_context(generation.assumed(generation_name))
+                    stack.enter_context(
+                        jax.sharding.use_abstract_mesh(generation.gpu_mesh(mesh, generation_name)))
+                jax.jit(exported.call).trace(*placed).lower().compile()
+        except jax.errors.JaxRuntimeError as error:
+            if (refused := REFUSED.search(str(error))) is None:
+                raise
+            return (Report("refused", int(refused.group(1)), 0, None, None, ("its compile",)),)
+        return reports(directory)
+
+
+def _compiled_apart(exported, generation_name: str, directory: str) -> tuple[Report, ...]:
+    """`_compiled_here` in a process of its own."""
+    with tempfile.TemporaryDirectory(prefix="dew-confirm-apart-") as apart:
+        blob, found = Path(apart) / "exported", Path(apart) / "reports.json"
+        blob.write_bytes(exported.serialize())
+        ran = subprocess.run([sys.executable, "-m", "dew.nn.kernels.templates.report", generation_name,
+                              str(blob), str(found), directory], capture_output=True, text=True, check=False)
+        if ran.returncode != 0 or not found.exists():
+            raise RuntimeError(f"confirming a kernel for {generation_name} failed in its own process:\n"
+                               f"{(ran.stdout + ran.stderr)[-3000:]}")
+        return tuple(Report(**{**entry, "unread": tuple(entry["unread"])})
+                     for entry in json.loads(found.read_text()))
+
+
+if __name__ == "__main__":
+    _generation, _blob, _found, _directory = sys.argv[1:5]
+    _reports = _compiled_here(jax.export.deserialize(bytearray(Path(_blob).read_bytes())), _generation,
+                              _directory)
+    Path(_found).write_text(json.dumps([dataclasses.asdict(entry) for entry in _reports]))

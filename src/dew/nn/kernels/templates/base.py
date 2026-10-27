@@ -12,10 +12,11 @@ import dataclasses
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import ClassVar, TypeGuard
 
+import jax
 import tokamax
 
 from dew.nn.kernels import generation, tuning
-from dew.nn.kernels.templates import cost
+from dew.nn.kernels.templates import cost, report
 
 
 class Template[Config: Hashable](tuning.KernelOp):
@@ -109,6 +110,40 @@ class Template[Config: Hashable](tuning.KernelOp):
     def _typed(self, config: Hashable) -> TypeGuard[Config]:
         """Whether `config` is of the launch's config type (`config_cls`)."""
         return isinstance(config, self.config_cls)
+
+    def confirmed(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
+        """Whether the compiler confirms the launch of `ba` at `config` on `target` (`report.confirmed`):
+        each of its Mosaic GPU kernels within a program's shared memory (`program_shared`) and the
+        target's tensor memory, spilling nothing. A launch nothing compiles needs no word: an interpreted
+        one, one off a CUDA target, and a confirmation's own trace (`report.confirming`)."""
+        if (ba.arguments.get('interpret') or generation.capability(target.generation) is None
+                or report.confirming()):
+            return True
+        def array(leaf) -> bool:
+            return isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct, jax.core.Tracer))
+
+        leaves, tree = jax.tree.flatten((ba.args, ba.kwargs), is_leaf=array)
+        places = [index for index, leaf in enumerate(leaves) if array(leaf)]
+        abstract = tuple(jax.ShapeDtypeStruct(leaves[index].shape, leaves[index].dtype) for index in places)
+        memo = (type(self).__name__, config, target.generation, abstract,
+                tuple(str(leaf) for index, leaf in enumerate(leaves) if index not in places))
+        if (known := _CONFIRMATIONS.get(memo)) is not None:
+            return known
+        configured = self.replace(config=config)
+
+        def launch(*arrays):
+            filled = list(leaves)
+            for index, value in zip(places, arrays, strict=True):
+                filled[index] = value
+            args, kwargs = jax.tree.unflatten(tree, filled)
+            return configured(*args, **kwargs)
+
+        # A call that compiles no Mosaic GPU kernel (a product of no depth) has nothing to refute.
+        found = report.confirmed(launch, abstract, target.generation)
+        held = all(entry.failure(self.program_shared(config, target), target.tmem_columns or 0) is None
+                   for entry in found)
+        _CONFIRMATIONS[memo] = held
+        return held
 
     def _held(self, ba: tokamax.BoundArguments, config: Config) -> bool:
         """Whether `config`'s threads hold their registers (`registers` within `register_budget`)."""
@@ -214,3 +249,7 @@ def call(implementations: Sequence[Template], *args, **kwargs) -> Call:
     """The call of `implementations` with `args` and `kwargs` on this device's target."""
     return Call({implementation.name: (implementation, implementation.bind(*args, **kwargs))
                  for implementation in implementations}, generation.gpu_target())
+
+
+_CONFIRMATIONS: dict = {}
+"""This process's confirmations by launch, config, generation and abstract operands (`Template.confirmed`)."""

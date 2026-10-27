@@ -623,3 +623,62 @@ def test_no_row_tile_reads_past_its_operands_allocation(sizes, row_tile):
     assert reads <= mosaic_gpu.row_extent(rows, row_tile)
     if sizes == [120, 8]:
         assert reads > -(-rows // row_tile) * row_tile  # past the row-tile padding that held before
+
+
+
+def test_a_refuted_config_steps_the_derivation_down_its_own_order():
+    """Where the compiler refutes the derived config (`resources.confirmed_derivation`), the derivation runs
+    again without it and takes its next config in its own order; it ends where the derivation runs out."""
+    from dew.nn.kernels.templates import resources
+
+    order = ["128x128 s3", "128x128 s2", "64x128 s3"]
+
+    def derive(allowed):
+        return next((config for config in order if allowed(config)), None)
+
+    assert resources.confirmed_derivation(derive, lambda config: config != "128x128 s3") == "128x128 s2"
+    assert resources.confirmed_derivation(derive, lambda config: True) == "128x128 s3"
+    assert resources.confirmed_derivation(derive, lambda config: False) is None
+
+
+def test_an_interpreted_launch_takes_the_models_tile_unconfirmed():
+    """An interpreted call compiles no kernel, so its derived tile needs no compiler's word
+    (`Template.confirmed`)."""
+    args = (jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16),
+            jax.ShapeDtypeStruct((8, 2048, 2048), jnp.bfloat16), jax.ShapeDtypeStruct((8,), jnp.int32))
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        launch = grouped_matmul.MosaicGmm()
+        ba = launch.bind(*args, interpret=True, out_dtype="bfloat16", trans_rhs=False)
+        tile = launch.derived(ba, target)
+        assert tile is not None and launch.confirmed(ba, tile, target)
+
+
+def test_a_kernels_reports_are_compiled_once_per_toolchain(monkeypatch, tmp_path):
+    """`report.confirmed` keys a kernel's reports by its exported module, its generation and the toolchain
+    (`report.toolchain`), and keeps them under Dew's cache: a second ask compiles nothing."""
+    from dew.nn.kernels.templates import report
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    compiled = []
+    found = (report.Report("dew_gmm", 1024, 0, 128, 0),)
+
+    def compile(exported, name, directory):
+        compiled.append(name)
+        return found
+
+    args = (jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16),
+            jax.ShapeDtypeStruct((2,), jnp.int32))
+    with generation.assumed("sm80"):
+        launch = grouped_matmul.MosaicGmm()
+        tile = launch.derived(launch.bind(*args, interpret=True, out_dtype="bfloat16", trans_rhs=False),
+                              generation.gpu_target())
+
+        def call(x, w, sizes):
+            return launch.replace(config=tile)(x, w, sizes, interpret=False, out_dtype="bfloat16",
+                                               trans_rhs=False)
+
+        assert report.confirmed(call, args, "sm80", compile=compile) == found
+        assert report.confirmed(call, args, "sm80", compile=compile) == found
+    assert compiled == ["sm80"]
+    assert len(list((tmp_path / "dew" / "kernel-reports").glob("*.json"))) == 1

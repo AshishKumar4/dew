@@ -567,10 +567,16 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if family is None:
             return None
         rows, depth, width = self._generated_extents(ba)
-        return mosaic_gpu.derived(family, rows=rows, depth=depth, width=width,
-                                  dtype=ba.arguments['tokens'].dtype,
-                                  multiprocessors=_multiprocessors(target),
-                                  holds=lambda tile: self.legal(ba, tile, target), grouped=depth is not None)
+        # The derivation's tile, confirmed by the compiler (`Template.confirmed`); one it refutes steps the
+        # derivation down its own order, as one the model refused would.
+        def derive(allowed) -> mosaic_gpu.Tiles | None:
+            return mosaic_gpu.derived(family, rows=rows, depth=depth, width=width,
+                                      dtype=ba.arguments['tokens'].dtype,
+                                      multiprocessors=_multiprocessors(target),
+                                      holds=lambda tile: allowed(tile) and self.legal(ba, tile, target),
+                                      grouped=depth is not None)
+
+        return resources.confirmed_derivation(derive, lambda tile: self.confirmed(ba, tile, target))
 
     def neighbours(self, ba, config: mosaic_gpu.Tiles) -> tuple[mosaic_gpu.Tiles, ...]:
         # The derived tile with one of its choices moved a step either way: a stage more or fewer, the
