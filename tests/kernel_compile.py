@@ -177,6 +177,8 @@ SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
 SMEM = re.compile(r"smem_scratch_bytes=(\d+)")
 KERNEL_COUNTER = re.compile(r"_\d+$")
 """The counter Mosaic GPU appends to a kernel's name in its reports' file names."""
+DUMP_NAME = re.compile(r'mosaic_gpu\.dump_basename = "[^"]*"')
+"""The one attribute of Mosaic's module dump that names the dump (its counter) rather than the module."""
 TMEM_USED = re.compile(r"tmem_scratch_cols=(\d+), tmem_collective_scratch_cols=(\d+)")
 
 
@@ -223,7 +225,8 @@ def mosaic_kernels(directory: str) -> list[dict]:
                                              ("registers", registers), ("spills", spills)) if not found]
         module = found.get("module")
         kernels.append({"kernel": name, "unread": unread,
-                        "module": hashlib.sha256(module.read_bytes()).hexdigest() if module else None,
+                        "module": hashlib.sha256(DUMP_NAME.sub("", module.read_text()).encode()).hexdigest()
+                        if module else None,
                         "shared": int(shared.group(1)) if shared else None,
                         "tmem": sum(map(int, tmem.groups())) if tmem else None,
                         "registers": max(map(int, registers), default=None),
