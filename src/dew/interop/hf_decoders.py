@@ -138,7 +138,10 @@ def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
-        default_tied = hf_config.get("model_type") not in QWEN35_TYPES
+        # Transformers ties by the wrapper config's own field (modeling_utils' tie_weights reads
+        # `getattr(config, "tie_word_embeddings", False)`), which Qwen 3.5's and Muse Glimmer's
+        # configs leave unset.
+        default_tied = hf_config.get("model_type") not in (*QWEN35_TYPES, "muse_glimmer")
         tied = hf_config.get("tie_word_embeddings", default_tied)
         if tied is not None and not isinstance(tied, bool):
             refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
