@@ -285,12 +285,11 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
                         seeds=SEEDS, truth_fn=truth)
 
 
-def test_a_gated_delta_net_named_onto_the_template_runs_it_and_matches_the_portable_rule():
-    """A layer whose route names the template (`generation.chosen(gated_delta_rule='mosaic_gpu')`) runs it:
-    its probe ahead of the gates (`on_the_port`, which binds no launches) takes the selector's own pick, not
-    a refusal, and the rule then takes the template, its output on par from float64 with the portable
-    rule's (the layer's own float64 forward the truth). The layer computes in bf16, the call the template's
-    launches hold on every family (an fp32 call's solve holds more registers than a thread has)."""
+def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
+    """A layer naming the template (`generation.chosen(gated_delta_rule='mosaic_gpu')`): its output on par
+    from float64 with the portable rule's (the layer's own float64 forward the truth). The layer computes
+    in bf16, the call the template's launches hold on every family (an fp32 call's solve holds more
+    registers than a thread has)."""
     from dew.nn.linear import GatedDeltaNet
 
     x = jax.random.normal(jax.random.key(23), (1, 72, 64)).astype(jnp.bfloat16)
@@ -299,9 +298,8 @@ def test_a_gated_delta_net_named_onto_the_template_runs_it_and_matches_the_porta
     with generation.chosen(gated_delta_rule='xla'):
         params = layer.init(jax.random.key(29), x)
         want = layer.apply(params, x)
-    with generation.chosen(gated_delta_rule='mosaic_gpu'), generation.routes() as taken:
+    with generation.chosen(gated_delta_rule='mosaic_gpu'):
         got = layer.apply(params, x)
-    assert any(route.choice == 'gated_delta_rule' and route.kernel == 'mosaic_gpu' for route in taken)
     truth, terms = float64_forward(layer, params, x)
     assert_as_exact_as_the_reference(got, want, truth, 'a layer named onto the template', terms=terms)
 

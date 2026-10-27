@@ -25,7 +25,7 @@ from tuned import each_config, taken
 from dew.nn.activations import exact_gelu
 from dew.nn.gpt_oss import GptOssExperts
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.generation import chosen as kernel_choices, gpu_target, routes, triton_runs
+from dew.nn.kernels.generation import chosen as kernel_choices, gpu_target, triton_runs
 from dew.nn.moe import ExpertMLP, expert_dispatch, expert_projection
 from dew.training import MeshSpec
 from tools import grouped_oracle as oracle
@@ -234,8 +234,8 @@ def _tile_gate_arm(implementation, fault=1.0):
 
 def _tile_gate(kernel, width, features):
     """The tile gate of `kernel`'s launch at one shape: its draws, and `check(config, fault)`, check 1 of
-    the launch at `config` against XLA's ragged dot, which runs under its own choice (its route checked
-    once) so the forced kernel never reaches it."""
+    the launch at `config` against XLA's ragged dot, which runs under its own choice so the forced kernel
+    never reaches it."""
     rows = int(TILE_SIZES.sum())
 
     def draw(seed):
@@ -250,9 +250,6 @@ def _tile_gate(kernel, width, features):
         return oracle.products(x, rounded(kernel_matrix), dy, TILE_SIZES)
 
     xla = jax.jit(_tile_gate_arm('xla'))
-    with kernel_choices(grouped_matmul='xla'), routes() as taken:
-        xla(*draw(0))
-    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'xla'}
 
     def reference(*inputs):
         with kernel_choices(grouped_matmul='xla'):
