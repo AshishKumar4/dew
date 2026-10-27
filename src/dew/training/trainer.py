@@ -964,8 +964,11 @@ class Trainer(Generic[Loss, Effects]):
         """
         if self.lower_for is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
-            compiled = topology_devices(self.lower_for) is not None
-            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for), compiled=compiled)
+            target, compiled = self.lower_for, topology_devices(self.lower_for) is not None
+            lowered = Lowered(target, self._lowered_for(state, batch, target), compiled=compiled)
+            if compiled and self.checkpoints is not None:  # The run's own record of its target's compile.
+                lowered.save(f"{self.checkpoints.directory}/compiled-{self.lower_for}")
+            raise lowered
         split, unaligned = divmod(int(state.window_size), self.accumulation)
         if unaligned or (state.accumulation is not None and self._split not in (None, split)):
             raise ValueError(f"the state pools windows of {int(state.window_size)} microbatches, and this "
@@ -1614,6 +1617,8 @@ class Trainer(Generic[Loss, Effects]):
                 first = waited_read(run, interval, agree=True, peek=True)
                 if first is not None:
                     placed_first = placed_abstract(mesh, first)
+                    if topology_devices(self.lower_for):  # A TPU topology's step compiles here, unplaced.
+                        self.compile(abstract, placed_first)
                     # A process whose reader changed a field or a shape is refused by every process, as
                     # a compile refuses it, before the state it would check is traced from that batch.
                     agreed_same("training batch layout", lambda: batch_layout(split_fields(placed_first)[0]))

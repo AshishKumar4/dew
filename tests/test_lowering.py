@@ -568,3 +568,69 @@ def test_a_function_traced_before_a_routes_block_reports_its_routes_within_it():
         with routes() as found:
             jax.block_until_ready(outer(x))
         assert [found_route.choice for found_route in found] == ["ssd"]
+
+
+# ------------------------------------------------------------------ a TPU topology, compiled here
+
+
+def _topology_lowered(topology: str, **trainer_options):
+    """A tiny Llama's language-model training step compiled for the TPU `topology` on this host, its
+    state sharded whole over the topology's devices (`fsdp` of all of them, each leaf split)."""
+    import optax
+
+    from dew.distributed.placement import MeshSpec
+    from dew.layout import Layout
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+    from dew.training._lowering import Lowered, topology_devices
+
+    devices = len(topology_devices(topology) or ())
+    model = CausalTransformer(vocab_size=256, num_layers=2, num_heads=4, emb_features=128, mlp_features=256,
+                              dtype=jnp.bfloat16)
+    trainer = Trainer(LMObjective(model, 64), optax.adamw(1e-4), key=jax.random.key(0), lower_for=topology,
+                      mesh=MeshSpec(fsdp=devices), layout=Layout(min_shard=1), **trainer_options)
+    state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
+    with pytest.raises(Lowered) as lowered:
+        trainer.compile(state, {"text": jax.ShapeDtypeStruct((devices, 65), jnp.int32)})
+    return trainer, lowered.value
+
+
+def test_a_step_compiles_here_for_a_tpu_topology_and_states_each_devices_memory_and_work(tmp_path):
+    """A run's step compiles on this CPU host for a TPU topology it is not running on, its mesh built
+    over the topology's devices (`jax.experimental.topologies`), as MaxText's train_compile compiles:
+    its arguments lie on every TPU of the topology, each device's memory and work are XLA's own for
+    that TPU, and a topology of more devices holds less of the sharded state on each. The executable
+    saves for a host of that topology to load."""
+    small, large = (_topology_lowered(name)[1] for name in ("v5e:2x2", "v5e:4x4"))
+    for lowered, count in ((small, 4), (large, 16)):
+        assert lowered.compiled is not None
+        placed = jax.tree.leaves(lowered.compiled.input_shardings)
+        assert {device.platform for sharding in placed for device in sharding.device_set} == {"tpu"}
+        assert {len(sharding.device_set) for sharding in placed} == {count}
+        assert lowered.memory["argument"] > 0 and lowered.memory["temp"] > 0 and lowered.cost["flops"] > 0
+    assert large.memory["argument"] < small.memory["argument"]
+    small.save(tmp_path / "compiled")
+    assert (tmp_path / "compiled").stat().st_size > 0
+    stated = json.loads((tmp_path / "compiled.json").read_text())
+    assert stated == {"target": "v5e:2x2", "memory": small.memory, "cost": small.cost}
+
+
+def test_a_run_compiled_for_a_tpu_topology_keeps_its_executable_beside_its_checkpoints(tmp_path):
+    """A run under `lower_for` of a TPU topology compiles its step for it and saves the executable, with
+    each device's memory and work, in its checkpoint directory, before it trains."""
+    from dew.checkpoints import Checkpoints
+
+    _, lowered = _topology_lowered("v5e:2x2", checkpoints=Checkpoints(str(tmp_path / "run")))
+    assert (tmp_path / "run" / "compiled-v5e:2x2").stat().st_size > 0
+    assert json.loads((tmp_path / "run" / "compiled-v5e:2x2.json").read_text())["memory"] == lowered.memory
+
+
+def test_a_cuda_generation_lowers_and_compiles_nothing_here():
+    """A CUDA generation's step lowers alone, as XLA's compile of it needs the GPU: its memory is asked
+    of no executable, and is refused."""
+    from dew.training._lowering import Lowered, topology_devices
+
+    assert topology_devices("sm80") is None and topology_devices(None) is None
+    with pytest.raises(ValueError):
+        _ = Lowered("sm80", jax.jit(lambda x: x + 1).trace(jnp.ones(2)).lower()).memory

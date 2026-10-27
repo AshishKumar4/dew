@@ -493,6 +493,14 @@ class TrainerConfig:
     first compile there fails here, in seconds and without the GPU; XLA's
     compile of the whole step still needs one. The program exits with status
     0 once the step lowers, and opens no W&B run.
+
+    A TPU topology, `--trainer.lower-for v5e:4x4` (as
+    `jax.experimental.topologies` names one), builds the run's mesh over that
+    topology's devices and compiles its first step for them on any host that
+    holds libtpu, as MaxText's train_compile does: the run saves the executable
+    in its checkpoint directory, `compiled-v5e:4x4`, with each device's memory
+    and work beside it (`compiled-v5e:4x4.json`, `dew.training._lowering.Lowered`),
+    and exits.
     """
     tune_kernels: bool = False
     """Measure each Pallas launch of the step that has no config measured on this GPU.

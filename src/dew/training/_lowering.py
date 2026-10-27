@@ -31,6 +31,7 @@ host, so attention traces its XLA path.
 
 from __future__ import annotations
 
+import json
 import pickle
 from collections import Counter
 from dataclasses import dataclass
@@ -134,12 +135,17 @@ class Lowered(SystemExit):
                 if key in found}
 
     def save(self, path: str | Path) -> None:
-        """Write the compiled step to `path`: its serialized executable and its argument and result
-        trees, which `jax.experimental.serialize_executable.deserialize_and_load` reads on a host of
-        the topology it was compiled for."""
+        """Write the compiled step to `path`, local or remote: its serialized executable and its
+        argument and result trees, which `jax.experimental.serialize_executable.deserialize_and_load`
+        reads on a host of the topology it was compiled for, and beside it (`path.json`) the target it
+        was compiled for and each device's memory and work."""
+        from etils import epath
         from jax.experimental.serialize_executable import serialize
 
-        Path(path).write_bytes(pickle.dumps(serialize(self._compiled())))
+        saved = epath.Path(path)
+        saved.write_bytes(pickle.dumps(serialize(self._compiled())))
+        saved.with_name(saved.name + ".json").write_text(json.dumps(
+            {"target": self.generation, "memory": self.memory, "cost": self.cost}, indent=1))
 
     def _compiled(self) -> jax.stages.Compiled:
         if self.compiled is None:
