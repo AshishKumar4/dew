@@ -2,6 +2,7 @@
 
 Run with transformers 5.16.1, Torch and tokenizers installed:
     PYTHONPATH=src python tools/multimodal_reference.py
+    PYTHONPATH=src:. python tools/multimodal_reference.py float64 [references ...]  # the float64 truths
 
 No network access or pretrained downloads are used. Each family's existing
 tiny fixture supplies the weights, and every reference lands in
@@ -443,6 +444,47 @@ def write_gemma4_unified_native() -> None:
     print(f"{destination.name}: forward shape {tuple(result.logits.shape)}", flush=True)
 
 
+TRUTHS = {"gemma4-native-tiny": "gemma4-native-tiny", "qwen35-native-tiny": "qwen35-native-tiny",
+          "llama4-native-tiny": "llama4-native-tiny", "gemma3n-native-tiny": "gemma-3n-audio-tiny"}
+"""Each written reference directory and the checkpoint it was written from, whose float64 truths
+`write_float64_truths` writes beside the references."""
+
+
+def write_float64_truths(references: str) -> None:
+    """The float64 truth of what `_write_forward_backward` recorded in `references`: the reference
+    model's float64 twin (tools/torch_precision.py) over the same stored batch encoding, one row at a
+    time, its summed next-token loss, pixel gradient and logits after one SGD step of LEARNING_RATE,
+    in training_f64.json, pixel_gradient_f64.npy and updated_logits_f64.npy. The Dew side's
+    checks hold Dew and the fp32 reference to it (tests/test_multimodal_model.py)."""
+    from transformers import AutoModelForImageTextToText
+
+    from tools.torch_precision import float64, float64_twin
+
+    destination, source = ROOT / references, ROOT / TRUTHS[references]
+    model = AutoModelForImageTextToText.from_pretrained(source, dtype=torch.float32,
+                                                        attn_implementation="eager").eval()
+    recorded = ("logits", "updated_logits", "pixel_gradient", "continuation", "raw_images")
+    encoded = {path.stem: torch.from_numpy(np.load(path)) for path in destination.glob("*.npy")
+               if path.stem not in recorded and not path.stem.endswith("_f64")}
+    twin = float64_twin(model)
+    with float64():
+        widened = {name: value.double() if value.is_floating_point() else value
+                   for name, value in encoded.items()}
+        valid = widened["attention_mask"].bool()
+        singles = _row_slices(widened, twin)
+        loss, pixel_inputs = _sgd_step(twin, singles, valid)
+        updated = torch.zeros((*widened["input_ids"].shape, twin.config.get_text_config().vocab_size),
+                              dtype=torch.float64)
+        with torch.no_grad():
+            for row, single in enumerate(singles):
+                updated[row, valid[row]] = twin(**single, use_cache=False).logits[0]
+    np.save(destination / "pixel_gradient_f64.npy",
+            torch.cat([pixels.grad for pixels in pixel_inputs]).numpy())
+    np.save(destination / "updated_logits_f64.npy", updated.numpy())
+    (destination / "training_f64.json").write_text(json.dumps({"loss": float(loss.detach())}) + "\n")
+    print(destination, "float64 loss", float(loss.detach()), flush=True)
+
+
 def write_llama4_native() -> None:
     """The actual Llama4Processor tiling: local tiles, a global tile and separators."""
     from transformers import Llama4Config, Llama4ForConditionalGeneration, Llama4Processor
@@ -486,6 +528,10 @@ if __name__ == "__main__":
         sys.exit()
     if sys.argv[1:] == ["gemma3n-spread"]:
         gemma3n_post_sgd_spread()
+        sys.exit()
+    if sys.argv[1:2] == ["float64"]:
+        for references in sys.argv[2:] or TRUTHS:
+            write_float64_truths(references)
         sys.exit()
     write_gemma3_native()
     write_gemma3n_native()
