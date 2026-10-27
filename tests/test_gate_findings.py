@@ -229,8 +229,10 @@ def test_a_reference_exactly_zero_on_a_residue_row_does_not_measure_it():
     reference = np.asarray([[1.0, -1.0, 0.5], [0.0, 0.0, 0.0]])
     dew = np.asarray([[1.0, -1.0, 0.5], [1e-15, -1e-15, 1e-15]])
     mine = leaf_summary(dew, truth)
-    _, _, worst, _, (rows, _, _), _ = _paired("leaf", mine, leaf_summary(reference, truth))
-    assert rows.tolist() == [1] and worst < 0
+    # Exactly zero, and zero but for a value far below the residue, which carries nothing of the row.
+    for nothing in (reference, reference + np.asarray([[0.0, 0.0, 0.0], [1e-45, 0.0, 0.0]])):
+        _, _, worst, _, (rows, _, _), _ = _paired("leaf", mine, leaf_summary(nothing, truth))
+        assert rows.tolist() == [1] and worst < 0
     close = np.asarray([[1.0, -1.0, 0.5], [1.6e-40, -1.6e-40, 1.5e-40]])
     _, _, worst, _, (rows, _, _), _ = _paired("leaf", mine, leaf_summary(close, truth))
     assert rows.tolist() == [] and worst > 50
