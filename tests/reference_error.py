@@ -876,11 +876,6 @@ def _sign_bits(size: int, seed: int) -> np.ndarray:
     return np.random.default_rng([0x5E7C4, size, seed]).integers(0, 1 << SKETCH, size, dtype=np.uint64)
 
 
-_BYTE_SIGNS = ((np.arange(256)[:, None] >> np.arange(8)) & 1) * 2.0 - 1
-"""A (256, 8) float64 table whose [byte, k] entry is +1.0 where the byte's bit k is set and -1.0 where it
-is not, least significant bit first."""
-
-
 def truth_sketch(truth, seed: int) -> np.ndarray:
     """A float64 truth leaf's sketch `[SKETCH]` at a recorded seed: its entries summed under SKETCH random
     signs of that seed's own (`_sign_bits`), each sign's
@@ -894,10 +889,13 @@ def truth_sketch(truth, seed: int) -> np.ndarray:
     for start in range(0, flat.size, 1 << 16):
         chunk = flat[start:start + (1 << 16)]
         # Sign k of an entry is its word's bit k: its low four bytes, read little-endian whatever the host's
-        # order, so the first byte holds bits 0 to 7.
+        # order, so the first byte holds bits 0 to 7, unpacked least significant bit first.
         words = bits[start:start + chunk.size].astype("<u8").view(np.uint8).reshape(chunk.size, 8)[:, :4]
+        negative = np.unpackbits(words, axis=1, bitorder="little") == 0
         products = np.zeros((chunk.size + -chunk.size % SKETCH_BLOCK, SKETCH))
-        np.multiply(chunk[:, None], _BYTE_SIGNS[words].reshape(chunk.size, SKETCH), out=products[:chunk.size])
+        # Each product is the entry or its negation, exact: the sign table's product, bit for bit.
+        products[:chunk.size] = chunk[:, None]
+        np.negative(products[:chunk.size], out=products[:chunk.size], where=negative)
         partials.append(products.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
     return np.asarray([math.fsum(column) for column in np.concatenate(partials).T.tolist()])
 
@@ -932,25 +930,45 @@ class RecordedLeaf:
         return self.worst_log if self.worst_log is not None else float(_log_over(self.worst, 1.0))
 
 
-def leaf_summary(reference, truth) -> RecordedLeaf:
+@dataclasses.dataclass(frozen=True)
+class _TruthRows:
+    """What `leaf_summary` reads of a truth leaf alone, read once a draw for both arms (`_evidence`):
+    each row's own RMS (`_scaled_rms`), its size (the RMS where it is past RESOLUTION of the leaf, else
+    zero: `row_errors`'s), and whether every value is finite."""
+
+    own: np.ndarray
+    sizes: np.ndarray
+    finite: bool
+
+    @staticmethod
+    def of(truth: np.ndarray) -> "_TruthRows":
+        own = _scaled_rms(truth.reshape(-1, truth.shape[-1])) if truth.ndim >= 2 else np.zeros(0)
+        leaf = distance(truth, 0)
+        return _TruthRows(own, np.where(own > RESOLUTION * leaf, own, 0.0), bool(np.isfinite(truth).all()))
+
+
+def leaf_summary(reference, truth, rows_of: _TruthRows | None = None) -> RecordedLeaf:
     """`RecordedLeaf` of a leaf against its float64 truth: check 1's evidence of the reference's leaf, or
-    of Dew's (`_drawn` reads both so, a recorded reference's as recorded). An empty leaf is exact."""
+    of Dew's (`_drawn` reads both so, a recorded reference's as recorded). An empty leaf is exact.
+    `rows_of` is the truth's own rows (`_TruthRows.of`), where a caller has read them already."""
     dtype = str(jnp.dtype(getattr(reference, "dtype", np.asarray(reference).dtype)))
     reference, truth = np.asarray(reference, np.float64), np.asarray(truth, np.float64)
     if not reference.size:
         assert truth.shape == reference.shape, (f"an empty leaf {reference.shape} against a truth "
                                                 f"{truth.shape}")
         return RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=True, dtype=dtype)
-    sizes, rows = row_errors(reference, truth)
-    sized = sizes > 0
+    held = rows_of or _TruthRows.of(truth)
     # Each row's own size by the arithmetic its errors take (`_scaled_rms`), so an arm exactly zero on a
-    # row is exactly its size from it.
-    own = _scaled_rms(truth.reshape(-1, truth.shape[-1])) if truth.ndim >= 2 else np.zeros(0)
+    # row is exactly its size from it: `row_errors`' sizes and errors, the truth's read once.
+    sizes, own = held.sizes, held.own
+    rows = (_scaled_rms((reference - truth).reshape(-1, truth.shape[-1])) if truth.ndim >= 2
+            else np.zeros(0))
+    sized = sizes > 0
     logged = float(np.max(_log_over(rows[sized], sizes[sized]))) if sized.any() else LOG_ZERO
     return RecordedLeaf(float(np.mean(np.square(reference - truth))),
                         float(np.max(_over(rows[sized], sizes[sized]))) if sized.any() else 0.0,
                         np.flatnonzero(~sized), rows[~sized],
-                        finite=bool(np.isfinite(reference).all() and np.isfinite(truth).all()), dtype=dtype,
+                        finite=bool(np.isfinite(reference).all()) and held.finite, dtype=dtype,
                         zero_sizes=own[~sized], worst_log=logged)
 
 
@@ -1044,7 +1062,10 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
             if shape != np.shape(true):
                 raise AssertionError(f"{jax.tree_util.keystr(path)}: {name}'s shape is {shape}, the truth's "
                                      f"{np.shape(true)}")
-        their = their_leaf if recorded else leaf_summary(their_leaf, their_true)
+        # A truth's rows are read once a draw, for both arms where the two truths are the same values.
+        same = their_true is true
+        rows_of = None if not np.size(true) else _TruthRows.of(np.asarray(true, np.float64))
+        their = their_leaf if recorded else leaf_summary(their_leaf, their_true, rows_of if same else None)
         if np.size(leaf) == 0:
             # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
             # reference's dtype (its shape is held above; the truth's dtype, float64, is its own), it
@@ -1056,7 +1077,8 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = (recorded or their_truth is truth
                   or np.array_equal(np.asarray(true), np.asarray(their_true)))
-        row.append(_paired(jax.tree_util.keystr(path), leaf_summary(leaf, true), their, paired=paired))
+        mine = leaf_summary(leaf, true, rows_of)
+        row.append(_paired(jax.tree_util.keystr(path), mine, their, paired=paired))
     return row
 
 
