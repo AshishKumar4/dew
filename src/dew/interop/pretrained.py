@@ -1310,7 +1310,7 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
     codec = source_quantization(config)
     if codec is None or codec.input_scale_dtype is None:
         return model, variables
-    sites: dict[tuple[str, ...], tuple[InputKind, jax.Array]] = {}
+    sites: dict[tuple[str, ...], tuple[InputKind, jax.Array | np.ndarray]] = {}
     consumed: set[str] = set()
     for layout in layouts:
         part = layout.name.removesuffix('.weight') + codec.input_suffix

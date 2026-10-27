@@ -12,12 +12,15 @@ so, rather than computing on values it was not given.
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Mapping
-from typing import cast
+from collections.abc import Callable, Collection, Mapping
+from typing import Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from numpy.typing import ArrayLike, DTypeLike
+
+from dew.interop.safetensors_io import LazyTensors
 
 
 class PayloadUnread(LookupError):
@@ -112,10 +115,14 @@ class Unread:
         held = _counterpart(ufunc, ufunc.__name__)
         return evaluated(held if method == "__call__" else getattr(held, method), *inputs, **kwargs)
 
-    def __array_function__(self, function, types, args, kwargs):
-        if function in _METADATA:
-            return _METADATA[function](*args, **kwargs)
-        return evaluated(_counterpart(function, function.__name__), *args, **kwargs)
+    def __array_function__(self, func: Callable[..., Any], types: Collection[type[Any]],
+                           args: tuple[Any, ...], kwargs: dict[str, Any]) -> object:
+        if func in (np.asarray, np.ascontiguousarray):
+            dtype = kwargs.get("dtype", args[1] if len(args) > 1 else None)
+            return self if dtype is None else self.astype(dtype)
+        if func in _METADATA:
+            return _METADATA[func](*args, **kwargs)
+        return evaluated(_counterpart(func, func.__name__), *args, **kwargs)
 
     def __getitem__(self, index):
         return evaluated(lambda array, index: array[index], self, index)
@@ -167,12 +174,14 @@ class Unread:
         return np.absolute(self)
 
 
-def held(value, dtype=None, *, contiguous: bool = False):
+def held(value: ArrayLike, dtype: DTypeLike | None = None, *, contiguous: bool = False) -> np.ndarray:
     """`np.asarray(value, dtype)` (`np.ascontiguousarray` with `contiguous`), an `Unread` kept one: the
-    array a reader goes on with, values or not."""
+    array a reader goes on with, values or not, an `Unread` standing in for its array."""
+    create = np.ascontiguousarray if contiguous else np.asarray
     if isinstance(value, Unread):
-        return value if dtype is None else value.astype(dtype)
-    return np.ascontiguousarray(value, dtype) if contiguous else np.asarray(value, dtype)
+        # NumPy's array-creation protocol (NEP 35): an Unread answers as itself, cast to `dtype`.
+        return create(value, dtype, like=value)
+    return create(value, dtype)
 
 
 def equal(first, second) -> bool:
@@ -227,9 +236,7 @@ _METADATA = {np.shape: lambda array: array.shape, np.ndim: lambda array: array.n
 """The NumPy functions an `Unread` answers from its shape and dtype, which hold what they return."""
 
 
-def unread(specs: Mapping[str, jax.ShapeDtypeStruct]) -> Mapping[str, np.ndarray]:
+def unread(specs: Mapping[str, jax.ShapeDtypeStruct]) -> LazyTensors:
     """`specs`' tensors as a load without its weights holds them: each an `Unread` of its shape and
-    dtype, standing in for the array a reader takes (its NumPy runs on it abstractly)."""
-    from dew.interop.safetensors_io import LazyTensors
-
-    return LazyTensors(specs, lambda name: cast(np.ndarray, Unread(specs[name].shape, specs[name].dtype)))
+    dtype, standing in for the array a reader takes (`held`), its NumPy run on it abstractly."""
+    return LazyTensors(specs, lambda name: held(Unread(specs[name].shape, specs[name].dtype)))

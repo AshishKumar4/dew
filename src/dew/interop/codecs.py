@@ -202,7 +202,7 @@ def dequantize_mxfp4(blocks: ArrayLike, scales: ArrayLike, dtype: DTypeLike = np
     if not unread.valued(codes, exponents):
         # Of a load without its weights: the decoded weight's shape and dtype.
         experts, outputs, groups, _ = codes.shape
-        return unread.Unread((experts, groups * GROUP, outputs), kept)
+        return unread.held(unread.Unread((experts, groups * GROUP, outputs), kept))
     work = kept if kept in _EXACT_E2M1 else np.dtype(np.float32)
     table = _scaled_e2m1(work)
     experts, outputs, groups, _ = codes.shape
