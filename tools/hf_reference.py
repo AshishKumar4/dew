@@ -614,7 +614,7 @@ def write_nemotron_h(*, moe: bool = False, latent: bool = False) -> None:
     MoE uses nonzero selection bias, two routing groups and an ungated shared
     expert; the latent case leaves top-k weights unnormalized.
     """
-    from torch_precision import float64
+    from torch_precision import float64, float64_twin
 
     torch.manual_seed(0)
     name = "nemotron-h-moe-latent-tiny" if latent else "nemotron-h-moe-tiny" if moe else "nemotron-h-tiny"
@@ -638,8 +638,9 @@ def write_nemotron_h(*, moe: bool = False, latent: bool = False) -> None:
     write_tiny(name, model, seed=2024)
     directory = FIXTURES / name
     ids = torch.from_numpy(np.load(directory / "input_ids.npy")).long()
+    wide = float64_twin(model)
     with float64(), torch.no_grad():
-        truth = model.double()(input_ids=ids, use_cache=False).logits.double().numpy()
+        truth = wide(input_ids=ids, use_cache=False).logits.double().numpy()
     np.save(directory / "logits_f64.npy", truth)
     write_provenance(directory, seed=2024)
     (directory / "model.safetensors").chmod(0o644)
