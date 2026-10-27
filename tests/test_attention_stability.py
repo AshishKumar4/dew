@@ -866,8 +866,15 @@ def test_the_mosaic_mainloops_default_is_finite_where_the_reference_is_at_fp32s_
     _default_is_finite(family, "mosaic")
 
 
-@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES
-                                    if FAMILIES[family].folded or FAMILIES[family].overflows])
+GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",)
+"""The families whose frozen Triton default-form check runs on a GPU alone, compiled as its route runs it:
+256 draws interpreted take past the CPU suite's 240 s target (218-257 s, row 1849)."""
+
+
+@pytest.mark.parametrize("family", [
+    pytest.param(family, marks=pytest.mark.gpu(reason="256 draws of the Triton mainloop, compiled"))
+    if family in GPU_TRITON_FAMILIES else family
+    for family in TEMPLATE_FAMILIES if FAMILIES[family].folded or FAMILIES[family].overflows])
 def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
     """The Triton mainloop's default form finite over the families the fold holds and those whose sums pass
     fp32's largest (`_default_is_finite`): it guards its sums' headroom in either form, as the template's
