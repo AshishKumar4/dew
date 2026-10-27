@@ -85,13 +85,19 @@ def test_mixer_records_and_values_compute_the_same_logits():
     assert not jnp.allclose(tiny(mixer=ScaleMixer(0.0)).apply(params, ids), logits)
 
 
-def test_a_layer_runs_no_mask_its_mixer_does_not_read():
-    """A pairwise mask says which keys each query reads. An attention layer reads it, so a mask
-    that keeps only each token's own key moves its output; a gated delta net reads every earlier
+OWN_KEYS = {"pairwise_mask": AttentionMetadata(pairwise_mask=jnp.eye(4, dtype=bool)[None]),
+            "key_runs": AttentionMetadata(key_runs=jnp.stack([jnp.arange(4), jnp.arange(4) + 1],
+                                                             axis=-1)[None, :, None])}
+"""A call whose every token reads only its own key, as a pairwise mask and as key runs."""
+
+
+@pytest.mark.parametrize("own", OWN_KEYS.values(), ids=list(OWN_KEYS))
+def test_a_layer_runs_no_mask_its_mixer_does_not_read(own):
+    """A pairwise mask, or key runs, says which keys each query reads. An attention layer reads it, so
+    a call that keeps only each token's own key moves its output; a gated delta net reads every earlier
     token of its document and no mask, so its layer refuses the call rather than run it as if
     unmasked. A model asked for a mask refuses it at the layer that cannot read it."""
     x = jax.random.normal(jax.random.key(1), (1, 4, 32))
-    own = AttentionMetadata(pairwise_mask=jnp.eye(4, dtype=bool)[None])
     context = MixerContext(emb_features=32, num_heads=4, num_kv_heads=4, head_dim=8, max_seq_len=16)
     delta = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2, linear_key_head_dim=8,
                                linear_value_head_dim=8)
@@ -108,7 +114,8 @@ def test_a_layer_runs_no_mask_its_mixer_does_not_read():
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     params = recurrent.init(jax.random.key(0), ids)
     with pytest.raises(ValueError):
-        recurrent.apply(params, ids, attention_pairwise_mask=own.pairwise_mask)
+        recurrent.apply(params, ids, attention_pairwise_mask=own.pairwise_mask,
+                        attention_key_runs=own.key_runs)
 
 
 def test_alibi_biases_rotated_attention_by_its_keys_places():

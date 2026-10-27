@@ -18,6 +18,7 @@ from .attention import (
     combined_attention_mask,
     cudnn_takes_mask,
     kernel_for_materialized_mask,
+    query_split,
     resolve_implementation,
     scaled_dot_product_attention,
     split_with_queries,
@@ -138,6 +139,12 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     # slice is at least that long. A wider span takes the dense call, whose
     # mask the sequence exchange carries.
     halo = length % shards == 0 and length // shards >= span
+    if (length <= 2 * span or not halo) and chunk is None:
+        # A window over documents and real keys is the template's spans, which the whole call reads as
+        # they are where its kernel takes them, else as the mask they mean (`visibility_mask`).
+        return whole(implementation=implementation if implementation == 'auto' else masked, causal=True,
+                     sliding_window=window, segment_ids=segment_ids, max_segments=max_segments,
+                     key_valid=valid)
     if length <= 2 * span or not halo:
         # A mask pairs every query with every key, which an Explicit axis splitting both sides of it
         # would place twice, so the `[B, S]` fields it is built from are each device's whole.
@@ -248,11 +255,11 @@ def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chun
     if placed is not None:
         split = jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(*placed.spec[:2]))
         fields = {name: jax.sharding.reshard(field, split) for name, field in fields.items()}
-    rows = logical_spec(("activation_batch", "activation_length"), (batch, length))
-    specs = [rows] * len(fields)
+    specs = [query_split(("activation_batch", "activation_length"), field, queries, query.shape)
+             for field in fields.values()]
     if sinks is not None:
         fields['sinks'] = sinks
-        specs.append(logical_spec(("activation_heads",), sinks.shape))
+        specs.append(query_split(("activation_heads",), sinks, queries, query.shape))
     names = tuple(fields)
     local_length = length // shards
     # Chunks that start at every shard's first row stay inside their shard.

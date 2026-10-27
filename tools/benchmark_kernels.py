@@ -24,6 +24,7 @@ with these commands, for example:
 import argparse
 import json
 
+import grouped_oracle
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -71,17 +72,7 @@ def projection(args: argparse.Namespace) -> dict[str, object]:
     both = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))
     output = np.asarray(forward(x, kernel), np.float64)
     _, (dx, dk) = both(x, kernel)
-    xr = np.asarray(x, np.float64)
-    kr = np.asarray(kernel.astype(jnp.bfloat16), np.float64)
-    cr = np.asarray(cotangent, np.float64)
-    starts = np.cumsum(sizes) - sizes
-    oracle, dx_oracle = np.zeros((rows, features)), np.zeros((rows, width))
-    dk_oracle = np.zeros((experts, width, features))
-    for expert in range(experts):
-        block = slice(starts[expert], starts[expert] + sizes[expert])
-        oracle[block] = xr[block] @ kr[expert]
-        dx_oracle[block] = cr[block] @ kr[expert].T
-        dk_oracle[expert] = xr[block].T @ cr[block]
+    oracle, dx_oracle, dk_oracle = grouped_oracle.products(x, kernel.astype(jnp.bfloat16), cotangent, sizes)
 
     def relative(value, reference):
         return float(np.abs(np.asarray(value, np.float64) - reference).max() / np.abs(reference).max())

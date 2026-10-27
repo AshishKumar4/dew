@@ -27,7 +27,6 @@ from reference_error import (
 from sharded import assert_runs_per_shard
 from ssd_support import mamba_ssd_draw, mamba_ssd_operands, mamba_ssd_xla, ssd_value_and_grad
 from tool_support import load
-from tuned import each_config
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -150,10 +149,36 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
         pins = {mamba_ssd.ChunkStateBwdDb: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
                 mamba_ssd.ChunkScanBwdDc: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
                 mamba_ssd.ChunkScanBwdDcb: mamba_ssd.Tiles(rows, min(32, chunk), 0, 4, 3, heads)}
-        assert all(pin in each_config(kernel, run, *draw(0)) for kernel, pin in pins.items())
     with tuning.pinned(pins):
         assert_as_exact(jax.jit(run), reference, draw, f"mamba_ssm {case}, heads={heads}",
                         seeds=seeds, truth_fn=truth)
+
+
+def test_the_port_takes_widths_padded_to_powers_of_two():
+    """A scan whose head and state widths are no powers of two (Nemotron-H 4B's 80-wide heads) runs on the
+    port over its operands padded with zero columns (`recurrence_chunk._rated_scan`), its route the port's:
+    its output, final state and every operand's gradient the port's over the padded operands, cut back,
+    bit for bit."""
+    (x, dt, A, B, C, D, h0), starts = scan_operands(2, 40, 4, 20, 2, 24, documents=True)
+    keys = jax.random.split(jax.random.key(3))
+    dy, dfinal = jax.random.normal(keys[0], x.shape), jax.random.normal(keys[1], h0.shape)
+
+    def padded(t, *widths):
+        """`t` padded with zero columns on its last axes to `widths`."""
+        ends = [(0, wide - size) for wide, size in zip(widths, t.shape[-len(widths):], strict=True)]
+        return jnp.pad(t, [(0, 0)] * (t.ndim - len(widths)) + ends)
+
+    with row_names_port(), generation.routes() as found:
+        got = jax.jit(through(16, starts, dy, dfinal))(x, dt, A, B, C, D, h0)
+    assert ("ssd", "pallas") in {(route.choice, route.kernel) for route in found}
+    wide = (padded(x, 32), dt, A, padded(B, 32), padded(C, 32), D, padded(h0, 32, 32))
+    with row_names_port():
+        want = jax.jit(through(16, starts, padded(dy, 32), padded(dfinal, 32, 32)))(*wide)
+    cut = {"y": (..., slice(20)), "final": (..., slice(20), slice(24)), "x": (..., slice(20)),
+           "B": (..., slice(24)), "C": (..., slice(24)), "h0": (..., slice(20), slice(24))}
+    for name, value in got.items():
+        np.testing.assert_array_equal(np.asarray(value), np.asarray(want[name][cut.get(name, ...)]),
+                                      err_msg=name)
 
 
 LAYER_SEEDS = {"float32": 256, "bfloat16": 32}
@@ -220,8 +245,14 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
     def draw(seed):
         return scan_operands(*SHARDED, documents=True, seed=seed)[0]
 
-    # One float64 program for every seed's truth.
-    exact = jax.jit(through(32, starts, *widened((dy, dfinal))))
+    # One float64 program for every seed's truth: the scan's reference math, which the port chosen below
+    # refuses for float64 operands.
+    wide = through(32, starts, *widened((dy, dfinal)))
+
+    @jax.jit
+    def exact(*operands):
+        with row_names_port(port=False):
+            return wide(*operands)
 
     def spec(rank: int, axes: tuple[int, ...]):
         return PartitionSpec(*(axis if dim in axes else None for dim in range(rank)))

@@ -57,9 +57,8 @@ from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
 from dew.mesh import LogicalAxes
-from dew.nn.attention import cache_positions
 from dew.nn.inputs import document_reach
-from dew.nn.kv_cache import filled_slots
+from dew.nn.kv_cache import cache_positions, filled_slots
 from dew.nn.precision import at_least_fp32, configured_precision, float32_products, scaled
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import Suffix, parameter_path
