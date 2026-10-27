@@ -173,6 +173,8 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
 
     gradient = as_a_step(trainer, variables, drawn(0),
                          lambda values, rows: objective_gradient(obj, values, rows, step))
+    # The producer marks its options-bearing jit as given, so the gate never nests it (row 1800).
+    assert gradient.as_given
     assert_as_exact(trained, gradient, draw, "trainer update", seeds=seeds,
                     truth_fn=float64_gradient(twin, step))
     taken, _, _ = trainer_update(obj, batch, run_key, optax.sgd(0.001))

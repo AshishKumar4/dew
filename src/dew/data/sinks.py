@@ -1,26 +1,30 @@
-"""Immutable Parquet and ArrayRecord exports to filesystem URLs."""
+"""Immutable exports to filesystem URLs: ArrayRecord shards Dew writes, and Parquet or any other
+format a native writer writes from one Arrow stream (`Writer`), all committed by one publisher."""
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import io
+import itertools
 import tempfile
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
-from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from pathlib import Path, PurePosixPath
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as grain
 import numpy as np
 import pyarrow as pa
 import pyarrow.dataset as ds
+import pyarrow.fs as pafs
 from array_record.python.array_record_module import ArrayRecordWriter
 
 from dew.batch import Batch
 from dew.data.dataset import Closeable
 from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
-from dew.data.sources.files import _arrow_filesystem
+from dew.data.sources.files import Format, _arrow_filesystem
 from dew.data.steps.text import count_rules, stated_rules
 from dew.data.storage import ObjectRef, Store, commit_export
 
@@ -124,22 +128,79 @@ def _array_shard(root: Store, writer: str, number: int, batch, index: ObjectRef 
         }
 
 
-def _parquet_shard(target: Store, number: int, batch, partitioning: tuple[str, ...] | None) -> None:
-    if any(not isinstance(row, Mapping) for row in batch):
-        raise TypeError("Parquet export takes records with named fields")
-    table = pa.Table.from_pylist(batch)
+@runtime_checkable
+class Writer(Protocol):
+    """A native writer an export hands its rows to as one Arrow stream (`pyarrow.RecordBatchReader`,
+    the stream Arrow's dataset writer, Delta's, Lance's and DuckDB's take, and a Spark session reads
+    as a table): it writes them as files of `format`, one `Files` reads, under `directory` of
+    `filesystem`, Arrow's over the export's storage. The export then lists what it wrote and commits
+    its manifest and `_SUCCESS` after them (`commit_export`), the one publisher every export shares,
+    so a reader finds the whole export or, where the writer stopped, none. `Files` reads the files
+    in the order of their paths."""
+
+    format: Format
+
+    def write(self, rows: pa.RecordBatchReader, directory: str, filesystem: pafs.FileSystem) -> None: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class _Parquet:
+    """Arrow's Parquet dataset writer (`pyarrow.dataset.write_dataset`), the writer of
+    `export(format="parquet")`: a file of each batch of the stream, numbered in its order, so a
+    read of the export's files by path reads the rows in it, each partition column a Hive
+    `name=value` directory, as Spark lays out its own Parquet output."""
+
+    partitioning: tuple[str, ...] | None = None
+    format: ClassVar[Format] = "parquet"
+
+    def write(self, rows: pa.RecordBatchReader, directory: str, filesystem: pafs.FileSystem) -> None:
+        for number, batch in enumerate(rows):
+            ds.write_dataset(
+                pa.Table.from_batches([batch]),
+                directory,
+                format="parquet",
+                filesystem=filesystem,
+                partitioning=None if self.partitioning is None else list(self.partitioning),
+                partitioning_flavor=None if self.partitioning is None else "hive",
+                basename_template=f"part-{number:06d}-{{i}}.parquet",
+                existing_data_behavior="overwrite_or_ignore",
+            )
+
+
+def _streamed(chunks: Iterator[list[Batch | bytes | None]]) -> pa.RecordBatchReader | None:
+    """`chunks` of records with named fields as one Arrow stream, typed by the first; None where
+    there is none, which no writer is handed."""
+
+    def named() -> Iterator[list[Batch | bytes | None]]:
+        for chunk in chunks:
+            if any(not isinstance(row, Mapping) for row in chunk):
+                raise TypeError("an export through an Arrow writer takes records with named fields")
+            yield chunk
+
+    tables = named()
+    first = next(tables, None)
+    if first is None:
+        return None
+    schema = pa.Table.from_pylist(first).schema
+    return pa.RecordBatchReader.from_batches(schema, (pa.RecordBatch.from_pylist(chunk, schema=schema)
+                                                      for chunk in itertools.chain([first], tables)))
+
+
+def _written(target: Store, prefix: str) -> list[Mapping[str, object]]:
+    """The files a writer left under `target`, each by its path under the export, `prefix` and its
+    path under `target`, its bytes and digest; the names Spark, Hadoop and Arrow pass over as hidden
+    (a part starting with `_` or `.`, as a `_SUCCESS` or a checksum's) left out, as their readers
+    leave them out."""
     fs, directory = target.resolve()
-    fs.makedirs(directory, exist_ok=True)
-    ds.write_dataset(
-        table,
-        directory,
-        format="parquet",
-        filesystem=_arrow_filesystem(fs),
-        partitioning=list(partitioning) if partitioning is not None else None,
-        partitioning_flavor="hive" if partitioning is not None else None,
-        basename_template=f"part-{number:06d}-{{i}}.parquet",
-        existing_data_behavior="overwrite_or_ignore",
-    )
+    files = []
+    for path in sorted(fs.find(directory)) if fs.exists(directory) else []:
+        relative = path[len(directory):].lstrip("/")
+        if any(part.startswith(("_", ".")) for part in PurePosixPath(relative).parts):
+            continue
+        payload = fs.cat_file(path)
+        files.append({"path": f"{prefix}/{relative}", "bytes": len(payload),
+                      "sha256": hashlib.sha256(payload).hexdigest()})
+    return files
 
 
 def passed(values: Source | Dataset) -> Iterator[Batch]:
@@ -159,7 +220,7 @@ def export(
     values: Source | grain.IterDataset | Iterable[Batch | bytes | None] | Pipeline,
     url: str,
     *,
-    format: Literal["parquet", "array_record"] = "parquet",
+    format: Literal["parquet", "array_record"] | Writer = "parquet",
     rows_per_shard: int = 100_000,
     partitioning: tuple[str, ...] | None = None,
     storage_options: Mapping[str, object] | None = None,
@@ -168,15 +229,17 @@ def export(
 ) -> Mapping[str, object]:
     """Write immutable shards, then conditionally commit their manifest and _SUCCESS.
 
-    Arrow discovers and writes partition columns with Hive directory names.
-    Each export owns a UUID directory; racing exporters cannot share shards.
+    ArrayRecord shards are Dew's own, one of `rows_per_shard` records each. Parquet is Arrow's
+    writer (`_Parquet`), each partition column a Hive directory; any other `Writer`, a native one
+    of the caller's, writes the rows as one Arrow stream. Each export owns a UUID directory, so
+    racing exporters cannot share shards, and commits only once its writer has written them all.
     """
     if rows_per_shard < 1:
         raise ValueError("export rows_per_shard must be positive")
-    if format not in ("parquet", "array_record"):
+    if not isinstance(format, Writer) and format not in ("parquet", "array_record"):
         raise ValueError(f"unknown export format {format!r}")
-    if format == "array_record" and partitioning is not None:
-        raise ValueError("ArrayRecord export has no partition columns")
+    if format != "parquet" and partitioning is not None:
+        raise ValueError("only a Parquet export has partition columns; a writer of its own lays out its own")
     if url.startswith("hf://"):
         return _hub_export(
             values,
@@ -197,28 +260,31 @@ def export(
     files = []
     count = 0
     rules: set[tuple[int | None, int | None]] = set()
+
+    def counted() -> Iterator[list[Batch | bytes | None]]:
+        nonlocal count
+        for chunk in _chunks(rows, rows_per_shard):
+            count += len(chunk)
+            rules.update(stated_rules(count_rules(chunk)))
+            yield chunk
+
     try:
-        for number, batch in enumerate(_chunks(rows, rows_per_shard)):
-            count += len(batch)
-            rules.update(stated_rules(count_rules(batch)))
-            index = _length_index(root, writer, number, batch, length_field)
-            if format == "array_record":
+        if format == "array_record":
+            for number, batch in enumerate(counted()):
+                index = _length_index(root, writer, number, batch, length_field)
                 files.append(_array_shard(root, writer, number, batch, index))
-            else:
-                _parquet_shard(target, number, batch, partitioning)
-        if format == "parquet":
-            fs, directory = target.resolve()
-            for path in sorted(fs.find(directory)) if fs.exists(directory) else []:
-                if not path.endswith(".parquet"):
-                    continue
-                payload = fs.cat_file(path)
-                relative = f"shards/{writer}/" + path[len(directory) :].lstrip("/")
-                files.append(
-                    {"path": relative, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
-                )
+            written: Format = "array_record"
+        else:
+            native = _Parquet(partitioning) if format == "parquet" else format
+            stream = _streamed(counted())
+            if stream is not None:
+                fs, directory = target.resolve()
+                fs.makedirs(directory, exist_ok=True)
+                native.write(stream, directory, _arrow_filesystem(fs))
+            files, written = _written(target, f"shards/{writer}"), native.format
         # The rules other than every target's its rows were counted by, which a pack of them by a
         # plan of their lengths could not count (`dew.data.analysis._ruled`).
-        return commit_export(root, format=format, codec=1 if format == "array_record" else None, rows=count,
+        return commit_export(root, format=written, codec=1 if format == "array_record" else None, rows=count,
                              files=files, metadata=metadata,
                              certified={"count_rules": [list(rule) for rule in sorted(rules, key=repr)],
                                         "partitioning": None if partitioning is None else list(partitioning)})

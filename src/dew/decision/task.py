@@ -64,7 +64,7 @@ from dew.decision.questions import (
 )
 from dew.files import write_atomically
 from dew.inference import scoring
-from dew.inference.tasks import shape_bucket
+from dew.inference.tasks import SavedRun, SavedRunTask, shape_bucket
 from dew.interop.processors import Processor
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.sources import SourceReference
@@ -157,7 +157,7 @@ class DecideSettings:
 
 
 @dataclass(frozen=True)
-class Decide:
+class Decide(SavedRunTask):
     """Answers typed questions about a state, with one forward pass per batch.
 
     `decide(state, questions)` returns one answer per question, with its
@@ -237,27 +237,22 @@ class Decide:
                    name=str(epath.Path(directory).name), weights=weights, processor=processor)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: "MeshSpec | Mesh | None" = None, layout: "Placement | None" = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
-                 trust: Sequence[str] = ()) -> Self:
-        """Load the `DecisionObjective` run in `directory` as a task.
+    def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: "MeshSpec | Mesh | None" = None,
+                   layout: "Placement | None" = None, dtype: DTypeLike | None = None,
+                   param_dtype: DTypeLike | None = None) -> Self:
+        """Load the `DecisionObjective` run `run` (its checkpoint pinned, `SavedRun.pinned`) as a task;
+        `from_run` loads one from its directory.
 
-        The task is rebuilt from the run's record over the latest checkpoint's
-        weights (or `step`'s), and includes any calibration `save` wrote into the
-        run. `ema` selects the averaged weights, and None uses them when the run kept
-        them. `mesh` and `layout` place the weights as the trainer does, `dtype`
-        overrides the compute dtype and `param_dtype` the storage dtype. `trust`
-        names the packages outside Dew the run's record may import, as Dew's other
-        tasks' `from_run` take it (`dew.inference.tasks.SavedRun.pinned`).
-        The image processor reloads from its recorded source independently of
-        the tokenizer that lays out the task's text.
+        The task is rebuilt from the run's record over the checkpoint's weights, and includes any
+        calibration `save` wrote into the run. `ema` selects the averaged weights, and None uses them
+        when the run kept them. `mesh` and `layout` place the weights as the trainer does, `dtype`
+        overrides the compute dtype and `param_dtype` the storage dtype. The image processor reloads
+        from its recorded source independently of the tokenizer that lays out the task's text.
         """
-        from dew.inference.tasks import SavedRun, saved_model
+        from dew.inference.tasks import saved_model
         from dew.registry import from_record
 
-        run = SavedRun.pinned(directory, step, trust)
-        record, step = run.record, run.step
+        directory, record, step = run.directory, run.record, run.step
         variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         if ema is None:
             with Checkpoints(directory) as checkpoints:
@@ -296,10 +291,11 @@ class Decide:
         refused (ValueError), naming them. The task's `weights` record each run's directory, step and
         whether its average was read, so it is no one run's: `save` writes it to a directory of its own
         as a run, which `from_run` and `dew.pipeline` then load, whatever its layout."""
-        from dew.checkpoints import averaged
-        from dew.inference.tasks import SavedRun, saved_settings
+        from dew.checkpoints import averaged_pinned
+        from dew.inference.tasks import saved_settings
 
-        recorded = [SavedRun.pinned(directory, step).record for directory in runs]
+        pinned = [SavedRun.pinned(directory, step) for directory in runs]
+        recorded = [run.record for run in pinned]
         first = saved_settings(recorded[0], DecideSettings) if recorded else None
         for directory, saved in zip(runs, recorded, strict=True):
             settings = saved_settings(saved, DecideSettings)
@@ -308,7 +304,7 @@ class Decide:
             if differing:
                 raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
                                  f"{', '.join(differing)}, so their weights are not one task's to average")
-        average = averaged(runs, step=step, ema=ema)
+        average = averaged_pinned(pinned, ema=ema)
         task = cls._recorded(runs[0], recorded[0], average.model.build(), average.variables,
                              Weights(average.runs[0][1], ema=False, averaged=average.runs), None)
         return task if calibrate_on is None else task.calibrated(calibrate_on)

@@ -17,6 +17,7 @@ from dew.nn.dropout import Dropout
 from dew.nn.flops import MissingFlopsCount, projection_flops
 from dew.nn.precision import at_least_fp32, float32_dot_general
 
+from .decoder_stack import pipelined_blocks, pipelines
 from .joint import embedding, embedding_flops
 from .spatial import SpatialCount, SpatialForward, SpatialShape
 
@@ -81,15 +82,27 @@ class _SpatialAttention(nn.Module):
         else:
             x = Conv(channels, (1, 1), padding="VALID", dtype=self.dtype,
                      precision=self.precision, name="input")(x).reshape(batch, height * width, channels)
-        for index in range(self.stage.depth):
+        def layer(index: int) -> BasicTransformerBlock:
             # Affine layer norms at 1e-5, no query, key or value bias, and under `stage.cross_only`
             # a first attention that reads the text too: what the SD checkpoints hold.
-            x = BasicTransformerBlock(
+            return BasicTransformerBlock(
                 self.stage.features, self.stage.heads, self.stage.features // self.stage.heads, self.dtype,
                 self.precision, qkv_bias=False,
                 first_attention="context" if self.stage.cross_only else "self", norm="layer",
                 norm_epsilon=1e-5, dropout_rate=self.dropout, approximate_gelu=self.approximate_gelu,
-                attention_impl=self.attention_impl, name=f"layer_{index}")(x, context, train=train)
+                attention_impl=self.attention_impl, name=f"layer_{index}")
+
+        def run(blocks, x, context):
+            for block in blocks:
+                x = block(x, context, train=train)
+            return x
+
+        # The level's transformers are like blocks, which a stage axis that
+        # splits them runs as a pipeline; SDXL's levels of two and ten do.
+        if pipelines(self, ["transformer"] * self.stage.depth):
+            x = pipelined_blocks(self, ("layer_",), self.stage.depth, x, layer, run, rows=context)
+        else:
+            x = run([layer(index) for index in range(self.stage.depth)], x, context)
         if self.linear_projection:
             x = Dense(channels, dtype=self.dtype, precision=self.precision, name="output",
                       dot_general=float32_dot_general)(x)

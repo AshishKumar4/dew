@@ -42,6 +42,7 @@ from dew.data.pipeline import (
     Bound,
     Configured,
     Expansion,
+    External,
     Filter,
     FlatMap,
     Interleave,
@@ -692,6 +693,13 @@ def _random(stage: Stage) -> bool:
     """Whether a stage draws from the record rng, so what it makes differs
     each epoch and no cache can hold it."""
     return isinstance(stage, RandomMap) or (isinstance(stage, Configured) and stage.random)
+
+
+def _external(stage: Stage) -> bool:
+    """Whether `stage` reads storage its record names by path (a step that says it is `External`), which
+    the record's content does not key, so no automatic cache stands for it."""
+    return (isinstance(stage, (Map, MapWithIndex)) and isinstance(stage.step, External)
+            and stage.step.external)
 
 
 def _volatile(stage: Stage) -> bool:

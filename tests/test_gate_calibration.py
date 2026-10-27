@@ -22,7 +22,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
-from reference_error import ORDERS, REFERENCE, assert_leaves_as_exact_over_orders, widened
+from reference_ensemble import REFERENCE, assert_leaves_as_exact_over_orders
+from reference_error import ORDERS, widened
 from reference_trees import assignments, tree_contract, tree_sum
 
 from dew.nn.attention import scaled_dot_product_attention

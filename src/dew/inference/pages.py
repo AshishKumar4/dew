@@ -17,6 +17,12 @@ the rest. Only full pages of prompt tokens are
 shared; the page a prompt ends inside, and every page its draws fill, stay
 private to the row, so a shared page is never written again. A cached page
 is reclaimed, least recently released first, when the free list runs dry.
+
+A decoder that keeps a row's own state beside its pages (a recurrent mixer's
+memory, latent attention's index keys) reads a prefix with the state its
+prompt left at the prefix's end as well, which `States` names as vLLM's
+hybrid prefix caching does: a row reuses pages only as deep as a state is
+held, and starts from that state.
 """
 
 from __future__ import annotations
@@ -39,13 +45,54 @@ def prefix_hashes(tokens: np.ndarray, page_size: int, pages: int, salt: bytes = 
     return hashes
 
 
-class Pages:
-    """Free, held and cached pages of one pool of `count` pages of `size` slots."""
+class States:
+    """The row states a prefix's pages are read with: `count` entries, each one slot's state after a
+    prompt's first full pages, named by the chain digest of the last of them (`prefix_hashes`). The least
+    recently used entry gives way to a new state; an entry whose page is reclaimed goes with it."""
 
-    def __init__(self, count: int, size: int, *, prefix_cache: bool) -> None:
+    def __init__(self, count: int) -> None:
+        self.count = count
+        self._free: deque[int] = deque(range(count))
+        self._by_hash: OrderedDict[bytes, int] = OrderedDict()
+
+    def __contains__(self, digest: bytes) -> bool:
+        return digest in self._by_hash
+
+    def entry(self, digest: bytes) -> int:
+        """The entry holding the state after `digest`'s page, now the most recently used."""
+        self._by_hash.move_to_end(digest)
+        return self._by_hash[digest]
+
+    def take(self, digest: bytes) -> int | None:
+        """An entry to write the state after `digest`'s page into: a free one, or the least recently used
+        one's; None where a state after that page is held already or the store holds none."""
+        if digest in self._by_hash or not self.count:
+            return None
+        entry = self._free.popleft() if self._free else self._by_hash.popitem(last=False)[1]
+        self._by_hash[digest] = entry
+        return entry
+
+    def drop(self, digest: bytes) -> None:
+        """Forget the state after `digest`'s page, whose page is reclaimed."""
+        entry = self._by_hash.pop(digest, None)
+        if entry is not None:
+            self._free.append(entry)
+
+    def forget(self) -> None:
+        """Hold no state: the weights that wrote them are replaced."""
+        self._free.extend(self._by_hash.values())
+        self._by_hash.clear()
+
+
+class Pages:
+    """Free, held and cached pages of one pool of `count` pages of `size` slots, and with `states` the row
+    states a shared prefix is read with (`States`)."""
+
+    def __init__(self, count: int, size: int, *, prefix_cache: bool, states: States | None = None) -> None:
         self.size = size
         self.count = count
         self.prefix_cache = prefix_cache
+        self.states = states
         self._free: deque[int] = deque(range(count))
         self._holders = np.zeros(count, np.int32)
         self._cached: OrderedDict[int, None] = OrderedDict()
@@ -60,35 +107,47 @@ class Pages:
         return len(self._free) + len(self._cached)
 
     def shared(self, prompt: np.ndarray, salt: bytes = b"") -> list[int]:
-        """The cached pages that hold `prompt`'s leading full pages under `salt`, in order.
+        """The cached pages that hold `prompt`'s leading full pages under `salt`, in order, as deep as a
+        state after the last of them is held where the pool's rows keep states (`States`).
 
         The last prompt token is never covered, since its logits score the
         first draw and have to be computed.
         """
+        return self._matched(prompt, salt)[0]
+
+    def _matched(self, prompt: np.ndarray, salt: bytes) -> tuple[list[int], bytes | None]:
+        """`shared`'s pages and the digest of the last of them, None for none."""
         pages: list[int] = []
+        depth, last = 0, None
         if self.prefix_cache:
             for digest in prefix_hashes(prompt, self.size, (len(prompt) - 1) // self.size, salt):
                 page = self._by_hash.get(digest)
                 if page is None:
                     break
                 pages.append(page)
-        return pages
+                if self.states is None or digest in self.states:
+                    depth, last = len(pages), digest
+        return pages[:depth], last
 
-    def reserve(self, prompt: np.ndarray, total: int, salt: bytes = b"") -> tuple[list[int], int] | None:
+    def reserve(self, prompt: np.ndarray, total: int,
+                salt: bytes = b"") -> tuple[list[int], int, int | None] | None:
         """Pages for a row that will hold `total` tokens of which `prompt`, under `salt`, comes first.
 
-        Returns the row's pages and how many leading prompt tokens they
-        already hold, or None when the pool cannot cover the row; then
-        nothing changes.
+        Returns the row's pages, how many leading prompt tokens they
+        already hold, and the `States` entry holding the state the row starts
+        from after them (None where it starts afresh), or None when the pool
+        cannot cover the row; then nothing changes.
         """
         needed = -(-total // self.size)
-        shared = self.shared(prompt, salt)
+        shared, last = self._matched(prompt, salt)
         reclaimable = len(self._free) + sum(page not in shared for page in self._cached)
         if needed - len(shared) > reclaimable:
             return None
         for page in shared:
             self._hold(page)
-        return shared + [self._take() for _ in range(needed - len(shared))], len(shared) * self.size
+        entry = None if self.states is None or last is None else self.states.entry(last)
+        return (shared + [self._take() for _ in range(needed - len(shared))], len(shared) * self.size,
+                entry)
 
     def publish(self, prompt: np.ndarray, pages: Sequence[int], salt: bytes = b"") -> None:
         """Name the row's full prompt pages by their prefix hash under `salt`, once their keys are written."""
@@ -126,6 +185,8 @@ class Pages:
         self._cached.clear()
         self._by_hash.clear()
         self._hash_of.clear()
+        if self.states is not None:
+            self.states.forget()
 
     def _hold(self, page: int) -> None:
         self._cached.pop(page, None)
@@ -136,6 +197,9 @@ class Pages:
             page = self._free.popleft()
         else:
             page, _ = self._cached.popitem(last=False)
-            del self._by_hash[self._hash_of.pop(page)]
+            digest = self._hash_of.pop(page)
+            del self._by_hash[digest]
+            if self.states is not None:
+                self.states.drop(digest)
         self._holders[page] += 1
         return page
