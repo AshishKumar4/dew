@@ -63,13 +63,17 @@ from dew.nn.sparse_selection import (
 from dew.quantization import quantized_products
 
 
-def open_latent_cache(module: nn.Module, key, value_dim: int, index_keys, max_seq_len: int, *, valid=None):
+def open_latent_cache(module: nn.Module, key, value_dim: int, index_keys, max_seq_len: int, *, valid=None,
+                      layout: KVCache):
     """Open a sparse latent attention's decode cache: its expanded keys and values, as DeepSeek V3.2
-    stores them, through the attention cache (`open_kv_cache`), and the sparse indexer's keys beside
-    them where `index_keys` is given (None on a layer that owns no indexer and reads another layer's
-    selection). Returns the [B, S] slots and an `append` that writes the new rows and returns the
-    whole cache, the index keys last or None."""
-    positions, written = open_kv_cache(module, key, max_seq_len, valid=valid, value_dim=value_dim)
+    stores them, through the attention cache (`open_kv_cache`) in `layout`, and the sparse indexer's
+    keys beside them where `index_keys` is given (None on a layer that owns no indexer and reads
+    another layer's selection), one compact row each, which a paged server keeps as a row's state.
+    Returns the [B, S] slots, an `append` that writes the new rows and returns the whole cache, the
+    index keys last or None, and the attention cache's own append, whose `query` puts a query in the
+    basis the stored keys are in."""
+    positions, written = open_kv_cache(module, key, max_seq_len, valid=valid, value_dim=value_dim,
+                                       layout=layout)
     cached_index = None if index_keys is None else module.variable(
         "cache", "cached_index", jnp.zeros, (key.shape[0], max_seq_len, index_keys.shape[-1]),
         index_keys.dtype)
@@ -80,7 +84,7 @@ def open_latent_cache(module: nn.Module, key, value_dim: int, index_keys, max_se
             cached_index.value = write_cache(cached_index.value, new_index_keys, written.positions)
         return full_key, full_value, None if cached_index is None else cached_index.value
 
-    return positions, append
+    return positions, append, written
 
 
 INDEXER = 'indexer'
@@ -338,6 +342,9 @@ class MultiHeadLatentAttention(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
+    kv_cache: KVCache = dataclasses.field(default_factory=KVCache)
+    """The decode cache's storage layout (`dew.nn.kv_cache`), paged or quantized, over the latents
+    or, under the sparse layout, the expanded keys."""
     rotary: bool = True
     """False is Kimi K3's MLA (`mla_use_nope`, modeling_kimi_linear.py:396-437
     of moonshotai/Kimi-K3 at f831ab6): the decoupled rope head is kept as
@@ -562,8 +569,9 @@ class MultiHeadLatentAttention(nn.Module):
         # since the widths add up exactly.
         q_pass, q_rot = jnp.split(
             queries, [self.qk_nope_head_dim], axis=-1)
+        query_basis = None
         if decode:
-            q_rot, key, value, mask = self._decode_step(
+            q_rot, key, value, mask, query_basis = self._decode_step(
                 x, q_rot, rot, latent, q_resid, logical_positions, valid, call, prediction_phase)
             if self.sparse:
                 unselected = self._empty_selection(mask[:, 0], row_valid)
@@ -616,6 +624,8 @@ class MultiHeadLatentAttention(nn.Module):
             if not decode:
                 mask = mask & jnp.asarray(valid, bool)[:, None, None, :]
         query = self._scaled_query(q_pass, q_rot)
+        if query_basis is not None:
+            query = query_basis(query)
         if mask is not None and not decode:
             # Packed documents, row validity and the indexer's selection all
             # materialize a mask on the training path, so they take the xla
@@ -653,9 +663,11 @@ class MultiHeadLatentAttention(nn.Module):
     def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, call,
                       prediction_phase: PredictionPhase):
         """One decode step's rotated query heads, its keys and values with the
-        cache's joined, and the mask over them: the expanded keys and the
+        cache's joined, the mask over them, and what puts the scaled query in the
+        basis the cached keys are in (None for none): the expanded keys and the
         indexer's selection under the sparse layout, or the latents expanded
-        after the append under the dense one."""
+        after the append under the dense one. `kv_cache`, the cache's layout,
+        stores either form paged or quantized."""
         # The cache hands out the slots first, because the rope heads
         # rotate at absolute positions: the queries at this step's slots
         # and the appended latents at theirs, while the cached ones keep
@@ -668,8 +680,8 @@ class MultiHeadLatentAttention(nn.Module):
             # draw. Only the decoupled rope channels change once the cache supplies their slots.
             key, value = self._expand(latent, rot)
             index_keys = self._index_keys(x, row_valid) if self.indexed else None
-            positions, append = open_latent_cache(self, key, self.v_head_dim, index_keys,
-                                                  self.max_seq_len, valid=valid)
+            positions, append, basis = open_latent_cache(self, key, self.v_head_dim, index_keys,
+                                                         self.max_seq_len, valid=valid, layout=self.kv_cache)
             q_rot, rot, freqs_cos, freqs_sin = self._rotated(
                 q_rot, rot,
                 positions if logical_positions is None else logical_positions)
@@ -683,17 +695,21 @@ class MultiHeadLatentAttention(nn.Module):
                 x, q_resid, index_full, keep, freqs_cos, freqs_sin, call, row_valid, slots=positions,
                 allocated=allocated, committed=committed, prediction_phase=prediction_phase)
             mask = selection_mask(selection, key.shape[1])[:, None]
+            query_basis = basis.query
         else:
-            # The latent and its rotary part, one head each, as the attention cache's keys and values.
+            # The latent and its rotary part, one head each, as the attention cache's keys and values,
+            # the latents read back in their own basis, which the expansion reads.
             positions, append = open_kv_cache(self, latent[:, :, None], self.max_seq_len, valid=valid,
-                                              value_dim=self.qk_rope_head_dim)
+                                              value_dim=self.qk_rope_head_dim, layout=self.kv_cache)
             q_rot, rot, _, _ = self._rotated(
                 q_rot, rot,
                 positions if logical_positions is None else logical_positions)
-            latent, rot = (part[:, :, 0] for part in append(latent[:, :, None], rot[:, :, None]))
+            latent, rot = append(latent[:, :, None], rot[:, :, None])
+            latent, rot = append.plain(latent)[:, :, 0], rot[:, :, 0]
             key, value = self._expand(latent, rot)
             mask = self._visible(positions, key.shape[1])
-        return q_rot, key, value, mask
+            query_basis = None
+        return q_rot, key, value, mask, query_basis
 
     def _visible(self, slots, total: int):
         """`[B, 1, T, total]`: which of the cache's `total` slots each query at `slots` sees, those up
@@ -806,7 +822,8 @@ def latent_refusals(ctx: MixerContext) -> Mapping[str, object]:
     """What a latent attention does not run of its layer's context: the
     attention policies it is asked (`MixerContext.policies`), the standard
     attention's value norm, keys as values, window, chunk, score scale and
-    partial rotation, and a cache other than its latents."""
+    partial rotation. Its cache takes the layer's layout (`kv_cache`), paged or
+    quantized, over its latents or its expanded keys."""
     return {
         **ctx.policies(),
         "v_norm": ctx.v_norm,
@@ -815,7 +832,6 @@ def latent_refusals(ctx: MixerContext) -> Mapping[str, object]:
         "attention_chunk": ctx.attention_chunk,
         "attention_scale": ctx.attention_scale,
         "partial_rotary_factor": ctx.partial_rotary_factor,
-        "kv_cache": ctx.kv_cache != KVCache(),
     }
 
 
@@ -894,4 +910,5 @@ class MLAMixer(MixerBase):
             precision=ctx.precision,
             attention_impl=ctx.attention_impl,
             rotary=not self.mla_use_nope,
-            output_gate=self.mla_use_output_gate)
+            output_gate=self.mla_use_output_gate,
+            kv_cache=ctx.kv_cache)

@@ -48,6 +48,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import MixerCall
 from dew.nn.kernels import generation
+from dew.nn.kv_cache import KVCache
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling, rotary_freqs, yarn_attention_factor, yarn_inv_freq, yarn_query_scale
@@ -86,7 +87,7 @@ def yarn_of(settings: dict) -> YarnScaling:
 
 
 def mla_module(settings: dict, max_seq_len: int = 64,
-               attention_impl: str = "reference"
+               attention_impl: str = "reference", kv_cache: KVCache | None = None
                ) -> MultiHeadLatentAttention:
     """The fixture's reference config as a dew mixer."""
     return MultiHeadLatentAttention(
@@ -106,7 +107,8 @@ def mla_module(settings: dict, max_seq_len: int = 64,
         index_topk=settings.get("index_topk"),
         index_n_heads=settings.get("index_n_heads"),
         index_head_dim=settings.get("index_head_dim"),
-        attention_impl=attention_impl)
+        attention_impl=attention_impl,
+        kv_cache=KVCache() if kv_cache is None else kv_cache)
 
 
 def block_variables(tensors: dict) -> dict:
@@ -314,6 +316,26 @@ def test_decode_matches_prefill(name):
     draw = block_draw(name)
     assert_as_exact(decoded, full, lambda seed: (variables, draw(seed)[0]), f"{name} decode",
                     seeds=SEEDS["decode"])
+
+
+@pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
+@pytest.mark.parametrize("name", ["mla_v3", "mla_v32"])
+def test_a_paged_latent_cache_decodes_what_the_compact_cache_decodes(name, quantized):
+    """A latent attention's cache takes the layer's layout: paged, it decodes every step as the compact
+    cache does at the same format, bit for bit, full precision or quantized, over the latents (V3) and
+    over the expanded keys the indexer selects among (V3.2), the quantized keys read back in the basis
+    their queries or their expansion take."""
+    settings = CONFIG[SETTINGS[name]]
+    variables = block_variables(fixture(name))
+    hidden = block_draw(name)(0)[0]
+
+    def decoded(layout):
+        module = mla_module(settings, kv_cache=layout)
+        return np.asarray(jax.jit(lambda variables, hidden: decode_loop(module, variables, hidden))(
+            variables, hidden))
+
+    np.testing.assert_array_equal(decoded(KVCache(quantized=quantized, page_size=4)),
+                                  decoded(KVCache(quantized=quantized)))
 
 
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v3n"])

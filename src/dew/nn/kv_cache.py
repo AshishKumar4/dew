@@ -735,6 +735,13 @@ class Append:
         rotation = self.store.rotation
         return query if rotation is None else rotated(query, rotation)
 
+    def plain(self, keys: jax.Array) -> jax.Array:
+        """Return keys read back in the store's rotation `[..., head_dim]` in their own basis: for keys a
+        projection expands before any query meets them (a latent attention's latents), where `query`
+        has no query to rotate."""
+        rotation = self.store.rotation
+        return keys if rotation is None else rotated(keys, rotation.T)
+
     def places(self, places: jax.Array) -> jax.Array:
         """Store the call's token places beside its keys and return every slot's, `[rows, capacity]`.
 

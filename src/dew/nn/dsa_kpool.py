@@ -375,4 +375,5 @@ class KPoolSparseAttentionMixer(MixerBase):
             dtype=ctx.dtype,
             precision=ctx.precision,
             attention_impl=ctx.attention_impl,
-            force_fp32_for_softmax=ctx.force_fp32_for_softmax)
+            force_fp32_for_softmax=ctx.force_fp32_for_softmax,
+            kv_cache=ctx.kv_cache)
