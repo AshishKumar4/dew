@@ -604,6 +604,22 @@ def test_a_named_mainloop_runs_or_is_refused(named):
     assert [route.kernel for route in found if route.choice == "attention_mainloop"] == [named] * 2
 
 
+def test_a_call_traced_for_an_assumed_hopper_runs_its_mosaic_mainloop():
+    """A template call traced for an H100 on any host (`generation.assumed`, as a Trainer's or an AOT
+    lowering traces a step), its forward and backward reporting Mosaic's mainloop, the one the GPU runs, not
+    the plain-JAX one the host would (audit K5: the route read the host's placement)."""
+    spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
+    query, key, value, _, dout = drawing(QUERIES, KEYS, jnp.bfloat16, sinks=False)(0)
+
+    def pulled(query, key, value, dout):
+        out, pull = jax.vjp(lambda q, k, v: attention_route.attend(q, k, v, spans), query, key, value)
+        return out, pull(dout)
+
+    with generation.assumed("sm90"), generation.routes() as found:
+        jax.jit(pulled).trace(query, key, value, dout)
+    assert [route.kernel for route in found if route.choice == "attention_mainloop"] == ["mosaic"] * 2
+
+
 def test_the_mainloop_is_the_shared_selectors_choice():
     """The template's mainloop is an op of the shared selector (`attention_route.MAINLOOP`,
     `selection.select`), one chooser for its preference, its named choice and its route: on a GPU Mosaic

@@ -586,6 +586,28 @@ def test_a_row_whose_documents_lie_below_its_start_reads_nothing(cross):
     np.testing.assert_array_equal(np.asarray(cotangent), 0)
 
 
+@pytest.mark.parametrize("generation", ["sm80", "sm90"])
+def test_a_decode_step_over_no_keys_returns_the_empty_result(generation):
+    """A decode step of no cache capacity, its row's length 0 and a sink beside it, chosen for an A100 or an
+    H100 (`generation.assumed`): the decode kernel's dense and paged layouts return the empty result, the
+    reference's value product over no keys, zero, before any split config forms over no steps (audit K6:
+    an IndexError on both GPUs)."""
+    from dew.nn.kernels import decode_attention
+    from dew.nn.kernels.generation import assumed
+
+    query, key = jnp.ones((1, 1, 1, 64), jnp.bfloat16), jnp.zeros((1, 0, 1, 64), jnp.bfloat16)
+    lengths, sinks = jnp.zeros((1,), jnp.int32), jnp.zeros((1,), jnp.bfloat16)
+    want = scaled_dot_product_attention(query, key, key, sinks=sinks, implementation="reference")
+    np.testing.assert_array_equal(np.asarray(want, np.float32), 0.0)
+    pages = jnp.zeros((1, 1, 16, 64), jnp.bfloat16)
+    with assumed(generation), chosen(decode="decode"):
+        dense = scaled_dot_product_attention(query, key, key, key_value_seq_lengths=lengths, sinks=sinks)
+        paged = decode_attention.attend_paged(query[:, 0], pages, pages, jnp.zeros((1, 0), jnp.int32),
+                                              lengths, sinks=sinks)
+    np.testing.assert_array_equal(np.asarray(dense), np.asarray(want))
+    np.testing.assert_array_equal(np.asarray(paged), np.asarray(want[:, 0]))
+
+
 def test_a_lone_query_whose_heads_do_not_group_is_refused_by_name():
     """A lone query of 5 heads over 3 key heads is no grouped query: the core leaves it as it is, and
     the kernel refuses its head counts, as it refuses them in any call."""
