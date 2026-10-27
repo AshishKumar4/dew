@@ -9,6 +9,8 @@ pool's own resume is tests/test_multiprocess.py's
 import dataclasses
 import itertools
 import json
+import multiprocessing
+import sys
 import threading
 from typing import ClassVar
 
@@ -219,24 +221,12 @@ def test_a_per_share_read_whose_filter_rejects_its_whole_share_is_refused_and_an
     """Read by two shares, a shuffled endless repeat of ids is cut to the even ids for the first share
     before its filter keeps the odd ones, so that share's filter rejects every record of every pass:
     its reader refuses the read once two whole passes are rejected, where it read on forever. The read
-    runs on a thread held to a deadline, so that a reader that reads on fails this test. Read
-    elastically, the same chain reads the odd ids on that share."""
+    runs in a process held to a deadline (`starved`). Read elastically, the same chain reads the odd
+    ids on that share."""
     chain = Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(96)))).shuffle(5).repeat()
-    starved = chain.filter(odd).batch(BATCH)
-    outcome = []
-
-    def read():
-        try:
-            next(reader(starved, 0, 2))
-        except ValueError as refused:
-            outcome.append(refused)
-
-    thread = threading.Thread(target=read, daemon=True)
-    thread.start()
-    thread.join(60)
-    assert not thread.is_alive(), "the reader read on with every record of its share rejected"
-    assert len(outcome) == 1 and isinstance(outcome[0], ValueError)
-    ids = np.asarray(next(reader(starved.elastic(), 0, 2))["id"])
+    starving = chain.filter(odd).batch(BATCH)
+    assert starved(starving, 0, 2)
+    ids = np.asarray(next(reader(starving.elastic(), 0, 2))["id"])
     assert len(ids) == BATCH // 2 and all(int(value) % 2 for value in ids)
 
 
@@ -297,25 +287,38 @@ def test_automatic_loading_sizes_an_elastic_reads_workers_by_the_groups_they_rea
     assert resolved and "holding 4 reads ahead" in resolved[-1]
 
 
-def starved(chain: Pipeline, index: int, count: int, *, workers: int = 0) -> list[ValueError]:
-    """What the first batch of share `index` of `count` raises, read on a thread held to a minute's
-    deadline, so a reader that reads on forever fails the test that reads it."""
-    raised = []
+REFUSED, READ_A_BATCH = 3, 4
+"""How a starved read's process ends (`first_batch`): refused, or with a batch."""
 
-    def read():
-        opened = worker_reader(chain, index, count, workers)
-        try:
-            next(opened)
-        except ValueError as refused:
-            raised.append(refused)
-        finally:
-            opened.close()
 
-    thread = threading.Thread(target=read, daemon=True)
-    thread.start()
-    thread.join(60)
-    assert not thread.is_alive(), "the reader read on with every record of its share rejected"
-    return raised
+def first_batch(chain: Pipeline, index: int, count: int, workers: int) -> None:
+    """Read share `index` of `count` of `chain` in `workers` loading workers to its first batch, in a
+    process of its own, its end its exit code (`REFUSED`, `READ_A_BATCH`)."""
+    opened = worker_reader(chain, index, count, workers)
+    try:
+        next(opened)
+    except ValueError:
+        sys.exit(REFUSED)
+    finally:
+        opened.close()
+    sys.exit(READ_A_BATCH)
+
+
+def starved(chain: Pipeline, index: int, count: int, *, workers: int = 0) -> bool:
+    """Whether share `index` of `count` of `chain` is refused before its first batch, read in a
+    process held to a minute's deadline and killed past it, with its loading workers, so a reader
+    that reads on forever fails the test that reads it and leaves nothing running behind it."""
+    spawned = multiprocessing.get_context("spawn")
+    process = spawned.Process(target=first_batch, args=(chain, index, count, workers))
+    process.start()
+    process.join(60)
+    alive = process.is_alive()
+    if alive:
+        process.kill()
+        process.join()
+    assert not alive, "the reader read on with every record of its share rejected"
+    assert process.exitcode in (REFUSED, READ_A_BATCH), f"the read ended {process.exitcode}"
+    return process.exitcode == REFUSED
 
 
 @pytest.mark.parametrize(("elastic", "workers"), [(False, 2), (True, 0), (True, 2)],
@@ -326,8 +329,7 @@ def test_a_filter_that_rejects_every_record_read_is_refused_in_workers_and_elast
     carried to the reading process that drops the workers' markers."""
     chain = Pipeline(Memory(tuple({"id": np.int64(2 * index)} for index in range(24)))).shuffle(5).repeat()
     read = chain.filter(odd).batch(BATCH)
-    raised = starved(read.elastic() if elastic else read, 0, 2, workers=workers)
-    assert len(raised) == 1
+    assert starved(read.elastic() if elastic else read, 0, 2, workers=workers)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -369,6 +371,6 @@ def test_rejections_that_need_not_go_on_forever_are_read_through(chain):
         seed = next(seed for seed in range(200) if first_kept(seed) >= 5)
         read = records.shuffle(seed, window=100).filter(Kept("id", 1))
         expected = ("id", 1)
-    assert starved(read.batch(1), 0, 1) == []
+    assert not starved(read.batch(1), 0, 1)
     field, value = expected
     assert int(np.asarray(next(worker_reader(read.batch(1), 0, 1, 0))[field])[0]) == value
