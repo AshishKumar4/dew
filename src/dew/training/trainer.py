@@ -965,7 +965,7 @@ class Trainer(Generic[Loss, Effects]):
         """
         if self.lower_for is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
-            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for))
+            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for)[0])
         split, unaligned = divmod(int(state.window_size), self.accumulation)
         if unaligned or (state.accumulation is not None and self._split not in (None, split)):
             raise ValueError(f"the state pools windows of {int(state.window_size)} microbatches, and this "
@@ -1160,10 +1160,11 @@ class Trainer(Generic[Loss, Effects]):
                        out_shardings=(moving, replicated, replicated, replicated, replicated, replicated),
                        donate_argnums=0)
 
-    def _lowered_for(self, state: TrainState, batch: Batch, generation: str,
-                     devices: Mesh | None = None) -> jax.stages.Lowered:
+    def _lowered_for(self, state: TrainState, batch: Batch, generation: str, devices: Mesh | None = None
+                     ) -> tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]:
         """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered
-        for one (`dew.training._lowering`), on whatever devices this process has.
+        for one (`dew.training._lowering`), on whatever devices this process has, and the options its
+        compile there takes (`step_compiler_options`) where it is lowered over `devices`.
 
         It traces on an abstract mesh of that GPU's devices, from which JAX's Pallas lowering reads the
         GPU, or on `devices`, compile-only GPUs that XLA compiles it for (`dew.training.ahead`), at the
@@ -1187,7 +1188,11 @@ class Trainer(Generic[Loss, Effects]):
             jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
             traced = jitted.trace(*apart(placed_shapes(prepared, shardings)), placed_shapes(batch, placement),
                                   jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated))
-            return traced.lower() if devices is not None else traced.lower(lowering_platforms=('cuda',))
+            if devices is None:
+                return traced.lower(lowering_platforms=('cuda',)), None
+            shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
+            tokens, frozen = device_tokens(self.objective, micro, shards), FROZEN in prepared.variables
+            return traced.lower(), step_compiler_options(self.objective, tokens, frozen, mesh.devices.size)
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies

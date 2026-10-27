@@ -145,8 +145,9 @@ class AheadOfTime:
 def compile_ahead(trainer: Trainer, batch: Batch) -> AheadOfTime:
     """`trainer`'s first step over a batch of `batch`'s shapes, compiled for the compile-only GPUs its
     mesh is built over (`compile_only_gpus`) and never run: the step `fit` would compile there,
-    traced as on those GPUs (`dew.nn.kernels.generation.assumed`), at the base rung and the plan's
-    first split, its state the fresh one the trainer builds, abstract and placed by its layout."""
+    traced as on those GPUs (`dew.nn.kernels.generation.assumed`) and compiled with the options the
+    run's compile there takes, at the base rung and the plan's first split, its state the fresh one
+    the trainer builds, abstract and placed by its layout."""
     devices = list(trainer.device_mesh.devices.flat)
     generations = {gpu_target(device.device_kind).generation for device in devices}
     if {device.platform for device in devices} != {"gpu"} or len(generations) != 1:
@@ -155,7 +156,8 @@ def compile_ahead(trainer: Trainer, batch: Batch) -> AheadOfTime:
                          f"mesh holds {sorted({device.device_kind for device in devices})}")
     (generation,) = generations
     start = trainer._started()
-    compiled = trainer._lowered_for(start.abstract, batch, generation, trainer.device_mesh).compile()
+    lowered, options = trainer._lowered_for(start.abstract, batch, generation, trainer.device_mesh)
+    compiled = lowered.compile(options)
     executable, in_tree, out_tree = serialize_executable.serialize(compiled)
     memory = compiled.memory_analysis()
     if memory is None:

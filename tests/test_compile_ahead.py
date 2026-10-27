@@ -6,7 +6,11 @@ eight CPU devices: the bytes each device reads and writes are the state's and th
 under one placement, whichever backend compiles it. What it costs and its executable are XLA's own;
 a GPU loads and runs the saved executable (TL-*-compile-ahead-881)."""
 
+import dataclasses
+
 import jax
+import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 from model_support import TINY_DECODER
@@ -74,3 +78,50 @@ def test_compiling_ahead_takes_a_mesh_of_compile_only_gpus():
 
     with pytest.raises(ValueError):
         compile_ahead(fine_tune(MeshSpec(fsdp=8).build()), token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+
+
+@pytest.mark.gpu(reason="loads and runs a step compiled ahead on this host's own GPU")
+def test_a_step_compiled_ahead_and_saved_runs_on_its_gpu_in_the_run_s_place(tmp_path):
+    """A step compiled ahead for one compile-only GPU of this GPU's generation, saved, and loaded
+    again, runs on this GPU in the place of the run's own compile of it: handed the arguments the
+    run's step is (the state the trainer places, the batch, the first part), it makes outputs of
+    the same tree, shapes, dtypes and placements, the same step and microstep counters, a finite
+    loss, and parameters it has updated. Its floats are not held to the run's own bit for bit: XLA
+    tunes a GEMM's algorithm on the GPU it compiles on and takes its default with none attached."""
+    from dew.nn.kernels.generation import chosen, device_generation
+    from dew.state import apart
+    from dew.training.ahead import AheadOfTime, compile_ahead, compile_only_gpus
+
+    batch = token_rows(VOCAB, BATCH, SEQ_LEN + 1)
+    # A step that reads its parameters whole, so its arguments are the placed state's own.
+    with chosen(narrow_copies="off"):
+        compile_ahead(fine_tune(MeshSpec().build(compile_only_gpus(device_generation(), 1))), batch).save(
+            tmp_path / "step.dew-aot")
+        run = fine_tune(MeshSpec().build(jax.devices()[:1]))
+        state, _, _ = run.place()
+        run.compile(state, batch)
+    ahead = AheadOfTime.load(tmp_path / "step.dew-aot")
+    assert run.executable is not None
+    here = run.executable.memory_analysis()
+    assert (ahead.argument_bytes, ahead.output_bytes, ahead.alias_bytes) == (
+        here.argument_size_in_bytes, here.output_size_in_bytes, here.alias_size_in_bytes)
+    shardings, _ = run.executable.input_shardings
+
+    def arguments():
+        # Each call takes the state it is handed, so each is handed its own placing of the same one.
+        given, _, _ = run.place()
+        return jax.device_put((*apart(dataclasses.replace(given, compute=None)), batch, np.int32(0)),
+                              shardings)
+
+    theirs, ours = run.executable(*arguments()), ahead.loaded()(*arguments())
+    assert jax.tree.structure(ours) == jax.tree.structure(theirs)
+    for left, right in zip(jax.tree.leaves(ours), jax.tree.leaves(theirs), strict=True):
+        assert (left.shape, left.dtype, left.sharding) == (right.shape, right.dtype, right.sharding)
+    moving, *outputs = ours
+    np.testing.assert_array_equal(np.asarray(moving.step), np.asarray(theirs[0].step))
+    np.testing.assert_array_equal(np.asarray(moving.microstep), np.asarray(theirs[0].microstep))
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(outputs)
+               if jnp.issubdtype(leaf.dtype, jnp.floating))
+    initial = jax.tree.leaves(state.variables["params"])
+    assert any(not np.array_equal(np.asarray(new), np.asarray(old))
+               for new, old in zip(jax.tree.leaves(moving.variables["params"]), initial, strict=True))
