@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from process_support import run_pool
-from reference_error import assert_as_exact, widened
+from reference_error import assert_as_exact
 from test_indexer_training import SEQ, VOCAB, deepseek_stack
 
 from dew.data.preferences import MASK_KEY
@@ -87,8 +87,10 @@ def test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_
     def leaves(scored):
         return lambda *drawn: trained(scored)(*drawn)[0]
 
-    def truth(variables, reference, batch):
-        return leaves(wide)(*widened((variables, reference, batch)))
+    def truth(*drawn):
+        # Traced by the gate, so widened in JAX: every floating leaf to float64, exactly.
+        return leaves(wide)(*jax.tree.map(
+            lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, drawn))
 
     with jax.enable_x64(new_val=True):
         assert_as_exact(leaves(headed), leaves(plain), draw, f"{objective.__name__} head",
