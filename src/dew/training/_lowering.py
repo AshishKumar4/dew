@@ -78,7 +78,8 @@ def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operatio
 def custom_calls(lowered: jax.stages.Lowered) -> list[CustomCall]:
     """Every custom call a lowered program makes, in program order."""
     def shapes(values) -> tuple[tuple[int, ...], ...]:
-        return tuple(tuple(value.type.shape) for value in values if isinstance(value.type, ir.RankedTensorType))
+        return tuple(tuple(value.type.shape) for value in values
+                     if isinstance(value.type, ir.RankedTensorType))
 
     return _read_calls(lowered, lambda target, operation: CustomCall(
         target, shapes(operation.operands), shapes(operation.results)))
@@ -91,7 +92,8 @@ def triton_calls(lowered: jax.stages.Lowered) -> list[TritonCall]:
             return None
         config = ir.DictAttr(operation.attributes["mhlo.backend_config"])
         return TritonCall(ir.StringAttr(config["name"]).value, ir.StringAttr(config["ir"]).value_bytes,
-                          ir.IntegerAttr(config["num_warps"]).value, ir.IntegerAttr(config["num_stages"]).value)
+                          ir.IntegerAttr(config["num_warps"]).value,
+                          ir.IntegerAttr(config["num_stages"]).value)
 
     return _read_calls(lowered, read)
 

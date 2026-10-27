@@ -267,10 +267,12 @@ def test_bf16_logits_round_as_rounded_to_and_are_held_as_bf16_under_cuda():
     assert jnp.array_equal(held, jax.jit(rounded)(x)) and not jnp.array_equal(held, x)
     assert jnp.array_equal(jax.jit(jax.grad(loss(bf16_logits)))(x), jax.jit(jax.grad(loss(rounded)))(x))
     if jax.default_backend() == "gpu":
-        program = hlo_instructions(jax.jit(jax.value_and_grad(loss(bf16_logits))).lower(x).compile().as_text())
+        compiled = jax.jit(jax.value_and_grad(loss(bf16_logits))).lower(x).compile()
+        program = hlo_instructions(compiled.as_text())
         assert not [name for name, instruction in program.items()
                     if "reduce-precision" in {instruction.op, *instruction.fused}]
-        assert ("bf16", (16, 512)) in {(instruction.element, instruction.dims) for instruction in program.values()}
+        results = {(instruction.element, instruction.dims) for instruction in program.values()}
+        assert ("bf16", (16, 512)) in results
 
 
 @pytest.mark.parametrize("rows, columns, features", [(1, 37, 16), (1, 2048, 64), (6, 1, 8), (6, 3, 8),
