@@ -183,6 +183,8 @@ def test_a_build_runs_where_the_user_mode_driver_runs_its_cuda(tmp_path, driver,
     runs = cuda is not None and newest is not None and (installed == "cuda12" or newest == "cuda13")
     plugin = tmp_path / "plugins" / "jax_plugins" / f"xla_{installed}"
     plugin.mkdir(parents=True)
+    # A package of its own ahead of the environment's, so the stand-in is the one build installed.
+    (plugin.parent / "__init__.py").write_text("")
     # A plugin JAX finds and that registers no backend, so JAX opens on the CPU.
     (plugin / "__init__.py").write_text("def initialize():\n    pass\n")
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -24,7 +24,13 @@ import numpy as np
 import pytest
 import tool_support
 from interop_support import assert_transformer_exports, extract_fixture, fixture_arrays, source_transformer
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    torch_with_gradients,
+    with_gradients,
+)
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux2_fields, flux2_path
@@ -34,6 +40,8 @@ from dew.nn.scan_orders import pixel_shuffle
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("dev", "rect", "unguided", "narrow")
+CASE_SEEDS = {"dev": 256, "rect": 256, "unguided": 256, "narrow": 256}
+"""Each transformer's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` (on armada)."""
 
 
 @pytest.fixture(scope="module")
@@ -71,31 +79,101 @@ def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
     assert_transformer_exports(source, name, layouts, params)
 
 
+def flux2_ids(rows: int, columns: int, tokens: int):
+    """`Flux2Pipeline._prepare_text_ids` and `_prepare_latent_ids`: the four-axis ids the pipeline lays
+    out for a text of `tokens` and a latent of `rows` by `columns` positions."""
+    import torch
+
+    text = torch.cartesian_prod(torch.arange(1), torch.arange(1), torch.arange(1), torch.arange(tokens))
+    image = torch.cartesian_prod(torch.arange(1), torch.arange(rows), torch.arange(columns), torch.arange(1))
+    return text, image
+
+
+def flux2_arms(source, arrays, record, name):
+    """The case's draw, Dew's compiled walk and Diffusers' `Flux2Transformer2DModel` walks in float32
+    and float64: each the forward, then the gradients of the latent, the text states and every
+    parameter (by its published name) under the draw's probe, as `Flux2Pipeline` runs the model."""
+    import torch
+    from diffusers import Flux2Transformer2DModel
+
+    from tools.torch_precision import float64
+
+    model, params, layouts = load(source, name)
+    rows, columns = record["cases"][name]["grid"]
+    tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts}
+    fixture = {key: np.asarray(arrays[f"{name}.{key}"], np.float32)
+               for key in ("latent", "context", "times", "guidance", "probe")}
+
+    def draw(seed):
+        """The fixture's inputs at seed 0, else normal draws of their shapes at `seed`, each guidance
+        value perturbed by a unit-normal draw."""
+        if seed == 0:
+            return (fixture,)
+        generator = np.random.default_rng(31 + seed)
+        drawn = {key: generator.standard_normal(fixture[key].shape).astype(np.float32)
+                 for key in ("latent", "context", "probe")}
+        shift = generator.standard_normal(fixture["guidance"].shape).astype(np.float32)
+        guidance = fixture["guidance"] + shift
+        return ({**drawn, "times": fixture["times"], "guidance": guidance},)
+
+    @as_given
+    def native(inputs):
+        batch = inputs["latent"].shape[0]
+        guidance = jnp.asarray(inputs["guidance"]) if inputs["guidance"].size else None
+
+        @jax.jit
+        def walk(latent, context, params, probe):
+            def forward(latent, context, params):
+                image = latent.reshape(batch, rows, columns, -1)
+                out = model.apply({"params": params}, image, inputs["times"],
+                                  DenoisingCondition(context, guidance=guidance))
+                return out.reshape(batch, rows * columns, -1)
+
+            return with_gradients(forward)(latent, context, params, probe)
+
+        out, grad_latent, grad_context, grad_params = walk(inputs["latent"], inputs["context"], params,
+                                                           inputs["probe"])
+        return out, grad_latent, grad_context, {
+            tensor: np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()}
+
+    checkpoint = source / name / "transformer"
+    narrow = Flux2Transformer2DModel.from_pretrained(checkpoint, torch_dtype=torch.float32,
+                                                     local_files_only=True).eval()
+    with float64():
+        wide = Flux2Transformer2DModel.from_pretrained(checkpoint, torch_dtype=torch.float64,
+                                                       local_files_only=True).eval()
+    weights = {id(module): {key: value.detach().numpy() for key, value in module.named_parameters()}
+               for module in (narrow, wide)}
+    text_ids, image_ids = flux2_ids(rows, columns, fixture["context"].shape[1])
+
+    def reference_walk(module, drawn):
+        dtype = torch.from_numpy(np.asarray(drawn["latent"])).dtype
+        times = torch.tensor(drawn["times"], dtype=dtype)
+        guidance = torch.tensor(drawn["guidance"], dtype=dtype) if drawn["guidance"].size else None
+
+        def forward(latent, context, params):
+            return torch.func.functional_call(module, params, (), {
+                "hidden_states": latent, "encoder_hidden_states": context, "timestep": times / 1000,
+                "guidance": guidance, "img_ids": image_ids, "txt_ids": text_ids, "return_dict": False})[0]
+
+        out, grad_latent, grad_context, grad_params = torch_with_gradients(forward)(
+            drawn["latent"], drawn["context"], weights[id(module)], drawn["probe"])
+        return out, grad_latent, grad_context, {tensor: grad_params[tensor] for tensor in tensors}
+
+    def truth(inputs):
+        with float64():
+            return reference_walk(wide, inputs)
+
+    return draw, native, as_given(lambda inputs: reference_walk(narrow, inputs)), truth
+
+
 @pytest.mark.parametrize("name", CASES)
 def test_the_forward_and_every_gradient_match_the_source(source, arrays, record, name):
-    model, params, layouts = load(source, name)
-    latent, times, condition, (rows, columns) = walk(name, arrays, record)
-    probe = arrays[f"{name}.probe"].reshape(latent.shape[0], rows, columns, -1)
-
-    def objective(params, latent, context):
-        conditioned = DenoisingCondition(context, guidance=condition.guidance)
-        return jnp.sum(model.apply({"params": params}, latent, times, conditioned) * probe)
-
-    def held(value, key):
-        reference = arrays[f"{name}.{key}"]
-        assert_as_exact_as_the_reference(np.asarray(value).reshape(reference.shape), reference,
-                                         arrays[f"{name}.fp64.{key}"], f"{name} {key}")
-
-    held(model.apply({"params": params}, latent, times, condition), "output")
-    grad_params, grad_latent, grad_context = jax.grad(objective, argnums=(0, 1, 2))(
-        params, latent, condition.context)
-    held(grad_latent, "grad_latent")
-    held(grad_context, "grad_context")
-    tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts}
-    assert_leaves_as_exact(
-        {tensor: np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()},
-        {tensor: arrays[f"{name}.grad_param.{tensor}"] for tensor in tensors},
-        {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
+    """The forward, the latent's and the text states' gradients and every parameter's, each as near
+    float64 as Diffusers' float32 walk of the published model (check 1), over the variants whose
+    wiring differs: distilled guidance, a rectangular grid, no guidance embedder, a narrower model."""
+    draw, native, reference, truth = flux2_arms(source, arrays, record, name)
+    assert_as_exact(native, reference, draw, f"FLUX.2 {name}", seeds=CASE_SEEDS[name], truth_fn=truth)
 
 
 def nhwc(array):
