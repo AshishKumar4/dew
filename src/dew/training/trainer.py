@@ -129,7 +129,7 @@ from dew.training._fit import (
     unrecorded_parts,
     waited_read,
 )
-from dew.training._lowering import Lowered
+from dew.training._lowering import Lowered, generation_of, topology_devices
 from dew.training.budget import Pause, Plateau, run_length, run_steps, run_tokens
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -421,7 +421,7 @@ class Trainer(Generic[Loss, Effects]):
     @functools.cached_property
     def device_mesh(self) -> Mesh:
         """The device mesh (`device_mesh`), built on first use."""
-        return device_mesh(self.mesh)
+        return device_mesh(self.mesh, topology_devices(self.lower_for))
 
     @property
     def microbatches(self) -> int:
@@ -964,7 +964,8 @@ class Trainer(Generic[Loss, Effects]):
         """
         if self.lower_for is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
-            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for))
+            compiled = topology_devices(self.lower_for) is not None
+            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for), compiled=compiled)
         split, unaligned = divmod(int(state.window_size), self.accumulation)
         if unaligned or (state.accumulation is not None and self._split not in (None, split)):
             raise ValueError(f"the state pools windows of {int(state.window_size)} microbatches, and this "
@@ -1169,9 +1170,12 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
                              "the variables on the host")
-        mesh = gpu_mesh(self.device_mesh, generation)
+        # A TPU topology's mesh holds its own devices, which libtpu lowers and compiles for.
+        chip = generation_of(generation)
+        topology = topology_devices(generation) is not None
+        mesh = self.device_mesh if topology else gpu_mesh(self.device_mesh, generation)
         self._at_base_rung(batch)
-        with assumed(generation), self._traced_on(mesh) as schedule:
+        with assumed(chip), self._traced_on(mesh) as schedule:
             state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
             split = splits(self._rows, batch, mesh, self.microbatches, self._split)[0]
             micro = microbatch_shapes(batch, split)
@@ -1183,7 +1187,7 @@ class Trainer(Generic[Loss, Effects]):
             jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
             return jitted.trace(*apart(placed_shapes(prepared, shardings)), placed_shapes(batch, placement),
                                 jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)).lower(
-                lowering_platforms=('cuda',))
+                lowering_platforms=('tpu' if topology else 'cuda',))
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
