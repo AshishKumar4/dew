@@ -506,16 +506,19 @@ class Pretrained:
                              base=None if self.origin is None else AdapterBase(self.origin, self.revision))
         return replace(self, model=adapter.model, variables=adapter.variables, adapter=adapter)
 
-    def with_cross_attention(self, cross: CrossAttention, *, key: int | jax.Array) -> Self:
+    def with_cross_attention(self, cross: CrossAttention, *, key: int | jax.Array,
+                             frozen: bool = True) -> Self:
         """Return this source with gated cross-attention before the layers `cross` names, each
         block drawn from `key` (`dew.nn.cross_attention`).
 
         The blocks' gates start at zero, so the model computes what the source
-        does until they train. The variables hold the blocks under `params` and
-        the source's weights under `FROZEN`, so an objective built over the
-        result trains the blocks alone; an adapter's factors that already train
-        keep training, and `adapt` keeps the blocks training, so the two
-        compose in either order. The source's own format holds no
+        does until they train. The variables hold the blocks under `params` and,
+        where `frozen`, the source's weights under `FROZEN`, so an objective
+        built over the result trains the blocks alone; an adapter's factors that
+        already train keep training, and `adapt` keeps the blocks training, so
+        the two compose in either order. With `frozen=False` the source's own
+        split stands: an unsplit source's every weight trains beside the
+        blocks, a full fine-tune. The source's own format holds no
         cross-attention, so `save` and `export` refuse the result; a run's
         checkpoint keeps it.
         """
@@ -537,8 +540,8 @@ class Pretrained:
             return select(thaw(model.init(draw, jnp.zeros((1, length), jnp.int32))),
                           lambda path: path[0] == "params" and crossing(path))
 
-        variables = freeze(merge(self.variables, jax.jit(drawn)(request_key(key))), crossing)
-        return replace(self, model=model, variables=variables)
+        variables = merge(self.variables, jax.jit(drawn)(request_key(key)))
+        return replace(self, model=model, variables=freeze(variables, crossing) if frozen else variables)
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
         """Return the tensors `save` writes, by their source names; `dew.inference.NCCLPush` sends these.
@@ -875,7 +878,8 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
                           size: tuple[int, ...] | None = None, variables: Variables | None = None,
                           mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                           text: bool = True, text_only: bool = False,
-                          prediction_depths: int | None = None) -> PretrainedPipeline:
+                          prediction_depths: int | None = None,
+                          modeling_overrides: Mapping[str, object] | None = None) -> PretrainedPipeline:
     """A published diffusion pipeline, to train from its own weights.
 
     `size` is the (height, width) in pixels the pipeline runs at instead of
@@ -896,10 +900,12 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     (`TextToImage.prepare(conditions=...)`), and a prompt, training or
     `save`, which read the text encoder, are refused.
 
-    `text_only` and `prediction_depths` read as `Pretrained.load`'s do: a
-    pipeline has no wrapper's language model for `text_only` to take, and
-    its components hold no prediction depths, so any count keeps them all.
+    `text_only`, `prediction_depths` and `modeling_overrides` read as
+    `Pretrained.load`'s do: a pipeline has no wrapper's language model for
+    `text_only` to take, its components hold no prediction depths, so any
+    count keeps them all, and none reads overrides, which are refused.
     """
+    _unread_overrides(modeling_overrides, "a diffusion pipeline")
     if text_only:
         _no_language_model(checkpoint, "diffusion pipeline")
     directory = sources.snapshot(checkpoint, revision, weights=False)
