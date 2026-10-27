@@ -45,9 +45,9 @@ gpu="--python-platform x86_64-manylinux_2_35"
 lock cuda12 --extra cuda12 --torch-backend cpu $gpu
 lock cuda13 --extra cuda13 --torch-backend cpu $gpu
 # Each GPU lock serves aarch64 too: resolved for it, it pins the same, which this holds, so a GH200 installs it.
-for name in cuda12 cuda13; do
-  lock "$name-aarch64" --extra "$name" --torch-backend cpu --python-platform aarch64-manylinux_2_35
-  diff "locks/$name.txt" "locks/$name-aarch64.txt" >&2 || {
-    echo "locks/$name.txt resolves otherwise for aarch64: lock it for each machine" >&2; exit 1; }
-  rm "locks/$name-aarch64.txt"
+for extra in cuda12 cuda13; do
+  lock "$extra-aarch64" --extra "$extra" --torch-backend cpu --python-platform aarch64-manylinux_2_35
+  diff "locks/$extra.txt" "locks/$extra-aarch64.txt" >&2 || {
+    echo "locks/$extra.txt resolves otherwise for aarch64: lock it for each machine" >&2; exit 1; }
+  rm "locks/$extra-aarch64.txt"
 done
