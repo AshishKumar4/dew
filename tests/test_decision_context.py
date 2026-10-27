@@ -168,6 +168,7 @@ def test_rows_that_carry_a_context_pack_several_a_window_each_beside_its_own(gro
     notes = {text: note for text, _, note in ROWS}
     several = 0
     for window in windows_of(objective, rows):
+        assert "context_segments" in window, sorted(window)
         segments, contexts = np.asarray(window["segments"]), np.asarray(window["context_segments"])
         tokens, context = np.asarray(window["tokens"]), np.asarray(window["context"])
         for batch_row in range(len(segments)):
