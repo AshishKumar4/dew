@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import itertools
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -37,9 +38,13 @@ from dew import position
 from dew.artifacts import Representations
 from dew.batch import merge, under
 from dew.checkpoints import Ranking
+from dew.data import Memory
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, replayed
+from dew.data.pipeline import Pipeline
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Aux, EMASpec, Objective
+from dew.objectives.lm import LMObjective
 from dew.optim import Cosine, OptimConfig, Power
 from dew.state import CHECKPOINTED, TrainState
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, ema_update
@@ -212,6 +217,52 @@ def test_resumed_tokens_stay_exact_above_float32_integer_resolution(tmp_path, ca
     resumed = make_trainer(tmp_path, objective=LargeTokenRegression())
     state = resumed.fit(dataset(LargeTokenRows), tokens=65 * 262143 + 1, log_every=cadence)
     assert int(state.step) == 66
+
+
+LM_CONTEXT = 6
+LM_ROWS = 8
+
+
+def lm_data() -> Pipeline:
+    """Batches of eight rows of seven real ids, read again and again: each step commits its rows'
+    48 targets, the most they hold (`Objective.row_tokens`)."""
+    rows = (np.arange(2 * LM_ROWS * (LM_CONTEXT + 1), dtype=np.int32) % 13).reshape(-1, LM_CONTEXT + 1)
+    return Pipeline(Memory({"text": rows})).repeat().batch(LM_ROWS)
+
+
+def lm_trainer(tmp_path=None, **kwargs) -> Trainer:
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=12, dtype="float32")
+    return make_trainer(tmp_path, objective=LMObjective(model, seq_len=LM_CONTEXT), **kwargs)
+
+
+@pytest.mark.parametrize("accumulation", [1, 2], ids=["one-step-updates", "two-step-windows"])
+def test_a_token_budget_reads_its_count_off_the_devices_as_often_in_a_longer_run(caplog, accumulation):
+    """An LM run's step commits at most its rows' targets (`Objective.row_tokens`), so a token budget
+    reads the committed count off the devices at its first step, whose window a checkpoint may have
+    begun, and at the steps whose rows could have brought it to the budget, never at those between, each
+    of which such a read waits on before the next step dispatches: a run of twenty steps reads it as
+    often as a run of four."""
+    def reads(steps: int) -> int:
+        caplog.clear()
+        with jax.transfer_guard_device_to_host("log_explicit"), caplog.at_level(logging.WARNING):
+            state = lm_trainer(accumulation=accumulation).fit(lm_data(), tokens=steps * LM_ROWS * LM_CONTEXT)
+        assert int(state.step) == steps
+        return sum("shape=(2,), dtype=uint32" in record.getMessage() for record in caplog.records)
+
+    assert reads(4) == reads(20)
+
+
+def test_a_token_budget_resumed_inside_an_update_ends_where_an_unbroken_run_does(tmp_path):
+    """A run stopped one step into an update of two resumes with that step's rows still to commit,
+    which the update's commit brings in with the next step's: the resumed budget ends at the step
+    whose commit reaches it, as a run that never stopped does, not a step later, where its own steps
+    alone would have reached it."""
+    budget = 4 * LM_ROWS * LM_CONTEXT
+    unbroken = lm_trainer(tmp_path / "unbroken", accumulation=2).fit(lm_data(), tokens=budget)
+    lm_trainer(tmp_path / "broken", accumulation=2).fit(lm_data(), steps=3)
+    resumed = lm_trainer(tmp_path / "broken", accumulation=2).fit(lm_data(), tokens=budget)
+    assert int(unbroken.step) == int(resumed.step) == 4
 
 
 @pytest.mark.parametrize("variant", ["ema", "accumulation", "schedule", "dynamic_scale", "checkpoints"])
@@ -538,9 +589,6 @@ def test_final_checkpoint_policy_is_independent_of_the_cadence(tmp_path, cadence
 def held_lm_trainer(container=dict, **settings):
     """A one-layer LM trainer over held weights, which the objective holds
     in `container` (Flax's FrozenDict, say)."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.lm import LMObjective
-
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
@@ -700,8 +748,6 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
     their gradient to bf16, and resumes bit-exactly too."""
     from dew.data import Loading, presets
     from dew.data.sources.tokens import TokenFiles
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.lm import LMObjective
 
     corpus = write_token_corpus(tmp_path / "tokens", np.tile(np.arange(8), 256), tokenizer="symbols",
                                 vocab_size=8)

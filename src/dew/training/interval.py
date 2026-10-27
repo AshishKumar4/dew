@@ -223,6 +223,43 @@ class Interval:
             self.book = self.book._replace(loss=self.fresh.loss)
 
 
+@dataclasses.dataclass
+class TokenClock:
+    """The committed-token clock as a fit's loop reads it (`dew.training._fit.FitPlan.committed`): `read`,
+    the count at its last read off the devices (`Interval.real_tokens`), and `bound`, above any count
+    the steps since can have brought it to, so the loop reads it again only where that reaches what a
+    budget, a cadence or a schedule reads next, and otherwise dispatches each step without waiting on
+    the last.
+
+    A step commits at most its rows' tokens (`Objective.row_tokens`), and a window of `accumulation`
+    steps commits after its last: the window a read finds open holds at most `accumulation - 1` steps,
+    each of at most the `largest` step's tokens, which a resumed run's steps before it held as well, a
+    window never spanning a ramp's or a schedule's stages. A step of no declared tokens leaves the
+    bound unknown (None) until the next read, as does the start, whose window is the checkpoint's."""
+
+    read: int = 0
+    accumulation: int = 1
+    outstanding: int | None = None
+    """The most the window open at the last read and the steps since can commit; None where unknown."""
+    largest: int | None = 0
+    """The most one step of this fit can commit; None once a step declares no tokens."""
+
+    @property
+    def bound(self) -> int | None:
+        """The most the committed tokens can be after the latest step, or None where unknown."""
+        return None if self.outstanding is None else self.read + self.outstanding
+
+    def stepped(self, most: int | None) -> None:
+        """Count a step that commits at most `most` tokens, None for a step that declares none."""
+        self.largest = None if self.largest is None or most is None else max(self.largest, most)
+        self.outstanding = None if self.outstanding is None or most is None else self.outstanding + most
+
+    def reread(self, read: int) -> None:
+        """Take `read`, the committed tokens read off the devices after the latest step."""
+        self.read = read
+        self.outstanding = None if self.largest is None else (self.accumulation - 1) * self.largest
+
+
 @jax.jit
 def _added_tokens(left: jax.Array, right: jax.Array) -> jax.Array:
     return _TokenCount.add(left, right)

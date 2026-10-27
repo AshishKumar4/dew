@@ -27,6 +27,7 @@ prompt once per event.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
@@ -546,6 +547,14 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     def scored_tokens(self, batch: Batch) -> np.ndarray:
         """Each row's targets the loss scores (`scored_targets`), its `loss_role`'s alone."""
         return self._prediction_lengths(batch)
+
+    def row_tokens(self, batch: Batch) -> int | None:
+        """Each row's targets, of the ids under the field the scorer reads (`inputs`): every sequence a
+        row holds (a preference pair's two) has one fewer than its ids."""
+        if self.inputs is None:
+            return None
+        *sequences, ids = self.inputs.sample.held(batch)
+        return math.prod(sequences) * (ids - 1)
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real input lengths, each packed document its own attention square.

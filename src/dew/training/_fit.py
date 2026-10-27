@@ -28,7 +28,7 @@ from dew.telemetry.profile import region
 from dew.training.budget import Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Tokens
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
-from dew.training.interval import Interval, Taken
+from dew.training.interval import Interval, Taken, TokenClock
 from dew.training.observe import Observe
 from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
@@ -124,10 +124,25 @@ class FitPlan:
         """Whether this fit has nothing left to train: its budget reached, or its pause."""
         return self.finished(step, real) or self.paused(step, real)
 
-    def real(self, interval: Interval) -> int:
-        """The run's real tokens where a token budget reads them, else 0: the count is read from the
-        devices, which a run without one need not wait on."""
-        return interval.real_tokens if self.tokens is not None else 0
+    def horizon(self, real: int) -> int | None:
+        """The least count of committed tokens past `real` at which something this plan reads of the
+        clock changes: its budget, its pause, the next multiple of each cadence of tokens, or the end
+        of a schedule's stage. None where nothing it reads does."""
+        cadences = (self.log_every, self.eval_every, self.checkpoint_every, self.local_every,
+                    *(suite.every for suite in self.suites.values()))
+        nexts = [(real // every.every + 1) * every.every for every in cadences if isinstance(every, Tokens)]
+        ends = (self.tokens, self.pause[1], *(self.dataset.token_ends or ()), *nexts)
+        return min((end for end in ends if end is not None and end > real), default=None)
+
+    def committed(self, interval: Interval, clock: TokenClock) -> int:
+        """The run's committed tokens after its latest step, as this plan reads them: read off the
+        devices where the clock's bound reaches the next count the plan reads (`horizon`), and
+        otherwise the count of its last read, which falls on no budget, cadence or stage the latest
+        step's count could not, so the loop does not wait on that step."""
+        horizon, bound = self.horizon(clock.read), clock.bound
+        if horizon is not None and (bound is None or bound >= horizon):
+            clock.reread(interval.real_tokens)
+        return clock.read
 
     @property
     def scored(self) -> tuple[Metric, ...]:
@@ -222,8 +237,8 @@ class FitRun:
     checkpoint_due: bool = False
     local_due: bool = False
     """Whether the local checkpoint cadence falls on the run's latest step (`FitPlan.local_every`)."""
-    committed: int = 0
-    """The run's committed tokens after its last step, where a token budget reads them (`FitPlan.real`)."""
+    clock: TokenClock = dataclasses.field(default_factory=TokenClock)
+    """The run's committed tokens as its budget, cadences and schedule read them (`FitPlan.committed`)."""
     stop_control: dict = dataclasses.field(default_factory=dict)
     last_local_saved: int | None = None
     stopped: bool = False
@@ -310,20 +325,20 @@ def unrecorded_parts(objective: str, dataset: Dataset | Loader, *, optimized: bo
     return reasons
 
 
-def stage_reached(plan: FitPlan, run: FitRun, interval: Interval) -> tuple[PhasedStream, bytes, int] | None:
+def stage_reached(plan: FitPlan, run: FitRun) -> tuple[PhasedStream, bytes, int] | None:
     """Where the run's commits reached the tokens of the schedule's stage it stands in
     (`dew.data.pipeline.schedule`), on every process alike, as the committed tokens are the pool's: its
     stream opened again where the step that reached them left it, the stages that step's commit passed
     ended there, reading nothing, and the stage it now reads; what the prefetch worker read ahead of
     the end is dropped untrained. The last stage's tokens, where they end the data, are the run's token
-    budget (`dew.training.budget.run_tokens`). None before a stage's end, which the devices' count is
-    read for before each step while it lies ahead, as a token budget's is."""
+    budget (`dew.training.budget.run_tokens`). None before a stage's end, which the run's clock reads
+    off the devices where its steps may have reached it (`FitPlan.committed`), as a token budget's."""
     ends = plan.dataset.token_ends
     state = None if run.train is None else run.train.source_state
     if ends is None or state is None:
         return None
     stage = len(position.read(state).completed)
-    if stage >= len(ends) - 1 or (committed := interval.real_tokens) < (end := ends[stage] or 0):
+    if stage >= len(ends) - 1 or (committed := run.clock.read) < (end := ends[stage] or 0):
         return None
     assert run.train is not None and run.partition is not None
     run.train.close()

@@ -50,6 +50,7 @@ from dew.data.dataset import (
     RampedStream,
     Reader,
     Stage,
+    rows_of,
     stream_endless,
     stream_identity,
 )
@@ -148,7 +149,7 @@ from dew.training.distributed import (
     traced_start,
 )
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
-from dew.training.interval import Interval, held
+from dew.training.interval import Interval, TokenClock, held
 from dew.training.memory import (
     climb_to,
     device_tokens,
@@ -1400,10 +1401,10 @@ class Trainer(Generic[Loss, Effects]):
         compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]] = {}
         seen = 0
         run.notice = PreemptionNotice()
-        run.committed = plan.real(interval)
-        while not plan.ended(run.current, plan.real(interval)):
+        run.clock = TokenClock(interval.real_tokens, self.accumulation)
+        while not plan.ended(run.current, run.clock.read):
             # A schedule's stage ends where the commits reach its tokens.
-            self._scheduled(plan, run, interval)
+            self._scheduled(plan, run)
             # The window's capture opens before this iteration's first read, so the step row records
             # the read it waits on rather than a compile that ran before capture began.
             if (profiler is not None and profile is not None
@@ -1466,6 +1467,8 @@ class Trainer(Generic[Loss, Effects]):
                 self._display.step(run.current)
                 seen += 1
                 interval.count(batch, measured_flops, loss, finite, committed, aux)
+                per_row = self.objective.row_tokens(device)
+                run.clock.stepped(None if per_row is None else rows_of(device) * per_row)
                 if run.first_step is None:
                     loss.block_until_ready()
                     run.first_step = time.perf_counter() - run.started
@@ -1671,15 +1674,15 @@ class Trainer(Generic[Loss, Effects]):
         return DevicePrefetchIterator(source, self.device_mesh, self._prefetch, source_state=position,
                                       reads=run.reads, prepare=prepare)
 
-    def _scheduled(self, plan: FitPlan, run: FitRun, interval: Interval) -> None:
+    def _scheduled(self, plan: FitPlan, run: FitRun) -> None:
         """Open the next stage of a schedule where the run's commits reached the one it stands in
         (`stage_reached`), the prefetch worker reading it from the step that ended the last."""
-        reached = stage_reached(plan, run, interval)
+        reached = stage_reached(plan, run)
         if reached is None:
             return
         source, state, stage = reached
         self._display.note(f"Stage {stage} of the schedule begins at step {run.current}, after "
-                           f"{interval.real_tokens} committed tokens")
+                           f"{run.clock.read} committed tokens")
         # An update pools one stage's batches: a window a rejection left part filled at the commit the
         # stage begins after is dropped as a ramp's stage drops it (`_staged`), and laid out for the
         # stage's batches, which may be shaped as no earlier stage's were (`_runner`).
@@ -1713,8 +1716,8 @@ class Trainer(Generic[Loss, Effects]):
         the checkpoints, and the preemption notice. Returns whether the
         notice stops the run at this step, whose checkpoint is then written."""
         current, checkpoints = run.current, self.checkpoints
-        real = plan.real(interval)
-        before, run.committed = run.committed, real
+        before = run.clock.read
+        real = plan.committed(interval, run.clock)
         record, aux = taken_record(aux)
         if record is not None:
             self.records.append(record)
@@ -1910,7 +1913,7 @@ class Trainer(Generic[Loss, Effects]):
             scores = run.evaluation.scores
         # A token update may cross the pause and the budget at once, which still saves the whole state.
         self._saves(plan, run, interval, state, position, scores, evaluation_due=bool(scores), final=True,
-                    full=plan.paused(current, plan.real(interval)))
+                    full=plan.paused(current, run.clock.read))
         if plan.observe:
             plan.observe.last(current, state)
         if checkpoints is not None:

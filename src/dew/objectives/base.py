@@ -777,6 +777,13 @@ class Objective(ABC, Generic[Loss, Effects]):
             lambda leaf, index=index: leaf[index:index + 1] if np.ndim(leaf) and np.shape(leaf)[0] == rows
             else leaf, batch))) for index in range(rows)], np.int64)
 
+    def row_tokens(self, batch: Batch) -> int | None:
+        """The tokens each of `batch`'s rows holds, read from its shapes alone, so a placed batch
+        answers without a wait: the most a row's `scored_tokens` counts, and what a device steps of
+        it (`dew.training.memory.device_tokens`). None where rows hold no token geometry, an image's,
+        whose run reads its committed tokens off the devices at each step a count is due."""
+        return None
+
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real row (or packed-segment) lengths, read before device placement.
 
