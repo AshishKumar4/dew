@@ -408,6 +408,8 @@ def _dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
     def dispatched(*operands):
         return jax.lax.platform_dependent(*operands, default=default, **branches)
 
-    if any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(operands)):
+    from jax.core import Tracer
+
+    if any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
         return dispatched(*operands)
     return jax.jit(dispatched)(*operands)
