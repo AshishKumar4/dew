@@ -330,10 +330,10 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
     @functools.cached_property
     def bounds(self) -> Bounds:
         """The most rows, questions and options a window packs (`Layout.bounds`),
-        at most `segments` rows, and one where rows carry a context: a backbone's
-        cross-attention reads one context a window row, the row's own."""
+        at most `segments` rows; rows that carry a context pack as any do, each reading its own
+        (`DecisionInputs.context_segments`)."""
         bounds = self.layout.bounds(self.tokenizer, self.specials, self.context_length)
-        most = 1 if self.context_length is not None else self.segments
+        most = self.segments
         if most is None:
             return bounds
         return dataclasses.replace(bounds, segments=min(most, bounds.segments))

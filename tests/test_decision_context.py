@@ -2,6 +2,7 @@
 pretrained backbone: trained as an adapter, counted in its training work, and served, each request's
 answer read from its own context."""
 
+import copy
 import dataclasses
 import itertools
 from collections.abc import Sequence
@@ -58,12 +59,14 @@ with the batch as `dew_fn`, 2026-10-23 on armada, both arms without YNNPACK's fu
 
 
 def conditioned(length: int = 32, layers: tuple[int, ...] = (0, 1),
-                encoder: ContextEncoder = "table") -> DecisionObjective:
+                encoder: ContextEncoder = "table", segments: int | None = None) -> DecisionObjective:
     """A decision over the tiny Llama with fresh cross-attention before `layers`, its context up to
-    `length` tokens and encoded as `encoder` says, its rows laid out by bytes."""
+    `length` tokens and encoded as `encoder` says, its rows laid out by bytes, at most `segments` rows
+    a window where given."""
     source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
     return DecisionObjective(source.with_cross_attention(CrossAttention(layers, length), key=0),
-                             tokenizer=ByteTokenizer(), specials=SPECIALS, context_encoder=encoder)
+                             tokenizer=ByteTokenizer(), specials=SPECIALS, context_encoder=encoder,
+                             segments=segments)
 
 
 def examples() -> list[Example]:
@@ -128,21 +131,10 @@ def opened(variables, value: float = 1.0):
 
 
 def windows_of(objective: DecisionObjective, rows, count: int = 6) -> list[dict]:
-    """The first `count` training windows `objective`'s data packs of `rows`, three rows a window at
-    most: a window's packing alone, the bounds a backbone's cross-attention reads not yet lifted."""
-    from dew.decision.layout import Bounds
-
-    held = DecisionObjective.bounds
-
-    def three(self) -> Bounds:
-        return dataclasses.replace(held.func(self), segments=3)
-
-    DecisionObjective.bounds = property(three)
-    try:
-        reader = decision_rows(rows, None, objective=objective.data(), tokens=objective.layout.max_len)
-        return list(itertools.islice(reader.train(DataPartition()), count))
-    finally:
-        DecisionObjective.bounds = held
+    """The first `count` windows `objective`'s data packs of `rows` as its evaluation reads them, in
+    order, each window as many rows as its bounds allow."""
+    reader = decision_rows(rows, None, rows, objective=objective.data(), tokens=objective.layout.max_len)
+    return list(itertools.islice(reader.val(DataPartition()), count))
 
 
 @pytest.mark.parametrize("grouped", ["rows", "unit", "unit beside rows"])
@@ -155,10 +147,10 @@ def test_rows_that_carry_a_context_pack_several_a_window_each_beside_its_own(gro
     beside its units (row 1885; the last crashed where a lone row had no `context_row`)."""
     from dew.decision import Group, GroupedExamples
 
-    objective = conditioned()
+    objective = conditioned(segments=3)
     if grouped != "rows":
         objective = DecisionObjective(objective.model.backbone, tokenizer=ByteTokenizer(), specials=SPECIALS,
-                                      context_encoder="table", consistency=0.5)
+                                      context_encoder="table", consistency=0.5, segments=3)
         pairs = [(examples()[index], examples()[index + 1]) for index in range(0, 12, 2)]
         rows = [GroupedExamples(pair, groups=(Group("pick", {f"{member}.pick": {option: option for option in
                                                                                   "abc"}
@@ -187,6 +179,65 @@ def test_rows_that_carry_a_context_pack_several_a_window_each_beside_its_own(gro
                 read = bytes(context[batch_row][contexts[batch_row] == number].astype(np.uint8)).decode()
                 assert (notes[state] or "") in read and (read == "") == (notes[state] is None), (state, read)
     assert several, "no window held more than one row"
+
+
+PACKED_CONTEXT_SEEDS = 8
+"""Check 1's declared seeds for packed rows reading their own contexts against each row alone, sized
+paired (`seeds_for` with the packed windows as `dew_fn`) on armada."""
+
+
+@pytest.mark.parametrize("encoder", ["table", "backbone"])
+def test_packed_rows_each_read_their_own_context_as_each_does_alone(encoder):
+    """Rows that carry a context, three packed a window, decide each row's options as the row does in a
+    window of its own beside its context alone, through the unmodified objective, its cross-attention
+    open (every gate 1): each row's tokens read its own context and no other row's, the context read
+    through the token table and through the backbone's own pass over each context as its own
+    document, the real options' logits on par from float64 (check 1, over drawn parameters)."""
+    from test_decision_packing import owners
+
+    from dew.decision.task import laid_out
+
+    rows = examples()[:12]
+    packed, alone = conditioned(encoder=encoder, segments=3), conditioned(encoder=encoder, segments=1)
+    windows = {name: windows_of(objective, rows, count=12)
+               for name, objective in (("packed", packed), ("alone", alone))}
+    assert max(int(np.max(window["segments"])) for window in windows["packed"]) > 1, "no window packed two"
+
+    def scored(objective, batches, variables) -> dict[str, np.ndarray]:
+        """Each row's real options' logits, keyed by its state's text."""
+        forward = COMPILED.setdefault((id(objective.model), "packed"), without_ynn(
+            lambda variables, inputs: objective.model.logits(variables, inputs)))
+        logits = {}
+        for batch in batches:
+            inputs = laid_out(batch, objective.bounds.segments)
+            held = np.asarray(forward(variables, inputs))
+            options, owned = np.asarray(batch["options"]), owners(batch)
+            for window, segments in enumerate(np.asarray(batch["segments"])):
+                for row in range(1, int(segments.max()) + 1):
+                    own = np.asarray(batch["tokens"])[window][segments == row]
+                    text = bytes(own.astype(np.uint8)).decode(errors="replace")
+                    (state,) = {example.state for example in rows if example.state in text}
+                    asked = owned[window] == row
+                    logits.setdefault(state, held[window][asked][options[window][asked]])
+        return dict(sorted(logits.items()))
+
+    def arm(objective, batches):
+        return as_given(lambda variables: scored(objective, batches, variables))
+
+    initialized = jax.jit(packed.init)
+    wide = copy.copy(alone)
+    wide.model = DecisionModel(alone.model.backbone.clone(dtype=jnp.float64),
+                               alone.model.head.clone(dtype=jnp.float64), alone.model.context_encoder)
+
+    def truth(variables):
+        with jax.enable_x64(new_val=True):
+            return scored(wide, windows["alone"], widened(variables))
+
+    def draw(seed):
+        return (opened(initialized(jax.random.key(seed))),)
+
+    assert_as_exact(arm(packed, windows["packed"]), arm(alone, windows["alone"]), draw,
+                    f"packed contexts by {encoder}", seeds=PACKED_CONTEXT_SEEDS, truth_fn=truth)
 
 
 def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_does():

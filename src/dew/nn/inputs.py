@@ -413,15 +413,25 @@ CONTEXT = "context"
 CONTEXT_LENGTHS = "context_lengths"
 """The `ModelInputs.conditioning` entry counting each row's real context tokens, `[B]`
 integers; a row's padding comes after them. Without it every context token is real."""
+CONTEXT_SEGMENTS = "context_segments"
+"""The `ModelInputs.conditioning` entry naming each context token's document `[B, C]` integers, the
+packed row of the call it belongs to (0 for padding): a call's token reads the context of its own
+document alone, as several packed rows each read their own context. Without it every token of a row
+reads the row's whole context."""
 
 
 @struct.dataclass
 class CrossContext:
     """The sequence a call's cross-attention layers read: `embeddings` `[B, C, features]`
-    and each row's count of real tokens, `lengths` `[B]` int32, its padding after them."""
+    and each row's count of real tokens, `lengths` `[B]` int32, its padding after them, and where the
+    row packs several documents, each context token's document, `segments` `[B, C]` (0 for padding,
+    `CONTEXT_SEGMENTS`), whose tokens the call's tokens of that document alone read; and the call's own
+    tokens' documents, `queries` `[B, S]`, which the decoder sets from its coordinates."""
 
     embeddings: jax.Array
     lengths: jax.Array
+    segments: jax.Array | None = None
+    queries: jax.Array | None = None
 
     @staticmethod
     def parted(conditioning: Mapping[str, jax.Array] | None
@@ -430,7 +440,7 @@ class CrossContext:
         the rest, which a module around the decoder reads itself (a multimodal model's media); each
         None where it holds nothing."""
         context = {name: value for name, value in (conditioning or {}).items()
-                   if name in (CONTEXT, CONTEXT_LENGTHS)}
+                   if name in (CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS)}
         rest = {name: value for name, value in (conditioning or {}).items() if name not in context}
         return context or None, rest or None
 
@@ -442,10 +452,10 @@ class CrossContext:
         `[B, C, features]` floats, and for lengths that are not one integer
         per row.
         """
-        unknown = sorted(set(conditioning) - {CONTEXT, CONTEXT_LENGTHS})
+        unknown = sorted(set(conditioning) - {CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS})
         if unknown or CONTEXT not in conditioning:
-            raise ValueError(f"a decoder's conditioning is {CONTEXT!r} and optionally {CONTEXT_LENGTHS!r}, "
-                             f"got {sorted(conditioning)}")
+            raise ValueError(f"a decoder's conditioning is {CONTEXT!r} and optionally {CONTEXT_LENGTHS!r} "
+                             f"and {CONTEXT_SEGMENTS!r}, got {sorted(conditioning)}")
         embeddings = jnp.asarray(conditioning[CONTEXT])
         if embeddings.ndim != 3 or not jnp.issubdtype(embeddings.dtype, jnp.floating):
             raise ValueError(f"a context is [B, C, features] floats, got "
@@ -457,7 +467,14 @@ class CrossContext:
         if lengths.shape != embeddings.shape[:1] or not jnp.issubdtype(lengths.dtype, jnp.integer):
             raise ValueError(f"context lengths are one integer per row, [{embeddings.shape[0]}], "
                              f"got {lengths.dtype}{lengths.shape}")
-        return cls(embeddings, lengths.astype(jnp.int32))
+        segments = conditioning.get(CONTEXT_SEGMENTS)
+        if segments is not None:
+            segments = jnp.asarray(segments)
+            if segments.shape != embeddings.shape[:2] or not jnp.issubdtype(segments.dtype, jnp.integer):
+                raise ValueError(f"context segments are one integer per context token, "
+                                 f"{list(embeddings.shape[:2])}, got {segments.dtype}{segments.shape}")
+            segments = segments.astype(jnp.int32)
+        return cls(embeddings, lengths.astype(jnp.int32), segments)
 
 
 @struct.dataclass

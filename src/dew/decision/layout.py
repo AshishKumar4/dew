@@ -1402,9 +1402,11 @@ class DecisionInputs:
     - `option_slots` `[B, P]` each window's real options as flat indices
       `q * K + k` into its `[Q, K]` grid, in that order (`compacted`), and
       `slotted` `[B, P]` which of them are real, or None for the grid itself;
-    - `context` `[B, C]` each window row's context tokens, which a backbone's
-      cross-attention reads, `context_lengths` `[B]` how many are real, the
-      padding after them, or None for rows that carry none.
+    - `context` `[B, C]` each window's rows' context tokens end to end, which a
+      backbone's cross-attention reads, `context_lengths` `[B]` how many are
+      real, the padding after them, and `context_segments` `[B, C]` each one's
+      row in the window as `segments` numbers it (0 for padding), which its
+      row's tokens alone read; or None for rows that carry none.
 
     A row of one question with one marker per option, Laya's, has spans one
     token long. A head that reads `option_slots` computes the real options
@@ -1425,6 +1427,7 @@ class DecisionInputs:
     slotted: jnp.ndarray | None = None
     context: jnp.ndarray | None = None
     context_lengths: jnp.ndarray | None = None
+    context_segments: jnp.ndarray | None = None
     readout: jnp.ndarray | None = None
     """`[B, Q]` where a readout of labels reads each question's answer (`Laid.readout`), or None; the
     labels' ids are the readout head's own (`LabelReadout.label_ids`)."""
