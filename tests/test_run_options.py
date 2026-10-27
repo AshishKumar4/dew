@@ -27,6 +27,7 @@ from dew.config.diffusion import DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
 from dew.data import TFDS, Files, Loading, images as image_steps, presets
+from dew.data.pipeline import Rejected
 from dew.data.sources.tokens import TokenFiles
 from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig
@@ -45,21 +46,35 @@ RATE = 0.0123
 """A learning rate no kind takes by default, which the run's optimizer logs as it steps."""
 
 
-def read(chain):
-    return chain.read("memory").loading(Loading(workers=0))
+@dataclasses.dataclass(frozen=True)
+class MostlyKept:
+    """A record kept by its draw three times in four (`Pipeline.random_filter_map`): which records a
+    batch holds is then the run's data seed's."""
+
+    identity = "mostly-kept@1"
+
+    def __call__(self, row, rng: np.random.Generator):
+        return row if rng.random() < 0.75 else Rejected("drawn out")
 
 
-def lm(root: Path) -> RunConfig:
+def read(chain, drawn: bool):
+    """`chain`'s records in batches of 8, read from memory, each drawn in or out by the run's data
+    seed where `drawn` (`MostlyKept`)."""
+    kept = chain.random_filter_map(MostlyKept()) if drawn else chain
+    return kept.batch(8).read("memory").loading(Loading(workers=0))
+
+
+def lm(root: Path, drawn: bool) -> RunConfig:
     corpus = write_token_files(root / "tokens", 40 * SEQ, 8 * SEQ)
 
     def windows(path):
-        return read(TokenFiles(path).shuffle().pipe(presets.lm, None, seq_len=SEQ, batch=8, pack=None))
+        return read(TokenFiles(path).pipe(presets.lm, None, seq_len=SEQ, batch=None, pack=None), drawn)
     return LMRunConfig(model=ModelConfig("causal_transformer", {"emb_features": 16, "num_layers": 1,
                                                                 "num_heads": 2, "dtype": "float32"}),
                        data=windows(corpus.train), validation=windows(corpus.val))
 
 
-def decision(root: Path) -> RunConfig:
+def decision(root: Path, drawn: bool) -> RunConfig:
     table = root / "tickets.csv"
     tickets = [("charged twice for March", "billing"), ("the site is down", "technical"),
                ("how much is the pro plan", "sales"), ("refund my last invoice", "billing")] * 8
@@ -70,7 +85,7 @@ def decision(root: Path) -> RunConfig:
     train, held = Files(str(table), format="csv").holdout(0.25)
 
     def asked(rows):
-        return read(rows.shuffle().pipe(decisions, question="team").batch(8))
+        return read(rows.pipe(decisions, question="team"), drawn)
     return DecisionRunConfig(pretrained=str(TINY_LAYA), model=ModelConfig("causal_transformer",
                                                                           {"dtype": "float32"}),
                              data=asked(train), validation=asked(held))
@@ -80,12 +95,12 @@ def pictures():
     return TFDS("dew_images", path=str(IMAGES), split="all").holdout(records=4)
 
 
-def diffusion(root: Path) -> RunConfig:
+def diffusion(root: Path, drawn: bool) -> RunConfig:
     del root
     train, held = pictures()
 
     def captioned(rows):
-        return read(rows.shuffle().pipe(presets.images, 4, batch=8, caption=image_steps.caption()))
+        return read(rows.pipe(presets.images, 4, batch=None, caption=image_steps.caption()), drawn)
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
                                          "num_heads": 2}),
@@ -94,12 +109,12 @@ def diffusion(root: Path) -> RunConfig:
         objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 2}))
 
 
-def jepa(root: Path) -> RunConfig:
+def jepa(root: Path, drawn: bool) -> RunConfig:
     del root
     train, held = pictures()
 
     def patched(rows):
-        return read(rows.shuffle().pipe(presets.images, 16, batch=8))
+        return read(rows.pipe(presets.images, 16, batch=None), drawn)
     return JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
                                            "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
@@ -131,12 +146,12 @@ def test_every_trainer_option_set_on_the_command_line_reaches_the_kinds_run(kind
     scored on the held split, with no metric the kind would score by default and the summary named
     formed from the scores; and the run's one checkpoint kept is its last, in the directory named."""
     record = tmp_path / "record"
-    KINDS[kind](tmp_path).save(str(record))
+    KINDS[kind](tmp_path, drawn=False).save(str(record))
     runs = tmp_path / "runs"
     settings = {"trainer.name": "set", "trainer.checkpoint_dir": str(runs), "trainer.steps": "2",
                 "trainer.accumulation": "2", "trainer.log_every": "1", "trainer.eval_every": "1",
-                "trainer.checkpoint_every": "1", "trainer.keep": "1", "trainer.dynamic_scale": "true",
-                "trainer.multi_host": "false", "trainer.compilation_cache_dir": "None",
+                "trainer.checkpoint_every": "1", "trainer.keep": "1", "trainer.dynamic_scale": "True",
+                "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None",
                 "optim.learning_rate": str(RATE), "val_metrics": "[]",
                 "val_summaries": json.dumps([{"name": "board", "weights": {"val/loss": 1},
                                               "better": "lower"}])}
@@ -155,10 +170,9 @@ def test_every_trainer_option_set_on_the_command_line_reaches_the_kinds_run(kind
     assert sorted(path.name for path in run.iterdir() if path.name.isdigit()) == ["2"]
 
 
-def trained(kind: str, root: Path, name: str, **fields):
-    """A kind's run trained one step from Python (`prepare().train`) over a mesh of four data shards
-    by two fsdp shards, its trainer the fields given: its state, and its step's scalars."""
-    run = KINDS[kind](root)
+def trained(run: RunConfig, root: Path, name: str, **fields):
+    """`run` trained one step from Python (`prepare().train`) over a mesh of four data shards by two
+    fsdp shards, its trainer the fields given: its state, and its step's scalars."""
     trainer = TrainerConfig(checkpoint_dir=str(root / "runs"), steps=1, log_every=1, eval_every=None,
                             checkpoint_every=None, checkpoint_final=False, multi_host=False,
                             mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=64), **fields.pop("trainer", {}))
@@ -173,16 +187,17 @@ def test_a_kinds_key_data_seed_mesh_and_adapter_reach_what_it_trains(kind, tmp_p
     other parameters, another `data_seed` reads another first batch from parameters drawn alike, its
     mesh and layout split a parameter over its fsdp shards, and a `lora` trains its factors over a
     frozen base."""
-    base, first = trained(kind, tmp_path, "base", trainer={"key": 1})
-    keyed, _ = trained(kind, tmp_path, "keyed", trainer={"key": 2})
-    _, reordered = trained(kind, tmp_path, "seeded", trainer={"key": 1}, data_seed=5)
+    run = KINDS[kind](tmp_path, drawn=True)
+    base, first = trained(run, tmp_path, "base", trainer={"key": 1})
+    keyed, _ = trained(run, tmp_path, "keyed", trainer={"key": 2})
+    _, reordered = trained(run, tmp_path, "seeded", trainer={"key": 1}, data_seed=5)
     held = [np.asarray(leaf) for leaf in jax.tree.leaves(base.variables["params"])]
     assert any(not np.array_equal(mine, np.asarray(theirs))
                for mine, theirs in zip(held, jax.tree.leaves(keyed.variables["params"]), strict=True))
     assert first["train/loss"] != reordered["train/loss"]
     assert any(len(leaf.sharding.device_set) > 1 and not leaf.sharding.is_fully_replicated
                for leaf in jax.tree.leaves(base.variables["params"]))
-    adapted, _ = trained(kind, tmp_path, "adapted", trainer={"key": 1}, lora=LoRA(rank=2))
+    adapted, _ = trained(run, tmp_path, "adapted", trainer={"key": 1}, lora=LoRA(rank=2))
     assert FROZEN in adapted.variables
     factors = sum(leaf.size for leaf in jax.tree.leaves(adapted.variables["params"]))
     assert 0 < factors < sum(leaf.size for leaf in held)
@@ -192,7 +207,7 @@ def test_a_kinds_key_data_seed_mesh_and_adapter_reach_what_it_trains(kind, tmp_p
 def test_a_kind_that_builds_its_model_fresh_refuses_source_options(kind, tmp_path):
     """`source` says what a run builds of the source it loads, and a run whose model is built from
     `model` loads none: its source options are refused as it is prepared, not dropped."""
-    run = KINDS[kind](tmp_path)
+    run = KINDS[kind](tmp_path, drawn=False)
     with pytest.raises(ValueError):
         dataclasses.replace(run, source=SourceOptions(text_only=True)).prepare()
 
@@ -201,7 +216,7 @@ def test_a_kind_that_builds_its_model_fresh_refuses_source_options(kind, tmp_pat
 def test_a_kind_whose_source_decides_its_model_refuses_another_model_name(kind, tmp_path):
     """A run that starts from a source takes its architecture from it, and its model's fields'
     few choices alone: a model it names is refused as it is prepared, not dropped."""
-    run = KINDS[kind](tmp_path)
+    run = KINDS[kind](tmp_path, drawn=False)
     model = ModelConfig("simple_dit", {})
     pretrained = {"pretrained": str(TINY_LAYA)} if kind == "lm" else {}
     with pytest.raises(ValueError):
@@ -216,9 +231,9 @@ def test_a_process_option_the_process_does_not_carry_is_refused_before_training(
     one it states is refused before it trains, not trained without it."""
     stated = {"xla_flags": "--xla_cpu_enable_fast_math=false",
               "compilation_cache_dir": str(tmp_path / "cache"), "multi_host": True}[option]
-    run = KINDS[kind](tmp_path)
-    trainer = TrainerConfig(checkpoint_dir=str(tmp_path / "runs"), steps=1, multi_host=False,
-                            **{option: stated})
+    run = KINDS[kind](tmp_path, drawn=False)
+    trainer = TrainerConfig(**{"checkpoint_dir": str(tmp_path / "runs"), "steps": 1, "eval_every": None,
+                               "multi_host": False, option: stated})
     prepared = dataclasses.replace(run, trainer=trainer).prepare()
     with pytest.raises(ValueError):
         prepared.train("refused")
