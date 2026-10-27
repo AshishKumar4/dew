@@ -79,7 +79,7 @@ def published(*, wide: bool) -> dict:
 def evaluated(build, read, inputs) -> tuple[dict, dict]:
     """`read(schedule, inputs)` as FlaxDiff runs, x64 off, and wide, x64 on and its source in float64,
     each schedule built by `build(scope)` in its own run."""
-    with jax.enable_x64(val=False):
+    with jax.enable_x64(new_val=False):
         narrow = read(build(NARROW), inputs)
         reference = {name: np.asarray(value) for name, value in narrow.items()}
     wide_inputs = {name: value.astype(np.float64) if value.dtype == np.float32 else value
@@ -118,7 +118,7 @@ def record(destination: Path) -> None:
 
         arrays.update(record_case(name, indices,
                                   lambda inputs, build=build: evaluated(build, rates_and_weight, inputs)))
-        with jax.enable_x64(val=False):
+        with jax.enable_x64(new_val=False):
             arrays[f"{name}.betas"] = np.asarray(NARROW["exp_beta_schedule"](
                 arguments["timesteps"], 0.008, arguments.get("beta_end", 0.999)))
 
@@ -133,7 +133,7 @@ def record(destination: Path) -> None:
 
         arrays.update(record_case(name, lambda seed, site=site: times(seed, site),
                                   lambda inputs, build=build: evaluated(build, sigma_and_weight, inputs)))
-        with jax.enable_x64(val=False):
+        with jax.enable_x64(new_val=False):
             _, chunks = build(NARROW).transform_inputs(None, jnp.asarray(GRID))
         arrays[f"{name}.model_time"] = np.asarray(chunks)
     arrays["grid"] = GRID
