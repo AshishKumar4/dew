@@ -146,7 +146,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_decoding_components.py": {
-   "comparisons": 8,
+   "comparisons": 5,
    "lane": "Training"
   },
   "tests/test_decoding_strategies.py": {
@@ -306,7 +306,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_image_metrics.py": {
-   "comparisons": 5,
+   "comparisons": 3,
    "lane": "Training"
   },
   "tests/test_inference.py": {
@@ -564,10 +564,6 @@
   "tests/test_rcm.py": {
    "comparisons": 8,
    "lane": "Models, Serving & RL"
-  },
-  "tests/test_records.py": {
-   "comparisons": 1,
-   "lane": "Training"
   },
   "tests/test_reference_runs.py": {
    "comparisons": 2,
