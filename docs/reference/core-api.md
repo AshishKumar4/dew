@@ -153,7 +153,7 @@ Sources implement `Source`: `Memory` holds records or columns, `Files` opens a f
 
 A global count-preserving or memory-materialized plan resumes across process counts dividing its batch. A streamed, rejecting, expanding or online-packed plan saves exact Grain iterator state per share and refuses topology changes. Volatile fetches cannot claim exact resume before their bytes are persisted.
 
-`workers(n)`, `threads(n)`, `prefetch(n)` and `loading(Loading(...))` change concurrency without changing record order or draws. A chain that names none reads in the training process (`workers=0`); `Loading(workers="auto")` takes Grain's memory-budgeted tuning. A multiprocessing program needs a main guard.
+`workers(n)`, `threads(n)`, `prefetch(n)` and `loading(Loading(...))` change concurrency without changing record order or draws. A chain that names none reads in the training process (`workers=0`); `Loading(workers="auto")` sizes the workers and read buffer from the CPUs the process may run on and the memory it may take. A multiprocessing program needs a main guard.
 
 Each factory returns an exclusively owned iterator. Final `close()` must not race iteration or checkpoint operations. `request_stop()`, where supplied, is a nonblocking signal safe alongside both. The compiler's host stages forward ownership and position.
 

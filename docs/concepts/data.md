@@ -201,7 +201,7 @@ With it, `r2://bucket/path` reads and publishes through s3fs with those options.
 
 ## Loading and image augmentation
 
-`workers(n)`, `threads(n)` and `prefetch(n)`, or `loading(Loading(...))` for every setting at once, change concurrency, never data order or per-record draws. A chain that names none reads in the training process (`workers=0`); `loading(Loading(workers="auto"))` takes Grain's memory-budgeted tuning. A script that starts worker processes needs an `if __name__ == "__main__":` guard.
+`workers(n)`, `threads(n)` and `prefetch(n)`, or `loading(Loading(...))` for every setting at once, change concurrency, never data order or per-record draws. A chain that names none reads in the training process (`workers=0`); `loading(Loading(workers="auto"))` sizes the workers and read buffer from the CPUs the process may run on and the memory it may take. A script that starts worker processes needs an `if __name__ == "__main__":` guard.
 
 `augment=True` on `presets.images` runs the crop, flip and colour jitter on a batch with JAX; `images.DeviceAugment(size, crop_scale=, flip=, jitter=)` sets them itself, and a random host step or a tuple of them, such as `images.RandomCrop(size)` or `images.Albumentations(aug)`, runs on the host instead. Without `augment`, the preset resizes deterministically. `staging_size` is the decoded square before cropping, and `crop_scale` is the area fraction kept.
 

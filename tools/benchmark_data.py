@@ -164,7 +164,9 @@ class Measurement:
     warmup: int = 8
     train_steps: int = 16
     stage_batches: int = 16
-    workers: int = 2
+    workers: int | Literal["auto"] = 2
+    """Loading workers: a count, or `auto`, each engine's own sizing (Dew's `Loading.resolved`,
+    Grain's `pick_performance_config`)."""
     batch: int = 32
     tokens: int = 16384
     seq_len: int = 128
@@ -362,11 +364,18 @@ def _dropping(config: Worker):
 
 def grain_options(rows, config: Worker):
     measured = config.measurement
+    import grain.experimental as gx
     import grain.python as grain
+    import psutil
 
-    if measured.workers:
-        rows = rows.mp_prefetch(grain.MultiprocessingOptions(
-            num_workers=measured.workers, per_worker_buffer_size=2))
+    workers = measured.workers
+    if workers == "auto":
+        # Grain's own pick, by half the memory available, as Dew's auto loading budgets it.
+        picked = gx.pick_performance_config(rows, ram_budget_mb=psutil.virtual_memory().available // 2**21,
+                                            max_workers=None, max_buffer_size=None).multiprocessing_options
+        workers = 0 if picked is None else picked.num_workers
+    if workers:
+        rows = rows.mp_prefetch(grain.MultiprocessingOptions(num_workers=workers, per_worker_buffer_size=2))
     return rows
 
 
@@ -647,7 +656,13 @@ def stage_profile(factory, batches: int = 16) -> list[dict]:
 
 def matrix_worker(config: Worker) -> dict:
     measured = config.measurement
+    import logging
+
     import jax
+
+    # What automatic loading resolves to, in the arm's log.
+    logging.basicConfig()
+    logging.getLogger("dew.data.dataset").setLevel(logging.INFO)
 
     if config.cold:
         config = replace(config, source=evicted_copy(config.source, config.workload,
