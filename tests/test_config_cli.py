@@ -161,17 +161,22 @@ def test_dew_profile_with_no_output_prepares_its_process_before_naming_its_direc
     the time agreed across the pool once the process is prepared: the run's XLA flags reach XLA, which
     reads them as JAX opens its backend, so an XLA dump the run asks for is written."""
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
-    import autoencoder_experiment
-
     dump = tmp_path / "dump"
+    flags = f"--xla_dump_to={dump}"
+    (tmp_path / "dumped.py").write_text(
+        "import dataclasses\n"
+        "from autoencoder_experiment import run as experiment\n"
+        "def run():\n"
+        "    built = experiment()\n"
+        f"    trainer = dataclasses.replace(built.trainer, xla_flags={flags!r})\n"
+        "    return dataclasses.replace(built, trainer=trainer)\n")
     root = Path(__file__).resolve().parents[1]
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")])}
-    done = subprocess.run(
-        [sys.executable, "-m", "dew.cli.main", "profile", autoencoder_experiment.__file__, "--warmup", "2",
-         "--steps", "2", "--set", f"trainer.xla_flags=--xla_dump_to={dump}"],
-        cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=900)
+    done = subprocess.run([sys.executable, "-m", "dew.cli.main", "profile", str(tmp_path / "dumped.py"),
+                           "--warmup", "2", "--steps", "2"],
+                          cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=900)
     assert done.returncode == 0, done.stderr[-4000:]
-    (report_file,) = (tmp_path / "profiles" / "autoencoder_experiment").glob("*/report.json")
+    (report_file,) = (tmp_path / "profiles" / "dumped").glob("*/report.json")
     profiled(report_file)
     assert any(dump.iterdir())
 

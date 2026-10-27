@@ -51,6 +51,7 @@ from dew.training.memory import (
     step_fits,
     temporaries_factor,
 )
+from dew.training.profiling import PGLE_CAPTURE
 
 if TYPE_CHECKING:
     from dew.training.rollout import Rollout
@@ -390,13 +391,11 @@ class Trials:
         and waited on, as JAX's AutoPGLE waits on the runs it profiles
         (`jax.experimental.profiler.get_profiled_instructions_proto`), on a trial, which `step` steps once
         first, untraced, so what a step builds at its first call (its window, its narrow copies) is built
-        and the trace holds the executable alone; empty on a backend XLA profiles none of. JAX holds one
-        trace at a time: a capture of the caller's own running (`dew.Profiler`) is refused, and a fit's
-        window opens only past a compile (`Trainer.fit`)."""
+        and the trace holds the executable alone; empty on a backend XLA profiles none of. A process holds
+        one profiling session at a time, so a capture of the caller's own running (`dew.Profiler`) is
+        refused (`PGLE_CAPTURE`), as a fit's window is under AutoPGLE."""
         if active_profile() is not None:
-            raise RuntimeError("AutoPGLE (jax_enable_pgle) profiles the step with a trace of its own, and a "
-                               "capture of this process is running; compile the step before the capture "
-                               "starts, or profile without AutoPGLE")
+            raise RuntimeError(PGLE_CAPTURE)
 
         def profile(state: TrainState) -> bytes:
             stepped, *_ = step(state, self.batch)
@@ -412,15 +411,6 @@ class Trials:
                 return get_profiled_instructions_proto(str(capture))
 
         return self.run(profile)
-
-
-def pgle_runs() -> int:
-    """The runs of a step JAX's AutoPGLE profiles before compiling it again guided by their profile
-    (`jax_enable_pgle`, `jax_pgle_profiling_runs`), 0 where it is off. JAX's jit guides the programs it
-    compiles at a call; a step the plan compiles ahead of its run (`Lowered.compile`) is no such call,
-    which JAX compiles for the profile's sake (command buffers off) and never guides, so the trainer
-    guides it (`Planned.guided`)."""
-    return jax.config.jax_pgle_profiling_runs if jax.config.jax_enable_pgle else 0
 
 
 @dataclasses.dataclass

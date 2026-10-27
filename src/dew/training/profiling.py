@@ -29,8 +29,8 @@ class ProfileWindow:
 
     It traces `steps` steps into `directory` after `warmup` steps have run and the
     run's first step has compiled, so the trace shows the loop and not the compile.
-    Under JAX's AutoPGLE, which traces a step of a new shape before the run takes
-    it, the window ends before such a step, holding the steps it traced.
+    A fit under JAX's AutoPGLE, which profiles programs in sessions of its own,
+    refuses a window (`PGLE_CAPTURE`).
 
     `dew.Profiler` is the other way to capture a trace, as a context manager
     around any code; a fit refuses to schedule a window inside one. The loop
@@ -40,6 +40,25 @@ class ProfileWindow:
     directory: str
     steps: int
     warmup: int = 2
+
+
+def pgle_runs() -> int:
+    """The runs of a program JAX's AutoPGLE profiles before compiling it again guided by their profile
+    (`jax_enable_pgle`, `jax_pgle_profiling_runs`), 0 where it is off. JAX's jit guides the programs it
+    compiles at a call; a step the trainer compiles ahead of its run (`Lowered.compile`) is no such call,
+    which JAX compiles for the profile's sake (command buffers off) and never guides, so the trainer
+    guides it (`dew.training.planning.Planned.guided`)."""
+    import jax
+
+    return jax.config.jax_pgle_profiling_runs if jax.config.jax_enable_pgle else 0
+
+
+PGLE_CAPTURE = (
+    "JAX's AutoPGLE (jax_enable_pgle) profiles each program's first runs in a profiling session of its own, "
+    "and a process holds one session at a time, so no capture runs beside it: train once under "
+    "JAX_ENABLE_PGLE=1 to fill the compilation cache with the guided programs, then capture a run under "
+    "JAX_COMPILATION_CACHE_EXPECT_PGLE=1, which loads them")
+"""Why a capture refuses to run where JAX's AutoPGLE profiles programs, and JAX's own way round it."""
 
 
 def owned_capture(window: ProfileWindow | None) -> "Profiler | None":
@@ -64,6 +83,8 @@ def owned_capture(window: ProfileWindow | None) -> "Profiler | None":
                 "Trainer.profile cannot schedule a window while an explicit "
                 "dew.Profiler capture is active; drop one or stop the outer "
                 "profiler before fitting")
+        if pgle_runs():
+            raise ValueError(PGLE_CAPTURE)
         telemetry_profile.require_profile_support()
         return telemetry_profile.Profiler(window.directory)
 

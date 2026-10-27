@@ -184,7 +184,6 @@ from dew.training.planning import (
     Planned,
     Trials,
     faster,
-    pgle_runs,
     plan_step,
     read_whole,
     settled,
@@ -192,7 +191,7 @@ from dew.training.planning import (
     untimed_frontier,
     whole_step,
 )
-from dew.training.profiling import ProfileWindow, owned_capture, start_capture, stop_capture
+from dew.training.profiling import ProfileWindow, owned_capture, pgle_runs, start_capture, stop_capture
 from dew.training.rollout import Rollout, _reported, _rollout_metrics
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
@@ -1450,7 +1449,6 @@ class Trainer(Generic[Loss, Effects]):
                     with jax.set_mesh(self.device_mesh):
                         checked = self._model_shapes(device) if self._device else device
                     agreed("training input declaration", functools.partial(inputs.check, checked))
-                self._close_window_for(run, profile, profiler, compiled, device)
                 known, began = len(compiled), time.perf_counter()
                 train_step, measured_flops, state = self._compiled_for(compiled, state, device, run)
                 if len(compiled) > known and self.executable is not None and not self.host_master:
@@ -2465,21 +2463,11 @@ class Trainer(Generic[Loss, Effects]):
                      compiled: Mapping[Signature, object]) -> None:
         """Open the profile window's capture before an iteration's first read, so the step row records
         the read it waits on, once its warmup steps have run and the run's first step has compiled: the
-        window holds steps, not the compile, nor AutoPGLE's own trace of the step (`Trials.profiled`)."""
+        window holds steps, not the compile."""
         if (profiler is not None and profile is not None and not run.tracing and run.traced == 0
                 and seen >= profile.warmup and compiled):
             start_capture(profiler)
             run.tracing = True
-
-    def _close_window_for(self, run: FitRun, profile: ProfileWindow | None, profiler: Profiler | None,
-                          compiled: Mapping[Signature, object], device: Batch) -> None:
-        """End the profile window before a step of a shape the run has yet to compile where AutoPGLE
-        profiles that step with a trace of its own (`Trials.profiled`), which JAX cannot open inside the
-        window's: the window then holds the steps before it (`ProfileWindowRecord`)."""
-        if (run.tracing and profile is not None and profiler is not None and pgle_runs()
-                and batch_signature(device) not in compiled):
-            run.tracing = False
-            self._stop_trace(run, profile, profiler)
 
     def _stop_trace(self, run: FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
         """Stop the window's owned capture (`stop_capture`), then report it on process zero."""

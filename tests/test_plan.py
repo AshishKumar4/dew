@@ -20,6 +20,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import FEATURES, Regression
+from jax.extend.backend import get_backend
 from reference_error import as_given, assert_as_exact, seeds_for
 from token_support import write_token_corpus
 
@@ -369,17 +370,24 @@ class Timed(Trials):
 
 @dataclasses.dataclass
 class Handed(Trials):
-    """Trials that profile the plan admitted, keep weak references to the executable it was admitted with
-    and to XLA's executable inside it (`unguided`), and hand back `profile` where given in place of the
-    profile they measured."""
+    """Trials that profile the plan admitted, keep a weak reference to the executable it was admitted with
+    (`unguided`) and count the executables the backend holds then, it among them (`live`), and hand back
+    `profile` where given in place of the profile they measured."""
     profile: bytes | None = None
-    unguided: list[weakref.ref] = dataclasses.field(default_factory=list)
+    unguided: weakref.ref | None = None
+    live: int = 0
 
     def profiled(self, step, planned, mesh, runs):
         measured = super().profiled(step, planned, mesh, runs)
-        executable = planned.executable
-        self.unguided[:] = [weakref.ref(executable), weakref.ref(executable.runtime_executable())]
+        self.unguided = weakref.ref(planned.executable)
+        self.live = live_executables()
         return measured if self.profile is None else self.profile
+
+
+def live_executables() -> int:
+    """The executables the backend holds once the garbage they are part of is collected."""
+    gc.collect()
+    return len(get_backend().live_executables())
 
 
 COST = b"\x0a\x0c\x0a\x01x\x11" + struct.pack("<d", 1.0)
@@ -422,32 +430,24 @@ def test_a_step_compiled_ahead_is_profiled_on_a_trial_under_autopgle(tmp_path, s
 
 def test_the_executable_a_profile_replaces_goes_with_its_program():
     """Under AutoPGLE a profile of the admitted step's runs compiles its program again, and the run keeps
-    the guided executable alone: the one the plan was admitted with, and XLA's executable inside it, are
-    freed once the compile returns, though JAX keeps every executable it compiled of a program while the
-    program's lowering lives. A handoff that kept the admitted executable, or both, would hold them."""
+    the guided executable alone: once the compile returns, the one the plan was admitted with is freed
+    and the backend holds as many executables as it did with that one alive, though JAX keeps every
+    executable it compiled of a program while the program's lowering lives. A handoff that kept the
+    admitted executable, or kept both, would hold one more."""
     with autopgle(2):
         trainer = lm()
         state, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH, profile=COST))
-    gc.collect()
     assert trainer.plan["pgle"] == {"runs": 2, "bytes": len(COST)}
-    assert len(trials.unguided) == 2 and [ref() for ref in trials.unguided] == [None, None]
-    assert int(state.step) == 3
+    assert trials.unguided is not None and trials.unguided() is None
+    assert live_executables() == trials.live and int(state.step) == 3
 
 
-def rows_at(position: int) -> dict[str, np.ndarray]:
-    """BATCH's rows at a run's first three steps, its rows cut to eight inputs from the fourth on."""
-    rows = np.asarray(BATCH["text"])
-    return {"text": rows if position < 3 else rows[:, :9]}
-
-
-@pytest.mark.parametrize("cut, traced", [(False, (1, 2, 3)), (True, (1, 2))],
-                         ids=["one-shape", "a-shape-met-inside"])
-def test_a_profile_window_under_autopgle_traces_steps_and_never_a_compile(tmp_path, cut, traced):
-    """A fit's window opens once its warmup steps have run and its first step has compiled, so under
-    AutoPGLE, which traces a step's first runs as it compiles, a window of no warmup traces the steps
-    after the first; and a step of a shape the run meets inside the window, whose compile AutoPGLE
-    traces, ends the window before it, which holds the steps it traced. JAX holds one trace at a time,
-    so either trace inside the other would refuse the run."""
+def test_a_profile_window_traces_steps_past_the_first_compile_and_is_refused_under_autopgle(tmp_path):
+    """A fit's window opens once its warmup steps have run and its first step has compiled, so a window of
+    no warmup traces the three steps after the first, never the compile. Under JAX's AutoPGLE, which
+    profiles each program's first runs in a profiling session of its own where a process holds one at a
+    time, a fit with a window is refused before it trains, naming JAX's way to capture guided programs
+    (`PGLE_CAPTURE`): JAX's sessions would fail inside the window, as the trainer's would."""
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     from affine_run import Replaying
     from recording import RecordingTracker
@@ -457,17 +457,23 @@ def test_a_profile_window_under_autopgle_traces_steps_and_never_a_compile(tmp_pa
     from dew.training.profiling import traced_steps
 
     tracker = RecordingTracker()
-    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
-                              max_seq_len=SEQ)
-    trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
-                                 tracker=tracker, profile=ProfileWindow(str(tmp_path / "window"), steps=3,
-                                                                        warmup=0)))
-    rows = rows_at if cut else (lambda position: rows_at(0))
-    with autopgle(2):
-        trainer.fit(Loader(lambda partition: Replaying(rows), None, None, ROWS), steps=5, log_every=1)
+
+    def fit(directory):
+        model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                                  max_seq_len=SEQ)
+        window = ProfileWindow(str(directory), steps=3, warmup=0)
+        trainer = one_device(Trainer(LMObjective(model, seq_len=SEQ), optax.sgd(1e-2), key=jax.random.key(0),
+                                     tracker=tracker, profile=window))
+        rows = Replaying(lambda position: {"text": np.asarray(BATCH["text"])})
+        trainer.fit(Loader(lambda partition: rows, None, None, ROWS), steps=5, log_every=1)
+
+    fit(tmp_path / "window")
     (window,) = [value for _, value in tracker.artifacts if type(value).__name__ == "ProfileWindow"]
     (capture,) = (tmp_path / "window").glob("capture-*")
-    assert window.steps == len(traced) and traced_steps(capture) == traced
+    assert window.steps == 3 and traced_steps(capture) == (1, 2, 3)
+    with autopgle(2), pytest.raises(ValueError):
+        fit(tmp_path / "pgle")
+    assert not (tmp_path / "pgle").exists()
 
 
 def regression_steps(x, *, pgle: bool):
@@ -495,14 +501,14 @@ def regression_rows(seed: int) -> tuple[np.ndarray]:
 def test_a_step_guided_by_its_profile_is_the_step_the_run_takes_and_trains_as_exactly():
     """On an NVIDIA GPU the profile of the admitted step's runs holds its instructions' times, its
     program compiles again guided by it, and the run steps the guided executable alone: the one the plan
-    was admitted with, and XLA's executable inside it, are freed, as they are not where the handoff
-    is discarded. The guided steps' losses and weights are as exact as the unguided step's (check 1)."""
+    was admitted with is freed and the backend holds no more executables than with it alive, as it would
+    not where the handoff is discarded. The guided steps' losses and weights are as exact as the unguided
+    step's (check 1)."""
     with autopgle(2):
         trainer = lm()
         _, trials = stepped(trainer, trials=functools.partial(Handed, batch=BATCH))
-    gc.collect()
     assert trainer.plan["pgle"]["runs"] == 2 and trainer.plan["pgle"]["bytes"] > 0
-    assert len(trials.unguided) == 2 and [ref() for ref in trials.unguided] == [None, None]
+    assert trials.unguided is not None and trials.unguided() is None and live_executables() == trials.live
     guided = as_given(functools.partial(regression_steps, pgle=True))
     unguided = as_given(functools.partial(regression_steps, pgle=False))
     label = "a step guided by its profile"
