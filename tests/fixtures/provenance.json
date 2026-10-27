@@ -785,6 +785,22 @@
    ],
    "note": "RK4Sampler.sample_step and MultiStepDPM.take_next_step through DiffusionSampler.sample_step, on KarrasVENoiseScheduler, walked as generate_samples walks its grid, around a stand-in denoiser; x_T and the cotangent are inputs. Also generate_samples as published from x_T (its priors): the closing clean prediction. rounding.npz adds RK4's clipped output over four copies of the independent initial states (128, 64); its float64 namespace widens every explicit jnp.float32 timestep cast so sigma arithmetic also runs in float64. The original solvers.npz arrays are unchanged."
   },
+  "flaxdiff_schedules": {
+   "tool": "tools/flaxdiff_schedule_reference.py",
+   "sources": [
+    {
+     "repo": "AshishKumar4/FlaxDiff",
+     "version": "15c55b001304604147a2a8002a76cf5d4c32092f",
+     "runs": "fetched"
+    },
+    {
+     "repo": "jax-ml/jax",
+     "version": "0.12.0.1",
+     "runs": "jax"
+    }
+   ],
+   "note": "ExpNoiseScheduler, CosineContinuousNoiseScheduler and CosineGeneralNoiseScheduler with the NoiseScheduler, GeneralizedNoiseScheduler, ContinuousNoiseScheduler and DiscreteNoiseScheduler they extend, run as published: float32 with x64 off, and float64 (every jnp.float32 read as jnp.float64, x64 on) as the truth, over check 1's seeds; each exponential table's float64 betas and the tangent grid's transform_inputs at 33 times beside them."
+  },
   "flow/densities.npz": {
    "tool": "tools/flow_density_reference.py",
    "sources": [

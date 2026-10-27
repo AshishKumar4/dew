@@ -43,6 +43,7 @@ from dew.diffusion.schedules import (
     LinearNoiseScheduler,
     SqrtContinuousNoiseScheduler,
 )
+from tools.flaxdiff_schedule_reference import general_times
 from tools.weighting_reference import RECORDED, TABLES, closed_form, label_of, table_inputs
 
 # Timesteps ascending from low to high noise, in each schedule's own domain:
@@ -533,12 +534,13 @@ FLAXDIFF_VE = {"general-cosine": CosineGeneralNoiseScheduler,
                                                kappa=0.5)}
 
 
-def flaxdiffs(site: str):
-    """`site`'s recorded draw, FlaxDiff's float32 outputs and their float64 truth (`indexed_recording`),
-    with the seeds the recording declares, and the recording itself."""
+def flaxdiffs(site: str, **redrawn):
+    """`site`'s recorded draw, FlaxDiff's float32 outputs and their float64 truth (`indexed_recording`,
+    given `redrawn`'s `inputs_of` and `truth_fn` where the recording keeps FlaxDiff's evidence alone), with
+    the seeds the recording declares, and the recording itself."""
     stored = recording(FLAXDIFF)
     seeds = declared_seeds(FLAXDIFF)[site]
-    return (*indexed_recording(stored, site, seeds), seeds, stored)
+    return (*indexed_recording(stored, site, seeds, **redrawn), seeds, stored)
 
 
 @pytest.mark.parametrize("site", sorted(FLAXDIFF_VP))
@@ -566,16 +568,18 @@ def test_flaxdiffs_tangent_cosine_grid_is_its_own(site):
     """FlaxDiff's variance-exploding cosine at its defaults and at nondefault ends and kappa, run from its
     source at 15c55b001: Dew's sigma and loss weight at drawn times are on par with FlaxDiff's own in
     float32, from their float64 truth (check 1); alpha is one, and the model's input over a grid of
-    times is FlaxDiff's `transform_inputs`, to the integer."""
-    draw, reference, truth, seeds, stored = flaxdiffs(site)
+    times is FlaxDiff's `transform_inputs`, to the integer. The recording keeps FlaxDiff's evidence
+    alone, its times drawn again and its truth Dew's own float64 path, held to FlaxDiff's float64 run."""
     schedule = FLAXDIFF_VE[site]()
 
-    @as_given
-    def dews(index, inputs):
-        return {"sigma": schedule.sigmas(jnp.asarray(inputs["steps"])),
-                "weight": schedule.weight(jnp.asarray(inputs["steps"]))}
+    def sigma_and_weight(steps):
+        return {"sigma": schedule.sigmas(steps), "weight": schedule.weight(steps)}
 
-    assert_as_exact(dews, reference, draw, site, seeds=seeds, truth_fn=truth)
+    draw, reference, truth, seeds, stored = flaxdiffs(
+        site, inputs_of=partial(general_times, site),
+        truth_fn=lambda inputs: sigma_and_weight(jnp.asarray(inputs["steps"], jnp.float64)))
+    assert_as_exact(as_given(lambda index, inputs: sigma_and_weight(jnp.asarray(inputs["steps"]))),
+                    reference, draw, site, seeds=seeds, truth_fn=truth)
     alpha, _ = schedule.rates(jnp.asarray(stored["grid"]))
     np.testing.assert_array_equal(np.asarray(alpha), np.ones_like(stored["grid"]))
     np.testing.assert_array_equal(np.asarray(schedule.model_time(stored["grid"])),
