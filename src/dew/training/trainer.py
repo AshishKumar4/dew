@@ -38,7 +38,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
-from dew.batch import FROZEN, Batch, Variables, owned_dicts, select, thaw
+from dew.batch import FROZEN, Batch, Variables, owned_dicts, select
 from dew.checkpoints import Checkpoints, Ranking
 from dew.cleanup import attempted
 from dew.data.compile import fitted
@@ -271,10 +271,7 @@ class Trainer(Generic[Loss, Effects]):
         where the process has the GPU to itself (`dew.nn.kernels.tuning.tune`); without it such a
         launch runs the nearest measured shape's config or its heuristic. `record` makes each step return in
         its metrics what each evaluation, replays too, sampled or passed as a boundary (`taken_record`).
-        `links` states a mesh axis's interconnect and its devices' peak (`dew.nn.sharding.Link`) by axis
-        name, in place of measuring them: for devices the peak table does not name, a CPU's among them,
-        where nothing is measured and no projection spreads, or a run that is to decide as another
-        machine's would.
+        `links` states an axis's `Link` by name in place of measuring it (`_links`).
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -284,17 +281,14 @@ class Trainer(Generic[Loss, Effects]):
         from dew.nn.inputs import request_key
         self.seed = int(key) if isinstance(key, (int, np.integer)) and not isinstance(key, bool) else None
         self.key = request_key(key)
-        self.mesh = mesh
-        self.layout = layout
+        self.mesh, self.layout = mesh, layout
         self._microbatches = microbatches
         self.accumulation = accumulation
         self.split = split
         self._loss_scale = loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
-        self.checkpoints = checkpoints
-        self.tracker = tracker
-        self.step = step
-        self.rollout = rollout
+        self.checkpoints, self.tracker = checkpoints, tracker
+        self.step, self.rollout = step, rollout
         self.tune_kernels = tune_kernels
         if record and step is not None:
             raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
@@ -738,20 +732,11 @@ class Trainer(Generic[Loss, Effects]):
         leaves = jax.tree.leaves(frozen)
         if leaves and all(isinstance(leaf, jax.Array) for leaf in leaves):
             return jax.tree.map(lambda leaf: leaf.sharding, frozen)
-        from dew.training.execution import resident
+        from dew.training.execution import resident, stack_sites
         rows = self.layout.shardings(
             self.state_mesh, dataclasses.replace(state, variables={FROZEN: frozen}, accumulation=None))
-        return resident(rows.variables[FROZEN], self._bank_sites({**state.variables, FROZEN: frozen}),
-                        self.device_mesh)
-
-    def _bank_sites(self, variables):
-        """The objective's declared layer stacks over the state's `variables` as its model reads them, the
-        frozen leaves back in `params` (`thaw`), which a host layout streams as banks: their runs end
-        where the model's rows differ (`CausalTransformer.bank_sites`), so the frozen banks, the
-        execution's snapshot and the model's own scan agree on every run."""
-        from dew.inference.banks import bank_sites
-        store = thaw(variables)
-        return bank_sites(self.objective, store) if self.objective.bank_sites(store) else ()
+        sites = stack_sites(self.objective, {**state.variables, FROZEN: frozen})
+        return resident(rows.variables[FROZEN], sites, self.device_mesh)
 
     def _banked_frozen(self, variables, stack, release=None):
         """Stack each scanned run's shared leaves of the frozen collection of `variables` into one bank
@@ -760,7 +745,8 @@ class Trainer(Generic[Loss, Effects]):
         That is the shape a placement and a checkpoint template take, and the
         arrays the state holds."""
         from dew.inference.banks import banked
-        return banked(variables[FROZEN], self._bank_sites(variables), stack, release)
+        from dew.training.execution import stack_sites
+        return banked(variables[FROZEN], stack_sites(self.objective, variables), stack, release)
 
     def _placed_host(self, initializer, key, shardings: Placement[TrainState]) -> TrainState:
         """A fresh CPU-owned state, its leaves streamed into place one at a time.
@@ -774,13 +760,13 @@ class Trainer(Generic[Loss, Effects]):
         returned to the two device sets anyway.
         """
         from dew.distributed.host import evict, place_leaf, stream, transfer
-        from dew.training.execution import bank_bytes, check_bank_pool
+        from dew.training.execution import bank_bytes, check_bank_pool, stack_sites
         held = self.objective.held_variables()
         with jax.default_device(self.state_mesh.local_devices[0]):
             state = self.initial_state(initializer, key)
             if FROZEN in state.variables:
-                check_bank_pool(bank_bytes(state.variables[FROZEN], self._bank_sites(state.variables)),
-                                self.device_mesh)
+                sites = stack_sites(self.objective, state.variables)
+                check_bank_pool(bank_bytes(state.variables[FROZEN], sites), self.device_mesh)
                 # A scanned run's frozen rows become its bank here and the bank lands where it stays
                 # resident before the next is stacked, so the host holds one bank in transit, not the
                 # stack; the rows' pages are let go as it lands and the held tree holds the placed bank
@@ -1231,10 +1217,10 @@ class Trainer(Generic[Loss, Effects]):
 
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
         from dew.distributed.host import transfer
-        from dew.training.execution import HostExecution
+        from dew.training.execution import HostExecution, stack_sites
         cpu = self.state_mesh
         execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu,
-                                  self._bank_sites(state.variables), device=self._device)
+                                  stack_sites(self.objective, state.variables), device=self._device)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
         with self._traced_on(cpu) as schedule:
             shapes = self._loss_shape(state, cpu_batch)
@@ -2409,9 +2395,9 @@ class Trainer(Generic[Loss, Effects]):
         averaged = with_ema(state.variables, self._fetched(state, shardings).ema)
         key = state.key
         if self.host_master:
-            from dew.training.execution import HostExecution
+            from dew.training.execution import HostExecution, stack_sites
             execution = HostExecution(self.objective, self.layout, mesh, self.state_mesh,
-                                      self._bank_sites(state.variables))
+                                      stack_sites(self.objective, state.variables))
             with jax.set_mesh(self.state_mesh):
                 params, averaged = execution.snapshot(params), execution.snapshot(averaged)
             key = execution.on_accelerator(key)

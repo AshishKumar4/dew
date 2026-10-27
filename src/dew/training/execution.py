@@ -40,6 +40,7 @@ from dew.distributed.host import transfer
 from dew.inference.banks import (
     assembled,
     bank_sharding,
+    bank_sites,
     banked,
     entry_tree,
     in_namespace,
@@ -70,6 +71,15 @@ def _in_stack(path: tuple[str, ...], sites) -> bool:
                and len(path) > len(site.namespace)
                and layer_index(path[len(site.namespace)]) is not None
                for site in sites)
+
+
+def stack_sites(objective, variables) -> tuple[DecoderBank, ...]:
+    """The objective's declared layer stacks over `variables` as its model reads them, the frozen leaves
+    back in `params` (`thaw`), which a host layout streams as banks: their runs end where the model's
+    rows differ (`CausalTransformer.bank_sites`), so the frozen banks, the execution's snapshot and the
+    model's own scan agree on every run."""
+    store = thaw(variables)
+    return bank_sites(objective, store) if objective.bank_sites(store) else ()
 
 
 def bank_bytes(tree, sites) -> int:
@@ -195,7 +205,7 @@ class HostExecution:
                  device: tuple[DeviceStep, ...] = ()):
         self.objective, self.layout = objective, layout
         self.accelerator, self.cpu = accelerator, cpu
-        # The trainer's banks over the state it owns (`Trainer._bank_sites`), the runs its frozen banks keep.
+        # The trainer's banks over the state it owns (`stack_sites`), the runs its frozen banks keep.
         self.sites = sites
         self.device = device
         self.unstack = functools.partial(program(logical, static_argnames="sites"), sites=self.sites)

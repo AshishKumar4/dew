@@ -1844,57 +1844,10 @@ class CausalTransformer(nn.Module):
             if span is not None and banked:
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                     f"by run holds whole runs; {list(banked)} arrived banked")
-            view = StackView(self.groups if span is None else spanned, banked=banked)
+            view, split = (StackView(self.groups if span is None else spanned, banked=banked),
+                           StageSplit(0, self.num_layers, 0))
         else:
-            if span is not None:
-                raise LayoutRefused(f"a loop over layers {span} runs part of the stack, which a pipeline "
-                                    "over the stage axis cuts into stages of its own; run it on one stage")
-            if decode:
-                raise LayoutRefused(
-                    "decoding appends one token at a time to the cache, which no "
-                    "pipeline over the stage axis runs; decode outside jax.set_mesh")
-            if banked:
-                raise LayoutRefused(
-                    f"a pipeline over the stage axis stacks every stage's copy of a "
-                    f"layer, which a store already banked by run cannot be reshaped "
-                    f"into; {list(banked)} arrived banked. Place the weights per layer "
-                    f"for a pipeline, or run the stack whole")
-            if isinstance(x, Carried):
-                raise ValueError(
-                    "Single-Pass mHC carries each sublayer's collapse beside the streams, "
-                    "which the pipeline's microbatch buffers do not hold; run the stack whole")
-            split = split_stages(self.specs, stages)
-            batch_axis = 1 if self.altup is not None else 0
-            rows, count_microbatches = x.shape[batch_axis], microbatches()
-            if count_microbatches % stages or rows % count_microbatches:
-                raise LayoutRefused(
-                    f"a batch of {rows} rows over {stages} stages needs a microbatch "
-                    f"count that divides the rows and is a multiple of the stages, "
-                    f"got {count_microbatches}")
-            # Microbatch m takes rows m, m + count, ... (`microbatched`), a
-            # share of every device's rows only where the count divides a
-            # block; otherwise devices holding none of a microbatch recompute
-            # another's (1.43 times one device's FLOPs for 8 rows in 4
-            # microbatches over 4 row shards, against the bubble's 1.25).
-            splitting = row_axes(rows)
-            shards = math.prod(jax.sharding.get_abstract_mesh().shape[axis] for axis in splitting)
-            if (rows // shards) % count_microbatches:
-                raise LayoutRefused(
-                    f"a batch of {rows} rows splits {shards} ways over {' x '.join(splitting)}, "
-                    f"{rows // shards} rows a device, which {count_microbatches} microbatches "
-                    f"do not divide, so the devices that hold none of a microbatch's rows would "
-                    f"compute another's again; use a microbatch count that divides "
-                    f"{rows // shards}, or a batch that is a multiple of "
-                    f"{count_microbatches * shards} rows")
-            start, count = split.prefix, split.count
-            view = StackView(
-                scan_groups(self.scan_keys[start:start + count], self.bank_layers) if self.scan_layers
-                else tuple((index, 1) for index in range(count)),
-                stages=stages, microbatches=count_microbatches,
-                # What enters the loop is read on every iteration; what the
-                # loop creates (the routers' sowing) comes out per iteration.
-                broadcast=tuple(name for name, tree in self.variables.items() if tree),
-                batch_axis=batch_axis, offset=start)
+            view, split = self._pipelined(x, stages, decode=decode, banked=banked, span=span)
         dtype = self.residual_dtype(
             x, train=train, decode=decode, per_layer_input=per_layer_input,
             attention_metadata=attention_metadata)
@@ -1902,12 +1855,10 @@ class CausalTransformer(nn.Module):
         x = x._replace(streams=x.streams.astype(dtype)) if isinstance(x, Carried) else x.astype(dtype)
         run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
                                trans_out_fn=view.unstack, init=False, mutable=True)
-        if stages == 1:
-            return run(self, view, x, train, decode, per_layer_input, attention_metadata)
-        # The layers outside the run the stages repeat run on every stage, as the plain loop runs
-        # them, around the pipeline; a provider among them fills the store a later one reads.
+        # The layers outside the run the stages repeat (none on one stage) run on every stage, as the
+        # plain loop runs them, around the pipeline; a provider among them fills the store a later one
+        # reads.
         store = {} if self._provides else None
-        end = self.num_layers - split.suffix
 
         def outside(x, first: int, last: int):
             return x if first == last else run_stack(
@@ -1917,7 +1868,62 @@ class CausalTransformer(nn.Module):
 
         x = outside(x, 0, split.prefix)
         x = run(self, view, x, train, decode, per_layer_input, attention_metadata)
-        return outside(x, end, self.num_layers)
+        return outside(x, self.num_layers - split.suffix, self.num_layers)
+
+    def _pipelined(self, x, stages: int, *, decode: bool, banked: tuple[str, ...],
+                   span: tuple[int, int] | None) -> tuple[StackView, StageSplit]:
+        """The view a pipeline over `stages` runs the stack's repeated run through, and how the stack
+        splits around it (`split_stages`); `LayoutRefused` where the call or the store cannot pipeline."""
+        if span is not None:
+            raise LayoutRefused(f"a loop over layers {span} runs part of the stack, which a pipeline "
+                                "over the stage axis cuts into stages of its own; run it on one stage")
+        if decode:
+            raise LayoutRefused(
+                "decoding appends one token at a time to the cache, which no "
+                "pipeline over the stage axis runs; decode outside jax.set_mesh")
+        if banked:
+            raise LayoutRefused(
+                f"a pipeline over the stage axis stacks every stage's copy of a "
+                f"layer, which a store already banked by run cannot be reshaped "
+                f"into; {list(banked)} arrived banked. Place the weights per layer "
+                f"for a pipeline, or run the stack whole")
+        if isinstance(x, Carried):
+            raise ValueError(
+                "Single-Pass mHC carries each sublayer's collapse beside the streams, "
+                "which the pipeline's microbatch buffers do not hold; run the stack whole")
+        split = split_stages(self.specs, stages)
+        batch_axis = 1 if self.altup is not None else 0
+        rows, count_microbatches = x.shape[batch_axis], microbatches()
+        if count_microbatches % stages or rows % count_microbatches:
+            raise LayoutRefused(
+                f"a batch of {rows} rows over {stages} stages needs a microbatch "
+                f"count that divides the rows and is a multiple of the stages, "
+                f"got {count_microbatches}")
+        # Microbatch m takes rows m, m + count, ... (`microbatched`), a
+        # share of every device's rows only where the count divides a
+        # block; otherwise devices holding none of a microbatch recompute
+        # another's (1.43 times one device's FLOPs for 8 rows in 4
+        # microbatches over 4 row shards, against the bubble's 1.25).
+        splitting = row_axes(rows)
+        shards = math.prod(jax.sharding.get_abstract_mesh().shape[axis] for axis in splitting)
+        if (rows // shards) % count_microbatches:
+            raise LayoutRefused(
+                f"a batch of {rows} rows splits {shards} ways over {' x '.join(splitting)}, "
+                f"{rows // shards} rows a device, which {count_microbatches} microbatches "
+                f"do not divide, so the devices that hold none of a microbatch's rows would "
+                f"compute another's again; use a microbatch count that divides "
+                f"{rows // shards}, or a batch that is a multiple of "
+                f"{count_microbatches * shards} rows")
+        start, count = split.prefix, split.per_stage
+        view = StackView(
+            scan_groups(self.scan_keys[start:start + count], self.bank_layers) if self.scan_layers
+            else tuple((index, 1) for index in range(count)),
+            stages=stages, microbatches=count_microbatches,
+            # What enters the loop is read on every iteration; what the
+            # loop creates (the routers' sowing) comes out per iteration.
+            broadcast=tuple(name for name, tree in self.variables.items() if tree),
+            batch_axis=batch_axis, offset=start)
+        return view, split
 
     def banked_collections(self) -> tuple[str, ...]:
         """Return the collections whose layer subtrees the store holds as banks.

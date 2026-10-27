@@ -485,9 +485,9 @@ def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *
 class StageSplit(NamedTuple):
     """How a stack of layers runs over a stage axis: the `prefix` layers before the run its stages
     repeat and the `suffix` layers after it run on every stage, as the plain loop runs them, and
-    each stage runs `count` layers of the run between."""
+    each stage runs `per_stage` layers of the run between. A stack on one stage has neither."""
     prefix: int
-    count: int
+    per_stage: int
     suffix: int
 
 

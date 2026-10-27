@@ -220,11 +220,6 @@ def zoo() -> dict[str, Any]:
              "num_kv_heads": 4, "head_dim": 8, "mlp_features": 128, "max_seq_len": 33}
     moe = {**dense, "mixture": {"experts": 8, "top_k": 2, "expert_features": 32,
                                 "layers": (0, 1, 2, 3)}}
-    # The expert exchange under a capacity: each device's buckets hold what
-    # its sequences keep, one round, so its program splits evenly. Dropless,
-    # the exchange also compiles the rounds a skewed routing needs, which a
-    # static count of the step's FLOPs reads whether or not they run.
-    exchange = {**moe, "mixture": {**moe["mixture"], "dispatch": "exchange", "capacity_factor": 2.0}}
     moe128 = {**dense, "mixture": {**_fixture("qwen3-30b-a3b")["mixture"], "expert_features": 32,
                                    "layers": (0, 1, 2, 3)}}
     # Four periods of five sliding layers and one global one, so each stage
@@ -242,14 +237,6 @@ def zoo() -> dict[str, Any]:
                        "n_groups": 1, "chunk_size": 8}}}
     hybrid = {**dense, "layer_types": ("mamba", "attention") * 2,
               "kinds": {"mamba": mamba, "attention": {}}}
-    # DeepSeek's class: a dense first layer before routed ones, each layer
-    # reading its own per-layer input (Gemma's), so a pipeline runs the dense
-    # layer on every stage and slices the inputs past it.
-    routed_tail = {**dense, "num_layers": 5, "per_layer_input_dim": 8,
-                   "mixture": {"experts": 8, "top_k": 2, "expert_features": 32, "layers": (1, 2, 3, 4)}}
-    # Gemma 3n's class: the last two layers read the keys and values the
-    # fourth stored, so a pipeline runs that tail on every stage.
-    shared_tail = {**dense, "num_layers": 6, "kv_shared_layers": (4, 5)}
     nemotron_h = _fixture("nemotron-h-tiny")
     nemotron_h.update(vocab_size=512, num_layers=20, max_seq_len=33,
                      layer_types=tuple(nemotron_h["layer_types"]) * 4)
@@ -286,10 +273,9 @@ def zoo() -> dict[str, Any]:
         "gated": Case("causal_transformer", {**dense, **OWN_GATE}, **lm),
         "moe": Case("causal_transformer", moe, **lm),
         "moe128": Case("causal_transformer", moe128, **lm),
-        "moe_exchange": Case("causal_transformer", exchange, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
-        "routed_tail": Case("causal_transformer", routed_tail, **lm),
-        "shared_tail": Case("causal_transformer", shared_tail, **lm),
+        **{name: Case("causal_transformer", config, **lm)
+           for name, config in _placed_zoo(dense, moe).items()},
         "nemotron_h": Case("causal_transformer", nemotron_h, **lm),
         "nemotron_h_moe": Case("causal_transformer", _nemotron_h_moe(), orders=True, **lm),
         "window": Case("causal_transformer", window, **lm),
@@ -312,6 +298,24 @@ def zoo() -> dict[str, Any]:
                       "num_heads": 4, "image_size": 16, "patch_size": 8}},
             "projector": {"class": "gemma", "fields": {"text_width": 64, "patches_per_side": 2,
                           "tokens_per_side": 2}}}, **lm),
+    }
+
+
+def _placed_zoo(dense: dict[str, object], moe: dict[str, object]) -> dict[str, dict[str, object]]:
+    """The zoo's decoders a layout places apart (`zoo`), built on its `dense` and `moe` ones: the
+    expert exchange under a capacity, whose buckets hold what each device's sequences keep, one round,
+    so its program splits evenly (dropless, it also compiles the rounds a skewed routing needs, which
+    a static count of the step's FLOPs reads whether or not they run); DeepSeek's class, a dense first
+    layer before routed ones, each layer reading its own per-layer input (Gemma's), which a pipeline
+    runs on every stage, slicing the inputs past it; and Gemma 3n's, the last two layers reading the
+    keys and values the fourth stored, which a pipeline runs on every stage."""
+    mixture = moe["mixture"]
+    assert isinstance(mixture, dict)
+    return {
+        "moe_exchange": {**moe, "mixture": {**mixture, "dispatch": "exchange", "capacity_factor": 2.0}},
+        "routed_tail": {**dense, "num_layers": 5, "per_layer_input_dim": 8,
+                        "mixture": {**mixture, "layers": (1, 2, 3, 4)}},
+        "shared_tail": {**dense, "num_layers": 6, "kv_shared_layers": (4, 5)},
     }
 
 
