@@ -573,14 +573,15 @@ def _call(model, variables, inputs, **apply) -> jax.Array:
 
 
 def _saved(model, variables, inputs, **apply) -> int:
-    """The bytes `model`'s forward keeps for its backward: the residuals its linearization holds
-    (`jax.linearize`), traced abstractly. A remat rung recomputes what it does not keep, so a stronger
-    rung keeps fewer."""
+    """The device bytes `model`'s forward keeps for its backward: the residuals its linearization holds
+    (`jax.linearize`) in device memory, traced abstractly. A remat rung recomputes what it does not keep
+    and an offloading one holds it on the host, so a stronger rung keeps fewer."""
     def forward(params):
         return _call(model, {**variables, "params": params}, inputs, **apply)
 
     kept = jax.eval_shape(lambda params: jax.linearize(forward, params)[1], variables["params"])
-    return sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(kept))
+    return sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(kept)
+               if jax.typeof(leaf).memory_space == jax.memory.Space.Device)
 
 
 def _stepped(model, variables, inputs, **apply) -> dict:
