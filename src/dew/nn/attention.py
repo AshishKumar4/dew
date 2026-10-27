@@ -1740,14 +1740,11 @@ def _xla_kernel_narrows(query) -> bool:
 def _xla_kernel_rounds_off(query, key, *, folded: bool) -> bool:
     """Whether jax.nn's xla attention would multiply this call off the arithmetic it names, so 'auto'
     and 'xla' take the reference path with jax.nn's own logits (`xla_logits`): a bf16 query on a GPU
-    whose query-key product has a side of one, a one-query decode's or a one-key read's, unless the
-    call is `folded` (`folds`), whose products are Dew's already (`folded_attention`). jax.nn names XLA's
-    BF16_BF16_F32 algorithm for that product, and an A100 computes a dot under it with a side of one
-    off round-to-nearest-even at its ties, where the same bf16 values widened to fp32, as the
-    reference path's wide logits take them, multiply exactly (node receipts SF-a100-tie-probe3 and 4,
-    row 1550). jax.nn names no algorithm for the probability-value product, whose bf16 operands were
-    exact at every shape. Every GPU takes the reference path for these calls, as its products are
-    right on each."""
+    whose query-key product has a side of one, unless the call is `folded` (`folds`), whose products
+    are Dew's (`folded_attention`). jax.nn names BF16_BF16_F32 for that product, which an A100 rounds
+    off round-to-nearest-even at its ties where the same values widened to fp32 multiply exactly (node
+    receipts SF-a100-tie-probe3 and 4, row 1550); it names no algorithm for the probability-value
+    product. Every GPU takes the reference path for these calls, as its products are right on each."""
     return (query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not folded
             and 1 in (query.shape[-3], key.shape[-3]))
 
