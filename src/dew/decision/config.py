@@ -186,8 +186,7 @@ class DecisionRunConfig(DecoderRunConfig):
                                 **self.source_keywords(frozen=frozen))
         release = isinstance(start, PretrainedDecision)
         # Whether a fresh head's rows lie in blocks, as the loaded checkpoint and the run declare it.
-        blocked = not release and reads_blocks(start.config, self.source.overrides(),
-                                               text_only=self.source.text_only)
+        blocked = not release and reads_blocks(start.config, self.source.overrides())
         if release and self.head is not None:
             raise ValueError("--head draws a head over a fresh backbone; a decision release reads with "
                              "its own")
