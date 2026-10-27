@@ -333,6 +333,15 @@ class SourceOptions:
     prediction_depths: int | None = None
     """The first that many multi-token prediction depths, 0 for none; None the checkpoint's own
     (`Pretrained.load`'s `prediction_depths`)."""
+    attention: dict[str, Literal["causal", "block_bidirectional"]] | None = None
+    """How each layer kind's attention reads, by kind (`full_attention`): causal, or
+    block_bidirectional, each of a row's blocks read whole, which a run's rows then lie in
+    (`Pretrained.load`'s `modeling_overrides`); None the checkpoint's own:
+    `--source.attention full_attention block_bidirectional`."""
+
+    def overrides(self) -> Mapping[str, object] | None:
+        """The `modeling_overrides` these options state, None where they state none."""
+        return None if self.attention is None else {"attention": dict(self.attention)}
 
 
 class SourcePlacement(TypedDict, total=False):
@@ -351,6 +360,7 @@ class SourceOptionsKeywords(SourcePlacement, total=False):
 
     text_only: bool
     prediction_depths: int | None
+    modeling_overrides: Mapping[str, object] | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1078,7 +1088,7 @@ class RunConfig:
         (`source`) and where it reads it (`TrainerConfig.source_placement`, `frozen` where the run
         keeps the source as it is). Every run kind that starts from a source loads it with these."""
         return {"text_only": self.source.text_only, "prediction_depths": self.source.prediction_depths,
-                **self.trainer.source_placement(frozen=frozen)}
+                "modeling_overrides": self.source.overrides(), **self.trainer.source_placement(frozen=frozen)}
 
     def check_resume(self, saved: Mapping[str, object]) -> None:
         """Refuse to resume the run whose record is `saved` as this one where they train different

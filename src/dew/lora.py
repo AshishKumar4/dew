@@ -328,13 +328,18 @@ class Adapter:
         """Adapt `model` to `targets` and split `variables` into factors and frozen weights.
 
         The factors go under `params` and everything else under `FROZEN`,
-        but what a split tree already trains, such as a cross-attention
-        block, keeps training (`freeze`). `bases` are the published models its
-        components were bound to (`Adapter.bases`).
+        but what a split tree already trains keeps training (`freeze`), as do
+        a cross-attention block's leaves (`crossing`), which a source attached
+        unsplit holds beside its weights (`Pretrained.with_cross_attention`).
+        `bases` are the published models its components were bound to
+        (`Adapter.bases`).
         """
+        from dew.nn.cross_attention import crossing
+
         adapted = _adapted(model, _Bound(targets, rslora, dropout, layouts, dict(bases or {})))
         factors = {(*path, factor) for path in targets for factor in FACTORS}
-        return cls(adapted, _fp8_packed(model, freeze(variables, lambda path: path in factors)))
+        split = freeze(variables, lambda path: path in factors or crossing(path))
+        return cls(adapted, _fp8_packed(model, split))
 
     @classmethod
     def from_run(cls, directory: str | FilePath, *, step: int | str | None = None,
