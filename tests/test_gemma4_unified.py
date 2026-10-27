@@ -159,7 +159,8 @@ def audio_rich(config, pair: dict[str, np.ndarray], seed: int) -> dict[str, np.n
 
 
 BACKWARD_GROUPS = {
-    "late": ("logits", "parameter.model.language_model.norm.", "parameter.model.language_model.layers.3."),
+    "logits": ("logits",),
+    "layer3": ("parameter.model.language_model.norm.", "parameter.model.language_model.layers.3."),
     "layer2": ("parameter.model.language_model.layers.2.",),
     "layer1": ("parameter.model.language_model.layers.1.",),
     "layer0": ("parameter.model.language_model.layers.0.",),
