@@ -120,7 +120,7 @@ def sigma_and_weight(schedule, inputs) -> dict:
             "weight": schedule.get_schedule_weights(steps, shape=(-1,))}
 
 
-def record(destination: Path) -> None:
+def recorded_schedules(destination: Path) -> None:
     """Every case over the seeds check 1 draws, its betas or model inputs beside them."""
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from recorded_references import provenance, record_case, save
@@ -167,4 +167,4 @@ def record(destination: Path) -> None:
 
 
 if __name__ == "__main__":
-    record(Path(sys.argv[1]))
+    recorded_schedules(Path(sys.argv[1]))
