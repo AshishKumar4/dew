@@ -417,3 +417,20 @@ def test_a_runs_base_loads_without_its_weights_under_the_runs_source_options():
     assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables) == jax.tree.map(
         lambda leaf: (leaf.shape, leaf.dtype), loaded.variables)
     assert shapes.model.kind_of("full_attention").mixer.bidirectional_blocks
+
+
+@pytest.mark.parametrize("name", ["hf/gpt2-tiny", "codecs/modelopt/tiny", "codecs/nvfp4_qdq/e4m3"])
+def test_a_load_without_its_weights_builds_what_a_load_with_them_builds(name):
+    """A checkpoint loaded without its weights is the model a load with them builds, its variables the
+    same shapes and dtypes: GPT-2's legacy causal buffers and a quantized release's scales are read as
+    stored, which the load checks and decodes from (ledger 1918)."""
+    import jax
+
+    from dew.interop import Pretrained
+
+    directory = Path(__file__).resolve().parent / "fixtures" / name
+    shapes = Pretrained.load(directory, dtype="float32", weights=False)
+    loaded = Pretrained.load(directory, dtype="float32")
+    assert shapes.model == loaded.model
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables) == jax.tree.map(
+        lambda leaf: (leaf.shape, leaf.dtype), loaded.variables)
