@@ -671,3 +671,16 @@ def test_a_decision_run_trains_its_backbone_beside_its_context_layers_on_the_com
     flags = ["--trainer.multi-host", "False", "--context-layers", "0", "1"]
     assert DecisionRunConfig.cli(flags).context_frozen
     assert not DecisionRunConfig.cli([*flags, "--no-context-frozen"]).context_frozen
+
+
+def test_a_run_branches_into_the_cooldowns_its_command_line_names():
+    """`--trainer.cooldowns.at` and its length and shape choose a run's cooldown branches, which its
+    record holds and reads back."""
+    from dew.config.lm import LMRunConfig
+    from dew.training.cooldown import Cooldowns
+
+    run = LMRunConfig.cli(["--trainer.cooldowns.at", "20%", "40%", "--trainer.cooldowns.length", "10%",
+                           "--trainer.cooldowns.shape", "linear", "--trainer.multi-host", "False"])
+    assert run.trainer.cooldowns == Cooldowns(at=("20%", "40%"), length="10%", shape="linear")
+    assert LMRunConfig.from_dict(run.to_dict()).trainer.cooldowns == run.trainer.cooldowns
+    assert LMRunConfig.cli(["--trainer.multi-host", "False"]).trainer.cooldowns is None

@@ -37,7 +37,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
 from dew.batch import Coordinates, coordinates as build_coordinates, merge, shifted_span
-from dew.mesh import LayoutRefused, row_axes
+from dew.mesh import LayoutRefused
 from dew.nn.continuum import Continuum, ContinuumLevel
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
@@ -90,7 +90,7 @@ from ..precision import (
 )
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
-from ..sharding import RESIDUAL, constrain, logical_axes, microbatches, pipeline_stages
+from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
 from .decoder_block import (
     DECODER_REMAT,
     NORM_SITES,
@@ -110,8 +110,10 @@ from .decoder_stack import (
     DecoderBank,
     Loop,
     PassView,
+    PipelineStage,
     SharedPassView,
     StackView,
+    microbatch_count,
     run_pipeline,
     run_stack,
 )
@@ -1845,27 +1847,7 @@ class CausalTransformer(nn.Module):
                     "which the pipeline's microbatch buffers do not hold; run the stack whole")
             count = self.stage_layers(stages)
             batch_axis = 1 if self.altup is not None else 0
-            rows, count_microbatches = x.shape[batch_axis], microbatches()
-            if count_microbatches % stages or rows % count_microbatches:
-                raise LayoutRefused(
-                    f"a batch of {rows} rows over {stages} stages needs a microbatch "
-                    f"count that divides the rows and is a multiple of the stages, "
-                    f"got {count_microbatches}")
-            # Microbatch m takes rows m, m + count, ... (`microbatched`), a
-            # share of every device's rows only where the count divides a
-            # block; otherwise devices holding none of a microbatch recompute
-            # another's (1.43 times one device's FLOPs for 8 rows in 4
-            # microbatches over 4 row shards, against the bubble's 1.25).
-            splitting = row_axes(rows)
-            shards = math.prod(jax.sharding.get_abstract_mesh().shape[axis] for axis in splitting)
-            if (rows // shards) % count_microbatches:
-                raise LayoutRefused(
-                    f"a batch of {rows} rows splits {shards} ways over {' x '.join(splitting)}, "
-                    f"{rows // shards} rows a device, which {count_microbatches} microbatches "
-                    f"do not divide, so the devices that hold none of a microbatch's rows would "
-                    f"compute another's again; use a microbatch count that divides "
-                    f"{rows // shards}, or a batch that is a multiple of "
-                    f"{count_microbatches * shards} rows")
+            count_microbatches = microbatch_count(x.shape[batch_axis])
             view = StackView(
                 scan_groups(self.scan_keys[:count], self.bank_layers) if self.scan_layers
                 else tuple((index, 1) for index in range(count)),
@@ -2032,9 +2014,10 @@ class CausalTransformer(nn.Module):
             self,
             view,
             x,
-            train=train,
-            per_layer_input=per_layer_input,
-            attention_metadata=attention_metadata,
+            lambda module: PipelineStage(block=module.block, specs=module.specs[:view.per_stage],
+                                         groups=view.groups, train=train, name='stages'),
+            layered=per_layer_input,
+            rows=attention_metadata,
         )
 
     def _layer_inputs(self, tokens, x, routed_experts, routed) -> LayerInputs | None:

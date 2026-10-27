@@ -223,6 +223,36 @@ def test_a_decision_mixture_states_its_weights_and_the_manifest_that_made_it(tmp
     assert held is not None
 
 
+def test_a_decision_corpus_of_one_file_reads_through_every_loading_worker(tmp_path):
+    """A corpus whose examples are one JSON-lines file, one physical shard, streams through the run's
+    loading workers, each reading the lines of its own part of the file (data.md §10), and a pass
+    reads each example once, where a read by more workers than shards was refused."""
+    from dew.batch import VALID_ROWS
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.decision.data import corpus
+
+    question = {"type": "choice", "instructions": "Which team?", "criteria": ["billing", "technical"]}
+    rows = [{"state": f"ticket {index}", "questions": {"team": question},
+             "answers": {"team": ["billing", "technical"][index % 2]}} for index in range(24)]
+    (tmp_path / "mixture.json").write_text(json.dumps({"weights": {"a": 1.0}, "slots": {"questions": 1,
+                                                                                         "options": 2}}))
+    (tmp_path / "a.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    examples = corpus(str(tmp_path), "a", "train")
+    assert examples is not None
+    chain = examples.read("streamed").repeat(1).batch(4, drop_remainder=False)
+    loading = Loading(workers=2, threads=1, read_buffer=1, worker_buffer=1)
+    reader = compile(chain, loading=loading).train(DataPartition())
+    try:
+        # Each worker batches its own part, the last batch of each filled out with rows it marks.
+        states = [example.state for batch in reader
+                  for example, real in zip(batch["example"], batch.get(VALID_ROWS, [True] * 4), strict=True)
+                  if real]
+    finally:
+        reader.close()
+    assert sorted(states) == sorted(row["state"] for row in rows)
+
+
 def test_a_named_validation_split_reads_the_source_s_own_split():
     """A holdout of the store's own named split (`holdout(split="validation")`) opens it through the
     source's `with_split`, and the decisions over it read that split's rows; a source with no native

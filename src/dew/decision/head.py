@@ -35,7 +35,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
-from dew.nn.precision import accumulated, at_least_fp32, capped_logits, scaled_logits
+from dew.nn.precision import accumulated, at_least_fp32, capped_logits, divided, scaled_logits
 from dew.nn.scatter import DROPPED
 from dew.registry import Record, component, from_record, import_path, record_fields
 
@@ -642,7 +642,9 @@ class SlotReadout(Head):
         score = jnp.einsum("bqd,kd->bqk", answers, slots[:real], precision=highest)
         query = jnp.einsum("bqd,hd->bqh", answers, q, precision=highest)
         key = jnp.einsum("bqkd,hd->bqkh", pooled, k, precision=highest)
-        scores = score + jnp.einsum("bqh,bqkh->bqk", query, key, precision=highest) / math.sqrt(self.head_dim)
+        # IEEE division: XLA takes a division by a constant as a product with its rounded reciprocal.
+        scores = score + divided(jnp.einsum("bqh,bqkh->bqk", query, key, precision=highest),
+                                 math.sqrt(self.head_dim))
         return _past_labels(scores, width)
 
 

@@ -45,10 +45,12 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from reference_releases import RELEASES, require
+from diffusers_reference_helpers import recording, restore_transformers_names
+from reference_releases import RELEASES
 from torch_precision import default_dtype, float64, widened
 
-DIFFUSERS = RELEASES["diffusers"]["diffusers"]
+COHORT = "diffusers-0.34"
+DIFFUSERS = RELEASES[COHORT]["diffusers"]
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/wan-source"
 BASE = {"patch_size": [1, 2, 2], "num_attention_heads": 2, "attention_head_dim": 12, "in_channels": 4,
         "out_channels": 4, "text_dim": 20, "freq_dim": 16, "ffn_dim": 40, "num_layers": 2,
@@ -160,17 +162,8 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     return arrays
 
 
-def output_root(destination: str) -> Path:
-
-    require("diffusers")
-    torch.set_num_threads(2)
-    root = Path(destination)
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
 def transformer(destination: str) -> None:
-    root = output_root(destination)
+    root = recording(destination, COHORT)
     arrays: dict[str, np.ndarray] = {}
     for name, case in CASES.items():
         arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})
@@ -317,7 +310,7 @@ def pipeline(destination: str) -> None:
     the whole pipeline in float64 (`float64`: the Wan modules' float32 pins,
     the call's float32 latents and the UniPC tables widened with it), under
     `_f64` names."""
-    root = output_root(destination)
+    root = recording(destination, COHORT)
     pipe = build_pipeline(root)
     generator = torch.Generator().manual_seed(SEED + 9)
     shape = (len(PROMPTS), PIPELINE_VAE["z_dim"], (FRAMES - 1) // 4 + 1, HEIGHT // 8, WIDTH // 8)
@@ -339,8 +332,6 @@ def pipeline(destination: str) -> None:
 
 
 if __name__ == "__main__":
-    from diffusers_reference_helpers import restore_transformers_names
-
     # The pipeline walk needs `WanPipeline` itself.
     restore_transformers_names()
     if len(sys.argv) > 3 and sys.argv[1] == "bundle":

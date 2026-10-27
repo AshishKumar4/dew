@@ -24,7 +24,7 @@ from dew.data.retention import LocalRetention
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _indexed_manifest, _uncounted, url_label
 from dew.data.sources.codec import decode, encode, encoded_fingerprint, fingerprint
 from dew.data.sources.index import ArrayIndex
-from dew.data.sources.records import ArrayRecords
+from dew.data.sources.records import ArrayRecords, ShardReaders
 from dew.data.storage import Store, Versioned, local
 
 if TYPE_CHECKING:
@@ -467,11 +467,11 @@ class Generation:
         return opened
 
     @cached_property
-    def _shard(self):
-        # A shuffled read visits every shard all the time: each is checked whole (its size and digest)
-        # as it is opened, which stands for every record its reader reads (`outputs`), and many readers
-        # are kept open, so a shard is checked again only once its reader has been closed.
-        @lru_cache(maxsize=64)
+    def _shards(self) -> ShardReaders[str]:
+        # As many shards' readers stay open as a read's threads, the room the transport's mirror holds
+        # (`ShardReaders`): a local shard is checked whole (its size and digest) as its reader opens,
+        # which stands for every record that reader reads (`outputs`), and checked again only once it
+        # reopens.
         def opened(path: str) -> ArrayRecords:
             root = Store(self.manifest["root"], self.storage_options)
             if self._local:
@@ -479,12 +479,12 @@ class Generation:
                 _checked(root, self.manifest["shards"][path])
             return ArrayRecords((root.child(path).url,), self.storage_options)
 
-        return opened
+        return ShardReaders(opened)
 
     @cached_property
     def _local(self) -> bool:
         """Whether its shards are local files, which a reader reads as they were checked whole as it
-        opened them (`_shard`); a remote shard's reader reads an object the check did not, so each
+        opened them (`_shards`); a remote shard's reader reads an object the check did not, so each
         record it reads is checked against its digest (`outputs`)."""
         return local(Store(self.manifest["root"], self.storage_options).resolve()[0])
 
@@ -499,7 +499,10 @@ class Generation:
         pin = self.__dict__.pop("pin", None)
         if pin is not None:
             pin.close()
-        for cached in ("_shard", "_page", "_rows"):
+        shards = self.__dict__.pop("_shards", None)
+        if shards is not None:
+            shards.close()
+        for cached in ("_page", "_rows"):
             self.__dict__.pop(cached, None)
 
     def plan(self, name: str) -> np.ndarray:
@@ -540,7 +543,7 @@ class Generation:
     def outputs(self, row_id: RowId) -> Outputs:
         row_key = _row_key(row_id)
         shard, place, digest = self._page(input_page(row_key))[row_key]
-        payload = self._shard(shard)[place]
+        payload = self._shards.read(shard, place)
         if not isinstance(payload, bytes):
             raise ValueError(f"committed cache record is not bytes: {self.url}")
         values = _decode_outputs(payload)

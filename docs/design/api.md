@@ -271,8 +271,8 @@ Same table and the same `logical_axes` and `_mesh_spec` machinery (`training/dis
 ### 3.10 Inference
 
 ```python
-pipe = inference.TextToImage.from_run("runs/flowers")            # manifest and checkpoint, EMA by default
-pipe = inference.TextToImage.from_pretrained("user/flowers-dit")  # hub export, same manifest
+pipe = inference.TextToImage.from_run("runs/flowers")  # manifest and checkpoint, EMA by default
+pipe = dew.pipeline("user/flowers-dit")                # hub export, same manifest
 images = pipe(["a water lily", "a sunflower"], steps=40, guidance=4.0, sampler=samplers.Heun(), key=key)
 text = generate(model, params, prompt, 300, key=key, sampling=Sampling(temperature=0.8)).tokens
 ```
@@ -402,7 +402,7 @@ The mixer keeps its recurrent state in the `cache` collection, exactly as the KV
 | --- | --- |
 | Alternating or multi-optimizer updates (GAN, actor-critic) | Not one `loss`. `Trainer(step=make_my_step)` replaces the compiled step and is the one documented place for a custom step. |
 | Tensor or sequence parallel | `MeshSpec(tensor=N)` and rules are cheap; correct TP needs `with_sharding_constraint` on activations inside each model. Per-architecture work. |
-| Pipeline parallel | Out of scope. |
+| Pipeline parallel | `MeshSpec(stage=N)` runs GPipe over a stack of like layers (a decoder's, a DiT's, a JEPA's, a UNet level's transformers; `decoder_stack.run_pipeline`); everything outside the stacks runs on every stage, and no 1F1B schedule is built. |
 | Non-grain data | `Dataset.train` is any callable returning an iterator; without `get_state` the run cannot checkpoint its position and `fit` says so. |
 
 ## 8. How to build against this design
