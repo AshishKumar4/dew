@@ -891,12 +891,16 @@ def truth_sketch(truth, seed: int) -> np.ndarray:
         # Sign k of an entry is its word's bit k: its low four bytes, read little-endian whatever the host's
         # order, so the first byte holds bits 0 to 7, unpacked least significant bit first.
         words = bits[start:start + chunk.size].astype("<u8").view(np.uint8).reshape(chunk.size, 8)[:, :4]
-        negative = np.unpackbits(words, axis=1, bitorder="little") == 0
-        products = np.zeros((chunk.size + -chunk.size % SKETCH_BLOCK, SKETCH))
-        # Each product is the entry or its negation, exact: the sign table's product, bit for bit.
-        products[:chunk.size] = chunk[:, None]
-        np.negative(products[:chunk.size], out=products[:chunk.size], where=negative)
+        positive = np.unpackbits(words, axis=1, bitorder="little").astype(bool)
+        # Each product is the entry or its negation, exact, in one pass; the last block's rows padded
+        # with zeros, which its sum adds exactly, as a block of SKETCH_BLOCK sums them.
+        full = chunk.size - chunk.size % SKETCH_BLOCK
+        products = np.where(positive[:full], chunk[:full, None], -chunk[:full, None])
         partials.append(products.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
+        if full < chunk.size:
+            tail = np.zeros((SKETCH_BLOCK, SKETCH))
+            tail[:chunk.size - full] = np.where(positive[full:], chunk[full:, None], -chunk[full:, None])
+            partials.append(tail.sum(axis=0)[None])
     return np.asarray([math.fsum(column) for column in np.concatenate(partials).T.tolist()])
 
 
