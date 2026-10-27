@@ -646,32 +646,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return _hooks_lower(ba, dtype, mosaic_gpu_lowering.mosaic_lowering_rules[plgpu_core.WGxWG_SEMANTICS])
 
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles, target) -> int:
-        # Each allocation a program scopes, rounded up to Mosaic's alignment (`resources.allocated`): each
-        # stream's stages (both operand blocks and each prologue side's tile), each output's staging (every
-        # output's at once, the columns its family stages at once: `mosaic.Family.output_columns`), each
-        # epilogue side's two staging copies (`mosaic.staging`), and the barriers: each stream stage's two
-        # and each staged side's two (at a block's edge, a Hopper tile's barriers alone took it 128 bytes
-        # past, the reason they are counted).
-        size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
-        hooks = ba.arguments['hooks']
-        outs = [jnp.dtype(dtype).itemsize for dtype in (hooks.out_dtypes or (ba.arguments['out_dtype'],))]
-        extents = self.extents(config)
-        prologue_sides = ba.arguments['prologue_operands']
-        epilogue_sides = ba.arguments.get('epilogue_operands', ())
-        streams = [config.block_m * config.block_k * size, config.block_k * config.block_n * size,
-                   *(_side_tile_bytes((side,), (axes,), extents)
-                     for side, axes in zip(prologue_sides, hooks.prologue_axes, strict=True))]
+        # The kernel's own allocations at `config` (`mosaic_gpu.Allocations`), counted as Mosaic's resource
+        # estimate counts them (`resources.shared_bytes`): its streams' stages, its side operands' staging,
+        # its outputs' staging as its family stages them, and every barrier (at a block's edge, a Hopper
+        # tile's barriers alone took it 128 bytes past). mma.sync's output staging is scoped beside its
+        # pipeline's walk, so the two add (an L4 refused 114688 bytes for a 98304-byte pipeline and its
+        # 16384-byte output, GEN4-gpu-l4).
+        del target
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-        staged = [config.block_m * family.output_columns(config.block_n, (dtype,)) * out
-                  for dtype, out in zip(hooks.out_dtypes or (ba.arguments['out_dtype'],), outs, strict=True)]
-        sides = [2 * _side_tile_bytes((side,), (axes,), extents)
-                 for side, axes in zip(epilogue_sides, hooks.epilogue_axes, strict=True)]
-        barriers = 2 * config.stages * len(streams) + 2 * (len(epilogue_sides) + len(prologue_sides) + 1)
-        # mma.sync's too, though its output's staging is scoped after its pipeline's stages: Mosaic places
-        # both at once (an L4 refused 114688 bytes for a 98304-byte pipeline and its 16384-byte output,
-        # GEN4-gpu-l4).
-        return (resources.allocated(*(config.stages * stream for stream in streams), *staged, *sides)
-                + resources.BARRIER_BYTES * barriers)
+        return resources.shared_bytes(family, self._allocations(ba, config, family).scope(family, config))
+
+    @abc.abstractmethod
+    def _allocations(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
+        """The kernel's allocations at `config` for the call `ba`."""
 
     @staticmethod
     @abc.abstractmethod
@@ -695,6 +682,16 @@ class MosaicGmm(_Mosaic):
     """`Gmm` through the Mosaic GPU kernels (`mosaic_gpu.gmm`)."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
+
+    def _allocations(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
+        hooks = ba.arguments['hooks']
+        return mosaic_gpu.gmm_allocations(
+            config, family, dtype=ba.arguments['tokens'].dtype, rhs_dtype=ba.arguments['kernel'].dtype,
+            transpose_rhs=ba.arguments['trans_rhs'], prologue_axes=hooks.prologue_axes,
+            prologue_dtypes=tuple(side.dtype for side in ba.arguments['prologue_operands']),
+            epilogue_axes=hooks.epilogue_axes,
+            epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
+            dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],))
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
@@ -732,6 +729,13 @@ class MosaicTgmm(_Mosaic):
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
 
     EXACT_SUMS: ClassVar[bool] = True
+
+    def _allocations(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
+        return mosaic_gpu.tgmm_allocations(
+            config, family, lhs_dtype=ba.arguments['tokens'].dtype,
+            rhs_dtype=ba.arguments['cotangent'].dtype, prologue_axes=ba.arguments['hooks'].prologue_axes,
+            prologue_dtypes=tuple(side.dtype for side in ba.arguments['prologue_operands']),
+            out_dtype=ba.arguments['out_dtype'])
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         # A gradient tile's rows are the tokens' width; its steps run over a group's rows, padded to whole

@@ -262,6 +262,89 @@ TMA_ROWS = 8
 """The rows a TMA descriptor tiles by, to which `gmm` pads its rows and a group's first tile starts."""
 
 
+@dataclasses.dataclass(frozen=True)
+class Allocations:
+    """Dew: a GEMM launch's shared memory at its tile, as its kernel scopes it (`gmm_allocations`,
+    `tgmm_allocations`): its streams' blocks `(shape, dtype)` by name (`mosaic.Family.streams`), what it
+    scopes beside them in the kernel's order (`staged`: side operands' staging, `mosaic.staging`, a meeting's
+    barriers), and its outputs' tiles `(shape, dtype)`, which the family stages (`mosaic.Family.persist`)."""
+    blocks: dict
+    staged: tuple
+    outputs: tuple
+
+    def scope(self, family: mosaic.Family, tiles: "Tiles") -> resources.Scope:
+        """Its allocations by lifetime (`resources.shared_bytes`): a ring family's streams the program's,
+        a family whose walks scope their streams apart (`mosaic.Family.walks_scoped`) a walk's; each
+        output staged as its family stages it (`mosaic.Family.output_columns` of each consumer's share)."""
+        consumers = tiles.warpgroups
+        staging = tuple(plgpu.SMEM((consumers, shape[0], family.output_columns(shape[1], (dtype,))), dtype)
+                        for shape, dtype in self.outputs)
+        if family.walks_scoped:
+            walk = tuple(plgpu.SMEM((tiles.stages, *shape), dtype) for shape, dtype in self.blocks.values())
+            return resources.Scope(program=(self.staged, staging), walks=(walk,))
+        multicast = ('matrix',) if tiles.cluster > 1 and 'matrix' in self.blocks else ()
+        streams = family.streams(self.blocks, tiles.stages, consumers, multicast=multicast)
+        return resources.Scope(program=(streams, self.staged, staging))
+
+
+def _typed(dtype) -> jax.ShapeDtypeStruct:
+    """A stand-in for an operand of `dtype`, as `mosaic.staging` reads an operand's dtype."""
+    return jax.ShapeDtypeStruct((), dtype)
+
+
+def gmm_allocations(tiles: "Tiles", family: mosaic.Family, *, dtype, rhs_dtype, transpose_rhs: bool,
+                    prologue_axes: tuple, prologue_dtypes: tuple, epilogue_axes: tuple,
+                    epilogue_dtypes: tuple, dtypes: tuple) -> Allocations:
+    """Dew: `gmm`'s allocations at `tiles` (`Allocations`), for rows of `dtype` and a matrix of `rhs_dtype`,
+    its side operands' axes and dtypes and its outputs' dtypes: a stream for the rows, the matrix and each
+    prologue side operand that follows the steps (`_stepped`), each epilogue side operand's staging at a
+    consumer's share of the tile, each prologue side operand without depth's at the tile's rows."""
+    block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
+    part = (block_m // tiles.warpgroups, block_n)
+    stepped, _, fixed = _stepped(family, prologue_axes, 'depth')
+    extent = {'rows': block_m, 'depth': block_k}
+    rhs_block = (block_n, block_k) if transpose_rhs else (block_k, block_n)
+    blocks = {'rows': ((block_m, block_k), dtype), 'matrix': (rhs_block, rhs_dtype),
+              **{f'side_{i}': (tuple(extent[axis] for axis in prologue_axes[i]), prologue_dtypes[i])
+                 for i in stepped}}
+    sides = mosaic.staging('side', [(tuple({'rows': part[0], 'columns': part[1]}[axis] for axis in axes),
+                                     _typed(side))
+                                    for axes, side in zip(epilogue_axes, epilogue_dtypes, strict=True)])
+    held = mosaic.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]),
+                                     _typed(prologue_dtypes[i])) for i in fixed])
+    return Allocations(blocks, (sides['side_smems'], sides['side_barriers'], held['fixed_smems'],
+                                held['fixed_barriers']), tuple((part, jnp.dtype(out)) for out in dtypes))
+
+
+def tgmm_allocations(tiles: "Tiles", family: mosaic.Family, *, lhs_dtype, rhs_dtype,
+                     prologue_axes: tuple, prologue_dtypes: tuple, out_dtype) -> Allocations:
+    """Dew: `tgmm`'s allocations at `tiles` (`Allocations`): a ring for the rows, the cotangent and each
+    prologue side operand with rows that follows the steps (`_stepped`), each side operand without rows'
+    staging, the consumers' meeting, and its output's share of the tile."""
+    block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
+    stepped, _, fixed = _stepped(family, prologue_axes, 'rows')
+    extent = {'rows': block_k, 'depth': block_m}
+    blocks = {'ring_0': ((block_k, block_m), lhs_dtype), 'ring_1': ((block_k, block_n), rhs_dtype),
+              **{f'ring_{2 + position}': (tuple(extent[axis] for axis in prologue_axes[i]),
+                                          prologue_dtypes[i]) for position, i in enumerate(stepped)}}
+    held = mosaic.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]),
+                                     _typed(prologue_dtypes[i])) for i in fixed])
+    return Allocations(blocks, (held['fixed_smems'], held['fixed_barriers'],
+                                mosaic.meeting(tiles.warpgroups)),
+                       (((block_m // tiles.warpgroups, block_n), jnp.dtype(out_dtype)),))
+
+
+def _stepped(family: mosaic.Family, axes_of: tuple, stepping: str) -> tuple[tuple, tuple, tuple]:
+    """Dew: which side operands a launch streams with its steps (each with the `stepping` axis, but a vector a
+    family does not copy, `mosaic.Family.copies_vectors`), which its step reads from global memory (such a
+    vector), and which it loads once a tile (none with the `stepping` axis)."""
+    stepped = tuple(i for i, axes in enumerate(axes_of)
+                    if stepping in axes and (len(axes) > 1 or family.copies_vectors))
+    read = tuple(i for i, axes in enumerate(axes_of) if stepping in axes and i not in stepped)
+    fixed = tuple(i for i, axes in enumerate(axes_of) if stepping not in axes)
+    return stepped, read, fixed
+
+
 def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, transpose_rhs: bool,
         out_dtype, multiprocessors: int, interpret: bool | plgpu.InterpretGPUParams = False,
         prologue=None, prologue_operands: tuple = (), prologue_axes: tuple = (), epilogue=None,
@@ -341,26 +424,22 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                                   for side, axes in zip(epilogue_operands, epilogue_axes, strict=True))
     share = block_m // consumers
     part = (share, block_n)
-    side_shapes = [tuple({'rows': part[0], 'columns': part[1]}[axis] for axis in axes)
-                   for axes in epilogue_axes]
     # A stream for each operand that follows the steps, but a vector a family does not copy, which its
-    # step reads from global memory (`mosaic.Family.copies_vectors`); a prologue side operand without
-    # depth is loaded once a tile.
-    stepped = tuple(i for i, axes in enumerate(prologue_axes)
-                    if 'depth' in axes and (len(axes) > 1 or family.copies_vectors))
-    read = tuple(i for i, axes in enumerate(prologue_axes) if 'depth' in axes and i not in stepped)
-    fixed = tuple(i for i, axes in enumerate(prologue_axes) if 'depth' not in axes)
-    extent = {'rows': block_m, 'depth': block_k}
+    # step reads from global memory; a prologue side operand without depth is loaded once a tile.
+    stepped, read, fixed = _stepped(family, prologue_axes, 'depth')
+    allocations = gmm_allocations(tiles, family, dtype=lhs.dtype, rhs_dtype=rhs.dtype,
+                                  transpose_rhs=transpose_rhs, prologue_axes=prologue_axes,
+                                  prologue_dtypes=tuple(side.dtype for side in prologue_operands),
+                                  epilogue_axes=epilogue_axes,
+                                  epilogue_dtypes=tuple(side.dtype for side in epilogue_operands),
+                                  dtypes=dtypes)
     steps = k // block_k
     # A pair's tiles: g groups' boundaries, and the unrouted rows.
     grid = (pl.cdiv(m, block_m * pair) + g, n // block_n)
-    rhs_block = (block_n, block_k) if transpose_rhs else (block_k, block_n)
 
     def body(table_gmem, lhs_gmem, rhs_gmem, *refs):
         prologue_gmems, side_gmems, o_gmems = _split(refs, len(prologue_operands), len(epilogue_operands))
-        blocks = {'rows': ((block_m, block_k), lhs_gmem.dtype), 'matrix': (rhs_block, rhs_gmem.dtype),
-                  **{f'side_{i}': (tuple(extent[axis] for axis in prologue_axes[i]), prologue_gmems[i].dtype)
-                     for i in stepped}}
+        blocks = allocations.blocks
 
         def schedule(index):
             """A tile's whether it multiplies any row, its steps, its streams' views and its group, row
@@ -405,14 +484,10 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                     store(output, value, o_gmem, (part_row, first, stored, column, min(part[0], m)))
 
             family.persist(streams, (grid[0] * grid[1],), schedule, consumer, consumers=consumers,
-                           axis="programs", outputs=tuple((part, dtype) for dtype in dtypes),
+                           axis="programs", outputs=allocations.outputs,
                            interpret=bool(interpret), in_flight=_IN_FLIGHT)
 
-        staged_sides = mosaic.staging('side', zip(side_shapes, side_gmems, strict=True))
-        staged_fixed = mosaic.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]),
-                                                 prologue_gmems[i]) for i in fixed])
-        family.scoped(scope, staged_sides['side_smems'], staged_sides['side_barriers'],
-                      staged_fixed['fixed_smems'], staged_fixed['fixed_barriers'],
+        family.scoped(scope, *allocations.staged,
                       streams=family.streams(blocks, tiles.stages, consumers,
                                              multicast=('matrix',) if pair > 1 else ()))
 
@@ -550,12 +625,12 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     part = (depth_half, block_n)
     grid = (m // block_m, n // block_n)
     # A stream for each side operand with rows, but a vector a family does not copy, which its step reads
-    # from global memory (`mosaic.Family.copies_vectors`).
-    stepped = tuple(i for i, axes in enumerate(prologue_axes)
-                    if 'rows' in axes and (len(axes) > 1 or family.copies_vectors))
-    read = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' in axes and i not in stepped)
-    fixed = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' not in axes)
-    extent = {'rows': block_k, 'depth': block_m}
+    # from global memory.
+    stepped, read, fixed = _stepped(family, prologue_axes, 'rows')
+    allocations = tgmm_allocations(tiles, family, lhs_dtype=lhs.dtype, rhs_dtype=rhs.dtype,
+                                   prologue_axes=prologue_axes,
+                                   prologue_dtypes=tuple(side.dtype for side in prologue_operands),
+                                   out_dtype=out_dtype)
 
     def body(sizes_gmem, starts_gmem, ends_gmem, blocks_gmem, block_starts_gmem, lhs_gmem, rhs_gmem, *refs):
         *side_gmems, o_gmem = refs
@@ -582,13 +657,9 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                         for position, i in enumerate(stepped)}}
             return steps > 0, steps, views, (g_i, depth, columns, steps)
 
-        blocks = [((block_k, block_m), lhs_gmem), ((block_k, block_n), rhs_gmem),
-                  *((tuple(extent[axis] for axis in prologue_axes[i]), side_gmems[i]) for i in stepped)]
-        fixed_staging = mosaic.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]),
-                                                  side_gmems[i]) for i in fixed])
 
         def scope(fixed_smems, fixed_barriers, halves, *, streams):
-            names = tuple(f'ring_{i}' for i in range(len(blocks)))
+            names = tuple(allocations.blocks)
 
             def consumer(wg, tile, walk, store, *, active):
                 g_i, depth, columns, steps = tile
@@ -618,14 +689,11 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                       (depth.start + wg * depth_half, 0, depth_half, columns.start, depth_half))
 
             family.persist(streams, (g, grid[0] * grid[1]), schedule, consumer, consumers=consumers,
-                           axis="programs", outputs=((part, out_dtype),), interpret=bool(interpret),
+                           axis="programs", outputs=allocations.outputs, interpret=bool(interpret),
                            in_flight=_IN_FLIGHT)
 
-        family.scoped(scope, fixed_staging['fixed_smems'], fixed_staging['fixed_barriers'],
-                      mosaic.meeting(consumers),
-                      streams=family.streams({f'ring_{i}': (block, gmem.dtype)
-                                              for i, (block, gmem) in enumerate(blocks)}, tiles.stages,
-                                             consumers))
+        family.scoped(scope, *allocations.staged,
+                      streams=family.streams(allocations.blocks, tiles.stages, consumers))
 
     kernel = family.kernel(body, out_type=jax.ShapeDtypeStruct((g, m, n), out_dtype),
                            grid=(multiprocessors,), grid_names=("programs",), consumers=consumers,
