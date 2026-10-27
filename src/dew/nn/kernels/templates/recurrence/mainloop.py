@@ -281,8 +281,8 @@ class _Call:
     """A call's static geometry: value heads over key heads (`group`), key and value widths (whole blocks),
     the chunk-laid rows (`rows`), the inputs' operand form (`given`, the queries', keys' and values') and the
     values passed between the launches' (`held`), whether its decay is a key dimension's (`per_key`), whether
-    it runs the delta rule (`delta`), the bundle its launches issue by (`family`), and whether they are
-    interpreted."""
+    it runs the delta rule (`delta`), the bundle its launches issue by (`family`), whether they are
+    interpreted, and the key block a launch narrows its own tiles to (`narrowed`, `_narrowed`)."""
 
     heads: int
     group: int
@@ -296,6 +296,7 @@ class _Call:
     family: mosaic.Family
     interpret: bool
     target: generation.GpuTarget
+    narrowed: int | None = None
 
     @property
     def gates(self) -> _Operand:
@@ -308,13 +309,30 @@ class _Call:
 
     @property
     def block(self) -> int:
-        """A tile's width (`block_of`)."""
-        return block_of(self.family)
+        """A tile's width (`block_of`), or the key block a launch narrows its own to (`narrowed`)."""
+        return self.narrowed or block_of(self.family)
+
 
     @property
     def memories(self) -> _Operand:
         """The memories the chunks enter, `[chunks * heads * width, value_width]` as `held`."""
         return dataclasses.replace(self.held, rows=self.chunks * self.heads * self.width)
+
+
+def _narrowed(call: _Call, held: Callable[[_Call], "_Held"]) -> _Call:
+    """`call` at the widest key block (halving the family's `block_of` down to the narrowest a staged operand
+    block takes, `Family.narrowest_columns`) dividing its keys at which a consumer thread holds the launch's
+    tiles (`held`) within its registers (`Family.registers`), the narrowest where none does: a decay a key
+    dimension's launches hold a key block's prefix halves, exponent and gated rows and keys beside their
+    products, Kimi delta attention's intra launch 328 registers a thread 64 columns wide on an A100 and its
+    weighted launch 264, past the 255 a thread holds, an H100's intra launch 264, past 256."""
+    block, narrowest = block_of(call.family), call.family.narrowest_columns(jnp.bfloat16)
+    widths = [width for width in (block >> step for step in range(block.bit_length()))
+              if width >= narrowest and call.width % width == 0]
+    budget = call.family.registers(1)
+    return next((narrowed for narrowed in (dataclasses.replace(call, narrowed=width) for width in widths)
+                 if held(narrowed).registers(call.family) <= budget),
+                dataclasses.replace(call, narrowed=widths[-1]))
 
 
 def _streamed(**blocks) -> dict:
@@ -880,7 +898,9 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     `call.held`: the chunk's scores and its keys' system, each pair's decay factored over the chunk's
     sub-chunks (`algebra.key_decayed_pairs`, which the call's declared floor bounds), their products on the
     tensor cores, and the system inverted (`algebra.doubled`): fla_kda's intra rows and solve, fused.
-    Without the delta rule, `(Aqk,)` alone."""
+    Without the delta rule, `(Aqk,)` alone. Its key block is the widest whose tiles a thread holds
+    (`_narrowed`)."""
+    call = _narrowed(call, _intra_held)
     width, held, gates = call.width, dataclasses.replace(call.held, rows=call.rows), call.gates
     family = call.family
 
@@ -938,18 +958,21 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
     pairs = (CHUNK // algebra.SUB) * (1 + call.delta)
     work = Work(pairs * 2 * CHUNK * CHUNK * width + (_inverse_flops() if call.delta else 0),
                 exponentials=pairs * 2 * CHUNK * width)
-    # The sum of the pairs, beside a sub-chunk's and key block's prefix halves, exponent, gated rows and
-    # keys; then the doubling's, as the solve's.
-    held_tiles = _Held(phases=(
-        [_f32(CHUNK, CHUNK)] + [_f32(CHUNK, call.block)] * 4 + _masks(CHUNK, call.block) * 2
-        + _fragments(call, (_pairing_operand(call), CHUNK, call.block), (_pairing_operand(call), CHUNK,
-                                                                              call.block)),
-        [_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK) * 2))
     staging = (_pairing(call), *(_merges(call) if call.delta else ()))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(5), work=work,
-                   held=held_tiles, staging=staging, landing={"square": held.landing(CHUNK, CHUNK)},
+                   held=_intra_held(call), staging=staging, landing={"square": held.landing(CHUNK, CHUNK)},
                    persistent=True)(q, k, hi, lo, beta, taken)
+
+
+def _intra_held(call: _Call) -> _Held:
+    """The intra launch's registers (`_intra`): the sum of the pairs, beside a sub-chunk's and key block's
+    prefix halves, exponent, gated rows and keys; then the doubling's, as the solve's."""
+    pairing = (_pairing_operand(call), CHUNK, call.block)
+    return _Held(phases=(
+        [_f32(CHUNK, CHUNK)] + [_f32(CHUNK, call.block)] * 4 + _masks(CHUNK, call.block) * 2
+        + _fragments(call, pairing, pairing),
+        [_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK) * 2))
 
 
 def _pairing_operand(call: _Call) -> _Operand:
@@ -972,7 +995,9 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
     """`(w [R, HV * Dk], u [R, HV * Dv])` as `call.held` (`algebra.weighted`): the inverse against the decayed
     write-gated keys and against the write-gated values; under a decay a key dimension, also the keys decayed
     to their chunk's end, `[R, HV * Dk]` as `call.held` (`algebra.key_decayed_write`), which the memory takes,
-    and those alone without the delta rule (`a` None)."""
+    and those alone without the delta rule (`a` None). Its key and value blocks are the widest whose tiles a
+    thread holds (`_narrowed`)."""
+    call = _narrowed(call, _weighted_held)
     width, value_width, gates, family = call.width, call.value_width, call.gates, call.family
     held = dataclasses.replace(call.held, rows=call.rows)
 
@@ -1054,21 +1079,25 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
     # Without the delta rule the inverse's place takes the keys, an operand no step reads.
     work = Work(2 * CHUNK * CHUNK * (width + value_width) if call.delta else 0,
                 exponentials=CHUNK * width if call.per_key else 0)
-    # The inverse beside a block's product, its decay and its keys or values; under a decay a key dimension
-    # the block's prefix halves and its decayed write too.
-    held_tiles = _Held(phases=(
-        _held(held, CHUNK, CHUNK) + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
-        + [_f32(CHUNK, call.block)] * 3 * call.per_key
-        + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block)),))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"),
                    blocks=_streamed(**given) | _vector_blocks(call, *(("write",) if call.delta else ()),
                                                               *(() if call.per_key else ("gate", "low"))),
                    stages=1, live=_taken(6),
-                   work=work, held=held_tiles,
+                   work=work, held=_weighted_held(call),
                    staging=_staging(held, (CHUNK, call.block)) if call.delta else (),
                    landing={"block": held.landing(CHUNK, call.block)}, persistent=True)(
         k, v, k if a is None else a, hi, lo, beta, taken)
+
+
+def _weighted_held(call: _Call) -> _Held:
+    """The weighted launch's registers (`_weighted`): the inverse beside a block's product, its decay and its
+    keys or values; under a decay a key dimension the block's prefix halves and its decayed write too."""
+    held = dataclasses.replace(call.held, rows=call.rows)
+    return _Held(phases=(
+        _held(held, CHUNK, CHUNK) + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
+        + [_f32(CHUNK, call.block)] * 3 * call.per_key
+        + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block)),))
 
 
 def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, walked: tuple, step, start,
