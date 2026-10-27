@@ -707,7 +707,10 @@ def _climbs_and_restores(name: str, model, variables, inputs, **apply) -> None:
     assert all(above < below for below, above in itertools.pairwise(saved)), list(zip(records, saved,
                                                                                          strict=True))
     written = model.apply(variables, *inputs, mutable=True, **apply)[1].keys()
-    twin, wide_variables = float64_twin(model), widened(variables)
+    # Device arrays, made under x64 so they stay float64: a layer that indexes a weight by its ids
+    # (DeepSeek V4's hash routing, Gemma 4's per-expert scales) indexes a device array in a program.
+    with jax.enable_x64(new_val=True):
+        twin, wide_variables = float64_twin(model), jax.tree.map(jnp.asarray, widened(variables))
 
     # Plain functions of the inputs, which the gate compiles, the truths under x64 over inputs it widens.
     def forward(rung, variables=variables):
