@@ -28,7 +28,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from reference_source import loaded
-from trace_window import device_events, kernel_category, kernel_totals, window_totals
+from trace_window import kernel_category, kernel_totals, library
 
 SOURCE = Path(__file__).resolve().parents[2] / "src" / "dew"
 EVIDENCE = Path(os.environ.get(
@@ -121,7 +121,7 @@ def kernel_summary(kernels: Sequence[tuple[str, int, int, int]], steps: int) -> 
     """Per-step device time from `(name, start_ns, end_ns, device)` kernel
     records of `steps` traced steps.
 
-    Each device's window is split by `trace_window.window_split`, the split
+    Each device's window is split by `dew.telemetry.timeline.window_split`, the split
     `tools/benchmark_step.py` reports, and the figures are averaged over the
     devices: busy is the union of a device's kernels, the window runs from its
     first kernel's start to its last one's end, and the window is compute +
@@ -131,8 +131,9 @@ def kernel_summary(kernels: Sequence[tuple[str, int, int, int]], steps: int) -> 
     if not kernels:
         raise ValueError("the trace holds no device kernels")
     devices = sorted({device for *_, device in kernels})
-    figures = window_totals([[(name, start, end) for name, start, end, owner in kernels if owner == device]
-                             for device in devices])
+    figures = library("telemetry/timeline.py").window_totals(
+        [[(name, start, end) for name, start, end, owner in kernels if owner == device]
+         for device in devices])
     scale = 1e-6 / steps / len(devices)
     records = [(name, start, end) for name, start, end, _ in kernels]
     by_category, _ = kernel_totals(records, kernel_category)
@@ -368,7 +369,7 @@ def attach_xplane_profile(record: dict, trace_dir: str | Path, steps: int,
     recorded as such: the run's curves stand without it."""
     trace_dir = Path(trace_dir)
     try:
-        planes, lines = device_events(trace_dir)
+        planes, lines = library("telemetry/timeline.py").device_events(trace_dir)
         kernels = [(event.name, event.start_ns, event.end_ns, int(plane.rsplit(":", 1)[1]))
                    for plane, events in planes.items() for event in events]
         record["profile"] = kernel_summary(kernels, steps)

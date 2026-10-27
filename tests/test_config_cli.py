@@ -129,7 +129,7 @@ def profiled(report_file: Path) -> dict:
     assert traced_steps(Path(report["capture"])) == (2, 3) and tuple(report["traced"]) == (2, 3)
     assert (report["steps"], report["warmup"]) == (2, 2)
     assert report["step_ms"] > 0 and report["input_wait_ms"] >= 0 and report["compile_s"] > 0
-    assert (report["device_ms"] is None) == (report["attribution"] is not None)
+    assert (report["device_idle_ms"] is None) == (report["attribution"] is not None)
     assert (Path(report["capture"]) / "reports").is_dir()
     return report
 

@@ -250,3 +250,21 @@ def test_a_captures_kernels_are_filed_under_the_programs_that_ran_them(tmp_path)
     assert [row["kernel_name"] for row in found[""]] == ["d"]
     with pytest.raises(FileNotFoundError):
         program_kernels(tmp_path / "capture-y", ["step"])
+
+
+def test_a_profile_counts_overlapped_collectives_once_and_the_rest_of_the_step_as_idle():
+    """A step of 15 ms in which a device ran 10 ms of compute and an all-reduce over the same 10 ms, then
+    nothing for 5 ms: its profile reports 10 ms of compute and of communication, none of it exposed, and
+    5 ms of device idle, the overlap counted once (`device_time`); the report's lines say the same. Two
+    devices and two steps of that step average to it."""
+    from dew.training.profiling import ProfileReport, device_time
+
+    step = [("gemm_fusion_dot", 0, 10_000_000), ("ncclDevKernel_AllReduce_Sum_f32_RING_LL", 0, 10_000_000)]
+    later = [(name, start + 15_000_000, end + 15_000_000) for name, start, end in step]
+    figures = device_time([step + later, later + step], steps=2, step_ms=15.0)
+    assert figures == {"compute_ms": 10.0, "communication_ms": 10.0, "exposed_communication_ms": 0.0,
+                       "device_idle_ms": 5.0}
+    report = ProfileReport("profile", 2, 2, (2, 3), "capture", 15.0, 1.0, 3.0, **figures, flops=None,
+                           mfu=None, hfu=None, tokens_per_s=None, attribution=None)
+    text = report.text()
+    assert f"device idle   {5.0:10.2f} ms" in text and "The largest share of a step: compute, 67%." in text

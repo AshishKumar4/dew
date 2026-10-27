@@ -1851,14 +1851,17 @@ class Trainer(Generic[Loss, Effects]):
                           compiled=run.compiled)
         branched.train = self._prefetched(plan, branched, plan.dataset.train(run.partition), position)
         # The branch's own clock of committed tokens, from the run's, which a schedule's stages end at
-        # as the run's do (`_scheduled`); the stages it begins are its own, the run's kept as they were.
+        # as the run's do (`_scheduled`), read off the devices where its steps may have reached what it
+        # reads next (`FitPlan.committed`); the stages it begins are its own, the run's kept as they were.
         counted = Interval(time.time(), None, tokens_before_log=interval.real_tokens)
+        branched.clock = TokenClock(*counted.clocked(state.accumulation))
         starts = self._stage_starts
         cooled, done, cut = state, 0, False
         try:
-            while (done < steps and not schedule_ended(plan.dataset.token_ends, counted.real_tokens)
+            while (done < steps and not schedule_ended(plan.dataset.token_ends,
+                                                       plan.committed(counted, branched.clock, cooled))
                    and not (cut := run.notice.reached())):
-                self._scheduled(plan, branched, counted)
+                self._scheduled(plan, branched)
                 assert branched.train is not None
                 batch = agreed_next("cooldown read", branched.train)
                 if batch is None:
@@ -1871,6 +1874,7 @@ class Trainer(Generic[Loss, Effects]):
                 cooled, loss, aux, finite, _, committed = step(dataclasses.replace(cooled, opt_state=scaled),
                                                               device)
                 counted.count(batch, None, loss, finite, committed, aux)
+                branched.clock.stepped(self.objective.row_tokens(device), rows_of(device))
                 done, branched.current = done + 1, branched.current + 1
         finally:
             self._stage_starts = starts

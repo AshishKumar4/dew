@@ -144,7 +144,7 @@ def step(args):
 
 
 def convolution_profile(directory):
-    from trace_window import device_events
+    from dew.telemetry.timeline import device_events
 
     native = 0.0
     for events in device_events(directory)[0].values():

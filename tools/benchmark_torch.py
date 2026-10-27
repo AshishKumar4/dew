@@ -75,7 +75,7 @@ import torch.nn.functional as F
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchmark_cases import TEXT_FEATURES, TEXT_TOKENS, Case, parity_case
 from reference_runs.common import WorkloadWork, peak_flops
-from trace_window import kernel_category, kernel_totals, window_split
+from trace_window import kernel_category, kernel_totals, library
 
 BF16 = torch.bfloat16
 F32 = torch.float32
@@ -689,7 +689,7 @@ def profile_step(step, n_steps):
                       if e.device_type == torch.autograd.DeviceType.CUDA), key=lambda kernel: kernel[1])
     if not kernels:
         return None
-    split = window_split(kernels)
+    split = library("telemetry/timeline.py").window_split(kernels)
     busy, window = split["busy"], split["window"]
     by_cat, count_cat = kernel_totals(kernels, kernel_category)
     by_name, count_name = kernel_totals(kernels)

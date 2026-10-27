@@ -11,7 +11,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   as `trainer.resume` and refuses before writing its record over the directory's.
 - `dew profile run.py --warmup 20 --steps 10` (`RunConfig.profile`) trains a run afresh in a directory of
   its own, traces a window of steps and prints where they spent their time (`ProfileReport`): step,
-  input wait, compile, device time in collectives and the rest, analytic work and MFU.
+  input wait, compile, the device's compute, communication and idle time with overlapping kernels
+  counted once, analytic work and MFU.
   `Supervised(work=)` declares a batch's training FLOPs for a model Dew holds no count for.
 - `Supervised(model, loss, inputs="x")` names the input field alone; the run reads its shape off its
   first batch as the model reads it, after the loader's device steps (`Objective.named_inputs`). An
