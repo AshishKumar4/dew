@@ -13,7 +13,7 @@ from dew._coordination import agreed
 from dew.batch import Batch
 from dew.data.dataset import DataPartition
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
-from dew.inference.rollouts import Draw, InfrastructureError, response
+from dew.inference.rollouts import INFRASTRUCTURE, Draw, response
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of, pad_token_rows
 from dew.sampling.text import Sampling
 
@@ -30,11 +30,11 @@ def scored_draw(task: str, sample: int, call: Call, text: str, record: PromptRec
                 reward: Reward) -> Session:
     """One draw's one-call session: COMPLETED where its call stopped, TRUNCATED where it ran out,
     scored by `reward(text, record)` on its decoded `text`. A reward whose external boundary failed
-    (an `InfrastructureError` or an `OSError`: a sandbox, a service) leaves an INFRA_ERROR session
+    (`INFRASTRUCTURE`: a sandbox, a service) leaves an INFRA_ERROR session
     naming it, which a scheduler retries; a non-finite score is refused."""
     try:
         score = reward(text, record)
-    except (InfrastructureError, OSError) as error:
+    except INFRASTRUCTURE as error:
         return Session(task, "", sample, 0, (call,), Status.INFRA_ERROR, None, {},
                        f"reward: {type(error).__name__}: {error}")
     status = Status.COMPLETED if call.terminated else Status.TRUNCATED
