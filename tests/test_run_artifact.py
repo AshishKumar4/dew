@@ -9,6 +9,7 @@ import numpy as np
 import optax
 import pytest
 
+import dew
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, Memory
 from dew.data.compile import compile
@@ -224,7 +225,9 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["text", "masked", "block"])
-def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypatch, kind):
+def test_a_hub_run_loads_as_its_task_at_the_requested_snapshot(tmp_path, monkeypatch, kind):
+    """`dew.pipeline`, the one loader of a run published to the Hub, pulls it at the revision asked for and
+    loads it as the task its objective declares, each token task's alike."""
     import huggingface_hub
     from flax.core import freeze
 
@@ -255,9 +258,12 @@ def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypat
         checkpoints = Checkpoints(str(tmp_path / name))
         checkpoints.save(0, state, None, artifact=objective.inference_record())
         checkpoints.wait()
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id, revision=None:
-                        str(tmp_path / ("main" if revision is None else {"pinned": "pinned"}[revision])))
-    task = task_type.from_pretrained("user/published-model", revision="pinned", ema=False)
+    def downloaded(repo_id, revision=None, allow_patterns=None):
+        return str(tmp_path / ("main" if revision is None else {"pinned": "pinned"}[revision]))
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", downloaded)
+    task = dew.pipeline("user/published-model", revision="pinned", ema=False)
+    assert isinstance(task, task_type)
     # A loaded task holds its serving layout (projections packed); its canonical tree is the snapshot.
     restored = unpacked(task.model, task.variables)
     assert jax.tree.structure(restored) == jax.tree.structure(freeze(selected))

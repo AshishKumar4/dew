@@ -177,9 +177,9 @@ Import `Checkpoints` from `dew`.
 
 This object does not write `run.json`; run configuration saving is separate. Use the [complete resume example](../guides/checkpoints.md) before adapting these lower-level calls.
 
-<!-- api: dew.checkpoints.averaged dew.checkpoints.Averaged -->
+<!-- api: dew.checkpoints.averaged dew.checkpoints.averaged_pinned dew.checkpoints.Averaged -->
 
-`dew.checkpoints.averaged(runs, step=None, ema=None, mesh=None, layout=None)` averages runs trained apart from one model, of any objective, in fp32, each read onto `mesh` as `layout` places it; a pool's processes each take the mean of the shards they hold. A LoRA run's factors are merged into its kernels first. It returns an `Averaged`: the mean `variables`, the `model` record they apply to (its adapter merged away), and each run's directory, step and whether its EMA was read. Runs of another model are refused.
+`dew.checkpoints.averaged(runs, step=None, ema=None, mesh=None, layout=None)` averages runs trained apart from one model, of any objective, in fp32, each read onto `mesh` as `layout` places it; a pool's processes each take the mean of the shards they hold. A LoRA run's factors are merged into its kernels first. It returns an `Averaged`: the mean `variables`, the `model` record they apply to (its adapter merged away), and each run's directory, step and whether its EMA was read. Runs of another model are refused. `averaged_pinned(runs, ema=None, mesh=None, layout=None)` averages runs pinned already (`SavedRun.pinned`), as `Decide.averaged` does with the runs whose records it compared.
 
 ## Language modeling and generation
 
@@ -440,9 +440,9 @@ Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `Tex
 
 `Objective.pipeline` builds the objective's task over `state.averaged` or `state.variables`. An omitted processor keeps the objective's own; `None` clears it. `build_task` returns `TextGeneration` for LM, GRPO and PPO's actor, `MaskedGeneration` for MDLM, `BlockGeneration` for block SFT and `TextToImage` for diffusion, which takes no processor. An objective whose `saved_task` builds from the settings its run records (`from_settings`, as Dew's token tasks do) needs no `build_task` of its own: the default builds that task from its `task_settings()` over its model, as a saved run of it loads.
 
-<!-- api: dew.inference.TextGeneration dew.inference.TextGeneration.__call__ dew.inference.TextGeneration.bind dew.inference.TextGeneration.decode dew.inference.TextGeneration.quantized dew.inference.TextGeneration.from_run dew.inference.TextGeneration.from_pretrained -->
+<!-- api: dew.inference.TextGeneration dew.inference.TextGeneration.__call__ dew.inference.TextGeneration.bind dew.inference.TextGeneration.decode dew.inference.TextGeneration.quantized dew.inference.TextGeneration.from_run dew.inference.TextGeneration.from_saved -->
 
-<!-- api: dew.inference.BlockGeneration dew.inference.BlockGeneration.__call__ dew.inference.BlockGeneration.from_run dew.inference.BlockGeneration.from_pretrained dew.inference.MaskedGeneration.from_run dew.inference.MaskedGeneration.from_pretrained -->
+<!-- api: dew.inference.BlockGeneration dew.inference.BlockGeneration.__call__ dew.inference.BlockGeneration.from_run dew.inference.BlockGeneration.from_saved dew.inference.MaskedGeneration.from_run dew.inference.MaskedGeneration.from_saved -->
 
 <!-- api: dew.interop.Pretrained.load dew.interop.PretrainedDecoder.text_generation dew.interop.PretrainedMaskedDecoder.text_generation dew.interop.PretrainedBlockDecoder.block_generation dew.interop.PretrainedPipeline.text_to_image dew.interop.Pretrained.adapt dew.interop.Pretrained.save dew.interop.Pretrained.push_to_hub -->
 
@@ -450,7 +450,7 @@ Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `Tex
 
 <!-- api: dew.lora.LoRA dew.lora.LoRA.apply dew.lora.LoRA.load dew.lora.Adapter.from_run dew.lora.Adapter.merge dew.lora.Adapter.save -->
 
-<!-- api: dew.inference.TextToImage dew.inference.TextToImage.from_objective dew.inference.TextToImage.from_run dew.inference.TextToImage.from_pretrained dew.objectives.lm.LMObjective.policy dew.inference.TextToImage.bind dew.inference.TextToImage.quantized dew.inference.TextToImage.prepare dew.inference.TextToImage.__call__ dew.inference.RunProcessor dew.inference.Server.from_task -->
+<!-- api: dew.inference.TextToImage dew.inference.TextToImage.from_objective dew.inference.TextToImage.from_run dew.inference.TextToImage.from_saved dew.objectives.lm.LMObjective.policy dew.inference.TextToImage.bind dew.inference.TextToImage.quantized dew.inference.TextToImage.prepare dew.inference.TextToImage.__call__ dew.inference.RunProcessor dew.inference.Server.from_task -->
 
 `RunProcessor` adapts a run's `ByteTokenizer` or `HFTokenizer` as a task processor.
 
@@ -458,9 +458,9 @@ A task captures the variables mapping at construction and on `bind`. Replacing t
 
 `max_new_tokens` takes precedence over a source default. If only `max_length` is declared, the budget is that total minus the padded prompt width. Otherwise an LM run records its `max_new_tokens` and `sampling` value; an objective uses its `Samples`. With no limit the call must provide one. A call's `n` takes precedence over the task's bound count the same way, including `n=1` over a source that asks for more; omitting it uses the bound count. Equal shapes and controls reuse the compiled executable across calls and `bind`.
 
-`LMObjective.policy(params)` uses those parameters directly. DPO, GRPO and PPO pipelines publish the trained policy and leave out the frozen reference their loss uses; PPO also removes the critic. For other generative objectives, `ema=True` requires the moving-average state and raises if it is absent; use `ema=False` for live weights. `objective.pipeline`, `dew.pipeline`, `Pretrained.from_run` and every task's `from_run` and `from_pretrained` default to `ema=None`, which uses the EMA copy merged over the live parameters when the state or run has one, and the live parameters otherwise. `ema=True` refuses a run without an EMA copy, and `ema=False` takes the live parameters.
+`LMObjective.policy(params)` uses those parameters directly. DPO, GRPO and PPO pipelines publish the trained policy and leave out the frozen reference their loss uses; PPO also removes the critic. For other generative objectives, `ema=True` requires the moving-average state and raises if it is absent; use `ema=False` for live weights. `objective.pipeline`, `dew.pipeline`, `Pretrained.from_run` and every task's `from_run` and `from_saved` default to `ema=None`, which uses the EMA copy merged over the live parameters when the state or run has one, and the live parameters otherwise. `ema=True` refuses a run without an EMA copy, and `ema=False` takes the live parameters.
 
-`TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory, and `from_pretrained` first pulls a published run directory from the Hub. The three text tasks are constructed the same way for the model kinds they generate for, and `dew.pipeline` picks the task class from the objective name in `run.json`. In `pipeline`, `dtype` selects the computation dtype and `param_dtype` the parameter storage. `None` keeps a run's stored dtypes and uses FP32 masters for a source, and `"auto"` keeps the stored dtypes of either.
+`TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory, pinning it once (`SavedRun.pinned`), and `from_saved` builds the task from a run pinned already. `dew.pipeline` is the one loader of a published run on the Hub: it pulls the run directory at the revision asked for, pins it, and picks the task class from the objective name in `run.json`. The three text tasks are constructed the same way for the model kinds they generate for. In `pipeline`, `dtype` selects the computation dtype and `param_dtype` the parameter storage. `None` keeps a run's stored dtypes and uses FP32 masters for a source, and `"auto"` keeps the stored dtypes of either.
 
 A source-default text task keeps the temperature, top-k, top-p, min-p, EOS and padding settings as its `Sampling` value. It holds the source's complete chain as `logits`, its criteria as `stopping` and the strategy its config names, and takes its return count from `num_return_sequences`.
 
@@ -508,7 +508,7 @@ Ollama requests go through the SDK's public `generate` and `chat` methods, which
 
 Provider extensions cannot override the task's model, prompt, token budget, requested choice count or an explicit `Sampling` policy. The SDK writes `extra_body` over the named parameters, so a policy field in it must equal the policy, or the request is refused before any network call.
 
-`Pretrained.from_run(run_dir, *, ema=None, step=None).save(destination)` writes a saved run in that same layout. `from_run` rebuilds the run's model from its record as the right kind of bundle (`PretrainedDecoder` for a decoder), and `save` passes it to its family's writer, which refuses by name a model with no published layout. `dew export <run> <dest>` does the same from the command line. `bundle.push_to_hub(repo_id, private=, commit_message=)` publishes what `save` writes. To publish in the form `from_pretrained` pulls back, upload the run directory itself with `huggingface_hub.HfApi().upload_folder`.
+`Pretrained.from_run(run_dir, *, ema=None, step=None).save(destination)` writes a saved run in that same layout. `from_run` rebuilds the run's model from its record as the right kind of bundle (`PretrainedDecoder` for a decoder), and `save` passes it to its family's writer, which refuses by name a model with no published layout. `dew export <run> <dest>` does the same from the command line. `bundle.push_to_hub(repo_id, private=, commit_message=)` publishes what `save` writes. To publish in the form `dew.pipeline` pulls back, upload the run directory itself with `huggingface_hub.HfApi().upload_folder`.
 
 A decoder trained through the LM recipe, exported with `PretrainedDecoder.from_model(...).save` and converted by `ollama create` answers a greedy request with Dew's own greedy continuation, token for token, over the live daemon. A loaded source's `save` and a `from_model` bundle's leave the same files, so either export converts.
 
