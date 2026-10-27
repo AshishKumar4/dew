@@ -1,6 +1,7 @@
 """Disk-backed MoE banks read at execution, not once at trace or load time."""
 
 import json
+import re
 import shutil
 from importlib import import_module
 from pathlib import Path
@@ -85,14 +86,40 @@ def test_disk_moe_logits_and_cached_decode_equal_resident(bank_layers, read_ahea
         assert source.stats().cache_bytes == 0
 
 
-def test_disk_source_reads_shards_and_bounds_cache(tmp_path):
+def experts_fused(tensors: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """`tensors` with each layer's per-expert projections as transformers 5 stores them fused, the
+    layout a packed family splits: `experts.gate_up_proj` [E, 2I, H] and `experts.down_proj` [E, H, I]."""
+    experts: dict[tuple[str, str], dict[int, np.ndarray]] = {}
+    held = {}
+    for name, tensor in tensors.items():
+        found = re.fullmatch(r"(.*\.experts)\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight", name)
+        if found is None:
+            held[name] = tensor
+        else:
+            experts.setdefault((found[1], found[3]), {})[int(found[2])] = np.asarray(tensor)
+    for stem in {stem for stem, _ in experts}:
+        def stacked(projection, stem=stem):
+            return np.stack([experts[stem, projection][index] for index in sorted(experts[stem, projection])])
+        held[f"{stem}.gate_up_proj"] = np.concatenate([stacked("gate_proj"), stacked("up_proj")], axis=1)
+        held[f"{stem}.down_proj"] = stacked("down_proj")
+    return held
+
+
+@pytest.mark.parametrize("fused_experts", [False, True], ids=["per-expert", "fused-experts"])
+def test_disk_source_reads_shards_and_bounds_cache(fused_experts, tmp_path):
+    """A row read from a sharded checkpoint is the resident translation's, under a cache bound: Mixtral's
+    per-expert tensors, and Qwen2-MoE's fused experts (`experts_fused`), which a lazy read splits into
+    views and reads only when the row is placed."""
     from dew.inference.banks import SafetensorsBanks
 
-    (tmp_path / "config.json").write_bytes((FIXTURE / "config.json").read_bytes())
-    save_sharded(read_weights(FIXTURE), tmp_path, max_shard_size=12_000)
+    fixture = FIXTURE.parent / "qwen2-moe-tiny" if fused_experts else FIXTURE
+    tensors = experts_fused(read_weights(fixture)) if fused_experts else read_weights(fixture)
+    (tmp_path / "config.json").write_bytes((fixture / "config.json").read_bytes())
+    save_sharded(tensors, tmp_path, max_shard_size=12_000)
     with SafetensorsBanks(tmp_path, cache_bytes=1, param_dtype="float32") as source:
         row = source.read(0)
-        expected = translate_weights(read_weights(FIXTURE), translate_config(source.config), "mixtral")
+        expected = translate_weights(read_weights(fixture), translate_config(source.config),
+                                     str(source.config["model_type"]))
         for actual, reference in zip(
             jax.tree.leaves(row),
             jax.tree.leaves(

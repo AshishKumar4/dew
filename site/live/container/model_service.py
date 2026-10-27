@@ -97,7 +97,8 @@ class NativeModels:
         import numpy as np
         import progress
 
-        from dew.inference import Server, TextToImage
+        import dew
+        from dew.inference import Server
         from dew.interop import PretrainedDecoder
         from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling
 
@@ -106,7 +107,7 @@ class NativeModels:
         self.cfg = CFG
         self.solvers = {solver.__name__: solver for solver in (DPMSolverMultistep, EulerAncestral, Heun)}
         self.repo, self.revision = (root / "text-to-image").read_text().strip().split("@")
-        self.pipe = progress.Reporting(TextToImage.from_pretrained(self.repo, revision=self.revision))
+        self.pipe = progress.Reporting(dew.pipeline(self.repo, revision=self.revision))
         self.text_servers = {}
         for line in (root / "text-models").read_text().split():
             name, _ = line.split("@")
