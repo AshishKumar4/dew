@@ -593,8 +593,9 @@ def test_a_named_mainloop_runs_or_is_refused(named):
         traced = jax.jit(pulled("template", CASES["causal"]))
         with generation.chosen(attention_mainloop=named), generation.routes() as found:
             if named != "portable":
-                with pytest.raises(selection.KernelRefused, match=named):
+                with pytest.raises(selection.KernelRefused) as refused:
                     traced.trace(query, key, value, sinks, dout)
+                assert refused.value.kernel == named
                 return
             traced.trace(query, key, value, sinks, dout)
     assert [route.kernel for route in found if route.choice == "attention_mainloop"] == [named] * 2
