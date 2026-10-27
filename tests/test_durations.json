@@ -2087,6 +2087,7 @@
 "tests/test_config.py::test_a_chain_the_record_cannot_describe_trains_from_python_and_refuses_to_rebuild": 0.018,
 "tests/test_config.py::test_a_decision_run_chooses_its_head_by_its_subcommand": 0.646,
 "tests/test_config.py::test_a_decision_run_trains_its_backbone_beside_its_context_layers_on_the_command_line": 0.423,
+"tests/test_config.py::test_a_diffusion_source_has_no_language_model_for_text_only_to_take": 0.146,
 "tests/test_config.py::test_a_diffusion_source_has_no_language_model_for_text_only_to_take[overrides]": 0.007,
 "tests/test_config.py::test_a_diffusion_source_has_no_language_model_for_text_only_to_take[text-only]": 0.275,
 "tests/test_config.py::test_a_learning_rate_schedule_is_a_typed_record_that_round_trips": 0.019,
