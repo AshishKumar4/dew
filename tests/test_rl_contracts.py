@@ -1,6 +1,5 @@
 """Policy loss terms and replicated-reader rollout contracts."""
 
-import dataclasses
 from pathlib import Path
 
 import jax
@@ -8,6 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from process_support import run_pool
+from reference_error import assert_as_exact, widened
 from test_indexer_training import SEQ, VOCAB, deepseek_stack
 
 from dew.data.preferences import MASK_KEY
@@ -27,10 +27,11 @@ from dew.objectives.rl.sessions import (
 WORKER = Path(__file__).with_name("rl_contracts_worker.py")
 
 
-def scored_batch(objective) -> tuple[dict, jax.Array]:
-    """Two rows of SEQ + 1 ids, each with a four-id prompt: a pair for DPO, two one-chain packed
-    rows with drawn likelihoods and advantages for GRPO. With them, the rows the loss scores."""
-    rng = np.random.default_rng(0)
+def scored_batch(objective, seed: int = 0) -> tuple[dict, jax.Array]:
+    """Two rows of SEQ + 1 ids, each with a four-id prompt, drawn by `seed`: a pair for DPO, two
+    one-chain packed rows with drawn likelihoods and advantages for GRPO. With them, the rows the loss
+    scores."""
+    rng = np.random.default_rng(seed)
     ids = rng.integers(0, VOCAB, (2, SEQ + 1)).astype(np.int32)
     mask = np.ones((2, SEQ + 1), np.float32)
     mask[:, :4] = 0
@@ -49,34 +50,57 @@ def scored_batch(objective) -> tuple[dict, jax.Array]:
     }, jnp.asarray(ids)
 
 
+HEAD_SEEDS = {GRPOObjective: 8, DPOObjective: 8}
+"""Check 1's declared seeds for the headed policy losses, sized by `seeds_for` on armada."""
+
+
 @pytest.mark.parametrize("objective", [GRPOObjective, DPOObjective])
 def test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_maxima(objective):
     """A policy or preference loss over a routed decoder with prediction depths scores its tokens
     through the token scorer. The head's chunks and tile change how the head runs, not the loss
-    or its gradient; `qk_stats` reports, for the optimizer's QK-Clip, the per-head logit maxima of
-    the policy's own forward, not of the frozen reference it also runs, and nothing without it."""
-    model = deepseek_stack(None, mixture=Mixture(experts=4, top_k=2), num_nextn_predict_layers=1)
-    plain = objective(model, SEQ, 0.1)
-    variables = plain.init(jax.random.key(0))
-    reference = jax.tree.map(lambda leaf: leaf * 0.9, variables)
-    batch, rows = scored_batch(objective)
-    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=reference)
+    or its gradient: over each drawn model, reference and batch, the headed loss and every gradient
+    leaf are as exact as the plain head's (check 1), the truth the plain loss over the model's float64
+    twin. `qk_stats` reports, for the optimizer's QK-Clip, the per-head logit maxima of the policy's
+    own forward, those its own scores give, not the frozen reference's it also runs, and nothing
+    without it."""
+    def built(dtype, **head):
+        model = deepseek_stack(None, mixture=Mixture(experts=4, top_k=2), num_nextn_predict_layers=1,
+                               dtype=dtype)
+        return objective(model, SEQ, 0.1, **head)
 
-    def trained(built, step):
-        (loss, aux), gradient = jax.value_and_grad(built.scalar_loss, has_aux=True)(variables, batch, step)
-        return loss, gradient, aux.qk_stats
+    plain, headed, wide = built(None), built(None, head_chunks=2, head_tile="whole"), built(jnp.float64)
+    initialize = jax.jit(plain.init)
 
-    loss, gradient, qk = trained(plain, step)
-    assert qk is None
-    headed = objective(model, SEQ, 0.1, head_chunks=2, head_tile="whole")
-    headed_loss, headed_gradient, qk = trained(headed, dataclasses.replace(step, qk_stats=True))
-    np.testing.assert_allclose(headed_loss, loss, rtol=1e-5)
-    jax.tree.map(lambda found, expected: np.testing.assert_allclose(found, expected, rtol=1e-4, atol=1e-6),
-                 headed_gradient, gradient)
-    own, frozen = (plain.token_scores(tree, rows, qk_stats=True).qk for tree in (variables, reference))
-    jax.tree.map(np.testing.assert_allclose, qk, own)
-    assert not all(np.allclose(found, other) for found, other in zip(
-        jax.tree.leaves(qk), jax.tree.leaves(frozen), strict=True))
+    def draw(seed):
+        variables = initialize(jax.random.key(seed))
+        reference = jax.tree.map(lambda leaf: leaf * 0.9, variables)
+        return variables, reference, scored_batch(objective, int(seed))[0]
+
+    def trained(scored, *, qk_stats=False):
+        def run(variables, reference, batch):
+            step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=reference, qk_stats=qk_stats)
+            scalar = jax.value_and_grad(scored.scalar_loss, has_aux=True)
+            (loss, aux), gradient = scalar(variables, batch, step)
+            return {"loss": loss, "gradient": gradient}, aux.qk_stats
+        return run
+
+    def leaves(scored):
+        return lambda *drawn: trained(scored)(*drawn)[0]
+
+    def truth(variables, reference, batch):
+        return leaves(wide)(*widened((variables, reference, batch)))
+
+    with jax.enable_x64(new_val=True):
+        assert_as_exact(leaves(headed), leaves(plain), draw, f"{objective.__name__} head",
+                        seeds=HEAD_SEEDS[objective], truth_fn=truth)
+        variables, reference, batch = draw(0)
+        assert trained(plain)(variables, reference, batch)[1] is None
+        _, qk = trained(headed, qk_stats=True)(variables, reference, batch)
+        rows = scored_batch(objective)[1]
+        own, frozen = (plain.token_scores(tree, rows, qk_stats=True).qk for tree in (variables, reference))
+        jax.tree.map(np.testing.assert_array_equal, qk, own)
+        assert not all(np.array_equal(found, other) for found, other in zip(
+            jax.tree.leaves(qk), jax.tree.leaves(frozen), strict=True))
 
 
 @pytest.mark.mesh
