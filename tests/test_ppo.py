@@ -458,14 +458,14 @@ def test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged(o
     def wider(leaf):
         return leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
 
-    with jax.enable_x64(new_val=True):
-        assert_as_exact(dew, lambda batch: equations(state.variables, state.averaged, batch), draw,
-                        f"PPO actor controls {options}", seeds=ACTOR_CONTROL_SEEDS,
-                        truth_fn=lambda batch: equations(
-                            *jax.tree.map(wider, (state.variables, state.averaged, batch))))
-        if "sequence_mask" in options or "geometric_mask" in options:
-            _, aux = objective.scalar_loss(state.variables, draw(0)[0], step)
-            assert float(aux.metrics["pg"]) == 0
+    # The gate runs the truth in float64 on the draw widened; the state it reads beside the draw too.
+    assert_as_exact(dew, lambda batch: equations(state.variables, state.averaged, batch), draw,
+                    f"PPO actor controls {options}", seeds=ACTOR_CONTROL_SEEDS,
+                    truth_fn=lambda batch: equations(
+                        *jax.tree.map(wider, (state.variables, state.averaged, batch))))
+    if "sequence_mask" in options or "geometric_mask" in options:
+        _, aux = objective.scalar_loss(state.variables, draw(0)[0], step)
+        assert float(aux.metrics["pg"]) == 0
 
 
 @pytest.mark.parametrize("coefficient", [0., .5])

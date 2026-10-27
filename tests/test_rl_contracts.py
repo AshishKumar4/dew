@@ -94,17 +94,17 @@ def test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_
             return leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
         return leaves(wide)(*jax.tree.map(wider, drawn))
 
-    with jax.enable_x64(new_val=True):
-        assert_as_exact(leaves(headed), leaves(plain), draw, f"{objective.__name__} head",
-                        seeds=HEAD_SEEDS[objective], truth_fn=truth)
-        variables, reference, batch = draw(0)
-        assert trained(plain)(variables, reference, batch)[1] is None
-        _, qk = trained(headed, qk_stats=True)(variables, reference, batch)
-        rows = scored_batch(objective)[1]
-        own, frozen = (plain.token_scores(tree, rows, qk_stats=True).qk for tree in (variables, reference))
-        jax.tree.map(np.testing.assert_array_equal, qk, own)
-        assert not all(np.array_equal(found, other) for found, other in zip(
-            jax.tree.leaves(qk), jax.tree.leaves(frozen), strict=True))
+    # The gate runs the truth in float64 on the draw widened.
+    assert_as_exact(leaves(headed), leaves(plain), draw, f"{objective.__name__} head",
+                    seeds=HEAD_SEEDS[objective], truth_fn=truth)
+    variables, reference, batch = draw(0)
+    assert trained(plain)(variables, reference, batch)[1] is None
+    _, qk = trained(headed, qk_stats=True)(variables, reference, batch)
+    rows = scored_batch(objective)[1]
+    own, frozen = (plain.token_scores(tree, rows, qk_stats=True).qk for tree in (variables, reference))
+    jax.tree.map(np.testing.assert_array_equal, qk, own)
+    assert not all(np.array_equal(found, other) for found, other in zip(
+        jax.tree.leaves(qk), jax.tree.leaves(frozen), strict=True))
 
 
 @pytest.mark.mesh
