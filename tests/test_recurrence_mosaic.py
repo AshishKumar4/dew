@@ -425,10 +425,8 @@ def resource_failures(found: list, plans: dict, family: mosaic.Family) -> list[s
     kernel past its target's shared or tensor memory, or past its plan's shared memory; a kernel that
     spilled whose launch's stated registers its family's thread holds (`Launch.registers` within
     `Family.registers`, the template's legality), so a legal config never spills; and a kernel with no
-    register report (ptxas's) but where an earlier case compiled the same kernel: Mosaic compiles a module
-    once a process, so a case's kernel built before (the training case's forward launches, its forward
-    case's) reports its resources and not ptxas's, its registers the earlier report's (same name and shared
-    bytes)."""
+    register report (ptxas's), which a kernel whose module an earlier case compiled takes from that compile
+    (`kernel_compile.inherited`)."""
     def planned(record: dict, kernel: dict, resource: str) -> int | None:
         """The case's plan's `resource` ('shared', 'registers') for the kernel's launch, None where no launch
         of the plan names it."""
@@ -444,19 +442,9 @@ def resource_failures(found: list, plans: dict, family: mosaic.Family) -> list[s
 
     kernels = [(record, kernel) for record in found for kernel in record.get('kernels', ())]
     budget = family.registers(1)
-    # Each kernel's ptxas report: its own, or an earlier case's of the same kernel.
-    reported: dict = {}
-    unreported = []
-    for record, kernel in kernels:
-        key = (kernel['kernel'], kernel['shared'])
-        if {'registers', 'spills'} & set(kernel['unread']):
-            if key in reported:
-                kernel.update(registers=reported[key]['registers'], spilled=reported[key]['spilled'])
-            else:
-                unreported.append(f"{record['name']} {kernel['kernel']}: no register report, and no earlier "
-                                  f"case compiled it")
-        else:
-            reported.setdefault(key, kernel)
+    unreported = [f"{record['name']} {kernel['kernel']}: no register report, and no earlier case compiled "
+                  f"its module" for record, kernel in kernels
+                  if {'registers', 'spills'} & set(kernel['unread'])]
     return ([f"{record['name']}: {record.get('error', 'no Mosaic GPU kernel compiled')}" for record in found
              if 'error' in record or not record.get('kernels')]
             + [f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes (limit "

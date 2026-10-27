@@ -13,7 +13,6 @@ logits moves at least one bit of them.
 
 import functools
 import math
-import re
 from pathlib import Path
 
 import jax
@@ -39,6 +38,7 @@ from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 from dew.nn.mixers import AttentionMixer
 from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling
+from dew.telemetry.instrumentation import hlo_instructions
 
 VOCAB = 37
 SEQ = 12
@@ -352,12 +352,13 @@ def test_a_cached_prompt_reads_its_cache_through_flash_where_its_wheel_runs(rng,
     params = model.init(rng, ids)
     prompt = ids[:, :6]
     made, step = decode_steps(model)
-    compiled = step.lower(params, made(params, prompt.shape[0]), prompt).compile().as_text()
+    compiled = hlo_instructions(step.lower(params, made(params, prompt.shape[0]), prompt).compile().as_text())
     probe = jnp.zeros((1, 8, 1, 64), jnp.bfloat16)
     failed = ATTENTION.kernel('flash').failed(attention_case(probe, probe))
     flash = not {requirement.code for requirement in failed} & {'not_installed', 'binary_arch'}
     # FlashAttention-2's and -3's packed calls (dew_flash_attn's custom-call targets).
-    assert bool(re.search(r'dew_flash3?_mha_varlen_fwd', compiled)) == flash
+    packed = {'dew_flash_mha_varlen_fwd', 'dew_flash3_mha_varlen_fwd'}
+    assert bool(packed & {instruction.target for instruction in compiled.values()}) == flash
     assert_as_exact(lambda params, prompt: step(params, made(params, prompt.shape[0]), prompt)[0],
                     applied(model.clone(attention_impl='xla')), drawn(model, length=6), "cached prefill",
                     seeds=SEEDS['cached prefill'], truth_fn=applied(float64(model)))

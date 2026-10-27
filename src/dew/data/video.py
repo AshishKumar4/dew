@@ -159,16 +159,19 @@ class DecodeVideo(grain.MapTransform):
 
 @dataclasses.dataclass(frozen=True)
 class Row(grain.MapTransform):
-    """A listed media file's path (`video_path`, else `path`) under `mp4`, where the decoders read it,
-    and its caption, `caption` where it states none."""
+    """A listed media file's record with its path (`video_path`, else `path`) moved to `mp4`, where the
+    decoders read it, and its caption, `caption` where it states none: every other field the record
+    holds (a label, an id) reaches the batch as it is."""
 
     caption: str = ""
 
     def map(self, element: Batch) -> Batch:
         from dew._records import text
 
-        path = text(element.get("video_path", element.get("path")), "video_path")
-        return {"mp4": path, "caption": element.get("caption", self.caption)}
+        named = "video_path" if "video_path" in element else "path"
+        path = text(element.get(named), named)
+        kept = {key: value for key, value in element.items() if key != named}
+        return {**kept, "mp4": path, "caption": element.get("caption", self.caption)}
 
 
 def media(listing: Files, extensions: Sequence[str] = (".mp4", ".avi", ".mov", ".webm")) -> Files:
