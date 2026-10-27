@@ -152,7 +152,9 @@ def test_a_bounded_group_clamps_its_parameters_and_no_others():
             return stepped(params, updates, first, state)
         kernel = np.asarray(step(wide, widened)["kernel"])
         roundings = chain_roundings(jax.make_jaxpr(step)(wide, widened))
-    adam = np.asarray([0.05, 2.95]) - 0.5 * np.asarray([1.0, -1.0]) / (1.0 + 1e-8)
+    # From the float32 parameters and gradients the step read, widened.
+    start, gradient = np.asarray(wide["kernel"]), np.asarray(widened["kernel"])
+    adam = start - 0.5 * gradient / (np.abs(gradient) + 1e-8)
     assert_computes_the_oracle(kernel, adam, "the unbounded kernel", roundings=roundings)
 
 
