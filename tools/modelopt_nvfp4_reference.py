@@ -136,7 +136,7 @@ def author_weight(stored: dict[str, torch.Tensor], stem: str) -> torch.Tensor:
 
 
 def tiny(*, mixed: bool = False) -> None:
-    from torch_precision import float64
+    from torch_precision import float64, float64_twin
 
     torch.manual_seed(2049)
     config = Qwen3Config(vocab_size=96, hidden_size=64, intermediate_size=128, num_hidden_layers=1,
@@ -177,7 +177,7 @@ def tiny(*, mixed: bool = False) -> None:
     reference.tie_weights()
     direct_float = torch.Tensor.float
     original_to = torch.Tensor.to
-    hooks = []
+    hooks, hooked = [], []
     for stem in quantized:
         module = reference.get_submodule(stem)
         if stem + '.input_scale' not in stored:
@@ -203,10 +203,15 @@ def tiny(*, mixed: bool = False) -> None:
             return (output,)
 
         hooks.append(module.register_forward_pre_hook(input_hook))
+        hooked.append((stem, input_hook))
     with torch.no_grad():
         arrays["logits"] = reference(ids, use_cache=False).logits.cpu().numpy()
+    # The float64 truth is the reference's twin (`float64_twin`), built inside `float64` so its rotary
+    # tables are float64's, with the same input quantizers on the same layers.
+    wide = float64_twin(reference)
+    hooks += [wide.get_submodule(stem).register_forward_pre_hook(hook) for stem, hook in hooked]
     with float64(), torch.no_grad():
-        arrays["logits_f64"] = reference.double()(ids, use_cache=False).logits.cpu().numpy()
+        arrays["logits_f64"] = wide(ids, use_cache=False).logits.cpu().numpy()
     for hook in hooks:
         hook.remove()
     generator = torch.Generator(device="cuda").manual_seed(2050)
