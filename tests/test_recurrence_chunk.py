@@ -3,7 +3,6 @@ every hook combination it takes, a sequence over several chunks and a ragged las
 too, held to the same recurrence run a token at a time (the decode step's reference,
 `recurrence.step_reference`) under the accuracy gate (tests/reference_error.py), both from float64."""
 
-import dataclasses
 import functools
 import itertools
 
@@ -11,10 +10,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from reference_error import assert_as_exact
 
-from dew.nn.kernels import recurrence, recurrence_algebra as algebra, recurrence_chunk
+from dew.nn.kda import KimiDeltaAttention
+from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.linear import GatedDeltaNet
+from dew.nn.mixers.mamba2 import Mamba2
 from dew.nn.precision import float32_einsum
 
 ROWS, LENGTH, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH = 2, 70, 1, 2, 16, 8
@@ -58,6 +61,14 @@ COMPOSED_SEEDS = {(HOOKS[4], False): 16, (HOOKS[4], True): 16, (HOOKS[8], False)
 scalar without; one sequence and packed), sized by `seeds_for` on armada (2026-10-21)."""
 
 PACKED = (False, True)
+
+
+def chunk_on(kernel: str, hooks, *args, **kwargs):
+    """`chunk` on `kernel`, which `generation.chosen` names for the delta rule's selector, and for the rated
+    scan's the portable math where `kernel` is it ('xla')."""
+    named = {'gated_delta_rule': kernel, **({'ssd': kernel} if kernel == 'xla' else {})}
+    with generation.chosen(**named):
+        return chunk(hooks, *args, **kwargs)
 """A row of one sequence, and of packed documents."""
 
 SEEDS = dict(zip(((hooks, packed) for hooks in HOOKS + FORMED for packed in PACKED), (
@@ -157,7 +168,7 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
     """`chunk`'s portable math in `CHUNK`-token chunks against the same recurrence a token at a time,
     output and final memory, over draws of fresh operands under orders of the keys' and values'
     dimensions, both from float64."""
-    dew = jax.jit(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=False))
+    dew = jax.jit(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(draw, hooks, packed), f'{hooks} packed={packed}',
                     seeds=SEEDS[hooks, packed])
@@ -186,7 +197,7 @@ def test_the_output_rounds_once_after_the_epilogue(hooks, ported):
                      skip=jnp.full((1,), -0.10009765625, jnp.float32),
                      z=jnp.ones((1, 1, 1, 8)) if hooks.output else None,
                      weight=jnp.ones((8,)) if hooks.output else None)
-    found, _ = chunk(hooks, operands, ported=ported, dtype=jnp.float32)
+    found, _ = chunk_on('fla' if ported else 'xla', hooks, operands, dtype=jnp.float32)
     want, _, _ = recurrence.step_reference(hooks, recurrence.Step(
         jnp.zeros((1, 1, 8, 8), jnp.float32), query=unit[:, 0], key=unit[:, 0], value=operands.value[:, 0],
         log_decay=None if operands.log_decay is None else operands.log_decay[:, 0], beta=beta[:, 0],
@@ -203,10 +214,10 @@ def test_the_output_takes_the_dtype_asked_for():
     plain = recurrence.Hooks(decay='scalar', scale=0.25)
     wide = Chunk(*(x.astype(jnp.float32) for x in (ones, ones, ones)), log_decay=jnp.zeros((1, 1, 1)),
                  beta=jnp.ones((1, 1, 1)))
-    assert chunk(plain, wide, ported=False, dtype=jnp.bfloat16)[0].dtype == jnp.bfloat16
+    assert chunk_on('xla', plain, wide, dtype=jnp.bfloat16)[0].dtype == jnp.bfloat16
     normed = recurrence.Hooks(decay='scalar', l2norm=True)
-    assert chunk(normed, Chunk(ones, ones, ones, log_decay=jnp.zeros((1, 1, 1)), beta=jnp.ones((1, 1, 1))),
-                 ported=False)[0].dtype == jnp.bfloat16
+    assert chunk_on('xla', normed, Chunk(ones, ones, ones, log_decay=jnp.zeros((1, 1, 1)),
+                                         beta=jnp.ones((1, 1, 1))))[0].dtype == jnp.bfloat16
 
 
 def test_a_rated_decay_is_its_log_decay_bit_for_bit():
@@ -231,9 +242,9 @@ def test_a_rated_decay_is_its_log_decay_bit_for_bit():
     sequence = {name: jnp.asarray(rng.standard_normal((rows, LENGTH, heads, width)), jnp.float32)
                 for name in ('query', 'key', 'value')}
     steps = jnp.asarray(rng.uniform(0.0, 0.5, (rows, LENGTH, heads)), jnp.float32)
-    found = chunk(rated, Chunk(**sequence, beta=steps, rate=rate, skip=skip), chunk_size=CHUNK, ported=False)
-    want = chunk(whole, Chunk(**sequence, beta=steps, log_decay=rate[None, None, :] * steps, skip=skip),
-                 chunk_size=CHUNK, ported=False)
+    found = chunk_on('xla', rated, Chunk(**sequence, beta=steps, rate=rate, skip=skip), chunk_size=CHUNK)
+    want = chunk_on('xla', whole, Chunk(**sequence, beta=steps, log_decay=rate[None, None, :] * steps,
+                                        skip=skip), chunk_size=CHUNK)
     for mine, theirs in zip(found, want, strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
@@ -361,22 +372,50 @@ def test_composed_chunks_leave_the_memory_the_recurrence_leaves(hooks, packed):
                     f'{hooks} composed', seeds=COMPOSED_SEEDS[hooks, packed])
 
 
-def test_the_delta_rules_selector_keeps_the_port_only_on_its_declared_cells():
-    """The recurrence template is the delta rule's kernel on every cell but the declared ones
-    (`PORT_CELLS`, each a family and a product a receipt shows the port faster on), where its 'declared'
-    requirement turns it down; off a GPU its 'device' requirement does. Both are measured requirements, so
-    a call that names the template still takes it."""
-    case = recurrence_chunk.PortCase(reverse=True, varying=False, dtype=np.dtype(jnp.bfloat16), key_width=128)
-    codes = {(family, product): [r.code for r in recurrence_chunk.MOSAIC.failed(
-        dataclasses.replace(case, family=family, product=product))]
-        for family in ('wgmma', 'mma.sync', None) for product in ('forward', 'training')}
-    for cell, reason in recurrence_chunk.PORT_CELLS.items():
-        assert 'declared' in codes[cell] and 'SE-' in reason, (cell, codes[cell])
-    assert 'declared' not in codes['wgmma', 'training']
-    assert all('device' in codes[None, product] for product in ('forward', 'training'))
-    forced = recurrence_chunk.MOSAIC.failed(dataclasses.replace(case, family='wgmma', product='forward'),
-                                            forced=True)
-    assert 'declared' not in [r.code for r in forced]
+UNSEEN = generation.GpuTarget("sm87", "NVIDIA Jetson AGX Orin", 163 * 1024, multiprocessors=16)
+"""A GPU no row names: an mma.sync GPU's facts alone."""
+
+ROUTED = {'sm80': ('fla', 'fla'), 'sm86': ('fla', 'fla'), 'sm90': ('fla', 'mosaic_gpu'),
+          'sm100': ('fla', 'fla'), 'unseen': ('fla', 'fla'), 'cpu': ('xla', 'xla')}
+"""Each emulated target's gated delta net kernels, its forward's and its training's: the template on the
+H100's training, the cell it is not declared slower on (`PORT_CELLS`); the port on every other GPU, by what
+it takes; the portable math on a CPU stating no GPU."""
+
+
+@pytest.mark.parametrize('target', ROUTED)
+def test_each_products_route_follows_what_its_kernels_take(target):
+    """A layer's recurrence kernels on an emulated GPU, a route each product (`GATED_DELTA`'s forward and
+    training, `SCAN`'s), no table of GPUs read: a bf16 gated delta net's as `ROUTED` names them (the template
+    where it takes the call and no port cell is declared, else the port on any GPU Dew's Triton kernels run
+    on: an A10's, a B200's and a GPU no row names among them, which took the portable math at 140 to 155 ms a
+    training step against the port's 3.1, template review 2026-10-26 P1-1); Kimi delta attention's the port
+    where the gated delta net's is a kernel (the template refuses its intra launch's registers), and
+    Mamba-2's scan the port's there."""
+    def routes(module: nn.Module, x: jax.ShapeDtypeStruct) -> list[str]:
+        params = jax.eval_shape(module.init, jax.random.key(0), x)
+        with generation.routes() as found:
+            jax.eval_shape(module.apply, params, x)
+        return [route.kernel for route in found if route.choice in ('gated_delta_rule', 'ssd')]
+
+    def traced():
+        bf16 = jnp.bfloat16
+        tokens = jax.ShapeDtypeStruct((1, 128, 256), bf16)
+        delta = routes(GatedDeltaNet(256, 1, 2, 128, 128, dtype=bf16), tokens)
+        kimi = routes(KimiDeltaAttention(256, 2, 128, dtype=bf16), tokens)
+        scan = routes(Mamba2(emb_features=64, num_heads=4, head_dim=16, state_size=16, n_groups=2,
+                             chunk_size=32, dtype=bf16), jax.ShapeDtypeStruct((1, 64, 64), bf16))
+        return delta, kimi, scan
+
+    if target == 'cpu':
+        delta, kimi, scan = traced()
+    else:
+        with generation.assumed(UNSEEN if target == 'unseen' else target):
+            delta, kimi, scan = traced()
+    forward, training = ROUTED[target]
+    kernel = forward != 'xla'
+    assert delta == [forward, training]
+    assert kimi == (['fla', 'fla'] if kernel else ['xla', 'xla'])
+    assert scan == ['pallas' if kernel else 'xla']
 
 
 def test_a_call_runs_its_products_kernels_apart():

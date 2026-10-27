@@ -41,7 +41,7 @@ from dew.nn.dense import Dense
 
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
-from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, on_the_port, recurrent_delta_rule
+from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel_routed, recurrent_delta_rule
 from .linear import DepthwiseConv1d, RMSNormGated, held_scan
 from .mixer_base import DELTA_RULE_RESIDUALS, MixerBase, MixerContext
 from .precision import at_least_fp32, float32_dot_general
@@ -183,7 +183,6 @@ class KimiDeltaAttention(nn.Module):
             # A held history can make the convolved operands vary where the projections did not, so the
             # route is asked again of them.
             return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size,
-                                          ported=ported and on_the_port(query, key, value),
                                           starts=starts, max_segments=tokens.max_segments,
                                           floor=self.lower_bound)
 
@@ -192,7 +191,8 @@ class KimiDeltaAttention(nn.Module):
         # normalises the queries and keys (`l2norm`) and rounds once, to the
         # dtype the rule takes: the projections' where the port runs it, as
         # fla's layer hands them over, the wide one for the math.
-        ported = S > 1 and on_the_port(*(split(part) for part in jnp.split(projected, 3, axis=-1)))
+        rows, keys, values = (split(part) for part in jnp.split(projected, 3, axis=-1))
+        ported = S > 1 and kernel_routed(rows, keys, values, g, beta, floor=self.lower_bound)
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         out = held_scan(self, projected, taps, None, scan,
                         (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,

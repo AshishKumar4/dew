@@ -613,6 +613,27 @@ def translate_wrapper_weights(
     return read_wrapper(hf_tensors, record, param_dtype=param_dtype, lazy=lazy)[0]
 
 
+def source_depths(record: DecoderFields, model_type: str | DecoderFamily | None = None
+                  ) -> Callable[[str], int | None]:
+    """The prediction depth (or DSpark stage) each decoder source tensor belongs to, by its name, as
+    its family, `model_type`'s or else its record's as `read_decoder` reads it, places it
+    (`DecoderFamily.prediction_depth`), None for the trunk's; the family resolved once."""
+    family = _family_for_config(record) if model_type is None else family_entry(model_type)
+    return lambda name: family.prediction_depth(name, record)
+
+
+def wrapper_source_depths(record: WrapperFields) -> Callable[[str], int | None]:
+    """`source_depths` of a wrapper's tensors: its language model's, each routed as `wrapper_route`
+    routes it, of the family `read_wrapper` reads it by; None for a tower's or a projector's."""
+    language = source_depths(record["text"])
+
+    def depth(name: str) -> int | None:
+        component, local = wrapper_route(name, record)
+        return language(local) if component == "language_model" else None
+
+    return depth
+
+
 def read_wrapper(
     hf_tensors: Mapping[str, np.ndarray],
     record: WrapperFields,

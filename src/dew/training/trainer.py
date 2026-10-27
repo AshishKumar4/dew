@@ -127,7 +127,6 @@ from dew.training._fit import (
     declarations,
     stage_reached,
     unrecorded_parts,
-    validation_suites,
     waited_read,
 )
 from dew.training._lowering import Lowered
@@ -227,10 +226,6 @@ _DEFAULT_LAYOUT = Layout()
 
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
-
-    _restaged: bool = False
-    """Whether a schedule's stage has begun in this fit, whose batches may be shaped as no earlier
-    stage's were (`_scheduled`): the step lays its accumulation window out for them."""
 
     def __init__(
         self,
@@ -1022,7 +1017,7 @@ class Trainer(Generic[Loss, Effects]):
                         lambda variables: narrowed(variables, candidate.copies),
                         out_shardings=candidate.shardings.compute)(current.variables))
                 if (window > 1 and self.step is None and (current.accumulation is None or (
-                        (self._ramp or self._restaged)
+                        (self._ramp or self._stage_starts)
                         and not current.accumulation.replays(candidate.prepared.accumulation)))):
                     # The window, and with it the split, is the state's from here on.
                     current = dataclasses.replace(self._initialize_accumulation(
@@ -1238,7 +1233,7 @@ class Trainer(Generic[Loss, Effects]):
             with self._traced_on(cpu):
                 batch = transfer(batch, batch_shardings(cpu, batch))
                 if self.accumulation > 1 and (current.accumulation is None or (
-                        (self._ramp or self._restaged)
+                        (self._ramp or self._stage_starts)
                         and not current.accumulation.replays(prepared.accumulation))):
                     current = self._initialize_accumulation(current, batch, shapes, window=self.accumulation)
                 # The device steps run in the accelerator's forward (`HostExecution`).
@@ -1261,9 +1256,9 @@ class Trainer(Generic[Loss, Effects]):
         epochs: int | None = None,
         tokens: int | None = None,
         examples: int | None = None,
-        log_every: int = 100,
-        eval_every: int | None = None,
-        checkpoint_every: int | datetime.timedelta | None = None,
+        log_every: int | str = 100,
+        eval_every: int | str | None = None,
+        checkpoint_every: int | str | datetime.timedelta | None = None,
         checkpoint_final: bool = True,
         metrics: Sequence[Metric] = (),
         preview: bool = False,
@@ -1305,7 +1300,7 @@ class Trainer(Generic[Loss, Effects]):
         so it is the best model, not a point to resume training from, which
         the run's checkpoints are.
 
-        Every `checkpoint_every` steps, the state and the data position are written;
+        Every `checkpoint_every` steps (or "5%", `FitPlan.cadences`), the state and data position are written;
         `checkpoint_final=True` also writes the final state, independently of that cadence. A
         duration is checked at each `log_every` step, so they are written at the first log step
         after that much time, and every `checkpoints.local_every` steps to the local directory.
@@ -1334,9 +1329,11 @@ class Trainer(Generic[Loss, Effects]):
         steps = run_steps(loader, steps, epochs, tokens, self.accumulation, examples)
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
-        suites = validation_suites(loader, validation, metrics, eval_every)
+        written = log_every, eval_every, checkpoint_every
+        logged, evaluated, saved, local, suites = FitPlan.cadences(
+            loader, validation, metrics, steps, tokens, self.accumulation, written, self.checkpoints)
         declared = declarations(suites, metrics, summaries, loss=self.objective.defines_validation_loss)
-        selection, plateau, pause = self._fit_policies(best, stop, declared, checkpoint_every, steps, tokens)
+        selection, plateau, pause = self._fit_policies(best, stop, declared, saved, steps, tokens)
         self._preflight(loader, plateau, suites, preview=preview, stated=dataset,
                         loss=(self.checkpoints is not None or restore_best) and not selection)
         preview = preview and self.tracker is not None
@@ -1350,9 +1347,8 @@ class Trainer(Generic[Loss, Effects]):
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
         try:
             plan = FitPlan(
-                dataset=loader, steps=steps, log_every=log_every, eval_every=eval_every, tokens=tokens,
-                checkpoint_every=checkpoint_every, checkpoint_final=checkpoint_final,
-                local_every=None if checkpoints is None else checkpoints.local_every,
+                dataset=loader, steps=steps, log_every=logged, eval_every=evaluated, tokens=tokens,
+                checkpoint_every=saved, checkpoint_final=checkpoint_final, local_every=local,
                 metrics=metrics, preview=preview, best=selection, stop=plateau, suites=suites, pause=pause,
                 held_best=restore_best and checkpoints is None, observe=observe, summaries=tuple(summaries),
                 declared=declared,
@@ -1402,6 +1398,7 @@ class Trainer(Generic[Loss, Effects]):
         compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]] = {}
         seen = 0
         run.notice = PreemptionNotice()
+        run.committed = plan.real(interval)
         while not plan.ended(run.current, plan.real(interval)):
             # A schedule's stage ends where the commits reach its tokens.
             self._scheduled(plan, run, interval)
@@ -1578,8 +1575,8 @@ class Trainer(Generic[Loss, Effects]):
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
             self._ramp = run.source.stages if isinstance(run.source, RampedStream) else ()
-            self._restaged = False
-            # The steps a stage after the first begins at, each where an update does (`Ramp.stages`).
+            # The steps a stage after the first begins at, each where an update does (`Ramp.stages`): a
+            # ramp's here, a schedule's as each begins (`_scheduled`); the step lays its window out there.
             self._stage_starts = frozenset(accumulate((after.records - stage.records) // stage.batch
                                                       for stage, after in pairwise(self._ramp)))
             if self._ramp:
@@ -1607,7 +1604,7 @@ class Trainer(Generic[Loss, Effects]):
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
-            seed=self.seed, tokens=plan.tokens)
+            seed=self.seed, tokens=plan.tokens, cadences=plan.recorded(self._config, self.accumulation))
         self._report(started, current)
         if plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
@@ -1685,7 +1682,6 @@ class Trainer(Generic[Loss, Effects]):
         # stage begins after is dropped as a ramp's stage drops it (`_staged`), and laid out for the
         # stage's batches, which may be shaped as no earlier stage's were (`_runner`).
         self._stage_starts = self._stage_starts | {run.current}
-        self._restaged = True
         run.train = self._prefetched(plan, run, source, state)
         run.source = None  # Lifetime transferred to the prefetch worker.
 
@@ -1716,27 +1712,30 @@ class Trainer(Generic[Loss, Effects]):
         notice stops the run at this step, whose checkpoint is then written."""
         current, checkpoints = run.current, self.checkpoints
         real = plan.real(interval)
+        before, run.committed = run.committed, real
         record, aux = taken_record(aux)
         if record is not None:
             self.records.append(record)
         aux = {name: value for name, value in aux.items() if name not in (TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         run.stepped = (loss, aux, accepted)
-        if current % plan.log_every == 0:
+        logged = plan.falls(plan.log_every, current, real, before)
+        if logged:
             self._take(plan, run, interval, state)
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
             # The clock is read at the log interval, where the step is already waited on, so a pool's
             # processes agree on it there rather than gathering behind every step.
             run.checkpoint_due = False
-            if current % plan.log_every == 0:
+            if logged:
                 elapsed = time.perf_counter() - run.last_checkpoint
                 due = elapsed >= plan.checkpoint_every.total_seconds()
                 run.checkpoint_due = agree_process_phase(None, phase="checkpoint clock", available=due) > 0
         else:
-            run.checkpoint_due = bool(plan.checkpoint_every and current % plan.checkpoint_every == 0)
-        due = plan.due(current)
-        evaluation_due = bool(due) or bool(plan.eval_every and current % plan.eval_every == 0)
+            run.checkpoint_due = plan.falls(plan.checkpoint_every, current, real, before)
+        run.local_due = plan.falls(plan.local_every, current, real, before)
+        due = plan.due(current, real, before)
+        evaluation_due = bool(due) or plan.falls(plan.eval_every, current, real, before)
         # A run's last step, its budget's or the step after which its stream runs out, is scored and saved
         # once, by `_wind_down`, with every suite: never here before a rarer suite has. Only a step that
         # evaluates or pauses could save first (a ranked save scores every suite), so only there is the
@@ -1844,8 +1843,7 @@ class Trainer(Generic[Loss, Effects]):
                 and not (final and plan.checkpoint_final) and bool(winners)
                 and all(rank.weights_only for rank in winners) and not self._ends_here(run, interval))
             run.last_checkpoint = time.perf_counter()
-        if (plan.local_every and checkpoints is not None and current % plan.local_every == 0
-                and run.last_local_saved != current):
+        if run.local_due and checkpoints is not None and run.last_local_saved != current:
             self._read_taken(run)
             run.other += self._saved_local_checkpoint(
                 checkpoints, current, state, position, interval, control=run.stop_control)

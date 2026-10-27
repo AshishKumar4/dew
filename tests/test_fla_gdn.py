@@ -5,6 +5,7 @@ to the XLA expression of the same fla kernel with the same dtypes. Triton's own 
 speed against fla's kernels are the GPU session's (c53 onwards).
 """
 
+import contextlib
 import functools
 
 import fla_gdn_support as support
@@ -790,8 +791,11 @@ def test_the_rule_computes_the_route_its_geometry_selects(label):
     """The rule a layer calls (`recurrence_chunk.chunk_gated_delta_rule`), its output, final memory and every
     operand's gradient (its tangents under `jax.jvp`), at each geometry the port takes and each it
     refuses (`recurrence_chunk.PORT_SUPPORTS`): bit for bit the port's (`fla_rule`) where it takes the
-    rule and the portable math's (`chunk_delta_rule`) where it does not, under an A100's row, which names
-    the port; the port chosen for a geometry it refuses raises (`selection.KernelRefused`). Each route is
+    rule, and where it does not, the next kernel the delta rule's selector gives on an A100
+    (`recurrence_chunk.GATED_DELTA`): the recurrence template where its launches take the call (its
+    numbers held by tests/test_recurrence_mosaic.py; here its results finite, interpreted), else bit for
+    bit the portable math's (`chunk_delta_rule`); the port chosen for a geometry it refuses raises
+    (`selection.KernelRefused`). Each route is
     held to its reference elsewhere, the port to fla's own runs
     (`test_where_the_rule_takes_the_port_it_is_as_exact_as_fla` here) and the portable math to
     `torch_chunk_gated_delta_rule`'s (tests/test_linear_attention.py)."""
@@ -802,9 +806,25 @@ def test_the_rule_computes_the_route_its_geometry_selects(label):
     if refused:
         with row_names_port(), pytest.raises(KernelRefused):
             run_rule(recurrence_chunk.chunk_gated_delta_rule, mode, operands, cotangents)
-    with generation.assumed("sm80") if refused else row_names_port(port=names_port):
-        found = run_rule(recurrence_chunk.chunk_gated_delta_rule, mode, operands, cotangents)
-        want = run_rule(fla_rule if ported else portable, mode, operands, cotangents)
+    if refused:
+        from dew.nn.attention import forward_mode_attention
+
+        forward = forward_mode_attention() if mode == "forward" else contextlib.nullcontext()
+        with generation.assumed("sm80"), forward:
+            routed = recurrence_chunk.port_kernel(*operands[:5], operands[5], report=False,
+                                                  product="training" if mode == "reverse" else "forward")
+        assert routed in ("mosaic_gpu", "xla"), routed
+        # Off a GPU a route runs interpreted where the call names it, as an A100 runs it natively.
+        with generation.chosen(gated_delta_rule=routed):
+            found = run_rule(recurrence_chunk.chunk_gated_delta_rule, mode, operands, cotangents)
+        if routed == "mosaic_gpu":
+            assert all(np.all(np.isfinite(np.asarray(x, np.float32))) for x in jax.tree.leaves(found))
+            return
+        want = run_rule(portable, mode, operands, cotangents)
+    else:
+        with row_names_port(port=names_port):
+            found = run_rule(recurrence_chunk.chunk_gated_delta_rule, mode, operands, cotangents)
+            want = run_rule(fla_rule if ported else portable, mode, operands, cotangents)
     jax.tree.map(np.testing.assert_array_equal, found, want)
 
 

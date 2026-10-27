@@ -65,7 +65,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
-from dew.nn.kernels.generation import measured_kernel
+from dew.nn.kernels.generation import triton_runs
 from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY, Chunk, chunk
 from dew.nn.linear import DepthwiseConv1d, causal_conv1d, held_conv1d, held_scan, real_tail
@@ -478,10 +478,11 @@ class Mamba2Mixer(MixerBase):
 
     @property
     def keeps_triton_gemm(self) -> bool:
-        """Where the scan runs on XLA (the GPU's target row names no port), its
-        small batched dots gain from the fusions, 7.7% on an A100; on the
-        port a Mamba-2 130M step ran 3% faster without them."""
-        return measured_kernel('ssd', 'xla') != 'pallas'
+        """Where the scan runs on XLA (no GPU Dew's Triton kernels run on, the
+        port's, `recurrence_chunk.SCAN`), its small batched dots gain from the
+        fusions, 7.7% on an A100; on the port a Mamba-2 130M step ran 3% faster
+        without them."""
+        return not triton_runs()
 
     num_heads: int = 128
     head_dim: int = 64

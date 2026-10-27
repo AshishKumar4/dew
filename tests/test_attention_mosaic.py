@@ -18,7 +18,7 @@ import numpy as np
 import pytest
 from generation_support import INTERPRETS, lowers
 from jax.sharding import Mesh
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 from test_attention_template import CASES, ROWS, RUN_CASES, arguments, geometry as core_geometry
 from test_attention_triton import BACKWARD_SEEDS, HOOKS, SCORE_HOOKS, gate_of, hooks_for, score_hooks
 
@@ -590,7 +590,8 @@ def test_a_guarded_launch_walks_its_own_key_tiles(tiles):
     def reference(query, key, value):
         return jax.nn.dot_product_attention(query, key, value, mask=keep, implementation="xla")
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic guarded spans forward", seeds=SEEDS)
+    assert_as_exact(jax.jit(ours), as_given(jax.jit(reference)), draw, "mosaic guarded spans forward",
+                    seeds=SEEDS)
 
 
 @pytest.mark.parametrize("unseen", UNSEEN)

@@ -13,11 +13,13 @@ one strictly lower inverse (`recurrence_algebra.factor`, fla's WY form), and onl
 linear attentions) the inverse is the identity and nothing is corrected.
 
 The portable math in XLA (`chunk_delta_rule`) computes every hook: Dew's float32 reference and the
-CPU path. Kernels take the rest: on a GPU whose row names it, the port of fla 0.5.2's kernels
-(`fla_rule`, `fla_gdn` and `fla_kda`) takes the delta rule with one decay a head or one per key
-dimension; without the delta rule, a rated decay (Mamba2's SSD) runs on the port of mamba_ssm's
-kernels (`dew.nn.kernels.mamba_ssd`) on such a GPU, or on a TPU's Pallas scan (`dew.nn.kernels.ssd`).
-`chunk` picks one per call and applies the hooks around it.
+CPU path. Kernels take the rest, by what each takes and in order, no GPU named: the delta rule with one
+decay a head or one per key dimension runs on the recurrence template (`mosaic_rule`) where its
+launches take the call and the cell is not a declared port cell (`PORT_CELLS`), else on the port of fla
+0.5.2's kernels (`fla_rule`, `fla_gdn` and `fla_kda`) on any GPU Dew's Triton kernels run on
+(`GATED_DELTA`); without the delta rule, a rated decay (Mamba2's SSD) runs on the port of mamba_ssm's
+kernels (`dew.nn.kernels.mamba_ssd`) on such a GPU, or on a TPU's Pallas scan (`dew.nn.kernels.ssd`)
+(`SCAN`). `chunk` picks one per call and applies the hooks around it.
 """
 
 import contextlib
@@ -37,8 +39,8 @@ from dew.nn.precision import at_least_fp32, l2norm
 from dew.nn.sharding import grouped_heads, manual_map, rows_like
 
 from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
-from .generation import INHERENT, measured_kernel, triton_runs
-from .selection import Kernel, Op, Requirement, forced, select
+from .generation import INHERENT, triton_runs
+from .selection import Kernel, Op, Requirement, select, selected
 from .ssd import ssd_chunk_scan, ssd_kernel_platform
 from .templates import base
 
@@ -227,13 +229,14 @@ def _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, 
     Dv = value.shape[-1]
     steps = chunked(query, key, value, g, beta, chunk_size, starts=starts, delta=delta, scale=scale)
     T = S + steps.padding
-    # XLA:CPU workaround: under a jitted scan over the layers the chunk
-    # loop's zero initial state came back with other values in most
-    # processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical modules;
-    # still so on base 8c5b5b16a, test_layer_stack's scanned GLM-5-Next).
-    # The barrier materializes the zero. Remove it when XLA:CPU no longer
-    # returns an uninitialized scan carry here.
-    state = jax.lax.optimization_barrier(state)
+    # XLA:CPU workaround, on a CPU alone (row 1701): under a jitted scan over the
+    # layers the chunk loop's zero initial state came back with other values in
+    # most processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical
+    # modules; still so on base 8c5b5b16a, test_layer_stack's scanned
+    # GLM-5-Next). The barrier materializes the zero. Remove it when XLA:CPU no
+    # longer returns an uninitialized scan carry here.
+    if generation.placed_platform() == 'cpu':
+        state = jax.lax.optimization_barrier(state)
     grown, last, kept, last_token = _peeled_chunk_inputs(steps, value, g, beta, starts, chunk_size)
     entered, v_corrected, state = xla_chunk_states(
         steps.key, steps.w, steps.u, grown, last, state, kept, last_token=last_token, delta=delta)
@@ -426,8 +429,7 @@ _differentiable_chunk_delta_rule.defvjp(_chunk_delta_residual, _chunk_delta_back
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
-                           ported: bool | None = None, starts=None, max_segments: int | None = None,
-                           floor: float | None = None):
+                           starts=None, max_segments: int | None = None, floor: float | None = None):
     """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453) with one
     log decay per head, `g` `[B, S, H]`, or `chunk_kimi_delta_attention`
     (modeling_glm5_next.py:482-578) with one per key dimension, `[B, S, H,
@@ -435,15 +437,14 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     scaled by `Dk^-1/2`. Its queries and keys may sit on fewer heads than the
     values, each serving `Hv // Hk` of them, as fla takes them.
 
-    On the port it is fla 0.5.2's chunked rule on Dew's port of its kernels
-    (`fla_rule`), on fla's numbers; elsewhere the portable math
-    (`chunk_delta_rule`), in `chunk_size` chunks, which the port's 64 need
-    not match: the rule's value does not depend on them. Both take the
-    operands as they come. `ported` is the caller's route (`on_the_port`),
-    which a layer decides once, before it rounds the operands for that route
-    (the projections' dtype for the port, as fla's layer hands them over, the
-    wide one for the math); None decides it here, where the port takes these
-    operands.
+    Its kernels (`GATED_DELTA`: the recurrence template, or fla 0.5.2's
+    chunked rule on Dew's port of its kernels, `fla_rule`, on fla's numbers)
+    take it where they take these operands; elsewhere the portable math
+    (`chunk_delta_rule`), in `chunk_size` chunks, which the kernels' 64 need
+    not match: the rule's value does not depend on them. Each takes the
+    operands as they come, which a layer rounds for the route it asks of
+    them first (`kernel_routed`: the projections' dtype for a kernel, as
+    fla's layer hands them over, the wide one for the math).
 
     `starts` `[B, S]` marks packed documents' first tokens, each starting
     from a zero memory (`state` continues a row's first document), at most
@@ -457,7 +458,7 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: i
     hooks = recurrence.Hooks(decay='vector' if g.ndim == 4 else 'scalar', scale=key.shape[-1] ** -0.5,
                              floor=floor)
     return chunk(hooks, Chunk(query, key, value, log_decay=g, beta=beta, state=state, starts=starts),
-                 chunk_size=chunk_size, ported=ported, max_segments=max_segments)
+                 chunk_size=chunk_size, max_segments=max_segments)
 
 
 @jax.tree_util.register_dataclass
@@ -481,20 +482,20 @@ class Chunk(recurrence.Gated):
 
 
 def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_SIZE,
-          ported: bool | None = None, max_segments: int | None = None, dtype=None,
-          mainloop: str | None = None):
+          max_segments: int | None = None, dtype=None, mainloop: str | None = None):
     """`(output [B, S, Hv, Dv], final memory [B, Hv, Dk, Dv])` of a sequence through the recurrence of
     `hooks` (`recurrence.Hooks`, the decode step's form), the output in `dtype` (the queries', keys'
     and values' common dtype where None) and the memory in at least fp32.
 
     The prologue (the l2 norm, the queries' scale, the gates' activations) and the epilogue (the
     skip, the gated RMS norm) are the decode step's arithmetic (`recurrence.step_reference`) on every
-    token, in at least fp32. The recurrence between them runs on the port of fla's kernels
-    (`fla_rule`) for the delta rule with a decay where `ported` (the caller's route, `on_the_port`,
-    decided here where None); without the delta rule, a rated decay (Mamba2's SSD) runs on the port
-    of mamba_ssm's kernels where it takes the call, or on a TPU's Pallas scan where its tiling covers
-    the geometry (`SCAN`), unless `ported` is False; else the portable math (`chunk_delta_rule`, in
-    `chunk_size` chunks, the delta rule's no longer than `held_chunk`, which a port's need not match).
+    token, in at least fp32. The recurrence between them runs, for the delta rule with a decay, on the
+    kernel the delta rule's selector gives each product (`GATED_DELTA`, `port_kernel`: the recurrence
+    template, or the port of fla's kernels, `fla_rule`); without the delta rule, a rated decay (Mamba2's
+    SSD) runs on the port of mamba_ssm's kernels where it takes the call, or on a TPU's Pallas scan where
+    its tiling covers the geometry (`SCAN`); else on the portable math (`chunk_delta_rule`, in
+    `chunk_size` chunks, the delta rule's no longer than `held_chunk`, which a kernel's need not match),
+    which `generation.chosen` names for either selector ('xla').
     Packed documents
     (`starts`, at most `max_segments` a row) each compute as they would alone. A conv runs before the
     op: it takes the conv's output. The operands the hooks read are checked as the decode step's
@@ -533,15 +534,12 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         out = recurrence.skipped(hooks, out, value, given, work)
     elif hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
         # Each of its routes adds the skip, the port in its kernels.
-        out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, chunk_size, work,
-                                 kernels=ported is not False)
+        out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, chunk_size, work)
     else:
-        port = hooks.delta and hooks.decay != 'none' and ported is not False
-        # A caller asking the port (`ported`) takes it where the selector would take the portable math.
+        decayed = hooks.delta and hooks.decay != 'none'
         kernels = [(port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
                                 scale=scale, wide=epilogue, floor=hooks.floor, product=product)
-                    if port else 'xla') for product in ('forward', 'training')]
-        kernels = ['fla' if ported and kernel == 'xla' else kernel for kernel in kernels]
+                    if decayed else 'xla') for product in ('forward', 'training')]
 
         def run(kernel, query, key, value, g, beta, state, starts):
             if kernel == 'mosaic_gpu':
@@ -578,7 +576,7 @@ class PortCase:
     reverse mode alone (`reverse`; `FORWARD_MODE` marks `jax.jvp`'s traces), whether a caller's
     `shard_map` that checks varying axes holds operands that vary (`varying`), the operands' common
     `dtype`, the keys' width (`key_width`), the recurrence template's implementations bound to the call
-    (`call`, `templates.base.Call`; None where the caller asks of the port alone, `on_the_port`), the
+    (`call`, `templates.base.Call`; None where the caller asks of the port alone), the
     instruction family of the device it runs on (`family`, `generation.family`; None off a GPU), and the
     product it is selected for (`product`: 'forward' where no gradient is taken, 'training' where one is,
     `_by_product`)."""
@@ -590,6 +588,12 @@ class PortCase:
     call: base.Call | None = None
     family: str | None = None
     product: str = 'forward'
+
+    @property
+    def cell(self) -> tuple[str | None, str]:
+        """The call's cell, its device's instruction family and its product (`selection.Celled`,
+        `PORT_CELLS`)."""
+        return self.family, self.product
 
     @property
     def widest(self) -> int:
@@ -610,8 +614,13 @@ PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
     Requirement('key_width', lambda case: case.key_width <= case.widest,
                 lambda case: f"keys {case.key_width} wide; the port takes at most {case.widest} in "
                              f"{case.dtype.name}", row=INHERENT),
+    Requirement('triton', lambda case: triton_runs(),
+                "no GPU Dew's Triton kernels run on (sm80 or later): off one the port's kernels interpret, "
+                "as the CPU suite runs them where a call names the port", row=INHERENT, kind='measured'),
 )
-"""What the port (`fla_rule`) needs of a rule's call: every shape, dtype, chunk size and mesh, except
+"""What the port (`fla_rule`) needs of a rule's call: a GPU Dew's Triton kernels run on, any of them (no
+target's row names it: a GPU no row named took the portable math, 140 to 155 ms a training step where the
+port took 3.1, template review 2026-10-26 P1-1), and every shape, dtype, chunk size and mesh, except
 inside `jax.jvp`'s traces, which the port's custom VJP gives no tangent; inside a caller's `shard_map`
 that checks varying axes over operands that vary, where a Pallas call, which states no varying type for
 its results, cannot run; float64 operands, whose rule is the reference math itself; and keys wider than
@@ -619,23 +628,24 @@ the port takes in their dtype. Packed documents take the port at any bound: it s
 where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
 (`chunked_launch.Sequences`)."""
 
-PORT_CELLS: dict[tuple[str | None, str], str] = {
-    ('wgmma', 'forward'): "on an H100 80GB HBM3, 16-bit, the port's forward 0.440 ms against the template's "
-                          "0.559 on Qwen3.5-27B's gated delta net and 0.276 against 0.489 on Qwen3-Next's "
-                          "(SE-family-h100-b0980aaff; on an H100 PCIe 0.602 against 0.776, "
-                          "SE-family-h100-e0de17766)",
-    ('mma.sync', 'forward'): "on an A100 SXM4 40GB, 16-bit, the port's forward 0.892 ms against the "
-                             "template's 1.213 on Qwen3.5-27B's gated delta net and 0.690 against 0.942 on "
-                             "Qwen3-Next's (SE-family-a100-1a31d279a)",
-    ('mma.sync', 'training'): "on an A100 SXM4 40GB, 16-bit, the port's forward and gradient 4.77 ms against "
-                              "the template's 5.53 on Qwen3.5-27B's gated delta net (its gradient the "
-                              "port's, the fast backward's launches not holding an A100's registers) "
-                              "(SE-family-a100-1a31d279a)",
+PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
+    ('wgmma', 'forward'): ('fla', "on an H100 80GB HBM3, 16-bit, the port's forward 0.440 ms against the "
+                                  "template's 0.559 on Qwen3.5-27B's gated delta net and 0.276 against 0.489 "
+                                  "on Qwen3-Next's (SE-family-h100-b0980aaff; on an H100 PCIe 0.602 against "
+                                  "0.776, SE-family-h100-e0de17766)"),
+    ('mma.sync', 'forward'): ('fla', "on an A100 SXM4 40GB, 16-bit, the port's forward 0.892 ms against the "
+                                     "template's 1.213 on Qwen3.5-27B's gated delta net and 0.690 against "
+                                     "0.942 on Qwen3-Next's (SE-family-a100-1a31d279a)"),
+    ('mma.sync', 'training'): ('fla', "on an A100 SXM4 40GB, 16-bit, the port's forward and gradient 4.77 ms "
+                                      "against the template's 5.53 on Qwen3.5-27B's gated delta net (its "
+                                      "gradient the port's, the fast backward's launches not holding an "
+                                      "A100's registers) (SE-family-a100-1a31d279a)"),
 }
-"""The cells, each an instruction family and a product (`PortCase.product`), where a receipt shows the fla
-port faster than the recurrence template, the port running them (owner, bible da64ae5): the list shrinks as
-the template wins its cells, and no cell is picked or ranked at run time. Training on an H100 is the
-template's: its fast backward took 1.851 ms against the port's 2.400 (SE-family-h100-b0980aaff; 2.56
+"""The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows the fla
+port faster than the recurrence template, each its old route's kernel and that receipt: the delta rule's
+selector runs the port on them where it takes the call (`Op.declared`, owner, bible da64ae5); the list
+shrinks as the template wins its cells, and no cell is picked or ranked at run time. Training on an H100 is
+the template's: its fast backward took 1.851 ms against the port's 2.400 (SE-family-h100-b0980aaff; 2.56
 against 3.14 on an H100 PCIe, SE-family-h100-e0de17766)."""
 
 MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
@@ -646,55 +656,41 @@ MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
     Requirement('device', lambda case: case.family is not None,
                 "no GPU runs the call: off one, the mainloop runs interpreted where a call names it",
                 row=INHERENT, kind='measured'),
-    Requirement('declared', lambda case: (case.family, case.product) not in PORT_CELLS,
-                lambda case: f"a declared port cell: {PORT_CELLS[case.family, case.product]}",
-                row='bible da64ae5', kind='measured'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
 call: the port's trace and placement (its custom VJP, a Pallas call's results), its own launches' call
-(`Template.eligible`: dtypes, widths, a bundle for the device's family, a config that fits), a GPU, and a
-cell the port is not declared faster on (`PORT_CELLS`)."""
+(`Template.eligible`: dtypes, widths, a bundle for the device's family, a config that fits), and a GPU.
+A declared port cell runs the port first (`PORT_CELLS`, `GATED_DELTA`'s declared cells)."""
 
 MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
 
-def _preferred_kernel(case: PortCase) -> str:
-    """The delta rule's kernel for `case`: the recurrence template wherever it takes the call (the default
-    on every cell, owner); else the current route, the port where the target's row names it
-    (`measured_kernel`, the table qualification reads) and the call meets its requirements, else the
-    portable math."""
-    return MOSAIC.name if not MOSAIC.failed(case) else measured_kernel('gated_delta_rule', 'xla')
-
-
 GATED_DELTA: Op[PortCase] = Op('gated_delta_rule',
                                (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
-                               _preferred_kernel)
-"""The delta rule's selector (`_preferred_kernel`): the recurrence template at its derived tiles on every
-cell it takes but the declared port cells (`PORT_CELLS`), else the current route."""
+                               declared=PORT_CELLS)
+"""The delta rule's selector: on a declared port cell (`PORT_CELLS`) the port where it takes the call;
+otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the
+recurrence template at its derived tiles, else the port on any GPU Dew's Triton kernels run on, else the
+portable math."""
 
 
-def port_kernel(query, key, value, g=None, beta=None, state=None, starts=None, *,
-                max_segments: int | None = None, scale: float | None = None, wide: bool = False,
-                floor: float | None = None, product: str = 'forward') -> str:
+def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segments: int | None = None,
+                scale: float | None = None, wide: bool = False, floor: float | None = None,
+                product: str = 'forward', report: bool = True) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
-    ('forward', 'training'), which logs a call the row's port turns down the first time: the template's
-    implementations bound to it where its decay and write gate are given. Where they are not
-    (`on_the_port`, a layer's probe ahead of its gates), a call that names the template falls back to the
-    selector's own pick rather than refusing it, its launches unbound; one that names another kernel insists
-    on it, as every call does (`selection.KernelRefused`: the port named over varying operands)."""
+    ('forward', 'training'), the template's implementations bound to it, on the target (`generation`'s, an
+    assumed one's within `assumed`): reported as its route, or not where not `report` (`selected`). A
+    kernel a call names (`generation.chosen`) insists on it (`selection.KernelRefused`: the port named over
+    varying operands)."""
     from .templates.recurrence import template
 
-    call = None if g is None or beta is None else base.call(
-        (template.MOSAIC,), query, key, value, g, beta, state, starts, max_segments=max_segments, scale=scale,
-        delta=True, wide=wide, floor=floor)
-    family = generation.family(generation.device_generation()) if jax.default_backend() == 'gpu' else None
+    call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts, max_segments=max_segments,
+                     scale=scale, delta=True, wide=wide, floor=floor)
+    family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
                     family=family, product=product)
-    named = forced(GATED_DELTA.choice)
-    if call is None and named == MOSAIC.name:
-        return select(GATED_DELTA, case, named, insist=False).kernel
-    return select(GATED_DELTA, case).kernel
+    return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
 
 def _by_product(forward, training, *operands):
@@ -716,9 +712,11 @@ def _by_product(forward, training, *operands):
     return rule(*operands)
 
 
-def on_the_port(query, key, value) -> bool:
-    """Whether the rule over these operands runs on the port, its forward at least (`port_kernel`)."""
-    return port_kernel(query, key, value) != 'xla'
+def kernel_routed(query, key, value, g, beta, *, floor: float | None = None) -> bool:
+    """Whether the delta rule's selector gives a call over these operands a kernel, its forward's
+    (`port_kernel`, unreported: the call reports its own): what a layer rounds its operands for, the
+    projections' dtype for a kernel, as fla's layer hands them over, the wide one for the portable math."""
+    return port_kernel(query, key, value, g, beta, floor=floor, report=False) != 'xla'
 
 
 def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None,
@@ -784,7 +782,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop
     (`templates.recurrence.mainloop.forward`): `fla_rule`'s operands and results, the operands in their
     common dtype and beta with them, the decay and the memory fp32, on one device, by the bundle of its
-    instruction family (`mainloop.family_of`), interpreted off a GPU of a family a bundle claims (Mosaic GPU's
+    instruction family (`mainloop.family_of`, `bundles.of`), interpreted off a GPU (Mosaic GPU's
     interpreter, `mainloop.INTERPRETED`'s). Its gradient: the gated delta rule's in a 16-bit call on the
     mainloop (`mainloop.gradients`, fla's DAG, fla's rounding) where its launches hold on the device
     (`mainloop.backward_holds`); on a GPU, a 16-bit delta rule's call the port takes (`PORT_SUPPORTS`) the
@@ -800,8 +798,12 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     dtype = jnp.result_type(query, key, value)
     query, key, value, beta = (x.astype(dtype) for x in (query, key, value, beta))
     g = g.astype(jnp.float32)
-    device = mainloop.family_of()
-    run = {"family": family or device or mainloop.INTERPRETED, "interpret": device is None, "tiles": tiles,
+    # Interpreted off a GPU (an assumed one's calls lower for it); a GPU no bundle claims runs no launch.
+    device, interpret = mainloop.family_of(dtype), generation.backend() != 'gpu'
+    if family is None and device is None and not interpret:
+        raise NotImplementedError(f"the recurrence template has no bundle for the "
+                                  f"{generation.family(generation.device_generation())!r} family")
+    run = {"family": family or device or mainloop.INTERPRETED, "interpret": interpret, "tiles": tiles,
            "floor": floor}
     # The fast backward where its launches hold on the device (a derived launch spills nothing), else the
     # portable math's.
@@ -817,7 +819,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     # recurrence's distance from float64 (SE-family-h100-be7214123).
     case = PortCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(dtype), key_width=key.shape[-1])
-    ported = (not fast and delta and device is not None and dtype != jnp.float32
+    ported = (not fast and delta and not interpret and dtype != jnp.float32
               and all(requirement.holds(case) for requirement in PORT_SUPPORTS))
 
     # The documents' starts an operand, not closed over (a custom VJP's function closes over no tracer).
@@ -973,15 +975,18 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None)
 
 
 def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict, state, starts,
-                chunk_size: int, work, *, kernels: bool = True):
+                chunk_size: int, work):
     """`chunk` without the delta rule over a rated decay (Mamba2's SSD: `x` the values, `B` the keys,
     `C` the queries, `dt` the write gate and `A` the rate): on the port of mamba_ssm's kernels where
     it takes the call, which adds the skip itself and takes the rated decay's declared domain, a
     contraction (`recurrence.Hooks`), as its kernels clamp each pairwise decay to at most one; else
     on a TPU's Pallas scan where its tiling covers the geometry, or the portable math, the skip added
-    after; only the portable math without `kernels`. `g` is the log decay the rate and the write gate
-    `beta` form (`recurrence.log_gates`), which the kernels form themselves. Returns the output in
-    `work`, unrounded, and the memory `[B, Hv, Dk, Dv]`."""
+    after (`SCAN`). `g` is the log decay the rate and the write gate
+    `beta` form (`recurrence.log_gates`), which the kernels form themselves. A kernel takes head and
+    state widths padded with zero columns to powers of two (`_scan_widths`), which change no real
+    output or gradient, the outputs cut back: Nemotron-H 4B's 80-wide heads took the portable math, 6.89
+    ms a forward against mamba_ssm's 0.89 (SE-ssd-mamba-h100-0428aad7b). Returns the output in `work`,
+    unrounded, and the memory `[B, Hv, Dk, Dv]`."""
     rate = given['rate'].astype(work)
     skip = given['skip'].astype(work) if hooks.skip else jnp.zeros(rate.shape, work)
     operand = jnp.result_type(query, key, value)
@@ -991,21 +996,31 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     # The SSD's memory is `[P, N]`, values by keys: the template's `[N, P]` transposed.
     carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x) if state is None
                else jnp.swapaxes(state, -1, -2).astype(work))
-    case = scan_case(x, B, chunk_size, tpu=kernels)
-    # Without `kernels` the caller's route is the portable math.
-    kernel = select(SCAN, case, None if kernels else 'xla').kernel
-    if kernel == 'pallas':
-        out, final = _ssd_ported(x, beta, rate, B, C, skip, carried, chunk_size, starts)
-        return out.astype(work), jnp.swapaxes(final.astype(work), -1, -2)
-    if kernel == 'tpu':
-        out, final = _ssd_tpu(x, beta, rate, B, C, skip, carried, chunk_size, starts, case.tpu, work)
-        return out, jnp.swapaxes(final, -1, -2)
+    columns, rows = _scan_widths(head_dim), _scan_widths(state_size)
+    wide_x, wide_B, wide_C = _padded(x, 3, columns), _padded(B, 3, rows), _padded(C, 3, rows)
+    case = scan_case(wide_x, wide_B, chunk_size)
+    kernel = select(SCAN, case).kernel
+    if kernel in ('pallas', 'tpu'):
+        wide_state = _padded(_padded(carried, 2, columns), 3, rows)
+        if kernel == 'pallas':
+            out, final = _ssd_ported(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size, starts)
+            out, final = out.astype(work), final.astype(work)
+        else:
+            out, final = _ssd_tpu(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size, starts,
+                                  case.tpu, work)
+        return out[..., :head_dim], jnp.swapaxes(final[..., :head_dim, :state_size], -1, -2)
     group = heads // key.shape[2]
     if group > 1:
         query, key = (jnp.repeat(t, group, axis=2) for t in (query, key))
     out, final = chunk_delta_rule(query, key, value, g[..., None], beta, state, chunk_size, starts=starts,
                                   delta=False, scale=1.0, dtype=work)
     return recurrence.skipped(hooks, out, value, given, work), final
+
+
+def _scan_widths(width: int) -> int:
+    """A scan kernel's width for a head or state `width` (`_rated_scan`): the power of two at or past it, at
+    least 16, the smallest block Triton's dot takes (`SSD_SUPPORTS`)."""
+    return max(16, 1 << (width - 1).bit_length())
 
 
 RESET_DECAY = -1e4
@@ -1070,12 +1085,16 @@ SSD_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
     Requirement('widths', lambda case: all(width >= 16 and width & (width - 1) == 0 for width in case.widths),
                 lambda case: "head width {}, state {} and chunk {}; the port takes powers of two of at least "
                              "16".format(*case.widths), row=INHERENT),
+    Requirement('triton', lambda case: triton_runs(),
+                "no GPU Dew's Triton kernels run on (sm80 or later): off one the port's kernels interpret, "
+                "as the CPU suite runs them where a call names the port", row=INHERENT, kind='measured'),
 )
 """What mamba_ssm's kernels (`mamba_ssd.ssd_scan`) need of a scan: reverse mode, which the port's
 custom VJP alone gives; no caller's `shard_map` that checks varying axes over operands that vary,
 where a Pallas call, which states no varying type for its results, cannot run; no float64 operands,
-whose scan is the reference math itself; and head widths, state widths and chunks that are powers of
-two of at least 16, the smallest block Triton's dot takes."""
+whose scan is the reference math itself; head widths, state widths and chunks that are powers of
+two of at least 16, the smallest block Triton's dot takes (a call's head and state widths padded to them,
+`_rated_scan`); and a GPU Dew's Triton kernels run on, any of them."""
 
 TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
     Requirement('geometry', lambda case: case.tpu is not None,
@@ -1098,16 +1117,12 @@ def scan_case(x, B, chunk_size: int, *, tpu: bool = True) -> ScanCase:
                          if tpu and generation.backend() == 'tpu' else None))
 
 
-def _scan_preferred(case: ScanCase) -> str:
-    """The port where the GPU's target row names it ('pallas'), the TPU's Pallas scan on a TPU, else the
-    portable math."""
-    return measured_kernel('ssd', 'tpu' if generation.backend() == 'tpu' else 'xla')
-
-
 SCAN: Op[ScanCase] = Op('ssd', (Kernel('pallas', SSD_SUPPORTS), Kernel('tpu', TPU_SCAN_SUPPORTS),
-                               Kernel('xla', (), generic=True)), _scan_preferred)
-"""The rated scan's selector: the port of mamba_ssm's kernels on every GPU whose target row names it, the
-TPU's Pallas scan where its tiling covers the geometry, else the portable math."""
+                               Kernel('xla', (), generic=True)))
+"""The rated scan's selector: the first of its kernels that takes the call, by what each takes (no table
+of GPUs): the port of mamba_ssm's kernels on any GPU Dew's Triton kernels run on, the TPU's Pallas scan
+where its tiling covers the geometry, else the portable math (a GPU no row named took it, 103 ms a
+training step of Nemotron-H 30B's where the port took 2.58, template review 2026-10-26 P1-1)."""
 
 
 def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts):

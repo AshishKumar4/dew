@@ -3,7 +3,6 @@ templates' Mosaic mainloops, which take every other primitive from the shared to
 warpgroup MMA reads its right operand from shared memory and its left from shared memory or registers,
 accumulates in a warpgroup's registers in the WGMMA layout, and runs asynchronously until waited for."""
 
-import functools
 
 import jax
 import jax.numpy as jnp
@@ -136,18 +135,7 @@ class Wgmma(mosaic.RingFamily):
         return pl.run_scoped(run, *(plgpu.WGMMAAccumulatorRef(shape, jnp.float32) for shape in shapes))
 
 
-
 WGMMA = Wgmma()
 """The wgmma family's bundle."""
 
 
-def finished(run, shape: tuple[int, int], barrier, finish) -> None:
-    """A consumer's output tile: `run` on a scoped warpgroup accumulator of `shape`, its MMAs waited for,
-    the tile reported drained (`barrier`, the producer's cue to reload its stage), then `finish` of its
-    value."""
-    @functools.partial(pl.run_scoped, acc_ref=plgpu.WGMMAAccumulatorRef(shape))
-    def _(acc_ref):
-        run(acc_ref)
-        plgpu.wgmma_wait(0)
-        plgpu.barrier_arrive(barrier)
-        finish(acc_ref[...])

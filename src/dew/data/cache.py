@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import tempfile
 import threading
@@ -21,8 +22,9 @@ from typing import Literal, TypedDict, overload
 import grain.python as grain
 import numpy as np
 
+from dew.cache import dew_cache_dir
 from dew.data.concurrent import Concurrently
-from dew.data.dataset import _QUIET_STOP_SECONDS
+from dew.data.dataset import _QUIET_STOP_SECONDS, Loading
 from dew.data.generation import (
     GENERATION_SCHEMA,
     DependencyManifest,
@@ -47,6 +49,34 @@ from dew.data.sources.records import ArrayRecords
 from dew.data.storage import PreconditionFailed, Store, _byte_size
 
 _log = logging.getLogger(__name__)
+
+
+AUTOMATIC = "DEW_DATA_CACHE"
+"""The environment variable that names the directory a process's runs cache their chains' leading
+deterministic steps in (`automatic_root`), or turns that off (`off`)."""
+
+
+def automatic_root(loading: Loading) -> str | None:
+    """Where a run caches what its chains' leading deterministic steps make of their records, with no
+    `cache=` (`dew.data.compile._automatic`): `$DEW_DATA_CACHE`, else `data` in Dew's cache directory
+    (`dew.cache.dew_cache_dir`), a local root holding at most `Cache.keep_local_bytes`, its oldest
+    generations evicted first (`LocalRetention`). None where the run's `loading` opts out
+    (`Loading(cache=False)`) or the process does (`DEW_DATA_CACHE=off`)."""
+    named = os.environ.get(AUTOMATIC)
+    if not loading.cache or (named is not None and named.strip().lower() in ("off", "0", "false", "")):
+        return None
+    return named or os.path.join(dew_cache_dir(), "data")
+
+
+def _opened_writer(cache: Cache, key: DependencyManifest) -> _Writer | _Computed:
+    """A writer of `key`'s fill, or, where an optional cache's storage cannot hold one, none: its
+    records are computed (`Cache.read_on`)."""
+    try:
+        return _Writer(cache, key)
+    except (OSError, sqlite3.Error) as error:
+        if not cache.read_on(error, "writes nothing"):
+            raise
+        return _Computed()
 
 
 class Abandoned(RuntimeError):
@@ -107,6 +137,19 @@ class Cache:
     retry: int = 3
     shard_bytes: int | str = 16 * 2**20
     storage_options: Mapping[str, object] | None = field(default=None, repr=False)
+    optional: bool = False
+    """Whether a run reads on without it where its storage fails (no room, no permission, its
+    index's database full or read-only): a cache the compiler placed (`dew.data.compile._automatic`),
+    which a run never needs, then looks nothing up, stops admitting and its records are computed,
+    as they are with no cache (`read_on`). A cache a chain names stops the run."""
+
+    def read_on(self, error: OSError | sqlite3.Error | ValueError, doing: str) -> bool:
+        """Whether this cache reads on uncached after its storage raised `error` while `doing`: it is
+        `optional`, and logs that it does."""
+        if not self.optional:
+            return False
+        _log.warning("cache %s %s: %s; the run reads on uncached", self.url, doing, error)
+        return True
 
     def __post_init__(self) -> None:
         if min(self.spool_limit, _byte_size(self.mirror_bytes), self.local_limit, self.shard_limit) < 1:
@@ -170,12 +213,21 @@ class Cache:
         input publishes the generation of `source`, the source they are. The
         inputs `missing` that a read skips (a store's absent records) are written
         as a fill starts, so it can complete without reading them."""
-        self._root(key)
+        computed = _Mapped(parent if transform is None else parent.map_with_index(_Passthrough(transform)))
         if transform is not None and _volatile(transform):
-            return _Mapped(parent.map_with_index(_Passthrough(transform)))
-        published = self.generation(key)
+            return computed
+        try:
+            self._root(key)
+            published = self.generation(key)
+        except (OSError, sqlite3.Error) as error:
+            if not self.read_on(error, "looks up nothing"):
+                raise
+            return computed
         if published is not None:
-            return _Mapped(grain.MapDataset.range(len(parent)).map(_Published(published, transform)))
+            # An optional cache's replay computes a record its generation cannot give (`Cache.read_on`).
+            replay = (_Published(published, transform, self, parent).at if self.optional
+                      else _Published(published, transform))
+            return _Mapped(grain.MapDataset.range(len(parent)).map(replay))
         return _CachedMap(parent, self, key, transform, source, tuple(missing))
 
     def streamed(
@@ -186,12 +238,20 @@ class Cache:
         transform: Transform | None = None,
         threads: int | None = None,
     ) -> Callable[[Shard], grain.IterDataset]:
-        self._root(key)
+        computed = (reader if transform is None
+                    else _PassthroughReader(reader, _Passthrough(transform), threads))
         if transform is not None and _volatile(transform):
-            return _PassthroughReader(reader, _Passthrough(transform), threads)
-        published = self.generation(key)
+            return computed
+        try:
+            self._root(key)
+            published = self.generation(key)
+        except (OSError, sqlite3.Error) as error:
+            if not self.read_on(error, "looks up nothing"):
+                raise
+            return computed
         return _CachedReader(reader, self, key, transform,
-                             None if published is None else _Published(published, transform))
+                             None if published is None
+                             else _Published(published, transform, self if self.optional else None))
 
     def generation(self, key: DependencyManifest) -> Generation | None:
         root = self._root(key)
@@ -227,13 +287,36 @@ class _Published:
 
     generation: Generation
     transform: Transform | None
+    optional: Cache | None = None
+    """The optional cache it replays (`Cache.read_on`), whose records are computed from their inputs
+    where its generation cannot be read; None replays or refuses."""
+    inputs: grain.MapDataset | None = None
+    """The inputs by index a replay by index computes a record from where it reads on."""
 
     def __call__(self, row_id: RowId) -> CachedValue:
         outputs = self.generation.outputs(row_id)
         return outputs if self.transform is not None else outputs[0]
 
+    def at(self, index: int) -> CachedValue:
+        """The record at `index` of its inputs, as a replay by index reads it: computed from that
+        input where an optional cache's generation cannot give it (`Cache.read_on`)."""
+        try:
+            return self(index)
+        except (OSError, sqlite3.Error, ValueError) as error:
+            if (self.inputs is None or self.optional is None
+                    or not self.optional.read_on(error, "replays nothing")):
+                raise
+            outputs = _transformed(index, self.inputs[index], self.transform)
+            return outputs if self.transform is not None else outputs[0]
+
     def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
-        return self(row_id)
+        try:
+            return self(row_id)
+        except (OSError, sqlite3.Error, ValueError) as error:
+            if self.optional is None or not self.optional.read_on(error, "replays nothing"):
+                raise
+            outputs = _transformed(ordinal, value, transform)
+            return outputs if transform is not None else outputs[0]
 
     def finish(self) -> None:
         pass
@@ -352,7 +435,17 @@ class _Writer:
                     raise ValueError(f"conflicting cache duplicate for row {row_key}")
                 return outputs if transform is not None else outputs[0]
             if not transient and self.admitting:
-                self._admit(row_key, payload)
+                try:
+                    self._admit(row_key, payload)
+                except (OSError, sqlite3.Error) as error:
+                    # Storage that fails mid-fill: an optional cache stops admitting, as a full one
+                    # does with on_full='stop', and reads on.
+                    if not self.cache.read_on(error, "stopped admission"):
+                        raise
+                    # What it held unwritten is dropped, so its fill ends unsealed and publishes nothing.
+                    self.admitting = False
+                    self.pending.clear()
+                    self.pending_bytes = 0
         return outputs if transform is not None else outputs[0]
 
     def _admit(self, row_key: str, payload: bytes) -> None:
@@ -519,6 +612,9 @@ class _Writer:
             if self.cache.on_full == "block":
                 raise
             _log.warning("cache %s remains filling after upload failure: %s", self.root.url, error)
+        except sqlite3.Error as error:
+            if not self.cache.read_on(error, "remains filling"):
+                raise
 
     def _completed(self) -> None:
         """The outcome of a fill's completion (`complete`) once it ends,
@@ -641,10 +737,17 @@ class _CachedMap(_Mapped):
         self.writer_lock = threading.RLock()
 
     @property
-    def writer(self) -> _Writer:
+    def writer(self) -> _Writer | _Computed:
         with self.writer_lock:
             if "_writer" not in self.__dict__:
-                writer = _Writer(self.cache, self.key, expected=len(self), source=self.filled)
+                try:
+                    writer = _Writer(self.cache, self.key, expected=len(self), source=self.filled)
+                except (OSError, sqlite3.Error) as error:
+                    # Storage that cannot hold a writer: an optional cache computes its records.
+                    if not self.cache.read_on(error, "writes nothing"):
+                        raise
+                    self.__dict__["_writer"] = _Computed()
+                    return self.__dict__["_writer"]
                 finalizer = weakref.finalize(self, writer.close)
                 finalizer.atexit = False
                 self.__dict__["_writer"] = writer
@@ -737,29 +840,31 @@ class _CachedIter(grain.IterDataset):
         self.published, self.input_parent = published, parent
 
     def __iter__(self) -> grain.DatasetIterator:
-        return _CachedIterator(self.input_parent.__iter__(), self.cache, self.key, self.shard, self.transform,
-                               self.published)
+        # A shard keeps its iterator's state either way, so a fill resumes onto its published generation.
+        # A shard the generation holds under another ID (another mount, a stream cut into more shards
+        # than it has) runs its steps and writes nothing, so the key holds no rows under its IDs. The
+        # writer opens before the shard's input does, so a writer the cache refuses leaves no input open.
+        published = self.published
+        writer = (_opened_writer(self.cache, self.key) if published is None
+                  else published if published.generation.holds((self.shard.id, 0))
+                  else _Computed())
+        with ExitStack() as opening:
+            opening.callback(writer.close)
+            parent = self.input_parent.__iter__()
+            opening.pop_all()
+        return _CachedIterator(parent, writer, self.shard, self.transform)
 
 
 class _CachedIterator(grain.DatasetIterator):
     def __init__(
         self,
         parent: grain.DatasetIterator,
-        cache: Cache,
-        key: DependencyManifest,
+        writer: _Writer | _Published | _Computed,
         shard: Shard,
         transform: Transform | None,
-        published: _Published | None,
     ):
         super().__init__(parent)
-        self.parent, self.shard, self.transform = parent, shard, transform
-        # A shard keeps its iterator's state either way, so a fill resumes onto its published generation.
-        # A shard the generation holds under another ID (another mount, a stream cut into more shards
-        # than it has) runs its steps and writes nothing, so the key holds no rows under its IDs.
-        self.writer: _Writer | _Published | _Computed = (
-            _Writer(cache, key) if published is None
-            else published if published.generation.holds((shard.id, 0))
-            else _Computed())
+        self.parent, self.writer, self.shard, self.transform = parent, writer, shard, transform
         self.ordinal = 0
 
     def __next__(self):

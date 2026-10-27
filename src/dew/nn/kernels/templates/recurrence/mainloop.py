@@ -39,6 +39,7 @@ six of the parts' whose orders sum under three, an fp32 product's accuracy.
 
 Decode is not on the mainloop: a one-token step takes `recurrence.step` (row 1424 for its Mosaic form)."""
 
+import contextlib
 import contextvars
 import dataclasses
 import functools
@@ -55,21 +56,23 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn import precision
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
-from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90
-
-FAMILIES: dict[str, mosaic.Family] = {"mma.sync": mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)),
-                                      "wgmma": mosaic_sm90.WGMMA}
-"""The bundles the mainloop issues by, by the instruction family each claims (`generation.family`)."""
+from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs the mainloop by off a GPU of a family it claims (a CPU): wgmma's,
 whose producer role, TMA rings and barriers the interpreter models (its products the dots they compute)."""
 
 
-def family_of() -> mosaic.Family | None:
-    """The bundle of the device's instruction family, None where the mainloop has none (a CPU's)."""
-    name = generation.family(generation.device_generation())
-    return None if name is None else FAMILIES.get(name)
+def bundle_dtype(dtype) -> jnp.dtype:
+    """The 16-bit operands a call of `dtype`'s products take on a bundle (`bundles.of`'s dtype): its own, an
+    fp32 call's bf16 parts."""
+    return jnp.dtype(jnp.bfloat16 if jnp.dtype(dtype) == jnp.float32 else dtype)
+
+
+def family_of(dtype=jnp.bfloat16) -> mosaic.Family | None:
+    """The bundle of the device's instruction family for a call of `dtype` (`bundles.of`), None where the
+    mainloop has none (a CPU's)."""
+    return bundles.of(generation.device_generation(), bundle_dtype(dtype))
 
 CHUNK = 64
 """Tokens a chunk, fla's."""
@@ -397,8 +400,14 @@ def _staging(operand: _Operand, *shapes) -> tuple:
 def _merges(call: _Call) -> tuple:
     """The inverse's staging tiles (`algebra.doubled`'s 'merge' products, both operands fp32 registers): three
     sets, the system's kept across the levels and each level's inverse across its two products, each set a
-    `[C, C]` tile an operand's part: an fp32 call's three bf16 parts, a 16-bit call's one fp16, 11 significand
-    bits past the TF32 fla merges in (10) where the inverse is rounded to the call's 8 after."""
+    `[C, C]` tile an operand's part: an fp32 call's three bf16 parts, a 16-bit call's one fp16, 11 significant
+    bits as the TF32 fla merges its blocks in, where the inverse is rounded to the call's 8 after. fla inverts
+    its 16-row diagonal blocks by fp32 forward substitution and merges in TF32; every doubling level here
+    rounds to fp16, about 2^-12 absolute on the inverse under aligned keys, a sixth of the bf16 rounding
+    both arms share. fp16's range holds the inverse of keys the layers normalize (`l2norm`: each entry at
+    most `beta |k_s| |k_t|`, at most one); unnormalized keys with `beta |k|^2` past two grow it
+    geometrically, past fp16's largest in about 16 tokens, where TF32's stays finite (template numerics
+    review 2026-10-26, P3-4)."""
     dtype, parts = (jnp.bfloat16, PARTS) if call.held.parts > 1 else (jnp.float16, 1)
     tile = (CHUNK, CHUNK)
     return tuple(tuple(plgpu.SMEM(tile, dtype) for _ in range(parts)) for _ in range(3))
@@ -532,7 +541,7 @@ _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned"
 """Where `planned` collects its launches; None where they run."""
 
 
-def _allocated(family: mosaic.Family, *allocations, reduces: bool = True) -> int:
+def _allocated(family: mosaic.Family, *allocations, reduces: bool = True, after: tuple = ()) -> int:
     """The bytes of shared memory a program of `allocations` takes, as Mosaic GPU's resource estimate counts
     them (`mosaic.allocated`, `mosaic.BARRIER_BYTES`): each tile's (a ring's stages one tile), a pipelined
     family's streams' stages of each tile (`mosaic_sm80.Pipeline`, which `emit_pipeline` allocates in its
@@ -540,7 +549,9 @@ def _allocated(family: mosaic.Family, *allocations, reduces: bool = True) -> int
     asked for 16 KiB less than their sum, its memory entered beside its chunks), each barrier's, and where
     the program `reduces`, the scratch the family's compiler parameters reserve for a reduction across warps
     (`Family.reduction_scratch`), which the estimate takes for a kernel with any reduction and none without
-    (an A100's solve launch asked for its tiles' 90112 bytes alone, SE-family-a100-0c8018352)."""
+    (an A100's solve launch asked for its tiles' 90112 bytes alone, SE-family-a100-0c8018352). Tiles a
+    program scopes `after` its walks, each `(shape, dtype)`, take the larger of them and the walks' on a
+    family that scopes its walks apart (`_walks_scoped`), else their sum."""
     barrier, tile = (plgpu.Barrier, plgpu.ClusterBarrier), type(plgpu.SMEM((1,), jnp.float32))
 
     def leaf(x) -> bool:
@@ -555,6 +566,11 @@ def _allocated(family: mosaic.Family, *allocations, reduces: bool = True) -> int
             barriers += math.prod(np.atleast_1d(x.num_barriers))
         elif isinstance(x, tile):
             sizes.append(math.prod(x.shape) * jnp.dtype(x.dtype).itemsize)
+    scoped = [math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in after]
+    if _walks_scoped(family):
+        pipelines += [mosaic.allocated(size) for size in scoped]
+    else:
+        sizes += scoped
     scratch = [family.reduction_scratch] if reduces and family.reduction_scratch else []
     return mosaic.allocated(*sizes, *scratch) + max(pipelines) + mosaic.BARRIER_BYTES * barriers
 
@@ -585,12 +601,29 @@ def _memory_landing(call: _Call, bv: int) -> dict:
     return {f"memory{i}": call.memories.landing(call.block, bv) for i in range(call.width // call.block)}
 
 
-def _landed(landing: dict) -> dict:
-    """A launch's stores' shared-memory tiles, `landing[name]` a store's `(shape, dtype)`: every family's
-    stores go through shared memory (`Family.stored`, `Family.added`; a TMA copy, or rows through registers
-    where a GPU has none), since a product layout's register store of a tile to global memory leaves partial
-    32-byte sectors (JAX's `plan_gmem_transfer` refuses it)."""
-    return {name: plgpu.SMEM(shape, dtype) for name, (shape, dtype) in landing.items()}
+def _walks_scoped(family: mosaic.Family) -> bool:
+    """Whether `family` scopes each walk's streams apart (`mosaic_sm80.Pipeline`, which `emit_pipeline`
+    allocates): a tile scoped after a walk takes the larger of the two, and its stores, copied out through
+    registers, finish when they return (`mosaic_sm80.Mma.stored`), nothing in flight."""
+    return isinstance(family, mosaic_sm80.Mma)
+
+
+def _landing_keys(landing: dict, family: mosaic.Family) -> dict:
+    """Each store's landing tile by name (`_landed`'s keys): its own, or on a family whose stores finish when
+    they return (`_walks_scoped`) one a shape and dtype, its stores' in turn: an A100's states launch held
+    three 4 KB tiles of one form, which kept its walk one stage deep (two needed 15 KB less)."""
+    shared = _walks_scoped(family)
+    return {name: f"{shape}-{jnp.dtype(dtype).name}" if shared else name
+            for name, (shape, dtype) in landing.items()}
+
+
+def _landed(landing: dict, family: mosaic.Family) -> dict:
+    """A launch's stores' shared-memory tiles, `landing[name]` a store's `(shape, dtype)`, by key
+    (`_landing_keys`): every family's stores go through shared memory (`Family.stored`, `Family.added`; a TMA
+    copy, or rows through registers where a GPU has none), since a product layout's register store of a tile
+    to global memory leaves partial 32-byte sectors (JAX's `plan_gmem_transfer` refuses it)."""
+    keys = _landing_keys(landing, family)
+    return {keys[name]: plgpu.SMEM(shape, dtype) for name, (shape, dtype) in landing.items()}
 
 
 def held_programs(family: mosaic.Family, target: generation.GpuTarget, shared: int) -> int:
@@ -628,7 +661,8 @@ def _persisted(call: _Call, blocks: dict, staging: tuple, tiles: int, *, reduces
 
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int, live,
             work: Work, held: _Held, staging: tuple = (), once: dict | None = None,
-            landing: dict | None = None, persistent: bool = False, reduces: bool = True):
+            landing: dict | None = None, persistent: bool = False, reduces: bool = True,
+            after: tuple = ()):
     """`program(*refs, streams, staging, landing)` as a kernel over `grid`, run where `live(refs)` holds (a
     laid call's chunks and sequences are as many as its worst case, most of them empty): its streams'
     allocations (of `blocks`, `stages` deep, and of `once`'s blocks, loaded once, one deep; `Family.opened`
@@ -639,9 +673,11 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
     once, its streams' rings running on across them (`_persisted`); its program gives its tile's walk
     (`_walk`) for the grid's indices `_axis` reads. A program that `reduces` none takes no reduction scratch
-    (`_allocated`; the compile gate holds its plan's shared memory to at least the compiled kernel's)."""
+    (`_allocated`; the compile gate holds its plan's shared memory to at least the compiled kernel's).
+    `after` are the `(shape, dtype)` tiles its program scopes after its walks (`_final_landing`), which its
+    plan counts beside them as its family scopes them."""
     family = call.family
-    landed = _landed(landing or {})
+    landed = _landed(landing or {}, family)
     staging = (*staging, landed)
     tiles = math.prod(grid)
     threads = 128 * family.warpgroups(1)
@@ -665,7 +701,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             each = -(-tiles // programs)
             flops = work.flops * _products(call.held.parts) * each
             collected.append(Launch(name, programs, threads,
-                                    _allocated(family, streams, staging, reduces=reduces),
+                                    _allocated(family, streams, staging, reduces=reduces, after=after),
                                     held.registers(family),
                                     work.steps * each, stages, stepped, flops, work.exponentials * each,
                                     moved))
@@ -676,7 +712,8 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     def entry(*arrays):
         def scoped(staged, *, streams):
             *staged, lands = staged
-            lands = {name: lands.get(name) for name in landing or {}}
+            keys = _landing_keys(landing or {}, family)
+            lands = {name: lands[keys[name]] for name in landing or {}}
             if not persistent:
                 program(*arrays, streams=streams, staging=tuple(staged), landing=lands)
                 return
@@ -1064,7 +1101,8 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
     key slice's tile `{name}{i}` of `memory` (`entering`, the opened streams and their views), zero where
     `kept` is 0; `step` over its chunks `[start, start + count)` of `walked` (the same); and the memory it
     gives written to each slice's view `out(i)` where `written` is nonzero, through `landing` (a slice's
-    shared tile, `_landed`) (`_states`', and `_reverse`'s from its last chunk). Where
+    shared tile, `_landed`, or where None one scoped after the walk, `_final_landing`) (`_states`', and
+    `_reverse`'s from its last chunk). Where
     `prefetch(n)` is given, it loads chunk `n`'s own values from global memory (its prefix), a step ahead:
     each step issues the next chunk's loads before its own work and takes the ones the step before issued
     (`step(n, slots, state, accumulators, loaded)`), so their latency is the step's, not on its path."""
@@ -1099,13 +1137,28 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
 
         @pl.when(written > 0)
         def _():
-            family.stored(list(state), [out(i) for i in range(slices)], smem=landing)
+            def store(smem):
+                family.stored(list(state), [out(i) for i in range(slices)], smem=smem)
+
+            if landing is None:
+                pl.run_scoped(store, plgpu.SMEM((call.block, bv), jnp.float32))
+            else:
+                store(landing)
 
     def producer():
         family.stream(entered, entered_views, 0, 1)
         family.stream(chunks, views, start, start + count)
 
     family.roles(1, consumer, producer)
+
+
+def _final_landing(call: _Call, bv: int) -> tuple[dict, tuple]:
+    """`_sequence_walk`'s final memory's landing, a key slice `[block, bv]` fp32: `(landing, after)`, the
+    launch's own tile (`landing['final']`) where its family's walks share its scope (`_walks_scoped`), else
+    one the walk scopes after it (`after`, `_kernel`'s), which takes no more than the walk's tiles: an A100's
+    states launch then holds two stages at two programs a multiprocessor."""
+    final = ((call.block, bv), jnp.float32)
+    return ({}, (final,)) if _walks_scoped(call.family) else ({"final": final}, ())
 
 
 def _gated_write(call: _Call, corrected, loaded, prefix: tuple, last, head) -> tuple:
@@ -1227,7 +1280,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
         _sequence_walk(call, initial, "initial", (entering, initial_views), (chunks, views), step, first,
                        count, begins, ends,
                        lambda i: final_ref.at[pl.ds(memory(row, i), call.block), pl.ds(j * bv, bv)], bv,
-                       prefetch=None if call.per_key else prefetch, landing=landing["final"])
+                       prefetch=None if call.per_key else prefetch, landing=landing.get("final"))
 
     out_type = (memories.shape(value_width), held.shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))
@@ -1237,13 +1290,15 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
     # A sequence's chunks, the mean over the laid sequences; two products a chunk.
     steps = call.chunks / sequences.shape[0]
     work = Work(4 * CHUNK * width * bv * steps, steps)
+    final_landing, after = _final_landing(call, bv)
     return _kernel(program, call, out_type=out_type, grid=(value_width // bv, sequences.shape[0], call.heads),
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
                    live=lambda refs: refs[7][lax.axis_index("sequences"), 1] > 0, work=work,
                    held=_states_held(call, values, keys, bv),
                    staging=(*_staging(held, (call.block, bv)), _column_scratch(call)), once=initials,
                    landing={**_memory_landing(call, bv), "corrected": held.landing(CHUNK, bv),
-                            "final": ((call.block, bv), jnp.float32)},
+                            **final_landing},
+                   after=after,
                    # Its last write's column sums an fp32 call's alone (`_columns`).
                    reduces=held.parts > 1)(
         k, k if w is None else w, u, hi, lo, beta, h0, sequences)
@@ -1511,7 +1566,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
     `kept` values, `(w, h, corrected)`, are (`kept_forward`'s; its final memory then None). The solve stores
     its inverse where the call `keeps` it (`_solved`)."""
-    family = family_of() if family is None else family
+    family = family_of(jnp.result_type(q, k, v)) if family is None else family
     if family is None:
         raise NotImplementedError(f"the mainloop has no bundle for the "
                                   f"{generation.family(generation.device_generation())!r} family")
@@ -1573,10 +1628,11 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
 
 def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, starts=None,
             max_segments: int | None = None, delta: bool = True, backward: bool = False,
-            floor: float | None = None) -> tuple[Launch, ...]:
+            floor: float | None = None, target: generation.GpuTarget | None = None) -> tuple[Launch, ...]:
     """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `forward`'s) runs at
-    `tiles` by `family`'s bundle, in order, as planned (`Launch`): its arrays abstract (`jax.eval_shape`), its
-    kernels declared and not built (`_kernel`); with `backward`, the fast backward's too (`gradients`)."""
+    `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in order, as
+    planned (`Launch`): its arrays abstract (`jax.eval_shape`), its kernels declared and not built
+    (`_kernel`); with `backward`, the fast backward's too (`gradients`)."""
     found: list[Launch] = []
 
     def run(q, k, v, g, beta, h0, starts):
@@ -1591,7 +1647,8 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, s
         finally:
             _PLANNED.reset(token)
 
-    jax.eval_shape(run, q, k, v, g, beta, h0, starts)
+    with contextlib.nullcontext() if target is None else generation.assumed(target):
+        jax.eval_shape(run, q, k, v, g, beta, h0, starts)
     return tuple(found)
 
 
@@ -1829,7 +1886,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
         _sequence_walk(call, final, "final", (leaving, final_views), (walked, views), step,
                        chunks - first - count, count, ends, begins,
                        lambda i: dh0_ref.at[pl.ds(memory(row, i), call.block), pl.ds(j * bv, bv)], bv,
-                       landing=landing["final"])
+                       landing=landing.get("final"))
 
     out_type = (memories.shape(value_width), held.shape(call.heads * value_width),
                 jax.ShapeDtypeStruct((batch * call.heads * width, value_width), jnp.float32))
@@ -1846,6 +1903,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
         [_f32(CHUNK, bv)] * 3 + _held(given, CHUNK, bv)
         + _held(held, call.block, bv) + _held(memories, call.block, bv) + _held(held, CHUNK, bv)
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block)),))
+    final_landing, after = _final_landing(call, bv)
     return _kernel(program, call, out_type=out_type, grid=(value_width // bv, sequences.shape[0], call.heads),
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=2, work=work,
                    held=held_tiles,
@@ -1853,8 +1911,8 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
                    staging=(*_staging(held, (call.block, bv)), (plgpu.SMEM((CHUNK, bv), held.stored),)),
                    once=finals,
                    landing={**_memory_landing(call, bv), "corrected": held.landing(CHUNK, bv),
-                            "final": ((call.block, bv), jnp.float32)})(q, k, w, do, local, hi, lo, dht,
-                                                                        sequences)
+                            **final_landing},
+                   after=after)(q, k, w, do, local, hi, lo, dht, sequences)
 
 
 def _query_key_views(call: _Call, keyed: tuple, served: tuple, memory: tuple, *, row, key_columns, first,
@@ -1975,6 +2033,10 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
                 jnp.sum(column("entered", memories, j).value().astype(jnp.float32)
                         * column("leaving", memories, j).value().astype(jnp.float32), axis=1)
                 for j in range(blocks)))
+            # The step's reduce-adds ('dq', 'dk', `Family.added`) waited on by design, not by 'dw''s store
+            # being emitted after them: Mosaic GPU waits on no copy at a kernel's exit (template numerics
+            # review 2026-10-26, P3-4).
+            family.store_wait(0)
             return carry, accumulators
 
         _walk(streams, views, step, call, steps=group)

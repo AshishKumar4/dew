@@ -32,10 +32,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, widened, with_gradients
-from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, draw, token_by_token
+from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, chunk_on, draw, token_by_token
 
 from dew.nn.kernels import recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.recurrence_chunk import Chunk
 
 SITES = {'scalar delta': recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5),
          'vector delta': recurrence.Hooks(decay='vector', scale=KEY_WIDTH ** -0.5),
@@ -322,14 +322,15 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
     """The portable math's output and final memory finite wherever the float64 reference's are on every
     declared seed, and on par with the reference's from float64 (module docstring)."""
     hooks = SITES[name]
-    dew = jax.jit(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=False))
-    reference = jax.jit(functools.partial(token_by_token, hooks))
+    # Plain functions: the gate compiles both arms alike (`reference_error._arms`).
+    dew = functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK)
+    reference = functools.partial(token_by_token, hooks)
     draws = functools.partial(stressed, hooks, regime)
     for seed in range(SEEDS[name, regime]):
         operands = draws(seed)
-        mine = dew(*operands)
+        mine = jax.jit(dew)(*operands)
         with jax.enable_x64(new_val=True):
-            truth = reference(*widened(operands))
+            truth = jax.jit(reference)(*widened(operands))
         for leaf, ours, exact in zip(('output', 'final memory'), mine, truth, strict=True):
             finite = np.isfinite(np.asarray(exact))
             assert np.all(np.isfinite(np.asarray(ours))[finite]), (
@@ -338,20 +339,31 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
                     seeds=SEEDS[name, regime])
 
 
-@pytest.mark.parametrize('name, regime', CASES)
+ACCELERATED = [pytest.param(name, regime, id=f'{name}-{regime}-{backend}',
+                           marks=getattr(pytest.mark, backend)(reason=f"the portable backward as {backend} "
+                                                                      f"compiles it"))
+               for backend in ('gpu', 'tpu') for name in ('scalar delta', 'vector delta')
+               for regime in ('decays near zero', 'aligned keys', 'resets on chunk edges')]
+"""The gradient sites an accelerator holds too: the portable backward is a TPU's default and any GPU's past
+its kernels, whose compilers fuse and round its arithmetic as the CPU's do not (template numerics review
+2026-10-26 follow-up: its float64 evidence was the CPU's alone); the delta rule a decay a head and a key
+dimension under the regimes its chunked forms break hardest."""
+
+
+@pytest.mark.parametrize('name, regime', CASES + ACCELERATED)
 def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
     """The portable math's gradient finite wherever the reference's in float64 is, and on par with the
     token-by-token recurrence's from float64 (check 1) over the site's declared seeds."""
     hooks = SITES[name]
-    dew = jax.jit(with_gradients(restarting(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=False),
-                                            regime)))
-    reference = jax.jit(with_gradients(restarting(functools.partial(token_by_token, hooks), regime)))
+    # Plain functions: the gate compiles both arms alike (`reference_error._arms`).
+    dew = with_gradients(restarting(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK), regime))
+    reference = with_gradients(restarting(functools.partial(token_by_token, hooks), regime))
     draws = functools.partial(cotangents, hooks, regime)
     for seed in range(2):
         drawn = draws(seed)
-        mine = dew(*drawn)
+        mine = jax.jit(dew)(*drawn)
         with jax.enable_x64(new_val=True):
-            truth = reference(*widened(drawn))
+            truth = jax.jit(reference)(*widened(drawn))
         leaves = zip(jax.tree.leaves(mine), jax.tree.leaves(truth), strict=True)
         for index, (ours, exact) in enumerate(leaves):
             finite = np.isfinite(np.asarray(exact))

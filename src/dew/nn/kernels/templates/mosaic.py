@@ -4,13 +4,11 @@ The math is each template's algebra, written once; what an instruction family ad
 layout facts alone (`Family`: mosaic_sm90's wgmma; mma.sync's and tcgen05's to come). Each template keeps
 its own mainloop, product dependencies and launch DAG; only these primitives are shared.
 
-A cooperative launch (`cooperative`) runs a producer warpgroup issuing the loads beside consumer warpgroups
-computing, persistent over the multiprocessors, a pair of them a cluster where it shares one operand's blocks
-(multicast, `multicast_axes`). The consumers report a tile drained (`drained`, `drain`) so a persistent
-producer never loads a next tile's stage over one an MMA still reads, and meet (`meet`) where one consumer's
-writes to shared memory are the other's operand. Each consumer's accumulator lives for one output tile
-(`finished`), and a tile's rows reach global memory through `store_rows`, whose stores have static extents
-however many rows a tile holds.
+A launch takes each warpgroup's role (`roles`: a producer issuing the loads beside consumers computing where
+the family's roles split the register file, `Family.consumers`), persistent over the multiprocessors. The
+consumers meet (`meet`) where one consumer's writes to shared memory are the other's operand, and a tile's
+rows reach global memory through `store_rows`, whose stores have static extents however many rows a tile
+holds. The derivation's shared steps are here too (`held_rows`, `deepest`, `band`, `program_shared`).
 
 A mainloop that drives its own loads (the GEMM's kernel gradient, its stages streaming across tiles)
 streams each operand through a `Ring` whose counter runs across tiles, and takes each warpgroup's role
@@ -34,8 +32,6 @@ from dew.nn.kernels.templates import cost
 Ref = state_types.AbstractRef | state_types.TransformedRef
 Operand = Ref | jax.Array
 """A product's operand: a tile in shared memory (a ref) or in registers (an array)."""
-"""A scoped allocation a primitive takes: shared memory, transformed (tiled and swizzled) or not, or
-barriers."""
 
 
 def compiler_params(*, approx_math: bool = False) -> plgpu.CompilerParams:

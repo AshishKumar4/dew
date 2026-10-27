@@ -274,7 +274,7 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     (`WIDE_CPU_ARITHMETIC`), and in a library process, which sets nothing, the plain computation:
     no platform choice and no float64 beside a float32 computation. Each is traced afresh, as a
     process with either setting traces it."""
-    from dew.diffusion.schedules.common import divided
+    from dew.nn.precision import divided
     from dew.nn.protocols import OutputTable
     from dew.objectives.lm.chunked import chunked_cross_entropy
 

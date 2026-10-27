@@ -348,7 +348,11 @@ class _Triton(_GroupedLaunch[Tile]):
         contracted = self._contracted(ba)
         single = contracted is not None and contracted <= self.contraction(config)
         rows, columns = self.output(config)
-        return step * (config.stages - held) + (2 * rows * columns if single else 0)
+        # A hooked call converts its hooks' tiles' layouts through shared memory beside the stages: an A100
+        # refused 181504 bytes for a relu producer's tile counted at 147456 (ALIGNED-gpu-a100), within a
+        # step's more.
+        hooked = ba.arguments['hooks'] != NO_HOOKS
+        return step * (config.stages - held + hooked) + (2 * rows * columns if single else 0)
 
     @staticmethod
     def _contracted(ba) -> int | None:

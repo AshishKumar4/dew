@@ -457,17 +457,21 @@ def gated_rms_normalized(x, gate, scale, epsilon: float, dtype, activation: str,
 
 
 def _moment_normalized(x, scale, bias, axes: tuple[int, ...], epsilon: float, requested):
-    """`x` normalized over `axes` op for op as flax computes it, reduced in
-    the module's `requested` dtype, else `x`'s, at least fp32
-    (flax.linen.normalization._compute_stats): E[x] and E[x^2], the variance
-    their difference clipped at zero, the weight folded into the inverse
-    deviation before it meets the centered activations. `scale` and `bias`
-    (None for none) broadcast against `x`'s trailing axes."""
+    """`x` normalized over `axes`, reduced in the module's `requested` dtype,
+    else `x`'s, at least fp32, as flax lays the computation out
+    (flax.linen.normalization._compute_stats) but for the variance: the
+    centered mean square E[(x - E[x])^2], as torch's GroupNorm takes it, where
+    flax takes E[x^2] - E[x]^2. That difference cancels where a group's mean
+    dwarfs its spread, and its gradient carries the loss: FLUX.2's published
+    VAE's input gradient sat twice torch's distance from float64, its worst
+    seeds 6 to 10 times. The centered form has no such cancellation, at one
+    more pass over the group. The weight is folded into the inverse deviation
+    before it meets the centered activations. `scale` and `bias` (None for
+    none) broadcast against `x`'s trailing axes."""
     statistics = at_least_fp32(x.dtype if requested is None else requested)
     reduced = x.astype(statistics)
     mean = jnp.mean(reduced, axis=axes, keepdims=True)
-    variance = jnp.maximum(0.0, jnp.mean(jax.lax.square(reduced), axis=axes, keepdims=True)
-                           - jax.lax.square(mean))
+    variance = jnp.mean(jax.lax.square(reduced - mean), axis=axes, keepdims=True)
     scaling = jax.lax.rsqrt(variance + epsilon)
     if scale is not None:
         scaling = scaling * scale
@@ -479,8 +483,8 @@ def _moment_normalized(x, scale, bias, axes: tuple[int, ...], epsilon: float, re
 @functools.partial(normalized_in_fp32, static_argnums=(3, 4, 5, 6, 7))
 def group_normalized(x, scale, bias, groups: int, epsilon: float, activation, requested, dtype):
     """`x` `[batch, ..., channels]` normalized over each of `groups` channel
-    groups and every axis but the batch, as flax's `GroupNorm`
-    (`_moment_normalized`). `activation` (None for none) runs on the result
+    groups and every axis but the batch, as flax's `GroupNorm` lays it out, its
+    variance centered as torch's (`_moment_normalized`). `activation` (None for none) runs on the result
     before its one cast to `dtype`."""
     grouped = x.reshape(*x.shape[:-1], groups, x.shape[-1] // groups)
     scale, bias = (None if value is None else value.reshape(grouped.shape[-2:]) for value in (scale, bias))
@@ -593,9 +597,10 @@ class LayerNorm(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_sa
 
 
 class GroupNorm(nn.Module):
-    """Flax's `nn.GroupNorm` over the last axis, op for op and with its
-    parameter tree, and an `activation` applied to its fp32 output before
-    the one cast to `dtype`.
+    """Flax's `nn.GroupNorm` over the last axis, with its parameter tree, its
+    variance centered as torch's GroupNorm takes it (`_moment_normalized`),
+    and an `activation` applied to its fp32 output before the one cast to
+    `dtype`.
 
     Diffusers' norms keep their fp32 affine output into the activation and
     the next layer casts its result (vae_flax.py:154 and its UNet), so a
