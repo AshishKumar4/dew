@@ -199,8 +199,13 @@ def build(model_module, engram_module, args, seed: int, widen: bool = False):
     weights drawn. `float` and `double` leave the complex rotary tables as
     they were built. The vision half draws from a generator of its own, so
     the decoder's weights are the same with it or without."""
+    from torch_precision import float64
+
     torch.manual_seed(seed)
-    net = model_module.Transformer(args, tokenizer())
+    # Built inside the shared `float64` when widened, so every value its constructor computes is
+    # float64's; the run's own widening (`widened`) is the caller's.
+    with float64() if widen else contextlib.nullcontext():
+        net = model_module.Transformer(args, tokenizer())
     net = net.double() if widen else net.float()
     generator = torch.Generator().manual_seed(seed)
     media = torch.Generator().manual_seed(seed + 2)
