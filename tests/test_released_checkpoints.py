@@ -54,6 +54,7 @@ import numpy as np
 import optax
 import pytest
 from model_support import flat_tree
+from reference_error import assert_as_exact_as_the_reference, float64_forward
 
 from dew.interop import Pretrained
 from dew.objectives.base import Step
@@ -74,7 +75,6 @@ PROMPTS = ("The Cascade Range runs from northern California through Oregon and W
 SEQ = 32
 NEW_TOKENS = 12
 RATE = 1e-4
-LOGITS = {"SmolLM2-135M": 3e-4, "Qwen3-0.6B": 7e-4}
 TOKEN_LOSS = 5e-3
 
 
@@ -141,8 +141,25 @@ def reference(bundle):
     return model
 
 
-def reference_logits(model, ids, mask=None, positions=None) -> np.ndarray:
-    """`model`'s logits for exactly the ids, mask and positions dew was given."""
+@pytest.fixture(scope="module")
+def truth(reference):
+    """transformers' float64 twin of the same weights, the logits' truth."""
+    from tools.torch_precision import float64_twin
+
+    return float64_twin(reference)
+
+
+def wide_logits(model, ids, mask=None, positions=None) -> np.ndarray:
+    """A float64 twin's logits for exactly the ids, mask and positions dew was given."""
+    from tools.torch_precision import float64
+
+    with float64():
+        return reference_logits(model, ids, mask, positions, wide=True)
+
+
+def reference_logits(model, ids, mask=None, positions=None, *, wide: bool = False) -> np.ndarray:
+    """`model`'s logits for exactly the ids, mask and positions dew was given, in float32, or as the
+    model computes them where `wide`."""
     import torch
 
     def rows(value):
@@ -153,7 +170,8 @@ def reference_logits(model, ids, mask=None, positions=None) -> np.ndarray:
         fields["attention_mask"] = rows(mask)
         fields["position_ids"] = rows(positions)
     with torch.no_grad():
-        return model(**fields).logits.to(torch.float32).numpy()
+        logits = model(**fields).logits
+        return (logits if wide else logits.to(torch.float32)).numpy()
 
 
 @pytest.fixture(scope="module")
@@ -208,20 +226,21 @@ def test_the_load_hands_back_the_checkpoints_own_tokenizer(bundle, batch):
 
 
 def test_the_released_logits_match_transformers_on_the_same_ids(
-        bundle, batch, reference, checkpoint):
+        bundle, batch, reference, truth, checkpoint):
     """The parity claim on real weights: dew's fp32 forward over the released
-    checkpoint against transformers over the same directory, the same ids,
-    the same mask and the same positions."""
+    checkpoint as exact as transformers' over the same directory, the same
+    ids, the same mask and the same positions (`assert_as_exact_as_the_reference`),
+    the truth transformers' float64 twin of the same weights."""
     inputs, _, _ = batch
-    valid = np.asarray(inputs.token_fields["attention_mask"])
+    valid = np.asarray(inputs.token_fields["attention_mask"]).astype(bool)
+    positions = inputs.token_fields["positions"]
     ours = np.asarray(bundle.model.apply(bundle.variables, inputs.tokens, **inputs.kwargs()),
                       np.float32)
-    theirs = reference_logits(reference, inputs.tokens, valid,
-                              inputs.token_fields["positions"])
-
-    assert np.array_equal(np.argmax(ours[valid], -1), np.argmax(theirs[valid], -1))
-    difference = float(np.max(np.abs(ours[valid] - theirs[valid])))
-    assert difference < LOGITS[checkpoint], f"max |logit difference| {difference:.3e}"
+    theirs = reference_logits(reference, inputs.tokens, valid, positions)
+    wide = wide_logits(truth, inputs.tokens, valid, positions)
+    _, terms = float64_forward(bundle.model, bundle.variables, inputs.tokens, **inputs.kwargs())
+    assert_as_exact_as_the_reference(ours[valid], theirs[valid], wide[valid], f"{checkpoint} logits",
+                                     terms=np.asarray(terms)[valid])
 
 
 def test_the_objectives_token_scores_are_the_references_cross_entropy(
@@ -281,13 +300,14 @@ def test_the_trained_export_reloads_and_transformers_reads_it(
     layout: `Pretrained.load` reads them back leaf for leaf, rebuilds the
     same model and still carries a tokenizer, and transformers loads the
     same directory, consuming every tensor and wanting none, and computes
-    the same logits."""
+    logits Dew's are as exact as (`assert_as_exact_as_the_reference`), the
+    truth its float64 twin of the exported weights."""
     import torch
     from transformers import AutoModelForCausalLM
 
     inputs, _, _ = batch
     state = trained
-    valid = np.asarray(inputs.token_fields["attention_mask"])
+    valid = np.asarray(inputs.token_fields["attention_mask"]).astype(bool)
     export = tmp_path / "trained"
 
     bundle.save(export, variables=state.variables)
@@ -316,7 +336,11 @@ def test_the_trained_export_reloads_and_transformers_reads_it(
 
     read_back.eval()
     read_back.set_attn_implementation("eager")
-    theirs = reference_logits(read_back, inputs.tokens, valid, inputs.token_fields["positions"])
-    assert np.array_equal(np.argmax(theirs[valid], -1), np.argmax(ours[valid], -1))
-    difference = float(np.max(np.abs(theirs[valid] - ours[valid])))
-    assert difference < LOGITS[checkpoint], f"max |logit difference| {difference:.3e}"
+    positions = inputs.token_fields["positions"]
+    theirs = reference_logits(read_back, inputs.tokens, valid, positions)
+    from tools.torch_precision import float64_twin
+
+    wide = wide_logits(float64_twin(read_back), inputs.tokens, valid, positions)
+    _, terms = float64_forward(bundle.model, state.variables, inputs.tokens, **inputs.kwargs())
+    assert_as_exact_as_the_reference(ours[valid], theirs[valid], wide[valid], f"{checkpoint} export",
+                                     terms=np.asarray(terms)[valid])
