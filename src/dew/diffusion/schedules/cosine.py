@@ -65,8 +65,9 @@ class CosineGeneralNoiseScheduler(GeneralizedNoiseScheduler):
     moving linearly from atan(sigma_min / kappa) at t = 0 to atan(sigma_max / kappa) at t = 1, the
     angles of FlaxDiff's log-SNR bounds. With kappa 1 the grid runs from sigma_min to sigma_max; with
     another it runs from sigma_min / kappa^2 to sigma_max / kappa^2, as FlaxDiff's divides the tangent
-    by kappa again. The schedule's `sigma_min` and `sigma_max` are the grid's own ends, which a solver
-    keeps its sigmas inside (Heun's churn, `BrownianTree`); `nominal` holds the two arguments.
+    by kappa again: those ends are its `sigma_range`, which a solver keeps its sigmas inside (Heun's
+    churn, `BrownianTree`), and `sigma_min` and `sigma_max` the arguments, as FlaxDiff keeps them and a
+    record rebuilds the schedule from.
 
     The arithmetic is FlaxDiff's `CosineGeneralNoiseScheduler` and the `GeneralizedNoiseScheduler`
     it extends (flaxdiff/schedulers/cosine.py and common.py at 15c55b001): its grid operation for
@@ -83,12 +84,16 @@ class CosineGeneralNoiseScheduler(GeneralizedNoiseScheduler):
 
     def __init__(self, sigma_min: float = 0.02, sigma_max: float = 80.0, kappa: float = 1.0,
                  sigma_data: float = 1.0):
-        self.kappa, self.nominal = kappa, (sigma_min, sigma_max)
+        super().__init__(sigma_min, sigma_max, sigma_data)
+        self.kappa = kappa
         logsnr_max = 2 * (math.log(self.kappa) - math.log(sigma_max))
         self.theta_max = math.atan(math.exp(-0.5 * logsnr_max))
         logsnr_min = 2 * (math.log(self.kappa) - math.log(sigma_min))
         self.theta_min = math.atan(math.exp(-0.5 * logsnr_min))
-        super().__init__(math.tan(self.theta_min) / kappa, math.tan(self.theta_max) / kappa, sigma_data)
+
+    @property
+    def sigma_range(self) -> tuple[float, float]:
+        return math.tan(self.theta_min) / self.kappa, math.tan(self.theta_max) / self.kappa
 
     def sigmas(self, t):
         return jnp.tan(self.theta_min + times(t) * (self.theta_max - self.theta_min)) / self.kappa
@@ -98,7 +103,7 @@ class CosineGeneralNoiseScheduler(GeneralizedNoiseScheduler):
         return divided(angle - self.theta_min, self.theta_max - self.theta_min)
 
     def weight(self, t):
-        return 1 + divided(jnp.square(self.sigmas(t)), self.nominal[1] ** 2)
+        return 1 + divided(jnp.square(self.sigmas(t)), self.sigma_max ** 2)
 
     def model_time(self, t):
         # FlaxDiff's `transform_inputs`: the progress in whole thousandths, truncated as its int32 cast is.

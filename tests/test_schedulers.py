@@ -682,16 +682,17 @@ def test_the_tangent_grids_time_of_a_sigma_is_on_par_with_its_formula_rounded_in
 
 @pytest.mark.parametrize("kappa", [0.5, 2.0])
 def test_heuns_churn_stays_inside_the_tangent_grid_whatever_its_kappa(kappa):
-    """The tangent grid of nominal bounds 0.02 and 80 ends at 80 / kappa^2 (`sigma_max`, 320 at kappa
+    """The tangent grid of nominal bounds 0.02 and 80 ends at 80 / kappa^2 (`sigma_range`, 320 at kappa
     0.5 and 20 at kappa 2), the top a churn may raise a sigma to: a churn of the grid's top sigma is
     refused, and one of the sigma at t = 0.99, raised by a tenth to about 102 at kappa 0.5 (past the
-    nominal 80) and 14 at kappa 2, runs."""
+    nominal 80) and 14 at kappa 2, runs; a record of the schedule rebuilds its nominal bounds."""
     from types import SimpleNamespace
 
     from dew.sampling import Heun
 
     schedule = CosineGeneralNoiseScheduler(kappa=kappa)
-    assert schedule.nominal == (0.02, 80.0)
+    assert (schedule.sigma_min, schedule.sigma_max) == (0.02, 80.0)
+    assert schedule.sigma_range[1] == pytest.approx(80.0 / kappa ** 2)
     process, x = SimpleNamespace(sampler_schedule=schedule), jnp.zeros((1, 4), jnp.float32)
     with pytest.raises(ValueError):
         Heun(s_churn=0.2).init(x, jnp.asarray([1.0, 0.5, 0.0]), process, key=jax.random.key(0))
