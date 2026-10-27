@@ -1414,7 +1414,7 @@ class Trainer(Generic[Loss, Effects]):
         compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]] = run.compiled
         seen = 0
         run.notice = PreemptionNotice()
-        run.clock = TokenClock(interval.real_tokens, self.accumulation)
+        run.clock = TokenClock(*interval.clocked(state.accumulation))
         if run.cooling is not None and not plan.ended(run.current, run.clock.read):
             # A branch a preemption cut short runs again before the run reads on from where it stood.
             state, cut = self._cooled(plan, run, state, shardings, position, run.cooling)
@@ -1735,7 +1735,7 @@ class Trainer(Generic[Loss, Effects]):
         notice stops the run at this step, whose checkpoint is then written."""
         current, checkpoints = run.current, self.checkpoints
         before = run.clock.read
-        real = plan.committed(interval, run.clock)
+        real = plan.committed(interval, run.clock, state)
         record, aux = taken_record(aux)
         if record is not None:
             self.records.append(record)

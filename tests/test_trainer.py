@@ -29,7 +29,18 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import pytest
-from affine_run import BATCH, FEATURES, Counting, Features, Regression, Spread, dataset, raw_leaf, val_batches
+from affine_run import (
+    BATCH,
+    FEATURES,
+    Counting,
+    Features,
+    Regression,
+    Replaying,
+    Spread,
+    dataset,
+    raw_leaf,
+    val_batches,
+)
 from flax.core import FrozenDict, freeze as frozen_dict
 from recording import Preempting, RecordingTracker
 from steady_state import steady_state
@@ -256,16 +267,26 @@ def test_a_token_budget_reads_its_count_off_the_devices_as_often_in_a_longer_run
     assert reads(4) == reads(20)
 
 
+def varied_rows(position: int) -> dict[str, np.ndarray]:
+    """The batch read at `position`: eight rows of thirteen ids, twelve targets each, then rows of four
+    ids, three targets each, from there on."""
+    width = 13 if position == 0 else 4
+    return {"text": (np.arange(LM_ROWS * width, dtype=np.int32) % 13).reshape(LM_ROWS, width)}
+
+
 def test_a_token_budget_resumed_inside_an_update_ends_where_an_unbroken_run_does(tmp_path):
-    """A run stopped one step into an update of two resumes with that step's rows still to commit,
-    which the update's commit brings in with the next step's: the resumed budget ends at the step
-    whose commit reaches it, as a run that never stopped does, not a step later, where its own steps
-    alone would have reached it."""
-    budget = 4 * LM_ROWS * LM_CONTEXT
-    unbroken = budget_lm_trainer(tmp_path / "unbroken", accumulation=2).fit(lm_data(), tokens=budget)
-    budget_lm_trainer(tmp_path / "broken", accumulation=2).fit(lm_data(), steps=3)
-    resumed = budget_lm_trainer(tmp_path / "broken", accumulation=2).fit(lm_data(), tokens=budget)
-    assert int(unbroken.step) == int(resumed.step) == 4
+    """A run of updates of three steps stopped after its first step resumes with that step's 96 targets
+    still to commit, more than any later step's 24: the update's commit at step 3 brings the run to the
+    budget of 144, so the resumed run ends there, as a run that never stopped does, where a bound of its
+    own steps alone would not reach the budget until step 6."""
+    def data():
+        return Loader(lambda partition: Replaying(varied_rows), None, batch=LM_ROWS, records=None)
+
+    budget = LM_ROWS * (12 + 3 + 3)
+    unbroken = budget_lm_trainer(tmp_path / "unbroken", accumulation=3).fit(data(), tokens=budget)
+    budget_lm_trainer(tmp_path / "broken", accumulation=3).fit(data(), steps=1)
+    resumed = budget_lm_trainer(tmp_path / "broken", accumulation=3).fit(data(), tokens=budget)
+    assert int(unbroken.step) == int(resumed.step) == 3
 
 
 def context_schedule(tmp_path, longer: int) -> Pipeline:

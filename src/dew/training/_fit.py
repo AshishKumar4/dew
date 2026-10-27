@@ -141,14 +141,15 @@ class FitPlan:
         ends = (self.tokens, self.pause[1], *(self.dataset.token_ends or ()), *nexts, *branches)
         return min((end for end in ends if end is not None and end > real), default=None)
 
-    def committed(self, interval: Interval, clock: TokenClock) -> int:
+    def committed(self, interval: Interval, clock: TokenClock, state: TrainState) -> int:
         """The run's committed tokens after its latest step, as this plan reads them: read off the
-        devices where the clock's bound reaches the next count the plan reads (`horizon`), and
-        otherwise the count of its last read, which falls on no budget, cadence or stage the latest
-        step's count could not, so the loop does not wait on that step."""
+        devices, with the tokens `state`'s open window holds, where the clock's bound reaches the next
+        count the plan reads (`horizon`), and otherwise the count of its last read, which falls on no
+        budget, cadence or stage the latest step's count could not, so the loop does not wait on that
+        step."""
         horizon, bound = self.horizon(clock.read), clock.bound
         if horizon is not None and (bound is None or bound >= horizon):
-            clock.reread(interval.real_tokens)
+            clock.reread(*interval.clocked(state.accumulation))
         return clock.read
 
     @property
