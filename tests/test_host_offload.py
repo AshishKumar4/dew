@@ -1,4 +1,4 @@
-"""The plan's host offload (`dew.training.planning.Search`): where a step does not fit its devices, the
+"""The plan's host offload (`dew.training.planning.FitSearch`): where a step does not fit its devices, the
 plan keeps the optimizer state and the EMA in its host's pinned memory before it recomputes anything,
 and a remat rung that keeps its residuals there stands before the next that recomputes them, each only
 where the bytes it moves, over the host link, take no longer than the step's FLOPs at the device's peak
@@ -16,12 +16,13 @@ import optax
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from kernel_compile import compile_only_gpus
 from reference_error import as_given, assert_as_exact
+from test_host_placement import memory_kinds
+from test_layout_validation import step_loss
 from test_plan import LIMIT, ROWS, SEQ, free, needs, one_device, trained
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import Link
-from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training import Trainer
 
@@ -43,11 +44,7 @@ def offloading(split=None, link=FAST, **fields):
                               key=jax.random.key(0), split=split, links={HOST: link}))
 
 
-def memory_kinds(tree):
-    return {leaf.sharding.memory_kind for leaf in jax.tree.leaves(tree)}
-
-
-def asked(trainer):
+def offload_probes(trainer):
     """The compiles the plan's search made, as (split, remat, host, fits, hidden)."""
     return [(probe["split"], probe["remat"], probe.get("host"), probe["fits"], probe.get("hidden"))
             for probe in trainer.plan["probes"]]
@@ -71,7 +68,7 @@ def test_a_step_that_fits_only_without_its_state_on_the_device_keeps_it_in_host_
     trainer = offloading()
     state = trained(trainer)
     assert (trainer.plan.get("host"), trainer.plan["remat"]) == (OFFLOADED, None)
-    searched = asked(trainer)
+    searched = offload_probes(trainer)
     assert all(not fits for _, remat, host, fits, _ in searched if host == [])
     assert (trainer.plan["split"], None, OFFLOADED, True, True) in searched
     assert memory_kinds(state.opt_state) == memory_kinds(state.ema) == {"pinned_host"}
@@ -93,7 +90,7 @@ def test_a_state_offload_the_host_link_cannot_hide_is_taken_back_and_the_step_re
     state = trained(trainer)
     assert trainer.plan.get("host") == []
     assert (trainer.plan["remat"], trainer.plan["head_tile"]) != (None, None)
-    assert any(host == OFFLOADED and hidden is False for _, _, host, _, hidden in asked(trainer))
+    assert any(host == OFFLOADED and hidden is False for _, _, host, _, hidden in offload_probes(trainer))
     assert memory_kinds(state.opt_state) == {"device"}
 
 
@@ -117,11 +114,8 @@ def test_an_offloading_remat_rung_is_priced_by_the_residuals_it_keeps_in_host_me
         placed = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=whole),
                               variables)
         batch = {"text": jax.ShapeDtypeStruct((8, 65), jnp.int32, sharding=whole)}
-
-        def loss(params, batch):
-            at = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
-            return objective.scalar_loss({**placed, "params": params}, batch, at)[0]
-        return jax.jit(jax.grad(loss)).trace(placed["params"], batch).lower().compile()
+        gradient = jax.jit(lambda params, batch: jax.grad(step_loss(objective, placed, batch))(params))
+        return gradient.trace(placed["params"], batch).lower().compile()
 
     kept, offloading_step = compiled("minimal"), compiled("minimal_offloaded")
     assert kept.memory_analysis().host_temp_size_in_bytes == 0

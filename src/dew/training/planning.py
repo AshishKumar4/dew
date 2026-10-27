@@ -441,7 +441,7 @@ def hides(moved: int, executable: jax.stages.Compiled, link: Link | None) -> boo
 
 
 @dataclasses.dataclass
-class Search:
+class FitSearch:
     """One plan's search over the fit ladder (`plan_step`): what it lowered, compiled and measured, and
     where on the ladder it stands, from the rung `objective`, `xla_defaults`, `narrow` and `host` give.
 
@@ -594,7 +594,7 @@ def plan_step[LossT, EffectsT](
     `base` at each remat rung (`recompute_more`). The first rung climbed drops the narrow copies, which a
     plan above it, the frontier's too, takes back where its rung and split fit with them. Past XLA's
     defaults the `offloadable` fields of the state go to host memory before the next remat rung, where
-    what they move hides behind the step (`Search`). A split missing at a rung with a half rung
+    what they move hides behind the step (`FitSearch`). A split missing at a rung with a half rung
     (`remat_half`) is compiled there, the plan staying where it fits; climbing and the frontier pass every
     half rung asked (`onward`). Each compile's measure (`Forecast`) orders the splits; `resumed`, a
     checkpoint's rung, is warned of where it misses; where nothing fits it raises with the closest
@@ -602,8 +602,8 @@ def plan_step[LossT, EffectsT](
     batch whole a remat rung up (`remat_more`), the head tiled and unfused, follows where it fits, above
     any rung that dropped the copies. Each compile made comes beside the plans; the objective is left at
     the last plan's rung."""
-    search = Search(lower, options, objective, mesh, xla_defaults, narrow, base, resumed, host, offloadable,
-                    link)
+    search = FitSearch(lower, options, objective, mesh, xla_defaults, narrow, base, resumed, host,
+                       offloadable, link)
     split = planned(candidates, first, search.fits, search.climb,
                     lambda split: search.forecast.likely(search.rung(), split))
     if split is None or search.fitted is None:

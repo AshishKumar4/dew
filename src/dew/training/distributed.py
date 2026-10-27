@@ -158,7 +158,7 @@ def peak_flops(mesh: Mesh) -> float | None:
 
 
 OFFLOADABLE = ("opt_state", "ema")
-"""The state's fields a plan may keep in its host's pinned memory (`dew.training.planning.Search`), each
+"""The state's fields a plan may keep in its host's pinned memory (`dew.training.planning.FitSearch`), each
 fetched for the update and written back after it, as `Layout.host` keeps them."""
 
 
