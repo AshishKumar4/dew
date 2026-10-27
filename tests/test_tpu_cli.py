@@ -577,3 +577,151 @@ def test_the_disk_script_opens_and_records_the_mount_once_the_disk_is_mounted(tm
     else:
         assert done.returncode == 32
         assert [line.split()[0] for line in ran] == ["mkdir", "mountpoint", "mount"]
+
+
+# ------------------------------------------------------------ every other command
+
+
+@pytest.fixture()
+def tree(tmp_path, monkeypatch):
+    """A git working tree as the current directory, the one `sync` copies."""
+    root = tmp_path / "tree"
+    root.mkdir()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    monkeypatch.chdir(root)
+    return root
+
+
+def commands(fake: Fake, verb: str) -> list[str]:
+    """The remote commands the fake was asked to run over ssh, in order, the venv prefix off."""
+    return [next(part.split("=", 1)[1] for part in call if part.startswith("--command="))
+            .removeprefix(env_prefix()) for call in only(fake.gcloud_calls(), verb)
+            if any(part.startswith("--command=") for part in call)]
+
+
+def test_list_asks_every_configured_zone_and_reports_none_found(fake):
+    """`list` asks each configured zone's listing once, the TPUs found in any; with none it reports
+    none and succeeds."""
+    fake.offer("slice", "us-central2-b")
+    fake.offer("other", "us-east1-d")
+    assert run("list") == 0
+    assert zones_seen(only(fake.gcloud_calls(), "list"), "list") == list(CONFIG.zones)
+    fake.state["nodes"] = {}
+    fake.flush()
+    assert run("list", "--zone", "europe-west4-a") == 0
+    assert zones_seen(only(fake.gcloud_calls(), "list"), "list")[-1] == "europe-west4-a"
+
+
+def test_attach_disk_attaches_the_disk_then_mounts_it_on_every_worker(fake):
+    fake.offer("slice", "us-central2-b")
+    assert run("attach-disk", "slice", "data", "--read-only") == 0
+    assert only(fake.gcloud_calls(), "attach-disk") == [gcloud(
+        "compute", "tpus", "tpu-vm", "attach-disk", "slice", "--zone=us-central2-b",
+        "--disk=projects/my-project/zones/us-central2-b/disks/data", "--mode=read-only")]
+    mounts = [call for call in only(fake.gcloud_calls(), "ssh")
+              if any("sudo -n bash" in part for part in call)]
+    assert sorted(part for call in mounts for part in call if part.startswith("--worker=")) == [
+        "--worker=0", "--worker=1"]
+
+
+def test_copy_sends_a_directory_recursively_to_every_worker(fake, tmp_path):
+    fake.offer("slice", "us-central2-b")
+    (tmp_path / "payload").mkdir()
+    assert run("copy", "slice", str(tmp_path / "payload"), "~/payload") == 0
+    assert only(fake.gcloud_calls(), "scp") == [gcloud(
+        "compute", "tpus", "tpu-vm", "scp", str(tmp_path / "payload"), "you@slice:~/payload",
+        "--zone=us-central2-b", "--worker=all", "--recurse")]
+
+
+def test_sync_rsyncs_the_working_tree_to_each_worker_with_its_excludes(fake, tree):
+    fake.offer("slice", "us-central2-b")
+    assert run("sync", "slice", "--exclude", "runs", "--delete") == 0
+    synced = fake.rsync_calls()
+    assert [call[-1] for call in synced] == [f"you@34.0.0.{index}:~/tree/" for index in (1, 2)]
+    assert all("--delete" in call and "--exclude=runs" in call and call[-2] == f"{tree}/"
+               for call in synced)
+
+
+def test_setup_from_source_syncs_installs_and_checks_every_workers_devices(fake, tree):
+    """`setup --from-source` syncs the tree, copies its rendered script to every worker, runs it on
+    each, and checks each sees the slice's 16 devices; a worker that sees fewer fails it."""
+    fake.offer("slice", "us-central2-b")
+    assert run("setup", "slice", "--from-source") == 0
+    assert len(fake.rsync_calls()) == 2
+    assert [call[4:6] for call in only(fake.gcloud_calls(), "scp")] == [
+        [str(config_dir() / "setup-slice.sh"), "you@slice:~/dew-setup.sh"]]
+    ran = commands(fake, "ssh")
+    assert ran.count("bash ~/dew-setup.sh") == 2 and sum("jax.device_count" in command for command in ran) == 2
+    fake.offer("slice", "us-central2-b", devices="8 8")
+    assert run("setup", "slice") == 1
+
+
+def test_train_syncs_starts_the_recipe_on_every_worker_and_follows_worker_zero(fake, tree):
+    fake.offer("slice", "us-central2-b")
+    assert run("train", "slice", "--job", "j1", "--", "recipes/lm/train.py", "--steps", "3") == 0
+    ran = commands(fake, "ssh")
+    started = [command for command in ran if "nohup" in command]
+    assert len(started) == 2
+    assert all("cd ~/tree && python recipes/lm/train.py --steps 3 --trainer.multi-host True" in command
+               for command in started)
+    assert ran[-1].startswith("tail -f -n 200 ") and ran[-1].endswith("j1/worker-0.log")
+    with pytest.raises(SystemExit):
+        run("train", "slice")
+
+
+def test_run_detached_starts_a_named_job_and_logs_reads_its_tail(fake):
+    fake.offer("slice", "us-central2-b")
+    assert run("run", "slice", "--detach", "--job", "j2", "--", "echo", "hi") == 0
+    assert sum("nohup" in command and "j2/worker-" in command for command in commands(fake, "ssh")) == 2
+    assert run("logs", "slice", "j2", "--worker", "all", "--lines", "5") == 0
+    tails = [command for command in commands(fake, "ssh") if command.startswith("tail ")]
+    assert tails == [f"tail -n 5 {tpu_setup.log_path('j2', index)}" for index in (0, 1)]
+    with pytest.raises(SystemExit):
+        run("run", "slice")
+
+
+def test_status_and_reset_ask_every_worker(fake):
+    fake.offer("slice", "us-central2-b")
+    assert run("status", "slice") == 0
+    assert run("reset", "slice") == 0
+    ran = commands(fake, "ssh")
+    assert ran.count(tpu_setup.STATUS) == 2 and ran.count(tpu_setup.RESET) == 2
+
+
+def test_create_queued_spot_goes_through_the_queued_resources_api(fake):
+    fake.offer("slice", "us-central2-b")
+    assert run("create", "slice", "--queued", "--spot") == 0
+    assert fake.gcloud_calls()[0] == gcloud(
+        "compute", "tpus", "queued-resources", "create", "slice", "--zone=us-central2-b",
+        "--accelerator-type=v5litepod-16", "--runtime-version=v2-alpha-tpuv5-lite", "--node-id=slice",
+        "--spot")
+
+
+def test_spawn_creates_sets_up_and_starts_a_command_on_each_tpu(fake):
+    for name in ("pool-0", "pool-1"):
+        fake.offer(name, "us-central2-b")
+    assert run("spawn", "pool", "2", "--spot", "--", "echo", "hi") == 0
+    created = sorted(call[4] for call in only(fake.gcloud_calls(), "create"))
+    assert created == ["pool-0", "pool-1"]
+    assert sum("nohup" in command and "echo hi" in command for command in commands(fake, "ssh")) == 4
+
+
+def test_help_lists_the_config_defaults_a_command_reads(fake, capsys):
+    with pytest.raises(SystemExit) as done:
+        run("spawn", "--help")
+    assert done.value.code == 0
+    shown = capsys.readouterr().out
+    assert all(f"  {field}" in shown for field in tpu_cli.Spawn.reads)
+
+
+def test_a_tpu_no_zone_lists_and_one_not_ready_are_refused(fake):
+    """A name no configured zone lists is refused after asking each, and forgotten from the zone
+    cache; a TPU that is TERMINATED does not come back to READY, so `start` stops at once."""
+    (config_dir() / "zones.json").write_text(json.dumps({"ghost": "us-east1-d"}))
+    with pytest.raises(SystemExit):
+        run("describe", "ghost")
+    assert sorted(zones_seen(only(fake.gcloud_calls(), "list"), "list")) == sorted(CONFIG.zones)
+    assert json.loads((config_dir() / "zones.json").read_text()) == {}
+    fake.offer("slice", "us-central2-b", dict(NODE, state="TERMINATED"))
+    with pytest.raises(SystemExit):
+        run("start", "slice")
