@@ -658,9 +658,33 @@ def test_an_interpreted_launch_takes_the_models_tile_unconfirmed():
         assert tile is not None and launch.confirmed(ba, tile, target)
 
 
-def test_a_kernels_reports_are_compiled_once_per_toolchain(monkeypatch, tmp_path):
-    """`report.confirmed` keys a kernel's reports by its exported module, its generation and the toolchain
-    (`report.toolchain`), and keeps them under Dew's cache: a second ask compiles nothing."""
+LAUNCH = textwrap.dedent("""
+    import jax, jax.numpy as jnp, tokamax
+    from dew.nn.kernels import generation, grouped_matmul, tuning
+
+    args = (jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16),
+            jax.ShapeDtypeStruct((2,), jnp.int32))
+    with generation.assumed("sm80"):
+        launch = grouped_matmul.MosaicGmm()
+        tile = launch.derived(launch.bind(*args, interpret=True, out_dtype="bfloat16", trans_rhs=False),
+                              generation.gpu_target())
+        configured = launch.replace(config=tile)
+        bound = configured.bind(*args, interpret=False, out_dtype="bfloat16", trans_rhs=False)
+        name = tuning.launch_text(bound)
+
+    def call(x, w, sizes):
+        return configured(x, w, sizes, interpret=False, out_dtype="bfloat16", trans_rhs=False)
+""")
+"""A plain grouped forward at its derived tile on an A100 (`call`, at `args`) and the text every process
+names it by (`name`, `tuning.launch_text`)."""
+
+
+def test_a_launchs_reports_are_compiled_once_per_toolchain_and_found_by_its_name_in_a_later_process(
+        monkeypatch, tmp_path):
+    """`report.confirmed` keeps a launch's reports under Dew's cache by the launch's text
+    (`tuning.launch_text`), its generation, the toolchain and Dew's source (`report.toolchain`,
+    `report.source`): a second ask compiles nothing, and a later process that names the launch alike finds
+    them without tracing the launch to export it or compiling it."""
     from dew.nn.kernels.templates import report
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
@@ -671,54 +695,20 @@ def test_a_kernels_reports_are_compiled_once_per_toolchain(monkeypatch, tmp_path
         compiled.append(name)
         return found
 
-    args = (jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16),
-            jax.ShapeDtypeStruct((2,), jnp.int32))
-    with generation.assumed("sm80"):
-        launch = grouped_matmul.MosaicGmm()
-        tile = launch.derived(launch.bind(*args, interpret=True, out_dtype="bfloat16", trans_rhs=False),
-                              generation.gpu_target())
-
-        def call(x, w, sizes):
-            return launch.replace(config=tile)(x, w, sizes, interpret=False, out_dtype="bfloat16",
-                                               trans_rhs=False)
-
-        assert report.confirmed(call, args, "sm80", compile=compile) == found
-        assert report.confirmed(call, args, "sm80", compile=compile) == found
+    here: dict = {}
+    exec(LAUNCH, here)
+    for _ in range(2):
+        confirmed = report.confirmed(here["call"], here["args"], "sm80", call=here["name"], compile=compile)
+        assert confirmed == found
     assert compiled == ["sm80"]
     assert len(list((tmp_path / "dew" / "kernel-reports").glob("*.json"))) == 1
-
-
-def test_a_launch_named_whole_finds_its_reports_in_a_later_process_without_exporting(monkeypatch, tmp_path):
-    """Reports confirmed for a launch named whole (`report.confirmed`'s `call`) serve a later process under
-    the same cache by that name, with Dew's source and the toolchain (`report.source`, `report.toolchain`):
-    it neither traces the launch to export it nor compiles it."""
-    from dew.nn.kernels.templates import report
-
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-    found = (report.Report("dew_gmm", 1024, 0, 128, 0),)
-    args = (jax.ShapeDtypeStruct((256, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16),
-            jax.ShapeDtypeStruct((2,), jnp.int32))
-    with generation.assumed("sm80"):
-        launch = grouped_matmul.MosaicGmm()
-        tile = launch.derived(launch.bind(*args, interpret=True, out_dtype="bfloat16", trans_rhs=False),
-                              generation.gpu_target())
-
-        def call(x, w, sizes):
-            return launch.replace(config=tile)(x, w, sizes, interpret=False, out_dtype="bfloat16",
-                                               trans_rhs=False)
-
-        assert report.confirmed(call, args, "sm80", call="a launch", compile=lambda *_: found) == found
-    later = textwrap.dedent("""
-        import jax, jax.numpy as jnp
+    later = LAUNCH + textwrap.dedent("""
         from dew.nn.kernels.templates import report
 
         def refused(*_):
             raise AssertionError("traced or compiled again")
 
-        args = (jax.ShapeDtypeStruct((256, 128), jnp.bfloat16),
-                jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16), jax.ShapeDtypeStruct((2,), jnp.int32))
-        print([entry.kernel for entry in report.confirmed(refused, args, "sm80", call="a launch",
-                                                          compile=refused)])
+        print([entry.kernel for entry in report.confirmed(refused, args, "sm80", call=name, compile=refused)])
     """)
     done = subprocess.run([sys.executable, "-c", later], env=dict(os.environ), capture_output=True, text=True,
                           check=False)

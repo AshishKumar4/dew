@@ -290,6 +290,18 @@ def _launch_json(ba: tokamax.BoundArguments) -> dict[str, JSON]:
                           for name, value in ba.arguments.items()}}
 
 
+def launch_text(ba: tokamax.BoundArguments) -> str:
+    """The launch `ba` as text, the same in every process: its op as its picks name it at its config, and
+    its arguments, each array by its shape and dtype and each hook by what it computes (`_launch_json`,
+    `encoded`). A template's confirmed reports are kept under it (`templates.report.confirmed`); an
+    argument with no such text raises (`encoded`)."""
+    shaped = {name: jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype)
+                                 if isinstance(leaf, (jax.Array, np.ndarray)) else leaf, value)
+              for name, value in ba.arguments.items()}
+    launch = _launch_json(tokamax.BoundArguments(ba.op, shaped))
+    return json.dumps({**launch, "config": encoded(ba.op.config)}, sort_keys=True)
+
+
 def _launch(entry: object) -> tokamax.BoundArguments:
     """The launch `_launch_json` wrote; `Unreadable` where this checkout cannot rebuild it: its op's
     class or fields, or arguments that are not exactly its kernel's parameters (another checkout's

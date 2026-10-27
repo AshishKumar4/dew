@@ -9,14 +9,13 @@ every run.
 """
 
 import dataclasses
-import re
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from typing import ClassVar, TypeGuard
 
 import jax
 import tokamax
 
-from dew.nn.kernels import generation, tuning
+from dew.nn.kernels import generation, selection, tuning
 from dew.nn.kernels.templates import cost, report
 
 
@@ -116,21 +115,23 @@ class Template[Config: Hashable](tuning.KernelOp):
         """Whether the compiler confirms the launch of `ba` at `config` on `target` (`report.confirmed`):
         each of its Mosaic GPU kernels within a program's shared memory (`program_shared`) and the
         target's tensor memory, spilling nothing. A launch nothing compiles needs no word: an interpreted
-        one, one off a CUDA target, and a confirmation's own trace (`report.confirming`)."""
+        one, one off a CUDA target, a confirmation's own trace (`report.confirming`), and a declared cell's
+        preference, which names the template for a call another kernel runs (`selection.preferring`)."""
         if (ba.arguments.get('interpret') or generation.capability(target.generation) is None
-                or report.confirming()):
+                or report.confirming() or selection.preferring()):
             return True
+        configured = self.replace(config=config)
+        # The launch as every process names it: what keys its reports (`report.confirmed`).
+        call = tuning.launch_text(tokamax.BoundArguments(configured, dict(ba.arguments)))
+        if (known := _CONFIRMATIONS.get((call, target.generation))) is not None:
+            return known
+
         def array(leaf) -> bool:
             return isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct, jax.core.Tracer))
 
         leaves, tree = jax.tree.flatten((ba.args, ba.kwargs), is_leaf=array)
         places = [index for index, leaf in enumerate(leaves) if array(leaf)]
         abstract = tuple(jax.ShapeDtypeStruct(leaves[index].shape, leaves[index].dtype) for index in places)
-        memo = (type(self).__name__, config, target.generation, abstract,
-                tuple(str(leaf) for index, leaf in enumerate(leaves) if index not in places))
-        if (known := _CONFIRMATIONS.get(memo)) is not None:
-            return known
-        configured = self.replace(config=config)
 
         def launch(*arrays):
             filled = list(leaves)
@@ -139,14 +140,11 @@ class Template[Config: Hashable](tuning.KernelOp):
             args, kwargs = jax.tree.unflatten(tree, filled)
             return configured(*args, **kwargs)
 
-        # The launch's text keys its reports across processes where it names nothing by its address.
-        named = repr((configured, memo[2:]))
         # A call that compiles no Mosaic GPU kernel (a product of no depth) has nothing to refute.
-        found = report.confirmed(launch, abstract, target.generation,
-                                 call=None if re.search(r" at 0x[0-9a-fA-F]+", named) else named)
+        found = report.confirmed(launch, abstract, target.generation, call=call)
         held = all(entry.failure(self.program_shared(config, target), target.tmem_columns or 0) is None
                    for entry in found)
-        _CONFIRMATIONS[memo] = held
+        _CONFIRMATIONS[call, target.generation] = held
         return held
 
     def _held(self, ba: tokamax.BoundArguments, config: Config) -> bool:
@@ -255,5 +253,5 @@ def call(implementations: Sequence[Template], *args, **kwargs) -> Call:
                  for implementation in implementations}, generation.gpu_target())
 
 
-_CONFIRMATIONS: dict = {}
-"""This process's confirmations by launch, config, generation and abstract operands (`Template.confirmed`)."""
+_CONFIRMATIONS: dict[tuple[str, str], bool] = {}
+"""This process's confirmations by launch (`tuning.launch_text`) and generation (`Template.confirmed`)."""

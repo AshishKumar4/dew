@@ -17,6 +17,7 @@ operation to the program, and outside `generation.routes()` it records nothing
 (`dew.cache.KERNEL_ROUTES` stays `()`), so a run's trace keys are those of a run that never selects.
 """
 
+import contextvars
 import dataclasses
 from collections.abc import Callable, Mapping
 from typing import Protocol, runtime_checkable
@@ -190,12 +191,27 @@ def _old_route[C](op: Op[C], case: C) -> tuple[Kernel[C], str, Refusal | None] |
     kernel = op.kernel(name)
     if kernel.failed(case):
         return None
-    preferred = _preferred(op, case)
+    token = _PREFERRING.set(True)
+    try:
+        preferred = _preferred(op, case)
+    finally:
+        _PREFERRING.reset(token)
     if preferred == name:
         return kernel, name, None
     return kernel, preferred, Refusal(
         'old_route', f"{name} measured faster on this cell ({', '.join(part for part in cell if part)}): "
                      f"{receipt}", 'bible da64ae5')
+
+
+_PREFERRING = contextvars.ContextVar("dew_preferring", default=False)
+
+
+def preferring() -> bool:
+    """Whether this dispatch only names the kernel it would prefer for a call another kernel runs (a
+    declared cell's, `_old_route`): no launch rests on the answer, so a kernel's eligibility may skip what
+    only its launch needs (`templates.base.Template.confirmed`'s compile, 1.5 s of a first trace on an
+    A100's declared grouped input gradient, CONFIRMCOST1)."""
+    return _PREFERRING.get()
 
 
 def _preferred[C](op: Op[C], case: C) -> str:

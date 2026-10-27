@@ -1593,3 +1593,18 @@ def test_each_cell_runs_the_template_unless_its_old_route_measured_faster(genera
         with generation.assumed(generation_name), generation.routes() as taken:
             jax.jit(call).trace(*operands)
         assert _kernels(taken) == {expected}, (cell, _kernels(taken))
+
+
+def test_a_declared_cell_names_the_template_it_prefers_without_compiling_it(monkeypatch, tmp_path):
+    """A declared cell's call (an A100's grouped kernel gradient, `grouped_matmul.DECLARED`) runs its old
+    route, whose route names the template as the kernel the call prefers without the compiler's word on
+    the template's tile (`selection.preferring`): no launch rests on it, so nothing is compiled or kept
+    for it (Dew's cache holds no kernel report; the word cost 1.5 s of an A100 trace, CONFIRMCOST1)."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    x, dy = jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16), jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
+    sizes = jnp.full((8,), 512, jnp.int32)
+    with generation.assumed("sm80"), generation.routes() as taken:
+        jax.jit(lambda x, dy: template.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16)).trace(x, dy)
+    assert {(route.kernel, route.preferred) for route in taken if route.choice == "grouped_matmul"} == {
+        (grouped_matmul.DECLARED["mma.sync", "grouped kernel_gradient"][0], "mosaic_gpu")}
+    assert not (tmp_path / "dew" / "kernel-reports").exists()
