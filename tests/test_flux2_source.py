@@ -81,16 +81,6 @@ def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
     assert_transformer_exports(source, name, layouts, params)
 
 
-def flux2_ids(rows: int, columns: int, tokens: int):
-    """`Flux2Pipeline._prepare_text_ids` and `_prepare_latent_ids`: the four-axis ids the pipeline lays
-    out for a text of `tokens` and a latent of `rows` by `columns` positions."""
-    import torch
-
-    text = torch.cartesian_prod(torch.arange(1), torch.arange(1), torch.arange(1), torch.arange(tokens))
-    image = torch.cartesian_prod(torch.arange(1), torch.arange(rows), torch.arange(columns), torch.arange(1))
-    return text, image
-
-
 def flux2_arms(source, arrays, record, name):
     """The case's draw, Dew's compiled walk and Diffusers' `Flux2Transformer2DModel` walks in float32
     and float64: each the forward, then the gradients of the latent, the text states and every
@@ -98,6 +88,7 @@ def flux2_arms(source, arrays, record, name):
     import torch
     from diffusers import Flux2Transformer2DModel
 
+    from tools.diffusers_flux2_reference import ids
     from tools.torch_precision import float64
 
     model, params, layouts = load(source, name)
@@ -147,7 +138,8 @@ def flux2_arms(source, arrays, record, name):
                                                        local_files_only=True).eval()
     weights = {id(module): {key: value.detach().numpy() for key, value in module.named_parameters()}
                for module in (narrow, wide)}
-    text_ids, image_ids = flux2_ids(rows, columns, fixture["context"].shape[1])
+    # The pipeline's four-axis ids, as the fixture's walk laid them out for its text and latent.
+    text_ids, image_ids = ids(rows, columns)
 
     def reference_walk(module, drawn):
         dtype = torch.from_numpy(np.asarray(drawn["latent"])).dtype
