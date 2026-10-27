@@ -16,7 +16,7 @@ def test_an_empty_file_holds_no_range_beside_one_that_holds_records(tmp_path):
     other file is cut into its own."""
     (tmp_path / "empty.jsonl").write_text("")
     (tmp_path / "rows.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(3)))
-    shards = Files(str(tmp_path), shard_bytes=10).manifest().shards
+    shards = Files(str(tmp_path), format="jsonl", shard_bytes=10).manifest().shards
     assert shards and all(shard.uri.endswith("rows.jsonl") for shard in shards)
 
 
