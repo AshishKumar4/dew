@@ -40,8 +40,10 @@ from dew.nn.scan_orders import pixel_shuffle
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("dev", "rect", "unguided", "narrow")
-CASE_SEEDS = {"dev": 256, "rect": 256, "unguided": 256, "narrow": 256}
-"""Each transformer's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` (on armada)."""
+CASE_SEEDS = {"dev": 8, "rect": 8, "unguided": 8, "narrow": 8}
+"""Each transformer's declared seeds for check 1 (`assert_as_exact`), sized paired by `seeds_for` with
+Dew's arm, which shares the reference's float32 inputs (2026-10-27, on armada): the reference compared
+with itself does not resolve within 512 seeds for three of them, its errors heavy-tailed across draws."""
 
 
 @pytest.fixture(scope="module")
