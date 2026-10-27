@@ -22,7 +22,7 @@ import optax
 import pytest
 import torch
 from model_support import TINY_DECODER, Digits, decoder, flat_tree
-from reference_error import assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from test_serving import assert_same_generation
 
 from dew.batch import FROZEN, coordinates, thaw
@@ -141,6 +141,7 @@ def idefics_block(wide: bool):
                 "image_hidden_states": context, "image_attention_mask": mask,
                 "cross_attention_gate": torch.ones(x.shape[:2], dtype=x.dtype)})
 
+    @as_given
     def run(x, context, params, lengths, cotangent):
         arm = torch_with_gradients(functools.partial(forward, lengths=lengths))
         return arm(x, context, params, cotangent)
@@ -383,6 +384,46 @@ def test_the_blocks_train_beside_an_adapter_with_the_source_frozen(source, tmp_p
     kept = flat_tree(thaw(restored.variables))
     for path, leaf in flat_tree(thaw(state.variables)).items():
         np.testing.assert_array_equal(np.asarray(kept[path]), np.asarray(leaf), err_msg=path)
+
+
+def test_the_blocks_train_beside_a_whole_source_where_it_is_not_frozen(source):
+    """With `frozen=False` the blocks join an unsplit source's weights, which all train beside them, a
+    full fine-tune: the source's leaves are its own, the blocks' gates zero, so the bundle computes
+    what the source does, and two steps move the source's weights and the gates both. A LoRA adapter
+    over it, attached in either order, trains its factors and the blocks over the frozen base."""
+    cross = CrossAttention(layer_ids=(1,), context_length=3, context_features=8)
+    attached = source.with_cross_attention(cross, key=0, frozen=False)
+    assert FROZEN not in attached.variables
+    held, own = flat_tree(attached.variables["params"]), flat_tree(thaw(source.variables)["params"])
+    assert {path for path in held if not crossing(path)} == set(own)
+    for path, leaf in own.items():
+        np.testing.assert_array_equal(np.asarray(held[path]), np.asarray(leaf), err_msg=path)
+    tokens = jnp.arange(8, dtype=jnp.int32)[None] % 256
+    np.testing.assert_array_equal(np.asarray(attached.model.apply(attached.variables, tokens)),
+                                  np.asarray(source.model.apply(source.variables, tokens)))
+    lora = LoRA(rank=2, modules=("q_proj",))
+    later = attached.adapt(lora, key=1)
+    earlier = source.adapt(lora, key=1).with_cross_attention(cross, key=0, frozen=False)
+    for adapted in (later, earlier):
+        held = flat_tree(adapted.variables["params"])
+        assert any("alpha_" in path for path in held) and any("lora_A" in path for path in held)
+        assert all(crossing(path) or "lora_" in path for path in held)
+    assert set(flat_tree(later.variables["params"])) == set(flat_tree(earlier.variables["params"]))
+
+    rng = np.random.default_rng(0)
+    rows = 2 * jax.device_count()
+    inputs = ModelInputs(jnp.asarray(rng.integers(0, 256, (rows, 8)), jnp.int32), conditioning={
+        CONTEXT: jnp.asarray(rng.standard_normal((rows, 3, 8)), jnp.float32),
+        CONTEXT_LENGTHS: jnp.asarray(rng.integers(1, 4, rows), jnp.int32)})
+    trainer = Trainer(LMObjective(attached, 7), optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
+                      layout=Layout(min_shard=2**30))
+    initial = flat_tree(thaw(trainer.initial_state().variables)["params"])
+    state = trainer.fit(Loader(train=lambda partition: iter([{"text": inputs}] * 2), val=None, records=rows,
+                               batch=rows), steps=2, log_every=2)
+    trained = flat_tree(thaw(state.variables)["params"])
+    assert FROZEN not in state.variables
+    moved = {path for path, leaf in trained.items() if not np.array_equal(np.asarray(leaf), initial[path])}
+    assert any(not crossing(path) for path in moved) and any("alpha_" in path for path in moved)
 
 
 SERVED = CrossAttention(layer_ids=(0,), context_length=4, context_features=6)

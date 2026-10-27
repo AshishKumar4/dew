@@ -8,7 +8,8 @@ Grain's packers, and `_fill` with `_CachedOutputs` for opening a cache and
 reading what it holds.
 
 `_Build` lowers a pipeline's stages in the order they are written, as the
-analysis (`dew.data.analysis`) says to cut them. A global order is built
+analysis (`dew.data.analysis`) says to cut them, each run of adjacent record
+steps as one Grain operator (`_run`). A global order is built
 indexed and whole, and `batches` cuts it into shares just before the batch;
 a per-share order is cut at its read and streams this share's accepted
 rows. A row carries its source position in a private field from the read to
@@ -380,13 +381,67 @@ def _positioned(manifest: ShardManifest) -> ShardManifest:
     return dataclasses.replace(manifest, reader=_PlacedShards(manifest.reader, placed))
 
 
+type RecordStage = Map | RandomMap | MapWithIndex | Filter | FlatMap
+
+_RECORD = (Map, RandomMap, MapWithIndex, Filter, FlatMap)
+
+
+def _chained(
+    stages: Sequence[Stage], position: int | None, value: Record, rng: np.random.Generator | None = None,
+    *, counts: CorpusCounts | None = None,
+) -> tuple[Record, ...]:
+    """What adjacent record `stages` make of one row: each stage's `_outputs` over every output of
+    the one before, a marker passing through the rest."""
+    held: tuple[Record, ...] = (value,)
+    for stage in stages:
+        held = tuple(made for given in held for made in _outputs(stage, position, given, rng, counts=counts))
+    return held
+
+
+def _run(
+    stages: Sequence[Stage], start: int, stop: int, *, marked: bool, indexed: bool
+) -> tuple[RecordStage, ...]:
+    """The run of adjacent record stages from `start`, before `stop`, that lowers as one Grain
+    operator (`_Rows`), as tf.data fuses adjacent maps and filters: one call per record for the
+    run, not an operator and a copy of the record for each step. A step written after a filter
+    then runs where the steps before it do, on the read's threads or in its workers.
+
+    The run's one random stage draws from the rng Grain hands its operator, keyed by the record's
+    place in what that operator reads, as it would lowered alone: so a stage before it that drops
+    records (counted out by `Accepted`, unless they go on `marked`) or expands them ends the run,
+    as does a second random stage. A fetch on its own pool (`Fetch.threads`) runs alone on it.
+    Over `indexed` rows the steps before an expansion run by index, on the read's threads, and the
+    expansion and the steps after it read them as a stream (`_expanded`)."""
+    run: list[RecordStage] = []
+    drawn = counted = False
+    for stage in stages[start:stop]:
+        if not isinstance(stage, _RECORD):
+            break
+        if _threads((stage,)) is not None:
+            return tuple(run) or (stage,)
+        if isinstance(stage, RandomMap):
+            if drawn or counted:
+                break
+            drawn = True
+        if isinstance(stage, FlatMap):
+            if drawn or (indexed and run):
+                break
+            counted = True
+        elif not marked and _drops(stage):
+            counted = True
+        run.append(stage)
+    return tuple(run)
+
+
 @dataclasses.dataclass(frozen=True)
 class _Rows(gx.FlatMapTransform):
-    """Grain's form of a record stage: `_outputs` over each element, keeping
-    the source position an element carries out of the step's sight."""
+    """Grain's form of a run of adjacent record stages (`_run`): `_chained` over each element,
+    keeping the source position an element carries out of the steps' sight, and dropping it after
+    the run where it holds the last step that reads it (`unplaced`)."""
 
-    stage: Map | RandomMap | MapWithIndex | Filter | FlatMap
+    stages: tuple[RecordStage, ...]
     counts: CorpusCounts | None = None
+    unplaced: bool = False
 
     def __call__(self, element: Record, rng: np.random.Generator | None = None) -> Record:
         return self.flat_map(element, rng)[0]
@@ -394,14 +449,33 @@ class _Rows(gx.FlatMapTransform):
     def flat_map(self, element: Record, rng: np.random.Generator | None = None) -> tuple[Record, ...]:
         position = _position(element)
         if position is None:
-            return _outputs(self.stage, None, element, rng, counts=self.counts)
-        outputs = _outputs(self.stage, position, _unplaced(element), rng, counts=self.counts)
-        return tuple(_placed(output, position) for output in outputs)
+            return _chained(self.stages, None, element, rng, counts=self.counts)
+        outputs = _chained(self.stages, position, _unplaced(element), rng, counts=self.counts)
+        return outputs if self.unplaced else tuple(_placed(output, position) for output in outputs)
 
 
-def _expanded(rows: pygrain.IterDataset, stage: FlatMap, name: str, label: str) -> pygrain.IterDataset:
-    return (Chunked(rows, name, label, functools.partial(_Rows, stage)) if isinstance(stage.step, Chunks)
-            else gx.FlatMapIterDataset(rows, _Rows(stage)))
+def _expanded(rows: pygrain.IterDataset, stages: tuple[RecordStage, ...], name: str, label: str, *,
+              unplaced: bool = False) -> pygrain.IterDataset:
+    """`rows` through a run of record stages that expands them, one Grain flat map; a chunk
+    expansion's counted at its fan-out (`Chunked`)."""
+    expand = functools.partial(_Rows, stages, unplaced=unplaced)
+    if any(isinstance(stage, FlatMap) and isinstance(stage.step, Chunks) for stage in stages):
+        return Chunked(rows, name, label, expand)
+    return gx.FlatMapIterDataset(rows, expand())
+
+
+def _through(rows: Rows, run: tuple[RecordStage, ...], name: str, label: str, loading: Loading, *,
+             seed: int | None = None, unplaced: bool = False) -> Rows:
+    """`rows` through a run of record stages (`_run`) as one Grain operator: on the pool of its
+    fetch, as an expansion, as a draw from `seed` where it holds its random stage, or as a map."""
+    lowered = _Rows(run, unplaced=unplaced)
+    threads = _threads(run)
+    if threads is not None:
+        # A step with a pool of its own: its records in flight at once, delivered in order.
+        return Concurrently(_as_iter(rows, loading), lowered, threads)
+    if any(isinstance(stage, FlatMap) for stage in run):
+        return _expanded(_as_iter(rows, loading), run, name, label, unplaced=unplaced)
+    return rows.map(lowered) if seed is None else rows.random_map(lowered, seed=seed)
 
 
 type Field = Batch | np.ndarray | np.generic | str | bytes | int | float | bool | None | list | tuple
@@ -507,10 +581,7 @@ class _Prefix:
         position = _position(raw)
         if position is not None:
             index, raw = position, _unplaced(raw)
-        held: tuple[Record, ...] = (raw,)
-        for stage in self.stages:
-            held = tuple(output for value in held for output in _outputs(stage, index, value))
-        return held
+        return _chained(self.stages, index, raw)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -525,15 +596,16 @@ class _ShardSteps:
     cached: bool
     name: str
     label: str
+    loading: Loading
 
     def __call__(self, shard: Shard) -> pygrain.IterDataset:
         rows = self.reader(shard)
         rows = gx.FlatMapIterDataset(rows, _CachedOutputs()) if self.cached else rows
-        for stage in self.stages:
-            threads = _threads((stage,))
-            rows = (_expanded(rows, stage, self.name, self.label) if isinstance(stage, FlatMap)
-                    else Concurrently(rows, _Rows(stage), threads) if threads is not None
-                    else rows.map(_Rows(stage)))
+        start = 0
+        while start < len(self.stages):
+            run = _run(self.stages, start, len(self.stages), marked=True, indexed=False)
+            rows = _as_iter(_through(rows, run, self.name, self.label, self.loading), self.loading)
+            start += len(run)
         return rows
 
 
@@ -1217,7 +1289,8 @@ class _Build:
         shards = _positioned(shards) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
         local = tuple(stage for stage in written if isinstance(stage, _LOCAL))
-        steps = _ShardSteps(shards.reader, local, cache is not None, _name(pipeline), _label(pipeline))
+        steps = _ShardSteps(shards.reader, local, cache is not None, _name(pipeline), _label(pipeline),
+                            self.loading)
         shards = dataclasses.replace(shards, reader=steps)
         rows = self.streamed(shards, pipeline, partition)
         if not marked and (cache is not None or any(_drops(stage) for stage in local)):
@@ -1278,7 +1351,10 @@ class _Build:
         marked = self.lowering.cache is not None and (self.read == "streamed" or not self.lowering.one_to_one)
         marked = marked or any(_drops(stage) for stage in pipeline.stages[:consumed])
         carried = _carried(pipeline, consumed, marked=marked) if pooled and pool is not None else -1
+        ran = consumed
         for index, stage in enumerate(pipeline.stages[consumed:], start=consumed):
+            if index < ran:
+                continue
             if index < carried and isinstance(stage, Native) and not isinstance(rows, pygrain.MapDataset):
                 # What a Grain step drops from a stream leaves no marker: the workers hand on before it.
                 carried = index
@@ -1292,8 +1368,14 @@ class _Build:
                 continue
             if isinstance(stage, Workers) and pool is not None:
                 continue
-            if index < carried and isinstance(stage, (Map, RandomMap, MapWithIndex, Filter, FlatMap)):
-                rows = self.record_stage(rows, stage, pipeline, partition, index, marked=True)
+            if isinstance(stage, _RECORD):
+                # The record steps from here run as one operator (`_run`), up to where the workers
+                # hand their rows on.
+                run = _run(pipeline.stages, index, carried if index < carried else len(pipeline.stages),
+                           marked=index < carried, indexed=isinstance(rows, pygrain.MapDataset))
+                ran = index + len(run)
+                rows = self.record_stage(rows, run, pipeline, partition, index, marked=index < carried,
+                                         unplaced=index <= last < ran)
             elif index < carried and isinstance(stage, Repeat) and not isinstance(rows, pygrain.MapDataset):
                 # A worker's inputs hold a marker for each record dropped, so a pass with nothing
                 # in it holds no input: that worker reads no more, and the others read on.
@@ -1311,8 +1393,6 @@ class _Build:
                     carried = -1
             else:
                 rows = self.stage(rows, stage, pipeline, partition, index)
-            if index == last:
-                rows = rows.map(_unplaced)
         if carried == len(pipeline.stages) and pool is not None:
             rows = self.handed(rows, pipeline, partition, pool)
         if not self.global_order and _counts_own_rows(pipeline):
@@ -1321,8 +1401,8 @@ class _Build:
 
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:
         """`rows` through `stage`, written at `at` in `pipeline`."""
-        if isinstance(stage, (Map, RandomMap, MapWithIndex, Filter, FlatMap)):
-            return self.record_stage(rows, stage, pipeline, partition, at)
+        if isinstance(stage, _RECORD):
+            return self.record_stage(rows, (stage,), pipeline, partition, at)
         if isinstance(stage, Shuffle) and stage.block_shards is not None:
             return self.block_shuffle(rows, stage, pipeline, partition)
         if isinstance(stage, Repeat):
@@ -1437,24 +1517,18 @@ class _Build:
         return Accepted(flat, _name(pipeline), _label(pipeline))
 
     def record_stage(
-        self, rows: Rows, stage: Map | RandomMap | MapWithIndex | Filter | FlatMap, pipeline: Pipeline,
-        partition: DataPartition, at: int, *, marked: bool = False,
+        self, rows: Rows, run: tuple[RecordStage, ...], pipeline: Pipeline, partition: DataPartition, at: int,
+        *, marked: bool = False, unplaced: bool = False,
     ) -> Rows:
-        """`rows` through a record stage. A stage that can drop records drops them after it, counted
-        (`Accepted`), unless its rows are `marked`: then each dropped record goes on as a marker for
-        the reading process to drop (`handed`)."""
-        lowered = _Rows(stage)
-        threads = _threads((stage,))
-        if threads is not None:
-            # A step with a pool of its own: its records in flight at once, delivered in order.
-            rows = Concurrently(_as_iter(rows, self.loading), lowered, threads)
-        elif isinstance(stage, FlatMap):
-            rows = _expanded(_as_iter(rows, self.loading), stage, _name(pipeline), _label(pipeline))
-        elif isinstance(stage, RandomMap):
-            rows = rows.random_map(lowered, seed=self.stage_seed(pipeline, at, partition))
-        else:
-            rows = rows.map(lowered)
-        if not marked and (isinstance(stage, (Filter, FlatMap)) or stage.rejects):
+        """`rows` through a run of adjacent record stages written from `at` (`_run`), as one Grain
+        operator. A run that can drop records drops them after it, counted (`Accepted`), unless its
+        rows are `marked`: then each dropped record goes on as a marker for the reading process to
+        drop (`handed`). Its random stage draws with the seed it has lowered alone (`stage_seed`)."""
+        drawn = next((offset for offset, stage in enumerate(run) if isinstance(stage, RandomMap)), None)
+        seed = None if drawn is None else self.stage_seed(pipeline, at + drawn, partition)
+        rows = _through(rows, run, _name(pipeline), _label(pipeline), self.loading, seed=seed,
+                        unplaced=unplaced)
+        if not marked and any(_drops(stage) for stage in run):
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
         return rows
 
@@ -1466,22 +1540,22 @@ class _Build:
         return iter(self.after_batch(stream, after, pipeline, partition))
 
     def tuned(self, pipeline: Pipeline) -> _Build:
-        """This build with automatic loading resolved on the whole order
-        (`Loading.resolved`), and at most one worker per batch of a pass that
-        ends where its rows are indexed. Grain sizes workers by memory alone,
-        and a validation pass read with training's workers, so a pass of five
-        batches had one per core, 26 on an H100 host. Each worker past the
-        last batch reads nothing, yet starts a process that imports the
-        program and keeps about six pipes open until the reader is collected."""
+        """This build with automatic loading resolved on the whole order from the host's CPUs and
+        memory (`Loading.resolved`), and at most one worker per batch of a pass that ends where
+        its rows are indexed. A validation pass is read with training's workers, so a pass of
+        five batches had one per core, 26 on an H100 host. Each worker past the last batch reads
+        nothing, yet starts a process that imports the program and keeps about six pipes open
+        until the reader is collected."""
         loading = self.loading
         bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0))
+        size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
         if loading.workers == "auto":
+            # A global order is read by the batch, any other order by the record (`batch_order`).
             with _closing(bare.batched(pipeline, DataPartition())[0]) as sampled:
-                loading = loading.resolved(sampled)
+                loading = loading.resolved(sampled, reads=1 if self.global_order else size)
         if loading.worker_count and (not self.training or not self.lowering.endless):
             with _closing(bare.records(pipeline, DataPartition())) as rows:
                 if isinstance(rows, pygrain.MapDataset):
-                    size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
                     batches = -(-len(rows) // size)
                     loading = dataclasses.replace(loading, workers=min(loading.worker_count, batches))
         return dataclasses.replace(self, loading=loading)

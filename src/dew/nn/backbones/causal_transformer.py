@@ -37,7 +37,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
 from dew.batch import Coordinates, coordinates as build_coordinates, merge, shifted_span
-from dew.mesh import LayoutRefused, row_axes
+from dew.mesh import LayoutRefused
 from dew.nn.continuum import Continuum, ContinuumLevel
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
@@ -90,7 +90,7 @@ from ..precision import (
 )
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
-from ..sharding import RESIDUAL, constrain, logical_axes, microbatches, pipeline_stages
+from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
 from .decoder_block import (
     DECODER_REMAT,
     NORM_SITES,
@@ -110,8 +110,10 @@ from .decoder_stack import (
     DecoderBank,
     Loop,
     PassView,
+    PipelineStage,
     SharedPassView,
     StackView,
+    microbatch_count,
     run_pipeline,
     run_stack,
 )
@@ -1225,14 +1227,15 @@ class CausalTransformer(nn.Module):
                  positions=None, segment_ids=None,
                  input_embeddings=None,
                  attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
-                 attention_pairwise_mask=None, attention_key_positions=None, right_padded: bool = False,
-                 coordinates: Coordinates | None = None, conditioning: Mapping[str, jax.Array] | None = None):
+                 attention_pairwise_mask=None, attention_key_positions=None, attention_key_runs=None,
+                 right_padded: bool = False, coordinates: Coordinates | None = None,
+                 conditioning: Mapping[str, jax.Array] | None = None):
         x, prediction = self.hidden_and_mtp_inputs(
             tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
             block_groups=block_groups, rotary_positions=rotary_positions,
-            attention_pairwise_mask=attention_pairwise_mask,
-            attention_key_positions=attention_key_positions, right_padded=right_padded,
+            attention_pairwise_mask=attention_pairwise_mask, attention_key_positions=attention_key_positions,
+            attention_key_runs=attention_key_runs, right_padded=right_padded,
             coordinates=coordinates, conditioning=conditioning)
         if self.is_initializing() and self.dspark is not None:
             self.reach_drafter(tokens, x.dtype)
@@ -1562,7 +1565,7 @@ class CausalTransformer(nn.Module):
                               input_embeddings=None,
                               attention_mask=None, image_groups=None, block_groups=None,
                               rotary_positions=None, attention_pairwise_mask=None,
-                              attention_key_positions=None,
+                              attention_key_positions=None, attention_key_runs=None,
                               routed_experts=None, routed=None, media_mask=None, admitted=None,
                               right_padded: bool = False, coordinates: Coordinates | None = None,
                               conditioning: Mapping[str, jax.Array] | None = None):
@@ -1583,6 +1586,10 @@ class CausalTransformer(nn.Module):
           visibility mask for ordinary attention, and the optional
           `attention_key_positions` [B, keys] give key positions for local
           windows. Both describe the cached reads of this call only.
+          `attention_key_runs` [B, queries, R, 2] replaces the mask with each
+          query's key intervals, whose union it reads, R of them, static, its
+          key positions windowed within each run alone (the template's spans,
+          `dew.nn.attention.scaled_dot_product_attention`'s `key_runs`).
         - `routed_experts` `[B, S, layers, top_k]` replays a rollout engine's
           routing (vLLM's `routed_experts`, SGLang's
           `meta_info.routed_experts`), and `routed` `[B, S]` marks the tokens
@@ -1608,7 +1615,8 @@ class CausalTransformer(nn.Module):
         """
         attention_metadata = self._attention_metadata(
             tokens, decode, positions, segment_ids, attention_mask, image_groups, block_groups,
-            rotary_positions, attention_pairwise_mask, attention_key_positions, media_mask, admitted,
+            rotary_positions, attention_pairwise_mask, attention_key_positions, attention_key_runs,
+            media_mask, admitted,
             right_padded, coordinates, conditioning)
         # The stack's entry and exit sit where the batch does, so neither the
         # lookup nor the head is computed whole on the shards of an axis that
@@ -1670,7 +1678,7 @@ class CausalTransformer(nn.Module):
         return hidden, prediction
 
     def _attention_metadata(self, tokens, decode: bool, positions, segment_ids, attention_mask, image_groups,
-                            block_groups, rotary_positions, pairwise_mask, key_positions,
+                            block_groups, rotary_positions, pairwise_mask, key_positions, key_runs,
                             media_mask, admitted=None,
                             right_padded: bool = False,
                             coordinates: Coordinates | None = None,
@@ -1691,9 +1699,13 @@ class CausalTransformer(nn.Module):
             # The context enters in the dtype a server holds it in (`context_dtype`), so a served and
             # a standalone call, and a cached and a full one, project the same values.
             context = CrossContext(context.embeddings.astype(self.context_dtype), context.lengths)
-        # A layer whose mixer reads no pairwise mask refuses one (`MixerCall`).
-        if key_positions is not None and pairwise_mask is None:
-            raise ValueError("attention_key_positions requires attention_pairwise_mask")
+        # A layer whose mixer reads no pairwise mask or key runs refuses one (`MixerCall`).
+        if key_positions is not None and pairwise_mask is None and key_runs is None:
+            raise ValueError("attention_key_positions requires attention_pairwise_mask or "
+                             "attention_key_runs")
+        if pairwise_mask is not None and key_runs is not None:
+            raise ValueError("attention_key_runs and attention_pairwise_mask each name a call's whole "
+                             "visibility; pass one")
         if self.engram is None and (self.mixture is None or not self.mixture.media_bias):
             media_mask = None
         if coordinates is None and (segment_ids is not None or attention_mask is not None or right_padded
@@ -1713,14 +1725,16 @@ class CausalTransformer(nn.Module):
             coordinates_of(None, *tokens.shape[:2]) if coordinates is None else coordinates, tokens.shape[:2],
             block)
         if (coordinates is None and image_groups is None and block_groups is None and rotary_positions is None
-                and pairwise_mask is None and key_positions is None and not self.hash_layers
+                and pairwise_mask is None and key_positions is None and key_runs is None
+                and not self.hash_layers
                 and engram_ids is None and media_mask is None and admitted is None and blocks is None
                 and context is None):
             return None
         return AttentionMetadata(
             coordinates=coordinates, image_groups=image_groups, block_groups=block_groups,
             rotary_positions=rotary_positions, pairwise_mask=pairwise_mask, key_positions=key_positions,
-            token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
+            key_runs=key_runs, token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids,
+            media=media_mask,
             admitted=admitted, blocks=blocks, context=context, routing_block=block)
 
     def looped(self, x, **stack):
@@ -1845,27 +1859,7 @@ class CausalTransformer(nn.Module):
                     "which the pipeline's microbatch buffers do not hold; run the stack whole")
             count = self.stage_layers(stages)
             batch_axis = 1 if self.altup is not None else 0
-            rows, count_microbatches = x.shape[batch_axis], microbatches()
-            if count_microbatches % stages or rows % count_microbatches:
-                raise LayoutRefused(
-                    f"a batch of {rows} rows over {stages} stages needs a microbatch "
-                    f"count that divides the rows and is a multiple of the stages, "
-                    f"got {count_microbatches}")
-            # Microbatch m takes rows m, m + count, ... (`microbatched`), a
-            # share of every device's rows only where the count divides a
-            # block; otherwise devices holding none of a microbatch recompute
-            # another's (1.43 times one device's FLOPs for 8 rows in 4
-            # microbatches over 4 row shards, against the bubble's 1.25).
-            splitting = row_axes(rows)
-            shards = math.prod(jax.sharding.get_abstract_mesh().shape[axis] for axis in splitting)
-            if (rows // shards) % count_microbatches:
-                raise LayoutRefused(
-                    f"a batch of {rows} rows splits {shards} ways over {' x '.join(splitting)}, "
-                    f"{rows // shards} rows a device, which {count_microbatches} microbatches "
-                    f"do not divide, so the devices that hold none of a microbatch's rows would "
-                    f"compute another's again; use a microbatch count that divides "
-                    f"{rows // shards}, or a batch that is a multiple of "
-                    f"{count_microbatches * shards} rows")
+            count_microbatches = microbatch_count(x.shape[batch_axis])
             view = StackView(
                 scan_groups(self.scan_keys[:count], self.bank_layers) if self.scan_layers
                 else tuple((index, 1) for index in range(count)),
@@ -2032,9 +2026,10 @@ class CausalTransformer(nn.Module):
             self,
             view,
             x,
-            train=train,
-            per_layer_input=per_layer_input,
-            attention_metadata=attention_metadata,
+            lambda module: PipelineStage(block=module.block, specs=module.specs[:view.per_stage],
+                                         groups=view.groups, train=train, name='stages'),
+            layered=per_layer_input,
+            rows=attention_metadata,
         )
 
     def _layer_inputs(self, tokens, x, routed_experts, routed) -> LayerInputs | None:
@@ -2310,6 +2305,20 @@ class CausalTransformer(nn.Module):
     def cache_rebuild_position(self) -> int | None:
         scaling = self.rope_scaling
         return scaling.original_max_position_embeddings if isinstance(scaling, LongRopeScaling) else None
+
+    @nn.nowrap
+    def block_chunks(self) -> tuple[int | None, ...]:
+        """The attention chunk of each trunk layer that reads a block whole
+        (`AttentionMixer.bidirectional_blocks`), None where a layer has none (`BlockReading`). Each layer's
+        mixer is `_layer_specs`' own, the kind's or the model's layer mixer, so a prediction depth's or the
+        drafter's kind, which the trunk never runs, reads none here."""
+        types = self.per_layer_types
+        kinds = self.layer_kinds(types)
+        default = self.layer_mixer
+        built = [(spec.kind.mixer or default, spec.kind.chunk)
+                 for spec in self._layer_specs(types, kinds, default)]
+        return tuple(chunk for mixer, chunk in built
+                     if isinstance(mixer, AttentionMixer) and mixer.bidirectional_blocks)
 
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:

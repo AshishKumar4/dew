@@ -11,6 +11,7 @@ here are the knobs a run has:
 
     python tools/benchmark_data.py --steps 100 --data run.py
     python tools/benchmark_data.py matrix --output data-matrix.json --work matrix-work
+    python tools/benchmark_data.py caching --workload bpe --read indexed --output caching.json
 
 The matrix runs each arm, Dew's reader and plain Grain over the same steps, in
 a fresh interpreter over the same produced files.
@@ -33,7 +34,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
@@ -52,6 +53,7 @@ from dew.data.dataset import Forwarding
 flags.FLAGS.mark_as_parsed()
 
 if TYPE_CHECKING:
+    from dew.batch import Batch
     from dew.data.pipeline import Pipeline
 
 
@@ -163,7 +165,9 @@ class Measurement:
     warmup: int = 8
     train_steps: int = 16
     stage_batches: int = 16
-    workers: int = 2
+    workers: int | Literal["auto"] = 2
+    """Loading workers: a count, or `auto`, each engine's own sizing (Dew's `Loading.resolved`,
+    Grain's `pick_performance_config`)."""
     batch: int = 32
     tokens: int = 16384
     seq_len: int = 128
@@ -361,11 +365,18 @@ def _dropping(config: Worker):
 
 def grain_options(rows, config: Worker):
     measured = config.measurement
+    import grain.experimental as gx
     import grain.python as grain
+    import psutil
 
-    if measured.workers:
-        rows = rows.mp_prefetch(grain.MultiprocessingOptions(
-            num_workers=measured.workers, per_worker_buffer_size=2))
+    workers = measured.workers
+    if workers == "auto":
+        # Grain's own pick, by half the memory available, as Dew's auto loading budgets it.
+        picked = gx.pick_performance_config(rows, ram_budget_mb=psutil.virtual_memory().available // 2**21,
+                                            max_workers=None, max_buffer_size=None).multiprocessing_options
+        workers = 0 if picked is None else picked.num_workers
+    if workers:
+        rows = rows.mp_prefetch(grain.MultiprocessingOptions(num_workers=workers, per_worker_buffer_size=2))
     return rows
 
 
@@ -528,10 +539,10 @@ def training_measure(factory, objective, config: Worker) -> dict:
     import jax
     import optax
 
+    from dew.distributed.batches import DevicePrefetchIterator
     from dew.telemetry.instrumentation import model_flops_utilization
     from dew.telemetry.profile import capture_options
     from dew.training import Trainer
-    from dew.training.distributed import DevicePrefetchIterator
 
     trainer = Trainer(objective, optax.adam(1e-4), key=0, checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
@@ -646,7 +657,13 @@ def stage_profile(factory, batches: int = 16) -> list[dict]:
 
 def matrix_worker(config: Worker) -> dict:
     measured = config.measurement
+    import logging
+
     import jax
+
+    # What automatic loading resolves to, in the arm's log.
+    logging.basicConfig()
+    logging.getLogger("dew.data.dataset").setLevel(logging.INFO)
 
     if config.cold:
         config = replace(config, source=evicted_copy(config.source, config.workload,
@@ -826,6 +843,140 @@ def run_scaling(config: Scaling) -> None:
         str(row["cycle"]): row["records_per_second"] / base for row in rows}}, indent=2, default=str) + "\n")
 
 
+@dataclass(frozen=True)
+class Caching:
+    """A finite pass over `records` records through a chain's leading map, read to its end, run each
+    time (`computed`), run while filling a cache of it (`fill`) and read back from the generation that
+    fill published (`replay`), each twice and a first computed pass discarded as warmup, every pass a
+    fresh compile: what a cache costs and saves where its steps are a decode (`images`: PNGs of 256
+    pixels decoded and resized to 128), a learned tokenizer (`bpe`: a 4,000-token byte-level BPE
+    trained here over the documents of 700 words) or a field selection (`fields`). Every pass must read
+    each record once, and every arm the records the computed pass read, each its id and a digest of
+    what the map made (`Digest`). It qualifies which steps are `Costly` (`dew.data.pipeline`)."""
+
+    workload: Literal["images", "bpe", "fields"] = "bpe"
+    read: Literal["memory", "indexed"] = "indexed"
+    records: int = 2000
+    batch: int = 32
+    output: Path = Path("data-caching.json")
+
+
+@dataclass(frozen=True)
+class Digest:
+    """A record as its id and a CRC of every other field it holds, in name order: what a pass read, which
+    arms that read the same records alike read the same of."""
+
+    def __call__(self, row: "Batch") -> "Batch":
+        import zlib
+
+        import numpy as np
+
+        crc = 0
+        for name in sorted(row):
+            if name != "id":
+                crc = zlib.crc32(np.ascontiguousarray(np.asarray(row[name])).tobytes(), crc)
+        return {"id": row["id"], "digest": np.uint32(crc)}
+
+
+def caching_chain(config: Caching, directory: Path) -> "tuple[list[dict], Callable[[str | None], Pipeline]]":
+    """The workload's records in memory and the chain of its leading map over them."""
+    import numpy as np
+
+    from dew.data import Memory, images, text
+    from dew.data.pipeline import Pipeline
+    from dew.data.steps.generic import Fields
+
+    rng = np.random.default_rng(0)
+    if config.workload == "images":
+        import cv2
+
+        rows = [{"id": np.int32(index), "image": cv2.imencode(".png", rng.integers(0, 255, (256, 256, 3),
+                                                                                np.uint8))[1].tobytes()}
+                for index in range(config.records)]
+        steps = (images.DecodeImage("image", rejects=False), images.Resize(128))
+    else:
+        words = np.asarray(["the", "of", "and", "to", "in", "is", "that", "for", "it", "as", "with",
+                            "was", "on", "be", "by", "this", "are", "from", "at", "or", "an", "have",
+                            "not", "which", "data", "model", "train", "token", "layer", "weight", "cache",
+                            "shard", "record", "image", "text", "batch", "step", "loss", "value"])
+        rows = [{"id": np.int32(index), "text": " ".join(rng.choice(words, 700))}
+                for index in range(config.records)]
+        steps = (Fields(("id", "text")),)
+        if config.workload == "bpe":
+            from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+            from transformers import PreTrainedTokenizerFast
+
+            tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
+            tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
+            tokenizer.train_from_iterator((row["text"] for row in rows[:200]), trainers.BpeTrainer(
+                vocab_size=4000, special_tokens=["[UNK]", "</s>"]))
+            PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token="</s>").save_pretrained(directory)
+            steps = (text.tokenize(str(directory)),)
+    def chain(cache: str | None) -> Pipeline:
+        """The steps over the records, cached after them where `cache` names one, in one finite pass:
+        a cache holds what they make whole (a tokenized document's ids), and the batch reads each
+        record's id and the digest of what they made (`Digest`)."""
+        mapped = Pipeline(Memory(rows))
+        for step in steps:
+            mapped = mapped.map(step)
+        cached = mapped if cache is None else mapped.cache(cache)
+        return cached.map(Digest(), identity="digest@1").repeat(1).batch(config.batch, drop_remainder=False)
+
+    return rows, chain
+
+
+def run_caching(config: Caching) -> None:
+    import numpy as np
+
+    from dew.batch import VALID_ROWS
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+
+    with tempfile.TemporaryDirectory() as work:
+        _, chain = caching_chain(config, Path(work) / "tokenizer")
+        root = str(Path(work) / "cache")
+
+        def passed(cache: str | None) -> tuple[float, list[tuple[int, int]]]:
+            """One pass read to its end: its seconds, and each record it read as its id and digest."""
+            started = time.perf_counter()
+            loader = compile(chain(cache), read=config.read, loading=Loading(workers=0, cache=False))
+            stream = loader.train(DataPartition())
+            try:
+                # A short last batch is padded to the batch's rows, its padding marked (`VALID_ROWS`).
+                read = [(int(row), int(digest)) for batch in stream
+                        for row, digest, valid in zip(batch["id"], batch["digest"],
+                                                      batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)),
+                                                      strict=True) if valid]
+            finally:
+                stream.close()
+            if len(read) != config.records:
+                raise ValueError(f"a pass read {len(read)} of the {config.records} records")
+            return time.perf_counter() - started, read
+
+        _, expected = passed(None)
+        rows: dict[str, list[float]] = {"computed": [], "fill": [], "replay": []}
+
+        def timed(arm: str, cache: str | None) -> None:
+            seconds, read = passed(cache)
+            if read != expected:
+                raise ValueError(f"the {arm} pass read other records than the computed one")
+            rows[arm].append(seconds)
+
+        timed("computed", None)
+        timed("computed", None)
+        timed("fill", root)
+        if not any(Path(root).rglob("CURRENT")):
+            raise ValueError("the fill published no generation for the replay to read")
+        timed("replay", root)
+        timed("replay", root)
+        shutil.rmtree(root)
+        timed("fill", root)
+    result = {"schema": 1, "config": asdict(config), "host": platform.processor() or platform.machine(),
+              "cpus": os.cpu_count(), "seconds": rows}
+    config.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
+    print(json.dumps(result, default=str), flush=True)
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["matrix"]:
         run_matrix(tyro.cli(Matrix, args=sys.argv[2:]))
@@ -833,5 +984,7 @@ if __name__ == "__main__":
         matrix_worker(tyro.cli(Worker, args=sys.argv[2:]))
     elif sys.argv[1:2] == ["scaling"]:
         run_scaling(tyro.cli(Scaling, args=sys.argv[2:]))
+    elif sys.argv[1:2] == ["caching"]:
+        run_caching(tyro.cli(Caching, args=sys.argv[2:]))
     else:
         main(benchmark(sys.argv[1:]))

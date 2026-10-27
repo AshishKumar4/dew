@@ -13,7 +13,7 @@ import optax
 import pytest
 from decision_support import decision_rows
 from recording import RecordingTracker
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.batch import VALID_ROWS
 from dew.data.dataset import DataPartition
@@ -31,7 +31,7 @@ from dew.decision import (
 )
 from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
 from dew.decision.layout import OPTION_TILE, QUESTION_FIELDS, DecisionInputs, Labels, compacted
-from dew.decision.objective import TRAINING_FIELDS
+from dew.decision.rows import TRAINING_FIELDS
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -322,10 +322,12 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int) -> None:
     wide.substitute(wide_modules)
     decide = jax.jit(lambda variables, batch: decided(objective, variables, batch, segments))
 
+    @as_given
     def packed(variables):
         logits, grads = decide(variables, batch)
         return asked(batch, logits), grads
 
+    @as_given
     def alone(variables):
         return rows_alone(lambda one: decide(variables, one), batch)
 

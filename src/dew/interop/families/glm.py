@@ -29,6 +29,7 @@ from dew.interop.decoder_parts import (
     fixed_fields,
     hf_tensor_name,
     kind_mixers,
+    layer_depth,
     layer_depth_path,
     layout_tensors,
     leaf_layouts,
@@ -442,7 +443,7 @@ GLM5_NEXT_TEXT = DecoderFamily(
     'glm5_next_text',
     'Glm5NextTextForCausalLM',
     _glm5_next_export,
-    weight_path=layer_depth_path,
+    weight_path=layer_depth_path, prediction_depth=layer_depth,
     export_weights=_glm5_next_export_weights,
     preserve_source_layout=True,
     # The config class's norm epsilon.
@@ -461,7 +462,7 @@ GLM4_MOE = DecoderFamily(
     'glm4_moe',
     'Glm4MoeForCausalLM',
     lambda model: {},
-    weight_path=layer_depth_path,
+    weight_path=layer_depth_path, prediction_depth=layer_depth,
     preserve_source_layout=True,
     # Glm4MoeConfig's defaults for the fields its decoder reads.
     defaults={'rms_norm_eps': 1e-5, 'num_key_value_heads': 8, 'max_position_embeddings': 131072,
@@ -483,7 +484,7 @@ GLM_MOE_DSA = DecoderFamily(
     'glm_moe_dsa',
     'GlmMoeDsaForCausalLM',
     lambda model: {},
-    weight_path=layer_depth_path,
+    weight_path=layer_depth_path, prediction_depth=layer_depth,
     preserve_source_layout=True,
     # The config class's norm epsilon.
     defaults={'max_position_embeddings': 202752, 'rms_norm_eps': 1e-5},

@@ -25,10 +25,10 @@ from typing import TYPE_CHECKING, Annotated, ClassVar
 import jax
 
 from dew._records import number, record
-from dew.config import ObjectiveConfig, Prepared, RunConfig
-from dew.decision.head import DecisionHead, JointSchemaHead
+from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
+from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
 from dew.decision.laya import LAYA
-from dew.decision.layout import Framing, Layout, Schema, Segment, default_layout
+from dew.decision.layout import Framing, Labels, Layout, QuestionLayout, Schema, Segment, default_layout
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import default_metrics
@@ -37,11 +37,11 @@ from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention
 from dew.nn.protocols import RematChoosing
 from dew.optim import OptimConfig
-from dew.registry import ModelConfig, record_argument
+from dew.registry import ModelConfig, import_path, record_argument
 from dew.state import TrainState
 
 if TYPE_CHECKING:
-    from dew.interop import Pretrained
+    pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -59,10 +59,24 @@ class JointShape:
 
 
 @dataclasses.dataclass(frozen=True)
-class DecisionRunConfig(RunConfig):
+class Letters:
+    """The letter readout (`LabelReadout`): each option scored by the backbone's own logit at its
+    label's token, read at the row's answer cue, as a slot release reads it; its rows lettered as
+    `labels` letter them, each label one token of the run's tokenizer. The head holds `count`
+    labels, and its rows letter no more: a question of more options, one the objective's
+    none-of-the-above adds among them, is refused where its row is laid out. `untied` gives each
+    label a trainable output row of its own, drawn from the backbone's."""
+
+    labels: Labels = dataclasses.field(default_factory=Labels)
+    count: int = 26
+    untied: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
+class DecisionRunConfig(DecoderRunConfig):
     """A run, plus the decision objective's own knobs."""
 
-    RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "calibrate")
+    RESUMABLE: ClassVar[tuple[str, ...]] = (*DecoderRunConfig.RESUMABLE, "calibrate")
 
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("decision"))
     """The decision objective and its arguments: its scoring rule (`loss`),
@@ -78,27 +92,14 @@ class DecisionRunConfig(RunConfig):
     subfolder: str | None = None
     """The checkpoint's folder inside a repository that bundles several, such as `multilingual`."""
     revision: str | None = None
-    loop_steps: int | None = None
-    """The passes a looped checkpoint runs its block (`CausalTransformer.loop`), such
-    as Ouro's at 1, 2 or 4; None keeps the checkpoint's own."""
-    loop_layers: tuple[int, int] | None = None
-    """The block of layers [first, end) that `loop_steps` repeats: a pretrained
-    decoder with no loop gains one over its own layers, as Qwen 3.5's middle block
-    repeated twice; None keeps a looped checkpoint's block."""
-    loop_backprop_steps: int | None = None
-    """Train through the last k passes of the loop alone, with earlier passes
-    cut from backpropagation; None keeps the loop's own choice."""
-    loop_remat: bool = False
-    """Checkpoint every pass of the loop, including the first, and recompute
-    it in the backward pass; requires a loop and leaves decoding unchanged.
-    False keeps a checkpoint's own choice."""
     remat: str | None = None
     """A `REMAT_POLICIES` name for the loaded backbone's layers, applied before
     looping and LoRA. The trainer's fitting ladder starts here; a policy
     outside `DECODER_REMAT` cannot climb. None keeps the checkpoint's policy."""
-    head: JointShape | None = None
-    """The joint schema head over a fresh backbone, which then reads the
-    joint layout; None draws Laya's head."""
+    head: JointShape | Letters | None = None
+    """The head over a fresh backbone: the joint schema head, which then reads the joint layout, or
+    the letter readout of the backbone's own logits (`Letters`), over lettered rows; None draws
+    Laya's head."""
     calibrate: bool = True
     """Fit the task's temperatures on the held-out rows after training."""
     max_len: int | None = None
@@ -128,8 +129,14 @@ class DecisionRunConfig(RunConfig):
     """The backbone layers that read each example's context (`Example.context`)
     through gated cross-attention, the context encoded as `context_encoder` says;
     the blocks train from zero gates beside the head, the loaded backbone frozen
-    (`Pretrained.with_cross_attention`), with `lora` its adapter beside them. None
-    reads no context."""
+    (`Pretrained.with_cross_attention`) unless `context_frozen` is off, with
+    `lora` its adapter beside them. None reads no context."""
+    context_frozen: bool = True
+    """Whether the context layers freeze the backbone beside their blocks, which
+    then train alone with the head; off, they freeze nothing more, so the
+    backbone trains as the run trains it: whole, a full fine-tune, or through
+    its `lora` adapter over the frozen base (`--no-context-frozen`). With
+    `context_layers` alone."""
     context_length: int = 256
     """The most tokens of an example's context the cross-attention reads; an
     example with a longer context refuses the run where its data reads it,
@@ -164,16 +171,22 @@ class DecisionRunConfig(RunConfig):
                              "--context-layers")
         if self.context_encoder != "table" and self.context_layers is None:
             raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
+        if not self.context_frozen and self.context_layers is None:
+            raise ValueError("--no-context-frozen says how context layers hold the backbone; set "
+                             "--context-layers")
         derived = {}
         if self.context_layers is not None:
             derived["context_encoder"] = self.context_encoder
+        from dew.decision.slot_source import reads_blocks
         from dew.decision.sources import PretrainedDecision
 
-        frozen = self.lora is not None or self.context_layers is not None
+        frozen = self.lora is not None or (self.context_layers is not None and self.context_frozen)
         start = Pretrained.load(self.pretrained, subfolder=self.subfolder, revision=self.revision,
                                 dtype=dtype, param_dtype=self.param_dtype, attention_impl=attention_impl,
-                                **self.trainer.source_placement(frozen=frozen))
+                                **self.source_keywords(frozen=frozen))
         release = isinstance(start, PretrainedDecision)
+        # Whether a fresh head's rows lie in blocks, as the loaded checkpoint and the run declare it.
+        blocked = not release and reads_blocks(start.config, self.source.overrides())
         if release and self.head is not None:
             raise ValueError("--head draws a head over a fresh backbone; a decision release reads with "
                              "its own")
@@ -184,26 +197,33 @@ class DecisionRunConfig(RunConfig):
                 raise ValueError(f"--remat chooses a decoder's layer policy (RematChoosing), which "
                                  f"{type(start.model).__name__} does not support")
             start = dataclasses.replace(start, model=start.model.with_remat(remat_policy(self.remat)))
-        if (self.loop_steps is not None or self.loop_layers is not None
-                or self.loop_backprop_steps is not None or self.loop_remat):
-            start = looping(start, self.loop_steps, self.loop_layers,
-                            backprop_steps=self.loop_backprop_steps, remat=self.loop_remat or None)
+        start = self.looped(start)
         if self.context_layers is not None:
             # Drawn from a key of their own, apart from the adapter's and the head's.
             blocks = CrossAttention(self.context_layers, self.context_length)
             start = start.with_cross_attention(blocks, key=jax.random.fold_in(
-                jax.random.key(self.trainer.key), 1))
+                jax.random.key(self.trainer.key), 1), frozen=self.context_frozen)
         start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
         if isinstance(start, PretrainedDecision):
+            # A release lays its rows out as it states, its blocks where its overrides read them.
             start = Decide.of(start)
             derived["layout"] = _budgeted(start.layout, budgets)
         else:
-            if self.head is not None:
+            labels = None
+            if isinstance(self.head, JointShape):
                 width, head_dtype = DecisionModel.head_size(start.model)
                 derived["head"] = JointSchemaHead(hidden_size=width, dtype=head_dtype,
                                                   **dataclasses.asdict(self.head))
+            elif isinstance(self.head, Letters):
+                # Its ids are its labels' under the objective's tokenizer, which lays the rows out too.
+                letters, (width, head_dtype) = self.head.labels, DecisionModel.head_size(start.model)
+                labels = dataclasses.replace(letters, names=letters.names_for(self.head.count))
+                derived["head"] = LabelReadout(features=width, label_ids=(), untied=self.head.untied,
+                                               dtype=head_dtype)
             head = derived.get("head", DecisionHead)
-            derived["layout"] = _fresh_layout(start.model.causal, head.one_question, budgets)
+            # Lettered rows lie one question to a row, as the backbone's order asks.
+            layout = _fresh_layout(start.model.causal, head.one_question or labels is not None, budgets)
+            derived["layout"] = _laid(layout, blocked, labels)
         objective = self.objective.build(backbone=start, **derived)
         assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
         summary: dict[str, object] = {"pretrained": self.pretrained}
@@ -234,27 +254,16 @@ class DecisionRunConfig(RunConfig):
             if jax.process_index() == 0:
                 calibrated.save(directory)
 
-        # The task's own default metrics, asked for where its data holds held-out rows to score.
-        metrics = tuple(default_metrics()) if held else ()
+        metrics = self.validation_metrics(validates=bool(held))
         after = calibrate if self.calibrate and held else None
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
                                                       summary=summary, after=after, validation=held))
 
-
-def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None, *,
-            backprop_steps: int | None = None, remat: bool | None = None) -> Pretrained:
-    """A loaded checkpoint whose block runs `steps` passes: a looped one's own block, or `layers`,
-    which gives a decoder with no loop one over its own layers. Refused where neither names a block,
-    or a new block's passes are not stated. `backprop_steps` and `remat` choose
-    the loop's backward memory; None keeps a looped checkpoint's own value."""
-    from dew.nn.protocols import Looping
-
-    looped = (start.model.with_passes(steps, layers, backprop_steps=backprop_steps, remat=remat)
-              if isinstance(start.model, Looping) else None)
-    if looped is None:
-        raise ValueError(f"this {type(start.model).__name__} has no loop: --loop-layers names the block of "
-                         "its layers to repeat and --loop-steps how many times")
-    return dataclasses.replace(start, model=looped)
+    def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
+        """The task's own held-out suite (`default_metrics`), where the data holds held-out rows."""
+        if not validates:
+            return ()
+        return tuple(MetricConfig(import_path(type(metric))) for metric in default_metrics())
 
 
 type Budgets = dict[str, int | Framing | tuple[Segment, ...] | None]
@@ -264,6 +273,20 @@ type Budgets = dict[str, int | Framing | tuple[Segment, ...] | None]
 def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets) -> Layout:
     """The layout a fresh head reads (`default_layout`), with the run's `budgets`."""
     return _budgeted(default_layout(causal, one_question), budgets)
+
+
+def _laid(layout: Layout, blocked: bool, labels: Labels | None) -> Layout:
+    """A fresh head's `layout` with its rows in blocks where its backbone's text reads each of a row's
+    blocks whole, as the checkpoint's attention and the run's `--source.attention` declare it
+    (`blocked`, `reads_blocks`), not where a checkpoint reads its own media so, and lettered by
+    `labels` where the run reads letters; a layout whose rows can do neither, a joint row of every
+    question, is refused."""
+    stated = {**({"blocks": True} if blocked else {}), **({} if labels is None else {"labels": labels})}
+    if stated and not isinstance(layout, QuestionLayout):
+        raise ValueError(f"{type(layout).__name__} lays every question in one row, which lies in no blocks "
+                         "and carries no labels; a block_bidirectional --source.attention and the letter "
+                         "readout read a question to a row")
+    return dataclasses.replace(layout, **stated)
 
 
 def _budgeted(layout: Layout, budgets: Budgets) -> Layout:
@@ -279,4 +302,4 @@ def _budgeted(layout: Layout, budgets: Budgets) -> Layout:
     return dataclasses.replace(layout, **stated)
 
 
-__all__ = ["DecisionRunConfig", "JointShape"]
+__all__ = ["DecisionRunConfig", "JointShape", "Letters"]

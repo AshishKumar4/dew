@@ -1,17 +1,20 @@
-"""A diffusion schedule's division of a state by a rate (`dew.diffusion.schedules.divided`): IEEE's
-correctly rounded quotient on every backend, as the PyTorch sources divide, where XLA's division
+"""A diffusion schedule's division of a state by a rate, and an array's by a constant
+(`dew.nn.precision.divided`): IEEE's correctly rounded quotient on every backend, as the PyTorch
+sources divide, where XLA's division
 rounds twice on a CPU (a broadcast divisor's reciprocal, openxla/xla#51148) and approximately on a
 GPU; and the schedule sites that divide, on par with their PyTorch float32 forms (check 1)."""
+
+import math
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
-from dew.diffusion.schedules import divided
 from dew.diffusion.transforms import EpsilonPredictionTransform, from_clean
+from dew.nn.precision import divided
 from dew.sampling.solvers.sigma import _euler_step
 
 SHAPE = (64, 4, 4, 3)
@@ -109,6 +112,7 @@ def test_a_schedules_division_is_ieee_division(broadcast, dtype):
 
 def torch_wide(fn, dtype):
     """`fn` over the draw's arrays as torch tensors of `dtype`, its result as numpy."""
+    @as_given
     def run(*drawn):
         return fn(*(torch.from_numpy(np.asarray(array, np.float64)).to(dtype) for array in drawn)).numpy()
     return run
@@ -136,3 +140,31 @@ def test_each_division_site_is_on_par_with_its_pytorch_form(site):
     dew, source = SITES[site]
     assert_as_exact(jax.jit(dew), torch_wide(source, torch.float32), draw, f"{site} division",
                     seeds=DIVISION_SEEDS, truth_fn=torch_wide(source, torch.float64))
+
+
+@pytest.mark.parametrize("site", ["unit range", "magnitude-preserving SiLU", "magnitude-preserving sum"])
+def test_a_division_by_a_constant_is_ieee_division_under_jit(site):
+    """The library's divisions of an array by a constant are IEEE's, bit for bit with NumPy's, under
+    jit, where XLA takes `x / c` as `x * RN(1 / c)` (row 1402): pixels' `(p - 127.5) / 127.5`
+    (`dew.inputs.unit_range`) over every float32 the 0-255 range's halves give, and EDM2's
+    `silu(x) / 0.596` (`dew.nn.mp.mp_silu`) over a normal draw, and its interpolation's
+    `(a + t (b - a)) / sqrt((1 - t)**2 + t**2)` (`dew.nn.mp.mp_sum`) at t = 0.5, where a = b = 0.75
+    showed it (train 208's review)."""
+    from dew.inputs import unit_range
+    from dew.nn.activations import silu
+    from dew.nn.mp import mp_silu, mp_sum
+
+    if site == "unit range":
+        pixels = np.arange(0, 255.5, 0.5, dtype=np.float32)
+        got = np.asarray(jax.jit(unit_range)(pixels))
+        expected = (pixels - np.float32(127.5)) / np.float32(127.5)
+    elif site == "magnitude-preserving SiLU":
+        values = np.random.default_rng(1402).standard_normal(1 << 16).astype(np.float32)
+        got = np.asarray(jax.jit(mp_silu)(values))
+        expected = np.asarray(jax.jit(silu)(values)) / np.float32(0.596)
+    else:
+        values = np.concatenate([np.float32([0.75]), np.random.default_rng(1805).standard_normal(1 << 16)])
+        values = values.astype(np.float32)
+        got = np.asarray(jax.jit(lambda a: mp_sum(a, a, 0.5))(values))
+        expected = values / np.float32(math.sqrt(0.5))
+    np.testing.assert_array_equal(got.view(np.uint32), expected.astype(np.float32).view(np.uint32))

@@ -339,8 +339,11 @@ class TrainingDisplay:
     # as one line (`data_line`) rather than as rows; the trackers keep each of them.
     corpus_counts: Mapping[str, float] = dataclasses.field(default_factory=dict)
     # Each split's last `TREND` evaluations, in the order they completed,
-    # scores only: the trackers keep the previews. A new evaluation rebinds
-    # its split's list, so the refresh thread never iterates one that grows.
+    # scores only: the trackers keep the previews. A split reported in parts
+    # at one step, as the summaries are (each formed by the evaluation that
+    # completes the splits it weighs), is one evaluation at that step. A new
+    # evaluation rebinds its split's list, so the refresh thread never
+    # iterates one that grows.
     evaluations: dict[str, list[Evaluation]] = dataclasses.field(default_factory=dict)
     # Whether evaluation scores the objective's EMA, which each split's label says.
     averaged: bool = False
@@ -444,8 +447,12 @@ class TrainingDisplay:
 
     def evaluation(self, evaluation: Evaluation) -> None:
         self.phase = ""
-        self.evaluations[evaluation.split] = [*self.evaluations.get(evaluation.split, ()),
-                                              dataclasses.replace(evaluation, previews=())][-TREND:]
+        history, scores = self.evaluations.get(evaluation.split, []), evaluation.scores
+        if history and history[-1].step == evaluation.step:
+            *history, latest = history
+            scores = {**latest.scores, **scores}
+        self.evaluations[evaluation.split] = [
+            *history, dataclasses.replace(evaluation, scores=scores, previews=())][-TREND:]
         if self.live is not None:
             return
         counts = f"{evaluation.records} records in {evaluation.elapsed_seconds:.2f} s"

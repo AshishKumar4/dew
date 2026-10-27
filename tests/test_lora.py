@@ -32,7 +32,7 @@ from affine_run import Replaying
 from flax import linen as nn
 from interop_support import extract_fixture, hub_cache
 from model_support import flat_tree
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened, without_ynn
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, widened
 from safetensors.numpy import load_file
 from test_joined import row_joins
 
@@ -43,6 +43,7 @@ from dew.diffusion.process import DenoisingCondition
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import Adapter, AdapterBase, LoRA, Target
+from dew.nn.kernels import generation
 from dew.nn.sharding import ADAPTER_RANK, declarations, declared_axes, parameter_path
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
@@ -531,10 +532,12 @@ def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, referenc
 
 @pytest.mark.parametrize("scan", [False, True])
 def test_an_adapter_on_gate_and_up_keeps_its_branch_where_the_row_joins_them(decoder, reference, scan):
-    """A row that joins gate and up into one GEMM (`dew.nn.joined`) leaves an
-    adapted model's projections to their own calls, which the adapter
-    intercepts, in a scanned stack too: the adapted logits are those with the
-    projections apart, and the branch moves them off the base model's."""
+    """A row that joins gate and up into one GEMM (`dew.nn.joined`, an A100's)
+    leaves an adapted model's projections to their own calls, which the
+    adapter intercepts, in a scanned stack too, its route saying why; the join
+    chosen for it hands the call to them too (a join's requirements are
+    handoffs), so the adapted logits are those with the projections apart, and
+    the branch moves them off the base model's."""
     adapter = LoRA(rank=3, modules=("gate_proj", "up_proj")).apply(
         decoder.model, decoder.variables, key=0, layouts=decoder.layouts)
     model = adapter.model.clone(scan_layers=scan)
@@ -542,6 +545,10 @@ def test_an_adapter_on_gate_and_up_keeps_its_branch_where_the_row_joins_them(dec
         lambda path, leaf: jax.random.normal(jax.random.key(7), leaf.shape, leaf.dtype)
         if path[-1].key == "lora_B" else leaf, adapter.variables)
     tokens = jnp.asarray(reference["input_ids"])
+    with generation.assumed("sm80"), generation.routes() as found:
+        jax.eval_shape(model.apply, variables, tokens)
+    assert {(route.kernel, route.preferred, route.refusal and route.refusal.code) for route in found
+            if route.choice == "gate_up"} == {("apart", "joined", "intercepted")}
     with row_joins("gate_up", joins=False):
         apart = np.asarray(model.apply(variables, tokens))
     with row_joins("gate_up"):
@@ -630,7 +637,7 @@ def test_a_clipped_linear_adapts_once_inside_its_bounds_and_reloads(tmp_path):
     import torch
 
     model, variables, adapter, draw, forward, reference = clipped_adapter_case()
-    assert_as_exact(forward, lambda *args: reference(torch.float32, *args), draw,
+    assert_as_exact(forward, as_given(lambda *args: reference(torch.float32, *args)), draw,
                     "clipped linear adapter", seeds=CLIPPED_SEEDS,
                     truth_fn=lambda *args: reference(torch.float64, *args))
     factors, inputs, _ = draw(3)
@@ -932,7 +939,6 @@ def test_a_registry_model_adapts_through_the_names_its_own_kernels_carry(tmp_pat
                                     ("params", "layers_1", "mlp", "up_proj")}
     factors = [leaf for path, leaf in flat_tree(adapted["params"]).items() if path.endswith("lora_B")]
     assert len(factors) == 3 and not any(np.any(np.asarray(factor)) for factor in factors)
-    adapted_logits, base_logits = without_ynn(adapter.model.apply), without_ynn(model.apply)
     wide = model.clone(dtype=jnp.float64)
 
     def draw(seed):
@@ -942,8 +948,8 @@ def test_a_registry_model_adapts_through_the_names_its_own_kernels_carry(tmp_pat
         with jax.enable_x64(new_val=True):
             return np.asarray(wide.apply(widened(variables), jnp.asarray(tokens)))
 
-    assert_as_exact(lambda tokens: np.asarray(adapted_logits(adapted, jnp.asarray(tokens))),
-                    lambda tokens: np.asarray(base_logits(variables, jnp.asarray(tokens))), draw,
+    assert_as_exact(lambda tokens: adapter.model.apply(adapted, tokens),
+                    lambda tokens: model.apply(variables, tokens), draw,
                     "a fresh adapter against its base", seeds=REGISTRY_SEEDS, truth_fn=truth)
 
     adapter.save(adapted, tmp_path)

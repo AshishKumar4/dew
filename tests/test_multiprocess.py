@@ -139,6 +139,26 @@ def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_pat
 
 
 @pytest.mark.distributed
+def test_a_schedule_ends_its_stage_at_one_step_on_every_process(tmp_path):
+    """The committed tokens a schedule's stage ends on are the pool's, summed over its processes, so
+    two processes end the first stage at one step, the one a single process ends it at, and land on
+    its parameters."""
+    # Fifteen windows of four, whose tokens all stand in the model's vocabulary of 64.
+    corpus = token_corpus(tmp_path / "tokens", records=15, seq_len=4)
+    flags = {"tokens": corpus.train, "seq_len": 4, "steps": 6}
+    pool = run_pool("schedule_fit", tmp_path / "pool", 2, **flags)
+    alone = run_pool("schedule_fit", tmp_path / "alone", 1, **flags)
+    assert [report["step"] for report in pool + alone] == [6, 6, 6]
+    ends = {tuple(report["stage_ends"]) for report in pool + alone}
+    assert len(ends) == 1, ends
+    (end,) = ends.pop()
+    assert 0 < end < 6 * worker.BATCH
+    for index in range(2):
+        assert_same_parameters(dumped_params(tmp_path / "pool" / f"process{index}.json"),
+                               dumped_params(tmp_path / "alone" / "process0.json"))
+
+
+@pytest.mark.distributed
 def test_a_decision_release_partitioned_over_a_pool_publishes_its_readout(tmp_path):
     """A slot release placed over two processes, its readout partitioned across them, publishes every
     tensor it saves: its readout gathered home to process 0 beside its backbone, written to
@@ -384,7 +404,7 @@ def test_two_processes_train_the_step_one_process_trains(tmp_path):
     pool = run_pool("steps", tmp_path / "pool", 2, fsdp_size=2, steps=steps,
                     name="pool", run_dir=tmp_path / "pool-run")
 
-    from dew.training.distributed import shard_batch
+    from dew.distributed.batches import shard_batch
 
     trainer = worker.build_trainer("single", tmp_path / "single-run", fsdp=2)
     state, _, _ = trainer.place()
@@ -635,10 +655,9 @@ ONLINE = {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}
 
 @pytest.mark.distributed
 def test_processes_fetch_disjoint_shares_of_one_online_order(tmp_path):
-    """Two processes each fetch their own share of one shuffled catalog over HTTP: the first pass's
-    shares cover the corpus once, and the server answers every url, the two together asking for
-    fewer than two passes' worth, so neither fetched the other's share (each reads a little of its
-    next pass ahead)."""
+    """Two processes each fetch their own share of one pass of a shuffled catalog over HTTP, to its end:
+    their shares cover the corpus once, and the server answers each url once, so neither fetched a
+    record of the other's share."""
     answered, lock = collections.Counter(), threading.Lock()
 
     def counted(request) -> None:
@@ -652,8 +671,7 @@ def test_processes_fetch_disjoint_shares_of_one_online_order(tmp_path):
     shards = [report["records"] for report in reports]
     assert not set(shards[0]) & set(shards[1]), "both processes read the same record"
     assert sorted(shards[0] + shards[1]) == list(range(RECORDS))
-    assert set(answered) == {f"/{index}" for index in range(RECORDS)}
-    assert sum(answered.values()) < 2 * RECORDS, answered
+    assert answered == {f"/{index}": 1 for index in range(RECORDS)}
 
 
 @pytest.mark.distributed
@@ -1479,6 +1497,23 @@ def test_composite_rejection_and_partial_restart_agree_across_processes(tmp_path
     for report in pool:
         for want, got in zip(single["state"], report["state"], strict=True):
             np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.distributed
+def test_a_pool_serves_a_prefix_run_as_one_process_and_refuses_a_short_prompt_together(tmp_path):
+    """A prefix run's task over a request two processes each hold a share of, as one global array, answers
+    the rows one process answers: each prompt's blocks are made of the process's own rows inside the
+    request's agreed check. A prompt too short for the prefix in one rank's share alone is refused on both
+    ranks, neither left waiting on its peer's agreement."""
+    worker_script = Path(__file__).with_name("prefix_worker.py")
+    reports = run_pool("prefix_generation", tmp_path / "pool", 2, script=worker_script, devices=2,
+                       fsdp_size=2, timeout=240)
+    single = run_worker("prefix_generation", tmp_path / "single.json", script=worker_script, fsdp_size=1,
+                        devices=1)
+
+    assert [report["refused"] for report in reports] == [True, True] and single["refused"]
+    assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
+    assert reports[0]["lengths"] + reports[1]["lengths"] == single["lengths"]
 
 
 @pytest.mark.distributed

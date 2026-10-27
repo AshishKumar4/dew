@@ -113,7 +113,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import flat_tree, llada_draw, llada_fields
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, declared_seeds, recording
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    declared_seeds,
+    recording,
+)
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config, translate_weights
@@ -1230,7 +1236,8 @@ def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, de
     actual = jax.jit(lambda tokens: reloaded.model.apply(reloaded.variables, tokens, **fields))
     expected = jax.jit(lambda tokens: model.apply(trained, tokens, **fields))
     # Saving and loading is an identity, so the reference is exact at every draw.
-    assert_as_exact(lambda seed: actual(draws[int(seed)]), lambda seed: expected(draws[int(seed)]),
+    assert_as_exact(as_given(lambda seed: actual(draws[int(seed)])),
+                    as_given(lambda seed: expected(draws[int(seed)])),
                     lambda seed: (np.asarray(seed, np.int32),), name + ' trained export', seeds=8,
                     truth_fn=lambda seed: np.asarray(expected(draws[int(seed)]), np.float64))
     prompt = ids[:1, :4]
@@ -1480,6 +1487,40 @@ def test_a_nemotron_h_prediction_step_loads_computes_the_reference_and_trains(tm
     moved = jax.tree.map(lambda old, new: bool(np.any(old != np.asarray(new))), before,
                          jax.device_get(trained.variables["params"]["mtp_0"]))
     assert all(jax.tree.leaves(moved)), moved
+
+
+def test_a_nemotron_h_load_keeps_its_prediction_steps_whole(tmp_path):
+    """A Nemotron-H prediction step is its blocks together, an attention block and a routed one under
+    `mtp.layers.{0,1}.*` (`step_depth`): `prediction_depths=1` keeps a one-step source whole, and of a
+    two-step source, its second step the first's blocks again under `mtp.layers.{2,3}.*`, keeps the
+    first step alone, as the one-step source loads; 0 keeps the trunk."""
+    from safetensors.numpy import load_file, save_file
+
+    def load(directory, **options):
+        return Pretrained.load(str(directory), dtype="float32", attention_impl="reference", **options)
+
+    def same(loaded, other) -> bool:
+        ours, theirs = flat_tree(loaded.variables), flat_tree(other.variables)
+        return ours.keys() == theirs.keys() and all(np.array_equal(ours[key], theirs[key]) for key in ours)
+
+    nemotron_step_source(tmp_path / "one")
+    one = load(tmp_path / "one")
+    assert one.model.num_nextn_predict_layers == 1
+    assert same(load(tmp_path / "one", prediction_depths=1), one)
+    two = tmp_path / "two"
+    two.mkdir()
+    tensors = load_file(str(tmp_path / "one" / "model.safetensors"))
+    for name in [name for name in tensors if name.startswith("mtp.layers.")]:
+        index, rest = name.removeprefix("mtp.layers.").split(".", 1)
+        tensors[f"mtp.layers.{int(index) + 2}.{rest}"] = tensors[name]
+    save_file(tensors, str(two / "model.safetensors"))
+    config = json.loads((tmp_path / "one" / "config.json").read_text())
+    (two / "config.json").write_text(json.dumps({**config, "num_nextn_predict_layers": 2}))
+    first = load(two, prediction_depths=1)
+    assert first.model == one.model and same(first, one)
+    trunk = load(two, prediction_depths=0)
+    assert trunk.model.num_nextn_predict_layers == 0
+    assert not any("mtp_" in key for key in flat_tree(trunk.variables))
 
 
 @pytest.mark.parametrize("step", [

@@ -20,7 +20,7 @@ from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
 from model_support import largest_difference
 from optim_support import LR, decoder_params, drawn_tree
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, without_ynn
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, equations
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
@@ -36,6 +36,7 @@ from dew.optim import (
     Power,
     PowerTail,
     ScheduleBase,
+    clips_qk,
     learning_rate,
     muon_weight_dimension_numbers,
     rates_of,
@@ -115,7 +116,7 @@ def assert_updates_as(solver, reference, params, paths, label, *, flatten=None, 
             steps.append(reference.update(grad, reference.init(param), param)[0])
         return steps
 
-    assert_as_exact(without_ynn(dew), without_ynn(alone), lambda seed: drawn_tree(params, seed), label,
+    assert_as_exact(dew, alone, lambda seed: drawn_tree(params, seed), label,
                     seeds=seeds, truth_fn=alone)
 
 
@@ -240,8 +241,7 @@ def test_both_groups_step_with_the_one_schedule():
             return taken
         return walked
 
-    assert_as_exact(without_ynn(steps(scheduled, lambda step: 1.0)),
-                    without_ynn(steps(unscaled, lambda step: reported[step])),
+    assert_as_exact(steps(scheduled, lambda step: 1.0), steps(unscaled, lambda step: reported[step]),
                     lambda seed: drawn_tree(decoder_params(), seed), "one schedule over both groups",
                     seeds=UPDATE_SEEDS,
                     truth_fn=jax.jit(steps(unscaled, lambda step: rate(jnp.asarray(step, jnp.float64)))))
@@ -315,7 +315,7 @@ def test_an_expert_stack_placed_over_the_mesh_is_orthogonalized_one_expert_at_a_
     def reference(params, grads):
         return alone.update(grads, alone.init(params), params)[0]
 
-    assert_as_exact(placed, without_ynn(reference), draw, f"an expert stack over {spec}", seeds=UPDATE_SEEDS,
+    assert_as_exact(as_given(placed), reference, draw, f"an expert stack over {spec}", seeds=UPDATE_SEEDS,
                     truth_fn=reference)
 
 
@@ -401,8 +401,10 @@ def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None, kv_heads=None, h
 
 
 def test_muonclip_without_stats_steps_like_muon():
-    """No maxima, no clip: the transform steps aside bitwise, leaving every
-    run whose loss never opened the collection on Muon's step."""
+    """No maxima, no clip: called without them, as a loop of plain optax calls may, the transform
+    steps aside bitwise, leaving the weights on Muon's step. Its state marks the optimizer as one that
+    reads them (`clips_qk`), through the chain that composes it, so a run asks its objective for them;
+    Muon's does not."""
     params, grads = qk_tree()
     muon = muon_solver()
     clipped = muonclip_solver()
@@ -411,6 +413,7 @@ def test_muonclip_without_stats_steps_like_muon():
     updates, state = clipped.update(grads, initial, params)
     moved = stepped(params, updates, initial, state)
     assert largest_difference(moved, optax.apply_updates(params, expected)) == 0.0
+    assert clips_qk(initial) and not clips_qk(muon.init(params))
 
 
 def test_a_quiet_clip_steps_like_muon():
@@ -498,7 +501,7 @@ def test_the_clip_matches_the_paper_equations():
             params['layers_0']['self_attn'][proj]['kernel'] + grads['layers_0']['self_attn'][proj]['kernel'],
             gamma, 4)} for proj in ('q_proj', 'k_proj')}}}
 
-    assert_as_exact(without_ynn(applied), without_ynn(paper), lambda seed: qk_tree(seed=seed),
+    assert_as_exact(applied, paper, lambda seed: qk_tree(seed=seed),
                     "the clip against the paper", seeds=CLIP_SEEDS, truth_fn=paper)
 
 
@@ -575,6 +578,7 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
         groups = np.asarray(maxima(model, variables, tokens)[1]).reshape(2, 2).max(axis=1)
         return variables, tokens, np.float32(np.mean(groups))
 
+    @as_given
     def read_after(variables, ids, tau):
         stats, _ = maxima(model, variables, ids)
         tx = scale_by_qk_clip(float(tau))
@@ -700,7 +704,7 @@ def test_the_threshold_rides_optimizer_opts():
 
     # The truth's Muon keeps its momentum in the parameters' float64, where the config's holds float32.
     wide = muon_solver(optimizer_opts={'mu_dtype': None})
-    assert_as_exact(without_ynn(clipped), without_ynn(paper(muon)), lambda seed: qk_tree(seed=seed),
+    assert_as_exact(clipped, paper(muon), lambda seed: qk_tree(seed=seed),
                     "the clip at a configured threshold", seeds=THRESHOLD_SEEDS, truth_fn=paper(wide))
 
 
@@ -771,11 +775,11 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
 
     model = tiny_decoder(num_layers=1)
     if kind == "dpo":
-        objective = DPOObjective(model, 5, qk_stats=True)
+        objective = DPOObjective(model, 5)
     elif kind == "ppo":
-        objective = PPOObjective(model, 5, critic=Critic(), qk_stats=True, beta=.01)
+        objective = PPOObjective(model, 5, critic=Critic(), beta=.01)
     else:
-        objective = GRPOObjective(model, 5, qk_stats=True, beta=.01 if kind == "grpo-kl" else 0.)
+        objective = GRPOObjective(model, 5, beta=.01 if kind == "grpo-kl" else 0.)
     rows = jax.device_count()
     ids = jnp.asarray(np.random.default_rng(7).integers(0, 32, (rows, 6)), jnp.int32)
     if kind == "dpo":
@@ -806,7 +810,7 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
     assert np.max(peaks) > threshold
     # The reference must not determine the clip, even when its logits are much larger.
     reference = None if initial.ema is None else jax.tree.map(lambda leaf: leaf * 3, initial.averaged)
-    _, aux = objective.loss(variables, batch, Step(jnp.array(0), jax.random.key(1), reference))
+    _, aux = objective.loss(variables, batch, Step(jnp.array(0), jax.random.key(1), reference, qk_stats=True))
     observed = aux.qk_stats["policy"] if kind == "ppo" and aux.qk_stats is not None else aux.qk_stats
     assert observed is not None
     for got, want in zip(jax.tree.leaves(compact_qk(observed)), jax.tree.leaves(expected), strict=True):
@@ -1057,13 +1061,17 @@ def test_a_scheduled_rate_is_as_near_float64_as_optaxs(name):
             rates[f"step {step}"] = stepped_rate["w"]
         return rates
 
+    @as_given
     def truth(multipliers):
         built = [optax_schedule(name, rate_fields(name, float(multiplier))) for multiplier in multipliers]
         # optax counts in int32, which divides to float32: a float64 count keeps the schedule float64.
         return {f"step {step}": jnp.stack([values(jnp.asarray(step, jnp.float64)) for values in built])
                 for step in range(10)}
 
-    assert_as_exact(dew, optax_rates, draw, f"the {name} rate", seeds=RATE_SEEDS, truth_fn=truth)
+    # Each arm builds its schedules from the draw's multipliers on the host and reads their rates off
+    # its runs' states, as given.
+    assert_as_exact(as_given(dew), as_given(optax_rates), draw, f"the {name} rate", seeds=RATE_SEEDS,
+                    truth_fn=truth)
 
 
 @pytest.mark.parametrize("name", ["constant", "cosine"])

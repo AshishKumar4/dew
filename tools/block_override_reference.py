@@ -1,6 +1,6 @@
 """Record tiny Qwen 3.5 block-attention draws from the release's mask adapter and transformers.
 
-Run in the declared transformers-5.19 reference environment, on armada. The
+Run in the reference environment (`TRANSFORMERS`'s pin), on armada. The
 release's pinned serve.patch supplies install_noncausal/blocks; no attention
 mask is transcribed here. The generator writes a native checkpoint, paired
 fp32/float64 logits and source.json with exact package/source provenance.
@@ -9,19 +9,20 @@ fp32/float64 logits and source.json with exact package/source provenance.
 
 import argparse
 import contextlib
-import contextvars
 import copy
 import importlib
 import importlib.metadata
 import json
+import shutil
+import subprocess
 import sys
-from collections.abc import Sequence
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
 from fetched_fixtures import save
-from reference_source import CACHE, defined_in, git_head, verified
+from reference_source import CACHE, git_head, package, published_files, verified
 from torch_precision import default_dtype, dtype_widened, float_as, replaced, widened_to
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,25 +31,60 @@ REVISION = "b3f8a93462fb1051a9de031e94a7ff380e254072"
 PATCH_SHA256 = "f234c125f1d38d82104b9e1f24e75bde51e4401928acfba2fbf5c59ef2fb46b8"
 REFERENCE = f"https://huggingface.co/{REPO}/blob/{REVISION}/serve.patch; transformers"
 LICENSE = "MIT AND Apache-2.0"
+PROMPT_REPO = "OmniJev/OneJev"
+PROMPT_REVISION = "81ce62f1597c91e46767d4d02d6ac2e18534fe94"
+PROMPT_FILES = {
+    "qev/prompt.py": "17dfae09e4dff47cb8ce80e172eba116f188b82b70c2777bd14fd9b8a71680de",
+    "qev/schema.py": "bce4b7d353ac115a9e50aef284975ddeed9a3bb452e3fd928a556668705bc2f3",
+    "qev/engine.py": "f9665c68714818dbea8edc1e80d0b0d86737537dd606ff53cff37aafb84d6bf4",
+    "qev/answers.py": "09b06dba258c80a6a9afdaa5aacfd0f7523f9d2a087a7b6402ca03553ea6fba6",
+    "qev/calibrate.py": "3fa6013a81c7e79a702afcdcc0ebd089bee7047590c18cc44708850f5aeda1ee",
+}
+TRANSFORMERS = ROOT / "locks/reference/transformers519-v1.override.txt"
+"""The transformers the release's patch is recorded against: its one pin, which the reference
+environments install as an override."""
 
 
-def release_source() -> tuple[Path, str]:
-    """The verified patch and the complete readout module it adds."""
-    filename = verified(f"https://huggingface.co/{REPO}/raw/{REVISION}/serve.patch",
-                        CACHE / REPO / REVISION / "serve.patch", PATCH_SHA256)
-    section = filename.read_text().split("diff --git a/qev/readout.py b/qev/readout.py\n", 1)[1]
-    section = section.split("\ndiff --git ", 1)[0]
-    source = "\n".join(line[1:] for line in section.splitlines()
-                       if line.startswith("+") and not line.startswith("+++"))
-    return filename, source
+def require_reference_transformers() -> None:
+    """Refuse a process whose transformers is not the reference's (`TRANSFORMERS`)."""
+    from packaging.requirements import Requirement
+
+    pin = Requirement(TRANSFORMERS.read_text().strip())
+    installed = importlib.metadata.version(pin.name)
+    if not pin.specifier.contains(installed):
+        raise RuntimeError(f"this reference is {pin}, got {pin.name} {installed}")
+
+
+def release_source() -> Path:
+    """The verified patch."""
+    return verified(f"https://huggingface.co/{REPO}/raw/{REVISION}/serve.patch",
+                    CACHE / REPO / REVISION / "serve.patch", PATCH_SHA256)
+
+
+@contextlib.contextmanager
+def release_package():
+    """The authors' pinned prompt, schema and engine with the release patch applied, beside the readout
+    module the patch adds, imported as the package `slot_reference`: its `prompt`, `schema` and
+    `readout` modules, for as long as the context lasts."""
+    held = published_files(PROMPT_REPO, PROMPT_REVISION, PROMPT_FILES)
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        for name in PROMPT_FILES:
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(held / name, target)
+        subprocess.run(["git", "apply", "--include=qev/prompt.py", "--include=qev/engine.py",
+                        "--include=qev/readout.py", str(release_source())], cwd=root, check=True)
+        package("slot_reference", root / "qev")
+        yield tuple(importlib.import_module(f"slot_reference.{name}")
+                    for name in ("prompt", "schema", "readout"))
 
 
 def release_blocks():
-    """The release's own module-level block context and transformers mask adapter."""
-    filename, source = release_source()
-    return defined_in(source, ("_BLOCKS", "install_noncausal", "blocks", "block_ids"),
-                      {"torch": torch, "contextlib": contextlib, "contextvars": contextvars,
-                       "importlib": importlib, "Sequence": Sequence}, filename=str(filename))
+    """The release's readout module (`release_package`), whose module-level block context and
+    transformers mask adapter (`install_noncausal`, `blocks`) the recorded draws run under."""
+    with release_package() as (_, _, readout):
+        return readout
 
 
 @contextlib.contextmanager
@@ -107,9 +143,7 @@ def main():
         return
     if args.seeds is None or args.redraw is None or args.seeds <= 0 or args.redraw < 0:
         parser.error("seeds must be positive and redraw nonnegative")
-    version = importlib.metadata.version("transformers")
-    if version != "5.19.0":
-        raise RuntimeError(f"this reference is transformers 5.19.0, got {version}")
+    require_reference_transformers()
     torch.set_num_threads(1)
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -119,15 +153,15 @@ def main():
     model = AutoModelForImageTextToText.from_config(config, dtype=torch.float32,
                                                    attn_implementation="eager").cpu().eval()
     release = release_blocks()
-    release["install_noncausal"](model)
+    release.install_noncausal(model)
     probe = inputs(1, config.text_config.vocab_size)
     ids = torch.from_numpy(probe["input_ids"])
     altered = ids.clone()
     altered[0, 1] = (altered[0, 1] - 6) % (config.text_config.vocab_size - 7) + 7
-    with torch.no_grad(), release["blocks"](None):
+    with torch.no_grad(), release.blocks(None):
         causal = model(input_ids=ids, use_cache=False).logits[0, 0]
         causal_changed = model(input_ids=altered, use_cache=False).logits[0, 0]
-    with torch.no_grad(), release["blocks"](torch.from_numpy(probe["block_groups"])):
+    with torch.no_grad(), release.blocks(torch.from_numpy(probe["block_groups"])):
         blocked = model(input_ids=ids, use_cache=False).logits[0, 0]
         blocked_changed = model(input_ids=altered, use_cache=False).logits[0, 0]
     if not torch.equal(causal, causal_changed) or torch.equal(blocked, blocked_changed):
@@ -145,9 +179,9 @@ def main():
         draw = inputs(seed, config.text_config.vocab_size)
         ids = torch.from_numpy(draw["input_ids"])
         blocks = torch.from_numpy(draw["block_groups"])
-        with torch.no_grad(), release["blocks"](blocks):
+        with torch.no_grad(), release.blocks(blocks):
             reference = model(input_ids=ids, use_cache=False).logits
-        with torch.no_grad(), oracle_precision(), release["blocks"](blocks):
+        with torch.no_grad(), oracle_precision(), release.blocks(blocks):
             truth = exact(input_ids=ids, use_cache=False).logits
         if reference.dtype != torch.float32 or truth.dtype != torch.float64:
             raise RuntimeError(f"reference/oracle returned {reference.dtype}/{truth.dtype}")

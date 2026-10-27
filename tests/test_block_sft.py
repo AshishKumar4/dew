@@ -16,20 +16,29 @@ import numpy as np
 import optax
 import pytest
 from diffusion_support import as_a_step, float64_gradient, moved_weights, objective_gradient
-from reference_error import assert_as_exact
+from flax.traverse_util import flatten_dict, unflatten_dict
+from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 
 from dew import Trainer
-from dew.batch import FROZEN, freeze, select
+from dew.batch import FROZEN, freeze, select, thaw
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
 from dew.interop.diffusion_gemma import translate_weights
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Step
-from dew.objectives.diffusion.block import BlockDiffusionObjective
+from dew.nn.multimodal import VisionConditioner
+from dew.nn.precision import at_least_fp32
+from dew.nn.sharding import LOGITS, constrain
+from dew.nn.vision import GemmaProjector, SiglipVision
+from dew.objectives.base import Step, model_rngs
+from dew.objectives.diffusion.block import BlockDiffusionObjective, _cache_geometry
+from dew.objectives.lm.chunked import chunked_tile, model_logits
+from dew.optim import scale_by_qk_clip, stepped
 from dew.training import MeshSpec
-from dew.training.transaction import example_fields
+from dew.training.transaction import compact_qk, example_fields
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
 REFERENCES = FIXTURE / "reference"
@@ -62,6 +71,19 @@ def objective(loaded, *, variables=None, **kwargs):
     values = loaded.variables if variables is None else variables
     return BlockDiffusionObjective(loaded.model, prompt_length=4, num_canvases=2,
                                    variables=values, **kwargs)
+
+
+def test_the_block_objectives_head_takes_the_fit_ladders_tile():
+    """The block objective runs its head by the policy every token objective takes
+    (`dew.objectives.lm.head`): it keeps the whole logits until the fit ladder tiles it, and its program
+    reports the tile, which a resumed run restores."""
+    loaded, *_ = loaded_source()
+    built = objective(loaded)
+    assert built.program_key()[0].head_tile is None
+    assert built.tile_head() is not None and built.program_key()[0].head_tile == chunked_tile()
+    resumed = objective(loaded)
+    resumed.restore_head(chunked_tile(), fused=False)
+    assert [module[1:] for module in resumed.program_key()] == [module[1:] for module in built.program_key()]
 
 
 def reference_variables(loaded, name):
@@ -140,6 +162,7 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
     def draw(seed):
         return (*weights(seed), drawn(seed))
 
+    @as_given
     def trained(values, rows):
         state = stepped(values, rows)
         trace = jax.tree.map(np.asarray, optax.tree_utils.tree_get(state.opt_state, "trace"))
@@ -150,6 +173,8 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
 
     gradient = as_a_step(trainer, variables, drawn(0),
                          lambda values, rows: objective_gradient(obj, values, rows, step))
+    # The producer marks its options-bearing jit as given, so the gate never nests it (row 1800).
+    assert gradient.as_given
     assert_as_exact(trained, gradient, draw, "trainer update", seeds=seeds,
                     truth_fn=float64_gradient(twin, step))
     taken, _, _ = trainer_update(obj, batch, run_key, optax.sgd(0.001))
@@ -548,3 +573,208 @@ def test_a_canvas_rows_context_reads_an_id_its_vocabulary_also_pads_with(source)
     for left, right in zip(jax.tree.leaves(loss(variables, marked)), jax.tree.leaves(loss(variables, stated)),
                            strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+
+def merged(passes):
+    """The union by module path of several passes' `qk` trees, in NumPy: a path more than one pass sowed
+    keeps the elementwise maximum of its sown values, and a path one pass sowed keeps what it sowed."""
+    found = {}
+    for tree in passes:
+        for path, sown in flatten_dict(tree).items():
+            found.setdefault(path, []).append(sown)
+    return unflatten_dict({path: tuple(np.max(np.stack(column), axis=0) for column in zip(*sown, strict=True))
+                           for path, sown in found.items()})
+
+
+def peaks(tree):
+    """The per-layer `[rows, heads]` maxima of a `qk` tree, past the layers' geometry scalars."""
+    return [leaf for leaf in jax.tree.leaves(tree) if leaf.ndim == 2]
+
+
+def sown_passes(obj, variables, batch, step):
+    """The attention logit maxima of the encoder's pass and of both denoising passes, each computed by
+    calling the training model on the step's own draws as `BlockDiffusionObjective` runs them: the encoder
+    over the clean row, the first denoising pass with no self-conditioning signal, and the second with the
+    first's logits where the row's draw conditions it. Returns the three `qk` trees, the encoder's first."""
+    prepared, tokens, response, _, full_valid, canvas_mask, _ = obj._row(batch)
+    noisy, selected, use_sc = obj._corrupted(response, canvas_mask, step)
+    fields = prepared.token_fields
+    positions, encoder_mask, encoder_keys, decoder_mask, decoder_keys = _cache_geometry(
+        full_valid, selected, obj.prompt_length, obj.canvas_size, fields.get("positions"),
+        fields.get("image_groups"))
+    model, params = obj.training_model, thaw(variables)
+    rngs = model_rngs(step.key, training=step.training)
+    cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
+    encoder_kwargs = prepared.kwargs()
+    encoder_kwargs.update(positions=positions, attention_mask=full_valid)
+    encoder_states, encoded = model.apply(
+        {**params, "cache": cache}, tokens, **encoder_kwargs, attention_pairwise_mask=encoder_mask,
+        attention_key_positions=encoder_keys, method=model.encode, train=step.training, states=True,
+        mutable=["cache", "qk"], rngs=rngs, capture_intermediates=False)
+
+    def denoise(sc_logits):
+        states, sown = model.apply(
+            {**params, "cache": encoded["cache"]}, noisy, self_conditioning_logits=sc_logits,
+            train=step.training, rngs=rngs, positions=positions[:, obj.prompt_length:],
+            attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys, states=True,
+            mutable=["qk"])
+        return states, sown["qk"]
+
+    zero = jnp.zeros((*response.shape, model.vocab_size), at_least_fp32(encoder_states.dtype))
+    first_states, first = denoise(zero)
+    first_logits = jax.lax.stop_gradient(constrain(model_logits(
+        model, params, jax.lax.stop_gradient(first_states)), LOGITS))
+    _, second = denoise(jnp.where(use_sc[:, None, None], first_logits, zero))
+    return encoded["qk"], first, second
+
+
+def test_the_block_objective_observes_the_maxima_of_its_three_passes(source):
+    """The fixture's model norms its queries and keys, so QK-Clip refuses it at any threshold (`dew.optim`).
+    What the objective owes a clipping step is the observation: `Aux.qk_stats` merges the passes' own maxima
+    by module path, which the same draws give when those passes are called directly."""
+    loaded, batch, step, _ = source
+    obj = objective(loaded)
+    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    _, aux = obj.scalar_loss(variables, batch, step.replace(qk_stats=True))
+    assert aux.qk_stats is not None
+    expected = merged(sown_passes(obj, variables, batch, step))
+    jax.tree.map(np.testing.assert_array_equal, jax.tree.map(np.asarray, aux.qk_stats),
+                 jax.tree.map(np.asarray, expected))
+
+
+def test_an_image_conditioned_run_observes_its_vision_tower_beside_its_passes(image_source):
+    """An image's conditioner runs its vision tower in the encoder pass alone, and that tower's attention
+    sows its maxima as the text layers' do. The merge keeps them by module path, beside the text layers'
+    maxima, which the same draws give when the three passes are called directly."""
+    _, inputs, obj, variables, step = image_source
+    batch = {"text": inputs}
+    _, aux = obj.scalar_loss(variables, batch, step.replace(qk_stats=True))
+    assert any(path[0] == "conditioner" for path in flatten_dict(aux.qk_stats))
+    expected = merged(sown_passes(obj, variables, batch, step))
+    jax.tree.map(np.testing.assert_array_equal, jax.tree.map(np.asarray, aux.qk_stats), expected)
+
+
+def unnormed_objective(**options):
+    """A small DiffusionGemma whose queries and keys are not normed, so QK-Clip may rescale them."""
+    text = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
+                             max_seq_len=8, qk_norm=False, layer_scalar="trainable")
+    return BlockDiffusionObjective(DiffusionGemma(text=text, canvas_length=4), prompt_length=4, **options)
+
+
+def unnormed_image_objective():
+    """A small image-conditioned DiffusionGemma with no query or key norm anywhere, so QK-Clip may rescale
+    every projection it reads: its text layers and its vision tower's (`SiglipVision`'s layers, built with
+    `qk_norm=False`). The fixture's own vision tower is Gemma's, and it norms its queries and keys."""
+    text = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
+                             max_seq_len=16, qk_norm=False, layer_scalar="trainable")
+    vision = SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2, image_size=8,
+                          patch_size=4)
+    projection = GemmaProjector(text_width=8, patches_per_side=2, tokens_per_side=1)
+    model = DiffusionGemma(text=text, canvas_length=4, conditioner=VisionConditioner(
+        vision, projection, dtype=jnp.float32))
+    return BlockDiffusionObjective(model, prompt_length=8)
+
+
+def unnormed_image_batch(rows):
+    """`rows` rows of an image batch over the unnormed model's vocabulary: one image a row, and each row's
+    text slots 2 and 3 its image's soft tokens."""
+    tokens = jnp.asarray([[0, 2, 9, 9, 5, 0, 6, 7, 8, 9, 0, 0]] * rows, jnp.int32)
+    indices = jnp.asarray([[-1, -1, 0, 1, -1, -1, -1, -1, -1, -1, -1, -1]] * rows, jnp.int32)
+    valid = jnp.asarray([[0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]] * rows, bool)
+    positions = jnp.asarray([[0, 0, 1, 2, 4, 5, 7, 8, 9, 10, 10, 10]] * rows, jnp.int32)
+    pixels = jnp.broadcast_to(jnp.linspace(-0.5, 0.5, 3 * 8 * 8).reshape(1, 1, 3, 8, 8), (rows, 1, 3, 8, 8))
+    return {"text": ModelInputs(tokens, {"image_indices": indices, "attention_mask": valid,
+                                         "image_groups": jnp.where(indices >= 0, indices // 2, -1),
+                                         "positions": positions},
+                                {"pixel_values": pixels, "image_lengths": jnp.ones((rows,), jnp.int32)})}
+
+
+def qk_clip(limit):
+    """sgd(0) then `limit`'s QK-Clip: the step's own update is zero, so what it moves is the clip alone."""
+    return optax.chain(optax.sgd(0.0), scale_by_qk_clip(limit))
+
+
+def recorded_clip(limit, template):
+    """`qk_clip(limit)` and then a transform that keeps the maxima the step hands its optimizer
+    (`qk_stats`), in a tree shaped as `template`: what the run's own program sowed, which a program
+    of the test's would compute again only to the rounding of its own fusions."""
+    def init(params):
+        del params
+        return jax.tree.map(jnp.zeros_like, template)
+
+    def update(updates, state, params=None, qk_stats=None):
+        del params
+        return updates, state if qk_stats is None else jax.tree.map(
+            lambda sown, kept: jnp.asarray(sown, kept.dtype), qk_stats, state)
+
+    return optax.chain(qk_clip(limit), optax.GradientTransformationExtraArgs(init, update))
+
+
+def clipped_run(obj, batch, limit):
+    """One step of `obj` over `batch` under `recorded_clip(limit)`: the starting variables and optimizer
+    state of `qk_clip(limit)`, read before the step consumes them, the passes' `qk` trees at that step's
+    draws, the stepped variables with the updates committed, and the clip's state and the maxima the
+    run handed it after the step."""
+    initial_key = jax.random.PRNGKey(3)
+    probe = Trainer(obj, qk_clip(limit), key=initial_key, split=1).initial_state()
+    step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(probe.key, 0), None,
+                **example_fields(probe, 0, 1, batch))
+    start = jax.tree.map(np.asarray, probe.variables)
+    passes = jax.jit(sown_passes, static_argnums=(0,))(obj, jax.tree.map(jnp.asarray, start), batch, step)
+    train = Trainer(obj, recorded_clip(limit, compact_qk(merged(passes))), key=initial_key, split=1)
+    initial = train.initial_state()
+    opt_state = jax.tree.map(np.asarray, initial.opt_state[0])
+    final, *_ = train.compile(initial, batch)(initial, batch)
+    clip_state, handed = jax.tree.map(np.asarray, final.opt_state)
+    return start, opt_state, passes, jax.tree.map(np.asarray, final.variables), clip_state, handed, int(
+        final.updates)
+
+
+def assert_clipped_at_the_maxima(start, opt_state, final, clip_state, handed, limit):
+    """The run handed its clip a maximum for every path its passes sowed, and its parameters are
+    `qk_clip(limit)`'s update at those maxima, applied to `start` with its rescale (`stepped`), bit for
+    bit, the rescale the clip's state holds; the clip moved some of them."""
+    zero = jax.tree.map(np.zeros_like, start["params"])
+    applied, after = jax.jit(qk_clip(limit).update)(zero, opt_state, start["params"], qk_stats=handed)
+    jax.tree.map(np.testing.assert_array_equal, clip_state, jax.tree.map(np.asarray, after))
+    expected = jax.tree.map(np.asarray, stepped(start["params"], applied, opt_state, after))
+    jax.tree.map(np.testing.assert_array_equal, final["params"], expected)
+    assert any(not np.array_equal(moved, before) for moved, before in
+               zip(jax.tree.leaves(final["params"]), jax.tree.leaves(start["params"]), strict=True))
+
+
+def test_a_block_run_clips_its_attention_at_its_passes_maxima():
+    """An optimizer holding a QK-Clip has the run ask the block objective for its maxima, and its update is
+    `scale_by_qk_clip`'s at the maxima of its three passes, bit for bit (its own update is zero). Every
+    row conditions the second denoising pass, so it differs from the first, and the first's maxima must
+    be the strongest somewhere for the merge to matter. A threshold no head reaches moves nothing."""
+    threshold = 0.05
+    obj = unnormed_objective(self_cond_prob=1.0)
+    rows = 8 * jax.device_count()
+    batch = {"text": jnp.asarray(np.random.default_rng(5).integers(1, 16, size=(rows, 8)), jnp.int32)}
+    start, opt_state, passes, final, clip_state, handed, updates = clipped_run(obj, batch, threshold)
+    assert updates == 1
+    encoder, first, second = passes
+    assert max(float(np.max(peak)) for peak in peaks(handed)) > threshold
+    assert any(np.any(own > np.maximum(before, after)) for own, before, after in
+               zip(peaks(first), peaks(encoder), peaks(second), strict=True))
+    assert_clipped_at_the_maxima(start, opt_state, final, clip_state, handed, threshold)
+    unclipped = clipped_run(obj, batch, 1e30)[3]
+    jax.tree.map(np.testing.assert_array_equal, unclipped["params"], start["params"])
+
+
+def test_an_image_conditioned_run_clips_its_text_and_vision_attention_at_their_maxima():
+    """The image run clips where its projections carry no norm: its text layers and its vision tower alike,
+    each at its merged maxima (`merged`), where the vision tower's attention is what only the encoder pass
+    observes. A threshold no head reaches moves nothing."""
+    obj = unnormed_image_objective()
+    rows = math.lcm(2, jax.device_count())
+    batch = unnormed_image_batch(rows)
+    threshold = 0.05
+    start, opt_state, _, final, clip_state, handed, updates = clipped_run(obj, batch, threshold)
+    assert updates == 1
+    assert_clipped_at_the_maxima(start, opt_state, final, clip_state, handed, threshold)
+    assert max(float(np.max(peak)) for peak in peaks(handed)) > threshold
+    assert any(path[0] == "conditioner" for path in flatten_dict(handed))
+    unclipped = clipped_run(obj, batch, 1e30)[3]
+    jax.tree.map(np.testing.assert_array_equal, unclipped["params"], start["params"])

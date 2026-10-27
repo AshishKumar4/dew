@@ -63,7 +63,8 @@ batch is placed from every process alike:
     python tools/layout_parity.py --models dense moe --references refs --prepare  # one device
     python tools/layout_parity.py --models dense moe --references refs              # every device
     python tools/layout_parity.py --models moe --layouts expert4,data2_expert2,expert2_fsdp2 \\
-        --mixture '{"experts": 32, "top_k": 8, "dispatch": "exchange"}' --objective '{"aux_loss_alpha": 0.01}'
+        --mixture '{"experts": 32, "top_k": 8, "dispatch": "exchange"}' \\
+        --objective '{"balance": {"aux_loss_alpha": 0.01}}'
     python tools/layout_parity.py --models dense --layouts stage4,stage2_sequence2 --devices 4
     dew launch --processes-per-host 4 --devices-per-process 1 -- \\
         python tools/layout_parity.py --models dense,dit --out parity.json
@@ -343,7 +344,7 @@ def placed(batch, mesh):
     import jax
     import numpy as np
 
-    from dew.training.distributed import batch_shardings
+    from dew.distributed.batches import batch_shardings
 
     def put(leaf, sharding):
         array = np.asarray(leaf)
@@ -1177,7 +1178,7 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
          mixture: Annotated[str, tyro.conf.arg(
              help="JSON merged into each model's mixture, e.g. '{\"dispatch\": \"exchange\"}'")] = "{}",
          objective: Annotated[str, tyro.conf.arg(
-             help="JSON of LMObjective keywords, e.g. '{\"aux_loss_alpha\": 0.01}'")] = "{}",
+             help="JSON of LMObjective keywords, e.g. '{\"balance\": {\"aux_loss_alpha\": 0.01}}'")] = "{}",
          references: Annotated[Path | None, tyro.conf.arg(
              help="a directory of references a --prepare run wrote, read instead of computed")] = None,
          prepare: Annotated[bool, tyro.conf.arg(

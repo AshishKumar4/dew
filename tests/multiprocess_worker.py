@@ -227,11 +227,11 @@ class Pixels:
         return {"image": np.frombuffer(row["bytes"], np.uint8).reshape(RES, RES, 3)}
 
 
-def online_pipeline(records: int, address: str, *, shared: bool):
+def online_pipeline(records: int, address: str, *, shared: bool, epochs: int | None = None):
     """`elastic_loader`'s records fetched over HTTP from the pool's server at `address`, a url each, in
     either order a fetch is read in: the catalog shuffled and each process fetching its own share of it
     (`shared`), or every process fetching the catalog as a memory read does and shuffling what it kept,
-    one global order."""
+    one global order; `epochs` passes of it, or passes without end."""
     from dew.data import Memory
     from dew.data.pipeline import Pipeline
     from dew.data.sources.urls import Fetch
@@ -239,8 +239,8 @@ def online_pipeline(records: int, address: str, *, shared: bool):
     catalog = Pipeline(Memory([{"url": f"http://{address}/{index}"} for index in range(records)]))
     fetched = (Fetch(output="bytes"), Pixels())
     if shared:
-        return catalog.shuffle(0).repeat().filter_map(*fetched)
-    return catalog.filter_map(*fetched).shuffle(0).repeat()
+        return catalog.shuffle(0).repeat(epochs).filter_map(*fetched)
+    return catalog.filter_map(*fetched).shuffle(0).repeat(epochs)
 
 
 def online_loader(records: int, workers: int, address: str, *, shared: bool):
@@ -331,8 +331,9 @@ def dump_params(path: Path, params) -> None:
 def mode_topology(args) -> dict:
     import jax
 
+    from dew.distributed.batches import shard_batch
+    from dew.distributed.placement import MeshSpec
     from dew.training import runtime
-    from dew.training.distributed import MeshSpec, shard_batch
 
     mesh = MeshSpec(fsdp=args.fsdp_size).build()
     rows = BATCH // args.processes
@@ -422,24 +423,21 @@ def mode_data(args) -> dict:
 
 
 def mode_online_data(args) -> dict:
-    """The first pass of records fetched from the pool's server, each process fetching its share of the
-    shuffled catalog (`online_pipeline`): the records it read, by the image each url's bytes hold. A
-    training order reads on past its pass, so the pass is its batches."""
-    import itertools
-
+    """One pass of records fetched from the pool's server, each process fetching its share of the
+    shuffled catalog (`online_pipeline`) to its end: the records it read, by the image each url's bytes
+    hold."""
     import jax
 
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
     from dew.training import MeshSpec
 
-    data = compile(online_pipeline(args.records, args.online, shared=True).batch(BATCH), seed=0,
+    data = compile(online_pipeline(args.records, args.online, shared=True, epochs=1).batch(BATCH), seed=0,
                    loading=Loading(workers=args.workers, threads=2, read_buffer=8, worker_buffer=2))
     partition = DataPartition.of(MeshSpec().build())
     stream = data.train(partition)
     try:
-        records = [record for batch in itertools.islice(stream, args.records // BATCH)
-                   for record in batch_records(batch)]
+        records = [record for batch in stream for record in batch_records(batch)]
     finally:
         stream.close()
     return {"process_index": jax.process_index(), "records": records}
@@ -532,8 +530,9 @@ def mode_reads(args) -> dict:
     import jax
     import jax.numpy as jnp
 
+    from dew.distributed.batches import batch_signature, shard_batch
     from dew.training import MeshSpec
-    from dew.training.distributed import batch_signature, shard_batch, step_reads
+    from dew.training.distributed import step_reads
 
     mesh = MeshSpec().build()
     rows = len(mesh.local_devices)
@@ -605,6 +604,26 @@ def mode_token_budget(args) -> dict:
     return {"step": int(state.step), "updates": int(state.updates), "logged": len(tracker.losses)}
 
 
+def mode_schedule_fit(args) -> dict:
+    """`--steps` of `token_trainer` on a schedule of `--tokens` read in two orders, the first stage for
+    60 committed tokens (`dew.data.schedule`): the step the run reached, the record its first stage
+    ended at in the saved position, and the parameters beside the report."""
+    from dew import position
+    from dew.data import presets, schedule
+    from dew.data.sources.tokens import TokenFiles
+
+    def ordered(seed: int):
+        windows = TokenFiles(args.tokens).shuffle(seed).repeat()
+        return windows.pipe(presets.token_windows, seq_len=args.seq_len, batch=None)
+
+    trainer = token_trainer(args.name, args.out.parent, fsdp=1, seq_len=args.seq_len)
+    state = trainer.fit(schedule([(ordered(0), 60), (ordered(1), None)]).batch(BATCH), steps=args.steps)
+    dump_params(args.out.with_suffix(".npz"), state.variables)
+    _, saved = restored_state(trainer)
+    completed = [] if saved is None else position.read(saved.encode()).completed
+    return {"step": int(as_numpy(state.step)), "stage_ends": [end for _, end in completed]}
+
+
 def mode_steps(args) -> dict:
     """`--steps` more steps of the executable fit runs, from the directory's state.
 
@@ -612,7 +631,7 @@ def mode_steps(args) -> dict:
     the losses it computed; fit reports them through the tracker on process 0
     alone.
     """
-    from dew.training.distributed import shard_batch
+    from dew.distributed.batches import shard_batch
 
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
     checkpoints = trainer.checkpoints
@@ -1037,7 +1056,7 @@ def pipeline_trainer(stage: int, microbatches, fsdp: int):
 def pipeline_losses(trainer, rows, steps: int):
     """`steps` steps of the compiled step over this process's `rows` of the
     token batch, with the losses and the final parameters."""
-    from dew.training.distributed import shard_batch
+    from dew.distributed.batches import shard_batch
 
     state, _, _ = trainer.place()
     batch = shard_batch(trainer.device_mesh, {"text": rows})
@@ -1312,8 +1331,8 @@ def mode_training_contract(args) -> dict:
     from test_training_transactions import SHORT_SCALE, Tiny
 
     from dew.checkpoints import Checkpoints
+    from dew.distributed.batches import shard_batch
     from dew.training import Trainer
-    from dew.training.distributed import shard_batch
 
     class Rows(Tiny):
         def loss(self, variables, batch, step):
@@ -1539,8 +1558,8 @@ def mode_rollout(args) -> dict:
     # A resident global array reaches the task as it is: a process cannot
     # fetch the rows the other process's devices hold, so a host round trip
     # would fail here before any model ran.
+    from dew.distributed.batches import shard_batch
     from dew.inference import TextGeneration
-    from dew.training.distributed import shard_batch
 
     resident = shard_batch(trainer.device_mesh, {"prompt": local["prompt"]})["prompt"]
     controls = Sampling(temperature=0.8, top_k=5, eos_token_ids=eos, pad_token_id=12)
@@ -1834,7 +1853,7 @@ def mixed_validity_step(trainer, batch: dict, out: Path | None = None) -> dict:
     gradients between topologies instead of the state an optimizer with
     memory would have reached.
     """
-    from dew.training.distributed import shard_batch
+    from dew.distributed.batches import shard_batch
 
     state, _, _ = trainer.place()
     placed = shard_batch(trainer.device_mesh, batch)
@@ -2142,10 +2161,10 @@ def mode_host_training(args) -> dict:
     import jax.numpy as jnp
     import optax
 
+    from dew.distributed.batches import shard_batch
+    from dew.distributed.host import companion_mesh
     from dew.objectives.base import Aux, Objective
     from dew.training import Layout, MeshSpec, Trainer
-    from dew.training.distributed import shard_batch
-    from dew.training.host import companion_mesh
 
     class Coupled(Objective):
         def fresh_variables(self, key, held):
@@ -2199,7 +2218,7 @@ def mode_step_fits(args) -> dict:
 
     import jax
 
-    from dew.training.distributed import MeshSpec
+    from dew.distributed.placement import MeshSpec
     from dew.training.memory import fits_everywhere, step_fits
 
     # A step over a mesh that spans both processes: each may read only its
@@ -2327,7 +2346,7 @@ def mode_matrix(args) -> dict:
             "batches": batches}
 
 
-MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
+MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit": mode_schedule_fit,
          "decision_publish": mode_decision_publish,
          "host_training": mode_host_training, "step_fits": mode_step_fits,
          "whole_validation": mode_whole_validation, "host_fields": mode_host_fields,

@@ -276,7 +276,8 @@ type DecoderFields = NativeFields[CausalTransformer]
 class AudioFields(TypedDict):
     """Describes the audio half of a wrapper record.
 
-    A family without an audio tower carries all four as None.
+    A family without audio carries all four as None; one whose audio is a projector of raw frames
+    (Gemma 4 Unified) carries no tower (`audio` None) beside its projector and placeholder id.
     """
 
     audio: Mapping[str, object] | None
@@ -295,8 +296,8 @@ class WrapperFields(AudioFields):
     model_type: str
     text_model_type: str
     text: DecoderFields
-    tower: Mapping[str, object]
-    projector: Mapping[str, object]
+    tower: Mapping[str, object] | None
+    projector: Mapping[str, object] | None
     image_token_id: int
     tokens_per_image: int | None
     video_token_id: int | None
@@ -976,8 +977,8 @@ def modeling_overrides(source: Mapping[str, object], config: DecoderFields, used
         kinds[name] = kind
 
 
-# Every wrapper record carries the audio fields; families without an audio
-# tower carry them as None.
+# Every wrapper record carries the audio fields; families without audio carry
+# them as None.
 NO_AUDIO: AudioFields = {"audio": None, "audio_projector": None,
                           "audio_token_id": None, "audio_soft_tokens": None}
 
@@ -1242,6 +1243,16 @@ PREDICTION_LEAVES: Mapping[str, tuple[str, ...]] = {
 `model.layers.{num_layers + d}.` (`layer_depth_path`)."""
 
 
+def layer_depth(name: str, config: Mapping[str, object]) -> int | None:
+    """The prediction depth of `name` in DeepSeek-V3's layout, the `d` of `model.layers.{num_layers +
+    d}.*`, or None for the trunk's (`layer_depth_path`)."""
+    parts = name.split('.')
+    trunk = _records.integer(config['num_layers'], 'num_layers')
+    if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit() and int(parts[2]) >= trunk:
+        return int(parts[2]) - trunk
+    return None
+
+
 def layer_depth_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     """The path of `name` in DeepSeek-V3's layout, which GLM's MoE releases
     share: prediction depth d at `model.layers.{num_layers + d}.*`, its own
@@ -1251,14 +1262,12 @@ def layer_depth_path(name: str, config: Mapping[str, object]) -> tuple[str, ...]
     head in the embedding, which stores the same [vocab, features] the copy
     does; an untied one has the head's own kernel, which stores its
     transpose. Any other name is the trunk's, `dew_path`'s."""
-    parts = name.split('.')
-    trunk = _records.integer(config['num_layers'], 'num_layers')
-    if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
-            and int(parts[2]) >= trunk):
+    index = layer_depth(name, config)
+    if index is None:
         return dew_path(name, config)
-    tail = '.'.join(parts[3:])
+    tail = '.'.join(name.split('.')[3:])
     depths = _records.integer(config.get('num_nextn_predict_layers', 0), 'num_nextn_predict_layers')
-    depth = _declared_depth(name, int(parts[2]) - trunk, depths)
+    depth = _declared_depth(name, index, depths)
     if tail == 'embed_tokens.weight':
         return ('params', 'embed_tokens', 'embedding')
     if tail == 'shared_head.head.weight':
@@ -1581,6 +1590,12 @@ class Packed:
     """Config-derived count of the runs the parts are interleaved in, as in
     MiMo-V2.6's fused qkv, pre-sharded over its key heads."""
 
+    @property
+    def viewed(self) -> bool:
+        """Whether `split` gives views of the source tensor, which a lazy read keeps unread: every
+        record but one whose parts are interleaved in runs (`chunks`), which it copies."""
+        return self.chunks is None
+
     def split(self, name: str, tensor: np.ndarray,
               config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
         """The parts of the source tensor `name`, as views of it, or copies
@@ -1791,6 +1806,11 @@ class DecoderFamily:
     preserve_source_layout: bool = field(kw_only=True)
     """Bind source tensor names/config for export instead of deriving them from the model."""
     weight_path: Callable[[str, Mapping[str, object]], tuple[str, ...] | None] = dew_path
+    prediction_depth: Callable[[str, Mapping[str, object]], int | None] = lambda name, config: None
+    """The prediction depth (or DSpark stage) a source tensor belongs to, the `d` of the `mtp_{d}` or
+    `dspark_{d}` its `weight_path` places it under, or None for the trunk's: a load keeping fewer
+    depths drops the others' tensors by it before any is read (`Pretrained.load(prediction_depths=)`).
+    A family whose `weight_path` places depths names its own; the others hold none."""
     export_path: Callable[[str, Mapping[str, object]], str | None] | None = None
     """The source name of a dew path; None is the shared names (`hf_tensor_name`)."""
     export_weights: Callable[["DecoderFamily", CausalTransformer, Mapping[str, object], Mapping[str, object]],

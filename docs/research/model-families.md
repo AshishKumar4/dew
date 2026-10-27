@@ -391,6 +391,20 @@ Lineup, all ungated: `google/gemma-4-E2B`, `-E4B`, `-12B`, `-31B`,
 `-12B-it-assistant` and QAT copies. `gemma-4-12B` reports
 `model_type=gemma4_unified`; E2B, E4B, 31B and 26B-A4B report `gemma4`.
 
+For Unified, Dew follows the ordinary forward's vision-block mask in both training and serving:
+vision tokens in the same contiguous block attend bidirectionally in full and sliding layers.
+The block overlay is applied after the sliding window, so the full block stays visible even when
+it is longer than that window.
+Transformers 5.17.0's `Gemma4UnifiedModel.forward` passes block IDs to the generic mask builder
+(`modeling_gemma4_unified.py:1095-1107`, `masking_utils.py:1520-1598`), whose causal and sliding
+builders OR the block overlay in (`masking_utils.py:975-977,1215-1217`). Its stock generation method
+instead calls the vision-specific builder, which adds that overlay only to sliding layers and
+then intersects it with the window
+(`modeling_gemma4_unified.py:1186-1247,1355-1383`). This is an upstream forward/generation difference;
+Dew keeps one mask policy and compares against the ordinary forward. A call without
+`mm_token_type_ids` has no blocks in either (its block IDs stay -1), so its vision tokens read
+causally, in Dew as in transformers.
+
 `Gemma4TextConfig` (`TF/models/gemma4/configuration_gemma4.py:152-183`) plus
 `__post_init__` (`:185-225`):
 
@@ -1151,7 +1165,7 @@ Dew's seams today, for reference:
   (`scaled_dot_product_attention` in `src/dew/nn/attention.py`), which is
   where sinks and top-k masks go.
 - The decode cache is opened per module in the flax style
-  (`open_kv_cache` in `src/dew/nn/attention.py`).
+  (`open_kv_cache` in `src/dew/nn/kv_cache.py`).
 
 > 2026-09-22: this list describes Dew on 2026-09-02. The feed-forward can
 > be a `moe.SparseMLP`, `LAYER_TYPES` is gone and the mixer is a registry. See the
@@ -1213,7 +1227,7 @@ output gate.
 This is the step that needs a new cache kind: a conv state of shape
 `[B, conv_dim, kernel - 1]` and a recurrent state of shape
 `[B, heads, k_dim, v_dim]`, both written every step. Dew's
-`open_kv_cache` in `src/dew/nn/attention.py` is the place that has to
+`open_kv_cache` in `src/dew/nn/kv_cache.py` is the place that has to
 learn about non-KV state.
 
 Unlocks: Qwen3-Next, Qwen3.5, Qwen3.6, Qwen3.8 dense (with step 4),

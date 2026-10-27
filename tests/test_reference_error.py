@@ -14,6 +14,7 @@ from reference_error import (
     REDRAW,
     GateFailure,
     Inconclusive,
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact,
@@ -160,6 +161,210 @@ def test_a_without_ynn_arm_runs_over_windows():
 
     x = np.ones((3, 2), np.float32)
     np.testing.assert_array_equal(over_windows(without_ynn(lambda x: x * 2))(x), x * 2)
+
+
+def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_arm_as_users_run_it():
+    """Check 1 compiles its arms itself (`_arms`): two Dew paths each `without_ynn`, one function as
+    both arms once, a window loop's arm within it, an arm compiled so already as it is; beside an arm
+    run `as_given` (torch, NumPy, a program of its own), which it never traces, the Dew arm with the
+    fusions, as users run it. A NumPy arm passes `as_given`, and the verdict holds."""
+    from reference_error import _arms, _Windowed, as_given, assert_as_exact, over_windows, without_ynn
+
+    def dew(x):
+        return jnp.asarray(x) * 2
+
+    def written(x):
+        return x + x
+
+    mine, theirs = _arms(dew, written)
+    assert mine.without_ynn and theirs.without_ynn
+    np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
+    same, again = _arms(dew, dew)
+    assert same is again and same.without_ynn
+    compiled = without_ynn(dew)
+    assert _arms(compiled, written)[0] is compiled
+    windowed, _ = _arms(over_windows(dew), written)
+    assert isinstance(windowed, _Windowed) and windowed.fn.without_ynn
+
+    host = as_given(lambda x: np.asarray(x) + np.asarray(x))
+    mine, theirs = _arms(dew, host)
+    assert theirs is host and not getattr(mine, "without_ynn", False)
+    np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
+    def draw(seed):
+        return (np.random.default_rng(seed).standard_normal(8).astype(np.float32),)
+
+    assert_as_exact(dew, host, draw, "a NumPy arm as given", seeds=8)
+
+
+def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_policy():
+    """An arm the gate would compile that returns NumPy values is refused (a NumPy reference compiled
+    would compute in JAX); passed `as_given` it runs as given. A window loop of a given arm is
+    classified by that arm, so its Dew partner compiles with the fusions as it does without windows.
+    A paired sizing of one function against itself stays paired, its draws from SIZING_FROM on."""
+    from reference_error import SIZING_FROM, _arms, as_given, assert_as_exact, over_windows, seeds_for
+
+    def dew(x):
+        return jnp.asarray(x) * 2
+
+    def numpy(x):
+        return np.asarray(x) * 2
+
+    def draw(seed):
+        return (np.random.default_rng(seed).standard_normal(8).astype(np.float32),)
+
+    with pytest.raises(TypeError):
+        assert_as_exact(dew, numpy, draw, "a NumPy arm unmarked", seeds=8)
+    assert_as_exact(dew, as_given(numpy), draw, "a NumPy arm as given", seeds=8)
+    windowed, _ = _arms(over_windows(dew), over_windows(as_given(numpy)))
+    assert not getattr(windowed.fn, "without_ynn", False)
+    seen = []
+
+    def drawn(seed):
+        seen.append(seed)
+        return draw(seed)
+
+    seeds_for(dew, drawn, "paired against itself", dew_fn=dew)
+    assert min(seen[1:]) >= SIZING_FROM
+
+
+def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references():
+    """With the owner's library arm (`library_fn`), Dew is held within PARITY of the larger of the
+    reference's error and the library arm's, seed by seed, on the leaves the exception covers: a Dew
+    1.7 times the reference's error passes beside a library arm 1.8 times it, fails without it, fails
+    at 3 times (past the library arm's own by 1.67), and fails on a leaf the exception does not cover;
+    a library arm without its ledger row or its leaves is refused, as is one in NumPy the gate would
+    compile. Null runs judge as the site does."""
+    from reference_error import null_runs
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return rng.standard_normal(4096), *(1e-7 * rng.standard_normal(4096) for _ in range(3))
+
+    def arm(scale, noise):
+        @as_given
+        def run(x, mine, theirs, library):
+            value = x + scale * {"mine": mine, "theirs": theirs, "library": library}[noise]
+            return {"covered": value, "other": value}
+        return run
+
+    @as_given
+    def truth(x, *_):
+        return {"covered": x, "other": x}
+
+    reference, library, both = arm(1.0, "theirs"), arm(1.8, "library"), ["['covered']", "['other']"]
+    assert_as_exact(arm(1.7, "mine"), reference, draw, "library arm", seeds=16, truth_fn=truth,
+                    library_fn=library, library_row=1543, library_leaves=both)
+    with pytest.raises(GateFailure):
+        assert_as_exact(arm(1.7, "mine"), reference, draw, "no library arm", seeds=16, truth_fn=truth)
+    with pytest.raises(GateFailure):
+        assert_as_exact(arm(3.0, "mine"), reference, draw, "past the library", seeds=16, truth_fn=truth,
+                        library_fn=library, library_row=1543, library_leaves=both)
+    with pytest.raises(GateFailure) as failed:
+        assert_as_exact(arm(1.7, "mine"), reference, draw, "one leaf", seeds=16, truth_fn=truth,
+                        library_fn=library, library_row=1543, library_leaves=["['covered']"])
+    assert {finding.leaf for finding in failed.value.findings} == {"one leaf['other']"}
+    for unnamed in ({"library_leaves": both}, {"library_row": 1543}, {"library_row": 1543,
+                                                                      "library_leaves": ["['third']"]}):
+        with pytest.raises(ValueError):
+            assert_as_exact(arm(1.7, "mine"), reference, draw, "unrecorded", seeds=16, truth_fn=truth,
+                            library_fn=library, **unnamed)
+    with pytest.raises(TypeError):
+        assert_as_exact(arm(1.7, "mine"), reference, draw, "a NumPy library arm", seeds=16, truth_fn=truth,
+                        library_fn=lambda x, *_: {"covered": np.full(np.shape(x), 1 / 3),
+                                                  "other": np.full(np.shape(x), 1 / 3)},
+                        library_row=1543, library_leaves=both)
+    verdicts = null_runs(reference, draw, "library arm", seeds=16, runs=2, truth_fn=truth,
+                         dew_fn=arm(1.7, "mine"), paired=True, library_fn=library, library_leaves=both)
+    assert [(verdict, stage) for verdict, stage, _ in verdicts] == [("pass", 1), ("pass", 1)], verdicts
+
+
+def test_a_reference_compiled_with_options_of_its_own_runs_as_given():
+    """A reference compiled with compiler options of its own (a trainer step's, `as_a_step`) runs as
+    given: the gate would nest it in its own jit, which a jit with options of its own refuses (row
+    1800)."""
+    from reference_error import _arms
+
+    own = jax.jit(lambda x: {"y": x * 2}, compiler_options={"xla_cpu_enable_fast_math": False})
+    def doubled(x):
+        return {"y": jnp.asarray(x) + jnp.asarray(x)}
+
+    mine, theirs = _arms(doubled, as_given(own))
+    assert theirs.as_given and not getattr(mine, "without_ynn", False)
+    # Unmarked, the gate nests it in its own jit, which a jit with options of its own refuses.
+    _, nested = _arms(doubled, own)
+    with pytest.raises(ValueError):
+        nested(np.ones(4, np.float32))
+    assert_as_exact(doubled, as_given(own),
+                    lambda seed: (np.random.default_rng(seed).standard_normal(64).astype(np.float32),),
+                    "a reference with options", seeds=8)
+
+
+def test_a_float64_truth_runs_as_one_compiled_program():
+    """The gate compiles a JAX truth (`_truth_program`): its first call runs as given and every later
+    one is the compiled program's, whose values are the eager truth's own. A NumPy truth (its first
+    call returns host values) runs as given, and so do a truth `as_given`, one compiled already and a
+    window loop's by its own; a check over a compiled truth judges as over the eager one."""
+    from reference_error import _Truth, _truth_program, _Windowed, as_given, over_windows
+
+    calls = []
+
+    def truth(x, w):
+        calls.append(isinstance(x, jax.core.Tracer))
+        return {"y": jnp.dot(x, w, precision="highest")}
+
+    with jax.enable_x64(new_val=True):
+        program = _truth_program(truth)
+        x, w = (np.asarray(value, np.float64) for value in _draw(0))
+        eager = program(x, w)
+        compiled = program(x, w)
+        assert calls[0] is False and True in calls
+        np.testing.assert_allclose(compiled["y"], eager["y"], rtol=1e-14)
+        numpy = _truth_program(lambda x, w: {"y": np.asarray(x) @ np.asarray(w)})
+        numpy(x, w)
+        assert numpy.run is numpy.fn
+        # A truth that widens its inputs on the host and returns JAX values fails at its first call.
+        hosted = _truth_program(lambda x, w: truth(np.asarray(x, np.float64), np.asarray(w, np.float64)))
+        with pytest.raises(jax.errors.TracerArrayConversionError):
+            hosted(x, w)
+    given = as_given(truth)
+    assert _truth_program(given) is given and _truth_program(_product) is _product
+    assert _truth_program(None) is None
+    windowed = _truth_program(over_windows(truth))
+    assert isinstance(windowed, _Windowed) and isinstance(windowed.fn, _Truth)
+    assert_as_exact(_reordered, _product, _draw, "a compiled truth", seeds=8, truth_fn=truth)
+
+
+def test_an_arm_of_dew_programs_compiles_them_as_the_gate_compiles_its_other_arm(monkeypatch):
+    """Beside another Dew arm, an arm of Dew's own programs (`dew_programs`) runs with Dew's compile
+    seam holding WITHOUT_YNN open (`compiled_with`), so a program it compiles through the seam
+    (`dew.nn.kernels.options.program`) carries the option, and beside an arm `as_given` it runs as it
+    is; the seam adds nothing once the arm returns, and a run's own XLA flag for an option wins."""
+    from reference_error import WITHOUT_YNN, _arms, as_given, dew_programs
+
+    from dew.nn.kernels import options
+
+    seen = []
+
+    @dew_programs
+    def programs(x):
+        seen.append(options.compiler_options())
+        return options.program(lambda x: x * 2)(x)
+
+    def written(x):
+        return x + x
+
+    mine, _ = _arms(programs, written)
+    np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
+    expected = WITHOUT_YNN if jax.default_backend() == "cpu" else {}
+    assert seen == [expected] and options.compiler_options() == {}
+    mine, _ = _arms(programs, as_given(lambda x: np.asarray(x) * 2))
+    mine(np.ones(3, np.float32))
+    assert seen[-1] == {}
+    with options.compiled_with({"xla_cpu_experimental_ynn_fusion_type": ""}):
+        assert options.compiler_options() == {"xla_cpu_experimental_ynn_fusion_type": ""}
+        monkeypatch.setenv("XLA_FLAGS", "--xla_cpu_experimental_ynn_fusion_type=dot")
+        assert options.compiler_options() == {}
+    assert options.compiler_options() == {}
 
 
 def test_a_recordings_measured_errors_size_its_site_as_seeds_for_would():
@@ -500,9 +705,12 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
         return (np.zeros(64, np.float32), np.full(64, 2.0 if seed % 2 == 0 else 0.1, np.float32),
                 np.ones(64, np.float32))
 
+    # NumPy arms, as given: the error law is set on the host, seed by seed.
+    @as_given
     def dew(x, mine, theirs):
         return {"y": x + mine}
 
+    @as_given
     def reference(x, mine, theirs):
         return {"y": x + theirs}
 
@@ -524,9 +732,12 @@ def _set_errors(even: float, odd: float):
         return (np.zeros(64, np.float32), np.full(64, np.sqrt(even if seed % 2 == 0 else odd), np.float32),
                 np.ones(64, np.float32))
 
+    # NumPy arms, as given: the error law is set on the host, seed by seed.
+    @as_given
     def dew(x, mine, theirs):
         return {"y": x + mine}
 
+    @as_given
     def reference(x, mine, theirs):
         return {"y": x + theirs}
 
@@ -770,6 +981,7 @@ def _recorded_pairs(dew, reference, count: int, missing=()):
         asked.append(int(seed))
         return theirs[int(seed)]
 
+    @as_given
     def recorded_dew(seed):
         return mine[int(seed)]
 
@@ -846,7 +1058,8 @@ def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_pa
                 indexed_recording({**stored, "site.truth.y": truth.astype(narrow)}, "site", seeds)
 
 
-def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path):
+@pytest.mark.parametrize("proxy", [True, False])
+def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path, proxy):
     """tools/recorded_references.py records a reference over the seeds its own recording resolves, and
     their redraw; check 1 then judges Dew against the recording by its index."""
     from tool_support import load
@@ -863,7 +1076,7 @@ def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path
     def squared(inputs):
         return {"y": inputs["x"] * inputs["x"] - 1}
 
-    recorded = recorder.record_case("site", draw, evaluate, squared)
+    recorded = recorder.record_case("site", draw, evaluate, squared if proxy else None)
     seeds = int(recorded["site.seeds"])
     assert seeds >= 8 and len(recorded["site.input.x"]) == 5 * seeds
     path = tmp_path / "recorded.npz"
@@ -873,6 +1086,13 @@ def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path
         draw_recorded, reference, truth = indexed_recording(dict(stored), "site", seeds)
         assert_as_exact(jax.jit(lambda index, inputs: squared(inputs)), reference, draw_recorded, "recorded",
                         seeds=seeds, truth_fn=truth)
+        with pytest.raises(AssertionError):
+            assert_as_exact(lambda index, inputs: {"y": jnp.asarray(inputs["x"]) ** 2}, reference,
+                            draw_recorded, "recorded with its subtraction missing", seeds=seeds,
+                            truth_fn=truth)
+    if not proxy:
+        with pytest.raises(ValueError):
+            recorder.record_case("site", draw, evaluate, None, truth_proxy=squared)
 
 
 def test_check_one_holds_an_empty_leaf_exact_by_construction():
@@ -1127,9 +1347,11 @@ def test_a_change_moves_by_its_intervals_lower_end_and_one_leaf_is_enough():
 
     dew, reference, errors, truth = _set_errors(4.0, 4.0)
 
+    @as_given
     def two(x, mine, theirs):
         return {"moved": dew(x, mine, theirs)["y"], "kept": reference(x, mine, theirs)["y"]}
 
+    @as_given
     def two_original(x, mine, theirs):
         return {"moved": reference(x, mine, theirs)["y"], "kept": reference(x, mine, theirs)["y"]}
 
@@ -1138,8 +1360,9 @@ def test_a_change_moves_by_its_intervals_lower_end_and_one_leaf_is_enough():
 
     assert_moves(two_original, two, errors, "one leaf", seeds=8, truth_fn=two_truth)
 
+    @as_given
     def infinite(x, mine, theirs):
-        return {"y": x + jnp.inf}
+        return {"y": x + np.inf}
 
     with pytest.raises(AssertionError):
         assert_moves(reference, infinite, errors, "infinite", seeds=8, truth_fn=truth)

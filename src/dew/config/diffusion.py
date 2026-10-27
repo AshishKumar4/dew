@@ -28,7 +28,7 @@ from dew.inputs import AudioCondition, Field, InputSpec, TextCondition
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 from dew.nn.protocols import IntervalModel, TimeScaled
-from dew.objectives.base import TEACHER
+from dew.objectives.base import TEACHER, Metric
 from dew.objectives.diffusion.alignment import Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER
 from dew.objectives.diffusion.few_step import SMOOTH_TIME_SCALE, MeanFlowObjective
@@ -50,7 +50,6 @@ from dew.registry import (
     models,
     objectives,
     presets,
-    record_argument,
     resolve_dtype,
     to_record,
 )
@@ -130,7 +129,6 @@ class DiffusionRunConfig(RunConfig):
     """A diffusion run's configuration: the shared run fields plus the diffusion objective's own settings."""
 
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {**RunConfig._FLAG_SELECTED, "rollout": "rollout"}
-    RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "val_metrics")
 
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
@@ -182,25 +180,8 @@ class DiffusionRunConfig(RunConfig):
     transitions, `--rollout.reward clip_score --rollout.groups 4`. A Flow-GRPO run without one takes
     `FlowRolloutConfig()`, which its record then states; another objective trains on its data and
     takes none."""
-    val_metrics: (Annotated[tuple[MetricConfig, ...], record_argument(tuple[MetricConfig, ...])]
-                  | None) = None
-    """The metrics scored on every validation pass, each with the arguments the run gives it (a
-    CLIP metric's model, an FID's weights), one JSON list on the command line:
-    `--val-metrics '[{"name": "clip", "fields": {"modelname": "openai/clip-vit-base-patch32"}}]'`.
-    None is the run's default: CLIP where an image run's data holds a validation split, and
-    nothing otherwise. A metric given is asked for whatever the data holds, so data with no
-    validation split refuses it.
-    """
-
     def __post_init__(self) -> None:
-        # A record carries every sequence as a JSON list and a command line
-        # writes one too; the field is a tuple, so the value is one.
-        if self.val_metrics is not None:
-            object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
-            stray = [metric for metric in self.val_metrics if not isinstance(metric, MetricConfig)]
-            if stray:
-                raise TypeError(f"val_metrics holds metrics' records, {{'name': ..., 'fields': {{...}}}}, "
-                                f"not {stray!r}")
+        super().__post_init__()
         if not issubclass(objectives[self.objective.name], DiffusionObjective):
             raise ValueError(f"--objective {self.objective.name} trains no diffusion model")
         from dew.objectives.rl.flow import FlowGRPOObjective
@@ -393,7 +374,7 @@ class DiffusionRunConfig(RunConfig):
         objective = run.build()
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
         dataset, held = run.compiled(objective.data(), run.chain(), run.validation)
-        metrics = run.build_eval_metrics(bool(held))
+        metrics = run.validation_metrics(validates=bool(held))
         rollout = None
         if isinstance(objective, FlowGRPOObjective) and run.rollout is not None:
             rollout = run.rollout.build(objective)
@@ -466,13 +447,15 @@ class DiffusionRunConfig(RunConfig):
         reference = SourceReference.parse(self.pretrained)
         # An adapter keeps the pipeline's weights as they are: they load where the start keeps them.
         # The pipeline reads its weights on a resume too, which binds the checkpoint over them.
-        placement = self.trainer.source_placement(frozen=self.lora is not None)
+        placement = self.source_keywords(frozen=self.lora is not None)
         return load_diffusion_source(
             reference.name, revision=reference.revision, dtype=self._compute or "bfloat16",
             param_dtype=self.pretrained_param_dtype,
             attention_impl=str(self.model.fields.get("attention_impl", "auto")),
             size=self.sample_field().shape[:-1],
-            variables=variables, mesh=placement.get("mesh"), layout=placement.get("layout"))
+            variables=variables, mesh=placement.get("mesh"), layout=placement.get("layout"),
+            text_only=placement.get("text_only", False), prediction_depths=placement.get("prediction_depths"),
+            modeling_overrides=placement.get("modeling_overrides"))
 
     def _process(self, convention: Process | None) -> Process:
         """The preset's process, which must be of the kind the pretrained
@@ -493,31 +476,25 @@ class DiffusionRunConfig(RunConfig):
                 "name a preset of its kind, or none for the scheduler's own")
         return process
 
-    def build_eval_metrics(self, validates: bool = True) -> list:
-        """Build the validation metrics `val_metrics` holds, each loading its own weights, or by
-        default CLIP for an image run whose data `validates`.
+    def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
+        """CLIP for an image run whose data `validates`, and nothing otherwise."""
+        return (MetricConfig("clip"),) if validates and len(self.sample_field().shape) != 4 else ()
 
-        A video run scores a `VideoGrid` against its `video` field, which a PSNR or SSIM that
-        states no field of its own reads there, and an image-only metric raises a ValueError
-        naming it here, before the trainer starts.
-        """
+    def metric(self, config: MetricConfig) -> Metric:
+        """`config` built, loading its own weights: a video run scores a `VideoGrid` against its `video`
+        field, which a PSNR or SSIM that states no field of its own reads there, and an image-only
+        metric raises a ValueError naming it here, before the trainer starts."""
         from dew.artifacts import ImageGrid, VideoGrid
 
         video = len(self.sample_field().shape) == 4
-        configs = self.val_metrics if self.val_metrics is not None else (
-            (MetricConfig("clip"),) if validates and not video else ())
-        built = []
-        for config in configs:
-            member = metrics[config.name]
-            if video and member in (metrics["fid"], metrics["clip"], metrics["clip_score"]):
-                raise ValueError(
-                    f"metric {config.name!r} reads an ImageGrid and this run samples video; "
-                    "validate a video run with psnr or ssim")
-            grids = member in (metrics["psnr"], metrics["ssim"])
-            built.append(config.build(**({"field": "video" if video else "image",
-                                          "reads": VideoGrid if video else ImageGrid} if grids else {})))
-        return built
-
+        member = metrics[config.name]
+        if video and member in (metrics["fid"], metrics["clip"], metrics["clip_score"]):
+            raise ValueError(
+                f"metric {config.name!r} reads an ImageGrid and this run samples video; "
+                "validate a video run with psnr or ssim")
+        grids = member in (metrics["psnr"], metrics["ssim"])
+        return config.build(**({"field": "video" if video else "image",
+                                "reads": VideoGrid if video else ImageGrid} if grids else {}))
 
 if not TYPE_CHECKING:
     PresetSpec = presets.union

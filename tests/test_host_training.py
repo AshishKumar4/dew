@@ -21,6 +21,7 @@ from dew.checkpoints import Checkpoints
 from dew.data import Loading, Memory
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import DeviceStep
+from dew.distributed.host import companion_mesh, transfer
 from dew.inference.banks import spread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -28,8 +29,8 @@ from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, Trainer
-from dew.training.host import companion_mesh, transfer
 
 HOST = Layout(host=("variables",), min_shard=1, tolerance=1.)
 DEVICE = Layout(min_shard=1, tolerance=1.)
@@ -200,8 +201,8 @@ def test_dropout_composite_replay_restarts_with_effects_and_ema_intact(tmp_path)
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2,
                               mlp_features=16, max_seq_len=8, scan_layers=True, dropout_rate=.4,
                               mixture=Mixture(experts=4, top_k=2, bias=True))
-    objective = LMObjective(model, 8, head_chunks=1, aux_loss_alpha=.2, seq_aux=False,
-                            balance_rate=.01, ema_decay=.9)
+    objective = LMObjective(model, 8, head_chunks=1, ema_decay=.9,
+                            balance=ExpertBalance(balance_rate=.01, aux_loss_alpha=.2, seq_aux=False))
     checkpoints = Checkpoints(str(tmp_path / "dropout"))
     def make(checkpoints=None):
         return Trainer(objective, optax.chain(optax.clip_by_global_norm(.5), optax.adam(.001)),
@@ -820,7 +821,7 @@ def test_a_streamed_node_takes_the_one_target_its_placement_gives_it_whole():
     tree the sources came from (`held`) is handed the placed node, so the two share one copy."""
     import types
 
-    from dew.training.host import stream
+    from dew.distributed.host import stream
 
     sharding = NamedSharding(Mesh(np.asarray(jax.devices()[:1]), ("data",)), P())
     pair = (np.arange(4, dtype=np.float32), np.ones((2, 3), np.float32))
@@ -840,7 +841,7 @@ def test_a_node_two_places_share_goes_to_each_places_own_target():
     mapping is rebuilt (a defaultdict) is handed the placed node all the same."""
     import collections
 
-    from dew.training.host import stream
+    from dew.distributed.host import stream
 
     first, second = (SingleDeviceSharding(device) for device in jax.devices()[:2])
     pair = (np.arange(4, dtype=np.float32), np.ones((2, 3), np.float32))

@@ -22,7 +22,7 @@ import numpy as np
 import optax
 import pytest
 from model_support import decoder
-from reference_error import assert_as_exact, widened
+from reference_error import as_given, assert_as_exact, widened
 from rl_support import clipped_surrogate, prompt_inputs
 from test_mixers import KIND_FIELDS, tiny
 
@@ -89,17 +89,10 @@ def forward(model):
     return jax.jit(model.apply)
 
 
-def row_logits(model, params, prompt, lengths, tokens, positions=None):
-    """Each row's logits for its drawn `tokens`, from one full forward over every row's unpadded prompt and
-    the tokens drawn before each, right-padded to the longest as a learner scores a batch of rollouts, at
-    `positions` where given (a row each, the prompt's and the tokens', continued past the row's end): a
-    causal model reads no padding at a real position, and the batch's products take a learner's shapes.
-    In the model's dtype: an array a row, a step each."""
-    width, lengths = prompt.shape[1], np.asarray(lengths)
-    contexts = [np.concatenate([prompt[row, width - length:], tokens[row, :-1]])
-                for row, length in enumerate(lengths)]
-    longest = max(len(context) for context in contexts)
-    rows = np.zeros((len(contexts), longest), np.int32)
+def _right_padded(model, params, contexts, width: int, positions=None):
+    """One full forward over `contexts`, a row each, right-padded to `width`, at `positions` where given
+    (a row each, continued past the row's end): a causal model reads no padding at a real position."""
+    rows = np.zeros((len(contexts), width), np.int32)
     for row, context in enumerate(contexts):
         rows[row, :len(context)] = context
     extra = {}
@@ -107,10 +100,29 @@ def row_logits(model, params, prompt, lengths, tokens, positions=None):
         placed = np.asarray(positions)
         extra["positions"] = jnp.asarray(np.stack([
             np.concatenate([placed[row, :len(context)],
-                            placed[row, len(context) - 1] + np.arange(1, longest - len(context) + 1)])
+                            placed[row, len(context) - 1] + np.arange(1, width - len(context) + 1)])
             for row, context in enumerate(contexts)]))
-    logits = forward(model)(params, jnp.asarray(rows), **extra)
-    return [logits[row, length - 1:length - 1 + tokens.shape[1]] for row, length in enumerate(lengths)]
+    return forward(model)(params, jnp.asarray(rows), **extra)
+
+
+def row_logits(model, params, prompt, lengths, tokens, positions=None):
+    """Each row's logits for its drawn `tokens`, from full forwards over every row's unpadded tokens,
+    right-padded as a learner scores a batch of rollouts, at `positions` where given (a row each, the
+    prompt's and the tokens', continued past the row's end). The first token's are a forward over the
+    prompts alone at the prompt batch's width, the shapes the cached prefill computes them at, so a GPU
+    picks each product's kernel as it does there; the later tokens' are one forward over each prompt and
+    the tokens drawn before it, at its longest row. A cached decode step projects one token a row, ROWS
+    of them, where that forward projects every token of a row, ROWS x (prompt + step), so the later
+    steps' ratio holds what a GPU's kernel for each shape rounds apart too: on an A100, kpool's at 1.35 and
+    1.26 (row 1543, a float32 dot's error by the rows cuBLAS's kernel takes, 1.5e-7 to 4.1e-7 at K=512).
+    In the model's dtype: an array a row, a step each."""
+    width, lengths = prompt.shape[1], np.asarray(lengths)
+    prompts = [prompt[row, width - length:] for row, length in enumerate(lengths)]
+    contexts = [np.concatenate([alone, tokens[row, :-1]]) for row, alone in enumerate(prompts)]
+    first = _right_padded(model, params, prompts, width, positions)
+    later = _right_padded(model, params, contexts, max(len(context) for context in contexts), positions)
+    return [jnp.concatenate([first[row, length - 1:length], later[row, length:length - 1 + tokens.shape[1]]])
+            for row, length in enumerate(lengths)]
 
 
 def policy_scores(model, params, prompt, lengths, tokens, sampling, positions=None) -> dict:
@@ -161,7 +173,7 @@ def generation_draw(model, params, sampling, steps: int, *, margin: bool, **prom
 
 def only(name: str, run):
     """`run`'s leaf `name` alone."""
-    return lambda *draw: {name: run(*draw)[name]}
+    return as_given(lambda *draw: {name: run(*draw)[name]})
 
 
 def generated(model, params, sampling, steps: int):
@@ -223,6 +235,7 @@ def test_padding_and_cached_likelihoods_match_unpadded_full_forwards(kind):
     np.testing.assert_array_equal(result.terminated, [False, False])
     objective = GRPOObjective(model, seq_len=6)
 
+    @as_given
     def rescored(prompt, lengths, key, tokens):
         rows = np.concatenate([prompt, tokens], axis=1)
         padding = prompt.shape[1] - lengths
@@ -279,6 +292,7 @@ def test_right_padding_and_logical_positions_survive_cached_generation(kind):
                           sampling=greedy)
         return tokens, positions, np.asarray(result.tokens)[:, 4:]
 
+    @as_given
     def cached(tokens, positions, drawn):
         result = generate(model, params, inputs(tokens, positions), steps, key=jax.random.key(1),
                           sampling=greedy)
@@ -289,6 +303,7 @@ def test_right_padding_and_logical_positions_survive_cached_generation(kind):
     def full(dtype=None):
         at, weights = (model, params) if dtype is None else (model.clone(dtype=dtype), widened(params))
 
+        @as_given
         def run(tokens, positions, drawn):
             with jax.enable_x64(new_val=True) if dtype is not None else nullcontext():
                 return policy_scores(at, weights, tokens[:, :2], np.full(ROWS, 2), drawn, greedy,
@@ -337,6 +352,7 @@ def test_padding_repro_greedy_and_seeded_reproducibility(sampling, name):
         raise AssertionError(f"no draw of seed {seed} clears MARGIN")
 
     def recorded(generation):
+        @as_given
         def run(prompt, key, tokens):
             result = generation(prompt, key)
             np.testing.assert_array_equal(np.asarray(result.tokens)[:, -steps:], tokens)
@@ -348,6 +364,7 @@ def test_padding_repro_greedy_and_seeded_reproducibility(sampling, name):
 
     wide = scored(model, params, sampling, "float64")
 
+    @as_given
     def full(prompt, key, tokens):
         return wide(prompt, np.full(ROWS, 2), key, tokens)
 
@@ -412,6 +429,7 @@ def test_prompt_perplexity_uses_unpadded_context_and_real_transitions(kind):
         return {"prompt": prompt, "prompt_length": lengths, "data_source": np.zeros((ROWS, 1), np.int32),
                 "ground_truth": np.zeros((ROWS, 1), np.int32), "extra_info": np.zeros((ROWS, 1), np.int32)}
 
+    @as_given
     def evaluated(prompt, lengths):
         found = objective.evaluate(params, batch_of(prompt, lengths), step)
         real = np.arange(3)[None, :] >= 4 - lengths[:, None]
@@ -421,6 +439,7 @@ def test_prompt_perplexity_uses_unpadded_context_and_real_transitions(kind):
     def full(model, params):
         apply = forward(model)
 
+        @as_given
         def run(prompt, lengths):
             losses = []
             for row, length in enumerate(np.asarray(lengths)):
@@ -433,6 +452,7 @@ def test_prompt_perplexity_uses_unpadded_context_and_real_transitions(kind):
 
     wide = full(model.clone(dtype="float64"), widened(params))
 
+    @as_given
     def truth(prompt, lengths):
         with jax.enable_x64(new_val=True):
             return wide(prompt, lengths)
@@ -470,6 +490,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
         key = np.asarray(jax.random.key_data(jax.random.fold_in(jax.random.key(5), seed)))
         return key, rolled_from(jax.random.wrap_key_data(key))
 
+    @as_given
     def trained(key, rolled):
         data = Loader(train=lambda partition: iter([batch]), val=None, records=rows, batch=rows)
         trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.wrap_key_data(key), rollout=rollout)
@@ -479,7 +500,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
 
     def by_hand(dtype=None):
         if dtype is None:
-            return lambda key, rolled: stepped(objective, params, rolled)
+            return as_given(lambda key, rolled: stepped(objective, params, rolled))
         weights = widened(params)
         # Built under x64, as it computes, so nothing it holds narrows to float32.
         with jax.enable_x64(new_val=True):
@@ -488,7 +509,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
         def run(key, rolled):
             with jax.enable_x64(new_val=True):
                 return stepped(wide, weights, widened(rolled))
-        return run
+        return as_given(run)
 
     def stepped(objective, params, rolled):
         def raw_policy_loss(p):
@@ -531,6 +552,7 @@ def test_padding_slots_do_not_consume_cache_capacity(kind):
                 return prompt, tokens
         raise AssertionError(f"no draw of seed {seed} clears MARGIN")
 
+    @as_given
     def behind_padding(prompt, tokens):
         rows = jnp.asarray(np.pad(prompt, ((0, 0), (6, 0))))
         inputs = ModelInputs(rows, {"attention_mask": jnp.broadcast_to(mask, rows.shape)})
@@ -539,12 +561,14 @@ def test_padding_slots_do_not_consume_cache_capacity(kind):
         np.testing.assert_array_equal(result.behavior_log_probs, 0)
         return {"raw": result.raw_log_probs}
 
+    @as_given
     def unpadded(prompt, tokens):
         result = generate(model, params, prompt, steps, key=jax.random.key(1), sampling=greedy)
         return {"raw": result.raw_log_probs}
 
     wide = scored(model, params, greedy, "float64")
 
+    @as_given
     def full(prompt, tokens):
         return wide(prompt, np.full(ROWS, 2), None, tokens)
 

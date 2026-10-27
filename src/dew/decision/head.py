@@ -22,7 +22,8 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
 from dew._records import JSON
-from dew.decision.layout import DecisionInputs, Encoded
+from dew.data.text import Tokenizer
+from dew.decision.layout import DecisionInputs, Encoded, Labels
 from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.nn.activations import gelu_exact_torch
 from dew.nn.attention import NormalAttention, l2_normalized
@@ -34,7 +35,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
-from dew.nn.precision import accumulated, at_least_fp32, capped_logits, scaled_logits
+from dew.nn.precision import accumulated, at_least_fp32, capped_logits, divided, scaled_logits
 from dew.nn.scatter import DROPPED
 from dew.registry import Record, component, from_record, import_path, record_fields
 
@@ -72,6 +73,13 @@ class Head(nn.Module):
         """The label ids, `[K][V]`, at which the head reads the backbone's own logits (`tied`), or
         None where it reads none."""
         return None
+
+    @nn.nowrap
+    def labelled(self, labels: Labels, tokenizer: Tokenizer) -> "Head":
+        """The head reading `labels` as `tokenizer` spells them, where it reads labels and was drawn
+        before its tokenizer was known, with no ids (a run's letter readout, `LabelReadout`); itself
+        otherwise."""
+        return self
 
     @nn.nowrap
     def validate_rows(self, rows: Sequence[Encoded]) -> None:
@@ -518,6 +526,14 @@ class LabelReadout(Head):
         return None if self.untied else self.label_ids
 
     @nn.nowrap
+    def labelled(self, labels: Labels, tokenizer: Tokenizer) -> "LabelReadout":
+        if self.label_ids:
+            return self
+        if labels.names is None:
+            raise ValueError("a letter readout drawn with no label ids reads labels that name their count")
+        return self.clone(label_ids=labels.ids(tokenizer, len(labels.names)))
+
+    @nn.nowrap
     def validate_rows(self, rows: Sequence[Encoded]) -> None:
         """Refuse rows whose labels are not the head's (`_labels_of`)."""
         super().validate_rows(rows)
@@ -626,7 +642,9 @@ class SlotReadout(Head):
         score = jnp.einsum("bqd,kd->bqk", answers, slots[:real], precision=highest)
         query = jnp.einsum("bqd,hd->bqh", answers, q, precision=highest)
         key = jnp.einsum("bqkd,hd->bqkh", pooled, k, precision=highest)
-        scores = score + jnp.einsum("bqh,bqkh->bqk", query, key, precision=highest) / math.sqrt(self.head_dim)
+        # IEEE division: XLA takes a division by a constant as a product with its rounded reciprocal.
+        scores = score + divided(jnp.einsum("bqh,bqkh->bqk", query, key, precision=highest),
+                                 math.sqrt(self.head_dim))
         return _past_labels(scores, width)
 
 

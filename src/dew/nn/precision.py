@@ -39,6 +39,19 @@ from jax.extend import core
 from jax.typing import DTypeLike
 
 
+def stochastic_bf16(x, noise):
+    """fp32 `x` rounded to bf16 up in magnitude with the probability of its dropped low 16 bits: `noise`'s
+    low 16 bits (uint32, uniform) added below the kept bits and the sum truncated, which carries into them
+    exactly with that probability. It does not saturate: a value past bf16's largest finite rounds to
+    infinity with its dropped bits' probability, as rounding to nearest would. NaN stays NaN. The noise is
+    its caller's policy: a hash of the state's own bits and the token (`recurrence.round_to_bf16`), of the
+    step's seed and the element's index (`optim.stochastic_round_bf16`)."""
+    bits = jax.lax.bitcast_convert_type(x, jnp.uint32)
+    rounded = jax.lax.bitcast_convert_type((bits + (noise & jnp.uint32(0xFFFF))) & jnp.uint32(0xFFFF0000),
+                                           jnp.float32)
+    return jnp.where(jnp.isnan(x), x, rounded).astype(jnp.bfloat16)
+
+
 def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
     """The dtype arithmetic Dew keeps from rounding below float32 runs in:
     float32 for float32, every narrower float and a module's unset dtype
@@ -484,7 +497,7 @@ def rounded_to(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.reduce_precision(x, exponent_bits=bits.nexp, mantissa_bits=bits.nmant)
 
 
-def _two_sum(left, right):
+def two_sum(left, right):
     """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum)."""
     total = left + right
     part = total - left
@@ -508,6 +521,11 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         return value if rounding is None else rounding(value)
 
     def split(value):
+        if bit_split and isinstance(value, np.generic | np.ndarray):
+            # A constant (a kernel's static factor) splits where it is known, on the host.
+            constant = np.asarray(value, np.float32)
+            high = (constant.view(np.uint32) & np.uint32(0xfffff000)).view(np.float32)
+            return jnp.asarray(high), jnp.asarray(constant - high)
         if bit_split:
             bits = jax.lax.bitcast_convert_type(value, jnp.uint32) & jnp.uint32(0xfffff000)
             high = jax.lax.bitcast_convert_type(bits, jnp.float32)
@@ -622,6 +640,22 @@ def _divide_jvp(primals, tangents):
     return correctly_rounded_divide(*primals), jax.jvp(jnp.divide, primals, tangents)[1]
 
 
+def divided(numerator, rate):
+    """`numerator / rate` as a source written in PyTorch divides a state by a rate, or an array by a
+    constant: IEEE division, whatever the backend's own division does (XLA takes a division by a
+    constant as a product with its rounded reciprocal, on a CPU and an A100 alike, row 1402). A
+    float32, bfloat16 or float16 quotient is `correctly_rounded_divide`'s of the operands widened to
+    float32, rounded to its dtype, as PyTorch's float32 opmath gives it, under any compiler flags. A
+    float64 one is the plain division."""
+    numerator, rate = jnp.asarray(numerator), jnp.asarray(rate)
+    dtype = jnp.result_type(numerator, rate)
+    if not jnp.issubdtype(dtype, jnp.floating):
+        return numerator / rate
+    if dtype == jnp.float64:
+        return numerator / rate
+    return correctly_rounded_divide(numerator.astype(jnp.float32), rate.astype(jnp.float32)).astype(dtype)
+
+
 def compensated_add(left, right):
     """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
     `hi` is the sum rounded and `lo` what the rounding dropped (the his'
@@ -632,8 +666,8 @@ def compensated_add(left, right):
     XLA reassociates no float arithmetic unless fast math is on; with it,
     `lo` cancels to zero and the sum is the plain one."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
-    total, dropped = _two_sum(left_hi, right_hi)
-    return _two_sum(total, dropped + left_lo + right_lo)
+    total, dropped = two_sum(left_hi, right_hi)
+    return two_sum(total, dropped + left_lo + right_lo)
 
 
 def compensated_difference(later, earlier):
@@ -687,7 +721,15 @@ def running_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:
     pair and the plain sum beside it, where loops compensate (`compensates_loops`), else `[1, *shape]`,
     the plain sum alone. Its leading axis is the form's, so a loop slices and updates the sum's own
     axes one past theirs."""
-    return jnp.zeros((3 if compensates_loops() else 1, *shape), dtype)
+    return paired_sum(shape, dtype) if compensates_loops() else jnp.zeros((1, *shape), dtype)
+
+
+def paired_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:
+    """An empty running sum of `shape` that is a double-float pair on every backend, the plain sum
+    beside it (`added_to`, `running_total`): for partials of a product Dew splits where its reference
+    takes the product whole, so the sum's error is the partials' own, whether XLA takes the addition
+    into a GEMM's epilogue or cuBLAS splits a product's sum by its shape (row 1725)."""
+    return jnp.zeros((3, *shape), dtype)
 
 
 def added_to(running: jax.Array, term: jax.Array) -> jax.Array:

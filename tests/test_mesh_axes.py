@@ -24,6 +24,7 @@ from token_support import repeated_token_batch, write_token_corpus
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
+from dew.distributed.batches import shard_batch
 from dew.mesh import mesh_axes
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
@@ -35,7 +36,6 @@ from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.telemetry.instrumentation import COLLECTIVES
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.distributed import shard_batch
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -401,10 +401,10 @@ def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, device
     fsdp and sequence, and split as the rules split it over the rest
     (tensor): the step gathers none of what they split, the optimizer state
     and the trained parameters lie as the split layout lays them, and one
-    step trains what it trains."""
+    step trains what it trains, bit for bit."""
     from dew.batch import FROZEN
+    from dew.distributed.placement import placed_bytes
     from dew.lora import LoRA
-    from dew.training.distributed import placed_bytes
 
     model = tiny()
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj", "gate_proj", "down_proj")).apply(
@@ -439,8 +439,10 @@ def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, device
     assert placed_bytes(whole_state.opt_state) == placed_bytes(split_state.opt_state)
     kept = placed_bytes(whole_state.variables[FROZEN]) - placed_bytes(split_state.variables[FROZEN])
     assert kept > 0 and split_gathered - whole_gathered >= kept
+    # Holding the base whole only skips its gather, an exact copy: the step's arithmetic is the split
+    # layout's, so it trains the same bits.
     for got, want in zip(jax.tree.leaves(whole_trained), jax.tree.leaves(split_trained), strict=True):
-        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
+        np.testing.assert_array_equal(got, want)
 
 
 class Named(nn.Module):

@@ -271,8 +271,8 @@ Same table and the same `logical_axes` and `_mesh_spec` machinery (`training/dis
 ### 3.10 Inference
 
 ```python
-pipe = inference.TextToImage.from_run("runs/flowers")            # manifest and checkpoint, EMA by default
-pipe = inference.TextToImage.from_pretrained("user/flowers-dit")  # hub export, same manifest
+pipe = inference.TextToImage.from_run("runs/flowers")  # manifest and checkpoint, EMA by default
+pipe = dew.pipeline("user/flowers-dit")                # hub export, same manifest
 images = pipe(["a water lily", "a sunflower"], steps=40, guidance=4.0, sampler=samplers.Heun(), key=key)
 text = generate(model, params, prompt, 300, key=key, sampling=Sampling(temperature=0.8)).tokens
 ```
@@ -295,8 +295,15 @@ under the text family's names. No tower, projector or audio encoder is built or 
 decoder with the tokenizer, saves as that text checkpoint, and names no Hub origin, since the id alone
 loads the wrapper. A decoder or a fallback source is text already and loads as it is. A diffusion
 pipeline, a family that reads its media bundle as one decoder (DeepSeek-V4.1), and a quantized wrapper
-are refused. A checkpoint that holds none of the prediction depths its config names loads as its trunk,
-with or without `text_only`; one holding some of them must hold all.
+are refused. A checkpoint that holds none of the prediction depths its config names loads as its trunk;
+one holding some of them must hold all. `prediction_depths` chooses how many the load builds: None
+the ones the checkpoint holds, 0 none, `n` the first `n`; a DSpark drafter, whose stages draft as
+one with its heads on the last, is kept whole or at 0 not at all. The load reads the source as the checkpoint of those depths alone, its config's counts cut
+before routing and the others' tensors dropped before any is read, and saves as that checkpoint,
+with or without `text_only`. A run passes both through `--source.text-only` and
+`--source.prediction-depths` (`RunConfig.source`), whatever kind of run it is, and the load's
+`modeling_overrides` through `--source.attention`, each layer kind causal or block_bidirectional;
+a diffusion pipeline, which no override reaches, refuses them.
 
 Serving is one engine of kinds (`dew.inference.Engine`). A kind (`Kind`) admits waiting requests
 within its own bounds, runs them with one bounded device call a `step`, and settles each request's
@@ -395,7 +402,7 @@ The mixer keeps its recurrent state in the `cache` collection, exactly as the KV
 | --- | --- |
 | Alternating or multi-optimizer updates (GAN, actor-critic) | Not one `loss`. `Trainer(step=make_my_step)` replaces the compiled step and is the one documented place for a custom step. |
 | Tensor or sequence parallel | `MeshSpec(tensor=N)` and rules are cheap; correct TP needs `with_sharding_constraint` on activations inside each model. Per-architecture work. |
-| Pipeline parallel | Out of scope. |
+| Pipeline parallel | `MeshSpec(stage=N)` runs GPipe over a stack of like layers (a decoder's, a DiT's, a JEPA's, a UNet level's transformers; `decoder_stack.run_pipeline`); everything outside the stacks runs on every stage, and no 1F1B schedule is built. |
 | Non-grain data | `Dataset.train` is any callable returning an iterator; without `get_state` the run cannot checkpoint its position and `fit` says so. |
 
 ## 8. How to build against this design

@@ -20,16 +20,18 @@ import optax
 import pytest
 import selection_margins
 from model_support import largest_difference
-from reference_error import assert_as_exact, without_ynn
+from reference_error import as_given, assert_as_exact, without_ynn
 
 from dew.checkpoints import Checkpoints
+from dew.distributed.batches import shard_batch
+from dew.distributed.placement import Layout, MeshSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step, model_rngs
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.state import TrainState
-from dew.training.distributed import Layout, MeshSpec, shard_batch
 from dew.training.transaction import write_back
 
 SHAPES = {
@@ -59,9 +61,8 @@ def batch():
 
 def objective_for(model):
     sparse = model.mixture is not None
-    return LMObjective(model, 8, qk_stats=True,
-                       balance_rate=0.01 if sparse else None,
-                       aux_loss_alpha=0.001 if sparse else None,
+    return LMObjective(model, 8,
+                       balance=ExpertBalance(balance_rate=0.01, aux_loss_alpha=0.001) if sparse else None,
                        mtp_weight=0.2 if model.num_nextn_predict_layers else None)
 
 
@@ -72,7 +73,7 @@ def training_step(model):
     optimizer = optax.sgd(1e-3, momentum=0.9)
 
     def step(variables, state, tokens, key):
-        info = Step(jnp.zeros((), jnp.int32), key, None)
+        info = Step(jnp.zeros((), jnp.int32), key, None, qk_stats=True)
         (loss, aux), grads = jax.value_and_grad(
             lambda params: objective.scalar_loss({**variables, "params": params},
                                        tokens, info),
@@ -125,7 +126,7 @@ def drawn_steps(plain, stepped, *, routed: bool, within=contextlib.nullcontext, 
     objective = objective_for(plain)
     scored = jax.jit(lambda variables, tokens, key: objective.token_scores(
         variables, tokens, train=True, rngs=model_rngs(key, training=True), routing=True,
-        depths=objective.mtp_weight is not None, qk_stats=objective.qk_stats).routing)
+        depths=objective.mtp_weight is not None, qk_stats=True).routing)
     inferred = jax.jit(lambda variables, tokens: objective.token_scores(
         variables, tokens, routing=True).routing)
 
@@ -188,11 +189,11 @@ def test_recomputed_blocks_train_the_same_model(shape, scan):
     rerun, _ = training_step(remat)
     draw = drawn_steps(plain, stepped, routed=shape == "sparse")
     wide = plain.clone(dtype=jnp.float64)
-    assert_as_exact(without_ynn(lambda variables, *_: remat.apply(variables, ids)),
-                    without_ynn(lambda variables, *_: plain.apply(variables, ids)), draw,
+    assert_as_exact(lambda variables, *_: remat.apply(variables, ids),
+                    lambda variables, *_: plain.apply(variables, ids), draw,
                     f"a recomputed {shape} block's forward, scan {scan}", seeds=STEP_SEEDS,
                     truth_fn=jax.jit(lambda variables, *_: wide.apply(variables, ids)))
-    assert_as_exact(without_ynn(committed(rerun)), without_ynn(committed(run)), draw,
+    assert_as_exact(committed(rerun), committed(run), draw,
                     f"a recomputed {shape} block's step, scan {scan}",
                     seeds=SIZED_STEP_SEEDS.get((shape, scan), STEP_SEEDS),
                     truth_fn=committed(wide_step(plain)))
@@ -254,15 +255,19 @@ def test_recomputed_pipeline_preserves_updates_and_sown_values(shape, scan):
             yield
 
     def placed(step):
+        # Both arms are Dew's programs, each compiled once as the gate compiles two Dew arms (row 1801).
+        compiled = without_ynn(committed(step))
+
         def on_mesh(variables, state, tokens, key):
             variables, tokens = place(variables, tokens)
             with staged():
-                return jax.device_get(committed(step)(variables, state, tokens, key))
+                return jax.device_get(compiled(variables, state, tokens, key))
         return on_mesh
 
     draw = drawn_steps(plain, stepped, routed=shape == "sparse", within=staged, place=place)
-    assert_as_exact(placed(rerun), placed(run), draw, f"a recomputed {shape} pipeline's step, scan {scan}",
-                    seeds=STEP_SEEDS, truth_fn=placed(wide_step(plain)))
+    assert_as_exact(as_given(placed(rerun)), as_given(placed(run)), draw,
+                    f"a recomputed {shape} pipeline's step, scan {scan}", seeds=STEP_SEEDS,
+                    truth_fn=placed(wide_step(plain)))
 
 
 @pytest.mark.parametrize("saved_remat", [None, 'full'])
@@ -314,7 +319,7 @@ def gradient_step(model):
 
     def step(variables, key):
         def loss(params):
-            info = Step(jnp.zeros((), jnp.int32), jax.random.wrap_key_data(key), None)
+            info = Step(jnp.zeros((), jnp.int32), jax.random.wrap_key_data(key), None, qk_stats=True)
             return objective.scalar_loss({**variables, "params": params}, batch(), info)
 
         (value, aux), grads = jax.value_and_grad(loss, has_aux=True)(variables["params"])
@@ -336,7 +341,7 @@ def against_full(scan):
     def draw(seed):
         return initialized(jax.random.key(seed)), jax.random.key_data(jax.random.key(seed + (1 << 20)))
 
-    return full, draw, without_ynn(gradient_step(full)), jax.jit(gradient_step(full.clone(dtype=jnp.float64)))
+    return full, draw, gradient_step(full), jax.jit(gradient_step(full.clone(dtype=jnp.float64)))
 
 
 @pytest.mark.parametrize("policy", NAMED)
@@ -347,5 +352,5 @@ def test_named_policies_train_the_same_model_as_full(policy, scan):
     decoders and keys, a named policy's loss, gradients and metrics on par
     with `full`'s, both from `full`'s float64 run (check 1)."""
     full, draw, reference, truth = against_full(scan)
-    assert_as_exact(without_ynn(gradient_step(full.clone(remat=policy))), reference, draw,
+    assert_as_exact(gradient_step(full.clone(remat=policy)), reference, draw,
                     f"{policy} against full, scan {scan}", seeds=POLICY_SEEDS, truth_fn=truth)

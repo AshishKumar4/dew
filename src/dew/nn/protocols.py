@@ -739,6 +739,59 @@ class Serving(Protocol):
 
 
 @runtime_checkable
+class BlockReading(Protocol):
+    """A decoder whose trunk layers may read a block whole (`AttentionMixer.bidirectional_blocks`: a block's
+    tokens see each other both ways). `block_chunks` lists each trunk layer that reads blocks by its attention
+    chunk, None where it has none. A prefix run needs one: its blocks reach a model call as `block_groups`,
+    and a layer that reads none computes them causally."""
+
+    def block_chunks(self) -> tuple[int | None, ...]: ...
+
+
+def block_chunks_of(model: nn.Module) -> tuple[int | None, ...]:
+    """The attention chunk of each trunk layer that reads blocks whole, None where a layer has none; empty for
+    a model that says nothing, or whose layers read none (`BlockReading`)."""
+    return model.block_chunks() if isinstance(model, BlockReading) else ()
+
+
+def whole_block(chunks: tuple[int | None, ...]) -> bool:
+    """Whether a layer that reads blocks reads every block whole: one with no attention chunk. A chunk is
+    a run of places counted from 0 (`chunk_mask`), and a block's places start wherever its tokens sit in
+    their document, a window that continues a document or a prompt after cached tokens included, so a
+    chunk of any length cuts a block that crosses one of its multiples. The loss drops every target inside
+    a block, so a layer must read the block's every token for its targets to be ones its source saw."""
+    return any(chunk is None for chunk in chunks)
+
+
+def refuse_block_reading(model: nn.Module, reading: str) -> None:
+    """Refuse `reading` blocks (a prefix run's, a batch's) where `model` cannot read them whole: it needs a
+    trunk layer that reads blocks (`block_chunks_of`) with no attention chunk (`whole_block`). The loss drops
+    the targets inside a block, which the trunk sees only where a layer reads the whole block. A prefix run
+    and a batch that carries its own blocks are both admitted by this one rule."""
+    chunks = block_chunks_of(model)
+    if not chunks:
+        raise ValueError(f"{reading} needs a trunk layer that reads blocks "
+                         f"(AttentionMixer.bidirectional_blocks), and {type(model).__name__} has none")
+    if not whole_block(chunks):
+        raise ValueError(f"{reading} is read whole only by a layer with no attention chunk, and every layer "
+                         f"of {type(model).__name__} that reads blocks has one ({list(chunks)}), which cuts "
+                         "a block that crosses its multiples")
+
+
+def refuse_prefix(model: nn.Module, prefix: int | Literal["prompt"] | None, *, longest: int | None) -> None:
+    """Refuse a prefix run the model or its values cannot take. A prefix is "prompt" or a positive number of
+    tokens, at most `longest` where a longest row is declared, and its blocks are read as a batch's are
+    (`refuse_block_reading`)."""
+    if prefix is None:
+        return
+    if prefix != "prompt" and (type(prefix) is not int or prefix < 1):
+        raise ValueError(f"prefix is 'prompt' or a positive number of tokens, got {prefix!r}")
+    if isinstance(prefix, int) and longest is not None and prefix > longest:
+        raise ValueError(f"prefix {prefix} is more tokens than the longest row, {longest}")
+    refuse_block_reading(model, "a prefix's blocks")
+
+
+@runtime_checkable
 class ShiftsLogits(Protocol):
     """A masked-diffusion model that declares how its logits line up with its inputs: with
     `shifted_logits`, position i's prediction is position i-1's logits (Dream-v0's). A model that

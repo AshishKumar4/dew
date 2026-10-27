@@ -3,8 +3,9 @@
 The gate the suite converts to holds every element over orders: a comparison drawn over
 exact symmetries of its computation (`assert_leaves_as_exact_over_orders`), each element against the
 worst admitted member of the reference's ensemble (`assert_elements_as_exact`), and a kernel held where
-it rounds, as a graph of the values it rounds and holds (`assert_graph_as_exact`). The one-draw rules
-below hold the comparisons that have not converted yet.
+it rounds, as a graph of the values it rounds and holds (`assert_graph_as_exact`), all three in
+tests/reference_ensemble.py. The one-draw rules below hold the comparisons that have not converted
+yet.
 
 A port that computes what its reference computes, at the same precision,
 differs from it only by rounding: the two sum the same terms in other
@@ -66,6 +67,7 @@ import dataclasses
 import functools
 import hashlib
 import math
+from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -155,30 +157,37 @@ def windows(draw, count: int):
     return drawn
 
 
+class _Windowed:
+    """An arm of one draw (`fn`) over `windows`' stacked arguments, window by window (`over_windows`):
+    the gate compiles `fn` as it compiles any arm (`_arms`) and runs the windows through that program."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, *arguments):
+        return _stack_host([self.fn(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
+                            for index in range(_window_count(arguments))])
+
+
 def over_windows(fn):
     """`fn`, an arm of one draw, run over `windows`' stacked arguments window by window, each window's
     arguments sliced from the stack, with its outputs stacked on their leading axis as host arrays.
 
     Each window runs the program one draw runs, never a batched one: a batch axis changes the program
     XLA compiles (its fusions, its reductions' order, its dots' batching, a kernel's route), which XLA
-    holds to no common bits with one draw's, so check 1 would judge a program users never run. Pass a
-    JAX arm jitted (`jax.jit(fn)`, `without_ynn(fn)`), so it compiles once a signature and every window
-    calls that program; a torch or NumPy reference as it is. The loop keeps `fn` (`window_fn`), which
-    a recorded truth's rounding count traces on one window (`indexed_recording`)."""
-    def run(*arguments):
-        return _stack_host([fn(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
-                            for index in range(_window_count(arguments))])
-    run.window_fn = fn
-    return run
+    holds to no common bits with one draw's, so check 1 would judge a program users never run. The gate
+    compiles `fn` as it compiles an arm of one draw (`_arms`), once a signature, and every window calls
+    that program; a torch or NumPy reference passes `as_given`. The loop keeps `fn`, which a recorded
+    truth's rounding count traces on one window (`indexed_recording`)."""
+    return _Windowed(fn)
 
 
 def _one_draws_program(fn, arguments):
     """`fn` and its `arguments` as one draw's program reads them: a window loop's (`over_windows`) own
     function on its first window's arguments, any other function on them all."""
-    window_fn = getattr(fn, "window_fn", None)
-    if window_fn is None:
+    if not isinstance(fn, _Windowed):
         return fn, arguments
-    return window_fn, jax.tree.map(lambda leaf: leaf[0], arguments)
+    return fn.fn, jax.tree.map(lambda leaf: leaf[0], arguments)
 
 
 WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
@@ -194,16 +203,157 @@ because compiler options take no such spelling and that one leaves a scan's redu
 
 def without_ynn(fn, **jit_options):
     """`fn` jitted with WITHOUT_YNN on the CPU lane, the process's default backend
-    (`jax.default_backend()`), and plain `jax.jit` elsewhere. It compiles both arms of a check 1
-    between two Dew paths, such as an interpreted kernel and the XLA program it replaces, the latter
-    the arm the check measures against, so that the two run the same kind of code on any host. A
-    program Dew's users run compiles with the fusions, as they do. Call it at top level, since on the
-    CPU lane its compiler options refuse to be nested in another jit, differentiated through or
-    batched; `over_windows` runs it window by window. A caller's own compiler options take
-    precedence over WITHOUT_YNN's."""
+    (`jax.default_backend()`), and plain `jax.jit` elsewhere: how the gate compiles both arms of a
+    check 1 between two Dew paths (`_arms`), such as an interpreted kernel and the XLA program it
+    replaces, so that the two run the same kind of code on any host. A program Dew's users run compiles
+    with the fusions, as they do. On the CPU lane its compiler options refuse to be nested in another
+    jit, differentiated through or batched, so the gate compiles an arm whole; a site passes its arms
+    as functions and never calls this. A caller's own compiler options take precedence over
+    WITHOUT_YNN's; `fn` already compiled so is returned as it is."""
+    if getattr(fn, "without_ynn", False):
+        return fn
     if jax.default_backend() == "cpu":
         jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
-    return jax.jit(fn, **jit_options)
+    compiled = jax.jit(fn, **jit_options)
+    compiled.without_ynn = True
+    return compiled
+
+
+def as_given(fn):
+    """`fn`, an arm the gate runs as it is given and never compiles: a torch or NumPy reference, or a Dew
+    arm that runs whole programs of its own (a trainer's fit, a placement on a mesh and the program
+    run there, a host loop). The other arm of its check then compiles as Dew's users run it, with the
+    fusions (`_arms`), as the programs this one runs do."""
+    @functools.wraps(fn)
+    def given(*inputs, **options):
+        return fn(*inputs, **options)
+    given.as_given = True
+    return given
+
+
+def dew_programs(fn):
+    """`fn`, a Dew arm that runs Dew's own compiled programs (a trainer's step, a task's forward, a
+    server's decode), which the gate cannot compile but which take their XLA options from Dew's one
+    seam (`dew.nn.kernels.options.compiler_options`). Beside another Dew arm, the gate runs it with
+    that seam holding WITHOUT_YNN open (`compiled_with`), so the programs it compiles go without
+    YNNPACK's fusions as the gate's own compile of its other arm does; beside an arm `as_given`, as it
+    is, with the fusions. A program it compiled before its check, or compiles by a bare `jax.jit`
+    outside the seam, keeps its own options."""
+    @functools.wraps(fn)
+    def programs(*inputs, **options):
+        return fn(*inputs, **options)
+    programs.dew_programs = True
+    return programs
+
+
+def _given(fn) -> bool:
+    """Whether the gate runs `fn` as it is given (`as_given`, a recorded reference), a window loop's
+    arm by its own (`over_windows`)."""
+    if isinstance(fn, _Windowed):
+        return _given(fn.fn)
+    return bool(getattr(fn, "as_given", False) or getattr(fn, "recorded", False))
+
+
+def _compiles(fn) -> bool:
+    """Whether the gate compiles `fn` itself: a plain function, not an arm it runs as given, a program
+    already compiled (a jit) or an arm of Dew's own programs (`dew_programs`)."""
+    fn = fn.fn if isinstance(fn, _Windowed) else fn
+    return not (_given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"))
+
+
+def _refuse_numpy_arms(draw, *arms) -> None:
+    """Refuse an arm the gate would compile that computes in NumPy: called once as it is given on a
+    draw's inputs (a window's, for a window loop's arm), a JAX arm returns JAX arrays, and an arm that
+    returns NumPy arrays is a NumPy reference, which compiled would compute in JAX, in float32 where
+    its draw is float64, by other sums. It passes `as_given`; a Dew arm that only converts its
+    outputs returns them unconverted instead."""
+    plain = [fn for fn in dict.fromkeys(arms) if _compiles(fn)]
+    if not plain:
+        return
+    drawn = draw(0)
+    for fn in plain:
+        inputs = drawn
+        if isinstance(fn, _Windowed):
+            fn, inputs = fn.fn, jax.tree.map(lambda leaf: leaf[0], drawn)
+        outputs = jax.tree.leaves(fn(*inputs))
+        kinds = {type(leaf).__name__ for leaf in outputs if not isinstance(leaf, jax.Array)}
+        if kinds:
+            raise TypeError(f"{getattr(fn, '__qualname__', repr(fn))} returns {sorted(kinds)}: a NumPy arm, "
+                            f"which the gate would compile in JAX; pass it as_given, or return its JAX "
+                            f"values unconverted")
+
+
+def _compiled(fn, compile):
+    """`fn` as the gate runs it: as given (`_given`), as it is where it is a `without_ynn` program
+    already (another jit around it would nest its compiler options), or compiled by `compile`, a
+    window loop's arm within it (`over_windows`)."""
+    if _given(fn) or getattr(fn, "without_ynn", False):
+        return fn
+    if getattr(fn, "dew_programs", False):
+        return fn if compile is jax.jit else _with_ynn_off(fn)
+    if isinstance(fn, _Windowed):
+        return _Windowed(_compiled(fn.fn, compile))
+    return compile(fn)
+
+
+class _Truth:
+    """A check's float64 truth as the gate runs it (`_truth_program`): its first call runs `fn` as it is
+    given and decides the rest, compiled where that call returned JAX values, as given where it
+    returned host values (a NumPy truth). A truth that returns JAX values is traced at that first call,
+    so one that does host work on its inputs (a widening or a conversion on the host) fails there, at
+    its first seed, naming itself; it passes `as_given`."""
+
+    def __init__(self, fn):
+        self.fn, self.run = fn, None
+
+    def __call__(self, *inputs):
+        if self.run is not None:
+            return self.run(*inputs)
+        first = self.fn(*inputs)
+        self.run = self.fn
+        if all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(first)):
+            self.run = jax.jit(self.fn)
+            self.run.trace(*inputs)
+        return first
+
+
+def _truth_program(fn):
+    """`fn`, a check's float64 truth, as the gate runs it: compiled, once a signature, so the truth runs
+    as one float64 program on the device's FP64 units rather than one eager dispatch an equation, every
+    primitive at its own float64 semantics. A truth the gate runs as given (`as_given`: torch, a
+    recording, a host loop), one compiled already (a jit, `dew_programs`), or none, as it is; a window
+    loop's by its own; a NumPy truth (its first call returns host values) as given after that call. A
+    JAX truth with host work inside fails at its trace, loudly, and passes `as_given`."""
+    if fn is None or _given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"):
+        return fn
+    if isinstance(fn, _Windowed):
+        return _Windowed(_truth_program(fn.fn))
+    return _Truth(fn)
+
+
+def _with_ynn_off(fn):
+    """`fn` run with Dew's compile seam holding WITHOUT_YNN open on the CPU lane (`dew_programs`)."""
+    from dew.nn.kernels.options import compiled_with
+
+    @functools.wraps(fn)
+    def run(*inputs, **options):
+        with compiled_with(WITHOUT_YNN if jax.default_backend() == "cpu" else {}):
+            return fn(*inputs, **options)
+    return run
+
+
+def _arms(dew_fn, reference_fn):
+    """The two arms of a check as the gate runs them (docs/design/testing.md, "the numerical contract"):
+    where both are Dew paths, each without YNNPACK's fusions (`without_ynn`), whose microkernels the
+    host's instruction set picks at run time, so the two run the same kind of code on any host: a
+    plain function the gate compiles so, an arm that runs Dew's own programs (`dew_programs`) with
+    them compiled so through Dew's seam; where one runs as it is given (`as_given`: torch, NumPy, a
+    recording, a host loop over programs of its own), the other as Dew's users run it, with the
+    fusions (`jax.jit`). A site passes plain functions; the gate compiles them, so no site can compile
+    one arm otherwise than its other. One function as both arms compiles once."""
+    compile = jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn
+    reference = _compiled(reference_fn, compile)
+    return (reference if dew_fn is reference_fn else _compiled(dew_fn, compile)), reference
 
 
 def with_gradients(fn, *, has_aux: bool = False):
@@ -256,7 +406,8 @@ def torch_with_gradients(fn):
     - An input the output does not reach has a zero gradient, a non-floating one none, and an output no
       input reaches pulls nothing back.
     - A narrow float array (bfloat16, the float8 formats) goes in and comes out through the float32 that
-      holds it."""
+      holds it.
+    The gate runs the torch arm as it is given (`as_given`)."""
     def run(*arguments):
         import torch
 
@@ -282,104 +433,11 @@ def torch_with_gradients(fn):
             gradients[index] = _host_array(torch.zeros_like(flat[index]) if grad is None else grad)
         return jax.tree.map(_host_array, out), *jax.tree.unflatten(tree, gradients)
 
-    return run
-
-
-REPLAYED = frozenset({
-    "add", "sub", "mul", "div", "neg", "max", "min", "sqrt", "exp", "expm1", "log", "erf", "erf_inv",
-    "broadcast_in_dim", "convert_element_type", "gather", "iota", "reshape", "slice", "squeeze",
-    "stack", "stop_gradient",
-})
-"""The float operations `float64_replay` evaluates in float64: those an initializer's parameters
-depend on (the parallelism matrix's models', surveyed). Any other operation on a float refuses."""
-FORMATTED = frozenset({"bitcast_convert_type", "nextafter", "reduce_precision"})
-"""Operations whose meaning is a float format's: `float64_replay` runs them at the traced dtypes
-and widens a float they return."""
-
-
-def float64_replay(fn):
-    """`fn` as its float64 truth: its program, as traced, with every operation on a float run in
-    float64 from operands widened exactly, so no float result is rounded but where the program
-    names a format. Operations on integers, bits and keys run as traced, so a draw's random bits
-    and the uniform built from them are the program's own (`FORMATTED`); a float literal or constant
-    is the program's value widened. The program's calls (`jit`), custom derivatives' calls and
-    scans are replayed inside, each equation under the context it was traced in; a float
-    operation outside `REPLAYED`, a complex one, and any other call of a program refuse by name.
-    Returns a function of `fn`'s arguments whose float results are float64, for check 1's
-    `truth_fn` where a float64 run of `fn` would be another program (a float64 draw reads 64-bit
-    random bits). It traces `fn` as the float32 program, x64 off, whatever the caller's mode and
-    however widened its arguments arrive (check 1 hands a truth widened inputs under x64), and
-    rounds each argument to its traced dtype before widening it, as the program would read it."""
-    def run(*arguments):
-        with jax.enable_x64(new_val=False):
-            graph, shapes = jax.make_jaxpr(fn, return_shape=True)(*arguments)
-        native = [value if jax.dtypes.issubdtype(aval.dtype, jax.dtypes.extended)
-                  else np.asarray(value).astype(aval.dtype)
-                  for value, aval in zip(jax.tree.leaves(arguments), graph.in_avals, strict=True)]
-        with jax.enable_x64(new_val=True):
-            outputs = _replayed(graph.jaxpr, graph.consts, native)
-        return jax.tree.unflatten(jax.tree.structure(shapes), outputs)
-    return run
+    return as_given(run)
 
 
 def _floating(dtype) -> bool:
     return jnp.issubdtype(dtype, jnp.floating)
-
-
-def _widened(value):
-    """`value` with a float widened exactly to float64: `widened` for one value, kept on the device,
-    since inside a replayed scan body it is a tracer, which a host array cannot hold."""
-    dtype = value.dtype if hasattr(value, "dtype") else np.result_type(value)
-    return jnp.asarray(value, jnp.float64) if _floating(dtype) else value
-
-
-def _replayed(graph, consts, arguments):
-    held = {variable: _widened(value) for variable, value in
-            zip((*graph.constvars, *graph.invars), (*consts, *arguments), strict=True)}
-
-    def read(variable):
-        return _widened(variable.val) if hasattr(variable, "val") else held[variable]
-
-    for equation in graph.eqns:
-        with equation.ctx.manager:
-            outputs = _replayed_equation(equation, [read(variable) for variable in equation.invars])
-        held.update(zip(equation.outvars, outputs, strict=True))
-    return [read(variable) for variable in graph.outvars]
-
-
-def _replayed_equation(equation, values):
-    name, params = equation.primitive.name, equation.params
-    dtypes = [variable.aval.dtype for variable in (*equation.invars, *equation.outvars)
-              if hasattr(variable.aval, "dtype")]
-    if any(jnp.issubdtype(dtype, jnp.complexfloating) for dtype in dtypes):
-        raise NotImplementedError(f"float64_replay has no float64 rule for complex {name}")
-    if name == "jit":
-        return _replayed(params["jaxpr"].jaxpr, params["jaxpr"].consts, values)
-    if name in ("custom_jvp_call", "custom_vjp_call"):
-        return _replayed(params["call_jaxpr"].jaxpr, params["call_jaxpr"].consts, values)
-    if name == "scan":
-        # The body, replayed in float64 for its operands' widened dtypes, as the scan's own.
-        body = params["jaxpr"]
-        widened = jax.make_jaxpr(lambda *operands: _replayed(body.jaxpr, body.consts, list(operands)))(
-            *(jax.ShapeDtypeStruct(variable.aval.shape, jnp.float64 if _floating(variable.aval.dtype)
-                                   else variable.aval.dtype) for variable in body.jaxpr.invars))
-        return equation.primitive.bind(*values, **{**params, "jaxpr": widened})
-    if next(equations(params), None) is not None:
-        # A call this replay does not open may hold float arithmetic its integer boundary hides.
-        raise NotImplementedError(f"float64_replay does not replay inside {name}")
-    if name in FORMATTED or not any(_floating(dtype) for dtype in dtypes):
-        traced = [jnp.asarray(value).astype(variable.aval.dtype) if hasattr(variable.aval, "dtype")
-                  and _floating(variable.aval.dtype) else value
-                  for value, variable in zip(values, equation.invars, strict=True)]
-        outputs = equation.primitive.bind(*traced, **equation.primitive.get_bind_params(params))
-        outputs = outputs if equation.primitive.multiple_results else [outputs]
-        return [_widened(output) if _floating(output.dtype) else output for output in outputs]
-    if name not in REPLAYED:
-        raise NotImplementedError(f"float64_replay has no float64 rule for {name}")
-    widened = {key: jnp.float64 if key in ("dtype", "new_dtype") and value is not None
-               and _floating(value) else value for key, value in params.items()}
-    outputs = equation.primitive.bind(*values, **equation.primitive.get_bind_params(widened))
-    return outputs if equation.primitive.multiple_results else [outputs]
 
 
 def equations(graph, *, platform: str | None = None):
@@ -439,8 +497,8 @@ def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
     if truth.ndim < 2:
         return np.zeros(0), np.zeros(0)
 
-    def rms(rows):
-        return np.sqrt(np.mean(np.square(np.asarray(rows, np.float64).reshape(-1, truth.shape[-1])), axis=1))
+    def rms(values):
+        return _scaled_rms(np.reshape(values, (-1, truth.shape[-1])))
 
     sizes = rms(truth) if terms is None else np.maximum(rms(truth), rms(terms))
     leaf = max(distance(truth, 0), 0.0 if terms is None else distance(terms, 0))
@@ -462,13 +520,14 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tup
     sized = sizes > 0
     over = []
     if sized.any():
-        row = float(np.max(mine[sized] / sizes[sized]))
-        their_row = float(np.max(theirs[sized] / sizes[sized]))
-        allowed = max(their_row, floor)
-        if not within(row, ROW_FACTOR * allowed):
-            over.append(("row", log_ratio(row, allowed), f"the worst row is {row:.3e} from "
-                         f"float64 over its size, the reference's {their_row:.3e}, allowed "
-                         f"{ROW_FACTOR * allowed:.3e}"))
+        # Compared by their logs, so a row's error over its size orders where the quotient overflows.
+        row = float(np.max(_log_over(mine[sized], sizes[sized])))
+        their_row = float(np.max(_log_over(theirs[sized], sizes[sized])))
+        allowed = max(their_row, float(_log_over(floor, 1.0)))
+        if not row <= math.log(ROW_FACTOR) + allowed:
+            over.append(("row", row - allowed, f"the worst row is {_shown(row)} from float64 over its size, "
+                         f"the reference's {_shown(their_row)}, allowed "
+                         f"{_shown(math.log(ROW_FACTOR) + allowed)}"))
     zero = ~sized & ~(mine <= ROW_FACTOR * theirs)
     if zero.any():
         at = int(np.flatnonzero(zero)[0])
@@ -578,6 +637,41 @@ def _logs(values) -> np.ndarray:
         return np.where(values > 0, np.log(np.where(values > 0, values, 1.0)), LOG_ZERO)
 
 
+LOG_LARGEST = math.log(np.finfo(np.float64).max)
+"""The log of float64's largest value: a quotient of finite evidence past it is held there where it is
+recorded or shown (`_over`), never where it is judged (`_log_over`)."""
+
+
+def _log_over(numerators, denominators) -> np.ndarray:
+    """The log of each nonnegative numerator over its positive denominator (`_logs`), exact and finite for
+    every finite pair, so a quotient past float64's range (an error of 1e154 over a row of 1e-160) keeps
+    its order against every other; LOG_ZERO for a zero numerator, and not a number for one that is not."""
+    numerators = np.asarray(numerators, np.float64)
+    logs = np.where(numerators > 0, _logs(numerators) - _logs(denominators), LOG_ZERO)
+    return np.where(np.isnan(numerators), np.nan, logs)
+
+
+def _over(numerators, denominators) -> np.ndarray:
+    """Each quotient of `_log_over` as a value, held at float64's largest: a recorded reference's worst
+    row (`RecordedLeaf.worst`) and a message's figure; zero over anything is zero."""
+    quotient = np.exp(np.minimum(_log_over(numerators, denominators), LOG_LARGEST))
+    return np.where(np.asarray(numerators, np.float64) > 0, quotient, 0.0)
+
+
+def _shown(log: float) -> str:
+    """A log quotient as a message shows it, held at float64's largest."""
+    return f"{float(np.exp(np.minimum(log, LOG_LARGEST))):.3e}"
+
+
+def _scaled_rms(rows) -> np.ndarray:
+    """Each row's root mean square of finite values, the row scaled by its largest first, so no square
+    overflows (row 1628): zero for a row of zeros."""
+    rows = np.abs(np.asarray(rows, np.float64))
+    largest = np.max(rows, axis=1, keepdims=True) if rows.shape[1] else np.zeros((len(rows), 1))
+    scale = np.where(largest > 0, largest, 1.0)
+    return scale[:, 0] * np.sqrt(np.mean(np.square(rows / scale), axis=1))
+
+
 def log_sum(values) -> float:
     """The natural log of the sum of nonnegative values, scaled by their largest first, so no sum of
     finite values overflows on the way: LOG_ZERO for a sum of zeros."""
@@ -684,7 +778,8 @@ NO_ZERO_ROWS: ZeroRows = (np.zeros(0, np.int64), np.zeros(0), np.zeros(0))
 @dataclasses.dataclass
 class _Draws:
     """Each leaf's errors over a run of seeds: Dew's and the reference's mean squared error from
-    float64 (seed by leaf), each seed's worst sized row over its size (Dew's, the reference's), each
+    float64 (seed by leaf), the log of each seed's worst sized row over its size (Dew's, the
+    reference's; `_log_over`), each
     seed's rows of float64 zero with Dew's and the reference's errors on them (`ZeroRows`, seed by leaf;
     `pooled_zero_rows`), whether every value of the leaf was finite on every seed, and each leaf's row
     width (its last axis's length, 0 for a leaf of no rows; NARROW_FACTORS)."""
@@ -702,6 +797,28 @@ class _Draws:
                       self.zero_rows + other.zero_rows, np.concatenate([self.finite, other.finite]),
                       self.widths)
 
+    def against_larger(self, library: "_Draws", leaves: Sequence[str]) -> "_Draws":
+        """These draws judged against the larger of their reference's error and `library`'s, the same
+        Dew on the same draws against the library arm (`assert_as_exact`'s `library_fn`), on the
+        exception's `leaves` alone: seed by seed and leaf by leaf, the reference's evidence (its error,
+        its worst row, its rows of float64 zero) is whichever of the two arms' error is the larger there,
+        and a value must be finite in both. Every other leaf is the reference's alone."""
+        if library.names != self.names or len(library.mine) != len(self.mine):
+            raise AssertionError("the library arm's draws are not the reference's")
+        unknown = sorted(set(leaves) - set(self.names))
+        if unknown or not leaves:
+            raise ValueError(f"a library arm names the leaves it covers, of {self.names}; it names "
+                             f"{list(leaves)}")
+        covered = np.isin(self.names, leaves)
+        pick = (library.theirs > self.theirs) & covered
+        worst = self.worst.copy()
+        worst[..., 1] = np.where(pick, library.worst[..., 1], self.worst[..., 1])
+        zero_rows = [[(theirs if chosen else mine)
+                      for mine, theirs, chosen in zip(seed, other, picked, strict=True)]
+                     for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
+        return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
+                      self.finite & (library.finite | ~covered), self.widths)
+
 
 def pooled_zero_rows(evidence: list[ZeroRows]) -> list[tuple[int, float, float]]:
     """The rows of float64 zero Dew is further from than ROW_FACTOR times the reference over a run's
@@ -718,17 +835,19 @@ def pooled_zero_rows(evidence: list[ZeroRows]) -> list[tuple[int, float, float]]
     zero-row-10x`): 0 of 15,000 runs failed at 8 seeds (a red rate at most 4.6e-4 at 99.9%) and 0 of
     3,000 at 40 (at most 2.3e-3), and the 10x row failed every run at both. Judged seed by seed, the
     same pairs failed on 6.6% of runs of 8 seeds and 42% of 64."""
-    mine: dict[int, float] = {}
-    theirs: dict[int, float] = {}
-    seen: dict[int, int] = {}
+    mine: dict[int, list[float]] = {}
+    theirs: dict[int, list[float]] = {}
     for rows, my_errors, their_errors in evidence:
         for row, my_error, their_error in zip(rows.tolist(), my_errors.tolist(), their_errors.tolist(),
                                               strict=True):
-            mine[row] = mine.get(row, 0.0) + my_error ** 2
-            theirs[row] = theirs.get(row, 0.0) + their_error ** 2
-            seen[row] = seen.get(row, 0) + 1
-    return [(row, float(np.sqrt(mine[row] / seen[row])), float(np.sqrt(theirs[row] / seen[row])))
-            for row in sorted(mine) if not mine[row] <= ROW_FACTOR ** 2 * theirs[row]]
+            mine.setdefault(row, []).append(my_error)
+            theirs.setdefault(row, []).append(their_error)
+    # Each row's errors pooled as a scaled root mean square and compared by their logs, so errors near
+    # float64's largest pool and order without a square or a product overflowing.
+    pooled = [(row, float(_scaled_rms([mine[row]])[0]), float(_scaled_rms([theirs[row]])[0]))
+              for row in sorted(mine)]
+    return [(row, my_rms, their_rms) for row, my_rms, their_rms in pooled
+            if not _logs(my_rms) <= math.log(ROW_FACTOR) + _logs(their_rms)]
 
 
 SKETCH = 32
@@ -804,6 +923,13 @@ class RecordedLeaf:
     finite: bool
     dtype: str
     zero_sizes: np.ndarray | None = None
+    worst_log: float | None = None
+
+    @property
+    def log_worst(self) -> float:
+        """The log of `worst`, exact where this leaf was read here (`leaf_summary`), which keeps its
+        order past float64's range; a recording's, from the value it holds."""
+        return self.worst_log if self.worst_log is not None else float(_log_over(self.worst, 1.0))
 
 
 def leaf_summary(reference, truth) -> RecordedLeaf:
@@ -819,14 +945,16 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
     sized = sizes > 0
     own = (np.sqrt(np.mean(np.square(truth.reshape(-1, truth.shape[-1])), axis=1)) if truth.ndim >= 2
            else np.zeros(0))
+    logged = float(np.max(_log_over(rows[sized], sizes[sized]))) if sized.any() else LOG_ZERO
     return RecordedLeaf(float(np.mean(np.square(reference - truth))),
-                        float(np.max(rows[sized] / sizes[sized])) if sized.any() else 0.0,
+                        float(np.max(_over(rows[sized], sizes[sized]))) if sized.any() else 0.0,
                         np.flatnonzero(~sized), rows[~sized],
                         finite=bool(np.isfinite(reference).all() and np.isfinite(truth).all()), dtype=dtype,
-                        zero_sizes=own[~sized])
+                        zero_sizes=own[~sized], worst_log=logged)
 
 
-def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None) -> _Draws:
+def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
+           library_fn=None, library_leaves: Sequence[str] = ()) -> _Draws:
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
@@ -834,10 +962,14 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     With `orders`, each arm also runs at every other order of its own draw (`orders(inputs)` past its
     first, the draw itself), held to that draw's one truth: each arm's worst row is its worst over the
     orders, measured rows of float64 zero included, and its values finite at every one; its errors and
-    its rows of float64 zero are the draw's own order's."""
+    its rows of float64 zero are the draw's own order's. With `library_fn`, the library arm runs beside
+    the reference on Dew's own inputs, held to Dew's truth, and the draws are judged against the larger
+    of the two on `library_leaves` (`_Draws.against_larger`), Dew and the truth evaluated once."""
     if orders is not None and getattr(reference_fn, "recorded", False):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
-    mine, theirs, worst, zero_rows, finite, names, widths = [], [], [], [], [], None, None
+    arms = [reference_fn] + ([] if library_fn is None else [library_fn])
+    mine, theirs, worst, zero_rows, finite, names, widths = [], [[] for _ in arms], [[] for _ in arms], \
+        [[] for _ in arms], [[] for _ in arms], None, None
 
     def truth_of(inputs):
         with jax.enable_x64(new_val=True):
@@ -857,26 +989,33 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             ordered = list(zip(orders(inputs), orders(their_inputs), strict=True))
             if len(ordered) < 2:
                 raise ValueError(f"orders of {len(ordered)}; an orbit holds the draw's own and another")
-        row = None
+        rows = [None for _ in arms]
         for mine_at, theirs_at in ordered:
             dew = dew_fn(*mine_at)
             names = names or [jax.tree_util.keystr(path)
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
             widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
                                      for leaf in jax.tree.leaves(dew))
-            # The reference against itself on the same inputs is one evaluation (`seeds_for`'s sizing).
-            reference = dew if dew_fn is reference_fn and theirs_at is mine_at else reference_fn(*theirs_at)
-            evidence = _evidence(dew, reference, truth, their_truth)
-            row = evidence if row is None else [
-                (first[0], first[1], float(np.fmax(first[2], other[2])), float(np.fmax(first[3], other[3])),
-                 first[4], first[5] and other[5]) for first, other in zip(row, evidence, strict=True)]
-        mine.append([entry[0] for entry in row])
-        theirs.append([entry[1] for entry in row])
-        worst.append([(entry[2], entry[3]) for entry in row])
-        zero_rows.append([entry[4] for entry in row])
-        finite.append([entry[5] for entry in row])
-    return _Draws(names, np.asarray(mine), np.asarray(theirs), np.asarray(worst).reshape(len(mine), -1, 2),
-                  zero_rows, np.asarray(finite), widths)
+            for at_arm, arm in enumerate(arms):
+                # The reference against itself on the same inputs is one evaluation (`seeds_for`'s
+                # sizing); the library arm runs on Dew's own inputs.
+                here, true_here = (theirs_at, their_truth) if arm is reference_fn else (mine_at, truth)
+                other = dew if dew_fn is arm and here is mine_at else arm(*here)
+                evidence = _evidence(dew, other, truth, true_here)
+                rows[at_arm] = evidence if rows[at_arm] is None else [
+                    (first[0], first[1], float(np.fmax(first[2], later[2])),
+                     float(np.fmax(first[3], later[3])), first[4], first[5] and later[5])
+                    for first, later in zip(rows[at_arm], evidence, strict=True)]
+        mine.append([entry[0] for entry in rows[0]])
+        for at_arm, row in enumerate(rows):
+            theirs[at_arm].append([entry[1] for entry in row])
+            worst[at_arm].append([(entry[2], entry[3]) for entry in row])
+            zero_rows[at_arm].append([entry[4] for entry in row])
+            finite[at_arm].append([entry[5] for entry in row])
+    drawn = [_Draws(names, np.asarray(mine), np.asarray(theirs[at_arm]),
+                    np.asarray(worst[at_arm]).reshape(len(mine), -1, 2), zero_rows[at_arm],
+                    np.asarray(finite[at_arm]), widths) for at_arm in range(len(arms))]
+    return drawn[0] if library_fn is None else drawn[0].against_larger(drawn[1], library_leaves)
 
 
 def _leaf_paths(tree) -> list[str]:
@@ -911,7 +1050,7 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
             # adds no error and resolves nothing.
             kept = str(jnp.dtype(leaf.dtype))
             assert kept == their.dtype, (jax.tree_util.keystr(path), kept, their.dtype)
-            row.append((0.0, 0.0, 0.0, 0.0, NO_ZERO_ROWS, True))
+            row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = (recorded or their_truth is truth
@@ -937,7 +1076,8 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     in Dew's truth the reference's lacks (a recorded truth recomputed otherwise) is refused. Not
     `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
-        return mine.mse, theirs.mse, mine.worst, theirs.worst, NO_ZERO_ROWS, mine.finite and theirs.finite
+        return (mine.mse, theirs.mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
+                mine.finite and theirs.finite)
     at_zero = dict(zip(theirs.zero_rows.tolist(), theirs.zero_errors.tolist(), strict=True))
     unrecorded = [at for at in mine.zero_rows.tolist() if at not in at_zero]
     if unrecorded:
@@ -945,11 +1085,12 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
                              f"{unrecorded[:4]}")
     sizes = (dict(zip(theirs.zero_rows.tolist(), theirs.zero_sizes.tolist(), strict=True))
              if theirs.zero_sizes is not None else {})
-    worst, their_worst, zero = mine.worst, theirs.worst, []
+    worst, their_worst, zero = mine.log_worst, theirs.log_worst, []
     for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True):
         size = sizes.get(at, 0.0)
         if at_zero[at] < size:
-            worst, their_worst = max(worst, error / size), max(their_worst, at_zero[at] / size)
+            worst = max(worst, float(_log_over(error, size)))
+            their_worst = max(their_worst, float(_log_over(at_zero[at], size)))
         else:
             zero.append((at, error, at_zero[at]))
     rows, errors, their_errors = (np.asarray(column, dtype) for column, dtype in zip(
@@ -1000,11 +1141,11 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                                     f"[{low:.3f}, {high:.3f}] (allowed {PARITY})"))
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
         factor = NARROW_FACTORS.get(draws.widths[index], ROW_FACTOR)
-        if not within(my_row, factor * their_row):
-            over.append(Finding(leaf, "row", log_ratio(my_row, their_row),
-                                f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 "
-                                f"over its size, the reference's {their_row:.3e}, allowed "
-                                f"{factor * their_row:.3e} ({factor} times it)"))
+        if not my_row <= math.log(factor) + their_row:
+            over.append(Finding(leaf, "row", my_row - their_row,
+                                f"{leaf}: the worst row over {count} seeds is {_shown(my_row)} from float64 "
+                                f"over its size, the reference's {_shown(their_row)}, allowed "
+                                f"{_shown(math.log(factor) + their_row)} ({factor} times it)"))
         zero = pooled_zero_rows([seed[index] for seed in draws.zero_rows])
         if zero:
             # The measure is the worst of them, the first the example.
@@ -1088,7 +1229,8 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> N
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
-                    orders=None) -> None:
+                    orders=None, library_fn=None, library_row: int | None = None,
+                    library_leaves: Sequence[str] = ()) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1103,7 +1245,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     output dtype it closes over). A draw may be an orbit's: the same values under an exact symmetry
     the seed picks. `seeds` is the site's declared count, sized by `seeds_for` so the reference
     compared with itself resolves PARITY, or, where the arms share their upstream rounding, so Dew
-    paired with the reference does; jit the two functions so every seed reuses one compiled program.
+    paired with the reference does. The gate compiles the two functions (`_arms`), once for every seed:
+    two Dew paths without YNNPACK's fusions, a Dew arm beside an arm run `as_given` with them.
 
     Where a computation has an orbit of summation orders, `orders(inputs)` lists a draw's inputs at K
     of them, the draw itself first: an exact symmetry of the result (a batch's rows in another order
@@ -1128,6 +1271,14 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     judgement's stage is logged (STAGES_LOG). A leaf the reference holds exactly on every seed, Dew
     must too.
 
+    `library_fn`, the owner's exception under BIBLE §7 (recorded on ledger row `library_row`): where Dew's
+    arm decomposes a product the reference computes whole and the library's own accuracy at the
+    pieces' shapes is the residual, a library arm on the same inputs runs the arm's pieces through the
+    library and combines them exactly (in float64), and Dew is held within PARITY of the larger of the
+    reference's error and that arm's, seed by seed, on the leaves the exception covers
+    (`library_leaves`, by their paths; `_Draws.against_larger`). Every other leaf, and every other rule,
+    is as above; a site without it is judged against the reference alone.
+
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/certified.py)."""
@@ -1136,9 +1287,17 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                                     f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                                     f"(`seeds_for`)")])
     narrow_leaves: list[str] = []
+    if (library_fn is None) != (library_row is None) or (library_fn is None) != (not library_leaves):
+        raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row and "
+                         f"the leaves it covers")
+    _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]))
+    dew_fn, reference_fn = _arms(dew_fn, reference_fn)
+    library_fn = None if library_fn is None else _arms(library_fn, library_fn)[1]
+    truth_fn = _truth_program(truth_fn)
 
     def drawn(start, stop):
-        draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders)
+        draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
+                       library_fn=library_fn, library_leaves=library_leaves)
         narrow_leaves[:] = [name for name, width in zip(draws.names, draws.widths, strict=True)
                             if width in NARROW_FACTORS]
         return draws
@@ -1192,6 +1351,9 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
                                     f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                                     f"(`seeds_for`)")])
+    _refuse_numpy_arms(draw, changed_fn, original_fn)
+    changed_fn, original_fn = _arms(changed_fn, original_fn)
+    truth_fn = _truth_program(truth_fn)
     draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn)
     moved, kept, unresolved = _moved(draws, 1)
     if not moved:
@@ -1266,6 +1428,11 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
             raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
                              f"sizing's from SIZING_FROM; its site keeps its recorded count")
         most = min(most, len(pilots))
+    paired = dew_fn is not None
+    _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
+    dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
+    dew_fn = dew_fn if paired else None
+    truth_fn = _truth_program(truth_fn)
     count, drawn, wide = max(start, FEWEST_SEEDS), None, []
     if count > most:
         raise AssertionError(f"{label}: sizing starts at {count} seeds, past the {most} it may take; "
@@ -1333,7 +1500,8 @@ def recording(path) -> dict[str, np.ndarray]:
 
 def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: int = 0,
               truth_fn=None, two_stage: bool = True, dew_fn=None, orders=None,
-              paired: bool = False) -> list[tuple[str, int, list[str]]]:
+              paired: bool = False, library_fn=None,
+              library_leaves: Sequence[str] = ()) -> list[tuple[str, int, list[str]]]:
     """Check 1 run `runs` times on an equally exact pair, the reference against itself on disjoint
     draws: each run's verdict, "pass", "over" or "inconclusive", the stage it reached and its findings
     (`_judgement`'s, each naming its leaf and rule), a run judged as `assert_as_exact` judges a site
@@ -1346,7 +1514,11 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     reference (a dropped term, a wrong scale), the runs measure the procedure's power on that class,
     both procedures on the same draws. `paired` runs both arms on the same draws, as a site does, `dew_fn`
     then the other implementation (an equally exact one, or a fault); `orders` judges rows over each
-    draw's orbit, as a site that declares one."""
+    draw's orbit, as a site that declares one. The runs evaluate their arms as given: a class's
+    arms compile themselves where they are programs, and a fault injects itself on the host.
+    `library_fn` judges each run against the larger of the reference's error and that library arm's
+    on `library_leaves`, as `assert_as_exact` does (paired runs: the library arm is measured on Dew's
+    own draws)."""
     if paired and dew_fn is None:
         raise ValueError("a paired null run takes its other implementation, `dew_fn`")
     verdicts = []
@@ -1357,7 +1529,8 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
         def drawn(start, stop, base=base):
             return _drawn(dew_fn or reference_fn, reference_fn, draw, range(base + start, base + stop),
                           truth_fn, orders=orders,
-                          reference_seeds=None if paired else range(base + span + start, base + span + stop))
+                          reference_seeds=None if paired else range(base + span + start, base + span + stop),
+                          library_fn=library_fn, library_leaves=library_leaves)
 
         over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage)
         verdicts.append((_verdict(over, unresolved), stage, [str(finding) for finding in over + unresolved]))
@@ -1518,9 +1691,13 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
 
     reference.recorded = True
 
+    # The truth recomputed, compiled as the gate compiles a truth; its roundings are counted on its trace.
+    live = _truth_program(truth_fn)
+
+    @as_given
     def truth(index, inputs):
         index = int(index)
-        computed = truth_fn(inputs)
+        computed = live(inputs)
         if not roundings:
             # One draw's roundings, a window loop's its window's: each window is a draw of its own.
             program, arguments = _one_draws_program(truth_fn, (inputs,))
@@ -1922,402 +2099,6 @@ def _assert_rows_over_orders(dew, members, label: str, sizes=None) -> None:
     assert within(worst, ROW_FACTOR * their_worst), (
         f"{label}: dew's worst row is {worst:.3e} from float64 (rms over {ORDERS} orders, over its size), "
         f"the reference's {their_worst:.3e} (allowed {ROW_FACTOR:g} times it)")
-
-
-STAGES = 4
-"""The batches of ORDERS fresh orders an element is measured over before it fails
-(`assert_elements_as_exact`): the first, and a confirmation of each element still flagged in each of
-the rest. Provisional, from the review of the rule: with errors independent across
-elements and orders, K = ORDERS a side needs three stages for a familywise FALSE_FAILURE at Dory's
-43.5M elements where the errors are Gaussian, and four where they are Laplace. Shapes with heavier
-or rarer tails (a Student t of 3 degrees, rare bf16 flips) are certified at none of these: the stage
-count comes from calibrating the rule on held-out real order traces at the real element count, and
-until it has, the rule's false-failure rate on such shapes is unmeasured. Nor is it calibrated
-where a sum's order no symmetry changes: that rounding is the same at every stage, so more stages
-do not redraw it, and an element it parts past the factor stays flagged."""
-
-
-REFERENCE = "reference"
-"""The member of an ensemble that is the reference itself (`assert_elements_as_exact`)."""
-
-
-def _inflation(bar, reference) -> dict:
-    """How far the worst admitted member's sums `bar` raise the bar over the reference's alone, over a
-    leaf's elements: the ratio's mean of sums, its median, 99th percentile and largest at elements
-    where the reference is not exact, and the count of elements it makes positive where the
-    reference is exact."""
-    bar, reference = (np.asarray(side, np.float64).ravel() for side in (bar, reference))
-    moving = reference > 0
-    ratios = bar[moving] / reference[moving]
-    total = float(reference.sum())
-    return {"inflation": float(bar.sum()) / total if total > 0 else 1.0,
-            "median": float(np.median(ratios)) if ratios.size else 1.0,
-            "p99": float(np.percentile(ratios, 99)) if ratios.size else 1.0,
-            "largest": float(ratios.max()) if ratios.size else 1.0,
-            "positive_where_exact": int(np.count_nonzero(~moving & (bar > 0)))}
-
-
-def assert_elements_as_exact(batch, label: str, *, reference: str = REFERENCE, admitted=None) -> dict:
-    """Every element on par with the reference at that element, measured over fresh batches of ORDERS
-    orders. `batch(stage)` gives `(dew, members)` for stage 0, 1, ...: Dew's sums and the reference's
-    ensemble's, by member, each member's tree of Dew's shape, arrays or trees of them holding each
-    element's absolute distance from float64 summed over the stage's ORDERS orders, the same orders
-    for every side. The member `reference` is the reference itself; every other is the reference's
-    math under another declared summation tree (tests/reference_trees.py), declared before Dew runs
-    and computing every element at every order and stage. `admitted` maps each leaf's path to the
-    members admitted there, those no less exact than the reference over the leaf
-    (`assert_leaves_as_exact_over_orders` measures it), every member where it is None. `batch` is
-    asked for a stage only while elements stay flagged, up to STAGES.
-
-    An element is flagged at a stage where Dew's mean absolute error over its orders is more than
-    FACTOR times the worst admitted member's there: no floor, no error borrowed from its row or from a
-    model of rounding. Two equally exact trees cross a sum's rounding boundaries at different rates, so
-    at an element the reference's own tree can be lucky in every order; the worst admitted member says
-    what the reference's accuracy allows there, and a member is admitted only where it is no less exact
-    than the reference over its leaf, so the ensemble moves the reference's accuracy between elements
-    and never loosens it overall. Where every admitted member measures zero and Dew does not, the
-    element is flagged; where all measure zero, it passes. An element fails only where every stage
-    flags it, each re-measuring it over fresh orders on every side. Any non-finite value fails at
-    once. The mean absolute error rather than the RMS: a bf16 rounding's flips give errors
-    heavier-tailed than a Gaussian's, whose squares' mean varies with their kurtosis.
-
-    Returns, by leaf, the members admitted and the bar's inflation over the reference's alone
-    (`_inflation`): the worst admitted member's mean absolute error over the leaf's elements, over the
-    reference's, and its spread over the elements."""
-    flagged, report = None, {}
-    for stage in range(STAGES):
-        dew, members = batch(stage)
-        assert reference in members, f"{label}: the ensemble {sorted(members)} holds no {reference!r}"
-        paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
-        mines = [np.asarray(leaf, np.float64) for leaf in jax.tree.leaves(dew)]
-        named = {member: [np.asarray(leaf, np.float64) for leaf in jax.tree.leaves(tree)]
-                 for member, tree in members.items()}
-        for member, leaves in named.items():
-            assert len(leaves) == len(mines), (
-                f"{label}: member {member!r} has {len(leaves)} leaves, Dew {len(mines)}")
-        bars = []
-        for index, (name, mine) in enumerate(zip(paths, mines, strict=True)):
-            held = list(members) if admitted is None else list(admitted[name])
-            assert reference in held, f"{label} {name}: the admitted members {held} leave out {reference!r}"
-            for member, leaves in named.items():
-                theirs = leaves[index]
-                assert theirs.shape == mine.shape, (
-                    f"{label} {name}: member {member!r} {theirs.shape}, Dew {mine.shape}")
-                broken = int(np.count_nonzero(~np.isfinite(theirs)))
-                assert broken == 0, (
-                    f"{label} {name}: {broken} non-finite sums of member {member!r} at stage {stage}")
-            broken = int(np.count_nonzero(~np.isfinite(mine)))
-            assert broken == 0, f"{label} {name}: {broken} non-finite element sums of Dew's at stage {stage}"
-            worst = np.max(np.stack([named[member][index] for member in held]), axis=0)
-            bars.append(worst)
-            if stage == 0:
-                report[name] = {"admitted": held, **_inflation(worst, named[reference][index])}
-        over = [mine > FACTOR * bar for mine, bar in zip(mines, bars, strict=True)]
-        # A confirmation clears an element it does not flag again; one flagged before stays so only if it is.
-        flagged = over if flagged is None else [now & then for now, then in zip(over, flagged, strict=True)]
-        if not any(leaf.any() for leaf in flagged):
-            return report
-    failing = [(name, leaf, mine, bar)
-               for name, leaf, mine, bar in zip(paths, flagged, mines, bars, strict=True) if leaf.any()]
-    name, leaf, mine, bar = failing[0]
-    at = np.unravel_index(int(np.argmax(np.where(leaf, mine - FACTOR * bar, -np.inf))), leaf.shape)
-    count = sum(int(np.count_nonzero(leaf)) for _, leaf, _, _ in failing)
-    raise AssertionError(
-        f"{label}: {count} elements past FACTOR {FACTOR:g} times the worst admitted member's error at every "
-        f"one of {STAGES} stages of {ORDERS} orders; in {name}, element {tuple(int(i) for i in at)} is "
-        f"{mine[at] / ORDERS:.3e} from float64 at the last (mean absolute over its orders), the worst "
-        f"admitted member {bar[at] / ORDERS:.3e} ({report[name]['admitted']})")
-
-
-def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> dict:
-    """A computation held where it rounds (the gate's source-aware check; tests/reference_graph.py).
-    `dew`, `reference` and `truth` are `Graph`s (src/dew/nn/kernels/graph.py) of one shape, `truth`
-    the reference's in float64;
-    `inputs` the case's inputs by name, and `orbit(order)` the case's exact symmetries:
-    `(inputs, back)`, order `order`'s permuted inputs and the map that takes outputs back.
-
-    1. Each graph's replay equals its native witness (`Graph.fused`) bit for bit, on order 0's inputs
-       and every order's of the end-to-end check.
-    2. Every node is held on common parents, both the reference's values and Dew's, the float64 truth
-       computed on the same parents widened. A `Sum` or `Online` node is held over ORDERS orders of its
-       own summed axis permuted, an exact symmetry of it that redraws both sides' summation order, by
-       `assert_leaves_as_exact_over_orders`, its permuted output axes taken back (`Sum.follows`); an
-       `Ordered` node so over its declared orbit with its order-preserving members beside the
-       reference; a `Pointwise` node, or an `Ordered` one with no orbit, once, each element within
-       FACTOR of the worst of the reference's node and its admitted members (within ADMISSION_MARGIN
-       of its RMS), its leaf within FACTOR of the reference's alone. Errors follow
-       `reference_graph.errors`: a NaN anywhere fails, and matching infinities count zero only at a
-       node's sentinel.
-    3. End to end, each output's RMS distance from float64 over ORDERS orders of `orbit` within FACTOR of
-       the reference's alone.
-
-    Returns each node's report (`assert_elements_as_exact`'s) by node and parent bundle. The element
-    rule's calibration at a test's real element count is still open: the report states each node's
-    measured inflation, and no false-failure rate is claimed."""
-    from dew.nn.kernels.graph import Pointwise
-
-    names = [node.name for node in dew.nodes]
-    assert names == [node.name for node in reference.nodes] == [node.name for node in truth.nodes], (
-        f"{label}: the graphs name other nodes: {names}, {[node.name for node in reference.nodes]}")
-    for graph, side in ((dew, "dew"), (reference, "the reference")):
-        _assert_witness(graph, inputs, f"{label} {side}")
-    bundles = {"reference's parents": reference.replay(inputs), "dew's parents": dew.replay(inputs)}
-    report = {}
-    for name in names:
-        mine, theirs, true = dew.node(name), reference.node(name), truth.node(name)
-        assert type(mine.kind) is type(theirs.kind), f"{label} {name}: {mine.kind} against {theirs.kind}"
-        for bundle, values in bundles.items():
-            parents = {parent: values[parent] for parent in mine.parents}
-            wide = widened(parents)
-            where = f"{label} {name} on {bundle}"
-            if isinstance(mine.kind, Pointwise) or not mine.kind.axes:
-                report[name, bundle] = _assert_node_once(mine, theirs, true, parents, wide, where)
-            else:
-                report[name, bundle] = assert_leaves_as_exact_over_orders(
-                    _node_draw(mine, theirs, true, parents, wide, mine.kind), where, rows=False)
-    _assert_end_to_end(dew, reference, truth, inputs, orbit, label)
-    return report
-
-
-def _node_draw(mine, theirs, true, parents, wide, kind):
-    """The over-orders draw of a node on common `parents` whose `kind` names an orbit: order `order`
-    permutes each named parent's axis (`kind.axes`), an exact symmetry of the node, on Dew's node, the
-    reference's, its members (an `Ordered` node's) and the float64 truth's alike, and takes the output
-    axes the permutation carries (`kind.follows`) back, so an element is the same element at every
-    order. An element where a side and the truth both hold the node's sentinel is no error there; a
-    side that misses a sentinel the truth holds is NaN there, which fails."""
-    from reference_graph import permuted
-
-    axes = kind.axes
-    length = int(np.shape(parents[next(iter(axes))])[axes[next(iter(axes))]])
-    sides = {"dew": mine.fn, REFERENCE: theirs.fn, **theirs.members}
-
-    def draw(order):
-        units = np.arange(length) if order == 0 else np.random.default_rng(order).permutation(length)
-        back = np.argsort(units)
-
-        def restored(value):
-            value = np.asarray(value, np.float64)
-            for axis in kind.follows:
-                value = np.take(value, back, axis=axis)
-            return value
-
-        with jax.enable_x64(new_val=True):
-            exact = restored(true.fn(**permuted(wide, axes, units)))
-        found = {side: restored(fn(**permuted(parents, axes, units))) for side, fn in sides.items()}
-        if mine.sentinel is not None:
-            held = exact == mine.sentinel
-            found = {side: np.where(held, np.where(value == mine.sentinel, 0.0, np.nan), value)
-                     for side, value in found.items()}
-            exact = np.where(held, 0.0, exact)
-        dew = found.pop("dew")
-        return {"node": dew}, {side: {"node": value} for side, value in found.items()}, {"node": exact}
-    return draw
-
-
-def _assert_witness(graph, inputs, label: str) -> None:
-    """`graph`'s replay equal to its native witness (`Graph.fused`) bit for bit at every value both name."""
-    witnessed, replayed = graph.fused(**inputs), graph.replay(inputs)
-    for name, value in witnessed.items():
-        assert name in replayed, f"{label}: the witness holds {name!r}, which the graph does not name"
-        value, again = np.asarray(value), np.asarray(replayed[name])
-        # Bit for bit: a NaN the witness holds the graph must hold too, and the node checks fail it.
-        assert value.dtype == again.dtype and value.shape == again.shape and np.array_equal(
-            value.view(np.uint8), again.view(np.uint8)), (
-            f"{label}: {name} replayed from the graph differs from the native witness")
-
-
-def _assert_node_once(mine, theirs, true, parents, wide, label: str) -> dict:
-    """A node no orbit of its own redraws, held once on common `parents` (`assert_graph_as_exact`): one
-    draw on each side, so its element rule's confirmations re-read the same values and an element
-    flagged once stays flagged. A pointwise node is deterministic there, as it should be; an `Ordered`
-    node held once between equally exact sides flags about one element in twenty at FACTOR 2, which
-    is why an `Ordered` node declares its orbit wherever it has one."""
-    from reference_graph import errors
-
-    with jax.enable_x64(new_val=True):
-        exact = np.asarray(true.fn(**wide), np.float64)
-    ours = errors(mine.fn(**parents), exact, mine.sentinel)
-    members = {REFERENCE: errors(theirs.fn(**parents), exact, mine.sentinel)} | {
-        member: errors(fn(**parents), exact, mine.sentinel) for member, fn in theirs.members.items()}
-    native = float(np.sqrt(np.mean(np.square(members[REFERENCE]))))
-    admitted = [member for member, found in members.items()
-                if member == REFERENCE
-                or float(np.sqrt(np.mean(np.square(found)))) <= ADMISSION_MARGIN * native]
-    assert within(float(np.sqrt(np.mean(np.square(ours)))), FACTOR * native), (
-        f"{label}: dew is {float(np.sqrt(np.mean(np.square(ours)))):.3e} from float64 (rms), the reference "
-        f"{native:.3e} (allowed {FACTOR} times it)")
-    return assert_elements_as_exact(lambda stage: ({"node": ours}, {member: {"node": members[member]}
-                                                                    for member in admitted}), label)
-
-
-def _assert_end_to_end(dew, reference, truth, inputs, orbit, label: str) -> None:
-    """Each output's RMS from float64 over ORDERS orders of `orbit` within FACTOR of the reference's, and
-    each graph's witness equal to its replay at every order (`assert_graph_as_exact`)."""
-    distances = {}
-    for order in range(ORDERS):
-        moved, back = orbit(order)
-        for graph, side in ((dew, "dew"), (reference, "the reference")):
-            _assert_witness(graph, moved, f"{label} {side} at order {order}")
-        outputs = {side: back({name: np.asarray(graph.fused(**moved)[name], np.float64)
-                               for name in graph.outputs})
-                   for side, graph in (("dew", dew), ("reference", reference))}
-        with jax.enable_x64(new_val=True):
-            fused = truth.fused(**widened(moved))
-            exact = back({name: np.asarray(fused[name], np.float64) for name in truth.outputs})
-        for name in dew.outputs:
-            for side in ("dew", "reference"):
-                distances.setdefault((name, side), []).append(distance(outputs[side][name], exact[name]))
-    for name in dew.outputs:
-        assert_as_exact_over_orders(distances[name, "dew"], distances[name, "reference"], f"{label} {name}")
-
-
-def _batch(draw, stage: int, terms, rows: bool) -> tuple[object, dict, list, list, dict]:
-    """Batch `stage` of ORDERS draws (`assert_leaves_as_exact_over_orders`), orders `stage` ORDERS on:
-    each leaf's absolute distance from float64 at every element summed over them, Dew's in Dew's tree
-    and each reference member's so, by member; each order's RMS distance of each leaf, and,
-    where `rows`, of each row (`row_errors`), Dew's and each member's; and each leaf's row sizes, from
-    the batch's first truth and `terms`."""
-    dew_sums, member_sums, leaves, row_distances, sizes = {}, {}, [], [], {}
-    for order in range(stage * ORDERS, (stage + 1) * ORDERS):
-        dew, members, truth = draw(order)
-        summed = jax.tree.leaves(truth) if terms is None else jax.tree.leaves(terms)
-        named = {member: jax.tree.leaves(tree) for member, tree in members.items()}
-        at_order, rows_at_order = {}, {}
-        for index, ((path, mine), true, size) in enumerate(zip(
-                jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(truth), summed, strict=True)):
-            name, true = jax.tree_util.keystr(path), np.asarray(true, np.float64)
-            theirs = {member: leaves_of[index] for member, leaves_of in named.items()}
-
-            def add(sums, side, name=name, true=true):
-                error = np.abs(np.asarray(side, np.float64) - true)
-                sums[name] = error if name not in sums else sums[name] + error
-
-            add(dew_sums, mine)
-            for member, leaf in theirs.items():
-                add(member_sums.setdefault(member, {}), leaf)
-            at_order[name] = (distance(mine, true),
-                              {member: distance(leaf, true) for member, leaf in theirs.items()})
-            if rows:
-                held = None if terms is None else size
-                row_sizes, ours = row_errors(mine, true, held)
-                sizes.setdefault(name, row_sizes)
-                rows_at_order[name] = (ours, {member: row_errors(leaf, true, held)[1]
-                                              for member, leaf in theirs.items()})
-        leaves.append(at_order)
-        row_distances.append(rows_at_order)
-    # The sums in Dew's own tree, so the element rule names each leaf by its path.
-    structure, names = jax.tree.structure(dew), list(dew_sums)
-    return (jax.tree.unflatten(structure, [dew_sums[name] for name in names]),
-            {member: jax.tree.unflatten(structure, [sums[name] for name in names])
-             for member, sums in member_sums.items()},
-            leaves, row_distances, sizes)
-
-
-ADMISSION_MARGIN = 1.05
-"""How much less exact than the reference, in RMS from float64 over a leaf, a member may be and still be
-admitted (`admitted_members`): 5%. With no margin an equally exact member is
-admitted about half the time, by its orders' luck alone."""
-
-ADMISSION_CONFIDENCE = 0.99
-"""The simultaneous one-sided confidence of `admitted_members`' bound, over every candidate and leaf."""
-
-def admitted_members(native, candidates) -> dict[str, list[str]]:
-    """The members admitted at each leaf. `native` maps each leaf's path to the reference's mean squared
-    distance from float64 over the leaf at each order of an admission sample (`_admission`), and
-    `candidates` maps each other member to its own so, at the same orders. A candidate is admitted at a
-    leaf where the one-sided ADMISSION_CONFIDENCE upper bound on the mean over the orders of
-    d = its distance - ADMISSION_MARGIN^2 times the reference's is at most zero: a Student t bound on the
-    paired differences, the orders the units, simultaneous over every candidate and leaf (Bonferroni).
-    The orders are shared, so pairing takes out what every member's rounding at an order has in common.
-    The reference is admitted everywhere."""
-    from scipy import stats
-
-    tests = max(1, sum(len(leaves) for leaves in candidates.values()))
-    admitted = {}
-    for leaf, reference in native.items():
-        reference = np.asarray(reference, np.float64)
-        held = [REFERENCE]
-        for member, leaves in candidates.items():
-            difference = np.asarray(leaves[leaf], np.float64) - ADMISSION_MARGIN ** 2 * reference
-            spread = np.std(difference, ddof=1) / np.sqrt(difference.size)
-            quantile = stats.t.ppf(1 - (1 - ADMISSION_CONFIDENCE) / tests, difference.size - 1)
-            if float(np.mean(difference) + quantile * spread) <= 0:
-                held.append(member)
-        admitted[leaf] = held
-    return admitted
-
-
-def _admission(draw) -> dict[str, list[str]]:
-    """The members `draw`'s ensemble admits at each leaf (`admitted_members`), over a sample of ORDERS
-    orders of its own past the STAGES batches that hold Dew: each member's mean squared distance from
-    float64 over each leaf at each order, Dew's draws unread."""
-    native, candidates = {}, {}
-    for order in range(STAGES * ORDERS, (STAGES + 1) * ORDERS):
-        _, members, truth = draw(order)
-        assert REFERENCE in members, f"the ensemble {sorted(members)} holds no {REFERENCE!r}"
-        paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(truth)]
-        for member, tree in members.items():
-            found = candidates.setdefault(member, {}) if member != REFERENCE else native
-            for name, leaf, true in zip(paths, jax.tree.leaves(tree), jax.tree.leaves(truth), strict=True):
-                found.setdefault(name, []).append(distance(leaf, true) ** 2)
-    return admitted_members(native, candidates)
-
-
-def assert_leaves_as_exact_over_orders(draw, label: str, *, terms=None, rows: bool = True) -> dict:
-    """The K-order gate over a comparison's rounding draws. `draw(order)` gives one draw `(dew,
-    members, truth)`: order 0 the case's own, every other the same input under an exact symmetry of
-    the computation that reorders its sums (tests/residual_orders.py), and `members` the reference's
-    ensemble, by name, each its run of the same math under one declared summation tree
-    (tests/reference_trees.py) or, for an external reference whose tree is fixed, that run beside
-    Dew's float32 references. Every order's trees are in order 0's layout (a permuted output's
-    cotangent permuted with it, a permuted parameter's gradient permuted back). `terms`, None or
-    each leaf's float64 terms in that layout (`float64_terms`, order 0's), size the rows: a symmetry
-    moves no row's size, so a draw computes them once, not once an order. Another input is another
-    element, not another rounding of this one, so it is no order. A sum no symmetry reorders
-    (attention's over keys, where a kernel fixes their order) is reordered only by the trees the
-    members sum it under, and the orbit a test draws names the axes it moves.
-
-    Every element of every leaf is held by `assert_elements_as_exact`, over batches of ORDERS orders:
-    orders 0 to ORDERS - 1 first, and the next ORDERS for each confirmation while an element stays
-    flagged. Over the first batch each leaf's RMS distance is held too, within FACTOR of the
-    reference's (`assert_as_exact_over_orders`), and, unless `rows` is false, its worst row within
-    ROW_FACTOR of the reference's worst (`assert_rows_as_exact_over_orders`): supplements, the leaf's
-    rule derived for Gaussian roundings independent across orders and the row's uncalibrated (ORDERS,
-    ROW_FACTOR). One draw within its factors is no evidence that a few elements
-    are, so the first batch is always taken whole. After a second training step a row inherits the
-    first step's rounding through the parameters it reads, which its own terms do not see, so such a
-    comparison passes `rows=False` and its first step holds the rows.
-
-    A member other than the reference (`REFERENCE`) is admitted at a leaf where it is no less exact than
-    the reference there by ADMISSION_MARGIN, judged over a sample of orders of its own on the ensemble
-    alone, Dew's draws unread (`_admission`); the element rule holds Dew to the worst admitted member,
-    the leaf and row rules to the reference alone. Returns `assert_elements_as_exact`'s report: by
-    leaf, the members admitted and the bar's inflation over the reference alone."""
-    batches = {0: _batch(draw, 0, terms, rows)}
-    _, members, leaves, row_distances, sizes = batches[0]
-    # Eligibility is decided on the reference's ensemble alone, its own sample of orders, never on
-    # Dew's; an ensemble of the reference alone has nothing to admit and takes no sample.
-    admitted = ({name: [REFERENCE] for name in leaves[0]} if set(members) == {REFERENCE}
-                else _admission(draw))
-    for name in leaves[0]:
-        mine = np.asarray([order[name][0] for order in leaves])
-        theirs = {member: np.asarray([order[name][1][member] for order in leaves])
-                  for member in leaves[0][name][1]}
-        # The leaf and row supplements hold Dew to the reference alone, so admission moves accuracy
-        # between elements without loosening the leaf's.
-        assert_as_exact_over_orders(mine, theirs[REFERENCE], f"{label} {name}")
-        if rows and sizes[name].size:
-            ours = np.stack([order[name][0] for order in row_distances])
-            reference = np.stack([order[name][1][REFERENCE] for order in row_distances])
-            assert_rows_as_exact_over_orders(ours, reference, f"{label} {name}", sizes[name])
-
-    def batch(stage):
-        if stage not in batches:
-            batches[stage] = _batch(draw, stage, terms, rows=False)
-        return batches[stage][0], batches[stage][1]
-
-    return assert_elements_as_exact(batch, label, admitted=admitted)
 
 
 def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, roundings: int) -> None:

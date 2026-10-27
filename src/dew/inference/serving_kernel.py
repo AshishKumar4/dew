@@ -24,8 +24,9 @@ from dew.batch import Variables
 from dew.inference.tasks import cache_sized
 from dew.mesh import logical_spec
 from dew.nn.attention import CROSS_KEY, CROSS_VALUE
+from dew.nn.cross_attention import CROSS_CACHE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, as_words, from_words, grouped, is_paged, leaf_name
 from dew.nn.protocols import Serving
@@ -463,7 +464,7 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
 
 
 def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
-              options: Mapping[str, str | bool] | None = None) -> jax.stages.Wrapped:
+              options: Mapping[str, Option] | None = None) -> jax.stages.Wrapped:
     """Compile the step program over a state split into resident and carried halves.
 
     The matrix half is donated so XLA updates the cache in place instead of
@@ -545,12 +546,55 @@ def _reusable(compiled: jax.stages.Compiled, formats: Formats) -> Step | None:
     return step
 
 
+def row_state(path) -> bool:
+    """Whether the decoder cache leaf at `path` is a row's own state, which its prompt leaves in the row's
+    slot (a recurrent mixer's memory and conv tail, latent attention's index keys): any leaf but the paged
+    pool's, its table, a row's cursors and a cross-attention layer's context."""
+    return leaf_name(path) not in POOLED | {TABLE} | ROW_CURSORS | CROSS_CACHE
+
+
+def _restored(resident: Slots, carried: Slots, states: Variables, slots: jax.Array,
+              entries: jax.Array) -> tuple[Slots, Slots]:
+    """The state with each row state leaf's `slots` rows set to `states`' `entries` (`row_state`), the rest
+    as it is; a slot past the rows is dropped."""
+    state = joined(resident, carried)
+
+    def restored(held, leaf):
+        return leaf if held is None else leaf.at[slots].set(held[entries].astype(leaf.dtype), mode="drop")
+
+    cache = jax.tree.map(restored, states, state.decoder.cache, is_leaf=lambda x: x is None)
+    return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))
+
+
+def _captured(states: Variables, resident: Slots, carried: Slots, slots: jax.Array,
+              entries: jax.Array) -> Variables:
+    """`states` with `entries` set to the row state leaves' `slots` rows (`row_state`); an entry past the
+    store is dropped."""
+    def captured(held, leaf):
+        return None if held is None else held.at[entries].set(leaf[slots].astype(held.dtype), mode="drop")
+
+    cache = joined(resident, carried).decoder.cache
+    return jax.tree.map(captured, states, cache, is_leaf=lambda x: x is None)
+
+
+def state_programs(formats: Formats, states: Variables) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
+    """The programs that move row states between the resident state, kept in `formats`, and a store of
+    them placed as `states` is: restoring a store's entries into slots, the resident matrices donated, and
+    capturing slots into a store's entries, the store donated (`dew.inference.pages.States`)."""
+    resident, carried = split_donated(formats)
+    placed = jax.tree.map(lambda leaf: leaf.sharding, states)
+    return (jax.jit(_restored, donate_argnums=(0,), in_shardings=(resident, carried, placed, None, None),
+                    out_shardings=(resident, carried)),
+            jax.jit(_captured, donate_argnums=(0,), in_shardings=(placed, resident, carried, None, None),
+                    out_shardings=placed))
+
+
 def opened_in(formats: Formats) -> jax.stages.Wrapped:
     """`opened`, allocating its state in `formats`."""
     return jax.jit(opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
 
 
-_PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None, tuple[tuple[str, bool], ...]],
+_PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None, tuple[tuple[str, Option], ...]],
                 tuple[jax.stages.Wrapped, jax.stages.Wrapped]] = {}
 """One pair of step programs per resident layout; see `decode_programs`."""
 
@@ -562,7 +606,7 @@ Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
 (docs/performance.md). Only a GPU backend is handed them."""
 
 
-def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, bool]
+def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, Option]
                     ) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
     """`_compiled` over `formats`, once per layout and model `options`
     (`dew.nn.kernels.options.compiler_options`), for the decoding step and
@@ -572,9 +616,12 @@ def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[
     it leaves it runs that compile as its decoding step instead
     (`resident_formats`). The formats tree holds the cache mapping and is
     not hashable itself, so its leaves and its structure's text key the
-    programs."""
+    programs. They stay apart from `dew.nn.kernels.options.program`, the
+    seam every other outer program shares: they donate the cache they step
+    and take its formats as placements, neither of which that seam's
+    arguments carry."""
     leaves, structure = jax.tree_util.tree_flatten(formats)
-    key = (tuple(leaves), str(structure), rows, tuple(options.items()))
+    key = (tuple(leaves), str(structure), rows, tuple(sorted(options.items())))
     programs = _PROGRAMS.get(key)
     if programs is None:
         halves = split_donated(formats)

@@ -24,7 +24,7 @@ import numpy as np
 import optax
 import pytest
 from flax.traverse_util import unflatten_dict
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, widened
 
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -32,6 +32,7 @@ from dew.objectives import DistillationObjective
 from dew.objectives.base import Step
 from dew.objectives.distillation import PROJECTIONS, TEACHER
 from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "distillation"
@@ -197,6 +198,7 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
         loss, aux = objective.scalar_loss(params, fixture_batch(arrays), step_at())
         return {metric: {**aux.metrics, "loss": loss}[metric] for metric in named}
 
+    @as_given
     def reference(params, dtype="float32"):
         wide = dtype == "float64"
         trainable = widened(params["params"]) if wide else params["params"]
@@ -228,6 +230,7 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
         return jax.grad(lambda trainable: objective.scalar_loss(
             {**params, "params": trainable}, batch, step_at())[0])(params["params"])
 
+    @as_given
     def pulled(params, dtype="float32"):
         wide = dtype == "float64"
         trainable = widened(params["params"]) if wide else params["params"]
@@ -237,7 +240,8 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
         return student_pullback(wide=wide)(trainable, ids, tuple(jnp.asarray(value) for value in cotangents))
 
     assert_as_exact(dew, pulled, drawn_parameters(params), f"{kind} student gradient",
-                    seeds=DISTILLATION_SEEDS["gradient"], truth_fn=lambda params: pulled(params, "float64"))
+                    seeds=DISTILLATION_SEEDS["gradient"],
+                    truth_fn=as_given(lambda params: pulled(params, "float64")))
     # The fixture's own draw: the student's logits as near its float64 forward as the fixture's,
     # which the reference generator wrote from the same forward.
     outputs = student_forward(wide=False)(params["params"], ids)
@@ -365,10 +369,11 @@ def test_a_vocabulary_mismatch_is_refused_with_the_reason(student_vocab, teacher
 
 
 def test_a_student_with_the_router_balance_loss_is_refused():
-    """`aux_loss_alpha`'s router terms normalise per router, not per token,
+    """The balance loss's router terms normalize per router, not per token,
     so the seam refuses them at the first trace and names the way out."""
     arrays = fixture()
-    student = LMObjective(CausalTransformer(**META["student"]), SEQ, ema_decay=None, aux_loss_alpha=0.01)
+    student = LMObjective(CausalTransformer(**META["student"]), SEQ, ema_decay=None,
+                          balance=ExpertBalance(aux_loss_alpha=0.01))
     teacher = LMObjective(CausalTransformer(**META["teacher"]), SEQ, ema_decay=None)
     objective = DistillationObjective(student, teacher)
     with pytest.raises(ValueError):

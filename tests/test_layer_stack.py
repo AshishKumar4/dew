@@ -19,18 +19,19 @@ import numpy as np
 import pytest
 import selection_margins
 from model_support import largest_difference
-from reference_error import FEWEST_SEEDS, GateFailure, assert_as_exact, widened, without_ynn
+from reference_error import FEWEST_SEEDS, GateFailure, as_given, assert_as_exact, widened, without_ynn
 from sharded import assert_sharded
 from token_support import token_rows
 
+from dew.distributed.batches import shard_batch
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.registry import models
 from dew.training import Layout, MeshSpec
-from dew.training.distributed import shard_batch
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 VOCAB = 64
@@ -269,7 +270,8 @@ class ScanCase:
                 return jax.device_get(self.runs["truth"](*widened((ids, cotangent))))
 
         def arm(name):
-            return lambda ids, cotangent: jax.device_get(self.runs[name](ids, cotangent))
+            # Each arm runs its program, compiled as two Dew arms are (`measured`), and fetches its outputs.
+            return as_given(lambda ids, cotangent: jax.device_get(self.runs[name](ids, cotangent)))
         return arm("scanned"), arm("plain"), truth
 
 
@@ -350,7 +352,7 @@ def test_a_scanned_moe_stack_sows_and_balances_like_the_plain_loop():
 
     outcomes = []
     for model in (plain, scanned):
-        objective = LMObjective(model, 11, balance_rate=0.01, aux_loss_alpha=0.1)
+        objective = LMObjective(model, 11, balance=ExpertBalance(balance_rate=0.01, aux_loss_alpha=0.1))
         loss, aux = objective.scalar_loss(variables, batch, step)
         assert aux.effects is not None
         outcomes.append((float(loss), {name: float(value) for name, value in aux.metrics.items()},
@@ -444,7 +446,8 @@ def loss_and_grads(objective, spec, variables, batch, devices=None, microbatches
 
 
 @mesh_lane
-@pytest.mark.parametrize("build, balance", [(tiny, {}), (routed, {"balance_rate": 0.01})],
+@pytest.mark.parametrize("build, balance",
+                         [(tiny, {}), (routed, {"balance": ExpertBalance(balance_rate=0.01)})],
                          ids=["dense", "moe"])
 def test_a_pipeline_over_two_stages_has_the_loss_and_gradient_of_one(build, balance):
     """Four layers over two stages fed four microbatches, against the same
@@ -482,6 +485,7 @@ def layer_states_on(spec, model, variables, microbatches=None):
     placed = jax.device_put(variables, Layout(min_shard=TINY_SHARD).shardings(mesh, variables))
     compiled = without_ynn(lambda tree, rows: layer_states(model, tree, rows))
 
+    @as_given
     def states(ids):
         rows = shard_batch(mesh, {"ids": ids})["ids"]
         with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
@@ -670,8 +674,9 @@ def fetched_layer_states():
               if name.startswith("layers_")}
     on_host = {**variables, "params": {**variables["params"], **layers}}
     compiled = without_ynn(lambda tree, ids: layer_states(model, tree, ids))
-    return (lambda ids: compiled(on_host, ids)), (lambda ids: compiled(variables, ids)), float64_layer_states(
-        model, variables)
+    # Each arm runs the compiled program on its own weights, the host-resident ones kept in host memory.
+    return (as_given(lambda ids: compiled(on_host, ids)), as_given(lambda ids: compiled(variables, ids)),
+            float64_layer_states(model, variables))
 
 
 def test_a_host_resident_stacks_layer_states_are_a_resident_ones():

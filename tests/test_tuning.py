@@ -20,23 +20,31 @@ from process_support import READ_ONLY, REPO_ROOT, fresh, keeping_picks, run_pool
 from reference_error import equations
 
 from dew.nn.activations import gated_product
-from dew.nn.attention import rms_normalized, stream_rms_normalized
+from dew.nn.attention import stream_rms_normalized
 from dew.nn.kernels import generation, norm_swiglu, tuning
 
 
+def seam(x, branch, scale):
+    """The fused pre-norm seam called itself (`norm_swiglu.stream_rms_norm`), interpreted on a CPU, XLA's
+    seam its portable arithmetic."""
+    def portable(x, branch, scale):
+        return stream_rms_normalized(x, branch, scale, 1e-6, x.dtype, scale_offset=True,
+                                     scale_after_cast=False, fp32_statistics=True, implementation="xla")
+
+    return norm_swiglu.stream_rms_norm(x, branch, scale, 1e-6, x.dtype, offset=True, after_cast=False,
+                                       portable=portable)
+
+
 def loss(x, branch, scale, gate, up):
-    stream, normed = stream_rms_normalized(x, branch, scale, 1e-6, x.dtype, scale_offset=True,
-                                           scale_after_cast=False, fp32_statistics=True,
-                                           implementation="pallas")
+    stream, normed = seam(x, branch, scale)
     # The product feeds the rest of the step, as a down projection reads it: a step whose gradient
     # never reads a fused kernel's output drops its forward launch (`generation.linear_tangent`).
-    product = gated_product("swiglu", implementation="pallas")(gate, up)
+    product = norm_swiglu.swiglu(gate, up, gated_product("swiglu", implementation="xla"))
     return jnp.sum(stream * normed) + jnp.sum(product * product)
 
 
 def plain(x, scale):
-    return rms_normalized(x, scale, 1e-6, x.dtype, scale_offset=True, scale_after_cast=False,
-                          fp32_statistics=True, implementation="pallas")
+    return seam(x, None, scale)[1]
 
 
 def step():
@@ -95,19 +103,24 @@ READ = """
 import json
 from test_tuning import launches, operands, step
 from dew.nn.kernels import tuning
-print(json.dumps([{rows: launches(step(), *operands(rows)) for rows in (13, 15, 40)},
-                  tuning.settled(tuning.tune(lambda: step().lower(*operands(15)))[1])]))
+with tuning.reading():
+    found = {rows: launches(step(), *operands(rows)) for rows in (13, 15, 40)}
+print(json.dumps([found, tuning.settled(tuning.tune(lambda: step().lower(*operands(15)))[1])]))
 """
 
 
 def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     """The four launches of a norm seam and SwiGLU step are found in its
     lowered program, keyed with their token axis at a power of two. Each
-    takes its heuristic, a pinned config its space holds, and in a fresh
-    process the picks stored for its device beside its compilation cache,
-    for every token count in the bucket, and a token count stored for no
-    bucket the nearest bucket's, beside a launch of a kernel only another
-    checkout has. Nothing measures on a CPU or beside other work on a GPU.
+    takes its heuristic, a pinned config of its type (one of another type
+    raises, naming the config and why), and in a fresh
+    process reading picks as an opt-in tuning run does (`tuning.reading`)
+    the picks stored for its device beside its compilation cache (each a
+    variant of its launch, `KernelOp.variants`), for every token count in
+    the bucket, and at a token count of a bucket nothing stores its
+    heuristic, a pick serving its own key alone, beside a launch of a kernel
+    only another checkout has. Nothing measures on a CPU or beside other
+    work on a GPU.
     A process under deterministic ops reads none of them and launches its
     heuristics, the same in every process while other runs store picks."""
     with tuning.launches():
@@ -124,21 +137,25 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
 
     usual = launches(step(), *operands(15))
     assert usual["rms_norm_forward"] == ((1,), 4) and usual["swiglu_forward"] == ((2,), 4)
-    # A pinned config its space holds wins; one it does not hold (64 rows of a 64-wide norm) is passed over.
+    # A pinned config of the launch's type wins; one of another type raises.
     with tuning.pinned({norm_swiglu.RmsForward: norm_swiglu.RowsConfig(1, 1),
                         norm_swiglu.RmsBackward: norm_swiglu.ReverseConfig(1, 256, 2),
                         norm_swiglu.SwigluForward: norm_swiglu.BlockConfig(4096, 8)}):
         pinned = launches(step(), *operands(15))
     assert pinned["rms_norm_forward"] == ((15,), 1) and pinned["rms_norm_backward"] == ((15,), 2)
     assert pinned["swiglu_forward"] == ((1,), 8) and pinned["swiglu_backward"] == usual["swiglu_backward"]
-    with tuning.pinned({norm_swiglu.RmsForward: norm_swiglu.RowsConfig(64, 2)}):
-        assert launches(step(), *operands(15)) == usual
+    with (tuning.pinned({norm_swiglu.RmsForward: norm_swiglu.BlockConfig(1024, 4)}),
+          pytest.raises(tuning.Unpinnable) as refused):
+        launches(step(), *operands(15))
+    assert (refused.value.kernel, refused.value.config) == ("RmsForward", norm_swiglu.BlockConfig(1024, 4))
 
-    # The picks a GPU measured, stored for this device, as a fresh process finds them.
-    picked = {norm_swiglu.RmsForward: norm_swiglu.RowsConfig(4, 2),
-              norm_swiglu.RmsBackward: norm_swiglu.ReverseConfig(2, 256, 8),
-              norm_swiglu.SwigluForward: norm_swiglu.BlockConfig(512, 2),
-              norm_swiglu.SwigluBackward: norm_swiglu.BlockConfig(256, 1)}
+    # The picks a GPU measured, stored for this device, as a fresh process finds them: each launch's
+    # variant beside its heuristic (16 rows and 4 warps a norm program, a step's 1024 elements a SwiGLU's).
+    picked = {norm_swiglu.RmsForward: norm_swiglu.RowsConfig(8, 4),
+              norm_swiglu.RmsBackward: norm_swiglu.ReverseConfig(16, 1, 8),
+              norm_swiglu.SwigluForward: norm_swiglu.BlockConfig(2048, 4),
+              norm_swiglu.SwigluBackward: norm_swiglu.BlockConfig(512, 4)}
+    assert all(picked[type(ba.op)] in ba.op.keyed(ba).autotuning_configs for ba in found)
     timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                    metadata={})
     # A plain norm's pick beside them: a launch with no branch, which the seam's nearest search passes over.
@@ -146,7 +163,7 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
         [alone] = tokamax.autotuning.get_bound_args(jax.jit(plain), operands(15)[0], operands(15)[2])
     picks = tuning.dumps_picks(jax.devices()[0].device_kind, (
         *((ba, tuning.Timings({picked[type(ba.op)]: timing})) for ba in found),
-        (alone, tuning.Timings({norm_swiglu.RowsConfig(2, 1): timing}))))
+        (alone, tuning.Timings({norm_swiglu.RowsConfig(16, 8): timing}))))
     # Stored as every checkout writes its picks: each op as its picks name it, without the device check
     # a describing launch bypasses (`tuning._identity`).
     written = json.loads(picks)
@@ -155,16 +172,17 @@ def test_a_steps_launches_take_pins_stored_picks_and_heuristics(tmp_path):
     [path] = fresh(STORED, with_foreign(json.dumps(written)), cache_dir=tmp_path / "cache", flags=flags)
     assert path.startswith(str(tmp_path / "cache" / "autotune" / "jaxlib-")) and path.endswith(".json")
     stored, tuned = fresh(READ, cache_dir=tmp_path / "cache", flags=flags)
-    for rows in ("13", "15", "40"):
-        assert stored[rows]["rms_norm_forward"] == [[-(-int(rows) // 4)], 2]
-        assert stored[rows]["swiglu_backward"] == [[-(-int(rows) * 96 // 256)], 1]
+    heuristics = {str(rows): launches(step(), *operands(rows)) for rows in (13, 15, 40)}
+    heuristics = json.loads(json.dumps(heuristics))
     for rows in ("13", "15"):
-        assert stored[rows]["rms_norm_backward"] == [[-(-int(rows) // 2)], 8]
+        assert stored[rows]["rms_norm_forward"] == [[-(-int(rows) // 8)], 4]
+        assert stored[rows]["swiglu_backward"] == [[-(-int(rows) * 96 // 512)], 4]
+        assert stored[rows]["rms_norm_backward"] == [[1], 8]
+    assert stored["40"] == heuristics["40"]
     assert tuned is True
     assert os.listdir(os.path.dirname(path)) == [os.path.basename(path)]
     repeatable, _ = fresh(READ, cache_dir=tmp_path / "cache", flags=f"{flags} {DETERMINISTIC_OPS}")
-    heuristics = {str(rows): launches(step(), *operands(rows)) for rows in (13, 15, 40)}
-    assert repeatable == json.loads(json.dumps(heuristics))
+    assert repeatable == heuristics
     assert repeatable != stored
 
 
@@ -247,30 +265,29 @@ def test_a_step_settles_each_distinct_launch_once(tmp_path):
     Tuned as on a GPU, the two-layer step's launches are the one layer's,
     each once: the pool decides each distinct launch once, and a measuring
     pass measures it once, not once a layer. With no picks stored, the process
-    says so once, as information: a heuristic config is a working default,
-    which a notebook's output should not flag as a fault."""
+    says nothing: a derived config is the default, and users tune nothing
+    (bible §6)."""
     two, one, told = fresh(DISTINCT, cache_dir=tmp_path / "cache", flags=keeping_picks())
     assert len(one) == 4 and two == one
-    assert [level for level, message in told if "have no config measured" in message] == ["INFO"]
+    assert not [message for _, message in told if "measure" in message]
 
 
 @pytest.mark.parametrize("stores, rows, norms", [
-    ({0: {8: (4, 2)}}, (15,), [[[4], 2]]),
-    ({1: {8: (4, 2)}}, (15,), [[[1], 4]]),
-    ({0: {16: (4, 2)}, 1: {8: (4, 2), 64: (8, 4)}}, (16, 32), [[[4], 2], [[8], 2]]),
-], ids=["process 0 holds", "process 1 holds", "one pick moves another's nearest"])
+    ({0: {15: (8, 4)}}, (15,), [[[2], 4]]),
+    ({1: {15: (8, 4)}}, (15,), [[[1], 4]]),
+    ({0: {16: (8, 4)}, 1: {64: (32, 4)}}, (16, 64), [[[2], 4], [[4], 4]]),
+], ids=["process 0 holds", "process 1 holds", "each key its own"])
 def test_every_process_launches_process_zeros_config_for_a_launch_without_a_pick(tmp_path, stores, rows,
                                                                                    norms):
-    """A launch without a pick of its own takes the nearest stored pick, or its
-    heuristic, as process 0 resolves it, whatever another process stores: the
-    program `tune` returns on each of two processes launches each norm alike.
-    Where process 0 stores an 8-token norm's pick, 4 rows a program and 2
-    warps, a 15-token step's norm takes it on both; where process 1 does, the
-    heuristic's one program of 4 warps. Where process 0 stores a 16-token pick
-    and process 1 an 8- and a 64-token one, a step at 16 and 32 tokens takes
-    process 0's pick for both on both: process 1's 32-token norm, first traced
-    with its 64-token neighbour's 8 rows and 4 warps, traces again once the
-    16-token pick that becomes its nearest is installed."""
+    """A launch takes its own key's pick as process 0 resolves it, else its
+    heuristic, whatever another process stores: the program `tune` returns on
+    each of two processes launches each norm alike. Where process 0 stores a
+    15-token norm's pick, 8 rows a program (a variant of the heuristic's 16),
+    the step's norm takes it on both; where process 1 does, the heuristic's
+    one program of 4 warps. Where process 0 stores a 16-token pick and process
+    1 a 64-token one, a step at 16 and 64 tokens takes process 0's pick at 16
+    and the heuristic at 64 on both: process 1's 64-token norm, first traced
+    with its own pick's 32 rows, traces again with process 0's decision."""
     timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                    metadata={})
 
@@ -301,8 +318,8 @@ import dew.nn.backbones
 from dew import cache
 from dew.objectives.lm import LMObjective
 from dew.registry import models
+from dew.distributed.batches import shard_batch
 from dew.training import Trainer
-from dew.training.distributed import shard_batch
 
 seq = int(sys.argv[1])
 model = models.build("causal_transformer", vocab_size=4096, emb_features=1024, num_layers=2, num_heads=8,
@@ -341,7 +358,7 @@ print(json.dumps([path, stamp, tuning.settled(launches), len(lowerings)]))
 def test_only_an_explicit_pass_on_a_gpu_to_itself_measures_and_it_measures_each_launch_once(tmp_path):
     """A language model's step compiled by the Trainer measures nothing. An
     explicit pass (`tune(..., measure=True)`) on a GPU it has to itself
-    measures each launch over every config of its space, stores every time
+    measures each launch over every variant (`KernelOp.variants`), stores every time
     and keeps the fastest; the next pass measures nothing, and one beside
     other work on its GPU (gpu-run -n 0.5) adds no picks for a new shape."""
     inherited = keeping_picks()
@@ -393,7 +410,7 @@ def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement(
     broken_config = sorted(norm.autotuning_configs, key=repr)[0]
 
     class Broken(norm_swiglu.RmsForward):
-        """The norm's forward, raising for one config of its space. Its signature is the norm's, which
+        """The norm's forward, raising for one of its variants. Its signature is the norm's, which
         tokamax reads to bind the launch's operands."""
 
         @functools.wraps(norm_swiglu.RmsForward._fwd)

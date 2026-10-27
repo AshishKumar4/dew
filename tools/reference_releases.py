@@ -45,6 +45,9 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     "diffusers-pipelines": {"diffusers": tested("diffusers"), "transformers": "4.49.0"},
     "diffusers-limits": {"diffusers": tested("diffusers"), "mpmath": "1.3.0"},
     "diffusers-0.40": {"diffusers": "0.40.0"},
+    # Wan 2.1's transformer and pipeline fixtures, recorded against diffusers 0.34.0, whose UniPC schedule a later
+    # release moves by a step (diffusers_wan_reference).
+    "diffusers-0.34": {"diffusers": "0.34.0", "transformers": "5.16.1"},
     "rae": {"diffusers": "0.40.0", "transformers": "4.57.1"},
     "gptqmodel": {"gptqmodel": "7.5.0"},
     "trl": {"trl": "1.12.0"},

@@ -1,6 +1,7 @@
 """Artifact coverage, crash boundaries, duplicate records and bounded admission."""
 
 import contextlib
+import gc
 import hashlib
 import json
 import os
@@ -248,6 +249,35 @@ def test_cache_identity_and_clean_revision_are_required(refused):
     with pytest.raises(ValueError):
         _cache().mapped(rows, _key(**refused))
     assert _key().key != _key(revision="changed").key
+
+
+def test_a_remote_generation_of_more_shards_than_its_mirror_holds_reads_every_record(tmp_path):
+    """A generation's replay keeps as many shards' readers open as Loading's read threads, the room a
+    remote transport's mirror is sized for (`ShardReaders`): a generation of more shards than that, a
+    record each, read by index end to end through one mirror directory of exactly that many shards,
+    reads every record, each idle reader's mirror released before the next shard's opens."""
+    from dew.data.dataset import Loading
+
+    readers, count = Loading().threads, Loading().threads + 4
+    with moto_bucket("cache") as (bucket, options):
+        url = f"s3://{bucket}/cache"
+        cache, key = Cache(url, storage_options=options, shard_bytes=1), _key()
+        source = Memory([{"id": index} for index in range(count)])
+        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
+        for index in range(len(rows)):
+            rows[index]
+        rows.finish()
+        rows.close()
+        cache.publish(key, source)
+        sizes = [entry["bytes"] for entry in cache.generation(key).manifest["shards"].values()]
+        assert len(sizes) > readers
+        mirror = {"dewcache": {"cache_storage": str(tmp_path / "mirror")}}
+        mirrored = Cache(url, storage_options={**options, **mirror}, mirror_bytes=readers * max(sizes))
+        generation = mirrored.generation(key)
+        assert [generation[index] for index in range(len(generation))] == [
+            {"id": index} for index in range(count)
+        ]
+        generation.close()
 
 
 def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
@@ -1215,31 +1245,55 @@ def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
     assert publish(chunked(first).pack(4, bins=2), cache, read="streamed").url != generation.url
 
 
+def rewritten_warm_read(tmp_path, read: str, loading):
+    """A warm cached read, under `loading`, of a generation whose manifest was rewritten since its
+    cache's CURRENT committed it: the same records in other bytes. Shards of two records, so each
+    worker streams its own."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition
+
+    chain = Memory([{"id": index} for index in range(8)], shard_rows=2).map(Offset(1))
+    cache = Cache(str(tmp_path / "cache"))
+    publish(chain, cache, read=read)
+    loader = compile(chain.cache(cache).repeat().batch(2), read=read, loading=loading)
+    (manifest,) = (tmp_path / "cache").rglob("generations/*/manifest.json")
+    rewritten = json.dumps(json.loads(manifest.read_bytes()), indent=1).encode()
+    manifest.unlink()
+    manifest.write_bytes(rewritten)
+    return loader.train(DataPartition())
+
+
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
 def test_a_warm_cache_read_by_worker_processes_refuses_a_manifest_rewritten_since_it_was_committed(
         tmp_path, read):
     """Worker processes read a published generation's manifest checked against the size and digest
     its cache's CURRENT committed it under, as the process that compiled the read does: a manifest
     rewritten since, the same records in other bytes, is refused, not read."""
-    from dew.data.compile import compile, publish
-    from dew.data.dataset import DataPartition, Loading
+    from dew.data.dataset import Loading
 
-    # Shards of two records, so each worker streams its own.
-    chain = Memory([{"id": index} for index in range(8)], shard_rows=2).map(Offset(1))
-    cache = Cache(str(tmp_path / "cache"))
-    publish(chain, cache, read=read)
-    loader = compile(chain.cache(cache).repeat().batch(2), read=read,
-                     loading=Loading(workers=2, threads=1, read_buffer=2))
-    (manifest,) = (tmp_path / "cache").rglob("generations/*/manifest.json")
-    rewritten = json.dumps(json.loads(manifest.read_bytes()), indent=1).encode()
-    manifest.unlink()
-    manifest.write_bytes(rewritten)
-    reader = loader.train(DataPartition())
+    reader = rewritten_warm_read(tmp_path, read, Loading(workers=2, threads=1, read_buffer=2))
     try:
         with pytest.raises(OSError):
             next(reader)
     finally:
         reader.close()
+
+
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_cached_read_its_cache_refuses_leaves_no_shard_iterator_half_built(tmp_path, read):
+    """A read whose published generation the cache refuses, its manifest rewritten since it was
+    committed, raises where it opens, and the iterators it opened close whole: none is left half
+    built for the collector to close, so no close raises unraisably."""
+    from dew.data.dataset import Loading
+
+    reader = rewritten_warm_read(tmp_path, read, Loading(workers=0, threads=1, read_buffer=0))
+    try:
+        with pytest.raises(OSError):
+            next(reader)
+    finally:
+        reader.close()
+    gc.collect()
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed"])
@@ -1342,6 +1396,27 @@ def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_pat
     retry.close()
     assert cache.publish(second_key, source)[0] == {"id": 0}
     assert cache.generation(first_key) is None
+
+
+def test_local_retention_counts_what_its_root_holds_once_its_record_passes_the_limit(tmp_path):
+    """A local root records the bytes its writes reserve, so a write under the limit counts nothing
+    again. Bytes removed outside a reservation leave the record above what the root holds: the next
+    write the record would refuse counts the root again and is admitted, and nothing is evicted."""
+    from dew.data.retention import LocalRetention
+
+    retention = LocalRetention(tmp_path, 1_000)
+    key = tmp_path / ("a" * 64)
+    for name in ("one", "two"):
+        target = key / name
+        with retention.reserve(target, 400):
+            key.mkdir(exist_ok=True)
+            target.write_bytes(b"x" * 400)
+    assert int((tmp_path / ".retention.bytes").read_text()) == 800
+    (key / "one").unlink()
+    with retention.reserve(key / "three", 400):
+        (key / "three").write_bytes(b"x" * 400)
+    assert sorted(path.name for path in key.iterdir()) == ["three", "two"]
+    assert int((tmp_path / ".retention.bytes").read_text()) == 800
 
 
 def test_local_retention_reclaims_the_bytes_of_fills_closed_before_they_sealed(tmp_path):

@@ -22,12 +22,20 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER, decode_steps, model_draw, with_logit_cotangent
-from reference_error import assert_as_exact, torch_with_gradients, widened, with_gradients, without_ynn
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    torch_with_gradients,
+    widened,
+    with_gradients,
+    without_ynn,
+)
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.kernels.selection import KernelRefused
+from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 from dew.nn.mixers import AttentionMixer
 from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling
@@ -180,10 +188,12 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
         ids = np.random.default_rng([0x0D, seed]).integers(0, 17, held["ids"].shape)
         return (ids.astype(held["ids"].dtype),)
 
+    @as_given
     def ours(ids):
         with jax.default_device(cpu), jax.default_matmul_precision(FP32_SUMS):
             return jax.device_get(current(params, ids))
 
+    @as_given
     def theirs(ids):
         with jax.default_device(cpu):
             return jax.device_get(exported(params, ids))
@@ -196,12 +206,22 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
                     truth_fn=truth)
 
 
+def flax_with_keep(query, value, mask, rng, rate: float) -> jax.Array:
+    """Flax's attention arithmetic under `dew`'s dropout draw: the weights of `query` against itself under
+    `mask`, times the keep draw `dropout_keep` takes from `rng` (the draw `scaled_dot_product_attention`
+    takes), then the value product. Flax's own dropout is a bernoulli draw of another stream, so the keep
+    is materialized here and the arithmetic around it is flax's."""
+    weights = nn.dot_product_attention_weights(query, query, mask=mask, deterministic=True)
+    keep = dropout_keep(dropout_seed(rng), rate, weights.shape)
+    scale = jnp.asarray(1 / (1 - rate), weights.dtype)
+    return jnp.einsum("...hqk,...khd->...qhd", weights * jnp.where(keep, scale, 0), value)
+
+
 def test_attention_probability_dropout_matches_flax_on_the_same_draw(rng):
     query = jnp.zeros((1, 4, 2, 4), jnp.float32)
     value = jnp.broadcast_to(jnp.eye(4)[None, :, None, :], (1, 4, 2, 4))
     mask = jnp.tril(jnp.ones((4, 4), bool))[None, None]
-    expected = nn.dot_product_attention(query, query, value, mask=mask, dropout_rate=.5,
-                                        dropout_rng=rng, broadcast_dropout=False, deterministic=False)
+    expected = flax_with_keep(query, value, mask, rng, .5)
     actual = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference",
                                           dropout_rate=.5, dropout_rng=rng, deterministic=False)
     assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
@@ -241,8 +261,7 @@ def test_attention_dropout_preserves_visibility_masks(rng):
     documents = jnp.asarray([[1, 1, 2, 2]])
     visible = (documents[:, :, None] == documents[:, None, :])[:, None]
     visible = visible & jnp.tril(jnp.ones((4, 4), bool))[None, None]
-    expected = nn.dot_product_attention(query, query, value, mask=visible, dropout_rate=.5,
-                                        dropout_rng=rng, broadcast_dropout=False, deterministic=False)
+    expected = flax_with_keep(query, value, visible, rng, .5)
     actual = scaled_dot_product_attention(query, query, value, causal=True, segment_ids=documents,
         implementation="auto", dropout_rate=.5, dropout_rng=rng, deterministic=False)
     assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
@@ -319,13 +338,14 @@ def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
 
 
 @pytest.mark.gpu(reason="FlashAttention runs on CUDA")
-def test_a_cached_prompt_reads_its_cache_through_flash_where_its_row_names_it(rng, without_deterministic_ops):
+def test_a_cached_prompt_reads_its_cache_through_flash_where_its_wheel_runs(rng, without_deterministic_ops):
     """A bf16 prompt prefilled into the cache under 'auto' reads it as the documents its tokens end, no
-    mask, which FlashAttention takes where the GPU's row names it for packed documents: the compiled
-    prefill holds its kernel there, and its logits are on par with the xla
-    kernel's uncached forward from the float64 forward over drawn weights and
-    prompts (check 1)."""
-    from dew.nn.kernels.generation import measured_kernel
+    mask, which FlashAttention takes wherever its wheel holds code for the GPU (Hopper's declared cell, other
+    GPUs' first kernel by legality): the compiled prefill holds its kernel there, and its logits are on par
+    with the xla kernel's uncached forward from the float64 forward over drawn weights and prompts
+    (check 1)."""
+    from dew.nn.attention import attention_case
+    from dew.nn.attention_kernels import ATTENTION
 
     model = tiny(dtype=jnp.bfloat16)
     ids = tokens(rng)
@@ -333,8 +353,9 @@ def test_a_cached_prompt_reads_its_cache_through_flash_where_its_row_names_it(rn
     prompt = ids[:, :6]
     made, step = decode_steps(model)
     compiled = step.lower(params, made(params, prompt.shape[0]), prompt).compile().as_text()
-    flash = (measured_kernel('attention_packed', 'xla') == 'flash'
-             and measured_kernel('attention', 'cudnn') == 'flash')
+    probe = jnp.zeros((1, 8, 1, 64), jnp.bfloat16)
+    failed = ATTENTION.kernel('flash').failed(attention_case(probe, probe))
+    flash = not {requirement.code for requirement in failed} & {'not_installed', 'binary_arch'}
     # FlashAttention-2's and -3's packed calls (dew_flash_attn's custom-call targets).
     assert bool(re.search(r'dew_flash3?_mha_varlen_fwd', compiled)) == flash
     assert_as_exact(lambda params, prompt: step(params, made(params, prompt.shape[0]), prompt)[0],
@@ -1013,6 +1034,7 @@ def test_the_tied_head_rounds_its_bf16_product_to_bf16_logits_under_bf16_compute
         # otherwise, and the head's input is the compiled one's.
         states = jax.jit(lambda params, ids: model.apply(params, ids, method=CausalTransformer.hidden_states))
 
+        @as_given
         def run(params, ids):
             narrow = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
             with jax.enable_x64(new_val=False):
@@ -1120,6 +1142,7 @@ def test_a_cast_then_scale_norm_rounds_under_jit_and_keeps_an_fp32_weight_gradie
             return norm.apply({"params": {"scale": weight}}, x).astype(jnp.float32)
         return with_gradients(normed)(weight, c)[1]
 
+    @as_given
     def summed(x, weight, c):
         rounded = normalized(x)
         dtype = np.asarray(c).dtype
@@ -1208,7 +1231,7 @@ def test_an_expert_gated_product_rounds_its_projections_and_product_under_jit(ac
         out, dx = expert(*inputs, np.float32(1))
         return out, *_blocks(dx)
 
-    assert_as_exact(ours, lambda *inputs: handed_out(*reference(*inputs)), draw,
+    assert_as_exact(ours, as_given(lambda *inputs: handed_out(*reference(*inputs))), draw,
                     f"{activation} output and input gradient", seeds=GATED_SEEDS, truth_fn=truth)
 
 
@@ -1280,6 +1303,7 @@ def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head
 
     from dew.nn.mixers.attention import exclusive_self_attention
 
+    @as_given
     def oracle(y, v):
         v = np.repeat(np.asarray(v), 2, axis=-2)
         norm = np.sum(v * v, -1, keepdims=True)

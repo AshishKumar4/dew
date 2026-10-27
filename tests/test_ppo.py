@@ -24,7 +24,7 @@ from episode_support import (
     verify,
 )
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
 from rl_support import clipped_surrogate, token_mean
 
 from dew.batch import part
@@ -232,9 +232,9 @@ def test_whitened_advantages_of_rewards_far_above_the_values_are_as_exact_as_the
         return np.concatenate(advantages), rewards, values
 
     def equations(dtype):
-        return lambda seed: {"advantages": whitened(*drawn(int(seed))[1:], 1., 1., dtype)}
+        return as_given(lambda seed: {"advantages": whitened(*drawn(int(seed))[1:], 1., 1., dtype)})
 
-    assert_as_exact(lambda seed: {"advantages": drawn(int(seed))[0]}, equations(np.float32),
+    assert_as_exact(as_given(lambda seed: {"advantages": drawn(int(seed))[0]}), equations(np.float32),
                     lambda seed: (np.int32(seed),), "whitened advantages of shifted rewards",
                     seeds=PPO_SHIFT_SEEDS, truth_fn=equations(np.float64))
 
@@ -279,7 +279,7 @@ def test_muonclip_steps_both_the_actor_and_a_transformer_critic():
 
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1,
                               num_heads=2, mlp_features=16, max_seq_len=8, qk_norm=False)
-    objective = PPOObjective(model, 5, critic=ValueHead(model), qk_stats=True)
+    objective = PPOObjective(model, 5, critic=ValueHead(model))
     optimizer = OptimConfig(optimizer="muonclip", learning_rate=0.,
                             optimizer_opts={"qk_clip_threshold": .01}).build(1)
     trainer = Trainer(objective, optimizer, key=jax.random.key(0))
@@ -291,7 +291,8 @@ def test_muonclip_steps_both_the_actor_and_a_transformer_critic():
              "response_mask": mask, "advantages": mask,
              "behavior_log_probs": jnp.full(ids.shape, -3.),
              "old_values": jnp.zeros_like(mask), "returns": mask}
-    _, aux = objective.loss(initial.variables, batch, Step(jnp.array(0), jax.random.key(1), None))
+    observing = Step(jnp.array(0), jax.random.key(1), None, qk_stats=True)
+    _, aux = objective.loss(initial.variables, batch, observing)
     assert aux.qk_stats is not None and set(aux.qk_stats) == {"policy", "critic"}
     for name, path in (("policy", ()), ("critic", ("backbone",))):
         stats = aux.qk_stats[name]

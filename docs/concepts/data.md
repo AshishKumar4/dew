@@ -51,6 +51,7 @@ A preset is a plain function from a dataset and its settings to a dataset, appli
 |---|---|
 | A source and `batch(n)` | The source's fields, with numeric values in JAX's configured widths |
 | `lm` | `text`, int32 `[B, seq_len + 1]`; packing adds `text_coordinates` |
+| `lm` with a prefix run (`LMObjective(prefix=...)`) | `text_block_groups`, int32 `[B, seq_len + 1]`: the blocks a prefix run reads whole, -1 outside any |
 | `sft` | Packed `text`, `text_coordinates` and aligned `text_roles` |
 | `canvas` | One row per assistant turn: `text`, int32 `[B, prompt_length + canvases * canvas_size]`, and `canvas_mask` |
 | `prompts` | Left-padded prompt IDs, prompt lengths and fixed-width reward metadata |
@@ -162,7 +163,7 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 ## Mixtures, objectives and order
 
-`mix(datasets, weights=..., by="records" | "tokens")` mixes accepted records before sharding and ends at its first exhausted member, as Grain's mix does; a member that repeats never ends. With `by="tokens"`, token stores' shares count valid targets, not padding. `phases((first, until_step), ..., (last, None))` reads datasets one after another, each until the training step it names and the last until the run ends; each phase is a whole chain of the same batch.
+`mix(datasets, weights=..., by="records" | "tokens")` mixes accepted records before sharding and ends at its first exhausted member, as Grain's mix does; a member that repeats never ends. With `by="tokens"`, token stores' shares count valid targets, not padding. `phases((first, until_step), ..., (last, None))` reads datasets one after another, each until the training step it names and the last until the run ends; each phase is a whole chain of the same batch. `schedule([(first, tokens), ..., (last, None)])` reads them on the run's committed-token clock instead: each stage ends at the step whose commit brings the run's committed tokens, the count `fit(tokens=)` reads, to the stage's own.
 
 ## Token-budget batches
 
@@ -180,7 +181,7 @@ A chain's stages run where written. Use `map`, `random_map`, `filter`, `filter_m
 
 ## Cache and storage publication
 
-`pipeline.cache(Cache(url, ...))` is a bounded write-through artifact stage. It identifies the source snapshot, transform code, dependencies and tokenizer. A filling run keeps its own plan even if another process publishes a complete generation.
+With no `cache=`, a memory or indexed read caches the records its leading maps make where one of them costs more to run than to read back, a learned tokenizer's encoding (`dew.data.pipeline.Costly`), up to a step that reads a file its record names by path (`External`), in a local directory of bounded size, and a later run reads them back; `Loading(cache=False)` or `DEW_DATA_CACHE=off` turns it off. `pipeline.cache(Cache(url, ...))` is a bounded write-through artifact stage. It identifies the source snapshot, transform code, dependencies and tokenizer. A filling run keeps its own plan even if another process publishes a complete generation.
 
 `publish(prefix, Cache(url), read=...)` drains a deterministic prefix, certifies source coverage and publishes one generation transactionally. A future run names `Generation(url)` explicitly to read it. Random steps belong after the cache; a plain function before it needs a stable identity. Cache writes require a clean checkout.
 
@@ -200,7 +201,7 @@ With it, `r2://bucket/path` reads and publishes through s3fs with those options.
 
 ## Loading and image augmentation
 
-`workers(n)`, `threads(n)` and `prefetch(n)`, or `loading(Loading(...))` for every setting at once, change concurrency, never data order or per-record draws. A chain that names none reads in the training process (`workers=0`); `loading(Loading(workers="auto"))` takes Grain's memory-budgeted tuning. A script that starts worker processes needs an `if __name__ == "__main__":` guard.
+`workers(n)`, `threads(n)` and `prefetch(n)`, or `loading(Loading(...))` for every setting at once, change concurrency, never data order or per-record draws. A chain that names none reads in the training process (`workers=0`); `loading(Loading(workers="auto"))` sizes the workers and read buffer from the CPUs the process may run on and the memory it may take. A script that starts worker processes needs an `if __name__ == "__main__":` guard.
 
 `augment=True` on `presets.images` runs the crop, flip and colour jitter on a batch with JAX; `images.DeviceAugment(size, crop_scale=, flip=, jitter=)` sets them itself, and a random host step or a tuple of them, such as `images.RandomCrop(size)` or `images.Albumentations(aug)`, runs on the host instead. Without `augment`, the preset resizes deterministically. `staging_size` is the decoded square before cropping, and `crop_scale` is the area fraction kept.
 

@@ -35,6 +35,8 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.batch import FROZEN, merge, select, thaw
+from dew.distributed.batches import batch_shardings
+from dew.distributed.host import transfer
 from dew.inference.banks import (
     assembled,
     bank_sharding,
@@ -49,9 +51,7 @@ from dew.inference.banks import (
 )
 from dew.mesh import batch_axes
 from dew.nn.backbones.layer_plan import layer_index
-from dew.nn.kernels.options import program
-from dew.training.distributed import batch_shardings
-from dew.training.host import transfer
+from dew.nn.kernels.options import Option, program
 from dew.training.memory import device_tokens, step_compiler_options
 from dew.training.transaction import Realization, placed_as_rows
 
@@ -196,9 +196,9 @@ class HostExecution:
         self.accelerator, self.cpu = accelerator, cpu
         self.sites = bank_sites(objective) if objective.bank_sites else ()
         self.device = device
-        self.unstack = jax.jit(functools.partial(logical, sites=self.sites))
+        self.unstack = functools.partial(program(logical, static_argnames="sites"), sites=self.sites)
 
-    def forward(self, step: Mapping[str, bool | int]):
+    def forward(self, step: Mapping[str, Option]):
         """The loss and its pullback, compiled for the objective's modules as they are now, under the
         `step`'s XLA options (`step_options`): the objective owns the program, which its fit ladder
         replaces with its model. The dataset's device steps run in it, on the accelerator, before the
@@ -208,7 +208,7 @@ class HostExecution:
             functools.partial(_forward, functools.partial(_after, self.device, self.objective._loss)),
             static_argnames=("layout",), holds=self.device, step=step)
 
-    def step_options(self, variables, batch) -> dict[str, bool | int]:
+    def step_options(self, variables, batch) -> dict[str, Option]:
         """The XLA options the resident step compiles under (`step_compiler_options`), which the host
         step's forward and pullback take too, so the two differ by the host boundary alone: the
         tokens each accelerator device steps of `batch`, whether the step trains next to frozen
@@ -343,8 +343,7 @@ class HostExecution:
             with jax.set_mesh(self.accelerator):
                 # The pullback runs its int8 dots here, apart from the forward's program, with an
                 # int8 backward (`Quantization.bwd_qtype`) on the options that ask for it.
-                pulled = program(_trainable_cotangent,
-                                 *(entry.module for entry in self.objective.program_key()), step=options,
+                pulled = program(_trainable_cotangent, *self.objective.towers(), step=options,
                                  static_argnames=("sites", "paths", "layout"))
                 gradient = pulled(back, self.on_accelerator(cotangent), sites=self.sites, paths=moving,
                                   layout=layout)

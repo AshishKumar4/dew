@@ -8,6 +8,7 @@ splits the step's batch until the step fits everywhere
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from collections.abc import Mapping, Sequence
@@ -21,13 +22,13 @@ from dew._records import JSON, integers, json_value
 from dew.batch import Batch, Variables
 from dew.data.dataset import rows_of
 from dew.devices import gpu_free_bytes, xla_flag
+from dew.distributed.placement import parameter_axes
 from dew.mesh import mesh_axes
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
-from dew.training.distributed import parameter_axes
 
 _log = logging.getLogger(__name__)
 
@@ -83,7 +84,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     (`compiler_options`).
     """
     generation = device_generation()
-    options: dict[str, bool | int] = {}
+    options: dict[str, Option] = {}
     if backend() == 'gpu' and devices > 1:
         options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
     small = tokens <= 128
@@ -96,7 +97,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
             and modules and not any(isinstance(module, TritonGemm) and module.keeps_triton_gemm
                                     for module in modules)):
         options['xla_gpu_enable_triton_gemm'] = False
-    options.update(compiler_options(*modules))
+    options.update(compiler_options(*objective.towers()))
     return options or None
 
 
@@ -254,6 +255,27 @@ def peak_memory_gib() -> float | None:
     peaks = [stats['peak_bytes_in_use'] for device in jax.local_devices()
              if (stats := device.memory_stats()) is not None and 'peak_bytes_in_use' in stats]
     return max(peaks) / 1024 ** 3 if peaks else None
+
+
+def local_devices(mesh: Mesh) -> list:
+    """This process's devices of `mesh`, whose memory the fit check reads."""
+    process = jax.process_index()
+    return [device for device in mesh.devices.flat if device.process_index == process]
+
+
+def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> None:
+    """Wait for a newly compiled step's first run, and raise its failure on the devices as the step's,
+    with the check that said it fits (`fitted`, `memory_record`) and what `mesh`'s devices of this
+    process hold now."""
+    try:
+        loss.block_until_ready()
+    except jax.errors.JaxRuntimeError as error:
+        now = [{"id": device.id, **{key: value for key, value in (device.memory_stats() or {}).items()
+                                    if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
+               for device in local_devices(mesh)]
+        raise RuntimeError(
+            f"the training step compiled for step {step} failed on its first run. It was checked to "
+            f"fit: {json.dumps(fitted)}; the devices now hold {json.dumps(now)}") from error
 
 
 def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int, *, fits: bool) -> JSON:

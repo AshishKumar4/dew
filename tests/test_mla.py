@@ -37,7 +37,8 @@ import torch
 from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
-from reference_error import assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
+from selection_margins import indexer_margins
 from tool_support import load
 
 from dew.data.dataset import Loader
@@ -51,6 +52,7 @@ from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling, rotary_freqs, yarn_attention_factor, yarn_inv_freq, yarn_query_scale
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mla"
@@ -185,10 +187,11 @@ def dew_walk(name: str, settings: dict, attention_impl: str = "reference"):
 
 
 def boundary_gap(name: str, hidden: np.ndarray) -> float:
-    """The smallest margin, over every query, between the reference's last selected index score and
-    its best rejected one (modeling_deepseek_v32.py, `DeepseekV32Indexer.forward`, replayed): a query
-    that sees no more keys than the budget, or whose boundary is an exact zero tie (which
-    `stable_top_k` decides alike in float32 and float64), has no margin to keep."""
+    """The smallest margin, over every query, of the reference's top-k (modeling_deepseek_v32.py,
+    `DeepseekV32Indexer.forward`, replayed) in its scores' units (`indexer_margins`): the gap between
+    its last selected index score and its best rejected one, or at an exact zero tie, how near zero
+    a tied key's best head agreement sits. A query that sees no more keys than the budget has no
+    margin to keep."""
     from transformers.models.deepseek_v32.modeling_deepseek_v32 import apply_rotary_pos_emb
 
     block, rotary = reference_block(name)
@@ -205,19 +208,13 @@ def boundary_gap(name: str, hidden: np.ndarray) -> float:
         k_rot, k_pass = torch.split(indexer.k_norm(indexer.wk(states)).unsqueeze(2), rope, dim=-1)
         q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
         query, keys = torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1).squeeze(2)
-        scores = torch.relu(torch.matmul(query.float(), keys.transpose(-1, -2).float().unsqueeze(1))
-                            * indexer.softmax_scale)
+        agreements = (torch.matmul(query.float(), keys.transpose(-1, -2).float().unsqueeze(1))
+                      * indexer.softmax_scale)
         weights = indexer.weights_proj(states).float() * indexer.n_heads ** -0.5
-        index = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
-        future = torch.arange(length)[None, None, :] > positions[:, :, None]
-        ranked = index.masked_fill(future, float("-inf")).sort(-1, descending=True).values
-        budget = indexer.index_topk
-        if length <= budget:
-            return math.inf
-        kept, rejected = ranked[..., budget - 1], ranked[..., budget]
-        decided = torch.isfinite(rejected) & ~((kept == 0) & (rejected == 0))
-        margins = torch.where(decided, kept - rejected, torch.full_like(kept, math.inf))
-        return float(margins.min())
+        index = torch.matmul(weights.unsqueeze(-2), torch.relu(agreements)).squeeze(-2)
+        seen = torch.arange(length)[None, None, :] <= positions[:, :, None]
+    return float(np.min(indexer_margins(index.numpy(), agreements.numpy(), seen.numpy(), indexer.index_topk,
+                                        relative=False)))
 
 
 def block_draw(name: str):
@@ -251,6 +248,7 @@ def test_yarn_matches_the_reference_derivation():
     assert yarn_query_scale(yarn) == (0.1 * math.log(40.0) + 1.0) ** 2
     _, wide = reference_block("mla_v3", wide=True)
 
+    @as_given
     def reference(positions, wide_run=False):
         with float64() if wide_run else contextlib.nullcontext():
             rows = torch.from_numpy(np.asarray(positions)).long()[None]
@@ -517,7 +515,7 @@ def test_the_deepseek_stack_fits_on_the_mesh(fsdp, expert):
     model = deepseek_stack()
     tracker = RecordingTracker()
     trainer = Trainer(
-        LMObjective(model, 16, balance_rate=0.01), optax.adam(1e-3),
+        LMObjective(model, 16, balance=ExpertBalance(balance_rate=0.01)), optax.adam(1e-3),
         key=jax.random.key(0), mesh=MeshSpec(fsdp=fsdp, expert=expert),
         layout=Layout(min_shard=TINY_SHARD), tracker=tracker)
 

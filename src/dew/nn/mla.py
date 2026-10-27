@@ -29,18 +29,16 @@ from dew.mesh import LogicalAxes
 from dew.nn.attention import (
     LayerNorm,
     RMSNorm,
-    cached_validity,
     causal_attention_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
-    open_kv_cache,
     scaled_dot_product_attention,
 )
 from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of
-from dew.nn.kv_cache import KVCache, write_cache
+from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
 
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
 # contracts from base avoids importing the kind hub back during this module's
@@ -55,7 +53,13 @@ from dew.nn.precision import (
 )
 from dew.nn.rope import YarnScaling, deinterleaved, rotary_freqs, rotate, yarn_query_scale
 from dew.nn.sharding import RESIDUAL, constrain, down_projection, logical_axes
-from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
+from dew.nn.sparse_selection import (
+    index_agreements,
+    index_scores,
+    selection_mask,
+    sparse_latent_attention,
+    top_k_selection,
+)
 from dew.quantization import quantized_products
 
 
@@ -86,6 +90,11 @@ of the indexer's weights carry and nothing else in the tree does."""
 INDEXER_COLLECTION = 'indexer'
 """The collection an attention layer sows its per-query indexer KL under
 when a caller opens it, as the LM objective does to train the indexer."""
+
+SELECTIONS = 'selections'
+"""The collection V3.2's lightning indexer sows its scores and its heads' agreements before their relu
+under when a caller opens it (`SparseIndexer.scores`), as a selection's margin does to read how near a
+tie each key sits; never at initialization, so no variable tree holds it."""
 
 INDEXER_EPS = 1e-8
 """MaxText's `EPS` (src/maxtext/utils/globals.py at 538fe7a3), which its
@@ -170,10 +179,15 @@ class IndexerFront:
         batch, length = q_resid.shape[:2]
         return self.wq_b(jax.lax.stop_gradient(q_resid)).reshape(batch, length, self.n_heads, self.head_dim)
 
+    def weighed(self, agreements, hidden):
+        """Scores `[B, S, T]` of the heads' `agreements` (`index_agreements`), weighted by
+        `weights_proj` of the detached `hidden` (`index_scores`)."""
+        return index_scores(agreements, self.weights_proj(jax.lax.stop_gradient(hidden)), self.head_dim,
+                            self.precision)
+
     def scored(self, query, keys, hidden):
-        """`query`'s scores against `keys` `[B, S, T]`, its heads weighted by `weights_proj` of the
-        detached `hidden` (`index_scores`)."""
-        return index_scores(query, keys, self.weights_proj(jax.lax.stop_gradient(hidden)), self.precision)
+        """`query`'s scores against `keys` `[B, S, T]` (`weighed`)."""
+        return self.weighed(index_agreements(query, keys, self.precision), hidden)
 
 
 @logical_axes({
@@ -242,7 +256,13 @@ class SparseIndexer(IndexerFront, nn.Module):
         q_rot, q_pass = jnp.split(self.queries(q_resid), [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
             [_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
-        return self.scored(query, keys, hidden)
+        agreements = index_agreements(query, keys, self.precision)
+        scores = self.weighed(agreements, hidden)
+        if not self.is_initializing():
+            # Kept only where a caller opens the collection, as a selection's margin does.
+            self.sow(SELECTIONS, "scores", scores)
+            self.sow(SELECTIONS, "agreements", agreements)
+        return scores
 
     def select(self, scores, keep):
         """The top-k keys of each query among those `keep` allows, as

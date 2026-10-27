@@ -466,6 +466,177 @@ def test_spark_directory_requires_success_marker(tmp_path):
     assert len(Files(str(tmp_path), format="parquet", spark=True).records("indexed")) == 2
 
 
+@dataclasses.dataclass(frozen=True)
+class ArrowFiles:
+    """A native writer of the caller's: an Arrow IPC file for each batch it is handed, each beside a
+    hidden checksum as Hadoop's writers leave one, stopping before its file `stop` where given."""
+
+    stop: int | None = None
+    format = "arrow"
+
+    def write(self, rows, directory, filesystem):
+        for number, batch in enumerate(rows):
+            if number == self.stop:
+                raise RuntimeError(f"the writer stopped before file {number}")
+            path = f"{directory}/part-{number:06d}.arrow"
+            with filesystem.open_output_stream(path) as stream, pa.ipc.new_file(stream, batch.schema) as file:
+                file.write_batch(batch)
+            with filesystem.open_output_stream(f"{directory}/.part-{number:06d}.arrow.crc") as stream:
+                stream.write(b"checksum")
+
+
+def test_a_native_writers_export_is_committed_by_the_one_publisher_and_read_back(tmp_path):
+    """An export hands its rows to a native writer of the caller's as one Arrow stream; the files it
+    writes, not the ones it hides, are committed by the manifest and `_SUCCESS` every export
+    commits, in their format, and read back in their order, a Spark reader's committed directory
+    among them."""
+    rows = [{"id": index, "text": str(index)} for index in range(10)]
+    manifest = export(Memory(rows), str(tmp_path), format=ArrowFiles(), rows_per_shard=4)
+    assert manifest["format"] == "arrow" and manifest["rows"] == 10
+    assert [Path(entry["path"]).name for entry in manifest["files"]] == [
+        f"part-{number:06d}.arrow" for number in range(3)]
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    assert (tmp_path / "_SUCCESS").read_bytes() == hashlib.sha256(encoded).hexdigest().encode()
+    for read in (Files(str(tmp_path)), Files(str(tmp_path), format="arrow", spark=True)):
+        stored = read.records("indexed")
+        assert [stored[index] for index in range(len(stored))] == rows
+
+
+def test_an_export_whose_writer_stops_commits_nothing_and_the_next_commits_only_its_own(tmp_path):
+    """A writer that stops partway leaves its files uncommitted: no manifest and no `_SUCCESS`, so a
+    reader of committed directories refuses them. The next export to the same place commits its
+    own files alone, and its rows are what a read finds."""
+    rows = [{"id": index} for index in range(10)]
+    with pytest.raises(RuntimeError):
+        export(Memory(rows), str(tmp_path), format=ArrowFiles(stop=2), rows_per_shard=4)
+    assert not (tmp_path / "_dew_manifest.json").exists() and not (tmp_path / "_SUCCESS").exists()
+    assert len(list(tmp_path.rglob("part-*.arrow"))) == 2
+    with pytest.raises(ValueError):
+        Files(str(tmp_path), format="arrow", spark=True).records("indexed")
+    export(Memory(rows[:6]), str(tmp_path), format=ArrowFiles(), rows_per_shard=4)
+    stored = Files(str(tmp_path)).records("indexed")
+    assert [stored[index] for index in range(len(stored))] == rows[:6]
+
+
+@pytest.mark.parametrize("kind", ["jsonl", "text"])
+def test_one_small_file_streams_to_every_reader_each_reading_its_own_lines(tmp_path, kind):
+    """One file smaller than a shard is one physical shard. A streamed read by more readers than that
+    cuts it into as many parts, each the lines that start in an even cut of the file, as Hadoop
+    splits a text file: every share reads lines of its own, and together they read each once, where
+    a read by more readers and workers than shards was refused. Fewer lines than parts are refused."""
+    lines = [json.dumps({"id": index, "pad": "x" * (index % 9)}) for index in range(40)]
+    path = tmp_path / f"rows.{'jsonl' if kind == 'jsonl' else 'txt'}"
+    path.write_text("".join(line + "\n" for line in lines))
+    files = Files(str(path), format=kind)
+    assert len(files.manifest().shards) == 1
+    shares = []
+    for share in range(4):
+        rows = streamed(files.manifest(), partition=DataPartition(share, 4), loading=Loading(workers=0))
+        shares.append([row["id"] if kind == "jsonl" else json.loads(row["text"])["id"] for row in rows])
+    assert all(shares)
+    assert sorted(itertools.chain(*shares)) == list(range(40))
+    (tmp_path / "two.jsonl").write_text(lines[0] + "\n" + lines[1] + "\n")
+    with pytest.raises(ValueError):
+        streamed(Files(str(tmp_path / "two.jsonl")).manifest(), partition=DataPartition(0, 4),
+                 loading=Loading(workers=0))
+
+
+@dataclasses.dataclass(frozen=True)
+class LineOrTarFiles:
+    """A native writer of a record format no suffix of its name spells as `Files` infers one: the
+    rows' `text` as lines of a `.txt` file ("text"), or as each key's `txt` member of a `.tar`
+    ("webdataset"), a file for each batch it is handed."""
+
+    format: str
+
+    def write(self, rows, directory, filesystem):
+        for number, batch in enumerate(rows):
+            texts = batch.column("text").to_pylist()
+            if self.format == "text":
+                payload = "".join(text + "\n" for text in texts).encode()
+            else:
+                archive = io.BytesIO()
+                with tarfile.open(fileobj=archive, mode="w") as tar:
+                    for index, text in enumerate(texts):
+                        member = tarfile.TarInfo(f"{number:06d}-{index:06d}.txt")
+                        member.size = len(text.encode())
+                        tar.addfile(member, io.BytesIO(text.encode()))
+                payload = archive.getvalue()
+            suffix = "txt" if self.format == "text" else "tar"
+            with filesystem.open_output_stream(f"{directory}/part-{number:06d}.{suffix}") as stream:
+                stream.write(payload)
+
+
+@pytest.mark.parametrize("kind", ["text", "webdataset"])
+def test_a_native_writers_export_reads_back_by_the_format_its_manifest_commits(tmp_path, kind):
+    """An export commits the record format its writer states, and `Files` reads the export by that
+    value, whatever a suffix would spell: text lines and WebDataset members, which a reader that
+    looked the format up by a suffix (`data.text`, `data.webdataset`) refused."""
+    texts = [f"record {index}" for index in range(10)]
+    manifest = export(Memory([{"text": text} for text in texts]), str(tmp_path), format=LineOrTarFiles(kind),
+                      rows_per_shard=4)
+    assert manifest["format"] == kind
+    stored = Files(str(tmp_path))
+    rows = list(stored.records("memory"))
+    read = [row["text"].removesuffix("\n") if kind == "text" else row["txt"].decode() for row in rows]
+    assert read == texts
+
+
+def test_a_writer_of_a_format_no_reader_opens_is_refused_before_it_commits(tmp_path):
+    """A writer stating a record format `Files` has no reader for is refused before anything is
+    written: an export's manifest is committed once, so one committed under such a format could
+    never be read, nor written again, there."""
+    with pytest.raises(ValueError):
+        export(Memory([{"text": "one"}]), str(tmp_path), format=LineOrTarFiles("tfrecord"))
+    assert not (tmp_path / "_dew_manifest.json").exists() and not list(tmp_path.rglob("part-*"))
+
+
+def ids_per_reader(path: Path, readers: int, kind: str = "jsonl") -> list[list[int]]:
+    """The ids each of `readers` readers of a streamed read of the store at `path` reads."""
+    stored = Files(str(path), format=kind)
+    shares = []
+    for share in range(readers):
+        partition = DataPartition(share, readers)
+        rows = streamed(stored.manifest(), partition=partition, loading=Loading(workers=0))
+        shares.append([row["id"] if kind == "jsonl" else json.loads(row["text"])["id"] for row in rows])
+    return shares
+
+
+@pytest.mark.parametrize("kind", ["jsonl", "text"])
+def test_a_long_first_record_moves_the_cuts_it_holds_on_to_the_records_after_it(tmp_path, kind):
+    """Four records, the first 10,000 characters long, read by four readers: the even cuts that fall
+    inside the first record move on to the records after it, so each reader reads one record of its
+    own, where they collapsed into one another, left two parts and the read was refused."""
+    lines = [json.dumps({"id": index, "pad": "x" * (10_000 if index == 0 else index)}) for index in range(4)]
+    (tmp_path / "rows.jsonl").write_text("".join(line + "\n" for line in lines))
+    shares = ids_per_reader(tmp_path / "rows.jsonl", 4, kind)
+    assert sorted(len(ids) for ids in shares) == [1, 1, 1, 1]
+    assert sorted(itertools.chain(*shares)) == [0, 1, 2, 3]
+
+
+def test_a_file_of_fewer_records_than_its_byte_share_hands_its_other_parts_to_another(tmp_path):
+    """A store of two files is cut by their bytes: a file of one long record holds one part, and the
+    parts its bytes would have given it go to the file of many short records, so every reader of
+    four reads, where the read was refused."""
+    (tmp_path / "long.jsonl").write_text(json.dumps({"id": 0, "pad": "x" * 10_000}) + "\n")
+    (tmp_path / "short.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(1, 9)))
+    shares = ids_per_reader(tmp_path, 4)
+    assert all(shares)
+    assert sorted(itertools.chain(*shares)) == list(range(9))
+
+
+def test_no_part_of_a_json_lines_file_starts_on_blank_lines_alone(tmp_path):
+    """Blank lines hold no JSON record: a cut that falls among them moves on to the next record, so
+    no reader is handed a part of blank lines alone and reads nothing."""
+    blank = "\n" * 3000
+    records = [json.dumps({"id": index}) for index in range(4)]
+    lines = [records[0], blank, *records[1:]]
+    (tmp_path / "rows.jsonl").write_text("".join(line + "\n" for line in lines))
+    shares = ids_per_reader(tmp_path / "rows.jsonl", 4)
+    assert sorted(len(ids) for ids in shares) == [1, 1, 1, 1]
+    assert sorted(itertools.chain(*shares)) == [0, 1, 2, 3]
+
+
 def test_a_corrupt_export_manifest_is_refused_and_never_falls_back_to_raw_shards():
     root = Store(f"memory://corrupt-export-{uuid4().hex}")
     export(Memory([{"id": 1}]), root.url)
@@ -1180,7 +1351,7 @@ def test_arrayrecords_wait_for_a_busy_reader_before_opening_a_missing_shard(arra
         return underlying_read(reader, index)
 
     def waiting(condition, timeout=None):
-        if condition is source._lock:
+        if condition is source._shards._lock:
             queued.set()
         return condition_wait(condition, timeout)
 
@@ -1849,6 +2020,46 @@ def test_artifact_codec_preserves_extended_numpy_dtypes():
     assert restored["scalar"].dtype == values["scalar"].dtype
     assert np.array_equal(restored["array"], values["array"])
     assert restored["scalar"] == values["scalar"]
+
+
+@pytest.mark.parametrize("value", [
+    np.arange(24, dtype=np.uint8).reshape(2, 3, 4),
+    np.asfortranarray(np.arange(12, dtype=np.float32).reshape(3, 4)),
+    np.arange(6, dtype=">i4"),
+    np.asarray(3.5, dtype=np.float64),
+    np.zeros((0, 5), dtype=np.int16),
+    np.asarray([True, False]),
+    np.asarray(["ab", "cde"]),
+    np.asarray([b"ab", b"c"]),
+    np.asarray([1, 2], dtype="datetime64[ns]"),
+    np.zeros(2, dtype=[("x", "<f4"), ("y", "<i8")]),
+    np.arange(2 ** 17, dtype=np.int64).reshape(256, 512),
+    np.ndarray((2,), dtype="V0"),
+    np.zeros(3, dtype="S0"),
+], ids=["uint8-3d", "fortran", "big-endian", "0d", "empty", "bool", "unicode", "bytes", "datetime",
+        "structured", "long-header-free", "void-0", "bytes-0"])
+def test_artifact_codec_reads_back_every_array_as_saved(value):
+    """Every array a record holds reads back as it was saved, its dtype, shape, memory order and
+    values, whether its header is read straight or by `np.load`, and owns its writable memory."""
+    from dew.data.sources.codec import decode, encode
+
+    restored = decode(encode({"value": value}))["value"]
+    assert restored.dtype == value.dtype and restored.shape == value.shape
+    assert restored.flags.f_contiguous == value.flags.f_contiguous or value.ndim < 2
+    assert restored.flags.writeable
+    np.testing.assert_array_equal(restored, value)
+
+
+def test_artifact_codec_reads_back_a_complex_field_exactly():
+    """A record's Python complex field reads back as written, both parts exactly, as a record holds it
+    beside its other fields."""
+    from dew.data.sources.codec import decode, encode
+
+    values = {"z": complex(0.1, -2.5e-300), "zs": [complex(1, 0), complex(float("inf"), float("nan"))]}
+    restored = decode(encode(values))
+    assert restored["z"] == values["z"] and isinstance(restored["z"], complex)
+    assert restored["zs"][0] == values["zs"][0]
+    assert restored["zs"][1].real == float("inf") and np.isnan(restored["zs"][1].imag)
 
 
 def test_content_fingerprint_preserves_array_identity_and_sequence_order():

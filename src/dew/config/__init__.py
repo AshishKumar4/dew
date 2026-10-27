@@ -46,7 +46,7 @@ from etils import epath
 import dew.io
 from dew import registry
 from dew._coordination import agree_process_phase, agreed
-from dew._records import JSON, duration, record, recorded_duration
+from dew._records import JSON, duration, is_share, record, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -54,6 +54,7 @@ from dew.data import records
 from dew.data.compile import fitted
 from dew.data.dataset import Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
+from dew.distributed.placement import Layout, MeshSpec
 from dew.files import write_atomically
 from dew.inputs import Field
 from dew.lora import LoRA
@@ -72,22 +73,27 @@ from dew.registry import (
     models,
     objectives,
     parameters,
+    record_argument,
     to_record,
     wants_tuple,
 )
 from dew.state import TrainState
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
-from dew.training.budget import Pause, run_length, run_steps
+from dew.training.budget import Pause, budget_tokens, run_length, run_steps
+from dew.training.cooldown import Cooldowns
 from dew.training.display import TrainingDisplay
-from dew.training.distributed import Layout, MeshSpec
+from dew.training.evaluation import EvalSuite, Summary
 from dew.training.profiling import ProfileWindow
 from dew.training.quantization import quantize_trunk
+from dew.training.rollout import Rollout
 from dew.training.selection import Best
 from dew.training.tracker import LocalTracker, Tracker, Trackers, Wandb, WandbTracker
-from dew.training.trainer import Rollout, Trainer
+from dew.training.trainer import Trainer
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
+
+    from dew.interop import Pretrained
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,10 +136,11 @@ class MetricConfig(Registered):
     `ObjectiveConfig` holds an objective's: a CLIP metric's `modelname`, an
     FID's `weights`. `defaults` holds every other argument the class defaults,
     so a metric whose default model changes later scores a recorded run as it
-    did.
+    did. `split` is the validation split it scores, every split where None.
     """
 
     name: str
+    split: str | None = None
 
     @staticmethod
     def _member(name: str) -> type:
@@ -293,23 +300,48 @@ def _keep_argument():
     )
 
 
-def _cadence_argument():
+def _cadence_argument(*, timed: bool = True):
+    """A cadence's command-line form: steps, `epoch`, a share of the run such as `5%`, None, and with
+    `timed` a duration such as `30m`."""
     def read(given):
         value = given[0]
         if value == 'None':
             return None
-        if value == 'epoch':
+        if value == 'epoch' or is_share(value):
             return value
-        return int(value) if value.isdecimal() else duration(value)
+        return int(value) if value.isdecimal() or not timed else duration(value)
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
-        metavar="STEPS|DURATION|epoch",
+        metavar="STEPS|DURATION|SHARE%|epoch" if timed else "STEPS|SHARE%|epoch",
         instance_from_str=read,
         is_instance=lambda value: value is None or isinstance(value, (int, str, datetime.timedelta)),
         str_from_instance=lambda value: [
             recorded_duration(value) if isinstance(value, datetime.timedelta) else str(value)
         ],
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceOptions:
+    """What a run builds of the source it starts from: `Pretrained.load`'s keywords for its parts,
+    beside where it reads them (`TrainerConfig.source_placement`), every run kind's alike
+    (`RunConfig.source_keywords`)."""
+
+    text_only: bool = False
+    """A multimodal wrapper's language model alone: no tower, projector or audio encoder built, nor
+    their tensors read (`Pretrained.load`'s `text_only`)."""
+    prediction_depths: int | None = None
+    """The first that many multi-token prediction depths, 0 for none; None the checkpoint's own
+    (`Pretrained.load`'s `prediction_depths`)."""
+    attention: dict[str, Literal["causal", "block_bidirectional"]] | None = None
+    """How each layer kind's attention reads, by kind (`full_attention`): causal, or
+    block_bidirectional, each of a row's blocks read whole, which a run's rows then lie in
+    (`Pretrained.load`'s `modeling_overrides`); None the checkpoint's own:
+    `--source.attention full_attention block_bidirectional`."""
+
+    def overrides(self) -> Mapping[str, object] | None:
+        """The `modeling_overrides` these options state, None where they state none."""
+        return None if self.attention is None else {"attention": dict(self.attention)}
 
 
 class SourcePlacement(TypedDict, total=False):
@@ -320,6 +352,15 @@ class SourcePlacement(TypedDict, total=False):
     on_host: bool
     mesh: MeshSpec
     layout: Layout
+
+
+class SourceOptionsKeywords(SourcePlacement, total=False):
+    """`Pretrained.load`'s keywords for a run's source: what it builds of it (`SourceOptions`) and
+    where it reads it (`SourcePlacement`, `RunConfig.source_keywords`)."""
+
+    text_only: bool
+    prediction_depths: int | None
+    modeling_overrides: Mapping[str, object] | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -355,16 +396,22 @@ class TrainerConfig:
     stop: Annotated[Pause, tyro.conf.subcommand("pause")] | None = None
     """End the run at a fraction of its length, to resume it later as if it had never stopped
     (`Pause`): `--trainer.stop.fraction 0.5`."""
-    log_every: int = 100
-    eval_every: int | Literal["epoch"] | None = "epoch"
+    cooldowns: Annotated[Cooldowns, tyro.conf.subcommand("cooldowns")] | None = None
+    """Branch the run into cooldowns, each scored by its validation and discarded (`Cooldowns`):
+    `--trainer.cooldowns.at 20% 40% --trainer.cooldowns.length 20%`."""
+    log_every: Annotated[int | str, _cadence_argument(timed=False)] = 100
+    """The steps between logs, or a share of the run such as "1%" (`eval_every`)."""
+    eval_every: Annotated[int | str | None, _cadence_argument(timed=False)] = "epoch"
     """The steps between validation passes.
 
-    It is a number of steps, "epoch" for one pass over the data, or None to never
-    validate. "epoch" over a stream that reports no record count raises a
-    ValueError, since such a stream has no pass.
+    It is a number of steps, "epoch" for one pass over the data, a share of the
+    run such as "5%", resolved once against its planned length in steps, epochs,
+    examples or tokens (`dew.training.Trainer.fit`), or None to never validate.
+    "epoch" over a stream that reports no record count raises a ValueError, since
+    such a stream has no pass.
     """
     checkpoint_every: Annotated[int | str | datetime.timedelta | None, _cadence_argument()] = "epoch"
-    """The steps between checkpoints, with the same three choices as `eval_every`.
+    """The steps between checkpoints, with the same choices as `eval_every`, or a duration such as 30m.
 
     A stream whose iterator cannot report its read position must train with None;
     the trainer refuses any other value for it.
@@ -481,7 +528,13 @@ class TrainerConfig:
         if self.publish and (self.wandb is None or not self.checkpoint_final):
             raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
         run_length(self.steps, self.epochs, self.tokens, self.examples, required=False)
-        if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch':
+        if isinstance(self.log_every, str) and not is_share(self.log_every):
+            raise ValueError(f"--trainer.log-every is steps or a share such as 1%, not {self.log_every!r}")
+        if isinstance(self.eval_every, str) and self.eval_every != 'epoch' and not is_share(self.eval_every):
+            raise ValueError(f"--trainer.eval-every is steps, epoch or a share such as 5%, not "
+                             f"{self.eval_every!r}")
+        if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch' and not is_share(
+                self.checkpoint_every):
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
         if isinstance(self.keep, Mapping):
             object.__setattr__(self, 'keep', from_record(Keep, self.keep, dtypes=False))
@@ -543,9 +596,11 @@ class TrainerConfig:
         return trainer, dataset, trainer.total_steps(dataset)
 
     def total_steps(self, dataset: Loader) -> int | None:
-        """Return the step cap from `steps`, `epochs` or `examples`, None for a token-only run
-        (`run_steps`, the one policy a direct fit applies too)."""
-        return run_steps(dataset, self.steps, self.epochs, self.tokens, self.accumulation, self.examples)
+        """Return the step cap from `steps`, `epochs` or `examples`, None for a run its tokens bound
+        alone, its own or where its data's schedule ends (`budget_tokens`; `run_steps`, the one policy
+        a direct fit applies too, which refuses a schedule to an objective counting no tokens)."""
+        tokens = budget_tokens(dataset, self.tokens)
+        return run_steps(dataset, self.steps, self.epochs, tokens, self.accumulation, self.examples)
 
     def total_updates(self, dataset: Loader) -> int | None:
         """Return the optimizer updates the run takes over `dataset` as `RunConfig.train` finalizes it,
@@ -555,11 +610,11 @@ class TrainerConfig:
         # A window the run ends inside is never committed, as the trainer counts its updates.
         return None if steps is None else steps // trainer.accumulation
 
-    def eval_interval(self, dataset: Loader) -> int | None:
+    def eval_interval(self, dataset: Loader) -> int | str | None:
         """Return the steps between validation passes over `data`, or None for never."""
         return self._interval(self.eval_every, dataset, "eval-every")
 
-    def checkpoint_interval(self, dataset: Loader) -> int | datetime.timedelta | None:
+    def checkpoint_interval(self, dataset: Loader) -> int | str | datetime.timedelta | None:
         """Return the steps, or a recorded duration such as 30m, between checkpoints."""
         value = self.checkpoint_every
         if isinstance(value, datetime.timedelta):
@@ -568,8 +623,9 @@ class TrainerConfig:
             return value
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
-    def _interval(self, value, dataset: Loader, field_name: str) -> int | None:
-        if value is None or isinstance(value, int):
+    def _interval(self, value, dataset: Loader, field_name: str) -> int | str | None:
+        """Steps for `epoch`; steps, a share of the run (which `fit` resolves) or None as given."""
+        if value is None or isinstance(value, int) or is_share(value):
             return value
         if dataset.steps_per_epoch is None:
             raise ValueError(
@@ -858,12 +914,14 @@ class RunConfig:
     settings and builds what it trains from them (`prepare`); `run` trains it.
     """
 
-    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause"}
+    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause",
+                                                   "trainer.cooldowns": "cooldowns"}
     """The optional settings `cli` turns on by their own flags, each with the
     subcommand its flags imply."""
-    RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed")
-    """The fields a run resumed under its name may change: how it trains and optimizes, what it reads,
-    and, in a kind of run that adds them, how it evaluates and previews. Every other field says what
+    RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed",
+                                            "val_metrics", "val_summaries")
+    """The fields a run resumed under its name may change: how it trains and optimizes, what it reads
+    and scores, and, in a kind of run that adds them, how it previews. Every other field says what
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
@@ -878,6 +936,9 @@ class RunConfig:
     stage or the training batch."""
     data_seed: int = 0
     """The seed of the data's order and of its random steps."""
+    source: SourceOptions = dataclasses.field(default_factory=SourceOptions)
+    """What the run builds of the source it starts from (`--source.text-only`,
+    `--source.prediction-depths`), where it starts from one (`pretrained`)."""
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: ObjectiveConfig | None = None
@@ -892,6 +953,35 @@ class RunConfig:
     initialized from the run's key. The objective then trains only the adapter's
     factors, and the run's record stores the model with the adapter attached.
     """
+    val_metrics: (Annotated[tuple[MetricConfig, ...], record_argument(tuple[MetricConfig, ...])]
+                  | None) = None
+    """The metrics each validation split scores, each with the arguments the run gives it (a CLIP
+    metric's model, an FID's weights) and the split it scores, every split where it names none
+    (`MetricConfig.split`), one JSON list on the command line: `--val-metrics '[{"name": "accuracy"},
+    {"name": "brier", "split": "test"}]'` scores accuracy on every split and the Brier score on `test`.
+    A split no metric names scores none; `[]` scores none anywhere. None scores the kind of run's own
+    on every split (`default_metrics`): perplexity for a language model, a decision run's accuracy,
+    calibration, risk-coverage and log loss, a JEPA run's probes, CLIP for an image run. A metric
+    given is asked for whatever the data holds: a split the run does not validate, or data with no
+    validation split, refuses it.
+    """
+    val_summaries: Annotated[tuple[Summary, ...], record_argument(tuple[Summary, ...])] = ()
+    """Scalars weighed from each evaluation's split scores, a board's weighted index, each formed at a
+    step that scored every split it weighs and logged as `evaluation/summary/<name>`, which
+    `--trainer.best evaluation/summary/<name>` ranks by (`dew.training.evaluation.Summary`):
+    `--val-summaries '[{"name": "board", "weights": {"val/accuracy": 1, "test/accuracy": 2},
+    "better": "higher"}]'`.
+    """
+
+    def __post_init__(self) -> None:
+        # A record carries every sequence as a JSON list and a command line writes one too; the field
+        # is a tuple, so the value is one.
+        if self.val_metrics is not None:
+            object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
+            stray = [metric for metric in self.val_metrics if not isinstance(metric, MetricConfig)]
+            if stray:
+                raise TypeError(f"val_metrics holds metrics' records, {{'name': ..., 'fields': {{...}}}}, "
+                                f"not {stray!r}")
 
     def to_dict(self) -> dict[str, JSON]:
         """Return a JSON-safe record of the run.
@@ -989,6 +1079,13 @@ class RunConfig:
         """The run's class record: its class by its alias in `dew.registry.runs`, or by its import path
         where the table holds none, and its fields (`to_dict`)."""
         return {"class": registry.runs.name_of(type(self)), "fields": self.to_dict()}
+
+    def source_keywords(self, *, frozen: bool) -> SourceOptionsKeywords:
+        """`Pretrained.load`'s keywords for the source the run starts from: what it builds of it
+        (`source`) and where it reads it (`TrainerConfig.source_placement`, `frozen` where the run
+        keeps the source as it is). Every run kind that starts from a source loads it with these."""
+        return {"text_only": self.source.text_only, "prediction_depths": self.source.prediction_depths,
+                "modeling_overrides": self.source.overrides(), **self.trainer.source_placement(frozen=frozen)}
 
     def check_resume(self, saved: Mapping[str, object]) -> None:
         """Refuse to resume the run whose record is `saved` as this one where they train different
@@ -1099,8 +1196,13 @@ class RunConfig:
         """The run a class record (`record`) names, as its class, which must be
         this one or derive from it."""
         if record.get("rebuildable") is False:
-            raise ValueError("this run was defined in Python, so no record rebuilds it; it loads for "
-                             "inference through dew.pipeline or a task's from_run")
+            reasons = record.get("reasons", [])
+            stated = "".join(f"; {reason}" for reason in reasons) if isinstance(reasons, list) else ""
+            raise ValueError("this run was defined in Python without a recorded RunConfig, so no "
+                             f"record rebuilds it{stated}. It resumes through the Python that built it, and "
+                             "loads for inference through dew.pipeline or a task's from_run; a run built as "
+                             "a RunConfig in Python and trained with run() writes a run.json that rebuilds "
+                             "it (docs/recipes.md, Python experiments)")
         registry.import_trusted(record, trust)
         named = registry.class_record(record)
         if named is None:
@@ -1118,8 +1220,41 @@ class RunConfig:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
         objective = self.objective.build(model=self.model.build())
-        return Prepared(self, lambda name: self.train(objective, self.chain(), name=name,
+        scored = self.validation_metrics(validates=self.validation is not None)
+        return Prepared(self, lambda name: self.train(objective, self.chain(), name=name, metrics=scored,
                                                       validation=self.validation))
+
+    def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
+        """The metrics a validation pass scores where `val_metrics` names none, by what the run's data
+        `validates`: a kind of run's own, none for a run that names its objective alone."""
+        del validates
+        return ()
+
+    def metric(self, config: MetricConfig) -> Metric:
+        """`config` built with what this kind of run derives for it where it states none of its own."""
+        return config.build()
+
+    def validation_metrics(self, *, validates: bool) -> tuple[Metric, ...]:
+        """The kind of run's own metrics (`default_metrics`), built (`metric`), by what the run's data
+        `validates`: what each split scores where `val_metrics` names none (`suites`)."""
+        return tuple(self.metric(config) for config in self.default_metrics(validates=validates))
+
+    def suites(self, dataset: Loader, validation: Mapping[str, Reader] | None,
+               ) -> Mapping[str, EvalSuite] | None:
+        """Each split the run validates, `validation`'s or `dataset.val` as `val`, with the metrics
+        `val_metrics` names for it built (`metric`); None where `val_metrics` names none, so each scores
+        the kind's own. A metric for a split the run does not validate is refused."""
+        if self.val_metrics is None:
+            return None
+        splits = dict(validation) if validation is not None else (
+            {"val": dataset.val} if dataset.val is not None else {})
+        named = {config.split for config in self.val_metrics if config.split is not None}
+        if (self.val_metrics and not splits) or not named <= set(splits):
+            raise ValueError(f"val_metrics score {sorted(named) or 'every split'}, and the run validates "
+                             f"{sorted(splits) or 'none'}")
+        return {split: EvalSuite(reader, tuple(self.metric(config) for config in self.val_metrics
+                                                if config.split in (None, split)))
+                for split, reader in splits.items()}
 
     def chain(self) -> Dataset:
         """The run's `data`. Raises ValueError for a run that names none: a run trains on the chain
@@ -1206,13 +1341,16 @@ class RunConfig:
         each prefetched batch into the one the step trains on, as an on-policy
         objective samples it. `validation` names the splits each evaluation
         scores in place of `dataset.val`, as `Trainer.fit` takes them: a held-out
-        split and a test set are logged as `val/...` and `test/...`. With no
+        split and a test set are logged as `val/...` and `test/...`. `metrics` are
+        the kind's own, which each split scores where `val_metrics` names none. With no
         `trainer.best`, the first split's loss ranks the checkpoints; a `Best`
         over a metric names its split. `after` runs on the state training ends
         on and the run's directory before the checkpoint is published, as a
         decision run fits its calibration there, so what it writes is published.
         """
         dataset, validation = self.compiled(objective.data(), dataset, validation)
+        # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
+        suites = self.suites(dataset, validation)
         sized, dataset, steps = self.trainer.resolved(dataset)
         self = dataclasses.replace(self, trainer=sized)
         if self.trainer.quantization is not None:
@@ -1271,8 +1409,10 @@ class RunConfig:
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 checkpoint_final=trainer.checkpoint_final,
-                metrics=metrics, preview=trainer.wandb is not None,
-                best=trainer.best_policies(), stop=trainer.stop, validation=validation,
+                metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
+                best=trainer.best_policies(), stop=trainer.stop, cooldowns=trainer.cooldowns,
+                # A run that names no metrics and validates no split has no suite to score.
+                validation=validation if suites is None else suites or None, summaries=self.val_summaries,
             )
             if after is not None:
                 after(state, checkpoints.directory)
@@ -1318,4 +1458,57 @@ class RunConfig:
         return finished
 
 
-__all__ = ["MetricConfig", "ObjectiveConfig", "Prepared", "RunConfig", "TrainerConfig", "flag_selected"]
+@dataclasses.dataclass(frozen=True)
+class DecoderRunConfig(RunConfig):
+    """A run over a loaded decoder, which may run a block of its layers in passes: the pass count, the
+    block, the passes trained through and their recomputation (`CausalTransformer.with_passes`), each
+    the run's choice over the checkpoint's own. The language-model and the decision runs take it."""
+
+    loop_steps: int | None = None
+    """The passes a looped checkpoint runs its block (`CausalTransformer.loop`), such
+    as Ouro's at 1, 2 or 4; None keeps the checkpoint's own."""
+    loop_layers: tuple[int, int] | None = None
+    """The block of layers [first, end) that `loop_steps` repeats: a pretrained
+    decoder with no loop gains one over its own layers, as Qwen 3.5's middle block
+    repeated twice; None keeps a looped checkpoint's block."""
+    loop_backprop_steps: int | None = None
+    """Train through the last k passes of the loop alone, with earlier passes
+    cut from backpropagation; None keeps the loop's own choice."""
+    loop_remat: bool = False
+    """Checkpoint every pass of the loop, including the first, and recompute
+    it in the backward pass; requires a loop and leaves decoding unchanged.
+    False keeps a checkpoint's own choice."""
+
+    @property
+    def loops(self) -> bool:
+        """Whether the run asks anything of a loop (`looped`)."""
+        return (self.loop_steps is not None or self.loop_layers is not None
+                or self.loop_backprop_steps is not None or self.loop_remat)
+
+    def looped(self, start: "Pretrained") -> "Pretrained":
+        """`start` with its block run as the run asks (`looping`), as loaded where it asks nothing."""
+        if not self.loops:
+            return start
+        return looping(start, self.loop_steps, self.loop_layers, backprop_steps=self.loop_backprop_steps,
+                       remat=self.loop_remat or None)
+
+
+def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | None, *,
+            backprop_steps: int | None = None, remat: bool | None = None) -> "Pretrained":
+    """A loaded checkpoint whose block runs `steps` passes: a looped one's own block, or `layers`,
+    which gives a decoder with no loop one over its own layers. Refused where neither names a block,
+    or a new block's passes are not stated. `backprop_steps` and `remat` choose
+    the loop's backward memory; None keeps a looped checkpoint's own value."""
+    from dew.nn.protocols import Looping
+
+    looped = (start.model.with_passes(steps, layers, backprop_steps=backprop_steps, remat=remat)
+              if isinstance(start.model, Looping) else None)
+    if looped is None:
+        raise ValueError(f"this {type(start.model).__name__} has no loop: --loop-layers names the block of "
+                         "its layers to repeat and --loop-steps how many times")
+    return dataclasses.replace(start, model=looped)
+
+
+__all__ = ["DecoderRunConfig", "MetricConfig", "ObjectiveConfig", "Prepared", "RunConfig", "SourceOptions",
+           "TrainerConfig",
+           "flag_selected", "looping"]

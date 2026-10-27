@@ -33,8 +33,9 @@ import optax
 import tyro
 
 from dew._hashing import fmix32
+from dew._records import share
 from dew.mesh import LogicalAxes
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, stochastic_bf16
 from dew.nn.sharding import declarations, declared_axes
 from dew.registry import JsonDict, from_record, record_argument, schedules, to_record
 
@@ -327,6 +328,14 @@ class BoundsState(NamedTuple):
     bounds: Mapping[str, jax.Array]
 
 
+def clips_qk(opt_state) -> bool:
+    """Whether an optimizer state holds a QK-Clip's (`QKClipState`), however the optimizer composes it:
+    a run then asks its objective for the step's attention logit maxima (`dew.objectives.Step.qk_stats`)
+    and hands them to the update."""
+    return any(isinstance(node, QKClipState) for node in jax.tree.leaves(
+        opt_state, is_leaf=lambda node: isinstance(node, QKClipState)))
+
+
 def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArgs:
     """Rescale the query and key projections of every head past `tau`.
 
@@ -337,9 +346,10 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
     one rounding of `gamma * (W + update)`, the paper's.
 
     The per-head maxima arrive as `qk_stats`, the `qk` collection the model
-    sowed, which the trainer forwards from the loss's `Aux`. Without them
-    the transform steps aside, leaving every other optimizer and every run
-    whose loss never opened the collection on its old update."""
+    sowed, which a run asks its objective for when its optimizer's state
+    holds this transform's (`clips_qk`) and forwards from the loss's `Aux`,
+    refusing a step whose objective returns none. Called without them, as a
+    loop of plain optax calls may, the transform steps aside."""
     if tau <= 0:
         raise ValueError(f"the clip threshold bounds positive logits, got {tau}")
 
@@ -561,14 +571,11 @@ def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
     is split or carried, and nothing is read from memory. jax.random.bits
     (threefry) made the whole update 1.75x slower than fp32 state on a TPU
     v6e and 1.05x on an L4; this costs a few integer ops per element. NaN
-    stays NaN.
+    stays NaN (`precision.stochastic_bf16`, its rounding).
     """
     x = x.astype(jnp.float32)
     index = jax.lax.iota(jnp.uint32, x.size).reshape(x.shape)
-    noise = fmix32(index * jnp.uint32(0x9E3779B1) + seed.astype(jnp.uint32)) & jnp.uint32(0xFFFF)
-    bits = jax.lax.bitcast_convert_type(x, jnp.uint32)
-    rounded = jax.lax.bitcast_convert_type((bits + noise) & jnp.uint32(0xFFFF0000), jnp.float32)
-    return jnp.where(jnp.isnan(x), x, rounded).astype(jnp.bfloat16)
+    return stochastic_bf16(x, fmix32(index * jnp.uint32(0x9E3779B1) + seed.astype(jnp.uint32)))
 
 
 def _bias_corrected(moment, decay, count):
@@ -1050,8 +1057,63 @@ def with_rates(opt_state: optax.OptState, rates: Mapping[str | None, Mapping[str
     """`opt_state` with each `scheduled_solver`'s rate set to `rates`' for its param group, by name, or
     under None for a solver of no group (`rates_of`): a schedule's rate-valued fields in its
     `RateState`, or a constant in Optax's `learning_rate` hyperparameter. A solver an injected wrapper
-    of the run's own holds is reached through the wrapper's inner state. Each keeps the old value's
-    dtype and placement."""
+    of the run's own holds is reached through the wrapper's inner state (`_rated`). Each keeps the old
+    value's dtype and placement."""
+    def wanted(path: jax.tree_util.KeyPath, held: Mapping[str, jax.typing.ArrayLike],
+               kind: str) -> Mapping[str, float]:
+        return rates[next((entry.key for entry in path
+                           if isinstance(entry, jax.tree_util.DictKey) and entry.key in rates), None)]
+
+    return _rated(opt_state, wanted)
+
+
+def held_rates(opt_state: optax.OptState) -> dict[jax.tree_util.KeyPath, dict[str, float]]:
+    """Each injected solver's learning rate as `opt_state` holds it, on the host, by the solver's path
+    (`_rated`): a schedule's rate-valued fields, or a constant under `CONSTANT`."""
+    held: dict[jax.tree_util.KeyPath, dict[str, float]] = {}
+
+    def read(path: jax.tree_util.KeyPath, rates: Mapping[str, jax.typing.ArrayLike], kind: str) -> None:
+        held[path] = {name: float(np.asarray(value)) for name, value in rates.items()}
+
+    _rated(opt_state, read)
+    return held
+
+
+def scaled_rates(opt_state: optax.OptState, held: Mapping[jax.tree_util.KeyPath, Mapping[str, float]],
+                 factor: float) -> optax.OptState:
+    """`opt_state` training at `factor` times the learning rate each injected solver held where `held`
+    was read (`held_rates`), of a state of the same optimizer: a schedule's values are proportional to
+    its rate-valued fields (`ScheduleBase.values`), so its every value is the held one's times
+    `factor`."""
+    return _rated(opt_state, lambda path, *_: {name: value * factor for name, value in held[path].items()})
+
+
+def settable_rates(opt_state: optax.OptState) -> bool:
+    """Whether `opt_state` holds a learning rate and every one it holds is one `with_rates` sets: a
+    schedule's fields in its `RateState` or a constant, not a rate Optax computes from a step count
+    alone at each update (`optax.inject_hyperparams` of a schedule function), read through `_rated`."""
+    kinds: list[str] = []
+
+    def read(path: jax.tree_util.KeyPath, held: Mapping[str, jax.typing.ArrayLike], kind: str) -> None:
+        kinds.append(kind)
+
+    _rated(opt_state, read)
+    return bool(kinds) and "computed" not in kinds
+
+
+type Wanted = Callable[[jax.tree_util.KeyPath, Mapping[str, jax.typing.ArrayLike], str],
+                       Mapping[str, float] | None]
+"""What a solver at a path should hold of the learning rate it holds, of its kind (`_rated`), None for
+what it holds."""
+
+
+def _rated(opt_state: optax.OptState, wanted: Wanted) -> optax.OptState:
+    """`opt_state` with each injected solver's learning rate set to what `wanted` gives for the solver's
+    path, the rate it holds and its kind: `scheduled`, a schedule's rate-valued fields in its
+    `RateState`; `constant`, a constant's own value under `CONSTANT`; or `computed`, the value Optax
+    computed at the last update from a schedule function, which it computes again at the next. None
+    leaves it as it is. A solver an injected wrapper holds is reached through the wrapper's inner
+    state. Each keeps the old value's dtype and placement."""
     injected = optax.InjectStatefulHyperparamsState
 
     def put(value, like):
@@ -1066,14 +1128,18 @@ def with_rates(opt_state: optax.OptState, rates: Mapping[str | None, Mapping[str
                                                     (*full, jax.tree_util.GetAttrKey('inner_state'))))
             if 'learning_rate' not in node.hyperparams:
                 return node
-            group = next((entry.key for entry in full
-                          if isinstance(entry, jax.tree_util.DictKey) and entry.key in rates), None)
-            wanted, schedule = rates[group], node.hyperparams_states.get('learning_rate')
-            if isinstance(schedule, RateState):
-                fields = {name: put(wanted[name], held) for name, held in schedule.rates.items()}
+            schedule = node.hyperparams_states.get('learning_rate')
+            scheduled = isinstance(schedule, RateState)
+            held = schedule.rates if scheduled else {CONSTANT: node.hyperparams['learning_rate']}
+            given = wanted(full, held, "scheduled" if scheduled else "constant" if schedule is None
+                           else "computed")
+            if given is None:
+                return node
+            if scheduled:
+                fields = {name: put(given[name], held) for name, held in schedule.rates.items()}
                 states = {**node.hyperparams_states, 'learning_rate': schedule._replace(rates=fields)}
                 return node._replace(hyperparams_states=states)
-            rate = put(wanted[CONSTANT], node.hyperparams['learning_rate'])
+            rate = put(given[CONSTANT], node.hyperparams['learning_rate'])
             return node._replace(hyperparams={**node.hyperparams, 'learning_rate': rate})
 
         return jax.tree_util.tree_map_with_path(replaced, tree,
@@ -1158,6 +1224,11 @@ class ParamGroup:
         return rates_of(learning_rate if self.schedule is None else self.schedule,
                       self.learning_rate_multiplier)
 
+    def rate[R](self, learning_rate: R) -> R | ScheduleBase:
+        """The rate its solver runs at: its own schedule, or the config's `learning_rate` where it
+        names none."""
+        return learning_rate if self.schedule is None else self.schedule
+
     def solver(self, make: Callable[..., optax.GradientTransformation],
                learning_rate: float | ScheduleBase, steps: int | None,
                opts: Mapping[str, object]) -> optax.GradientTransformation:
@@ -1171,8 +1242,8 @@ class ParamGroup:
         if self.b1 is not None and 'b1' not in inspect.signature(make).parameters:
             raise ValueError(f"param group {self.name!r} schedules b1, and its optimizer "
                              f"takes no b1 (adam, adamw and lamb do)")
-        solver = scheduled_solver(make, learning_rate if self.schedule is None else self.schedule, steps,
-                                  opts, self.b1, self.learning_rate_multiplier)
+        solver = scheduled_solver(make, self.rate(learning_rate), steps, opts, self.b1,
+                                  self.learning_rate_multiplier)
         if self.bounds is not None:
             solver = optax.chain(solver, _keep_within(*self.bounds))
         return solver
@@ -1339,6 +1410,19 @@ class ScheduleBase:
             raise ValueError(f"{type(self).__name__} needs {field} or trainer.steps as its step horizon")
         return steps
 
+    def warmup(self, steps: int | None) -> int | None:
+        """Its warmup in its own steps over a run of `steps` updates, its share of the run resolved
+        (`_warmup`), as a run's plan records it; None for a schedule with no warmup of steps."""
+        return None
+
+    def _warmup(self, written: int | str, steps: int | None, horizon: int | None = None) -> int:
+        """A warmup of `written` steps in its own steps over a run of `steps` of them: as written, or a
+        share of the run such as `5%` (`dew._records.share`), the whole steps nearest it, of the run's
+        steps or, where the run has none, of the schedule's own `horizon`."""
+        if not isinstance(written, str):
+            return written
+        return round(share(written) * self._horizon(steps if steps is not None else horizon, "warmup_steps"))
+
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
         """Return the value at each of the schedule's own steps, over `steps` of them, from its
@@ -1358,25 +1442,30 @@ class Cosine(ScheduleBase):
     """
 
     peak_value: float = dataclasses.field(metadata={'rate': True})
-    warmup_steps: int = 10000
+    warmup_steps: int | str = 10000
+    """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`)."""
     end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
     init_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
     decay_steps: int | None = None
+
+    def warmup(self, steps: int | None) -> int:
+        return self._warmup(self.warmup_steps, steps, self.decay_steps)
 
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
         rates = self.rates() if rates is None else rates
         decay_steps = self._horizon(steps if self.decay_steps is None else self.decay_steps, "decay_steps")
-        if self.warmup_steps >= decay_steps:
+        warmup = self.warmup(steps)
+        if warmup >= decay_steps:
             raise ValueError(f"Cosine needs warmup_steps={self.warmup_steps} smaller than "
                              f"decay_steps={decay_steps}")
         # `optax.warmup_cosine_decay_schedule`'s own pieces, joined as it joins them; it forms the
         # floor's ratio by branching on the peak, so the ratio is the configured fields' (`values`).
         alpha = 0.0 if self.peak_value == 0.0 else self.end_value / self.peak_value
         return optax.join_schedules([
-            optax.linear_schedule(rates['init_value'], rates['peak_value'], self.warmup_steps),
-            optax.cosine_decay_schedule(rates['peak_value'], decay_steps - self.warmup_steps, alpha),
-        ], [self.warmup_steps])
+            optax.linear_schedule(rates['init_value'], rates['peak_value'], warmup),
+            optax.cosine_decay_schedule(rates['peak_value'], decay_steps - warmup, alpha),
+        ], [warmup])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1400,20 +1489,25 @@ class Power(ScheduleBase):
     """
 
     peak_value: float = dataclasses.field(metadata={'rate': True})
-    warmup_steps: int
+    warmup_steps: int | str
+    """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`)."""
     a: float = dataclasses.field(metadata={'rate': True})
     b: float = -0.51
     c: float = 1.0
     tail: PowerTail | None = None
 
+    def warmup(self, steps: int | None) -> int:
+        return self._warmup(self.warmup_steps, steps, None if self.tail is None else self.tail.steps)
+
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
         rates = self.rates() if rates is None else rates
         tail = self.tail
+        warmup = self.warmup(steps)
         if tail is None:
-            return power_schedule(rates['peak_value'], self.warmup_steps, rates['a'], self.b, self.c)
+            return power_schedule(rates['peak_value'], warmup, rates['a'], self.b, self.c)
         return power_schedule(
-            rates['peak_value'], self.warmup_steps, rates['a'], self.b, self.c, decay_start=tail.start,
+            rates['peak_value'], warmup, rates['a'], self.b, self.c, decay_start=tail.start,
             decay_end=self._horizon(steps if tail.steps is None else tail.steps, "tail.steps"),
             end_value=rates['tail.end_value'])
 
@@ -1428,15 +1522,19 @@ class Linear(ScheduleBase):
     """
 
     peak_value: float = dataclasses.field(metadata={'rate': True})
-    warmup_steps: int = 0
+    warmup_steps: int | str = 0
+    """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`)."""
     decay_start: int | None = None
     decay_steps: int | None = None
     end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
 
+    def warmup(self, steps: int | None) -> int:
+        return self._warmup(self.warmup_steps, steps, self.decay_steps)
+
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
         rates = self.rates() if rates is None else rates
-        return linear_schedule(rates['peak_value'], self.warmup_steps, self.decay_start,
+        return linear_schedule(rates['peak_value'], self.warmup(steps), self.decay_start,
                                self._horizon(steps if self.decay_steps is None else self.decay_steps,
                                              "decay_steps"),
                                end_value=rates['end_value'])
@@ -1463,7 +1561,8 @@ class OneCycle(ScheduleBase):
     peak_value: float = dataclasses.field(metadata={'rate': True})
     init_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
     end_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
-    warmup_fraction: float = 0.3
+    warmup_fraction: float | str = 0.3
+    """The share of the run its rise lasts, torch's `pct_start`: a fraction, or a share such as `30%`."""
 
     def rates(self) -> dict[str, float]:
         """The peak, and the init and end values with torch's derived defaults resolved."""
@@ -1471,12 +1570,21 @@ class OneCycle(ScheduleBase):
         return {'peak_value': self.peak_value, 'init_value': init,
                 'end_value': init / 1e4 if self.end_value is None else self.end_value}
 
+    def _rise(self, steps: int) -> float:
+        """The step its rate peaks at over a run of `steps`, torch's phase end, kept a float as torch
+        keeps it."""
+        fraction = self.warmup_fraction
+        return (share(fraction) if isinstance(fraction, str) else fraction) * steps - 1
+
+    def warmup(self, steps: int | None) -> int:
+        """The steps of its rise, to the whole step its rate peaks at (`_rise`)."""
+        return round(self._rise(self._horizon(steps, "trainer.steps")))
+
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
         rates = self.rates() if rates is None else rates
         steps = self._horizon(steps, "trainer.steps")
-        # torch's phase ends, kept as floats as torch keeps them.
-        rise, last = self.warmup_fraction * steps - 1, steps - 1
+        rise, last = self._rise(steps), steps - 1
         if not 0 < rise < last:
             raise ValueError(f"a one-cycle schedule over {steps} steps with warmup fraction "
                              f"{self.warmup_fraction} has no rise or no fall; give it more steps")
@@ -1625,6 +1733,24 @@ class OptimConfig:
     an average with any other relative standard deviation from the snapshots.
     Empty keeps none.
     """
+
+    def warmups(self, steps: int | None) -> dict[str, int]:
+        """Each of its schedules' warmup in that schedule's own steps over a run of `steps` updates,
+        its share of the run resolved (`ScheduleBase.warmup`), by where the config holds it, as a
+        run's plan records it; a schedule with no warmup of steps is not among them."""
+        held: list[tuple[str, object]] = [] if self.param_groups else [("learning_rate", self.learning_rate)]
+        for group in self.param_groups:
+            # The schedules the group's solver runs (`ParamGroup.rate`): the config's own where the
+            # group names none.
+            rate = "learning_rate" if group.schedule is None else f"param_groups.{group.name}.schedule"
+            held += [(rate, group.rate(self.learning_rate)), (f"param_groups.{group.name}.b1", group.b1)]
+        warmups = {}
+        for name, schedule in held:
+            if isinstance(schedule, ScheduleBase):
+                warmup = schedule.warmup(None if steps is None else steps // schedule.every)
+                if warmup is not None:
+                    warmups[name] = warmup
+        return warmups
 
     def build(self, steps: int | None) -> optax.GradientTransformation:
         """Build the optimizer this config describes, with its schedule, parameter groups and clipping.

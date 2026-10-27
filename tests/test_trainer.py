@@ -14,10 +14,12 @@ import contextlib
 import dataclasses
 import itertools
 import json
+import math
 import os
 import subprocess
 import sys
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 
 import jax
@@ -403,9 +405,11 @@ def test_a_resumed_run_continues_the_key_stream(tmp_path):
     resumed = make_trainer(tmp_path, objective=Keyed()).fit(dataset(), steps=4, log_every=1)
     whole = make_trainer(objective=Keyed()).fit(dataset(), steps=4, log_every=1)
 
+    # The restore is exact and the resumed steps are the uninterrupted run's program on the same
+    # values, so a resume that kept its key stream lands on the same bits.
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
-        np.testing.assert_allclose(np.asarray(expected), np.asarray(actual), rtol=1e-6)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 def drawn(seed=0, opened=None, diverge=None):
@@ -1216,6 +1220,258 @@ def test_each_suite_is_scored_on_its_own_cadence_with_its_own_metrics():
     assert steps == {"often": [2, 4, 6], "rare": [3, 6]}
 
 
+@pytest.mark.parametrize(("written", "expected"), [(("25%", "50%", 2), ([2, 4, 6, 8], [4, 8])),
+                                                   ((2, "50%", "25%"), ([2, 4, 6, 8], [4, 8]))])
+def test_a_cadence_may_be_a_share_of_the_run(tmp_path, written, expected):
+    """A log, validation or suite cadence written as a share of the run's planned steps is the whole
+    steps nearest it, as the steps it resolves to are: 25% and 50% of 8 steps log every 2 and score
+    every 4, and the run's start records what each resolved to."""
+    from dew.training import EvalSuite
+
+    log_every, eval_every, suite_every = written
+    tracker = RecordingTracker()
+    trainer = make_trainer(tmp_path, objective=Features(), tracker=tracker)
+    trainer.fit(dataset(val=None), steps=8, log_every=log_every, eval_every=eval_every,
+                metrics=(Spread([]),),
+                validation={"often": dataset(val=val_batches(1)).val,
+                            "own": EvalSuite(dataset(val=val_batches(1)).val, (Spread([]),), suite_every)})
+    logged = sorted({step for step, scalars in tracker.scalars if "train/loss" in scalars})
+    scored = sorted({step for step, scalars in tracker.scalars if "often/spread" in scalars})
+    assert (logged, scored) == expected
+    assert sorted({step for step, scalars in tracker.scalars if "own/spread" in scalars}) == [2, 4, 6, 8]
+
+
+def cooldown_run(schedule, steps: int, accumulation: int, tracker=None, cooldowns=None,
+                 directory=None) -> TrainState:
+    """Regression on AdamW at `schedule` for `steps`, scored once at its end, with any `cooldowns`,
+    checkpointed in `directory` where one is given."""
+    trainer = make_trainer(directory, tracker=tracker, accumulation=accumulation,
+                           optimizer=OptimConfig(optimizer="adamw", learning_rate=schedule))
+    return trainer.fit(dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps,
+                       cooldowns=cooldowns)
+
+
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the_run_as_it_was(accumulation):
+    """A linear cooldown of four updates from the fourth of a warmup-stable-decay run is the run whose
+    decay begins there: the branch's `cooldown_val/loss`, recorded at the step it branched from, is that
+    run's final `val/loss` bit for bit (its rates, 2^-4 times 1, 3/4, 1/2 and 1/4, exact), and the run
+    it branched from ends where a run with no cooldown ends, its parameters bit for bit."""
+    from dew.optim import Linear
+    from dew.telemetry.records import FitStarted
+    from dew.training.cooldown import Cooldowns
+
+    peak, at = 2.0 ** -4, 4 * accumulation
+    stable = Linear(peak, decay_start=64, decay_steps=128)
+    tracker = RecordingTracker()
+    branched = cooldown_run(stable, 3 * at, accumulation, tracker,
+                            Cooldowns(at=(at,), length=at, shape="linear"))
+    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
+              if "cooldown_val/loss" in scalars}
+    decayed = RecordingTracker()
+    cooldown_run(Linear(peak, decay_start=4, decay_steps=8), 2 * at, accumulation, decayed)
+    finals = [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars]
+    assert cooled == {at: finals[-1]}
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert started.cadences["cooldowns.at"] == [at]
+    plain = cooldown_run(stable, 3 * at, accumulation)
+    for ours, theirs in zip(jax.tree.leaves(branched.variables), jax.tree.leaves(plain.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+@pytest.mark.parametrize("best", [False, True], ids=["unranked", "weights-best"])
+def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path, best):
+    """A preemption that reaches a run as it branches into a cooldown stops it at the step the branch
+    left from, its state as it stood there, unscored, and saved whole in the step's one save, though a
+    weights-only best would have kept the step's weights alone; the resume runs the branch again first,
+    recording the score an uninterrupted run records, and trains on to the parameters a run with no
+    cooldown reaches, bit for bit."""
+    from dew.optim import Linear
+    from dew.training import Best
+    from dew.training.cooldown import Cooldowns
+
+    stable, cooldowns = Linear(2.0 ** -4, decay_start=64, decay_steps=128), Cooldowns(at=(4,), length=4)
+    uninterrupted = RecordingTracker()
+    cooldown_run(stable, 12, 1, uninterrupted, cooldowns)
+    expected = {step: scalars["cooldown_val/loss"] for step, scalars in uninterrupted.scalars
+                if "cooldown_val/loss" in scalars}
+    optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
+    # The notice step 3's log sends reaches the run after step 4, as its branch begins.
+    stopped = Preempting(3)
+    weights = Best(lambda scores: scores["val/loss"], weights_only=True)
+    ranked = {"eval_every": 4, "best": weights} if best else {"eval_every": 12}
+    with pytest.raises(Preempted):
+        make_trainer(tmp_path, tracker=stopped, optimizer=optimizer).fit(
+            dataset(val=val_batches(2)), steps=12, log_every=1, cooldowns=cooldowns, **ranked)
+    assert not any("cooldown_val/loss" in scalars for _, scalars in stopped.scalars)
+    assert Checkpoints(str(tmp_path / "run")).latest == 4
+    resumed = RecordingTracker()
+    state = cooldown_run(stable, 12, 1, resumed, cooldowns, tmp_path)
+    assert {step: scalars["cooldown_val/loss"] for step, scalars in resumed.scalars
+            if "cooldown_val/loss" in scalars} == expected
+    plain = cooldown_run(stable, 12, 1)
+    for ours, theirs in zip(jax.tree.leaves(state.variables), jax.tree.leaves(plain.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+@pytest.mark.parametrize("saves", ["final", "none", "weights-best"])
+def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume(tmp_path, saves):
+    """A cooldown at the run's last step runs after the step's final save, and one a preemption cuts
+    short stays pending beside the checkpoints (`Checkpoints.cooldown`), its step written whole even
+    where the run writes no final checkpoint or its best's weights alone: the resume runs it,
+    recording what an uninterrupted run records, and completes the run, and a fit of the completed run
+    runs nothing again."""
+    from dew.optim import Linear
+    from dew.training import Best
+    from dew.training.cooldown import Cooldowns
+
+    stable, cooldowns = Linear(2.0 ** -4, decay_start=64, decay_steps=128), Cooldowns(at=(8,), length=4)
+    uninterrupted = RecordingTracker()
+    cooldown_run(stable, 8, 1, uninterrupted, cooldowns)
+    expected = {step: scalars["cooldown_val/loss"] for step, scalars in uninterrupted.scalars
+                if "cooldown_val/loss" in scalars}
+    assert list(expected) == [8]
+    optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
+    best = Best(lambda scores: scores["val/loss"], weights_only=True) if saves == "weights-best" else None
+    with pytest.raises(Preempted):
+        make_trainer(tmp_path, tracker=Preempting(7), optimizer=optimizer).fit(
+            dataset(val=val_batches(2)), steps=8, log_every=1, eval_every=8, cooldowns=cooldowns,
+            checkpoint_final=saves == "final", best=best)
+    assert Checkpoints(str(tmp_path / "run")).latest == 8
+    assert Checkpoints(str(tmp_path / "run")).cooldown(8) is not None
+    resumed, again = RecordingTracker(), RecordingTracker()
+    cooldown_run(stable, 8, 1, resumed, cooldowns, tmp_path)
+    assert {step: scalars["cooldown_val/loss"] for step, scalars in resumed.scalars
+            if "cooldown_val/loss" in scalars} == expected
+    assert Checkpoints(str(tmp_path / "run")).cooldown(8) is None
+    cooldown_run(stable, 8, 1, again, cooldowns, tmp_path)
+    assert not any("cooldown_val/loss" in scalars for _, scalars in again.scalars)
+
+
+def test_a_cooldown_resolves_its_points_and_lengths_as_shares_of_the_run():
+    """A cooldown's point is a step or a share of the run, resolved as a cadence's is, and its length a
+    step count or a share of the steps the run has taken; it decays as 1 - sqrt(u / U), or linearly."""
+    from dew.training.cadence import Tokens
+    from dew.training.cooldown import Cooldowns, resolved
+
+    cooldowns = Cooldowns(at=("25%", 6), length="50%")
+    assert [branch.at for branch in cooldowns.branches(16, None, 1)] == [4, 6]
+    (shared,) = Cooldowns(at=("25%",)).branches(None, 96, 1)
+    assert shared.at == Tokens(24) and shared.due(3, 30, 20) and not shared.due(4, 50, 30)
+    assert cooldowns.steps(4, 1) == 2 and cooldowns.steps(12, 2) == 6
+    assert [cooldowns.factor(update, 4) for update in range(4)] == [1.0, 0.5, 1.0 - math.sqrt(0.5),
+                                                                    1.0 - math.sqrt(0.75)]
+    linear = Cooldowns(at=(4,), shape="linear")
+    assert [linear.factor(update, 4) for update in range(4)] == [1.0, 0.75, 0.5, 0.25]
+    # A branch a run kept pending is refused where a resume's updates do not divide its steps.
+    with pytest.raises(ValueError):
+        resolved({"step": 4, "steps": 3, "shape": "linear"}, 2)
+
+
+@pytest.mark.parametrize("refused", ["unscored", "unheld", "computed", "inside"])
+def test_a_cooldown_a_run_could_not_score_or_decay_is_refused(refused):
+    """A run with no validation to score its branches, an optimizer whose state holds no learning rate
+    (plain SGD) or one Optax computes from a step count at each update (an injected schedule function),
+    and a point inside an update's window are each refused before the run trains."""
+    from dew.training.cooldown import Cooldowns
+
+    computed = optax.inject_hyperparams(optax.sgd)(learning_rate=optax.linear_schedule(0.1, 0.0, 8))
+    optimizers = {"unheld": optax.sgd(0.1), "computed": computed}
+    trainer = make_trainer(optimizer=optimizers.get(refused, OptimConfig()),
+                           accumulation=2 if refused == "inside" else 1)
+    at = 3 if refused == "inside" else 4
+    with pytest.raises(ValueError):
+        trainer.fit(dataset(val=val_batches(2)), steps=8, eval_every=None if refused == "unscored" else 8,
+                    cooldowns=Cooldowns(at=(at,)))
+
+
+def test_a_cooldown_of_an_injected_constant_rate_is_the_run_that_decays_there():
+    """An optax optimizer injecting a constant rate (`optax.inject_hyperparams`) holds it in its state
+    as an OptimConfig does, and a linear cooldown from it is the run whose injected schedule decays
+    there, its score bit for bit."""
+    from dew.training.cooldown import Cooldowns
+
+    peak = 2.0 ** -4
+    decaying = optax.join_schedules([optax.constant_schedule(peak), optax.linear_schedule(peak, 0.0, 4)], [4])
+    tracker, decayed = RecordingTracker(), RecordingTracker()
+    for optimizer, steps, sink, cooldowns in (
+            (optax.inject_hyperparams(optax.sgd)(learning_rate=peak), 12, tracker,
+             Cooldowns(at=(4,), length=4, shape="linear")),
+            (optax.inject_hyperparams(optax.sgd)(learning_rate=decaying), 8, decayed, None)):
+        make_trainer(tracker=sink, optimizer=optimizer).fit(
+            dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps, cooldowns=cooldowns)
+    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
+              if "cooldown_val/loss" in scalars}
+    assert cooled == {4: [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars][-1]}
+
+
+def test_the_run_start_records_the_cadences_and_warmups_it_resolved(tmp_path):
+    """The run's start record holds each cadence and schedule warmup as the run resolved it, a share
+    of the run among them: 25% of 8 steps logs every 2, and a warmup of 50% is 4 updates."""
+    from dew.training import LocalTracker
+
+    with LocalTracker(tmp_path / "tracking") as tracker:
+        trainer = make_trainer(tmp_path, tracker=tracker,
+                               optimizer=OptimConfig(learning_rate=Cosine(1e-2, warmup_steps="50%")))
+        trainer.fit(dataset(), steps=8, log_every="25%", checkpoint_every="50%")
+    written = (tmp_path / "tracking" / "records.jsonl").read_text().splitlines()
+    started = next(record for record in map(json.loads, written) if record["type"] == "FitStarted")
+    assert started["value"]["cadences"] == {"log_every": 2, "eval_every": None, "checkpoint_every": 4,
+                                            "warmup_steps.learning_rate": 4}
+
+
+def test_a_local_checkpoint_cadence_may_be_a_share_of_the_run(tmp_path):
+    """`Checkpoints.local_every` may be a share of the run, resolved as `fit`'s other cadences are: 25%
+    of 8 steps writes the local checkpoint every 2, and the run's start records it."""
+    from dew.telemetry.records import CheckpointRequested, FitStarted
+
+    tracker = RecordingTracker()
+    checkpoints = Checkpoints(str(tmp_path / "run"), local_directory=str(tmp_path / "local"),
+                              local_every="25%")
+    trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker,
+                      layout=Layout(min_shard=1, tolerance=1.0), checkpoints=checkpoints)
+    trainer.fit(dataset(), steps=8, log_every=4)
+    local = [step for step, value in tracker.artifacts
+             if isinstance(value, CheckpointRequested) and value.local]
+    assert local == [2, 4, 6, 8]
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert started.cadences["local_every"] == 2
+    with pytest.raises(ValueError):
+        Checkpoints(str(tmp_path / "other"), local_directory=str(tmp_path / "local"), local_every="25")
+
+
+def test_a_share_of_a_token_budget_falls_where_the_committed_tokens_pass_its_multiples():
+    """A cadence written as a share of a token budget alone falls at each step whose commit passes a
+    multiple of that share of the budget's tokens: 25% of 96 logs at the steps that bring the
+    committed tokens past 24, 48, 72 and 96, as a run logging every step counts them."""
+    every = RecordingTracker()
+    make_trainer(objective=TokenRegression(), tracker=every).fit(dataset(), tokens=96, log_every=1)
+    # A log every step reports the tokens that step committed; the run's are their running sum.
+    each = sorted((step, scalars["train/tokens"]) for step, scalars in every.scalars
+                  if "train/tokens" in scalars)
+    committed = dict(zip((step for step, _ in each), itertools.accumulate(tokens for _, tokens in each),
+                         strict=True))
+    passing = sorted(step for step, tokens in committed.items()
+                     if tokens // 24 > committed.get(step - 1, 0) // 24)
+    shared = RecordingTracker()
+    make_trainer(objective=TokenRegression(), tracker=shared).fit(dataset(), tokens=96, log_every="25%")
+    logged = sorted({step for step, scalars in shared.scalars if "train/tokens" in scalars})
+    assert passing and logged == passing
+
+
+@pytest.mark.parametrize("written", ["5", "0%", "150%", "five%"])
+def test_a_cadence_that_is_neither_steps_nor_a_share_is_refused(written):
+    with pytest.raises(ValueError):
+        make_trainer().fit(dataset(), steps=4, log_every=written)
+
+
+def test_a_share_of_a_run_with_no_planned_length_is_refused():
+    """A run bounded by nothing but its data's end has no planned length to take a share of."""
+    with pytest.raises(ValueError):
+        make_trainer().fit(stream(lambda partition: endless()), eval_every="5%")
+
+
 def test_metrics_without_a_cadence_are_scored_once_at_the_end():
     """A metric costly enough to want once is scored by the pass every suite gets at the run's end
     alone, where neither fit's eval_every nor the suite's every schedules another. Metrics with no
@@ -1291,8 +1547,23 @@ def host(state):
     return np.array(state.variables["params"]["w"]), np.array(state.ema["params"]["w"])
 
 
+def unscaled(accum: int, microsteps: int):
+    """The weights and their average after `microsteps` good microbatches of the same trainer with no
+    dynamic scale: what a scaled run's accepted steps must equal bit for bit, its scale a power of two
+    that multiplies the loss and divides the gradients exactly."""
+    trainer = Trainer(ScaledObjective(), optax.sgd(.1), key=jax.random.key(0), accumulation=accum)
+    state = trainer.initial_state()
+    good = {"scale": jnp.ones((jax.device_count(),), jnp.float32)}
+    step = trainer.compile(state, good)
+    for _ in range(microsteps):
+        state, *_ = step(state, good)
+    return host(state)
+
+
 @pytest.mark.parametrize("accum", [1, 2])
 def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
+    """A dynamic scale's accepted steps are the unscaled run's, bit for bit, and a rejected one leaves
+    no trace: after it, the run steps on as the unscaled run of its accepted microbatches alone."""
     trainer = Trainer(ScaledObjective(), optax.sgd(.1), key=jax.random.key(0),
                       accumulation=accum, dynamic_scale=True)
     state = trainer.initial_state()
@@ -1302,8 +1573,9 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     for _ in range(2 * accum - 1):
         state, *_ = step(state, good)
     w, ema = host(state)
-    np.testing.assert_allclose(w, .8, rtol=1e-6)
-    np.testing.assert_allclose(ema, .9, rtol=1e-6)
+    assert np.all(w != 1.0)
+    for got, want in zip((w, ema), unscaled(accum, 2 * accum - 1), strict=True):
+        np.testing.assert_array_equal(got, want)
     # the step consumes the state
     counted, advanced, scaled = int(state.step), int(state.microstep), float(state.scale.scale)
     state, _, _, finite, accepted, _ = step(state, bad)
@@ -1317,8 +1589,9 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     for _ in range(accum):
         state, *_ = step(state, good)
     w, ema = host(state)
-    np.testing.assert_allclose(w, .64, rtol=1e-6)
-    np.testing.assert_allclose(ema, .77, rtol=1e-6)
+    # Two accepted updates: the rejection dropped its window, the pending microbatch with it.
+    for got, want in zip((w, ema), unscaled(accum, 2 * accum), strict=True):
+        np.testing.assert_array_equal(got, want)
     assert int(state.microstep) == 2 * accum
 
 
@@ -1407,6 +1680,107 @@ class ListedParameters(Objective):
         return jnp.sum(variables["params"]["layers"][0]["w"] ** 2), Aux({})
 
 
+MAPPINGS = {"dict": dict, "frozen": frozen_dict, "ordered": collections.OrderedDict}
+"""The kinds of mapping a caller's tree may hold its collections in."""
+
+
+def held_count(kind: str, container: str, count) -> dict:
+    """A `stats` collection of `count`, `{"count": count}` in a mapping of `kind`, as `container` holds
+    it: the mapping itself, or in a list or a tuple."""
+    node = MAPPINGS[kind]({"count": count})
+    return {"seen": node if container == "mapping" else [node] if container == "list" else (node,)}
+
+
+def counted(stats):
+    """The count `held_count` holds."""
+    seen = stats["seen"]
+    return (seen if isinstance(seen, Mapping) else seen[0])["count"]
+
+
+class Kinded(Counted):
+    """`Counted`, its count starting in mappings of `started`'s kind and written back in `written`'s,
+    each held as `container` holds it (`held_count`)."""
+
+    def __init__(self, started: str, written: str, container: str):
+        self.started, self.written, self.container = started, written, container
+
+    def fresh_variables(self, key, held):
+        stats = held_count(self.started, self.container, jnp.zeros(()))
+        return {"params": {"w": jnp.ones((2,))}, "stats": stats}
+
+    def loss(self, variables, batch, step):
+        loss = jnp.sum(variables["params"]["w"] ** 2)
+        stats = held_count(self.written, self.container, counted(variables["stats"]) + 1)
+        return loss, Aux({}, variables={"stats": stats})
+
+
+@pytest.mark.parametrize("container", ["mapping", "list", "tuple"])
+@pytest.mark.parametrize("kind", list(MAPPINGS))
+@pytest.mark.parametrize("entry", ["init", "supplied", "write-back"])
+def test_a_tree_of_any_kind_of_mapping_is_held_as_dicts_where_it_enters(tmp_path, entry, kind, container):
+    """A tree a run is handed holds its collections in any kind of mapping (a dict, a Flax
+    `FrozenDict`, an `OrderedDict`), under a list or a tuple too: where the objective's init returns
+    it, where a supplied state holds it and where the loss writes it back, the state holds it as
+    dicts, so every step's tree has one structure and the run counts every step."""
+    objective = Kinded(kind if entry == "init" else "dict", kind if entry == "write-back" else "dict",
+                       container)
+    trainer = make_trainer(tmp_path, objective=objective, optimizer=optax.sgd(1e-2))
+    supplied = None
+    if entry == "supplied":
+        initial = trainer.initial_state()
+        stats = held_count(kind, container, counted(initial.variables["stats"]))
+        supplied = dataclasses.replace(initial, variables={**initial.variables, "stats": stats})
+    state = trainer.fit(dataset(), steps=3, log_every=1, state=supplied)
+    others = [node for node in jax.tree.leaves(
+        state, is_leaf=lambda node: isinstance(node, Mapping) and type(node) is not dict)
+        if isinstance(node, Mapping)]
+    assert not others and float(counted(state.variables["stats"])) == 3.0
+
+
+@jax.tree_util.register_pytree_node_class
+class MomentumRecord(Mapping):
+    """An optimizer's state that is a mapping of its own kind, read by attribute: its momentum."""
+
+    def __init__(self, momentum):
+        self.momentum = momentum
+
+    def __getitem__(self, key):
+        return {"momentum": self.momentum}[key]
+
+    def __iter__(self):
+        return iter(("momentum",))
+
+    def __len__(self):
+        return 1
+
+    def tree_flatten(self):
+        return (self.momentum,), None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        return cls(*children)
+
+
+def recorded_momentum() -> optax.GradientTransformation:
+    """Momentum kept in a `MomentumRecord`."""
+    def init(params):
+        return MomentumRecord(jax.tree.map(jnp.zeros_like, params))
+
+    def update(updates, state, params=None):
+        momentum = jax.tree.map(lambda held, gradient: 0.9 * held + gradient, state.momentum, updates)
+        return jax.tree.map(lambda held: -1e-2 * held, momentum), MomentumRecord(momentum)
+
+    return optax.GradientTransformation(init, update)
+
+
+def test_a_supplied_state_keeps_an_optimizer_record_that_is_a_mapping_of_its_own_kind(tmp_path):
+    """Only container mappings become dicts where a state enters: an optimizer's record that is a
+    mapping of its own kind stays one, its fields read as its update reads them."""
+    trainer = make_trainer(tmp_path, objective=Counted(), optimizer=recorded_momentum())
+    state = trainer.fit(dataset(), steps=2, log_every=1, state=trainer.initial_state())
+    assert int(state.step) == 2 and isinstance(state.opt_state, MomentumRecord)
+
+
 def test_a_supplied_state_whose_parameters_and_moments_hold_a_frozen_dict_in_a_list_trains(tmp_path):
     """A state handed to fit is held whole as dicts of its own: its variables under any mapping, and a
     Flax `FrozenDict` in a list both where a parameter sits and where the optimizer's moments of it do,
@@ -1461,7 +1835,7 @@ def test_the_ema_stores_only_the_selected_subtree_and_merges_over_the_rest():
 
     assert set(state.ema["params"]) == {"tracked"}
     live = state.variables["params"]
-    assert not np.allclose(state.ema["params"]["tracked"]["w"], live["tracked"]["w"])
+    assert np.any(np.asarray(state.ema["params"]["tracked"]["w"]) != np.asarray(live["tracked"]["w"]))
     merged = merge(state.variables, state.ema)
     assert merged["params"]["untracked"] is live["untracked"]
     np.testing.assert_array_equal(merged["params"]["tracked"]["w"], state.ema["params"]["tracked"]["w"])
@@ -1548,14 +1922,15 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
 
     state = trainer().fit(dataset(), steps=2, log_every=1)
     # Step 0 moved the generator half way to 1 (lr 0.25 on a gradient of 2(g - 1));
-    # step 1 moved the discriminator half way to the generator.
-    assert float(state.variables["params"]["gen"]["g"]) == pytest.approx(0.5)
-    assert float(state.variables["params"]["disc"]["d"]) == pytest.approx(0.25)
+    # step 1 moved the discriminator half way to the generator. Every value is a few bits' dyadic
+    # fraction, so each product and sum is exact.
+    assert float(state.variables["params"]["gen"]["g"]) == 0.5
+    assert float(state.variables["params"]["disc"]["d"]) == 0.25
     assert [s["train/player"] for _, s in tracker.scalars if "train/player" in s] == [0.0, 1.0]
 
     resumed = trainer().fit(dataset(), steps=4, log_every=1)
-    assert float(resumed.variables["params"]["gen"]["g"]) == pytest.approx(0.75)
-    assert float(resumed.variables["params"]["disc"]["d"]) == pytest.approx(0.5)
+    assert float(resumed.variables["params"]["gen"]["g"]) == 0.75
+    assert float(resumed.variables["params"]["disc"]["d"]) == 0.5
     assert Checkpoints(str(tmp_path / "gan")).latest == 4
 
 

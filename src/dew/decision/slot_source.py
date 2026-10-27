@@ -55,6 +55,21 @@ def _attention(overrides: Mapping[str, object]) -> Mapping[str, object]:
     return _records.record(overrides.get("attention", {}), "modeling_overrides.attention")
 
 
+def reads_blocks(config: Mapping[str, object], overrides: Mapping[str, object] | None) -> bool:
+    """Whether a backbone loaded from `config` under the load's `overrides` reads each of a row's blocks
+    whole on some layer kind of its text, as the attention its `modeling_overrides` declares, the
+    load's over the checkpoint's (`with_overrides`), a wrapper's own scope's kinds over its
+    `text_config`'s, each kind the nearer scope names (a language model loaded alone holds the
+    config its loader made of the two, `decoders.language_model_config`). Its decision rows then lie
+    in blocks. A checkpoint reading its own media in blocks declares none."""
+    built = with_overrides(config, overrides)
+    text = built.get("text_config")
+    nested = _attention(_records.record(text.get("modeling_overrides", {}) if isinstance(text, Mapping)
+                                        else {}, "text_config.modeling_overrides"))
+    stated = _attention(_records.record(built.get("modeling_overrides", {}), "modeling_overrides"))
+    return "block_bidirectional" in {**nested, **stated}.values()
+
+
 def _full_attention(overrides: Mapping[str, object]) -> str:
     """The full-attention layers' mode a `modeling_overrides` record states: causal, or the release's
     block_bidirectional; causal where it states none. The release's `attention` field states it."""
@@ -138,10 +153,10 @@ class SlotSource(SourceKind):
         root = Path(directory)
         bundle.backbone().save(root, max_shard_size=max_shard_size)
         readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": len(ids)}
-        # The release's attention field states its full attention as the saved config's overrides do;
-        # the rows' blocks may serve another kind as well.
-        written = _records.record(json.loads((root / "config.json").read_text()), "config.json")
-        if _full_attention(_records.record(written.get("modeling_overrides", {}),
+        # The release's attention field states its full attention as the config `Pretrained.save` writes
+        # does: the bundle's own, the load's overrides over the release's. The rows' blocks may serve
+        # another kind as well.
+        if _full_attention(_records.record(bundle.config.get("modeling_overrides", {}),
                                            "modeling_overrides")) == "block_bidirectional":
             readout["attention"] = "noncausal"
         bundle.decision_tokenizer.save_pretrained(root)
@@ -234,9 +249,7 @@ class SlotSource(SourceKind):
             config["modeling_overrides"] = native
         # The load's own overrides over the release's: its rows lie in blocks exactly where a layer of
         # the backbone the native loader builds under them reads blocks, of whatever kind.
-        built = _records.record(with_overrides(config, overrides).get("modeling_overrides", {}),
-                                "modeling_overrides")
-        blocks = "block_bidirectional" in _attention(built).values()
+        blocks = reads_blocks(config, overrides)
         tokenizer = HFTokenizer(str(directory), local_files_only=True)
         labels, ids = _labels(tokenizer, count)
         head = (SlotHeadSource({"class": import_path(LabelReadout), "fields": {

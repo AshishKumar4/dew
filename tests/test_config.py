@@ -556,3 +556,131 @@ def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
     assert loaded == config
     assert loaded.optim.param_groups[0].bounds == (0.0, 24.0)
+
+
+def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits():
+    """`val_metrics` is every run's (`RunConfig`). Where it names none, each split scores the kind's own
+    (`default_metrics`): a language model its perplexity, a decision run its held-out suite, a JEPA run
+    its probes. Where it names them, each split scores those that name it or no split
+    (`MetricConfig.split`), a split none names scores none, and a metric of a split the run does not
+    validate is refused; the record round trips through the command line and run.json alike."""
+    import types
+
+    from dew.config import MetricConfig
+    from dew.config.jepa import JepaRunConfig
+    from dew.config.lm import LMRunConfig
+    from dew.decision.config import DecisionRunConfig
+    from dew.decision.metrics import AURC, ECE, Accuracy
+    from dew.decision.scoring import Brier, LogLoss
+    from dew.objectives.jepa.probes import KnnProbe, LinearProbe
+    from dew.objectives.lm.objective import Perplexity
+
+    def kinds(metrics):
+        return [type(metric) for metric in metrics]
+
+    assert kinds(LMRunConfig().validation_metrics(validates=True)) == [Perplexity]
+    assert LMRunConfig().validation_metrics(validates=False) == ()
+    assert kinds(DecisionRunConfig().validation_metrics(validates=True)) == [Accuracy, ECE, AURC, LogLoss]
+    assert kinds(JepaRunConfig(probe_classes=7).validation_metrics(validates=True)) == [LinearProbe, KnnProbe]
+    linear, knn = JepaRunConfig(probe_classes=7, knn_k=5).validation_metrics(validates=False)
+    assert (linear.num_classes, knn.num_classes, knn.k) == (7, 7, 5)
+    splits = {"val": object(), "test": object()}
+    stream = types.SimpleNamespace(val=None)
+    assert LMRunConfig().suites(stream, splits) is None
+    flag = '[{"name": "accuracy"}, {"name": "brier", "split": "test"}]'
+    named = DecisionRunConfig.cli(["--val-metrics", flag])
+    assert named.val_metrics == (MetricConfig("accuracy"), MetricConfig("brier", split="test"))
+    suites = named.suites(stream, splits)
+    assert {split: (suite.data, kinds(suite.metrics)) for split, suite in suites.items()} == {
+        "val": (splits["val"], [Accuracy]), "test": (splits["test"], [Accuracy, Brier])}
+    assert DecisionRunConfig.from_dict(named.to_dict()) == named
+    only = LMRunConfig(val_metrics=[MetricConfig("perplexity", split="test")]).suites(stream, splits)
+    assert {split: kinds(suite.metrics) for split, suite in only.items()} == {"val": [], "test": [Perplexity]}
+    assert LMRunConfig(val_metrics=[]).suites(types.SimpleNamespace(val=None), None) == {}
+    for stray in ([MetricConfig("brier", split="holdout")], [MetricConfig("brier")]):
+        with pytest.raises(ValueError):
+            LMRunConfig(val_metrics=stray).suites(stream, splits if stray[0].split else None)
+
+
+@pytest.mark.parametrize("kind", ["lm", "decision", "diffusion"])
+def test_every_run_kind_reads_its_source_options_from_the_command_line(kind):
+    """`--source.text-only`, `--source.prediction-depths` and `--source.attention` are every run kind's,
+    and its source's load reads them beside where it reads the source (`RunConfig.source_keywords`):
+    the attention as the load's `modeling_overrides`."""
+    from dew.config import SourceOptions
+    from dew.config.diffusion import DiffusionRunConfig
+    from dew.config.lm import LMRunConfig
+    from dew.decision.config import DecisionRunConfig
+
+    kinds = {"lm": LMRunConfig, "decision": DecisionRunConfig, "diffusion": DiffusionRunConfig}
+    run = kinds[kind].cli(["--source.text-only", "--source.prediction-depths", "0",
+                           "--source.attention", "full_attention", "block_bidirectional",
+                           "--trainer.multi-host", "False"])
+    assert run.source == SourceOptions(text_only=True, prediction_depths=0,
+                                       attention={"full_attention": "block_bidirectional"})
+    keywords = run.source_keywords(frozen=False)
+    assert keywords["text_only"] is True and keywords["prediction_depths"] == 0 and keywords["on_host"]
+    assert keywords["modeling_overrides"] == {"attention": {"full_attention": "block_bidirectional"}}
+    assert type(run).from_dict(run.to_dict()).source == run.source
+
+
+@pytest.mark.parametrize("options", [{"text_only": True},
+                                     {"modeling_overrides": {"attention": {"full_attention": "causal"}}}],
+                         ids=["text-only", "overrides"])
+def test_a_diffusion_source_has_no_language_model_for_text_only_to_take(options):
+    """A diffusion pipeline has no wrapper's language model for `text_only` to take, and no component
+    an override reaches: each is refused before anything is read."""
+    from dew.interop.pretrained import load_diffusion_source
+
+    with pytest.raises(ValueError):
+        load_diffusion_source("unused/pipeline", **options)
+
+
+def test_a_trainers_cadences_may_be_shares_of_the_run_on_the_command_line():
+    """`--trainer.log-every`, `--trainer.eval-every` and `--trainer.checkpoint-every` each take a share
+    of the run such as 5%, which reaches fit as written for it to resolve against the run's length;
+    a value that is neither steps, a share, epoch nor a duration is refused."""
+    from dew.config.lm import LMRunConfig
+
+    run = LMRunConfig.cli(["--trainer.log-every", "1%", "--trainer.eval-every", "5%",
+                           "--trainer.checkpoint-every", "10%", "--trainer.multi-host", "False"])
+    trainer = run.trainer
+    assert (trainer.log_every, trainer.eval_every, trainer.checkpoint_every) == ("1%", "5%", "10%")
+    for flags in (["--trainer.eval-every", "5x"], ["--trainer.log-every", "epoch"]):
+        with pytest.raises((ValueError, SystemExit)):
+            LMRunConfig.cli([*flags, "--trainer.multi-host", "False"])
+
+
+def test_a_decision_run_chooses_its_head_by_its_subcommand():
+    """`head:letters` and `head:joint-shape` choose a decision run's head on its command line, each with
+    its own flags, and none keeps Laya's."""
+    from dew.decision.config import DecisionRunConfig, JointShape, Letters
+
+    run = DecisionRunConfig.cli(["--trainer.multi-host", "False", "head:letters", "--head.count", "4"])
+    assert run.head == Letters(count=4)
+    joint = DecisionRunConfig.cli(["--trainer.multi-host", "False", "head:joint-shape", "--head.layers", "2"])
+    assert joint.head == JointShape(layers=2)
+    assert DecisionRunConfig.cli(["--trainer.multi-host", "False"]).head is None
+
+
+def test_a_decision_run_trains_its_backbone_beside_its_context_layers_on_the_command_line():
+    """`--no-context-frozen` with `--context-layers` trains the backbone whole beside the blocks; by
+    default it holds frozen."""
+    from dew.decision.config import DecisionRunConfig
+
+    flags = ["--trainer.multi-host", "False", "--context-layers", "0", "1"]
+    assert DecisionRunConfig.cli(flags).context_frozen
+    assert not DecisionRunConfig.cli([*flags, "--no-context-frozen"]).context_frozen
+
+
+def test_a_run_branches_into_the_cooldowns_its_command_line_names():
+    """`--trainer.cooldowns.at` and its length and shape choose a run's cooldown branches, which its
+    record holds and reads back."""
+    from dew.config.lm import LMRunConfig
+    from dew.training.cooldown import Cooldowns
+
+    run = LMRunConfig.cli(["--trainer.cooldowns.at", "20%", "40%", "--trainer.cooldowns.length", "10%",
+                           "--trainer.cooldowns.shape", "linear", "--trainer.multi-host", "False"])
+    assert run.trainer.cooldowns == Cooldowns(at=("20%", "40%"), length="10%", shape="linear")
+    assert LMRunConfig.from_dict(run.to_dict()).trainer.cooldowns == run.trainer.cooldowns
+    assert LMRunConfig.cli(["--trainer.multi-host", "False"]).trainer.cooldowns is None

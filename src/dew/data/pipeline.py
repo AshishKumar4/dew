@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
     from dew.data.dataset import Loading
     from dew.data.generation import DependencyManifest
+    from dew.data.sinks import Writer
     from dew.data.sources.base import Read, Source
     from dew.data.text import NearDuplicates
 
@@ -72,6 +73,27 @@ PREFETCH = 64
 @runtime_checkable
 class Volatile(Protocol):
     volatile: bool
+
+
+@runtime_checkable
+class External(Protocol):
+    """A step that reads the storage a record names by path, as a media decoder does when its field
+    holds a path rather than bytes: what it makes is keyed by the path, not by what the path holds, so
+    no automatic cache's prefix runs past it (`dew.data.compile._automatic`), a file replaced at the same
+    path reading anew; a chain's own `cache=` keeps what it made, as it is told to."""
+
+    external: bool
+
+
+@runtime_checkable
+class Costly(Protocol):
+    """A step that costs more to run on a record than reading what it made back from a cache costs,
+    as measured (`tools/benchmark_data.py automatic-cache`), and makes it from the record alone: so a
+    chain that runs it first caches what it makes with no `cache=` (`dew.data.compile._automatic`).
+    An image decode is not one: an image a record names by path is read from storage the record's
+    content does not key."""
+
+    costly: bool
 
 
 @runtime_checkable
@@ -295,17 +317,11 @@ class Pack:
         return (*self.fields, *(name for name, _ in self.along))
 
     def document(self, element: Batch) -> Batch:
-        """`element` as a document a window packs: its `packed` fields alone. Its `fields` hold one
-        entry a token, so a record whose fields differ in length is refused: packed, its fields would
-        be cut at different places, the windows holding one field's tokens beside another's from
-        other places, which no packer tells."""
-        from dew.data.steps.generic import Fields
+        """`element` as a document a window packs: its `packed` fields alone, its token `fields` of one
+        length (`dew.data.steps.generic.aligned`), its `along` fields beside them."""
+        from dew.data.steps.generic import aligned
 
-        lengths = {name: len(element[name]) for name in self.fields}
-        if len(set(lengths.values())) > 1:
-            raise ValueError(f"a packed record's fields {list(self.fields)} hold one entry a token, so one "
-                             f"length; this record's hold {lengths}")
-        return Fields(self.packed).map(element)
+        return aligned(element, self.fields, tuple(name for name, _ in self.along))
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """Rows of `seq_len` tokens along `fields`, the last of them a target: `seq_len - 1` inputs."""
@@ -404,6 +420,10 @@ class Cached(Protocol):
 @dataclasses.dataclass(frozen=True)
 class Artifact:
     cache: Cached
+    automatic: bool = False
+    """Whether the compiler placed it (`dew.data.compile._automatic`) rather than the chain: it holds
+    the records its prefix makes, so a run reads the same records with or without it and its plan
+    names none (`dew.data.cache.automatic_root`)."""
 
 
 type Stage = (
@@ -491,13 +511,20 @@ class Mixture:
 @dataclasses.dataclass(frozen=True)
 class Phases:
     pipelines: tuple[Pipeline, ...]
-    until_steps: tuple[int | None, ...]
+    ends: tuple[int | None, ...]
+    """Where each phase ends, as `clock` counts them: at the training step it names (`phases`), or at
+    the run's committed tokens (`schedule`). The last runs on (None); on the token clock it may end
+    instead, where the data ends."""
+    clock: Literal["steps", "tokens"] = "steps"
 
     def __post_init__(self) -> None:
-        if len(self.pipelines) != len(self.until_steps):
+        if len(self.pipelines) != len(self.ends):
             raise ValueError(f"phases need one end per pipeline: {len(self.pipelines)} pipelines and "
-                             f"{len(self.until_steps)} ends")
-        phase_ends(self.until_steps, "step")
+                             f"{len(self.ends)} ends")
+        if self.clock == "steps":
+            phase_ends(self.ends, "step")
+        else:
+            phase_ends(self.ends if self.ends[-1] is None else (*self.ends, None), "token")
 
 
 def children(pipeline: Pipeline) -> tuple[Pipeline, ...]:
@@ -803,12 +830,13 @@ class Dataset:
 
         return self._then(Artifact(Cache(cache) if isinstance(cache, str) else cache))
 
-    def snapshot(self, url: str, *, format: Literal["array_record", "parquet"] = "array_record",
+    def snapshot(self, url: str, *, format: Literal["array_record", "parquet"] | Writer = "array_record",
                  rows_per_shard: int = 100_000,
                  deduplicate: NearDuplicates | None = None) -> Mapping[str, object]:
         """Run this dataset once over every record and seal what it makes at
         `url`: immutable shards and their committed manifest, which
-        `Files(url)` reads back. A fetch's outcomes are sealed with it, so a
+        `Files(url)` reads back, written as ArrayRecord, as Parquet or by a
+        native writer (`dew.data.sinks.Writer`). A fetch's outcomes are sealed with it, so a
         run that reads the snapshot resumes exactly. With `deduplicate`
         (`dew.data.text.NearDuplicates`, the `curation` extra), each group of
         near-duplicates in that one pass is sealed as one record, and the
@@ -1042,6 +1070,26 @@ def phases(*entries: tuple[Dataset, int | None]) -> Pipeline:
         raise ValueError("phases need at least one (dataset, until_step)")
     return Pipeline(Phases(tuple(dataset._chain() for dataset, _ in entries),
                            tuple(until for _, until in entries)))
+
+
+def schedule(stages: Sequence[tuple[Dataset, float | None]]) -> Pipeline:
+    """Datasets read one after another on the run's committed-token clock, the clock `fit(tokens=)`
+    counts: each `(dataset, tokens)` for the valid target tokens its steps commit, the last for the
+    rest of the run (`None`), or for its tokens, where the data ends (the run's last step). A stage
+    ends at the step whose commit reaches its tokens, on every process alike, so its last step may
+    commit past them; one that a single step's commit passes reads nothing. A corpus that an earlier
+    stage read continues from where it left it, and what the run had read ahead of the end is not
+    trained on. Each stage is a whole chain, laid out and batched as it reads."""
+    if not stages:
+        raise ValueError("a schedule needs at least one (dataset, tokens)")
+    budgets = [tokens for _, tokens in stages]
+    if any(tokens is None for tokens in budgets[:-1]) or any(
+            tokens is not None and not (math.isfinite(tokens) and tokens >= 1) for tokens in budgets):
+        raise ValueError(f"every stage but the last commits a count of tokens, of at least one; got "
+                         f"{budgets}")
+    ends = list(itertools.accumulate(int(tokens) for tokens in budgets if tokens is not None))
+    return Pipeline(Phases(tuple(dataset._chain() for dataset, _ in stages),
+                           (*ends[:len(stages) - 1], None if budgets[-1] is None else ends[-1]), "tokens"))
 
 
 @dataclasses.dataclass(frozen=True)

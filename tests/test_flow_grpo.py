@@ -24,8 +24,10 @@ from certified import assert_certified
 from flax import linen as nn
 from recording import RecordingTracker
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
+    assert_fp32_reduction_bound,
     declared_seeds,
     indexed_recording,
     recording,
@@ -143,7 +145,7 @@ def test_recorded_trajectory_rescores_under_shifted_guided_process():
         return guided_density(walked_in_float32(walk, start, offset), offset, np.float64)
 
     assert_as_exact(lambda start, offset: walk(start, offset).log_probs,
-                    lambda start, offset: guided_density(walk(start, offset), offset, np.float32),
+                    as_given(lambda start, offset: guided_density(walk(start, offset), offset, np.float32)),
                     drawn_rows((2,), (1,)), "guided walk", seeds=SEEDS['guided walk'], truth_fn=truth)
     deterministic = FlowSDE(0).trajectory(denoiser(offset), x, 5, key=key)
     assert np.isnan(deterministic.log_probs).all()
@@ -201,7 +203,7 @@ def test_flow_objective_uses_converted_predictions(prediction):
         return {"recorded": density, "rescored": density}
 
     assert_as_exact(recorded_and_rescored(walk, rescore, variables),
-                    lambda start: rectified(walk(start), np.float32), drawn_rows((2,)),
+                    as_given(lambda start: rectified(walk(start), np.float32)), drawn_rows((2,)),
                     f"{prediction} converted", seeds=SEEDS['converted'],
                     truth_fn=lambda start: rectified(walked_in_float32(walk, start), np.float64))
     trajectory = walk(jnp.asarray([[0.2, -0.5], [-0.1, 0.7]]))
@@ -274,7 +276,7 @@ def test_a_prediction_undefined_at_pure_noise_is_refused_only_where_a_walk_evalu
         states, log_probs = walk(start)
         return {"recorded": log_probs, "rescored": rescored(states)}
 
-    assert_as_exact(scored, lambda start: closed(walk(start)[0], np.float32), drawn_rows((2,)),
+    assert_as_exact(scored, as_given(lambda start: closed(walk(start)[0], np.float32)), drawn_rows((2,)),
                     f"{type(prediction).__name__} rescored walk", seeds=SEEDS['rescored walk'],
                     truth_fn=lambda start: closed(walked_in_float32(walk, start)[0], np.float64))
 
@@ -369,6 +371,7 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
         return jax.vmap(closed, (0, 0, 0, 0, 0, None, None))(trajectory.states, trajectory.times, advantages,
                                                              mask, one, *gains)
 
+    @as_given
     def truth(start, advantages, mask, one):
         trajectory = walked_in_float32(jax.vmap(walk), start)
         with jax.enable_x64(new_val=True):
@@ -384,7 +387,8 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
         density = walk_density(trajectory, lambda t: t, lambda index, x, t: 0.25 * x + 0.1 * t, 0.6, dtype)
         return {"recorded": density, "rescored": density}
 
-    assert_as_exact(recorded_and_rescored(walk, rescore, old), lambda start: walked(walk(start), np.float32),
+    assert_as_exact(recorded_and_rescored(walk, rescore, old),
+                    as_given(lambda start: walked(walk(start), np.float32)),
                     drawn_rows((2,)), "rescored clipping walk", seeds=SEEDS['rescored walk'],
                     truth_fn=lambda start: walked(walked_in_float32(walk, start), np.float64))
 
@@ -547,14 +551,17 @@ def assert_rescores_as_walked(objective, variables, rollout_of, density, label: 
     rescore = jax.jit(objective.log_probs)
 
     def closed(variables, dtype):
+        @as_given
         def run(batch):
             found = density(variables, batch, dtype)
             return {"recorded": found, "rescored": found}
         return run
 
-    assert_as_exact(lambda batch: {"recorded": batch["old_log_probs"], "rescored": rescore(variables, batch)},
+    # The recorded log probabilities beside the rescored ones, and the widened weights' truth, on the host.
+    assert_as_exact(as_given(lambda batch: {"recorded": batch["old_log_probs"],
+                                            "rescored": rescore(variables, batch)}),
                     closed(variables, np.float32), lambda seed: (rollout_of(seed),), label, seeds=seeds,
-                    truth_fn=lambda batch: closed(widened(variables), np.float64)(batch))
+                    truth_fn=as_given(lambda batch: closed(widened(variables), np.float64)(batch)))
 
 
 class Inpainting(nn.Module):
@@ -774,12 +781,14 @@ def test_flow_evaluation_and_preview_use_live_policy_with_frozen_reference():
         keys = jax.random.split(jax.random.fold_in(jax.random.key(52), seed))
         return jax.random.uniform(keys[0], (), minval=0.2, maxval=0.9), jax.random.key_data(keys[1])
 
+    @as_given
     def sampled(speed, key):
         step = Step(jnp.asarray(0), jax.random.wrap_key_data(key), reference)
         live = {**reference, "params": {"speed": speed}}
         return {"evaluated": objective.evaluate(live, batch, step).images,
                 "previewed": objective.preview(live, batch, step).images}
 
+    @as_given
     def walked(speed, key):
         with jax.enable_x64(new_val=False):
             noise_key, _ = jax.random.split(jax.random.wrap_key_data(key))
@@ -816,6 +825,7 @@ def test_mixed_precision_transition_keeps_density_arithmetic_in_float32():
         sampled = transition.sample(jax.random.wrap_key_data(key))
         return {"sample": sampled, "log_prob": transition.log_prob(sampled)}
 
+    @as_given
     def gaussian(mean, variance, key):
         with jax.enable_x64(new_val=False):
             normal = np.asarray(jax.random.normal(jax.random.wrap_key_data(key), np.shape(mean)))
@@ -937,6 +947,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
         # The DiT computing at `dtype`: its own float32 floor would round a float64 truth's times.
         apply = jax.jit(model.clone(dtype=dtype).apply)
 
+        @as_given
         def run(key):
             with jax.enable_x64(new_val=False):
                 noise_key, _ = jax.random.split(jax.random.wrap_key_data(key))
@@ -1012,20 +1023,244 @@ def test_a_transitions_density_and_kl_hold_at_float32s_largest_variances():
                                      "a narrow transition's KL")
 
 
-def test_a_transitions_kl_keeps_its_half_where_the_error_is_near_float32s_least():
-    """A transition's KL of an error near float32's least over a variance as small is on its float64
-    value: the half is taken in the quotient's exponent, where half the error alone is below the normal
-    range, which XLA:CPU flushes to zero. A mean 2**-63 from its reference under a variance of 2**-126
-    has a KL of 0.5, not 0; one 1.25 * 2**-63 away under 1.3 * 2**-126, an inexact one."""
+def _kl_truth(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
+    """The KL, its JVP and its VJP to the mean and the variance in float64, on the float32 inputs."""
+    wide = [value.astype(np.float64) for value in
+            (mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent)]
+    difference, moving = wide[0] - wide[1], wide[3] - wide[4]
+    divergence = np.sum(difference**2, axis=1) / (2 * wide[2])
+    return {"KL": divergence,
+            "JVP": np.sum(difference * moving, axis=1) / wide[2] - divergence * wide[5] / wide[2],
+            "VJP to the mean": wide[6][:, None] * difference / wide[2][:, None],
+            "VJP to the variance": -wide[6] * divergence / wide[2]}
+
+
+def _plain_kl(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
+    """The reference arm (the gate's ruling on rows 1722 and 1778): the KL, its JVP along every tangent at
+    once and its VJPs as the plain float32 textbook formulas compute them, `|m - r|**2 / (2 v)` as
+    written, `sum((m - r) * (t_m - t_r)) / v - KL * t_v / v`, `c (m - r) / v` and `-c KL / v`, with no
+    alignment or scaling of any kind, compiled as Dew's arm is."""
+    def plain(m, r, v, tm, tr, tv, ct):
+        d = m - r
+        axes = tuple(range(1, d.ndim))
+        kl = jnp.square(d).sum(axis=axes) / (2 * v)
+        return {"KL": kl, "JVP": (d * (tm - tr)).sum(axis=axes) / v - kl * tv / v,
+                "VJP to the mean": ct[:, None] * d / v[:, None], "VJP to the variance": -ct * kl / v}
+
+    inputs = (mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent)
+    return {name: np.asarray(value) for name, value in jax.jit(plain)(*map(jnp.asarray, inputs)).items()}
+
+
+def _kl_bounds(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
+    """Each output's derived bound where the plain float32 arm overflows and has no reference (the
+    gate's ruling), check 2's form (`assert_fp32_reduction_bound`): the float64 magnitude of its terms
+    and the rounding count of its plain formula, a KL of n coordinates n + 2 (each difference, each
+    square, the n - 1 additions, the division), a VJP to the mean three, the variance's the KL's and
+    two more, and a JVP twice the KL's and six more over its terms' absolute sum, so a sum that
+    cancels is bounded by what it cancelled. Each as `(magnitudes, roundings)`."""
+    wide = [np.asarray(value, np.float64) for value in
+            (mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent)]
+    difference, moving = wide[0] - wide[1], wide[3] - wide[4]
+    count = difference.shape[1]
+    divergence = np.sum(difference**2, axis=1) / (2 * wide[2])
+    terms = np.sum(np.abs(difference * moving), axis=1) / wide[2] + divergence * np.abs(wide[5]) / wide[2]
+    return {"KL": (divergence, count + 2), "JVP": (terms, 2 * count + 10),
+            "VJP to the mean": (np.abs(wide[6][:, None] * difference / wide[2][:, None]), 3),
+            "VJP to the variance": (np.abs(wide[6] * divergence / wide[2]), count + 4)}
+
+
+def _kl_derivatives(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
+    """A transition's KL, its JVP along every tangent at once, and its VJP to the mean and the variance."""
     from dew.sampling.flow import GaussianTransition
 
-    variance = np.ldexp(np.asarray([1.3, 1.0], np.float32), -126)
-    mean = np.zeros((2, 3, 4), np.float32)
-    reference_mean = mean.copy()
-    reference_mean[:, 0, 0] = np.ldexp(np.asarray([1.25, 1.0], np.float32), -63)
-    transition = GaussianTransition(jnp.asarray(mean), jnp.asarray(variance))
-    kl = np.asarray(transition.kl(jnp.asarray(reference_mean)))
-    assert np.all(np.isfinite(kl))
-    error = np.square(reference_mean[:, 0, 0])
-    truth = error.astype(np.float64) / (2 * variance.astype(np.float64))
-    assert_as_exact_as_the_reference(kl, error / np.float32(2) / variance, truth, "a KL near float32's least")
+    def kl(at, reference, spread):
+        return GaussianTransition(at, spread).kl(reference)
+
+    value, moved = jax.jvp(kl, (mean, reference, variance),
+                           (mean_tangent, reference_tangent, variance_tangent))
+    _, pullback = jax.vjp(lambda at, spread: kl(at, reference, spread), mean, variance)
+    to_mean, to_variance = pullback(cotangent)
+    return {"KL": value, "JVP": moved, "VJP to the mean": to_mean, "VJP to the variance": to_variance}
+
+
+EDGE = 2.0**-16
+"""How near float32's least normal or its largest an exact value lies, relatively, where a few
+roundings may take a computed one across that bound (to a flushed subnormal or an infinity)."""
+
+
+def _kinds(exact):
+    """Each float64 value's place in float32's range: "normal" from a few roundings above the least
+    normal, its whole lowest binade [2**-126, 2**-125) but that sliver, to a few below the largest;
+    "over" from 2**128, past every float32; "below" zero or under half the least normal, which rounds
+    to zero or a subnormal; and "edge" the slivers between, where a few roundings may cross a bound
+    (`EDGE`)."""
+    size = np.abs(exact)
+    tiny, largest = float(np.finfo(np.float32).tiny), float(np.finfo(np.float32).max)
+    return np.where(size >= 2.0**128, "over", np.where(
+        (size >= tiny * (1 + EDGE)) & (size <= largest * (1 - EDGE)), "normal", np.where(
+            (size == 0) | (size < tiny / 2), "below", "edge")))
+
+
+def _below_normal(values):
+    """Whether each float32 is zero or subnormal: its exponent field is zero."""
+    return (values.astype(np.float32).view(np.uint32) >> 23 & 0xFF) == 0
+
+
+BAND = 16
+"""The binades one check-1 leaf of the KL's outputs spans: rows whose truths lie further apart are
+judged as leaves of their own, so a small row is not read as a large one's float64 zero."""
+
+
+def _assert_kl_outputs(dew, plain, truth, bounds, label):
+    """Each output of `_kl_derivatives` against the float64 truth, element by element as the gate rules
+    (rows 1722 and 1778): where the plain float32 arm (`_plain_kl`) is finite, on par with it (the grid's
+    one-draw rule, `assert_as_exact_as_the_reference` at FACTOR until the gate's switch-over to PARITY;
+    unscaled, its rows whole and its zero rows included, each band of `BAND` binades of the rows' sizes a
+    leaf of its own, an element the plain arm leaves out of a row taking the truth in both arms); where
+    it overflows, finite wherever the truth is a normal float32 and within the derived bound of the
+    truth (`_kl_bounds`); infinite of its sign past the largest float32, zero or subnormal below the
+    least, by the truth's place in float32's range (`_kinds`); and near either end (`edge`), the bound's
+    or the end's: infinite of its sign above, zero or subnormal below."""
+    for name, exact in truth.items():
+        value, reference, kinds = np.asarray(dew[name]), np.asarray(plain[name]), _kinds(exact)
+        # A truth below float32's least normal, or near either end, is held by its kind below.
+        held = np.isfinite(reference) & ((kinds == "normal") | (exact == 0))
+        mine, theirs = np.where(held, value, exact), np.where(held, reference, exact)
+        axes = tuple(range(1, exact.ndim))
+        size = np.max(np.abs(exact), axis=axes) if axes else np.abs(exact)
+        band = np.frexp(size)[1] // BAND
+        # Where the plain arm and Dew both give the float64 value there is no error to compare.
+        apart = (mine != exact) | (theirs != exact)
+        measured = np.any(apart, axis=axes) if axes else apart
+        for level in np.unique(band[measured]):
+            rows = measured & (band == level)
+            assert_as_exact_as_the_reference(mine[rows], theirs[rows], exact[rows],
+                                             f"{label}: {name}, rows near 2**{level * BAND}")
+        magnitudes, roundings = bounds[name]
+        unheld = ~np.isfinite(reference) & ((kinds == "normal") | (exact == 0))
+        assert np.all(np.isfinite(value[unheld])), name
+        assert_fp32_reduction_bound(value[unheld], exact[unheld], magnitudes[unheld], roundings)
+        over = kinds == "over"
+        assert np.all(np.isinf(value[over]) & (np.sign(value[over]) == np.sign(exact[over]))), name
+        assert np.all(_below_normal(value[kinds == "below"])), name
+        edge = kinds == "edge"
+        top = edge & (np.abs(exact) > 1)
+        bounded = top & ~(np.isinf(value) & (np.sign(value) == np.sign(exact)))
+        assert np.all(np.isfinite(value[bounded])), name
+        assert_fp32_reduction_bound(value[bounded], exact[bounded], magnitudes[bounded], roundings)
+        bottom = edge & ~top & ~_below_normal(value)
+        assert np.all(np.isfinite(value[bottom])), name
+        assert_fp32_reduction_bound(value[bottom], exact[bottom], magnitudes[bottom], roundings)
+
+
+KL_LEVELS = (-126, -125, -100, -63, -26, -1, 0, 1, 26, 63, 100, 126, 127)
+"""The exponents a grid row's operands take: both of float32's edge binades, its middle, and between."""
+
+FIXED_ROWS = (
+    # (mean, reference, variance, mean tangent, reference tangent, variance tangent, cotangent), three
+    # coordinates: each a review's or the second opinion's input. A JVP of products [2**120, -2**120,
+    # 2**-100], which a plain float32 sum keeps and aligning to the largest flushed (Main, 1778).
+    ([2.0**60, 2.0**60, 2.0**-100], [0, 0, 0], 1, [2.0**60, -2.0**60, 1], [0, 0, 0], 0, 1),
+    ([2.0**60, 2.0**60, 1], [0, 0, 0], 1, [2.0**60, -2.0**60, 2.0**-5], [0, 0, 0],
+     (1 + 2.0**-23) * 2.0**-125, 1),
+    ([2.0**60, 2.0**60, 0], [2.0**-100, 0, 0], 1, [1, -1, 0], [0, 0, 0], 0, 1),
+    ([1, 0, 0], [0, 0, 0], 1, [2.0**100, 0, 0], [2.0**-100, 0, 0], 2.0**101, 1),
+    # Variances near float32's largest, whose double overflows, and near its least.
+    ([1e18, 0, 0], [0, 0, 0], 2.5e38, [4, 0, 0], [4, 0, 0], 1e30, 0.7),
+    ([0.5, 0, 0], [0, 0, 0], 2.0**-126, [4, 0, 0], [-4, 0, 0], 2.0**-126, 2.0**-126),
+    ([2.0**127, 0, 0], [-2.0**127, 0, 0], float(np.finfo(np.float32).max), [1, 0, 0], [0, 0, 0], 0, 1),
+    # A product the plain sum flushes beside largest ones that cancel (train 208, 1806): Dew may lose
+    # it as plain does, and no more.
+    ([2.0**45, 2.0**45, 2.0**-73], [0, 0, 0], 2.0**-21, [2.0**81, -2.0**81, 2.0**-73], [0, 0, 0], 0, 1),
+    # A KL just under float32's largest (train 208), and two rows of far different sizes, the second's
+    # VJP not hiding the first's.
+    ([2.0**64, 0, 0], [0, 0, 0], 0.5 + 2.0**-24, [1, 0, 0], [0, 0, 0], 0, 1),
+    ([1, 1, 0], [0, 0, 0], 1, [1, 0, 0], [0, 0, 0], 0, 1),
+    ([2.0**100, 0, 0], [0, 0, 0], 3, [1, 0, 0], [0, 0, 0], 0, 1),
+)
+"""Rows every grid holds, beside its drawn ones."""
+
+
+def _kl_grid():
+    """Rows of three coordinates over float32's exponent range in every operand and tangent: each value
+    a signed significand in [1, 2) at a level of `KL_LEVELS`, or zero, drawn apart per coordinate, every
+    level met in every operand; in a third of the rows the mean's largest coordinate is the
+    reference's (a cancelling maximum, its survivors at their own levels), in another third the
+    tangents' largest cancel likewise; and `FIXED_ROWS` and `REVIEWED`'s rows. Every input is a normal
+    float32 or zero: XLA:CPU reads a subnormal input as zero, which no float64 truth of the input's own
+    value does."""
+    rng = np.random.default_rng(1778)
+    rows = 3 * 4096
+
+    def drawn(shape, zeros=0.2):
+        levels = rng.choice(KL_LEVELS, shape)
+        values = np.ldexp(rng.uniform(1, 2, shape) * rng.choice((-1.0, 1.0), shape), levels)
+        return np.where(rng.random(shape) < zeros, 0.0, values).astype(np.float32)
+
+    mean, reference, mean_tangent, reference_tangent = (drawn((rows, 3)) for _ in range(4))
+    variance = np.abs(drawn((rows,), zeros=0)).astype(np.float32)
+    variance_tangent, cotangent = drawn((rows,)), drawn((rows,), zeros=0.05)
+    cancelling, tangents = slice(0, rows // 3), slice(rows // 3, 2 * rows // 3)
+    mean[cancelling, 0] = np.ldexp(np.float32(1.5), rng.choice((126, 127, 100, 0), rows // 3))
+    reference[cancelling, 0] = mean[cancelling, 0]
+    mean_tangent[tangents, 0] = np.ldexp(np.float32(1.25), rng.choice((127, 126, 63), rows // 3))
+    reference_tangent[tangents, 0] = mean_tangent[tangents, 0]
+    # Every level in every operand at least once, in a row of its own.
+    for index, level in enumerate(KL_LEVELS):
+        for operand in (mean, reference, mean_tangent, reference_tangent):
+            operand[2 * rows // 3 + index, index % 3] = np.ldexp(np.float32(1.75), level)
+        for operand in (variance, variance_tangent, cotangent):
+            operand[2 * rows // 3 + index] = np.ldexp(np.float32(1.75), level)
+    def padded(case):
+        """A reviewed input's one row in three coordinates."""
+        return tuple(np.pad(np.asarray(value, np.float64)[0], (0, 3 - len(value[0])))
+                     if isinstance(value[0], list) else value[0] for value in case)
+
+    rows_given = FIXED_ROWS + tuple(padded(case) for case in REVIEWED.values())
+    fixed = [np.asarray(column, np.float32) for column in zip(*rows_given, strict=True)]
+    drawn_inputs = (mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent)
+    return tuple(np.concatenate([draws, row]) for draws, row in zip(drawn_inputs, fixed, strict=True))
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
+def test_a_transitions_kl_and_its_derivatives_hold_over_float32s_exponent_range(compiled):
+    """Over a grid of float32's exponents in every input (`_kl_grid`), cancelling and not, with every
+    review's input among its rows, a transition's KL, its JVP along the mean's, the reference's and
+    the variance's tangents at once, and its VJPs to the mean and the variance hold the float64 truth
+    as the gate rules (`_assert_kl_outputs`), eagerly and compiled."""
+    inputs = _kl_grid()
+    run = jax.jit(_kl_derivatives) if compiled else _kl_derivatives
+    _assert_kl_outputs(run(*(jnp.asarray(value) for value in inputs)), _plain_kl(*inputs),
+                       _kl_truth(*inputs), _kl_bounds(*inputs), "a KL over float32's exponents")
+
+
+REVIEWED = {
+    # (mean, reference, variance, mean tangent, reference tangent, variance tangent, cotangent), each
+    # input one row, the KL's JVP and VJP each exact in float32.
+    "train 192's cancelling tangent": (
+        [[0.5, 0.5]], [[0, 0]], [2.0**-126], [[16, -16]], [[0, 0]], [0], [1]),
+    "train 195's overflowing contraction": (
+        [[2.0**63, 0]], [[0, 0]], [2.0**32], [[2.0**66, 0]], [[0, 0]], [0], [1]),
+    "train 195's overflowing variance pullback": (
+        [[1, 1]], [[0, 0]], [1], [[0, 0]], [[0, 0]], [1], [2.0**127]),
+    "a variance tangent over the variance first": (
+        [[2.0**63, 0]], [[0, 0]], [2.0**32], [[0, 0]], [[0, 0]], [2.0**-126], [1]),
+    "two terms past the range whose sum is in it": (
+        [[1]], [[0]], [2.0**-126], [[4 + 2.0**-21]], [[0]], [2.0**-123], [1]),
+    "a difference past the largest": (
+        [[2.0**127]], [[-2.0**127]], [np.finfo(np.float32).max], [[1]], [[0]], [0], [1]),
+    "train 201's cancelling maximum": (
+        [[2.0**126, 2.0**-26]], [[2.0**126, 0]], [2.0**-52], [[0, 2.0**-26]], [[0, 0]], [0], [1]),
+}
+
+
+@pytest.mark.parametrize("case", list(REVIEWED))
+def test_a_transitions_kl_and_its_derivatives_hold_at_each_reviewed_input(case):
+    """Each input a review found leaving float32's range (`REVIEWED`), eagerly and compiled, as the
+    gate rules (`_assert_kl_outputs`)."""
+    inputs = tuple(np.asarray(value, np.float32) for value in REVIEWED[case])
+    for run in (_kl_derivatives, jax.jit(_kl_derivatives)):
+        _assert_kl_outputs(run(*(jnp.asarray(value) for value in inputs)), _plain_kl(*inputs),
+                           _kl_truth(*inputs), _kl_bounds(*inputs), case)
+
+

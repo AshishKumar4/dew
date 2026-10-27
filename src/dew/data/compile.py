@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import itertools
+import os
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -29,10 +31,13 @@ from dew.data.analysis import (
     Measuring,
     _analyzed,
     _at,
+    _cache_key,
     _cache_manifest,
+    _cacheable,
     _capabilities,
     _configured,
     _cut,
+    _external,
     _identity,
     _leaves,
     _Lowering,
@@ -48,7 +53,10 @@ from dew.data.analysis import (
     _until,
     _volatile,
     _written,
+    reach,
+    written,
 )
+from dew.data.compilation import compiling, within
 from dew.data.dataset import (
     Closeable,
     DataPartition,
@@ -79,6 +87,7 @@ from dew.data.pipeline import (
     Batched,
     BatchStage,
     Configured,
+    Costly,
     Dataset,
     DeviceStep,
     Expansion,
@@ -89,6 +98,7 @@ from dew.data.pipeline import (
     Limit,
     Map,
     MapBatch,
+    MapWithIndex,
     Mixture,
     Native,
     ObjectiveData,
@@ -102,6 +112,7 @@ from dew.data.pipeline import (
     Shuffle,
     SingleReader,
     Slice,
+    Stage,
     TokenBudget,
     TokenGeometry,
     Windows,
@@ -133,16 +144,67 @@ class _OrderFacts(Protocol):
     def order_fingerprints(self) -> Mapping[str, str]: ...
 
 
+def _writable(root: str) -> bool:
+    """Whether this process may make and write `root`: the nearest directory of it that exists may
+    be written (a read-only home, say, may not)."""
+    existing = os.path.abspath(root)
+    while not os.path.exists(existing):
+        existing = os.path.dirname(existing)
+    return os.path.isdir(existing) and os.access(existing, os.W_OK | os.X_OK)
+
+
+def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
+    """`pipeline` with a cache at `root` after its leading deterministic record maps, where one of them
+    costs more to run than its records cost to read back (`Costly`: a learned tokenizer's encoding)
+    and the chain writes no cache: each corpus of a mixture or phases its own, in a root this process
+    may write. The maps are the ones
+    a cache keys (`_cacheable`) and reads again unchanged (none `_volatile`), and in an indexed read
+    none that rejects, whose cache a read by index reads back as a stream, slower than it reruns
+    them. It stands for them only in a memory or indexed read, by each input's place in a store
+    whose content is named, in a clean checkout whose steps are exact (`Manifest`), and nowhere
+    else, so a chain no cache could serve reads as it is written, never refused. It holds the
+    records the maps make, and fills, publishes, replays and evicts as `cache(url)` does (`Cache`),
+    though local storage that fails it stops its fill and the run reads on (`Cache.optional`),
+    so a run reads the same records with or without it (`Artifact.automatic`), and a run of the
+    same maps over the same records reads them back once one has read them whole. Its root is the
+    run's to name or refuse (`automatic_root`)."""
+    from dew.data.cache import Cache
+
+    if root is None or read == "streamed":
+        return pipeline
+    if isinstance(pipeline.source, (Mixture, Phases)):
+        return with_children(pipeline, lambda child: _automatic(child, read, root))
+    if any(isinstance(stage, Artifact) for stage in _steps(pipeline)):
+        return pipeline
+
+    def kept(stage: Stage) -> bool:
+        return (isinstance(stage, (Map, MapWithIndex)) and _cacheable(stage) and not _volatile(stage)
+                and not _external(stage) and not (read == "indexed" and stage.rejects))
+
+    at = next((index for index, stage in enumerate(pipeline.stages) if not kept(stage)), len(pipeline.stages))
+    prefix = pipeline.stages[:at]
+    steps = [stage.step for stage in prefix if isinstance(stage, (Map, MapWithIndex))]
+    if not any(isinstance(step, Costly) and step.costly for step in steps):
+        return pipeline
+    if not pipeline.source.supports(read) or not _writable(root):
+        return pipeline
+    key = _cache_key(pipeline.source, prefix, read)
+    if key is None or not (key.clean and key.exact):
+        return pipeline
+    cached = Artifact(Cache(root, optional=True), automatic=True)
+    return dataclasses.replace(pipeline, stages=(*prefix, cached, *pipeline.stages[at:]))
+
+
 def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
     """The caches each corpus of `pipeline` reads through, among its stages as its pipeline wrote
     them (`_written`), the ones a memory read already ran included, each named against the source
     it came from."""
     references = []
     for leaf, source in _leaves(pipeline):
-        stages, written = _written(source, leaf.stages), source
-        while materialized(written):
-            written = written.source
-        references += [stage.cache.reference(_cache_manifest(written, stages[:index], read))
+        stages, origin = _written(source, leaf.stages), source
+        while materialized(origin):
+            origin = origin.source
+        references += [stage.cache.reference(_cache_manifest(origin, stages[:index], read))
                        for index, stage in enumerate(stages) if isinstance(stage, Artifact)]
     return tuple(references)
 
@@ -242,7 +304,9 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
         return _Facts(source, read, source.fingerprint(), metadata, held, label)
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
-        pinned = dict(zip(sources, readers.map(pin, sources.values()), strict=True))
+        # Each read in this compilation, which fingerprints each source once (`compiling`).
+        tasks = [within(functools.partial(pin, source)) for source in sources.values()]
+        pinned = dict(zip(sources, readers.map(lambda task: task(), tasks), strict=True))
 
     return tuple(with_stores(branch, lambda source: pinned[id(source)]) for branch in pipelines)
 
@@ -388,14 +452,14 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) 
     corpora = build.lowering.order["corpora"]
     if not isinstance(corpora, list):
         raise TypeError("a mixture's order holds its corpora's orders as a list")
-    members = {"": fingerprint({"steps": steps([*(_identity(stage) for stage in train.stages
+    members = {"": fingerprint({"steps": steps([*(_identity(stage) for stage in written(train.stages)
                                                   if not isinstance(stage, (Workers, Prefetch))),
                                                 *(StepIdentity.of(step) for step in host)])})}
     for index, (key, child) in enumerate(zip(_member_keys(_members(source.pipelines)), source.pipelines,
                                              strict=True)):
         sources = [read for _, read in _leaves(child)]
         identities = [*(_identity(stage) for read in sources for stage in _written(read, ())),
-                      *(_identity(stage) for stage in _steps(child)
+                      *(_identity(stage) for stage in written(tuple(_steps(child)))
                         if not isinstance(stage, (Workers, Prefetch)))]
         members[key] = fingerprint({
             "order": unplaced(json_value(corpora[index], "member order")),
@@ -444,6 +508,7 @@ def _prepared(
     training: bool = False,
     objective: ObjectiveData | None = None,
     counts: Sequence[dict[str, CorpusCounts]] | None = None,
+    automatic: str | None = None,
 ) -> tuple[Pipeline, ...]:
     """The one preparation compile, iterate, validation and publish lower from.
 
@@ -454,7 +519,8 @@ def _prepared(
     bind to the sources' metadata. With read='memory' and `counts`, the
     source-scoped steps run and materialize first, so run-scoped steps bind
     to measured facts; publication passes no counts and reads nothing before
-    its fill. The caller materializes what remains.
+    its fill. The caller materializes what remains. A training read caches
+    each corpus's leading deterministic steps under `automatic` (`_automatic`).
     """
     if read not in ("memory", "indexed", "streamed"):
         raise ValueError(f"unknown read mode {read!r}")
@@ -467,6 +533,7 @@ def _prepared(
     _capabilities(branches, read, provision)
     branches = _pin_sources(branches, read)
     _tokenizer_contract(branches)
+    branches = tuple(_automatic(branch, read, automatic) for branch in branches)
     if objective is not None:
         branches = tuple(
             _objective_branch(branch, objective, train=not scored, read=read)
@@ -520,6 +587,7 @@ def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, traini
     return _Build(read, loading, seed, batch, lowered, training=training)
 
 
+@compiling
 def compile(
     train: Pipeline,
     *,
@@ -586,6 +654,8 @@ def _staged(
     rejections: Literal["drop", "mask"],
     examples: int | None = None,
 ) -> _Staged:
+    from dew.data.cache import automatic_root
+
     if rejections == "mask":
         raise ValueError(
             "rejections='mask' needs an objective proven mask-safe; no objective currently declares it"
@@ -606,6 +676,7 @@ def _staged(
         training=True,
         objective=objective,
         counts=(counts,) if validation is None else (counts, validation_counts),
+        automatic=automatic_root(loading) if read != "streamed" else None,
     )
     if not any(isinstance(stage, BatchStage) for stage in branches[0].stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
@@ -650,7 +721,8 @@ def _compiled(
         {"sources": [source.fingerprint() for source in sources]},
         sources,
         (
-            *(_identity(stage) for stage in _steps(original) if not isinstance(stage, (Workers, Prefetch))),
+            *(_identity(stage) for stage in written(tuple(_steps(original)))
+              if not isinstance(stage, (Workers, Prefetch))),
             *(StepIdentity.of(step) for step in host),
         ),
     )
@@ -811,19 +883,29 @@ def _compile_phases(
     if not isinstance(source, Phases):
         raise TypeError("phased compilation needs a Phases source")
     _tokenizer_contract((train,) if validation is None else (train, validation))
-    consumed: dict[str, int] = {}
+
+    def staged_at(index: int, consumed: Mapping[str, int]) -> _Staged:
+        """Phase `index`, each corpus it reads continued past what the phases before it read of it."""
+        return _staged(_continued(source.pipelines[index], consumed)._then(*train.stages),
+                       validation if index == 0 else None, objective=objective, read=read,
+                       provision=provision, loading=loading, seed=seed, rejections=rejections)
+
+    def consumed_by(phases: Sequence[_Staged], ends: Sequence[int]) -> dict[str, int]:
+        """What `phases` read of each corpus, each ending at its record end of `ends`: its members a
+        memory read kept, at the shares the lowering mixes."""
+        consumed: dict[str, int] = {}
+        for phase, (start, end) in zip(phases, itertools.pairwise((0, *ends)), strict=True):
+            _delivered(phase.train, end - start, consumed)
+        return consumed
+
+    tokens = source.clock == "tokens"
     staged: list[tuple[_Staged, int | None]] = []
-    previous = 0
-    for index, (pipeline, until) in enumerate(zip(source.pipelines, source.until_steps, strict=True)):
-        phase = _staged(_continued(pipeline, consumed)._then(*train.stages),
-                        validation if index == 0 else None, objective=objective, read=read,
-                        provision=provision, loading=loading, seed=seed, rejections=rejections)
-        end = None if until is None else until * phase.build.batch
-        staged.append((phase, end))
-        if end is not None:
-            # The phase as it reads: its members a memory read kept, at the shares the lowering mixes.
-            _delivered(phase.train, end - previous, consumed)
-            previous = end
+    for index, until in enumerate(source.ends):
+        # A phase on the token clock ends where the run reaches it, so it is staged as it reads first,
+        # and again with the ends of the phases before it once the run reaches them (`opened`).
+        ends = [end for _, end in staged if end is not None]
+        phase = staged_at(index, {} if tokens else consumed_by([phase for phase, _ in staged], ends))
+        staged.append((phase, None if tokens or until is None else until * phase.build.batch))
     # Every phase declares the most documents a window of any phase holds, so the run steps one program.
     packed = _coordinated(*(phase.train for phase, _ in staged))
     built: list[tuple[Loader, int | None]] = []
@@ -841,20 +923,32 @@ def _compile_phases(
                              f"a run runs the same ones, written after the phases")
         built.append((loaded, end))
 
-    def training(partition: DataPartition) -> Iterator[Batch]:
-        def global_reader(reader: Reader) -> GlobalReader:
-            opened = reader(partition)
-            if not isinstance(opened, GlobalReader):
-                if isinstance(opened, Closeable):
-                    opened.close()
-                raise ValueError("a phase must expose a global record-count position")
-            return opened
+    @functools.cache
+    def opened(index: int, ends: tuple[int, ...]) -> Loader:
+        """Phase `index` as it reads where the phases before it ended at `ends`, in records: as staged,
+        unless a corpus it reads continues from theirs."""
+        if not tokens or not index:
+            return built[index][0]
+        consumed = consumed_by([phase for phase, _ in staged[:index]], ends)
+        if not any(consumed.get(_name(chain), 0) for chain, _ in _leaves(source.pipelines[index])):
+            return built[index][0]
+        return _compiled(staged_at(index, consumed), packed, host=host, resume=resume)
 
-        phases = [(functools.partial(global_reader, loaded.train), end) for loaded, end in built]
-        return PhasedStream(phases, loading.stop_seconds)
+    def training(partition: DataPartition) -> Iterator[Batch]:
+        def global_reader(index: int, ends: tuple[int, ...]) -> GlobalReader:
+            opened_reader = opened(index, ends).train(partition)
+            if not isinstance(opened_reader, GlobalReader):
+                if isinstance(opened_reader, Closeable):
+                    opened_reader.close()
+                raise ValueError("a phase must expose a global record-count position")
+            return opened_reader
+
+        phases = [(functools.partial(global_reader, index), end) for index, (_, end) in enumerate(built)]
+        return PhasedStream(phases, loading.stop_seconds, tokens=source.ends if tokens else None)
 
     # Only the last phase's order can end, so its batch decides what an epoch's short batch does.
-    return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None)
+    return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None,
+                               token_ends=source.ends if tokens else None)
 
 
 def _continued(pipeline: Pipeline, consumed: Mapping[str, int]) -> Pipeline:
@@ -1014,7 +1108,7 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
     branch = dataclasses.replace(branch, stages=(*branch.stages, *suffix))
     steps = objective.train_batch if train else objective.evaluate_batch
     # A string or object field stays in the batch for the host code and metrics that read it; the
-    # prefetcher places the rest (`dew.training.distributed.split_fields`).
+    # prefetcher places the rest (`dew.distributed.batches.split_fields`).
     return branch._then(*(MapBatch(step) for step in steps))
 
 
@@ -1026,6 +1120,7 @@ def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]
                         if not (isinstance(source, _Memory) and not source.held)), measured=measured)
 
 
+@compiling
 def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     """Inspect through training's lowering, finite unless a repeat asks otherwise.
 
@@ -1069,6 +1164,7 @@ def _finite(lowering: _Lowering) -> _Lowering:
                                children=tuple(_finite(child) for child in lowering.children))
 
 
+@compiling
 def iterate(
     pipeline: Pipeline,
     *,
@@ -1120,13 +1216,32 @@ def fitted[Entry](
 
 
 def _endless(chain: Pipeline) -> Pipeline:
-    """`chain` read endlessly: a repeat before its batch where it has none."""
-    if any(isinstance(stage, Repeat) for stage in chain.stages):
+    """`chain` read endlessly: a repeat before its batch where it has none and its read can end. A
+    chain of phases reads each phase through the chain's own stages, and where one of them already
+    reads on (`_reads_on`), as Grain refuses to repeat an order without end, each other phase repeats
+    at the place the chain's own repeat takes, its share of the chain's stages before the batch moved
+    into it; a mixture whose members all read on is read as it is."""
+    if any(isinstance(stage, Repeat) for stage in chain.stages) or _reads_on(chain):
         return chain
     batching = [index for index, stage in enumerate(chain.stages)
                 if isinstance(stage, (BatchStage, TokenBudget))]
     at = batching[0] if batching else len(chain.stages)
+    source = chain.source
+    if isinstance(source, Phases):
+        read = [child._then(*chain.stages[:at]) for child in source.pipelines]
+        if any(map(_reads_on, read)):
+            each = tuple(phase if _reads_on(phase) else phase.repeat() for phase in read)
+            return dataclasses.replace(chain, source=dataclasses.replace(source, pipelines=each),
+                                       stages=chain.stages[at:])
     return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
+
+
+def _reads_on(chain: Pipeline) -> bool:
+    """Whether `chain` reads without end as written (`analysis.reach`): its stages leave it endless, or
+    it mixes members that all read on."""
+    source = chain.source
+    unending = isinstance(source, Mixture) and all(_reads_on(child) for child in source.pipelines)
+    return reach(chain.stages, unending)[0]
 
 
 def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int | None = None,
@@ -1149,6 +1264,7 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
                       loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed)
 
 
+@compiling
 def validation(
     pipeline: Pipeline,
     *,
@@ -1174,6 +1290,7 @@ def validation(
                              host=packed + _held_steps(pipeline) + host)
 
 
+@compiling
 def publish(
     pipeline: Pipeline,
     cache,

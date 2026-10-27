@@ -22,13 +22,14 @@ import jax
 import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
-from dew.batch import Variables, thaw
+from dew.batch import Variables, real_slots, thaw
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import rotate_rows
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Aux, EMASpec, Ratio, Shown
-from dew.objectives.lm.chunked import final_read, head_cross_entropy
+from dew.objectives.lm.chunked import final_read
+from dew.objectives.routing import ExpertBalance
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
 from dew.rl.surrogate import (
     behavior_band_weights,
@@ -38,7 +39,7 @@ from dew.rl.surrogate import (
     sequence_rejection_mask,
 )
 
-from ..lm.objective import TokenScorer, _unpadded
+from ..lm.objective import Scores, TokenScorer, _unpadded
 from .sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
@@ -63,8 +64,8 @@ class _Terms(NamedTuple):
     """The loss's inputs on the packed grid, aligned with `input_ids`: current,
     old and behavior log-probabilities, advantages, the trainable mask, chain
     ids, the per-session weights when the batch carries them, and whether the
-    old policy was rescored rather than standing in for behavior, and the live
-    policy's QK collection."""
+    old policy was rescored rather than standing in for behavior. The policy's
+    live QK collection and routers' choices come with them where the step asks."""
 
     policy: jax.Array
     old: jax.Array
@@ -75,6 +76,7 @@ class _Terms(NamedTuple):
     session_weights: jax.Array | None
     proximal: bool
     qk_stats: Variables | None
+    routing: Variables | None
 
 
 def onto_ids(batch, scores: jax.Array) -> jax.Array:
@@ -112,6 +114,10 @@ class GRPOObjective(TokenScorer):
     `seq_len` one less than the row width; the response mask says which
     targets count. A positive `beta` reads the starting policy, frozen at unit
     decay, as the reference.
+
+    `balance` trains the routers of a mixture as `ExpertBalance` describes
+    (`dew.objectives.routing`), over the response tokens the policy's forward
+    reads; each chain of a packed row is a document of its own.
 
     `policy_loss` picks the surrogate:
 
@@ -174,14 +180,14 @@ class GRPOObjective(TokenScorer):
                  behavior_importance: float | tuple[float, float] | None = None,
                  sequence_mask: tuple[float, float] | None = None,
                  geometric_mask: tuple[float, float] | None = None,
-                 sampling_temperature: float = 1.0, **options):
+                 sampling_temperature: float = 1.0, balance: ExpertBalance | None = None, **options):
         if beta < 0:
             raise ValueError(f"beta scales the KL penalty, so it is non-negative, got {beta}")
         if policy_loss not in POLICY_LOSSES:
             raise ValueError(f"policy_loss must be one of {POLICY_LOSSES}, got {policy_loss!r}")
         if aggregation not in AGGREGATIONS:
             raise ValueError(f"aggregation must be one of {AGGREGATIONS}, got {aggregation!r}")
-        super().__init__(model, seq_len, **options)
+        super().__init__(model, seq_len, balance=balance, **options)
         # The reference is the starting policy, frozen at unit decay, where a KL term reads it.
         self.ema = EMASpec.constant(1.0 if beta > 0 else None)
         # The batch is packed `input_ids` rows, not the LM's text windows.
@@ -213,15 +219,17 @@ class GRPOObjective(TokenScorer):
 
         The loss and a proximal rescoring share its scoring path. A
         packed column whose shape differs from `input_ids` raises `ValueError`.
-        With `qk_stats`, the loss scores through `_packed_scores`, which returns
-        the QK collection from the same forward, so an override of this method
-        must override that one too.
+        Where its step asks for the attention logit maxima (`Step.qk_stats`), or the
+        routers' choices for a balance (`balance`), the loss scores through
+        `_packed_scores`, which returns them from the same forward, so an override
+        of this method must override that one too.
         """
         return self._packed_scores(params, batch)[0]
 
-    def _packed_scores(self, params: Variables, batch, *, qk_stats: bool = False
-                       ) -> tuple[jax.Array, Variables | None]:
-        """The packed policy likelihoods and, when requested, its live QK collection."""
+    def _packed_scores(self, params: Variables, batch, *, qk_stats: bool = False, routing: bool = False
+                       ) -> tuple[jax.Array, Scores]:
+        """The packed policy likelihoods and their live `Scores`: the QK collection where `qk_stats` asks
+        for it, and the routers' choices where `routing` does."""
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
         for key in (SEGMENT_IDS_KEY, POSITIONS_KEY, RESPONSE_MASK_KEY):
@@ -232,13 +240,13 @@ class GRPOObjective(TokenScorer):
                   else (batch[ROUTED_EXPERTS_KEY], batch.get(ROUTED_KEY)))
         scores = self.token_scores(params, ids, segment_ids=segments,
                                    positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32), routes=routes,
-                                   qk_stats=qk_stats)
+                                   qk_stats=qk_stats, routing=routing)
         support = (None if SUPPORT_KEY not in batch
                    else (batch[SUPPORT_KEY], batch[SUPPORT_COLUMNS_KEY]))
         sampled = self.sampled_log_probs(params, scores, ids, support, self.sampling_temperature)
-        return onto_ids(batch, sampled), scores.qk
+        return onto_ids(batch, sampled), scores
 
-    def _terms(self, params, batch) -> _Terms:
+    def _terms(self, params, batch, *, qk_stats: bool = False) -> _Terms:
         """Read a packed batch onto its own `[rows, width]` grid.
 
         The old policy is `old_log_probs` when a rescoring or the sampler
@@ -254,13 +262,18 @@ class GRPOObjective(TokenScorer):
         old = jnp.asarray(batch[OLD_LOG_PROBS_KEY], jnp.float32) if proximal else behavior
         weights = batch.get(SESSION_WEIGHTS_KEY)
         # `packed_log_probs` is the scoring seam a subclass may replace; the QK
-        # collection MuonClip reads comes from the same live forward when asked for.
-        policy, qk = (self._packed_scores(params, batch, qk_stats=True) if self.qk_stats
-                      else (self.packed_log_probs(params, batch), None))
+        # collection MuonClip reads and the routers the balance reads come from the
+        # same live forward when asked for.
+        routed = self.balance is not None
+        if qk_stats or routed:
+            policy, scores = self._packed_scores(params, batch, qk_stats=qk_stats, routing=routed)
+            qk, sown = scores.qk, scores.routing
+        else:
+            policy, qk, sown = self.packed_log_probs(params, batch), None, None
         return _Terms(policy, old, behavior,
                       jnp.asarray(batch[ADVANTAGES_KEY], jnp.float32), mask,
                       jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32),
-                      None if weights is None else jnp.asarray(weights, jnp.float32), proximal, qk)
+                      None if weights is None else jnp.asarray(weights, jnp.float32), proximal, qk, sown)
 
     def loss(self, variables, batch, step):
         """Compute the policy surrogate over the trainable tokens, plus the KL to the reference.
@@ -268,7 +281,7 @@ class GRPOObjective(TokenScorer):
         The policy's log-probabilities are recomputed from the rollout's own
         ids, so every term uses the tokens that were actually sampled.
         """
-        terms = self._terms(variables, batch)
+        terms = self._terms(variables, batch, qk_stats=step.qk_stats)
         mask = terms.mask
         correction = self.behavior_importance
         if isinstance(correction, float) and not terms.proximal:
@@ -322,9 +335,20 @@ class GRPOObjective(TokenScorer):
             kl_terms = k3_kl(terms.policy, self.packed_log_probs(step.ema, batch))
             kl = Ratio(jnp.sum(jnp.where(weights != 0, kl_terms, 0) * weights), mass)
             metrics["kl"], _ = kl.mean()
-            return Ratio(pg.total + self.beta * kl.total, mass), Aux[Variables](
-                metrics, qk_stats=terms.qk_stats)
-        return pg, Aux[Variables](metrics, qk_stats=terms.qk_stats)
+            objective = Ratio(pg.total + self.beta * kl.total, mass)
+        else:
+            objective = pg
+        statistics, effects = objective, None
+        if self.balance is not None:
+            # The router positions that count are the response tokens the policy's forward reads: a token's
+            # input (`[:, :-1]`) whose own target is trained, in a real chain.
+            fields = {"segment_ids": terms.segments}
+            queries = (real_slots(fields, mask.shape)[:, :-1] & (mask[:, :-1] != 0)
+                       & (self.row_weights(batch, mask.shape[0]) > 0)[:, None])
+            statistics, effects, router_metrics = self.balance.compose(
+                variables, objective, terms.routing or {}, batch, queries, fields)
+            metrics.update(router_metrics)
+        return statistics, Aux[Variables](metrics, qk_stats=terms.qk_stats, effects=effects)
 
     def _policy_terms(self, terms: _Terms, mask: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
         """The chosen surrogate's per-token terms and verl's three actor metrics."""
@@ -381,8 +405,7 @@ class GRPOObjective(TokenScorer):
         padding = prompts.shape[1] - lengths
         aligned = rotate_rows(prompts, padding)
         read = final_read(self.model, params, aligned[:, :-1], train=False)
-        losses, predicted, _ = head_cross_entropy(self.model, params, read, aligned[:, 1:],
-                                                  self.head_chunks, predict=True)
+        losses, predicted, _ = self.head_terms(self.model, params, read, aligned[:, 1:], predict=True)
         assert predicted is not None
         correct, _ = _unpadded(predicted == aligned[:, 1:], padding)
         losses, valid = _unpadded(losses, padding)

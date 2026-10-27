@@ -8,7 +8,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained
 
@@ -85,12 +85,14 @@ def test_a_yarn_phi_trains_as_transformers_computes_it_and_writes_it_back(tmp_pa
 
     stepped = jax.jit(dew)
 
+    @as_given
     def ours(ids):
         logits, gradient = stepped(jnp.asarray(ids, jnp.int32))
         return {'logits': logits, 'gradients': {
             layout.name: np.asarray(layout.export({'params': gradient})).reshape(layout.shape)
             for layout in loaded.weight_layouts}}
 
+    @as_given
     def reference(ids, wide=False):
         with float64() if wide else contextlib.nullcontext():
             model = AutoModelForCausalLM.from_pretrained(source, dtype=torch.float32)

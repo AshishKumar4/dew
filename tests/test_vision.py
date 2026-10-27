@@ -103,6 +103,8 @@ def test_a_siglip_tower_runs_any_layer_activation_and_an_inactive_dropout_as_the
     import torch
     from transformers import SiglipVisionConfig, SiglipVisionModel
 
+    from tools.torch_precision import float64, float64_twin
+
     config = SiglipVisionConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=2,
                                 num_attention_heads=4, image_size=28, patch_size=14, num_channels=3,
                                 hidden_act="quick_gelu", attention_dropout=0.1, layer_norm_eps=1e-6)
@@ -111,12 +113,11 @@ def test_a_siglip_tower_runs_any_layer_activation_and_an_inactive_dropout_as_the
     tensors = {name: tensor.numpy().copy() for name, tensor in reference.state_dict().items()}
     pixels = np.random.default_rng(11).random((2, 3, 28, 28)).astype(np.float32)
 
-    def features(dtype):
-        with torch.no_grad():
-            output = reference.to(dtype)(pixel_values=torch.from_numpy(pixels).to(dtype))
-        return output.last_hidden_state.numpy()
-
-    theirs, truth = features(torch.float32), features(torch.float64)
+    wide = float64_twin(reference)
+    with torch.no_grad():
+        theirs = reference(pixel_values=torch.from_numpy(pixels)).last_hidden_state.numpy()
+        with float64():
+            truth = wide(pixel_values=torch.from_numpy(pixels).double()).last_hidden_state.numpy()
     tower = towers.from_record(siglip.translate_siglip_vision_config(config.to_dict())).build()
     ours = np.asarray(tower.apply(tower_variables("siglip", tensors, "float32")[0], pixels))
     assert_as_exact_as_the_reference(ours, theirs, truth, "siglip quick_gelu features")

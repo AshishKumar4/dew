@@ -12,7 +12,13 @@ from xml.etree import ElementTree
 
 import numpy as np
 import pytest
-from reference_error import GateFailure, assert_as_exact, assert_as_exact_as_the_reference, row_errors
+from reference_error import (
+    GateFailure,
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    row_errors,
+)
 
 
 def test_the_one_draw_rule_measures_its_worst_zero_row_and_names_a_value_not_finite():
@@ -115,8 +121,9 @@ def test_a_subnormal_row_error_and_an_overflowing_sum_still_measure_a_worse_cand
     exact = []
     for far in (1e154, 1.2e154):
         with pytest.raises(GateFailure) as raised:
-            assert_as_exact(lambda x, far=far: {"y": x + far}, lambda x: {"y": x}, draw, "exact far", seeds=8,
-                            truth_fn=truth_fn)
+            # NumPy arms, as given: a Dew arm compiled would compute in float32 and overflow.
+            assert_as_exact(as_given(lambda x, far=far: {"y": x + far}), as_given(lambda x: {"y": x}), draw,
+                            "exact far", seeds=8, truth_fn=truth_fn)
         [finding] = [finding for finding in raised.value.findings if finding.rule == "exact reference"]
         assert math.isfinite(finding.measure)
         exact.append(finding.measure)
@@ -125,8 +132,8 @@ def test_a_subnormal_row_error_and_an_overflowing_sum_still_measure_a_worse_cand
     measures = []
     for far in (1e154, 1.2e154):
         with pytest.raises(GateFailure) as raised:
-            assert_as_exact(lambda x, far=far: {"y": x + far}, reference_fn, draw, "far", seeds=8,
-                            truth_fn=truth_fn)
+            assert_as_exact(as_given(lambda x, far=far: {"y": x + far}), as_given(reference_fn), draw, "far",
+                            seeds=8, truth_fn=truth_fn)
         [pooled] = [finding for finding in raised.value.findings
                     if finding.rule in ("pooled", "inconclusive")]
         assert math.isfinite(pooled.measure)
@@ -176,3 +183,36 @@ def test_a_test_the_gate_fails_reports_its_findings_as_a_junit_property(tmp_path
     with pytest.raises(GateFailure) as raised:
         three_times("call")
     assert found["test_call"][0]["measure"] == raised.value.findings[0].measure
+
+
+def test_a_measure_is_finite_where_the_evidence_is_finite_even_past_float64s_largest_quotient():
+    """Row 1628: a sized row's error over its size and the zero rows' pooled squares overflowed from
+    finite evidence (an error of 1e154 over a row of 1e-160), and the promotion matcher refuses a
+    non-finite measure. Each now comes from logs or a scaled sum: the measure is finite, and the row still
+    fails."""
+    from reference_error import pooled_zero_rows, rows_over
+
+    truth = np.asarray([[1e-160, 1e-160], [1.0, 1.0]])
+    reference = np.asarray([[0.0, 0.0], [1.0, 1.0]])
+    dew = np.asarray([[1e154, 1e154], [1.0, 1.0]])
+    found = rows_over(dew, reference, truth)
+    assert found and all(np.isfinite(measure) for _, measure, _ in found), found
+    rows = np.asarray([0]), np.asarray([1e155]), np.asarray([1e-10])
+    pooled = pooled_zero_rows([rows, rows])
+    assert pooled and all(np.isfinite(value) for row in pooled for value in row[1:]), pooled
+
+
+def test_a_worse_row_past_float64s_largest_quotient_measures_larger():
+    """A row's error over its size is judged and measured by its log (`_log_over`), so two quotients
+    past float64's largest, 1e310 and 1e311, keep their order: a candidate ten times worse is not
+    matched to its parent's failure."""
+    from reference_error import rows_over
+
+    truth = np.asarray([[1e-160, 1e-160], [1e-148, 1e-148]])
+    reference = truth + np.asarray([[1e140, 1e140], [1e152, 1e152]])
+
+    def measure(error):
+        dew = truth + np.asarray([[error, error], [1e152, 1e152]])
+        return {rule: value for rule, value, _ in rows_over(dew, reference, truth)}["row"]
+
+    assert np.isfinite(measure(1e150)) and measure(1e151) > measure(1e150) + 2

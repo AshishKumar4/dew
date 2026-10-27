@@ -115,6 +115,21 @@ def _keeping_gradients(optimizer):
     return optax.chain(kept, optimizer)
 
 
+def _decoder(*, scanned=False, remat=None, mixture=False, rows=8):
+    """`_trained`'s tied bf16 decoder over fp32 parameters, as its LM objective, and the batch of
+    `rows` rows it trains on."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import TEXT_KEY, LMObjective
+    from dew.objectives.routing import ExpertBalance
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
+                              num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
+                              tie_embeddings=True, dtype=jnp.bfloat16, scan_layers=scanned, remat=remat,
+                              mixture={"experts": 4, "top_k": 2} if mixture else None)
+    objective = LMObjective(model, seq_len=8, pad_id=0,
+                            balance=ExpertBalance(aux_loss_alpha=.01) if mixture else None)
+    return objective, {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (rows, 9)), jnp.int32)}
+
+
 def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1, split=None,
              mixture=False, rows=8, ragged=False, scanned=False, remat=None, longer=None):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
@@ -130,15 +145,9 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     as `remat` names. With `longer`, every other step reads a batch of that
     many rows, whose shape the trainer plans apart. Returns the state, each
     step's loss and the trainer, its plan the last shape's."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.lm import TEXT_KEY, LMObjective
+    from dew.objectives.lm import TEXT_KEY
     from dew.training import Layout, MeshSpec, Trainer
-    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
-                              num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
-                              tie_embeddings=True, dtype=jnp.bfloat16, scan_layers=scanned, remat=remat,
-                              mixture={"experts": 4, "top_k": 2} if mixture else None)
-    objective = LMObjective(model, seq_len=8, pad_id=0, aux_loss_alpha=.01 if mixture else None)
-    batch = {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (rows, 9)), jnp.int32)}
+    objective, batch = _decoder(scanned=scanned, remat=remat, mixture=mixture, rows=rows)
     long = longer and {TEXT_KEY: jnp.asarray(np.random.default_rng(1).integers(1, 64, (longer, 9)),
                                              jnp.int32)}
     with chosen(narrow_copies='on' if copies else 'off'):
@@ -272,7 +281,7 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     them before its first call, so their bytes count beside the step with the
     prefetched batches: the headroom the check leaves is the step's own,
     `step_headroom` of the devices' free bytes, less the bytes held beside it."""
-    from dew.training.distributed import placed_bytes
+    from dew.distributed.placement import placed_bytes
     from dew.training.memory import step_headroom
 
     limit = 2 ** 40
@@ -317,6 +326,51 @@ def test_a_step_that_fits_only_without_its_copies_drops_them_before_it_recompute
     assert [(probe["narrow"], probe["fits"]) for probe in probes] == [(True, False), (False, True)]
     assert (trainer.plan["narrow"], trainer.plan["remat"], trainer.plan["split"]) == (False, "full", 1)
     assert state.compute is None
+
+
+def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monkeypatch):
+    """Row 1661's run (1765): devices that hold the state a run keeps between steps, its parameters,
+    optimizer state and the window's accumulator, but not that state and its narrow bf16 copies. The
+    check `fit` makes before it places anything holds that state alone, which `validate` reports the
+    same with the copies on as off: the copies are the plan's first rung, dropped where the step does
+    not fit with them. On devices of that capacity, whose free bytes lie between the step's footprints
+    with and without its copies, fit trains, its plan without them."""
+    from test_layout_validation import capped
+    from token_support import repeated_token_batch
+
+    from dew.data.dataset import Loader
+    from dew.distributed.placement import placed_bytes
+    from dew.training import Layout, MeshSpec, Trainer
+
+    free = 2 ** 39
+    monkeypatch.setattr(jax.Device, "memory_stats",
+                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
+    geometry = {"steps": 1, "accumulation": 2, "split": 1, "remat": "full"}
+    narrow, _, trainer = _trained(optax.adam(1e-3), copies=True, **geometry)
+    with_copies = free - trainer.plan["probes"][0]["headroom"]
+    without = free - _trained(optax.adam(1e-3), copies=False, **geometry)[2].plan["probes"][0]["headroom"]
+    copies = placed_bytes(jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), narrow.compute))
+
+    def built(kind: type[Trainer] = Trainer) -> tuple[Trainer, dict]:
+        objective, batch = _decoder(remat="full")
+        return kind(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
+                    layout=Layout(min_shard=1, tolerance=1.0), accumulation=2, split=1), batch
+
+    def held(*, copies: bool) -> int:
+        run, batch = built()
+        with chosen(narrow_copies='on' if copies else 'off'):
+            return max(run.validate(batch).device_bytes.values())
+
+    state = held(copies=False)
+    assert copies > 0 and held(copies=True) == state
+    free = (with_copies + without) // 2
+    run, _ = built(capped(state + copies // 2))
+    stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
+    with chosen(narrow_copies='on'):
+        run.fit(stream, steps=2)
+    probes = run.plan["probes"]
+    assert [(probe["narrow"], probe["fits"]) for probe in probes] == [(True, False), (False, True)]
 
 
 def test_a_plan_a_rung_above_its_dropped_copies_takes_them_back_where_they_fit(monkeypatch):

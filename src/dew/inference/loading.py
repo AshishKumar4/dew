@@ -35,7 +35,7 @@ from dew.registry import dtype_name
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.training.distributed import Layout, MeshSpec
+    from dew.distributed.placement import Layout, MeshSpec
 
 
 def pipeline(
@@ -110,9 +110,8 @@ def pipeline(
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool | None,
               step: int | str | None, trust: Sequence[str]) -> SavedTask:
-    """The task the run's recorded objective declares (`Objective.saved_task`), loaded at the step
-    pinned here; the packages its record may import stay trusted for the process once pinned
-    (`dew.registry.import_trusted`), so the task's own load reads it too."""
+    """The task the run's recorded objective declares (`Objective.saved_task`), built from the checkpoint
+    pinned here (`SavedTask.from_saved`), which nothing pins again."""
     from dew.inference.tasks import SavedRun
 
     run = SavedRun.pinned(str(root), step, trust)
@@ -120,16 +119,15 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
     if task is None:
         raise TypeError(f"a run of {run.objective.__name__} loads as no task: its class declares no "
                         "`saved_task`")
-    return task.from_run(run.directory, ema=ema, step=run.step, mesh=mesh, layout=layout,
-                         dtype=dtype, param_dtype=param_dtype)
+    return task.from_saved(run, ema=ema, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype)
 
 
 def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
                  revision: str | None) -> SavedTask:
+    from dew.distributed.placement import MeshSpec as DefaultMesh
     from dew.inference.projections import packed_owned
     from dew.interop import Pretrained, PretrainedPipeline
-    from dew.training.distributed import MeshSpec as DefaultMesh
 
     storage = "auto" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
@@ -150,12 +148,12 @@ def place(variables: Variables, mesh: MeshSpec | Mesh | None, layout: Layout | N
     describes, one leaf at a time.
 
     The sharding is the one the trainer gives a train state's parameters under
-    `layout`; `dew.training.host.stream` places the leaves, updating the
+    `layout`; `dew.distributed.host.stream` places the leaves, updating the
     dict nodes of `variables` in place and rebuilding a frozen one, which a
     task holds, as a dict over the same leaves.
     """
-    from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, device_mesh
-    from dew.training.host import stream
+    from dew.distributed.host import stream
+    from dew.distributed.placement import Layout as DefaultLayout, MeshSpec as DefaultMesh, device_mesh
 
     placed_on = device_mesh(DefaultMesh() if mesh is None else mesh)
     chosen_layout = DefaultLayout() if layout is None else layout

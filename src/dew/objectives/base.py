@@ -18,7 +18,7 @@ import functools
 import math
 import zlib
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
@@ -46,7 +46,7 @@ from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
 from dew.nn import categorical
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.nn.sharding import rows_taken
@@ -59,14 +59,14 @@ if TYPE_CHECKING:
 
     from dew.data.pipeline import DeviceStep, ObjectiveData
     from dew.data.text import Tokenizer
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.images import TextToImage
-    from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
+    from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, SavedRun, TextGeneration
     from dew.inputs import InputSpec
     from dew.nn.autoencoders import AutoEncoder
     from dew.nn.backbones.decoder_stack import DecoderBank
     from dew.sampling.guidance import Guidance
     from dew.state import TrainState
-    from dew.training.distributed import Layout, MeshSpec
 
     type Task = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
 
@@ -272,6 +272,10 @@ class Step:
     witness: Witness | None = struct.field(pytree_node=False, default=None)
     """The evaluation's collector of what `sample` and `boundary` produce, which `Objective._loss` opens
     inside the trace of a recording step (`record`); None otherwise."""
+    qk_stats: bool = struct.field(pytree_node=False, default=False)
+    """Whether the run's optimizer reads the step's attention logit maxima (`dew.optim.clips_qk`, its
+    QK-Clip): the objective opens the `qk` collection in the model calls it trains through and returns
+    what they sowed (`Aux.qk_stats`). Static, as opening a collection changes the program."""
 
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
@@ -399,8 +403,9 @@ class Aux(Generic[Effects]):
     one-tuple of an fp32 `[rows, heads]` array of per-head logit maxima, and
     an MLA layer also holds `qk_nope`, an int scalar giving its nope width.
     Rows are the batch's rows, with microbatches concatenated under a
-    pipeline. It is None when the loss never opened the collection, and then
-    the clip does nothing."""
+    pipeline. It is None where the step asked for none (`Step.qk_stats`),
+    and empty where it asked and no layer sowed any; a run whose optimizer
+    clips by it refuses a step that returns None."""
     effects: Effects | None = None
     """Additive observations that `Objective.apply_effects` applies once per optimizer commit."""
     record: Evaluated | Recorded | None = None
@@ -545,14 +550,16 @@ class EMASpec:
 class SavedTask(Protocol):
     """The task class a saved run of an objective loads as (`Objective.saved_task`).
 
-    It is a class whose `from_run` builds the task from a run directory.
-    Dew's tasks (`TextToImage`, `TextGeneration`, `BlockGeneration`,
-    `MaskedGeneration`) are such classes, and a plugin can supply its own."""
+    It is a class whose `from_saved` builds the task from a run's pinned checkpoint
+    (`dew.inference.tasks.SavedRun`), which `dew.pipeline` and `dew export` pin once; deriving
+    from `dew.inference.tasks.SavedRunTask` adds `from_run`, which loads one from a run directory.
+    Dew's tasks (`TextToImage`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `Decide`)
+    are such classes, and a plugin can supply its own."""
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self: ...
+    def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
+                   layout: Layout | None = None, dtype: DTypeLike | None = None,
+                   param_dtype: DTypeLike | None = None) -> Self: ...
 
 
 @runtime_checkable
@@ -820,6 +827,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         model = vars(self).get("model")
         return () if model is None else (ProgramModule(model, None, trained=True),)
 
+    def towers(self) -> tuple[Held, ...]:
+        """Every network this objective's programs run, whose quantization the options they compile
+        with read (`dew.nn.kernels.options.compiler_options`): the modules `program_key` names, and
+        an objective whose steps also call frozen towers (a condition's encoder, an autoencoder)
+        adds them."""
+        return tuple(entry.module for entry in self.program_key())
+
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         """Replace the modules `program_key` names, one per entry in its order."""
         if len(modules) != len(self.program_key()):
@@ -907,7 +921,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
                 holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (),
-                modules: tuple[nn.Module, ...] = (), step: Mapping[str, bool | int] | None = None):
+                modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
 
@@ -923,7 +937,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         it as `holds` do, and its options cover them. `step` are the XLA options of the training step
         the program is part of (`dew.training.memory.step_compiler_options`), beside its modules' own,
         so a host step's programs compile as the resident step does. Keep only the current
-        specialization, not a history of old models or steps.
+        specialization, not a history of old models or steps. The cache is the objective's, so its
+        programs live as long as it does: the process-wide seam every other outer program shares
+        (`dew.nn.kernels.options.program`) would keep each objective alive with them.
         """
         programs = tuple((program.module, (program.head_tile, program.head_fused))
                          for program in self.program_key())
@@ -935,7 +951,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             self._program_cache = cached
         from dew.nn.sharding import trace_context
         # The options follow where the program runs (`compiler_options`), so they key it too.
-        options = {**compiler_options(*(module for module, _ in programs), *modules), **(step or {})}
+        options = {**compiler_options(*self.towers(), *modules), **(step or {})}
         key = (name, trace_context(), tuple(sorted(options.items())))
         held = cached[1].get(key)
         kept = (*holds, *modules)
@@ -1479,28 +1495,6 @@ class Metric(Protocol[S]):
     def finalize(self, accumulated: S, /) -> float:
         """Return the scalar for the completed pass."""
         ...
-
-
-def recorded_name[S, A](key, names: Collection[str], owner: Objective[S, A] | None = None) -> str:
-    """The recorded name a run's score object names, one rule for the scores `best=` and `stop=` read
-    live and the ones a checkpoint keeps: a `TrainingScalar` the training split's (of the objective
-    `owner` where it is given, by identity), a `Metric` the validation split's ('val'), and a
-    `(split, metric)` pair that split's. A metric its split did not record raises with the splits that
-    did."""
-    split = "val"
-    if isinstance(key, tuple) and len(key) == 2:
-        split, key = key
-    if isinstance(key, TrainingScalar):
-        if owner is not None and key.owner is not owner:
-            raise KeyError("training score belongs to another objective")
-        return f"train/{key.name}"
-    if isinstance(key, Metric):
-        if f"{split}/{key.name}" in names:
-            return f"{split}/{key.name}"
-        splits = sorted(name.rpartition("/")[0] for name in names if name.rpartition("/")[2] == key.name)
-        raise KeyError(f"metric {key.name!r} has no {split} score" + (
-            f"; it is recorded under {', '.join(splits)}: ask (split, metric)" if splits else ""))
-    raise KeyError(key)
 
 
 def merge_totals(accumulated: tuple[float, float],

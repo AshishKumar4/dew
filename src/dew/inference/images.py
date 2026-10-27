@@ -23,6 +23,7 @@ from dew._records import JSON
 from dew.artifacts import uint8_pixels
 from dew.batch import Variables, thaw
 from dew.diffusion.process import Conditioning, Process
+from dew.inference.tasks import SavedRun, SavedRunTask
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, host_rows, local_rows, mesh_of, request_key
@@ -40,9 +41,9 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
     from PIL.Image import Image as PILImage
 
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.objectives.diffusion import DiffusionObjective
     from dew.quantization import Quantization
-    from dew.training.distributed import Layout, MeshSpec
 
 @dataclass(frozen=True)
 class _Resolved:
@@ -156,7 +157,7 @@ class ImageSettings:
 
 
 @dataclass(frozen=True, eq=False)
-class TextToImage:
+class TextToImage(SavedRunTask):
     """Generates images from text prompts with a trained diffusion model and its encoders.
 
     Call it as `pipe(prompts, key=0)` or
@@ -231,14 +232,12 @@ class TextToImage:
                    grid=objective.grid, final_denoise=objective.final_denoise)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
-                 trust: Sequence[str] = ()) -> TextToImage:
-        """Load the run in `directory`, built from the inference record its checkpoint holds
-        (`Checkpoints.artifact`) the way the recipe built it; the run's `run.json` is not read.
-
-        The weights come from the run's latest checkpoint, or from `step`.
+    def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
+                   layout: Layout | None = None, dtype: DTypeLike | None = None,
+                   param_dtype: DTypeLike | None = None) -> TextToImage:
+        """Load the run `run` (its checkpoint pinned, `SavedRun.pinned`), built from the inference record
+        its checkpoint holds (`Checkpoints.artifact`) the way the recipe built it; the run's `run.json`
+        is not read. `from_run` loads one from its directory.
 
         `ema` None reads the averaged weights when the run kept them and the
         live ones when it kept none; True requires the averaged weights, and
@@ -250,25 +249,22 @@ class TextToImage:
 
         `dtype` sets the compute dtype of the model, the encoders and the VAE.
         `param_dtype` sets the dtype the parameters are stored in; None keeps
-        the checkpoint's dtypes exactly. `trust` names the packages outside
-        Dew the run's record may import (`TextGeneration.from_run`).
+        the checkpoint's dtypes exactly.
         """
         from dew._records import record as fields
         from dew.diffusion.schedules.source import SourceGrid
-        from dew.inference.tasks import SavedRun, saved_settings
+        from dew.inference.tasks import saved_model, saved_settings
         from dew.nn.autoencoders import AutoEncoder
         from dew.objectives.diffusion.objective import without_loss_heads
-        from dew.registry import ModelConfig, from_record
+        from dew.registry import from_record
 
-        run = SavedRun.pinned(directory, step, trust)
         settings = saved_settings(run.record, ImageSettings)
-        config = ModelConfig.from_dict(fields(run.record['model'], 'model'))
+        compute = dtype_name(resolve_dtype(dtype))
+        config = saved_model(run.record, compute)
         inputs_record = fields(settings.inputs, 'inputs')
         autoencoder_record = None if settings.autoencoder is None else fields(settings.autoencoder,
                                                                               'autoencoder')
-        compute = dtype_name(resolve_dtype(dtype))
         if compute is not None:
-            config = config.with_dtype(compute)
             conditions = {keyword: fields(condition, keyword) for keyword, condition
                           in fields(inputs_record['conditions'], 'conditions').items()}
             inputs_record = {**inputs_record, 'conditions': {
@@ -293,22 +289,6 @@ class TextToImage:
         return cls(config.build(), settings.process, inputs, without_loss_heads(params), autoencoder,
                    steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver,
                    grid=grid, final_denoise=grid is None)
-
-    @classmethod
-    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
-                        ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
-                        layout: Layout | None = None, dtype: DTypeLike | None = None,
-                        param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> TextToImage:
-        """Download a run directory from the Hugging Face Hub and load it with `from_run`.
-
-        The repository holds the run directory as `HfApi().upload_folder`
-        writes it. `revision` is the Hub revision to download; the other
-        arguments are `from_run`'s."""
-        from huggingface_hub import snapshot_download
-
-        return cls.from_run(snapshot_download(repo_id=repo_id, revision=revision),
-                            ema=ema, mesh=mesh, layout=layout,
-                            dtype=dtype, param_dtype=param_dtype, trust=trust)
 
     @classmethod
     def from_flaxdiff(cls, directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
@@ -353,9 +333,11 @@ class TextToImage:
         by the task's towers as the training step encodes its blank (`DiffusionObjective.encode`)."""
         leaves = jax.tree.leaves(tokens)
         if leaves and leaves[0].shape[0] != 1:
-            return _encode(plan.sharding)(self.inputs.encoders, self.variables, plan.place(plan.pad(tokens)))
+            encode = _encoder(plan.sharding, self.inputs.encoders)
+            return encode(self.inputs.encoders, self.variables, plan.place(plan.pad(tokens)))
         # Host tokens, which reach the encoders' devices as the call places them.
-        return _encode(None)(self.inputs.encoders, self.variables, jax.tree.map(np.asarray, tokens))
+        return _encoder(None, self.inputs.encoders)(self.inputs.encoders, self.variables,
+                                                    jax.tree.map(np.asarray, tokens))
 
 
     def prepare(
@@ -638,7 +620,7 @@ class TextToImage:
         plan, process = settled.plan, settled.process
         given = plan.place(plan.pad(settled.tokens))
         if "given" not in settled.encoded:
-            given = _encode(plan.sharding)(self.inputs.encoders, self.variables, given)
+            given = _encoder(plan.sharding, self.inputs.encoders)(self.inputs.encoders, self.variables, given)
         if settled.null_tokens is None:
             null = {}
         elif "null" in settled.encoded:
@@ -648,10 +630,11 @@ class TextToImage:
         else:
             null = self._unconditional(settled.null_tokens, plan)
         if not settled.samples:
-            return given, null, _noise(plan.sharding)(process, plan.keys(settled.request),
-                                                      settled.shape)
+            noise = program(_noised, static_argnums=(0, 2), in_shardings=(plan.sharding,),
+                            out_shardings=plan.sharding)
+            return given, null, noise(process, plan.keys(settled.request), settled.shape)
         start = process.times(settled.count)[0] if settled.times is None else settled.times[0]
-        starting = program(_image_start, *([] if self.autoencoder is None else [self.autoencoder.model]),
+        starting = program(_image_start, *(() if self.autoencoder is None else self.autoencoder.towers()),
                            static_argnums=(0, 1, 2),
                            in_shardings=(None, plan.sharding, plan.sharding, None, None),
                            out_shardings=plan.sharding)
@@ -714,7 +697,8 @@ class TextToImage:
             plan = RowPlan.over(mesh, prepared.rows)
             walk = jax.random.fold_in(request, 1)
             grid = _default_grid(process, count) if times is None else times
-            initial = _initial(plan.sharding)(solver, process, grid, prepared.noise, walk)
+            initial = program(_initial, static_argnums=(0, 1, 2), in_shardings=(plan.sharding, None))(
+                solver, process, grid, prepared.noise, walk)
             models = sampling_modules(self.model, chosen, self.autoencoder)
             walked = program(_walk, *models, static_argnums=(0, 1, 2, 3, 4, 5),
                              in_shardings=(None, None, None, None, None, plan.sharding, None, plan.sharding,
@@ -816,12 +800,16 @@ def _image_start(autoencoder, process, shape, params, samples, keys, encode_key,
 
 
 
-@functools.cache
-def _encode(rows: jax.sharding.NamedSharding | None):
-    def encode(encoders, params, tokens):
-        # A task without conditions holds no encoder weights.
-        return encode_conditions(encoders, params["encoders"] if encoders else {}, tokens)
-    return jax.jit(encode, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
+def _encoded(encoders, params, tokens):
+    """The conditions' encodings of `tokens` (`encode_conditions`), each row's where its rows sit."""
+    # A task without conditions holds no encoder weights.
+    return encode_conditions(encoders, params["encoders"] if encoders else {}, tokens)
+
+
+def _encoder(rows: jax.sharding.NamedSharding | None, encoders):
+    """The program that encodes rows placed by `rows` (`_encoded`) with `encoders`, placed as they are,
+    under the options its towers compile with (`compiler_options`)."""
+    return program(_encoded, encoders, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
 
 
 def _encoded_rows(conditions: Mapping[str, Conditioning]) -> int:
@@ -832,11 +820,9 @@ def _encoded_rows(conditions: Mapping[str, Conditioning]) -> int:
     return counts.pop()
 
 
-@functools.cache
-def _noise(rows: jax.sharding.NamedSharding | None):
-    def noise(process, keys, shape):
-        return jax.vmap(lambda key: process.noise(key, shape))(keys)
-    return jax.jit(noise, static_argnums=(0, 2), in_shardings=(rows,), out_shardings=rows)
+def _noised(process, keys, shape):
+    """Each row's starting noise of `shape`, drawn under its own key."""
+    return jax.vmap(lambda key: process.noise(key, shape))(keys)
 
 
 @functools.lru_cache(maxsize=64)
@@ -845,15 +831,12 @@ def _default_grid(process: Process, count: int) -> tuple[float, ...]:
     return _time_grid(process.times(count))
 
 
-@functools.cache
-def _initial(rows: jax.sharding.NamedSharding | None):
+def _initial(solver, process, grid, x_T, key):
     """The solver's state before a walk's first step, on the concrete `grid`: its checks and tables
     read the grid's values, so this small program is a grid's own and the walk's is every grid's."""
-    def initial(solver, process, grid, x_T, key):
-        with jax.ensure_compile_time_eval():
-            times = jnp.asarray(grid, jnp.float32)
-        return solver.init(x_T, times, process, key=key)
-    return jax.jit(initial, static_argnums=(0, 1, 2), in_shardings=(rows, None))
+    with jax.ensure_compile_time_eval():
+        times = jnp.asarray(grid, jnp.float32)
+    return solver.init(x_T, times, process, key=key)
 
 
 def _walk(model, process, autoencoder, finish, final_denoise, decode,

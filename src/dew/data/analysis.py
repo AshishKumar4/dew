@@ -42,6 +42,7 @@ from dew.data.pipeline import (
     Bound,
     Configured,
     Expansion,
+    External,
     Filter,
     FlatMap,
     Interleave,
@@ -589,11 +590,19 @@ def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Mani
     without the views of its inputs (`_VIEWS`), which order or select what it holds and make none of
     it. A store given no name states no content (`Manifest.exact`), and its cache would serve any
     other's rows."""
-    stated = source.fingerprint()
-    if not identified(json_value(stated, "source")):
+    manifest = _cache_key(source, prefix, read)
+    if manifest is None:
         raise ValueError(f"a cache keys its store's content, which {source.describe()} doesn't "
                          "state: name it (from_grain(..., name=), from_iter(..., name=), "
                          "from_torch(..., identity=))")
+    return manifest
+
+
+def _cache_key(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest | None:
+    """`_cache_manifest`, or None where `source` states no content of its own to key."""
+    stated = source.fingerprint()
+    if not identified(json_value(stated, "source")):
+        return None
     return _manifest(
         stated,
         (source,),
@@ -686,11 +695,19 @@ def _random(stage: Stage) -> bool:
     return isinstance(stage, RandomMap) or (isinstance(stage, Configured) and stage.random)
 
 
+def _external(stage: Stage) -> bool:
+    """Whether `stage` reads storage its record names by path (a step that says it is `External`), which
+    the record's content does not key, so no automatic cache stands for it."""
+    return (isinstance(stage, (Map, MapWithIndex)) and isinstance(stage.step, External)
+            and stage.step.external)
+
+
 def _volatile(stage: Stage) -> bool:
     """Whether `stage` reads what may change between reads (a step that says it is `Volatile`, as a
     live fetch does), so neither a cache nor a second reader may stand for it: the one test the
     cache prefix and the plan read."""
-    return isinstance(stage, Map) and isinstance(stage.step, Volatile) and stage.step.volatile
+    return (isinstance(stage, (Map, MapWithIndex)) and isinstance(stage.step, Volatile)
+            and stage.step.volatile)
 
 
 def _drops(stage: Stage) -> bool:
@@ -703,11 +720,19 @@ def _drops(stage: Stage) -> bool:
 
 def _written(source: Source, stages: Sequence[Stage]) -> tuple[Stage, ...]:
     """A corpus's stages as its pipeline wrote them: the ones a memory read
-    already ran (`materialized`), then the ones left to lower."""
+    already ran (`materialized`), then the ones left to lower, without a cache
+    the compiler placed (`written`)."""
     while materialized(source):
         stages = (*source.ran, *stages)
         source = source.source
-    return tuple(stages)
+    return written(stages)
+
+
+def written(stages: Sequence[Stage]) -> tuple[Stage, ...]:
+    """`stages` as a chain wrote them: without a cache the compiler placed (`Artifact.automatic`),
+    which holds what the stages before it make and is no step of the chain's identity, plan or
+    layout."""
+    return tuple(stage for stage in stages if not (isinstance(stage, Artifact) and stage.automatic))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -860,7 +885,8 @@ def _analyzed(
         order: Mapping[str, object] = {
             "phases": [child.order for child in lowered],
             "members": _members(source.pipelines),
-            "until_steps": list(source.until_steps),
+            # A run's phases on the step clock keep the key their plans were written with.
+            "until_steps" if source.clock == "steps" else "until_tokens": list(source.ends),
         }
     else:
         written = stages if isinstance(source, Mixture) else _written(source, stages)

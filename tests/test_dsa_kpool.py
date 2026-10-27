@@ -21,7 +21,6 @@ difference in the math and not in a tie-break.
 """
 
 import contextlib
-import copy
 from functools import partial
 
 import jax
@@ -31,7 +30,15 @@ import pytest
 import torch
 import torch.nn.functional as F
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_moves, torch_with_gradients, widened, with_gradients
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_moves,
+    torch_with_gradients,
+    widened,
+    with_gradients,
+)
+from selection_margins import indexer_margins
 from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention
 
@@ -148,12 +155,21 @@ def call(valid):
 def dew_block(variables, **overrides):
     """Dew's block over `variables` as a function of a draw: its output on the valid rows."""
     run = jax.jit(lambda hidden, valid: module(**overrides).apply(variables, hidden, call(valid)))
-    return lambda hidden, valid: {'output': on_valid_rows(run(hidden, valid), valid)}
+    return as_given(lambda hidden, valid: {'output': on_valid_rows(run(hidden, valid), valid)})
 
 
 def reference_block_output(block):
     """The reference block, fp32, as a function of a draw: its output on the valid rows."""
-    return lambda hidden, valid: {'output': on_valid_rows(reference_output(block, hidden, valid), valid)}
+    return as_given(lambda hidden, valid: {'output': on_valid_rows(reference_output(block, hidden, valid),
+                                                                    valid)})
+
+
+def wide_block(block):
+    """`block`'s float64 twin (`float64_twin`): built inside `float64`, so every value its constructor
+    computes is float64's, with `block`'s weights."""
+    from tools.torch_precision import float64_twin
+
+    return float64_twin(block, lambda: Glm5NextTextAttention(block.config, block.layer_idx))
 
 
 def float64_block(block):
@@ -161,7 +177,7 @@ def float64_block(block):
     widened draw: the truth check 1 measures both sides from."""
     from tools.torch_precision import float64
 
-    wide = copy.deepcopy(block).double()
+    wide = wide_block(block)
 
     def run(hidden, valid):
         with float64(), torch.no_grad():
@@ -171,9 +187,10 @@ def float64_block(block):
 
 
 def boundary_gap(block: Glm5NextTextAttention, hidden: torch.Tensor, valid: torch.Tensor) -> float:
-    """The smallest margin, over the valid queries, between the last selected
-    pool's reference score and the best rejected one (modeling_glm5_next.py:
-    797-847 replayed); a zero margin means the selection is a tie-break."""
+    """The smallest margin, over the valid queries, of the reference's pool selection
+    (modeling_glm5_next.py:797-847 replayed) in its scores' units (`indexer_margins`): the gap
+    between the last selected pool's score and the best rejected one; a tie, which the reference's
+    topk breaks as it likes, has none."""
     indexer, q_a_proj, q_a_layernorm = block.indexer, block.q_a_proj, block.q_a_layernorm
     assert indexer is not None and q_a_proj is not None and q_a_layernorm is not None
     with torch.no_grad():
@@ -183,20 +200,18 @@ def boundary_gap(block: Glm5NextTextAttention, hidden: torch.Tensor, valid: torc
                             F.linear(hidden, indexer.index_kpool_compress_gate),
                             valid.to(hidden.dtype)[..., None]], dim=-1)
         pool_keys, pool_indices, pool_valid = indexer.get_pooled_states(packed)
-        scores = F.relu(torch.matmul(query.float(), pool_keys.transpose(-1, -2).float().unsqueeze(1))
-                        * indexer.softmax_scale)
+        agreements = (torch.matmul(query.float(), pool_keys.transpose(-1, -2).float().unsqueeze(1))
+                      * indexer.softmax_scale)
         weights = indexer.weights_proj(hidden).float() * indexer.n_heads ** -0.5
-        index_scores = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
+        index_scores = torch.matmul(weights.unsqueeze(-2), F.relu(agreements)).squeeze(-2)
         slots = torch.arange(S)
         visible = (slots[None, None, :] <= slots[None, :, None]) & valid[:, None, :]
         pool_end = pool_indices[..., -1].clamp(0, S - 1)
         candidates = visible.gather(-1, pool_end[:, None, :].expand(B, S, -1)) & pool_valid[:, None]
-        ranked = index_scores.masked_fill(~candidates, float('-inf')).sort(-1, descending=True).values
-        select_k = indexer.index_topk // indexer.index_kpool
-        rejected = ranked[..., select_k]
-        margin = torch.where(torch.isfinite(rejected), ranked[..., select_k - 1] - rejected,
-                             torch.ones_like(rejected))
-        return float(margin[valid].min())
+    # The reference's torch topk orders equal scores as it likes, so a tie is no margin here.
+    margins = indexer_margins(index_scores.numpy(), agreements.numpy(), candidates.numpy(),
+                              indexer.index_topk // indexer.index_kpool, relative=False, stable=False)
+    return float(margins[valid.numpy()].min())
 
 
 def reference_output(block, hidden, valid):
@@ -244,6 +259,7 @@ def torch_gradients(block):
         with float64() if wide else contextlib.nullcontext():
             return torch.func.functional_call(block, params, (x, valid))[0]
 
+    @as_given
     def run(hidden, valid, readout):
         _, grad_x, grads, _ = torch_with_gradients(forward)(np.asarray(hidden), named, np.asarray(valid),
                                                            np.asarray(readout))
@@ -260,6 +276,7 @@ def dew_gradients(variables, names):
             x, variables, readout)
         return grad_x, grads
 
+    @as_given
     def run(hidden, valid, readout):
         grad_x, grads = pulled(hidden, variables, valid, readout)
         ours = {'.'.join(str(key.key) for key in path): leaf
@@ -283,7 +300,7 @@ def test_the_gradients_match_torch_autograd():
     names = [name for name, _ in block.named_parameters() if not name.startswith('indexer.')]
     assert len(names) == 7
     assert_as_exact(dew_gradients(variables, names), torch_gradients(block), draw, 'k-pool gradients',
-                    seeds=SEEDS['gradients'], truth_fn=torch_gradients(copy.deepcopy(block).double()))
+                    seeds=SEEDS['gradients'], truth_fn=torch_gradients(wide_block(block)))
 
     hidden, valid, readout = draw(0)
     x = torch.from_numpy(hidden).requires_grad_(requires_grad=True)
@@ -338,8 +355,8 @@ def decode_steps(block_module, variables, hidden, valid, prefill: int):
 def stepped(variables, rows: bool = True):
     """Dew's prefill of five tokens and then one at a time (`decode_steps`) as a function of a draw:
     its output on the valid rows, the steps told the row's validity where `rows`."""
-    return lambda hidden, valid: {'output': on_valid_rows(
-        decode_steps(module(), variables, hidden, valid if rows else None, prefill=5), valid)}
+    return as_given(lambda hidden, valid: {'output': on_valid_rows(
+        decode_steps(module(), variables, hidden, valid if rows else None, prefill=5), valid)})
 
 
 def test_prefill_then_token_steps_reproduce_the_parallel_block():

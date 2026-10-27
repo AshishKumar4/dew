@@ -71,6 +71,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -83,7 +84,7 @@ from jax.typing import ArrayLike
 from dew._hashing import array_fingerprint
 from dew.batch import Variables
 from dew.inference.engine import Timed, normalized, reloaded, settled
-from dew.inference.pages import Pages
+from dew.inference.pages import Pages, States, prefix_hashes
 from dew.inference.projections import pack_projections, packed_layout
 from dew.inference.serving_kernel import (
     Admission,
@@ -97,7 +98,9 @@ from dew.inference.serving_kernel import (
     opened,
     opened_in,
     resident_formats,
+    row_state,
     split_donated,
+    state_programs,
     state_shardings,
 )
 from dew.inference.tasks import (
@@ -111,7 +114,7 @@ from dew.inference.tasks import (
     shape_bucket,
 )
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
-from dew.nn.cross_attention import CROSS_CACHE, CrossAttention
+from dew.nn.cross_attention import CrossAttention
 from dew.nn.inputs import (
     CONTEXT,
     CONTEXT_LENGTHS,
@@ -122,8 +125,10 @@ from dew.nn.inputs import (
     request_key,
 )
 from dew.nn.kernels.options import compiler_options
-from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, KVCache, is_paged, leaf_name
+from dew.nn.kv_cache import GROUPS, KVCache, is_paged, leaf_name
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
+from dew.nn.scatter import DROPPED
+from dew.nn.visibility import with_served_blocks
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import Sample
@@ -255,8 +260,19 @@ class _Row:
     """The real tokens of the context a cross-attention decoder reads beside the prompt,
     `[length, features]`; None for none. Every piece of the prompt carries it."""
     salt: bytes = b""
-    """What the prompt's keys depend on beside its tokens, its context's digest, under which its
-    prefix pages are named (`dew.inference.pages`); empty for none."""
+    """What the prompt's keys depend on beside its tokens, its context's digest and its groups with the
+    tokens up to its last grouped one, under which its prefix pages are named (`dew.inference.pages`);
+    empty for none."""
+    restore: int | None = None
+    """The `States` entry the row's slot starts from after its shared prefix pages, before its first piece;
+    None where it starts afresh."""
+    snapshots: tuple[int, ...] = ()
+    """The prompt lengths, page boundaries past its shared prefix, after which the row's state is kept for a
+    later prompt that shares its pages (`PagedRows.boundaries`)."""
+    groups: dict[str, np.ndarray] = field(default_factory=dict)
+    """The groups of the prompt's tokens each group field the model reads holds (`dew.nn.kv_cache.GROUPS`),
+    -1 for a token in none: the groups the prompt carries, and the blocks the server's prefix run makes
+    where it carries none (`with_served_blocks`). Empty where the row reads its prompt causally."""
 
 
 def _seated_in(group: int, free: list[list[int]], taken: list[int], row: _Row) -> tuple[int, _Row]:
@@ -327,11 +343,16 @@ class PagedRows:
     one piece a step.
     """
 
-    def __init__(self, pages: list[Pages], chunk: int | None, width: int) -> None:
+    def __init__(self, pages: list[Pages], chunk: int | None, width: int, *, states: int = 0,
+                 every: int | None = None) -> None:
         self.pages = pages
         self.chunk = chunk
         self.width = width
         """Pages in a row's table, capacity over the page size."""
+        self.states = states
+        """The row states each group keeps for a shared prefix where its rows hold state beside pages."""
+        self.every = every
+        """The pages between the states a prompt keeps; None keeps its deepest shared boundary's alone."""
         self.placement: Placement = Paged(len(pages), continuing=chunk is not None
                                           or any(part.prefix_cache for part in pages))
         self.weights = 0
@@ -340,19 +361,31 @@ class PagedRows:
     def check(self, cache: Variables) -> None:
         """The pool holds paged attention's keys and values, and every other
         cached leaf is a row's own state (a recurrent mixer's memory, latent
-        attention's cache, image groups), kept in the row's slot. A shared
-        prefix's pages hold its keys alone, not the state its prompt left, so
-        a cache with such state is refused a prefix cache. A cross-attention
-        layer's context is not left by the prompt: every piece carries it and
-        writes it again, and the pages are named under its digest."""
+        attention's index keys), kept in the row's slot (`row_state`). A shared
+        prefix's pages hold its keys alone, so where rows hold state and share
+        prefixes, each group keeps the states prompts left at their page
+        boundaries (`dew.inference.pages.States`), and a row reuses a prefix as
+        deep as one is kept, starting from it. A cross-attention layer's
+        context is not left by the prompt: every piece carries it and writes
+        it again, and the pages are named under its digest."""
         if not is_paged(cache):
             raise ValueError("the model did not take the paged layout: none of its layers keeps a page table")
-        if any(part.prefix_cache for part in self.pages):
-            for path, _ in jax.tree_util.tree_leaves_with_path(cache):
-                if leaf_name(path) not in POOLED | {TABLE} | ROW_CURSORS | CROSS_CACHE:
-                    raise ValueError(f"a shared prefix's pages hold its keys, not "
-                                     f"{jax.tree_util.keystr(path)}, a row's own state its prompt left; "
-                                     "serve this model without prefix_cache")
+        if any(part.prefix_cache for part in self.pages) and any(
+                row_state(path) for path, _ in jax.tree_util.tree_leaves_with_path(cache)):
+            for part in self.pages:
+                part.states = States(self.states)
+
+    @property
+    def stateful(self) -> bool:
+        """Whether a shared prefix is read with the state its prompt left (`check`)."""
+        return self.pages[0].states is not None
+
+    def boundaries(self, row: _Row, size: int) -> tuple[int, ...]:
+        """The page boundaries past the row's shared prefix after which its state is kept: its deepest
+        shareable one, the pages before its last token, and every `every` pages below it."""
+        deepest = (len(row.prompt) - 1) // size
+        kept = {deepest, *(range(self.every, deepest, self.every) if self.every else ())}
+        return tuple(sorted(page * size for page in kept if page * size > row.prefilled))
 
     def refuse(self, length: int, budget: int) -> None:
         part = self.pages[0]
@@ -371,10 +404,14 @@ class PagedRows:
                                  key=lambda group: (len(self.pages[group].shared(row.prompt, row.salt)),
                                                     self.pages[group].available), reverse=True)
             for group in open_groups:
-                reserved = self.pages[group].reserve(row.prompt, len(row.prompt) + row.budget, row.salt)
+                part = self.pages[group]
+                reserved = part.reserve(row.prompt, len(row.prompt) + row.budget, row.salt)
                 if reserved is not None:
-                    row.pages, row.prefilled = reserved
+                    row.pages, row.prefilled, entry = reserved
+                    row.restore = None if entry is None else group * self.states + entry
                     row.weights = self.weights
+                    if part.states is not None:
+                        row.snapshots = self.boundaries(row, part.size)
                     break
             else:
                 break
@@ -394,6 +431,17 @@ class PagedRows:
 
     def release(self, row: _Row) -> None:
         self.pages[row.group].release(row.pages)
+
+    def kept(self, row: _Row) -> int | None:
+        """The `States` entry, global over the groups, that keeps the row's state after its prompt's first
+        `row.prefilled` tokens, a boundary its piece ended at; None where one is held already, or the
+        row's keys came from weights a reload replaced."""
+        part = self.pages[row.group]
+        if part.states is None or row.weights != self.weights:
+            return None
+        pages = row.prefilled // part.size
+        entry = part.states.take(prefix_hashes(row.prompt, part.size, pages, row.salt)[-1])
+        return None if entry is None else row.group * self.states + entry
 
     def reloaded(self) -> None:
         self.weights += 1
@@ -446,7 +494,8 @@ class Server:
     def __init__(self, model: nn.Module, variables: Variables, processor: Processor | None, *,
                  sampling: Sampling, transforms: tuple[LogitsTransform, ...], stopping: Finishing,
                  grammar: Grammar | None, rows: Rows, slots: int, capacity: int, admission: int,
-                 default_budget: int | None, max_length: int | None, decode_steps: int) -> None:
+                 default_budget: int | None, max_length: int | None, decode_steps: int,
+                 prefix: int | Literal["prompt"] | None = None) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
         if type(admission) is not int or not 1 <= admission <= slots:
@@ -484,6 +533,7 @@ class Server:
         self.admission = admission
         self.default_budget = default_budget
         self.max_length = max_length
+        self.prefix: int | Literal["prompt"] | None = prefix
         self.decode_steps = decode_steps
         self.steps = 0
         self._queue: deque[_Row] = deque()
@@ -513,6 +563,10 @@ class Server:
             shapes = jax.eval_shape(functools.partial(opened, model, pad_id=self.pad_id, slots=slots,
                                                       capacity=capacity), variables)
             rows.check(shapes.decoder.cache)
+            held = {leaf_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(shapes.decoder.cache)}
+            self.group_fields = frozenset(name for name, leaf in GROUPS.items() if leaf in held)
+            """The group fields some layer reads whole (`dew.nn.kv_cache.GROUPS`), whose groups its cache
+            keeps beside the keys: the ones a served prompt's slot beside its tokens."""
             # None selects the one mixed forward of `_mixed_step`.
             self.mixed_refusal = mixed_refusal(model, shapes, rows.placement)
             """Why the admitting step prefills in a separate forward, or None when it runs one mixed forward.
@@ -537,6 +591,28 @@ class Server:
                 self._step = chosen
             self._resident, self._carried = split_donated(
                 opened_in(formats)(model, self.variables, self.pad_id, slots, capacity))
+            self._keep_states(formats)
+
+    def _keep_states(self, formats) -> None:
+        """Open the store of row states a shared prefix is read with, where the rows keep state beside
+        their pages (`PagedRows.stateful`), and the programs that move them (`state_programs`)."""
+        self._states: Variables | None = None
+        """Each row state leaf (`row_state`) with its slot axis holding the groups' `States` entries,
+        placed as the slots are; None where rows keep none."""
+        self._restores: list[tuple[int, int]] = []
+        """The (slot, entry) pairs the next call restores before it runs: rows seated after a prefix, up
+        to every slot, whether or not their first piece goes in that call."""
+        self._captures: list[tuple[int, int]] = []
+        """The (slot, entry) pairs whose state the last call left at a kept boundary."""
+        rows = self.rows
+        if isinstance(rows, PagedRows) and rows.stateful:
+            entries = rows.states * self.groups
+            states = jax.tree_util.tree_map_with_path(
+                lambda path, leaf: jax.device_put(jnp.zeros((entries, *leaf.shape[1:]), leaf.dtype),
+                                                  leaf.sharding) if row_state(path) else None,
+                self.cache)
+            self._states = states
+            self._restored, self._captured = state_programs(formats, states)
 
     def _context(self) -> contextlib.AbstractContextManager[None]:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it."""
@@ -545,7 +621,8 @@ class Server:
     @classmethod
     def from_task(cls, task: TextGeneration, *, slots: int, capacity: int,
                   admission: int | None = None, kv_cache: KVCache | None = None,
-                  chunk: int | None = None, prefix_cache: bool = False, decode_steps: int = 1) -> Server:
+                  chunk: int | None = None, prefix_cache: bool = False, prefix_states: int | None = None,
+                  prefix_state_every: int | None = None, decode_steps: int = 1) -> Server:
         """Build a server over the task's model, weights, processor and policy.
 
         `capacity` is rounded up to whole 64-slot tiles and whole pages, and
@@ -559,7 +636,14 @@ class Server:
         does not stall the rows beside it. It also works over a dense cache
         where the admitting step is mixed. `prefix_cache` lets a request reuse
         the pages of a prompt prefix an earlier request computed, and needs a
-        paged cache.
+        paged cache. Where the model keeps a row's own state beside its pages
+        (a recurrent mixer's memory, latent attention's index keys), a reused
+        prefix is read with the state its prompt left at its end: each group
+        keeps `prefix_states` of them (one a slot by default), taken at a
+        prompt's deepest shareable page boundary and every
+        `prefix_state_every` pages below it, a piece cut to end there, and a
+        request reuses pages as deep as a state is kept
+        (`dew.inference.pages.States`).
 
         Weights on a mesh are served on that mesh. The slots, the admission
         and the pages are split over its row axes, so the number of row
@@ -606,6 +690,9 @@ class Server:
             raise ValueError("a server runs the row-wise sampler; beam and speculative loops are batch-wide")
         if chunk is not None and (type(chunk) is not int or chunk < 1):
             raise ValueError("chunk must be a positive number of prompt tokens per piece")
+        for name, value in (("prefix_states", prefix_states), ("prefix_state_every", prefix_state_every)):
+            if value is not None and (type(value) is not int or value < 1):
+                raise ValueError(f"{name} must be a positive integer")
         ceiling = cache_ceiling(task.model)
         if ceiling is None:
             raise ValueError("a server needs a model that declares max_seq_len for its cache")
@@ -626,21 +713,9 @@ class Server:
             raise ValueError(
                 f"a capacity of {capacity} rounds to {rounded}, over the model's max_seq_len of {ceiling}"
             )
-        model = cache_sized(model, rounded)
         groups = _row_groups(mesh)
-        rows: Rows
-        if layout.page_size is None:
-            if prefix_cache:
-                raise ValueError("prefix caching runs over a paged cache; "
-                                 "serve with kv_cache=KVCache(page_size=...)")
-            rows = DenseRows(groups, chunk)
-        else:
-            count = slots * (rounded // layout.page_size) if layout.pages is None else layout.pages
-            # Only a model that declares its layout has a paged one; the default pages nothing.
-            assert isinstance(model, Layered)
-            model = model.with_kv_cache(dataclasses.replace(layout, pages=count, groups=groups))
-            rows = PagedRows([Pages(count // groups, layout.page_size, prefix_cache=prefix_cache)
-                              for _ in range(groups)], chunk, rounded // layout.page_size)
+        model, rows = _cache_rows(cache_sized(model, rounded), layout, slots, rounded, groups, chunk,
+                                  prefix_cache, prefix_states, prefix_state_every)
         return cls(
             model,
             task.placed,
@@ -661,7 +736,7 @@ class Server:
             ),
             default_budget=task.max_new_tokens,
             max_length=task.max_length,
-            decode_steps=decode_steps,
+            decode_steps=decode_steps, prefix=task.prefix,
         )
 
     @property
@@ -704,8 +779,10 @@ class Server:
         """Queue one request and return a ticket that resolves to its `Generation`.
 
         `prompt` is one text prompt, `ModelInputs` row or token row, without
-        media or positions; a `ModelInputs` row may carry the context a
-        cross-attention decoder reads (`dew.nn.inputs.CONTEXT`). It is
+        media or noncanonical positions; a `ModelInputs` row may carry the
+        context a cross-attention decoder reads (`dew.nn.inputs.CONTEXT`) and
+        the image and block groups its layers read whole
+        (`dew.nn.kv_cache.GROUPS`), which slot beside its tokens. It is
         validated as `TextGeneration` validates it, against the server's
         capacity in place of the model's context.
         Without `max_new_tokens`, the task's default budget applies, its
@@ -739,10 +816,10 @@ class Server:
             if self.cross is not None and CONTEXT in conditioning:
                 context = self._request_context(conditioning.pop(CONTEXT),
                                                   conditioning.pop(CONTEXT_LENGTHS, None))
-            if set(inputs.token_fields) - {"attention_mask", "positions"} or conditioning:
+            if set(inputs.token_fields) - {"attention_mask", "positions", *GROUPS} or conditioning:
                 raise ValueError(
-                    "a served prompt carries tokens, validity and a cross-attention decoder's context "
-                    "only; media and custom token fields do not slot"
+                    "a served prompt carries tokens, validity, positions, image and block groups and a "
+                    "cross-attention decoder's context only; media and custom token fields do not slot"
                 )
             ids = np.asarray(inputs.tokens)
             fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
@@ -760,14 +837,60 @@ class Server:
                 positions[valid], (np.cumsum(valid, axis=1) - 1)[valid])):
             raise ValueError("a served prompt cannot carry noncanonical positions")
         self.rows.refuse(int(valid[0].sum()), budget)
+        tokens = ids[0][valid[0]].astype(np.int32)
+        # The prompt's own blocks, or the prefix run's where it carries none (`with_served_blocks`, which
+        # refuses a prompt shorter than an int prefix); a group field no layer reads is not slotted, as the
+        # model's call reads none of it.
+        fields = with_served_blocks(fields, valid, self.prefix)
+        groups = {name: np.asarray(fields[name])[0][valid[0]].astype(np.int32)
+                  for name in GROUPS if name in fields and name in self.group_fields}
         salt = b""
-        if context is not None:
-            # The context's dtype too, so equal bytes of another dtype salt apart.
+        if context is not None or groups:
             hasher = hashlib.blake2b(digest_size=16)
-            array_fingerprint(hasher, np.asarray(context))
+            if context is not None:
+                # The context's dtype too, so equal bytes of another dtype salt apart.
+                array_fingerprint(hasher, np.asarray(context))
+            if groups:
+                # A token's keys read its whole group, wherever its members lie, and what each member reads,
+                # so a prompt's keys depend on its tokens and groups up to its last grouped token: its prefix
+                # pages are shared only with a prompt that agrees with it there.
+                grouped = np.any([held >= 0 for held in groups.values()], axis=0)
+                reach = int(np.flatnonzero(grouped)[-1]) + 1 if grouped.any() else 0
+                for name, held in groups.items():
+                    hasher.update(name.encode())
+                    hasher.update(held[:reach].tobytes())
+                hasher.update(tokens[:reach].tobytes())
             salt = hasher.digest()
-        return _Row(ids[0][valid[0]].astype(np.int32), budget, seed, fold, Ticket(), context=context,
-                    salt=salt)
+        return _Row(tokens, budget, seed, fold, Ticket(), context=context, salt=salt, groups=groups)
+
+    def _book_capture(self, slot: int, row: _Row) -> None:
+        """Keep the state the call leaves in `slot` where the row's piece ends at a boundary it keeps
+        (`_Row.snapshots`, `PagedRows.kept`). An entry two rows book in one call keeps the later
+        booking's state, as `States` names it."""
+        if row.prefilled not in row.snapshots or not isinstance(self.rows, PagedRows):
+            return
+        entry = self.rows.kept(row)
+        if entry is not None:
+            others = [(held, kept) for held, kept in self._captures if kept != entry]
+            self._captures = [*others, (slot, entry)]
+
+    def _piece_end(self, row: _Row) -> int:
+        """Where the row's next prefill piece ends: the prompt's end, or `chunk` tokens on when the rows
+        prefill in pieces, and on past `chunk` to the last member of a group the cut would split, a block
+        or an image. A layer reads a group whole, so its tokens' keys and values are computed in one piece:
+        a group longer than `chunk` is one longer piece. A page boundary whose state the row keeps
+        (`_Row.snapshots`) ends the piece before it, so the state the call leaves is that boundary's."""
+        length, chunk = len(row.prompt), self.rows.chunk
+        end = length if chunk is None else min(length, row.prefilled + chunk)
+        # A group's members need not be adjacent: the cut moves past the last member of every group with
+        # members on both sides of it, until none straddles it.
+        spans = [(int(members[0]), int(members[-1])) for held in row.groups.values()
+                 for group in np.unique(held[held >= 0]) for members in [np.flatnonzero(held == group)]]
+        while (last := max((last for first, last in spans if first < end <= last), default=None)) is not None:
+            end = last + 1
+        # A boundary whose state is kept for a later prompt ends a piece, where no group straddles it.
+        return next((boundary for boundary in row.snapshots if row.prefilled < boundary < end
+                     and not any(first < boundary <= last for first, last in spans)), end)
 
     def _request_context(self, embeddings: ArrayLike, lengths: ArrayLike | None) -> np.ndarray:
         """A request's context as its real tokens on the host, `[length, features]`, in the dtype
@@ -805,10 +928,18 @@ class Server:
             return
         admission = self._admit()
         with self._context():
+            if self._restores:
+                self._resident, self._carried = self._restored(
+                    self._resident, self._carried, self._states, *_padded(self._restores, self.slots, 0))
+                self._restores = []
             program = self._step if admission is None else self._admitting
             error, (self._resident, self._carried, draws) = program(
                 self.model, self.variables, self.pad_id, self.rows.placement, self.decode_steps,
                 self._resident, self._carried, admission, self.transforms, self.stopping, self.grammar)
+            if self._captures:
+                self._states = self._captured(self._states, self._resident, self._carried,
+                                              *_padded(self._captures, self.admission, 1))
+                self._captures = []
         self.steps += self.decode_steps
         self._settle()
         self._pending = (error, draws)
@@ -844,7 +975,9 @@ class Server:
 
         Rows still prefilling send their next piece, oldest first, each
         group's share of `admission` a step; a piece is the rest of the
-        prompt, or at most `chunk` tokens when the rows prefill in pieces.
+        prompt, or at most `chunk` tokens when the rows prefill in pieces,
+        but for a prefix block the cut would split, which goes whole
+        (`_piece_end`).
         The admission's rows come group by group, as the slots do, and each
         names its slot within its group.
         """
@@ -863,6 +996,8 @@ class Server:
             self.prefix_hits += row.prefilled
             row.ticket.admitted = now
             self._rows[slot] = row
+            if row.restore is not None:
+                self._restores.append((slot, row.restore))
         pending: list[list[tuple[int, _Row]]] = [[] for _ in range(self.groups)]
         for slot, row in self._rows.items():
             waiting = pending[slot // size]
@@ -876,9 +1011,11 @@ class Server:
         chosen = [(group * share + index, slot, row) for group, waiting in enumerate(pending)
                   for index, (slot, row) in enumerate(waiting)]
         # The capacity is whole tiles, not a bucket, so a piece's width bucket can pass it.
-        longest = max(len(row.prompt) - row.prefilled for _, _, row in chosen)
+        ends = {slot: self._piece_end(row) for _, slot, row in chosen}
+        longest = max(ends[slot] - row.prefilled for _, slot, row in chosen)
         width = min(shape_bucket(longest, 64), self.capacity)
-        width = width if self.rows.chunk is None else min(width, self.rows.chunk)
+        if self.rows.chunk is not None and longest <= self.rows.chunk:
+            width = min(width, self.rows.chunk)
         count, capacity = share * self.groups, self.capacity
         tokens = np.zeros((count, width), np.int32)
         valid = np.zeros((count, width), bool)
@@ -901,10 +1038,15 @@ class Server:
             cross[0].context_length, cross[1], cross[2])
         contexts = np.zeros((count, context_length, features), dtype)
         context_lengths = np.zeros((count,), np.int32)
+        # A group field goes in where an admitted row carries it: prompts without groups keep the causal call.
+        pieces = {name: np.full((count, width), -1, np.int32)
+                  for name in sorted({name for _, _, row in chosen for name in row.groups})}
         for index, slot, row in chosen:
-            piece = row.prompt[row.prefilled:row.prefilled + width]
+            piece = row.prompt[row.prefilled:ends[slot]]
             tokens[index, width - len(piece):] = piece
             valid[index, width - len(piece):] = True
+            for name, held in row.groups.items():
+                pieces[name][index, width - len(piece):] = held[row.prefilled:row.prefilled + len(piece)]
             slots[index], budgets[index], folds[index] = slot % size, row.budget, row.fold
             if isinstance(row.seed, int):
                 seeds[index], seeded[index] = row.seed, True
@@ -914,6 +1056,7 @@ class Server:
             tables[index, :len(table)] = table
             cursors[index] = row.prefilled
             row.prefilled += len(piece)
+            self._book_capture(slot, row)
             final[index] = row.prefilled == len(row.prompt)
             history[index, capacity - len(row.prompt):] = row.prompt
             history_valid[index, capacity - len(row.prompt):] = True
@@ -935,11 +1078,14 @@ class Server:
                 history,
                 history_valid,
                 *([] if cross is None else [contexts, context_lengths]),
+                *pieces.values(),
             ],
             self._admitted,
         )
         conditioning = {} if cross is None else {CONTEXT: placed[10], CONTEXT_LENGTHS: placed[11]}
-        return Admission(ModelInputs(placed[0], {"attention_mask": placed[1]}, conditioning), *placed[2:10])
+        fields = {"attention_mask": placed[1], **dict(zip(pieces, placed[len(placed) - len(pieces):],
+                                                          strict=True))}
+        return Admission(ModelInputs(placed[0], fields, conditioning), *placed[2:10])
 
     def _settle(self) -> None:
         """Read the previous call's draws into their rows, iteration by
@@ -999,6 +1145,33 @@ class Server:
         settled(row.ticket, Generation(
             np.concatenate([row.prompt[None], drawn], axis=1), np.array([count], np.int32),
             np.array([terminated]), behavior, raw, rows=1, decoder=decoder))
+
+
+def _cache_rows(model: nn.Module, layout: KVCache, slots: int, capacity: int, groups: int, chunk: int | None,
+                prefix_cache: bool, states: int | None, every: int | None) -> tuple[nn.Module, Rows]:
+    """The model over its cache's layout, its pages pooled for `slots` rows of `capacity` slots in `groups`
+    where it pages, and the rows' host side (`Server.from_task`'s arguments)."""
+    if layout.page_size is None:
+        if prefix_cache:
+            raise ValueError("prefix caching runs over a paged cache; "
+                             "serve with kv_cache=KVCache(page_size=...)")
+        return model, DenseRows(groups, chunk)
+    count = slots * (capacity // layout.page_size) if layout.pages is None else layout.pages
+    # Only a model that declares its layout has a paged one; the default pages nothing.
+    assert isinstance(model, Layered)
+    model = model.with_kv_cache(dataclasses.replace(layout, pages=count, groups=groups))
+    return model, PagedRows([Pages(count // groups, layout.page_size, prefix_cache=prefix_cache)
+                             for _ in range(groups)], chunk, capacity // layout.page_size,
+                            states=slots // groups if states is None else states, every=every)
+
+
+def _padded(pairs: Sequence[tuple[int, int]], count: int, dropped: int) -> tuple[np.ndarray, np.ndarray]:
+    """`pairs`' two columns, (slot, entry) each, padded to `count` rows, so one program serves every step:
+    column `dropped`'s padding lies past every row (`DROPPED`), where the write drops it, the other's is 0."""
+    columns = np.zeros((2, count), np.int32)
+    columns[dropped] = DROPPED
+    columns[:, :len(pairs)] = np.asarray(pairs, np.int32).T
+    return columns[0], columns[1]
 
 
 def _nothing() -> None:

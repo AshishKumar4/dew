@@ -8,11 +8,13 @@ from pathlib import Path
 
 import pytest
 
+from dew.config import RunConfig
 from dew.data import Files, Loading, Memory
 from dew.decision import Choice, Decide, decisions
 from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
+from dew.training.evaluation import Summary
 
 pytestmark = pytest.mark.mesh
 
@@ -52,6 +54,49 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
     answer = decide("I was billed twice", {"team": Choice("Which team?", ["billing", "technical", "sales"])})
     assert answer["team"].choice in ("billing", "technical", "sales")
     assert decide.name == "tickets" and set(decide.calibration.temperatures.types) == {"choice"}
+
+
+def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_their_summary(tmp_path):
+    """A decision run names its validation splits and each one's metrics (`--val-metrics`): accuracy on
+    every split and the Brier score on `test` alone, in place of the task's own suite. A summary weighs
+    both splits' accuracy into one (`--val-summaries`), formed at each evaluation, which scores both, and
+    the run ranks its checkpoints by it (`--trainer.best evaluation/summary/board`)."""
+    board = f"{Summary.SPLIT}/board"
+    table = tmp_path / "tickets.csv"
+    tickets = [("charged twice for March", "billing"), ("the site is down", "technical"),
+               ("how much is the pro plan", "sales"), ("refund my last invoice", "billing")] * 6
+    with table.open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["text", "label"])
+        writer.writerows(tickets)
+    train, held = Files(str(table), format="csv").holdout(0.5)
+
+    def asked(rows):
+        return rows.pipe(decisions, question="team").read("memory").batch(8).loading(Loading(workers=0))
+
+    config = DecisionRunConfig.cli([
+        "--pretrained", str(TINY), "--trainer.name", "splits",
+        "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+        "--trainer.steps", "2", "--trainer.eval-every", "1", "--trainer.checkpoint-every", "1",
+        "--trainer.log-every", "1", "--trainer.multi-host", "False",
+        "--trainer.compilation-cache-dir", "None",
+        "--model.dtype", "float32", "--trainer.best", board,
+        "--val-metrics", '[{"name": "accuracy"}, {"name": "brier", "split": "test"}]',
+        "--val-summaries", json.dumps([{"name": "board", "weights": {"val/accuracy": 1, "test/accuracy": 3},
+                                        "better": "higher"}])],
+        default=DecisionRunConfig(data=asked(train), validation={"val": asked(held), "test": asked(held)}))
+    config.run()
+    run = tmp_path / "runs" / "splits"
+    logged = [json.loads(line) for line in (run / "tracking" / "scalars.jsonl").read_text().splitlines()]
+    scores = {}
+    for row in logged:
+        scores.setdefault(row["step"], {}).update(row["scalars"])
+    for step in (1, 2):
+        names = {name for name in scores[step] if name.rpartition("/")[0] in ("val", "test", Summary.SPLIT)}
+        assert names == {"val/loss", "val/accuracy", "test/loss", "test/accuracy", "test/brier", board}
+        assert scores[step][board] == (scores[step]["val/accuracy"] + 3 * scores[step]["test/accuracy"]) / 4
+    recorded = RunConfig.load(str(run))
+    assert (recorded.val_metrics, recorded.val_summaries) == (config.val_metrics, config.val_summaries)
 
 
 def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_path):
@@ -178,6 +223,36 @@ def test_a_decision_mixture_states_its_weights_and_the_manifest_that_made_it(tmp
     assert held is not None
 
 
+def test_a_decision_corpus_of_one_file_reads_through_every_loading_worker(tmp_path):
+    """A corpus whose examples are one JSON-lines file, one physical shard, streams through the run's
+    loading workers, each reading the lines of its own part of the file (data.md §10), and a pass
+    reads each example once, where a read by more workers than shards was refused."""
+    from dew.batch import VALID_ROWS
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.decision.data import corpus
+
+    question = {"type": "choice", "instructions": "Which team?", "criteria": ["billing", "technical"]}
+    rows = [{"state": f"ticket {index}", "questions": {"team": question},
+             "answers": {"team": ["billing", "technical"][index % 2]}} for index in range(24)]
+    (tmp_path / "mixture.json").write_text(json.dumps({"weights": {"a": 1.0}, "slots": {"questions": 1,
+                                                                                         "options": 2}}))
+    (tmp_path / "a.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    examples = corpus(str(tmp_path), "a", "train")
+    assert examples is not None
+    chain = examples.read("streamed").repeat(1).batch(4, drop_remainder=False)
+    loading = Loading(workers=2, threads=1, read_buffer=1, worker_buffer=1)
+    reader = compile(chain, loading=loading).train(DataPartition())
+    try:
+        # Each worker batches its own part, the last batch of each filled out with rows it marks.
+        states = [example.state for batch in reader
+                  for example, real in zip(batch["example"], batch.get(VALID_ROWS, [True] * 4), strict=True)
+                  if real]
+    finally:
+        reader.close()
+    assert sorted(states) == sorted(row["state"] for row in rows)
+
+
 def test_a_named_validation_split_reads_the_source_s_own_split():
     """A holdout of the store's own named split (`holdout(split="validation")`) opens it through the
     source's `with_split`, and the decisions over it read that split's rows; a source with no native
@@ -227,7 +302,7 @@ def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
     weights as they were; --loop-layers gives the tiny Qwen 3.5, which does not
     loop, a loop over a block of its own layers; a block with no passes, or
     passes with no block, on a decoder that does not loop is refused."""
-    from dew.decision.config import looping
+    from dew.config import looping
     from dew.interop import Pretrained
     from dew.nn.backbones.decoder_stack import Loop
 
@@ -288,6 +363,158 @@ class Fitted(DecisionRunConfig):
 
     def train(self, objective, dataset, **settings):
         return objective, dataset
+
+
+def test_a_decision_run_builds_its_source_as_its_source_options_say():
+    """A decision run's `--source.text-only` and `--source.prediction-depths` reach its source's load:
+    over Qwen3.5, a wrapper with a vision tower and a prediction depth, the run's backbone is the
+    language model alone, with no tower and no depth, where by default it builds both."""
+    from dew.config import SourceOptions
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+
+    def backbone(options: SourceOptions):
+        run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, source=options)
+        objective, _ = run.prepare().train("x")
+        return objective.model.backbone, objective.variables
+
+    whole, _ = backbone(SourceOptions())
+    assert not isinstance(whole, CausalTransformer) and whole.language_model.num_nextn_predict_layers == 1
+    text, variables = backbone(SourceOptions(text_only=True, prediction_depths=0))
+    assert isinstance(text, CausalTransformer) and text.num_nextn_predict_layers == 0
+    import jax
+
+    paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_flatten_with_path(variables)[0]]
+    assert paths and not any("mtp_" in path or "vision" in path or "visual" in path for path in paths)
+
+
+def test_a_decision_run_reads_letters_as_its_letter_readout():
+    """`head:letters` reads each option as the fresh backbone's own logit at its label's token, at the
+    answer cue of a row lettered as its labels letter it, as a slot release reads it: the run's head
+    is the letter readout of its labels' token ids under the objective's tokenizer, and its rows a
+    question to a row, lettered by those labels alone, each bare letter one token of the fixture's
+    byte-level vocabulary. A question of more options than the head holds labels is refused."""
+    from dew.data.dataset import DataPartition
+    from dew.decision.config import Letters
+    from dew.decision.head import LabelReadout
+    from dew.decision.layout import Labels, QuestionLayout
+    from dew.decision.objective import tokenizer_of
+    from dew.interop import Pretrained
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    labels = Labels(variants=("{}",))
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer,
+                              head=Letters(labels=labels, count=4))
+    objective, _ = run.prepare().train("x")
+    head, layout = objective.model.head, objective.layout
+    tokenizer = tokenizer_of(Pretrained.load(str(QWEN), dtype="float32").text_processor)
+    assert tokenizer is not None
+    assert isinstance(head, LabelReadout) and head.label_ids == labels.ids(tokenizer, 4)
+    assert isinstance(layout, QuestionLayout)
+    assert layout.labels == dataclasses.replace(labels, names=labels.names_for(4))
+    with pytest.raises(ValueError):
+        _, few = dataclasses.replace(run, head=Letters(labels=labels, count=2)).prepare().train("x")
+        next(iter(few.train(DataPartition())))
+
+
+def test_a_decision_run_trains_its_backbone_whole_beside_its_context_layers_where_asked():
+    """`--no-context-frozen` trains the backbone whole beside its context layers' blocks, a full
+    fine-tune, where by default it holds frozen and the blocks train alone: the objective's held tree
+    then splits off no frozen backbone, every backbone weight trained. With LoRA the adapter trains
+    beside the blocks over its frozen base; without context layers the flag is refused."""
+    from model_support import flat_tree
+
+    from dew.decision.objective import DecisionObjective
+    from dew.lora import LoRA
+    from dew.nn.cross_attention import crossing
+    from dew.objectives.base import FROZEN
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, context_layers=(0,),
+                              context_length=16)
+    frozen, _ = run.prepare().train("x")
+    assert isinstance(frozen, DecisionObjective) and frozen.variables is not None
+    assert all(crossing(path) for path in flat_tree(frozen.variables["params"]["backbone"]))
+    assert "backbone" in frozen.variables[FROZEN]
+    whole, _ = dataclasses.replace(run, context_frozen=False).prepare().train("x")
+    assert isinstance(whole, DecisionObjective) and whole.variables is not None
+    assert FROZEN not in whole.variables
+    trained = flat_tree(whole.variables["params"]["backbone"])
+    assert any(crossing(path) for path in trained) and any(not crossing(path) for path in trained)
+    adapted, _ = dataclasses.replace(run, context_frozen=False,
+                                     lora=LoRA(rank=2, modules=("q_proj",))).prepare().train("x")
+    assert isinstance(adapted, DecisionObjective) and adapted.variables is not None
+    held = flat_tree(adapted.variables["params"]["backbone"])
+    assert any(crossing(path) for path in held) and any("lora_A" in path for path in held)
+    assert "backbone" in adapted.variables[FROZEN]
+    with pytest.raises(ValueError):
+        dataclasses.replace(run, context_frozen=False, context_layers=None).prepare()
+
+
+def test_a_backbone_reading_its_own_media_in_blocks_keeps_a_joint_layout():
+    """Gemma 4 Unified reads its vision tokens' blocks whole, as its checkpoint states: that asks no
+    block of the run's rows, so a fresh joint head over it keeps the joint layout, a row of every
+    question, as a run that asks for no block-bidirectional attention."""
+    from dew.decision.config import JointShape
+    from dew.decision.layout import JointLayout
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    run = dataclasses.replace(default, pretrained=str(Path(__file__).parent / "fixtures" / "hf" /
+                                                       "gemma4-unified-native-tiny"),
+                              trainer=trainer, head=JointShape(), max_len=128)
+    objective, _ = run.prepare().train("x")
+    assert isinstance(objective.layout, JointLayout)
+
+
+@pytest.mark.parametrize("scope", ["wrapper", "text_config", "beside-another-kind"])
+def test_a_checkpoint_declaring_block_attention_lays_a_fresh_heads_rows_in_blocks(tmp_path, scope):
+    """A checkpoint whose own config declares its full-attention layers block-bidirectional
+    (`modeling_overrides`), at the wrapper's scope or its `text_config`'s, there beside a wrapper scope
+    naming another kind, lays a fresh head's rows in blocks for them, with no run option asking it,
+    as the run's `--source.attention` would."""
+    import shutil
+
+    declared = tmp_path / "declared"
+    shutil.copytree(QWEN, declared)
+    config = json.loads((declared / "config.json").read_text())
+    stated = config if scope == "wrapper" else config["text_config"]
+    stated["modeling_overrides"] = {"attention": {"full_attention": "block_bidirectional"}}
+    if scope == "beside-another-kind":
+        config["modeling_overrides"] = {"attention": {"linear_attention": "causal"}}
+    (declared / "config.json").write_text(json.dumps(config))
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    run = dataclasses.replace(default, pretrained=str(declared), trainer=trainer)
+    objective, _ = run.prepare().train("x")
+    assert objective.layout.blocks
+
+
+def test_a_decision_run_lays_its_rows_in_blocks_its_source_reads_whole():
+    """`--source.attention full_attention block_bidirectional` loads the backbone's full-attention
+    layers reading blocks (`Pretrained.load`'s `modeling_overrides`), and the run's rows lie in blocks
+    for them to read; a joint row of every question lies in none, and is refused."""
+    from dew.config import SourceOptions
+    from dew.decision.config import JointShape
+    from dew.interop import Pretrained
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    source = SourceOptions(text_only=True, attention={"full_attention": "block_bidirectional"})
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, source=source)
+    objective, _ = run.prepare().train("x")
+    assert objective.model.backbone.kind_of("full_attention").mixer.bidirectional_blocks
+    assert objective.layout.blocks
+    plain, _ = dataclasses.replace(run, source=SourceOptions(text_only=True)).prepare().train("x")
+    release = Pretrained.load(str(QWEN), dtype="float32", text_only=True).model
+    assert plain.model.backbone.kind_of("full_attention") == release.kind_of("full_attention")
+    assert not plain.layout.blocks
+    with pytest.raises(ValueError):
+        dataclasses.replace(run, head=JointShape()).prepare()
 
 
 def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():
