@@ -932,6 +932,49 @@ def test_a_first_party_patch_is_reported_however_its_owner_was_imported_and_a_bo
     assert found == [("tests/test_graph.py", line, "SLOP008") for line in (5, 7, 8, 11, 12)]
 
 
+ROW_1878_LINTS = {
+    "SLOP008": ({
+        "src/sparx/store.py": "class Store:\n    def _open(self):\n        pass\ndef open(path):\n    pass\n",
+        "tests/test_store.py": (
+            "from sparx.store import Store\n"
+            "import sparx.store as store\n"
+            "def test_private(monkeypatch):\n"
+            "    monkeypatch.setattr(Store, '_open', lambda self: None)\n"
+            "def test_public(monkeypatch):\n"
+            "    monkeypatch.setattr(store, 'open', lambda path: None)\n"
+            "def test_a_seams_own_private(monkeypatch):\n"
+            "    monkeypatch.setattr('sparx.store.os._exit', lambda code: None)\n"
+            "def test_a_first_party_private_under_a_seam_word(monkeypatch):\n"
+            "    monkeypatch.setattr('sparx.sources.hub.Hub._selected', lambda self: None)\n"),
+    }, "tests/test_store.py", (4, 10)),
+    "SLOP011": ({
+        "src/sparx/graph.py": "EDGES = 1\n",
+        "tests/test_graph.py": (
+            "def test_table(table):\n"
+            "    assert report.table().splitlines() == ['   a  b', 'x  1  2']\n"
+            "    assert table.plain == 'data 4,824 rows  ·  0 rejected'\n"
+            "    assert '4,824' in table.split()\n"
+            "    assert table.title == 'data rows'\n"
+            "    assert table.index('b') + 1 == len('   a  b')\n"
+            "    assert json.loads(payload) == ['a  b']\n"
+            "    assert parsed.name == 'two  spaces'\n"),
+    }, "tests/test_graph.py", (2, 3)),
+}
+"""Row 1878's two lint cases, by code: the files linted, the file the findings are in, their lines.
+SLOP008: a private attribute of a first-party object is the code under test, so replacing it is
+reported even where its name holds a seam's (`Checkpoints._open`); a public seam of the same name and a
+standard-library module's own private attribute are not. SLOP011: a rendering (its text read through
+`plain`, `table()`, captured output or `str`) compared whole with a string, or a list of strings, with a
+run of two or more spaces between words is a spacing snapshot; its words and numbers looked for, a
+one-space string, a column end measured and parsed data holding two spaces are not."""
+
+
+@pytest.mark.parametrize("code", sorted(ROW_1878_LINTS))
+def test_row_1878s_lints_report_their_cases_and_spare_the_rest(code, tmp_path):
+    files, where, lines = ROW_1878_LINTS[code]
+    assert _linted(tmp_path, files) == [(where, line, code) for line in lines]
+
+
 def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
     """SLOP015: a test that reaches its own package through `pytest.importorskip`,
     however it imports the skip, turns an import the package breaks into a skip; an
@@ -1718,3 +1761,29 @@ def test_every_remote_code_release_carries_the_fields_its_loader_reads(monkeypat
         for name, (repo, revision, files, auto) in load(tool).RELEASES.items():
             assert (repo.count("/"), len(revision), auto.startswith("Auto")) == (1, 40, True), name
             assert files and all(file.endswith(".py") for file in files), name
+
+
+def test_a_float64_twin_rotates_by_its_whole_complex_table():
+    """A float64 twin keeps a complex table its constructor computes complex (Llama 4's vision
+    `freqs_ci`): it rotates by the table's cosines and sines both, so its output is the float64
+    product of its input and the table, which a table cast to a real dtype is not."""
+    import torch
+
+    from tools.torch_precision import float64, float64_twin
+
+    class Rotation(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            angles = torch.arange(1, 5).float()
+            self.table = torch.nn.Buffer(torch.polar(torch.ones_like(angles), angles), persistent=False)
+            self.gain = torch.nn.Parameter(torch.ones(4))
+
+        def forward(self, pairs):
+            return torch.view_as_real(torch.view_as_complex(pairs.float()) * self.table * self.gain)
+
+    pairs = torch.from_numpy(np.random.default_rng(0).standard_normal((4, 2)))
+    with float64():
+        rotated = float64_twin(Rotation(), Rotation)(pairs)
+    angles = torch.arange(1, 5, dtype=torch.float64)
+    table = torch.polar(torch.ones_like(angles), angles)
+    assert torch.equal(rotated, torch.view_as_real(torch.view_as_complex(pairs) * table))

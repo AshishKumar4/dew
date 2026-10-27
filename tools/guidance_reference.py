@@ -23,16 +23,16 @@
   taking its decision. The sampler names float64 for its walk and float32
   for what it returns; each run reads its own precision for both.
 
-Each runs in float64 and in float32; what lands per case is the initial
-state, the settings and both results. APG's cases land over the seeds check 1
-draws (`apg-seeds`, `tools/recorded_references.py`): one initial state's
-rounding is a single draw, which a pointwise walk's spatial orders do not
-move.
-
-    PYTHONPATH=src python tools/guidance_reference.py
+Each runs in float64 and in float32, over the seeds check 1 draws
+(`tools/recorded_references.py`): one initial state's rounding is a single
+draw, which a pointwise walk's spatial orders do not move. APG's walks land
+with their initial states (`apg-seeds`); the APG projection, the autoguided
+walk and the interval-guided walks land as their two results a seed, their
+inputs drawn again by the test from the same seeded torch generator
+(`walk-seeds`, `projection_draw`, `noise_draw`).
 
     PYTHONPATH=src python tools/guidance_reference.py apg-seeds tests/fixtures/guidance/apg_seeds.npz
-    PYTHONPATH=src python tools/guidance_reference.py apg-projection OUTPUT.npz
+    PYTHONPATH=src python tools/guidance_reference.py walk-seeds tests/fixtures/guidance/walk_seeds.npz
 """
 
 from __future__ import annotations
@@ -78,6 +78,12 @@ INTERVAL_CASES = {
     "tail": {"num_steps": 10, "guidance_interval": [7, 9], "G": 2.5},
 }
 CONDITIONAL, UNCONDITIONAL = 0.5, 0.35
+PROJECTION_CASES = {"ordinary": (1.0, 1.0), "large": (1e30, 1e30), "tiny": (1e-20, 1e-20),
+                    "different_scales": (1.0, 1e30)}
+"""The APG projection's cases: the scales of the conditional and the unconditional prediction, so the
+orthogonal component's rounding shows at every magnitude float32 holds."""
+PROJECTION_ROWS = 32
+AUTOGUIDANCE = {"num_steps": 8, "guidance": 2.2, "strength": 0.5, "guide_strength": 0.35}
 
 
 def members(url: str, owner: str, names: set[str]) -> list[str]:
@@ -166,28 +172,79 @@ def apg_seeds(destination: Path) -> None:
         torch=torch.__version__)}, reference=f"huggingface/diffusers {DIFFUSERS}", license="Apache-2.0")
 
 
-def apg_projection(destination: Path) -> None:
-    """Diffusers' projection on fixed conditional and unconditional raw
-    predictions, without a norm clip or a solver's prediction conversion."""
+def projection_draw(name: str):
+    """A seed's conditional and unconditional raw predictions for the APG projection's case `name`:
+    nearly parallel, at the case's scales (PROJECTION_CASES), from torch's generator."""
+    scale, blank_scale = PROJECTION_CASES[name]
+
+    def draw(seed: int) -> dict[str, np.ndarray]:
+        generator = torch.Generator().manual_seed(seed)
+        conditional = 1.0 + 0.1 * torch.randn(PROJECTION_ROWS, *SHAPE[1:], generator=generator)
+        unconditional = 0.3 * conditional + 0.03 * torch.randn(conditional.shape, generator=generator)
+        return {"conditional": (conditional * scale).numpy(),
+                "unconditional": (unconditional * blank_scale).numpy()}
+    return draw
+
+
+def noise_draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's unit normal noise of SHAPE for the EDM samplers' walks, from torch's generator."""
+    return {"noise": torch.randn(*SHAPE, generator=torch.Generator().manual_seed(seed)).numpy()}
+
+
+def walk_seeds(destination: Path) -> None:
+    """The APG projection (Diffusers' guider on raw predictions, without a norm clip or a solver's
+    prediction conversion), NVlabs/edm2's autoguided walk and Kynkaanniemi et al.'s interval-guided
+    walks over the seeds check 1 draws (`record_case`), each seed's float32 result and its float64 one;
+    the test draws the inputs again (`projection_draw`, `noise_draw`)."""
+    from recorded_references import provenance, record_case, save
+
     published = guider()
-    generator = torch.Generator().manual_seed(29)
-    conditional = 1.0 + 0.1 * torch.randn(1024, *SHAPE[1:], generator=generator)
-    unconditional = 0.3 * conditional + 0.03 * torch.randn(conditional.shape, generator=generator)
-    arrays = {}
-    for name, scale, blank_scale in (("ordinary", 1.0, 1.0), ("large", 1e30, 1e30),
-                                     ("tiny", 1e-20, 1e-20), ("different_scales", 1.0, 1e30)):
-        conditioned, blank = conditional * scale, unconditional * blank_scale
-        arrays.update({f"{name}.conditional": conditioned.numpy(), f"{name}.unconditional": blank.numpy()})
-        for dtype, suffix in ((torch.float64, ""), (torch.float32, "32")):
-            guidance = published(guidance_scale=6.0, adaptive_projected_guidance_rescale=0.0, eta=0.0)
-            guidance.set_state(0, 1, 1000)
-            guidance.prepare_inputs({})
-            result = guidance.forward(conditioned.to(dtype), blank.to(dtype)).pred
-            arrays[f"{name}.result{suffix}"] = result.numpy()
-    if destination.is_file():
-        with np.load(destination) as stored:
-            assert all(np.array_equal(stored[name], arrays[name]) for name in stored.files)
-    np.savez_compressed(destination, **arrays)
+    arrays = {"cases": np.asarray(json.dumps(INTERVAL_CASES)),
+              "strengths": np.asarray([CONDITIONAL, UNCONDITIONAL]),
+              "settings": np.asarray(json.dumps(AUTOGUIDANCE))}
+    for name in PROJECTION_CASES:
+        def projected(inputs):
+            results = []
+            for dtype in (torch.float32, torch.float64):
+                guidance = published(guidance_scale=6.0, adaptive_projected_guidance_rescale=0.0, eta=0.0)
+                guidance.set_state(0, 1, 1000)
+                guidance.prepare_inputs({})
+                conditional, unconditional = (torch.from_numpy(inputs[key]).to(dtype)
+                                              for key in ("conditional", "unconditional"))
+                results.append({"result": guidance.forward(conditional, unconditional).pred.numpy()})
+            return tuple(results)
+
+        arrays.update(record_case(f"projection.{name}", projection_draw(name), projected, store_inputs=False))
+
+    edm2 = definitions(EDM2, ("edm_sampler",), {"torch": torch, "np": np})["edm_sampler"]
+
+    def autoguided(inputs):
+        noise = torch.from_numpy(inputs["noise"])
+        return tuple({"walked": edm2(Denoiser(AUTOGUIDANCE["strength"]), noise.to(dtype),
+                                     gnet=Denoiser(AUTOGUIDANCE["guide_strength"]),
+                                     num_steps=AUTOGUIDANCE["num_steps"], guidance=AUTOGUIDANCE["guidance"],
+                                     dtype=dtype).numpy()} for dtype in (torch.float32, torch.float64))
+
+    arrays.update(record_case("autoguidance", noise_draw, autoguided, store_inputs=False))
+    samplers = {}
+    for dtype in (torch.float32, torch.float64):
+        # The run's precision wherever the sampler names one.
+        names = types.SimpleNamespace(**{**vars(torch), "float64": dtype, "float32": dtype})
+        samplers[dtype] = definitions(INTERVAL, ("edm_sampler",), {"torch": names, "np": np, "Any": object,
+                                                                 "Optional": object})["edm_sampler"]
+    for name, case in INTERVAL_CASES.items():
+        def interval(inputs, case=case):
+            noise = torch.from_numpy(inputs["noise"])
+            return tuple({"walked": samplers[dtype](Denoiser(CONDITIONAL), noise.to(dtype),
+                                                    uncond_net=Denoiser(UNCONDITIONAL), **case).numpy()}
+                         for dtype in (torch.float32, torch.float64))
+
+        arrays.update(record_case(f"interval.{name}", noise_draw, interval, store_inputs=False))
+    save(destination, {**arrays, "provenance": provenance(
+        "diffusers, edm2, guidance-interval", f"{DIFFUSERS}, {EDM2}, {INTERVAL}", "cpu",
+        f"python tools/guidance_reference.py walk-seeds {destination}", torch=torch.__version__)},
+        reference=f"huggingface/diffusers {DIFFUSERS}; NVlabs/edm2; kynkaat/guidance-interval",
+        license="Apache-2.0; CC BY-NC-SA 4.0 (results only)")
 
 
 class Denoiser:
@@ -206,43 +263,10 @@ class Denoiser:
         return torch.as_tensor(sigma)
 
 
-def main() -> None:
-    FIXTURE.mkdir(parents=True, exist_ok=True)
-    noise = torch.randn(*SHAPE, generator=torch.Generator().manual_seed(5))
-    arrays = {"noise": noise.numpy(), "cases": np.asarray(json.dumps(INTERVAL_CASES)),
-              "strengths": np.asarray([CONDITIONAL, UNCONDITIONAL])}
-    for dtype, tail in ((torch.float64, ""), (torch.float32, "32")):
-        # The run's precision wherever the sampler names one.
-        names = types.SimpleNamespace(**{**vars(torch), "float64": dtype, "float32": dtype})
-        sampler = definitions(INTERVAL, ("edm_sampler",), {"torch": names, "np": np, "Any": object,
-                                                         "Optional": object})["edm_sampler"]
-        for name, case in INTERVAL_CASES.items():
-            walked = sampler(Denoiser(CONDITIONAL), noise.to(dtype), uncond_net=Denoiser(UNCONDITIONAL),
-                             **case)
-            arrays[f"{name}.result{tail}"] = walked.double().numpy()
-    np.savez(FIXTURE / "interval.npz", **arrays)
-
-    sampler = definitions(EDM2, ("edm_sampler",), {"torch": torch, "np": np})["edm_sampler"]
-    noise = torch.randn(*SHAPE, generator=torch.Generator().manual_seed(4))
-    settings = {"num_steps": 8, "guidance": 2.2, "strength": 0.5, "guide_strength": 0.35}
-    walks = {}
-    for dtype in (torch.float64, torch.float32):
-        walks[dtype] = sampler(Denoiser(settings["strength"]), noise.to(dtype),
-                               gnet=Denoiser(settings["guide_strength"]),
-                               num_steps=settings["num_steps"], guidance=settings["guidance"],
-                               dtype=dtype).double().numpy()
-    np.savez(FIXTURE / "autoguidance.npz", noise=noise.numpy(), result=walks[torch.float64],
-             result32=walks[torch.float32], settings=np.asarray(json.dumps(settings)))
-    print(f"{FIXTURE}: {len(APG_CASES)} APG walks, one autoguided walk, "
-          f"{len(INTERVAL_CASES)} interval-guided walks")
-
-
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "apg-seeds":
         apg_seeds(Path(sys.argv[2]))
-    elif len(sys.argv) == 3 and sys.argv[1] == "apg-projection":
-        apg_projection(Path(sys.argv[2]))
-    elif len(sys.argv) == 1:
-        main()
+    elif len(sys.argv) == 3 and sys.argv[1] == "walk-seeds":
+        walk_seeds(Path(sys.argv[2]))
     else:
         raise SystemExit(__doc__)

@@ -131,9 +131,13 @@ def float64_twin(model: torch.nn.Module,
     its constructor computes (a rotary `inv_freq`, Gemma's `embed_scale`) is float64's where a float32
     build cast afterwards keeps float32's, by `build` (a library's reader at float64, a head from its
     config) or else its class from a copy of its config at float64 (Diffusers' `from_config` for a
-    config that is no transformers one), and promoted to float64 where a reader decodes another dtype,
-    which computes nothing a construction did; `model`'s weights and persistent buffers loaded into it
-    strictly, on `model`'s device, in eval mode. Run it inside `float64` too."""
+    config that is no transformers one), and its floating tensors promoted to float64 where a reader
+    decodes another dtype, which computes nothing a construction did; `model`'s weights and persistent
+    buffers loaded into it strictly, on `model`'s device, in eval mode. Run it inside `float64` too.
+
+    A complex table keeps its imaginary half: built inside `float64` it is complex128 already, and
+    `Module.to(torch.float64)` would cast it to a real dtype, dropping the sines of a rotation (Llama 4's
+    vision `freqs_ci`), where `double` promotes floating tensors alone."""
     import copy
 
     with float64():
@@ -146,7 +150,7 @@ def float64_twin(model: torch.nn.Module,
             else:
                 config.dtype = torch.float64
                 twin = type(model)(config)
-        twin.to(torch.float64)
+        twin.double()
     twin.load_state_dict(model.state_dict(), strict=True)
     return twin.to(next(model.parameters()).device).eval()
 

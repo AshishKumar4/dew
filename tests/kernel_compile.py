@@ -11,6 +11,7 @@ everything else.
 
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from collections import Counter
 from pathlib import Path
 
 import jax
@@ -26,68 +28,39 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
 from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
-
-THREADS_PER_MULTIPROCESSOR = {(8, 0): 2048, (9, 0): 2048, (10, 0): 2048}
-"""Resident threads a multiprocessor holds by compute capability, 1536 on the others the targets name
-(CUDA C++ Programming Guide, "Technical Specifications per Compute Capability")."""
+from dew.training.ahead import compile_only_gpus
 
 REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
 """XLA's refusal of a Triton kernel whose shared memory a block of the GPU does not hold."""
 
-KERNEL = re.compile(r"kCustomKernel .*? shared_memory: (\d+) bytes")
-"""A custom (Triton) kernel's line in XLA's thunk sequence, with the shared bytes it launches with."""
+KERNEL = re.compile(r"kCustomKernel \[[^\]]*\] (\S+) .*? shared_memory: (\d+) bytes")
+"""A custom kernel's line in XLA's thunk sequence, with its name and the shared bytes it launches with: a
+Triton call's, or one of XLA's own fusions XLA emits so (`loop_multiply_fusion`)."""
 
+UNIQUIFIED = re.compile(r"__\d+$")
+"""The suffix XLA gives a kernel name's later launches in a program (`recurrence_cumulated__1`)."""
 
-def target_config(generation: str) -> str:
-    """The `gpu_device_info` XLA compiles for, from the CUDA `generation`'s target
-    (`generation.TARGETS`): its compute capability, the shared memory a block may opt into, its
-    multiprocessors, clock and bandwidth; CUDA's per-capability limits for the rest. The fields past
-    the capability and shared memory only steer XLA's own fusions, never a Triton kernel's code."""
-    target, version = gpu_target(generation), capability(generation)
-    facts = (target.shared_limit, target.multiprocessors, target.clock_hz, target.memory_bandwidth)
-    if version is None or any(fact is None for fact in facts):
-        raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
-    major, minor = version
-    shared, multiprocessors, clock, bandwidth = facts
-    return f"""gpu_device_info {{
-  threads_per_block_limit: 1024
-  threads_per_warp: 32
-  shared_memory_per_block: 49152
-  shared_memory_per_core: {shared + 1024}
-  threads_per_core_limit: {THREADS_PER_MULTIPROCESSOR.get((major, minor), 1536)}
-  core_count: {multiprocessors}
-  fpus_per_core: {64 if (major, minor) == (8, 0) else 128}
-  block_dim_limit_x: 2147483647
-  block_dim_limit_y: 65535
-  block_dim_limit_z: 65535
-  memory_bandwidth: {int(bandwidth)}
-  clock_rate_ghz: {clock / 1e9}
-  shared_memory_per_block_optin: {shared}
-  cuda_compute_capability {{
-    major: {major}
-    minor: {minor}
-  }}
-  registers_per_core_limit: 65536
-  registers_per_block_limit: 65536
-}}
-platform_name: "CUDA"
-device_description_str: "{target.device_kind}"
-"""
+TRITON_CALL = re.compile(r'custom_call_target="__gpu\$xla\.gpu\.triton".*?\bname = "([^"]+)"')
+"""A Triton kernel's call in XLA's optimized HLO, with the kernel's name, which its launch line carries."""
 
 
 @functools.cache
 def _device(generation: str) -> Mesh:
     """A one-device mesh of a compile-only device of `generation`."""
-    topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=target_config(generation),
-                                            topology="1x1x1")
-    return Mesh(np.array(topology.devices[:1]), ("data",))
+    return Mesh(np.array(compile_only_gpus(generation)), ("data",))
+
+
+def refused(record: dict) -> bool:
+    """Whether a compiled record failed as a program: its error, or shared bytes past its block's limit
+    (a Triton kernel's, or XLA's refusal of a block, which a Mosaic GPU program states only then)."""
+    return "error" in record or ("shared" in record and record["shared"] > record["limit"])
 
 
 def failures(found: list[dict]) -> list[str]:
     """Each compiled record's failure, if any: its error, or its shared bytes past its block's limit."""
     return [f"{record['name']}: {record['error']}" if "error" in record else
             f"{record['name']}: {record['shared']} shared bytes, limit {record['limit']}"
-            for record in found if "error" in record or not record["shared"] <= record["limit"]]
+            for record in found if refused(record)]
 
 
 def compile_kernels(cases, generation: str) -> list[dict]:
@@ -97,38 +70,71 @@ def compile_kernels(cases, generation: str) -> list[dict]:
     kernels launch with (the most of any; those XLA refused, where it refused one), or the error.
 
     A cheap first filter: a kernel that does not compile or takes more shared memory than its GPU's
-    block holds fails here as it would there, before a GPU is paid for."""
-    mesh = _device(generation)
-    replicated = NamedSharding(mesh, PartitionSpec())
+    block holds fails here as it would there, before a GPU is paid for. A program whose thunk sequence
+    launches no Triton kernel fails too: nothing states its kernel's shared bytes."""
     found: list[dict] = []
     for case in cases:
         record: dict = {"name": case.name, "generation": generation,
-                        "limit": gpu_target(generation).shared_limit, "shared": 0}
+                        "limit": gpu_target(generation).shared_limit}
         found.append(record)
-        fn, args = case.call()
-        placed = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated)
-                              if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, args)
-        try:
-            with assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)):
-                lowered = jax.jit(fn).trace(*placed).lower()
-        except Exception as error:  # A case that does not lower is its own failure.
-            record["error"] = f"it does not lower: {str(error)[-800:]}"
+        sequences = _compiled(case, generation, record)
+        if sequences is None:
             continue
-        # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
-        # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
-        with tempfile.TemporaryDirectory(prefix="dew-compile-") as dump:
-            try:
-                lowered.compile(compiler_options={"xla_dump_to": dump})
-            except jax.errors.JaxRuntimeError as error:
-                refused = REFUSED.search(str(error))
-                if refused is None:
-                    record["error"] = f"XLA does not compile it: {str(error)[-800:]}"
-                else:
-                    record["shared"] = int(refused.group(1))
-                continue
-            sequences = [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")]
-        record["shared"] = max((int(size) for text in sequences for size in KERNEL.findall(text)), default=0)
+        thunks, programs = sequences
+        record.update(triton_evidence(programs, thunks))
     return found
+
+
+def triton_evidence(programs: list[str], thunks: list[str]) -> dict:
+    """What XLA's optimized `programs` and thunk sequences (`thunks`) say of a program's Triton kernels:
+    the largest shared bytes a call launches with, or why they say nothing. Each Triton call (an HLO
+    custom call, named by its kernel) states its shared bytes in a launch line of its own, named as the
+    call is, XLA numbering a name's later calls (recurrence_cumulated__1): XLA's own fusions launch as
+    custom kernels too, and one kernel's name can begin another's (attention_forward,
+    attention_forward_headroom). A call with no launch line of its own, or a program that calls no
+    Triton kernel, is no evidence its kernel compiled within its block (row 1381)."""
+    calls = Counter(name for text in programs for name in TRITON_CALL.findall(text))
+    launches: dict[str, list[int]] = {}
+    for text in thunks:
+        for name, size in KERNEL.findall(text):
+            launches.setdefault(UNIQUIFIED.sub("", name), []).append(int(size))
+    if not calls:
+        return {"error": "XLA's program calls no Triton kernel"}
+    unlaunched = sorted(name for name, count in calls.items() if len(launches.get(name, ())) < count)
+    if unlaunched:
+        return {"error": f"no launch of its own states the shared bytes of {', '.join(unlaunched)}"}
+    return {"shared": max(size for name in calls for size in launches[name])}
+
+
+def _compiled(case, generation: str, record: dict) -> tuple[list[str], list[str]] | None:
+    """`case` lowered as on the CUDA `generation` (`assumed`, `gpu_mesh`) and compiled by XLA for a
+    compile-only device of it: XLA's thunk sequences and optimized programs, or None, `record` holding why:
+    the error, or the shared bytes of a block XLA refused."""
+    mesh = _device(generation)
+    replicated = NamedSharding(mesh, PartitionSpec())
+    fn, args = case.call()
+    placed = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated)
+                          if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, args)
+    try:
+        with assumed(generation), jax.sharding.use_abstract_mesh(gpu_mesh(mesh, generation)):
+            lowered = jax.jit(fn).trace(*placed).lower()
+    except Exception as error:  # A case that does not lower is its own failure.
+        record["error"] = f"it does not lower: {str(error)[-800:]}"
+        return None
+    # A process whose persistent compilation cache is on keeps it on here (JAX settles that once a
+    # process): a compile-only device's entry reads back as unloadable, with a warning, and compiles.
+    with tempfile.TemporaryDirectory(prefix="dew-compile-") as dump:
+        try:
+            lowered.compile(compiler_options={"xla_dump_to": dump})
+        except jax.errors.JaxRuntimeError as error:
+            refused = REFUSED.search(str(error))
+            if refused is None:
+                record["error"] = f"XLA does not compile it: {str(error)[-800:]}"
+            else:
+                record["shared"] = int(refused.group(1))
+            return None
+        return ([path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")],
+                [path.read_text() for path in Path(dump).glob("*after_optimizations.txt")])
 
 
 MOSAIC_DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
@@ -143,6 +149,8 @@ SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
 SMEM = re.compile(r"smem_scratch_bytes=(\d+)")
 KERNEL_COUNTER = re.compile(r"_\d+$")
 """The counter Mosaic GPU appends to a kernel's name in its reports' file names."""
+DUMP_NAME = re.compile(r'mosaic_gpu\.dump_basename = "[^"]*"')
+"""The one attribute of Mosaic's module dump that names the dump (its counter) rather than the module."""
 TMEM_USED = re.compile(r"tmem_scratch_cols=(\d+), tmem_collective_scratch_cols=(\d+)")
 
 
@@ -173,7 +181,8 @@ def mosaic_kernels(directory: str) -> list[dict]:
     kernels = []
     reports = Path(directory)
     named: dict[str, dict[str, Path]] = {}
-    for kind, suffix in (("resources", ".resources.txt"), ("ptxas", ".ptxas")):
+    for kind, suffix in (("resources", ".resources.txt"), ("ptxas", ".ptxas"),
+                         ("module", ".after_layout_inference.txt")):
         for path in reports.glob(f"*{suffix}"):
             found = named.setdefault(KERNEL_COUNTER.sub("", path.name.removesuffix(suffix)), {})
             # Paired by name: a case that compiles a name twice would pair the wrong reports.
@@ -186,7 +195,10 @@ def mosaic_kernels(directory: str) -> list[dict]:
         registers, spills = REGISTERS.findall(log), SPILLS.findall(log)
         unread = [field for field, found in (("shared bytes", shared), ("tensor memory columns", tmem),
                                              ("registers", registers), ("spills", spills)) if not found]
+        module = found.get("module")
         kernels.append({"kernel": name, "unread": unread,
+                        "module": hashlib.sha256(DUMP_NAME.sub("", module.read_text()).encode()).hexdigest()
+                        if module else None,
                         "shared": int(shared.group(1)) if shared else None,
                         "tmem": sum(map(int, tmem.groups())) if tmem else None,
                         "registers": max(map(int, registers), default=None),
@@ -214,7 +226,7 @@ def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     the calling test runs again in a process of its own, and these are its records there."""
     wanted = capability(generation)
     if _BINARY_CAPABILITY and _BINARY_CAPABILITY[0] != wanted and OWN_PROCESS not in os.environ:
-        return _compiled_apart()
+        return compiled_apart()
     _BINARY_CAPABILITY[:] = _BINARY_CAPABILITY or [wanted]
     found = _compiled_here(cases, generation)
     if OWN_PROCESS in os.environ:
@@ -222,28 +234,58 @@ def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     return found
 
 
-def _compiled_apart() -> list[dict]:
+def compiled_apart() -> list[dict]:
     """The records the calling test's `compile_mosaic_kernels` call gives in a pytest process of its own, its
-    first Mosaic GPU compile its generation's."""
+    first Mosaic GPU compile its generation's: read only from a process that passed, as its records are
+    written before its test's own checks and teardown, which a nonzero exit says failed (row 1877)."""
     test = os.environ["PYTEST_CURRENT_TEST"].rsplit(" ", 1)[0]
     with tempfile.TemporaryDirectory(prefix="dew-mosaic-apart-") as directory:
         records = Path(directory) / "records.json"
         ran = subprocess.run([sys.executable, "-m", "pytest", test, "-q", "-p", "no:cacheprovider"],
                              cwd=Path(__file__).parent.parent, env={**os.environ, OWN_PROCESS: str(records)},
                              capture_output=True, text=True, check=False)
-        if not records.exists():
-            raise RuntimeError(f"{test} gave no records in a process of its own:\n"
+        if ran.returncode != 0 or not records.exists():
+            raise RuntimeError(f"{test} in a process of its own exited {ran.returncode}"
+                               f"{'' if records.exists() else ', its records unwritten'}:\n"
                                f"{(ran.stdout + ran.stderr)[-3000:]}")
         return json.loads(records.read_text())
+
+
+PTXAS_REPORTS: dict[str, tuple[int, int]] = {}
+"""Each Mosaic GPU kernel's ptxas report this process read, its registers and spilled bytes, by its module
+(the digest of Mosaic's module after layout inference, `mosaic_kernels`): Mosaic compiles a module once a
+process, so a later case of the same module dumps the module and its resources, never PTX or ptxas's
+report (`inherited`)."""
+
+
+def inherited(kernel: dict) -> dict:
+    """`kernel`'s record (`mosaic_kernels`) with its registers and spills where ptxas reported them: its
+    own, which this process keeps by its module (`PTXAS_REPORTS`), or, where Mosaic compiled the same module
+    before in this process and so ran no ptxas, that compile's. A kernel whose module no report in this
+    process covers keeps them unread."""
+    ptxas = {"registers", "spills"}
+    if not ptxas & set(kernel["unread"]):
+        if kernel["module"] is not None:
+            PTXAS_REPORTS[kernel["module"]] = (kernel["registers"], kernel["spilled"])
+        return kernel
+    if kernel["module"] not in PTXAS_REPORTS:
+        return kernel
+    registers, spilled = PTXAS_REPORTS[kernel["module"]]
+    return {**kernel, "registers": registers, "spilled": spilled, "ptxas": "an earlier compile of its module",
+            "unread": [field for field in kernel["unread"] if field not in ptxas]}
 
 
 def _compiled_here(cases, generation: str) -> list[dict]:
     """`compile_mosaic_kernels`' records, compiled in this process."""
     found: list[dict] = []
     for case in cases:
+        # The program's own record (its error, or XLA's refusal of its block), its Mosaic kernels' reports the
+        # evidence of their resources: a Triton launch line is none of theirs.
+        record: dict = {"name": case.name, "generation": generation,
+                        "limit": gpu_target(generation).shared_limit}
         with tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory, mosaic_dumps(directory):
-            [record] = compile_kernels([case], generation)
-            record["kernels"] = mosaic_kernels(directory)
+            _compiled(case, generation, record)
+            record["kernels"] = [inherited(kernel) for kernel in mosaic_kernels(directory)]
         record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         found.append(record)
     return found
@@ -256,7 +298,7 @@ def mosaic_failures(found: list[dict]) -> list[str]:
     spilling registers."""
     failed = failures(found)
     for record in found:
-        if "error" in record or not record["shared"] <= record["limit"]:
+        if refused(record):
             continue
         if not record["kernels"]:
             failed.append(f"{record['name']}: no Mosaic GPU kernel compiled")
