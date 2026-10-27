@@ -43,7 +43,7 @@ def offloading(split=None, seq_len=SEQ, checkpoints=None, **fields):
                               key=jax.random.key(0), split=split, checkpoints=checkpoints))
 
 
-def searched(trainer):
+def offload_compiles(trainer):
     """The compiles the plan's search made, as (remat, host, fits)."""
     return [(probe["remat"], probe.get("host"), probe["fits"]) for probe in trainer.plan["probes"]]
 
@@ -78,7 +78,7 @@ def test_a_step_that_fits_only_with_its_state_in_host_memory_keeps_it_there(monk
     trainer = offloading()
     state = trained(trainer)
     assert (trainer.plan.get("host"), trainer.plan["remat"]) == (OFFLOADED, None)
-    compiles = searched(trainer)
+    compiles = offload_compiles(trainer)
     assert not any(fits for _, host, fits in compiles if host == [])
     assert {remat for remat, host, _ in compiles if host == []} >= {None, "minimal", "full"}
     assert memory_kinds(state.opt_state) == memory_kinds(state.ema) == {"pinned_host"}
