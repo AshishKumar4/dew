@@ -371,9 +371,16 @@ def test_the_dense_decoders_gradient_is_the_references():
         _, gradient = with_gradients(lambda params: loss(params, rows))(stored, one)
         return gradient
 
-    @as_given
+    layouts = {layout.name: layout for layout in loaded.weight_layouts}
+    if set(names) != set(layouts):
+        raise AssertionError(f"the export writes {sorted(set(names) ^ set(layouts))} beside its layouts")
+
+    @jax.jit
     def differentiated(rows, one):
-        return exported(loaded, gradient_of(rows, one))
+        """The gradient in the source's tensors by name, each its layout's source array (`export`'s
+        tensor before the host copy), in the program that computes it."""
+        gradient = {**loaded.variables, "params": gradient_of(rows, one)}
+        return {name: layouts[name].source_array(gradient).astype(jnp.float32) for name in names}
 
     def clamped(dtype):
         """The reference's parameters after its training forward, which clamps the stored coefficients
