@@ -381,6 +381,9 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
         if cache is not None or logical is not None or inputs.conditioning:
             raise ValueError('LongRoPE cache rebuilding requires a fresh text prompt '
                              'without custom coordinates')
+        if ops.depths or ops.record is not None:
+            raise ValueError("LongRoPE cache rebuilding recomputes the trunk's prefix alone, not a "
+                             "prediction depth's or a block drafter's cache, so it decodes without drafting")
         lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
         slots = jnp.where(real, jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1, -1)
         history = write_cache(jnp.zeros((batch, model.max_seq_len), inputs.tokens.dtype),
