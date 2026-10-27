@@ -50,8 +50,9 @@ def scored_batch(objective, seed: int = 0) -> tuple[dict, jax.Array]:
     }, jnp.asarray(ids)
 
 
-HEAD_SEEDS = {GRPOObjective: 8, DPOObjective: 8}
-"""Check 1's declared seeds for the headed policy losses, sized by `seeds_for` on armada."""
+HEAD_SEEDS = {GRPOObjective: 64, DPOObjective: 128}
+"""Check 1's declared seeds for the headed policy losses, sized by `seeds_for` paired on armada: the
+headed and plain heads run one model over one batch, so they share their upstream rounding."""
 
 
 @pytest.mark.parametrize("objective", [GRPOObjective, DPOObjective])
@@ -89,8 +90,9 @@ def test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_
 
     def truth(*drawn):
         # Traced by the gate, so widened in JAX: every floating leaf to float64, exactly.
-        return leaves(wide)(*jax.tree.map(
-            lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, drawn))
+        def wider(leaf):
+            return leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+        return leaves(wide)(*jax.tree.map(wider, drawn))
 
     with jax.enable_x64(new_val=True):
         assert_as_exact(leaves(headed), leaves(plain), draw, f"{objective.__name__} head",
