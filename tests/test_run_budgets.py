@@ -156,19 +156,22 @@ class Questioned:
                      for question in range(int(element["id"]) % 3 + 1))
 
 
+@pytest.mark.parametrize("configured", [False, True], ids=["step", "configured"])
 @pytest.mark.parametrize("read", ["memory", "streamed"])
 @pytest.mark.parametrize("examples", [7, 23])
-def test_an_examples_budget_counts_examples_before_the_objective_expands_them(examples, read):
+def test_an_examples_budget_counts_examples_before_the_objective_expands_them(examples, read, configured):
     """An objective that makes each record several rows (a question a row) is bounded by its examples,
     not its rows: the read bounded to `examples` records holds every row of each example the bound
     reaches, as many times as it reaches it, and ends, whatever number of rows each example makes, in a
-    memory read and a streamed one alike."""
-    from dew.data.pipeline import ObjectiveData
+    memory read and a streamed one alike, the expansion given as a step or as a configured one that
+    binds to it from the source's facts (`Configured`)."""
+    from dew.data.pipeline import Configured, ObjectiveData
 
     ids = np.arange(1, RECORDS + 1, dtype=np.int32)
     shuffled = {"seed": 3} if read == "memory" else {"seed": 3, "window": RECORDS}
+    expansion = Configured(lambda facts: Questioned(), needs=()) if configured else Questioned()
     loader = compile(Pipeline(Memory({"id": ids})).shuffle(**shuffled).batch(BATCH), read=read,
-                     objective=ObjectiveData(train=(Questioned(),)), examples=examples)
+                     objective=ObjectiveData(train=(expansion,)), examples=examples)
     read = ids_read(loader, loader.example_steps(examples), "id")
     passes, rest = divmod(examples, RECORDS)
     assert sum(count / (record % 3 + 1) for record, count in read.items()) == examples

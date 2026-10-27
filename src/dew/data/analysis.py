@@ -554,7 +554,10 @@ def _bind(stage: Configured, metadata: Mapping[str, object]) -> Map | RandomMap 
     if stage.one_to_one and (isinstance(resolved, Expansion) or _declares_rejects(resolved)):
         raise ValueError(f"Configured {_identity(stage).name} states one_to_one=True and binds to a step "
                          "that drops or expands records")
-    return record_stage(resolved, configured=binding)
+    bound = record_stage(resolved, configured=binding)
+    # An objective's expansion keeps the mark its configured step carried (`Configured.examples`).
+    marked = stage.examples and isinstance(bound, FlatMap)
+    return dataclasses.replace(bound, examples=True) if marked else bound
 
 
 def _keyed(stage: Stage) -> bool:
