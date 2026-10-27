@@ -652,6 +652,27 @@ armada. Each member stands for the others of its class:
 Every other model's top rung holds its forward to check 1 alone."""
 GRADIENT_SEEDS = dict(GRADIENT_COVERING.values())
 """Each covering member's declared seeds for its gradient."""
+RESOLVED_SINKHORN = {"hc_sinkhorn_iters": 3, "hc_eps": 1e-2}
+"""The Sinkhorn configuration the hyper-connection member's gradient is judged at (`judged`): the same
+code, five alternating normalisations through its loop, at a fixed point its float64 truth resolves. At
+the release's (hc_eps 1e-6, 20 iterations) the comb logits' gradient on a layer whose streams are copies
+is hc_eps times the derivative of the Sinkhorn residual S - 1, below float64's own resolution of the
+column sums: JAX's and torch's float64 put it 2x apart (1.2677e-23 and 6.3385e-24) and every float32
+arm, torch's included, leaves it as noise (ledger 1856). Over 64 drawn 2x2 comb logits (scales 0.02 to
+3) under a stream-constant cotangent, JAX's and torch's float64 gradients agree here within 2.7e-12 of
+the row's size and float32's error is 2.2e-5 of it at the median and 6.5e-4 at most, where at the
+release's setting they sit up to 9.8e5 apart (armada IG1856cfg; 2 iterations at 1e-3 agree within
+2.0e-11 but keep one alternation fewer, 5 iterations at 1e-2 already part by 1.9e-8). The release's
+setting keeps a finiteness check, its truth beyond float64 (ledger 1864)."""
+
+
+def judged(model):
+    """`model` as its gradient is judged: a hyper-connection model at `RESOLVED_SINKHORN`, every stack
+    of streams it holds alike; any other as it is."""
+    held = {name: dataclasses.replace(getattr(model, name), **RESOLVED_SINKHORN)
+            for name in ("hyper_connections", "mtp_hyper_connections")
+            if getattr(model, name, None) is not None}
+    return model.clone(**held) if held else model
 
 
 def _redrawn(inputs, seed: int):
@@ -729,8 +750,11 @@ def _climbs_and_restores(name: str, model, variables, inputs, **apply) -> None:
     assert_as_exact(forward(top), forward(model), draw, f"forward at {record}", seeds=RUNG_SEEDS,
                     truth_fn=forward(twin, wide_variables))
     if name in GRADIENT_SEEDS:
-        assert_as_exact(stepped(top), stepped(model), draw, f"gradient at {record}",
-                        seeds=GRADIENT_SEEDS[name], truth_fn=stepped(twin, wide_variables))
+        if judged(model) is not model:
+            # The release's setting, whose gradient no float64 truth judges, steps finitely.
+            assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(stepped(top)(*inputs)))
+        assert_as_exact(stepped(judged(top)), stepped(judged(model)), draw, f"gradient at {record}",
+                        seeds=GRADIENT_SEEDS[name], truth_fn=stepped(judged(twin), wide_variables))
     assert top.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written
 
 
