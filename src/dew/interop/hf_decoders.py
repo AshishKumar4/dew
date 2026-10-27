@@ -69,6 +69,10 @@ from dew.nn.vision.gemma3n import translate_gemma3n_projector_config, translate_
 from dew.nn.vision.gemma4 import translate_gemma4_projector_config, translate_gemma4_vision_config
 from dew.nn.vision.gemma4_unified import translate_gemma4_unified_vision_config
 from dew.nn.vision.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
+from dew.nn.vision.muse_glimmer import (
+    translate_muse_glimmer_projector_config,
+    translate_muse_glimmer_vision_config,
+)
 from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
 from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
 from dew.registry import from_record, towers
@@ -311,6 +315,20 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     return _wrapper_fields(family, used, text, tower, projector, image, None, video=video)
 
 
+def _muse_glimmer_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Read a Muse Glimmer wrapper: its windowed trunk, the merge adapter and projection, the decoder
+    (`MuseGlimmerModel`, modeling_muse_glimmer.py:933-941). One resolution per call, so the soft-token
+    count varies with the image, as Qwen 3.5's does."""
+    text = _wrapper_text(hf_config, used)
+    tower = translate_muse_glimmer_vision_config(hf_config)
+    projector = translate_muse_glimmer_projector_config(hf_config)
+    used.update(("out_hidden_size", "projector_hidden_size", "projector_hidden_act", "video_token_id"))
+    # MuseGlimmerConfig's placeholders where a config leaves them out (configuration_muse_glimmer.py:194).
+    image = _defaulted_token_id(hf_config, used, "image_token_id", 200092)
+    video = _records.integer(hf_config.get("video_token_id", 200091), "video_token_id")
+    return _wrapper_fields("muse_glimmer", used, text, tower, projector, image, None, video=video)
+
+
 def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
     """Read a Gemma 3n wrapper: MobileNet tower, vocabulary embedders and its audio."""
     text = _wrapper_text(hf_config, used)
@@ -331,15 +349,16 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
     "gemma4_unified": _gemma4_unified_wrapper,
-    **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper}
+    **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper,
+    "muse_glimmer": _muse_glimmer_wrapper}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     """Translate a multimodal wrapper into its decoder, tower and projector records.
 
-    gemma3, llama4, gemma4, gemma4_unified, qwen3_5, qwen3_5_moe, gemma3n and decoder-family
-    bundles translate. Records retain the decoder, tower, projector, image token ID and token count, and
-    for Gemma 3n and Gemma 4 the optional audio tower, its embedder, the
+    gemma3, llama4, gemma4, gemma4_unified, qwen3_5, qwen3_5_moe, gemma3n, muse_glimmer and
+    decoder-family bundles translate. Records retain the decoder, tower, projector, image token ID
+    and token count, and for Gemma 3n and Gemma 4 the optional audio tower, its embedder, the
     audio placeholder ID and Gemma 3n's fixed slots per clip. Gemma 4 Unified has neither tower: its
     embedders project vision patches and raw audio frames, either optional. Gemma 3n's
     embedders also embed their hard vocabulary ranges.
