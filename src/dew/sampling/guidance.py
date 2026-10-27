@@ -142,8 +142,24 @@ def guide(conditional: jax.Array, unconditional: jax.Array, scale) -> jax.Array:
     outside its guidance interval takes, it is the conditional prediction exactly, as the sources
     return it unguided there: the affine form would round it through their difference (float32's
     1 against 2**30 gives 0)."""
-    scale = expand(scale, conditional)
+    return _guided(conditional, unconditional, expand(scale, conditional))
+
+
+@jax.custom_jvp
+def _guided(conditional: jax.Array, unconditional: jax.Array, scale: jax.Array) -> jax.Array:
+    """`guide`'s value: the conditional prediction exactly at a unit scale, the affine combination
+    elsewhere."""
     return jnp.where(scale == 1, conditional, unconditional + scale * (conditional - unconditional))
+
+
+@_guided.defjvp
+def _guided_jvp(primals, tangents):
+    """The affine combination's derivative at every scale, a unit one's included, where the exact
+    conditional the value selects would leave the scale's out."""
+    conditional, unconditional, scale = primals
+    along_conditional, along_unconditional, along_scale = tangents
+    return _guided(*primals), (scale * along_conditional + (1 - scale) * along_unconditional
+                               + (conditional - unconditional) * along_scale)
 
 
 @struct.dataclass

@@ -973,3 +973,10 @@ def test_lms_walks_a_variance_exploding_grid_near_float32s_largest():
                               [1.0, 0.5, 0.25]))
     # Every step's arithmetic is exact in binary on this grid: the walk is the exact one.
     np.testing.assert_array_equal(latents, [np.full((1, 3), 0.5), np.full((1, 3), 0.25)])
+    # A last step far shorter than its history (sigmas 2, 1, 2**-100, 0 at order 3) keeps its basis in
+    # range: the walk is finite and its first step the exact one.
+    process = Process(KarrasVENoiseScheduler(sigma_min=0, sigma_max=2.0, rho=1), DirectPredictionTransform())
+    latents = np.asarray(walk(LMS(3), process, ZeroEndpoint(), jnp.ones((1, 3), jnp.float32),
+                              [1.0, 0.5, 2.0 ** -101, 0.0]))
+    assert np.isfinite(latents).all()
+    np.testing.assert_array_equal(latents[0], np.full((1, 3), 0.5))

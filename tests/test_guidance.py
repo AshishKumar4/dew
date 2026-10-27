@@ -220,3 +220,9 @@ def test_a_unit_scale_guides_to_the_conditional_prediction_exactly():
     unconditional = jnp.asarray([[2.0 ** 30], [3.0]], jnp.float32)
     guided = np.asarray(guide(conditional, unconditional, jnp.asarray([1.0, 2.0], jnp.float32)))
     np.testing.assert_array_equal(guided, [[1.0], [3.0 + 2.0 * (1.0 - 3.0)]])
+    # Its derivatives are the affine combination's at every scale, a unit one's included.
+    gradients = jax.grad(lambda c, u, s: guide(c, u, s).sum(), argnums=(0, 1, 2))(
+        jnp.asarray([[2.0], [2.0]]), jnp.asarray([[1.0], [1.0]]), jnp.asarray([1.0, 3.0]))
+    np.testing.assert_array_equal(np.asarray(gradients[0]), [[1.0], [3.0]])
+    np.testing.assert_array_equal(np.asarray(gradients[1]), [[0.0], [-2.0]])
+    np.testing.assert_array_equal(np.asarray(gradients[2]), [1.0, 1.0])

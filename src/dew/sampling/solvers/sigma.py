@@ -273,15 +273,17 @@ class MultiStepDPM:
 def _lagrange_integral(nodes: list, j: int, a, b):
     """The integral from a to b of the Lagrange basis polynomial that is 1 at
     `nodes[j]` and 0 at the other nodes, in closed form on the step's own
-    scale: with x = a + (b - a) u it is (b - a) times the basis's integral over
-    u in [0, 1] through the nodes (node - a) / (b - a), so no power of a sigma
-    is formed (VE sigmas near 2**70 cube past float32's largest) and the step
-    keeps the range its nodes' spacing has."""
-    width = b - a
-    # An empty step integrates to zero, as a first-order step over it stays; the unit width keeps its
-    # nodes finite where the substitution has no scale.
-    unit = jnp.where(width != 0, width, 1)
+    scale: with x = a + unit u, `unit` the widest of the step and the nodes'
+    distances from a, it is `unit` times the basis's integral over u from 0 to
+    (b - a) / unit through the nodes (node - a) / unit, each within [-1, 1], so
+    no power of a sigma is formed (VE sigmas near 2**70 cube past float32's
+    largest) and neither a step much shorter than its history (a tiny last
+    sigma) nor one much longer overflows the basis."""
+    unit = jnp.max(jnp.abs(jnp.stack([b - a, *(node - a for node in nodes)])), axis=0)
+    # A step and history of no width at all (one node, at a) integrates to zero over any unit.
+    unit = jnp.where(unit > 0, unit, 1)
     placed = [(node - a) / unit for node in nodes]
+    end = (b - a) / unit
     polynomial = [1.0]
     scale = 1.0
     for m, node in enumerate(placed):
@@ -291,8 +293,8 @@ def _lagrange_integral(nodes: list, j: int, a, b):
         polynomial = [polynomial[i] - node * (polynomial[i + 1] if i + 1 < len(polynomial) else 0.0)
                       for i in range(len(polynomial))]
         scale = scale * (placed[j] - node)
-    integral = sum(coefficient / (i + 1) for i, coefficient in enumerate(polynomial))
-    return width * integral / scale
+    integral = sum(coefficient * end ** (i + 1) / (i + 1) for i, coefficient in enumerate(polynomial))
+    return unit * integral / scale
 
 
 @struct.dataclass

@@ -1280,3 +1280,8 @@ def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
     truth = -(2 + 0.5 * (math.log(2 * math.pi) + 126 * math.log(2)))
     assert_as_exact_as_the_reference(density, [-(np.float32(2) + half_log)], [truth],
                                      "an overflowing residual")
+    # Differentiable at every order, as the plain density: at unit variance its Hessian in the mean is -I.
+    unit = GaussianTransition(jnp.zeros((1, 3), jnp.float32), jnp.ones((1,), jnp.float32))
+    hessian = jax.hessian(lambda mean: GaussianTransition(mean, unit.variance).log_prob(
+        jnp.ones((1, 3), jnp.float32)).sum())(unit.mean)
+    np.testing.assert_array_equal(np.asarray(hessian).reshape(3, 3), -np.eye(3))

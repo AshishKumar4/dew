@@ -78,10 +78,7 @@ class GaussianTransition:
         # The form of JAX's isotropic `multivariate_normal.logpdf` (a scalar covariance): log(2 pi) and
         # the log variance summed apart, so a variance near float32's largest does not overflow 2 pi
         # times it. Each row has its own variance, which that function would take one row at a time.
-        # The half-Mahalanobis term is the KL's range-safe |value - mean|**2 / (2 variance)
-        # (`_gaussian_kl`), with its derivatives: a residual of 2**64 over a variance of 2**126 squares
-        # past float32's largest, where its standardized square is 4.
-        log_prob = -(_gaussian_kl(value, mean, safe_variance)
+        log_prob = -(_half_mahalanobis(value - mean, safe_variance)
                      + 0.5 * dimensions * (jnp.log(2 * math.pi) + jnp.log(safe_variance)))
         return jnp.where(variance > 0, log_prob, jnp.nan)
 
@@ -102,6 +99,21 @@ class GaussianTransition:
         deterministic = jnp.where(apart, jnp.inf, 0.0)
         return jnp.where(variance > 0, _gaussian_kl(mean, reference_mean, safe_variance),
                          jnp.where(variance == 0, deterministic, jnp.nan))
+
+
+def _half_mahalanobis(residual: jax.Array, variance: jax.Array) -> jax.Array:
+    """`|residual|**2 / (2 variance)` per row, one variance a row: the plain formula over the residual
+    and the variance each scaled by an exact power of two, 2**-k and 2**-2k for the variance's 2**(2k),
+    so it rounds bit for bit as the plain formula wherever that stays in range, and a residual whose
+    square passes float32's largest (2**64 over a variance of 2**126, a standardized square of 4) stays
+    finite. The power is a constant of the variance's exponent, so its derivatives are the plain
+    formula's, at every order."""
+    held = jax.lax.stop_gradient(variance)
+    # 2**-k for the variance's 2**(2k), a normal number for every float32 variance, made apart from the
+    # values it scales, which a product by it then takes exactly.
+    factor = jnp.ldexp(jnp.ones_like(held), -(jnp.frexp(held)[1] // 2))
+    error = jnp.square(residual * expand(factor, residual)).sum(axis=tuple(range(1, residual.ndim)))
+    return error / (2 * (variance * factor * factor))
 
 
 def _exponent(x: jax.Array) -> jax.Array:
