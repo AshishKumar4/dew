@@ -68,7 +68,8 @@ def chunk_lengths(lengths, chunk_len: int, overlap: int) -> np.ndarray:
 
 def packed_window(chunks: Sequence[Batch], window: int) -> Batch:
     """`chunks`, each holding the same per-token fields, laid end to end in a
-    zero-padded window of `window` tokens.
+    zero-padded window of `window` tokens, each field keeping its trailing shape
+    (a token's row of an aligned auxiliary field), as grain's packer keeps it.
 
     Named after the first field (the ids), `<field>_segment_ids` says which
     chunk of the window each token came from, counted from 1, and 0 for the
@@ -78,8 +79,14 @@ def packed_window(chunks: Sequence[Batch], window: int) -> Batch:
     (`grain/_src/python/dataset/transformations/packing_packed_batch.py:116-117`);
     chunks are cut the same way in every field here, so one pair describes
     them all and nothing transfers a second copy to the device.
+
+    It is grain's assembly, held to it field for field (tests/test_grain_packing.py), and not grain's
+    own: on armada's CPUs grain's `PackedBatch` assembles a twelve-chunk window in 112 us and its
+    public packer in 3.6 ms where this takes 28 us, and an indexed read assembles a window a read
+    (row 1873).
     """
-    fields = {key: np.zeros(window, value.dtype) for key, value in chunks[0].items()}
+    fields = {key: np.zeros((window, *np.shape(value)[1:]), np.asarray(value).dtype)
+              for key, value in chunks[0].items()}
     segment_ids = np.zeros(window, np.int32)
     positions = np.zeros(window, np.int32)
     filled = 0
@@ -106,6 +113,10 @@ def first_fit(sizes: np.ndarray, window: int, bins: int,
     every chunk belongs to, without reading a token. That plan is what lets
     the packing run ahead of the shard, so a window holds the same chunks at
     any process count.
+
+    It is grain's placement, held to it window for window (tests/test_grain_packing.py), and not
+    grain's packer run over the lengths: over 200,000 chunks on armada's CPUs this plans in 0.15 s
+    and grain's packer, fed zero-strided stand-ins of each length, in 88 s, the same plan (row 1873).
 
     Returns the chunk indices grouped by window, in the order the packer
     added them, and where each window starts in that grouping. A window the

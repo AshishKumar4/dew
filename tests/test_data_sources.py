@@ -702,7 +702,8 @@ def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
     from dew.data.text import Tokenize
 
     root = Store(f"memory://text-{uuid4().hex}/source.txt")
-    original = b"first\r\nsecond\n\nlast without newline"
+    # Two 9-byte ranges cut inside "second", the last line ending the file without a terminator.
+    original = b"first\r\nsecond\n\nlast"
     root.write(original)
     files = Files(root.url, shard_bytes=9)
     if read == "indexed":

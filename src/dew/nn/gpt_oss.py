@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.ad_checkpoint import checkpoint_name
 
 from dew.mesh import LogicalAxes
 from dew.nn.activations import quick_gelu, swiglu_clamped
@@ -90,12 +91,15 @@ class GptOssExperts(nn.Module):
         gate_up, gate_bias, down, down_bias = parameters
         projected = jnp.asarray(expert_projection(
             tokens, gate_up, sizes, dtype, self.implementation, self.precision))
-        projected = projected + gather_expert_bias(gate_bias, expert_ids, dtype)
+        # The dense MLP's residual names, the interleaved gate and up one product as a packed MLP's
+        # (mlp.py), so one remat policy covers every MLP (mixer_base.RESIDUALS).
+        projected = checkpoint_name(checkpoint_name(
+            projected + gather_expert_bias(gate_bias, expert_ids, dtype), 'gate_proj'), 'up_proj')
         gate, up = swiglu_clamped(projected[..., ::2], projected[..., 1::2], 7.0)
         activated = (up + 1) * quick_gelu(gate)
         output = jnp.asarray(expert_projection(
             activated, down, sizes, dtype, self.implementation, self.precision))
-        return output + gather_expert_bias(down_bias, expert_ids, dtype)
+        return checkpoint_name(output + gather_expert_bias(down_bias, expert_ids, dtype), 'down_proj')
 
 
 @logical_axes({

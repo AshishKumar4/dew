@@ -15,6 +15,7 @@ transformers 5.16.1 ignores them.
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
@@ -80,7 +81,9 @@ def matches(model: CausalTransformer) -> bool:
                 return False
         elif name in ("mlp", "moe") and isinstance(mixer, MLPMixer) and mixer.activation == "relu2":
             continue
-        elif name != "full_attention" or mixer != AttentionMixer(nope=True):
+        elif name != "full_attention" or not isinstance(mixer, AttentionMixer) or dataclasses.replace(
+                mixer, bidirectional_blocks=False) != AttentionMixer(nope=True):
+            # A block-bidirectional override is the config's own (`modeling_overrides`).
             return False
     return True
 
@@ -146,7 +149,9 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     mlp = MLPMixer(intermediate_size=integer("intermediate_size", 21504),
                    activation=activation, use_bias=flag("mlp_bias", default=False))
     built = set(layers) | set(step)
-    kinds = {name: LayerKind(mixer=mixer) for name, mixer in (
+    # Records, as every family's kinds are, which a release's modeling overrides then read
+    # (`modeling_overrides`).
+    kinds = {name: native_fields(LayerKind)(mixer=mixer) for name, mixer in (
         ("linear_attention", mamba), ("full_attention", AttentionMixer(nope=True)), ("mlp", mlp))
         if name in built}
     if "moe" in built:
@@ -160,7 +165,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
             expert_features=integer("moe_intermediate_size", 7688),
             shared_features=integer("moe_shared_expert_intermediate_size", 7688) or mlp.intermediate_size,
             latent_features=None if latent is None else _records.integer(latent, "moe_latent_size"))
-        kinds["moe"] = LayerKind(mixer=MLPMixer(
+        kinds["moe"] = native_fields(LayerKind)(mixer=MLPMixer(
             intermediate_size=mixture.expert_features or mlp.intermediate_size,
             activation=activation, mixture=mixture))
     # Init, cache, unused attention knobs, and MoE-only fields change no dense eval forward.
@@ -174,16 +179,18 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
                  "routed_scaling_factor", "n_group", "topk_group", "norm_topk_prob"))
     heads = integer("num_attention_heads", 32)
     kv_heads = hf_config.get(field("num_key_value_heads"), 8)
-    return native_fields(CausalTransformer)(
+    config = native_fields(CausalTransformer)(
         vocab_size=integer("vocab_size", 131072), emb_features=integer("hidden_size", 4096),
         num_layers=len(layers), num_heads=heads,
         num_kv_heads=heads if kv_heads is None else _records.integer(kv_heads, "num_key_value_heads"),
         head_dim=integer("head_dim", 128), mlp_features=0, qk_norm=False, scale_after_cast=False,
         max_seq_len=integer("max_position_embeddings", 4096),
         norm_eps=_records.number(hf_config.get(field("layer_norm_epsilon"), 1e-5), "layer_norm_epsilon"),
-        tie_embeddings=flag("tie_word_embeddings", default=False), layer_types=layers, kinds=kinds,
+        tie_embeddings=flag("tie_word_embeddings", default=False), layer_types=layers,
         num_nextn_predict_layers=depths, mtp_layer_type=step[0] if step else None,
         mtp_feedforward_type=step[1] if len(step) == 2 else None)
+    config['kinds'] = kinds
+    return config
 
 
 def _prediction_step(hf_config: Mapping[str, object]) -> tuple[str, ...]:

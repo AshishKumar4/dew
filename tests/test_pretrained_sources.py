@@ -365,3 +365,55 @@ def test_a_tensor_two_shards_both_hold_is_refused_by_both_readers(tmp_path):
     for read in (lambda: read_weights(tmp_path), lambda: stored.specs("")):
         with pytest.raises(ValueError):
             read()
+
+
+_CONFIG_ONLY = """
+import sys
+import jax
+from dew.interop import Pretrained
+loaded = Pretrained.load(sys.argv[1], revision=sys.argv[2], weights=False, dtype="bfloat16")
+leaves = jax.tree.leaves(loaded.variables)
+assert leaves and all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in leaves)
+print(sum(leaf.size for leaf in leaves))
+"""
+
+
+@pytest.mark.network
+def test_a_hub_decoder_loaded_without_its_weights_downloads_none(tmp_path):
+    """`Pretrained.load(weights=False)` of a Hub decoder reads its config and its weights' safetensors
+    headers over HTTP, none of its weights downloaded, so a config-only check of a large base runs
+    on a small disk (ledger 1888): a fresh cache holds no weight file after it, and its variables are
+    the shapes of SmolLM2-135M's parameters."""
+    import subprocess
+    import sys
+
+    repo, revision = "HuggingFaceTB/SmolLM2-135M", "93efa2f097d58c2a74874c7e644dbc9b0cee75a2"
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "cache"), "PYTHONPATH": src,
+           "DEW_HUB_ANSWERS": str(tmp_path / "answers")}
+    done = subprocess.run([sys.executable, "-c", _CONFIG_ONLY, repo, revision], env=env, check=False,
+                          capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr[-3000:]
+    assert 130_000_000 < int(done.stdout.split()[-1]) < 140_000_000
+    assert not [path for path in (tmp_path / "cache").rglob("*") if path.suffix in (".safetensors", ".bin")]
+
+
+def test_a_runs_base_loads_without_its_weights_under_the_runs_source_options():
+    """A run's source options (`SourceOptions.keywords`) and `weights=False` load the base as the run
+    builds it, its variables the shapes and dtypes a load with its weights builds under the same
+    options: a wrapper's language model alone, its first prediction depth, its full attention reading
+    blocks (ledger 1888)."""
+    import jax
+
+    from dew.config import SourceOptions
+    from dew.interop import Pretrained
+
+    base = Path(__file__).resolve().parent / "fixtures" / "hf" / "qwen35-tiny-mm"
+    options = SourceOptions(text_only=True, prediction_depths=0,
+                            attention={"full_attention": "block_bidirectional"})
+    shapes = Pretrained.load(base, dtype="float32", weights=False, **options.keywords())
+    loaded = Pretrained.load(base, dtype="float32", **options.keywords())
+    assert shapes.model == loaded.model and shapes.config == loaded.config
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables) == jax.tree.map(
+        lambda leaf: (leaf.shape, leaf.dtype), loaded.variables)
+    assert shapes.model.kind_of("full_attention").mixer.bidirectional_blocks
