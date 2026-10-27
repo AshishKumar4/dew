@@ -763,7 +763,7 @@ def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
     assert_exits_cleanly(program)
 
 
-def test_a_process_that_ends_as_its_state_is_read_is_notrunning(monkeypatch):
+def test_a_process_that_ends_as_its_state_is_read_is_not_running(monkeypatch):
     """A loading worker that ends after its state file opens and before it is read: the kernel fails
     the read with ESRCH, which says the process has ended, as a missing file does."""
     child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
@@ -801,7 +801,7 @@ def _segments_marked(mark: bytes) -> set[str]:
 
 @pytest.mark.skipif(not (Path("/proc/self/stat").exists() and Path("/dev/shm").is_dir()),
                     reason="reads process states from /proc and shared memory from /dev/shm")
-def test_a_killed_program_leaves_no_loading_workerrunning():
+def test_a_killed_program_leaves_no_loading_worker_running():
     """A program killed mid-read, as a timeout or the kernel kills one, takes its loading workers
     with it, and the shared memory its batches were handed over in. Each worker read until its
     parent asked it to stop, so a killed parent left them reading into a queue no one empties,
@@ -837,7 +837,7 @@ def test_a_killed_program_leaves_no_loading_workerrunning():
         parent.send_signal(signal.SIGKILL)
         parent.wait(timeout=30)
         deadline = time.monotonic() + 60
-        while (any(map(_running, workers)) or _segments_marked(mark)) and time.monotonic() < deadline:
+        while (any(map(running, workers)) or _segments_marked(mark)) and time.monotonic() < deadline:
             time.sleep(0.5)
         assert [pid for pid in workers if running(pid)] == []
         assert _segments_marked(mark) == set()
