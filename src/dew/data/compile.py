@@ -518,6 +518,7 @@ def _prepared(
     objective: ObjectiveData | None = None,
     counts: Sequence[dict[str, CorpusCounts]] | None = None,
     automatic: str | None = None,
+    examples: int | None = None,
 ) -> tuple[Pipeline, ...]:
     """The one preparation compile, iterate, validation and publish lower from.
 
@@ -529,7 +530,9 @@ def _prepared(
     source-scoped steps run and materialize first, so run-scoped steps bind
     to measured facts; publication passes no counts and reads nothing before
     its fill. The caller materializes what remains. A training read caches
-    each corpus's leading deterministic steps under `automatic` (`_automatic`).
+    each corpus's leading deterministic steps under `automatic` (`_automatic`). A training read bounded
+    to `examples` source examples takes its bound as the objective's steps are placed, before any step
+    runs, so no eager pass expands an example the bound counts (`_bounded`).
     """
     if read not in ("memory", "indexed", "streamed"):
         raise ValueError(f"unknown read mode {read!r}")
@@ -548,6 +551,10 @@ def _prepared(
             _objective_branch(branch, objective, train=not scored, read=read)
             for branch, scored in zip(branches, held, strict=True)
         )
+    if examples is not None and training:
+        expansions = [] if objective is None else [step for step in objective.train
+                                                   if isinstance(step, Expansion)]
+        branches = (_bounded(branches[0], examples, expansions), *branches[1:])
     if any(isinstance(stage, Configured) for branch in branches for stage in _steps(branch)):
         def stored(branch: Pipeline) -> bool:
             return any(len(source.records(read)) for _, source in _leaves(branch))
@@ -687,13 +694,10 @@ def _staged(
         objective=objective,
         counts=(counts,) if validation is None else (counts, validation_counts),
         automatic=automatic_root(loading) if read != "streamed" else None,
+        examples=examples if written is None else None,
     )
     if not any(isinstance(stage, BatchStage) for stage in branches[0].stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
-    if examples is not None and written is None:
-        expansions = [] if objective is None else [step for step in objective.train
-                                                   if isinstance(step, Expansion)]
-        branches = (_bounded(branches[0], examples, expansions), *branches[1:])
     original = branches[0]
     train, *scored = _made(branches, read, (counts, validation_counts)[: len(branches)], training=True)
     validation = scored[0] if scored else None

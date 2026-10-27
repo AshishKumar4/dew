@@ -281,7 +281,8 @@ class Fit(pygrain.MapTransform):
                 },
             }
             if self.layout.joint
-            else {"decision_rows": fitted}
+            # The example is truncated where any of its rows is: the counts go by source examples.
+            else {"decision_rows": fitted, "_dew_truncated": any(row.truncated for row in fitted)}
         )
 
     def _rows(self, example: Example, asked: Mapping[str, Question]) -> tuple[FittedRow, ...] | Rejected:
@@ -315,7 +316,7 @@ class Fit(pygrain.MapTransform):
                 continue
             rows.extend(fitted)
         if rows:
-            return {"decision_rows": tuple(rows)}
+            return {"decision_rows": tuple(rows), "_dew_truncated": any(row.truncated for row in rows)}
         return Rejected("unfit" if "unfit" in reasons else "unlabelled")
 
     def _longest(self, row: FittedRow) -> int:

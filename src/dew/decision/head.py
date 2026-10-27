@@ -9,6 +9,7 @@ that reads the backbone's output table says so with `reads_table`, and is
 given it as `[V, D]` rows.
 """
 
+import dataclasses
 import functools
 import math
 from collections.abc import Mapping, Sequence
@@ -535,7 +536,9 @@ class LabelReadout(Head):
         if labels.names is None and not self.count:
             raise ValueError("a letter readout drawn with no label ids reads labels that name their count, "
                              "or a count of labels its tokenizer names")
-        named = labels.spelled(tokenizer, self.count)
+        # A count reads that many labels: the layout's own first names, or its tokenizer's (`spelled`).
+        named = (labels if not self.count else labels.spelled(tokenizer, self.count) if labels.names is None
+                 else dataclasses.replace(labels, names=labels.names_for(self.count)))
         return self.clone(label_ids=named.ids(tokenizer, len(named.names or ()))), named
 
     @nn.nowrap

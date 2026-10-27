@@ -193,11 +193,13 @@ def test_an_examples_budget_over_a_mixture_counts_each_corpus_examples_whatever_
     assert read[3] + read[2] // 3 == EXAMPLES
 
 
-def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_rows_each_makes():
+@pytest.mark.parametrize("shuffled", [True, False], ids=["shuffled", "in-order"])
+def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_rows_each_makes(shuffled):
     """A decision objective lays an example out as a row a question: an examples budget over examples
     of two questions each reads exactly that many source examples, two rows each, its windows holding
     twice as many rows as the budget's examples, in the memory read decision rows take, whose objective
-    steps start eagerly over the store."""
+    steps start eagerly over the store: shuffled, and in order, where the bound stands before every
+    objective step a memory read would run over the store first."""
     from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
 
     from dew.decision import DecisionObjective, Example, Noul, StateFirstLayout, decisions
@@ -208,8 +210,10 @@ def test_a_decision_runs_examples_budget_counts_its_source_examples_whatever_row
     asked = {"first": Noul("Is it on?"), "second": Noul("Is it off?")}
     answers = {"first": "true", "second": "false"}
     records = [{"example": Example(f"state {index}", asked, answers)} for index in range(RECORDS)]
-    loader = compile(Pipeline(Memory(records)).pipe(decisions).shuffle(3).batch(BATCH), read="memory",
-                     objective=objective.data(), examples=EXAMPLES)
+    chain = Pipeline(Memory(records)).pipe(decisions)
+    # In order, no stage stands between the chain's records and the objective's eager steps.
+    chain = chain.shuffle(3) if shuffled else chain
+    loader = compile(chain.batch(BATCH), read="memory", objective=objective.data(), examples=EXAMPLES)
     rows = 0
     for batch in itertools.islice(loader.train(DataPartition()), loader.example_steps(EXAMPLES)):
         # A short last batch is filled with windows it marks as no rows of its own (`VALID_ROWS`).
