@@ -106,8 +106,11 @@ def test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid():
     assert drawn[0] == drawn[1] == drawn[2]
 
 
-CLAUSES, HYPOTHESES, INTENTS = 40, 6, 24
-"""The ragged rows' real options: one question of `CLAUSES`, `HYPOTHESES` of three and one of `INTENTS`."""
+CLAUSES, HYPOTHESES, INTENTS = 24, 6, 12
+"""The ragged rows' real options: one question of `CLAUSES`, `HYPOTHESES` of three and one of `INTENTS`.
+At 40, 6 and 24 a window was 1504 tokens and 13 questions of 40 slots deep, and the site's 512 draws took
+201-266 s on armada (ledger 1851); here 1240 tokens and 10 of 24, a draw and its two arms 0.16 s against
+0.24."""
 
 
 def ragged() -> list[Example]:
@@ -123,11 +126,11 @@ def ragged() -> list[Example]:
             Example("book a flight", {"intent": intents}, {"intent": "i3"})]
 
 
-OPTION_SEEDS = 512
-"""The compacted-options site's declared draws, sized by `seeds_for` paired (both arms read the same head,
-states and cotangent, so their upstream rounding is shared): the head's scalar parameters, the prior's
-logit scale among them, take their gradient's error from one sum over every option, whose ratio to the
-reference's varies widely from draw to draw."""
+OPTION_SEEDS = 256
+"""The compacted-options site's declared draws, sized by `seeds_for` paired on armada at 6a398cc82 (both
+arms read the same head, states and cotangent, so their upstream rounding is shared): the head's scalar
+parameters, the prior's logit scale among them, take their gradient's error from one sum over every
+option, whose ratio to the reference's varies widely from draw to draw."""
 
 ALGEBRAIC_ZEROS = ("to_k",)
 """The head's modules whose bias gradient is zero by algebra: a key's bias shifts every key's logit of a
@@ -206,14 +209,14 @@ def zeroed(tree):
 
 
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
-    """Rows of 40, 6 x 3 and 24 real options packed into windows of a grid as many questions deep as a
-    window holds, which the packing compacts into the slots its bounds allow. The compaction is the
-    joint head's alone (the backbone reads the rows' tokens, never their option slots), so the head is
-    what check 1 holds: over draws of the backbone's states and of a cotangent on each real option, its
-    every real option's logit and the gradients of its parameters, of the states and of the vocabulary
-    rows it reads are on par with the grid's from float64, the compaction only reordering the sums over
-    the grid's option slots. The backbone's own gradient is its backward of those states' gradient, one
-    program on both. The loss reads only the real options."""
+    """Rows of `CLAUSES`, `HYPOTHESES` x 3 and `INTENTS` real options packed into windows of a grid as
+    many questions deep as a window holds, which the packing compacts into the slots its bounds allow.
+    The compaction is the joint head's alone (the backbone reads the rows' tokens, never their option
+    slots), so the head is what check 1 holds: over draws of the backbone's states and of a cotangent
+    on each real option, its every real option's logit and the gradients of its parameters, of the
+    states and of the vocabulary rows it reads are on par with the grid's from float64, the compaction
+    only reordering the sums over the grid's option slots. The backbone's own gradient is its backward
+    of those states' gradient, one program on both. The loss reads only the real options."""
     examples = ragged()
     objective = ragged_objective(examples)
     data = decision_rows(examples, len(examples), examples, objective=objective.data())

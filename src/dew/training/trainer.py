@@ -665,11 +665,13 @@ class Trainer(Generic[Loss, Effects]):
         """The rung a checkpoint records: the run's own, which every newly met
         shape starts from (`_rung`'s fields as the first compile found them),
         and under `shapes` the rung each shape compiled at, by its layout
-        (`batch_layout`). The split is the state's (`window_size`), and its
-        link figures by placement (`link_figures`), a resume's own there."""
+        (`batch_layout`). The split is the state's (`window_size`), its fields in host memory the
+        run's, every shape's (`placed_as`), and its link figures by placement (`link_figures`), a
+        resume's own there."""
         base = self._rung() if self._base_rung is None else self._base_rung[3]
         links = link_figures(self._bandwidths)
-        return {**base, 'shapes': dict(self._shape_rungs), **({'links': links} if links else {})}
+        return {**base, 'host': list(self.layout.host), 'shapes': dict(self._shape_rungs),
+                **({'links': links} if links else {})}
 
     def _resume_rung(self, rung: JSON) -> None:
         """Take a checkpoint's rung (`_checkpoint_rung`): the objective climbs

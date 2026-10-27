@@ -229,7 +229,8 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     test_fla_kda)."""
     objective = objective_for(arm)
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
-                                          objective.model.head.clone(dtype=jnp.float64)), PACKING_SEEDS[arm])
+                                          objective.model.head.clone(dtype=jnp.float64)), PACKING_SEEDS[arm],
+                              PACKING_WINDOWS.get(arm, 2))
 
 
 def test_a_labelled_readout_reads_each_packed_row_at_its_own_answer_cue():
@@ -303,6 +304,12 @@ truth is zero by symmetry, which both arms err at by 0 to 3 fp32 ulps: the marke
 scorer_out bias, shared by a question's options, and the joint arm's attention key biases (ledger
 1548). Twice the rows a draw took the same counts on an A100 (node receipts SF-packing-scale2-sizing),
 each draw twice the work."""
+
+
+PACKING_WINDOWS = {"marker": 1}
+"""The packed windows a draw holds where an arm's site takes fewer than two: the marker arm's one window
+packs several rows, and its draw at two windows took 0.50 s on armada against 0.31 at one, which
+brought its 256 draws past the suite's 240 s a test (ledger 1851)."""
 
 
 def assert_rows_decided_alone(objective, wide_modules, seeds: int, count: int = 2) -> None:
