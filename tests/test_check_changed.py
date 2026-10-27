@@ -13,7 +13,7 @@ from tool_support import git
 
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 GATE = ("check.sh", "check_gates", "lint_inputs.sh", "base_history.sh", "lint_slop.py", "lint_scopes.py",
-        "lint_tolerances.py", "duplicates.py", "forked.py")
+        "lint_tolerances.py", "lint_promotions.py", "duplicates.py", "forked.py")
 # Twenty lines beside the comparison, so a copy with its comparison gone is still the same file to Git.
 CLOSE = ("import numpy as np\n\n" + "".join(f"WIDTH_{index} = {index}\n" for index in range(20))
          + "\n\ndef test_close():\n    np.testing.assert_allclose(np.ones(2), np.ones(2), rtol=1e-6)\n")
