@@ -953,3 +953,22 @@ def test_pndms_runge_kutta_weighs_a_low_precision_stage_in_fp32_as_diffusers_ste
 
     expected = np.asarray(transfer(x, jnp.asarray(weighed)))
     np.testing.assert_array_equal(np.asarray(stepped).view(np.uint32), expected.view(np.uint32))
+
+
+class ZeroEndpoint(nn.Module):
+    """A model whose clean estimate is zero everywhere: x walks along its noise level alone."""
+
+    @nn.compact
+    def __call__(self, x, temb):
+        return jnp.zeros_like(x)
+
+
+def test_lms_walks_a_variance_exploding_grid_near_float32s_largest():
+    """LMS(order=2) on VE sigmas 2**70, 2**69, 2**68 toward a zero clean estimate: dx/dsigma = x /
+    sigma, so x walks 1 -> 0.5 -> 0.25, its Lagrange basis integrated on the step's own scale where
+    the absolute sigma powers would overflow on its second step (ledger 1874)."""
+    process = Process(KarrasVENoiseScheduler(sigma_min=0, sigma_max=2.0 ** 70, rho=1),
+                      DirectPredictionTransform())
+    latents = np.asarray(walk(LMS(2), process, ZeroEndpoint(), jnp.ones((1, 3), jnp.float32),
+                              [1.0, 0.5, 0.25]))
+    np.testing.assert_allclose(latents, [np.full((1, 3), 0.5), np.full((1, 3), 0.25)], rtol=1e-6)

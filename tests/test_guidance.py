@@ -207,3 +207,16 @@ def test_cfg_plus_plus_takes_the_papers_ddim_update(interval):
         return (np.asarray(jax.random.normal(jax.random.PRNGKey(seed), (rows, 4, 4, 3))),)
 
     assert_as_exact(walked, walk, noise, f"cfg++ {interval}", seeds=CFG_PLUS_PLUS_SEEDS)
+
+
+def test_a_unit_scale_guides_to_the_conditional_prediction_exactly():
+    """At a unit scale, a step outside its guidance interval, `guide` returns the conditional prediction
+    as the sources return it unguided, where the affine form would round it through the difference: a
+    conditional 1 beside an unconditional 2**30 gives 1, not 0 (ledger 1874). A row guided at another
+    scale keeps the affine form."""
+    from dew.sampling.guidance import guide
+
+    conditional = jnp.asarray([[1.0], [1.0]], jnp.float32)
+    unconditional = jnp.asarray([[2.0 ** 30], [3.0]], jnp.float32)
+    guided = np.asarray(guide(conditional, unconditional, jnp.asarray([1.0, 2.0], jnp.float32)))
+    np.testing.assert_array_equal(guided, [[1.0], [3.0 + 2.0 * (1.0 - 3.0)]])

@@ -1264,3 +1264,16 @@ def test_a_transitions_kl_and_its_derivatives_hold_at_each_reviewed_input(case):
                            _kl_truth(*inputs), _kl_bounds(*inputs), case)
 
 
+
+
+def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
+    """A residual of 2**64 under a variance of 2**126: its square passes float32's largest, its square
+    over the variance is 4, and the density is finite as the reference's is, the half-Mahalanobis term
+    taken range-safe as the KL takes it (ledger 1874)."""
+    from dew.sampling.flow import GaussianTransition
+
+    transition = GaussianTransition(jnp.zeros((1, 1), jnp.float32), jnp.asarray([2.0 ** 126], jnp.float32))
+    density = np.asarray(transition.log_prob(jnp.full((1, 1), 2.0 ** 64, jnp.float32)))
+    truth = -(2 + 0.5 * (math.log(2 * math.pi) + 126 * math.log(2)))
+    assert np.isfinite(density).all()
+    np.testing.assert_allclose(density, [truth], rtol=4 * np.finfo(np.float32).eps)

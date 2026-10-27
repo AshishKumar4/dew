@@ -469,3 +469,20 @@ def test_a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache(
     assert taken and set(taken) == {("triton", "triton")}
     assert_as_exact(paged, decoded(KVCache(), "bfloat16"), draw, "softcapped paged decode",
                     seeds=SOFTCAP_PAGED_SEEDS, truth_fn=decoded(KVCache(), "float64", "reference"))
+
+
+@pytest.mark.parametrize("quantized", ["float8_e4m3fn", "int8"])
+def test_a_vector_below_the_formats_scale_quantizes_finitely(quantized):
+    """A vector whose absmax over the format's largest is no normal float32 (2**-149 alone, or 2**-130
+    beside zeros) keeps scale one and dequantizes to the format's rounding of its values, zeros, never
+    a nonfinite code (ledger 1874); a vector at a normal scale keeps its own."""
+    from dew.nn.kv_cache import dequantize
+
+    values = jnp.asarray([[2.0 ** -149, 0.0, -(2.0 ** -149), 0.0], [2.0 ** -130, 0.0, 0.0, 0.0],
+                          [1.0, -0.5, 0.25, 0.0]], jnp.float32)
+    stored, scale = quantize(values, quantized)
+    restored = np.asarray(dequantize(stored, scale, jnp.float32))
+    assert np.isfinite(np.asarray(stored, np.float32)).all() and np.isfinite(restored).all()
+    np.testing.assert_array_equal(np.asarray(scale)[:2], [1.0, 1.0])
+    np.testing.assert_array_equal(restored[:2], 0.0)
+    assert np.asarray(scale)[2] != 1.0
