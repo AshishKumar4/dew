@@ -123,12 +123,12 @@ class ArrayRecords:
 
     def held(self, committed: Mapping[str, object]) -> bool:
         """Check the bytes a reader of one object reads against the size and digest `committed` states
-        (`matching`), refusing other bytes (OSError): the local file, or the mirror's copy its pin
-        holds, which no writer replaces while it is pinned. False, and nothing read, where the reader
-        reads the object through its service (GCS), whose bytes it cannot hold to one check."""
+        (`matching`), before the reader opens, refusing other bytes or none (OSError): the local file,
+        or the mirror's copy its pin holds, which no writer replaces while it is pinned. False, and
+        nothing read, where the reader reads the object through its service (GCS), whose bytes it
+        cannot hold to one check."""
         (url,) = self.urls
-        _ = self.reader  # Its opening records what it reads (`_snapshots`).
-        (snapshot,) = self._snapshots
+        ((_, snapshot),) = self._sources
         if snapshot is None:
             return False
         if isinstance(snapshot, str):
@@ -139,18 +139,17 @@ class ArrayRecords:
         return True
 
     @cached_property
-    def reader(self):
-        paths = []
-        # What each object's reader reads, for `held`: a local file's path, a mirror's pin, or None.
-        self._snapshots: list[str | io.BufferedReader | None] = []
+    def _sources(self) -> list[tuple[str, str | io.BufferedReader | None]]:
+        """Each object's path as its reader reads it, and what that path holds for `held`: a local
+        file's own path, the mirror's pin on its copy, or None for an object read through its
+        service (GCS)."""
+        sources: list[tuple[str, str | io.BufferedReader | None]] = []
         for url in self.urls:
             fs, path = Store(url, self.storage_options).resolve()
             if local(fs):
-                paths.append(path)
-                self._snapshots.append(path)
+                sources.append((path, path))
             elif on_gcs(fs):
-                paths.append("gs://" + path)
-                self._snapshots.append(None)
+                sources.append(("gs://" + path, None))
             else:
                 fs, path = Store(url, self.storage_options).cached().resolve()
                 pin = fs.open(path, "rb")
@@ -161,9 +160,12 @@ class ArrayRecords:
                         "(Loading's default read threads)"
                     )
                 self._pins.append(pin)
-                paths.append(pin.name)
-                self._snapshots.append(pin)
-        return grain.ArrayRecordDataSource(paths)
+                sources.append((pin.name, pin))
+        return sources
+
+    @cached_property
+    def reader(self):
+        return grain.ArrayRecordDataSource([path for path, _ in self._sources])
 
     def __len__(self) -> int:
         if not self.urls:
@@ -200,6 +202,7 @@ class ArrayRecords:
     def close(self) -> None:
         self._shards.close()
         self.__dict__.pop("reader", None)
+        self.__dict__.pop("_sources", None)
         for pin in self._pins:
             pin.close()
         self._pins.clear()
