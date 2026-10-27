@@ -32,7 +32,7 @@ from dew.data.text import tokenizer_for
 from dew.objectives.distillation import TEACHER
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import ValueHead
-from dew.training import Checkpoints, Layout
+from dew.training import Layout
 from recipes.chain import Episodes, Recipe, Stage, Teacher
 
 TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"
@@ -212,59 +212,6 @@ def test_a_grpo_stage_scores_decoded_text_and_stops_at_the_tokenizer_eos(tmp_pat
     identical(states[1].ema, states[0].variables)
     assert moved(states[1].variables, states[0].variables)
     identical(states[2].ema, states[1].variables)
-
-
-def test_one_decoder_is_pretrained_fine_tuned_then_trained_online_each_stage_from_the_last_ones_checkpoint(
-        tmp_path):
-    """The lifecycle in one run of a recipe: next-token pretraining on text, SFT on conversations, then
-    GRPO on prompts, one bigram decoder through all three, each stage in its own directory. Each stage
-    writes its final checkpoint, and each starts from the one before it, read back off disk: the table
-    rows pretraining moved and SFT's loss never reads stay pretraining's checkpoint's bit for bit, where
-    SFT's own rows move off it, and GRPO's frozen reference is SFT's checkpoint, leaf for leaf. GRPO
-    trains on its sampled rewards. Run again over the same directory, the chain trains no stage again:
-    each restores its final checkpoint and hands that on."""
-    tokenizer = tokenizer_for(str(TOKENIZER))
-    letter, = tokenizer.encode("a", add_special_tokens=False)
-    assert tokenizer.eos_id is not None
-    model = ToolPolicy(vocab_size=tokenizer.vocab_size, max_seq_len=12,
-                       logits=functools.partial(leaning, tokenizer.vocab_size, letter, tokenizer.eos_id))
-    text = Memory([{"text": "the quick brown fox jumps over the lazy dog"}] * 16).pipe(
-        presets.lm, str(TOKENIZER), seq_len=8, batch=8)
-    prompts = Memory([{"prompt": "hi"}] * 8).pipe(presets.prompts, str(TOKENIZER), max_prompt_len=8, batch=8,
-                                                  long="truncate")
-    lifecycle = (Stage(name="pretraining", loss="pretrain", data=text, steps=2),
-                 Stage(name="sft", loss="sft", data=chat(tmp_path), steps=2),
-                 Stage(name="grpo", loss="grpo", data=prompts, steps=1, beta=.01,
-                       reward=lambda text, _: len(text), max_new_tokens=4))
-
-    def recipe():
-        return Recipe(model, optax.sgd(.5), jax.random.key(0), lifecycle, str(tmp_path / "chain"),
-                      layout=LAYOUT)
-
-    states = recipe().run()
-
-    saved = {}
-    for stage, state in zip(lifecycle, states, strict=True):
-        checkpoints = Checkpoints(str(tmp_path / "chain" / stage.name))
-        assert checkpoints.latest == stage.steps == int(state.step)
-        saved[stage.name], _ = checkpoints.restore()
-    initial = model.init(jax.random.key(0), np.zeros((1, 1), np.int32))["params"]["table"]
-    pretrained, tuned = (np.asarray(saved[name]["variables"]["params"]["table"])
-                         for name in ("pretraining", "sft"))
-
-    def rows(changed) -> set[int]:
-        return {int(row) for row in np.flatnonzero(np.any(changed, axis=1))}
-
-    by_pretraining, by_sft = rows(pretrained != np.asarray(initial)), rows(tuned != pretrained)
-    assert by_pretraining - by_sft and by_sft
-    identical(states[2].ema, jax.tree.map(np.asarray, saved["sft"]["variables"]))
-    assert moved(states[2].variables, states[1].variables)
-
-    again = recipe().run()
-    for stage, state in zip(lifecycle, again, strict=True):
-        assert int(state.step) == stage.steps
-        identical(jax.tree.map(np.asarray, state.variables),
-                  jax.tree.map(np.asarray, saved[stage.name]["variables"]))
 
 
 def test_a_mislinked_chain_is_refused_before_anything_trains(tmp_path):

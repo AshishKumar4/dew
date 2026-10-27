@@ -70,8 +70,7 @@ class ToolPolicy(nn.Module):
     def setup(self):
         self.table = self.param("table", lambda key: jnp.asarray(self.logits()))
 
-    def hidden_states(self, tokens, train=False, **packing):
-        """Each id's one-hot row, whatever packing a scorer passes: a bigram mixes no positions."""
+    def hidden_states(self, tokens, train=False, attention_mask=None, positions=None, segment_ids=None):
         return jax.nn.one_hot(tokens, self.vocab_size)
 
     def output_table(self):

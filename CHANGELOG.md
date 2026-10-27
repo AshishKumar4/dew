@@ -5,9 +5,6 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
-- FlaxDiff's exponential beta table and its continuous and tangent-grid cosine schedules:
-  `ExpNoiseScheduler`, `CosineContinuousNoiseScheduler` and `CosineGeneralNoiseScheduler`, each held to
-  FlaxDiff's own source over drawn steps.
 - `dew.io.promote` publishes a run only where it ranks among its sweep's or project's best by a summary
   metric, aliased "best" in the registry where it ranks first; `trainer.promote` names the rule for a
   configured run. `dew.pipeline("wandb:...")` loads a published run from a W&B run or the registry.

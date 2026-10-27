@@ -24,8 +24,8 @@ Each row names what FlaxDiff provided, Dew's version of it, and the test that ho
 |---|---|---|
 | Linear, cosine, square-root, Karras VE and EDM schedules | `dew.diffusion.schedules`, and the `EDM`, `Karras`, `Cosine` and `Flow` presets in place of `get_diffusion_preset` | `tests/test_schedulers.py` (published beta tables, sigma grids, inversions) |
 | Flow matching, logit-normal draws, resolution shift | `FlowMatchingScheduler`, `Flow`, `ResolutionShift` | `tests/test_flow_matching.py` (SD3 and Flux losses and gradients) |
-| The exponential schedule | `ExpNoiseScheduler` | `tests/test_schedulers.py` (FlaxDiff's own tables, rates and P2 weights, a nondefault `beta_end` among them) |
-| The continuous VP cosine and the tangent-grid cosine schedules | `CosineContinuousNoiseScheduler`, `CosineGeneralNoiseScheduler` | `tests/test_schedulers.py` (FlaxDiff's own rates, sigmas, weights and model inputs, a nondefault `kappa` among them) |
+| The exponential schedule | `published_betas(schedule="exp")` | The formula only; no test compares it with FlaxDiff's yet |
+| The continuous VP cosine and the tangent-grid cosine schedules | Not in Dew yet | |
 | Epsilon, x0, v, velocity and EDM-preconditioned targets | `dew.diffusion.transforms` | `tests/test_predictors.py` |
 | DDPM, DDIM, Euler, Euler ancestral, Heun, RK4 and multistep DPM samplers | `dew.sampling.solvers` | `tests/test_samplers.py`; RK4 and multistep DPM against FlaxDiff's own latents and gradients |
 | Classifier-free guidance, also over an interval | `dew.sampling.guidance.CFG` | `tests/test_guidance.py` |
