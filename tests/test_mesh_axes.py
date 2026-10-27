@@ -25,11 +25,11 @@ from token_support import repeated_token_batch, write_token_corpus
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.distributed.batches import shard_batch
-from dew.mesh import mesh_axes
+from dew.mesh import TENSOR_AXIS, mesh_axes
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
-from dew.nn.sharding import declarations, declared_axes
+from dew.nn.sharding import Link, declarations, declared_axes
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -105,9 +105,10 @@ def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
                "qk_rope_head_dim": 8, "v_head_dim": 16}})
 
     def flops(mesh: MeshSpec, devices) -> float:
+        # A CPU's peak is not in the table, so the run states a link fast enough to spread over.
         trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
                           mesh=mesh, layout=Layout(min_shard=TINY_SHARD, tolerance=1.0),
-                          checkpoints=None, tracker=None)
+                          checkpoints=None, tracker=None, links={TENSOR_AXIS: Link(1e15, 1e12)})
         trainer.device_mesh = mesh.build(devices)
         state, _, _ = trainer.place()
         trainer.compile(state, shard_batch(trainer.device_mesh, next(token_batches())))
@@ -332,7 +333,7 @@ def test_a_meshs_explicit_axes_split_rows_and_hold_no_parameter(tmp_path):
 
 
 @pytest.mark.parametrize(("length", "tensor_shards", "heads", "slow", "fast"), [
-    (1, 1, 4, 60e9, None),
+    (1, 1, 4, 60e9, 1e15),
     (13, 1, 4, 60e9, 80e9),
     (13, 2, 4, 75e9, 90e9),
     (13, 2, 1, 90e9, 100e9),
@@ -346,11 +347,11 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
     not twelve, because three padded positions add work. The links straddle
     that crossover. Splitting four heads over tensor2 raises it to 78.7 GB/s;
     one head cannot split, and its smaller projection needs 92.6 GB/s.
-    A one-position context saves no work even on a CPU link.
+    A one-position context saves no work even on a link fast enough for any split.
     """
     from dew.mesh import SEQUENCE_AXIS
     from dew.nn.attention import NormalAttention
-    from dew.nn.sharding import Link, measured_links
+    from dew.nn.sharding import measured_links
     from dew.telemetry.instrumentation import compiled_flops
 
     model = NormalAttention(64, heads=heads, dim_head=16, attention_impl="reference")
@@ -376,10 +377,9 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
         moved = sharded.collective_bytes(executable.as_text(), COLLECTIVES)
         return result, flops * sequence * tensor, moved
 
-    expected, _, _ = compiled(1, 1, Link(None, None, "cpu"))
-    kept, kept_flops, kept_bytes = compiled(4, tensor_shards, Link(slow, 1e12, "gpu"))
-    link = Link(fast, 1e12, "gpu") if fast is not None else Link(None, None, "cpu")
-    split, split_flops, split_bytes = compiled(4, tensor_shards, link)
+    expected, _, _ = compiled(1, 1, Link(None, None))
+    kept, kept_flops, kept_bytes = compiled(4, tensor_shards, Link(slow, 1e12))
+    split, split_flops, split_bytes = compiled(4, tensor_shards, Link(fast, 1e12))
     for actual in (kept, split):
         for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
             np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
