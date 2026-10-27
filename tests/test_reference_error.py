@@ -999,6 +999,41 @@ def test_a_recording_with_pilot_shards_sizes_paired_on_them_as_the_live_draws_do
                           "site", seeds, inputs_of=draw, truth_fn=product)[0](SIZING_FROM)
 
 
+def test_a_recording_read_for_some_of_its_leaves_judges_them_alone():
+    """A summarized recording read for some of its leaves (`indexed_recording(..., leaves=)`) holds those
+    leaves' evidence and sketches, its pilots' too, and every entry the recording shares: its reference
+    gives those leaves alone, at a verdict seed and a pilot's, and check 1 judges them over it; a leaf the
+    recording lacks is refused."""
+    from reference_error import SIZING_FROM
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    @jax.jit
+    def both(x, w):
+        y = jnp.dot(x, w, precision="highest")
+        return {"y": y, "z": 2 * y}
+
+    def one(inputs):
+        return {"y": both(inputs["x"], inputs["w"])["y"]}
+
+    draw, evaluate = _tiny_row_recording(both)
+    with jax.enable_x64(new_val=True):
+        whole = recorder.record_case("site", draw, evaluate, lambda inputs: both(inputs["x"], inputs["w"]),
+                                     summary=True)
+        recorded = recorder.with_pilots("site", whole, [recorder.record_shard(
+            "site", draw, evaluate, range(SIZING_FROM, SIZING_FROM + 16))])
+        seeds = int(recorded["site.seeds"])
+        drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=one,
+                                                    leaves=("y",))
+        for seed in (0, SIZING_FROM):
+            assert set(reference(*drawn(seed))) == {"y"}
+        with pytest.raises(ValueError):
+            indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=one, leaves=("y", "w"))
+    assert_as_exact(lambda index, inputs: one(inputs), reference, drawn, "leaves", seeds=seeds,
+                    truth_fn=truth)
+
+
 def test_a_recorded_truth_over_windows_counts_one_window_and_checks_every_one():
     """A summarized recording of windows read back through `indexed_recording` with a truth over windows
     (`over_windows`): its rounding count traces one window, as one draw's program, so the truth is read
