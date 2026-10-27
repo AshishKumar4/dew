@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import math
 import shutil
 import threading
 import time
@@ -583,6 +584,14 @@ def mode_packed_fit(args) -> dict:
     }
 
 
+def holds_whole(leaf) -> bool:
+    """Whether this process's devices hold every element of `leaf` between them: the slices they hold,
+    each counted once, cover it."""
+    held = {tuple(index.indices(size)[:2] for index, size in zip(indices, leaf.shape, strict=True))
+            for indices in leaf.sharding.addressable_devices_indices_map(leaf.shape).values()}
+    return sum(math.prod(stop - start for start, stop in bounds) for bounds in held) == leaf.size
+
+
 def restored_state(trainer):
     """The step and this process's data position the trainer would resume
     from, restored the way `fit` restores: onto the mesh, which is the one
@@ -731,6 +740,8 @@ def mode_fit(args) -> dict:
         # A leaf whose shards are this process's and another's, not one replicated over both.
         "split_between_processes": any(not leaf.is_fully_addressable and not leaf.is_fully_replicated
                                        for leaf in jax.tree.leaves(state.variables)),
+        # Whether this process's devices hold every slice of every variable between them.
+        "holds_whole_state": all(holds_whole(leaf) for leaf in jax.tree.leaves(state.variables)),
         "restored_step": restored_step,
         "restored_dataset_state": restored,
         "restored_from": None if restored_step is None else checkpoints.source(restored_step),

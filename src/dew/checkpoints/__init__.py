@@ -1667,6 +1667,10 @@ class Checkpoints:
             state_tree['position'] = jax.tree.map(
                 lambda leaf: jax.device_put(leaf, state.step.sharding), state_tree['position'])
         local = self._open_local()
+        # A local step at or past this one is the run's that a resume from an earlier step cut short,
+        # left on this process where another held none, and the resumed run writes it anew.
+        for stale in [held for held in local.all_steps() if held >= step]:
+            local.delete(stale)
         self._metadata = None
         with region("checkpoint.submit_local"):
             local.save(
