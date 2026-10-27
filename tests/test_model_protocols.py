@@ -511,12 +511,22 @@ def _continued(model):
 
 
 def _scored(model, variables, *, wide: bool = False, **call):
-    """A drawn prompt's logits and each forced step's through the cache (`_greedy`), a host loop of the
-    model's own calls the gate runs as given: with `wide`, under x64, the float64 twin's truth."""
+    """A drawn prompt's logits and each forced step's through the cache, as `_greedy` takes them: a host
+    loop over the model's own call, compiled once as a server compiles its prefill and its step, which the
+    gate runs as given; with `wide`, under x64, the float64 twin's truth."""
+    allocated = jax.jit(lambda variables: model.apply(variables, ROWS, method="init_cache",
+                                                      mutable=["cache"])[1]["cache"])
+    applied = jax.jit(lambda variables, cache, tokens: model.apply(
+        {**variables, "cache": cache}, tokens, mutable=["cache"], **call))
+
     @as_given
     def run(tokens, forced):
         with jax.enable_x64(new_val=True) if wide else contextlib.nullcontext():
-            scores = _greedy(model, variables, jnp.asarray(tokens), forced=jnp.asarray(forced), **call)[2]
+            logits, held = applied(variables, allocated(variables), jnp.asarray(tokens))
+            scores = [logits]
+            for step in range(STEPS):
+                logits, held = applied(variables, held["cache"], jnp.asarray(forced)[:, step, None])
+                scores.append(logits)
             return [np.asarray(score, np.float64 if wide else score.dtype) for score in scores]
     return run
 
