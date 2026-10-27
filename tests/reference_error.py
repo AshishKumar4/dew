@@ -1405,7 +1405,11 @@ def recorded_pilots(reference_fn, draw, count: int):
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
               truth_fn=None, dew_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
-    interval is no wider than PARITY in every leaf. Of the reference compared with itself, its errors on
+    interval is no wider than PARITY in every leaf, on the count's own draws and again on as many more
+    (`_confirmed`): a doubling stops at the first count whose draws resolve, and where a leaf's errors
+    are heavy-tailed across draws those draws may hold none of the tail the verdict's will (ledger 1824:
+    a site sized at 16 left Inconclusive at 160), so a second block of the count's size must resolve
+    too. Of the reference compared with itself, its errors on
     two disjoint seed sets resampled apart (`_interval`'s control), by default; with `dew_fn`, paired:
     Dew's errors against the reference's on the same draws, the two resampled by the same seeds as the
     verdict resamples them (`_interval`), on draws from SIZING_FROM on that no verdict takes. A pair
@@ -1424,14 +1428,15 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     factors, not more seeds.
 
     Each draw is evaluated once however many doublings the sizing takes: a count's draws are its
-    predecessor's and the seeds it adds, the reference compared with itself takes its seeds 0 to twice
-    the count (the first half against the second), and the reference on the same inputs runs once."""
+    predecessor's and the seeds it adds, twice the count of them with the confirming block, the
+    reference compared with itself takes its seeds 0 to four times the count (each block's first half
+    against its second), and the reference on the same inputs runs once."""
     if dew_fn is not None and getattr(reference_fn, "recorded", False):
         pilots = getattr(reference_fn, "pilots", None)
         if pilots is None:
             raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
                              f"sizing's from SIZING_FROM; its site keeps its recorded count")
-        most = min(most, len(pilots))
+        most = min(most, len(pilots) // 2)
     paired = dew_fn is not None
     _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
     dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
@@ -1444,21 +1449,34 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     first = 0 if dew_fn is None else SIZING_FROM
     while count <= most:
         held = 0 if drawn is None else len(drawn.theirs)
-        fresh = _drawn(dew_fn or reference_fn, reference_fn, draw,
-                       range(first + held, first + (2 * count if dew_fn is None else count)), truth_fn)
+        block = 2 * count if dew_fn is None else count
+        fresh = _drawn(dew_fn or reference_fn, reference_fn, draw, range(first + held, first + 2 * block),
+                       truth_fn)
         drawn = fresh if drawn is None else drawn.joined(fresh)
-        if dew_fn is None:
-            wide = _unresolved_against_itself(drawn.theirs, drawn.names, count)
-        else:
-            wide = [name for index, name in enumerate(drawn.names)
-                    if np.sum(drawn.theirs[:, index]) > 0
-                    and not _resolves(*_interval(drawn.mine[:, index], drawn.theirs[:, index]))]
+        wide = _confirmed(drawn.names, drawn.theirs, count, None if dew_fn is None else drawn.mine)
         if not wide:
             return count
         count *= 2
     compared = "the reference compared with itself" if dew_fn is None else "Dew paired with the reference"
     raise AssertionError(f"{label}: {compared} does not resolve {PARITY} within {most} seeds at {wide[:4]}; "
                          f"give the site larger inputs or fewer shared factors")
+
+
+def _confirmed(names, theirs: np.ndarray, count: int, mine: np.ndarray | None = None) -> list[str]:
+    """The leaves `seeds_for` leaves unresolved at `count`: on the count's own block of draws or on the
+    next block of as many (`seeds_for`'s confirmation), each judged as the sizing judges it: paired,
+    `mine` Dew's squared errors against the reference's (`theirs`, seed by leaf) on the same draws, or
+    the reference compared with itself (`_unresolved_against_itself`, each block twice the count)."""
+    wide: list[str] = []
+    for start in (0, count) if mine is not None else (0, 2 * count):
+        if mine is not None:
+            held, ours = theirs[start:start + count], mine[start:start + count]
+            unresolved = [name for index, name in enumerate(names) if np.sum(held[:, index]) > 0
+                          and not _resolves(*_interval(ours[:, index], held[:, index]))]
+        else:
+            unresolved = _unresolved_against_itself(theirs[start:start + 2 * count], names, count)
+        wide += [name for name in unresolved if name not in wide]
+    return wide
 
 
 def _unresolved_against_itself(errors: np.ndarray, names, count: int) -> list[str]:
@@ -1476,11 +1494,12 @@ def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWES
     """`seeds_for`'s count for the reference compared with itself, from its errors already measured:
     `errors` holds its squared errors a seed (rows, from seed 0) and a leaf (columns), such as a
     recording's merged shards, and the count is the fewest, doubling from `start` to `most`, that
-    resolves every leaf (`_unresolved_against_itself`), as `seeds_for` doubles. Fails past `most`, as
-    `seeds_for` does, and where the rows held run out first: the recording then holds too few seeds."""
+    resolves every leaf on its own block and the next (`_confirmed`), as `seeds_for` doubles. Fails past
+    `most`, as `seeds_for` does, and where the rows held run out first: the recording then holds too
+    few seeds."""
     count, wide = max(start, FEWEST_SEEDS), []
-    while count <= most and 2 * count <= len(errors):
-        wide = _unresolved_against_itself(errors, names, count)
+    while count <= most and 4 * count <= len(errors):
+        wide = _confirmed(names, errors, count)
         if not wide:
             return count
         count *= 2
@@ -1489,7 +1508,7 @@ def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWES
                              f"{most} seeds at {wide[:4]}; give the site larger inputs or fewer shared "
                              f"factors")
     raise AssertionError(f"{label}: the reference compared with itself does not resolve {PARITY} within the "
-                         f"{len(errors)} seeds recorded, {len(errors) // 2} a half")
+                         f"{len(errors)} seeds recorded, {len(errors) // 4} a half of each block")
 
 
 def recording(path) -> dict[str, np.ndarray]:
@@ -1824,11 +1843,22 @@ def float64_forward(module, variables, *args, **kwargs):
     (`float64_terms`): the module computing in float64 over its variables
     widened, integer inputs as they are, `kwargs` given as they are. A
     reference's float64 truth written elsewhere (a fixture's) is sized by
-    these terms, what Dew's own float64 sums add."""
+    these terms, what Dew's own float64 sums add.
+
+    Only `module`'s own `dtype` is widened: a module holding another (a
+    multimodal wrapper's language model) that keeps its own dtype computes
+    that part in it, so an output that is not float64 is refused, and such a
+    model is passed widened whole (`ModelConfig.with_dtype`)."""
     with jax.enable_x64(new_val=True):
         wide = module.clone(dtype=jnp.float64)
-        return float64_terms(lambda held, *given: wide.apply(held, *given, **kwargs),
-                             *widened((variables, *args)))
+        outputs, terms = float64_terms(lambda held, *given: wide.apply(held, *given, **kwargs),
+                                       *widened((variables, *args)))
+    narrow = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(outputs)
+                     if jnp.issubdtype(leaf.dtype, jnp.floating) and leaf.dtype != jnp.float64})
+    if narrow:
+        raise ValueError(f"{type(module).__name__} widened to float64 still gives {', '.join(narrow)} "
+                         "outputs: a module it holds keeps its own dtype; widen the whole model")
+    return outputs, terms
 
 
 def float64_terms(fn, *args):

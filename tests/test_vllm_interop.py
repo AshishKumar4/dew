@@ -20,11 +20,12 @@ does not ship; a host whose gcc is newer than the CUDA toolkit allows also
 needs VLLM_USE_FLASHINFER_SAMPLER=0, or the engine fails to build
 FlashInfer's sampling kernels at startup.
 
-`--dtype float32` is what the logprob tolerance below is calibrated to.
+`--dtype float32` is what the logprob check below holds the server to: its
+logprobs as exact as Dew's own fp32 ones, the truth Dew's float64 forward.
 The export records no `torch_dtype`, so vLLM's own default serves it in
 bfloat16 through FlashAttention instead of fp32 through Triton: the argmax
 survives that on these prompts, but the reported logprobs move from within
-0.0013 of Dew's own to within 0.017, and the tolerance refuses the second.
+0.0013 of Dew's own to within 0.017, which the check refuses.
 This checkpoint's margin between first and second choice reaches down to
 0.07 in logits, so neither dtype flips a token here; a wider model or a
 longer draw is where that stops being true.
@@ -42,6 +43,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference, float64_forward
 
 from dew.inference import OpenAICompletion
 from dew.interop import Pretrained
@@ -196,13 +198,13 @@ def test_the_server_reports_dews_own_logprobs(client, reference):
     """Tighter than the token identity, and it drifts first.
 
     A logprob is a number rather than a decision, so it moves before an
-    argmax flips. Both engines score in fp32 here and the kernels still
-    differ, which is worth about 0.0013; the tolerance sits between that
-    and the 0.07 logit margin this model keeps between its first and second
-    choice, where drift would start flipping tokens.
+    argmax flips. Both engines score in fp32 here and the kernels differ:
+    the server's logprobs are as exact as Dew's own fp32 ones
+    (`assert_as_exact_as_the_reference`), the truth Dew's float64 forward of
+    the same weights over the same tokens.
     """
     tokenizer, loaded = reference
-    worst = 0.0
+    served, ours, truth = [], [], []
 
     for prompt in PROMPTS:
         head = tokenizer.encode(prompt, add_special_tokens=False)
@@ -212,14 +214,17 @@ def test_the_server_reports_dews_own_logprobs(client, reference):
         reported = choice.logprobs.token_logprobs
         assert len(reported) == DRAWN, prompt
 
-        logits = np.asarray(loaded.model.apply(
-            loaded.variables, jnp.asarray([head + choice.token_ids], jnp.int32)))[0]
+        ids = jnp.asarray([head + choice.token_ids], jnp.int32)
+        logits = np.asarray(loaded.model.apply(loaded.variables, ids))[0]
+        wide = np.asarray(float64_forward(loaded.model, loaded.variables, ids)[0])[0]
         for offset, token in enumerate(choice.token_ids):
-            row = logits[len(head) + offset - 1].astype(np.float64)
-            ours = float(row[token] - np.logaddexp.reduce(row))
-            worst = max(worst, abs(ours - float(reported[offset])))
+            place = len(head) + offset - 1
+            served.append(float(reported[offset]))
+            ours.append(float(jax.nn.log_softmax(logits[place])[token]))
+            truth.append(float(wide[place, token] - np.logaddexp.reduce(wide[place])))
 
-    assert worst < 0.01, f"max |dew - vllm| logprob {worst:.5f}"
+    assert_as_exact_as_the_reference(np.asarray(served), np.asarray(ours), np.asarray(truth),
+                                     "vLLM's reported logprobs")
 
 
 def test_streaming_replays_the_completion_it_would_have_returned(client, continuation):

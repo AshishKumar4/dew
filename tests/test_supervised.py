@@ -13,8 +13,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import BATCH, Affine, Counting, dataset
+from affine_run import BATCH, Affine, Counting, Replaying, dataset
 from flax import linen as nn
+from learning_gate import assert_learns
 from recording import RecordingTracker
 
 from dew.batch import VALID_ROWS
@@ -36,19 +37,43 @@ def squared(outputs, batch):
     return (outputs - batch["y"]) ** 2
 
 
-def batch(rows=8):
-    x = np.random.default_rng(0).normal(size=(rows, 3)).astype(np.float32)
+def batch(rows=8, seed=0):
+    x = np.random.default_rng(seed).normal(size=(rows, 3)).astype(np.float32)
     return {"x": x, "y": 2 * x[:, :2], "label": (x[:, 0] > 0).astype(np.int32)}
 
 
+RUNS = 32
+"""The independent training runs a learning claim here is judged over (`assert_learns`): at eight the
+gate's t threshold is 38.7, past what these runs' spread of initial losses reaches."""
+
+
+def learned(objective, optimizer, loader_of, held_out_of, steps: int, margin: float) -> np.ndarray:
+    """Each of RUNS independent runs' contrast for "training lowers the held-out loss by `margin` times":
+    the log of the loss before over the loss after, less the log of `margin`, on the run's own held-out
+    batch, each run from its own initialization key and data. A ratio's claim in logs, so a run's
+    initial loss scales none of it."""
+    contrasts = []
+    for run in range(RUNS):
+        trainer = Trainer(objective, optimizer, key=jax.random.key(run))
+        start = trainer.initial_state()
+        state = trainer.fit(loader_of(run), steps=steps, log_every=steps)
+        held_out = held_out_of(run)
+        before, _ = objective.scalar_loss(start.variables, held_out, STEP)
+        after, _ = objective.scalar_loss(state.variables, held_out, STEP)
+        contrasts.append(float(np.log(float(before) / float(after)) - np.log(margin)))
+    return np.asarray(contrasts)
+
+
 def test_a_plain_flax_model_trains_on_a_loss_function():
+    """Over independent runs, each from its own key on its own data, sixty steps of Adam cut the affine
+    model's held-out squared error to under a quarter (`assert_learns`)."""
     objective = Supervised(Affine(), squared, inputs=INPUTS)
-    trainer = Trainer(objective, optax.adam(0.1), key=jax.random.key(0))
-    start = trainer.initial_state()
-    state = trainer.fit(dataset(), steps=60, log_every=60)
-    before, _ = objective.scalar_loss(start.variables, batch(), STEP)
-    after, _ = objective.scalar_loss(state.variables, batch(), STEP)
-    assert after < before / 4
+    drop = learned(objective, optax.adam(0.1),
+                   lambda run: dataset(train=lambda run=run: Replaying(lambda step: batch(seed=[run, step])),
+                                       batch=8),
+                   lambda run: batch(rows=256, seed=[run, 10_000]), steps=60, margin=4)
+    assert_learns(lambda runs: {"training cuts the held-out loss to a quarter": drop[runs]},
+                  "a plain flax model", units=RUNS)
 
 
 def test_a_model_named_by_its_input_field_alone_takes_the_shape_its_data_gives():
@@ -201,11 +226,38 @@ def test_an_autoencoder_with_two_outputs_trains_and_its_record_trains_it_again_i
     loss = json.loads(record.read_text())["fields"]["objective"]["fields"]["loss"]
     assert loss == {"function": "autoencoder_experiment:evidence_bound"}
     trained = losses(tmp_path / "first")
-    assert len(trained) == 40 and np.mean(trained[-5:]) < 0.5 * np.mean(trained[:5])
+    # That the run learns is held over independent runs in process
+    # (`test_the_autoencoders_evidence_bound_falls_over_independent_runs`).
+    assert len(trained) == 40
 
     train(str(record), "--trust", "autoencoder_experiment",
           "--set", f"trainer.checkpoint_dir={tmp_path / 'again'}")
     assert losses(tmp_path / "again") == trained
+
+
+def test_the_autoencoders_evidence_bound_falls_over_independent_runs():
+    """The two-output experiment (tests/autoencoder_experiment.py), its objective and optimizer built
+    from its own run configuration, trained its forty steps halves its held-out evidence bound over
+    independent runs (`assert_learns`), each from its own key on its own points of the experiment's
+    plane."""
+    import autoencoder_experiment
+    from autoencoder_experiment import FEATURES
+
+    plane = np.random.default_rng(0).normal(size=(2, FEATURES)) / np.sqrt(2)
+
+    def points(seed, rows=32):
+        rng = np.random.default_rng(seed)
+        x = rng.normal(size=(rows, 2)) @ plane + rng.normal(0, 0.05, (rows, FEATURES))
+        return {"x": x.astype(np.float32)}
+
+    config = autoencoder_experiment.run()
+    objective = config.objective.build(model=config.model.build())
+    drop = learned(objective, config.optim.build(config.trainer.steps),
+                   lambda run: dataset(train=lambda run=run: Replaying(lambda step: points([run, step])),
+                                       batch=32),
+                   lambda run: points([run, 10_000], rows=256), steps=config.trainer.steps, margin=2)
+    assert_learns(lambda runs: {"training halves the held-out evidence bound": drop[runs]},
+                  "the autoencoder experiment", units=RUNS)
 
 
 class Normed(nn.Module):
