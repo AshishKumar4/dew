@@ -943,8 +943,9 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
         return RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=True, dtype=dtype)
     sizes, rows = row_errors(reference, truth)
     sized = sizes > 0
-    own = (np.sqrt(np.mean(np.square(truth.reshape(-1, truth.shape[-1])), axis=1)) if truth.ndim >= 2
-           else np.zeros(0))
+    # Each row's own size by the arithmetic its errors take (`_scaled_rms`), so an arm exactly zero on a
+    # row is exactly its size from it.
+    own = _scaled_rms(truth.reshape(-1, truth.shape[-1])) if truth.ndim >= 2 else np.zeros(0)
     logged = float(np.max(_log_over(rows[sized], sizes[sized]))) if sized.any() else LOG_ZERO
     return RecordedLeaf(float(np.mean(np.square(reference - truth))),
                         float(np.max(_over(rows[sized], sizes[sized]))) if sized.any() else 0.0,
@@ -1065,9 +1066,12 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     both arms' errors on them (`ZeroRows`, pooled over the run's seeds by `pooled_zero_rows`), and
     whether every value was finite. A row the truth sizes zero (below RESOLUTION of its leaf)
     is one of float64 zero unless a live reference measures it: its error there below the row's own
-    float64 RMS, so it carries the row better than zero would. That is an engineering definition of a
-    measured row, not a proof of float64's accuracy on it; a sum that cancels to float64's residue is
-    never measured so, and a product far below its leaf, which float64 holds to its own precision, is.
+    float64 RMS, so it carries the row better than zero would. The two are taken by one arithmetic
+    (`_scaled_rms`), so a reference exactly zero on a row is exactly the row's size from it and never
+    measures it (ledger 1831: two arithmetics broke that tie, and Dew's ordinary rounding on a residue
+    row read 1e8 of the row). That is an engineering definition of a measured row, not a proof of
+    float64's accuracy on it; a sum that cancels to float64's residue is never measured so, and a
+    product far below its leaf, which float64 holds to its own precision, is.
     A measured row is judged at its own size as any row is, its error over its size entering both worst
     rows: against the reference's worst row over the leaf, which holds it with less power than the zero
     rows' rule held it against the reference's own error on it. Both arms are classified alike, from the

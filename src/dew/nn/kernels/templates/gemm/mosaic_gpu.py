@@ -116,18 +116,20 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
     docs/design/kernel-templates.md §7). `holds(tile)` is the launch's legality on the device (its
     staged bytes within a block, its registers within a consumer's: `Template.legal`).
 
-    - Columns: the widest the family's one product spans (`Family.widest_product`) that divides the
-      call's width in its column unit, which reads its rows' slice fewest times a FLOP (each instruction
-      reads the columns' block whole) and writes its output in the longest runs.
+    - Shape: of the output tiles its consumers' registers hold (rows in whole roles, `mosaic.held_rows`,
+      `mosaic.tile_registers`; columns dividing the call's width in its column unit, at most the family's
+      one product's, `Family.widest_product`), the one loading its operands fewest times a FLOP
+      ((rows + columns) / (rows x columns): the squarest of the largest), the wider on a tie, which writes
+      its output in longer runs. mma.sync's one consumer so takes 128 x 128 over 64 x 256, whose four
+      warps, splitting its rows, each read the columns' block whole: 1.7x the shared memory a FLOP.
     - Consumers: as many roles as the family has (`Family.consumers`), a warpgroup each, or one where
       rows a tile must divide (not grouped) take no whole role for each, or where no tile of them holds.
     - Programs: the most a multiprocessor runs at once that the family's registers hold at those
       consumers (`Family.programs`) and whose share of its shared memory (`mosaic.program_shared`) holds
       a tile, one at least; a wave is all of them.
-    - Rows: the most, in whole roles of its consumers, its consumers' registers hold
-      (`mosaic.held_rows`, `mosaic.tile_registers`), and no more than the call's rows rounded up to a
-      role's or, where grouped, half a group's in whole roles, at least one role (each group takes a
-      partial tile more, so at half its rows that tile adds at most a third of its work).
+    - Rows: no more than the call's rows rounded up to a role's or, where grouped, half a group's in
+      whole roles, at least one role (each group takes a partial tile more, so at half its rows that tile
+      adds at most a third of its work).
     - Step: the family's widest depth dividing the call's (`Family.depths`) at those rows, a shallower
       one before fewer rows (a family whose products read registers holds a step's fragments).
     - Stages: the deepest a block holds (`holds`, `mosaic.deepest`), at least those the walk keeps busy
@@ -148,24 +150,27 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
         role = family.role_rows * consumers
         shared = mosaic.program_shared(family.most_shared, programs)
         most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
+        shapes = sorted(((block_m, block_n) for block_n in columns
+                         for block_m in range(min(most_rows, mosaic.held_rows(family, consumers, block_n)), 0,
+                                              -role)),
+                        key=lambda shape: (-shape[0] * shape[1] / (shape[0] + shape[1]), -shape[1]))
         fallback = None
-        for block_n in columns:
-            for block_m in range(min(most_rows, mosaic.held_rows(family, consumers, block_n)), 0, -role):
-                band = mosaic.band(multiprocessors * programs, block_m, block_n, width // block_n,
-                                   -(-rows // block_m) if grouped else None)
-                # More rows before a deeper step: each reads the columns' block fewer times a FLOP, where
-                # a step's depth only sets how many steps a tile takes (and, in registers, its fragments').
-                for step in steps:
-                    tile = mosaic.deepest(
-                        lambda stages, block_m=block_m, block_n=block_n, step=step, band=band: Tiles(
-                            block_m, block_n, step, stages, band, warpgroups=consumers, family=family.name,
-                            programs=programs),
-                        holds, shared // ((block_m + block_n) * step))
-                    if tile is None:
-                        continue
-                    if tile.stages >= busy:
-                        return tile
-                    fallback = fallback or tile
+        for block_m, block_n in shapes:
+            band = mosaic.band(multiprocessors * programs, block_m, block_n, width // block_n,
+                               -(-rows // block_m) if grouped else None)
+            # The shape before a deeper step: it sets how many times a FLOP reads each operand, where a
+            # step's depth only sets how many steps a tile takes (and, in registers, its fragments').
+            for step in steps:
+                tile = mosaic.deepest(
+                    lambda stages, block_m=block_m, block_n=block_n, step=step, band=band: Tiles(
+                        block_m, block_n, step, stages, band, warpgroups=consumers, family=family.name,
+                        programs=programs),
+                    holds, shared // ((block_m + block_n) * step))
+                if tile is None:
+                    continue
+                if tile.stages >= busy:
+                    return tile
+                fallback = fallback or tile
         return fallback
 
     # Rows a tile divides (a kernel gradient's) that take no whole role for each consumer take one, as
