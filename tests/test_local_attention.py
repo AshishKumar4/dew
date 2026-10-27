@@ -25,6 +25,7 @@ from dew.nn.inputs import counted_places
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.kv_cache import KVCache
 from dew.nn.local_attention import local_attention
+from dew.training._lowering import custom_calls
 
 SEEDS = {'window': 8, 'chunk': 8, 'packed': 8, 'given places': 8, 'gradients': 8, 'shared split': 8,
          'decode': 8, 'holey chunk': 8, 'diagnostic chunk': 8, 'holey window': 16, 'diagnostic window': 16,
@@ -466,23 +467,6 @@ def test_a_row_with_padding_among_its_tokens_counts_its_tokens_over_a_sequence_a
                     truth_fn=masked(keep, real))
 
 
-def custom_call_targets(lowered) -> list[str]:
-    """The target of every custom call in a lowered program's StableHLO module, in program order."""
-    from jax.extend.mlir import ir
-
-    targets: list[str] = []
-
-    def visit(operation):
-        if operation.name == "stablehlo.custom_call":
-            targets.append(ir.StringAttr(operation.attributes["call_target_name"]).value)
-        return ir.WalkResult.ADVANCE
-
-    module = lowered.compiler_ir(dialect="stablehlo")
-    with module.context:
-        module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
-    return targets
-
-
 @pytest.mark.gpu(reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
 @pytest.mark.skipif(not bf16_dot_runs(), reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
 def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn(without_deterministic_ops):
@@ -513,7 +497,7 @@ def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn(without_determini
             return jnp.sum(out.astype(jnp.float32) * cotangent * real[None, :, None, None]), out
         return jax.jit(jax.value_and_grad(run, argnums=(0, 1, 2), has_aux=True))
 
-    targets = custom_call_targets(loss("auto").lower(query, key, value))
+    targets = [call.target for call in custom_calls(loss("auto").lower(query, key, value))]
     assert any(target.startswith("__cudnn$fmha") for target in targets), targets
 
     def oracle(query, key, value):

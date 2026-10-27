@@ -25,6 +25,7 @@ host, so attention traces its XLA path.
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import jax
@@ -32,6 +33,16 @@ from jax.extend.mlir import ir
 
 TRITON = "__gpu$xla.gpu.triton"
 """The custom call Pallas lowers a Triton kernel to."""
+
+
+@dataclass(frozen=True)
+class CustomCall:
+    """One custom call of a lowered program: its target and the shapes of the arrays it reads and
+    writes."""
+
+    target: str
+    operands: tuple[tuple[int, ...], ...]
+    results: tuple[tuple[int, ...], ...]
 
 
 @dataclass(frozen=True)
@@ -45,26 +56,44 @@ class TritonCall:
     stages: int
 
 
-def triton_calls(lowered: jax.stages.Lowered) -> list[TritonCall]:
-    """Every Pallas-Triton custom call a lowered program makes, in program order."""
-    calls: list[TritonCall] = []
+def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operation], T | None]) -> list[T]:
+    """What `read` makes of each custom call a lowered program makes, given its target and its
+    operation, in program order: the calls it makes something of."""
+    found: list[T] = []
 
     def visit(operation: ir.Operation) -> ir.WalkResult:
-        attributes = operation.attributes
-        if (operation.name == "stablehlo.custom_call"
-                and ir.StringAttr(attributes["call_target_name"]).value == TRITON):
-            config = ir.DictAttr(attributes["mhlo.backend_config"])
-            calls.append(TritonCall(ir.StringAttr(config["name"]).value,
-                                    ir.StringAttr(config["ir"]).value_bytes,
-                                    ir.IntegerAttr(config["num_warps"]).value,
-                                    ir.IntegerAttr(config["num_stages"]).value))
+        if operation.name == "stablehlo.custom_call":
+            made = read(ir.StringAttr(operation.attributes["call_target_name"]).value, operation)
+            if made is not None:
+                found.append(made)
         return ir.WalkResult.ADVANCE
 
     module = lowered.compiler_ir(dialect="stablehlo")
     assert module is not None, "a lowered program always has its StableHLO module"
     with module.context:
         module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
-    return calls
+    return found
+
+
+def custom_calls(lowered: jax.stages.Lowered) -> list[CustomCall]:
+    """Every custom call a lowered program makes, in program order."""
+    def shapes(values) -> tuple[tuple[int, ...], ...]:
+        return tuple(tuple(value.type.shape) for value in values if isinstance(value.type, ir.RankedTensorType))
+
+    return _read_calls(lowered, lambda target, operation: CustomCall(
+        target, shapes(operation.operands), shapes(operation.results)))
+
+
+def triton_calls(lowered: jax.stages.Lowered) -> list[TritonCall]:
+    """Every Pallas-Triton custom call a lowered program makes, in program order."""
+    def read(target: str, operation: ir.Operation) -> TritonCall | None:
+        if target != TRITON:
+            return None
+        config = ir.DictAttr(operation.attributes["mhlo.backend_config"])
+        return TritonCall(ir.StringAttr(config["name"]).value, ir.StringAttr(config["ir"]).value_bytes,
+                          ir.IntegerAttr(config["num_warps"]).value, ir.IntegerAttr(config["num_stages"]).value)
+
+    return _read_calls(lowered, read)
 
 
 def triton_kernels(lowered: jax.stages.Lowered) -> dict[str, int]:
