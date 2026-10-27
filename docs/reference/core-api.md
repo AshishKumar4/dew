@@ -97,6 +97,7 @@ A custom `step(objective, optimizer)` factory is responsible for the accepted an
 - `checkpoint_every` controls periodic saves when a checkpointer exists. The normal completion path can still save a final checkpoint when a checkpointer is present.
 - Each of the three, an `EvalSuite`'s own `every` and `Checkpoints(local_every=)` may be a share of the run such as `"5%"`, resolved once against its planned length: the whole updates nearest that share of its steps, epochs or examples, at least one, or for a token budget alone each time the committed tokens pass a multiple of that share. A schedule's warmup (`Cosine`, `Power` and `Linear`'s `warmup_steps`, `OneCycle`'s `warmup_fraction`) takes a share too, of the run's updates. The run's start records what each resolved to, and the warmups of the schedules its optimizer runs (`FitStarted.cadences`).
 - `metrics` reduce evaluation artifacts and require evaluation to be enabled.
+- `cooldowns=Cooldowns(at=("20%", "40%"), length="20%")` branches the run into cooldowns at those points (`dew.training.cooldown`): each branch trains on from the run's state and data at its rate times a decay to zero, is scored by every validation suite as `cooldown_<split>/<metric>` at the step it branched from, and is discarded; the run trains on as one with none. `--trainer.cooldowns.at` sets it on a run's command line.
 - `preview=True` explicitly requests generated/display artifacts during evaluation; adding a scalar tracker alone does not request them.
 
 Checkpointable data must supply the consumed iterator position. A failed scaled transaction advances attempted work and scaler history while preserving the earlier accepted prefix. Completely inactive windows close accepted slots without an optimizer call, weight decay, EMA, or deferred effects. Auxiliary-only windows can still be active.
@@ -153,7 +154,7 @@ Sources implement `Source`: `Memory` holds records or columns, `Files` opens a f
 
 A global count-preserving or memory-materialized plan resumes across process counts dividing its batch. A streamed, rejecting, expanding or online-packed plan saves exact Grain iterator state per share and refuses topology changes. Volatile fetches cannot claim exact resume before their bytes are persisted.
 
-`workers(n)`, `threads(n)`, `prefetch(n)` and `loading(Loading(...))` change concurrency without changing record order or draws. A chain that names none reads in the training process (`workers=0`); `Loading(workers="auto")` takes Grain's memory-budgeted tuning. A multiprocessing program needs a main guard.
+`workers(n)`, `threads(n)`, `prefetch(n)` and `loading(Loading(...))` change concurrency without changing record order or draws. A chain that names none reads in the training process (`workers=0`); `Loading(workers="auto")` sizes the workers and read buffer from the CPUs the process may run on and the memory it may take. A multiprocessing program needs a main guard.
 
 Each factory returns an exclusively owned iterator. Final `close()` must not race iteration or checkpoint operations. `request_stop()`, where supplied, is a nonblocking signal safe alongside both. The compiler's host stages forward ownership and position.
 

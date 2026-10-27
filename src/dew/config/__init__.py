@@ -80,6 +80,7 @@ from dew.registry import (
 from dew.state import TrainState
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.budget import Pause, budget_tokens, run_length, run_steps
+from dew.training.cooldown import Cooldowns
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Summary
 from dew.training.profiling import ProfileWindow
@@ -385,6 +386,9 @@ class TrainerConfig:
     stop: Annotated[Pause, tyro.conf.subcommand("pause")] | None = None
     """End the run at a fraction of its length, to resume it later as if it had never stopped
     (`Pause`): `--trainer.stop.fraction 0.5`."""
+    cooldowns: Annotated[Cooldowns, tyro.conf.subcommand("cooldowns")] | None = None
+    """Branch the run into cooldowns, each scored by its validation and discarded (`Cooldowns`):
+    `--trainer.cooldowns.at 20% 40% --trainer.cooldowns.length 20%`."""
     log_every: Annotated[int | str, _cadence_argument(timed=False)] = 100
     """The steps between logs, or a share of the run such as "1%" (`eval_every`)."""
     eval_every: Annotated[int | str | None, _cadence_argument(timed=False)] = "epoch"
@@ -900,7 +904,8 @@ class RunConfig:
     settings and builds what it trains from them (`prepare`); `run` trains it.
     """
 
-    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause"}
+    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause",
+                                                   "trainer.cooldowns": "cooldowns"}
     """The optional settings `cli` turns on by their own flags, each with the
     subcommand its flags imply."""
     RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed",
@@ -1395,7 +1400,7 @@ class RunConfig:
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 checkpoint_final=trainer.checkpoint_final,
                 metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
-                best=trainer.best_policies(), stop=trainer.stop,
+                best=trainer.best_policies(), stop=trainer.stop, cooldowns=trainer.cooldowns,
                 # A run that names no metrics and validates no split has no suite to score.
                 validation=validation if suites is None else suites or None, summaries=self.val_summaries,
             )

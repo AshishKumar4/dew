@@ -6,6 +6,7 @@ import csv
 import hashlib
 import io
 import json
+import math
 import posixpath
 import threading
 from collections.abc import Iterator, Mapping, Sequence
@@ -167,6 +168,17 @@ def _open_lines(fs: AbstractFileSystem, path: str):
 
         return io.BufferedReader(ZstdDecompressor().stream_reader(fs.open(path, "rb")))
     return fs.open(path, "rb", compression=compression)
+
+
+def _line_start(file: BinaryIO, offset: int) -> int:
+    """Where the first line that starts at `offset` or after it starts in `file`, its end where none
+    does: a range of a file's bytes reads the lines that start in it."""
+    if not offset:
+        return 0
+    file.seek(offset - 1)
+    if file.read(1) != b"\n":
+        file.readline()
+    return file.tell()
 
 
 def _seek_lines(file: BinaryIO, offset: int) -> None:
@@ -635,7 +647,41 @@ class Files(Dataset):
                     Shard(self._shard_id(number, url, start), url, start, min(start + step, size))
                     for start in range(0, size, step)
                 )
-        return ShardManifest(tuple(shards), self._read_shard)
+        divisible = self.kind in ("jsonl", "text") and not any(
+            infer_compression(url.lower()) for url in self.paths)
+        return ShardManifest(tuple(shards), self._read_shard, self._subdivided if divisible else None)
+
+    def _subdivided(self, count: int) -> tuple[Shard, ...]:
+        """The JSON-lines or text files cut into `count` parts, for a streamed read with more
+        readers and workers than its shards (`ShardManifest.subdivide`), as Hadoop splits a text
+        file: each file a share of the parts by its bytes, each part the lines that start in an
+        even cut of it, the cut moved on to the line it falls in, found by reading that line. So
+        each part holds a line, and a reader or worker given one reads; a store of fewer lines
+        than parts is refused."""
+        sizes = [integer(self._header(url)["size"], "file bytes") for url in self.paths]
+        total = max(sum(sizes), 1)
+        # Each file that holds bytes at least one part, the rest by its share of the bytes, largest
+        # remainders first.
+        shares = [count * size / total for size in sizes]
+        parts = [max(1, math.floor(share)) if size else 0 for share, size in zip(shares, sizes, strict=True)]
+        for index in sorted((index for index, size in enumerate(sizes) if size),
+                            key=lambda index: parts[index] - shares[index]):
+            if sum(parts) >= count:
+                break
+            parts[index] += 1
+        shards = []
+        for number, (url, size, cuts) in enumerate(zip(self.paths, sizes, parts, strict=True)):
+            if not cuts:
+                continue
+            fs, path, _ = Store(url, self.storage_options).readable()
+            with _open_lines(fs, path) as file:
+                starts = sorted({_line_start(file, size * cut // cuts) for cut in range(cuts)} - {size})
+            shards.extend(Shard(self._shard_id(number, url, start), url, start, stop)
+                          for start, stop in zip(starts, [*starts[1:], size], strict=True))
+        if len(shards) < count:
+            raise ValueError(f"{self.describe()} holds {len(shards)} parts of whole lines for {count} "
+                             "readers × workers; read it with fewer")
+        return tuple(shards)
 
     def _read_shard(self, shard: Shard) -> grain.IterDataset:
         if self.kind in ("parquet", "arrow"):
@@ -964,9 +1010,7 @@ class _LineIterator(grain.DatasetIterator):
         self._opened = True
         self.names = _header(self.file) if source.kind == "csv" else None
         if self.names is None and shard.start:
-            self.file.seek(shard.start - 1)
-            if self.file.read(1) != b"\n":
-                self.file.readline()
+            self.file.seek(_line_start(self.file, shard.start))
         self.records = _lines(source.kind, self.file, self.names, shard.stop)
 
     def __next__(self) -> Batch:

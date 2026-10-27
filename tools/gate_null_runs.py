@@ -547,7 +547,7 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int) -> tu
 
         def drawn(start, stop, worst=worst):
             count = stop - start
-            return _Draws(["rows"], np.ones((count, 1)), np.ones((count, 1)), worst[start:stop],
+            return _Draws(["rows"], np.ones((count, 1)), np.ones((count, 1)), np.log(worst[start:stop]),
                           [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (width,))
 
         over, unresolved, stage = _staged(drawn, seeds, f"rows of {width}")
@@ -612,7 +612,7 @@ def main(argv: list[str]) -> int:
         draws = _drawn(reference, reference, draw, seeds, truth)
         print(json.dumps({"class": options.name, "chunk": options.chunk, "names": draws.names,
                           "mse": np.asarray(draws.mine).tolist(),
-                          "worst": np.asarray(draws.worst[..., 0]).tolist()}), flush=True)
+                          "log_worst": np.asarray(draws.worst[..., 0]).tolist()}), flush=True)
         return 0
     def twin(*inputs):
         return reference(*permuting(inputs, REORDERED))

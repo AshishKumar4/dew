@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
     from dew.data.dataset import Loading
     from dew.data.generation import DependencyManifest
+    from dew.data.sinks import Writer
     from dew.data.sources.base import Read, Source
     from dew.data.text import NearDuplicates
 
@@ -72,6 +73,16 @@ PREFETCH = 64
 @runtime_checkable
 class Volatile(Protocol):
     volatile: bool
+
+
+@runtime_checkable
+class External(Protocol):
+    """A step that reads the storage a record names by path, as a media decoder does when its field
+    holds a path rather than bytes: what it makes is keyed by the path, not by what the path holds, so
+    no automatic cache's prefix runs past it (`dew.data.compile._automatic`), a file replaced at the same
+    path reading anew; a chain's own `cache=` keeps what it made, as it is told to."""
+
+    external: bool
 
 
 @runtime_checkable
@@ -819,12 +830,13 @@ class Dataset:
 
         return self._then(Artifact(Cache(cache) if isinstance(cache, str) else cache))
 
-    def snapshot(self, url: str, *, format: Literal["array_record", "parquet"] = "array_record",
+    def snapshot(self, url: str, *, format: Literal["array_record", "parquet"] | Writer = "array_record",
                  rows_per_shard: int = 100_000,
                  deduplicate: NearDuplicates | None = None) -> Mapping[str, object]:
         """Run this dataset once over every record and seal what it makes at
         `url`: immutable shards and their committed manifest, which
-        `Files(url)` reads back. A fetch's outcomes are sealed with it, so a
+        `Files(url)` reads back, written as ArrayRecord, as Parquet or by a
+        native writer (`dew.data.sinks.Writer`). A fetch's outcomes are sealed with it, so a
         run that reads the snapshot resumes exactly. With `deduplicate`
         (`dew.data.text.NearDuplicates`, the `curation` extra), each group of
         near-duplicates in that one pass is sealed as one record, and the
