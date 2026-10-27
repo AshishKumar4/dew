@@ -35,7 +35,7 @@ import numpy as np
 import torch
 from lpips_weights import drawn_weights
 from reference_source import definitions, verified
-from torch_precision import float64
+from torch_precision import float64, float64_twin
 from torchvision import models
 
 REPAE = "https://raw.githubusercontent.com/End2End-Diffusion/REPA-E/2ad4e9f69234c109497fb41d3e5e555de7b4b0de/"
@@ -72,12 +72,15 @@ def lpips_class(vgg: dict[str, torch.Tensor], linear: dict[str, torch.Tensor]) -
 
 def distances(vgg, linear, images, references, dtype, *, gradient: bool) -> dict[str, np.ndarray]:
     """LPIPS's distances of `images` to `references` at `dtype`, and their mean's gradient by the first:
-    in float64 built and run inside `float64`, so the scaling layer's shift and scale, which its
-    constructor computes and no load overwrites, are float64's."""
+    in float64 the published network's float64 twin (`float64_twin`), run inside `float64`. The twin
+    loads every buffer the published one holds, the scaling layer's shift and scale as LPIPS ships
+    them, in float32."""
+    built = lpips_class({key: torch.as_tensor(value) for key, value in vgg.items()},
+                        {key: torch.as_tensor(value) for key, value in linear.items()})
+    network = built().eval()
+    if dtype == torch.float64:
+        network = float64_twin(network, built)
     with float64() if dtype == torch.float64 else contextlib.nullcontext():
-        built = lpips_class({key: torch.as_tensor(value) for key, value in vgg.items()},
-                            {key: torch.as_tensor(value) for key, value in linear.items()})
-        network = built().eval().to(dtype)
         first = torch.as_tensor(images, dtype=dtype).permute(0, 3, 1, 2).requires_grad_(gradient)
         second = torch.as_tensor(references, dtype=dtype).permute(0, 3, 1, 2)
         value = network(first, second)
