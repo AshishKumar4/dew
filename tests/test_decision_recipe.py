@@ -484,7 +484,8 @@ def test_a_checkpoint_declaring_block_attention_lays_a_fresh_heads_rows_in_block
     (declared / "config.json").write_text(json.dumps(config))
     default = Fitted(data=TICKETS)
     trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
-    objective, _ = dataclasses.replace(default, pretrained=str(declared), trainer=trainer).prepare().train("x")
+    run = dataclasses.replace(default, pretrained=str(declared), trainer=trainer)
+    objective, _ = run.prepare().train("x")
     assert objective.layout.blocks
 
 
