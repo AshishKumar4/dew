@@ -1114,11 +1114,13 @@ def test_a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, ca
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm89", "sm90"])
 @pytest.mark.parametrize("head_dim", [64, 128])
-def test_a_bf16_call_takes_flash_on_its_cell_or_by_legality(generation_name, head_dim):
+def test_a_bf16_call_takes_flash_on_its_cell_or_by_legality(generation_name, head_dim,
+                                                           without_deterministic_ops):
     """A causal bf16 call takes FlashAttention on every GPU it measured fastest on: Hopper's by its declared
     cell (`attention_kernels.DECLARED`), its refusal naming the template it sets aside and the receipt; a GPU
     of no routed Mosaic mainloop (mma.sync's) as the op's first kernel by legality, no table row
-    preferring another (bible §4)."""
+    preferring another (bible §4). Out of the cuda lane's deterministic ops, which FlashAttention refuses
+    (`without_deterministic_ops`; row 1858)."""
     from dew.nn.attention import resolve_implementation
     from dew.nn.kernels import generation
 
