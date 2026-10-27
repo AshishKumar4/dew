@@ -43,11 +43,11 @@ def decoder(**fields):
 
 
 def trainer(model, optimizer, mesh: MeshSpec, devices: int, *, variables=None, ema: float | None = 0.9,
-            checkpoints=None) -> Trainer:
+            checkpoints=None, key: int = 0) -> Trainer:
     objective = LMObjective(model, SEQ, ema_decay=ema) if variables is None else LMObjective(
         model, SEQ, ema_decay=ema, variables=variables)
-    run = Trainer(objective, optimizer, key=jax.random.key(0), mesh=mesh, layout=Layout(min_shard=TINY_SHARD),
-                  checkpoints=checkpoints, tracker=None)
+    run = Trainer(objective, optimizer, key=jax.random.key(key), mesh=mesh,
+                  layout=Layout(min_shard=TINY_SHARD), checkpoints=checkpoints, tracker=None)
     run.device_mesh = mesh.build(jax.devices()[:devices])
     return run
 
@@ -117,7 +117,25 @@ SEEDS = {"adamw": 8, "muon": 8, "muonclip": 8, "lamb": 8, "groups": 8, "int8": 8
 
 
 def draw(seed):
-    return (token_rows(VOCAB, BATCH, SEQ + 1, seed=seed)["text"],)
+    """A seed's batch and the seed, which draws the state the cell's arms start from (`initials`)."""
+    return token_rows(VOCAB, BATCH, SEQ + 1, seed=seed)["text"], np.int64(seed)
+
+
+def initials(model, optimizer, variables=None):
+    """Each seed's own initial state, one device's (`Trainer.initial_state`), its parameters drawn by
+    the seed's key, or `variables(seed)`: no draw starts where another does, so what one fixed state
+    rounds alike on every draw (an Adam step's few near-tied gradients) is no factor every draw
+    shares. Each seed's is made once, outside float64, for every arm that starts from it."""
+    made = {}
+
+    def initial(seed: int):
+        if seed not in made:
+            with jax.enable_x64(new_val=False):
+                given = None if variables is None else variables(seed)
+                one = trainer(model, optimizer, MeshSpec(), 1, variables=given, key=seed)
+                made[seed] = one.initial_state()
+        return made[seed]
+    return initial
 
 
 def wide(state):
@@ -134,20 +152,21 @@ def on_host(tree):
 
 
 def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variables=None, exact: bool = False):
-    """`STEPS` steps of `model` from `initial` on the batch a draw gives, over `mesh`, its step
-    compiled once for every draw, returning the variables, optimizer state and EMA as a checkpoint
-    holds them, every layer its own (`StageLocal.saved`). `exact` runs one device in float64 from the
-    state widened, under the caller's float64."""
+    """`STEPS` steps of `model` from the seed's state (`initial`) on the batch a draw gives, over
+    `mesh`, its step compiled once for every draw, returning the variables, optimizer state and EMA as
+    a checkpoint holds them, every layer its own (`StageLocal.saved`). `exact` runs one device in
+    float64 from the state widened, under the caller's float64."""
     built = []
 
     @as_given
-    def run(tokens):
+    def run(tokens, seed):
         if not built:
             held = model.clone(dtype=jnp.float64) if exact else model
             built.append(trainer(held, optimizer, mesh, devices, variables=variables))
             built[0].validate(steps=STEPS)
         steps = built[0]
-        state, _ = steps.staging.supplied(wide(initial) if exact else jax.tree.map(jnp.copy, initial),
+        start = initial(int(seed))
+        state, _ = steps.staging.supplied(wide(start) if exact else jax.tree.map(jnp.copy, start),
                                           steps.shardings)
         batch = shard_batch(steps.device_mesh, {"text": tokens})
         if len(built) == 1:
@@ -159,17 +178,23 @@ def stepped(model, optimizer, mesh: MeshSpec, devices: int, initial, *, variable
     return run
 
 
-def assert_trains_as_one_device(model, optimizer, label: str, seeds: int, variables=None):
-    one = trainer(model, optimizer, MeshSpec(), 1, variables=variables)
-    one.validate(steps=STEPS)
-    initial = one.initial_state()
-    staged = trainer(model, optimizer, STAGED, 8, variables=variables)
+def arms(model, optimizer, variables=None):
+    """A training cell's arms over `draw`: the stage layout's, one device's and its float64 truth, each
+    from the seed's own state (`initials`). `variables(seed)` gives an adapted run's, which its trainers
+    are built over at seed 0."""
+    given = None if variables is None else variables(0)
+    staged = trainer(model, optimizer, STAGED, 8, variables=given)
     staged.validate(steps=STEPS)
     assert staged.staging.sites, "the decoder's run splits over two stages"
-    truth = stepped(model, optimizer, MeshSpec(), 1, initial, variables=variables, exact=True)
-    assert_as_exact(stepped(model, optimizer, STAGED, 8, initial, variables=variables),
-                    stepped(model, optimizer, MeshSpec(), 1, initial, variables=variables), draw, label,
-                    seeds=seeds, truth_fn=truth)
+    initial = initials(model, optimizer, variables)
+    layouts = ((STAGED, 8, False), (MeshSpec(), 1, False), (MeshSpec(), 1, True))
+    return tuple(stepped(model, optimizer, mesh, devices, initial, variables=given, exact=exact)
+                 for mesh, devices, exact in layouts)
+
+
+def assert_trains_as_one_device(model, optimizer, label: str, seeds: int, variables=None):
+    staged, one, truth = arms(model, optimizer, variables)
+    assert_as_exact(staged, one, draw, label, seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.mesh(devices=8)
@@ -185,13 +210,13 @@ def test_a_stage_local_decoder_trains_as_one_device_through_each_optimizer(name)
     assert_trains_as_one_device(decoder(**fields), optimizer, f"stage-local {name}", SEEDS[name])
 
 
-def lora():
-    """A decoder adapted on its query and value projections, its factors drawn apart from zero so its
-    forward and every factor's gradient read them."""
+def lora(seed: int = 0):
+    """A decoder adapted on its query and value projections, its base and factors drawn by `seed`, the
+    factors apart from zero so its forward and every factor's gradient read them."""
     model = decoder()
-    variables = model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
-    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, variables, key=1)
-    rng = np.random.default_rng(1)
+    variables = model.init(jax.random.key(seed), jnp.zeros((1, SEQ), jnp.int32))
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, variables, key=seed + 1)
+    rng = np.random.default_rng(seed + 1)
 
     def drawn(leaf):
         zero = jnp.issubdtype(leaf.dtype, jnp.floating) and not np.any(leaf)
@@ -243,9 +268,9 @@ def test_each_pipeline_stage_applies_its_layers_lora_factors():
 def test_a_lora_adapter_over_a_stage_local_run_trains_as_one_device():
     """A LoRA adapter's factors and its frozen base, both held stacked by stage, train two steps as
     one device trains them (check 1)."""
-    model, variables = lora()
+    model, _ = lora()
     assert_trains_as_one_device(model, OptimConfig(optimizer="adamw", learning_rate=1e-2), "stage-local lora",
-                                SEEDS["lora"], variables=variables)
+                                SEEDS["lora"], variables=lambda seed: lora(seed)[1])
 
 
 def stream():
