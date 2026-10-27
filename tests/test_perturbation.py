@@ -130,8 +130,14 @@ def estimated(objective, variables, batch) -> dict:
 
 def rejected(drawn, exact) -> float:
     """The least p-value of Student's one-sample t-test of the draws against `exact`, coordinate by
-    coordinate: a correct estimator's falls below one in a billion in no coordinate."""
-    return float(stats.ttest_1samp(np.asarray(drawn, np.float64), np.asarray(exact, np.float64)).pvalue.min())
+    coordinate: a correct estimator's falls below one in a billion in no coordinate. A coordinate every
+    draw leaves at one value, an embedding's row no id reads, is that value exactly, or rejected outright."""
+    drawn, exact = np.asarray(drawn, np.float64), np.asarray(exact, np.float64)
+    constant = np.all(drawn == drawn[0], axis=0)
+    if not np.array_equal(drawn[0][constant], exact[constant]):
+        return 0.0
+    varying = ~constant
+    return float(stats.ttest_1samp(drawn[:, varying], exact[varying]).pvalue.min()) if varying.any() else 1.0
 
 
 @pytest.mark.parametrize("layers", sorted(SITES))
@@ -273,11 +279,15 @@ def test_an_update_read_in_two_microbatches_estimates_what_its_batch_whole_does(
             return pooled_estimate(objective, jax.tree.map(jnp.asarray, params), {"x": x, "y": y}, parts)
         return as_given(jax.jit(run))
 
+    @jax.jit
+    def wide(x, y):
+        widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params)
+        return pooled_estimate(objective, widened, {"x": x, "y": y}, 1)
+
     def truth(x, y):
+        # Traced under x64, so its jitters are the float32 runs' and everything after them float64.
         with jax.enable_x64(new_val=True):
-            wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params)
-            return jax.tree.map(np.asarray, pooled_estimate(objective, wide, {"x": jnp.asarray(x),
-                                                                                "y": jnp.asarray(y)}, 1))
+            return jax.tree.map(np.asarray, wide(jnp.asarray(x), jnp.asarray(y)))
 
     whole, split = estimate(1), estimate(2)
     label = "node perturbation in two microbatches"

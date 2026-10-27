@@ -151,7 +151,7 @@ def test_a_damped_gauss_newton_step_is_the_normal_equations_solve(rows, features
                     truth_fn=exact)
 
 
-@pytest.mark.parametrize("rows,features", [(64, 8), (8, 64)], ids=["primal", "dual"])
+@pytest.mark.parametrize("rows,features", [(64, 8), (16, 64)], ids=["primal", "dual"])
 def test_an_accumulated_gauss_newton_update_solves_its_whole_batch_once(rows, features):
     """An update of a least-squares objective read in two microbatches of an accumulation window takes
     one damped Gauss-Newton step of its whole batch: each microbatch states its part of the update's

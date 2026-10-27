@@ -73,7 +73,7 @@ Path = tuple[str, ...]
 class Site:
     """One `Dense`, `DenseGeneral` or `Embed` call of the model in the clean forward: its module's path,
     how it maps (`kind`: "dense", "embed" or "attend"), its input, its output's shape and dtype, and a
-    dense call's contracted input axes, normalized, in the order its kernel's leading axes take them."""
+    dense call's contracted input axes, normalized and sorted, as its kernel's leading axes take them."""
 
     path: Path
     kind: str
@@ -106,7 +106,8 @@ def _site(context, args, kwargs, output) -> Site | None:
         rank = jnp.ndim(inputs)
         axes = (-1,) if isinstance(module, nn.Dense) else (
             tuple(module.axis) if isinstance(module.axis, tuple | list) else (module.axis,))
-        contracted = tuple(axis % rank for axis in axes)
+        # Flax sorts the axes it contracts (`_normalize_axes`), and its kernel takes them in that order.
+        contracted = tuple(sorted(axis % rank for axis in axes))
     return Site(tuple(module.path), kind, inputs, tuple(jnp.shape(output)), jnp.result_type(output),
                 contracted)
 
@@ -295,7 +296,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
                 return {}
             kernel = flat[(*site.path, "kernel")]
             # The input's free axes, in order, lead the output and the features follow; the kernel is the
-            # contracted axes, in the order the call names them, then the features (`lax.dot_general`).
+            # contracted axes, sorted, then the features (`lax.dot_general`).
             letters = string.ascii_letters
             rank = site.inputs.ndim
             read = letters[:rank]
