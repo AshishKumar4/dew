@@ -578,11 +578,9 @@ def _topology_lowered(topology: str, **trainer_options):
     state sharded whole over the topology's devices (`fsdp` of all of them, each leaf split)."""
     import optax
 
-    from dew.distributed.placement import MeshSpec
-    from dew.layout import Layout
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
-    from dew.training import Trainer
+    from dew.training import Layout, MeshSpec, Trainer
     from dew.training._lowering import Lowered, topology_devices
 
     devices = len(topology_devices(topology) or ())
