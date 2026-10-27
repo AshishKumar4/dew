@@ -946,9 +946,11 @@ def test_a_private_first_party_attribute_is_no_seam_whatever_its_name(tmp_path):
             "def test_public(monkeypatch):\n"
             "    monkeypatch.setattr(store, 'open', lambda path: None)\n"
             "def test_a_seams_own_private(monkeypatch):\n"
-            "    monkeypatch.setattr('sparx.store.os._exit', lambda code: None)\n"),
+            "    monkeypatch.setattr('sparx.store.os._exit', lambda code: None)\n"
+            "def test_a_first_party_private_under_a_seam_word(monkeypatch):\n"
+            "    monkeypatch.setattr('sparx.sources.hub.Hub._selected', lambda self: None)\n"),
     })
-    assert found == [("tests/test_store.py", 4, "SLOP008")]
+    assert found == [("tests/test_store.py", line, "SLOP008") for line in (4, 10)]
 
 
 def test_a_frozen_rendering_spacing_is_reported_and_its_content_claims_are_not(tmp_path):

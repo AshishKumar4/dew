@@ -623,7 +623,10 @@ def _seam(target: str) -> bool:
     hook, a process of its own)."""
     owner, _, name = target.rpartition(".")
     if name.startswith("_"):
-        return bool(owner) and _seam(owner)
+        # A seam's own private attribute: its owner a standard library module the target reaches by
+        # name, as `os` in `dew._coordination.os._exit`, where `Hub` in `...hub.Hub._selected` is not.
+        held = owner.rpartition(".")[2]
+        return held in sys.stdlib_module_names and _seam(owner)
     words = [word for word in re.split(r"[._]", target.lower()) if word]
     for seam in SEAMS:
         parts = [word for word in re.split(r"[._]", seam) if word]
