@@ -137,8 +137,10 @@ def test_a_bounded_group_clamps_its_parameters_and_no_others():
     initial = solver.init(params)
     updates, state = solver.update(grads, initial, params)
     moved = stepped(params, updates, initial, state)
-    # The clamp is exact: the bounds themselves, where the step overshot them.
+    # The clamp is exact: the bounds themselves, where the step overshot them; no other group's
+    # parameters are clamped, the step applied as it is.
     np.testing.assert_array_equal(moved["delay"], [0.0, 3.0])
+    np.testing.assert_array_equal(moved["kernel"], optax.apply_updates(params, updates)["kernel"])
     # The kernel takes Adam's first step unclamped, 0.5 * g / (|g| + 1e-8) off: Dew's step in float64 is
     # that formula's to its own float64 rounding (the oracle rule).
     with jax.enable_x64(new_val=True):
