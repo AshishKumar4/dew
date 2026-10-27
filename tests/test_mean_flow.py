@@ -117,8 +117,9 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
 
 MEANFLOW_SEEDS = 128
 """Check 1's declared seeds for a MeanFlow step through a fused attention kernel: the most paired sizing
-(`seeds_for` with the fused step as `dew_fn`) gave on the GPUs the site runs on, an A100's 128 for
-Triton's kernel and 8 for cuDNN's (node receipt TL-a100-meanflow-679)."""
+(`seeds_for` with the fused step as `dew_fn`, its confirming block) gave on the GPUs the site runs on, 128
+for Triton's kernel on an A100 and an H100 and 8 for cuDNN's (node receipts TL-a100-sizing-1851-679,
+TL-h100-sizing-1851-679), the largest declared as docs/design/testing.md's check 1 rules (d28b1c318)."""
 
 
 def agrees_with_xla(kernel: str) -> None:
