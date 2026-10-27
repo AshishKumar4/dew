@@ -95,9 +95,10 @@ def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_param
     """Row 1900: a step that pools four microbatches into a commit, compiled ahead for a GPU, holds
     beyond the step that commits each one its window's gradient sum, a value a parameter in the
     parameter's dtype, among its arguments, and no more temporaries than one microbatch's activations,
-    as XLA's memory analysis of both programs states them. A resident copy of the parameters, a second
-    gradient buffer or a narrow copy kept beside the sum, each two bytes a parameter or more, exceeds
-    that: row 1661's 14 GB on a 4B run surfaced only on a GPU, and this finds its kind on a CPU host."""
+    nor more at its peak, outputs included, as XLA's memory analysis of both programs states them. A
+    resident copy of the parameters, a second gradient buffer or a narrow copy kept beside the sum,
+    each two bytes a parameter or more, exceeds that: row 1661's 14 GB on a 4B run surfaced only on a
+    GPU, and this finds its kind on a CPU host."""
     from dew.training.ahead import compile_ahead, compile_only_gpus
 
     model = models.build("causal_transformer", vocab_size=VOCAB, **WIDE_MLP, num_kv_heads=2, dtype=dtype)
@@ -119,6 +120,8 @@ def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_param
     # The window's arguments: its gradient sum, and at most a token row a microbatch it holds to replay.
     assert window.argument_bytes - one.argument_bytes <= gradient + held
     assert window.temp_bytes - one.temp_bytes <= activations
+    # Its whole peak, outputs that alias no argument among it.
+    assert window.peak_bytes - one.peak_bytes <= gradient + held + activations
 
 
 @pytest.mark.gpu(reason="loads and runs a step compiled ahead on this host's own GPU")

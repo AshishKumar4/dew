@@ -33,6 +33,16 @@ def apply_xla_flags(flags: str | None) -> None:
     os.environ['XLA_FLAGS'] = f"{existing} {flags}".strip()
 
 
+def flags_hold(flags: str) -> bool:
+    """Whether every flag of `flags` holds in XLA_FLAGS as XLA reads it (`xla_flag`): the value its
+    last occurrence gives, a bare flag's 'true'."""
+    for token in flags.split():
+        name, equals, value = token.removeprefix("--").partition("=")
+        if xla_flag(name) != (value if equals else "true"):
+            return False
+    return True
+
+
 def xla_flag(name: str) -> str | None:
     """The value `--<name>` carries in XLA_FLAGS, or None when it is absent.
 
@@ -60,7 +70,7 @@ def keep_roundings() -> None:
     `XLA_FLAGS=--xla_allow_excess_precision=false` set before importing JAX.
     """
     global _late_policy_warned
-    if _backend_open():
+    if backend_open():
         if not _late_policy_warned:
             _late_policy_warned = True
             _log.warning(
@@ -71,7 +81,7 @@ def keep_roundings() -> None:
         apply_xla_flags("--xla_allow_excess_precision=false")
 
 
-def _backend_open() -> bool:
+def backend_open() -> bool:
     """Whether JAX's backend has opened, after which XLA reads no flag or pool setting again."""
     # Private JAX query pinned by jax<0.11.3; the fresh-process late-import
     # test covers this path without opening a backend just to inspect it.
@@ -82,7 +92,7 @@ def _backend_open() -> bool:
 def _gpu_default(name: str, assignment: str) -> None:
     """Pass XLA's GPU compiler `assignment` (`--name=value`) before the backend opens, unless the run
     named `name`."""
-    if not _backend_open() and cuda_plugin() and xla_flag(name) is None:
+    if not backend_open() and cuda_plugin() and xla_flag(name) is None:
         apply_xla_flags(assignment)
 
 
@@ -141,7 +151,7 @@ def preallocate_gpu_pool() -> None:
     ran without, 351 ms a step against 403 (an A100-40 at 4 x 3072, 389
     against 444 ms; gdn-one-path e3c90a968, runs/SwiftHeron/parity-*-gdn).
     JAX's default 75% holds less than that step's 71.8 GiB peak."""
-    if _backend_open():
+    if backend_open():
         return
     named = ("XLA_PYTHON_CLIENT_MEM_FRACTION", "XLA_PYTHON_CLIENT_PREALLOCATE", "XLA_PYTHON_CLIENT_ALLOCATOR")
     if cuda_plugin() and not any(name in os.environ for name in named):

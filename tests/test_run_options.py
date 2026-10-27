@@ -31,12 +31,13 @@ from dew.data.pipeline import Rejected
 from dew.data.sources.tokens import TokenFiles
 from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig
+from dew.devices import flags_hold
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
 from dew.lora import LoRA
 from dew.registry import ModelConfig
 from dew.sampling import Euler
-from dew.training import Layout, MeshSpec
+from dew.training import Layout, MeshSpec, prepare_process
 from dew.training.evaluation import Summary
 
 pytestmark = pytest.mark.mesh
@@ -190,7 +191,8 @@ def test_every_trainer_option_set_on_the_command_line_reaches_the_kinds_run(kind
         assert row["train/learning_rate"] == float(np.float32(RATE))
         assert "train/loss_scale" in row
         assert row[f"{Summary.SPLIT}/board"] == row["val/loss"]
-        assert DEFAULT_METRICS.get(kind) not in row
+        if kind in DEFAULT_METRICS:
+            assert DEFAULT_METRICS[kind] not in row
     assert sorted(path.name for path in run.iterdir() if path.name.isdigit()) == ["1", "2", "3", "4"]
 
 
@@ -257,7 +259,7 @@ def test_a_process_option_the_process_does_not_carry_is_refused_before_training(
     """XLA's flags, the compilation cache and the process pool are set before JAX opens a backend,
     as `run()` and `dew train` do: a run prepared and trained in a process that carries none of the
     one it states is refused before it trains, not trained without it."""
-    stated = {"xla_flags": "--xla_cpu_enable_fast_math=false",
+    stated = {"xla_flags": "--xla_gpu_deterministic_ops=true",
               "compilation_cache_dir": str(tmp_path / "cache"), "multi_host": True}[option]
     run = KINDS[kind](tmp_path, drawn=False)
     trainer = TrainerConfig(**{"checkpoint_dir": str(tmp_path / "runs"), "steps": 1, "eval_every": None,
@@ -266,3 +268,23 @@ def test_a_process_option_the_process_does_not_carry_is_refused_before_training(
     with pytest.raises(ValueError):
         prepared.train("refused")
     assert not (tmp_path / "runs" / "refused").exists()
+
+
+def test_a_flag_holds_as_xla_reads_it_its_last_occurrence_winning(monkeypatch):
+    """A run's XLA flag holds where XLA would read its value: a later occurrence of the flag overrides
+    an earlier one, and a bare flag reads as true."""
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_deterministic_ops=true --xla_dump_hlo_as_text "
+                                    "--xla_gpu_deterministic_ops=false")
+    assert not flags_hold("--xla_gpu_deterministic_ops=true")
+    assert flags_hold("--xla_gpu_deterministic_ops=false --xla_dump_hlo_as_text")
+
+
+def test_flags_set_after_the_backend_opened_are_refused_where_the_process_is_prepared(monkeypatch):
+    """XLA reads its flags as JAX opens its backend: once it has, preparing the process with flags
+    that do not already hold is refused, not appended to no effect; flags that hold are accepted."""
+    jax.devices()
+    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
+    monkeypatch.setenv("XLA_FLAGS", "--xla_dump_hlo_as_text")
+    with pytest.raises(ValueError):
+        prepare_process(xla_flags="--xla_gpu_deterministic_ops=true")
+    assert flags_hold("--xla_dump_hlo_as_text") and not flags_hold("--xla_gpu_deterministic_ops=true")

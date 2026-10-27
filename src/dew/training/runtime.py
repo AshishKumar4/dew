@@ -23,7 +23,15 @@ from jax.experimental import multihost_utils
 
 from dew._coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew.cache import enable_compilation_cache, persist_compilations
-from dew.devices import apply_xla_flags, cuda_plugin, preallocate_gpu_pool, refuse_cpu_only_jax, xla_flag
+from dew.devices import (
+    apply_xla_flags,
+    backend_open,
+    cuda_plugin,
+    flags_hold,
+    preallocate_gpu_pool,
+    refuse_cpu_only_jax,
+    xla_flag,
+)
 from dew.logging import configure as configure_logging
 from dew.pool import (
     PREEMPTED_EXIT,
@@ -93,15 +101,16 @@ def prepare_process(wandb: Wandb | None = None,
 def unprepared(multi_host: bool | None, xla_flags: str | None,
                compilation_cache_dir: str | None) -> list[str]:
     """Which of `prepare_process`'s options a run states that this process does not carry: a flag of
-    `xla_flags` its XLA_FLAGS lacks, a compilation cache JAX keeps elsewhere, a pool it is not in
-    (`multi_host=True`) or is in (False). Each acts before JAX opens a backend, so a run trained in a
-    process no `prepare_process` set up with them would run without them."""
+    `xla_flags` that does not hold as XLA reads its flags (`flags_hold`), a compilation cache JAX keeps
+    elsewhere, a pool it has not joined (`multi_host=True`; False only says never to join one). Each
+    acts as JAX opens its backend, and `prepare_process` sets none after (`_set_environment`), so a
+    run trained in a process no `prepare_process` set up with them would run without them."""
     missed = []
-    if xla_flags and not set(xla_flags.split()) <= set(os.environ.get('XLA_FLAGS', '').split()):
+    if xla_flags and not flags_hold(xla_flags):
         missed.append("xla_flags")
     if compilation_cache_dir and jax.config.jax_compilation_cache_dir != compilation_cache_dir:
         missed.append("compilation_cache_dir")
-    if multi_host is not None and jax.distributed.is_initialized() != multi_host:
+    if multi_host and not jax.distributed.is_initialized():
         missed.append("multi_host")
     return missed
 
@@ -129,7 +138,12 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
         os.environ['WANDB_MODE'] = 'offline'
     # HF tokenizers fork a thread pool; grain's workers fork the process.
     os.environ['TOKENIZERS_PARALLELISM'] = "false"
-    apply_xla_flags(xla_flags)
+    if xla_flags and not flags_hold(xla_flags):
+        if backend_open():
+            raise ValueError(f"XLA reads its flags as JAX opens its backend, which has opened: {xla_flags!r} "
+                             "would not take effect. Call prepare_process before anything calls JAX, or "
+                             "set XLA_FLAGS before the process starts")
+        apply_xla_flags(xla_flags)
     preallocate_gpu_pool()
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
