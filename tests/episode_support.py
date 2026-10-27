@@ -70,7 +70,8 @@ class ToolPolicy(nn.Module):
     def setup(self):
         self.table = self.param("table", lambda key: jnp.asarray(self.logits()))
 
-    def hidden_states(self, tokens, train=False, attention_mask=None, positions=None, segment_ids=None):
+    def hidden_states(self, tokens, train=False, **packing):
+        # A bigram reads each token alone, so a packed row's positions and documents change nothing.
         return jax.nn.one_hot(tokens, self.vocab_size)
 
     def output_table(self):
