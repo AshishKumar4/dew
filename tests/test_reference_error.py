@@ -1022,9 +1022,10 @@ def test_a_recorded_reference_with_pilots_sizes_paired_on_them_alone():
     holed, _, _, _ = _recorded_pairs(unit, unit, 24, missing={SIZING_FROM + 5})
     with pytest.raises(KeyError):
         recorded_pilots(holed, draw, 24)
-    # Arms that agree exactly resolve at once, at the ceiling itself.
-    same, same_dew, zero, _ = _recorded_pairs(unit, unit, 24)
-    assert seeds_for(recorded_pilots(same, draw, 24), draw, "at the ceiling", start=24, dew_fn=same_dew,
+    # Arms that agree exactly resolve at once, at the ceiling itself: half the pilots, the other half
+    # its confirming block.
+    same, same_dew, zero, _ = _recorded_pairs(unit, unit, 48)
+    assert seeds_for(recorded_pilots(same, draw, 48), draw, "at the ceiling", start=24, dew_fn=same_dew,
                      truth_fn=zero) == 24
     with pytest.raises(AssertionError):
         seeds_for(held, draw, "start past the pilots", start=32, dew_fn=dew, truth_fn=truth)
