@@ -7,6 +7,7 @@ tangent that dropped a representable 2^-30 residue. The Adam checks compare
 the exchange dispatch with the global one, whose gradients the oracle checks.
 """
 
+import contextlib
 import types
 
 import jax
@@ -159,8 +160,10 @@ def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
         projected = jnp.asarray(interpreted_projection(x, kernel, jnp.asarray(sizes), jnp.bfloat16))
         return jnp.sum(projected.astype(jnp.float32) * jnp.asarray(qy, jnp.float32)), projected
 
-    (_, y), (dx, dk) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(
-        jnp.asarray(x, input_dtype), jnp.asarray(kernel))
+    # A CPU interprets the kernels as the A100 it states; a GPU runs its own.
+    with generation.assumed("sm80") if jax.default_backend() == "cpu" else contextlib.nullcontext():
+        (_, y), (dx, dk) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(
+            jnp.asarray(x, input_dtype), jnp.asarray(kernel))
     assert dx.dtype == input_dtype and dk.dtype == jnp.float32
     np.testing.assert_allclose(np.asarray(y, np.float64), rounded(forward), atol=TOLERANCE,
                                rtol=TOLERANCE)

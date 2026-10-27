@@ -1209,9 +1209,9 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     """The `GroupedCase` of `launches` called with `arguments` and `options` (`gmm_call`, `tgmm_call`),
     its kind of call as they state it: a kernel gradient (exactly summed or not) from `tgmm_call`'s
     launches, an input gradient or a forward from `gmm_call`'s, dense or grouped; and whether the kernels
-    run on its target (`placed`): a CUDA GPU's only from compute capability 8.0 (`generation.BF16_GPU`,
-    JAX's bound for its Pallas lowerings: a T4 fails to compile them), any other target's its own launches
-    judge."""
+    run on its target (`placed`): a TPU's, or a CUDA GPU's from compute capability 8.0
+    (`generation.BF16_GPU`, JAX's bound for its Pallas lowerings: a T4 fails to compile them), never a
+    CPU's (a CPU process interprets a GPU's only as the GPU it states, `generation.assumed`)."""
     if launches is _TGMMS:
         made = 'kernel_gradient exact' if options['exact_sums'] else 'kernel_gradient'
     else:
@@ -1219,20 +1219,18 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool)
     kind = f"{'dense' if options['dense'] else 'grouped'} {made}"
     call = base.call(launches, *arguments, **options)
     cuda = generation.capability(call.target.generation)
-    placed = cuda is None or cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
+    floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
+    placed = generation.tpu(call.target) or floor
     return GroupedCase(placed, whole, product, arguments[0].shape[0], call, kind)
 
 
 def launched(launches, arguments, options, *, product: Product, whole: bool):
     """The launch of `launches` that runs the call (`arguments`, `options`) as `GROUPED` selects it,
-    ready to call, or None where XLA's program takes it. A CPU process's GPU branch, which runs only where
-    a lowering for the GPU takes it, takes a chosen implementation where it can and the order's next
-    launch where it cannot (mma.sync's where this JAX lowers none: `_family`); every branch a process
-    runs insists on it."""
+    ready to call, or None where XLA's program takes it: on the call's target, a CPU process's own (whose
+    kernels run nowhere, so XLA's program takes every call and a kernel `generation.chosen` names raises)
+    or the GPU it states (`generation.assumed`). Every branch insists on a named kernel."""
     case = grouped_case(launches, arguments, options, product=product, whole=whole)
-    unrun = not options['interpret'] and jax.default_backend() == 'cpu'
-    named = selection.forced(GROUPED.choice) if unrun else None
-    route = selection.select(GROUPED, case, named, insist=not unrun)
+    route = selection.select(GROUPED, case)
     if route.kernel == 'xla':
         return None
     return functools.partial(case.call.implementation(route.kernel), *arguments, **options)

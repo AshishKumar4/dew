@@ -393,8 +393,8 @@ def test_the_kernels_forward_mode_keeps_the_projections_law():
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="a GPU of sm80 or later runs the named kernel")
 def test_a_named_kernel_refuses_where_the_kernels_do_not_run():
-    """A kernel `generation.chosen` names for a call no kernel runs (a CPU's without 'pallas', which alone
-    interprets them) raises with the reason, rather than running XLA."""
+    """A kernel `generation.chosen` names for a call no kernel runs (a CPU's, whose kernels run nowhere
+    but interpreted as a GPU it states) raises with the reason, rather than running XLA."""
     x, w, sizes = jnp.ones((8, 16), jnp.bfloat16), jnp.ones((2, 16, 16), jnp.float32), jnp.asarray([4, 4])
     with generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError):
         expert_projection(x, w, sizes, jnp.bfloat16, "auto", None)
