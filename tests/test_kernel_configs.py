@@ -253,9 +253,11 @@ def _gemm_mainloop_cases(generation_name: str, *, every_consumer_count: bool = F
                 family = mosaic_gpu.family_of(config, jnp.bfloat16)
                 configs = {}
                 for consumers in sorted({1, family.consumers}):
-                    # Each consumer keeps its share of the derived tile's rows.
+                    # Each consumer keeps its share of the derived tile's rows; one consumer runs alone,
+                    # a cluster being two consumers' (`mosaic_gpu.Tiles`).
                     rows_ = config.block_m // config.warpgroups * consumers
-                    tile = dataclasses.replace(config, warpgroups=consumers, block_m=rows_)
+                    tile = dataclasses.replace(config, warpgroups=consumers, block_m=rows_,
+                                               cluster=config.cluster if consumers > 1 else 1)
                     if launch.legal(ba, tile, target):
                         configs[f"{name} x{consumers} {tile}"] = tile
             for label, config in configs.items():
