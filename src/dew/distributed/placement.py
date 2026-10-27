@@ -113,8 +113,18 @@ def _spec_axes(spec: P) -> set[str]:
 def device_mesh(mesh: MeshSpec | Mesh, devices: list | None = None) -> Mesh:
     """The device mesh `mesh` names: a native `jax.sharding.Mesh` as it is,
     whatever its axes, or the one a `MeshSpec` builds, over `devices` where
-    given (a TPU topology's a run compiles for, `Trainer(lower_for=)`)."""
-    return mesh if isinstance(mesh, Mesh) else mesh.build(devices)
+    given (a TPU topology's a run compiles for, `Trainer(lower_for=)`): a
+    native mesh then keeps its shape, axes and their types over them, as
+    many as it holds."""
+    if not isinstance(mesh, Mesh):
+        return mesh.build(devices)
+    if devices is None:
+        return mesh
+    if len(devices) != mesh.devices.size:
+        raise LayoutRefused(f"a mesh of {mesh.devices.size} devices does not lie over a topology of "
+                            f"{len(devices)}")
+    return Mesh(np.asarray(devices, dtype=object).reshape(mesh.devices.shape), mesh.axis_names,
+                axis_types=mesh.axis_types)
 
 
 def explicit_axes(mesh: MeshSpec | Mesh | AbstractMesh) -> tuple[str, ...]:

@@ -84,7 +84,7 @@ from dew.distributed.placement import (
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes, batch_axes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
-from dew.nn.kernels.generation import assumed, backend, gpu_mesh, gpu_target, measured_kernel
+from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     Link,
@@ -129,7 +129,7 @@ from dew.training._fit import (
     unrecorded_parts,
     waited_read,
 )
-from dew.training._lowering import Lowered, generation_of, topology_devices
+from dew.training._lowering import Lowered, compile_for_topology, generation_of, topology_devices
 from dew.training.budget import Pause, Plateau, run_length, run_steps, run_tokens
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -173,7 +173,7 @@ from dew.training.model_flops import (
     prepare_counts,
     uncounted,
 )
-from dew.training.narrow import narrowed, narrowed_paths
+from dew.training.narrow import narrow_copies, narrowed
 from dew.training.observe import Observe
 from dew.training.planning import (
     Candidate,
@@ -421,7 +421,12 @@ class Trainer(Generic[Loss, Effects]):
     @functools.cached_property
     def device_mesh(self) -> Mesh:
         """The device mesh (`device_mesh`), built on first use."""
-        return device_mesh(self.mesh, topology_devices(self.lower_for))
+        return device_mesh(self.mesh, self.topology)
+
+    @functools.cached_property
+    def topology(self) -> list | None:
+        """The devices of the TPU topology `lower_for` names, which the run compiles for, or None."""
+        return topology_devices(self.lower_for)
 
     @property
     def microbatches(self) -> int:
@@ -964,7 +969,7 @@ class Trainer(Generic[Loss, Effects]):
         """
         if self.lower_for is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
-            target, compiled = self.lower_for, topology_devices(self.lower_for) is not None
+            target, compiled = self.lower_for, self.topology is not None
             lowered = Lowered(target, self._lowered_for(state, batch, target), compiled=compiled)
             if compiled and self.checkpoints is not None:  # The run's own record of its target's compile.
                 lowered.save(f"{self.checkpoints.directory}/compiled-{self.lower_for}")
@@ -1133,7 +1138,9 @@ class Trainer(Generic[Loss, Effects]):
         if shapes is not None:
             self._refuse_unpipelined(schedule)
         prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
-        copies = self._narrow_copies(state, batch) if (self._narrow if narrow is None else narrow) else {}
+        composed = self.step is None and not self.dynamic_scale
+        copies = (narrow_copies(self.objective, state, batch, self._model_batch, composed=composed)
+                  if (self._narrow if narrow is None else narrow) else {})
         prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
             lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
         return shapes, copies, prepared
@@ -1175,7 +1182,7 @@ class Trainer(Generic[Loss, Effects]):
                              "the variables on the host")
         # A TPU topology's mesh holds its own devices, which libtpu lowers and compiles for.
         chip = generation_of(generation)
-        topology = topology_devices(generation) is not None
+        topology = self.topology is not None
         mesh = self.device_mesh if topology else gpu_mesh(self.device_mesh, generation)
         self._at_base_rung(batch)
         with assumed(chip), self._traced_on(mesh) as schedule:
@@ -1191,29 +1198,6 @@ class Trainer(Generic[Loss, Effects]):
             return jitted.trace(*apart(placed_shapes(prepared, shardings)), placed_shapes(batch, placement),
                                 jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)).lower(
                 lowering_platforms=('tpu' if topology else 'cuda',))
-
-    def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
-        """The parameters the step reads through narrow copies
-        (`dew.training.narrow`), by path under `params`: on every GPU but
-        one whose row measured them off, for a step this trainer composes,
-        without a loss scale."""
-        if (measured_kernel('narrow_copies', 'on' if backend() == 'gpu' else 'off') == 'off'
-                or self.step is not None or self.dynamic_scale or FROZEN in state.variables):
-            return {}
-        variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
-
-        def loss(params, rest, batch, microstep, key, step, ema):
-            # As `_loss_shape` traces it, the averaged weights the step hands
-            # the objective included: a parameter read there is used twice.
-            variables = {**rest, "params": params}
-            return self.objective._loss(
-                variables, self._model_batch(batch),
-                Step(microstep, jax.random.fold_in(key, step), with_ema(variables, ema),
-                     qk_stats=clips_qk(state.opt_state)))
-
-        rest = {name: tree for name, tree in variables.items() if name != "params"}
-        return narrowed_paths(loss, variables["params"], rest, batch, state.microstep, state.key, state.step,
-                              state.ema)
 
     def _refuse_unpipelined(self, schedule: Schedule) -> None:
         """Refuse a stage axis under a model whose traced step ran no pipeline."""
@@ -1399,6 +1383,8 @@ class Trainer(Generic[Loss, Effects]):
         The loop is the state's one holder: each step donates the state it is
         handed, and a reference kept past that, as fit's own once was, holds
         an array whose buffers the step consumed."""
+        if self.topology is not None:  # A TPU topology's step compiles from shapes, nothing placed on it.
+            compile_for_topology(self, plan, initial)
         current, position, placed, abstract = self._starting(run, initial)
         run.last_checkpoint = time.perf_counter()
         interval = Interval.resumed(run.stop_control, last_saved=(
@@ -1617,8 +1603,6 @@ class Trainer(Generic[Loss, Effects]):
                 first = waited_read(run, interval, agree=True, peek=True)
                 if first is not None:
                     placed_first = placed_abstract(mesh, first)
-                    if topology_devices(self.lower_for):  # A TPU topology's step compiles here, unplaced.
-                        self.compile(abstract, placed_first)
                     # A process whose reader changed a field or a shape is refused by every process, as
                     # a compile refuses it, before the state it would check is traced from that batch.
                     agreed_same("training batch layout", lambda: batch_layout(split_fields(placed_first)[0]))

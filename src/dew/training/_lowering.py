@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import jax
+import numpy as np
 from jax.extend.mlir import ir
 
 TRITON = "__gpu$xla.gpu.triton"
@@ -100,6 +101,35 @@ def topology_devices(target: str | None) -> list | None:
     return list(topologies.get_topology_desc(target, "tpu").devices)
 
 
+def compile_for_topology(trainer, plan, initial) -> None:
+    """Compile `trainer`'s first step for the TPU topology it names, from shapes alone, as `fit` begins
+    (`Trainer.compile` raises `Lowered`): the supplied state's, or the fresh state its initializer
+    makes, at the rung a checkpoint it would resume records, and the first batch the run's data reads
+    on this host, its host fields set aside as a step's are. Nothing is placed on the topology's
+    devices, which this host does not run. A rollout's batches are its policy's own draws, which no
+    device here draws, so its step is compiled from a batch of its shapes (`Trainer.compile`)."""
+    from dew.data.dataset import DataPartition
+    from dew.distributed.batches import split_fields
+
+    if trainer.rollout is not None:
+        raise ValueError("a rollout run's batches are its policy's draws, which a TPU topology this host "
+                         "does not run cannot draw: compile its step with Trainer.compile(state, batch) "
+                         "over a batch of its shapes")
+    checkpoints = trainer.checkpoints
+    if initial is None and checkpoints is not None and checkpoints.latest is not None:
+        trainer._resume_rung(checkpoints.rung(checkpoints.latest))
+    state = (jax.eval_shape(lambda: initial) if initial is not None else
+             jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key))
+    stream = plan.dataset.train(DataPartition())
+    try:
+        first = next(iter(stream))
+    finally:
+        stream.close()
+    batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(np.shape(x), np.asarray(x).dtype),
+                         split_fields(first)[0])
+    trainer.compile(state, batch)
+
+
 class Lowered(SystemExit):
     """Raised by `Trainer.fit` under `lower_for` once the run's first step has lowered for its target.
 
@@ -116,7 +146,16 @@ class Lowered(SystemExit):
         self.generation = generation
         self.lowered = lowered
         self.kernels = triton_kernels(lowered)
-        self.compiled = lowered.compile() if compiled else None
+        self.compiled = None
+        if compiled:
+            # Compiled for devices this host is not, its executable cannot load back here: the
+            # persistent cache would write one no later compile of it reads, so it is off meanwhile.
+            cached = jax.config.jax_enable_compilation_cache
+            jax.config.update("jax_enable_compilation_cache", val=False)
+            try:
+                self.compiled = lowered.compile()
+            finally:
+                jax.config.update("jax_enable_compilation_cache", val=cached)
 
     @property
     def memory(self) -> dict[str, int]:
@@ -135,10 +174,18 @@ class Lowered(SystemExit):
                 if key in found}
 
     def save(self, path: str | Path) -> None:
-        """Write the compiled step to `path`, local or remote: its serialized executable and its
-        argument and result trees, which `jax.experimental.serialize_executable.deserialize_and_load`
-        reads on a host of the topology it was compiled for, and beside it (`path.json`) the target it
-        was compiled for and each device's memory and work."""
+        """Write the compiled step to `path`, local or remote, and beside it (`path.json`) the target it
+        was compiled for and each device's memory and work.
+
+        `path` holds a pickle of `jax.experimental.serialize_executable.serialize`'s triple, the
+        serialized executable and its argument and result trees. A host of the topology it was
+        compiled for, under the same JAX and libtpu, loads it as
+
+            serialized, inputs, outputs = pickle.loads(epath.Path(path).read_bytes())
+            step = deserialize_and_load(serialized, inputs, outputs, backend="tpu")
+
+        Unpickling and deserializing can run arbitrary code, so load only a file this run or another
+        trusted one wrote."""
         from etils import epath
         from jax.experimental.serialize_executable import serialize
 

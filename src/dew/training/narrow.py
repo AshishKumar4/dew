@@ -39,7 +39,7 @@ import jax.numpy as jnp
 from jax.core import ShapedArray
 from jax.extend import core
 
-from dew.batch import Variables, merge, select
+from dew.batch import FROZEN, Variables, merge, select
 
 _PASSED_THROUGH = ("jit", "pjit", "closed_call", "core_call", "remat2", "checkpoint")
 
@@ -145,3 +145,31 @@ def narrowed(variables: Variables, paths: dict[tuple[str, ...], jnp.dtype]) -> V
 def forward_variables(variables: Variables, compute: Variables | None) -> Variables:
     """The variables the forward reads: the narrow copies in place of their parameters."""
     return variables if compute is None else merge(variables, compute)
+
+
+def narrow_copies(objective, state, batch, model_batch, *, composed: bool) -> dict:
+    """The parameters a step reads through narrow copies, by path under `params` (`narrowed_paths`):
+    on every GPU but one whose row measured them off, for a step the trainer composes (`composed`),
+    without a loss scale, whose state holds no frozen collection. `model_batch` is the trainer's
+    batch as the model reads it."""
+    from dew.nn.kernels.generation import backend, measured_kernel
+    from dew.objectives.base import Step
+    from dew.optim import clips_qk
+    from dew.training.transaction import with_ema
+
+    if (measured_kernel('narrow_copies', 'on' if backend() == 'gpu' else 'off') == 'off'
+            or not composed or FROZEN in state.variables):
+        return {}
+    variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
+
+    def loss(params, rest, batch, microstep, key, step, ema):
+        # As the trainer's loss shape traces it, the averaged weights the step hands the objective
+        # included: a parameter read there is used twice.
+        variables = {**rest, "params": params}
+        return objective._loss(variables, model_batch(batch),
+                               Step(microstep, jax.random.fold_in(key, step), with_ema(variables, ema),
+                                    qk_stats=clips_qk(state.opt_state)))
+
+    rest = {name: tree for name, tree in variables.items() if name != "params"}
+    return narrowed_paths(loss, variables["params"], rest, batch, state.microstep, state.key, state.step,
+                          state.ema)

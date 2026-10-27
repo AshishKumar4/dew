@@ -573,25 +573,16 @@ def test_a_function_traced_before_a_routes_block_reports_its_routes_within_it():
 # ------------------------------------------------------------------ a TPU topology, compiled here
 
 
-def _topology_lowered(topology: str, **trainer_options):
-    """A tiny Llama's language-model training step compiled for the TPU `topology` on this host, its
-    state sharded whole over the topology's devices (`fsdp` of all of them, each leaf split)."""
-    import optax
-
-    from dew.nn.backbones import CausalTransformer
-    from dew.objectives.lm import LMObjective
-    from dew.training import Layout, MeshSpec, Trainer
+def _topology_lowered(topology: str):
+    """A tiny Llama's language-model training step compiled for the TPU `topology` on this host
+    (`_topology_trainer`)."""
     from dew.training._lowering import Lowered, topology_devices
 
-    devices = len(topology_devices(topology) or ())
-    model = CausalTransformer(vocab_size=256, num_layers=2, num_heads=4, emb_features=128, mlp_features=256,
-                              dtype=jnp.bfloat16)
-    trainer = Trainer(LMObjective(model, 64), optax.adamw(1e-4), key=jax.random.key(0), lower_for=topology,
-                      mesh=MeshSpec(fsdp=devices), layout=Layout(min_shard=1), **trainer_options)
+    trainer, devices = _topology_trainer(topology), len(topology_devices(topology) or ())
     state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
     with pytest.raises(Lowered) as lowered:
         trainer.compile(state, {"text": jax.ShapeDtypeStruct((devices, 65), jnp.int32)})
-    return trainer, lowered.value
+    return lowered.value
 
 
 def test_a_step_compiles_here_for_a_tpu_topology_and_states_each_devices_memory_and_work(tmp_path):
@@ -600,7 +591,7 @@ def test_a_step_compiles_here_for_a_tpu_topology_and_states_each_devices_memory_
     its arguments lie on every TPU of the topology, each device's memory and work are XLA's own for
     that TPU, and a topology of more devices holds less of the sharded state on each. The executable
     saves for a host of that topology to load."""
-    small, large = (_topology_lowered(name)[1] for name in ("v5e:2x2", "v5e:4x4"))
+    small, large = (_topology_lowered(name) for name in ("v5e:2x2", "v5e:4x4"))
     for lowered, count in ((small, 4), (large, 16)):
         assert lowered.compiled is not None
         placed = jax.tree.leaves(lowered.compiled.input_shardings)
@@ -614,14 +605,57 @@ def test_a_step_compiles_here_for_a_tpu_topology_and_states_each_devices_memory_
     assert stated == {"target": "v5e:2x2", "memory": small.memory, "cost": small.cost}
 
 
-def test_a_run_compiled_for_a_tpu_topology_keeps_its_executable_beside_its_checkpoints(tmp_path):
-    """A run under `lower_for` of a TPU topology compiles its step for it and saves the executable, with
-    each device's memory and work, in its checkpoint directory, before it trains."""
-    from dew.checkpoints import Checkpoints
+def _topology_trainer(topology: str, **options):
+    """A tiny Llama's language-model trainer that compiles for the TPU `topology`, its state sharded
+    whole over the topology's devices."""
+    import optax
 
-    _, lowered = _topology_lowered("v5e:2x2", checkpoints=Checkpoints(str(tmp_path / "run")))
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Layout, MeshSpec, Trainer
+    from dew.training._lowering import topology_devices
+
+    devices = len(topology_devices(topology) or ())
+    model = CausalTransformer(vocab_size=256, num_layers=2, num_heads=4, emb_features=128, mlp_features=256,
+                              dtype=jnp.bfloat16)
+    return Trainer(LMObjective(model, 64), optax.adamw(1e-4), key=jax.random.key(0), lower_for=topology,
+                   **{"mesh": MeshSpec(fsdp=devices), "layout": Layout(min_shard=1), **options})
+
+
+def test_a_run_compiled_for_a_tpu_topology_keeps_its_executable_beside_its_checkpoints(tmp_path):
+    """A run's fit under `lower_for` of a TPU topology compiles its step for it from its first batch's
+    shapes, its host fields set aside, before anything is placed, and saves the executable, with each
+    device's memory and work, in its checkpoint directory."""
+    from dew.checkpoints import Checkpoints
+    from dew.data import Loader
+    from dew.training._lowering import Lowered
+
+    def batches(partition):
+        while True:
+            yield {"text": np.zeros((4, 65), np.int32), "caption": np.asarray(["a row"] * 4, object)}
+
+    trainer = _topology_trainer("v5e:2x2", checkpoints=Checkpoints(str(tmp_path / "run")))
+    with pytest.raises(Lowered) as lowered:
+        trainer.fit(Loader(train=batches, val=None, batch=4, records=None), steps=1)
     assert (tmp_path / "run" / "compiled-v5e:2x2").stat().st_size > 0
-    assert json.loads((tmp_path / "run" / "compiled-v5e:2x2.json").read_text())["memory"] == lowered.memory
+    stated = json.loads((tmp_path / "run" / "compiled-v5e:2x2.json").read_text())
+    assert stated["memory"] == lowered.value.memory
+
+
+def test_a_native_mesh_lies_over_the_topology_it_compiles_for():
+    """A native mesh keeps its shape, axes and their types over the TPU topology's devices; one of
+    another device count is refused."""
+    from jax.sharding import AxisType
+
+    from dew.mesh import LayoutRefused
+
+    native = Mesh(np.asarray(jax.devices()[:4]).reshape(2, 2), ("data", "fsdp"),
+                  axis_types=(AxisType.Explicit, AxisType.Auto))
+    placed = _topology_trainer("v5e:2x2", mesh=native).device_mesh
+    assert dict(placed.shape) == {"data": 2, "fsdp": 2} and placed.axis_types == native.axis_types
+    assert {device.platform for device in placed.devices.flat} == {"tpu"}
+    with pytest.raises(LayoutRefused):
+        _ = _topology_trainer("v5e:4x4", mesh=native).device_mesh
 
 
 def test_a_cuda_generation_lowers_and_compiles_nothing_here():
