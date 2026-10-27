@@ -5,6 +5,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -43,6 +44,20 @@ def wait_gone(pids, seconds=5.):
     while any(alive(pid) for pid in pids) and time.monotonic() < deadline:
         time.sleep(.02)
     return [pid for pid in pids if alive(pid)]
+
+
+def test_alive_answers_for_a_process_reaped_as_it_is_read():
+    """A process reaped between `alive`'s open of its /proc stat and the read is gone, not an error: the
+    read raises ProcessLookupError (ESRCH) there, which red whole-suite runs through wait_gone (TartPenguin,
+    2026-10-27: test_parent_death_kills_the_worker). Each child here is reaped by a thread as its stat is
+    read."""
+    for _ in range(400):
+        child = subprocess.Popen(["true"])
+        reaper = threading.Thread(target=child.wait)
+        reaper.start()
+        while alive(child.pid):
+            pass
+        reaper.join()
 
 
 def test_worker_round_trip_and_process_group_cleanup():
