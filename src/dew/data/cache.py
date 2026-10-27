@@ -373,6 +373,9 @@ class _Writer:
         self.pending_bytes = 0
         self.spool_bytes = 0
         self.admitting = True
+        self.dropped = False
+        """Whether the fill was dropped where its storage or its codec failed an optional cache
+        (`_stopped`), so it ends unsealed, unlike a full one's stop, which seals what it admitted."""
         self.closed = False
         self.closing = False
         self.uploaded_bytes = 0
@@ -421,10 +424,10 @@ class _Writer:
         try:
             payload = encode(outputs)
         except Unencodable as error:
-            # A record the codec cannot write: an optional cache keeps none of the fill, as where its
-            # storage fails, and the run reads on computed; a required one refuses the record.
+            # A record the codec cannot write: a required cache refuses it wherever its fill stands; an
+            # optional one keeps none of the fill, as where its storage fails, and reads on computed.
             with self.lock:
-                if self.admitting:
+                if not self.cache.optional or not self.dropped:
                     if not self.cache.read_on(error, "stopped admission"):
                         raise
                     self._stopped()
@@ -458,9 +461,9 @@ class _Writer:
         return outputs if transform is not None else outputs[0]
 
     def _stopped(self) -> None:
-        """Stop admitting for good, under the lock: what the writer held unwritten is dropped, so its
-        fill ends unsealed and publishes nothing."""
-        self.admitting = False
+        """Stop admitting for good, under the lock: what the writer held unwritten is dropped, and the
+        fill is neither sealed nor published (`dropped`), what it wrote left for collection."""
+        self.admitting, self.dropped = False, True
         self.pending.clear()
         self.pending_bytes = 0
 
@@ -592,6 +595,9 @@ class _Writer:
             }
 
     def seal(self) -> None:
+        if self.dropped:
+            # A dropped fill seals nothing; its uploads drain as the writer finishes.
+            return
         with self.lock:
             self._flush()
         self.segments = [future.result() for future in self.futures]
@@ -611,7 +617,7 @@ class _Writer:
         under its key (`Cache.publish`). Another writer that completed the
         same fill may publish it first, which leaves it published."""
         self.seal()
-        if self.source is None:
+        if self.source is None or self.dropped:
             return
         try:
             self.cache.publish(self.key, self.source)

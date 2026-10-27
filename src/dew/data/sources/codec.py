@@ -206,7 +206,7 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
             return {"entries": [[_tree(key, leaves, canonical), _tree(entry, leaves, canonical)]
                                 for key, entry in entries]}
         if not all(isinstance(key, str) for key in value):
-            raise TypeError("artifact mappings need string keys")
+            raise Unencodable("artifact mappings need string keys")
         keys = sorted(value) if canonical else value
         return {"mapping": {key: _tree(value[key], leaves, canonical) for key in keys}}
     if isinstance(value, (list, tuple)):
@@ -215,7 +215,7 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         cls = type(value)
         if not cls.__module__.startswith("dew.") and not leaves.opaque:
-            raise TypeError(f"artifact codec has no schema for {cls.__module__}.{cls.__qualname__}")
+            raise Unencodable(f"artifact codec has no schema for {cls.__module__}.{cls.__qualname__}")
         return {
             "dataclass": [cls.__module__, cls.__qualname__],
             "fields": {

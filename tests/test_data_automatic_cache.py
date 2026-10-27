@@ -369,16 +369,44 @@ def test_an_image_a_record_names_by_path_is_read_past_the_automatic_cache(tmp_pa
     assert len(step.calls) == calls, "the costly map before the decode is read back"
 
 
+@dataclass(frozen=True)
+class Plain:
+    """A dataclass of no module of Dew's, which the artifact codec has no schema for."""
+
+    name: str = "plain"
+
+
+@pytest.mark.parametrize("unwritable", [Path("tag"), {1: "one"}, Plain()],
+                         ids=["path", "int-keys", "foreign"])
 @pytest.mark.parametrize("how", READS)
-def test_records_the_codec_cannot_write_are_read_computed_past_the_automatic_cache(how):
-    """A record holding a value the artifact codec has no encoding for (a `pathlib.Path`) stops the
-    automatic cache's fill, as storage that fails does, and the run reads every record computed, the
-    records a run with no cache reads."""
+def test_records_the_codec_cannot_write_are_read_computed_past_the_automatic_cache(how, unwritable):
+    """A record holding a value the artifact codec has no encoding for (a `pathlib.Path`, a mapping of
+    integer keys, a dataclass of no module of Dew's), after the first record wrote, drops the automatic
+    cache's fill, as storage that fails does: the run reads every record computed, the records a run
+    with no cache reads, and the fill is neither sealed nor published."""
     step = Counted()
-    # The random map ends the cache's prefix, so what the cache would hold still carries the path.
-    chain = (Pipeline(records()).map(lambda row: {**row, "tag": Path("tag")}, identity="tag@1")
-             .map(step, identity="counted@1")
+
+    def tagged(row):
+        return {**row, "tag": unwritable} if int(row["id"]) else row
+
+    # The random map ends the cache's prefix, so what the cache would hold still carries the value.
+    chain = (Pipeline(records()).map(tagged, identity="tag@1").map(step, identity="counted@1")
              .random_map(lambda row, rng: {key: value for key, value in row.items() if key != "tag"},
                          identity="untag@1"))
     assert read(chain, how) == read(chain, how, cache=False)
     assert not generations()
+    assert not list(Path(automatic_root(Loading())).rglob("seal.json"))
+
+
+def test_a_required_cache_refuses_a_record_its_codec_cannot_write_after_its_admission_stops(tmp_path):
+    """A required cache full after its first record (`on_full="stop"`) stops admitting, and still
+    refuses a later record holding a value the codec has no encoding for, as it would have before."""
+    from dew.data.cache import Cache
+
+    cache = Cache(str(tmp_path / "cache"), on_full="stop", keep_local_bytes=1)
+    chain = (Pipeline(records()).map(lambda row: {**row, "tag": Path("tag")} if int(row["id"]) else row,
+                                     identity="tag@1")
+             .cache(cache).random_map(lambda row, rng: {key: value for key, value in row.items()
+                                                        if key != "tag"}, identity="untag@1"))
+    with pytest.raises(TypeError):
+        read(chain, "indexed")
