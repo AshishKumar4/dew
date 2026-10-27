@@ -995,6 +995,12 @@ def _training_reader(
     partition.rows(build.batch)
     if plan.volatile and partition.readers > 1:
         raise ValueError("volatile pipeline requires one reader per share until its bytes are persisted")
+    if plan.volatile and build.elastic and partition.count > 1:
+        # Every share reads an elastic order's prefix whole on its own (`_elastic_cut`), so a source
+        # whose rows can differ between reads (a fetch that drops failed records) orders them apart.
+        raise ValueError(f"an elastic read's {partition.count} shares each read its whole order, which this "
+                         "pipeline's volatile source can read differently on each; persist its bytes first "
+                         "(`Pipeline.cache`), or read it without `.elastic()`")
     _one_shape(host, partition)
     opened: Iterator[Batch]
     if build.global_order:

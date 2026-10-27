@@ -18,8 +18,8 @@ from data_support import WideDraw, listed
 from dew import position
 from dew.batch import VALID_ROWS
 from dew.data.compile import compile
-from dew.data.dataset import DataPartition, Loading
-from dew.data.pipeline import Pipeline
+from dew.data.dataset import DataPartition, Loading, Ramp, ramped
+from dew.data.pipeline import Pipeline, Rejected
 from dew.data.sources import Memory
 
 READ = Loading(workers=0, threads=4, read_buffer=4)
@@ -150,3 +150,60 @@ def test_an_elastic_read_refuses_loading_workers_and_a_per_share_position():
     listed(elastic, 1)
     with pytest.raises(ValueError):
         reader(stream(elastic=False), 0, 2).set_state(elastic.get_state())
+
+
+@dataclasses.dataclass(frozen=True)
+class OddOnly:
+    """A record whose id is odd, or its rejection (`Pipeline.filter_map`)."""
+
+    def __call__(self, row):
+        return row if int(row["id"]) % 2 else Rejected("even")
+
+
+@pytest.mark.parametrize("count", [2, 4])
+def test_an_elastic_read_whose_map_rejects_records_reads_one_readers_order(count):
+    """A map that rejects records (`filter_map`) decides which rows there are, as a filter does, so
+    every elastic reader runs it over the whole order and keeps its share of each batch of what it
+    kept: the shares' rows together are one reader's, every id odd (row 1912, where the read took
+    the map as one record for one and its rows' mapping refused the rejected record)."""
+    def chain(elastic: bool = True) -> Pipeline:
+        built = (Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(96))))
+                 .shuffle(5).repeat(None).filter_map(OddOnly()).map(Squared()).batch(BATCH))
+        return built.elastic() if elastic else built
+
+    one = [rows(batch) for batch in listed(reader(chain(), 0, 1), 6)]
+    shares = [[rows(batch) for batch in listed(reader(chain(), index, count), 6)] for index in range(count)]
+    for step, whole in enumerate(one):
+        assert sorted(row for share in shares for row in share[step]) == sorted(whole)
+        assert all(ident % 2 for ident, *_ in whole)
+
+
+def test_an_elastic_read_refuses_a_batch_ramp_before_it_reads():
+    """A batch ramp cuts its steps out of a global record count, which an elastic read's position,
+    its order's, is not: an elastic read under a ramp is refused where the ramp opens it, not where
+    its first save or restore would find no record count (row 1913)."""
+    loader = ramped(compile(stream(), loading=READ, seed=3), Ramp(start=4, increment=4, samples=64))
+    with pytest.raises(TypeError):
+        loader.train(DataPartition(0, 2))
+
+
+@dataclasses.dataclass(frozen=True)
+class Fetched:
+    """A record as a live fetch returns it, which may differ between reads (`Volatile`)."""
+
+    volatile: bool = True
+
+    def __call__(self, row):
+        return row
+
+
+def test_an_elastic_read_of_a_volatile_source_over_several_shares_is_refused():
+    """Every elastic share reads its order's whole prefix on its own, so a source a fetch reads
+    differently each time (`Volatile`) would order the shares apart: over two shares it is refused
+    before any reads, and over one it reads (row 1914)."""
+    chain = (Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(32))))
+             .shuffle(5).repeat(None).map(Fetched()).filter(odd).batch(BATCH).elastic())
+    with pytest.raises(ValueError):
+        reader(chain, 0, 2)
+    assert len(listed(reader(chain, 0, 1), 2)) == 2
+
