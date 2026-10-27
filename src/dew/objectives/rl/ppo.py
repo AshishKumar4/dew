@@ -202,7 +202,7 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         return self.actor.build_task(part(variables, "policy"), processor=processor)
 
     def values(self, variables: Variables, batch: Mapping[str, object]) -> jax.Array:
-        """Return the critic's float32 value of each packed id's prefix, placed by `onto_ids`.
+        """Return the critic's value of each packed id's prefix, at least float32, placed by `onto_ids`.
 
         A critic that does not return one value per input position raises
         `ValueError`.
@@ -223,7 +223,7 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
             qk = gathered.get("qk", {})
         if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
-        return onto_ids(batch, values.astype(jnp.float32)), qk
+        return onto_ids(batch, values.astype(at_least_fp32(values.dtype))), qk
 
     def loss(self, variables: Variables, batch, step: Step) -> tuple[PPOStatistics, Aux[Variables]]:
         """Return independent statistics for the actor and the clipped value error.
