@@ -34,8 +34,12 @@ THREADS_PER_MULTIPROCESSOR = {(8, 0): 2048, (9, 0): 2048, (10, 0): 2048}
 REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
 """XLA's refusal of a Triton kernel whose shared memory a block of the GPU does not hold."""
 
-KERNEL = re.compile(r"kCustomKernel .*? shared_memory: (\d+) bytes")
-"""A custom (Triton) kernel's line in XLA's thunk sequence, with the shared bytes it launches with."""
+KERNEL = re.compile(r"kCustomKernel \[[^\]]*\] (\S+) .*? shared_memory: (\d+) bytes")
+"""A custom kernel's line in XLA's thunk sequence, with its name and the shared bytes it launches with: a
+Triton call's, or one of XLA's own fusions XLA emits so (`loop_multiply_fusion`)."""
+
+TRITON_CALL = re.compile(r'custom_call_target="__gpu\$xla\.gpu\.triton".*?\bname = "([^"]+)"')
+"""A Triton kernel's call in XLA's optimized HLO, with the kernel's name, which its launch line carries."""
 
 
 def target_config(generation: str) -> str:
@@ -113,19 +117,26 @@ def compile_kernels(cases, generation: str) -> list[dict]:
         sequences = _compiled(case, generation, record)
         if sequences is None:
             continue
-        launched = [int(size) for text in sequences for size in KERNEL.findall(text)]
-        if not launched:
-            # No launch line is no evidence the case's kernel compiled within its block (row 1381).
-            record["error"] = "XLA's thunk sequence launches no Triton kernel: none states its shared bytes"
+        thunks, programs = sequences
+        calls = sorted({name for text in programs for name in TRITON_CALL.findall(text)})
+        # Each Triton call's shared bytes from its own launch line, never XLA's fusions': a call none states,
+        # or a program that calls no Triton kernel, is no evidence its kernel compiled within its block
+        # (row 1381).
+        launched = {call: [int(size) for text in thunks for name, size in KERNEL.findall(text)
+                           if name.startswith(call)] for call in calls}
+        unlaunched = [call for call, sizes in launched.items() if not sizes]
+        if not calls or unlaunched:
+            record["error"] = (f"no launch states the shared bytes of {', '.join(unlaunched)}" if calls
+                               else "XLA's program calls no Triton kernel")
             continue
-        record["shared"] = max(launched)
+        record["shared"] = max(max(sizes) for sizes in launched.values())
     return found
 
 
-def _compiled(case, generation: str, record: dict) -> list[str] | None:
+def _compiled(case, generation: str, record: dict) -> tuple[list[str], list[str]] | None:
     """`case` lowered as on the CUDA `generation` (`assumed`, `gpu_mesh`) and compiled by XLA for a
-    compile-only device of it: XLA's thunk sequences, or None, `record` holding why: the error, or the
-    shared bytes of a block XLA refused."""
+    compile-only device of it: XLA's thunk sequences and optimized programs, or None, `record` holding why:
+    the error, or the shared bytes of a block XLA refused."""
     mesh = _device(generation)
     replicated = NamedSharding(mesh, PartitionSpec())
     fn, args = case.call()
@@ -149,7 +160,8 @@ def _compiled(case, generation: str, record: dict) -> list[str] | None:
             else:
                 record["shared"] = int(refused.group(1))
             return None
-        return [path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")]
+        return ([path.read_text() for path in Path(dump).glob("*thunk_sequence.txt")],
+                [path.read_text() for path in Path(dump).glob("*after_optimizations.txt")])
 
 
 MOSAIC_DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
