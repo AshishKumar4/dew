@@ -972,7 +972,7 @@ reshape, a slice, a select, a maximum or a negation is exact)."""
 
 
 def _rounded(jaxpr, consts, args, rng):
-    """`jaxpr` evaluated op by op in Monte Carlo arithmetic: every float result of a rounding primitive
+    """`jaxpr` evaluated op by op in Monte Carlo arithmetic: every float64 result of a rounding primitive
     (ROUNDED) scaled by 1 ± float64's unit roundoff at random, element by element, through calls, scans,
     loops and branches alike, so a value the truth rounds to its own resolution moves by that rounding,
     and one it computes exactly (0 = x - x) does not. A shard_map's program runs as it is."""
@@ -1008,9 +1008,10 @@ def _rounded(jaxpr, consts, args, rng):
                 outputs = equation.primitive.bind(*inputs, **equation.primitive.get_bind_params(params))
                 outputs = list(outputs) if equation.primitive.multiple_results else [outputs]
                 if name in ROUNDED:
-                    outputs = [jnp.asarray(output) * (1 + unit * rng.choice((-1.0, 1.0), np.shape(output)))
-                               if jnp.issubdtype(jnp.result_type(output), jnp.floating) else output
-                               for output in outputs]
+                    # The truth's own roundings, float64's; a result in another dtype (a float32 draw
+                    # inside the truth, which both arms share) is kept as computed.
+                    outputs = [(jnp.asarray(output) * (1 + unit * rng.choice((-1.0, 1.0), np.shape(output))))
+                               if jnp.result_type(output) == jnp.float64 else output for output in outputs]
         values.update(zip(equation.outvars, outputs, strict=True))
     return [read(var) for var in jaxpr.outvars]
 

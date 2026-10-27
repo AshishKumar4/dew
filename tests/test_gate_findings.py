@@ -272,6 +272,13 @@ def test_the_truths_spread_is_its_own_roundings_moved():
         spread = _truth_spread(exact, (ones, tiny), exact(ones, tiny))
         assert np.max(spread[1]) <= 2.0 ** -100 * float(np.finfo(np.float64).eps)
 
+        # A float32 value inside the truth, a draw both arms share, is kept as computed.
+        def drawn(x):
+            noise = jax.random.normal(jax.random.key(0), x.shape, jnp.float32).astype(x.dtype)
+            return x * noise
+        spread = _truth_spread(drawn, (x,), drawn(x))
+        assert spread.dtype == np.float64 and np.max(spread) <= 4 * float(np.finfo(np.float64).eps)
+
 
 def test_an_exact_tiny_row_keeps_its_bound_where_rows_are_resolved():
     """With `resolve_rows`, a tiny value float64 computes exactly ((x - 1) + t at x = 1, t = 2^-100)
