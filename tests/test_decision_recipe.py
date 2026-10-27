@@ -294,9 +294,9 @@ def test_a_decision_run_fine_tunes_on_a_mixture_by_the_weights_its_descriptor_an
     config = DecisionRunConfig.cli([
         "--pretrained", str(TINY), "--trainer.name", "mixed",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-        "--trainer.steps", "2", "--trainer.eval-every", "2", "--trainer.log-every", "1",
-        "--trainer.multi-host", "False", "--trainer.compilation-cache-dir", "None",
-        "--model.dtype", "float32"],
+        "--trainer.steps", "2", "--trainer.eval-every", "2", "--trainer.checkpoint-every", "2",
+        "--trainer.log-every", "1", "--trainer.multi-host", "False",
+        "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
         default=DecisionRunConfig(data=loaded(train), validation=loaded(held)))
     config.run()
     tracking = tmp_path / "runs" / "mixed" / "tracking"

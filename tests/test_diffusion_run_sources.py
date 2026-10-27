@@ -29,7 +29,6 @@ from dew.diffusion.presets import Flow, ResolutionShift
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import TextToImage
-from dew.inference.images import ImageSettings
 from dew.inputs import TextCondition
 from dew.objectives import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
@@ -364,7 +363,9 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     and the text towers. The loss the two share is held to Diffusers'
     train_dreambooth_flux.py statements on matched draws in
     tests/test_flow_matching.py (ad63cc6a). Both sample by the same policy, the
-    pipeline's own grid and finish too."""
+    pipeline's own grid and finish: their evaluations draw alike from one key,
+    unlike an evaluation on the process's own times, and the run's published
+    task draws the walk the pipeline's own task draws from the same noise."""
     from dew.interop.pretrained import load_diffusion_source
 
     directory = pipelines / family / "pipeline"
@@ -379,9 +380,6 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     written = DiffusionObjective(source, solver=Euler(), steps=2, **settings)
     assert configured.model == written.model
     assert to_record(configured.process, Process) == to_record(written.process, Process)
-    # The sampling policy a saved run records: the pipeline's grid and finish among it.
-    assert (to_record(configured.task_settings(), ImageSettings)
-            == to_record(written.task_settings(), ImageSettings))
     assert type(configured.autoencoder) is type(written.autoencoder)
     assert configured.inputs.sample == written.inputs.sample
     assert configured.inputs.conditions.keys() == written.inputs.conditions.keys()
@@ -398,6 +396,24 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
         np.testing.assert_array_equal(ours, theirs)
     batch = batch_for(configured, size)
     assert value(configured, states[0].variables, batch) == value(written, states[1].variables, batch)
+    # Both sample by the pipeline's own grid and its solver's finish: from one key an evaluation of
+    # either draws what the other's does, and not what the process's own times draw ...
+    step = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
+    drawn = [np.asarray(objective.evaluate(state.variables, batch, step).images)
+             for objective, state in zip((configured, written), states, strict=True)]
+    assert np.all(np.isfinite(drawn[0]))
+    np.testing.assert_array_equal(drawn[0], drawn[1])
+    on_times = DiffusionObjective(source, solver=Euler(), steps=2, grid=None, **settings)
+    elsewhere = np.asarray(on_times.evaluate(states[1].variables, batch, step).images)
+    assert not np.array_equal(drawn[0], elsewhere)
+    # ... and the run's published task draws the walk the pipeline's own task draws from the same noise,
+    # which tests/test_{family}_source.py holds to the source pipeline's.
+    prompts = list(PROMPTS)
+    published = configured.build_task(states[0].variables)(prompts, key=7).host()
+    pipeline = source.text_to_image()(prompts, steps=2, guidance=None, solver=Euler(), key=7).host()
+    for name in ("latents", "images"):
+        assert np.all(np.isfinite(getattr(published, name))), name
+        np.testing.assert_array_equal(getattr(published, name), getattr(pipeline, name), err_msg=name)
 
 
 def test_a_pretrained_run_refuses_a_preset_of_another_kind(pipelines):
