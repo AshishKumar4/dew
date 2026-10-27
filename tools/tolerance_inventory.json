@@ -413,10 +413,6 @@
    "comparisons": 2,
    "lane": "Training"
   },
-  "tests/test_mean_flow.py": {
-   "comparisons": 2,
-   "lane": "Training"
-  },
   "tests/test_mesh_axes.py": {
    "comparisons": 12,
    "lane": "Models, Serving & RL"
