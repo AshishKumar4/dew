@@ -637,7 +637,8 @@ def test_sync_rsyncs_the_working_tree_to_each_worker_with_its_excludes(fake, tre
     fake.offer("slice", "us-central2-b")
     assert run("sync", "slice", "--exclude", "runs", "--delete") == 0
     synced = fake.rsync_calls()
-    assert [call[-1] for call in synced] == [f"you@34.0.0.{index}:~/tree/" for index in (1, 2)]
+    # The workers sync at once, in whatever order they finish.
+    assert sorted(call[-1] for call in synced) == [f"you@34.0.0.{index}:~/tree/" for index in (1, 2)]
     assert all("--delete" in call and "--exclude=runs" in call and call[-2] == f"{tree}/"
                for call in synced)
 
@@ -662,8 +663,8 @@ def test_train_syncs_starts_the_recipe_on_every_worker_and_follows_worker_zero(f
     assert run("train", "slice", "--job", "j1", "--", "recipes/lm/train.py", "--steps", "3") == 0
     ran = commands(fake, "ssh")
     recipe = "python recipes/lm/train.py --steps 3 --trainer.multi-host True"
-    assert [command for command in ran if "nohup" in command] == [
-        tpu_setup.detached(recipe, "j1", index, home_dir="tree") for index in (0, 1)]
+    assert sorted(command for command in ran if "nohup" in command) == sorted(
+        tpu_setup.detached(recipe, "j1", index, home_dir="tree") for index in (0, 1))
     assert ran[-1] == tpu_setup.tail("j1", 0, follow=True)
     with pytest.raises(SystemExit):
         run("train", "slice")
@@ -674,7 +675,7 @@ def test_run_detached_starts_a_named_job_and_logs_reads_its_tail(fake):
     assert run("run", "slice", "--detach", "--job", "j2", "--", "echo", "hi") == 0
     assert sum("nohup" in command and "j2/worker-" in command for command in commands(fake, "ssh")) == 2
     assert run("logs", "slice", "j2", "--worker", "all", "--lines", "5") == 0
-    tails = [command for command in commands(fake, "ssh") if command.startswith("tail ")]
+    tails = sorted(command for command in commands(fake, "ssh") if command.startswith("tail "))
     assert tails == [f"tail -n 5 {tpu_setup.log_path('j2', index)}" for index in (0, 1)]
     with pytest.raises(SystemExit):
         run("run", "slice")
