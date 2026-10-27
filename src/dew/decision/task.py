@@ -578,8 +578,8 @@ class Decide(SavedRunTask):
         group's winner goes on, until one group is left to answer the question
         (Laya's `predict_tournament`). A finalist's probabilities cover only the last
         round's options. Each question plays its own rounds: one whose finalists fit a
-        group waits for the others' final unchanged, so its answer is the one it gets
-        asked alone, whatever else the call asks.
+        group is not split again while the others play on, and waits for the final with
+        its finalists unchanged.
         """
         if group < 2:
             raise ValueError("a tournament groups at least two options")
