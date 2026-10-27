@@ -615,6 +615,22 @@ def _planned_launch(call: _Call, scope: Callable[[int], resources.Scope], regist
     return resources.LaunchPlan(floor, 1, resources.shared_bytes(call.family, scope(floor)))
 
 
+def _laid(call: _Call, scope: Callable[[int], resources.Scope], registers: int, tiles: int, *,
+          stages: int | None) -> tuple[resources.LaunchPlan, int]:
+    """A launch's plan and its programs: a persistent launch's (`stages` None) as many as a multiprocessor
+    holds at once, at most its `tiles`, its rings two deep where they run on (`mosaic.RingFamily`'s) and two
+    deep hold as many programs as one, so a tile's loads go out under the last tile's work: a launch of
+    one-step tiles whose program holds a multiprocessor's registers alone (each launch's 255 registers a
+    thread an H100 holds one of, long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d; an
+    A100's launches held one program each, a quarter of the warps fla's held, SE-family-a100-8c5b5b16a);
+    any other a program a tile at its `stages`."""
+    if stages is None:
+        most = 2 if isinstance(call.family, mosaic.RingFamily) else 1
+        found = _planned_launch(call, scope, registers, floor=1, most=most)
+        return found, min(tiles, (call.target.multiprocessors or 1) * found.programs)
+    return _planned_launch(call, scope, registers, floor=stages, most=stages), tiles
+
+
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int, live,
             work: Work, held: _Held, staging: tuple = (), once: dict | None = None,
             landing: dict | None = None, persistent: bool = False, reduces: bool = True,
@@ -649,19 +665,8 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     def scope(depth: int) -> resources.Scope:
         return _scope(allocations(depth), staging, reduces=reduces, after=after)
 
-    if persistent:
-        # As many programs as a multiprocessor holds at once, at most the tiles, the rings two deep where
-        # they run on (`mosaic.RingFamily`'s) and two deep hold as many programs as one, so a tile's loads go
-        # out under the last tile's work: a launch of one-step tiles whose program holds a multiprocessor's
-        # registers alone (each launch's 255 registers a thread an H100 holds one of, long-scoreboard stalls
-        # 51 to 73% of its time, SE-family-h100-80a38c02d; an A100's launches held one program each, a quarter
-        # of the warps fla's held, SE-family-a100-8c5b5b16a).
-        found = _planned_launch(call, scope, held.registers(family), floor=1,
-                                most=2 if isinstance(family, mosaic.RingFamily) else 1)
-        stages, programs = found.stages, min(tiles, (call.target.multiprocessors or 1) * found.programs)
-    else:
-        found = _planned_launch(call, scope, held.registers(family), floor=stages, most=stages)
-        programs = tiles
+    found, programs = _laid(call, scope, held.registers(family), tiles, stages=None if persistent else stages)
+    stages = found.stages
     streams = allocations(stages)
     name = f"recurrence{program.__qualname__.split('.')[0]}"
     collected = _PLANNED.get()
