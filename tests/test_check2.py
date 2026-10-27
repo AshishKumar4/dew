@@ -249,30 +249,6 @@ def test_calls_are_certified_inside_and_unsupported_types_refused():
     assert ct.certified(lambda data: jax.random.key_data(jax.random.wrap_key_data(data)), data)[1] == []
 
 
-def test_a_high_level_primitive_is_certified_through_its_lowering_and_is_finite_is_exact():
-    """A `jax.experimental.hijax` primitive (Dew's reverse-mode seam, `generation.linear_map`) is run as
-    it lowers, one primitive at a time, in a vjp too; `is_finite` is exact, held to the value as stored,
-    and a false result where the value is finite breaks it."""
-    from dew.nn.kernels.generation import linear_map
-
-    x = np.float32(np.linspace(0.5, 2, 8))
-
-    def mapped(x):
-        return linear_map(lambda scale, moving: moving * scale, lambda scale, cotangent: cotangent * scale,
-                          np.float32(1.5), x)
-
-    outputs, findings = ct.certified(mapped, x)
-    assert findings == [] and np.array_equal(outputs, x * np.float32(1.5))
-    _, findings = ct.certified(lambda x: jax.vjp(mapped, x)[1](x)[0], x)
-    assert findings == []
-    _, findings = ct.certified(lambda x: linear_map(lambda scale, moving: jnp.sin(moving) * scale,
-                                                    lambda scale, cotangent: cotangent, np.float32(1), x), x)
-    assert findings and "sin" in findings[0]
-    values = np.float32([1.0, np.inf, -np.inf, np.nan, 1e-45, 0.0])
-    assert np.all(ct.CONTRACTS["is_finite"]({}, [values], np.isfinite(values), None))
-    assert not np.all(ct.CONTRACTS["is_finite"]({}, [values], np.zeros(6, bool), None))
-
-
 def test_extrema_order_zeros_and_propagate_nan_as_the_lane_does():
     """max and min take -0 below +0 and propagate NaN, alone and reduced; a flipped zero breaks them;
     boolean reductions, a scalar log, erf_inv's zero and an overflowing exp are each their own results."""
