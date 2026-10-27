@@ -311,22 +311,41 @@ class Host:
     memory: int
 
     @classmethod
-    def current(cls) -> Host:
+    def current(cls, cgroup: Path | None = None) -> Host:
+        """This process's host, read through `cgroup`, its own cgroup (v2) directory, which
+        /proc/self/cgroup names under /sys/fs/cgroup by default. Under a memory limit the page cache
+        the kernel reclaims first (`inactive_file`) is room, as the kubelet counts a container's
+        working set: a run that has read its corpus once holds it in cache, charged to its cgroup,
+        and counting that as taken left room for no worker beside it."""
         import psutil
 
+        group = _own_cgroup() if cgroup is None else cgroup
         cpus = len(os.sched_getaffinity(0))
-        quota = Path("/sys/fs/cgroup/cpu.max")
+        quota = group / "cpu.max"
         if quota.is_file():
             limit, period = quota.read_text().split()
             if limit != "max":
                 cpus = min(cpus, math.ceil(int(limit) / int(period)))
         memory = psutil.virtual_memory().available
-        maximum, current = Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")
+        maximum, current, stat = group / "memory.max", group / "memory.current", group / "memory.stat"
         if maximum.is_file() and current.is_file():
             limit = maximum.read_text().strip()
             if limit != "max":
-                memory = min(memory, max(0, int(limit) - int(current.read_text())))
+                stated = [line.split() for line in stat.read_text().splitlines()] if stat.is_file() else []
+                reclaimed = next((int(value) for name, value in stated if name == "inactive_file"), 0)
+                working = int(current.read_text()) - reclaimed
+                memory = min(memory, max(0, int(limit) - working))
         return cls(cpus, memory)
+
+
+def _own_cgroup() -> Path:
+    """This process's cgroup (v2) directory: the path /proc/self/cgroup names (`0::/path`) under
+    /sys/fs/cgroup, which is the root itself inside a container's own cgroup namespace."""
+    root, membership = Path("/sys/fs/cgroup"), Path("/proc/self/cgroup")
+    lines = membership.read_text().splitlines() if membership.is_file() else []
+    named = next((line[3:] for line in lines if line.startswith("0::")), None)
+    own = root / named.strip().lstrip("/") if named else root
+    return own if own.is_dir() else root
 
 
 def batch_bytes(batch: Batch) -> int:

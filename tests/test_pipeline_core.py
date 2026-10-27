@@ -780,6 +780,22 @@ def test_automatic_loading_starts_no_more_workers_than_the_hosts_cpus_and_memory
     assert workers <= 2
 
 
+def test_a_cgroups_reclaimable_page_cache_is_room_for_automatic_loading(tmp_path):
+    """Under a cgroup's memory limit, the page cache its kernel reclaims first is room: a run that read
+    1.5 GiB of its corpus into cache, charged to its cgroup of 2 GiB with 1.9 GiB in use, still has
+    1.6 GiB, where counting the cache as taken left 0.1 GiB, room for no loading worker. The cgroup's
+    CPU quota of two bounds the CPUs as its affinity does."""
+    from dew.data.dataset import Host
+
+    (tmp_path / "cpu.max").write_text("200000 100000\n")
+    (tmp_path / "memory.max").write_text(f"{2 * 2**30}\n")
+    (tmp_path / "memory.current").write_text(f"{int(1.9 * 2**30)}\n")
+    (tmp_path / "memory.stat").write_text(f"anon {int(0.4 * 2**30)}\ninactive_file {int(1.5 * 2**30)}\n")
+    host = Host.current(tmp_path)
+    assert host.cpus == min(2, len(os.sched_getaffinity(0)))
+    assert host.memory == 2 * 2**30 - int(1.9 * 2**30) + int(1.5 * 2**30)
+
+
 def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_the_memory():
     """Each worker holds its `worker_buffer` batches and its `read_buffer` reads in a process of its
     own, within half the memory the process may take; a read is a batch where the order is read by
