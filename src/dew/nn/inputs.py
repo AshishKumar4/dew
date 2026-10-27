@@ -436,7 +436,17 @@ class CrossContext:
 
     @classmethod
     def from_conditioning(cls, conditioning: Mapping[str, jax.Array]) -> CrossContext:
-        """The context a call's `conditioning` carries under `CONTEXT` and `CONTEXT_LENGTHS`.
+        """The context a call's `conditioning` carries under `CONTEXT` and `CONTEXT_LENGTHS`, as JAX
+        arrays (`checked`)."""
+        embeddings, lengths = cls.checked(conditioning, jnp)
+        return cls(jnp.asarray(embeddings), jnp.asarray(lengths, jnp.int32))
+
+    @staticmethod
+    def checked(conditioning: Mapping[str, jax.typing.ArrayLike], xp=np
+                ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
+        """The context and its lengths a call's `conditioning` carries under `CONTEXT` and
+        `CONTEXT_LENGTHS`, as arrays of `xp` (NumPy's on the host, where a server admits a request;
+        JAX's), each row's length its context's width where none is given, in the dtype given.
 
         Raises ValueError for any other entry, for a context that is not
         `[B, C, features]` floats, and for lengths that are not one integer
@@ -446,18 +456,18 @@ class CrossContext:
         if unknown or CONTEXT not in conditioning:
             raise ValueError(f"a decoder's conditioning is {CONTEXT!r} and optionally {CONTEXT_LENGTHS!r}, "
                              f"got {sorted(conditioning)}")
-        embeddings = jnp.asarray(conditioning[CONTEXT])
+        embeddings = xp.asarray(conditioning[CONTEXT])
         if embeddings.ndim != 3 or not jnp.issubdtype(embeddings.dtype, jnp.floating):
             raise ValueError(f"a context is [B, C, features] floats, got "
                              f"{embeddings.dtype}{embeddings.shape}")
         lengths = conditioning.get(CONTEXT_LENGTHS)
         if lengths is None:
-            lengths = jnp.full(embeddings.shape[:1], embeddings.shape[1], jnp.int32)
-        lengths = jnp.asarray(lengths)
+            lengths = xp.full(embeddings.shape[:1], embeddings.shape[1], np.int32)
+        lengths = xp.asarray(lengths)
         if lengths.shape != embeddings.shape[:1] or not jnp.issubdtype(lengths.dtype, jnp.integer):
             raise ValueError(f"context lengths are one integer per row, [{embeddings.shape[0]}], "
                              f"got {lengths.dtype}{lengths.shape}")
-        return cls(embeddings, lengths.astype(jnp.int32))
+        return embeddings, lengths
 
 
 @struct.dataclass

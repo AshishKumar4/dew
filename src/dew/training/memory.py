@@ -20,11 +20,11 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 
 from dew._records import JSON, integers, json_value
-from dew.batch import Batch, Variables
+from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
 from dew.devices import gpu_free_bytes, xla_flag
 from dew.distributed.placement import parameter_axes
-from dew.mesh import mesh_axes
+from dew.mesh import batch_axes, mesh_axes
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.protocols import Recomputing, TritonGemm
@@ -156,6 +156,16 @@ def split_share(params: Variables) -> float:
 @runtime_checkable
 class _TokenRows(Protocol):
     seq_len: int | None
+
+
+def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: Batch, variables: Variables,
+                                  mesh: Mesh) -> jax.stages.CompilerOptions | None:
+    """The options a step over microbatches of `micro` on `mesh` compiles with
+    (`step_compiler_options`): by the tokens one device steps of a microbatch split over the
+    mesh's batch axes, and whether `variables` hold frozen weights it trains beside."""
+    shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
+    return step_compiler_options(objective, device_tokens(objective, micro, shards), FROZEN in variables,
+                                 mesh.devices.size)
 
 
 def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch: Batch, shards: int) -> float:

@@ -727,9 +727,12 @@ class Layout:
         for ids, size in totals.items():
             for device in ids:
                 device_bytes[device] += size
+        # A compile-only device (`dew.training.ahead.compile_only_gpus`) is none of this process's
+        # own, and holds no memory to read a limit from.
+        attached = set(jax.local_devices())
         limits = (dict.fromkeys(device_bytes, capacity) if capacity is not None else
-                  {device.id: limit for device in mesh.local_devices
-                   if (limit := (device.memory_stats() or {}).get("bytes_limit")) is not None})
+                  {device.id: limit for device in mesh.local_devices if device in attached
+                   and (limit := (device.memory_stats() or {}).get("bytes_limit")) is not None})
         _refuse_overfull(held, device_bytes, limits)
         with nn.logical_axis_rules(self.axis_rules):
             rows = batch_axes(mesh)

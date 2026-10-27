@@ -31,10 +31,11 @@ from dew.nn.attention import alibi_bias
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.cross_attention import CrossAttention
 from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall
 from dew.nn.kernels.generation import chosen
 from dew.nn.memory import Gate, InContextMemory, MLPMemory
-from dew.nn.mixer_base import MixerRefused
+from dew.nn.mixer_base import MLP_RESIDUALS, MixerRefused
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.registry import mixers, models
@@ -422,6 +423,20 @@ def test_a_decoder_climbs_only_the_remat_rungs_its_layers_mark(kind, rungs):
     while (stronger := climbed[-1].recompute_more()) is not None:
         climbed.append(stronger)
     assert [rung.recompute_record() for rung in climbed] == rungs
+
+
+def test_a_cross_attention_feed_forward_keeps_its_rungs_where_the_trunk_has_none():
+    """A decoder with no trunk MLP, Mamba-2's layout, marks its gated cross-attention's feed-forward
+    (`marked_residuals`): 'minimal', which keeps that MLP's projections, climbs on to 'full', which
+    recomputes them, whether it starts there or a record restores it."""
+    fields, overrides = KIND_FIELDS["mamba2"]
+    model = tiny(mixer=mixers.build("mamba2", **fields), max_seq_len=64, mlp_features=0,
+                 cross_attention=CrossAttention(layer_ids=(0,), context_length=4, context_features=16,
+                                                intermediate_size=32), **overrides)
+    assert set(MLP_RESIDUALS) <= model.marked_residuals()
+    minimal = model.restore_recompute(model.clone(remat="minimal").recompute_record())
+    climbed = minimal.recompute_more()
+    assert climbed is not None and climbed.recompute_record() == "full"
 
 
 @pytest.mark.parametrize("kind", ["kimi_delta_attention", "mamba", "mamba2", "gated_delta_net"])

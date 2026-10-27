@@ -198,9 +198,10 @@ def _stepped(solver: Solver, key: jax.Array | RowKeys, index: jax.Array) -> Call
 def sampling_modules(model: nn.Module, guidance: Guidance | None,
                      autoencoder: AutoEncoder | None) -> tuple[nn.Module, ...]:
     """Every network a walk of `model` under `guidance` that `autoencoder` decodes runs: the
-    denoiser, an autoguide (`guidance_modules`) and the autoencoder's model, which the program
-    that walks it compiles for (`compiler_options`), a task's and an objective's alike."""
-    return (model, *guidance_modules(guidance), *(() if autoencoder is None else (autoencoder.model,)))
+    denoiser, an autoguide (`guidance_modules`) and the autoencoder's towers (`AutoEncoder.towers`,
+    none for a network-free one), which the program that walks it compiles for (`compiler_options`), a
+    task's and an objective's alike."""
+    return (model, *guidance_modules(guidance), *(() if autoencoder is None else autoencoder.towers()))
 
 
 def walk_and_decode(denoise: Denoiser, autoencoder: AutoEncoder | None, params, x_T: jax.Array, *,

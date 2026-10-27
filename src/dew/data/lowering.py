@@ -18,10 +18,12 @@ the last `map_with_index`, which is the only step that reads it.
 
 from __future__ import annotations
 
+import concurrent.futures
 import contextlib
 import dataclasses
 import functools
 import hashlib
+import itertools
 import logging
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -1037,6 +1039,73 @@ class _Barren(Exception):
     that held nothing: the worker holds no input (`_repeated`)."""
 
 
+def _elastic_cut(stages: Sequence[Stage]) -> int:
+    """Where an elastic read's own rows begin (`_Build.elastic_batches`): after the last step before
+    the batch that is not a `Map` of each record alone (or a `Prefetch`, which reads none ahead
+    there). Every reader runs the steps before it over the whole order, as each of them decides
+    which rows there are (a filter, an expansion, a pack), which draws they take or what their place
+    gives them, which only the whole order states; a map after them computes a row from it alone."""
+    return max((at + 1 for at, stage in enumerate(stages) if not isinstance(stage, (Map, Prefetch))),
+               default=0)
+
+
+class _ElasticBatches(pygrain.IterDataset):
+    """An elastic read's batches (`_Build.elastic_batches`): `rows`, the order one reader reads,
+    taken a whole batch's `size` at a time, of which this reader keeps its share (`partition.held`),
+    each through `maps` on `threads` threads, batched by `batch_fn`. A last batch of fewer rows is
+    dropped where `drop`, or else filled to the share's rows (`FilledBatch`), its rows not real where
+    the share holds none of them, so every reader reads a batch where any does. Its position is the
+    order's, the same on every reader at every batch, so any reader count resumes it."""
+
+    def __init__(self, rows: pygrain.IterDataset, maps: tuple[Map, ...], partition: DataPartition, size: int,
+                 *, drop: bool, fill: bool, batch_fn: _Batched, threads: int):
+        super().__init__(rows)
+        self.rows, self.maps, self.partition, self.size = rows, maps, partition, size
+        self.drop, self.fill, self.batch_fn, self.threads = drop, fill, batch_fn, threads
+
+    def mapped(self, row: Record) -> Batch:
+        (made,) = _chained(self.maps, None, row)
+        assert isinstance(made, Mapping), "a row a batch stacks is a record of fields"
+        return made
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return _ElasticIterator(self.rows.__iter__(), self)
+
+
+class _ElasticIterator(pygrain.DatasetIterator):
+    def __init__(self, parent: pygrain.DatasetIterator, batches: _ElasticBatches):
+        super().__init__(parent)
+        self._rows, self._batches = parent, batches
+        threads = batches.threads if batches.maps else 1
+        self._pool = (None if threads <= 1
+                      else concurrent.futures.ThreadPoolExecutor(threads, thread_name_prefix="dew-elastic"))
+
+    def __next__(self) -> Batch:
+        batches = self._batches
+        group = list(itertools.islice(self._rows, batches.size))
+        if not group or (batches.drop and len(group) < batches.size):
+            raise StopIteration
+        held, real = batches.partition.held(len(group))
+        mine = group[held]
+        pool = self._pool
+        made = [batches.mapped(row) for row in mine] if pool is None else list(pool.map(batches.mapped, mine))
+        batch = batches.batch_fn(made)
+        if not batches.fill:
+            return batch
+        return FilledBatch(batches.partition.rows(batches.size), real=real).map(batch)
+
+    def get_state(self) -> Mapping[str, object]:
+        return self._rows.get_state()
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self._rows.set_state(state)
+
+    def close(self) -> None:
+        if self._pool is not None:
+            self._pool.shutdown(wait=True, cancel_futures=True)
+        self._rows.close()
+
+
 class _Ended(pygrain.IterDataset):
     """A repeat of a loading worker's inputs, which ends where a pass of them holds none (`_Barren`)
     instead of repeating nothing forever, so the other workers read on."""
@@ -1105,6 +1174,9 @@ class _Build:
     training: bool
     corpus: tuple[int, ...] = ()
     """The key of the corpus this builds in each mixture above it (`_member_key`)."""
+    elastic: bool = False
+    """Whether the training read is elastic (`Pipeline.elastic`): every reader reads the order one
+    reader reads, and keeps its share of each batch (`elastic_batches`)."""
     pool: Workers | None = None
     """The loading workers of a read whose steps drop records (`pooled`), each a process that reads
     its corpus's steps up to the first that can't carry a dropped record as a marker (`_carried`),
@@ -1591,6 +1663,8 @@ class _Build:
         records in seeks into its batches as the run read them: past a limit's
         count, a window shuffle's draws and a repeat's passes. A repeat there
         replays its first pass, as a repeat of the batched stream does."""
+        if self.elastic and self.training and not self.global_order:
+            return self.elastic_batches(pipeline, partition, fill=fill)
         canonical = not self.training and not self.global_order
         rows = self.records(pipeline, DataPartition() if canonical else partition)
         batch_stage = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage))
@@ -1629,6 +1703,25 @@ class _Build:
         if read > share:
             batches = batches.map_with_index(_Rest(-(-(read - share) // partition.count)))
         return batches, tuple(at for at in after if isinstance(pipeline.stages[at], _UNPLACED))
+
+    def elastic_batches(
+        self, pipeline: Pipeline, partition: DataPartition, *, fill: bool = True
+    ) -> tuple[pygrain.IterDataset, tuple[int, ...]]:
+        """An elastic read's batches (`Pipeline.elastic`) and the stages after its batch. Every reader
+        reads the order one reader reads (`DataPartition()`) through the last step that decides which
+        rows there are, what they draw or what their place gives them (`_elastic_cut`), and keeps its
+        share of each batch's rows, every count-th (`DataPartition.cut`), as a validation pass keeps
+        them; the maps written after that step run on those rows alone (`_ElasticBatches`)."""
+        batch_stage = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage))
+        batched_at = pipeline.stages.index(batch_stage)
+        cut = _elastic_cut(pipeline.stages[:batched_at])
+        rows = self.records(dataclasses.replace(pipeline, stages=pipeline.stages[:cut]), DataPartition())
+        maps = tuple(stage for stage in pipeline.stages[cut:batched_at] if isinstance(stage, Map))
+        drop = batch_stage.drop_remainder
+        stream = _ElasticBatches(_as_iter(rows, self.loading), maps, partition, batch_stage.size, drop=drop,
+                                 fill=fill and not drop, batch_fn=_Batched(batch_stage.batch_fn),
+                                 threads=self.loading.threads)
+        return stream, tuple(range(batched_at + 1, len(pipeline.stages)))
 
     def placed[Item](self, batches: pygrain.MapDataset[Item], pipeline: Pipeline, partition: DataPartition,
                      after: tuple[int, ...]) -> pygrain.MapDataset[Item]:

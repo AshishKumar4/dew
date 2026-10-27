@@ -26,6 +26,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
@@ -205,8 +206,8 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     chunks; regrouped it is 1.068 and 0.989. The vector decay's is 1.021, and the formed gates'
     gate, log_a and bias 1.053, 1.038 and 1.023 over 320 draws. All arithmetic remains fp32.
     Only the chunk boundaries couple across the sequence; bounded groups schedule each chunk's C-step
-    token scans, not one scan over the sequence's T. Forward-mode callers keep the primal's tangent,
-    as the port's forward-mode fallback does (`FORWARD_MODE`).
+    token scans, not one scan over the sequence's T. Forward mode takes the chunked math's own tangent
+    (`_portable_rule`), in any context.
     """
     dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
     work = at_least_fp32(jnp.result_type(query, key, value))
@@ -218,9 +219,10 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
              else state.astype(work))
     query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
     scale = Dk ** -0.5 if scale is None else scale
-    rule = (_chunk_delta_rule if FORWARD_MODE.get() or query.shape[1] == 0
-            else _differentiable_chunk_delta_rule)
-    return rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
+    if query.shape[1] == 0:
+        return _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
+    rule = _portable_rule(chunk_size, delta, scale, jnp.dtype(dtype))
+    return rule(query, key, value, g, beta, state, starts)
 
 
 def _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
@@ -432,8 +434,28 @@ def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
     return dq * scale, dk, dv, dg, dbeta, ungrouped(initial)[:, :, 0], None
 
 
-_differentiable_chunk_delta_rule = jax.custom_vjp(_chunk_delta_rule, nondiff_argnums=(6, 8, 9, 10))
-_differentiable_chunk_delta_rule.defvjp(_chunk_delta_residual, _chunk_delta_backward)
+@functools.cache
+def _portable_rule(chunk_size: int, delta: bool, scale: float, dtype: jnp.dtype) -> Callable:
+    """The portable rule over `(query, key, value, g, beta, state, starts)` differentiated at every order
+    (`generation.linear_tangent`): reverse mode runs its reverse rule (`_chunk_delta_residual`,
+    `_chunk_delta_backward`), forward mode (`jax.jvp`, `jax.linearize`) the chunked math's own tangent,
+    in any context: a custom VJP alone refused a plain `jax.jvp` outside the attention's forward-mode
+    context (row 1834)."""
+    def forward(query, key, value, g, beta, state, starts):
+        return _chunk_delta_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale,
+                                     dtype)
+
+    def backward(saved, operands, cotangent):
+        # Every operand's cotangent, as the portable rule's pullback gives them (`linear_tangent` checks the
+        # trees agree): `starts` has no tangent space, its cotangent float0's zero, or none without it.
+        starts = operands[6]
+        cotangents = _chunk_delta_backward(chunk_size, delta, scale, dtype, saved, cotangent)[:6]
+        return (*cotangents, None if starts is None else np.zeros(starts.shape, jax.dtypes.float0))
+
+    def portable(query, key, value, g, beta, state, starts):
+        return _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
+
+    return generation.linear_tangent(forward, backward, portable)
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
@@ -1105,13 +1127,16 @@ two of at least 16, the smallest block Triton's dot takes (a call's head and sta
 `_rated_scan`); and a GPU Dew's Triton kernels run on, any of them."""
 
 TPU_SCAN_SUPPORTS: tuple[Requirement[ScanCase], ...] = (
+    Requirement('forward_mode', lambda case: case.reverse,
+                "forward_mode_attention traces for jax.jvp, which the TPU scan's custom VJP gives no "
+                "tangent: the portable math's scan takes it (row 1869, audit K2)", row=INHERENT),
     Requirement('geometry', lambda case: case.tpu is not None,
                 lambda case: "the TPU's Pallas scan takes a float32 scan on a TPU over power-of-two widths "
                              "and a chunk its program holds, not head width {}, state {} and chunk {}"
                              .format(*case.widths), row=INHERENT),
 )
-"""What the TPU's Pallas scan (`dew.nn.kernels.ssd`) needs: its tiling over the geometry
-(`ssd_kernel_runs`)."""
+"""What the TPU's Pallas scan (`dew.nn.kernels.ssd`) needs: reverse mode alone (its custom VJP gives no
+tangent) and its tiling over the geometry (`ssd_kernel_runs`)."""
 
 
 def scan_case(x, B, chunk_size: int, *, tpu: bool = True) -> ScanCase:
