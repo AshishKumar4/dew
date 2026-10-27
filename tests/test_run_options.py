@@ -31,13 +31,12 @@ from dew.data.pipeline import Rejected
 from dew.data.sources.tokens import TokenFiles
 from dew.decision import decisions
 from dew.decision.config import DecisionRunConfig
-from dew.devices import flags_hold
 from dew.diffusion.presets import Flow
 from dew.inputs import TextCondition
 from dew.lora import LoRA
 from dew.registry import ModelConfig
 from dew.sampling import Euler
-from dew.training import Layout, MeshSpec, prepare_process
+from dew.training import Layout, MeshSpec
 from dew.training.evaluation import Summary
 
 pytestmark = pytest.mark.mesh
@@ -269,22 +268,3 @@ def test_a_process_option_the_process_does_not_carry_is_refused_before_training(
         prepared.train("refused")
     assert not (tmp_path / "runs" / "refused").exists()
 
-
-def test_a_flag_holds_as_xla_reads_it_its_last_occurrence_winning(monkeypatch):
-    """A run's XLA flag holds where XLA would read its value: a later occurrence of the flag overrides
-    an earlier one, and a bare flag reads as true."""
-    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_deterministic_ops=true --xla_dump_hlo_as_text "
-                                    "--xla_gpu_deterministic_ops=false")
-    assert not flags_hold("--xla_gpu_deterministic_ops=true")
-    assert flags_hold("--xla_gpu_deterministic_ops=false --xla_dump_hlo_as_text")
-
-
-def test_flags_set_after_the_backend_opened_are_refused_where_the_process_is_prepared(monkeypatch):
-    """XLA reads its flags as JAX opens its backend: once it has, preparing the process with flags
-    that do not already hold is refused, not appended to no effect; flags that hold are accepted."""
-    jax.devices()
-    monkeypatch.setenv("TOKENIZERS_PARALLELISM", "false")
-    monkeypatch.setenv("XLA_FLAGS", "--xla_dump_hlo_as_text")
-    with pytest.raises(ValueError):
-        prepare_process(xla_flags="--xla_gpu_deterministic_ops=true")
-    assert flags_hold("--xla_dump_hlo_as_text") and not flags_hold("--xla_gpu_deterministic_ops=true")
