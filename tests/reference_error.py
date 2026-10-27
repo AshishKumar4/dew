@@ -876,6 +876,11 @@ def _sign_bits(size: int, seed: int) -> np.ndarray:
     return np.random.default_rng([0x5E7C4, size, seed]).integers(0, 1 << SKETCH, size, dtype=np.uint64)
 
 
+_BYTE_SIGNS = ((np.arange(256)[:, None] >> np.arange(8)) & 1) * 2.0 - 1
+"""A (256, 8) float64 table whose [byte, k] entry is +1.0 where the byte's bit k is set and -1.0 where it
+is not, least significant bit first."""
+
+
 def truth_sketch(truth, seed: int) -> np.ndarray:
     """A float64 truth leaf's sketch `[SKETCH]` at a recorded seed: its entries summed under SKETCH random
     signs of that seed's own (`_sign_bits`), each sign's
@@ -889,18 +894,11 @@ def truth_sketch(truth, seed: int) -> np.ndarray:
     for start in range(0, flat.size, 1 << 16):
         chunk = flat[start:start + (1 << 16)]
         # Sign k of an entry is its word's bit k: its low four bytes, read little-endian whatever the host's
-        # order, so the first byte holds bits 0 to 7, unpacked least significant bit first.
+        # order, so the first byte holds bits 0 to 7.
         words = bits[start:start + chunk.size].astype("<u8").view(np.uint8).reshape(chunk.size, 8)[:, :4]
-        positive = np.unpackbits(words, axis=1, bitorder="little").astype(bool)
-        # Each product is the entry or its negation, exact, in one pass; the last block's rows padded
-        # with zeros, which its sum adds exactly, as a block of SKETCH_BLOCK sums them.
-        full = chunk.size - chunk.size % SKETCH_BLOCK
-        products = np.where(positive[:full], chunk[:full, None], -chunk[:full, None])
+        products = np.zeros((chunk.size + -chunk.size % SKETCH_BLOCK, SKETCH))
+        np.multiply(chunk[:, None], _BYTE_SIGNS[words].reshape(chunk.size, SKETCH), out=products[:chunk.size])
         partials.append(products.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
-        if full < chunk.size:
-            tail = np.zeros((SKETCH_BLOCK, SKETCH))
-            tail[:chunk.size - full] = np.where(positive[full:], chunk[full:, None], -chunk[full:, None])
-            partials.append(tail.sum(axis=0)[None])
     return np.asarray([math.fsum(column) for column in np.concatenate(partials).T.tolist()])
 
 
