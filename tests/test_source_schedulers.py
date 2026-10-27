@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 from diffusion_support import SourceOracle, relative_gap, source_final, walk
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
@@ -172,6 +173,10 @@ def test_one_row_walks_each_source_grid_as_it_walks_in_a_batch(config):
         np.testing.assert_allclose(run(x_T[row:row + 1])[0], batch[row], rtol=1e-6, atol=1e-6)
 
 
+REPEATED_SEEDS = 8
+"""Check 1's declared seeds for the repeated-model-time walks (`seeds_for`, paired)."""
+
+
 @pytest.mark.parametrize("kind, extra", [
     ("EulerDiscrete", {"sigma_min": 30000, "sigma_max": 80000}),
     ("KDPM2Discrete", {}),
@@ -179,8 +184,9 @@ def test_one_row_walks_each_source_grid_as_it_walks_in_a_batch(config):
 ])
 def test_source_grids_walk_repeated_initial_model_times(kind, extra):
     """Repeated model times keep their own sigma rows, as an explicitly indexed source walk does:
-    each walked latent is as near the source's float64 walk as its own float32 walk is. The float64
-    walk builds its tables in float64 (`float64_scheduler`), at the float32 walk's integer times."""
+    over drawn starting latents, each walked latent on par with the source's own float32 walk against
+    the source's float64 walk (check 1). The float64 walk builds its tables in float64
+    (`float64_scheduler`), at the float32 walk's integer times."""
     import contextlib
 
     import torch
@@ -205,25 +211,32 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
     assert np.count_nonzero(model_times == model_times[0]) > 1
     sigmas = process.sampler_schedule.sigmas(times)
     assert np.all(np.diff(sigmas) < 0)
-    initial = np.random.default_rng(7).normal(size=(2, 3, 64)).astype(np.float32)
     model = SourceOracle()
     denoise = process.denoiser(model, {}, {})
-    _, walked = sample(denoise, jnp.asarray(initial), solver=schedule.solver, key=0,
-                       times=times, final_denoise=False, record=lambda x, state, denoised: x)
+
+    def draw(seed):
+        return (np.random.default_rng([7, seed]).normal(size=(2, 3, 64)).astype(np.float32),)
+
+    @as_given
+    def dew(initial):
+        _, walked = sample(denoise, jnp.asarray(initial), solver=schedule.solver, key=0,
+                           times=times, final_denoise=False, record=lambda x, state, denoised: x)
+        return {"latents": np.stack([np.asarray(latent) for latent in walked])}
 
     precision = load("diffusers_wan_reference")
-    reference = []
-    published = None
-    for dtype in (torch.float32, torch.float64):
+
+    published = getattr(module, kind + "Scheduler").from_config(config)
+    published.set_timesteps(6)
+    published = published.timesteps.clone()
+
+    def source_walk(initial, dtype):
         context = precision.float64_scheduler(module) if dtype == torch.float64 else contextlib.nullcontext()
         with context:
             source = getattr(module, kind + "Scheduler").from_config(config)
             source.set_timesteps(6)
             # A pipeline can choose its first sigma by index, without a model-time lookup.
             source.set_begin_index(0)
-            if published is None:
-                published = source.timesteps.clone()
-            elif not published.is_floating_point():
+            if dtype == torch.float64 and not published.is_floating_point():
                 # Integer conditioning times are the published ones, not a float64 rounding of them.
                 source.timesteps = published
             x = torch.tensor(initial, dtype=dtype)
@@ -234,10 +247,12 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
                 x = source.step(prediction, time, x).prev_sample
                 if kind != "KDPM2Discrete" or index % 2 == 1 or index == len(source.timesteps) - 1:
                     latents.append(x.numpy().copy())
-        reference.append(np.stack(latents))
-    for index, actual in enumerate(walked):
-        assert_as_exact_as_the_reference(actual, reference[0][index], reference[1][index],
-                                         f"{kind} repeated model time, step {index}")
+        return {"latents": np.stack(latents)}
+
+    reference = as_given(lambda initial: source_walk(np.asarray(initial, np.float32), torch.float32))
+    truth = as_given(lambda initial: source_walk(np.asarray(initial), torch.float64))
+    assert_as_exact(dew, reference, draw, f"{kind} repeated model time", seeds=REPEATED_SEEDS,
+                    truth_fn=truth)
 
 
 def walked(config: dict, steps: int) -> jax.Array:
