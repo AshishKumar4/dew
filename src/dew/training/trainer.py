@@ -17,7 +17,6 @@ import dataclasses
 import datetime
 import functools
 import logging
-import math
 import sys
 import time
 import types
@@ -81,7 +80,7 @@ from dew.distributed.placement import (
     placed_bytes,
     placed_shapes,
 )
-from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes, batch_axes
+from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, backend, gpu_mesh, gpu_target, measured_kernel
@@ -152,7 +151,6 @@ from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Interval, held, throughput
 from dew.training.memory import (
     climb_to,
-    device_tokens,
     first_run,
     head_tile_of,
     local_devices,
@@ -162,7 +160,7 @@ from dew.training.memory import (
     refuse_wide_floats,
     rung_record,
     split_share,
-    step_compiler_options,
+    step_options,
 )
 from dew.training.model_flops import (
     TOKENS,
@@ -964,7 +962,7 @@ class Trainer(Generic[Loss, Effects]):
         """
         if self.lower_for is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
-            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for))
+            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for)[0])
         split, unaligned = divmod(int(state.window_size), self.accumulation)
         if unaligned or (state.accumulation is not None and self._split not in (None, split)):
             raise ValueError(f"the state pools windows of {int(state.window_size)} microbatches, and this "
@@ -1048,7 +1046,6 @@ class Trainer(Generic[Loss, Effects]):
         replicated = NamedSharding(mesh, P())
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
-        shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
 
         def lower(split: int, narrow: bool) -> Candidate:
             rung = {**self._rung(), 'narrow': narrow, 'split': split}
@@ -1065,9 +1062,8 @@ class Trainer(Generic[Loss, Effects]):
             _log.warning("taking an earlier run's plan; delete %s to decide again", record_path)
         first = None if recorded is None else record(recorded, 'recorded plan').get('split', 1)
         plans, probes = plan_step(
-            lower, lambda candidate: step_compiler_options(
-                self.objective, device_tokens(self.objective, candidate.micro, shards),
-                FROZEN in candidate.prepared.variables, mesh.devices.size),
+            lower, lambda candidate: step_options(self.objective, candidate.micro,
+                                                  candidate.prepared.variables, mesh),
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
             objective=self.objective, mesh=mesh, xla_defaults=self._xla_defaults, narrow=self._narrow,
             base=None if self._base_rung is None else self._base_rung[1], resumed=resumed,
@@ -1158,18 +1154,21 @@ class Trainer(Generic[Loss, Effects]):
                        out_shardings=(moving, replicated, replicated, replicated, replicated, replicated),
                        donate_argnums=0)
 
-    def _lowered_for(self, state: TrainState, batch: Batch, generation: str) -> jax.stages.Lowered:
+    def _lowered_for(self, state: TrainState, batch: Batch, generation: str, devices: Mesh | None = None
+                     ) -> tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]:
         """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered
-        for one (`dew.training._lowering`), on whatever devices this process has.
+        for one (`dew.training._lowering`), on whatever devices this process has, and the options its
+        compile there takes (`step_options`) where it is lowered over `devices`.
 
         It traces on an abstract mesh of that GPU's devices, from which JAX's Pallas lowering reads the
-        GPU, at the base rung and the plan's first split: a run that does not fit splits its batch or
-        recomputes more, no other kernel. A CPU-owned state's step realizes its parameters on the host
-        as it runs, and is not lowered."""
+        GPU, or on `devices`, compile-only GPUs that XLA compiles it for (`dew.training.ahead`), at the
+        base rung and the plan's first split: a run that does not fit splits its batch or recomputes
+        more, no other kernel. A CPU-owned state's step realizes its parameters on the host as it
+        runs, and is not lowered."""
         if self.host_master:
             raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
                              "the variables on the host")
-        mesh = gpu_mesh(self.device_mesh, generation)
+        mesh = gpu_mesh(self.device_mesh, generation) if devices is None else devices
         self._at_base_rung(batch)
         with assumed(generation), self._traced_on(mesh) as schedule:
             state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
@@ -1181,9 +1180,11 @@ class Trainer(Generic[Loss, Effects]):
             placement = batch_shardings(mesh, batch)
             replicated = NamedSharding(mesh, P())
             jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
-            return jitted.trace(*apart(placed_shapes(prepared, shardings)), placed_shapes(batch, placement),
-                                jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)).lower(
-                lowering_platforms=('cuda',))
+            traced = jitted.trace(*apart(placed_shapes(prepared, shardings)), placed_shapes(batch, placement),
+                                  jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated))
+            if devices is None:
+                return traced.lower(lowering_platforms=('cuda',)), None
+            return traced.lower(), step_options(self.objective, micro, prepared.variables, devices)
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
