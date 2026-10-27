@@ -419,7 +419,39 @@ def test_a_runs_base_loads_without_its_weights_under_the_runs_source_options():
     assert shapes.model.kind_of("full_attention").mixer.bidirectional_blocks
 
 
-@pytest.mark.parametrize("name", ["hf/gpt2-tiny", "codecs/modelopt/tiny", "codecs/nvfp4_qdq/e4m3"])
+WITHOUT_WEIGHTS = ("hf/gpt2-tiny", "hf/gpt-neox-tiny", "hf/bloom-tiny", "hf/falcon-tiny", "hf/phi3-tiny",
+                   "hf/mamba2-tiny", "hf/nemotron-h-tiny", "hf/kimi-linear-tiny", "hf/deepseek-v4-tiny",
+                   "hf/gpt-oss-tiny", "hf/minimax-m2-fp8-tiny", "hf/qwen35-tiny-mm",
+                   "hf/gemma4-unified-native-tiny", "codecs/modelopt/tiny", "codecs/modelopt/mixed",
+                   "codecs/nvfp4_qdq/e4m3", "codecs/storage/fp8", "codecs/storage/nvfp4")
+"""Sources whose readers each compute on stored values a load without its weights does not read: legacy
+buffers (GPT-2, GPT-NeoX), packed and split projections, a prepare hook (Kimi Linear, DeepSeek V4),
+media towers and projectors (Qwen 3.5, Gemma 4 Unified), and each decoded format: MXFP4 (GPT OSS), block
+FP8 (MiniMax-M2), ModelOpt NVFP4 and FP8 with input scales, compressed-tensors NVFP4 and storage."""
+
+
+def test_a_tensor_a_load_without_its_weights_holds_has_shapes_and_no_values():
+    """An `Unread` tensor goes through a reader's NumPy as its shape and dtype (a split, a transpose, a
+    cast, a lookup, a decode's arithmetic), and a value asked of it, a branch on one, a Python number,
+    an array, raises PayloadUnread, so no reader computes on a value it was not given (ledger 1904)."""
+    import numpy as np
+
+    from dew.interop.unread import PayloadUnread, Unread, lookup
+
+    codes = Unread((4, 8), np.uint8)
+    halves = np.split(codes.reshape(4, 2, 4).transpose(0, 2, 1), 2, axis=-1)
+    assert [half.shape for half in halves] == [(4, 4, 1), (4, 4, 1)]
+    decoded = lookup(np.arange(256, dtype=np.float32), codes) * np.float32(0.5)
+    assert (decoded.shape, decoded.dtype) == ((4, 8), np.float32)
+    assert np.shape(decoded) == (4, 8) and decoded.astype(np.float16).dtype == np.float16
+    for asked in (lambda: bool(np.array_equal(codes, codes)), lambda: float(decoded[0, 0]),
+                  lambda: np.asarray(codes), lambda: np.isfinite(decoded).all() or None,
+                  lambda: np.zeros((4, 8)) + np.asarray(decoded)):
+        with pytest.raises(PayloadUnread):
+            asked()
+
+
+@pytest.mark.parametrize("name", WITHOUT_WEIGHTS)
 def test_a_load_without_its_weights_builds_what_a_load_with_them_builds(name):
     """A checkpoint loaded without its weights is the source a load with them reads, its config and
     model the same, its variables the same shapes and dtypes, from the stored tensors' shapes alone:

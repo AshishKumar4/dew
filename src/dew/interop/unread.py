@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -43,9 +44,9 @@ def evaluated(function: Callable, *args, **kwargs):
 
     # The stored dtypes as NumPy holds them: float64 and int64 stay so.
     with jax.enable_x64(new_val=True):
-        result = jax.eval_shape(run, *(_abstract(leaves[index]) for index in held))
+        shapes = jax.eval_shape(run, *(_abstract(leaves[index]) for index in held))
     return jax.tree.map(lambda leaf: Unread(leaf.shape, leaf.dtype)
-                        if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, result)
+                        if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, shapes)
 
 
 def _counterpart(function, name: str):
@@ -156,36 +157,6 @@ class Unread:
     def T(self):
         return self.transpose()
 
-    def _binary(name):
-        def operate(self, other):
-            return getattr(np, name)(self, other)
-
-        def reflected(self, other):
-            return getattr(np, name)(other, self)
-        return operate, reflected
-
-    __add__, __radd__ = _binary("add")
-    __sub__, __rsub__ = _binary("subtract")
-    __mul__, __rmul__ = _binary("multiply")
-    __truediv__, __rtruediv__ = _binary("true_divide")
-    __floordiv__, __rfloordiv__ = _binary("floor_divide")
-    __mod__, __rmod__ = _binary("remainder")
-    __pow__, __rpow__ = _binary("power")
-    __matmul__, __rmatmul__ = _binary("matmul")
-    __and__, __rand__ = _binary("bitwise_and")
-    __or__, __ror__ = _binary("bitwise_or")
-    __xor__, __rxor__ = _binary("bitwise_xor")
-    __lshift__, __rlshift__ = _binary("left_shift")
-    __rshift__, __rrshift__ = _binary("right_shift")
-    __lt__, _ = _binary("less")
-    __le__, _ = _binary("less_equal")
-    __gt__, _ = _binary("greater")
-    __ge__, _ = _binary("greater_equal")
-    __eq__, _ = _binary("equal")
-    __ne__, _ = _binary("not_equal")
-    del _binary, _
-    __hash__ = None
-
     def __neg__(self):
         return np.negative(self)
 
@@ -227,6 +198,28 @@ def valued(*values) -> bool:
     return not any(isinstance(value, Unread) for value in values)
 
 
+def _operator(name: str):
+    """The operator and its reflection that run NumPy's `name` ufunc on an `Unread`."""
+    def operate(self, other):
+        return getattr(np, name)(self, other)
+
+    def reflected(self, other):
+        return getattr(np, name)(other, self)
+    return operate, reflected
+
+
+for _dunder, _ufunc in (("add", "add"), ("sub", "subtract"), ("mul", "multiply"), ("truediv", "true_divide"),
+                        ("floordiv", "floor_divide"), ("mod", "remainder"), ("pow", "power"),
+                        ("matmul", "matmul"), ("and", "bitwise_and"), ("or", "bitwise_or"),
+                        ("xor", "bitwise_xor"), ("lshift", "left_shift"), ("rshift", "right_shift")):
+    _forward, _backward = _operator(_ufunc)
+    setattr(Unread, f"__{_dunder}__", _forward)
+    setattr(Unread, f"__r{_dunder}__", _backward)
+for _dunder, _ufunc in (("lt", "less"), ("le", "less_equal"), ("gt", "greater"), ("ge", "greater_equal"),
+                        ("eq", "equal"), ("ne", "not_equal")):
+    setattr(Unread, f"__{_dunder}__", _operator(_ufunc)[0])
+
+
 _METADATA = {np.shape: lambda array: array.shape, np.ndim: lambda array: array.ndim,
              np.size: lambda array, axis=None: array.size if axis is None else array.shape[axis],
              np.result_type: lambda *arrays: np.result_type(*(
@@ -234,9 +227,9 @@ _METADATA = {np.shape: lambda array: array.shape, np.ndim: lambda array: array.n
 """The NumPy functions an `Unread` answers from its shape and dtype, which hold what they return."""
 
 
-def unread(specs: Mapping[str, jax.ShapeDtypeStruct]):
+def unread(specs: Mapping[str, jax.ShapeDtypeStruct]) -> Mapping[str, np.ndarray]:
     """`specs`' tensors as a load without its weights holds them: each an `Unread` of its shape and
-    dtype."""
+    dtype, standing in for the array a reader takes (its NumPy runs on it abstractly)."""
     from dew.interop.safetensors_io import LazyTensors
 
-    return LazyTensors(specs, lambda name: Unread(specs[name].shape, specs[name].dtype))
+    return LazyTensors(specs, lambda name: cast(np.ndarray, Unread(specs[name].shape, specs[name].dtype)))
