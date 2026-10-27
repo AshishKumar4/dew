@@ -313,7 +313,7 @@ def test_a_decision_release_streams_its_wrappers_float64_layers_as_the_resident_
             actual = jax.jit(score)(streamed)
             assert actual.dtype == expected.dtype == jnp.float64
             np.testing.assert_array_equal(actual, expected)
-            assert source.stats().misses >= len(model.bank_sites[0].view.groups)
+            assert source.stats().misses >= len(model.bank_sites(resident.variables)[0].view.groups)
 
 
 def test_a_config_naming_expert_dtype_alone_streams_as_the_unquantized_load(tmp_path):
