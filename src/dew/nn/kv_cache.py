@@ -151,12 +151,18 @@ class KVCache:
 def quantize(values: jax.Array, dtype: KVDtype) -> tuple[jax.Array, jax.Array]:
     """`values` `[..., head_dim]` in `dtype`, and the float32 scale per vector.
 
-    The scale maps the vector's absmax to the format's largest value; an
-    all-zero vector keeps scale one so it dequantizes to zeros.
+    The scale maps the vector's absmax to the format's largest value. A vector
+    whose scale would not be a normal float32 (all zeros, or an absmax below
+    the format's largest times float32's least normal, 448 * 2**-126 for
+    float8) keeps scale one, so its codes are the format's rounding of the
+    values themselves, zeros, and it dequantizes to them: a subnormal scale
+    divides to codes no dequantize recovers, or flushes to zero where the
+    device flushes subnormals.
     """
     wide = values.astype(jnp.float32)
     amax = jnp.max(jnp.abs(wide), axis=-1)
-    scale = jnp.where(amax > 0, amax / _LIMITS[dtype], 1.0)
+    scaled_amax = amax / _LIMITS[dtype]
+    scale = jnp.where(scaled_amax >= jnp.finfo(jnp.float32).tiny, scaled_amax, 1.0)
     scaled = wide / scale[..., None]
     if dtype == "int8":
         return jnp.clip(jnp.rint(scaled), -127, 127).astype(jnp.int8), scale

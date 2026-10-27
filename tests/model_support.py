@@ -1,5 +1,6 @@
 """The tiny decoder and the parameter-tree view several model tests share."""
 
+import dataclasses
 import functools
 import json
 import os
@@ -92,6 +93,15 @@ def decode_through(module: nn.Module, variables, hidden, prefill: int):
                                   mutable=["cache"])
         outputs.append(out)
     return jnp.concatenate(outputs, axis=1), allocated["cache"], cache["cache"]
+
+
+def float64_twin(model: nn.Module) -> nn.Module:
+    """`model` computing in float64, its own `dtype` and every module it
+    holds: the truth a float32 run's rounding is measured from."""
+    fields = [field.name for field in dataclasses.fields(model) if field.name not in ("parent", "name")]
+    held = {name: float64_twin(getattr(model, name)) for name in fields
+            if isinstance(getattr(model, name), nn.Module)}
+    return model.clone(**held, **({"dtype": jnp.float64} if "dtype" in fields else {}))
 
 
 def largest_difference(left, right) -> float:

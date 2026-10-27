@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from model_support import decoder
+from model_support import decoder, float64_twin
 from reference_error import as_given, assert_as_exact, widened
 from rl_support import clipped_surrogate, prompt_inputs
 from test_mixers import KIND_FIELDS, tiny
@@ -197,7 +197,8 @@ def scored(model, params, sampling, dtype=None):
     parameters widened to it under x64: a draw's reference, and at float64 its truth. The model and its
     parameters are fixed once, so only the draw goes through."""
     if dtype is not None:
-        model, params = model.clone(dtype=dtype), widened(params)
+        twin = float64_twin(model) if dtype == "float64" else model.clone(dtype=dtype)
+        model, params = twin, widened(params)
 
     def run(prompt, lengths, key, tokens):
         with jax.enable_x64(new_val=True) if dtype is not None else nullcontext():
@@ -205,19 +206,22 @@ def scored(model, params, sampling, dtype=None):
     return run
 
 
-def assert_generation_scores_as_full_forwards(model, label: str, steps: int = 3) -> None:
+def assert_generation_scores_as_full_forwards(model, label: str, *, params=None, seeds=SEEDS,
+                                              steps: int = 3) -> None:
     """Check 1: a left-padded batch drawn through the cache scores each drawn token, under the raw
     model over every draw (`{label} raw`) and under the top-k policy that drew it over draws whose
     steps clear MARGIN (`{label} policy`), on par with a fresh full forward over that row's unpadded
-    tokens, from its float64 evaluation, over drawn prompts and keys."""
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    tokens, from its float64 twin's evaluation (`float64_twin`), over drawn prompts and keys: over
+    `params`, a fresh initialization where none are given, at the `seeds` declared for each label."""
+    if params is None:
+        params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     sampling = Sampling(temperature=0.7, top_k=5)
     for leaf, margin in (("raw", False), ("behavior", True)):
         name = f"{label} {'raw' if leaf == 'raw' else 'policy'}"
         assert_as_exact(only(leaf, generated(model, params, sampling, steps)),
                         only(leaf, scored(model, params, sampling)),
                         generation_draw(model, params, sampling, steps, margin=margin), name,
-                        seeds=SEEDS[name], truth_fn=only(leaf, scored(model, params, sampling, "float64")))
+                        seeds=seeds[name], truth_fn=only(leaf, scored(model, params, sampling, "float64")))
 
 
 @pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])

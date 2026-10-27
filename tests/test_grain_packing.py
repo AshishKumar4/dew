@@ -95,6 +95,38 @@ def test_planned_windows_are_grains_first_fit_windows(window, bins, segments):
     assert data.plan.derived["0/valid_targets"] == fingerprint(sum(targets))
 
 
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_packed_window_keeps_each_fields_trailing_shape_as_grain_packs_it(read):
+    """A pack of ids beside an aligned field that holds a row of three a token (a token's features):
+    every window an indexed plan or a memory read assembles holds each field with its trailing shape,
+    field for field what grain's first-fit packer writes of the same documents, where every packed
+    field was allocated one-dimensional and a row of three could not be assigned (row 1873)."""
+    lengths = (3, 7, 2, 5, 8, 4)
+    documents = [{"text": (np.arange(length) + 100 * index).astype(np.int32),
+                  "text_features": np.arange(3 * length, dtype=np.float32).reshape(length, 3) + index}
+                 for index, length in enumerate(lengths)]
+    fields = ("text", "text_features")
+    reference = list(FirstFitPackIterDataset(
+        grain.MapDataset.source(documents).to_iter_dataset(), length_struct=dict.fromkeys(fields, 8),
+        num_packing_bins=3, shuffle_bins=False, meta_features=fields[1:]))
+    source = (Memory(documents) if read == "memory" else
+              Memory({"text": [value["text"] for value in documents],
+                      "text_features": [value["text_features"] for value in documents],
+                      "length": list(lengths)}))
+    reader = validation(Pipeline(source).pack(8, fields=fields, bins=3), batch=1, read=read,
+                        loading=READ)(DataPartition())
+    try:
+        windows = list(reader)
+    finally:
+        reader.close()
+    assert len(windows) == len(reference)
+    for got, expected in zip(windows, reference, strict=True):
+        assert got["text_features"][0].shape == (8, 3)
+        for key in fields:
+            np.testing.assert_array_equal(got[key][0], expected[key], err_msg=key)
+        np.testing.assert_array_equal(got["text_coordinates"].segments[0], expected["text_segment_ids"])
+
+
 @pytest.mark.parametrize("policy, overlap", [("first-fit", 0), ("best-fit", 0), ("concat", 0), ("concat", 1)])
 def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy, overlap):
     """read='memory' packs the whole corpus before the order and an indexed

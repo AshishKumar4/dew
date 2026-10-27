@@ -58,25 +58,55 @@ class KernelCall:
     flops: float | None
 
 
-def kernel_calls(lowered: jax.stages.Lowered) -> list[KernelCall]:
-    """Every kernel call a lowered program makes, in program order: each custom call but those that run
-    no matmul (`instrumentation.custom_call_kind`), the launches one dispatch expands into, forward and
-    backward, which only the lowered program shows (a dispatch's `generation.Route` holds its decision
-    alone)."""
-    calls: list[KernelCall] = []
+@dataclass(frozen=True)
+class CustomCall:
+    """One custom call of a lowered program: its target and the shapes of the arrays it reads and
+    writes."""
+
+    target: str
+    operands: tuple[tuple[int, ...], ...]
+    results: tuple[tuple[int, ...], ...]
+
+
+def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operation], T | None]) -> list[T]:
+    """What `read` makes of each custom call a lowered program makes, given its target and its
+    operation, in program order: the calls it makes something of."""
+    found: list[T] = []
 
     def visit(operation: ir.Operation) -> ir.WalkResult:
         if operation.name == "stablehlo.custom_call":
-            target = ir.StringAttr(operation.attributes["call_target_name"]).value
-            if (kind := custom_call_kind(target)) != "no_matmul":
-                calls.append(_kernel_call(kind, target, operation))
+            made = read(ir.StringAttr(operation.attributes["call_target_name"]).value, operation)
+            if made is not None:
+                found.append(made)
         return ir.WalkResult.ADVANCE
 
     module = lowered.compiler_ir(dialect="stablehlo")
     assert module is not None, "a lowered program always has its StableHLO module"
     with module.context:
         module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
-    return calls
+    return found
+
+
+def custom_calls(lowered: jax.stages.Lowered) -> list[CustomCall]:
+    """Every custom call a lowered program makes, in program order."""
+    def shapes(values) -> tuple[tuple[int, ...], ...]:
+        return tuple(tuple(value.type.shape) for value in values
+                     if isinstance(value.type, ir.RankedTensorType))
+
+    return _read_calls(lowered, lambda target, operation: CustomCall(
+        target, shapes(operation.operands), shapes(operation.results)))
+
+
+def kernel_calls(lowered: jax.stages.Lowered) -> list[KernelCall]:
+    """Every kernel call a lowered program makes, in program order: each custom call but those that run
+    no matmul (`instrumentation.custom_call_kind`), the launches one dispatch expands into, forward and
+    backward, which only the lowered program shows (a dispatch's `generation.Route` holds its decision
+    alone)."""
+    def read(target: str, operation: ir.Operation) -> KernelCall | None:
+        kind = custom_call_kind(target)
+        return None if kind == "no_matmul" else _kernel_call(kind, target, operation)
+
+    return _read_calls(lowered, read)
 
 
 def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> KernelCall:
