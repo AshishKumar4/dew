@@ -1,21 +1,12 @@
-"""The float64 gate over orders (tests/reference_error.py): a comparison held over a whole batch of
+"""The float64 gate over orders (tests/reference_ensemble.py): a comparison held over a whole batch of
 exact-symmetry orders, its elements against the reference's own error at each, flagged elements
 confirmed over fresh batches, and its rows over the orders."""
 
 import jax
 import numpy as np
 import pytest
-from reference_error import (
-    FACTOR,
-    ORDERS,
-    REFERENCE,
-    ROW_FACTOR,
-    STAGES,
-    assert_elements_as_exact,
-    assert_leaves_as_exact_over_orders,
-    assert_rows_as_exact_over_orders,
-    distance,
-)
+from reference_ensemble import REFERENCE, STAGES, assert_elements_as_exact, assert_leaves_as_exact_over_orders
+from reference_error import FACTOR, ORDERS, ROW_FACTOR, assert_rows_as_exact_over_orders, distance
 
 
 def drawn(spread: float, rounding: float = 1.0, *, unstable: bool = False):
