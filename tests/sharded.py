@@ -112,7 +112,7 @@ def placed(tree, mesh: jax.sharding.Mesh, *spec):
 
 
 def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=(),
-                          donate=()) -> None:
+                          donate=(), arm=None) -> None:
     """The custom-kernel contract (module docstring): `fn` on `draw(seed)`'s arguments placed on `mesh`
     by `specs` (PartitionSpecs) is on par with `fn` on one device over the site's declared `seeds`
     (check 1, `assert_as_exact`), both measured from `truth_fn`, the float64 tree of `fn`'s outputs on
@@ -123,7 +123,11 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     takes in place, as its callers donate them (a kernel that aliases its state into its output): a
     call that keeps them would make XLA copy each before the kernel overwrites it. Both arms are Dew's
     programs, compiled here as the gate compiles two Dew arms (`without_ynn`) and run as given: the
-    split one is the executable whose collectives the contract reads."""
+    split one is the executable whose collectives the contract reads. `arm`, when given, is the arm the
+    split is compared with in place of `fn` on one device: a call whose rounding depends on the shapes it
+    runs at is compared with the shapes its shards run. A caller passing `arm` also asserts the split
+    against the reference path (check 1 against float64), so the comparison with `arm` alone is not the
+    whole contract."""
     run = without_ynn(fn, donate_argnums=donate)
 
     def put(args):
@@ -148,7 +152,8 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     def one_device(*args):
         return run(*kept(args))
 
-    assert_as_exact(as_given(split), as_given(one_device), draw, label, seeds=seeds, truth_fn=truth_fn)
+    assert_as_exact(as_given(split), as_given(one_device) if arm is None else arm, draw, label, seeds=seeds,
+                    truth_fn=truth_fn)
 
 
 VIEWS = frozenset({"bitcast", "get-tuple-element", "tuple", "parameter"})
