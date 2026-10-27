@@ -171,13 +171,16 @@ def _sown(node, name: str):
     return value[0] if isinstance(value, (tuple, list)) else value
 
 
-def _clip_scale(s_max: jax.Array, tau: float) -> jax.Array:
-    """Compute each head's rescale: `min(1, tau / s)` past `tau`, else 1.0.
+def _clip_scale(s_max: jax.Array, tau: float, guard: float) -> jax.Array:
+    """Compute each head's rescale: `min(1, tau / (s + guard))` past `tau`, else 1.0.
 
-    A head whose every logit is non-positive clips nothing: MaxText's
-    formula reads `minimum(1, tau / (s + 1e-6))`, which goes negative there
-    and would flip the weights' sign, so Dew holds those heads at 1.0."""
-    return jnp.where(s_max > 0, jnp.minimum(1.0, tau / (s_max + 1e-6)), 1.0)
+    The `guard` is each implementation's own: MaxText's latent clip reads
+    `minimum(1, tau / (s + 1e-6))`, and Megatron Core's grouped `clip_qk`
+    reads `min(1, tau / s)` (guard 0). A head whose every logit is
+    non-positive clips nothing on either path: there MaxText's formula goes
+    negative and would flip the weights' sign, and Megatron's square root of
+    it is NaN, so Dew holds those heads at 1.0."""
+    return jnp.where(s_max > 0, jnp.minimum(1.0, tau / (s_max + guard)), 1.0)
 
 
 def _columns(gamma: jax.Array, split: int, last: int, dtype) -> jax.Array:
@@ -280,7 +283,6 @@ def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tre
     logged = jnp.asarray(logged)
     s_max = jnp.max(logged.astype(jnp.promote_types(wide, at_least_fp32(logged.dtype))), axis=0)
     heads = s_max.shape[0]
-    scale = _clip_scale(s_max, tau)
     last = param.shape[-1]
     if last % heads:
         raise ValueError(
@@ -288,6 +290,8 @@ def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tre
             f"{heads} heads")
     proj = names[-2]
     nope = _sown(node, 'qk_nope')
+    # Latent attention is MaxText's clip, with its guard; grouped attention is Megatron Core's, without.
+    scale = _clip_scale(s_max, tau, 1e-6 if nope is not None else 0.0)
     if proj in ('q_proj', 'q_b_proj') and nope is not None:
         return _columns(_mla_query_gamma(scale, nope, last // heads), heads, last, wide)
     if proj == 'kv_b_proj':
