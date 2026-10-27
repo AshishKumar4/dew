@@ -1037,6 +1037,20 @@ class _Barren(Exception):
     that held nothing: the worker holds no input (`_repeated`)."""
 
 
+def _barren_bound(stages: Sequence[Stage], passes: tuple[int, int] | None, ran: int) -> int | None:
+    """How many rejections in a row a filter of the steps before `ran` makes certain to go on
+    forever (`Accepted`): two whole passes of the endless repeat of indexed rows written at
+    `passes[0]`, each of `passes[1]` rows, where every step from it is a view or a step that makes
+    a record's rows from it alone, so each pass's records, in another order, are rejected alike.
+    None where a step draws, numbers its rows or reads what may change (`_volatile`)."""
+    if passes is None:
+        return None
+    at, rows = passes
+    alike = all(isinstance(stage, (Shuffle, Slice, Map, Filter, FlatMap, Prefetch)) and not _volatile(stage)
+                for stage in stages[at + 1 : ran])
+    return 2 * rows if alike and rows else None
+
+
 class _Ended(pygrain.IterDataset):
     """A repeat of a loading worker's inputs, which ends where a pass of them holds none (`_Barren`)
     instead of repeating nothing forever, so the other workers read on."""
@@ -1352,6 +1366,8 @@ class _Build:
         marked = marked or any(_drops(stage) for stage in pipeline.stages[:consumed])
         carried = _carried(pipeline, consumed, marked=marked) if pooled and pool is not None else -1
         ran = consumed
+        # Where an endless repeat of indexed rows is written, and the rows of each of its passes.
+        passes: tuple[int, int] | None = None
         for index, stage in enumerate(pipeline.stages[consumed:], start=consumed):
             if index < ran:
                 continue
@@ -1375,7 +1391,8 @@ class _Build:
                            marked=index < carried, indexed=isinstance(rows, pygrain.MapDataset))
                 ran = index + len(run)
                 rows = self.record_stage(rows, run, pipeline, partition, index, marked=index < carried,
-                                         unplaced=index <= last < ran)
+                                         unplaced=index <= last < ran,
+                                         certain_after=_barren_bound(pipeline.stages, passes, ran))
             elif index < carried and isinstance(stage, Repeat) and not isinstance(rows, pygrain.MapDataset):
                 # A worker's inputs hold a marker for each record dropped, so a pass with nothing
                 # in it holds no input: that worker reads no more, and the others read on.
@@ -1392,6 +1409,9 @@ class _Build:
                     rows = self.handed(rows, pipeline, partition, pool)
                     carried = -1
             else:
+                endless = isinstance(stage, Repeat) and stage.epochs is None
+                if endless and isinstance(rows, pygrain.MapDataset):
+                    passes = index, len(rows)
                 rows = self.stage(rows, stage, pipeline, partition, index)
         if carried == len(pipeline.stages) and pool is not None:
             rows = self.handed(rows, pipeline, partition, pool)
@@ -1518,7 +1538,7 @@ class _Build:
 
     def record_stage(
         self, rows: Rows, run: tuple[RecordStage, ...], pipeline: Pipeline, partition: DataPartition, at: int,
-        *, marked: bool = False, unplaced: bool = False,
+        *, marked: bool = False, unplaced: bool = False, certain_after: int | None = None,
     ) -> Rows:
         """`rows` through a run of adjacent record stages written from `at` (`_run`), as one Grain
         operator. A run that can drop records drops them after it, counted (`Accepted`), unless its
@@ -1529,7 +1549,8 @@ class _Build:
         rows = _through(rows, run, _name(pipeline), _label(pipeline), self.loading, seed=seed,
                         unplaced=unplaced)
         if not marked and any(_drops(stage) for stage in run):
-            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
+            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
+                            certain_after=certain_after)
         return rows
 
     def batches(
