@@ -175,8 +175,9 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
         fallback = None
         for block_m, block_n in shapes:
             # A pair of multiprocessors a cluster runs two row tiles of one group where its family's loads
-            # multicast and a group averages a tile's rows, which then read its matrix's blocks once.
-            cluster = family.cluster if grouped and rows >= block_m else 1
+            # multicast and a group averages a tile's rows, which then read its matrix's blocks once; a
+            # pair is two consumers' (`Tiles`), so a one-consumer tile, the fallback, runs alone.
+            cluster = family.cluster if grouped and consumers > 1 and rows >= block_m else 1
             band = mosaic.band(multiprocessors * programs, block_m, block_n, width // block_n,
                                -(-rows // (block_m * cluster)) if grouped else None, cluster=cluster)
             # The shape before a deeper step: it sets how many times a FLOP reads each operand, where a
