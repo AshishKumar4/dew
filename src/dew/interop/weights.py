@@ -11,6 +11,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import _records
+from dew.interop.unread import held
 from dew.registry import dtype_name, resolve_dtype, storage_name
 
 if TYPE_CHECKING:
@@ -126,7 +127,7 @@ def decoding_storage(model: nn.Module, variables: Mapping) -> Mapping:
 
 def checkpoint_array(tensor, param_dtype: str = "float32") -> np.ndarray:
     """Cast a stored floating array directly, without an FP32 intermediate."""
-    leaf = np.asarray(tensor)
+    leaf = held(tensor)
     return leaf.astype(checkpoint_dtype(leaf.dtype, param_dtype), copy=False)
 
 

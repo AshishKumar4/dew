@@ -70,6 +70,7 @@ import numpy as np
 from numpy.typing import ArrayLike, DTypeLike
 
 from dew import _records
+from dew.interop import unread
 from dew.interop.weights import checkpoint_array, checkpoint_dtype
 from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS
 from dew.nn.precision import correctly_rounded_divide
@@ -90,7 +91,7 @@ _CODE_DTYPES = (np.dtype(np.uint8), np.dtype(np.int8))
 
 def _bytes(array: ArrayLike, dtypes: tuple[np.dtype, ...]) -> np.ndarray:
     """`array`'s bytes as uint8, if it is stored in one of `dtypes`."""
-    values = np.asarray(array)
+    values = unread.held(array)
     if values.dtype not in dtypes:
         raise ValueError(f"expected bytes stored as one of {[dtype.name for dtype in dtypes]}, "
                          f"got {values.dtype}")
@@ -116,7 +117,7 @@ def decode_e2m1(packed: ArrayLike, exponents: ArrayLike) -> np.ndarray:
     if codes.shape[:-1] != scales.shape[:-1] or codes.shape[-1] != scales.shape[-1] * (GROUP // 2):
         raise ValueError(f"packed E2M1 codes [..., n / 2] take E8M0 exponents [..., n / {GROUP}], "
                          f"got {codes.shape} and {scales.shape}")
-    values = _E2M1_BYTES[codes].reshape(*scales.shape, GROUP)
+    values = np.take(_E2M1_BYTES, codes, axis=0).reshape(*scales.shape, GROUP)
     values *= scales[..., None]
     return values.reshape(*codes.shape[:-1], 2 * codes.shape[-1])
 
@@ -143,14 +144,14 @@ def _float_groups(weight: ArrayLike, what: str, dtype: DTypeLike | None = None) 
     """A float weight, cast to `dtype` if given, as C-ordered [..., groups, 32]
     along its last axis, so the codes and exponents derived from it are
     C-ordered too; refused unless every value is finite in that dtype."""
-    values = np.asarray(weight)
+    values = unread.held(weight)
     # jnp's dtype lattice counts ml_dtypes' bfloat16 as floating; NumPy's does not.
     if not jnp.issubdtype(values.dtype, jnp.floating):
         raise ValueError(f"{what} encodes float weights, got {values.dtype}")
     if values.ndim < 1 or values.shape[-1] % GROUP:
         raise ValueError(f"{what} takes a weight whose input axis is a multiple of the "
                          f"{GROUP}-value group, got {values.shape}")
-    values = np.ascontiguousarray(values, dtype)
+    values = unread.held(values, dtype, contiguous=True)
     if not np.isfinite(values).all():
         raise ValueError(f"{what} holds no infinite or NaN weight: E2M1 encodes neither, and its "
                          "group would take the reserved E8M0 NaN scale 0xff")
@@ -162,7 +163,7 @@ def _float_groups(weight: ArrayLike, what: str, dtype: DTypeLike | None = None) 
 # --------------------------------------------------------------------------
 
 def _mxfp4_arrays(blocks: ArrayLike, scales: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
-    blocks, scales = np.asarray(blocks), np.asarray(scales)
+    blocks, scales = unread.held(blocks), unread.held(scales)
     if blocks.ndim != 4 or blocks.shape[-1] != GROUP // 2 or blocks.shape[:-1] != scales.shape:
         raise ValueError("MXFP4 blocks must be [expert, output, group, 16] with one scale per group")
     return blocks, scales
@@ -229,7 +230,7 @@ def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
     because no cast performs it: float8_e8m0fnu rounds to nearest and sends
     0 to the NaN byte 0xff.
     """
-    values = np.asarray(weight)
+    values = unread.held(weight)
     if values.ndim != 3:
         raise ValueError(f"MXFP4 takes an [expert, input, output] weight, got {values.shape}")
     groups = _float_groups(values.swapaxes(1, 2), "MXFP4", ml_dtypes.bfloat16).astype(np.float32)
@@ -320,7 +321,7 @@ class SourceQuantization:
             if taken:
                 raise ValueError(f"{', '.join(taken)} is already among the tensors to write, so "
                                  f"quantizing {name} would overwrite it")
-            out.update(self.encode(name, np.asarray(out.pop(name))))
+            out.update(self.encode(name, unread.held(out.pop(name))))
         return out
 
 
@@ -611,7 +612,7 @@ def _ceil_exponent(values: ArrayLike) -> np.ndarray:
     positive float32 value, read off its bits: the exponent, plus one if any
     mantissa bit is set. DeepGEMM's `ceil_to_ue8m0` and the release kernels'
     `fast_log2_ceil` both round this way."""
-    bits = np.asarray(values, np.float32).view(np.uint32)
+    bits = unread.held(values, np.float32).view(np.uint32)
     return (bits >> 23) + ((bits & 0x007fffff) != 0)
 
 
@@ -623,7 +624,7 @@ def _ue8m0(scale_inv: np.ndarray) -> np.ndarray:
 
 def _finite_matrix(weight: ArrayLike) -> np.ndarray:
     """A weight's host float32 copy, refused unless it is a finite matrix."""
-    values = np.asarray(weight, np.float32)
+    values = unread.held(weight, np.float32)
     if values.ndim != 2:
         raise ValueError(
             f"block-scaled quantization takes a [rows, cols] weight, got shape "
@@ -682,7 +683,7 @@ def quantize_fp8_blocks(weight: ArrayLike, block: Block = BLOCK, *,
     """
     if runs > 1:
         parts = [quantize_fp8_blocks(part, block, ue8m0=ue8m0)
-                 for part in _runs(np.asarray(weight), None, runs)[0]]
+                 for part in _runs(unread.held(weight), None, runs)[0]]
         return np.concatenate([codes for codes, _ in parts]), np.concatenate([scale for _, scale in parts])
     rows, cols = _sides(block)
     codes, scale_inv = _cast_blocks(_finite_matrix(weight), rows, cols, xp=np, divide=np.divide,
@@ -806,7 +807,7 @@ def _encode_store(name: str, weight: np.ndarray, *, block: int,
     to its own codes and exponents); the rest `quantize_fp8_blocks`."""
     partner = _store_partners(name)[0]
     if _ROUTED.search(name):
-        codes, exponents = quantize_mxfp4(np.asarray(weight).T[None])
+        codes, exponents = quantize_mxfp4(unread.held(weight).T[None])
         return {name: codes.reshape(codes.shape[1], -1), partner: exponents[0]}
     return dict(zip((name, partner), quantize_fp8_blocks(weight, block, runs=_qkv_runs(name, runs)),
                     strict=True))
@@ -1050,7 +1051,7 @@ def _gridded(
     if grid is None or any(part not in grid for part in parts):
         raise ValueError(f"{name} encodes against the scales and zeros it was loaded with, which this "
                          "codec was not given; save it through the Pretrained that loaded it")
-    return tuple(np.asarray(grid[part]) for part in parts)
+    return tuple(unread.held(grid[part]) for part in parts)
 
 
 def _awq_decode(tensors: Mapping[str, np.ndarray], name: str, *, bits: int, group: int) -> np.ndarray:
@@ -1062,7 +1063,7 @@ def _awq_decode(tensors: Mapping[str, np.ndarray], name: str, *, bits: int, grou
         return codes.reshape(*codes.shape[:-1], -1, 32 // bits)[..., order].reshape(codes.shape)
 
     codes, zeros = columns(tensors[stem + '.qweight']), columns(tensors[stem + '.qzeros'])
-    scales = np.asarray(tensors[stem + '.scales'])
+    scales = unread.held(tensors[stem + '.scales'])
     rows = np.arange(codes.shape[0]) // group
     return _scaled_product(codes, zeros[rows], scales[rows]).T
 
@@ -1076,7 +1077,7 @@ def _awq_encode(name: str, weight: np.ndarray, *, bits: int, group: int,
     zeros = _codes(packed_zeros, bits)
     zeros = zeros.reshape(*zeros.shape[:-1], -1, 32 // bits)[..., order].reshape(zeros.shape)
     rows = np.arange(weight.shape[1]) // group
-    codes = _encoded_codes(name, np.asarray(weight).T, zeros[rows], scales[rows], bits)
+    codes = _encoded_codes(name, unread.held(weight).T, zeros[rows], scales[rows], bits)
     packed = codes.reshape(codes.shape[0], -1, 32 // bits)[..., list(AWQ_ORDER)].reshape(codes.shape)
     return {stem + '.qweight': _words(packed, bits), stem + '.qzeros': packed_zeros, stem + '.scales': scales}
 
@@ -1115,10 +1116,10 @@ def _gptq_zeros(packed: np.ndarray, bits: int, v1: bool) -> np.ndarray:
 
 def _gptq_decode(tensors: Mapping[str, np.ndarray], name: str, *, bits: int, v1: bool) -> np.ndarray:
     stem = name.removesuffix('.weight')
-    codes = _codes(np.asarray(tensors[stem + '.qweight']).T, bits).T
-    zeros = _gptq_zeros(np.asarray(tensors[stem + '.qzeros']), bits, v1)
-    groups = np.asarray(tensors[stem + '.g_idx']).astype(np.int64)
-    return _scaled_product(codes, zeros[groups], np.asarray(tensors[stem + '.scales'])[groups]).T
+    codes = _codes(unread.held(tensors[stem + '.qweight']).T, bits).T
+    zeros = _gptq_zeros(unread.held(tensors[stem + '.qzeros']), bits, v1)
+    groups = unread.held(tensors[stem + '.g_idx']).astype(np.int64)
+    return _scaled_product(codes, zeros[groups], unread.held(tensors[stem + '.scales'])[groups]).T
 
 
 def _gptq_encode(name: str, weight: np.ndarray, *, bits: int, v1: bool,
@@ -1127,7 +1128,7 @@ def _gptq_encode(name: str, weight: np.ndarray, *, bits: int, v1: bool,
     packed_zeros, scales, groups = _gridded(grid, name, (stem + '.qzeros', stem + '.scales', stem + '.g_idx'))
     rows = groups.astype(np.int64)
     zeros = _gptq_zeros(packed_zeros, bits, v1)
-    codes = _encoded_codes(name, np.asarray(weight).T, zeros[rows], scales[rows], bits)
+    codes = _encoded_codes(name, unread.held(weight).T, zeros[rows], scales[rows], bits)
     return {stem + '.qweight': _words(codes.T, bits).T, stem + '.qzeros': packed_zeros,
             stem + '.scales': scales, stem + '.g_idx': groups}
 
@@ -1360,9 +1361,9 @@ def _unpacked(words: np.ndarray, bits: int, length: int) -> np.ndarray:
 def _ct_codes(scheme: _WeightScheme, tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
     parts = _ct_parts(scheme, name)
     if scheme.format != 'pack-quantized':
-        return np.asarray(tensors[name]).astype(np.float32)
-    outputs, inputs = (int(size) for size in np.asarray(tensors[parts['shape']]).reshape(-1))
-    return _unpacked(np.asarray(tensors[parts['packed']]), scheme.bits, inputs).reshape(outputs, inputs)
+        return unread.held(tensors[name]).astype(np.float32)
+    outputs, inputs = (int(size) for size in unread.held(tensors[parts['shape']]).reshape(-1))
+    return _unpacked(unread.held(tensors[parts['packed']]), scheme.bits, inputs).reshape(outputs, inputs)
 
 
 def _ct_zero(scheme: _WeightScheme, tensors: Mapping[str, np.ndarray], name: str,
@@ -1370,7 +1371,7 @@ def _ct_zero(scheme: _WeightScheme, tensors: Mapping[str, np.ndarray], name: str
     parts = _ct_parts(scheme, name)
     if 'zero' not in parts:
         return 0
-    zero = np.asarray(tensors[parts['zero']])
+    zero = unread.held(tensors[parts['zero']])
     if scheme.format == 'pack-quantized' and scheme.strategy in ('channel', 'group'):
         # Packed along the output axis (packed_dim=0).
         zero = _unpacked(zero.T, scheme.bits, shape[0]).T
@@ -1379,15 +1380,15 @@ def _ct_zero(scheme: _WeightScheme, tensors: Mapping[str, np.ndarray], name: str
 
 def _ct_order(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray | None:
     order = tensors.get(name.removesuffix('.weight') + '.weight_g_idx')
-    return None if order is None else np.asarray(order)
+    return None if order is None else unread.held(order)
 
 
 def _nvfp4_scales(scheme: _WeightScheme, scales: np.ndarray, overall: np.ndarray,
                   shape: tuple[int, int]) -> np.ndarray:
     """NVFP4's effective per-input scale: the E4M3 group scale over the float32
     global scale, a float32 division, as `_dequantize` divides them."""
-    spread = np.asarray(_per_input(scales.astype(np.float32), scheme, shape, None))
-    return spread / np.asarray(overall, np.float32).reshape(())
+    spread = unread.held(_per_input(scales.astype(np.float32), scheme, shape, None))
+    return spread / unread.held(overall, np.float32).reshape(())
 
 
 def _ct_decode(tensors: Mapping[str, np.ndarray], name: str, *, scheme: _WeightScheme) -> np.ndarray:
@@ -1398,22 +1399,23 @@ def _ct_decode(tensors: Mapping[str, np.ndarray], name: str, *, scheme: _WeightS
     (compressors/nvfp4/base.py `decompress`)."""
     if scheme.format == 'nvfp4-pack-quantized':
         parts = _ct_parts(scheme, name)
-        packed = np.asarray(tensors[parts['packed']])
-        values = _E2M1_BYTES[_bytes(packed, _CODE_DTYPES)].reshape(packed.shape[0], packed.shape[1] * 2)
+        packed = unread.held(tensors[parts['packed']])
+        values = np.take(_E2M1_BYTES, _bytes(packed, _CODE_DTYPES), axis=0).reshape(
+            packed.shape[0], packed.shape[1] * 2)
         scales = _nvfp4_scales(
             scheme,
-            np.asarray(tensors[parts["scale"]]),
-            np.asarray(tensors[parts["global"]]),
+            unread.held(tensors[parts["scale"]]),
+            unread.held(tensors[parts["global"]]),
             (values.shape[0], values.shape[1]),
         )
         return (values * scales).astype(ml_dtypes.bfloat16).astype(np.float32)
     codes = _ct_codes(scheme, tensors, name)
     shape = (codes.shape[0], codes.shape[1])
-    scales = np.asarray(tensors[_ct_parts(scheme, name)['scale']])
+    scales = unread.held(tensors[_ct_parts(scheme, name)['scale']])
     order = _ct_order(tensors, name)
     zero = _ct_zero(scheme, tensors, name, shape)
     zeros = zero if isinstance(zero, int) else _per_input(zero, scheme, shape, order)
-    return _scaled_product(codes, zeros, np.asarray(_per_input(scales, scheme, shape, order)))
+    return _scaled_product(codes, zeros, unread.held(_per_input(scales, scheme, shape, order)))
 
 
 def _ct_encode(name: str, weight: np.ndarray, *, scheme: _WeightScheme,
@@ -1427,7 +1429,7 @@ def _ct_encode(name: str, weight: np.ndarray, *, scheme: _WeightScheme,
             if role in ('scale', 'zero', 'shape', 'global', 'input_global')}
     order_name = name.removesuffix('.weight') + '.weight_g_idx'
     stored = dict(zip(kept, _gridded(grid, name, tuple(kept.values())), strict=True))
-    order = None if grid is None or order_name not in grid else np.asarray(grid[order_name])
+    order = None if grid is None or order_name not in grid else unread.held(grid[order_name])
     scales = stored['scale']
     shape = (weight.shape[0], weight.shape[1])
     out: dict[str, np.ndarray] = {part: stored[role] for role, part in kept.items()}
@@ -1438,18 +1440,18 @@ def _ct_encode(name: str, weight: np.ndarray, *, scheme: _WeightScheme,
         # The library's compressor adds its zero point and would write 0
         # there; released checkpoints carry code 8 (Qwen3-0.6B-NVFP4A16: 3.5%
         # of codes), which only a sign-keeping encoding round-trips.
-        quotients = np.asarray(weight).astype(np.float32) / _nvfp4_scales(
+        quotients = unread.held(weight).astype(np.float32) / _nvfp4_scales(
             scheme, scales, stored["global"], shape
         )
         out[parts['packed']] = encode_e2m1(np.clip(quotients, -6.0, 6.0), ties='even')
         return out
-    held = np.asarray(weight)
+    held = unread.held(weight)
     # Two float dtypes that differ promote to float32 in torch.
     dtype = scales.dtype if held.dtype == scales.dtype else np.dtype(np.float32)
     zero = 0 if 'zero' not in stored else _ct_zero(scheme, {parts['zero']: stored['zero']}, name, shape)
     zeros = zero if isinstance(zero, int) else _per_input(zero, scheme, shape, order)
     over = (held.astype(dtype).astype(np.float32)
-            / np.asarray(_per_input(scales, scheme, shape, order)).astype(np.float32)).astype(dtype)
+            / unread.held(_per_input(scales, scheme, shape, order)).astype(np.float32)).astype(dtype)
     if not isinstance(zeros, int):
         over = (over.astype(np.float32) + zeros.astype(np.float32)).astype(dtype)
     low, high = _code_range(scheme)
@@ -1546,18 +1548,18 @@ def _modelopt_names(tensors: Mapping[str, np.ndarray], *, method: str = 'NVFP4',
 def _modelopt_decode(tensors: Mapping[str, np.ndarray], name: str, *, method: str = 'NVFP4',
                      layers: Mapping[str, str] = _MODELOPT_EMPTY_LAYERS) -> np.ndarray:
     """ModelOpt 0.47.0's NVFP4QTensor.dequantize: block scale times global, then codes, then bf16."""
-    packed = np.asarray(tensors[name])
+    packed = unread.held(tensors[name])
     algo = _modelopt_algo(name, method, layers)
     parts = _modelopt_layer_parts(name, algo)
     if algo == 'FP8':
-        scale = np.asarray(tensors[parts[0]])
+        scale = unread.held(tensors[parts[0]])
         if packed.dtype != np.dtype(E4M3) or packed.ndim != 2 or scale.dtype != np.float32 or scale.size != 1:
             raise ValueError(f"{name} must be ModelOpt per-tensor E4M3 FP8 with a scalar float32 scale")
         # Reuse the existing per-tensor FP8 codec with the author's scale
         # rounding in FP8QTensor.dequantize: scale and product both bf16.
         codec = compressed_tensors(_MODELOPT_FP8_WEIGHTS)
         return codec.decode({name: packed, parts[0]: scale.astype(ml_dtypes.bfloat16)}, name)
-    scale, overall = (np.asarray(tensors[part]) for part in parts[:2])
+    scale, overall = (unread.held(tensors[part]) for part in parts[:2])
     if (packed.dtype != np.uint8 or packed.ndim not in (2, 3) or packed.shape[-1] % 8
             or scale.dtype != np.dtype(E4M3) or scale.shape != (*packed.shape[:-1], packed.shape[-1] // 8)
             or overall.dtype != np.float32 or overall.size not in (1, packed.shape[0])):
@@ -1566,7 +1568,7 @@ def _modelopt_decode(tensors: Mapping[str, np.ndarray], name: str, *, method: st
     if (not np.isfinite(scale.astype(np.float32)).all()
             or not np.isfinite(overall).all() or (overall < 0).any()):
         raise ValueError(f"{name} ModelOpt scales must be finite and nonnegative")
-    values = _E2M1_BYTES[packed].reshape(*packed.shape[:-1], -1, 16)
+    values = np.take(_E2M1_BYTES, packed, axis=0).reshape(*packed.shape[:-1], -1, 16)
     # The author's Python reader maps code 8 to +0; packed bytes remain in
     # the export grid so an untrained save can still keep that source code.
     values = np.where(values == 0, np.float32(0), values)

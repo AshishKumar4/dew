@@ -83,6 +83,7 @@ from dew.interop.decoder_parts import (
     refuse_encoder_fields,
     renamed_path,
 )
+from dew.interop.unread import held
 from dew.nn.activations import Situ
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -378,7 +379,7 @@ def _kimi_linear_prepare(tensors: Mapping[str, np.ndarray],
     prepared = dict(tensors)
     for name, value in tensors.items():
         if name.endswith('.self_attn.A_log'):
-            log = np.asarray(value)
+            log = held(value)
             if log.ndim != 4 or log.shape[:2] != (1, 1) or log.shape[3] != 1:
                 raise ValueError(
                     f"{name} holds {log.shape}, not the [1, 1, heads, 1] the gate broadcasts over"

@@ -196,6 +196,20 @@ class Unread:
         return np.absolute(self)
 
 
+def held(value, dtype=None, *, contiguous: bool = False):
+    """`np.asarray(value, dtype)` (`np.ascontiguousarray` with `contiguous`), an `Unread` kept one: the
+    array a reader goes on with, values or not."""
+    if isinstance(value, Unread):
+        return value if dtype is None else value.astype(dtype)
+    return np.ascontiguousarray(value, dtype) if contiguous else np.asarray(value, dtype)
+
+
+def valued(*values) -> bool:
+    """Whether each of `values` holds its values, none `Unread`: a check on values runs where they are
+    held, and a load without its weights checks the shapes alone."""
+    return not any(isinstance(value, Unread) for value in values)
+
+
 def unread(specs: Mapping[str, jax.ShapeDtypeStruct]):
     """`specs`' tensors as a load without its weights holds them: each an `Unread` of its shape and
     dtype."""

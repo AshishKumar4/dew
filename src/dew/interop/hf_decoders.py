@@ -60,6 +60,7 @@ from dew.interop.decoder_parts import (
     translated,
 )
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
+from dew.interop.unread import held, valued
 from dew.interop.weights import checkpoint_dtype, insert, nested
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.attention_residuals import AttentionResiduals
@@ -447,8 +448,14 @@ def _renamed(checked: Checked, names: Mapping[str, str]) -> Checked:
 
 def _equal(read: Callable[[str], np.ndarray], first: str, second: str, checked: Checked) -> bool:
     """Whether source tensors `first` and `second` hold equal values: known where `checked` joins
-    them, else read and compared."""
-    return second in checked.get(first, frozenset()) or np.array_equal(read(first), read(second))
+    them, else read and compared; of a load without its weights, whether their shapes and dtypes are
+    (`valued`)."""
+    if second in checked.get(first, frozenset()):
+        return True
+    one, other = read(first), read(second)
+    if not valued(one, other):
+        return (one.shape, one.dtype) == (other.shape, other.dtype)
+    return np.array_equal(one, other)
 
 
 def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], record,
@@ -849,7 +856,7 @@ def read_decoder(
         path = part.path
         if path is None or name in copies:
             continue
-        stored = np.asarray(part.tensor)
+        stored = held(part.tensor)
         dtype = checkpoint_dtype(stored.dtype, param_dtype if path[0] == "params" else "float32", path=path)
         # torch Linear holds [out, in]; a stacked expert kernel arrives
         # [E, in, out], which is the layout dew keeps.
