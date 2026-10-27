@@ -38,14 +38,16 @@ def batch(rows=8, seed=0):
     return {"x": x, "y": 2 * x[:, :2], "label": (x[:, 0] > 0).astype(np.int32)}
 
 
-RUNS = 8
-"""The independent training runs a learning claim here is judged over (`assert_learns`)."""
+RUNS = 32
+"""The independent training runs a learning claim here is judged over (`assert_learns`): at eight the
+gate's t threshold is 38.7, past what these runs' spread of initial losses reaches."""
 
 
 def learned(objective, optimizer, loader_of, held_out_of, steps: int, margin: float) -> np.ndarray:
-    """Each of RUNS independent runs' contrast for "training lowers the held-out loss by `margin`": the
-    loss before over `margin` less the loss after, on the run's own held-out batch, each run from its
-    own initialization key and data."""
+    """Each of RUNS independent runs' contrast for "training lowers the held-out loss by `margin` times":
+    the log of the loss before over the loss after, less the log of `margin`, on the run's own held-out
+    batch, each run from its own initialization key and data. A ratio's claim in logs, so a run's
+    initial loss scales none of it."""
     contrasts = []
     for run in range(RUNS):
         trainer = Trainer(objective, optimizer, key=jax.random.key(run))
@@ -54,7 +56,7 @@ def learned(objective, optimizer, loader_of, held_out_of, steps: int, margin: fl
         held_out = held_out_of(run)
         before, _ = objective.scalar_loss(start.variables, held_out, STEP)
         after, _ = objective.scalar_loss(state.variables, held_out, STEP)
-        contrasts.append(float(before) / margin - float(after))
+        contrasts.append(float(np.log(float(before) / float(after)) - np.log(margin)))
     return np.asarray(contrasts)
 
 
@@ -65,7 +67,7 @@ def test_a_plain_flax_model_trains_on_a_loss_function():
     drop = learned(objective, optax.adam(0.1),
                    lambda run: dataset(train=lambda run=run: Replaying(lambda step: batch(seed=[run, step])),
                                        batch=8),
-                   lambda run: batch(seed=[run, 10_000]), steps=60, margin=4)
+                   lambda run: batch(rows=256, seed=[run, 10_000]), steps=60, margin=4)
     assert_learns(lambda runs: {"training cuts the held-out loss to a quarter": drop[runs]},
                   "a plain flax model", units=RUNS)
 
@@ -185,7 +187,7 @@ def test_the_autoencoders_evidence_bound_falls_over_independent_runs():
     drop = learned(objective, optax.adam(1e-2),
                    lambda run: dataset(train=lambda run=run: Replaying(lambda step: points([run, step])),
                                        batch=32),
-                   lambda run: points([run, 10_000], rows=64), steps=40, margin=2)
+                   lambda run: points([run, 10_000], rows=256), steps=40, margin=2)
     assert_learns(lambda runs: {"training halves the held-out evidence bound": drop[runs]},
                   "the autoencoder experiment", units=RUNS)
 
