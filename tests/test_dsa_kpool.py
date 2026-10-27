@@ -21,7 +21,6 @@ difference in the math and not in a tie-break.
 """
 
 import contextlib
-import copy
 from functools import partial
 
 import jax
@@ -165,12 +164,20 @@ def reference_block_output(block):
                                                                     valid)})
 
 
+def wide_block(block):
+    """`block`'s float64 twin (`float64_twin`): built inside `float64`, so every value its constructor
+    computes is float64's, with `block`'s weights."""
+    from tools.torch_precision import float64_twin
+
+    return float64_twin(block, lambda: Glm5NextTextAttention(block.config, block.layer_idx))
+
+
 def float64_block(block):
     """The reference block run in float64, every float32 pin widened (`float64`), as a function of a
     widened draw: the truth check 1 measures both sides from."""
     from tools.torch_precision import float64
 
-    wide = copy.deepcopy(block).double()
+    wide = wide_block(block)
 
     def run(hidden, valid):
         with float64(), torch.no_grad():
@@ -293,7 +300,7 @@ def test_the_gradients_match_torch_autograd():
     names = [name for name, _ in block.named_parameters() if not name.startswith('indexer.')]
     assert len(names) == 7
     assert_as_exact(dew_gradients(variables, names), torch_gradients(block), draw, 'k-pool gradients',
-                    seeds=SEEDS['gradients'], truth_fn=torch_gradients(copy.deepcopy(block).double()))
+                    seeds=SEEDS['gradients'], truth_fn=torch_gradients(wide_block(block)))
 
     hidden, valid, readout = draw(0)
     x = torch.from_numpy(hidden).requires_grad_(requires_grad=True)

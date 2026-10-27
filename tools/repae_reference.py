@@ -113,7 +113,7 @@ def regularizer() -> None:
     total = F.l1_loss(images, reconstruction) + KL_WEIGHT * torch.sum(kl) / kl.shape[0]
 
     latents = torch.randn(3, 4, 4, 4, generator=generator, dtype=torch.float64) * 1.7 + 0.4
-    norm = torch.nn.BatchNorm2d(4, eps=1e-4, momentum=0.1, affine=False).double()
+    norm = torch.nn.BatchNorm2d(4, eps=1e-4, momentum=0.1, affine=False, dtype=torch.float64)
     norm.running_mean = torch.full((4,), SHIFT, dtype=torch.float64)
     norm.running_var = torch.full((4,), 1 / SCALE, dtype=torch.float64).pow(2)
     trained = norm.train()(latents)

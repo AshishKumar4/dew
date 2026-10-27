@@ -72,7 +72,7 @@ def walk(model, inputs, probe, dtype):
 
 
 def main():
-    from torch_precision import widened
+    from torch_precision import float64_twin, widened
 
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
@@ -104,8 +104,9 @@ def main():
                        for name, value in model.state_dict().items()})
         single = walk(model, inputs, probe, torch.float32)
         record.update({f"fp32.{key}": value for key, value in single.items()})
+        wide = float64_twin(model, lambda config=config: t2i.UViT(**config))
         with widened():
-            truth = walk(model, inputs, probe, torch.float64)
+            truth = walk(wide, inputs, probe, torch.float64)
         record.update({f"fp64.{key}": value for key, value in truth.items()})
         arrays.update({f"{case}/{key}": value for key, value in record.items()})
         gap = np.abs(record["fp32.output"] - record["fp64.output"]).max()
