@@ -204,6 +204,26 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
     # tokamax serializes a launch's arguments into the program by their types.
     HOOKS: ClassVar[tuple[str, ...]] = ('hooks',)
 
+    def bind(self, *args, **kwargs):
+        """tokamax's binding, its hooks stating the dtypes a kernel traces them at where the call left them
+        unstated (a launch called itself): the prologue's at the tokens' and its side operands' dtypes, the
+        epilogue's at the fp32 accumulator's and its side operands', as `templates.gemm` states them, so
+        every bound launch's hooks key alike (`traced`, `tuning.launch_text`)."""
+        ba = super().bind(*args, **kwargs)
+        hooks = ba.arguments.get('hooks', NO_HOOKS)
+        if not isinstance(hooks, Hooks):  # a stored launch's, already keyed (`traced`)
+            return ba
+
+        def named(*arrays) -> tuple[str, ...]:
+            return tuple(jnp.dtype(array.dtype).name for array in arrays)
+
+        stated = dataclasses.replace(
+            hooks, prologue_dtypes=hooks.prologue_dtypes or (() if hooks.prologue is None else named(
+                ba.arguments['tokens'], *ba.arguments.get('prologue_operands', ()))),
+            epilogue_dtypes=hooks.epilogue_dtypes or (() if hooks.epilogue is None else (
+                'float32', *named(*ba.arguments.get('epilogue_operands', ())))))
+        return ba if stated == hooks else type(ba)(ba.op, {**ba.arguments, 'hooks': stated})
+
     def traced(self, name: str, value: Callable | str | None) -> str | None:
         """The launch's `Hooks` as its picks key them (`tuning.KernelOp.traced`): each hook by what it
         computes (`tuning.program`) as a kernel traces it (`Hooks.before`, `Hooks.after`), at a
