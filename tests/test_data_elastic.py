@@ -303,10 +303,13 @@ def starved(chain: Pipeline, index: int, count: int, *, workers: int = 0) -> lis
     raised = []
 
     def read():
+        opened = worker_reader(chain, index, count, workers)
         try:
-            next(worker_reader(chain, index, count, workers))
+            next(opened)
         except ValueError as refused:
             raised.append(refused)
+        finally:
+            opened.close()
 
     thread = threading.Thread(target=read, daemon=True)
     thread.start()
