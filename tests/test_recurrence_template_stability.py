@@ -22,7 +22,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, equations, widened, with_gradients
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    equations,
+    widened,
+    with_gradients,
+)
 from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import NATIVE
 from test_recurrence_stability import SEEDS, SITES, cotangents, restarting, stressed
@@ -144,7 +150,7 @@ def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpret
     zero on a draw: a chunk's ranges sum each token's terms before it (`mainloop.gradients`), never a token's
     own order-one term added and taken away, which rounded away the `exp(-30)` terms before it (65 to 169
     times the port's distance on three draws, the H100's check 1 140 times, SE-numerics-h100-fd61e11eeb;
-    0.98 to 1.00 times after)."""
+    0.98 to 1.00 times after), held on one draw by the gate's one-draw rule."""
     regime = 'decays near zero'
     operands, (out, final) = cotangents(HOOKS, regime, 0)
     drawn = (bf16(operands), (out.astype(jnp.bfloat16), final))
@@ -153,8 +159,8 @@ def test_the_fast_backward_decay_gradient_holds_under_decays_near_zero_interpret
     with jax.enable_x64(new_val=True):
         exact = jax.jit(with_gradients(functools.partial(token_by_token, HOOKS)))(*widened(drawn))
 
-    def distance(fn) -> float:
-        leaf = np.asarray(jax.jit(fn)(*drawn)[1].log_decay, np.float64)
-        return float(np.sqrt(np.mean((leaf - np.asarray(exact[1].log_decay)) ** 2)))
+    def leaf(fn):
+        return np.asarray(jax.jit(fn)(*drawn)[1].log_decay)
 
-    assert distance(template) <= 2 * distance(port), (distance(template), distance(port))
+    assert_as_exact_as_the_reference(leaf(template), leaf(port), np.asarray(exact[1].log_decay),
+                                     f'the template, {regime}, its log decay gradient on a draw')
