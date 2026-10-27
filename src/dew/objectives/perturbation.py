@@ -160,7 +160,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
         @jax.custom_vjp
         def estimated(params, rest):
             others, held_batch, held_step = rest
-            return self._scored({**others, "params": params}, held_batch, held_step)
+            return self._objective_loss({**others, "params": params}, held_batch, held_step)
 
         def forward(params, rest):
             return estimated(params, rest), (params, rest)
@@ -175,7 +175,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
         estimated.defvjp(forward, backward)
         return estimated(variables["params"], (held, batch, step))
 
-    def _scored(self, variables: Variables, batch: Batch, step: Step) -> tuple[LossT, Aux[EffectsT]]:
+    def _objective_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[LossT, Aux[EffectsT]]:
         """The objective's own statistics and `Aux` for `batch`, the `Aux` empty where it returns none
         (`_has_aux`): statistics that are themselves a tuple stay whole."""
         scored = super().loss(variables, batch, step)
@@ -230,7 +230,7 @@ class NodePerturbation[LossT, EffectsT](Objective[LossT, EffectsT]):
         units = self.scored_units(variables, batch, step)
         if units is not None:
             return units
-        stats, _ = self._scored(variables, batch, step)
+        stats, _ = self._objective_loss(variables, batch, step)
         return stats, None
 
     def _update_key(self, step: Step, name: str) -> jax.Array:
