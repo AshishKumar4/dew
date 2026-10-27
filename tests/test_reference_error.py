@@ -923,6 +923,117 @@ def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
                                                                             range(cut - 1))])
 
 
+def test_a_recording_with_pilot_shards_sizes_paired_on_them_as_the_live_draws_do():
+    """A summarized recording made in shards with a run of pilots from SIZING_FROM (`merge_shards`) keeps
+    them apart from its verdict's seeds, and its reference carries them: a paired sizing of it takes those
+    pilots alone and declares what the live reference's paired sizing declares on the same draws, its
+    lookups never past them. Pilots that leave a seed out of their run, or whose leaves are not the
+    verdict's shapes, are refused, and so are a seed past them and a pilot drawn again otherwise."""
+    from reference_error import SIZING_FROM
+    from tool_support import load
+
+    recorder = load("recorded_references")
+    draw, evaluate = _tiny_row_recording(_product)
+
+    def product(inputs):
+        return _product(inputs["x"], inputs["w"])
+
+    # The product summed in the other order: Dew's own rounding, apart from the reference's on each draw.
+    reordered = jax.jit(lambda x, w: {"y": jnp.dot(x[:, ::-1], w[::-1], precision="highest")})
+    live = seeds_for(_product, _draw, "live", dew_fn=reordered)
+    pilots = range(SIZING_FROM, SIZING_FROM + 2 * live)
+
+    with jax.enable_x64(new_val=True):
+        whole = recorder.record_case("site", draw, evaluate, product, summary=True)
+        kept = len(whole["site.input_digest"])
+        cut = SIZING_FROM + live // 2
+        shards = [recorder.record_shard("site", draw, evaluate, seeds)
+                  for seeds in (range(cut, pilots.stop), range(kept), range(SIZING_FROM, cut))]
+        merged = recorder.merge_shards("site", shards)
+        for key, value in whole.items():
+            np.testing.assert_array_equal(merged[key], value, err_msg=key)
+        assert len(merged["site.pilot.input_digest"]) == len(pilots)
+        with pytest.raises(ValueError):
+            recorder.merge_shards("site", shards[:2])
+        # One pilot shard's leaf apart from the others', and every pilot's apart from the verdict's.
+        for at in ((0,), (0, 2)):
+            narrow = [dict(shard, **{"site.shape.y": np.asarray([1, 1], np.int64)}) if index in at else shard
+                      for index, shard in enumerate(shards)]
+            with pytest.raises(ValueError):
+                recorder.merge_shards("site", narrow)
+        # Pilots of another leaf than the verdict's.
+        renamed = [{key.removesuffix(".y") + ".z" if key.endswith(".y") else key: value
+                    for key, value in shard.items()} for shard in shards[::2]]
+        with pytest.raises(ValueError):
+            recorder.merge_shards("site", [shards[1], *renamed])
+        straddling = recorder.record_shard("site", draw, evaluate, range(SIZING_FROM - 1, SIZING_FROM + 1))
+        with pytest.raises(ValueError):
+            recorder.merge_shards("site", [*shards, straddling])
+        # Pilots joined onto a recording made whole before them are the pilots merged with its shards.
+        joined = recorder.with_pilots("site", whole, shards[::2])
+        assert joined.keys() == merged.keys()
+        for key, value in merged.items():
+            np.testing.assert_array_equal(joined[key], value, err_msg=key)
+        with pytest.raises(ValueError):
+            recorder.with_pilots("site", joined, shards[::2])
+
+        seeds = int(merged["site.seeds"])
+        drawn, reference, truth = indexed_recording(merged, "site", seeds, inputs_of=draw, truth_fn=product)
+    assert reference.pilots == pilots
+    asked = []
+
+    def recorded(index, inputs):
+        asked.append(int(index))
+        return reference(index, inputs)
+    recorded.recorded, recorded.pilots = True, reference.pilots
+
+    def dew(index, inputs):
+        return reordered(inputs["x"], inputs["w"])
+
+    assert seeds_for(recorded, drawn, "recorded", dew_fn=dew, truth_fn=truth) == live
+    assert min(asked) >= SIZING_FROM and max(asked) < pilots.stop
+    with pytest.raises(AssertionError):
+        drawn(pilots.stop)
+    with pytest.raises(AssertionError):
+        indexed_recording({**merged, "site.pilot.input_digest": merged["site.pilot.input_digest"][::-1]},
+                          "site", seeds, inputs_of=draw, truth_fn=product)[0](SIZING_FROM)
+
+
+def test_a_recording_read_for_some_of_its_leaves_judges_them_alone():
+    """A summarized recording read for some of its leaves (`indexed_recording(..., leaves=)`) holds those
+    leaves' evidence and sketches, its pilots' too, and every entry the recording shares: its reference
+    gives those leaves alone, at a verdict seed and a pilot's, and check 1 judges them over it; a leaf the
+    recording lacks is refused."""
+    from reference_error import SIZING_FROM
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    @jax.jit
+    def both(x, w):
+        y = jnp.dot(x, w, precision="highest")
+        return {"y": y, "z": 2 * y}
+
+    def one(inputs):
+        return {"y": both(inputs["x"], inputs["w"])["y"]}
+
+    draw, evaluate = _tiny_row_recording(both)
+    with jax.enable_x64(new_val=True):
+        whole = recorder.record_case("site", draw, evaluate, lambda inputs: both(inputs["x"], inputs["w"]),
+                                     summary=True)
+        recorded = recorder.with_pilots("site", whole, [recorder.record_shard(
+            "site", draw, evaluate, range(SIZING_FROM, SIZING_FROM + 16))])
+        seeds = int(recorded["site.seeds"])
+        drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=one,
+                                                    leaves=("y",))
+        for seed in (0, SIZING_FROM):
+            assert set(reference(*drawn(seed))) == {"y"}
+        with pytest.raises(ValueError):
+            indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=one, leaves=("y", "w"))
+    assert_as_exact(lambda index, inputs: one(inputs), reference, drawn, "leaves", seeds=seeds,
+                    truth_fn=truth)
+
+
 def test_a_recorded_truth_over_windows_counts_one_window_and_checks_every_one():
     """A summarized recording of windows read back through `indexed_recording` with a truth over windows
     (`over_windows`): its rounding count traces one window, as one draw's program, so the truth is read
