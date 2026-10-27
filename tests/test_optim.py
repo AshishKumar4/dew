@@ -496,7 +496,7 @@ def test_the_clip_matches_the_paper_equations():
     def paper(params, grads):
         s_max = jnp.max(jnp.asarray(stats['layers_0']['self_attn']['max_logits'][0], params[
             'layers_0']['self_attn']['q_proj']['kernel'].dtype), axis=0)
-        gamma = clip_scale(s_max, 100.0)
+        gamma = clip_scale(s_max, 100.0, guard=0.0)
         return {'layers_0': {'self_attn': {proj: {'kernel': clip_qk_kernel(
             params['layers_0']['self_attn'][proj]['kernel'] + grads['layers_0']['self_attn'][proj]['kernel'],
             gamma, 4)} for proj in ('q_proj', 'k_proj')}}}
@@ -601,7 +601,7 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
             # The paper's clip, written on the weights: each group's query heads and its key head by
             # the root of its eta, the gate half of each query head untouched; then the same tokens read.
             before = maxima(of, variables, ids)[1]
-            root = jnp.sqrt(clip_scale(before.reshape(2, 2).max(axis=1), tau))
+            root = jnp.sqrt(clip_scale(before.reshape(2, 2).max(axis=1), tau, guard=0.0))
             attention = dict(variables["params"]["layers_0"]["self_attn"])
             query = jnp.asarray(attention["q_proj"]["kernel"]).reshape(16, 2, 2, 2, -1)
             query = query.at[:, :, :, 0].multiply(root[None, :, None, None].astype(query.dtype))
@@ -709,7 +709,7 @@ def test_the_threshold_rides_optimizer_opts():
             moved = optax.apply_updates(params, solver.update(grads, solver.init(params), params)[0])
             s_max = jnp.max(jnp.asarray(stats['layers_0']['self_attn']['max_logits'][0], params[
                 'layers_0']['self_attn']['q_proj']['kernel'].dtype), axis=0)
-            gamma = clip_scale(s_max, 5.0)
+            gamma = clip_scale(s_max, 5.0, guard=0.0)
             return {'layers_0': {'self_attn': {proj: {'kernel': clip_qk_kernel(
                 moved['layers_0']['self_attn'][proj]['kernel'], gamma, 4)} for proj in ('q_proj', 'k_proj')}}}
         return rescaled
