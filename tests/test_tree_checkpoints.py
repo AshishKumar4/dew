@@ -1,4 +1,8 @@
 """A mapping saved in place of a train state checkpoints, resumes and is retained as a train state is."""
+import contextlib
+import os
+import sys
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -6,6 +10,40 @@ import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.checkpoints import Checkpoints, Keep, Ranking
+
+TOUCHES = frozenset({"open", "os.listdir", "os.scandir", "os.mkdir", "os.rename", "os.remove", "os.rmdir",
+                     "os.truncate", "shutil.rmtree", "shutil.copyfile", "shutil.move"})
+"""The interpreter's audit events a store on the local filesystem is read and written through."""
+
+_watched: list | None = None
+
+
+def _audited(event: str, arguments: tuple) -> None:
+    if _watched is not None and event in TOUCHES:
+        _watched.append((event, arguments))
+
+
+sys.addaudithook(_audited)
+
+
+@contextlib.contextmanager
+def store_touches(root):
+    """Every read and write of the store under `root` while held, as the interpreter's audit events
+    record them at the filesystem's boundary (`TOUCHES`): `(event, path)` for each, nothing patched."""
+    global _watched
+    root, seen = os.fspath(root), []
+    touched: list[tuple[str, str]] = []
+    _watched = seen
+    try:
+        yield touched
+    finally:
+        _watched = None
+        for event, arguments in seen:
+            path = arguments[0] if arguments else None
+            if isinstance(path, bytes):
+                path = os.fsdecode(path)
+            if isinstance(path, (str, os.PathLike)) and os.path.abspath(os.fspath(path)).startswith(root):
+                touched.append((event, os.path.relpath(os.fspath(path), root)))
 
 
 def tree(seed: int = 0):
@@ -153,14 +191,19 @@ def test_a_reader_beside_the_run_lists_each_step_as_it_commits(tmp_path):
     np.testing.assert_array_equal(reader.restore(step=2)[0]["x"], np.full((3,), 2))
 
 
-def test_a_listing_after_a_restore_and_close_opens_nothing(tmp_path, monkeypatch):
+def test_a_listing_after_a_restore_and_close_opens_nothing(tmp_path):
     """A reader that restored a step and closed lists the committed steps without reopening the store:
-    the listing reads the step names alone."""
+    observed at the filesystem's boundary (`store_touches`), the listing lists directories and opens no
+    file of the store, and writes, moves or removes nothing there, as the restore before it did read
+    the step's files."""
     writer = Checkpoints(str(tmp_path))
     writer.save(1, {"x": jnp.full((3,), 1)})
     writer.wait()
     reader = Checkpoints(str(tmp_path))
-    reader.restore(step=1)
+    with store_touches(tmp_path) as restoring:
+        reader.restore(step=1)
+    assert any(event == "open" for event, _ in restoring)
     reader.close()
-    monkeypatch.setattr(Checkpoints, "_open", lambda self: pytest.fail("committed() opened the store"))
-    assert reader.committed() == [1]
+    with store_touches(tmp_path) as listing:
+        assert reader.committed() == [1]
+    assert listing and {event for event, _ in listing} <= {"os.listdir", "os.scandir"}, listing
