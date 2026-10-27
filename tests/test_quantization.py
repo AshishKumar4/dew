@@ -284,10 +284,9 @@ def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width
                     seeds=CONVOLUTION_SEEDS, truth_fn=plain)
 
 
-@pytest.mark.skipif(jax.default_backend() == "gpu",
-                    reason="Dew refuses a grouped quantized convolution on a GPU; "
-                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
-@pytest.mark.parametrize("groups", [1, 16])
+@pytest.mark.parametrize("groups", [1, pytest.param(16, marks=pytest.mark.skipif(
+    jax.default_backend() == "gpu", reason="Dew refuses a grouped quantized convolution on a GPU; "
+                                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it"))])
 def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision_it_pins(groups):
     """A quantized convolution keeps its call's contract, as a quantized matmul does: one that asks
     for a float32 result from bf16 operands returns float32, where before it returned the bf16
