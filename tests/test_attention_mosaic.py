@@ -11,10 +11,12 @@ the device's, a site pinning one where it names a schedule (`tuning.pinned`)."""
 import contextlib
 import dataclasses
 import functools
+import os
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import lane_environment
 import pytest
 from generation_support import INTERPRETS, lowers
 from jax.sharding import Mesh
@@ -475,6 +477,23 @@ def _backward_call(shape, width: int, accurate: bool):
                                 stats))
     op = attention_mosaic.MosaicBackward(form="causal", keys=tokens, scale=width ** -0.5, accurate=accurate)
     return op, _bound(op, query, key, key, query, spans.start, spans.end, None, None, (), None, residuals)
+
+
+@pytest.mark.parametrize("call, fused", [("fast", True), ("accurate", False), ("deterministic", False)])
+def test_the_fast_forms_backward_is_one_launch_and_deterministic_mode_two(call, fused, monkeypatch):
+    """The backward derived on an H100 is one launch, the dK/dV program adding each tile's dQ atomically, for
+    a hookless fast-form call (FUSEDFORM-h100's speed, FUSEDSTAB-h100's check 1 and finiteness); the accurate
+    form and deterministic mode take two, the dQ launch then the dK/dV one, in a fixed order."""
+    flags = lane_environment.without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
+    if call == "deterministic":
+        flags = f"{flags} --xla_gpu_deterministic_ops=true"
+    monkeypatch.setenv("XLA_FLAGS", flags)
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        op, ba = _backward_call((2, 4096, 32, 8), 128, accurate=call == "accurate")
+        derived = op.derived(ba, target)
+        assert derived is not None and derived.fused == fused
+        assert op.legal(ba, derived, target)
 
 
 def _softcapped(s, q_pos, k_pos):
