@@ -4,6 +4,9 @@ the first plan above it that keeps them on the device. A run that times its plan
 where it runs clearly faster, and one that times none keeps the device-resident plan wherever one fits;
 where none fits, the offload stands.
 
+Climbing there, a GPU's GEMM autotuner can run out of memory profiling a rung's GEMMs, which the search
+reads as that rung's refusal for memory, as it reads XLA's RESOURCE_EXHAUSTED.
+
 A CPU's compiler keeps no host temporaries apart from its own, so the search's choice is held here on the
 memory a test's analysis reports at each rung (`fitting_at`), with host temporaries at the offloading rung as
 an A100's and a compile-only H100's compiler report them
@@ -169,3 +172,49 @@ def test_a_step_with_its_residuals_in_host_memory_trains_what_one_keeping_them_o
         truth(*draw(0))
     assert_as_exact(host, device, draw, "a step with its residuals in host memory", seeds=STEP_SEEDS,
                     truth_fn=truth)
+
+
+class Refused(jax.errors.JaxRuntimeError):
+    """An XLA refusal with its status code, as a GPU's compiler raises it."""
+    def __init__(self, code: str, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+
+    @property
+    def error_code_string(self):
+        return self.code
+
+
+AUTOTUNED = ("All configs failed during profiling or were excluded from selection.\nFailures (2):\n"
+             "EXECUTION FAILED: {}: Out of memory while trying to allocate 7.83GiB on GPU_0_bfc.\n"
+             "EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 7.83GiB.")
+
+
+@pytest.mark.parametrize(("code", "message", "refused"), [
+    ("RESOURCE_EXHAUSTED", "XLA:TPU's temporaries past HBM", True),
+    ("NOT_FOUND", AUTOTUNED.format("RESOURCE_EXHAUSTED"), True),
+    ("NOT_FOUND", AUTOTUNED.format("INTERNAL"), False),
+    ("NOT_FOUND", "no config for this fusion", False),
+    ("INTERNAL", "a ptxas failure", False)],
+    ids=["exhausted", "autotuned-out-of-memory", "autotuned-otherwise", "not-found", "internal"])
+def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, refused):
+    """XLA's refusal for memory, which the search reads as the rung's miss and climbs past
+    (`compiled_if_it_fits`), is RESOURCE_EXHAUSTED, or a GPU GEMM autotuner's NOT_FOUND where every config
+    it profiled ran out of memory, as an A100's did at a whole head's GEMM (node receipt
+    TL-a100-offload-1338-d); a config that failed otherwise, or any other error, is raised."""
+    from dew.training.memory import compiled_if_it_fits
+
+    error = Refused(code, message)
+
+    class Program:
+        def compile(self, options):
+            raise error
+
+    refusals = []
+    if refused:
+        assert compiled_if_it_fits(Program(), None, refusals) is None
+        assert refusals == [error]
+    else:
+        with pytest.raises(jax.errors.JaxRuntimeError) as raised:
+            compiled_if_it_fits(Program(), None, refusals)
+        assert raised.value is error and refusals == []

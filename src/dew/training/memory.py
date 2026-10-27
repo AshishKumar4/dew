@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from collections.abc import Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
@@ -103,7 +104,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
 
 def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
                         refusals: list[RuntimeError]) -> jax.stages.Compiled | None:
-    """Return `program` compiled under `options`, or None if XLA refuses it for memory.
+    """Return `program` compiled under `options`, or None if XLA refuses it for memory (`refused_for_memory`).
 
     A refusal is appended to `refusals`. XLA:TPU checks a program's temporaries
     against HBM while it compiles and raises RESOURCE_EXHAUSTED instead of
@@ -115,11 +116,24 @@ def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.Compile
     try:
         return program.compile(options)
     except jax.errors.JaxRuntimeError as error:
-        if error.error_code_string != 'RESOURCE_EXHAUSTED':
+        if not refused_for_memory(error.error_code_string, str(error)):
             raise
         _log.info("XLA refused the step for memory: %s", error)
         refusals.append(error)
         return None
+
+
+def refused_for_memory(code: str, message: str) -> bool:
+    """Whether XLA refused a program it compiled for memory, by its error's status `code` and `message`:
+    RESOURCE_EXHAUSTED, or on a GPU its GEMM autotuner finding no config it could profile (NOT_FOUND)
+    where each config it tried ran out of device memory. An A100 with 0.30 of its memory to a decoder's
+    step refused it so at the whole head's f32[65536,32000] GEMM, each config 7.83 GiB short (node
+    receipt TL-a100-offload-1338-d): the step at a rung that holds less compiles."""
+    if code == 'RESOURCE_EXHAUSTED':
+        return True
+    failures = re.findall(r"^EXECUTION FAILED: (\w+):", message, flags=re.MULTILINE)
+    return (code == 'NOT_FOUND' and bool(failures)
+            and all(failure == 'RESOURCE_EXHAUSTED' for failure in failures))
 
 
 def split_share(params: Variables) -> float:
