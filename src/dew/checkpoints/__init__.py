@@ -2084,7 +2084,11 @@ class Checkpoints:
                 if not isinstance(template, Mapping) else dict(template)
             held = _held_apart(state_tree, frozen)
             self._check_recovered(step, state_tree)
-            _refuse_reshaped(state_tree, metadata, where)
+            # The EMA is stored as byte planes of its difference from the weights, checked as such.
+            checked = dict(state_tree)
+            if checked.get('ema') is not None:
+                checked['ema'], _ = _plane_template(checked['ema'], _ema_deltas(snapshot))
+            _refuse_reshaped(checked, metadata, where)
             # This process's shards come from the replicas (`_from_replicas`); it holds none of them.
             restored = jax.tree.map(_zeros, state_tree)
         else:
