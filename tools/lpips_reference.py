@@ -26,6 +26,7 @@ come from is replaced: `models.vgg16(weights=IMAGENET1K_V1)` and
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 from collections import namedtuple
 from pathlib import Path
@@ -34,6 +35,7 @@ import numpy as np
 import torch
 from lpips_weights import drawn_weights
 from reference_source import definitions, verified
+from torch_precision import float64
 from torchvision import models
 
 REPAE = "https://raw.githubusercontent.com/End2End-Diffusion/REPA-E/2ad4e9f69234c109497fb41d3e5e555de7b4b0de/"
@@ -69,15 +71,20 @@ def lpips_class(vgg: dict[str, torch.Tensor], linear: dict[str, torch.Tensor]) -
 
 
 def distances(vgg, linear, images, references, dtype, *, gradient: bool) -> dict[str, np.ndarray]:
-    network = lpips_class({key: torch.as_tensor(value) for key, value in vgg.items()},
-                          {key: torch.as_tensor(value) for key, value in linear.items()})().eval().to(dtype)
-    first = torch.as_tensor(images, dtype=dtype).permute(0, 3, 1, 2).requires_grad_(gradient)
-    second = torch.as_tensor(references, dtype=dtype).permute(0, 3, 1, 2)
-    value = network(first, second)
-    result = {"distance": value.detach().reshape(-1).numpy()}
-    if gradient:
-        value.mean().backward()
-        result["gradient"] = first.grad.permute(0, 2, 3, 1).numpy()
+    """LPIPS's distances of `images` to `references` at `dtype`, and their mean's gradient by the first:
+    in float64 built and run inside `float64`, so the scaling layer's shift and scale, which its
+    constructor computes and no load overwrites, are float64's."""
+    with float64() if dtype == torch.float64 else contextlib.nullcontext():
+        built = lpips_class({key: torch.as_tensor(value) for key, value in vgg.items()},
+                            {key: torch.as_tensor(value) for key, value in linear.items()})
+        network = built().eval().to(dtype)
+        first = torch.as_tensor(images, dtype=dtype).permute(0, 3, 1, 2).requires_grad_(gradient)
+        second = torch.as_tensor(references, dtype=dtype).permute(0, 3, 1, 2)
+        value = network(first, second)
+        result = {"distance": value.detach().reshape(-1).numpy()}
+        if gradient:
+            value.mean().backward()
+            result["gradient"] = first.grad.permute(0, 2, 3, 1).numpy()
     return result
 
 
