@@ -932,6 +932,40 @@ def test_a_first_party_patch_is_reported_however_its_owner_was_imported_and_a_bo
     assert found == [("tests/test_graph.py", line, "SLOP008") for line in (5, 7, 8, 11, 12)]
 
 
+def test_a_private_first_party_attribute_is_no_seam_whatever_its_name(tmp_path):
+    """SLOP008: a private attribute of a first-party object is the code under test, so replacing it
+    is reported even where its name holds a seam's (`Checkpoints._open`, row 1878); the public seam
+    of the same name is not."""
+    found = _linted(tmp_path, {
+        "src/sparx/store.py": "class Store:\n    def _open(self):\n        pass\ndef open(path):\n    pass\n",
+        "tests/test_store.py": (
+            "from sparx.store import Store\n"
+            "import sparx.store as store\n"
+            "def test_private(monkeypatch):\n"
+            "    monkeypatch.setattr(Store, '_open', lambda self: None)\n"
+            "def test_public(monkeypatch):\n"
+            "    monkeypatch.setattr(store, 'open', lambda path: None)\n"),
+    })
+    assert found == [("tests/test_store.py", 4, "SLOP008")]
+
+
+def test_a_frozen_rendering_spacing_is_reported_and_its_content_claims_are_not(tmp_path):
+    """SLOP011: a rendering compared whole with a string, or with a list of strings, holding a run of
+    two or more spaces between words is a spacing snapshot (row 1878); its words and numbers looked for,
+    a one-space string compared, and a column end measured are not."""
+    found = _linted(tmp_path, {
+        "src/sparx/graph.py": "EDGES = 1\n",
+        "tests/test_graph.py": (
+            "def test_table(table):\n"
+            "    assert table.splitlines() == ['   a  b', 'x  1  2']\n"
+            "    assert table.plain == 'data 4,824 rows  ·  0 rejected'\n"
+            "    assert '4,824' in table.split()\n"
+            "    assert table.title == 'data rows'\n"
+            "    assert table.index('b') + 1 == len('   a  b')\n"),
+    })
+    assert found == [("tests/test_graph.py", line, "SLOP011") for line in (2, 3)]
+
+
 def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
     """SLOP015: a test that reaches its own package through `pytest.importorskip`,
     however it imports the skip, turns an import the package breaks into a skip; an
