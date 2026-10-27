@@ -373,10 +373,6 @@
    "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_local_attention.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_lora.py": {
    "comparisons": 26,
    "lane": "Models, Serving & RL"
