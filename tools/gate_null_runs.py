@@ -575,6 +575,9 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--runs", type=int, default=10)
     parser.add_argument("--chunk", type=int, default=0)
     parser.add_argument("--orders", type=int, help="judge an orbit class's rows over this many orders")
+    parser.add_argument("--resolve-rows", action="store_true", help="count a row of float64 zero as "
+                        "measured only where the truth resolves it, as a site passing assert_as_exact's "
+                        "`resolve_rows` does")
     parser.add_argument("--paired", action="store_true", help="run both arms on the same draws, as a site "
                         "does: Dew the reference at another order (REORDERED), or with --fault its fault")
     options = parser.parse_args(argv)
@@ -631,10 +634,12 @@ def main(argv: list[str]) -> int:
     verdicts = null_runs(reference, draw, options.name, seeds=options.seeds, runs=options.runs,
                          first=OFFSET + options.chunk * options.runs, truth_fn=truth,
                          two_stage=not options.today, dew_fn=other, paired=options.paired,
-                         orders=orbited(permuting, options.orders) if options.orders else None)
+                         orders=orbited(permuting, options.orders) if options.orders else None,
+                         resolve_rows=options.resolve_rows)
     print(json.dumps({"class": options.name, "chunk": options.chunk, "seeds": options.seeds,
                       "today": options.today, "fault": options.fault, "orders": options.orders,
-                      "paired": options.paired, "verdicts": verdicts}), flush=True)
+                      "paired": options.paired, "resolve_rows": options.resolve_rows,
+                      "verdicts": verdicts}), flush=True)
     return 0
 
 
