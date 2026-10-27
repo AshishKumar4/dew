@@ -64,10 +64,11 @@ def reader(chain: Pipeline, index: int, count: int):
 
 @pytest.mark.parametrize("count", [2, 4])
 def test_each_elastic_reader_reads_its_share_of_each_batch_one_reader_reads(count):
-    """Every reader of an elastic read keeps every count-th row of the batch one reader reads: its
-    filter's survivors, their draws and the map of each, in one reader's order, where a per-share
-    read deals the shuffled stream out first and filters and draws each share apart."""
-    one = reader(stream(), 0, 1)
+    """Every reader of an elastic read keeps every count-th row of the batch one reader of the chain
+    without `.elastic()` reads: its filter's survivors, their draws, keyed by their place among the
+    rows kept, and the map of each, where a per-share read deals the shuffled stream out first and
+    filters and draws each share apart."""
+    one = reader(stream(elastic=False), 0, 1)
     whole = [rows(batch) for batch in itertools.islice(one, 4)]
     shares = [reader(stream(), index, count) for index in range(count)]
     for step in range(4):
@@ -112,7 +113,7 @@ def test_an_elastic_position_is_every_readers_and_resumes_on_another_count(saved
     assert len(states) == 1
     (state,) = states
     assert position.translates(state) and position.decode(state) is None
-    one = reader(stream(), 0, 1)
+    one = reader(stream(elastic=False), 0, 1)
     whole = [rows(batch) for batch in itertools.islice(one, 5)][3:]
     again = [reader(stream(), index, resumed) for index in range(resumed)]
     for share in again:
@@ -150,8 +151,8 @@ def test_an_elastic_read_in_loading_workers_reads_one_readers_order_and_resumes_
     """Loading workers read an elastic read's inputs in their order, a batch's count at a time, so
     every reader's rows are those one reader reads in threads alone, whatever the count of either,
     and the position readers of one count save in workers of one count resumes readers of another
-    in another count of workers, in the batches one reader reads from there."""
-    one = reader(stream(), 0, 1)
+    in another count of workers, in the batches one reader reads from there, without `.elastic()`."""
+    one = reader(stream(elastic=False), 0, 1)
     whole = [rows(batch) for batch in itertools.islice(one, 5)]
     (readers, workers), (again, more) = saved, resumed
 
@@ -181,15 +182,29 @@ def test_an_elastic_read_in_loading_workers_reads_one_readers_order_and_resumes_
             share.close()
 
 
+def jsonl_ids(tmp_path, *, elastic: bool = True) -> Pipeline:
+    """A JSON-lines store of ids streamed, endlessly, the odd ones kept."""
+    (tmp_path / "ids.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(96)))
+    chain = Pipeline(Files(str(tmp_path / "ids.jsonl"), format="jsonl")).repeat().filter(odd).batch(BATCH)
+    return (chain.elastic() if elastic else chain).read("streamed")
+
+
+def test_an_elastic_stream_without_workers_reads_its_share_of_one_readers_batches(tmp_path):
+    """A streamed elastic read without loading workers reads, on each of two readers, its share of
+    the batches one reader of the stream reads."""
+    one = [np.asarray(batch["id"]).tolist() for batch in itertools.islice(
+        reader(jsonl_ids(tmp_path, elastic=False), 0, 1), 3)]
+    shares = [reader(jsonl_ids(tmp_path), index, 2) for index in range(2)]
+    for step in range(3):
+        held = [np.asarray(next(share)["id"]).tolist() for share in shares]
+        assert held == [one[step][0::2], one[step][1::2]]
+
+
 def test_an_elastic_stream_refuses_loading_workers_and_elastic_and_per_share_positions_each_other(tmp_path):
     """A streamed elastic read refuses loading workers, which read a stream's shards each their own;
     elastic and per-share positions each refuse the other's read."""
-    lines = "".join(json.dumps({"id": index}) + "\n" for index in range(96))
-    (tmp_path / "ids.jsonl").write_text(lines)
-    streamed = (Pipeline(Files(str(tmp_path / "ids.jsonl"), format="jsonl")).repeat().filter(odd).batch(BATCH)
-                .elastic().read("streamed"))
     with pytest.raises(ValueError):
-        compile(streamed, loading=Loading(workers=2), seed=3).train(DataPartition(0, 2))
+        compile(jsonl_ids(tmp_path), loading=Loading(workers=2), seed=3).train(DataPartition(0, 2))
     shared = reader(stream(elastic=False), 0, 2)
     listed(shared, 1)
     elastic = reader(stream(), 0, 2)
@@ -223,3 +238,134 @@ def test_a_per_share_read_whose_filter_rejects_its_whole_share_is_refused_and_an
     assert len(outcome) == 1 and isinstance(outcome[0], ValueError)
     ids = np.asarray(next(reader(starved.elastic(), 0, 2))["id"])
     assert len(ids) == BATCH // 2 and all(int(value) % 2 for value in ids)
+
+
+@dataclasses.dataclass(frozen=True)
+class Unkept:
+    """Keeps a record whose `field`'s first value is not `value`."""
+
+    field: str
+    value: int
+
+    def __call__(self, row):
+        return int(np.asarray(row[self.field]).flat[0]) != self.value
+
+
+@dataclasses.dataclass(frozen=True)
+class Pieces:
+    """A record as `count` pieces, each its id and its place among them."""
+
+    count: int
+
+    def __call__(self, row):
+        return [{"id": row["id"], "piece": np.int64(piece)} for piece in range(self.count)]
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_an_elastic_expansion_reads_one_readers_pieces_in_or_out_of_workers(workers):
+    """An elastic read by index whose records expand reads, in loading workers or none, the pieces
+    one reader of the chain without `.elastic()` reads: its workers hand on its inputs before the
+    expansion, which no index reads, and the reading process expands them in order."""
+    chain = Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(24)))).shuffle(5).repeat()
+    expanded = chain.flat_map(Pieces(3)).filter(Unkept("piece", 1)).batch(BATCH)
+
+    def pieces(batch):
+        return list(zip(np.asarray(batch["id"]).tolist(), np.asarray(batch["piece"]).tolist(), strict=True))
+
+    whole = [pieces(batch) for batch in itertools.islice(reader(expanded, 0, 1), 3)]
+    shares = [worker_reader(expanded.elastic(), index, 2, workers) for index in range(2)]
+    try:
+        for step in range(3):
+            assert [pieces(next(share)) for share in shares] == [whole[step][0::2], whole[step][1::2]]
+    finally:
+        for share in shares:
+            share.close()
+
+
+def test_automatic_loading_sizes_an_elastic_reads_workers_by_the_groups_they_read(caplog):
+    """An elastic read by index reads in its workers a batch's count of inputs a group, so automatic
+    loading sizes its read-ahead by groups: eight 64 KiB images make a 512 KiB group, so 2 MiB holds
+    four of them ahead, where sized by the record it held sixteen, 8 MiB."""
+    images = Memory(tuple({"image": np.full((128, 128, 4), index, np.uint8)} for index in range(64)))
+    chain = Pipeline(images).shuffle(1).repeat().filter(Unkept("image", -1)).batch(BATCH).elastic()
+    loading = Loading(workers="auto", ram_budget_mb=2, threads=2)
+    with caplog.at_level("INFO", logger="dew.data.dataset"):
+        reader_ = compile(chain, read="indexed", loading=loading, seed=0).train(DataPartition(0, 2))
+        reader_.close()
+    resolved = [message for message in (record.getMessage() for record in caplog.records)
+                if "automatic loading" in message]
+    assert resolved and "holding 4 reads ahead" in resolved[-1]
+
+
+def starved(chain: Pipeline, index: int, count: int, *, workers: int = 0) -> list[ValueError]:
+    """What the first batch of share `index` of `count` raises, read on a thread held to a minute's
+    deadline, so a reader that reads on forever fails the test that reads it."""
+    raised = []
+
+    def read():
+        try:
+            next(worker_reader(chain, index, count, workers))
+        except ValueError as refused:
+            raised.append(refused)
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    thread.join(60)
+    assert not thread.is_alive(), "the reader read on with every record of its share rejected"
+    return raised
+
+
+@pytest.mark.parametrize(("elastic", "workers"), [(False, 2), (True, 0), (True, 2)],
+                         ids=["per-share-in-workers", "elastic", "elastic-in-workers"])
+def test_a_filter_that_rejects_every_record_read_is_refused_in_workers_and_elastically(elastic, workers):
+    """A per-share read in loading workers whose share a filter rejects whole, and an elastic read
+    whose filter rejects the whole corpus, are refused once two passes are rejected, the bound
+    carried to the reading process that drops the workers' markers."""
+    chain = Pipeline(Memory(tuple({"id": np.int64(2 * index)} for index in range(24)))).shuffle(5).repeat()
+    read = chain.filter(odd).batch(BATCH)
+    raised = starved(read.elastic() if elastic else read, 0, 2, workers=workers)
+    assert len(raised) == 1
+
+
+@dataclasses.dataclass(frozen=True)
+class Kept:
+    """Keeps a record whose `field` is `value`."""
+
+    field: str
+    value: int
+
+    def __call__(self, row):
+        return int(row[self.field]) == self.value
+
+
+@pytest.mark.parametrize("chain", ["expanded", "drawn-before", "shuffled-after"])
+def test_rejections_that_need_not_go_on_forever_are_read_through(chain):
+    """Rejections past two passes refuse a read only where each pass is the same records: an
+    expansion whose first five pieces are rejected before its sixth is kept, from one record; a
+    filter of a draw made before the repeat, which Grain's repeat draws again each pass, keeping
+    only the third pass's draw; and a window shuffle across passes, keeping one of two records,
+    which puts five rejections in a row ahead of its kept record at the seed chosen. Each reads its
+    kept record."""
+    if chain == "expanded":
+        read = Pipeline(Memory(({"id": np.int64(0)},))).repeat().flat_map(Pieces(6)).filter(Kept("piece", 5))
+        expected = ("piece", 5)
+    elif chain == "drawn-before":
+        drawn = Pipeline(Memory(({"id": np.int64(0)},))).random_map(WideDraw()).repeat()
+        draws = list(itertools.islice(worker_reader(drawn.batch(1), 0, 1, 0), 3))
+        third = int(np.asarray(draws[2]["draw"])[0])
+        read = drawn.filter(Kept("draw", third))
+        expected = ("draw", third)
+    else:
+        records = Pipeline(Memory(({"id": np.int64(0)}, {"id": np.int64(1)}))).repeat()
+
+        def first_kept(seed: int) -> int:
+            ids = worker_reader(records.shuffle(seed, window=100).batch(1), 0, 1, 0)
+            return [int(np.asarray(batch["id"])[0]) for batch in itertools.islice(ids, 40)].index(1)
+
+        # A seed whose window puts five rejections or more ahead of the first kept record.
+        seed = next(seed for seed in range(200) if first_kept(seed) >= 5)
+        read = records.shuffle(seed, window=100).filter(Kept("id", 1))
+        expected = ("id", 1)
+    assert starved(read.batch(1), 0, 1) == []
+    field, value = expected
+    assert int(np.asarray(next(worker_reader(read.batch(1), 0, 1, 0))[field])[0]) == value

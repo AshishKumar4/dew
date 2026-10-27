@@ -1039,18 +1039,46 @@ class _Barren(Exception):
     that held nothing: the worker holds no input (`_repeated`)."""
 
 
+_UNCHANGING_BEFORE = (Shuffle, Slice, Limit, Map, MapWithIndex, Filter, Prefetch, Workers, Artifact)
+"""Steps before an endless indexed repeat that make each pass the same records, in another order:
+views of the inputs, a cache, and steps of a record alone that draw nothing. Grain's indexed repeat
+draws a random step's values afresh each pass (`_repeated`), so a `RandomMap` there is none."""
+
+_UNCHANGING_AFTER = (Map, Filter, Prefetch)
+"""Steps after an endless indexed repeat, before a filter, that keep its order a pass at a time:
+each record's own, drawing nothing. A shuffle there reads across passes, a slice or take keeps a
+stride of them, an expansion counts its records' pieces, a random step draws by place."""
+
+
 def _barren_bound(stages: Sequence[Stage], passes: tuple[int, int] | None, ran: int) -> int | None:
-    """How many rejections in a row a filter of the steps before `ran` makes certain to go on
-    forever (`Accepted`): two whole passes of the endless repeat of indexed rows written at
-    `passes[0]`, each of `passes[1]` rows, where every step from it is a view or a step that makes
-    a record's rows from it alone, so each pass's records, in another order, are rejected alike.
-    None where a step draws, numbers its rows or reads what may change (`_volatile`)."""
+    """How many rejections in a row of the records the steps before `ran` read in order make it
+    certain they go on forever (`Accepted`): two whole passes of the endless repeat of indexed rows
+    written at `passes[0]`, each of `passes[1]` rows, where every pass is the same records, in
+    another order. That holds where the steps before the repeat are among `_UNCHANGING_BEFORE` and
+    those after it among `_UNCHANGING_AFTER`, none reading what may change (`_volatile`); None
+    elsewhere."""
     if passes is None:
         return None
     at, rows = passes
-    alike = all(isinstance(stage, (Shuffle, Slice, Map, Filter, FlatMap, Prefetch)) and not _volatile(stage)
+    before = all(isinstance(stage, _UNCHANGING_BEFORE) and not _volatile(stage) for stage in stages[:at])
+    after = all(isinstance(stage, _UNCHANGING_AFTER) and not _volatile(stage)
                 for stage in stages[at + 1 : ran])
-    return 2 * rows if alike and rows else None
+    return 2 * rows if before and after and rows else None
+
+
+def _handoff(stages: Sequence[Stage], start: int, *, marked: bool) -> int:
+    """Where an elastic read's workers hand its rows on (`_InputOrder`), at the latest: before the
+    first step that may make its indexed rows a stream (an expansion, a window shuffle, a Grain
+    step), which no index reads, and before a random step after one that may drop, which one
+    reader keys by its place among the rows kept, not among the inputs with their markers. The
+    reading process runs the rest in that order, so its rows and draws are one reader's."""
+    for at, stage in enumerate(stages[start:], start=start):
+        windowed = isinstance(stage, Shuffle) and stage.window is not None
+        streams = windowed or isinstance(stage, (FlatMap, Native))
+        if streams or (marked and isinstance(stage, RandomMap)):
+            return at
+        marked = marked or _drops(stage)
+    return len(stages)
 
 
 def _elastic_cut(stages: Sequence[Stage]) -> int:
@@ -1273,11 +1301,12 @@ class _Build:
         in those."""
         count = _workers(pipeline, self.loading)
         written = any(isinstance(stage, Workers) for stage in _steps(pipeline))
-        # An elastic read reads its inputs as workers do (`_InputOrder`), none of them too, so its
-        # position is the same whatever their count; after its batch they would read every
-        # count-th of its rows.
+        # An elastic read by index reads its inputs as workers do (`_InputOrder`), none of them too,
+        # so its position is the same whatever their count; after its batch they would read every
+        # count-th of its rows. A streamed one reads without them (`compile._refuse_inelastic`).
         pooled = (count or written) and _dropping(pipeline, self.lowering)
-        if self.global_order or not self.training or not (self.elastic or pooled):
+        ordered = self.elastic and self.read != "streamed"
+        if self.global_order or not self.training or not (ordered or pooled):
             return self
         pool = next((stage for stage in pipeline.stages if isinstance(stage, Workers)),
                     Workers(count, self.loading.worker_buffer))
@@ -1491,6 +1520,8 @@ class _Build:
         marked = self.lowering.cache is not None and (self.read == "streamed" or not self.lowering.one_to_one)
         marked = marked or any(_drops(stage) for stage in pipeline.stages[:consumed])
         carried = _carried(pipeline, consumed, marked=marked) if pooled and pool is not None else -1
+        if self.elastic and carried >= 0:
+            carried = min(carried, _handoff(pipeline.stages, consumed, marked=marked))
         ran = consumed
         # Where an endless repeat of indexed rows is written, and the rows of each of its passes.
         passes: tuple[int, int] | None = None
@@ -1501,7 +1532,8 @@ class _Build:
                 # What a Grain step drops from a stream leaves no marker: the workers hand on before it.
                 carried = index
             if index == carried and pool is not None:
-                rows = self.handed(rows, pipeline, partition, pool)
+                rows = self.handed(rows, pipeline, partition, pool,
+                                   certain_after=_barren_bound(pipeline.stages, passes, carried))
             if isinstance(stage, (BatchStage, MapBatch)):
                 break
             if index == self.lowering.absorbed:
@@ -1540,7 +1572,8 @@ class _Build:
                     passes = index, len(rows)
                 rows = self.stage(rows, stage, pipeline, partition, index)
         if carried == len(pipeline.stages) and pool is not None:
-            rows = self.handed(rows, pipeline, partition, pool)
+            rows = self.handed(rows, pipeline, partition, pool,
+                               certain_after=_barren_bound(pipeline.stages, passes, carried))
         if not self.global_order and _counts_own_rows(pipeline):
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
         return rows
@@ -1649,29 +1682,39 @@ class _Build:
                 rows = viewed
         return rows
 
-    def handed(self, rows: Rows, pipeline: Pipeline, partition: DataPartition,
-               pool: Workers) -> pygrain.IterDataset:
+    def handed(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, pool: Workers, *,
+               certain_after: int | None = None) -> pygrain.IterDataset:
         """`rows`, read by this corpus's loading workers (`pool`), each handing on every row with
         a marker in place of each record its steps dropped, which the reading process drops here,
-        counting each by its reason."""
+        counting each by its reason, and refusing a run of `certain_after` rejections of inputs
+        read in order (`_barren_bound`) as certain to go on forever."""
         # A worker hands on its rows and markers a share's batch count at a time, the fields that
         # stack stacked as a batch's are, as many groups in flight as it had batches.
         size = partition.rows(self.batch)
-        if self.elastic:
-            if not isinstance(rows, pygrain.MapDataset):
+        if self.elastic and not isinstance(rows, pygrain.MapDataset):
+            # Its inputs come as a stream before any step (a cache of each input's outputs), which
+            # no worker reads by index; without workers they are read in their order as they come.
+            if pool.count:
                 raise ValueError(
-                    f"{_name(pipeline)} is read elastically in loading workers, which read its inputs "
-                    "by index, a batch's count at a time in their order; a step before its workers "
-                    "hand on that streams them (an expansion) reads no index: write it after a filter "
-                    "or a map, or read it with Loading(workers=0)")
+                    f"{_name(pipeline)} is read elastically, and its cache hands on each input's "
+                    "outputs as a stream, which loading workers cannot read in order by index: read "
+                    "it with Loading(workers=0), or publish the cache and read the generation by index")
+            return Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline),
+                            certain_after=certain_after)
+        if self.elastic and isinstance(rows, pygrain.MapDataset):
             size = self.batch
             handed = _InputOrder(rows, size, functools.partial(self.read_in, pipeline=pipeline,
                                                                partition=partition, pool=pool))
         else:
             grouped = _as_iter(rows, self.loading).batch(size, drop_remainder=False, batch_fn=_Grouped())
             handed = self.read_in(grouped, pipeline=pipeline, partition=partition, pool=pool)
+            if certain_after is not None:
+                # Each of Grain's W workers reads every W-th input a group at a time, and the reading
+                # process takes their groups in turn, so each round of W groups holds W consecutive
+                # groups' inputs in another order: a run of rejections spans two rounds more.
+                certain_after += 2 * pool.count * size
         flat = gx.FlatMapIterDataset(_as_iter(handed, self.loading), _Ungrouped(size))
-        return Accepted(flat, _name(pipeline), _label(pipeline))
+        return Accepted(flat, _name(pipeline), _label(pipeline), certain_after=certain_after)
 
     def read_in(self, groups: Rows, *, pipeline: Pipeline, partition: DataPartition,
                 pool: Workers) -> pygrain.IterDataset:
@@ -1714,9 +1757,11 @@ class _Build:
         bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0))
         size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
         if loading.workers == "auto":
-            # A global order is read by the batch, any other order by the record (`batch_order`).
+            # A global order is read by the batch, as an elastic read by index is, a batch's count of
+            # its inputs a group (`_InputOrder`); any other order by the record (`batch_order`).
+            grouped = self.global_order or (self.elastic and self.read != "streamed")
             with _closing(bare.batched(pipeline, DataPartition())[0]) as sampled:
-                loading = loading.resolved(sampled, reads=1 if self.global_order else size)
+                loading = loading.resolved(sampled, reads=1 if grouped else size)
         if loading.worker_count and (not self.training or not self.lowering.endless):
             with _closing(bare.records(pipeline, DataPartition())) as rows:
                 if isinstance(rows, pygrain.MapDataset):

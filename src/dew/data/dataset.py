@@ -311,30 +311,31 @@ class Host:
     memory: int
 
     @classmethod
-    def current(cls, cgroup: Path | None = None) -> Host:
+    def current(cls, cgroup: Path | None = None, root: Path = Path("/sys/fs/cgroup")) -> Host:
         """This process's host, read through `cgroup`, its own cgroup (v2) directory, which
-        /proc/self/cgroup names under /sys/fs/cgroup by default. Under a memory limit the page cache
-        the kernel reclaims first (`inactive_file`) is room, as the kubelet counts a container's
-        working set: a run that has read its corpus once holds it in cache, charged to its cgroup,
-        and counting that as taken left room for no worker beside it."""
+        /proc/self/cgroup names under `root` by default, and every ancestor of it up to `root`:
+        a container's limit on a parent binds an unlimited child, so each level's CPU quota and
+        the memory its limit leaves bound the host's. Under a memory limit the page cache the
+        kernel reclaims first (`inactive_file`) is room, as the kubelet counts a container's
+        working set: a run that has read its corpus once holds it in cache, charged to its
+        cgroup, and counting that as taken left room for no worker beside it."""
         import psutil
 
         group = _own_cgroup() if cgroup is None else cgroup
-        cpus = len(os.sched_getaffinity(0))
-        quota = group / "cpu.max"
-        if quota.is_file():
-            limit, period = quota.read_text().split()
-            if limit != "max":
-                cpus = min(cpus, math.ceil(int(limit) / int(period)))
-        memory = psutil.virtual_memory().available
-        maximum, current, stat = group / "memory.max", group / "memory.current", group / "memory.stat"
-        if maximum.is_file() and current.is_file():
-            limit = maximum.read_text().strip()
-            if limit != "max":
+        cpus, memory = len(os.sched_getaffinity(0)), psutil.virtual_memory().available
+        for level in (group, *group.parents):
+            quota = level / "cpu.max"
+            if quota.is_file():
+                limit, period = quota.read_text().split()
+                if limit != "max":
+                    cpus = min(cpus, math.ceil(int(limit) / int(period)))
+            maximum, current, stat = level / "memory.max", level / "memory.current", level / "memory.stat"
+            if maximum.is_file() and current.is_file() and (limit := maximum.read_text().strip()) != "max":
                 stated = [line.split() for line in stat.read_text().splitlines()] if stat.is_file() else []
                 reclaimed = next((int(value) for name, value in stated if name == "inactive_file"), 0)
-                working = int(current.read_text()) - reclaimed
-                memory = min(memory, max(0, int(limit) - working))
+                memory = min(memory, max(0, int(limit) - (int(current.read_text()) - reclaimed)))
+            if level == root:
+                break
         return cls(cpus, memory)
 
 
