@@ -544,10 +544,12 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         # Each of its routes adds the skip, the port in its kernels.
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, chunk_size, work)
     else:
-        decayed = hooks.delta and hooks.decay != 'none'
-        kernels = [(port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                                scale=scale, wide=epilogue, floor=hooks.floor, product=product)
-                    if decayed else 'xla') for product in ('forward', 'training')]
+        # The delta rule's selector decides every form (`GATED_DELTA`): the forms its kernels do not run hand
+        # over to the portable math there, reported as the call's route.
+        kernels = [port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
+                               scale=scale, wide=epilogue, floor=hooks.floor, product=product,
+                               delta=hooks.delta, decayed=hooks.decay != 'none')
+                   for product in ('forward', 'training')]
 
         def run(kernel, query, key, value, g, beta, state, starts):
             if kernel == 'mosaic_gpu':
@@ -587,7 +589,8 @@ class PortCase:
     (`call`, `templates.base.Call`; None where the caller asks of the port alone), the
     instruction family of the device it runs on (`family`, `generation.family`; None off a GPU), and the
     product it is selected for (`product`: 'forward' where no gradient is taken, 'training' where one is,
-    `_by_product`)."""
+    `_by_product`), and the recurrence's form: whether it is the delta rule (`delta`) and decays
+    (`decayed`)."""
 
     reverse: bool
     varying: bool
@@ -596,6 +599,8 @@ class PortCase:
     call: base.Call | None = None
     family: str | None = None
     product: str = 'forward'
+    delta: bool = True
+    decayed: bool = True
 
     @property
     def cell(self) -> tuple[str | None, str]:
@@ -613,6 +618,11 @@ _VARYING = ("a shard_map that checks varying axes holds the operands, and a Pall
             "type for its results")
 
 PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
+    Requirement('gated', lambda case: case.delta and case.decayed,
+                "a recurrence other than the gated delta rule, which the rule's kernels run (fla's "
+                "chunk_gated_delta_rule and chunk_kda, the template's delta-rule mainloop): no delta rule (a "
+                "gated linear attention, a rated scan with its keys normed or scaled) or no decay (the plain "
+                "delta rule), which the portable math runs", row=INHERENT, kind='handoff'),
     Requirement('forward_mode', lambda case: case.reverse,
                 "forward_mode_attention traces for jax.jvp, which the port's custom VJP gives no tangent",
                 row=INHERENT),
@@ -626,15 +636,15 @@ PORT_SUPPORTS: tuple[Requirement[PortCase], ...] = (
                 "no GPU Dew's Triton kernels run on (sm80 or later): off one the port's kernels interpret, "
                 "as the CPU suite runs them where a call names the port", row=INHERENT, kind='measured'),
 )
-"""What the port (`fla_rule`) needs of a rule's call: a GPU Dew's Triton kernels run on, any of them (no
-target's row names it: a GPU no row named took the portable math, 140 to 155 ms a training step where the
-port took 3.1, template review 2026-10-26 P1-1), and every shape, dtype, chunk size and mesh, except
-inside `jax.jvp`'s traces, which the port's custom VJP gives no tangent; inside a caller's `shard_map`
-that checks varying axes over operands that vary, where a Pallas call, which states no varying type for
-its results, cannot run; float64 operands, whose rule is the reference math itself; and keys wider than
-the port takes in their dtype. Packed documents take the port at any bound: it stores the memories by
-where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
-(`chunked_launch.Sequences`)."""
+"""What the port (`fla_rule`) needs of a rule's call: the gated delta rule, a decay with the delta rule (the
+other forms hand over to the portable math, the call's route reporting it); a GPU Dew's Triton kernels run on,
+any of them (no target's row names it: a GPU no row named took the portable math, 140 to 155 ms a training
+step where the port took 3.1, template review 2026-10-26 P1-1), and every shape, dtype, chunk size and mesh,
+except inside `jax.jvp`'s traces, which the port's custom VJP gives no tangent; inside a caller's `shard_map`
+that checks varying axes over operands that vary, where a Pallas call, which states no varying type for its
+results, cannot run; float64 operands, whose rule is the reference math itself; and keys wider than the port
+takes in their dtype. Packed documents take the port at any bound: it stores the memories by where they pass,
+as many as the tokens' chunks, a row's and one, whatever the bound (`chunked_launch.Sequences`)."""
 
 PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
     ('wgmma', 'forward'): ('fla', "on an H100 80GB HBM3, 16-bit, the port's forward 0.440 ms against the "
@@ -657,7 +667,7 @@ the template's: its fast backward took 1.851 ms against the port's 2.400 (SE-fam
 against 3.14 on an H100 PCIe, SE-family-h100-e0de17766)."""
 
 MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
-    *PORT_SUPPORTS[:2],
+    *PORT_SUPPORTS[:3],
     Requirement('launch', lambda case: case.call is not None and case.call.eligible('mosaic_gpu'),
                 "the recurrence template's launches take no call of these dtypes or widths, or no config "
                 "fits this device, or no Mosaic bundle claims its instruction family", row='ledger 1294'),
@@ -666,8 +676,9 @@ MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
                 row=INHERENT, kind='measured'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
-call: the port's trace and placement (its custom VJP, a Pallas call's results), its own launches' call
-(`Template.eligible`: dtypes, widths, a bundle for the device's family, a config that fits), and a GPU.
+call: the port's form, trace and placement (the gated delta rule, its custom VJP, a Pallas call's results),
+its own launches' call (`Template.eligible`: dtypes, widths, a bundle for the device's family, a config that
+fits), and a GPU.
 A declared port cell runs the port first (`PORT_CELLS`, `GATED_DELTA`'s declared cells)."""
 
 MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
@@ -684,20 +695,24 @@ portable math."""
 
 def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segments: int | None = None,
                 scale: float | None = None, wide: bool = False, floor: float | None = None,
-                product: str = 'forward', report: bool = True) -> str:
+                product: str = 'forward', report: bool = True, delta: bool = True,
+                decayed: bool = True) -> str:
     """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
-    ('forward', 'training'), the template's implementations bound to it, on the target (`generation`'s, an
-    assumed one's within `assumed`): reported as its route, or not where not `report` (`selected`). A
-    kernel a call names (`generation.chosen`) insists on it (`selection.KernelRefused`: the port named over
-    varying operands)."""
+    ('forward', 'training'), of the form `delta` and `decayed` state (`PortCase`), the template's
+    implementations bound to it, on the target (`generation`'s, an assumed one's within `assumed`):
+    reported as its route, or not where not `report` (`selected`). A kernel a call names
+    (`generation.chosen`) insists on it (`selection.KernelRefused`: the port named over varying operands),
+    but for a form the rule's kernels do not run, which the portable math takes."""
     from .templates.recurrence import template
 
-    call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts, max_segments=max_segments,
-                     scale=scale, delta=True, wide=wide, floor=floor)
+    call = None
+    if delta and decayed:
+        call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
+                         max_segments=max_segments, scale=scale, delta=True, wide=wide, floor=floor)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
-                    family=family, product=product)
+                    family=family, product=product, delta=delta, decayed=decayed)
     return select(GATED_DELTA, case).kernel if report else selected(GATED_DELTA, case).name
 
 
