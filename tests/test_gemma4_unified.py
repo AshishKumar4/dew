@@ -205,16 +205,20 @@ def gradient_functions(source):
         values.update({f"input.{name}": value for name, value in media.items()})
         return values
 
+    @as_given
     def ours(inputs):
         """Each row's program over its own length (`native_observations`), compiled once a length
-        rather than once a window's lengths, and the rows' observations collected."""
+        rather than once a window's lengths, and the rows' observations collected: on the host where
+        they are values, in the trace where the gate counts a truth's roundings."""
         observed = []
         for row in range(inputs["input/input_ids"].shape[0]):
             prefix = f"native/{row}/"
             fields = unflatten_dict({name.removeprefix(prefix): value for name, value in inputs.items()
                                      if name.startswith(prefix)}, sep="/")
             observed.append(native_observations(ModelInputs(**fields), inputs[f"probe/{row}"]))
-        return collect([jax.tree.map(np.asarray, values) for values in observed], np)
+        if any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(observed)):
+            return collect(observed, jnp)
+        return collect(jax.device_get(observed), np)
 
     def theirs(model, given, *, wide=False):
         inputs = {name.removeprefix("input/"): value for name, value in given.items()
