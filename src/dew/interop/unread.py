@@ -112,6 +112,8 @@ class Unread:
         return evaluated(held if method == "__call__" else getattr(held, method), *inputs, **kwargs)
 
     def __array_function__(self, function, types, args, kwargs):
+        if function in _METADATA:
+            return _METADATA[function](*args, **kwargs)
         return evaluated(_counterpart(function, function.__name__), *args, **kwargs)
 
     def __getitem__(self, index):
@@ -204,10 +206,11 @@ def held(value, dtype=None, *, contiguous: bool = False):
 
 def equal(first, second) -> bool:
     """Whether `first` and `second` hold equal values, as `np.array_equal`; where either is `Unread`,
-    whether their shapes and dtypes are, all a load without its weights can check."""
+    whether their shapes are, all a load without its weights can check."""
     if valued(first, second):
         return bool(np.array_equal(first, second))
-    return (tuple(first.shape), np.dtype(first.dtype)) == (tuple(second.shape), np.dtype(second.dtype))
+    return tuple(np.shape(first) if valued(first) else first.shape) == tuple(
+        np.shape(second) if valued(second) else second.shape)
 
 
 def lookup(table: np.ndarray, index):
@@ -222,6 +225,13 @@ def valued(*values) -> bool:
     """Whether each of `values` holds its values, none `Unread`: a check on values runs where they are
     held, and a load without its weights checks the shapes alone."""
     return not any(isinstance(value, Unread) for value in values)
+
+
+_METADATA = {np.shape: lambda array: array.shape, np.ndim: lambda array: array.ndim,
+             np.size: lambda array, axis=None: array.size if axis is None else array.shape[axis],
+             np.result_type: lambda *arrays: np.result_type(*(
+                 array.dtype if isinstance(array, Unread) else array for array in arrays))}
+"""The NumPy functions an `Unread` answers from its shape and dtype, which hold what they return."""
 
 
 def unread(specs: Mapping[str, jax.ShapeDtypeStruct]):

@@ -15,6 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
 from dew.batch import Variables
+from dew.interop.unread import held
 from dew.interop.weights import checkpoint_array, in_params
 from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
@@ -164,7 +165,7 @@ def translate_gemma_projector_weights(
     if unknown:
         raise ValueError(f"unknown tensor names {unknown}")
     paths = GEMMA_PROJECTOR_TENSORS
-    return ({module: {leaf: np.ascontiguousarray(checkpoint_array(hf_tensors[name], param_dtype))}
+    return ({module: {leaf: held(checkpoint_array(hf_tensors[name], param_dtype), contiguous=True)}
              for name, (module, leaf) in paths.items()},
             tuple(WeightLayout(name, (path,), tuple(np.shape(hf_tensors[name])))
                   for name, path in paths.items()))

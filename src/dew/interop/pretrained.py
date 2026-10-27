@@ -37,7 +37,7 @@ from dew.inference.images import TextToImage
 from dew.inference.loading import place
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import InputSpec
-from dew.interop import decoder_parts, gguf, hf_decoders as decoders, mamba2, sources, verify
+from dew.interop import decoder_parts, gguf, hf_decoders as decoders, mamba2, sources, unread, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.composite import CompositeSource, NativeComponent
 from dew.interop.config_records import NativeFields
@@ -1322,21 +1322,26 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
             raise ValueError(f"{layout.name} needs its input QDQ per expert or input part, "
                              "which one stored input scale does not quantize")
         consumed.add(part)
-        scale = np.asarray(grid[part])
+        scale = unread.held(grid[part])
         if scale.dtype != np.float32 or scale.size != 1:
             raise ValueError(f"{part} must be one float32 stored global scale, "
                              f"got {scale.dtype} {scale.shape}")
-        value = float(scale.reshape(()))
-        quantizer = (InputQuantizer.fp8(value) if codec.input_kind(layout.name) == 'fp8' else
-                     InputQuantizer.nvfp4(value, codec.input_scale_dtype == 'float8_e4m3fn',
-                                          format=codec.input_format))
+        kind: InputKind = 'fp8' if codec.input_kind(layout.name) == 'fp8' else 'nvfp4'
+        if unread.valued(scale):
+            value = float(scale.reshape(()))
+            quantizer = (InputQuantizer.fp8(value) if kind == 'fp8' else
+                         InputQuantizer.nvfp4(value, codec.input_scale_dtype == 'float8_e4m3fn',
+                                              format=codec.input_format))
+            stored = quantizer.scale
+        else:
+            # A load without its weights holds the scale's shape and dtype; its value is checked on load.
+            stored = scale.reshape(())
         for path in layout.paths:
             site = path[1:-1]
             # A fused tensor and an equal member stored beside it bind one Linear twice: they must
             # quantize its input alike, or one calibration would be silently dropped.
-            held_kind, held_scale = sites.setdefault(site, (quantizer.kind, quantizer.scale))
-            agrees = held_kind == quantizer.kind and np.array_equal(np.asarray(held_scale),
-                                                                    np.asarray(quantizer.scale))
+            held_kind, held_scale = sites.setdefault(site, (kind, stored))
+            agrees = held_kind == kind and unread.equal(held_scale, stored)
             if not agrees:
                 raise ValueError(f"{layout.name}'s input quantizer and another stored for "
                                  f"{'/'.join(site)} disagree; one Linear takes one")

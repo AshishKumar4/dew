@@ -22,6 +22,7 @@ from dew.interop.decoder_parts import (
     renamed_path,
     ungated_mlp,
 )
+from dew.interop.unread import equal
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.rope import inverse_frequencies
 
@@ -68,7 +69,7 @@ def _gpt_neox_buffers(tensors: Mapping[str, np.ndarray],
             )
             expected = inverse_frequencies(_records.number(config.get('rope_theta', 10000.), 'rope_theta'),
                                            rotated, dtype=np.float32).astype(tensor.dtype)
-            if not np.array_equal(tensor, expected):
+            if not equal(tensor, expected):
                 raise ValueError(
                     f"{name} disagrees with the configured rotary frequencies in its stored dtype"
                 )

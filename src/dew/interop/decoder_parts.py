@@ -24,6 +24,7 @@ from dew._model_types import SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
+from dew.interop.unread import valued
 from dew.interop.weights import check_tree
 from dew.nn.activations import GatedActivation, Situ
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -81,15 +82,16 @@ def fixed_attention_buffer(name: str, tensor: np.ndarray, attention: str,
     under its `attention` module: `bias`, the triangular causal mask, or
     `masked_bias`, a mask sentinel among `sentinels`, which each family's
     releases spell their own. They describe the fixed mask, not learned
-    biases, so an altered one is refused."""
+    biases, so an altered one is refused; of a load without its weights, by its shape alone
+    (`valued`)."""
     if name.endswith(f'.{attention}.bias'):
         if (tensor.ndim != 4 or tensor.shape[:2] != (1, 1)
                 or tensor.shape[-2] != tensor.shape[-1]
-                or not np.array_equal(tensor, np.tril(np.ones_like(tensor)))):
+                or (valued(tensor) and not np.array_equal(tensor, np.tril(np.ones_like(tensor))))):
             raise ValueError(f'{name} must hold the fixed triangular causal mask')
         return True
     if name.endswith(f'.{attention}.masked_bias'):
-        if tensor.shape != () or float(tensor) not in sentinels:
+        if tensor.shape != () or (valued(tensor) and float(tensor) not in sentinels):
             raise ValueError(f'{name} must hold a historical mask sentinel, one of {sorted(sentinels)}')
         return True
     return False

@@ -27,6 +27,7 @@ from flax import linen as nn
 from flax.typing import Dtype, Initializer, PrecisionLike
 
 from dew.batch import coordinates
+from dew.interop.unread import held
 from dew.interop.weights import ParamTree, checkpoint_array, insert, placed
 from dew.nn.activations import activation as named_activation
 from dew.nn.attention import LayerNorm, RMSNorm
@@ -560,7 +561,7 @@ def translate_vit_weights(hf_tensors: Mapping[str, np.ndarray],
                                  if name != PATCH_CONVOLUTION}, path_of, param_dtype)
     if PATCH_CONVOLUTION in hf_tensors:
         conv = checkpoint_array(hf_tensors[PATCH_CONVOLUTION], param_dtype)
-        dense = np.ascontiguousarray(conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
+        dense = held(conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]), contiguous=True)
         insert(variables, ("params", "patch_embed", "kernel"), dense, PATCH_CONVOLUTION)
         # The Dense map's transpose is the convolution, its input axes flattened.
         kernel = ("params", "patch_embed", "kernel")

@@ -83,7 +83,7 @@ from dew.interop.decoder_parts import (
     refuse_encoder_fields,
     renamed_path,
 )
-from dew.interop.unread import held
+from dew.interop.unread import held, valued
 from dew.nn.activations import Situ
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -413,10 +413,10 @@ def _kimi_k3_prepare(tensors: Mapping[str, np.ndarray],
         if rank is None or bias is None or bias.shape[0] % rank.shape[0]:
             raise ValueError(f"{name} has no dt_bias and f_a_proj to count its heads by")
         heads = bias.shape[0] // rank.shape[0]
-        log = np.asarray(value)
+        log = held(value)
         if log.ndim != 1 or log.shape[0] < heads:
             raise ValueError(f"{name} holds {log.shape}, fewer than its {heads} heads")
-        if np.any(log[heads:]):
+        if valued(log) and np.any(log[heads:]):
             raise ValueError(f"{name} pads its {heads} heads with nonzero values")
         prepared[name] = log[:heads]
     return prepared
