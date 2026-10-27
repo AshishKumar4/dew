@@ -416,7 +416,8 @@ class LightningIndexer(CompressedEntries):
         x = jax.lax.stop_gradient(x)
         q_resid = jax.lax.stop_gradient(q_resid)
         batch, length, _ = x.shape
-        keys = self.entries(x, valid, places) if cache is None else self.cached_entries(x, *cache, places)[0]
+        keys = (self.entries(x, valid, places) if cache is None
+                else self.cached_entries(x, *cache, places=places)[0])
         query = _rotate_rope(
             self.q_b_proj(q_resid).reshape(batch, length, self.n_heads, self.width), cos, sin)
         scores = self.scorer(query, keys, x)
@@ -448,7 +449,7 @@ class Compressor(CompressedEntries):
         first token's place among `places`; uncached, over each row's real tokens where `valid` marks
         them (`real_first`)."""
         entries = (self.entries(x, valid, places) if cache is None
-                   else self.cached_entries(x, *cache, places)[0])
+                   else self.cached_entries(x, *cache, places=places)[0])
         if self.index_topk is not None:
             return entries, self.indexer.select(x, q_resid, positions, places, cos, sin, cache, valid)
         seen = entries_visible(positions, entries.shape[1], self.rate)

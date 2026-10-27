@@ -808,7 +808,8 @@ class DecodeCursor(nn.Module):
     def __call__(self, valid) -> jax.Array:
         """Each token's place `[B, S]` continuing its row's count, a padding slot -1; the count
         advances by the call's real tokens (`valid`)."""
-        return cache_positions(self, *valid.shape, valid)[0]
+        batch, length = valid.shape
+        return cache_positions(self, batch, length, valid)[0]
 
 
 def cached_validity(module: nn.Module, length: int) -> jax.Array:

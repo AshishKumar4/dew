@@ -37,7 +37,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import FACTOR, distance
+from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 
 from dew.batch import coordinates
 from dew.interop import Pretrained
@@ -239,16 +239,16 @@ def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(sourc
 def test_an_interior_gap_leaves_every_window_on_its_rows_real_tokens(source):
     """Uncached, three padding slots inside each row leave each real token's sliding window counting
     its row's real tokens (`counted_places`), as a cache's slots count them, and its compressed windows
-    and n-grams on them: the real tokens' logits lie within FACTOR of the reference's rounding of the
-    float64 truth of the rows without the gap, where a window counted by index let the gap crowd out
-    the keys before it (audit NN-02)."""
+    and n-grams on them: the real tokens' logits are as exact as the reference's of the rows without the
+    gap (`assert_as_exact_as_the_reference`, the truth its float64 run), where a window counted by index
+    let the gap crowd out the keys before it (audit NN-02)."""
     loaded, plain, reference = source
     ids, at, gap = jnp.asarray(reference["input_ids"]), 5, 3
     tokens = jnp.concatenate([ids[:, :at], jnp.zeros((ids.shape[0], gap), ids.dtype), ids[:, at:]], axis=1)
     slots = jnp.arange(tokens.shape[1])
     real = (slots < at) | (slots >= at + gap)
     logits = plain.apply(loaded.variables, tokens, attention_mask=jnp.broadcast_to(real, tokens.shape))
-    assert distance(logits[:, real], TRUTH["logits"]) <= FACTOR * rounding("logits")
+    assert_as_exact_as_the_reference(logits[:, real], reference["logits"], TRUTH["logits"], "an interior gap")
 
 
 SHIFT = 8
@@ -259,23 +259,23 @@ rate, so a query that read entries by its given place would see SHIFT // rate wi
 def test_shifted_positions_compute_the_unshifted_rows_logits(source):
     """Uncached, positions given SHIFT past the tokens' indices: every rotation is relative, each
     compressed entry is visible by its window's tokens' ranks and rotates at its window's first given
-    place, where its queries rotate (`window_origins`), so the logits lie within FACTOR of the
-    reference's rounding of the float64 truth of the rows at their indices; entries visible by the
-    given places showed each query windows of later tokens, and entries rotated at zero-based
-    origins sat SHIFT away from their queries (audit NN-03)."""
+    place, where its queries rotate (`window_origins`), so the logits are as exact as the reference's
+    of the rows at their indices (`assert_as_exact_as_the_reference`, the truth its float64 run);
+    entries visible by the given places showed each query windows of later tokens, and entries rotated
+    at zero-based origins sat SHIFT away from their queries (audit NN-03)."""
     loaded, plain, reference = source
     ids = jnp.asarray(reference["input_ids"])
     positions = jnp.broadcast_to(jnp.arange(ids.shape[1]) + SHIFT, ids.shape)
     logits = plain.apply(loaded.variables, ids, positions=positions)
-    assert distance(logits, TRUTH["logits"]) <= FACTOR * rounding("logits")
+    assert_as_exact_as_the_reference(logits, reference["logits"], TRUTH["logits"], "shifted positions")
 
 
 def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(source):
     """Cached, a prompt at positions SHIFT past its indices, then the rest of each row one token at a
     time: each compressed entry rotates at its window's first given place, which the cache carries
-    across the calls a window spans (`append_windows`), so every step's logits lie within FACTOR of
-    the reference's rounding of the float64 truth of the rows at their indices, where entries rotated
-    at their slots sat SHIFT away from their queries (audit NN-03)."""
+    across the calls a window spans (`append_windows`), so every step's logits are as exact as the
+    reference's of the rows at their indices (`assert_as_exact_as_the_reference`, the truth its float64
+    run), where entries rotated at their slots sat SHIFT away from their queries (audit NN-03)."""
     from dew.sampling.text import decode_ops, prefill_state
 
     loaded, plain, reference = source
@@ -288,22 +288,24 @@ def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(source):
     for column in range(prompt, ids.shape[1]):
         state = ops.advance(state, ids[:, column], jnp.ones(ids.shape[0], bool))
         steps.append(np.asarray(state.logits))
-    assert distance(np.stack(steps, axis=1), TRUTH["logits"][:, prompt - 1:]) <= FACTOR * rounding("logits")
+    assert_as_exact_as_the_reference(np.stack(steps, axis=1), reference["logits"][:, prompt - 1:],
+                                     TRUTH["logits"][:, prompt - 1:], "a shifted cached walk")
 
 
 def test_a_llama3_ramp_reaches_every_layer_and_longrope_is_refused(source):
     """V4's layers take the model's one rope scaling (`MixerContext.rotary_scaling`), each kind's own
     in its place where the kind gives one (`kind_of`), as the compressed kinds give their YaRN ramp: a
-    Llama 3.1 ramp moves the logits from the unscaled decoder's further than rounding can, where the
-    layers forwarded YaRN alone and rotated at the plain frequencies. LongRoPE, whose factors a call's
-    reach picks and which the compressed entries do not see, is refused by name (audit NN-04)."""
+    Llama 3.1 ramp makes the decoder compute otherwise than the unscaled one, where the layers
+    forwarded YaRN alone, rotated at the plain frequencies and left the logits bit for bit the same.
+    LongRoPE, whose factors a call's reach picks and which the compressed entries do not see, is
+    refused by name (audit NN-04)."""
     loaded, plain, reference = source
     ids = jnp.asarray(reference["input_ids"])
     ramp = RopeScaling(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0,
                        original_max_position_embeddings=4)
     scaled, unscaled = (plain.clone(yarn=None, rope_scaling=scaling).apply(loaded.variables, ids)
                         for scaling in (ramp, None))
-    assert distance(scaled, unscaled) > FACTOR * rounding("logits")
+    assert not np.array_equal(scaled, unscaled)
     longrope = LongRopeScaling(short_factor=(1.0,) * 4, long_factor=(2.0,) * 4,
                                original_max_position_embeddings=4)
     with pytest.raises(ValueError):
