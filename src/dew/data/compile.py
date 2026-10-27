@@ -584,7 +584,7 @@ def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, traini
     """The build a reader of a prepared `branch` reads it by, in batches of `batch`: training's, or a
     scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise."""
     lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
-    return _Build(read, loading, seed, batch, lowered, training=training)
+    return _Build(read, loading, seed, batch, lowered, training=training, elastic=branch._elastic)
 
 
 @compiling
@@ -1007,9 +1007,12 @@ def _training_reader(
             endless=build.lowering.endless,
         )
     else:
+        if build.elastic:
+            _refuse_inelastic(pipeline, build)
         own_plan = dataclasses.replace(
             plan,
-            topology={
+            # An elastic read's order is one reader's at any count, its position every reader's.
+            topology={"elastic": True} if build.elastic else {
                 "shares": partition.count,
                 "share": partition.index,
                 "workers": _workers(pipeline, build.loading),
@@ -1028,9 +1031,24 @@ def _training_reader(
             resume,
             stop_seconds=build.loading.stop_seconds,
             endless=build.lowering.endless,
+            replicated=build.elastic,
         )
         statistics.observe(opened)
     return _Host(opened, host) if host else opened
+
+
+def _refuse_inelastic(pipeline: Pipeline, build: _Build) -> None:
+    """Refuse an elastic read (`Pipeline.elastic`) that would read in loading workers, which split
+    the order one reader reads by their count, so a position would hold only where they are as many;
+    or whose batch is a token budget's, which takes no fixed share of rows."""
+    if _workers(pipeline, build.loading) or any(isinstance(stage, Workers) for stage in _steps(pipeline)):
+        raise ValueError(
+            f"{pipeline.name or 'this chain'} is read elastically, by every reader in threads of its own; "
+            "loading workers split its order by their count, so read it with Loading(workers=0) "
+            "(elastic reads in workers are ledger row 1837)")
+    if any(isinstance(stage, TokenBudget) for stage in pipeline.stages):
+        raise ValueError("an elastic read keeps a share of each batch's rows, and a token budget's batch "
+                         "holds no fixed count of them; batch it by rows")
 
 
 def _validation_reader(

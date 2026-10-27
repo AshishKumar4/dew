@@ -46,7 +46,7 @@ from process_support import (
 from token_support import Corpus, write_token_corpus
 
 from dew.checkpoints import FROZEN_STORE
-from dew.position import ENVELOPE
+from dew.position import ENVELOPE, REPLICATED
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -754,6 +754,47 @@ def test_a_pool_fetching_its_shares_online_resumes_where_it_stopped(tmp_path, on
         assert report["dataset_state"] == whole[index]["dataset_state"]
         assert_identical_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
                                     dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+def replicated_flags(run_dir: Path, address: str, steps: int) -> dict:
+    """A fit over the online records each process fetches its share of, read elastically
+    (`Pipeline.elastic`): every process reads the order one reads, and keeps its rows."""
+    return {"name": "online", "online": address, "shared": True, "replicated": True, "run_dir": run_dir,
+            "fsdp_size": 1, "steps": steps, "records": RECORDS, "environment": ONLINE}
+
+
+@pytest.fixture(scope="module")
+def replicated_checkpoint(tmp_path_factory, online_server):
+    """Two processes' elastic fit over a filtered online stream, saved after `POOL_STEPS` steps."""
+    directory = tmp_path_factory.mktemp("replicated-checkpoint")
+    reports = run_pool("fit", directory / "out", 2, **replicated_flags(directory / "run", online_server,
+                                                                       POOL_STEPS))
+    positions = {report["dataset_state"] for report in reports}
+    assert len(positions) == 1, "the processes saved different elastic positions"
+    assert REPLICATED in json.loads(positions.pop())
+    return directory / "run"
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("processes", [1, 4])
+def test_an_elastic_filtered_stream_resumes_on_another_process_count(tmp_path, online_server,
+                                                                      replicated_checkpoint, processes):
+    """A filtered stream each process fetches its share of resumes only on the shares that saved
+    it. Read elastically, the position two processes saved is every process's, and one process or
+    four resume from it: they land where a pool of their own size that nobody stopped lands, its
+    data position and its parameters, since both read the batches one process reads."""
+    directory = tmp_path / "resumed-run"
+    shutil.copytree(replicated_checkpoint, directory)
+    resumed = run_pool("fit", tmp_path / "resumed", processes,
+                       **replicated_flags(directory, online_server, 2 * POOL_STEPS))
+    whole = run_pool("fit", tmp_path / "whole", processes,
+                     **replicated_flags(tmp_path / "whole-run", online_server, 2 * POOL_STEPS))
+    for index, report in enumerate(resumed):
+        assert report["restored_step"] == POOL_STEPS
+        assert report["step"] == 2 * POOL_STEPS
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
 
 
 PACKED_SEQ_LEN = 15
