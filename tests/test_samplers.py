@@ -980,3 +980,16 @@ def test_lms_walks_a_variance_exploding_grid_near_float32s_largest():
                               [1.0, 0.5, 2.0 ** -101, 0.0]))
     assert np.isfinite(latents).all()
     np.testing.assert_array_equal(latents[0], np.full((1, 3), 0.5))
+
+
+def test_an_empty_lms_step_integrates_to_zero_with_the_basis_as_its_derivative():
+    """Over an empty step (a = b) the Lagrange basis integrates to zero, and its derivative in the
+    step's end is the basis at that end: 1 for the node it is 1 at, 0 for the other (ledger 1874)."""
+    from dew.sampling.solvers.sigma import _lagrange_integral
+
+    for j, at in ((0, 1.0), (1, 0.0)):
+        def integral(b, j=j):
+            return _lagrange_integral([1.0, 2.0], j, jnp.float32(1.0), b)
+
+        value, slope = jax.value_and_grad(integral)(jnp.float32(1.0))
+        assert float(value) == 0.0 and float(slope) == at

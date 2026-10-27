@@ -1282,6 +1282,8 @@ def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
                                      "an overflowing residual")
     # Differentiable at every order, as the plain density: at unit variance its Hessian in the mean is -I.
     unit = GaussianTransition(jnp.zeros((1, 3), jnp.float32), jnp.ones((1,), jnp.float32))
-    hessian = jax.hessian(lambda mean: GaussianTransition(mean, unit.variance).log_prob(
-        jnp.ones((1, 3), jnp.float32)).sum())(unit.mean)
-    np.testing.assert_array_equal(np.asarray(hessian).reshape(3, 3), -np.eye(3))
+    def density(mean):
+        return GaussianTransition(mean, unit.variance).log_prob(jnp.ones((1, 3), jnp.float32)).sum()
+
+    for second in (jax.jacfwd(jax.jacrev(density)), jax.jacrev(jax.jacfwd(density))):
+        np.testing.assert_array_equal(np.asarray(second(unit.mean)).reshape(3, 3), -np.eye(3))
