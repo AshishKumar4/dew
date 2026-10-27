@@ -59,6 +59,39 @@ log, so Dew states the cap it set and reads a capture holding that many as cut s
 manifest)."""
 
 
+def held_back(capture: Path, metadata: dict) -> list[str]:
+    """Why a capture that stopped cleanly holds less than its run did, from what it holds (`capture_status`
+    "partial"), empty where nothing is missing: on an accelerator, a local device with no kernel track in
+    the trace; on GPU, as many activity events as CUPTI's cap (`ACTIVITY_CAP`, the options' own), past which
+    CUPTI drops whole buffers and says so only in a C++ log. A CPU run's trace holds no device track."""
+    if metadata.get("backend") not in ("gpu", "tpu"):
+        return []
+    from dew.telemetry.trace import device_events
+
+    try:
+        planes, _ = device_events(capture)
+    except FileNotFoundError:
+        return ["the capture wrote no trace"]
+    advanced = (metadata.get("options") or {}).get("advanced_configuration") or {}
+    return missing_tracks({name: len(events) for name, events in planes.items()},
+                          len(metadata["device_kinds"]), advanced.get("gpu_max_activity_api_events"))
+
+
+def missing_tracks(events: dict[str, int], devices: int, cap: int | None) -> list[str]:
+    """`held_back`'s reasons from the number of kernel events each device plane holds (`events`), the
+    local `devices` and CUPTI's activity `cap` (None off GPU). Within 1% of the cap is the cap reached:
+    CUPTI drops whole buffers (a 2000-event cap kept 1987 kernel events of an H100 step's 19160)."""
+    reasons = []
+    tracked = sum(1 for count in events.values() if count)
+    if tracked < devices:
+        reasons.append(f"{devices - tracked} of {devices} local devices have no kernel track in the trace")
+    total = sum(events.values())
+    if cap is not None and total >= cap * 0.99:
+        reasons.append(f"CUPTI's activity cap of {cap} events reached ({total} kept): the events past it "
+                       "were dropped, so the trace is cut short (a capture's `activity_cap` raises it)")
+    return reasons
+
+
 def capture_options(*, host_tracer_level: int = 2, python_tracer_level: int = 0,
                     activity_cap: int = ACTIVITY_CAP) -> jax.profiler.ProfileOptions:
     """The options a Dew capture starts with, for any JAX trace that should read like one: by default host
@@ -397,8 +430,10 @@ class Profiler:
         assert capture is not None and converter is not None
         self._captures.append(capture)
         metadata["body_status"] = body
-        metadata["capture_status"] = "failed" if failures else "completed"
+        reasons = [] if failures else held_back(capture, metadata)
+        metadata["capture_status"] = "failed" if failures else "partial" if reasons else "completed"
         metadata["capture_errors"] = [str(error) for error in failures]
+        metadata["capture_reasons"] = reasons
         try:
             _reports(capture, converter, metadata)
         except BaseException as error:
