@@ -34,7 +34,7 @@ from typing_extensions import TypeVar
 
 from dew._hashing import array_fingerprint
 from dew._records import finite
-from dew.batch import BLOCKS_FIELD, Variables, real_slots, token_positions, valid_order, with_validity
+from dew.batch import Variables, real_slots, token_positions, valid_order, with_validity
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import program
@@ -54,7 +54,7 @@ from dew.nn.protocols import (
     Serving,
     refuse_prefix,
 )
-from dew.nn.visibility import served_blocks
+from dew.nn.visibility import with_served_blocks
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,
@@ -820,8 +820,7 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
     ids = local_rows(inputs.tokens)
     fields = {name: jax.tree.map(local_rows, value) for name, value in inputs.token_fields.items()}
     refuse_prefix(model, prefix, longest=None)
-    if prefix is not None and BLOCKS_FIELD not in fields:
-        fields = {**fields, BLOCKS_FIELD: served_blocks(real_slots(fields, ids.shape, xp=np), prefix)}
+    fields = with_served_blocks(fields, real_slots(fields, ids.shape, xp=np), prefix)
     conditioning = {name: local_rows(value, host=False) for name, value in inputs.conditioning.items()}
     if "params" not in params:
         raise ValueError("generate takes the full variables dict ({'params': ...})")

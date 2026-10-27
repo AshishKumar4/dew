@@ -36,7 +36,7 @@ from dew.nn.attention import l2_normalized
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.conv import convolution
 from dew.nn.dit import TextContext, masked_mean
-from dew.nn.precision import accumulated
+from dew.nn.precision import accumulated, divided
 from dew.nn.protocols import Lacks
 from dew.nn.sharding import rows_taken
 from dew.objectives.base import TEACHER, Aux, Objective, Step
@@ -130,14 +130,15 @@ class Head(nn.Module):
     def __call__(self, x: jax.Array, condition: jax.Array, update: bool, batch: Batch) -> jax.Array:
         channels = x.shape[-1]
         h = Block(channels, (1, 1), name="block_0")(x, update, batch)
-        h = (Block(channels, self.kernel_size, name="block_1")(h, update, batch) + h) / math.sqrt(2)
+        # IEEE division: XLA takes a division by a constant as a product with its rounded reciprocal.
+        h = divided(Block(channels, self.kernel_size, name="block_1")(h, update, batch) + h, math.sqrt(2))
         out = SpectralConv(self.cmap_dim, (1, 1), circular=False, name="cls")(
             h, update)
         weight = self.param("cmapper_weight", nn.initializers.normal(1.0),
                             (condition.shape[-1], self.cmap_dim))
         cmap_bias = self.param("cmapper_bias", nn.initializers.zeros, (self.cmap_dim,))
-        cmap = accumulated(jnp.matmul, condition, weight / math.sqrt(condition.shape[-1])) + cmap_bias
-        return jnp.sum(out * cmap[:, None, None, :], axis=-1) / math.sqrt(self.cmap_dim)
+        cmap = accumulated(jnp.matmul, condition, divided(weight, math.sqrt(condition.shape[-1]))) + cmap_bias
+        return divided(jnp.sum(out * cmap[:, None, None, :], axis=-1), math.sqrt(self.cmap_dim))
 
 
 class Heads(nn.Module):
