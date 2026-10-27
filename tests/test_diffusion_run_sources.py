@@ -43,10 +43,17 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 @pytest.fixture(scope="module")
 def pipelines(tmp_path_factory):
+    """Each family's pipeline at `<family>/pipeline`: the flow transformers, and the tiny SD UNet
+    pipeline, whose DDIM grid ends short of a clean sample."""
     root = tmp_path_factory.mktemp("pipelines")
     for family in ("sd3", "flux", "qwen_image"):
         with tarfile.open(FIXTURES / f"{family}_source.tar.xz") as archive:
             archive.extractall(root / family, filter="data")
+    with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
+        archive.extractall(root / "unet", members=[member for member in archive.getmembers()
+                                                   if member.name.split("/")[0] == "sd"], filter="data")
+    (root / "sd").mkdir()
+    (root / "unet" / "sd").rename(root / "sd" / "pipeline")
     return root
 
 
@@ -352,7 +359,7 @@ def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_
     assert value(rebuilt, trained.variables, batch) == value(objective, trained.variables, batch)
 
 
-@pytest.mark.parametrize("family", ["sd3", "flux", "qwen_image"])
+@pytest.mark.parametrize("family", ["sd3", "flux", "qwen_image", "sd"])
 def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelines):
     """The wiring half of a configured run: `DiffusionRunConfig` over a
     published pipeline builds what `DiffusionObjective(Pretrained.load(...))`
@@ -365,11 +372,13 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     tests/test_flow_matching.py (ad63cc6a). Both sample by the same policy, the
     pipeline's own grid and finish: their evaluations draw alike from one key,
     unlike an evaluation on the process's own times, and the run's published
-    task draws the walk the pipeline's own task draws from the same noise."""
+    task draws the walk the pipeline's own task draws from the same noise. A
+    flow grid ends at a clean sample, where a closing denoise moves nothing;
+    the SD pipeline's DDIM grid ends short of one, where it would."""
     from dew.interop.pretrained import load_diffusion_source
 
     directory = pipelines / family / "pipeline"
-    size = 16 if family != "qwen_image" else 32
+    size = 16 if family in ("sd3", "flux") else 32
     settings = {"guidance": None, "unconditional_prob": 0.25, "ema_decay": None}
     configured = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
                                     data=images_of("tfds://oxford_flowers102", size),
@@ -407,7 +416,7 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     elsewhere = np.asarray(on_times.evaluate(states[1].variables, batch, step).images)
     assert not np.array_equal(drawn[0], elsewhere)
     # ... and the run's published task draws the walk the pipeline's own task draws from the same noise,
-    # which tests/test_{family}_source.py holds to the source pipeline's.
+    # which the family's source tests hold to the source pipeline's own walk.
     prompts = list(PROMPTS)
     published = configured.build_task(states[0].variables)(prompts, key=7).host()
     pipeline = source.text_to_image()(prompts, steps=2, guidance=None, solver=Euler(), key=7).host()
