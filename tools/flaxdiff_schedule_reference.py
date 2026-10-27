@@ -40,6 +40,9 @@ COMMIT = "15c55b001304604147a2a8002a76cf5d4c32092f"
 FLAXDIFF = f"https://raw.githubusercontent.com/AshishKumar4/FlaxDiff/{COMMIT}/flaxdiff/"
 ROWS = 64
 """A drawn batch's rows."""
+WIDE_ROWS = 4096
+"""A generalized cosine's drawn rows: its tangent's conditioning grows toward t = 1, so each seed's float32
+error is a few rows' near there, which a small batch leaves too varied for check 1's seeds to resolve."""
 EXP = {"exp-1000": {"timesteps": 1000},
        "exp-250-clipped": {"timesteps": 250, "beta_end": 0.02, "p2_loss_weight_k": 2,
                            "p2_loss_weight_gamma": 0.5}}
@@ -122,8 +125,8 @@ def record(destination: Path) -> None:
             arrays[f"{name}.betas"] = np.asarray(NARROW["exp_beta_schedule"](
                 arguments["timesteps"], 0.008, arguments.get("beta_end", 0.999)))
 
-    def times(seed, site):
-        return {"steps": np.random.default_rng([0xC0, site, seed]).uniform(0, 1, ROWS).astype(np.float32)}
+    def times(seed, site, rows=ROWS):
+        return {"steps": np.random.default_rng([0xC0, site, seed]).uniform(0, 1, rows).astype(np.float32)}
 
     arrays.update(record_case("continuous-cosine", lambda seed: times(seed, 0), lambda inputs: evaluated(
         lambda scope: scope["CosineContinuousNoiseScheduler"](), rates_and_weight, inputs)))
@@ -131,7 +134,7 @@ def record(destination: Path) -> None:
         def build(scope, arguments=arguments):
             return scope["CosineGeneralNoiseScheduler"](**arguments)
 
-        arrays.update(record_case(name, lambda seed, site=site: times(seed, site),
+        arrays.update(record_case(name, lambda seed, site=site: times(seed, site, WIDE_ROWS),
                                   lambda inputs, build=build: evaluated(build, sigma_and_weight, inputs)))
         with jax.enable_x64(new_val=False):
             _, chunks = build(NARROW).transform_inputs(None, jnp.asarray(GRID))

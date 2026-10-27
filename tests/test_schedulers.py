@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
+from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording, seeds_for
 from scipy import stats
 
 import dew.diffusion.schedules as schedulers
@@ -33,8 +33,11 @@ from dew.diffusion import (
     presets,
 )
 from dew.diffusion.schedules import (
+    CosineContinuousNoiseScheduler,
+    CosineGeneralNoiseScheduler,
     CosineNoiseScheduler,
     EDMNoiseScheduler,
+    ExpNoiseScheduler,
     FlowMatchingScheduler,
     KarrasVENoiseScheduler,
     LinearNoiseScheduler,
@@ -54,7 +57,10 @@ CONTINUOUS_STEPS = jnp.array([0.05, 0.3, 0.6, 0.95])
 SCHEDULES = [
     (CosineNoiseScheduler, partial(CosineNoiseScheduler, 1000), DISCRETE_STEPS, "vp"),
     (LinearNoiseScheduler, partial(LinearNoiseScheduler, 1000), DISCRETE_STEPS, "vp"),
+    (ExpNoiseScheduler, partial(ExpNoiseScheduler, 1000), DISCRETE_STEPS, "vp"),
     (SqrtContinuousNoiseScheduler, SqrtContinuousNoiseScheduler, CONTINUOUS_STEPS, "vp"),
+    (CosineContinuousNoiseScheduler, CosineContinuousNoiseScheduler, CONTINUOUS_STEPS, "vp"),
+    (CosineGeneralNoiseScheduler, CosineGeneralNoiseScheduler, CONTINUOUS_STEPS, "ve"),
     (
         KarrasVENoiseScheduler,
         partial(KarrasVENoiseScheduler, sigma_max=80, rho=7, sigma_data=0.5),
@@ -513,6 +519,92 @@ def test_a_karras_schedule_keeps_a_float64_runs_times_in_float64(schedule):
         narrow = schedule.sigmas(jnp.asarray(t, jnp.float32))
         assert narrow.dtype == jnp.float32
         assert not np.array_equal(np.asarray(sigma), np.asarray(narrow, np.float64))
+
+
+FLAXDIFF = Path(__file__).parent / "fixtures" / "flaxdiff_schedules" / "recorded.npz"
+"""FlaxDiff's own schedules at 15c55b001 over check 1's seeds, float32 as it runs and float64 its truth
+(tools/flaxdiff_schedule_reference.py)."""
+FLAXDIFF_VP = {"exp-1000": partial(ExpNoiseScheduler, 1000),
+               "exp-250-clipped": partial(ExpNoiseScheduler, 250, beta_end=0.02, p2_loss_weight_k=2,
+                                          p2_loss_weight_gamma=0.5),
+               "continuous-cosine": CosineContinuousNoiseScheduler}
+FLAXDIFF_VE = {"general-cosine": CosineGeneralNoiseScheduler,
+               "general-cosine-kappa": partial(CosineGeneralNoiseScheduler, sigma_min=0.002, sigma_max=160.0,
+                                               kappa=0.5)}
+
+
+def flaxdiffs(site: str):
+    """`site`'s recorded draw, FlaxDiff's float32 outputs and their float64 truth (`indexed_recording`),
+    with the seeds the recording declares, and the recording itself."""
+    stored = recording(FLAXDIFF)
+    seeds = declared_seeds(FLAXDIFF)[site]
+    return (*indexed_recording(stored, site, seeds), seeds, stored)
+
+
+@pytest.mark.parametrize("site", sorted(FLAXDIFF_VP))
+def test_flaxdiffs_variance_preserving_schedules_are_its_own(site):
+    """FlaxDiff's exponential table (its defaults at 1000 steps, and 250 steps whose betas a beta_end of
+    0.02 clips, with a nondefault P2 weight) and its continuous cosine, run from its source at
+    15c55b001: Dew's rates and loss weights at drawn indices or times are on par with FlaxDiff's own in
+    float32, from their float64 truth (check 1). An exponential table's betas, which FlaxDiff computes
+    in float64 on the host, are its own to the bit."""
+    draw, reference, truth, seeds, stored = flaxdiffs(site)
+    schedule = FLAXDIFF_VP[site]()
+
+    @as_given
+    def dews(index, inputs):
+        alpha, sigma = schedule.rates(jnp.asarray(inputs["steps"]))
+        return {"alpha": alpha, "sigma": sigma, "weight": schedule.weight(jnp.asarray(inputs["steps"]))}
+
+    assert_as_exact(dews, reference, draw, site, seeds=seeds, truth_fn=truth)
+    if f"{site}.betas" in stored:
+        np.testing.assert_array_equal(np.asarray(schedule.betas), stored[f"{site}.betas"])
+
+
+@pytest.mark.parametrize("site", sorted(FLAXDIFF_VE))
+def test_flaxdiffs_tangent_cosine_grid_is_its_own(site):
+    """FlaxDiff's variance-exploding cosine at its defaults and at nondefault ends and kappa, run from its
+    source at 15c55b001: Dew's sigma and loss weight at drawn times are on par with FlaxDiff's own in
+    float32, from their float64 truth (check 1); alpha is one, and the model's input over a grid of
+    times is FlaxDiff's `transform_inputs`, to the integer."""
+    draw, reference, truth, seeds, stored = flaxdiffs(site)
+    schedule = FLAXDIFF_VE[site]()
+
+    @as_given
+    def dews(index, inputs):
+        return {"sigma": schedule.sigmas(jnp.asarray(inputs["steps"])),
+                "weight": schedule.weight(jnp.asarray(inputs["steps"]))}
+
+    assert_as_exact(dews, reference, draw, site, seeds=seeds, truth_fn=truth)
+    alpha, _ = schedule.rates(jnp.asarray(stored["grid"]))
+    np.testing.assert_array_equal(np.asarray(alpha), np.ones_like(stored["grid"]))
+    np.testing.assert_array_equal(np.asarray(schedule.model_time(stored["grid"])),
+                                  stored[f"{site}.model_time"].astype(np.float32))
+
+
+@pytest.mark.parametrize("site", sorted(FLAXDIFF_VE))
+def test_the_tangent_cosine_grids_time_of_a_sigma_inverts_it(site):
+    """The tangent grid's time of a sigma, the angle atan(kappa sigma) along the grid, gives back the
+    drawn times of the sigmas it places: Dew's round trip in float32 is on par with the same arithmetic in
+    NumPy's float32, from the times themselves (check 1)."""
+    schedule = FLAXDIFF_VE[site]()
+
+    def draw(seed):
+        return (drawn(seed, 9).uniform(0, 1, 4096).astype(np.float32),)
+
+    def round_trip(t):
+        return schedule.t_of_sigma(schedule.sigmas(t))
+
+    @as_given
+    def numpy(t):
+        ends = (schedule.theta_min, schedule.theta_max, schedule.kappa)
+        low, high, kappa = (np.float32(value) for value in ends)
+        sigma = np.tan(low + t * (high - low)) / kappa
+        return (np.arctan(kappa * sigma) - low) / (high - low)
+
+    label = f"{site} time of a sigma"
+    assert_as_exact(jax.jit(round_trip), numpy, draw, label,
+                    seeds=seeds_for(numpy, draw, label, truth_fn=lambda t: t), truth_fn=lambda t: t)
 
 
 T_OF_SIGMA_SEEDS = 8
