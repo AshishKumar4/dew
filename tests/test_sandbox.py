@@ -34,7 +34,7 @@ def alive(pid):
     be a child subreaper that reaps when its own job ends, as a GPU node's job runner does."""
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
+    except (FileNotFoundError, ProcessLookupError):  # reaped before the open, or between it and the read
         return False
     return stat.rsplit(")", 1)[1].split()[0] != "Z"
 
