@@ -90,6 +90,8 @@ class DecodeImage(grain.MapTransform):
     _: dataclasses.KW_ONLY
     at_least: int | None = None
     rejects: bool = True
+    external: ClassVar[bool] = True
+    """An image a record names by path is read from storage (`dew.data.pipeline.External`)."""
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """RGB pixels under `to`, each image its own height and width, in place of the bytes in `field`."""
