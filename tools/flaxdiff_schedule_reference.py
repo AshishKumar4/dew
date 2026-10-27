@@ -41,9 +41,10 @@ COMMIT = "15c55b001304604147a2a8002a76cf5d4c32092f"
 FLAXDIFF = f"https://raw.githubusercontent.com/AshishKumar4/FlaxDiff/{COMMIT}/flaxdiff/"
 ROWS = 64
 """A drawn batch's rows."""
-WIDE_ROWS = 4096
+WIDE_ROWS = 1 << 16
 """A generalized cosine's drawn rows: its tangent's conditioning grows toward t = 1, so each seed's float32
-error is a few rows' near there, which a small batch leaves too varied for check 1's seeds to resolve."""
+error is a few rows' near there, which a small batch leaves too varied for check 1's seeds to resolve, and
+with 4096 rows the kappa case asked 128 seeds, whose evidence passed what git holds."""
 EXP = {"exp-1000": {"timesteps": 1000},
        "exp-250-clipped": {"timesteps": 250, "beta_end": 0.02, "p2_loss_weight_k": 2,
                            "p2_loss_weight_gamma": 0.5}}
