@@ -988,7 +988,8 @@ def test_a_tiny_lms_step_beside_a_distant_node_keeps_its_coefficient():
     assert coefficient == -1.5 * 2.0 ** -100
     # A step to zero from 2**-100 beside nodes 1 and 2, the end of a VE walk at order 3: its factors
     # are 1 plus terms of 2**-100, so the latest node's basis integrates to the step's width.
-    coefficient = float(_lagrange_integral([tiny, jnp.float32(1.0), jnp.float32(2.0)], 0, tiny, jnp.float32(0.0)))
+    nodes = [tiny, jnp.float32(1.0), jnp.float32(2.0)]
+    coefficient = float(_lagrange_integral(nodes, 0, tiny, jnp.float32(0.0)))
     assert coefficient == -(2.0 ** -100)
 
 
