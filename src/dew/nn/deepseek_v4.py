@@ -66,7 +66,7 @@ from dew.nn.kv_cache import KVCache, KVStore, cache_positions, cached_validity, 
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from dew.nn.mla import IndexerFront
 from dew.nn.precision import at_least_fp32, float32_dot_general
-from dew.nn.rope import Scaling, rotary_freqs, rotate
+from dew.nn.rope import LongRopeScaling, Scaling, rotary_freqs, rotate
 from dew.nn.sharding import RESIDUAL, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import (
     candidate_pool,
@@ -911,12 +911,13 @@ class DeepseekV4Mixer(MixerBase):
 
     The compressed kinds name `compressor` ('csa', 'hca' or V4.1's 'csa2') and
     `compress_rate` on their `LayerKind.mixer`, the csa kind the indexer's three
-    fields. The window, rope base and YaRN ramp are the context's, and
-    `rope_head_dim` the rotated slice. The context's standard attention dials
-    (`num_kv_heads`, the norms, `kv_shared` outside CSA2, sinks and scales) are
-    not read. A V4.1 Reuse layer is one listed in `kv_shared_layers`, in the
-    kind of the Full layer before it; `reindex` names the Reindex kind and
-    `candidates` the pool's role.
+    fields. The window, rope base and rope scaling are the context's (YaRN or
+    Llama 3.1's ramp; LongRoPE is refused), and `rope_head_dim` the rotated
+    slice. The context's standard attention dials (`num_kv_heads`, the norms,
+    `kv_shared` outside CSA2, sinks and scales) are not read. A V4.1 Reuse
+    layer is one listed in `kv_shared_layers`, in the kind of the Full layer
+    before it; `reindex` names the Reindex kind and `candidates` the pool's
+    role.
     """
 
     residuals = ATTENTION_CONTEXT_RESIDUALS
@@ -963,6 +964,12 @@ class DeepseekV4Mixer(MixerBase):
             raise ValueError("a deepseek_v4 layer attends a sliding window, not a chunk")
         if ctx.kv_shared and self.compressor != 'csa2':
             raise ValueError("of the deepseek_v4 kinds only CSA2 shares its entries across layers")
+        scaling = ctx.rotary_scaling()
+        if isinstance(scaling, LongRopeScaling):
+            raise ValueError("a deepseek_v4 layer takes YaRN or Llama 3.1's ramp, not LongRoPE: LongRoPE "
+                             "picks a call's factors by how far its tokens reach, which the compressed "
+                             "entries and the drafter, rotated at their windows' and context's own places, "
+                             "do not see")
         ctx.refuse("deepseek_v4", ctx.policies(),
                    "its attention keeps sinks of its own, softmaxes in fp32 and projects out through "
                    "grouped low-rank heads, without a softcap, value scale, bias or dropout")
@@ -978,7 +985,7 @@ class DeepseekV4Mixer(MixerBase):
             sliding_window=ctx.sliding_window,
             max_seq_len=ctx.max_seq_len,
             rope_theta=ctx.rope_theta,
-            rope_scaling=ctx.rotary_scaling(),
+            rope_scaling=scaling,
             compressor=self.compressor,
             compress_rate=self.compress_rate,
             index_topk=self.index_topk,

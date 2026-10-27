@@ -526,16 +526,19 @@ class CausalTransformer(nn.Module):
         return tuple(self.layer_types)
 
     def kind_of(self, layer_type: str) -> "ResolvedKind":
-        """Return the `ResolvedKind` of `layer_type`, with the model's defaults where the kind is unset."""
+        """Return the `ResolvedKind` of `layer_type`, with the model's defaults where the kind is unset.
+        A rope scaling is one setting, YaRN's record or a Llama 3.1 or LongRoPE ramp: a kind that gives
+        either takes it in place of the model's, never beside it (`MixerContext.rotary_scaling`)."""
         kind = (self.kinds or {}).get(layer_type, LayerKind())
+        scaled = kind.rope_scaling is not None or kind.yarn is not None
         return ResolvedKind(
             window=kind.window,
             bidirectional_window=kind.bidirectional_window,
             chunk=kind.chunk,
             num_kv_heads=self.kv_heads if kind.num_kv_heads is None else kind.num_kv_heads,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
-            rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
-            yarn=self.yarn if kind.yarn is None else kind.yarn,
+            rope_scaling=kind.rope_scaling if scaled else self.rope_scaling,
+            yarn=kind.yarn if scaled else self.yarn,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
             partial_rotary_factor=self._kind_rotary(kind),
             sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
@@ -1647,11 +1650,11 @@ class CausalTransformer(nn.Module):
             # caller gave them in; a cached call's continue from the model's own count of each row's
             # real tokens (`DecodeCursor`), whatever mixer its first layer runs.
             tokens_at = coordinates_of(attention_metadata, *tokens.shape)
-            places = tokens_at.positions
-            if places is None:
-                valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
-                places = (self.decode_cursor(valid) if decode
-                          else jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1)
+            valid = jnp.ones(tokens.shape, bool) if tokens_at.valid is None else tokens_at.valid
+            # Every cached call counts its real tokens, those at given places too, so a later call
+            # without places continues after them.
+            counted = self.decode_cursor(valid) if decode else jnp.cumsum(valid, axis=-1, dtype=jnp.int32) - 1
+            places = counted if tokens_at.positions is None else tokens_at.positions
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
         if self.embedding_norm:
             x = self.embedding_layernorm(x)

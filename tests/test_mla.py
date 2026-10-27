@@ -37,7 +37,14 @@ import torch
 from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
-from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    float64_forward,
+    torch_with_gradients,
+    with_gradients,
+)
 from selection_margins import indexer_margins
 from tool_support import load
 
@@ -523,6 +530,39 @@ def test_the_mla_kind_rotates_by_the_models_rope_scaling(scaling):
     inside = model.apply(variables, hidden, method=lambda m, x: m.layers[0].self_attn(x))
     standalone = mla_module(settings).clone(rope_scaling=scaling).apply(block_variables(tensors), hidden)
     np.testing.assert_array_equal(inside, standalone)
+
+
+def test_a_deepseek_checkpoint_scaled_by_llama3_loads_and_rotates_its_latents_by_it(tmp_path):
+    """A DeepSeek V3 checkpoint whose config scales its rope by Llama 3.1's ramp loads through the
+    shared rope codec, and its latent attention rotates by the ramp: Dew's logits as exact as
+    transformers' DeepseekV3 under the same config (`assert_as_exact_as_the_reference`, the truth its
+    float64 twin), where the family read YaRN alone and refused the checkpoint (audit NN-04)."""
+    import shutil
+
+    from transformers import AutoModelForCausalLM
+
+    from dew.interop import Pretrained
+    from tools.torch_precision import float64, float64_twin
+
+    source = Path(__file__).resolve().parent / "fixtures" / "hf" / "deepseek-v3-tiny"
+    for name in ("model.safetensors", "generation_config.json"):
+        shutil.copy(source / name, tmp_path / name)
+    config = json.loads((source / "config.json").read_text())
+    config["rope_scaling"] = {"rope_type": "llama3", "factor": 8.0, "low_freq_factor": 1.0,
+                              "high_freq_factor": 4.0, "original_max_position_embeddings": 4}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    reference = AutoModelForCausalLM.from_pretrained(tmp_path, dtype=torch.float32,
+                                                     attn_implementation="eager").eval()
+    ids = np.load(source / "input_ids.npy")
+    given = torch.from_numpy(ids.astype(np.int64))
+    with torch.no_grad():
+        theirs = reference(input_ids=given).logits.numpy()
+        with float64():
+            wide = float64_twin(reference)(input_ids=given).logits.numpy()
+    _, terms = float64_forward(loaded.model, loaded.variables, ids)
+    assert_as_exact_as_the_reference(np.asarray(loaded.model.apply(loaded.variables, ids)), theirs, wide,
+                                     "a llama3-scaled DeepSeek V3's logits", terms=terms)
 
 
 # --------------------------------------------------------------------------

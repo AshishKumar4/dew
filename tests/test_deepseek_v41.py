@@ -46,6 +46,7 @@ from dew.nn.engram import Engram
 from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
 from dew.nn.kv_cache import KVCache
+from dew.nn.rope import LongRopeScaling, RopeScaling
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
 from tools.deepseek_v41_numerics import QUANTIZERS, unquantized, vision_bundle, vision_run
@@ -269,19 +270,44 @@ def test_shifted_positions_compute_the_unshifted_rows_logits(source):
     assert distance(logits, TRUTH["logits"]) <= FACTOR * rounding("logits")
 
 
-def test_a_shifted_prompt_decodes_the_unshifted_greedy_walk(source):
-    """Cached, a prompt at positions SHIFT past its indices decodes the reference's greedy ids: each
-    compressed entry rotates at its window's first given place, which the cache carries across the
-    calls a window spans (`append_windows`), where entries rotated at their slots sat SHIFT away from
-    their queries (audit NN-03)."""
+def test_a_shifted_prompt_decodes_the_unshifted_rows_logits(source):
+    """Cached, a prompt at positions SHIFT past its indices, then the rest of each row one token at a
+    time: each compressed entry rotates at its window's first given place, which the cache carries
+    across the calls a window spans (`append_windows`), so every step's logits lie within FACTOR of
+    the reference's rounding of the float64 truth of the rows at their indices, where entries rotated
+    at their slots sat SHIFT away from their queries (audit NN-03)."""
+    from dew.sampling.text import decode_ops, prefill_state
+
     loaded, plain, reference = source
     ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
-    steps = reference["generated"].shape[1]
+    ops = decode_ops(plain, loaded.variables, 0, None)
     positions = jnp.broadcast_to(jnp.arange(prompt) + SHIFT, (ids.shape[0], prompt))
     inputs = ModelInputs(ids[:, :prompt], {"positions": positions})
-    generated = generate(plain, loaded.variables, inputs, steps, key=jax.random.key(1),
-                         sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(np.asarray(generated.tokens)[:, -steps:], reference["generated"])
+    state, _ = prefill_state(plain, loaded.variables, inputs, ops)
+    steps = [np.asarray(state.logits)]
+    for column in range(prompt, ids.shape[1]):
+        state = ops.advance(state, ids[:, column], jnp.ones(ids.shape[0], bool))
+        steps.append(np.asarray(state.logits))
+    assert distance(np.stack(steps, axis=1), TRUTH["logits"][:, prompt - 1:]) <= FACTOR * rounding("logits")
+
+
+def test_a_llama3_ramp_reaches_every_layer_and_longrope_is_refused(source):
+    """V4's layers take the model's one rope scaling (`MixerContext.rotary_scaling`), each kind's own
+    in its place where the kind gives one (`kind_of`), as the compressed kinds give their YaRN ramp: a
+    Llama 3.1 ramp moves the logits from the unscaled decoder's further than rounding can, where the
+    layers forwarded YaRN alone and rotated at the plain frequencies. LongRoPE, whose factors a call's
+    reach picks and which the compressed entries do not see, is refused by name (audit NN-04)."""
+    loaded, plain, reference = source
+    ids = jnp.asarray(reference["input_ids"])
+    ramp = RopeScaling(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0,
+                       original_max_position_embeddings=4)
+    scaled, unscaled = (plain.clone(yarn=None, rope_scaling=scaling).apply(loaded.variables, ids)
+                        for scaling in (ramp, None))
+    assert distance(scaled, unscaled) > FACTOR * rounding("logits")
+    longrope = LongRopeScaling(short_factor=(1.0,) * 4, long_factor=(2.0,) * 4,
+                               original_max_position_embeddings=4)
+    with pytest.raises(ValueError):
+        plain.clone(yarn=None, rope_scaling=longrope).apply(loaded.variables, ids)
 
 
 def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
