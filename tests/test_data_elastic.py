@@ -150,3 +150,28 @@ def test_an_elastic_read_refuses_loading_workers_and_a_per_share_position():
     listed(elastic, 1)
     with pytest.raises(ValueError):
         reader(stream(elastic=False), 0, 2).set_state(elastic.get_state())
+
+
+def test_a_per_share_read_whose_filter_rejects_its_whole_share_is_refused_and_an_elastic_one_reads():
+    """Read by two shares, a shuffled endless repeat of ids is cut to the even ids for the first share
+    before its filter keeps the odd ones, so that share's filter rejects every record of every pass:
+    its reader refuses the read once two whole passes are rejected, where it read on forever. The read
+    runs on a thread held to a deadline, so that a reader that reads on fails this test. Read
+    elastically, the same chain reads the odd ids on that share."""
+    chain = Pipeline(Memory(tuple({"id": np.int64(index)} for index in range(96)))).shuffle(5).repeat()
+    starved = chain.filter(odd).batch(BATCH)
+    outcome = []
+
+    def read():
+        try:
+            next(reader(starved, 0, 2))
+        except ValueError as refused:
+            outcome.append(refused)
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    thread.join(60)
+    assert not thread.is_alive(), "the reader read on with every record of its share rejected"
+    assert len(outcome) == 1 and isinstance(outcome[0], ValueError)
+    ids = np.asarray(next(reader(starved.elastic(), 0, 2))["id"])
+    assert len(ids) == BATCH // 2 and all(int(value) % 2 for value in ids)
