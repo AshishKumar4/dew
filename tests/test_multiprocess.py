@@ -1111,6 +1111,68 @@ def test_a_killed_pool_resumes_from_the_newer_local_checkpoint(tmp_path, killed_
     assert {name: after[name] for name in before} == before
 
 
+@pytest.fixture(scope="module")
+def killed_replicated_pool(tmp_path_factory):
+    """The killed pool run of `killed_local_pool`, its state replicated whole on each process (fsdp
+    over each process's own devices alone), so each process's local directory holds every slice."""
+    directory = tmp_path_factory.mktemp("killed-replicated")
+    channels = [channel(directory / f"blocked{index}") for index in range(2)]
+    coordinator = f"127.0.0.1:{free_port()}"
+    (directory / "killed").mkdir()
+    pool = [spawn("fit", directory / "killed" / f"process{index}.json", processes=2,
+                  process_id=index, coordinator=coordinator,
+                  **local_flags(directory, fsdp_size=1, block_after=LOCAL_KILL_AFTER, notify=path))
+            for index, path in enumerate(channels)]
+    handed = told(list(zip(pool, channels, strict=True)))
+    assert all(process.returncode == -signal.SIGKILL for process in pool)
+    assert handed == [LOCAL_KILL_AFTER] * 2
+    assert all(local_committed(directory, index, LOCAL_KILL_AFTER).exists() for index in range(2))
+    return directory
+
+
+@pytest.mark.distributed
+def test_a_host_that_lost_its_local_checkpoint_takes_a_replicas_copy(tmp_path, killed_replicated_pool):
+    """A process whose local directory is gone, as a replaced host's is, takes a surviving process's
+    copy of local step eight, a process holding the same slices of every array, sent over the pool's
+    devices: both resume from local step eight, not persistent step six, and land on the parameters
+    of the run nobody killed."""
+    directory = tmp_path / "killed"
+    shutil.copytree(killed_replicated_pool, directory)
+    shutil.rmtree(directory / "local" / "process1")
+    whole = run_pool("fit", tmp_path / "whole", 2, **local_flags(tmp_path / "whole-run", fsdp_size=1))
+
+    resumed = run_pool("fit", tmp_path / "resumed", 2, **local_flags(directory, fsdp_size=1))
+
+    for index, report in enumerate(resumed):
+        assert not report["split_between_processes"]
+        assert report["restored_step"] == LOCAL_KILL_AFTER
+        assert report["restored_from"] == str(directory / "local" / f"process{index}")
+        # The copy holds every process's data position, and process one resumes its own share's.
+        assert shard_of(report["restored_dataset_state"]) == index
+        assert report["step"] == STEPS
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_identical_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                                    dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+@pytest.mark.distributed
+def test_a_host_whose_slices_no_survivor_holds_resumes_the_pool_from_the_persistent_checkpoint(
+        tmp_path, killed_local_pool):
+    """Where the state is split between the processes, no survivor holds a lost process's slices, so a
+    pool missing one process's local step resumes, every process, from persistent step six."""
+    directory = tmp_path / "killed"
+    shutil.copytree(killed_local_pool, directory)
+    shutil.rmtree(directory / "local" / "process1")
+
+    resumed = run_pool("fit", tmp_path / "resumed", 2, **local_flags(directory))
+
+    for report in resumed:
+        assert report["split_between_processes"]
+        assert report["restored_step"] == 2 * SAVE_EVERY
+        assert report["restored_from"] == worker.checkpoint_dir(directory / "run", "local")
+        assert report["step"] == STEPS
+
+
 # --------------------------------------------------------------------------
 # Validation and artifacts in a pool
 # --------------------------------------------------------------------------

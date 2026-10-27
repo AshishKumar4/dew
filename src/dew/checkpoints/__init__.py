@@ -517,17 +517,38 @@ def _written_in_place(tree: Mapping[str, object]) -> bool:
                for leaf in jax.tree.leaves(tree))
 
 
+REPLICA_CHUNK = 64 * 2 ** 20
+"""The bytes of a local directory one collective sends a recovering process (`Checkpoints._received`)."""
+
+
+def replicas(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
+    """Each process's slices of every array leaf of `tree`, as a digest keyed by the process's index:
+    two processes whose digests agree hold the same slices, so either's local checkpoint restores the
+    other (`Checkpoints._recovered`)."""
+    held: dict[int, set] = {}
+    for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
+        if isinstance(leaf, jax.Array) and leaf.sharding is not None:
+            for device, indices in leaf.sharding.devices_indices_map(leaf.shape).items():
+                bounds = tuple(index.indices(size)[:2]
+                               for index, size in zip(indices, leaf.shape, strict=True))
+                held.setdefault(device.process_index, set()).add((jax.tree_util.keystr(path), bounds))
+    return {str(process): hashlib.sha256(json.dumps(sorted(slices)).encode()).hexdigest()
+            for process, slices in held.items()}
+
+
 def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
     """Return the placement of each array leaf of `tree` as a string, keyed by path:
-    its sharding and which slice of it each of this process's devices holds.
+    its sharding and the slices of it this process's devices hold.
 
     A local checkpoint restores onto this placement and no other. The sharding's
     text names its mesh's axes and sizes but not the order of its devices, and two
-    meshes over the same devices in another order give each process other slices."""
+    meshes over the same devices in another order give each process other slices.
+    Which of this process's devices holds a slice is not part of it: a restore reads
+    each slice by its index, and a process holding the slices another held reads
+    that one's directory (`Checkpoints._recovered`)."""
     def owned(leaf) -> str:
         slices = leaf.sharding.addressable_devices_indices_map(leaf.shape)
-        held = sorted((device.id, tuple((index.start, index.stop) for index in indices))
-                      for device, indices in slices.items())
+        held = sorted({tuple((index.start, index.stop) for index in indices) for indices in slices.values()})
         return f"{leaf.sharding} holding {held}"
 
     leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
@@ -1216,13 +1237,80 @@ class Checkpoints:
 
         Each process keeps one local step, its newest; a resume can read a
         local step only if every process has it, so the processes agree
-        here, and a host that lost its copy or was killed before its write
-        landed sends the whole pool to the persistent checkpoint.
+        here. A host that lost its copy, or was killed before its write of
+        the newest step landed, takes a surviving replica's: the copy of a
+        process holding the same slices of every array (`_recovered`). Where
+        no survivor holds a lost process's slices, the whole pool resumes
+        from the persistent checkpoint.
         """
         if self.local_directory is None:
             return None
         steps = from_every_process(self._open_local().latest_step())
-        return steps[0] if None not in steps and len(set(steps)) == 1 else None
+        newest = max((step for step in steps if step is not None), default=None)
+        if newest is None or (steps.count(newest) < len(steps) and not self._recovered(steps, newest)):
+            return None
+        return newest
+
+    def _recovered(self, steps: list[int | None], step: int) -> bool:
+        """Whether every process that holds no local `step` took a surviving replica's copy of it: a
+        process whose slices of every array another's equal (the step's `replicas`), that one's whole
+        local directory sent to it over the pool's devices (`_received`), as Orbax's emergency
+        checkpointing restores a lost host. Every process agrees on the copies as one plan, read from
+        the first survivor's record of the step."""
+        survivors = [process for process, held in enumerate(steps) if held == step]
+        first = survivors[0]
+        mine = (self._open_local().metadata(step).custom_metadata or {}).get("replicas") \
+            if jax.process_index() == first else None
+        replicas = from_every_process(mine)[first]
+        if not isinstance(replicas, dict):
+            return False
+        donors = {}
+        for process in (process for process, held in enumerate(steps) if held != step):
+            twin = next((survivor for survivor in survivors
+                         if replicas.get(str(survivor)) == replicas.get(str(process))), None)
+            if twin is None or str(process) not in replicas:
+                return False
+            donors[process] = twin
+        if jax.process_index() in donors and self._local_manager is not None:
+            # The manager read this process's directory, which the copy replaces.
+            opened, self._local_manager = self._local_manager, None
+            opened.close()
+        for process, donor in donors.items():
+            self._received(donor, process)
+        return True
+
+    def _received(self, donor: int, recipient: int) -> None:
+        """Send process `donor`'s local directory to process `recipient`, in place of its own: a tar of
+        it broadcast over the pool's devices in chunks of `REPLICA_CHUNK` bytes, which every process
+        takes part in as a collective."""
+        import tarfile
+        import tempfile
+
+        from jax.experimental import multihost_utils
+
+        me, directory = jax.process_index(), epath.Path(self.local_path)
+        with tempfile.TemporaryFile() as archive:
+            if me == donor:
+                with tarfile.open(fileobj=archive, mode="w") as tar:
+                    tar.add(str(directory), arcname=".")
+            size = from_every_process(archive.tell() if me == donor else None)[donor]
+            archive.seek(0)
+            for _ in range(math.ceil(size / REPLICA_CHUNK)):
+                piece = np.zeros(REPLICA_CHUNK, np.uint8)
+                if me == donor:
+                    read = archive.read(REPLICA_CHUNK)
+                    piece[:len(read)] = np.frombuffer(read, np.uint8)
+                sent = np.asarray(multihost_utils.broadcast_one_to_all(piece, is_source=me == donor))
+                if me == recipient:
+                    archive.write(sent.tobytes())
+            if me == recipient:
+                archive.truncate(size)
+                archive.seek(0)
+                if directory.exists():
+                    directory.rmtree()
+                directory.mkdir(parents=True)
+                with tarfile.open(fileobj=archive, mode="r") as tar:
+                    tar.extractall(str(directory), filter="data")
 
     def _complete(self, step: int) -> bool:
         if step in self._committed:
@@ -1589,6 +1677,7 @@ class Checkpoints:
                     **_step_record(deltas, control, rung, artifact, boxed),
                     "processes": jax.process_count(),
                     "placement": written,
+                    "replicas": replicas(state_tree),
                 },
             )
         if _written_in_place(state_tree):

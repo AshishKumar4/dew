@@ -304,7 +304,7 @@ A persistent checkpoint can restore into a different, compatible placement throu
 - One share's own offset, which custom iterators like the one above report, can only be read by a reader of the same share (`DataPartition`), whichever processes those are. Restore refuses any other share and names the shares the checkpoint holds.
 - A checkpoint without a position can change the process count when the tensor layout is compatible.
 
-Local checkpoints hold only the shards each process had, so they restore onto the placement they were written with. See [Training data](../concepts/data.md) for how datasets save their position.
+Local checkpoints hold only the shards each process had, so they restore onto the placement they were written with. A resume reads the newest local step only when every process can. A host that lost its local directory, or was killed before its newest local save landed, takes a surviving process's copy, sent over the pool's devices, if that process held the same slices of every array. That is the case for a data-parallel replica. If no survivor holds a lost host's slices, as when fsdp splits the state across hosts, every process resumes from the persistent checkpoint. See [Training data](../concepts/data.md) for how datasets save their position.
 
 ## Evaluating a run as it trains
 
