@@ -1234,6 +1234,77 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
         assert run() == runs, path
 
 
+def test_a_fixture_reruns_its_readers_alone_though_a_native_reader_reads_it(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A fixture is the input of the files that open it, whatever opens it: a tokenizer's JSON that Rust's
+    `Tokenizer.from_file` reads, which raises no audit event, runs its test again once changed (tests/
+    test_text_data.py reads one so); a fixture no test opens runs none; and an open by a test file's thread
+    after the file has ended joins the record of the file then running, which it can only widen (owner,
+    2026-10-27: one fixture re-recorded reran all 1,300 rows)."""
+    tokenizers = pytest.importorskip("tokenizers")
+
+    def tokenizer(vocabulary: dict[str, int]) -> None:
+        model = tokenizers.models.WordLevel({**vocabulary, "[UNK]": len(vocabulary)}, unk_token="[UNK]")
+        tokenizers.Tokenizer(model).save(str(tmp_path / "tests/fixtures/tok/tokenizer.json"))
+
+    (tmp_path / "tests/fixtures/tok").mkdir(parents=True)
+    tokenizer({"a": 0})
+    for name in ("unread.json", "late.json"):
+        (tmp_path / f"tests/fixtures/{name}").write_text("{}\n")
+    written(tmp_path, {
+        "test_a_native.py": "from pathlib import Path\nfrom tokenizers import Tokenizer\n"
+                            "def test_native():\n"
+                            "    with Path('runs-native').open('a') as runs: runs.write('x')\n"
+                            "    loaded = Tokenizer.from_file('tests/fixtures/tok/tokenizer.json')\n"
+                            "    assert loaded.get_vocab_size()\n",
+        # Its thread opens late.json once the next file has begun (its flag), after this file has ended.
+        "test_b_starter.py": "import threading, time\nfrom pathlib import Path\n"
+                             "def test_starter():\n"
+                             "    with Path('runs-starter').open('a') as runs: runs.write('x')\n"
+                             "    def late():\n"
+                             "        while not Path('flag').exists(): time.sleep(0.01)\n"
+                             "        Path('tests/fixtures/late.json').read_text()\n"
+                             "        Path('opened').touch()\n"
+                             "    threading.Thread(target=late, daemon=True).start()\n",
+        "test_c_later.py": "import time\nfrom pathlib import Path\n"
+                           "def test_later():\n"
+                           "    with Path('runs-later').open('a') as runs: runs.write('x')\n"
+                           "    Path('flag').touch()\n"
+                           "    while not Path('opened').exists(): time.sleep(0.01)\n"
+                           "    Path('flag').unlink(); Path('opened').unlink()\n"})
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+
+    def run() -> list[int]:
+        rows = armada_task(ci, monkeypatch, verdict)
+        assert [row["exitCode"] for row in rows] == [0, 0, 0]
+        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("native", "starter", "later")]
+
+    assert run() == [1, 1, 1]
+    assert run() == [1, 1, 1]
+    tokenizer({"a": 0, "b": 1})
+    assert run() == [2, 1, 1]
+    (tmp_path / "tests/fixtures/unread.json").write_text("[]\n")
+    assert run() == [2, 1, 1]
+    # The late open widened the later file's record: its change runs that file again.
+    (tmp_path / "tests/fixtures/late.json").write_text("[]\n")
+    assert run()[2] == 2
+
+
+def test_a_tree_past_the_watch_limit_keeps_no_row(ci, tmp_path, monkeypatch, cache_worker):
+    """A checkout whose directories under tests/ and src/ outnumber the inotify watches a process may hold
+    (fs.inotify.max_user_watches) records no key, so its rows run every time: a record that saw only some
+    directories' opens would be partial (owner, 2026-10-27)."""
+    limit = int(Path("/proc/sys/fs/inotify/max_user_watches").read_text())
+    for index in range(limit + 1):
+        (tmp_path / "src/many" / f"d{index}").mkdir(parents=True)
+    (tmp_path / "tests/test_kept.py").write_text(
+        "from pathlib import Path\n"
+        "def test_kept():\n"
+        "    with Path('runs').open('a') as runs: runs.write('x')\n")
+    run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
+    assert [run(), run()] == [1, 2]
+
+
 def test_a_pool_change_reruns_no_file_and_the_environments_variables_every_file(
         ci, tmp_path, monkeypatch, cache_worker):
     """.armada.json's pool decides where tasks run, so a change to it reruns no file; a change to the
