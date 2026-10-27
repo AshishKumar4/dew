@@ -8,6 +8,7 @@ float64, is the oracle's to its own float64 rounding (the gate's oracle rule,
 magnitude more.
 """
 
+import dataclasses
 from pathlib import Path
 
 import jax
@@ -75,11 +76,16 @@ def test_every_counts_the_schedules_fields_in_its_own_steps():
                   np.repeat(TORCH["exponential/lr"], 4), "exponential held four updates")
 
 
-def snn_delays_config() -> OptimConfig:
-    """SNN-delays' optimizer at the reference's size, as records only."""
+FLOAT64_MOMENTS = {"mu_dtype": "float64", "nu_dtype": "float64"}
+"""Adam's moments stored in float64, where a run stores them in float32 (`OptimConfig.state_dtype`):
+the same algorithm read in float64 for the oracle rule."""
+
+
+def snn_delays_config(**opts) -> OptimConfig:
+    """SNN-delays' optimizer at the reference's size, as records only; `opts` its optimizer's."""
     rate = OneCycle(peak_value=5e-3, every=PER_EPOCH)
     b1 = OneCycle(peak_value=0.85, init_value=0.95, end_value=0.95, every=PER_EPOCH)
-    return OptimConfig(optimizer="adam", param_groups=(
+    return OptimConfig(optimizer="adam", optimizer_opts=opts, param_groups=(
         ParamGroup("delays", ("delay",), schedule=Cosine(peak_value=0.1, warmup_steps=0, every=PER_EPOCH),
                    bounds=(0.0, 3.0)),
         ParamGroup("weights", ("kernel",), schedule=rate, b1=b1, weight_decay=WEIGHT_DECAY),
@@ -114,7 +120,7 @@ def test_grouped_adam_is_torchs_adam_with_param_groups_a_momentum_cycle_and_a_cl
     with jax.enable_x64(new_val=True):
         initial = {name: jnp.asarray(TORCH[f"initial/{name}"], jnp.float64) for name in NAMES}
         grads = {name: jnp.asarray(TORCH[f"grads/{name}"], jnp.float64) for name in NAMES}
-        solver = snn_delays_config().build(EPOCHS * PER_EPOCH)
+        solver = snn_delays_config(**FLOAT64_MOMENTS).build(EPOCHS * PER_EPOCH)
         trace = run(solver, initial, grads)
         roundings = chain_roundings(jax.make_jaxpr(
             lambda initial, grads: run(solver, initial, grads))(initial, grads))
@@ -138,10 +144,11 @@ def test_a_bounded_group_clamps_its_parameters_and_no_others():
     with jax.enable_x64(new_val=True):
         wide = {name: jnp.asarray(value, jnp.float64) for name, value in params.items()}
         widened = {name: jnp.asarray(value, jnp.float64) for name, value in grads.items()}
+        read = dataclasses.replace(config, optimizer_opts=FLOAT64_MOMENTS).build(1)
 
         def step(params, grads):
-            first = solver.init(params)
-            updates, state = solver.update(grads, first, params)
+            first = read.init(params)
+            updates, state = read.update(grads, first, params)
             return stepped(params, updates, first, state)
         kernel = np.asarray(step(wide, widened)["kernel"])
         roundings = chain_roundings(jax.make_jaxpr(step)(wide, widened))
