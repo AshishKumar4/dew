@@ -20,8 +20,12 @@ read from the op itself (`kind_of`): GEMM, attention, Pallas/Triton, layout (tra
 copies), slicing, gathers and scatters, reductions, elementwise, collectives; both together; GEMMs
 by the time they lose against the device's peak (time - flops / peak); the costliest layout
 moves and ops with framework name and source line, each with its HBM traffic a step (XProf's
-measured HBM bandwidth over the op's time); the device's idle time; with `--entry`, the
-step's model FLOPs over its device time against the peak. Without `--hlo`, a custom call or a
+measured HBM bandwidth over the op's time). Those are XProf's summed self times, which count
+concurrent kernels each: where the time went, not how long the device was busy. The device's
+time is the step program's kernel intervals in the capture's trace (`program_window`): its window,
+busy time (their union), compute, exposed communication, other programs' time in its gaps and
+idle; with `--entry`, the step's model FLOPs over that busy time against the peak, a diagnostic
+beside the canonical MFU over wall time. Without `--hlo`, a custom call or a
 fusion is kinded from its name alone, which cannot tell FlashAttention's call from any other.
 
 Memory, from the dump: the peak's bytes by role (arguments: parameters, optimizer state, inputs;
@@ -38,6 +42,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import html
+import itertools
 import json
 import re
 import resource
@@ -52,6 +57,7 @@ from pathlib import Path
 from dew.nn.kernels.generation import gpu_target
 from dew.telemetry.instrumentation import HloInstruction, collective, custom_call_kind, hlo_instructions
 from dew.telemetry.profile import report_table
+from dew.telemetry.trace import device_events, overlap, program_of, union, window_split
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from trace_window import program_times
@@ -178,6 +184,40 @@ def program_runs(rows: list, step: str, steps: int, ops: dict[str, HloInstructio
     return counts.most_common(1)[0][0] if counts else 0.0
 
 
+def program_window(capture: Path, step: str) -> dict[str, float] | None:
+    """The step program's own device time, in nanoseconds, from the capture's kernel intervals
+    (`dew.telemetry.trace`), averaged over the devices that ran it: the window from its first
+    kernel's start to its last one's end; `busy`, their union, where concurrent kernels count once;
+    its `compute` and the `exposed_communication` compute did not hide; and the window's gaps, split
+    into the time other programs' kernels ran in them (`other_programs`) and the device's own
+    `idle`. A host transfer, which no program launches, counts where it falls in the window. None
+    where the capture holds no accelerator timeline (a CPU's)."""
+    try:
+        planes, _ = device_events(capture)
+    except FileNotFoundError:
+        return None
+    found = []
+    for events in planes.values():
+        mine = [(event.name, event.start_ns, event.end_ns) for event in events if program_of(event) == step]
+        if not mine:
+            continue
+        low, high = min(start for _, start, _ in mine), max(end for _, _, end in mine)
+        inside = [event for event in events if event.start_ns < high and event.end_ns > low]
+        transfers = [(event.name, max(event.start_ns, low), min(event.end_ns, high)) for event in inside
+                     if program_of(event) is None]
+        split = window_split(mine + transfers)
+        covered = union([(start, end) for _, start, end in mine + transfers])
+        gaps = [(end, start) for (_, end), (start, _) in itertools.pairwise(covered)]
+        others = overlap(gaps, union([(max(event.start_ns, low), min(event.end_ns, high)) for event in inside
+                                      if program_of(event) not in (None, step)]))
+        found.append({"window": split["window"], "busy": split["busy"], "compute": split["compute"],
+                      "exposed_communication": split["exposed_communication"], "other_programs": others,
+                      "idle": split["window"] - split["busy"] - others})
+    if not found:
+        return None
+    return {key: sum(each[key] for each in found) / len(found) for key in found[0]}
+
+
 def attribute_time(trace: Path, steps: int, model_flops: float | None,
                    ops: dict[str, HloInstruction] | None = None, device: str | None = None) -> dict:
     capture = capture_of(trace)
@@ -249,10 +289,8 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
                 gemms.append(record)
         if kind == "layout":
             layouts.append(record)
-    device_us = sum(by_kind.values())
-    _, operations = report_table(reports / "framework_op_stats.json")
-    idle_us = sum(float(row["total_self_time"]) for row in operations
-                  if row.get("host_or_device") == "Device" and row.get("type") == "IDLE") / steps
+    timeline = program_window(capture, step)
+    figure = {} if timeline is None else {key: round(ns / steps / 1e6, 3) for key, ns in timeline.items()}
     judged_us = sum(record["us"] for record in gemms)
     judged = sum(record["us"] * record["fraction_of_peak"] for record in gemms)
     result = {
@@ -260,10 +298,13 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         "xprof_peak_gflops": xprof_peak, "step_program": step,
         "programs_ms": {program: round(us / 1e3 / steps, 3)
                         for program, us in sorted(programs.items(), key=lambda item: -item[1])[:6]},
-        # Busy is the kernels' own time, idle the gaps between them: the step's span is their sum.
-        "device_busy_ms_per_step": round(device_us / 1e3, 3),
-        "device_idle_ms_per_step": round(idle_us / 1e3, 3),
-        "device_window_ms_per_step": round((device_us + idle_us) / 1e3, 3),
+        # The step program's device time from its kernel intervals (`program_window`): busy is their
+        # union, the window busy + other programs' time in its gaps + idle. None without an accelerator
+        # timeline. The by-part and by-kind times below are XProf's summed self times, which count
+        # concurrent kernels each: attribution of where time went, not the device's busy time.
+        **{f"device_{key}_ms_per_step": figure.get(key) for key in (
+            "window", "busy", "compute", "exposed_communication", "other_programs", "idle")},
+        "op_self_time_ms_per_step": round(sum(by_kind.values()) / 1e3, 3),
         "by_part_ms": {part: {direction: round(us / 1e3, 3) for direction, us in directions.items()}
                        for part, directions in heaviest(by_part)},
         "by_kind_ms": ms(by_kind),
@@ -276,18 +317,22 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         "xprof_steps": report_table(reports / "input_pipeline_analyzer.json", 1)[1][:8],
     }
     if model_flops:
-        # Utilization names its precision and denominator. mfu_bf16: model FLOPs over the bf16 peak,
-        # which is utilization only when every GEMM is bf16 and otherwise a bf16-equivalent
-        # throughput. mfu_mixed: each GEMM's FLOPs over its own precision's peak, the true
-        # utilization, null where an FP8 GEMM runs on a device with no FP8 peak in Dew's table.
-        seconds = device_us * 1e-6
+        # Utilization of the step's busy device time, the union of its kernels (`program_window`), a
+        # diagnostic beside the canonical MFU over wall time (docs/design/training.md), none without an
+        # accelerator timeline. It names its precision: mfu_bf16, model FLOPs over the bf16 peak, which
+        # is utilization only when every GEMM is bf16 and otherwise a bf16-equivalent throughput;
+        # mfu_mixed, each GEMM's FLOPs over its own precision's peak, the true utilization, null where
+        # an FP8 GEMM runs on a device with no FP8 peak in Dew's table.
+        seconds = figure["busy"] * 1e-3 if figure else None
         fp8 = fp8_gflop * 1e9
+        throughput = round(model_flops / seconds / 1e12, 2) if seconds else None
         result.update(model_flops_per_step=model_flops, fp8_gemm_flops_per_step=fp8,
-                      bf16_equiv_throughput_tflops=round(model_flops / seconds / 1e12, 2))
-        result["mfu_bf16_of_device_time"] = round(model_flops / seconds / (peak * 1e9), 4) if peak else None
-        if peak and not fp8:
+                      bf16_equiv_throughput_tflops=throughput)
+        result["mfu_bf16_of_device_time"] = (
+            round(model_flops / seconds / (peak * 1e9), 4) if peak and seconds else None)
+        if seconds and peak and not fp8:
             result["mfu_mixed_of_device_time"] = result["mfu_bf16_of_device_time"]
-        elif peak and fp8_peak and fp8 <= model_flops:
+        elif seconds and peak and fp8_peak and fp8 <= model_flops:
             share = ((model_flops - fp8) / (peak * 1e9) + fp8 / (fp8_peak * 1e9)) / seconds
             result["mfu_mixed_of_device_time"] = round(share, 4)
         else:
@@ -475,7 +520,8 @@ def main(argv: list[str] | None = None) -> int:
     time = result.get("time", {})
     if "by_part_ms" in time:
         print(f"time: {time['device_window_ms_per_step']} ms a step on the device = "
-              f"{time['device_busy_ms_per_step']} busy + {time['device_idle_ms_per_step']} idle, "
+              f"{time['device_busy_ms_per_step']} busy + {time['device_other_programs_ms_per_step']} other "
+              f"programs + {time['device_idle_ms_per_step']} idle, "
               f"GEMMs at {time['gemm_fraction_of_peak']} of peak, {time['gemm_lost_ms']} ms lost to it, "
               f"MFU of device time: bf16 {time.get('mfu_bf16_of_device_time')}, "
               f"mixed {time.get('mfu_mixed_of_device_time')}")

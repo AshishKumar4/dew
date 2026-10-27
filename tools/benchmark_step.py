@@ -72,6 +72,7 @@ from dew.pool import joins_pool, pool_cluster
 from dew.registry import models
 from dew.telemetry.benchmark import carried
 from dew.telemetry.instrumentation import COLLECTIVES, model_flops_utilization
+from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.telemetry.profile import capture_options
 from dew.training import Trainer
 from dew.training.memory import recompute_record
@@ -89,7 +90,7 @@ from benchmark_cases import (
     small_cases,
 )
 from benchmark_models import build_trainer, compiled_step, global_batch, timed_steps, trainer_mesh
-from trace_window import communication_totals, device_events, kernel_category, kernel_totals, window_split
+from trace_window import kernel_category, kernel_totals
 
 Row = dict[str, object]
 
@@ -299,7 +300,7 @@ def device_timeline(directory: str, steps: int, *, planes=None) -> dict[str, Any
 
 
 def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
-    """Each device's traced window split by `trace_window.window_split` into
+    """Each device's traced window split by `dew.telemetry.trace.window_split` into
     compute, every collective, the communication no compute kernel
     overlapped, and idle time ended by a host-to-device copy (input) or by
     anything else (host), averaged over the devices.
