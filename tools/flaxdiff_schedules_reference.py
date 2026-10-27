@@ -15,10 +15,12 @@ times from 0 to 1, with the conditioning also at CONDITIONED random times.
 
 `python tools/flaxdiff_schedules_reference.py seeds OUTPUT.npz` records each
 site over the seeds check 1 declares (`record_case`): FlaxDiff's float32
-outputs and their float64 truth, FlaxDiff's own program run on the inputs
-widened, where it computes in its inputs' dtype (the continuous cosine, the
-tangent grid and its weights), and the same formulas in float64 on FlaxDiff's
-own float64 betas where it fixes float32 (a beta table's rates and P2 weights).
+outputs and their float64 truth. The truth is FlaxDiff's own program run on
+the inputs widened where it computes in its inputs' dtype (the continuous
+cosine, the tangent grid), its weight's function 1 + sigma^2 / sigma_max^2 on
+that grid (FlaxDiff's expression for it cancels as sigma grows, in float64
+too), and the same formulas in float64 on FlaxDiff's own float64 betas where
+it fixes float32 (a beta table's rates and P2 weights).
 
 Cases:
 - `exp/default`: 1000 steps at the default beta_end and P2 weights;
@@ -163,13 +165,20 @@ def seeds(destination: Path) -> None:
     for case, arguments in GENERAL.items():
         general = modules["cosine"].CosineGeneralNoiseScheduler(**arguments)
 
-        def grid(steps, general=general):
-            return {"sigma": general.get_sigmas(steps),
-                    "weight": general.get_schedule_weights(steps, shape=(-1,))}
+        def grid(inputs, general=general):
+            """FlaxDiff's float32 sigmas and weights at a draw's times, and their float64 truth: its grid
+            in float64, and its weight's function there, 1 + sigma^2 / sigma_max^2, without the
+            cancellation its own expression has (1 / (1 + (1 - sigma^2) / sigma^2) for sigma^2)."""
+            steps = jnp.asarray(inputs["t"])
+            reference = {"sigma": np.asarray(general.get_sigmas(steps)),
+                         "weight": np.asarray(general.get_schedule_weights(steps, shape=(-1,)))}
+            with jax.enable_x64(new_val=True):
+                sigma = np.asarray(general.get_sigmas(jnp.asarray(inputs["t"].astype(np.float64))))
+            return reference, {"sigma": sigma, "weight": 1 + sigma ** 2 / general.sigma_max ** 2}
 
         # The evidence alone, over draws the test makes again (`flaxdiff_times`), as their outputs would
         # take megabytes.
-        arrays.update(record_case(case, flaxdiff_times, evaluated(grid), store_inputs=False, summary=True))
+        arrays.update(record_case(case, flaxdiff_times, grid, store_inputs=False, summary=True))
     save(destination, {**arrays, "provenance": provenance(
         REPO, COMMIT, "cpu", f"python tools/flaxdiff_schedules_reference.py seeds {destination}")},
         reference=f"{REPO} {COMMIT}", license="MIT")

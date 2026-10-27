@@ -637,7 +637,8 @@ FLAXDIFF_GRIDS = ["cosine_general/default", "cosine_general/bounded", "cosine_ge
 def test_the_tangent_grid_is_flaxdiffs_with_its_weight_and_conditioning(case):
     """FlaxDiff's tangent grid of sigmas, from sigma_min / kappa^2 as its divides the tangent by kappa
     again, at its own bounds and at others: the sigmas and the weight of its `GeneralizedNoiseScheduler`,
-    1 + sigma^2 / sigma_max^2, each on par with FlaxDiff's; alpha exactly 1; and the model conditioned
+    1 + sigma^2 / sigma_max^2, each on par with FlaxDiff's against that function's float64 value (its
+    own expression cancels as sigma grows, Dew's does not); alpha exactly 1; and the model conditioned
     on FlaxDiff's whole thousandths of t, exactly its own at 33 times and 4096 drawn, the same
     float32 product truncated as its int32 cast truncates it."""
     schedule = CosineGeneralNoiseScheduler(**flaxdiff_case(case))
