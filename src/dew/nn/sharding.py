@@ -284,7 +284,8 @@ def split_positions(x: jax.Array, head_shape: tuple[int, int],
     unchanged. A cross-attention's context (SD's 77 text tokens) is the input
     this serves; its weight-gradient sum usually outweighs the saved
     projection, so a GPU's link rarely pays (an H100 would need 2.47 TB/s at
-    SDXL's widths), while a CPU mesh splits it."""
+    SDXL's widths); a CPU's devices measure no link and keep the context whole
+    unless the run states one (`Trainer(links=...)`)."""
     shards = sequence_shards()
     length = x.shape[1]
     if shards == 1 or length % shards == 0:

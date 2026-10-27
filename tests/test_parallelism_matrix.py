@@ -8,8 +8,7 @@ distance from fp64), and holds the layout's FLOPs to an even split. Each cell
 states what it does: it works, or it is refused by design for the reason
 REFUSED gives. A supported cell that refuses fails, and so does a refused
 cell that runs, so a refusal is never read as a pass and a lifted one is
-never left unclaimed. A model's layouts are one test, sharing its reference,
-and CI spreads the models over its tasks. The models are the
+never left unclaimed. The models are the
 tool's zoo, sized so every layout divides them. Each row lists the layouts that
 split its model in a way no other row covers: a pair's second axis, a packed or
 masked column under a sequence split, a bidirectional exchange, a vision tower
@@ -67,22 +66,36 @@ REFUSED: dict[tuple[str, str], str] = {
 """The cells refused by design, each with its reason."""
 
 
-@pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layouts", "devices"), [
-    *(pytest.param(model, layouts, None, id=model) for model, layouts in sorted(CELLS.items())),
-    *(pytest.param(model, layouts, 4, id=f"{model}-on-four")
-      for model, layouts in sorted(CELLS_ON_FOUR.items()))])
-def test_each_layout_of_a_model_matches_one_device_or_is_refused_as_stated(model, layouts, devices):
-    """A model's layouts are one test, which computes its one-device reference, floors and fp64 anchor
-    once for all of them (`layout_parity.run`), each layout starting from the very state the reference
-    does (`_initial`) and judged against it inside the tool's run, which gives the cell its status."""
+@pytest.fixture(scope="session")
+def references(tmp_path_factory):
+    """Each model's one-device reference and fp64 anchor, computed by its
+    first layout's test and read by the rest that run in this process: a
+    cell is a test of its own, so CI spreads a model's layouts over tasks
+    rather than running them all in one. Its tool module is the one each
+    test runs: the one-device state the references hold (`_initial`) lives
+    in that module, so each layout starts from that state itself rather than
+    a draw of its own, and its stepped state is judged against the reference
+    inside the tool's run, which gives the cell its status, never bit for bit
+    across layouts."""
     tool = load("layout_parity")
+    return tool, tool.References(directory=tmp_path_factory.mktemp("layout-references"), prepare=True)
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize(("model", "layout", "devices"), [
+    *(pytest.param(model, layout, None, id=f"{model}-{layout}")
+      for model, layouts in sorted(CELLS.items()) for layout in layouts),
+    *(pytest.param(model, layout, 4, id=f"{model}-{layout}-on-four")
+      for model, layouts in sorted(CELLS_ON_FOUR.items()) for layout in layouts)])
+def test_each_layout_of_a_model_matches_one_device_or_is_refused_as_stated(model, layout, devices,
+                                                                           references):
+    tool, held = references
     with jax.enable_x64(new_val=True):
-        rows = tool.run([model], layouts, dtype="float32", steps=1, anchor=True, mixture={}, objective={},
-                        references=tool.References(), speak=lambda line: None, keep=lambda rows: None,
-                        devices=devices)
-    stated = ["refused" if (model, layout) in REFUSED else "works" for layout in layouts]
-    assert [row["status"] for row in rows] == stated, [
+        rows = tool.run([model], (layout,), dtype="float32", steps=1, anchor=True, mixture={},
+                        objective={}, references=held, speak=lambda line: None,
+                        keep=lambda rows: None, devices=devices)
+    stated = "refused" if (model, layout) in REFUSED else "works"
+    assert [row["status"] for row in rows] == [stated], [
         {key: row.get(key) for key in ("layout", "status", "worst_leaf", "worst_ratio", "loss_error",
                                        "loss_bound", "flops_ratio", "reason", "error")}
         for row in rows]

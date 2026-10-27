@@ -11,6 +11,7 @@ call takes is the model's choice (`CausalTransformer.stack`).
 
 import dataclasses
 import functools
+import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple
 
@@ -534,14 +535,24 @@ class PipelineStage(nn.Module):
     groups: tuple[tuple[int, int], ...]
     offset: int = 0
 
+    @nn.nowrap
+    def _block(self, index: int, name: str):
+        """The stack's block for this stage's layer `index`, the stored layer `offset + index`."""
+        return self.block(self.offset + index, name)
+
     def setup(self):
-        self.layers = [self.block(self.offset + index, f'layers_{index}') for index in range(len(self.specs))]
+        self.layers = [self._block(index, f'layers_{index}') for index in range(len(self.specs))]
 
     @nn.compact
     def __call__(self, x, train: bool = False, per_layer_input=None, attention_metadata=None):
-        return run_stack(self.layers, self.block, self.specs, self.groups, x,
+        # Singleton layers and scanned runs alike are built from this stage's own indices.
+        return run_stack(self.layers, self._block, self.specs, self.groups, x,
                          train=train, decode=False, kv_store=None,
                          per_layer_input=per_layer_input, attention_metadata=attention_metadata)
+
+
+_LAYER_NAME = re.compile(r"layers_\d+")
+"""A stored layer's name, `layers_{index}`."""
 
 
 def stack_layers(*trees):
@@ -675,6 +686,11 @@ class StackView:
                     stages[name] = jax.tree.map(_on_stage_axis, stack_layers(*runs))
             if stages:
                 tree['stages'] = stages
+            if self.stages > 1:
+                # The layers a pipeline runs outside its stages (`StageSplit`) run beside it, so their
+                # entries, a prefix's sown statistics among them, stay out of the stages' scan; the
+                # entries the stages write merge back beside them.
+                tree = {name: value for name, value in tree.items() if not _LAYER_NAME.fullmatch(name)}
             inside[collection] = tree
         return inside
 
