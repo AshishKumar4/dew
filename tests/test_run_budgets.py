@@ -5,6 +5,7 @@ import collections
 import dataclasses
 import itertools
 
+import grain.python as grain
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -180,7 +181,7 @@ def test_an_examples_budget_counts_examples_before_the_objective_expands_them(ex
         [passes + 1] * rest + [passes] * (RECORDS - rest) if passes else [1] * rest)
 
 
-class Evens:
+class Evens(grain.MapTransform):
     """An objective's filter of the odd records, which it states it drops (`rejects`)."""
 
     rejects = True
