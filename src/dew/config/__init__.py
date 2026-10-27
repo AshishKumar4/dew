@@ -1325,7 +1325,8 @@ class RunConfig:
         profiled.prepare().train(name)
         if jax.process_index() != 0:
             return None
-        report = ProfileReport.read(Path(directory), name, Path(window), warmup=warmup, steps=steps)
+        report = ProfileReport.read(Path(directory), name, Path(window), warmup=warmup, steps=steps,
+                                    devices=jax.local_device_count())
         Path(directory, "report.json").write_text(json.dumps(dataclasses.asdict(report), indent=2) + "\n")
         return report
 

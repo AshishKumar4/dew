@@ -41,11 +41,11 @@ def capture(out: Path) -> dict:
     """One variant, in this process: warm the step, time it, capture it."""
     import jax
     import jax.numpy as jnp
+    from trace_window import busy_time, device_events
 
     import dew
     from dew.telemetry.benchmark import samples
     from dew.telemetry.profile import attributed_ops
-    from dew.telemetry.timeline import busy_time, device_events
 
     def layers(x, weights):
         return jax.lax.scan(lambda h, w: (jnp.tanh(h @ w), None), x, weights)[0]

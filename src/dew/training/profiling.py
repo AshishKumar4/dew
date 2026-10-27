@@ -10,7 +10,6 @@ import dataclasses
 import gzip
 import json
 import sys
-from collections.abc import Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -152,32 +151,14 @@ def traced_steps(capture: Path) -> tuple[int, ...]:
     return tuple(sorted(steps))
 
 
-def device_time(devices: Sequence[Sequence[tuple[str, int, int]]], *, steps: int,
-                step_ms: float) -> dict[str, float]:
-    """A traced window's device time per step and device, in milliseconds, from each device's kernels
-    (`(name, start_ns, end_ns)`): `compute` and `communication` the unions of its compute and its NCCL
-    kernels, `exposed_communication` the communication no compute ran beside
-    (`dew.telemetry.timeline.window_split`), so time two kernels overlap counts once, and `device_idle`
-    the rest of the step's `step_ms` of wall time, which no kernel ran in: dispatch, host work and the
-    device's wait on its input."""
-    from dew.telemetry.timeline import window_totals
-
-    totals = window_totals(devices)
-    scale = 1e-6 / steps / len(devices)
-    busy = (totals["compute"] + totals["exposed_communication"]) * scale
-    return {"compute_ms": totals["compute"] * scale, "communication_ms": totals["communication"] * scale,
-            "exposed_communication_ms": totals["exposed_communication"] * scale,
-            "device_idle_ms": step_ms - busy}
-
-
 @dataclasses.dataclass(frozen=True)
 class ProfileReport:
     """Where the steps of a run's profile window spent their time (`dew.config.RunConfig.profile`): the
-    window's own log, `Trainer.fit`'s scalars over exactly the steps its capture traced (`traced`), and the
-    device time its devices' kernels took, overlapping kernels counted once (`device_time`). Each figure
-    is per step, and the device's per device; None where the run reports none: no analytic work for its
-    model (`Objective.training_flops`, never the compiled program's count), no device peak to rate it
-    against, or no device kernels in the capture, a CPU's (`attribution` says why). The window holds no
+    window's own log, `Trainer.fit`'s scalars over exactly the steps its capture traced (`traced`), and
+    the device time XProf's hlo_stats attributes to the capture's ops, collectives apart from the rest.
+    Each figure is per step; None where the run reports none: no analytic work for its model
+    (`Objective.training_flops`, never the compiled program's count), no device peak to rate it
+    against, or no op the capture attributes time to (`attribution` says why). The window holds no
     checkpoint, validation or log read but its own, so their time is outside every figure here.
     `directory` is the profile's, its `report.json` beside the run."""
 
@@ -189,10 +170,8 @@ class ProfileReport:
     step_ms: float
     input_wait_ms: float
     compile_s: float | None
-    compute_ms: float | None
+    device_ms: float | None
     communication_ms: float | None
-    exposed_communication_ms: float | None
-    device_idle_ms: float | None
     flops: float | None
     mfu: float | None
     hfu: float | None
@@ -200,14 +179,14 @@ class ProfileReport:
     attribution: str | None
 
     @classmethod
-    def read(cls, directory: Path, name: str, window: Path, *, warmup: int, steps: int) -> "ProfileReport":
+    def read(cls, directory: Path, name: str, window: Path, *, warmup: int, steps: int,
+             devices: int) -> "ProfileReport":
         """The report of the window of `steps` steps after `warmup` that the run `name` under `directory`
-        traced into `window`, this process's newest capture's, its device time read off each local device's
-        kernels (`dew.telemetry.timeline.device_events`). The run logged its steps once at the window's end,
-        so that log's scalars are the steps the capture's annotations hold (`traced_steps`), or the report
-        is refused."""
-        from dew.telemetry.profile import process_directory
-        from dew.telemetry.timeline import device_events
+        traced into `window`, this process's newest capture's, over `devices` local devices. The run
+        logged its steps once at the window's end, so that log's scalars are the steps the capture's
+        annotations hold (`traced_steps`), or the report is refused."""
+        from dew.telemetry.instrumentation import collective, reported_instruction
+        from dew.telemetry.profile import process_directory, report_table
 
         capture = max(process_directory(window).glob("capture-*"), key=lambda path: path.stat().st_mtime)
         traced = traced_steps(capture)
@@ -221,18 +200,22 @@ class ProfileReport:
         records = (run / "tracking" / "records.jsonl").read_text().splitlines()
         compiles = [entry["value"]["seconds"] for entry in map(json.loads, records)
                     if entry["type"] == "StepCompiled"]
-        planes, _ = device_events(capture)
-        kernels = [[(event.name, event.start_ns, event.end_ns) for event in events]
-                   for events in planes.values()]
-        unknown = dict.fromkeys(("compute_ms", "communication_ms", "exposed_communication_ms",
-                                 "device_idle_ms"))
-        step_ms = logged["train/step_time_ms"]
-        device = device_time(kernels, steps=steps, step_ms=step_ms) if kernels else unknown
-        return cls(str(directory), steps, warmup, traced, str(capture), step_ms, logged["train/data_wait_ms"],
-                   compiles[0] if compiles else None, **device,
-                   flops=logged.get("train/flops"), mfu=logged.get("train/mfu"), hfu=logged.get("train/hfu"),
-                   tokens_per_s=logged.get("train/tokens_per_s"),
-                   attribution=None if kernels else "the capture holds no GPU or TPU kernels to attribute")
+        _, rows = report_table(capture / "reports" / "hlo_stats.json")
+        ops = [row for row in rows if not str(row.get("hlo_op_name") or "").startswith("XlaModule")]
+        # Why no op holds time, where the export could tell (`dew.telemetry.profile.COMMAND_BUFFERS`).
+        manifest = json.loads((capture / "manifest.json").read_text())
+        unattributed = manifest.get("op_attribution") or "XProf's hlo_stats names no op of this backend's"
+
+        def per_step(chosen: list) -> float:
+            return sum(float(str(row["total_self_time"])) for row in chosen) / 1000 / steps / devices
+
+        instructions = [(row, reported_instruction(str(row.get("hlo_op_expression") or ""))) for row in ops]
+        communication = [row for row, op in instructions if op is not None and collective(op.op) is not None]
+        return cls(str(directory), steps, warmup, traced, str(capture), logged["train/step_time_ms"],
+                   logged["train/data_wait_ms"], compiles[0] if compiles else None,
+                   per_step(ops) if ops else None, per_step(communication) if ops else None,
+                   logged.get("train/flops"), logged.get("train/mfu"), logged.get("train/hfu"),
+                   logged.get("train/tokens_per_s"), None if ops else unattributed)
 
     def text(self) -> str:
         """The report as lines a person reads, the largest share of a step named last."""
@@ -240,19 +223,16 @@ class ProfileReport:
                  f"this report in {self.directory}/report.json",
                  f"  step          {self.step_ms:10.2f} ms  wall clock a step",
                  f"  input wait    {self.input_wait_ms:10.2f} ms  the loop waiting on its next batch"]
-        shares: dict[str, float] = {}
-        if (self.compute_ms is None or self.communication_ms is None or self.exposed_communication_ms is None
-                or self.device_idle_ms is None):
+        shares = {"input wait": self.input_wait_ms}
+        if self.device_ms is None or self.communication_ms is None:
             lines.append(f"  device        unattributed: {self.attribution}")
         else:
-            # The step's partition: compute, the communication it hid nothing of, and the rest.
-            shares = {"compute": self.compute_ms, "exposed communication": self.exposed_communication_ms,
-                      "device idle": self.device_idle_ms}
-            lines += [f"  compute       {self.compute_ms:10.2f} ms  device time in compute kernels",
-                      f"  communication {self.communication_ms:10.2f} ms  device time in collectives, "
-                      f"{self.exposed_communication_ms:.2f} ms of it beside no compute",
-                      f"  device idle   {self.device_idle_ms:10.2f} ms  the rest of the step: dispatch, host "
-                      "work and input"]
+            compute = self.device_ms - self.communication_ms
+            idle = max(self.step_ms - self.device_ms - self.input_wait_ms, 0.0)
+            shares.update({"compute": compute, "communication": self.communication_ms, "device idle": idle})
+            lines += [f"  compute       {compute:10.2f} ms  device time outside collectives",
+                      f"  communication {self.communication_ms:10.2f} ms  device time in collectives",
+                      f"  device idle   {idle:10.2f} ms  the rest of the step: dispatch and host work"]
         if self.compile_s is not None:
             lines.append(f"  compile       {self.compile_s:10.2f} s   the step's first compile, in warmup")
         if self.flops is None:
@@ -265,8 +245,6 @@ class ProfileReport:
         if self.tokens_per_s is not None:
             lines.append(f"  tokens        {self.tokens_per_s:10.1f} real tokens a second")
         lines.append("  checkpoints, validation and logging: none inside the window")
-        if shares:
-            largest = max(shares, key=shares.__getitem__)
-            share = 100 * shares[largest] / self.step_ms
-            lines.append(f"The largest share of a step: {largest}, {share:.0f}%.")
+        largest = max(shares, key=shares.__getitem__)
+        lines.append(f"The largest share of a step: {largest}, {100 * shares[largest] / self.step_ms:.0f}%.")
         return "\n".join(lines)

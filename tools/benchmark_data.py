@@ -631,9 +631,9 @@ def training_measure(factory, objective, config: Worker) -> dict:
 
 def device_idle(directory: str) -> dict[str, float]:
     """The share of the traced steps' device window no kernel ran in, from the accelerator's own
-    timeline (`dew.telemetry.timeline.window_split`, summed over its devices), and the part of it a batch's
+    timeline (`trace_window.window_split`, summed over its devices), and the part of it a batch's
     host-to-device copy ended, the device waiting for data."""
-    from dew.telemetry.timeline import device_events, window_totals
+    from trace_window import device_events, window_totals
 
     planes, _ = device_events(directory)
     if not planes:

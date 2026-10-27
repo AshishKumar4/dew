@@ -128,7 +128,7 @@ def kernel_kind(name: str, launch: str, phase: str) -> tuple[str, str]:
 def attribute(path: Path, steps: int, intermediate: int) -> dict:
     """Join device kernels to host launches and keep the evidence for every name."""
     from common import chrome_trace_kernels, kernel_summary
-    from trace_window import library
+    from trace_window import window_split
 
     events = json.loads(path.read_text())["traceEvents"]
     cpu = {str(e["args"]["External id"]): e for e in events
@@ -181,8 +181,7 @@ def attribute(path: Path, steps: int, intermediate: int) -> dict:
         raise RuntimeError("CUDA profile contains no device kernels")
     if len({device for *_, device in kernels}) != 1:
         raise RuntimeError("the reference requires exactly one profiled device")
-    timeline = library("telemetry/timeline.py")
-    split = timeline.window_split([(name, start, end) for name, start, end, _ in kernels])
+    split = window_split([(name, start, end) for name, start, end, _ in kernels])
     scale = 1e-6 / steps
     return {"capture": str(path), "steps": steps, "step_program": "torch.compile",
             "device_busy_ms_per_step": split["busy"] * scale,
