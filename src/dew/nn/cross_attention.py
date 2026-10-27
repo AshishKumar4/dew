@@ -254,6 +254,11 @@ class GatedCrossAttention(nn.Module):
                            key_value_seq_lengths=jnp.maximum(lengths, 1), cached=decode,
                            cache_dtype=x.dtype if self.dtype is None else self.dtype, **documents)
         present = (lengths > 0).reshape((-1,) + (1,) * (stream.ndim - 1))
+        if context is not None and context.segments is not None and context.queries is not None:
+            # A token whose document holds no context reads none, as its row alone would skip the block.
+            keys = context.segments[:, None, :]
+            owned = (context.queries[:, :, None] == keys) & (keys > 0)
+            present = jnp.any(owned, axis=-1).reshape(owned.shape[:2] + (1,) * (stream.ndim - 2))
         dropout = Dropout(rate=self.dropout_rate)
 
         def joined(stream: jax.Array, name: str, branch: jax.Array) -> jax.Array:
