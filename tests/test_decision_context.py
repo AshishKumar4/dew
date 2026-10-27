@@ -145,17 +145,18 @@ def windows_of(objective: DecisionObjective, rows, count: int = 6) -> list[dict]
         DecisionObjective.bounds = held
 
 
-@pytest.mark.parametrize("grouped", [False, True], ids=["rows", "unit"])
+@pytest.mark.parametrize("grouped", ["rows", "unit", "unit beside rows"])
 def test_rows_that_carry_a_context_pack_several_a_window_each_beside_its_own(grouped):
     """Rows that carry a context pack several a window as rows without one do, each row's context
     laid end to end along the context in the order the rows stand and numbered as `segments` numbers
     its row (`context_segments`, 0 for padding), a row with no context holding none: every row's
-    context is its own example's, under a layout of a row an example and under a unit of rows that
-    train together (row 1885)."""
+    context is its own example's, under a layout of a row an example, under a unit of rows that
+    train together, and under a run of consistency whose ungrouped examples stand in rows of their own
+    beside its units (row 1885; the last crashed where a lone row had no `context_row`)."""
     from dew.decision import Group, GroupedExamples
 
     objective = conditioned()
-    if grouped:
+    if grouped != "rows":
         objective = DecisionObjective(objective.model.backbone, tokenizer=ByteTokenizer(), specials=SPECIALS,
                                       context_encoder="table", consistency=0.5)
         pairs = [(examples()[index], examples()[index + 1]) for index in range(0, 12, 2)]
@@ -163,6 +164,10 @@ def test_rows_that_carry_a_context_pack_several_a_window_each_beside_its_own(gro
                                                                                   "abc"}
                                                              for member in range(2)}),)) for pair in pairs]
         owned = [example for pair in pairs for example in pair]
+        if grouped == "unit beside rows":
+            # Examples of no group, each a row of its own beside the units.
+            alone = examples()[12:18]
+            rows, owned = [item for pair in zip(rows, alone, strict=True) for item in pair], owned + alone
     else:
         rows = owned = examples()
     notes = {text: note for text, _, note in ROWS}
