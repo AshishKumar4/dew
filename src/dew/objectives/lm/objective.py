@@ -661,9 +661,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         scored = self._scored(np, tokens, fields, self._batch_roles(batch, np), depth)
         return np.sum(scored, axis=-1, dtype=np.int64)
 
-    @property
-    def bank_sites(self) -> tuple[DecoderBank, ...]:
-        return self.model.bank_sites
+    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
+        return self.model.bank_sites(store)
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
