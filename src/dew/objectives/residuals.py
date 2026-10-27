@@ -15,16 +15,15 @@ gradient is the damped step of its whole batch, which `optax.sgd(1.0)` takes who
 composes with. A window of microbatches recomputes each microbatch's Jacobian under the pooled reduction,
 as the trainer replays any statistics it pools by summing.
 
-Where the update's residuals are at least its parameters, the statistics are the normal equations,
-J^T J of each microbatch's rows (`NormalEquations`), the parameters' square; where they are fewer, the
-dual, J^T (J J^T + damping I)^-1 r, the same step: each microbatch places its rows of J and r at its
-examples' places among the update's (`RowEquations`, `Step.example_index`), so their sum is the update's
-whole J and r, the residuals by the parameters. Either is formed in the parameters' dtype on each
-device, so the step fits a model whose smaller side squared fits there: a PINN's, not a language
-model's. A float64 run (x64 set for the process,
-`jax.config.update("jax_enable_x64", True)`, which its data's worker threads read too, and float64
-parameters) solves in float64, where Gauss-Newton reaches residuals near float64's roundoff that
-first-order steps do not.
+Where a microbatch's residuals are at least the parameters, the statistics are its normal equations,
+J^T J of its rows (`NormalEquations`), the parameters' square. Where they are fewer, the step is the
+dual's, J^T (J J^T + damping I)^-1 r, the same step from the rows' Gram matrix (`RowEquations`), which
+an update read in one microbatch takes; an update pooled from several is refused there, its Gram matrix
+no sum of its microbatches'. Either is formed in the parameters' dtype on each device, so the step fits
+a model whose smaller side squared fits there: a PINN's, not a language model's. A float64 run (x64 set
+for the process, `jax.config.update("jax_enable_x64", True)`, which its data's worker threads read too,
+and float64 parameters) solves in float64, where Gauss-Newton reaches residuals near float64's roundoff
+that first-order steps do not.
 """
 
 from __future__ import annotations
@@ -95,9 +94,8 @@ _solved.defvjp(_solved_fwd, _solved_bwd)
 
 @struct.dataclass
 class RowEquations:
-    """A microbatch's dual Gauss-Newton statistics, each pooling by adding: the squared residuals'
-    `total` and the rows' `mass`, and its rows of the update's `jacobian` and `residual`, zero at every
-    other example's place, so their sum is the update's whole J and r (`_rows`)."""
+    """An update's dual Gauss-Newton statistics, read in one microbatch: the squared residuals' `total`
+    and the rows' `mass`, and the residuals' `jacobian` and `residual` (`_rows`)."""
 
     total: jax.Array
     mass: jax.Array
@@ -107,8 +105,8 @@ class RowEquations:
 
 @jax.custom_vjp
 def _rows(params: Variables, jacobian: jax.Array, residual: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`jacobian` and `residual`, whose pullback takes a residual's cotangent c to the parameters'
-    J^T c, the placed rows' alone, in their tree."""
+    """`jacobian` and `residual`, whose pullback takes a residual's cotangent c to the parameters' J^T c,
+    in their tree."""
     return jacobian, residual
 
 
@@ -166,18 +164,18 @@ class Residuals(Objective[Ratio | NormalEquations | RowEquations]):
             return stats
         total, mass = jax.lax.stop_gradient(stats.total), jax.lax.stop_gradient(stats.mass)
         jacobian, residual = self._linearized(variables, batch, step)
-        rows, size = residuals.shape[0], jacobian.shape[1]
-        per_row = jacobian.shape[0] // rows
-        update = (rows if step.example_count is None else step.example_count) * per_row
-        if size <= update:
+        if jacobian.shape[1] <= jacobian.shape[0]:
             normal = float32_einsum("rp,rq->pq", jacobian, jacobian)
             pulled = float32_einsum("rp,r->p", jacobian, residual)
             return NormalEquations(total, mass, _normal(variables["params"], normal, pulled))
-        # Each row's residuals at its example's place among the update's.
-        places = (step.examples(rows)[:, None] * per_row + jnp.arange(per_row)).reshape(-1)
-        placed_jacobian = jnp.zeros((update, size), jacobian.dtype).at[places].set(jacobian)
-        placed_residual = jnp.zeros((update,), residual.dtype).at[places].set(residual)
-        return RowEquations(total, mass, *_rows(variables["params"], placed_jacobian, placed_residual))
+        rows = residuals.shape[0]
+        if step.example_count is not None and step.example_count != rows:
+            raise ValueError(
+                f"the dual Gauss-Newton step of {jacobian.shape[1]} parameters over {jacobian.shape[0]} "
+                f"residuals solves its rows' Gram matrix, which an update of {step.example_count} examples "
+                f"read in microbatches of {rows} does not sum to; read each update in one microbatch, or "
+                "microbatches of at least as many residuals as parameters, whose normal equations pool")
+        return RowEquations(total, mass, *_rows(variables["params"], jacobian, residual))
 
     def reduce_loss(self, stats: Ratio | NormalEquations | RowEquations) -> tuple[jax.Array, jax.Array]:
         """The mean squared residual; under Gauss-Newton its derivative in the pooled system is the damped

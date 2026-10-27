@@ -151,46 +151,60 @@ def test_a_damped_gauss_newton_step_is_the_normal_equations_solve(rows, features
                     truth_fn=exact)
 
 
-@pytest.mark.parametrize("rows,features", [(64, 8), (16, 64)], ids=["primal", "dual"])
-def test_an_accumulated_gauss_newton_update_solves_its_whole_batch_once(rows, features):
+def gauss_newton_arm(rows: int, features: int, accumulation: int):
+    """One update of a least-squares objective of damping 1e-3, from zero weights, of a draw's `rows`
+    rows read in `accumulation` microbatches of an accumulation window: its weights after it."""
+    trainer = Trainer(LeastSquares(features, damping=1e-3), optax.sgd(1.0), key=0, layout=LAYOUT,
+                      accumulation=accumulation)
+    template = jax.tree.map(jnp.copy, trainer.initial_state())
+    compiled = []
+
+    @as_given
+    def stepped(x, y):
+        # The step donates its state: each draw steps a copy of the untouched template.
+        state = jax.tree.map(jnp.copy, template)
+        parts = [{"x": part_x, "y": part_y} for part_x, part_y in
+                 zip(np.split(x, accumulation), np.split(y, accumulation), strict=True)]
+        if not compiled:
+            compiled.append(trainer.compile(state, parts[0]))
+        for part in parts:
+            state, *_ = compiled[0](state, part)
+        assert int(state.updates) == 1
+        return np.asarray(state.variables["params"]["Dense_0"]["kernel"])[:, 0]
+
+    return stepped
+
+
+def test_an_accumulated_gauss_newton_update_solves_its_whole_batch_once():
     """An update of a least-squares objective read in two microbatches of an accumulation window takes
-    one damped Gauss-Newton step of its whole batch: each microbatch states its part of the update's
-    system (its normal equations, or where the update's rows are fewer than the weights its rows of the
-    dual's), the trainer pools them, and the one solve's step is on par with the whole batch's own update
-    from the float64 solve (check 1). A solve per microbatch, averaged, would be another step: for the
-    rows (1, 1) and (2, 0) at damping 1, -1/4 where the batch's is -1/6."""
+    one damped Gauss-Newton step of its whole batch: each microbatch states its normal equations, the
+    trainer pools them, and the one solve's step is on par with the whole batch's own update from the
+    float64 solve (check 1). A solve per microbatch, averaged, would be another step: for the rows (1, 1)
+    and (2, 0) at damping 1, -1/4 where the batch's is -1/6."""
+    rows, features = 64, 8
+
     def draw(seed):
         generator = np.random.default_rng([0x6B, rows, seed])
         return (generator.normal(size=(rows, features)).astype(np.float32),
                 generator.normal(size=rows).astype(np.float32))
 
-    def arm(accumulation: int):
-        trainer = Trainer(LeastSquares(features, damping=1e-3), optax.sgd(1.0), key=0, layout=LAYOUT,
-                          accumulation=accumulation)
-        template = jax.tree.map(jnp.copy, trainer.initial_state())
-        compiled = []
-
-        @as_given
-        def stepped(x, y):
-            # The step donates its state: each draw steps a copy of the untouched template.
-            state = jax.tree.map(jnp.copy, template)
-            parts = [{"x": part_x, "y": part_y} for part_x, part_y in
-                     zip(np.split(x, accumulation), np.split(y, accumulation), strict=True)]
-            if not compiled:
-                compiled.append(trainer.compile(state, parts[0]))
-            for part in parts:
-                state, *_ = compiled[0](state, part)
-            assert int(state.updates) == 1
-            return np.asarray(state.variables["params"]["Dense_0"]["kernel"])[:, 0]
-
-        return stepped
-
     # The weights start at zero, so the step's weights are the solve's step, negated.
     exact = as_given(lambda x, y: -solved(x.astype(np.float64), y.astype(np.float64), 1e-3))
-    pooled, whole = arm(2), arm(1)
-    label = f"accumulated gauss-newton {rows}x{features}"
+    pooled, whole = gauss_newton_arm(rows, features, 2), gauss_newton_arm(rows, features, 1)
+    label = "accumulated gauss-newton"
     assert_as_exact(pooled, whole, draw, label, truth_fn=exact,
                     seeds=seeds_for(whole, draw, label, truth_fn=exact, dew_fn=pooled))
+
+
+def test_a_pooled_update_of_fewer_residuals_than_weights_is_refused():
+    """An update of 16 rows and 64 weights read in two microbatches would take the dual step, whose Gram
+    matrix of the update's rows its microbatches' do not sum to: it is refused, where read whole it steps."""
+    generator = np.random.default_rng(4)
+    x, y = generator.normal(size=(16, 64)).astype(np.float32), generator.normal(size=16).astype(np.float32)
+    whole = gauss_newton_arm(16, 64, 1)(x, y)
+    assert whole.shape == (64,) and np.isfinite(whole).all()
+    with pytest.raises(ValueError):
+        gauss_newton_arm(16, 64, 2)(x, y)
 
 
 def test_a_float64_gauss_newton_run_keeps_float64_through_its_state_and_checkpoints(tmp_path):
