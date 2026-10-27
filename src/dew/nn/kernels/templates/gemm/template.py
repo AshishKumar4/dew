@@ -399,6 +399,15 @@ def _routed(group_sizes: jax.Array, rows: int) -> jax.Array:
 
 def _dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
     """`kernel` where the call lowers for CUDA, interpreted on the CPU where asked, `portable` elsewhere
-    (`grouped_matmul._on_platform`)."""
+    (`grouped_matmul._on_platform`). Evaluated eagerly, `platform_dependent` knows its platform and runs
+    its branch alone, so a CPU's would skip the selection the kernel's branch makes (its routes, a named
+    kernel's refusal); an eager call is traced as a jit traces it, every branch selecting, by a function
+    of its own, so no cached trace stands in for a later call's choices."""
     branches, default = grouped_matmul._on_platform(kernel, portable, interpret_on_cpu)
-    return jax.lax.platform_dependent(*operands, default=default, **branches)
+
+    def dispatched(*operands):
+        return jax.lax.platform_dependent(*operands, default=default, **branches)
+
+    if any(isinstance(leaf, jax.core.Tracer) for leaf in jax.tree.leaves(operands)):
+        return dispatched(*operands)
+    return jax.jit(dispatched)(*operands)
