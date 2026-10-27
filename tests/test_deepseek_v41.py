@@ -235,6 +235,55 @@ def test_an_uncached_left_padded_row_pools_its_windows_over_its_own_tokens(sourc
     assert distance(logits[:, pad:], TRUTH["logits"]) <= FACTOR * rounding("logits")
 
 
+def test_an_interior_gap_leaves_every_window_on_its_rows_real_tokens(source):
+    """Uncached, three padding slots inside each row leave each real token's sliding window counting
+    its row's real tokens (`counted_places`), as a cache's slots count them, and its compressed windows
+    and n-grams on them: the real tokens' logits lie within FACTOR of the reference's rounding of the
+    float64 truth of the rows without the gap, where a window counted by index let the gap crowd out
+    the keys before it (audit NN-02)."""
+    loaded, plain, reference = source
+    ids, at, gap = jnp.asarray(reference["input_ids"]), 5, 3
+    tokens = jnp.concatenate([ids[:, :at], jnp.zeros((ids.shape[0], gap), ids.dtype), ids[:, at:]], axis=1)
+    slots = jnp.arange(tokens.shape[1])
+    real = (slots < at) | (slots >= at + gap)
+    logits = plain.apply(loaded.variables, tokens, attention_mask=jnp.broadcast_to(real, tokens.shape))
+    assert distance(logits[:, real], TRUTH["logits"]) <= FACTOR * rounding("logits")
+
+
+SHIFT = 8
+"""How far the shifted rows' given positions sit past their indices: a multiple of every compression
+rate, so a query that read entries by its given place would see SHIFT // rate windows of later tokens."""
+
+
+def test_shifted_positions_compute_the_unshifted_rows_logits(source):
+    """Uncached, positions given SHIFT past the tokens' indices: every rotation is relative, each
+    compressed entry is visible by its window's tokens' ranks and rotates at its window's first given
+    place, where its queries rotate (`window_origins`), so the logits lie within FACTOR of the
+    reference's rounding of the float64 truth of the rows at their indices; entries visible by the
+    given places showed each query windows of later tokens, and entries rotated at zero-based
+    origins sat SHIFT away from their queries (audit NN-03)."""
+    loaded, plain, reference = source
+    ids = jnp.asarray(reference["input_ids"])
+    positions = jnp.broadcast_to(jnp.arange(ids.shape[1]) + SHIFT, ids.shape)
+    logits = plain.apply(loaded.variables, ids, positions=positions)
+    assert distance(logits, TRUTH["logits"]) <= FACTOR * rounding("logits")
+
+
+def test_a_shifted_prompt_decodes_the_unshifted_greedy_walk(source):
+    """Cached, a prompt at positions SHIFT past its indices decodes the reference's greedy ids: each
+    compressed entry rotates at its window's first given place, which the cache carries across the
+    calls a window spans (`append_windows`), where entries rotated at their slots sat SHIFT away from
+    their queries (audit NN-03)."""
+    loaded, plain, reference = source
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+    steps = reference["generated"].shape[1]
+    positions = jnp.broadcast_to(jnp.arange(prompt) + SHIFT, (ids.shape[0], prompt))
+    inputs = ModelInputs(ids[:, :prompt], {"positions": positions})
+    generated = generate(plain, loaded.variables, inputs, steps, key=jax.random.key(1),
+                         sampling=Sampling(temperature=0))
+    np.testing.assert_array_equal(np.asarray(generated.tokens)[:, -steps:], reference["generated"])
+
+
 def test_an_uncached_draft_reads_a_padded_context_at_its_real_positions(source):
     """Uncached, DSpark drafts after a context whose padding `valid` marks, after it in one row and
     before it in the other, as after the context alone: its real positions keep their ranks, the
