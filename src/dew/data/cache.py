@@ -44,7 +44,7 @@ from dew.data.pipeline import Record, Rejected, Volatile
 from dew.data.retention import LocalRetention
 from dew.data.sinks import write_array_record
 from dew.data.sources.base import Shard, Source
-from dew.data.sources.codec import encode
+from dew.data.sources.codec import Unencodable, encode
 from dew.data.sources.records import ArrayRecords
 from dew.data.storage import PreconditionFailed, Store, _byte_size
 
@@ -68,11 +68,13 @@ def automatic_root(loading: Loading) -> str | None:
     return named or os.path.join(dew_cache_dir(), "data")
 
 
-def _opened_writer(cache: Cache, key: DependencyManifest) -> _Writer | _Computed:
-    """A writer of `key`'s fill, or, where an optional cache's storage cannot hold one, none: its
-    records are computed (`Cache.read_on`)."""
+def _opened_writer(cache: Cache, key: DependencyManifest, *, expected: int | None = None,
+                   source: Source | None = None) -> _Writer | _Computed:
+    """A writer of `key`'s fill, of `expected` rows from `source` where an indexed fill knows them, or,
+    where an optional cache's storage cannot hold one, none: its records are computed
+    (`Cache.read_on`)."""
     try:
-        return _Writer(cache, key)
+        return _Writer(cache, key, expected=expected, source=source)
     except (OSError, sqlite3.Error) as error:
         if not cache.read_on(error, "writes nothing"):
             raise
@@ -143,7 +145,7 @@ class Cache:
     which a run never needs, then looks nothing up, stops admitting and its records are computed,
     as they are with no cache (`read_on`). A cache a chain names stops the run."""
 
-    def read_on(self, error: OSError | sqlite3.Error | ValueError, doing: str) -> bool:
+    def read_on(self, error: OSError | sqlite3.Error | ValueError | TypeError, doing: str) -> bool:
         """Whether this cache reads on uncached after its storage raised `error` while `doing`: it is
         `optional`, and logs that it does."""
         if not self.optional:
@@ -371,6 +373,9 @@ class _Writer:
         self.pending_bytes = 0
         self.spool_bytes = 0
         self.admitting = True
+        self.dropped = False
+        """Whether the fill was dropped where its storage or its codec failed an optional cache
+        (`_stopped`), so it ends unsealed, unlike a full one's stop, which seals what it admitted."""
         self.closed = False
         self.closing = False
         self.uploaded_bytes = 0
@@ -416,7 +421,17 @@ class _Writer:
         outputs = _transformed(ordinal, value, transform)
         if self.closing:
             return outputs if transform is not None else outputs[0]
-        payload = encode(outputs)
+        try:
+            payload = encode(outputs)
+        except Unencodable as error:
+            # A record the codec cannot write: a required cache refuses it wherever its fill stands; an
+            # optional one keeps none of the fill, as where its storage fails, and reads on computed.
+            with self.lock:
+                if not self.cache.optional or not self.dropped:
+                    if not self.cache.read_on(error, "stopped admission"):
+                        raise
+                    self._stopped()
+            return outputs if transform is not None else outputs[0]
         transient = any(isinstance(output, Rejected) and not output.permanent for output in outputs)
         with self.lock:
             if self.closing:
@@ -442,11 +457,15 @@ class _Writer:
                     # does with on_full='stop', and reads on.
                     if not self.cache.read_on(error, "stopped admission"):
                         raise
-                    # What it held unwritten is dropped, so its fill ends unsealed and publishes nothing.
-                    self.admitting = False
-                    self.pending.clear()
-                    self.pending_bytes = 0
+                    self._stopped()
         return outputs if transform is not None else outputs[0]
+
+    def _stopped(self) -> None:
+        """Stop admitting for good, under the lock: what the writer held unwritten is dropped, and the
+        fill is neither sealed nor published (`dropped`), what it wrote left for collection."""
+        self.admitting, self.dropped = False, True
+        self.pending.clear()
+        self.pending_bytes = 0
 
     def _admit(self, row_key: str, payload: bytes) -> None:
         pages = self.index.execute("PRAGMA page_count").fetchone()[0]
@@ -576,6 +595,9 @@ class _Writer:
             }
 
     def seal(self) -> None:
+        if self.dropped:
+            # A dropped fill seals nothing; its uploads drain as the writer finishes.
+            return
         with self.lock:
             self._flush()
         self.segments = [future.result() for future in self.futures]
@@ -595,7 +617,7 @@ class _Writer:
         under its key (`Cache.publish`). Another writer that completed the
         same fill may publish it first, which leaves it published."""
         self.seal()
-        if self.source is None:
+        if self.source is None or self.dropped:
             return
         try:
             self.cache.publish(self.key, self.source)
@@ -740,16 +762,10 @@ class _CachedMap(_Mapped):
     def writer(self) -> _Writer | _Computed:
         with self.writer_lock:
             if "_writer" not in self.__dict__:
-                try:
-                    writer = _Writer(self.cache, self.key, expected=len(self), source=self.filled)
-                except (OSError, sqlite3.Error) as error:
-                    # Storage that cannot hold a writer: an optional cache computes its records.
-                    if not self.cache.read_on(error, "writes nothing"):
-                        raise
-                    self.__dict__["_writer"] = _Computed()
-                    return self.__dict__["_writer"]
-                finalizer = weakref.finalize(self, writer.close)
-                finalizer.atexit = False
+                writer = _opened_writer(self.cache, self.key, expected=len(self), source=self.filled)
+                if isinstance(writer, _Writer):
+                    finalizer = weakref.finalize(self, writer.close)
+                    finalizer.atexit = False
                 self.__dict__["_writer"] = writer
             return self.__dict__["_writer"]
 

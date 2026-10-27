@@ -10,6 +10,7 @@ the counters each cadence owns.
 from __future__ import annotations
 
 import dataclasses
+import math
 import time
 from collections.abc import Mapping
 from typing import NamedTuple, Protocol, runtime_checkable
@@ -21,7 +22,7 @@ import numpy as np
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
-from dew.telemetry.instrumentation import NO_FLOPS, StepFlops
+from dew.telemetry.instrumentation import NO_FLOPS, StepFlops, model_flops_utilization
 from dew.training.display import TrainingDisplay
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
 from dew.training.transaction import Committed
@@ -120,6 +121,9 @@ class Interval:
     last_log_time: float
     last_saved: int | None
     tokens_before_log: int = 0
+    resumable: int | None = None
+    """The step of the last checkpoint a resume can read, its whole state (`Checkpoints.latest`), where
+    `last_saved` may be a save of weights alone."""
     logged_tokens: jax.Array | None = None
     book: Book | None = None
     fresh: Book | None = None
@@ -173,7 +177,8 @@ class Interval:
     def resumed(cls, control: dict, *, last_saved: int | None) -> Interval:
         """An interval from now on, its token clock read off a checkpoint's `control`
         (`committed_tokens`), which it takes the clock's field out of."""
-        return cls(time.time(), last_saved=last_saved, tokens_before_log=committed_tokens(control))
+        return cls(time.time(), last_saved=last_saved, tokens_before_log=committed_tokens(control),
+                   resumable=last_saved)
 
     @property
     def token_control(self) -> dict[str, int]:
@@ -216,9 +221,12 @@ class Interval:
                                       norms=self.fresh.norms, commits=self.fresh.commits)
         return taken
 
-    def saved(self, step: int) -> None:
-        """Start the next checkpoint interval after the one saved at `step`."""
+    def saved(self, step: int, *, resumable: bool = True) -> None:
+        """Start the next checkpoint interval after the one saved at `step`, a step a resume can read
+        where `resumable`."""
         self.last_saved, self.steps = step, 0
+        if resumable:
+            self.resumable = step
         if self.book is not None and self.fresh is not None:
             self.book = self.book._replace(loss=self.fresh.loss)
 
@@ -337,3 +345,51 @@ def checked_streak(streak: int, step: int, display: TrainingDisplay) -> None:
             f"ending near step {step}, stopping")
     if streak:
         display.note(f"Non-finite loss for {streak} step(s) before {step}", style="red")
+
+
+def throughput(elapsed: float, steps: int, samples: int, flops: StepFlops | None, devices: int, *,
+               waited: float = 0.0, compiling: float = 0.0,
+               training_flops: float | None = None, tokens: float | None = None) -> dict[str, float]:
+    """Compute the interval's rates from the records it read and its FLOPs, on a mesh of `devices`.
+
+    The FLOPs are the ones the compiler measured for each step's own
+    shape; `flops` is None when a shape's measurement was unavailable.
+    train/flops is the objective's analytical training work on real rows a
+    step, over the whole mesh, on any device: 3*forward for full FT,
+    explicit frozen/trainable matrix work for PEFT. train/mfu is that work
+    over the whole mesh's peak, where the device's peak is known. train/hfu keeps hardware HLO
+    work including remat; train/hlo_flops_util is the former HLO model
+    count with recomputation removed (`StepFlops.utilizations`). No HLO
+    count substitutes for MFU.
+
+    `compiling` is the seconds the interval spent compiling the step for
+    shapes it met for the first time (a bucket length, a ramp's stage).
+    The rates are over the rest of `elapsed`, so a step that compiled
+    does not read as a slow step, and the compile is reported on its own
+    as train/compile_s. `waited` is the seconds the loop waited on its
+    next batch, reported per step as train/data_wait_ms. The loop
+    dispatches steps ahead of the device, so a wait the device's queued
+    work covers costs no device time; a wait near the step time is a
+    stalled input.
+    """
+    stepping = elapsed - compiling
+    if stepping <= 0 or steps <= 0:
+        return {}
+    step_time = stepping / steps
+    scalars = {"train/step_time_ms": step_time * 1000,
+               "train/samples_per_sec": samples / stepping,
+               "train/data_wait_ms": waited / steps * 1000}
+    if compiling > 0:
+        scalars["train/compile_s"] = compiling
+    if tokens is not None:
+        scalars["train/tokens"] = float(tokens) / steps
+        scalars["train/tokens_per_s"] = float(tokens) / stepping
+    # A batch whose work could not be counted carries NaN (`_counted_batch`),
+    # so an interval holding one, on any process, reports no train/flops or train/mfu.
+    if training_flops is not None and math.isfinite(training_flops):
+        scalars["train/flops"] = float(training_flops) / steps
+        per_device = float(training_flops) / devices
+        utilization = model_flops_utilization(per_device / steps, step_time)
+        if utilization is not None:
+            scalars["train/mfu"] = utilization
+    return scalars if flops is None else {**scalars, **flops.utilizations(steps, step_time)}

@@ -7,6 +7,8 @@ the patchify/conditioning/output machinery live in dit.py.
 import functools
 from collections.abc import Sequence
 
+from flax import linen as nn
+
 from ..dit import ModulatedBlock, build_block_pattern, remat_block
 from .dit import SimpleDiT
 
@@ -27,7 +29,10 @@ class HybridSSMAttentionDiT(SimpleDiT):
     bidirectional_ssm: bool = True
     use_2d_fusion: bool = False  # 2D state fusion in SSM blocks (see SpatialFusionConv)
 
-    def block(self, index: int, block_type: str, *, counted: bool = False) -> ModulatedBlock:
+    block_prefixes = ("dit_block_", "ssm_block_")
+
+    @nn.nowrap
+    def layer(self, index: int, kind: str, *, counted: bool = False) -> ModulatedBlock:
         """Build layer `index`'s block, with an SSM mixer or an attention mixer; `counted`,
         unbound and without remat, for work accounting.
 
@@ -50,7 +55,7 @@ class HybridSSMAttentionDiT(SimpleDiT):
             )
             return make(parent=None) if counted else make()
 
-        if block_type == 'ssm':
+        if kind == 'ssm':
             return build(
                 ModulatedBlock, None,
                 mixer='ssm',
@@ -83,6 +88,8 @@ class HybridSSMAttentionDiT(SimpleDiT):
         if self.routes and self.use_2d_fusion:
             raise ValueError("TREAD's routes leave a token subset, which 2D state fusion cannot "
                              "lay out on the image grid; set use_2d_fusion=False to route")
-        pattern = build_block_pattern(
-            self.num_layers, self.ssm_attention_ratio, self.block_pattern)
-        return [self.block(index, block_type, counted=counted) for index, block_type in enumerate(pattern)]
+        return super().stack(counted=counted)
+
+    @nn.nowrap
+    def kinds(self) -> list[str]:
+        return build_block_pattern(self.num_layers, self.ssm_attention_ratio, self.block_pattern)

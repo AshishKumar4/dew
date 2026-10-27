@@ -4,14 +4,23 @@
 leaf splits and the part each device holds, the bytes each device keeps between steps, the axes
 a batch's rows split over, and the logical axes no rule names. Each claim is held to the arrays
 `fit` then places on the eight simulated CPU devices, as is fit's own validation, and a capacity
-those bytes overflow is refused, as a CPU mesh standing in for GPUs states it.
+those bytes overflow is refused, as a CPU mesh standing in for GPUs states it. The collectives it
+says a step runs over each axis are the GPU's: each is held to a step compiled by XLA's CUDA backend
+for compile-only GPUs on this CPU (tests/kernel_compile.py), whose partitioner sums a gradient into
+shares as a GPU does, where XLA:CPU sums it whole.
 """
 
+import math
+
 import jax
+import jax.experimental.topologies as topologies
+import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from jax.sharding import Mesh
+from flax import linen as nn
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from kernel_compile import target_config
 from model_support import TINY_DECODER
 from sharded import collective_axes
 from test_parallelism import BoxedReadout
@@ -19,12 +28,15 @@ from token_support import repeated_token_batch, token_rows
 
 from dew.data.dataset import Loader
 from dew.distributed.placement import placed_shapes
-from dew.mesh import DEFAULT_RULES, LayoutRefused, mesh_axes
+from dew.mesh import DEFAULT_RULES, MESH_AXES, LayoutRefused, mesh_axes
+from dew.nn.kernels.generation import assumed
+from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.optim import OptimConfig
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import STEP_BATCH
+from dew.training.memory import step_compiler_options
 
 pytestmark = pytest.mark.mesh
 
@@ -78,7 +90,7 @@ def test_a_validated_fine_tune_is_placed_and_held_as_its_report_said(case):
     """The report read before launch, and fit's own once it compiled its step, name every leaf of
     the state the run then holds, each placed as reported; each device holds, byte for byte, what
     they said it would of the leaves in its own memory; the step reads its batch's rows split over
-    the reported axes; and it runs every collective the report says each axis implies, over it."""
+    the reported axes; and it names a collective for every axis above one."""
     mesh, layout, accumulation = CASES[case]
     run = fine_tune(mesh(), layout, accumulation)
     report = run.validate(step_batch())
@@ -106,12 +118,91 @@ def test_a_validated_fine_tune_is_placed_and_held_as_its_report_said(case):
     rows = {mesh_axes(sharding.spec[0]) for sharding in jax.tree.leaves(arguments[STEP_BATCH])
             if sharding.spec}
     assert rows == {report.batch_axes}
-    # Every collective the report says an axis implies, the compiled step runs over that axis.
-    ran = collective_axes(run.executable.as_text(), run.device_mesh)
     assert set(report.collectives) == {axis for axis, size in run.device_mesh.shape.items() if size > 1}
+
+
+GPU_BYTES = 40 * 2**30
+"""A compile-only GPU's capacity, which reports none: the smallest the generations here come in, an
+A100's 40 GB."""
+
+PLACEMENT = ("all-gather", "all-reduce", "reduce-scatter")
+"""The collectives a placement implies (`Layout.validate`'s), beside those a model chooses itself (an
+attention's or an expert dispatch's exchange) and a pipeline's hand-offs."""
+
+
+def gpus(generation: str, count: int, shape: tuple[int, ...], names: tuple[str, ...]) -> Mesh:
+    """A mesh of `names` over `count` compile-only GPUs of the CUDA `generation`, none attached."""
+    topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=target_config(generation),
+                                            topology=f"1x1x{count}")
+    return Mesh(np.asarray(topology.devices[:count]).reshape(shape), names)
+
+
+def spec_mesh(spec: MeshSpec, count: int):
+    """`spec`'s mesh over `count` devices, its data axis the devices the others leave."""
+    sizes = {"expert": spec.expert, "fsdp": spec.fsdp, "tensor": spec.tensor, "sequence": spec.sequence,
+             "stage": spec.stage}
+    sizes = {"data": count // math.prod(sizes.values()), **sizes}
+    return lambda generation: gpus(generation, count, tuple(sizes[axis] for axis in MESH_AXES), MESH_AXES)
+
+
+GPU_STEPS = {
+    # The 8-GPU wave's rows (ledger 1306): eight A100s over fsdp alone and beside two tensor shards,
+    # four H100s over fsdp alone and two beside two tensor shards. Then the sequence axis holding
+    # the state in shares (ledger 156), alone on two H100s and beside fsdp, the stage axis's
+    # hand-offs beside fsdp, and a native mesh's own axes.
+    "a100_fsdp8": ("sm80", spec_mesh(MeshSpec(fsdp=8), 8), Layout(min_shard=TINY_SHARD)),
+    "a100_fsdp4_tensor2": ("sm80", spec_mesh(MeshSpec(fsdp=4, tensor=2), 8), Layout(min_shard=TINY_SHARD)),
+    "h100_fsdp4": ("sm90", spec_mesh(MeshSpec(fsdp=4), 4), Layout(min_shard=TINY_SHARD)),
+    "h100_fsdp2_tensor2": ("sm90", spec_mesh(MeshSpec(fsdp=2, tensor=2), 4), Layout(min_shard=TINY_SHARD)),
+    "h100_sequence2": ("sm90", spec_mesh(MeshSpec(sequence=2), 2), Layout(min_shard=TINY_SHARD)),
+    "h100_fsdp2_sequence2": ("sm90", spec_mesh(MeshSpec(fsdp=2, sequence=2), 4),
+                             Layout(min_shard=TINY_SHARD)),
+    "h100_fsdp2_stage2": ("sm90", spec_mesh(MeshSpec(fsdp=2, stage=2), 4), Layout(min_shard=TINY_SHARD)),
+    "a100_native": ("sm80", lambda generation: gpus(generation, 8, (2, 2, 2), ("replica", "zero", "zero2")),
+                    NATIVE),
+}
+
+
+@pytest.mark.parametrize("case", list(GPU_STEPS))
+def test_a_gpu_step_runs_the_collectives_its_layout_plans(case):
+    """A fine-tune's step (its forward, backward and Adam update over the placed state, under the
+    step's XLA options for those GPUs) compiled for compile-only GPUs runs every collective its
+    layout's report says an axis implies, over that axis; and over each axis whose devices compute
+    their own share of a batch and hold the state in shares (fsdp's rows, sequence's positions, a
+    native mesh's fsdp levels), the placement's collectives are the report's: it gathers each
+    weight whole and sums each gradient into its shares, which a sequence axis's report left out."""
+    generation, mesh_of, layout = GPU_STEPS[case]
+    mesh = mesh_of(generation)
+    model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
+    objective, optimizer = LMObjective(model, SEQ_LEN), optax.adam(1e-3)
+    variables = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32)))
+    shardings = layout.shardings(mesh, variables)
+    placed = placed_shapes(variables, shardings)
+    report = layout.validate(mesh, placed, capacity=GPU_BYTES)
+    rows = NamedSharding(mesh, P(report.batch_axes))
+    batch = {"text": jax.ShapeDtypeStruct((BATCH, SEQ_LEN + 1), jnp.int32, sharding=rows)}
+
+    def step(variables, batch):
+        def loss(params):
+            at = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
+            return objective.scalar_loss({**variables, "params": params}, batch, at)[0]
+
+        params = variables["params"]
+        updates, _ = optimizer.update(jax.grad(loss)(params), optimizer.init(params), params)
+        return optax.apply_updates(params, updates)
+
+    with assumed(generation), jax.set_mesh(mesh), nn.logical_axis_rules(layout.axis_rules):
+        options = step_compiler_options(objective, BATCH * SEQ_LEN, frozen=False, devices=mesh.size)
+        compiled = jax.jit(step, out_shardings=shardings["params"]).trace(placed, batch).lower().compile(
+            compiler_options=options)
+    ran = collective_axes(compiled.as_text(), mesh)
     for axis, ops in report.collectives.items():
         for op in ops:
             assert any(kind == op and axis in axes for kind, axes in ran), (axis, op)
+    split = {axis for leaf in report.leaves.values() for entry in leaf.spec for axis in mesh_axes(entry)}
+    for axis in split & {*report.batch_axes, "sequence"}:
+        assert {kind for kind, axes in ran if axis in axes and kind in PLACEMENT} == set(
+            report.collectives[axis]), axis
 
 
 @pytest.mark.mesh(devices=8)
