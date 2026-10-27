@@ -152,35 +152,18 @@ def _polyphase_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> j
 
 def _taps(padded: jax.Array, kernel: jax.Array, dilation: int, height: int, width: int) -> list[jax.Array]:
     """The depthwise convolution's nine fp32 products, in the kernel's row-major order: each tap of the
-    padded input, shifted by its row and column times `dilation`, times the kernel's weight there. Each
-    schedule (`_shifted_depthwise_3x3`, `_materialized_depthwise_3x3`) sums them as it rounds."""
+    padded input, shifted by its row and column times `dilation`, times the kernel's weight there, which
+    `_materialized_depthwise_3x3` sums as it rounds."""
     return [padded[:, row * dilation:row * dilation + height, column * dilation:column * dilation + width, :]
             * kernel[row, column, 0] for row in range(3) for column in range(3)]
 
 
 def _accumulated(total: jax.Array, products: Sequence[jax.Array]) -> jax.Array:
-    """`total` plus each of `products` in order, one fp32 add at a time: the depthwise schedules'
-    accumulation, each giving its own seed (the first product, or zeros)."""
+    """`total` plus each of `products` in order, one fp32 add at a time: the materialized depthwise
+    form's accumulation onto its seed."""
     for product in products:
         total = total + product
     return total
-
-
-def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
-    """The depthwise convolution's taps (`_taps`), each product rounded to fp32 before it is added, the
-    sum from the first, rounded once to the input's dtype.
-
-    XLA:CPU runs a depthwise convolution of more than 16 features this way,
-    as exact as its library convolution (tests/test_depthwise_conv.py holds
-    it to check 1), which on the hybrid DiT's 2 x 16 x 16 x 768 maps takes
-    6.4 ms a call against 1.4 here; 16 features or fewer keep the
-    convolution. An output whose nine taps are all negative zero is the
-    sum's negative zero here, where the library gives a zero of either sign
-    by its kernel and the host it runs on."""
-    height, width = lhs.shape[1:3]
-    padded = jnp.pad(lhs, ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))).astype(jnp.float32)
-    products = jax.lax.optimization_barrier(_taps(padded, rhs.astype(jnp.float32), dilation, height, width))
-    return _accumulated(products[0], products[1:]).astype(lhs.dtype)
 
 
 def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
@@ -204,9 +187,8 @@ def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -
     height, width = lhs.shape[1:3]
     border = ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))
     padded = jnp.pad(_barrier(lhs.astype(jnp.float32)), border)
-    # Onto a positive zero, as the form has summed: XLA:CPU keeps it, so an output whose nine taps
-    # are all negative zero is positive zero there, and XLA:CUDA, where this form runs, drops it (A100
-    # and H100), so the output is the sum's negative zero, as the shifted form's is.
+    # Onto a positive zero, as the form has summed: XLA:CUDA, where this form runs, drops it (A100 and
+    # H100), so an output whose nine taps are all negative zero is the sum's negative zero.
     products = _taps(padded, _barrier(rhs.astype(jnp.float32)), dilation, height, width)
     return _barrier(_accumulated(jnp.zeros(lhs.shape, jnp.float32), products)).astype(lhs.dtype)
 
@@ -248,10 +230,7 @@ def _conv_general_dilated(
         if dilated is None:
             dilated = _polyphase_depthwise_3x3 if lhs.dtype == jnp.bfloat16 else _materialized_depthwise_3x3
         return jax.lax.platform_dependent(
-            lhs, rhs,
-            cuda=convolve if dilation[0] == 1 else lambda x, w: dilated(x, w, dilation[0]),
-            cpu=((lambda x, w: _shifted_depthwise_3x3(x, w, dilation[0]))
-                 if feature_group_count > 16 else convolve),
+            lhs, rhs, cuda=convolve if dilation[0] == 1 else lambda x, w: dilated(x, w, dilation[0]),
             default=convolve)
     return convolve(lhs, rhs)
 
