@@ -13,7 +13,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from pathlib import PurePosixPath
-from typing import BinaryIO, Literal
+from typing import BinaryIO, Literal, get_args
 from urllib.parse import urlsplit
 
 import grain.python as grain
@@ -26,7 +26,7 @@ from fsspec.utils import infer_compression
 from gcsfs import GCSFileSystem
 from s3fs import S3FileSystem
 
-from dew._records import integer, record
+from dew._records import integer, record, text
 from dew.batch import Batch
 from dew.data.dataset import Ranges, Records
 from dew.data.pipeline import Dataset
@@ -57,6 +57,19 @@ _SUFFIXES: dict[Format, tuple[str, ...]] = {
 }
 """The suffixes each record format's files carry, which a URL's format is inferred from and a
 directory's files of a format are found by."""
+
+
+FORMATS: tuple[Format, ...] = get_args(Format.__value__)
+
+
+def declared_format(value: str, store: str) -> Format:
+    """The record format `value` names, as a committed manifest and a native writer state it
+    (`dew.data.sinks.Writer`): one of `FORMATS`, never read by a suffix, which "text",
+    "webdataset" and "files" do not spell."""
+    for kind in FORMATS:
+        if value == kind:
+            return kind
+    raise ValueError(f"{store} declares record format {value!r}, none of {', '.join(FORMATS)}")
 
 
 def _inferred(url: str) -> Format | None:
@@ -170,6 +183,33 @@ def _open_lines(fs: AbstractFileSystem, path: str):
     return fs.open(path, "rb", compression=compression)
 
 
+def _record_starts(file: BinaryIO, size: int, parts: int, kind: Format) -> list[int]:
+    """Where at most `parts` parts of a `kind` line file of `size` bytes start, each at a record
+    (a line; a JSON line that is not blank, as `_lines` reads them), in order and distinct: part
+    `k` at the first record at or after the even cut `size * k / parts`, or after the record the
+    part before it starts at where that is further on. A record longer than the cuts apart (a
+    10,000-character first line, say) moves the cuts it holds on to the records after it rather
+    than onto one another; a file of fewer records than parts has as many parts as records."""
+    starts: list[int] = []
+    for part in range(parts):
+        cut = size * part // parts
+        at = _record_start(file, cut if not starts else max(cut, starts[-1] + 1), kind)
+        if at >= size:
+            break
+        starts.append(at)
+    return starts
+
+
+def _record_start(file: BinaryIO, offset: int, kind: Format) -> int:
+    """Where the first record of a `kind` line file that starts at `offset` or after it starts: the
+    next line start, past blank lines in JSON lines, which hold no record."""
+    at = _line_start(file, offset)
+    file.seek(at)
+    while kind == "jsonl" and (line := file.readline()) and not line.strip():
+        at = file.tell()
+    return at
+
+
 def _line_start(file: BinaryIO, offset: int) -> int:
     """Where the first line that starts at `offset` or after it starts in `file`, its end where none
     does: a range of a file's bytes reads the lines that start in it."""
@@ -244,7 +284,8 @@ class Files(Dataset):
     @cached_property
     def kind(self) -> Format:
         if self.committed is not None:
-            declared = _format("data." + str(self.committed["format"]))
+            declared = declared_format(text(self.committed["format"], "export format"),
+                                       f"committed export {self.url!r}")
             if self.format is not None and self.format != declared:
                 raise ValueError(f"source {self.url!r} declares format={declared}, not {self.format}")
             return declared
@@ -654,33 +695,44 @@ class Files(Dataset):
     def _subdivided(self, count: int) -> tuple[Shard, ...]:
         """The JSON-lines or text files cut into `count` parts, for a streamed read with more
         readers and workers than its shards (`ShardManifest.subdivide`), as Hadoop splits a text
-        file: each file a share of the parts by its bytes, each part the lines that start in an
-        even cut of it, the cut moved on to the line it falls in, found by reading that line. So
-        each part holds a line, and a reader or worker given one reads; a store of fewer lines
-        than parts is refused."""
+        file: each file a share of the parts by its bytes, each part the records that start from
+        its cut on (`_record_starts`), so each part holds a record and a reader or worker given
+        one reads. A file of fewer records than its share keeps a part for each and hands the rest
+        to the files that hold more, by their bytes; a store of fewer records than parts is
+        refused."""
         sizes = [integer(self._header(url)["size"], "file bytes") for url in self.paths]
-        total = max(sum(sizes), 1)
-        # Each file that holds bytes at least one part, the rest by its share of the bytes, largest
-        # remainders first.
-        shares = [count * size / total for size in sizes]
-        parts = [max(1, math.floor(share)) if size else 0 for share, size in zip(shares, sizes, strict=True)]
-        for index in sorted((index for index, size in enumerate(sizes) if size),
-                            key=lambda index: parts[index] - shares[index]):
-            if sum(parts) >= count:
+        parts = {number: 1 for number, size in enumerate(sizes) if size}
+        starts: dict[int, list[int]] = {}
+        out: set[int] = set()
+        while True:
+            short, open_files = count - sum(parts.values()), [number for number in parts if number not in out]
+            if short > 0 and open_files:
+                total = sum(sizes[number] for number in open_files)
+                shares = {number: short * sizes[number] / total for number in open_files}
+                for number, share in shares.items():
+                    parts[number] += math.floor(share)
+                for number in sorted(open_files, key=lambda held: math.floor(shares[held]) - shares[held]):
+                    if sum(parts.values()) >= count:
+                        break
+                    parts[number] += 1
+            planned = [number for number in parts if len(starts.get(number, ())) != parts[number]]
+            if not planned:
                 break
-            parts[index] += 1
+            for number in planned:
+                fs, path, _ = Store(self.paths[number], self.storage_options).readable()
+                with _open_lines(fs, path) as file:
+                    starts[number] = _record_starts(file, sizes[number], parts[number], self.kind)
+                if len(starts[number]) < parts[number]:
+                    out.add(number)
+                    parts[number] = len(starts[number])
         shards = []
-        for number, (url, size, cuts) in enumerate(zip(self.paths, sizes, parts, strict=True)):
-            if not cuts:
-                continue
-            fs, path, _ = Store(url, self.storage_options).readable()
-            with _open_lines(fs, path) as file:
-                starts = sorted({_line_start(file, size * cut // cuts) for cut in range(cuts)} - {size})
+        for number, held in sorted(starts.items()):
+            url = self.paths[number]
             shards.extend(Shard(self._shard_id(number, url, start), url, start, stop)
-                          for start, stop in zip(starts, [*starts[1:], size], strict=True))
+                          for start, stop in zip(held, [*held[1:], sizes[number]], strict=True))
         if len(shards) < count:
-            raise ValueError(f"{self.describe()} holds {len(shards)} parts of whole lines for {count} "
-                             "readers × workers; read it with fewer")
+            raise ValueError(f"{self.describe()} holds {len(shards)} records for {count} readers × workers; "
+                             "read it with fewer")
         return tuple(shards)
 
     def _read_shard(self, shard: Shard) -> grain.IterDataset:

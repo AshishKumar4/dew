@@ -19,9 +19,18 @@ from dew.nn.attention import (
     with_key_lengths,
     with_key_starts,
 )
-from dew.nn.documents import CrossDocuments, cross_document_mask, document_ids, document_mask, with_documents
+from dew.nn.documents import (
+    CrossDocuments,
+    aligned_places,
+    cross_document_mask,
+    document_ids,
+    document_mask,
+    with_documents,
+)
+from dew.nn.inputs import counted_places
 from dew.nn.kernels.templates import attention as template
 from dew.nn.precision import FP32_SUMS
+from dew.nn.visibility import windowed
 
 QUERIES, KEYS = 100, 96
 """A call's query and key counts, neither a multiple of a tile, so the block map's edges pad; a call of
@@ -47,6 +56,16 @@ LENGTHS = jnp.asarray([96, 61], jnp.int32)
 STARTS = jnp.asarray([0, 17], jnp.int32)
 
 
+def key_validity(keys: int) -> jax.Array:
+    """Which of a call's first `keys` keys are real `[2, keys]`: holes of a key and of five in the first row,
+    one across `own_documents`' boundary at 30; every seventh key in the second, and a run of thirty from
+    60, longer than the cases' window, so the queries late in it whose window it covers read no key."""
+    index = np.arange(QUERIES)
+    first = ~((index == 5) | ((index >= 28) & (index < 33)) | ((index >= 40) & (index < 45)))
+    second = (index % 7 != 3) & ~((index >= 60) & (index < 90))
+    return jnp.asarray(np.stack([first, second])[:, :keys])
+
+
 CASES = {
     "full": {},
     "causal": {"causal": True},
@@ -68,12 +87,81 @@ CASES = {
     "cross-causal-chunk": {"causal": True, "chunk": 32, "segment_ids": "cross"},
     "widest-window": {"sliding_window": 2 ** 31 - 1},
     "causal-widest-window": {"causal": True, "sliding_window": 2 ** 31 - 1},
+    "block-causal": {"causal": True, "block_groups": True},
+    "documents-block-causal-window": {"causal": True, "sliding_window": 24, "segment_ids": "own",
+                                      "block_groups": True},
+    "cross-block-causal-window": {"causal": True, "sliding_window": 24, "segment_ids": "cross",
+                                  "block_groups": True},
+    "valid": {"valid": True},
+    "causal-window-valid": {"causal": True, "sliding_window": 24, "valid": True},
+    "documents-causal-valid": {"causal": True, "segment_ids": "own", "valid": True},
+    "cross-causal-window-valid": {"causal": True, "sliding_window": 24, "segment_ids": "cross",
+                                  "valid": True},
+    "documents-window-valid-places": {"causal": True, "sliding_window": 24, "segment_ids": "own",
+                                      "valid": True, "positions": True},
 }
 
 
+OPTIONS = ((20, 4, 10), (10, 3, 12))
+"""Each row's decision layout over its call's 100 tokens (`decision_runs`): its prefix's length, then its
+options' count and width, the second row's options leaving a fragment empty."""
+
+
+def decision_runs() -> tuple[np.ndarray, np.ndarray]:
+    """A parallel decision layout's runs `[2, 100, 6, 2]` and places `[2, 100]` (`dew.decision.layout`): a
+    shared token reads every fragment of its row, the prefix, each option and the suffix, each a run of its
+    own; an option's token reads the prefix, its own option and the suffix, the rest empty. The places
+    restart at each option, the suffix continuing after the widest, so they never decrease within a run."""
+    runs = np.zeros((ROWS, QUERIES, 6, 2), np.int32)
+    places = np.zeros((ROWS, QUERIES), np.int32)
+    for row, (prefix, count, width) in enumerate(OPTIONS):
+        after = prefix + count * width
+        fragments = [(0, prefix), *((prefix + k * width, prefix + (k + 1) * width) for k in range(count)),
+                     (after, QUERIES)]
+        places[row] = np.concatenate([np.arange(prefix), *(np.arange(prefix, prefix + width),) * count,
+                                      np.arange(prefix + width, prefix + width + QUERIES - after)])
+        for query in range(QUERIES):
+            option = (query - prefix) // width if prefix <= query < after else None
+            kept = fragments if option is None else [fragments[0], fragments[1 + option], fragments[-1]]
+            runs[row, query, :len(kept)] = kept
+    return runs, places
+
+
+RUN_CASES = {
+    "runs": {"runs": True},
+    "runs-window-places": {"runs": True, "sliding_window": 6, "positions": True},
+    "runs-causal": {"runs": True, "causal": True},
+    "runs-documents-valid": {"runs": True, "segment_ids": "own", "valid": True},
+    "runs-chunk-places": {"runs": True, "chunk": 8, "positions": True},
+}
+"""Call forms over runs (`template.spans`'s `runs`): a decision row's, under a two-sided window over its
+places, under causality, beside packed documents and key validity, and in chunks of its places, which
+restart at each option, so a suffix's chunk holds keys of every option."""
+
+
 def geometry(case: dict) -> tuple[int, int]:
-    """`case`'s query and key counts: a call's own documents are its keys, so it has as many of each."""
-    return (QUERIES, QUERIES) if case.get("segment_ids") == "own" else (QUERIES, KEYS)
+    """`case`'s query and key counts: a call's own documents, or blocks of its own tokens, are its keys, so
+    it has as many of each; a cache call's blocks are its keys'."""
+    own = (case.get("segment_ids") == "own" or case.get("runs")
+           or (case.get("block_groups") and case.get("segment_ids") is None))
+    return (QUERIES, QUERIES) if own else (QUERIES, KEYS)
+
+
+def block_groups(keys: int = QUERIES) -> tuple[np.ndarray, np.ndarray]:
+    """Two layouts of contiguous blocks over a call's first `keys` keys `[2, keys]`, -1 outside any, read as
+    whole blocks and as images: blocks of a token, blocks across `own_documents`' boundaries (at 30 and 70 in
+    the first row, 55 in the second) and `cross_documents`' (at 60 in the first, 70 in the second), a block
+    of padding, blocks ending the row, blocks longer than the cases' window; and the images over the
+    blocks, as a kind reading both does."""
+    first = np.full((ROWS, QUERIES), -1, np.int32)
+    for row, runs in enumerate((((3, 4), (10, 22), (25, 35), (50, 60), (58, 64), (68, 72), (90, 100)),
+                                ((0, 1), (40, 50), (52, 58), (60, 61), (66, 99)))):
+        for group, (lo, hi) in enumerate(runs):
+            first[row, lo:hi] = group
+    second = np.full((ROWS, QUERIES), -1, np.int32)
+    second[:, 15:40] = 7
+    second[:, 41:43] = 8
+    return first[:, :keys], second[:, :keys]
 
 
 def arguments(case: dict) -> dict:
@@ -86,9 +174,21 @@ def arguments(case: dict) -> dict:
         keywords["lengths"] = LENGTHS
     if case.get("starts"):
         keywords["starts"] = STARTS
+    if case.get("block_groups"):
+        keywords["block_groups"], keywords["image_groups"] = block_groups(geometry(case)[1])
+    if case.get("valid"):
+        keywords["valid"] = key_validity(geometry(case)[1])
+    if case.get("runs"):
+        runs, places = decision_runs()
+        keywords["runs"] = jnp.asarray(runs)
+        if case.get("positions"):
+            keywords["positions"] = (jnp.asarray(places), jnp.asarray(places))
+            return keywords
     if case.get("positions"):
-        # Each token's place in its own document, as a packed row's coordinates count it.
-        places = coordinates(segments=keywords["segment_ids"]).positions
+        # Each token's place in its own document, as a packed row's coordinates count it, over its real
+        # tokens where only some are (`counted_places`).
+        places = (coordinates(segments=keywords["segment_ids"]).positions if "valid" not in keywords
+                  else counted_places(keywords["segment_ids"], keywords["valid"]))
         keywords["positions"] = (places, places)
     return keywords
 
@@ -99,17 +199,46 @@ def dews_mask(case: dict) -> np.ndarray:
     window aligned to their last keys (`cross_document_mask`), else causality and a window on the
     indices (`combined_attention_mask`) narrowed to the documents (`with_documents`); a chunk as
     `chunk_mask` keeps it over the call's places (the attention layer's `_chunked`), its indices where it
-    names none; then key lengths and starts."""
+    names none, as a window does where the call names places and real keys (the layer's counted places);
+    then key lengths and starts, and the real keys."""
     keywords = arguments(case)
     queries, keys = geometry(case)
     ids = keywords.get("segment_ids")
     causal, window = keywords.get("causal", False), keywords.get("sliding_window")
+    # Each query's own key: its index, or a cache call's slot, its document's first key plus its aligned
+    # place, none where that lies before its document's keys.
+    slots = np.broadcast_to(np.arange(queries), (ROWS, queries))
+    cross = False
     if isinstance(ids, CrossDocuments) and (causal or window is not None):
+        cross = True
         mask = cross_document_mask(ids, causal=causal, sliding_window=window)
+        query_ids, key_ids = (np.asarray(x) for x in document_ids(ids))
+        first = np.argmax(key_ids[:, None, :] == query_ids[:, :, None], axis=-1)
+        ranks = np.asarray(aligned_places(ids))
+        slots = np.where(ranks >= 0, first + ranks, -1)
+    elif window is not None and "positions" in keywords:
+        query_places, key_places = (np.asarray(x) for x in keywords["positions"])
+        counted = windowed(query_places[:, :, None], key_places[:, None, :], window, causal=causal)[:, None]
+        base = combined_attention_mask(queries, keys, causal, None, None)
+        mask = counted if base is None else base & counted
     else:
         mask = combined_attention_mask(queries, keys, causal, window, None)
+    held = (slots >= 0) & (slots < keys)
+    for groups, whole in ((keywords.get("block_groups"), True), (keywords.get("image_groups"), False)):
+        if groups is None or not causal:
+            continue
+        # A block's keys are seen by every query of its document whose own key is in it: a whole
+        # block's whatever the window (transformers' `block_sequence_ids`), an image's within the
+        # window, which bounds the keys behind (Gemma's).
+        own = np.where(held, np.take_along_axis(groups, np.clip(slots, 0, keys - 1), axis=1), -1)
+        same = (own[:, :, None] == groups[:, None, :]) & (own[:, :, None] >= 0)
+        if window is not None and not whole:
+            same = same & windowed(slots[:, :, None], np.arange(keys)[None, None, :], window, causal=causal)
         if ids is not None:
-            mask = with_documents(mask, ids)
+            same = same & np.asarray(document_mask(ids))
+        mask = same[:, None] if mask is None else mask | same[:, None]
+    if ids is not None and not cross:
+        mask = with_documents(mask, ids)
     if "chunk" in keywords:
         places = keywords.get("positions", (jnp.arange(queries), jnp.arange(keys)))
         chunked = chunk_mask(*places, keywords["chunk"])
@@ -117,11 +246,20 @@ def dews_mask(case: dict) -> np.ndarray:
     if "lengths" in keywords:
         mask = with_key_lengths(mask, keywords["lengths"], keys)
     mask = with_key_starts(mask, keywords.get("starts"), keys)
+    if "valid" in keywords:
+        real = jnp.asarray(keywords["valid"])[:, None, None, :]
+        mask = real if mask is None else jnp.logical_and(mask, real)
+    if "runs" in keywords:
+        # A query keeps a key one of its runs holds.
+        runs = np.asarray(keywords["runs"])
+        index = np.arange(keys)[None, None, :, None]
+        held = np.any((index >= runs[:, :, None, :, 0]) & (index < runs[:, :, None, :, 1]), axis=-1)
+        mask = held[:, None] if mask is None else jnp.logical_and(mask, held[:, None])
     full = np.ones((ROWS, queries, keys), bool)
     return full if mask is None else np.broadcast_to(np.asarray(mask)[:, 0], full.shape)
 
 
-@pytest.mark.parametrize("case", CASES.values(), ids=CASES)
+@pytest.mark.parametrize("case", [*CASES.values(), *RUN_CASES.values()], ids=[*CASES, *RUN_CASES])
 def test_key_spans_keep_the_keys_dews_masks_keep(case):
     """Each call form's spans (`template.spans`, `template.dense`) keep exactly the keys Dew's reference
     path keeps, under `jax.jit` too, the bounds traced."""
@@ -130,6 +268,28 @@ def test_key_spans_keep_the_keys_dews_masks_keep(case):
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     np.testing.assert_array_equal(np.asarray(template.dense(spans)), expected)
     static = {name: case[name] for name in ("causal", "sliding_window", "chunk") if name in case}
+    if case is CASES["block-causal"]:
+        # A block runs to its end, past the query's own place.
+        assert expected[0, 10, 21] and not expected[0, 9, 10]
+    if case is CASES["documents-block-causal-window"]:
+        # The second row's image of 15 to 40 sees ahead and, behind, only within the window of 24, and its
+        # whole block of 66 to 99 past the window too, but no further; the first row's image stops at the
+        # document's end at 30.
+        assert expected[1, 16, 39] and expected[1, 39, 16] and not expected[1, 39, 15]
+        assert expected[1, 98, 66] and not expected[1, 98, 65]
+        assert expected[0, 16, 29] and not expected[0, 16, 30]
+    if case is CASES["causal-window-valid"]:
+        # The second row's queries 84 to 89, whose window of 24 behind holds only the run of invalid keys
+        # from 60, read none; query 90 reads itself.
+        assert not expected[1, 84:90].any() and expected[1, 90, 90]
+    if case is CASES["documents-window-valid-places"]:
+        # The window counts real tokens: query 27, across the hole at 5, keeps key 3, 23 real tokens behind
+        # it and 24 slots, and not key 2.
+        assert expected[0, 27, 3] and not expected[0, 27, 2]
+    if case is CASES["cross-block-causal-window"]:
+        # A cache call's query 68 sits at slot 58, whose block runs to 64 past its document's last key
+        # at 59: it sees 59 and not 60. The second row's first 30 queries hold no slot, so see nothing.
+        assert expected[0, 68, 59] and not expected[0, 68, 60] and not expected[1, :30].any()
     if case is CASES["documents-causal-chunk-places"]:
         # The second document opens at token 30, so its chunk 0 holds tokens 30 to 45: chunks counted
         # from the row's start would part tokens 31 and 32.
@@ -156,16 +316,20 @@ def uniform_documents(ids, block: int) -> np.ndarray:
 
 
 @pytest.mark.parametrize("block_q, block_k", BLOCKS)
-@pytest.mark.parametrize("case", CASES.values(), ids=CASES)
+@pytest.mark.parametrize("case", [*CASES.values(), *RUN_CASES.values()], ids=[*CASES, *RUN_CASES])
 def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_where_it_is(case, block_q,
                                                                                          block_k):
     """At each tile shape, every visible entry lies in a tile its query block visits (`lo` to `hi`), and
     its key block's query range (`q_lo` to `q_hi`) holds that query block; each block's one document
-    (`query_doc`, `key_doc`) is the one its tokens carry (`uniform_documents`); every tile in a query
+    (`query_doc`, `key_doc`) is the one its tokens carry in the spans' ids, its documents' and its invalid
+    keys' padding id (`uniform_documents`); every tile in a query
     block's whole range (`full_lo` to `full_hi`) whose blocks carry one document, or which has no
     documents, has every entry visible, the padding past the call's queries and keys excluded from no
     tile; with no narrowing, every tile inside the call is whole, and a call of its own documents has
-    whole tiles inside them."""
+    whole tiles inside them. Over runs the block visits only its ranges (`ranges`), each tile once, and every
+    tile of its whole range, its widest run's tiles every query sees through that run, has every entry
+    visible; a tile its queries see whole through other runs is not called whole, so the whole range over
+    runs is sound, not exact."""
     queries_, keys_ = geometry(case)
     spans = template.spans(queries_, keys_, ROWS, **arguments(case))
     blocks = template.block_map(spans, block_q, block_k)
@@ -176,10 +340,19 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
     i, j = queries // block_q, keys // block_k
     assert np.all((lo[rows, i] <= j) & (j < hi[rows, i]))
     assert np.all((q_lo[rows, j] <= i) & (i < q_hi[rows, j]))
+    if blocks.ranges is not None:
+        ranges = np.asarray(blocks.ranges)
+        # The ranges are sorted, disjoint, nonempty first: a walk of them visits each tile once.
+        lengths = ranges[..., 1] - ranges[..., 0]
+        assert np.all(lengths >= 0)
+        assert np.all(ranges[..., 1:, 0][lengths[..., 1:] > 0] >= ranges[..., :-1, 1][lengths[..., 1:] > 0])
+        assert np.all(np.diff((lengths > 0).astype(int), axis=-1) <= 0)
+        covered = np.any((ranges[rows, i, :, 0] <= j[:, None]) & (j[:, None] < ranges[rows, i, :, 1]), -1)
+        assert covered.all()
     query_doc = key_doc = None
-    if "segment_ids" in case:
-        query_ids, key_ids = document_ids(arguments(case)["segment_ids"])
-        query_doc, key_doc = uniform_documents(query_ids, block_q), uniform_documents(key_ids, block_k)
+    if spans.query_ids is not None and spans.key_ids is not None:
+        query_doc = uniform_documents(spans.query_ids, block_q)
+        key_doc = uniform_documents(spans.key_ids, block_k)
         np.testing.assert_array_equal(np.asarray(blocks.query_doc), query_doc)
         np.testing.assert_array_equal(np.asarray(blocks.key_doc), key_doc)
     padded = np.zeros((ROWS, -(-queries_ // block_q) * block_q, -(-keys_ // block_k) * block_k), bool)
@@ -199,8 +372,8 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
     tiles = padded.reshape(ROWS, padded.shape[1] // block_q, block_q, -1, block_k).all(axis=(2, 4))
     if query_doc is not None:
         tiles &= (query_doc[:, :, None] == key_doc[:, None, :]) & (query_doc[:, :, None] != 0)
-    assert whole == tiles.sum()
-    if case is CASES["documents"] and (block_q, block_k) == (16, 16):
+    assert whole == tiles.sum() if blocks.ranges is None else whole <= tiles.sum()
+    if (case is CASES["documents"] or case is RUN_CASES["runs"]) and (block_q, block_k) == (16, 16):
         assert whole > 0
 
 
@@ -410,6 +583,153 @@ def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks, dt
 
     assert_as_exact(jax.jit(resumed), jax.jit(whole), drawing(queries, keys, dtype),
                     f"template resumed {case} {hooks} {jnp.dtype(dtype).name} {split}", seeds=SEEDS)
+
+
+@pytest.mark.parametrize("case", [CASES[name] for name in CASES], ids=list(CASES))
+def test_the_spans_form_says_what_their_intervals_hold(case):
+    """`KeySpans.form`, which a kernel resolves at trace time, agrees with the spans' own visibility:
+    'full' every key for every query, 'causal' keys 0 to i for query i, 'spans' anything narrower."""
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    seen = np.asarray(template.dense(spans))
+    if spans.form == "full":
+        assert seen.all()
+    elif spans.form == "causal":
+        np.testing.assert_array_equal(seen, np.broadcast_to(np.tri(queries, keys, dtype=bool), seen.shape))
+    else:
+        assert spans.form == "spans"
+    plain = {name: value for name, value in case.items() if name != "causal"}
+    assert (spans.form != "spans") == (not plain and case.get("causal") in (None, True))
+
+
+@pytest.mark.parametrize("case", [*CASES.values(), *RUN_CASES.values()], ids=[*CASES, *RUN_CASES])
+def test_a_query_reads_a_key_exactly_where_its_spans_hold_one(case):
+    """`template.reads`, the queries a call's spans leave a key, is where their visibility holds one."""
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    np.testing.assert_array_equal(np.asarray(template.reads(spans)),
+                                  np.asarray(template.dense(spans)).any(-1))
+
+
+def test_key_validity_hides_keys_by_their_ids_and_keeps_a_cross_calls_alignment():
+    """Key validity is the documents' padding id on the invalid keys (`template.spans`): a cross call's
+    spans, which its alignment to the documents' last keys bounds, are the same with it and without it, its
+    invalid keys id 0, its queries' ids its own; a call of no documents gives its queries and valid keys 1."""
+    case = CASES["cross-causal-window-valid"]
+    queries, keys = geometry(case)
+    given = arguments(case)
+    valid = given.pop("valid")
+    plain = template.spans(queries, keys, ROWS, **given)
+    hidden = template.spans(queries, keys, ROWS, **given, valid=valid)
+    for field in ("start", "end", "query_ids"):
+        np.testing.assert_array_equal(np.asarray(getattr(hidden, field)), np.asarray(getattr(plain, field)))
+    assert plain.key_ids is not None
+    np.testing.assert_array_equal(np.asarray(hidden.key_ids), np.where(valid, plain.key_ids, 0))
+    bare = template.spans(queries, keys, ROWS, causal=True, valid=valid)
+    np.testing.assert_array_equal(np.asarray(bare.query_ids), 1)
+    np.testing.assert_array_equal(np.asarray(bare.key_ids), np.asarray(valid, np.int32))
+
+
+@pytest.mark.parametrize("ids, keywords", [
+    ([[1, 2, 1, 2, 2, 3, 1, 0]], {"causal": True, "starts": [3]}),
+    ([[1, 2, 1, 2, 2, 3, 1, 0]], {"sliding_window": 2}),
+    ([[2, 1, 2]], {"causal": True, "starts": [1], "lengths": [2]}),
+], ids=["causal-starts", "two-sided-window", "interval-of-another-document"])
+def test_reads_count_the_keys_of_interleaved_documents(ids, keywords):
+    """Interleaved documents, whose keys no interval holds alone: a query reads a key where its document
+    holds one inside its interval, so a query whose interval holds only another document's keys (the
+    third row's last, over key 1 alone) reads none."""
+    ids = jnp.asarray(ids, jnp.int32)
+    starts, lengths = (None if name not in keywords else jnp.asarray(keywords[name], jnp.int32)
+                       for name in ("starts", "lengths"))
+    spans = template.spans(ids.shape[1], ids.shape[1], 1, segment_ids=ids,
+                           causal=keywords.get("causal", False),
+                           sliding_window=keywords.get("sliding_window"), starts=starts, lengths=lengths)
+    np.testing.assert_array_equal(np.asarray(template.reads(spans)),
+                                  np.asarray(template.dense(spans)).any(-1))
+
+
+@pytest.mark.parametrize("valid, ids", [
+    ([[1, 0, 0, 1, 1, 1, 0, 1]], None),
+    ([[1, 0, 0, 1, 1, 1, 0, 1], [1, 1, 0, 0, 0, 1, 1, 1]],
+     [[1, 1, 1, 1, 2, 2, 2, 2], [3, 3, 3, 4, 4, 4, 4, 4]]),
+], ids=["padding-inside", "documents"])
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "two-sided"])
+def test_a_window_counts_the_places_it_is_given(valid, ids, causal):
+    """A window over a call's places (`counted_places`, each padding slot at the place before it) keeps the
+    real keys within w - 1 places of the query, in its document: behind query 3 of the first row, padding
+    inside, a window of two keeps key 0, where one over slots would drop it. The second row's second
+    document opens with padding that took the first document's place, which no real key's window reads."""
+    valid = jnp.asarray(valid, bool)
+    ids = None if ids is None else jnp.asarray(ids, jnp.int32)
+    places = counted_places(ids, valid)
+    assert places is not None
+    real = np.asarray(valid)[:, None, :]
+    for window in (1, 2, 3):
+        spans = template.spans(8, 8, valid.shape[0], causal=causal, sliding_window=window,
+                               positions=(places, places), segment_ids=ids)
+        expected = windowed(places[:, :, None], places[:, None, :], window, causal=causal)
+        if causal:
+            expected = expected & np.tril(np.ones((8, 8), bool))
+        if ids is not None:
+            expected = expected & document_mask(ids)
+        np.testing.assert_array_equal(np.asarray(template.dense(spans)) & real, np.asarray(expected) & real)
+        if window == 2 and causal:
+            assert np.asarray(template.dense(spans))[0, 3, 0]
+
+
+def test_a_window_holding_no_key_keeps_its_lower_bound_against_an_image():
+    """A cache call's query at place 100 under a causal window of two over keys at places 0 and 1: its
+    window holds no key, so neither is seen, though its own key (its document's last, aligned) begins an
+    image, which reads only within the window; a whole block reads past it."""
+    ids = CrossDocuments(jnp.asarray([[1]], jnp.int32), jnp.asarray([[1, 1]], jnp.int32))
+    places = (jnp.asarray([[100]], jnp.int32), jnp.asarray([[0, 1]], jnp.int32))
+    groups = jnp.asarray([[-1, 0]], jnp.int32)
+    images = template.spans(1, 2, 1, causal=True, sliding_window=2, positions=places, segment_ids=ids,
+                            image_groups=groups)
+    np.testing.assert_array_equal(np.asarray(template.dense(images)), [[[False, False]]])
+    blocks = template.spans(1, 2, 1, causal=True, sliding_window=2, positions=places, segment_ids=ids,
+                            block_groups=groups)
+    np.testing.assert_array_equal(np.asarray(template.dense(blocks)), [[[False, True]]])
+
+
+@pytest.mark.parametrize(("query", "key"), [(jnp.int64, jnp.uint64), (jnp.int32, jnp.uint32)])
+def test_places_no_integer_dtype_holds_both_of_are_refused(query, key):
+    """Signed and unsigned places no enabled integer dtype holds both of (JAX would promote int64 beside
+    uint64 to float64, and canonicalize int32 beside uint32 to int32 without x64) are refused for one dtype
+    rather than moved in floats or a narrowed one; int32 beside uint32 widens to int64 under x64."""
+    with jax.enable_x64(query == jnp.int64):
+        places = (jnp.asarray([[0]], query), jnp.asarray([[0]], key))
+        with pytest.raises(ValueError):
+            template.spans(1, 1, 1, sliding_window=1, positions=places)
+    with jax.enable_x64(new_val=True):
+        mixed = template.spans(1, 2, 1, sliding_window=2, positions=(
+            jnp.asarray([[0]], jnp.int32), jnp.asarray([[0, 1]], jnp.uint32)))
+        signed = template.spans(1, 2, 1, sliding_window=2, positions=(
+            jnp.asarray([[0]], jnp.int64), jnp.asarray([[0, 1]], jnp.int64)))
+        np.testing.assert_array_equal(np.asarray(template.dense(mixed)), np.asarray(template.dense(signed)))
+
+
+def test_a_window_moves_its_bound_in_a_dtype_that_holds_both_places():
+    """Queries' places at the top of int8, keys' in int16 past it: a two-sided window of two around 127
+    keeps the key at 128, its bound moved in the wider dtype rather than held at int8's largest."""
+    places = (jnp.asarray([[127]], jnp.int8), jnp.asarray([[127, 128]], jnp.int16))
+    spans = template.spans(1, 2, 1, sliding_window=2, positions=places)
+    np.testing.assert_array_equal(np.asarray(template.dense(spans)), [[[True, True]]])
+
+
+@pytest.mark.parametrize("window", [2 ** 31, 2 ** 32 - 1, 2 ** 32 + 7], ids=["half", "span", "past"])
+def test_a_window_over_the_widest_places_neither_wraps_nor_aliases(window):
+    """Places at both ends of int32, under windows as wide as their whole range and past it, keep the keys
+    the window keeps counted exactly (in int64), causal and two-sided: no bound wraps around the dtype."""
+    places = jnp.asarray([[-2 ** 31, -2 ** 31 + 5, -1, 0, 2 ** 31 - 6, 2 ** 31 - 1]], jnp.int32)
+    wide = np.asarray(places, np.int64)
+    queries, keys = wide[:, :, None], wide[:, None, :]
+    for causal in (True, False):
+        spans = template.spans(6, 6, 1, causal=causal, sliding_window=window, positions=(places, places))
+        after = 0 if causal else window - 1
+        expected = (keys >= queries - (window - 1)) & (keys <= queries + after)
+        np.testing.assert_array_equal(np.asarray(template.dense(spans)), expected)
 
 
 def test_hooks_are_a_pytree_whose_values_a_compiled_call_takes():

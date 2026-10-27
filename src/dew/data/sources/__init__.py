@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from os import PathLike, fspath
+from pathlib import PurePosixPath
 
 from .base import Read, Shard, ShardManifest, Source
 from .concatenate import Concatenate
@@ -35,9 +36,10 @@ def source(
         if url.startswith("tfds://"):
             name, _, version = url[7:].partition(":")
             resolved = TFDS(name=name, version=version or None, split=split or "train")
-        elif url.startswith("hf://") and format is None and "*" not in url and _inferred(url) is None:
-            # A repository's own URL; a file or glob in it, or any URL given a format, is read as files.
-            repo, _, revision = url.removeprefix("hf://").removeprefix("datasets/").partition("@")
+        elif url.startswith("hf://") and format is None and _repository(url):
+            # A repository's own URL; a path in it (a file, a glob, a committed export's directory),
+            # or any URL given a format, is read as files.
+            repo, _, revision = url.removeprefix("hf://").removeprefix("datasets/").rstrip("/").partition("@")
             resolved = Hub(repo=repo, revision=revision or None, split=split or "train")
         else:
             files = Files(url, format=format)
@@ -56,6 +58,14 @@ def source(
     if provision and isinstance(resolved, (Files, Hub, TFDS, TokenFiles)):
         resolved.provision()
     return resolved
+
+
+def _repository(url: str) -> bool:
+    """Whether an hf:// URL names a dataset repository itself, `owner/name[@revision]`, rather than
+    a path in it: a file, a glob or a directory, such as a committed export's (`dew.data.sinks`),
+    which its manifest names the record format of, whatever its suffix spells."""
+    path = PurePosixPath(url.removeprefix("hf://").removeprefix("datasets/"))
+    return len(path.parts) <= 2 and "*" not in url and _inferred(url) is None
 
 
 __all__ = [

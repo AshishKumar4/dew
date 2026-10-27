@@ -55,3 +55,23 @@ def _refusal(compute: jnp.dtype, operands: tuple, above: bool) -> str | None:
     if compute != jnp.dtype(jnp.float32):
         return f"the kernels do not multiply in {compute.name}"
     return "fp32 products above the default precision, and the kernels multiply in TF32" if above else None
+
+
+def interpreted(product: Product, lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.Array:
+    """The declared `product` of `lhs` and `rhs` as an interpreted or portable mainloop issues it off a GPU,
+    an fp32 result. A promoted fp32 product (one asked above the default precision) accumulates in float64
+    and rounds once to fp32: each fp32 product is exact in float64 and the sum rounds in float64, so the
+    result is within half an fp32 ulp of the float64 sum, which is within gamma_n (float64's) times the
+    sum of its terms' magnitudes of the exact one (adding 2^60, 1 and -2^60 in that order loses the 1).
+    That bound holds at every tiling: XLA's CPU dot picks its fp32 accumulation by shape and instruction
+    set (an fp32 [128, 128] by [128, N] product is 2.32e-6 from float64 at N a multiple of 128, 1.25e-6
+    at N = 300), which a tile's shape would otherwise choose. float64 runs on this path alone, under
+    `jax.enable_x64` for its own ops; the kernels' refusal of x64 (`declared`) is their int32 offsets'.
+    Any other product is `jax.lax.dot_general`'s, accumulated in fp32: a 16-bit one's products are
+    exact."""
+    if product.compute == jnp.dtype(jnp.float32) and product.promoted:
+        with jax.enable_x64(new_val=True):
+            wide = jax.lax.dot_general(lhs.astype(jnp.float64), rhs.astype(jnp.float64), dimension_numbers,
+                                       preferred_element_type=jnp.float64)
+            return wide.astype(jnp.float32)
+    return jax.lax.dot_general(lhs, rhs, dimension_numbers, preferred_element_type=jnp.float32)
