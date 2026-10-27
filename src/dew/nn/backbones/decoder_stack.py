@@ -809,10 +809,12 @@ class StackView:
                                      f"stacked {shape} cuts into {len(rows)} rows, not its {len(layers)} "
                                      "layers'")
                 return rows
-            rows = jax.tree_util.tree_map_with_path(rows_of, held.pop(name))
+            # Each layer's tree rebuilt from its rows of every leaf, the run's own structure kept: a
+            # tuple the run's tree holds (an optimizer's state) is a node, not a leaf's rows.
+            leaves, structure = jax.tree_util.tree_flatten_with_path(held.pop(name))
+            rows = [rows_of(path, leaf) for path, leaf in leaves]
             for index, layer in enumerate(layers):
-                tree[layer] = jax.tree.map(lambda cuts, index=index: cuts[index], rows,
-                                           is_leaf=lambda node: isinstance(node, tuple))
+                tree[layer] = structure.unflatten([cuts[index] for cuts in rows])
         if self.stages > 1 and held:
             tree['stages'] = held
         return tree

@@ -121,8 +121,9 @@ def draw(seed):
 
 
 def wide(state):
-    """`state` as a float64 truth's inputs (`widened`), its PRNG keys as they are."""
-    return jax.tree.map(lambda leaf: leaf if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key)
+    """`state` as a float64 truth's inputs (`widened`), its PRNG keys copies of its own, which a step
+    donates."""
+    return jax.tree.map(lambda leaf: jnp.copy(leaf) if jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key)
                         else widened(leaf), state)
 
 
