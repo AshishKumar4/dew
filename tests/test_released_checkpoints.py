@@ -141,20 +141,17 @@ def reference(bundle):
     return model
 
 
-@pytest.fixture(scope="module")
-def truth(reference):
-    """transformers' float64 twin of the same weights, the logits' truth."""
-    from tools.torch_precision import float64_twin
-
-    return float64_twin(reference)
-
-
 def wide_logits(model, ids, mask=None, positions=None) -> np.ndarray:
-    """A float64 twin's logits for exactly the ids, mask and positions dew was given."""
-    from tools.torch_precision import float64
+    """`model`'s float64 twin's logits for exactly the ids, mask and positions dew was given, the twin
+    released as soon as they are read: a 0.6B model's float64 copy beside the float32 ones is most of
+    a CI task's memory."""
+    from tools.torch_precision import float64, float64_twin
 
+    twin = float64_twin(model)
     with float64():
-        return reference_logits(model, ids, mask, positions, wide=True)
+        logits = reference_logits(twin, ids, mask, positions, wide=True)
+    del twin
+    return logits
 
 
 def reference_logits(model, ids, mask=None, positions=None, *, wide: bool = False) -> np.ndarray:
@@ -226,7 +223,7 @@ def test_the_load_hands_back_the_checkpoints_own_tokenizer(bundle, batch):
 
 
 def test_the_released_logits_match_transformers_on_the_same_ids(
-        bundle, batch, reference, truth, checkpoint):
+        bundle, batch, reference, checkpoint):
     """The parity claim on real weights: dew's fp32 forward over the released
     checkpoint as exact as transformers' over the same directory, the same
     ids, the same mask and the same positions (`assert_as_exact_as_the_reference`),
@@ -237,7 +234,7 @@ def test_the_released_logits_match_transformers_on_the_same_ids(
     ours = np.asarray(bundle.model.apply(bundle.variables, inputs.tokens, **inputs.kwargs()),
                       np.float32)
     theirs = reference_logits(reference, inputs.tokens, valid, positions)
-    wide = wide_logits(truth, inputs.tokens, valid, positions)
+    wide = wide_logits(reference, inputs.tokens, valid, positions)
     _, terms = float64_forward(bundle.model, bundle.variables, inputs.tokens, **inputs.kwargs())
     assert_as_exact_as_the_reference(ours[valid], theirs[valid], wide[valid], f"{checkpoint} logits",
                                      terms=np.asarray(terms)[valid])
@@ -338,9 +335,8 @@ def test_the_trained_export_reloads_and_transformers_reads_it(
     read_back.set_attn_implementation("eager")
     positions = inputs.token_fields["positions"]
     theirs = reference_logits(read_back, inputs.tokens, valid, positions)
-    from tools.torch_precision import float64_twin
-
-    wide = wide_logits(float64_twin(read_back), inputs.tokens, valid, positions)
+    wide = wide_logits(read_back, inputs.tokens, valid, positions)
+    del read_back
     _, terms = float64_forward(bundle.model, state.variables, inputs.tokens, **inputs.kwargs())
     assert_as_exact_as_the_reference(ours[valid], theirs[valid], wide[valid], f"{checkpoint} export",
                                      terms=np.asarray(terms)[valid])
