@@ -164,8 +164,8 @@ def test_a_muse_glimmer_wrapper_loads_whole_and_computes_its_logits(wrapper):
     directory, reference, truth = wrapper
     loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
     exported = loaded.export()
-    stored = {name: tensor.detach().numpy() for name, tensor in reference.state_dict().items()
-              if name != "lm_head.weight" or not reference.config.tie_word_embeddings}
+    # Untied, as the wrapper's config leaves its head (transformers ties by its unset field).
+    stored = {name: tensor.detach().numpy() for name, tensor in reference.state_dict().items()}
     assert sorted(exported) == sorted(stored)
     for name, tensor in stored.items():
         np.testing.assert_array_equal(np.asarray(exported[name]), tensor, err_msg=name)
