@@ -955,11 +955,20 @@ def test_a_recording_with_pilot_shards_sizes_paired_on_them_as_the_live_draws_do
         assert len(merged["site.pilot.input_digest"]) == len(pilots)
         with pytest.raises(ValueError):
             recorder.merge_shards("site", shards[:2])
-        for at in (0, 2):
-            narrow = [dict(shard, **{"site.shape.y": np.asarray([1, 1], np.int64)}) if index == at else shard
+        # One pilot shard's leaf apart from the others', and every pilot's apart from the verdict's.
+        for at in ((0,), (0, 2)):
+            narrow = [dict(shard, **{"site.shape.y": np.asarray([1, 1], np.int64)}) if index in at else shard
                       for index, shard in enumerate(shards)]
             with pytest.raises(ValueError):
                 recorder.merge_shards("site", narrow)
+        # Pilots of another leaf than the verdict's.
+        renamed = [{key.removesuffix(".y") + ".z" if key.endswith(".y") else key: value
+                    for key, value in shard.items()} for shard in shards[::2]]
+        with pytest.raises(ValueError):
+            recorder.merge_shards("site", [shards[1], *renamed])
+        straddling = recorder.record_shard("site", draw, evaluate, range(SIZING_FROM - 1, SIZING_FROM + 1))
+        with pytest.raises(ValueError):
+            recorder.merge_shards("site", [*shards, straddling])
 
         seeds = int(merged["site.seeds"])
         drawn, reference, truth = indexed_recording(merged, "site", seeds, inputs_of=draw, truth_fn=product)

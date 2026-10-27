@@ -156,6 +156,12 @@ def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict
     Shards of seeds from SIZING_FROM on are the recording's pilots, the draws a paired sizing of it takes
     and no verdict does (`seeds_for`): joined in order from SIZING_FROM, every one kept, under
     `<label>.pilot.`, their leaves the verdict's in shape and dtype, as a run from seed 0 is."""
+    straddling = [_runs(shard[f"{label}.drawn"]) for shard in shards
+                  if (np.asarray(shard[f"{label}.drawn"]) < SIZING_FROM).any()
+                  and (np.asarray(shard[f"{label}.drawn"]) >= SIZING_FROM).any()]
+    if straddling:
+        raise ValueError(f"{label}: shards of seeds {straddling} hold verdict seeds and pilots from "
+                         f"SIZING_FROM alike")
     verdict = [shard for shard in shards if int(shard[f"{label}.drawn"][0]) < SIZING_FROM]
     pilots = [shard for shard in shards if int(shard[f"{label}.drawn"][0]) >= SIZING_FROM]
     joined = _joined(label, verdict, 0)
@@ -170,12 +176,13 @@ def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict
     result = _finished(label, joined, confirmed)
     if pilots:
         held = _joined(label, pilots, SIZING_FROM)
-        for key, value in _kept(label, held, len(held[f"{label}.drawn"])).items():
-            if _whole(label, key):
-                if not np.array_equal(value, result[key]):
-                    raise ValueError(f"{label}: the pilots' {key} is {value}, the verdict's {result[key]}")
-            else:
-                result[f"{label}.pilot.{key.removeprefix(f'{label}.')}"] = value
+        pilot = _kept(label, held, len(held[f"{label}.drawn"]))
+        whole = {key for key in result if _whole(label, key)}
+        if {key for key in pilot if _whole(label, key)} != whole or any(
+                not np.array_equal(pilot[key], result[key]) for key in whole):
+            raise ValueError(f"{label}: the pilots' leaves are not the verdict's in name, shape and dtype")
+        result.update({f"{label}.pilot.{key.removeprefix(f'{label}.')}": value for key, value in pilot.items()
+                       if not _whole(label, key)})
     print(f"{label}: declared {confirmed} seeds; merged {kept} draws' evidence"
           + (f" and {len(held[f'{label}.drawn'])} pilots" if pilots else ""), flush=True)
     return result
