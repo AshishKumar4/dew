@@ -60,7 +60,7 @@ from dew.interop.decoder_parts import (
     translated,
 )
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
-from dew.interop.unread import held, valued
+from dew.interop.unread import equal, held
 from dew.interop.weights import checkpoint_dtype, insert, nested
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.attention_residuals import AttentionResiduals
@@ -450,12 +450,7 @@ def _equal(read: Callable[[str], np.ndarray], first: str, second: str, checked: 
     """Whether source tensors `first` and `second` hold equal values: known where `checked` joins
     them, else read and compared; of a load without its weights, whether their shapes and dtypes are
     (`valued`)."""
-    if second in checked.get(first, frozenset()):
-        return True
-    one, other = read(first), read(second)
-    if not valued(one, other):
-        return (one.shape, one.dtype) == (other.shape, other.dtype)
-    return np.array_equal(one, other)
+    return second in checked.get(first, frozenset()) or equal(read(first), read(second))
 
 
 def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], record,

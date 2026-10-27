@@ -117,6 +117,16 @@ class Unread:
     def __getitem__(self, index):
         return evaluated(lambda array, index: array[index], self, index)
 
+    def __setitem__(self, index, value):
+        # A write keeps the array's shape and dtype; it is checked to fit where it writes.
+        evaluated(lambda array, index, value: array.at[index].set(value), self, index, value)
+
+    def __getattr__(self, name: str):
+        # The array methods NumPy readers call (`all`, `any`, `mean`, `clip`, ...), as `jax.Array`'s.
+        if name.startswith("_") or not callable(getattr(jax.Array, name, None)):
+            raise AttributeError(name)
+        return lambda *args, **kwargs: evaluated(lambda array: getattr(array, name)(*args, **kwargs), self)
+
     def __iter__(self):
         return (self[position] for position in range(len(self)))
 
@@ -139,18 +149,6 @@ class Unread:
 
     def copy(self, *_):
         return self
-
-    def squeeze(self, axis=None):
-        return evaluated(lambda array: array.squeeze(axis), self)
-
-    def sum(self, *args, **kwargs):
-        return evaluated(lambda array: array.sum(*args, **kwargs), self)
-
-    def max(self, *args, **kwargs):
-        return evaluated(lambda array: array.max(*args, **kwargs), self)
-
-    def min(self, *args, **kwargs):
-        return evaluated(lambda array: array.min(*args, **kwargs), self)
 
     @property
     def T(self):
@@ -202,6 +200,22 @@ def held(value, dtype=None, *, contiguous: bool = False):
     if isinstance(value, Unread):
         return value if dtype is None else value.astype(dtype)
     return np.ascontiguousarray(value, dtype) if contiguous else np.asarray(value, dtype)
+
+
+def equal(first, second) -> bool:
+    """Whether `first` and `second` hold equal values, as `np.array_equal`; where either is `Unread`,
+    whether their shapes and dtypes are, all a load without its weights can check."""
+    if valued(first, second):
+        return bool(np.array_equal(first, second))
+    return (tuple(first.shape), np.dtype(first.dtype)) == (tuple(second.shape), np.dtype(second.dtype))
+
+
+def lookup(table: np.ndarray, index):
+    """`table[index]` along its first axis, `index` an integer array of codes; an `Unread` index gives
+    an `Unread` of the result's shape and dtype (NumPy's own `take` reads its index)."""
+    if isinstance(index, Unread):
+        return evaluated(lambda codes: jnp.take(jnp.asarray(table), codes, axis=0), index)
+    return np.take(table, index, axis=0)
 
 
 def valued(*values) -> bool:

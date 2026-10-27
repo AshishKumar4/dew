@@ -117,7 +117,7 @@ def decode_e2m1(packed: ArrayLike, exponents: ArrayLike) -> np.ndarray:
     if codes.shape[:-1] != scales.shape[:-1] or codes.shape[-1] != scales.shape[-1] * (GROUP // 2):
         raise ValueError(f"packed E2M1 codes [..., n / 2] take E8M0 exponents [..., n / {GROUP}], "
                          f"got {codes.shape} and {scales.shape}")
-    values = np.take(_E2M1_BYTES, codes, axis=0).reshape(*scales.shape, GROUP)
+    values = unread.lookup(_E2M1_BYTES, codes).reshape(*scales.shape, GROUP)
     values *= scales[..., None]
     return values.reshape(*codes.shape[:-1], 2 * codes.shape[-1])
 
@@ -199,6 +199,10 @@ def dequantize_mxfp4(blocks: ArrayLike, scales: ArrayLike, dtype: DTypeLike = np
     codes = _bytes(blocks, _CODE_DTYPES)
     exponents = _bytes(scales, (np.dtype(np.uint8), np.dtype(ml_dtypes.float8_e8m0fnu)))
     kept = np.dtype(dtype)
+    if not unread.valued(codes, exponents):
+        # Of a load without its weights: the decoded weight's shape and dtype.
+        experts, outputs, groups, _ = codes.shape
+        return unread.Unread((experts, groups * GROUP, outputs), kept)
     work = kept if kept in _EXACT_E2M1 else np.dtype(np.float32)
     table = _scaled_e2m1(work)
     experts, outputs, groups, _ = codes.shape
@@ -1400,7 +1404,7 @@ def _ct_decode(tensors: Mapping[str, np.ndarray], name: str, *, scheme: _WeightS
     if scheme.format == 'nvfp4-pack-quantized':
         parts = _ct_parts(scheme, name)
         packed = unread.held(tensors[parts['packed']])
-        values = np.take(_E2M1_BYTES, _bytes(packed, _CODE_DTYPES), axis=0).reshape(
+        values = unread.lookup(_E2M1_BYTES, _bytes(packed, _CODE_DTYPES)).reshape(
             packed.shape[0], packed.shape[1] * 2)
         scales = _nvfp4_scales(
             scheme,
@@ -1565,10 +1569,10 @@ def _modelopt_decode(tensors: Mapping[str, np.ndarray], name: str, *, method: st
             or overall.dtype != np.float32 or overall.size not in (1, packed.shape[0])):
         raise ValueError(f"{name} must be ModelOpt U8 E2M1 pairs with one E4M3 scale per 16 inputs "
                          "and scalar float32 weight_scale_2/input_scale")
-    if (not np.isfinite(scale.astype(np.float32)).all()
-            or not np.isfinite(overall).all() or (overall < 0).any()):
+    if unread.valued(scale, overall) and (not np.isfinite(scale.astype(np.float32)).all()
+                                          or not np.isfinite(overall).all() or (overall < 0).any()):
         raise ValueError(f"{name} ModelOpt scales must be finite and nonnegative")
-    values = np.take(_E2M1_BYTES, packed, axis=0).reshape(*packed.shape[:-1], -1, 16)
+    values = unread.lookup(_E2M1_BYTES, packed).reshape(*packed.shape[:-1], -1, 16)
     # The author's Python reader maps code 8 to +0; packed bytes remain in
     # the export grid so an untrained save can still keep that source code.
     values = np.where(values == 0, np.float32(0), values)

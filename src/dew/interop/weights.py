@@ -11,7 +11,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import _records
-from dew.interop.unread import held
+from dew.interop.unread import equal, held, valued
 from dew.registry import dtype_name, resolve_dtype, storage_name
 
 if TYPE_CHECKING:
@@ -168,7 +168,7 @@ def source_alias(tensors: Mapping[str, np.ndarray], owners: dict[tuple[str, ...]
                  path: tuple[str, ...], name: str) -> None:
     """Compare source aliases before casting, since unequal values can round alike."""
     previous = owners.setdefault(path, name)
-    if previous != name and not np.array_equal(tensors[previous], tensors[name]):
+    if previous != name and not equal(tensors[previous], tensors[name]):
         raise ValueError(f"Two different source tensors {previous!r} and {name!r} map to {path}")
 
 
@@ -202,6 +202,8 @@ def _copy(stored: np.ndarray, dtype: np.dtype, order: tuple[int, ...] | None) ->
     leaf = stored.astype(dtype, copy=False)
     if order is None:
         return leaf
+    if not valued(leaf):
+        return leaf.transpose(order)
     if order == (*range(leaf.ndim - 2), leaf.ndim - 1, leaf.ndim - 2):
         return swapped(leaf)
     return np.ascontiguousarray(leaf.transpose(order))
@@ -218,7 +220,7 @@ def _leaves[LeafT](tensors: Mapping[str, np.ndarray], path_of: TensorPath, param
         path = path_of(name)
         if path is None:
             continue
-        stored = np.asarray(tensor)
+        stored = held(tensor)
         order, transpose = _orders(path, stored.ndim)
         dtype = checkpoint_dtype(stored.dtype, param_dtype, path=path)
         yield name, path, read(stored, dtype, order), transpose
