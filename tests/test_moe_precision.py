@@ -15,6 +15,7 @@ import ml_dtypes
 import numpy as np
 import optax
 import pytest
+from generation_support import interpreted_projection
 from jax.sharding import NamedSharding, PartitionSpec as P
 from reference_error import assert_as_exact, with_gradients
 from scipy.special import erfc
@@ -141,8 +142,8 @@ def test_a_projection_rounds_whole_contractions_once(case, master, input_dtype, 
     ids=['even', 'ragged', 'one-expert', 'fewer-rows', 'all-empty'])
 @pytest.mark.parametrize('input_dtype', [jnp.bfloat16, jnp.float32])
 def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
-    """Forward, input and kernel cotangents of 'pallas' against float64
-    sums of the bf16 operands, on the kernels (interpreted on a CPU): rows
+    """Forward, input and kernel cotangents of the projection's kernels against
+    float64 sums of the bf16 operands (interpreted on a CPU, `interpreted_projection`): rows
     past the routed ones, and every row when no expert is routed, come back
     zero in the output and the input gradient."""
     rng = np.random.default_rng(88)
@@ -155,8 +156,7 @@ def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
     forward, input_oracle, kernel_oracle = oracle.products(qx, qk, qy, sizes)
 
     def loss(x, kernel):
-        projected = jnp.asarray(expert_projection(x, kernel, jnp.asarray(sizes), jnp.bfloat16,
-                                                  'pallas', None))
+        projected = jnp.asarray(interpreted_projection(x, kernel, jnp.asarray(sizes), jnp.bfloat16))
         return jnp.sum(projected.astype(jnp.float32) * jnp.asarray(qy, jnp.float32)), projected
 
     (_, y), (dx, dk) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(
@@ -216,11 +216,15 @@ TILE_SIZES = np.array([0, 70, 1, 129, 100, 0], np.int32)
 
 
 def _tile_gate_arm(implementation, fault=1.0):
-    """A bf16 projection's output and both gradients through `implementation` ('pallas' with the CPU's
-    interpreter), its output times `fault`."""
+    """A bf16 projection's output and both gradients through `implementation` ('pallas': the kernels,
+    interpreted on a CPU, `interpreted_projection`), its output times `fault`."""
+    def project(x, k):
+        if implementation == 'pallas':
+            return interpreted_projection(x, k, jnp.asarray(TILE_SIZES), jnp.bfloat16)
+        return expert_projection(x, k, jnp.asarray(TILE_SIZES), jnp.bfloat16, implementation, None)
+
     def run(x, kernel_matrix, dy):
-        y, *gradients = with_gradients(lambda x, k: expert_projection(
-            x, k, jnp.asarray(TILE_SIZES), jnp.bfloat16, implementation, None))(x, kernel_matrix, dy)
+        y, *gradients = with_gradients(project)(x, kernel_matrix, dy)
         return ((y.astype(jnp.float32) * fault).astype(y.dtype), *gradients)
     return run
 
@@ -269,8 +273,8 @@ TILE_SEEDS = 8
 def test_a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels(implementation):
     """The kernels are chosen where the call lowers, not by the process's
     default backend. On a GPU host, a projection placed on the CPU runs
-    `jax.lax.ragged_dot` ('auto') or the interpreted kernels ('pallas'), and
-    its forward is the float64 sum of the bf16 operands either way."""
+    XLA's program ('auto' and 'pallas' alike), and its forward is the float64
+    sum of the bf16 operands either way."""
     rng = np.random.default_rng(88)
     x = rng.normal(size=(24, 16)).astype(np.float32)
     kernel = rng.normal(size=(8, 16, 16)).astype(np.float32)
@@ -525,9 +529,9 @@ def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, sc
                                                           expert, fsdp, implementation):
     """Three Adam steps of a bf16 routed layer: outputs, gradients, parameters
     and moments agree between global and exchange dispatch. Observed maxima
-    1.5e-8 random and 6e-8 skewed. 'pallas' runs its kernels (interpreted on
-    a CPU) on every device's own rows, the exchange included on a mesh whose
-    only split axis is the expert one."""
+    1.5e-8 random and 6e-8 skewed. On a GPU 'pallas' runs its kernels on
+    every device's own rows, the exchange included on a mesh whose only split
+    axis is the expert one; a CPU runs XLA's program."""
     mesh = MeshSpec(expert=expert, fsdp=fsdp).build()
     model, parameters, specs, tokens, x, weights, choices = placed_experts(
         mesh, activation, skewed, scale_inputs, limit, implementation)

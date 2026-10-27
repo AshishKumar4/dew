@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, generations, lowers, runs
+from generation_support import INTERPRETS, generations, interpreted_projection, lowers, runs
 from jax.sharding import Mesh
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, with_gradients
 
@@ -175,7 +175,8 @@ def test_the_portable_branch_writes_each_gradient_from_the_rounded_operands():
 @pytest.mark.parametrize("generation_name,implementation", [("sm80", "triton"), ("sm90", "mosaic_gpu")])
 def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(generation_name: str,
                                                                                implementation: str):
-    """'pallas' interprets the kernels on a CPU as the named generation runs them, each launch the
+    """The projection's kernels, interpreted on a CPU as the named generation runs them
+    (`interpreted_projection`), each launch the
     implementation `generation.chosen` names: its forward and both gradients as exact as XLA's, the input
     gradient in the input's dtype and the kernel gradient in the master's, each launch's route the one
     named."""
@@ -186,8 +187,7 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
     group_sizes = jnp.asarray(sizes, jnp.int32)
 
     def products(x, w):
-        y, pull = jax.vjp(lambda x, w: expert_projection(x, w, group_sizes, jnp.bfloat16, "pallas", None),
-                          x, w)
+        y, pull = jax.vjp(lambda x, w: interpreted_projection(x, w, group_sizes, jnp.bfloat16), x, w)
         return (y, *pull(jnp.asarray(dy, jnp.bfloat16)))
 
     with (generation.assumed(generation_name), generation.chosen(grouped_matmul=implementation),
