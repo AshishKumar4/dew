@@ -40,6 +40,9 @@ KERNEL = re.compile(r"kCustomKernel \[[^\]]*\] (\S+) .*? shared_memory: (\d+) by
 """A custom kernel's line in XLA's thunk sequence, with its name and the shared bytes it launches with: a
 Triton call's, or one of XLA's own fusions XLA emits so (`loop_multiply_fusion`)."""
 
+UNIQUIFIED = re.compile(r"__\d+$")
+"""The suffix XLA gives a kernel name's later launches in a program (`recurrence_cumulated__1`)."""
+
 TRITON_CALL = re.compile(r'custom_call_target="__gpu\$xla\.gpu\.triton".*?\bname = "([^"]+)"')
 """A Triton kernel's call in XLA's optimized HLO, with the kernel's name, which its launch line carries."""
 
@@ -125,17 +128,18 @@ def compile_kernels(cases, generation: str) -> list[dict]:
 
 
 def triton_evidence(programs: list[str], thunks: list[str]) -> dict:
-    """What XLA's optimized `programs` and thunk sequences (`thunks`) say of a program's Triton kernels: the
-    largest shared bytes a call launches with, or why they say nothing. Each Triton call (an HLO custom call,
-    named by its kernel) states its shared bytes in a launch line of its own, named exactly as the call is:
-    XLA's own fusions launch as custom kernels too, and one kernel's name can begin another's
-    (attention_forward, attention_forward_headroom). A call with no launch line of its own, or a program that
-    calls no Triton kernel, is no evidence its kernel compiled within its block (row 1381)."""
+    """What XLA's optimized `programs` and thunk sequences (`thunks`) say of a program's Triton kernels:
+    the largest shared bytes a call launches with, or why they say nothing. Each Triton call (an HLO
+    custom call, named by its kernel) states its shared bytes in a launch line of its own, named as the
+    call is, XLA numbering a name's later calls (recurrence_cumulated__1): XLA's own fusions launch as
+    custom kernels too, and one kernel's name can begin another's (attention_forward,
+    attention_forward_headroom). A call with no launch line of its own, or a program that calls no
+    Triton kernel, is no evidence its kernel compiled within its block (row 1381)."""
     calls = Counter(name for text in programs for name in TRITON_CALL.findall(text))
     launches: dict[str, list[int]] = {}
     for text in thunks:
         for name, size in KERNEL.findall(text):
-            launches.setdefault(name, []).append(int(size))
+            launches.setdefault(UNIQUIFIED.sub("", name), []).append(int(size))
     if not calls:
         return {"error": "XLA's program calls no Triton kernel"}
     unlaunched = sorted(name for name, count in calls.items() if len(launches.get(name, ())) < count)
