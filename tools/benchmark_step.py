@@ -204,6 +204,14 @@ class BenchmarkConfig:
 
 
 def build_cases(config: BenchmarkConfig) -> list[Case]:
+    """The cases a run measures, each released decoder's fields in its config (`released`)."""
+    return [released(case) for case in given_cases(config)]
+
+
+def given_cases(config: BenchmarkConfig) -> list[Case]:
+    """The cases a run measures as it names them, its overrides applied and a released decoder still
+    named by its family: the form `--cases` reads, which a peak process is handed and resolves itself
+    (`measured_peak`), where a resolved config holds native records JSON does not carry."""
     if config.cases:
         cases = config.cases
     elif config.preset == 'cpu-smoke':
@@ -240,7 +248,7 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
         packed = ({'packed_documents': config.packed_documents}
                   if config.packed_documents is not None and case.packs_documents else {})
         dtype = {'dtype': config.dtype} if case.dtype is None else {}
-        return released(dataclasses.replace(case, **overrides, **frames, **packed, **dtype))
+        return dataclasses.replace(case, **overrides, **frames, **packed, **dtype)
 
     return [apply(case) for case in cases]
 
@@ -540,7 +548,7 @@ def main(config: BenchmarkConfig) -> list[Row]:
         jax.config.update("jax_enable_compilation_cache", val=False)
     # Before this process opens a backend, which would hold the device each case's peak process needs.
     measuring = not (joins_pool(None, pool_cluster(None)) or config.peak_run)
-    peaks = [measured_peak(case, config) for case in build_cases(config)] if measuring else None
+    peaks = [measured_peak(case, config) for case in given_cases(config)] if measuring else None
     # Joins a `dew launch` pool when one launched this process, and applies
     # the flags before the backend opens either way.
     prepare_process(xla_flags=config.xla_flags)

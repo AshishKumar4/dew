@@ -53,14 +53,15 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     assert row["training_flops"] == counted
 
 
-def peak_row(tmp_path, platform: str, *arguments: str) -> dict:
-    """The causal_transformer smoke case's row, the tool run as a person runs it on one device of
-    `platform` with `arguments`, its peak measured in a process of the case's own."""
+def peak_row(tmp_path, platform: str, *arguments: str, cases: str | None = None) -> dict:
+    """The causal_transformer smoke case's row, or `cases`', the tool run as a person runs it on one
+    device of `platform` with `arguments`, its peak measured in a process of the case's own."""
     out = tmp_path / "rows.json"
     environment = {name: value for name, value in os.environ.items() if name != "XLA_FLAGS"}
     tool = str(REPO_ROOT / "tools/benchmark_step.py")
-    done = subprocess.run([sys.executable, tool, "--preset", "cpu-smoke",
-                           "--architectures", "causal_transformer", "--warmup", "1", "--steps", "2",
+    named = (["--cases", cases] if cases is not None else
+             ["--preset", "cpu-smoke", "--architectures", "causal_transformer"])
+    done = subprocess.run([sys.executable, tool, *named, "--warmup", "1", "--steps", "2",
                            "--dtype", "float32", "--mesh", "{}", "--json-out", str(out), *arguments],
                           env={**environment, "JAX_PLATFORMS": platform,
                                "PYTHONPATH": os.pathsep.join((str(REPO_ROOT / "src"), str(tmp_path)))},
@@ -83,6 +84,16 @@ def test_a_cases_peak_is_read_in_a_process_of_its_own_inside_the_cases_context(t
     row = peak_row(tmp_path, "cpu", "--within", "marking:marked")
     assert row["devices"] == 1 and len(row["peak_bytes_by_device"]) == 1 and row["planned_device_bytes"] > 0
     assert len(set((tmp_path / "entered").read_text().split())) == 3, "this process and both peak processes"
+
+
+def test_a_released_decoders_peak_is_read_in_a_process_that_resolves_its_family(tmp_path):
+    """A case naming a released decoder (`Case.family`) hands its peak process the case as it was
+    named, which resolves the family itself: the resolved config holds native records JSON does not
+    carry, and the run measured nothing where it tried to (row 1308, TL-h100-dory4b-1308)."""
+    cases = json.dumps([{"architecture": "causal_transformer", "family": "dory-tiny", "batch_size": 8,
+                         "seq_len": 32, "optimizer": {"state_dtype": "bfloat16"}}])
+    row = peak_row(tmp_path, "cpu", cases=cases)
+    assert row["finite"] and len(row["peak_bytes_by_device"]) == 1 and row["planned_device_bytes"] > 0
 
 
 @pytest.mark.gpu(reason="a GPU's allocator keeps the high-water the measured peak reads")
