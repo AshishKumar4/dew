@@ -802,6 +802,17 @@ class ShiftsLogits(Protocol):
 
 
 @runtime_checkable
+class PositionCapacity(Protocol):
+    """A model that declares the most places a row may hold that its positions cover, which a row longer
+    than that would read past (a learned table's rows), None where its positions cover any (rotary,
+    ALiBi): what a training row's length is checked against, apart from its decode cache's capacity
+    (`Bounded.max_seq_len`). A model that declares none is checked for none."""
+
+    @property
+    def position_capacity(self) -> int | None: ...
+
+
+@runtime_checkable
 class Bounded(Protocol):
     """A model that declares its vocabulary and cache capacity, which the host
     checks read to refuse an id outside the vocabulary or a request that would

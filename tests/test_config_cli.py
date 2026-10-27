@@ -3,6 +3,9 @@ that rebuilds from what it logged."""
 
 import dataclasses
 import json
+import os
+import subprocess
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated
@@ -117,11 +120,26 @@ def test_a_python_run_whose_chain_is_unrecorded_trains_from_dew_train(tmp_path):
         RunConfig.load(str(tmp_path / "runs" / "unrecorded_run"))
 
 
+def profiled(report_file: Path) -> dict:
+    """A profile's report, held to the capture it names: the steps the capture's training annotations
+    hold are exactly the two after its warmup of two, the steps its log covers."""
+    from dew.training.profiling import traced_steps
+
+    report = json.loads(report_file.read_text())
+    assert traced_steps(Path(report["capture"])) == (2, 3) and tuple(report["traced"]) == (2, 3)
+    assert (report["steps"], report["warmup"]) == (2, 2)
+    assert report["step_ms"] > 0 and report["input_wait_ms"] >= 0 and report["compile_s"] > 0
+    assert (report["device_ms"] is None) == (report["attribution"] is not None)
+    assert (Path(report["capture"]) / "reports").is_dir()
+    return report
+
+
 def test_dew_profile_trains_a_run_afresh_and_reports_where_its_window_spent_the_time(tmp_path):
-    """`dew profile run.py --warmup 2 --steps 2` trains the run afresh in a directory of its own, writing
-    no checkpoint, traces the two steps after its warmup and writes the report of the window, one log
-    interval: its step and input-wait times, the step's compile, and the device time XProf attributes to
-    its ops or why it attributes none, beside the capture's own reports. A second profile into the same
+    """`dew profile run.py --warmup 2 --steps 2 --out DIR` trains the run afresh in a directory of its
+    own, writing no checkpoint, traces the two steps after its warmup, its capture's training
+    annotations those steps alone, and writes the report of the window, the one log interval those steps
+    make: its step and input-wait times, the step's compile, and the device time XProf attributes to its
+    ops or why it attributes none, beside the capture's own reports. A second profile into the same
     directory is refused."""
     pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     import autoencoder_experiment
@@ -132,14 +150,49 @@ def test_dew_profile_trains_a_run_afresh_and_reports_where_its_window_spent_the_
     out = tmp_path / "profile"
     command = ["profile", autoencoder_experiment.__file__, "--warmup", "2", "--steps", "2", "--out", str(out)]
     assert main(command) == 0
-    report = json.loads((out / "report.json").read_text())
-    assert (report["steps"], report["warmup"]) == (2, 2)
-    assert report["step_ms"] > 0 and report["input_wait_ms"] >= 0 and report["compile_s"] > 0
-    assert (report["device_ms"] is None) == (report["attribution"] is not None)
-    assert (Path(report["capture"]) / "reports").is_dir()
+    assert profiled(out / "report.json")["directory"] == str(out)
     assert Checkpoints(str(out / "autoencoder_experiment")).latest is None
     with pytest.raises(ValueError):
         main(command)
+
+
+def test_dew_profile_with_no_output_prepares_its_process_before_naming_its_directory(tmp_path):
+    """`dew profile run.py` with no `--out` profiles into profiles/<the run's name>/<the time it starts>,
+    the time agreed across the pool once the process is prepared: the run's XLA flags reach XLA, which
+    reads them as JAX opens its backend, so an XLA dump the run asks for is written."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    import autoencoder_experiment
+
+    dump = tmp_path / "dump"
+    root = Path(__file__).resolve().parents[1]
+    environment = {**os.environ, "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")])}
+    done = subprocess.run(
+        [sys.executable, "-m", "dew.cli.main", "profile", autoencoder_experiment.__file__, "--warmup", "2",
+         "--steps", "2", "--set", f"trainer.xla_flags=--xla_dump_to={dump}"],
+        cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=900)
+    assert done.returncode == 0, done.stderr[-4000:]
+    (report_file,) = (tmp_path / "profiles" / "autoencoder_experiment").glob("*/report.json")
+    profiled(report_file)
+    assert any(dump.iterdir())
+
+
+def test_a_configured_run_is_profiled_without_its_ranking_cooldowns_or_validation(tmp_path):
+    """A configured run that ranks its checkpoints by its training loss, branches into cooldowns and
+    validates a split of its own is profiled without them: its profile writes no checkpoint, best or
+    otherwise, and runs no cooldown, which would want the validation the profile drops."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
+    import autoencoder_experiment
+
+    from dew.checkpoints import Checkpoints
+    from dew.training import Cooldowns
+
+    run = autoencoder_experiment.run()
+    run = dataclasses.replace(run, trainer=dataclasses.replace(
+        run.trainer, name="ranked", best="train/loss", cooldowns=Cooldowns(at=(2,), length=2)))
+    report = run.profile(str(tmp_path / "profile"), warmup=2, steps=2)
+    assert report is not None and report.traced == (2, 3)
+    with Checkpoints(str(tmp_path / "profile" / "ranked")) as checkpoints:
+        assert checkpoints.latest is None and checkpoints.best is None
 
 
 @pytest.mark.parametrize("built", ["in Python", "as a run states them"])

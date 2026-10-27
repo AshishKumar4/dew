@@ -55,7 +55,7 @@ from dew.registry import models, projectors, read_arguments, resolve_dtype, towe
 from dew.state import TrainState
 from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.planning import Timer
+from dew.training.planning import Trials
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 
@@ -425,7 +425,7 @@ class CompiledStep:
 @contextlib.contextmanager
 def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) -> Iterator[CompiledStep]:
     """Place the case's state as a run does (`Trainer.place`), compile its step on the first placed batch
-    with the timer a run's compile takes (`Timer`), which times a frontier's plans and profiles the
+    with the trials a run's compile takes (`Trials`), which time a frontier's plans and profile the
     step where JAX's AutoPGLE asks, on a copy of the state, and yield it.
 
     Each step reads the next placed batch, or with `fixed_batch` the first
@@ -436,10 +436,10 @@ def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) ->
         first = next(source)
         jax.block_until_ready((state, first))
         start = time.perf_counter()
-        timer = Timer(state, first)
-        compiled = trainer.compile(state, first, timer)
+        trials = Trials(state, first)
+        compiled = trainer.compile(state, first, trials)
         compile_seconds = time.perf_counter() - start
-        state = timer.state
+        state = trials.state
 
         def step(state: TrainState) -> tuple[TrainState, jax.Array, jax.Array]:
             state, loss, _, finite, _, _ = compiled(state, first if fixed_batch else next(source))

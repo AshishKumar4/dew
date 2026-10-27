@@ -320,6 +320,18 @@ def test_a_schedule_stage_past_the_models_context_is_refused(tmp_path):
         budget_lm_trainer().fit(context_schedule(tmp_path / "past", 13), steps=4)
 
 
+def test_an_objective_whose_rows_pass_a_learned_position_table_is_refused():
+    """A decoder whose positions are a learned table of twelve rows covers twelve places
+    (`PositionCapacity`), however long the rows its objective names: an objective of thirteen-token rows
+    is refused, whose rows, and the rows of any stage it reads up to them, would gather past the table,
+    and one of twelve is not."""
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=12, position_embedding="learned", dtype="float32")
+    assert LMObjective(model, seq_len=12).context == 12
+    with pytest.raises(ValueError):
+        LMObjective(model, seq_len=13)
+
+
 @pytest.mark.parametrize("variant", ["ema", "accumulation", "schedule", "dynamic_scale", "checkpoints"])
 def test_steps_after_the_first_logs_neither_compile_nor_move_data_unasked(variant, tmp_path):
     """Past its first two logging intervals and checkpoints the loop reruns

@@ -82,6 +82,7 @@ from dew.distributed.placement import (
     placed_bytes,
     placed_shapes,
 )
+from dew.inputs import Field, InputSpec
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes, batch_axes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
@@ -181,11 +182,10 @@ from dew.training.observe import Observe
 from dew.training.planning import (
     Candidate,
     Planned,
-    Timer,
+    Trials,
     faster,
     pgle_runs,
     plan_step,
-    profile_guided,
     read_whole,
     settled,
     splits,
@@ -307,10 +307,9 @@ class Trainer(Generic[Loss, Effects]):
         self.profile = profile
         self.lower_for = lower_for
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
-        # `fit` keeps them beside each step. The program is the step as handed to XLA, before GSPMD partitions
-        # it, and the executable the step as compiled, whose memory analysis a benchmark reads.
+        # `fit` keeps them beside each step. The executable is the step as compiled, whose memory analysis a
+        # benchmark reads; the program it was lowered from is released with its plan (`Planned.released`).
         self.step_flops: StepFlops | None = None
-        self.program: jax.stages.Lowered | None = None
         self.executable: jax.stages.Compiled | None = None
         # The plan of the last compiled step: its split, the rows of its
         # microbatch and every compile its search made (`Probe`).
@@ -947,7 +946,7 @@ class Trainer(Generic[Loss, Effects]):
         return run
 
     @ruled
-    def compile(self, state: TrainState, batch: Batch, timed: Timer | None = None) -> CompiledStep:
+    def compile(self, state: TrainState, batch: Batch, trials: Trials | None = None) -> CompiledStep:
         """Compile a transaction over the state and one already-produced global batch.
 
         The step consumes the state it is given. The returned state takes over its
@@ -965,10 +964,12 @@ class Trainer(Generic[Loss, Effects]):
         transaction, a window pooling `split` x `accumulation`. Every batch of
         a run is split alike, as its first compile planned or its pooling
         state's window holds; later shapes climb the ladder alone. A plan that
-        splits or spans devices, left open and unrecorded, is timed by `timed`
-        (`fit`) against the batch whole a rung up, and the faster kept. Where JAX's AutoPGLE is on
-        (`jax_enable_pgle`), `timed` profiles the plan's first runs on a copy of the state, and the
-        same program compiles again guided by that profile (`dew.training.planning.profile_guided`).
+        splits or spans devices, left open and unrecorded, is timed on `trials` (`fit`'s, `Trials`)
+        against the batch whole a rung up where they ask for it, and the faster kept. Where JAX's AutoPGLE
+        is on (`jax_enable_pgle`), the plan admitted runs its first runs on a trial, `trials`' or a copy
+        of the state beside it where none are given, and its program compiles again guided by their
+        profile (`Planned.guided`), the executable it replaces released with its program
+        (`Planned.released`).
         """
         if self.lower_for is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
@@ -988,9 +989,8 @@ class Trainer(Generic[Loss, Effects]):
         shaped = self._at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with self._traced_on(mesh, links) as schedule:
-            planned, flops = self._planned(state, batch, mesh, schedule, resumed, timed)
+            planned, flops = self._planned(state, batch, mesh, schedule, resumed, trials)
             split, candidate, self.executable = planned.split, planned.candidate, planned.executable
-            self.program = candidate.program
             self._split = split
             self._shape_rungs[batch_layout(batch)] = self._rung()
             self.step_flops = flops and split * flops
@@ -1047,11 +1047,12 @@ class Trainer(Generic[Loss, Effects]):
         return run
 
     def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
-                 timed: Timer | None) -> tuple[Planned, StepFlops | None]:
+                 trials: Trials | None) -> tuple[Planned, StepFlops | None]:
         """The plan `compile` reads `batch` in (`plan_step`), from the run's splits (`splits`), the
-        faster by `timed` of a frontier of two, with `plan` its record and the objective at its rung,
-        and a microbatch's FLOPs (`plan_flops`). A plan recorded beside the compilation cache
-        (`recorded_rung`) is the first candidate, kept untimed; `resumed` is a checkpoint's rung."""
+        faster on `trials` of a frontier of two, guided under AutoPGLE (`Planned.guided`) and released
+        (`Planned.released`), with `plan` its record and the objective at its rung, and a microbatch's
+        FLOPs (`plan_flops`). A plan recorded beside the compilation cache (`recorded_rung`) is the first
+        candidate, kept untimed; `resumed` is a checkpoint's rung."""
         replicated = NamedSharding(mesh, P())
         placement = batch_shardings(mesh, batch)
         candidates = splits(self._rows, batch, mesh, self.microbatches, self._split)
@@ -1079,13 +1080,15 @@ class Trainer(Generic[Loss, Effects]):
             objective=self.objective, mesh=mesh, xla_defaults=self._xla_defaults, narrow=self._narrow,
             base=None if self._base_rung is None else self._base_rung[1], resumed=resumed,
             # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
-            frontier=timed is not None and recorded is None and resumed is None)
-        seconds = timed([self._runner(plan, mesh) for plan in plans]) if len(plans) > 1 and timed else []
+            frontier=trials is not None and trials.frontier and recorded is None and resumed is None)
+        seconds = ([] if trials is None or len(plans) == 1
+                   else trials.seconds([self._runner(plan, mesh) for plan in plans]))
         # Every process runs the plan process zero timed clearly faster (`faster`).
         planned = plans[broadcast_from_process_zero(faster(seconds) if seconds else 0)]
-        if (runs := pgle_runs()) and timed is not None:
-            profile = timed.profiled(self._runner(planned, mesh), planned, mesh, runs)
-            planned = profile_guided(planned, profile, runs, mesh)
+        if runs := pgle_runs():
+            trials = Trials(state, batch, owned=False, frontier=False) if trials is None else trials
+            planned = planned.guided(trials.profiled(self._runner(planned, mesh), planned, mesh, runs), runs,
+                                     mesh)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         self.validation = self._validation(planned.candidate.prepared)
@@ -1099,7 +1102,7 @@ class Trainer(Generic[Loss, Effects]):
         self.plan = settled(planned, plans, seconds, probes)
         if planned.split != candidates[0] or seconds:
             _log.info("the step fits the devices in the plan %s", self.plan)
-        return planned, flops
+        return planned.released(), flops
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
                    split: int, narrow: bool, launches: str | None) -> Candidate:
@@ -1424,13 +1427,7 @@ class Trainer(Generic[Loss, Effects]):
         while not plan.ended(run.current, run.clock.read):
             # A schedule's stage ends where the commits reach its tokens.
             self._scheduled(plan, run)
-            # The window's capture opens before this iteration's first read, so the step row records
-            # the read it waits on rather than a compile that ran before capture began.
-            if (profiler is not None and profile is not None
-                    and not run.tracing and run.traced == 0
-                    and seen >= profile.warmup):
-                start_capture(profiler)
-                run.tracing = True
+            self._open_window(run, profile, profiler, seen, compiled)
             capturing = tracer is not None and tracer.running
             step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=run.current)
                           if capturing else contextlib.nullcontext())
@@ -1453,6 +1450,7 @@ class Trainer(Generic[Loss, Effects]):
                     with jax.set_mesh(self.device_mesh):
                         checked = self._model_shapes(device) if self._device else device
                     agreed("training input declaration", functools.partial(inputs.check, checked))
+                self._close_window_for(run, profile, profiler, compiled, device)
                 known, began = len(compiled), time.perf_counter()
                 train_step, measured_flops, state = self._compiled_for(compiled, state, device, run)
                 if len(compiled) > known and self.executable is not None and not self.host_master:
@@ -1553,11 +1551,10 @@ class Trainer(Generic[Loss, Effects]):
         to make, and the state's shapes it checks first. A supplied `initial` state is placed as it
         is given, its shapes already placed: no continuation, which `resume="require"` refuses, and
         under "never" into a directory that holds no run either. An objective that names its input field
-        alone takes the field's shape off `dataset`'s first batch first (`Objective.shaped`)."""
+        alone declares it first (`_declare_input`)."""
         checkpoints = self.checkpoints
         if self.objective.named_inputs is not None and self.objective.inputs is None:
-            first = agreed("training input shape", lambda: first_batch(dataset, self.device_mesh))
-            self.objective.shaped(first)
+            self._declare_input(self.objective.named_inputs, dataset)
         if resume == "require" and (checkpoints is None or initial is not None):
             raise ValueError("resume='require' continues the checkpointer's latest checkpoint, which a "
                              "trainer with no checkpointer, or a run given its state=, starts without")
@@ -1577,6 +1574,19 @@ class Trainer(Generic[Loss, Effects]):
             return 0, None, lambda: self._placed(start, positioned=False)[:2], start.abstract
         return (start.resume, checkpoints.position(start.resume, DataPartition.of(self.device_mesh)),
                 lambda: self._placed(start, positioned=False)[:2], start.abstract)
+
+    def _declare_input(self, named: str, dataset: Loader) -> None:
+        """Declare the objective's input `named` (`Objective.named_inputs`) at the per-example shape its
+        model reads (`Field.of`): of `dataset`'s first batch, placed as the run places it and through the
+        loader's device steps (`_model_shapes`), which may crop or resize it, agreed across the pool
+        before anything initializes."""
+        mesh = self.device_mesh
+        first = agreed("training input batch", lambda: first_batch(dataset, mesh))
+        with jax.set_mesh(mesh):
+            device, _ = split_fields(placed_abstract(mesh, first))
+            shape = Field.of(named, self._model_shapes(device)).shape
+        held = agreed_same("training input shape", lambda: list(shape))
+        self.objective.inputs = InputSpec(Field(named, tuple(held)))
 
     def _opened(self, plan: FitPlan, run: FitRun, interval: Interval, current: int, position,
                 placed: Callable[[], tuple[TrainState, Placement[TrainState]]],
@@ -1823,7 +1833,7 @@ class Trainer(Generic[Loss, Effects]):
         by the run's own compiled steps at the rates its state holds times the branch's decay
         (`scaled_rates`); score every suite on it as `cooldown_<split>` at the run's step, and discard
         it. The run's moving state waits on the host and its stream is closed meanwhile, so the devices
-        hold one state and one prefetcher, as the run's plan sized them (`Timer`). Returns the run's
+        hold one state and one prefetcher, as the run's plan sized them (`Trials`). Returns the run's
         state, and whether a preemption cut the branch short: then it stays pending beside the
         checkpoints (`Checkpoints.cooldown`), and a resume from this step runs it first."""
         (steps, shape), checkpoints = resolved(pending, self.accumulation), self.checkpoints
@@ -2161,7 +2171,7 @@ class Trainer(Generic[Loss, Effects]):
                       reported: int | None = None) -> tuple[CompiledStep, StepFlops | None, TrainState]:
         """Return the step compiled for this batch's abstract signature (`batch_signature`),
         compiling on first sight, and the state to step, a fresh copy where the plan timed steps
-        on it (`Timer`). A compile reads `run`'s pending log first: it holds the devices idle
+        on it (`Trials`). A compile reads `run`'s pending log first: it holds the devices idle
         anyway, and its seconds are the next interval's.
 
         A ramped run reads a new shape at every stage, so `compiled` keeps
@@ -2174,7 +2184,8 @@ class Trainer(Generic[Loss, Effects]):
         cooldown branch's at the run's step, else at the state's.
         """
         state = self._staged(state, run.current)
-        timer = Timer(state, batch)
+        # Dew's tests keep a frontier's first plan (`UNTIMED_FRONTIER`), a test setting.
+        trials = Trials(state, batch, frontier=not untimed_frontier())
         signature = batch_signature(batch)
         if signature not in compiled:
             self._read_taken(run)
@@ -2183,16 +2194,14 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
             with region("compile"):
-                # Dew's tests keep a frontier's first plan (`UNTIMED_FRONTIER`), a test setting.
-                compiled[signature] = (self.compile(state, batch, None if untimed_frontier() else timer),
-                                       self.step_flops)
+                compiled[signature] = (self.compile(state, batch, trials), self.step_flops)
             seconds = time.perf_counter() - began
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
             self._report(StepCompiled(seconds, recompute_record(self.objective), links, self.memory,
-                                      self.plan), int(timer.state.step) if reported is None else reported)
+                                      self.plan), int(trials.state.step) if reported is None else reported)
             self._unproven = True
-        return (*compiled[signature], timer.state)
+        return (*compiled[signature], trials.state)
 
     def _saved_checkpoint(
         self,
@@ -2450,6 +2459,27 @@ class Trainer(Generic[Loss, Effects]):
 
     # ------------------------------------------------------------------ Telemetry
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _open_window(run: FitRun, profile: ProfileWindow | None, profiler: Profiler | None, seen: int,
+                     compiled: Mapping[Signature, object]) -> None:
+        """Open the profile window's capture before an iteration's first read, so the step row records
+        the read it waits on, once its warmup steps have run and the run's first step has compiled: the
+        window holds steps, not the compile, nor AutoPGLE's own trace of the step (`Trials.profiled`)."""
+        if (profiler is not None and profile is not None and not run.tracing and run.traced == 0
+                and seen >= profile.warmup and compiled):
+            start_capture(profiler)
+            run.tracing = True
+
+    def _close_window_for(self, run: FitRun, profile: ProfileWindow | None, profiler: Profiler | None,
+                          compiled: Mapping[Signature, object], device: Batch) -> None:
+        """End the profile window before a step of a shape the run has yet to compile where AutoPGLE
+        profiles that step with a trace of its own (`Trials.profiled`), which JAX cannot open inside the
+        window's: the window then holds the steps before it (`ProfileWindowRecord`)."""
+        if (run.tracing and profile is not None and profiler is not None and pgle_runs()
+                and batch_signature(device) not in compiled):
+            run.tracing = False
+            self._stop_trace(run, profile, profiler)
 
     def _stop_trace(self, run: FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
         """Stop the window's owned capture (`stop_capture`), then report it on process zero."""

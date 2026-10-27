@@ -14,7 +14,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   input wait, compile, device time in collectives and the rest, analytic work and MFU.
   `Supervised(work=)` declares a batch's training FLOPs for a model Dew holds no count for.
 - `Supervised(model, loss, inputs="x")` names the input field alone; the run reads its shape off its
-  first batch (`Objective.shaped`). An explicit `InputSpec` still states it.
+  first batch as the model reads it, after the loader's device steps (`Objective.named_inputs`). An
+  explicit `InputSpec` still states it.
 - Under JAX's AutoPGLE (`JAX_ENABLE_PGLE=1`) the trainer guides its ahead-compiled step by a profile of
   its first runs, which JAX's jit never did for it, and records the profile in the step's plan.
 - A token budget, a cadence of tokens and a schedule's stages read the committed-token count off the

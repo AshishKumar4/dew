@@ -660,19 +660,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         self._inputs = inputs
 
     named_inputs: str | None = None
-    """The batch field an objective names as its sample alone, as `Supervised(inputs="x")` does, whose
-    per-example shape a run reads off its first batch (`shaped`); None where `inputs` declares the shapes
-    in full, an explicit spec that overrides any the data would give, or declares none."""
-
-    def shaped(self, batch: Batch) -> None:
-        """Declare `inputs` at the shape `batch`, the first a run reads, holds under `named_inputs`
-        (`dew.inputs.Field.of`), before anything initializes: the one place a run's input geometry is read
-        off its data."""
-        from dew.inputs import Field, InputSpec
-
-        if self.named_inputs is None:
-            raise ValueError(f"{type(self).__name__} names no input field to read a shape for")
-        self.inputs = InputSpec(Field.of(self.named_inputs, batch))
+    """The batch field an objective names as its sample alone, as `Supervised(inputs="x")` does, which a
+    run declares as `inputs` at the per-example shape its model reads of the run's first batch
+    (`Trainer.fit`); None where `inputs` declares the shapes in full, an explicit spec that overrides
+    any the data would give, or declares none."""
 
     ema: EMASpec | None = None
     saved_task: ClassVar[type[SavedTask] | None] = None

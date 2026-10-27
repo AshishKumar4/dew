@@ -232,13 +232,10 @@ class Profile:
     """Packages outside Dew whose modules a `run.json` may import."""
 
     def run_command(self) -> int:
-        from dew.training.runtime import run_timestamp
-
-        run = run_named(self.run, self.trust).assigned(self.set)
-        out = self.out or str(Path("profiles", run.trainer.name or Path(self.run).stem, run_timestamp()))
-        report = run.profile(out, warmup=self.warmup, steps=self.steps)
-        Path(out, "report.json").write_text(json.dumps(dataclasses.asdict(report), indent=2) + "\n")
-        emit(report.text())
+        report = run_named(self.run, self.trust).assigned(self.set).profile(self.out, warmup=self.warmup,
+                                                                            steps=self.steps)
+        if report is not None:
+            emit(report.text())
         return 0
 
 

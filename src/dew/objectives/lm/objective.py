@@ -80,6 +80,7 @@ from dew.nn.protocols import (
     DecoderTraining,
     Lacks,
     LayerStates,
+    PositionCapacity,
     SteppedInContext,
     TokenModel,
     head_table,
@@ -502,6 +503,11 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         _check_reads(model)
         self.model = model
         self.seq_len = seq_len
+        # A row longer than its positions cover would read past a learned table, which clamps silently.
+        capacity = model.position_capacity if isinstance(model, PositionCapacity) else None
+        if capacity is not None and seq_len > capacity:
+            raise ValueError(f"{seq_len}-token rows read past the {capacity} places {type(model).__name__}'s "
+                             "positions cover")
         # A schedule's later stage may read longer rows, up to what the model declares it holds.
         declared = model.max_seq_len if isinstance(model, Bounded) else None
         self.context = seq_len if declared is None else max(seq_len, declared)

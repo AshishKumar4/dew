@@ -37,7 +37,7 @@ from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.benchmark import samples
-from dew.telemetry.profile import capture_options
+from dew.telemetry.profile import active_profile, capture_options
 from dew.training.distributed import batch_divisor
 from dew.training.memory import (
     compiled_if_it_fits,
@@ -109,16 +109,22 @@ def splits(rows: Sequence[int] | None, batch: Batch, mesh: Mesh | AbstractMesh, 
 class Candidate:
     """A step a plan compiles: the shapes of the microbatch it reads, the
     loss's shapes, the narrow copies, the state's placement and shapes as it
-    traces them, the bytes held beside it, the program lowered and its kernel
-    launches (`dew.nn.kernels.tuning.tune`)."""
+    traces them, the bytes held beside it, the program lowered, None once its plan is admitted
+    (`Planned.released`), and its kernel launches (`dew.nn.kernels.tuning.tune`)."""
     micro: Batch
     shapes: object
     copies: dict
     shardings: Placement[TrainState]
     prepared: TrainState
     held: int
-    program: jax.stages.Lowered
+    program: jax.stages.Lowered | None
     launches: str
+
+    @property
+    def lowered(self) -> jax.stages.Lowered:
+        """The program, which a plan's search and its guided compile read before it is released."""
+        assert self.program is not None, "a plan's program is released once the plan is admitted"
+        return self.program
 
 
 @jax.jit
@@ -247,7 +253,7 @@ class Planned:
     options and reads the parameters through narrow copies, and the rung it compiled
     at, as a record and as the objective's modules, head tile and whether that
     head is fused. `profiled` is the runs and the bytes of the profile that guided its executable
-    (`profile_guided`), None where none did."""
+    (`guided`), None where none did."""
     split: int
     candidate: Candidate
     executable: jax.stages.Compiled
@@ -270,6 +276,31 @@ class Planned:
     def parts(self, mesh: Mesh) -> list[jax.Array]:
         """The microbatch index of each of the step's `split` calls, on every device of `mesh`."""
         return [jax.device_put(np.int32(part), NamedSharding(mesh, P())) for part in range(self.split)]
+
+    def guided(self, profile: bytes, runs: int, mesh: Mesh) -> Planned:
+        """This plan with its program compiled again under the options its executable compiled under,
+        guided by `profile` of `runs` runs (`Trials.profiled`) as JAX's jit guides AutoPGLE's (XLA's
+        feedback-directed `fdo_profile`, which JAX shares across a pool's processes under AutoPGLE), and
+        held to the fit check the plan passed: a schedule the profile guides may keep more alive at once,
+        and one that no longer fits is refused. An empty profile, of a backend XLA profiles none of, leaves
+        the executable as it is. The plan given up holds the executable it replaces, which goes with it
+        and its program (`released`)."""
+        if not profile:
+            return dataclasses.replace(self, profiled=(runs, 0))
+        executable = self.candidate.lowered.compile({**(self.options or {}), "fdo_profile": profile})
+        fit, headroom = step_fits(executable, mesh, self.candidate.held)
+        if not fit:
+            raise RuntimeError(f"the step guided by its profile (jax_enable_pgle) needs {-(headroom or 0)} "
+                               "bytes more than its tightest device has, where unguided it fits; train it "
+                               "without AutoPGLE")
+        return dataclasses.replace(self, executable=executable, profiled=(runs, len(profile)))
+
+    def released(self) -> Planned:
+        """This plan as the run keeps it once admitted: its executable without the program it was lowered
+        from. JAX keeps each executable compiled from a lowering while the lowering lives (its in-memory
+        compilation cache, keyed by the lowered module), so releasing it lets every executable the search
+        or a guided compile made of it go, the one the run steps alone held."""
+        return dataclasses.replace(self, candidate=dataclasses.replace(self.candidate, program=None))
 
 
 TIMED_STEPS, TIMED_REPEATS, TIMED_WARMUP = 10, 3, 2
@@ -318,54 +349,69 @@ def faster(timings: Sequence[Sequence[float]]) -> int:
 
 
 @dataclasses.dataclass
-class Timer:
-    """Times a frontier's steps on `batch` from `state` (`step_seconds`):
-    the first steps the state itself, which it then deletes, and each later
-    one a fresh copy from the host, so the devices hold one state at a time.
-    `state` is then a fresh copy for the run to go on from."""
+class Trials:
+    """Trial runs of a plan's steps on `batch` from `state`, each on a copy of the state as it stood
+    (`run`): a frontier's timing (`seconds`), where `frontier` asks for it, and AutoPGLE's profile of the
+    plan admitted (`profiled`). A state the trials own (`owned`, `fit`'s) is stepped by the first trial
+    and deleted, each later trial stepping a fresh copy from the host, so the devices hold one state at a
+    time; one they borrow (a compile given none, `Trainer.compile`) is never stepped, each trial stepping a
+    copy beside it. `state` is then a copy as it stood, for the run to go on from."""
     state: TrainState
     batch: Batch
+    owned: bool = True
+    frontier: bool = True
+    restored: Callable[[], TrainState] | None = None
+    """The moving state as it stood, copied to the host at the first trial (`snapshot`)."""
 
-    def __call__(self, steps: Sequence[Callable]) -> list[list[float]]:
+    def run[R](self, trial: Callable[[TrainState], R]) -> R:
+        """`trial` on a copy of the state as it stood, which it may step and donate."""
         # The frozen tree is no step's to change or donate, and the objective's held tree shares it: it
         # is kept as it is, and the moving state alone is copied, freed and restored.
         moving, frozen = apart(self.state)
-        restore = snapshot(moving)
-        seconds = [step_seconds(steps[0], self.state, self.batch)]
-        # What the step did not donate of the moving state is freed too, so the run holds no
-        # reference to the state it handed over, on any backend.
+        if self.restored is None:
+            self.restored = snapshot(moving)
+            if not self.owned:
+                moving = self.restored()
+        outcome = trial(together(moving, frozen))
+        # What the trial did not donate of the state it stepped is freed too, so nothing holds a
+        # reference to a state handed to a trial, on any backend.
         for leaf in jax.tree.leaves(moving):
             if not leaf.is_deleted():
                 leaf.delete()
-        seconds += [step_seconds(step, together(restore(), frozen), self.batch) for step in steps[1:]]
-        self.state = together(restore(), frozen)
-        return seconds
+        self.state = together(self.restored(), frozen)
+        return outcome
+
+    def seconds(self, steps: Sequence[Callable]) -> list[list[float]]:
+        """Each of a frontier's `steps` timed on its own trial (`step_seconds`)."""
+        return [self.run(lambda state, step=step: step_seconds(step, state, self.batch)) for step in steps]
 
     def profiled(self, step: Callable, planned: Planned, mesh: Mesh, runs: int) -> bytes:
         """XLA's profile of `runs` runs of `planned`'s executable, each over the microbatches of `batch`
         and waited on, as JAX's AutoPGLE waits on the runs it profiles
-        (`jax.experimental.profiler.get_profiled_instructions_proto`): on a copy of `state`, which `step`
-        steps once first, untraced, so what a step builds at its first call (its window, its narrow copies)
-        is built and the trace holds the executable alone. `state` is then a fresh copy, as a frontier's
-        timing leaves it; the profile is empty on a backend XLA profiles none of."""
-        moving, frozen = apart(self.state)
-        restore = snapshot(moving)
-        stepped, *_ = step(self.state, self.batch)
-        current, held = apart(stepped)
-        parts = planned.parts(mesh)
-        with tempfile.TemporaryDirectory() as directory:
-            with jax.profiler.trace(directory, profiler_options=capture_options()):
-                for _ in range(runs):
-                    for part in parts:
-                        current, *_ = planned.executable(current, held, self.batch, part)
-                    jax.block_until_ready(current)
-            (capture,) = Path(directory).glob("plugins/profile/*")
-            profile = get_profiled_instructions_proto(str(capture))
-        for leaf in jax.tree.leaves(current):
-            if not leaf.is_deleted():
-                leaf.delete()
-        self.state = together(restore(), frozen)
-        return profile
+        (`jax.experimental.profiler.get_profiled_instructions_proto`), on a trial, which `step` steps once
+        first, untraced, so what a step builds at its first call (its window, its narrow copies) is built
+        and the trace holds the executable alone; empty on a backend XLA profiles none of. JAX holds one
+        trace at a time: a capture of the caller's own running (`dew.Profiler`) is refused, and a fit's
+        window opens only past a compile (`Trainer.fit`)."""
+        if active_profile() is not None:
+            raise RuntimeError("AutoPGLE (jax_enable_pgle) profiles the step with a trace of its own, and a "
+                               "capture of this process is running; compile the step before the capture "
+                               "starts, or profile without AutoPGLE")
+
+        def profile(state: TrainState) -> bytes:
+            stepped, *_ = step(state, self.batch)
+            current, held = apart(stepped)
+            parts = planned.parts(mesh)
+            with tempfile.TemporaryDirectory() as directory:
+                with jax.profiler.trace(directory, profiler_options=capture_options()):
+                    for _ in range(runs):
+                        for part in parts:
+                            current, *_ = planned.executable(current, held, self.batch, part)
+                        jax.block_until_ready(current)
+                (capture,) = Path(directory).glob("plugins/profile/*")
+                return get_profiled_instructions_proto(str(capture))
+
+        return self.run(profile)
 
 
 def pgle_runs() -> int:
@@ -373,25 +419,8 @@ def pgle_runs() -> int:
     (`jax_enable_pgle`, `jax_pgle_profiling_runs`), 0 where it is off. JAX's jit guides the programs it
     compiles at a call; a step the plan compiles ahead of its run (`Lowered.compile`) is no such call,
     which JAX compiles for the profile's sake (command buffers off) and never guides, so the trainer
-    guides it (`profile_guided`)."""
+    guides it (`Planned.guided`)."""
     return jax.config.jax_pgle_profiling_runs if jax.config.jax_enable_pgle else 0
-
-
-def profile_guided(planned: Planned, profile: bytes, runs: int, mesh: Mesh) -> Planned:
-    """`planned` with its program compiled again under the options its executable compiled under, guided
-    by `profile` of `runs` runs (`Timer.profiled`) as JAX's jit guides AutoPGLE's (XLA's feedback-directed
-    `fdo_profile`, which JAX shares across a pool's processes), and held to the fit check the plan passed:
-    a schedule the profile guides may keep more alive at once, and one that no longer fits is refused.
-    An empty profile, of a backend XLA profiles none of, leaves the executable as it is."""
-    if not profile:
-        return dataclasses.replace(planned, profiled=(runs, 0))
-    executable = planned.candidate.program.compile({**(planned.options or {}), "fdo_profile": profile})
-    fit, headroom = step_fits(executable, mesh, planned.candidate.held)
-    if not fit:
-        raise RuntimeError(f"the step guided by its profile (jax_enable_pgle) needs {-(headroom or 0)} "
-                           "bytes more than its tightest device has, where unguided it fits; train it "
-                           "without AutoPGLE")
-    return dataclasses.replace(planned, executable=executable, profiled=(runs, len(profile)))
 
 
 @dataclasses.dataclass
@@ -524,7 +553,7 @@ def plan_step[LossT, EffectsT](
             lowered[key] = lower(split, narrow)
         candidate = lowered[key]
         chosen = required if xla_defaults else options(candidate)
-        executable = compiled_if_it_fits(candidate.program, chosen, refusals)
+        executable = compiled_if_it_fits(candidate.lowered, chosen, refusals)
         fit, headroom = step_fits(executable, mesh, candidate.held)
         probes.append(Probe.read(split, candidate, current(), fit, headroom, executable))
         forecast.read(rung(), split, executable, headroom, factor)

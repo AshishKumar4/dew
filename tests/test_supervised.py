@@ -13,12 +13,14 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import BATCH, Affine, dataset
+from affine_run import BATCH, Affine, Counting, dataset
 from flax import linen as nn
 from recording import RecordingTracker
 
 from dew.batch import VALID_ROWS
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
+from dew.data.dataset import Loader
+from dew.data.pipeline import DeviceStep
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Step
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
@@ -61,6 +63,30 @@ def test_a_model_named_by_its_input_field_alone_takes_the_shape_its_data_gives()
         Trainer(named, optax.sgd(0.1), key=0).place()
     state = Trainer(named, optax.sgd(0.1), key=0).fit(dataset(), steps=3)
     assert named.inputs == INPUTS
+    for leaf, expected in zip(jax.tree.leaves(state.variables), jax.tree.leaves(declared.variables),
+                              strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(expected))
+
+
+class Cropped(DeviceStep):
+    """A device step that keeps the first two of each row's three features."""
+
+    def __call__(self, batch):
+        return {**batch, "x": batch["x"][:, :2]}
+
+
+def test_a_named_input_takes_the_shape_the_loaders_device_steps_give_the_model():
+    """A loader whose device steps crop each row's three features to two gives the model rows of two: an
+    input named alone is declared at those, as the model reads them after the steps, not as the reader
+    delivers them, and the run trains as the run given an explicit spec of two does."""
+    def data() -> Loader:
+        return Loader(lambda partition: Counting(), None, None, BATCH, device=(Cropped(),))
+
+    two = InputSpec(Field("x", (2,)))
+    declared = Trainer(Supervised(Affine(), squared, inputs=two), optax.sgd(0.1), key=0).fit(data(), steps=3)
+    named = Supervised(Affine(), squared, inputs="x")
+    state = Trainer(named, optax.sgd(0.1), key=0).fit(data(), steps=3)
+    assert named.inputs == two
     for leaf, expected in zip(jax.tree.leaves(state.variables), jax.tree.leaves(declared.variables),
                               strict=True):
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(expected))

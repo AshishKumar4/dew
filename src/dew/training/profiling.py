@@ -26,8 +26,10 @@ if TYPE_CHECKING:
 class ProfileWindow:
     """A request for one profiler window per fit.
 
-    It traces `steps` steps into `directory` after `warmup` steps have run, so the
-    trace shows the loop and not the compile.
+    It traces `steps` steps into `directory` after `warmup` steps have run and the
+    run's first step has compiled, so the trace shows the loop and not the compile.
+    Under JAX's AutoPGLE, which traces a step of a new shape before the run takes
+    it, the window ends before such a step, holding the steps it traced.
 
     `dew.Profiler` is the other way to capture a trace, as a context manager
     around any code; a fit refuses to schedule a window inside one. The loop
@@ -113,18 +115,36 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
     agreed("profile stop", stop)
 
 
+def traced_steps(capture: Path) -> tuple[int, ...]:
+    """The steps a capture's training annotations hold (`jax.profiler.StepTraceAnnotation`, which a fit
+    names `train`), each by the steps the run had taken as it began, its `step_num`, in order, read from
+    the capture's native trace (`jax.profiler.ProfileData`)."""
+    import jax
+
+    steps = set()
+    for trace in capture.glob("plugins/profile/*/*.xplane.pb"):
+        for plane in jax.profiler.ProfileData.from_file(str(trace)).planes:
+            for line in plane.lines:
+                steps.update(int(str(value)) for event in line.events if event.name == "train"
+                             for name, value in event.stats if name == "step_num")
+    return tuple(sorted(steps))
+
+
 @dataclasses.dataclass(frozen=True)
 class ProfileReport:
     """Where the steps of a run's profile window spent their time (`dew.config.RunConfig.profile`): the
-    window's own log, `Trainer.fit`'s scalars over exactly its steps, and the device time XProf's
-    hlo_stats attributes to the capture's ops, collectives apart from the rest. Each figure is per
-    step; None where the run reports none: no analytic work for its model (`Objective.training_flops`,
-    never the compiled program's count), no device peak to rate it against, or no op the capture
-    attributes time to (`attribution` says why). The window holds no checkpoint, validation or log
-    read but its own, so their time is outside every figure here."""
+    window's own log, `Trainer.fit`'s scalars over exactly the steps its capture traced (`traced`), and
+    the device time XProf's hlo_stats attributes to the capture's ops, collectives apart from the rest.
+    Each figure is per step; None where the run reports none: no analytic work for its model
+    (`Objective.training_flops`, never the compiled program's count), no device peak to rate it
+    against, or no op the capture attributes time to (`attribution` says why). The window holds no
+    checkpoint, validation or log read but its own, so their time is outside every figure here.
+    `directory` is the profile's, its `report.json` beside the run."""
 
+    directory: str
     steps: int
     warmup: int
+    traced: tuple[int, ...]
     capture: str
     step_ms: float
     input_wait_ms: float
@@ -138,20 +158,27 @@ class ProfileReport:
     attribution: str | None
 
     @classmethod
-    def read(cls, run: Path, window: Path, *, warmup: int, steps: int, devices: int) -> "ProfileReport":
-        """The report of the window of `steps` steps after `warmup` that a run under `run` traced into
-        `window`, its newest capture's, over `devices` local devices; the run logged its steps once
-        at the window's end, so that log's scalars are the window's."""
+    def read(cls, directory: Path, name: str, window: Path, *, warmup: int, steps: int,
+             devices: int) -> "ProfileReport":
+        """The report of the window of `steps` steps after `warmup` that the run `name` under `directory`
+        traced into `window`, this process's newest capture's, over `devices` local devices. The run
+        logged its steps once at the window's end, so that log's scalars are the steps the capture's
+        annotations hold (`traced_steps`), or the report is refused."""
         from dew.telemetry.instrumentation import collective, reported_instruction
-        from dew.telemetry.profile import report_table
+        from dew.telemetry.profile import process_directory, report_table
 
+        capture = max(process_directory(window).glob("capture-*"), key=lambda path: path.stat().st_mtime)
+        traced = traced_steps(capture)
+        if traced != tuple(range(warmup, warmup + steps)):
+            raise ValueError(f"the window traced the steps begun after {list(traced)} steps, and its log "
+                             f"covers those begun after {warmup} to {warmup + steps - 1}")
+        run = directory / name
         # The window's log, and any score the run's end logged under its last step beside it.
-        logged = {name: value for step, scalars in LocalTracker(run / "tracking").scalars()
-                  if step == warmup + steps for name, value in scalars.items()}
+        logged = {key: value for step, scalars in LocalTracker(run / "tracking").scalars()
+                  if step == warmup + steps for key, value in scalars.items()}
         records = (run / "tracking" / "records.jsonl").read_text().splitlines()
         compiles = [entry["value"]["seconds"] for entry in map(json.loads, records)
                     if entry["type"] == "StepCompiled"]
-        capture = max(window.rglob("capture-*"), key=lambda path: path.stat().st_mtime)
         _, rows = report_table(capture / "reports" / "hlo_stats.json")
         ops = [row for row in rows if not str(row.get("hlo_op_name") or "").startswith("XlaModule")]
         # Why no op holds time, where the export could tell (`dew.telemetry.profile.COMMAND_BUFFERS`).
@@ -163,15 +190,16 @@ class ProfileReport:
 
         instructions = [(row, reported_instruction(str(row.get("hlo_op_expression") or ""))) for row in ops]
         communication = [row for row, op in instructions if op is not None and collective(op.op) is not None]
-        return cls(steps, warmup, str(capture), logged["train/step_time_ms"], logged["train/data_wait_ms"],
-                   compiles[0] if compiles else None, per_step(ops) if ops else None,
-                   per_step(communication) if ops else None, logged.get("train/flops"),
-                   logged.get("train/mfu"), logged.get("train/hfu"), logged.get("train/tokens_per_s"),
-                   None if ops else unattributed)
+        return cls(str(directory), steps, warmup, traced, str(capture), logged["train/step_time_ms"],
+                   logged["train/data_wait_ms"], compiles[0] if compiles else None,
+                   per_step(ops) if ops else None, per_step(communication) if ops else None,
+                   logged.get("train/flops"), logged.get("train/mfu"), logged.get("train/hfu"),
+                   logged.get("train/tokens_per_s"), None if ops else unattributed)
 
     def text(self) -> str:
         """The report as lines a person reads, the largest share of a step named last."""
-        lines = [f"Profiled {self.steps} steps after {self.warmup} of warmup, the capture in {self.capture}",
+        lines = [f"Profiled {self.steps} steps after {self.warmup} of warmup, the capture in {self.capture}, "
+                 f"this report in {self.directory}/report.json",
                  f"  step          {self.step_ms:10.2f} ms  wall clock a step",
                  f"  input wait    {self.input_wait_ms:10.2f} ms  the loop waiting on its next batch"]
         shares = {"input wait": self.input_wait_ms}

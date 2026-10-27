@@ -1290,26 +1290,44 @@ class RunConfig:
                                 f"{_chain_label(prepared.run.data)}/date-{run_timestamp()}")
         return prepared.train(name)
 
-    def profile(self, directory: str, *, warmup: int = 20, steps: int = 10) -> ProfileReport:
+    def profile(self, directory: str | None = None, *, warmup: int = 20,
+                steps: int = 10) -> ProfileReport | None:
         """Train this run afresh under `directory` for `warmup` steps, then a window of `steps` more traced
-        (`ProfileWindow`), the warmup rounded up to whole windows so the window is one log interval, with
-        no checkpoint, validation split, stop or W&B sink, and report where the window's steps spent
-        their time (`ProfileReport`), beside XProf's own reports. The run's own directory is left as it
-        is. Raises ValueError for a directory that holds this run's profile already."""
+        (`ProfileWindow`), and report where the window's steps spent their time (`ProfileReport`), written
+        as `report.json` beside XProf's own reports. The warmup is whole windows, at least one, so the step
+        compiles before the window and the window is one log interval. The run keeps its own settings but
+        those that would read or write outside the window, which a profile drops together: its length,
+        stop, checkpoints, the checkpoint ranking (`best`), its cooldowns, the validation splits it names
+        and their metrics and summaries (a split its chain holds out scores after the window), and its W&B
+        sink. `directory` unset is profiles/<the run's name>/<the time
+        it starts>, read once the process is prepared, as `run` reads a run's name. The run's own
+        directory is left as it is. Raises ValueError for a directory that holds this run's profile
+        already. The report is process zero's, which logs the run; None on the others."""
+        from dew.training import prepare_process, run_timestamp
+
         name = self.trainer.name or "profile"
+        warmup = max(1, -(-warmup // steps)) * steps
+        trainer = dataclasses.replace(
+            self.trainer, name=name, resume="never", steps=warmup + steps, epochs=None, tokens=None,
+            examples=None, stop=None, best=None, cooldowns=None, log_every=steps, eval_every=None,
+            checkpoint_every=None, checkpoint_final=False, wandb=None, publish=False)
+        prepare_process(None, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir)
+        directory = directory or os.path.join("profiles", name, run_timestamp())
         if (Path(directory) / name / "tracking").exists():
             raise ValueError(f"{directory} holds a profile of {name} already; give the profile a directory "
                              "of its own")
-        warmup = -(-warmup // steps) * steps
         window = os.path.join(directory, "capture")
-        trainer = dataclasses.replace(
-            self.trainer, name=name, checkpoint_dir=directory, resume="never", steps=warmup + steps,
-            epochs=None, tokens=None, examples=None, stop=None, log_every=steps, eval_every=None,
-            checkpoint_every=None, checkpoint_final=False, wandb=None, publish=False,
-            profile=ProfileWindow(window, steps, warmup))
-        dataclasses.replace(self, trainer=trainer, validation=None).run()
-        return ProfileReport.read(Path(directory) / name, Path(window), warmup=warmup, steps=steps,
-                                  devices=jax.local_device_count())
+        captured = ProfileWindow(window, steps, warmup)
+        trainer = dataclasses.replace(trainer, checkpoint_dir=directory, profile=captured)
+        profiled = dataclasses.replace(self, validation=None, val_metrics=None, val_summaries=(),
+                                       trainer=trainer)
+        profiled.prepare().train(name)
+        if jax.process_index() != 0:
+            return None
+        report = ProfileReport.read(Path(directory), name, Path(window), warmup=warmup, steps=steps,
+                                    devices=jax.local_device_count())
+        Path(directory, "report.json").write_text(json.dumps(dataclasses.asdict(report), indent=2) + "\n")
+        return report
 
     def recorded(self, objective: Objective[Loss, Effects]) -> Self:
         """Return this config as the record of the run that trains `objective`.

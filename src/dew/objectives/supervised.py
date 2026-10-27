@@ -44,8 +44,9 @@ class Supervised(Objective[Ratio]):
     starts from, on `loss`, reporting `metrics` beside it.
 
     `inputs` is the batch field the model reads: its name, whose per-example
-    shape a run reads off its first batch before the model initializes
-    (`Objective.shaped`), or an `InputSpec` whose sample states the shape too,
+    shape a run reads off its first batch as the model reads it, after the
+    loader's device steps, before the model initializes (`Objective.named_inputs`),
+    or an `InputSpec` whose sample states the shape too,
     which the trainer checks the first batch against. The model's
     collections besides its parameters update as it trains, a BatchNorm's
     running statistics among them. A model with no

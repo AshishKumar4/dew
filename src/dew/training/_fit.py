@@ -421,7 +421,7 @@ def fit_policies[LossT, EffectsT](objective: Objective[LossT, EffectsT], best, s
 
 def first_batch(loader: Loader, mesh: Mesh) -> Batch:
     """The first batch `loader`'s training stream gives this process's share of `mesh`, the stream then
-    closed: what an objective that names its input alone reads the shape off (`Objective.shaped`), once,
+    closed: what an objective that names its input alone reads the shape off (`Trainer._declare_input`), once,
     before the run opens its stream where it starts."""
     stream = loader.train(DataPartition.of(mesh))
     try:
