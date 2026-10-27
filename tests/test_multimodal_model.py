@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import GateFailure, assert_as_exact_as_the_reference
+from reference_error import GateFailure, assert_as_exact_as_the_reference, float64_forward
 from safetensors.numpy import load_file
 
 from dew.batch import coordinates
@@ -559,12 +559,19 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
             restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
         )[valid]
 
+    def terms(model):
+        """Each valid logit's float64 terms over `model`'s step, which size its row's rounding."""
+        _, sized = float64_forward(model.model, model.variables, inputs.tokens, **inputs.kwargs())
+        return np.asarray(sized)[valid]
+
     restored, output = trained(gradient, tmp_path / "trained")
-    assert_as_exact_as_the_reference(output, reference, updated, f"{family} post-SGD logits")
+    assert_as_exact_as_the_reference(output, reference, updated, f"{family} post-SGD logits",
+                                     terms=terms(restored))
     # The rule still catches one layer's gradient with its sign flipped.
-    _, slipped = trained(_one_layer_negated(gradient), tmp_path / "slipped")
+    slip, slipped = trained(_one_layer_negated(gradient), tmp_path / "slipped")
     with pytest.raises(GateFailure):
-        assert_as_exact_as_the_reference(slipped, reference, updated, f"{family} post-SGD logits of a slip")
+        assert_as_exact_as_the_reference(slipped, reference, updated, f"{family} post-SGD logits of a slip",
+                                         terms=terms(slip))
     for collection, tree in restored.variables.items():
         if collection != "params":
             for actual, original in zip(jax.tree.leaves(tree),
