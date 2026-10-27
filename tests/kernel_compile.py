@@ -11,6 +11,7 @@ everything else.
 
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import re
@@ -206,7 +207,8 @@ def mosaic_kernels(directory: str) -> list[dict]:
     kernels = []
     reports = Path(directory)
     named: dict[str, dict[str, Path]] = {}
-    for kind, suffix in (("resources", ".resources.txt"), ("ptxas", ".ptxas")):
+    for kind, suffix in (("resources", ".resources.txt"), ("ptxas", ".ptxas"),
+                         ("module", ".after_layout_inference.txt")):
         for path in reports.glob(f"*{suffix}"):
             found = named.setdefault(KERNEL_COUNTER.sub("", path.name.removesuffix(suffix)), {})
             # Paired by name: a case that compiles a name twice would pair the wrong reports.
@@ -219,7 +221,9 @@ def mosaic_kernels(directory: str) -> list[dict]:
         registers, spills = REGISTERS.findall(log), SPILLS.findall(log)
         unread = [field for field, found in (("shared bytes", shared), ("tensor memory columns", tmem),
                                              ("registers", registers), ("spills", spills)) if not found]
+        module = found.get("module")
         kernels.append({"kernel": name, "unread": unread,
+                        "module": hashlib.sha256(module.read_bytes()).hexdigest() if module else None,
                         "shared": int(shared.group(1)) if shared else None,
                         "tmem": sum(map(int, tmem.groups())) if tmem else None,
                         "registers": max(map(int, registers), default=None),
@@ -272,27 +276,27 @@ def compiled_apart() -> list[dict]:
         return json.loads(records.read_text())
 
 
-PTXAS_REPORTS: dict[tuple[str, int], set[tuple[int, int]]] = {}
-"""Each Mosaic GPU kernel's ptxas report this process read, its registers and spilled bytes, by the
-kernel's name and shared bytes: Mosaic compiles a module once a process, so a later case of the same
-module states its resources and not ptxas's (`inherited`)."""
+PTXAS_REPORTS: dict[str, tuple[int, int]] = {}
+"""Each Mosaic GPU kernel's ptxas report this process read, its registers and spilled bytes, by its module
+(the digest of Mosaic's module after layout inference, `mosaic_kernels`): Mosaic compiles a module once a
+process, so a later case of the same module dumps the module and its resources, never PTX or ptxas's
+report (`inherited`)."""
 
 
 def inherited(kernel: dict) -> dict:
     """`kernel`'s record (`mosaic_kernels`) with its registers and spills where ptxas reported them: its
-    own, which this process keeps (`PTXAS_REPORTS`), or, where Mosaic compiled its module before in this
-    process and so ran no ptxas, the one report this process read of a kernel of its name and shared
-    bytes. A kernel with no such report, or several that differ, keeps them unread."""
+    own, which this process keeps by its module (`PTXAS_REPORTS`), or, where Mosaic compiled the same module
+    before in this process and so ran no ptxas, that compile's. A kernel whose module no report in this
+    process covers keeps them unread."""
     ptxas = {"registers", "spills"}
-    key = (kernel["kernel"], kernel["shared"])
     if not ptxas & set(kernel["unread"]):
-        PTXAS_REPORTS.setdefault(key, set()).add((kernel["registers"], kernel["spilled"]))
+        if kernel["module"] is not None:
+            PTXAS_REPORTS[kernel["module"]] = (kernel["registers"], kernel["spilled"])
         return kernel
-    earlier = PTXAS_REPORTS.get(key, set())
-    if kernel["shared"] is None or len(earlier) != 1:
+    if kernel["module"] not in PTXAS_REPORTS:
         return kernel
-    ((registers, spilled),) = earlier
-    return {**kernel, "registers": registers, "spilled": spilled, "ptxas": "an earlier compile's",
+    registers, spilled = PTXAS_REPORTS[kernel["module"]]
+    return {**kernel, "registers": registers, "spilled": spilled, "ptxas": "an earlier compile of its module",
             "unread": [field for field in kernel["unread"] if field not in ptxas]}
 
 
