@@ -15,12 +15,13 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 
 class KernelEvent(Protocol):
-    """The fields read from JAX's native, untyped ProfileEvent objects."""
+    """The fields a kernel's event is read by: `Kernel`'s, as `device_events` reads them."""
 
     @property
     def name(self) -> str: ...
@@ -39,6 +40,19 @@ class KernelEvent(Protocol):
 # `ncclDevKernel_SendRecv` (collective-permute and all-to-all), and the same
 # with `ncclKernel_` before NCCL 2.19.
 COLLECTIVES = ("AllReduce", "AllGather", "ReduceScatter", "SendRecv", "Broadcast", "Reduce")
+
+
+@dataclass(frozen=True)
+class Kernel:
+    """One kernel's event as a trace holds it, read out of JAX's native ProfileEvent, whose fields live
+    only as long as the ProfileData it came from: its stats read after that was freed crashed the reader."""
+
+    name: str
+    start_ns: float
+    end_ns: float
+    duration_ns: float
+    stats: tuple[tuple[str, object], ...]
+
 
 def device_events(directory: str | Path) -> tuple[dict[str, list[KernelEvent]], list[str]]:
     """The kernel events of the newest JAX trace under `directory`, by device
@@ -65,7 +79,9 @@ def device_events(directory: str | Path) -> tuple[dict[str, list[KernelEvent]], 
             lines.add(f"{plane.name}:{line.name}")
             if (line.name.lower().startswith("stream") if match.group(1) == "GPU"
                     else line.name == "XLA Ops"):
-                planes.setdefault(plane.name, []).extend(line.events)
+                planes.setdefault(plane.name, []).extend(
+                    Kernel(event.name, event.start_ns, event.end_ns, event.duration_ns, tuple(event.stats))
+                    for event in line.events)
     return planes, sorted(lines)
 
 
