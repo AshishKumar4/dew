@@ -780,7 +780,10 @@ def _exchange_shard[Parameters](
     expert axis's maximum needs. Under a capacity the first bucket holds what
     the device's sequences can keep for one peer and nothing is left over. The
     later rounds run in a checkpointed scan, which recomputes rather than keeps
-    their intermediates, so they are as few as the bucket size allows.
+    their intermediates, so they are as few as the bucket size allows. They are
+    in the compiled program whether or not a routing needs them, so a static
+    count of a dropless step's FLOPs reads them (moe_grpo on four expert shards
+    1.10 of one device's global dispatch, 1.00 under a capacity of 2).
     """
     top_k = indices.shape[-1]
     tokens = x.reshape(-1, x.shape[-1])
