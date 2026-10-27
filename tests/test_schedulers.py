@@ -575,9 +575,16 @@ def test_flaxdiffs_tangent_cosine_grid_is_its_own(site):
     def sigma_and_weight(steps):
         return {"sigma": schedule.sigmas(steps), "weight": schedule.weight(steps)}
 
-    draw, reference, truth, seeds, stored = flaxdiffs(
-        site, inputs_of=partial(general_times, site),
-        truth_fn=lambda inputs: sigma_and_weight(jnp.asarray(inputs["steps"], jnp.float64)))
+    def truth_of(inputs):
+        # FlaxDiff's float64 run computes its weight as 1 + (1 / (1 + (1 - sigma^2) / sigma^2)) / sigma_max^2,
+        # whose cancellation at a large sigma, past sigma_max at kappa 0.5, its truth keeps: the truth is
+        # what that run computed, a float64 rounding of it far below float32's.
+        sigma = schedule.sigmas(jnp.asarray(inputs["steps"], jnp.float64))
+        weight = 1 + (1 / (1 + ((1 - sigma ** 2) / (sigma ** 2)))) / (schedule.sigma_max ** 2)
+        return {"sigma": sigma, "weight": weight}
+
+    draw, reference, truth, seeds, stored = flaxdiffs(site, inputs_of=partial(general_times, site),
+                                                      truth_fn=truth_of)
     assert_as_exact(as_given(lambda index, inputs: sigma_and_weight(jnp.asarray(inputs["steps"]))),
                     reference, draw, site, seeds=seeds, truth_fn=truth)
     alpha, _ = schedule.rates(jnp.asarray(stored["grid"]))
@@ -587,28 +594,26 @@ def test_flaxdiffs_tangent_cosine_grid_is_its_own(site):
 
 
 @pytest.mark.parametrize("site", sorted(FLAXDIFF_VE))
-def test_the_tangent_cosine_grids_time_of_a_sigma_inverts_it(site):
-    """The tangent grid's time of a sigma, the angle atan(kappa sigma) along the grid, gives back the
-    drawn times of the sigmas it places: Dew's round trip in float32 is on par with the same arithmetic in
-    NumPy's float32, from the times themselves (check 1)."""
+def test_the_tangent_cosine_grids_time_of_a_sigma_is_on_par_with_numpys(site):
+    """The tangent grid's time of a sigma, its angle atan(kappa sigma) along the grid, over sigmas drawn
+    log-uniformly across the grid's own: on par with the same arithmetic in NumPy's float32 (check 1),
+    from the float64 quotient of the angles."""
     schedule = FLAXDIFF_VE[site]()
+    grid = [float(sigma) for sigma in schedule.sigmas(jnp.asarray([0.0, 1.0], jnp.float32))]
 
     def draw(seed):
-        return (drawn(seed, 9).uniform(0, 1, 4096).astype(np.float32),)
+        return (np.exp(drawn(seed, 9).uniform(*np.log(grid), 4096)).astype(np.float32),)
 
-    def round_trip(t):
-        return schedule.t_of_sigma(schedule.sigmas(t))
-
-    @as_given
-    def numpy(t):
+    def quotient(sigma, dtype):
         ends = (schedule.theta_min, schedule.theta_max, schedule.kappa)
-        low, high, kappa = (np.float32(value) for value in ends)
-        sigma = np.tan(low + t * (high - low)) / kappa
-        return (np.arctan(kappa * sigma) - low) / (high - low)
+        low, high, kappa = (dtype(value) for value in ends)
+        return (np.arctan(kappa * sigma.astype(dtype)) - low) / (high - low)
 
+    numpy = as_given(partial(quotient, dtype=np.float32))
     label = f"{site} time of a sigma"
-    assert_as_exact(jax.jit(round_trip), numpy, draw, label,
-                    seeds=seeds_for(numpy, draw, label, truth_fn=lambda t: t), truth_fn=lambda t: t)
+    exact = as_given(partial(quotient, dtype=np.float64))
+    assert_as_exact(jax.jit(schedule.t_of_sigma), numpy, draw, label,
+                    seeds=seeds_for(numpy, draw, label, truth_fn=exact), truth_fn=exact)
 
 
 T_OF_SIGMA_SEEDS = 8
