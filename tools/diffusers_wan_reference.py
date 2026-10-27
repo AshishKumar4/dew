@@ -48,7 +48,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reference_releases import RELEASES, require
 from torch_precision import default_dtype, float64, widened
 
-DIFFUSERS = RELEASES["diffusers"]["diffusers"]
+COHORT = "diffusers-0.34"
+DIFFUSERS = RELEASES[COHORT]["diffusers"]
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/wan-source"
 BASE = {"patch_size": [1, 2, 2], "num_attention_heads": 2, "attention_head_dim": 12, "in_channels": 4,
         "out_channels": 4, "text_dim": 20, "freq_dim": 16, "ffn_dim": 40, "num_layers": 2,
@@ -162,7 +163,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
 
 def output_root(destination: str) -> Path:
 
-    require("diffusers-0.34")
+    require(COHORT)
     torch.set_num_threads(2)
     root = Path(destination)
     root.mkdir(parents=True, exist_ok=True)
