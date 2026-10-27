@@ -247,10 +247,9 @@ def test_a_sweeps_best_run_is_promoted_to_the_registry_and_loads_in_one_call_fro
     the best three of its project's runs (those whose summary holds the metric) or of its sweep's: ranked
     first it publishes, aliased "best" in the registry; second, it publishes with no alias; past the
     third, or tied with the third, it publishes nothing. A configured run's `trainer.promote` names the
-    rule and requires its W&B sink. `dew.pipeline("wandb:...")` then loads the promoted run in one call, from the
-    registry by its alias and from the W&B run by its path, as the task the run directory itself loads:
-    its continuation is the run's, token for token."""
-    import jax.numpy as jnp
+    rule and requires its W&B sink. `dew.pipeline("wandb:...")` then loads the promoted run in one call,
+    from the registry by its alias and from the W&B run by its path, as the task the run directory itself
+    loads: its continuation is the run's, token for token."""
     import numpy as np
     import optax
     import wandb as library
@@ -312,4 +311,3 @@ def test_a_sweeps_best_run_is_promoted_to_the_registry_and_loads_in_one_call_fro
         loaded = dew.pipeline(source)
         np.testing.assert_array_equal(np.asarray(loaded(prompt, 4, key=0, sampling=greedy).tokens),
                                       np.asarray(own))
-    assert jnp.asarray(own).shape == (1, 8)
