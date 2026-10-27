@@ -66,15 +66,23 @@ def test_pair_labels_lay_out_as_rows_by_columns_in_one_unit():
 
     measured = Benchmark({("euler", "4 steps"): (0.002, 0.001, 0.003), ("euler", "8 steps"): (0.004,),
                           ("heun", "8 steps"): (1.0115,)}, {})
-    # Each column as wide as its widest cell, right-aligned, two spaces from the next.
-    assert measured.table().splitlines() == [
-        "       4 steps     8 steps",
-        "euler   2.0 ms      4.0 ms",
-        "heun            1,011.5 ms"]
+    # Each column right-aligned: every cell ends where its column's label ends, at least two spaces
+    # past the column before; a pair that never ran leaves its cell blank.
+    header, euler, heun = measured.table().splitlines()
+    ends = [header.index(label) + len(label) for label in ("4 steps", "8 steps")]
+    assert euler.startswith("euler") and heun.startswith("heun")
+    assert [euler.index(cell) + len(cell) for cell in ("2.0 ms", "4.0 ms")] == ends
+    assert heun.index("1,011.5 ms") + len("1,011.5 ms") == ends[1] and not heun[len("heun"):ends[0]].strip()
+    assert ends[0] + 2 <= header.index("8 steps")
     html = measured._repr_html_()
     assert "<th>heun</th>" in html and "1,011.5 ms" in html and html.count("<td") == 4
     slow = Benchmark({"sample": (12.0, 14.0, 13.0), "<script>": (1.0,)}, {})
-    assert slow.table().splitlines() == ["          median", "sample    13.0 s", "<script>   1.0 s"]
+    # A median of ten seconds or more and its column in seconds, the column right-aligned.
+    header, *rows = slow.table().splitlines()
+    assert [row.split()[0] for row in rows] == ["sample", "<script>"]
+    assert [row.rstrip()[-len(cell):] for row, cell in zip(rows, ("13.0 s", "1.0 s"), strict=True)] == [
+        "13.0 s", "1.0 s"]
+    assert {len(row.rstrip()) for row in rows} == {len(header.rstrip())}
     assert "&lt;script&gt;" in slow._repr_html_()
 
 
