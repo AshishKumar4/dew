@@ -146,19 +146,23 @@ def draw(dtype, seed: int, *, rows: int, length: int, key_heads: int, value_head
                   log_decay=log_decay, beta=beta.astype(dtype), state=state, starts=starts),)
 
 
+def template_call(given: Chunk, hooks: recurrence.Hooks):
+    """The template's call over `given`'s operands under `hooks`, as the chunked op hands them over
+    (`recurrence_chunk.chunk`): no decay a zero log decay a head, no write gate ones, the rule's form its
+    hooks'."""
+    heads = given.value.shape[:3]
+    g = jnp.zeros(heads, jnp.float32) if given.log_decay is None else given.log_decay
+    beta = jnp.ones(heads, given.value.dtype) if given.beta is None else given.beta
+    return template.MOSAIC.bind(given.query, given.key, given.value, g, beta, given.state, given.starts,
+                                delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
+                                floor=hooks.floor)
+
+
 def taken(given: Chunk, hooks: recurrence.Hooks) -> bool:
     """Whether the template takes a call over `given`'s operands under `hooks` on the device its launches run
     for (`Mosaic.eligible`: every launch's shared memory and registers within a block's and a thread's, a
     decay a key dimension's declared floor)."""
-    # The operands as the chunked op hands them over (`recurrence_chunk.chunk`): no decay a zero log decay a
-    # head, no write gate ones, the rule's form its hooks'.
-    heads = given.value.shape[:3]
-    g = jnp.zeros(heads, jnp.float32) if given.log_decay is None else given.log_decay
-    beta = jnp.ones(heads, given.value.dtype) if given.beta is None else given.beta
-    bound = template.MOSAIC.bind(given.query, given.key, given.value, g, beta, given.state, given.starts,
-                                 delta=hooks.delta, wide=hooks.skip or hooks.output is not None,
-                                 floor=hooks.floor)
-    return template.MOSAIC.eligible(bound, template.Mosaic.launched())
+    return template.MOSAIC.eligible(template_call(given, hooks), template.Mosaic.launched())
 
 
 REFUSED = (Unfitted, NotImplementedError)

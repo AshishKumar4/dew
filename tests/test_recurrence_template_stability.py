@@ -12,8 +12,8 @@ Natively on a GPU of a family the mainloop claims (`NATIVE`: interpreted, one ca
 tier's hour); off one, the CPU interprets the forward's finiteness under aligned keys and reads the
 gradient's backward decision. The gradient's arm asserts which backward runs: the fast backward where its
 launches hold at the call's derived tiles (`mainloop.backward_holds`, as `mosaic_rule` reads it; natively,
-its reverse launch in the trace), and on an mma.sync GPU, where they do not, the port's, whose gradient its
-reference arm computes too, so check 1 there holds the forward alone."""
+its reverse launch in the trace), and on an mma.sync GPU, where they do not, none: the rule refuses the
+gradient (row 1926), so check 1 there holds the forward alone."""
 
 import dataclasses
 import functools
@@ -94,7 +94,7 @@ def assert_finite(fn, truth, operands, regime: str) -> None:
 def test_the_template_stays_finite_and_on_par_with_the_port_where_chunked_forms_break(regime, product):
     """The template's 16-bit forward, or its forward and gradient, finite wherever the float64 recurrence's
     are on the regime's first draws, and on par with the port's from float64 over its declared seeds
-    (check 1); its gradient the fast backward's where its launches hold, the port's on an mma.sync GPU."""
+    (check 1); its gradient the fast backward's where its launches hold, refused on an mma.sync GPU."""
     template = functools.partial(chunk, HOOKS, mainloop='mosaic')
     port = functools.partial(chunk_on, 'fla', HOOKS)
     exact = functools.partial(token_by_token, HOOKS)
@@ -113,13 +113,15 @@ def test_the_template_stays_finite_and_on_par_with_the_port_where_chunked_forms_
         fast = generation.family(generation.device_generation()) != 'mma.sync'
         operands, _ = draws(0)
         assert fast_backward(restarting(lambda given: given, regime)(operands)) == fast, regime
+        if not fast:
+            # The rule takes no gradient its fast backward does not (row 1926): check 1 holds the forward
+            # alone (its own case).
+            with pytest.raises(NotImplementedError):
+                jax.eval_shape(dew, *draws(0))
+            return
         names = launched(dew, *draws(0))
         if names:
-            assert any('recurrence_reverse' in name for name in names) == fast, (regime, sorted(names))
-        if not fast:
-            # Both arms take the port's gradient: check 1 holds the forward alone (its own case).
-            assert_finite(dew, truth, draws(0), regime)
-            return
+            assert any('recurrence_reverse' in name for name in names), (regime, sorted(names))
     for seed in range(2):
         assert_finite(dew, truth, draws(seed), regime)
     assert_as_exact(dew, reference, draws, f'the template, {regime}, its {product}',
@@ -139,7 +141,7 @@ def test_the_template_forward_stays_finite_under_aligned_keys_interpreted():
 def test_the_template_gradient_takes_the_fast_backward_where_its_launches_hold(regime):
     """The template's gradient over each regime's draw takes its fast backward where its launches hold at the
     call's derived tiles (`fast_backward`): off a GPU by the interpreted bundle, on a warpgroup-MMA GPU by
-    its own; on an mma.sync GPU they do not, and the port's gradient runs."""
+    its own; on an mma.sync GPU they do not, and the rule refuses the gradient (row 1926)."""
     operands, _ = cotangents(HOOKS, regime, 0)
     fast = generation.family(generation.device_generation()) != 'mma.sync'
     assert fast_backward(restarting(lambda given: given, regime)(bf16(operands))) == fast

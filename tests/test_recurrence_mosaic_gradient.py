@@ -1,8 +1,9 @@
 """The recurrence template's Mosaic GPU mainloop's gradient (`mainloop.gradients`, its fast backward)
 through the chunked op's explicit route, as test_recurrence_mosaic holds its forward: check 1 of the rule's
 gradient against its reference's, both from float64, over a GPU's cases and, interpreted off one, the cases
-that cover each launch (`INTERPRETED_GRADIENT`). A file of its own: interpreted, the forward's and the
-gradient's checks together took 37 minutes in one process, past a CI task's deadline."""
+that cover each launch (`INTERPRETED_GRADIENT`); a gradient the fast backward does not take, refused. A file
+of its own: interpreted, the forward's and the gradient's checks together took 37 minutes in one process, past
+a CI task's deadline."""
 
 import dataclasses
 import functools
@@ -12,10 +13,20 @@ import jax.numpy as jnp
 import pytest
 from reference_error import assert_as_exact, with_gradients
 from test_recurrence_chunk import chunk_on, token_by_token
-from test_recurrence_mosaic import DTYPES, SEEDS, SHAPES, draw, geometry, interpreted, on_the_mainloop
+from test_recurrence_mosaic import (
+    DTYPES,
+    SEEDS,
+    SHAPES,
+    draw,
+    geometry,
+    interpreted,
+    on_the_mainloop,
+    template_call,
+)
 
 from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, recomputing
+from dew.nn.kernels.templates.recurrence import template
 
 pytestmark = pytest.mark.kernel
 
@@ -24,7 +35,7 @@ INTERPRETED_GRADIENT = {('a ragged length', 'bf16', 'kept'), ('a ragged length',
                         ('packed documents', 'bf16', 'kept')}
 """The gradient's cases the CPU interprets: the fast backward's launches over a ragged chunk, two key blocks
 and two key heads' groups, packed documents, its forward's memories kept and recomputed, and an fp32
-call's adjoint (the portable math's). Interpreted, the whole grid took 5.4 times these (7828 against 1452
+call's gradient refused. Interpreted, the whole grid took 5.4 times these (7828 against 1452
 seconds)."""
 
 GRADIENT_CASES = [case for case, shape in SHAPES.items() if not shape.get('per_key')]
@@ -58,9 +69,12 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast
     backward (`mainloop.gradients`, fla's DAG) against the fla port's, whose numbers it runs, from the
-    forward's memories kept or, under a remat rung that recomputes them (`recomputing`), recomputed; in an
-    fp32 call the portable math's adjoint against the fp32 recurrence's. A call the template refuses is
-    checked refused and its gradient on the mainloop's rule (`on_the_mainloop`)."""
+    forward's memories kept or, under a remat rung that recomputes them (`recomputing`), recomputed. A call
+    the template refuses is checked refused and its gradient on the mainloop's rule (`on_the_mainloop`). A
+    gradient the fast backward does not take, an fp32 call's or one whose launches the device does not hold
+    (`Mosaic.trains`), the rule refuses as it is traced: the delta rule's selector gives it the port or the
+    portable math, whose check 1 test_recurrence_chunk holds (row 1926: no kernel falls back inside
+    itself)."""
     hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
 
     # Plain functions: the gate compiles both arms alike (`reference_error._arms`).
@@ -72,10 +86,20 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
         return traced
 
     truth = with_gradients(restarted(functools.partial(token_by_token, hooks), case))
-    reference = truth if dtype == jnp.float32 else compiled(functools.partial(chunk_on, 'fla', hooks))
     on = on_the_mainloop(hooks, case, dtype)
     if on is None:
         return
-    assert_as_exact(compiled(on), reference,
-                    functools.partial(drawn, dtype, **geometry(case)),
+    draws = functools.partial(drawn, dtype, **geometry(case))
+    (sample,) = draw(dtype, 0, **geometry(case))
+    if not trained(sample, hooks):
+        with pytest.raises(NotImplementedError):
+            jax.eval_shape(compiled(on), *draws(0))
+        return
+    assert_as_exact(compiled(on), compiled(functools.partial(chunk_on, 'fla', hooks)), draws,
                     f'the mosaic gradient, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
+
+
+def trained(given: Chunk, hooks: recurrence.Hooks) -> bool:
+    """Whether the template's gradient runs a call over `given`'s operands under `hooks` on the device its
+    launches run for (`Mosaic.trains`: the fast backward takes it, its launches held at the call's tiles)."""
+    return template.MOSAIC.trains(template_call(given, hooks), template.Mosaic.launched())

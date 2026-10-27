@@ -119,7 +119,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """The most registers a consumer thread of any of the forward's launches holds (`Launch.registers`,
         each launch's stated tiles, `resources.live_registers`): a legal config's launches spill nothing. The
         fast backward's launches are held to the same budget where its rule takes them
-        (`mainloop.backward_holds`), the portable math's gradient where they are not."""
+        (`mainloop.backward_holds`), and a call they do not hold takes no gradient of it (`trains`)."""
         target = self.launched()
         if bundle(target) is None:
             return None
@@ -174,6 +174,20 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
         # `legal` runs widest first: the last of those in one wave is the narrowest.
         return next((tiles for tiles in reversed(legal) if one_wave(tiles)), legal[0])
+
+    def trains(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
+        """Whether the call's gradient runs on `target`: its fast backward takes it (the delta rule, a decay a
+        head, 16-bit operands) and its launches hold at the call's derived tiles (`_backward_holds`), the
+        rule's gradient (`mosaic_rule`) refusing every other call."""
+        if generation.backend() == "cpu" and bundle(target) is None:
+            target = self.launched()
+        arguments = ba.arguments
+        dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
+        sixteen = dtype in (jnp.bfloat16, jnp.float16)
+        if not (arguments.get("delta", True) and arguments["g"].ndim == 3 and sixteen):
+            return False
+        fits = self.fits(ba, target)
+        return bool(fits) and self._backward_holds(ba, fits[0], target)
 
     def _backward_holds(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,
                         target: generation.GpuTarget) -> bool:
