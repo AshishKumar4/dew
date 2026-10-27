@@ -13,14 +13,15 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Collection, Mapping
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from numpy.typing import ArrayLike, DTypeLike
 
-from dew.interop.safetensors_io import LazyTensors
+if TYPE_CHECKING:
+    from dew.interop.safetensors_io import LazyTensors
 
 
 class PayloadUnread(LookupError):
@@ -239,4 +240,7 @@ _METADATA = {np.shape: lambda array: array.shape, np.ndim: lambda array: array.n
 def unread(specs: Mapping[str, jax.ShapeDtypeStruct]) -> LazyTensors:
     """`specs`' tensors as a load without its weights holds them: each an `Unread` of its shape and
     dtype, standing in for the array a reader takes (`held`), its NumPy run on it abstractly."""
+    # The safetensors reader's module reads weights through this one.
+    from dew.interop.safetensors_io import LazyTensors
+
     return LazyTensors(specs, lambda name: held(Unread(specs[name].shape, specs[name].dtype)))
