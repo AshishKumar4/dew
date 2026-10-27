@@ -291,14 +291,19 @@ def _half_mahalanobis_jvp(primals, tangents):
     level, spread = _split(variance)
     axes = tuple(range(1, value.ndim))
     widest = jnp.max(shift, axis=axes)
-    residual_power = expand(widest, shift) - expand(spread, shift)
-    before = residual_power // 2
-    products = _scaled(difference, shift - expand(widest, shift) + before) * (along_value - along_mean)
-    moved = _scaled(products.sum(axis=axes) / level, widest - spread - (widest - spread) // 2)
+    residual_power = widest - spread
+    before = _half(residual_power)
+    products = _scaled(difference, shift - expand(widest - before, shift)) * (along_value - along_mean)
+    moved = _scaled(products.sum(axis=axes) / level, residual_power - before)
     stretch_power = power - spread
-    stretched = _scaled(-quotient, stretch_power // 2) * along_variance / level
+    stretched = _scaled(-quotient, _half(stretch_power)) * along_variance / level
     return (_half_mahalanobis(value, mean, variance),
-            moved + _scaled(stretched, stretch_power - stretch_power // 2))
+            moved + _scaled(stretched, stretch_power - _half(stretch_power)))
+
+
+def _half(power: jax.Array) -> jax.Array:
+    """Half an integer power of two's exponent, rounded toward zero, the rest restored apart."""
+    return (power.astype(jnp.float32) * 0.5).astype(jnp.int32)
 
 
 _gaussian_kl = linear_tangent(_measured, _kl_pullback, _directional)
