@@ -1,10 +1,11 @@
 """A run's setup stops a process whose JAX opened on the CPU beside an NVIDIA
 GPU, with the install that fixes it (`dew.devices`), and `import dew`
-does not. The GPU is nvidia-smi's answer and its CUDA version the user-mode
-driver's (libcuda's `cuDriverGetVersion`), so a stand-in nvidia-smi and a
-stand-in driver library play every machine on a host without one. `import dew`
-keeps every rounding a program states, unless the run or a backend opened
-before it decided otherwise."""
+does not. The GPU is nvidia-smi's answer, its CUDA version the user-mode
+driver's (libcuda's `cuDriverGetVersion`) and JAX's CUDA builds the plugins
+installed, so stand-ins for nvidia-smi, the driver library and the plugins
+play every machine on a host without one. `import dew` keeps every rounding a
+program states, unless the run or a backend opened before it decided
+otherwise."""
 
 import json
 import os
@@ -15,7 +16,6 @@ import sys
 import pytest
 
 from dew.builds import CUDA_BUILDS
-from dew.devices import cuda_builds
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -108,14 +108,29 @@ def test_a_run_stops_where_the_gpu_would_sit_idle_and_import_dew_does_not(tmp_pa
     assert (refusal is None) == (platforms == "cpu")
 
 
+def stand_in_builds(directory, builds) -> str:
+    """The PYTHONPATH entry of JAX's CUDA builds `builds` installed, in place of this environment's,
+    as `cuda_builds` and JAX's plugin discovery find them: a `jax_plugins` package over the namespace
+    one, each build's plugin in it registering no backend, as a build that opens no GPU here."""
+    plugins = directory / "jax_plugins"
+    plugins.mkdir()
+    (plugins / "__init__.py").write_text("")
+    for build in builds:
+        (plugins / f"xla_{build}").mkdir()
+        (plugins / f"xla_{build}" / "__init__.py").write_text("def initialize():\n    pass\n")
+    return str(directory)
+
+
 MACHINES = {
-    # nvidia-smi's rows, the CUDA version the user-mode driver reports, and the builds that run there,
-    # newest first.
-    "a-580-driver-runs-cuda-13-itself": ("580.82.07, 9.0\\n580.82.07, 9.0\\n", 13000, ("cuda13", "cuda12")),
-    "a-570-under-nvidias-cuda-compat": ("570.124.06, 9.0\\n", 13000, ("cuda13", "cuda12")),
-    "the-same-570-without-it": ("570.124.06, 9.0\\n", 12080, ("cuda12",)),
-    "the-least-sm-of-the-gpus": ("580.82.07, 8.9\\n580.82.07, 7.0\\n", 13000, ("cuda12",)),
-    "a-cuda-no-build-runs-on": ("520.61.05, 8.0\\n", 11080, ()),
+    # nvidia-smi's rows, the CUDA version the user-mode driver reports, the builds that run there,
+    # newest first, and the builds installed.
+    "a-580-driver-runs-cuda-13-itself": ("580.82.07, 9.0\\n580.82.07, 9.0\\n", 13000,
+                                         ("cuda13", "cuda12"), ()),
+    "a-570-under-nvidias-cuda-compat": ("570.124.06, 9.0\\n", 13000, ("cuda13", "cuda12"), ()),
+    "the-same-570-without-it": ("570.124.06, 9.0\\n", 12080, ("cuda12",), ("cuda13",)),
+    "the-least-sm-of-the-gpus": ("580.82.07, 8.9\\n580.82.07, 7.0\\n", 13000, ("cuda12",), ("cuda13",)),
+    "a-cuda-no-build-runs-on": ("520.61.05, 8.0\\n", 11080, (), ()),
+    "an-installed-build-that-runs": ("580.82.07, 9.0\\n", 13000, ("cuda13", "cuda12"), ("cuda13",)),
 }
 
 
@@ -125,16 +140,21 @@ def test_a_runs_setup_installs_the_cuda_build_the_user_mode_driver_runs(tmp_path
     CUDA version, JAX having opened on the CPU, refuses it with the install that runs there: JAX's
     cuda13 build where that version is 13.0 or newer, as its plugin checks, a 580 driver's own or a
     570's under NVIDIA's cuda-compat, whose kernel driver's major is then no bar; the cuda12 build
-    alone under CUDA 12.8, or beside a GPU older than cuda13's least SM; and none where no build runs.
-    Where this environment's JAX has a build that runs there, the refusal installs nothing: that JAX
+    alone under CUDA 12.8, or beside a GPU older than cuda13's least SM, in place of an installed
+    cuda13 that cannot run; and none where no build runs, nor where an installed build runs, whose JAX
     should have opened the GPU."""
-    printed, cuda, runs = MACHINES[machine]
-    (tmp_path / "driver").mkdir()
+    printed, cuda, runs, installed = MACHINES[machine]
+    for part in ("driver", "plugins"):
+        (tmp_path / part).mkdir()
     done, refusal = readied(tmp_path, "prepare", PATH=stand_in(tmp_path, printed),
-                            LD_LIBRARY_PATH=stand_in_driver(tmp_path / "driver", cuda))
+                            LD_LIBRARY_PATH=stand_in_driver(tmp_path / "driver", cuda),
+                            PYTHONPATH=ahead(stand_in_builds(tmp_path / "plugins", installed),
+                                             os.path.join(ROOT, "src")))
     assert done.returncode == REFUSED and refusal is not None, done.stderr[-2000:]
     installs = {build for build, *_ in CUDA_BUILDS if f"dewml[{build}]" in refusal}
-    assert installs == (set() if set(runs) & set(cuda_builds()) else set(runs[:1])), refusal
+    replaced = {build for build, *_ in CUDA_BUILDS if f"jax-{build}-plugin" in refusal}
+    expected = set() if set(runs) & set(installed) else set(runs[:1])
+    assert (installs, replaced) == (expected, set(installed) if expected else set()), refusal
 
 
 @pytest.mark.parametrize("smi", ["none-on-the-path", "a-driver-too-old-to-report-an-sm", "failing"])
