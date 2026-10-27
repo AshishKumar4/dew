@@ -414,6 +414,14 @@ def offloaded(prepared: TrainState, fields: Sequence[str], temporaries: int) -> 
     return 2 * (sum(placed_bytes(getattr(prepared, field)) for field in fields) + temporaries)
 
 
+def priced(link: Link | None) -> tuple[float, float] | None:
+    """What the host `link` moves a second and its device's peak, which an offload is priced by
+    (`hides`); None where it states either not."""
+    if link is None or link.bytes_per_second is None or link.flops_per_second is None:
+        return None
+    return link.bytes_per_second, link.flops_per_second
+
+
 def hides(moved: int, executable: jax.stages.Compiled, link: Link | None) -> bool:
     """Whether `moved` bytes over the host `link` take no longer than the step's FLOPs at its device's
     peak (`step_flops`, `Link.flops_per_second`), the least time they take at any utilisation: where
@@ -424,10 +432,12 @@ def hides(moved: int, executable: jax.stages.Compiled, link: Link | None) -> boo
     MaxText and NVIDIA's JAX-Toolbox offload the optimizer state and remat residuals as a run's own
     choice (`optimizer_memory_host_offload`, the `*_offloaded` remat policies), over the same memory
     kinds and checkpoint policies; here the plan chooses, priced by the host link it measures."""
-    if link is None or link.bytes_per_second is None or link.flops_per_second is None:
+    rates = priced(link)
+    flops = None if rates is None else step_flops(executable)
+    if rates is None or flops is None:
         return False
-    flops = step_flops(executable)
-    return flops is not None and moved / link.bytes_per_second <= flops.hardware / link.flops_per_second
+    bandwidth, peak = rates
+    return moved / bandwidth <= flops.hardware / peak
 
 
 @dataclasses.dataclass
@@ -436,11 +446,11 @@ class Search:
     where on the ladder it stands, from the rung `objective`, `xla_defaults`, `narrow` and `host` give.
 
     `host` is the state's fields the step keeps in its host's pinned memory, the run's layout's first
-    (`own`); `offloadable` is those the ladder may move there, its rung past XLA's defaults and before
-    the next remat rung, kept up the ladder only where some compile there hid what it moves (`hides`,
-    over the host `link`, read once a compile is priced). An offload the run's own rung holds is the
-    run's choice, never priced; the ladder's own are: its state fields, and the temporaries XLA keeps in
-    host memory at a remat rung above the run's own (an offloading rung's residuals)."""
+    (`own`); `offloadable` is those the ladder may move there, a rung past XLA's defaults before each
+    remat rung, kept up the ladder once some compile there hid what it moves (`hides`, over the host
+    `link`, read the first time the ladder reaches it), else taken back. An offload the run's own rung
+    holds is the run's choice, never priced; the ladder's own are: its state fields, and the temporaries
+    XLA keeps in host memory at a remat rung above the run's own (an offloading rung's residuals)."""
     lower: Callable[[int, bool, tuple[str, ...]], Candidate]
     options: Callable[[Candidate], jax.stages.CompilerOptions | None]
     objective: Objective[Any, Any]
@@ -550,9 +560,9 @@ class Search:
             return True
         self.xla_defaults = False
         self.lowered.clear()
-        # The state's offload, which costs nothing where it hides, stands before any recomputation, and
-        # stays up the ladder only where it hid.
-        if self.offloadable and self.host == self.own:
+        # The state's offload, which costs nothing where it hides, stands before each remat rung, and
+        # stays up the ladder only where it hid; over a link that prices nothing it is never compiled.
+        if self.offloadable and self.host == self.own and priced(self.link()) is not None:
             self.host = (*self.own, *self.offloadable)
             return True
         if not self.hid:

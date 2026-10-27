@@ -66,7 +66,7 @@ def test_a_step_that_fits_only_without_its_state_on_the_device_keeps_it_in_host_
     """With room for no split while the optimizer state and the EMA sit on the device, the plan keeps
     them in host memory before it recomputes anything, over a host link that moves them in less time
     than the step's FLOPs take, and the run trains from there with them in pinned host memory. Its
-    checkpoint's rung says so, and a run resuming from it places them there before its first step."""
+    checkpoint's rung says so, and a trainer that takes that rung places them there."""
     free(monkeypatch, tight(monkeypatch))
     trainer = offloading()
     state = trained(trainer)
