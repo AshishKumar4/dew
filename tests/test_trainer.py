@@ -840,6 +840,8 @@ runs = {"first": fit(1e-3, 2, root + "/run")}
 for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
     shutil.copytree(root + "/run", f"{root}/{name}")
     runs[name] = fit(peak, 3, f"{root}/{name}")
+for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
+    runs["fresh " + name] = fit(peak, 3, f"{root}/fresh {name}")
 print(json.dumps(runs))
 """
 
@@ -868,9 +870,11 @@ def test_a_run_resumed_at_another_rate_steps_at_it_on_the_compiled_step(tmp_path
         np.testing.assert_allclose(fast - start, 2 * (slow - start), rtol=1e-5,
                                    atol=2 * np.spacing(np.abs(start).max()))
     if not grouped:
-        for name, peak in (("slow", 4e-3), ("fast", 8e-3)):
-            schedule = optax.warmup_cosine_decay_schedule(0.0, peak, 1, 8)
-            assert runs[name]["rates"]["3"] == pytest.approx(float(schedule(2)))
+        # A resumed step's rate is the one a run configured so from its start steps at, bit for bit: the
+        # same program reading the same rate operands.
+        for name in ("slow", "fast"):
+            assert runs[name]["rates"]["3"] == runs["fresh " + name]["rates"]["3"]
+        assert runs["fast"]["rates"]["3"] != runs["slow"]["rates"]["3"]
 
 
 def test_the_compiled_step_consumes_the_state_it_is_given():

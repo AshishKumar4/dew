@@ -666,7 +666,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_trainer.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_training_dtypes.py": {
