@@ -231,6 +231,11 @@ class CausalTransformer(nn.Module):
     epsilon or a weight of a norm's own."""
     embedding_norm: bool = False
     """Normalize token embeddings before the first block, as BLOOM and ModernBERT do."""
+    embedding_norm_reads: Literal['inputs', 'lookup'] = 'inputs'
+    """What `embedding_norm` normalizes: every input embedding, a caller's own and a media encoder's
+    among them, as BLOOM's and ModernBERT's embedding norms read their `inputs_embeds` ('inputs'); or
+    the table's lookup alone, before media take their slots, as Muse Glimmer's normed embedding module
+    does (`scaled_embeddings`, 'lookup')."""
     first_attention_norm: bool = True
     """Whether the first block norms its attention input. ModernBERT's first
     block reads the embedding norm's output as it is (modeling_modernbert.py,
@@ -1450,8 +1455,10 @@ class CausalTransformer(nn.Module):
     def scaled_embeddings(self, x):
         """Return the token embeddings `x` scaled the way the first layer reads them.
 
-        `x` is multiplied by sqrt(emb_features) when `embedding_scale` is set
-        (Gemma), then by `embedding_multiplier` (lm-engine, GraniteMoeHybrid).
+        `x` is normalized first where the norm reads the lookup alone
+        (`embedding_norm_reads`, Muse Glimmer), multiplied by
+        sqrt(emb_features) when `embedding_scale` is set (Gemma), then by
+        `embedding_multiplier` (lm-engine, GraniteMoeHybrid).
         The decoder, the multimodal wrapper and the Qwen-Image conditioner all
         scale here.
 
@@ -1462,6 +1469,8 @@ class CausalTransformer(nn.Module):
         """
         # Gemma's cast: modeling_gemma3.py:117. lm-engine's fp32 opmath:
         # mixins/dense/base.py at 45b6b57b.
+        if self.embedding_norm and self.embedding_norm_reads == 'lookup':
+            x = self.embedding_layernorm(x)
         if self.embedding_scale:
             x = (x * jnp.asarray(math.sqrt(self.emb_features),
                                  self.embed_tokens.embedding.dtype)).astype(x.dtype)
@@ -1654,7 +1663,7 @@ class CausalTransformer(nn.Module):
                 if start is not None:
                     places = places + start[:, None]
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
-        if self.embedding_norm:
+        if self.embedding_norm and self.embedding_norm_reads == 'inputs':
             x = self.embedding_layernorm(x)
         if self.embedding_dropout_rate:
             x = self.embedding_dropout(x, deterministic=not train)
