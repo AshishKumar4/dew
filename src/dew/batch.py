@@ -137,15 +137,22 @@ class Coordinates:
     tokens; `starts` marks each document's first real token but a row's
     first, which continues whatever state the row holds. Each is None where
     it holds nothing (one document a row, every token real, no start), which
-    a layer's fast path reads as a static fact. `max_segments` bounds the
-    documents a row holds (the packer's static plan, else the row length) and
-    `right_padded` says every row's real tokens come first.
+    a layer's fast path reads as a static fact. `firsts` `[B, D]` are each
+    row's documents' first slots in order, the row's first slot among them,
+    `S` past its last (`document_firsts`): the packed documents' coordinates
+    every varlen kernel reads (`dew.nn.inputs.cu_seqlens`), built once with
+    the batch, never by a layer: each layer's own scan over the batch's
+    flattened tokens, which a mesh splits, ran one token a loop iteration on
+    a 2xH100 run (row 1897). `max_segments` bounds the documents a row holds
+    (the packer's static plan, else the row length) and `right_padded` says
+    every row's real tokens come first.
     """
 
     positions: jax.Array | None = None
     segments: jax.Array | None = None
     valid: jax.Array | None = None
     starts: jax.Array | None = None
+    firsts: jax.Array | None = None
     max_segments: int = struct.field(pytree_node=False, default=1)
     right_padded: bool = struct.field(pytree_node=False, default=False)
 
@@ -193,10 +200,20 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
         real = real & (segments != 0)
         positions = xp.where(real, document_ranks(real, starts, xp=xp), 0)
     positions = None if positions is None else xp.asarray(positions, np.int32)
-    return Coordinates(positions, segments, valid, starts,
-                       max_segments=(1 if segments is None else length) if max_segments is None
-                       else max_segments,
+    max_segments = (1 if segments is None else length) if max_segments is None else max_segments
+    firsts = None if starts is None else document_firsts(starts, max_segments + 1, xp=xp)
+    return Coordinates(positions, segments, valid, starts, firsts, max_segments=max_segments,
                        right_padded=right_padded)
+
+
+def document_firsts(starts, documents: int, *, xp=jnp):
+    """Each row's first `documents` documents' first slots in order `[B, min(documents, S)]`, the row's
+    first slot and each of `starts` `[B, S]`, `S` past its last: a sort of each row's slots, which a mesh
+    splitting the rows sorts on each device (`Coordinates.firsts`)."""
+    rows, length = starts.shape
+    slots = xp.broadcast_to(xp.arange(length, dtype=np.int32), (rows, length))
+    begun = xp.concatenate([xp.ones((rows, 1), bool), xp.asarray(starts, bool)[:, 1:]], axis=1)
+    return xp.sort(xp.where(begun, slots, length), axis=1)[:, :min(documents, length)].astype(np.int32)
 
 
 def document_ranks(real, starts, *, xp=jnp):

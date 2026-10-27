@@ -21,6 +21,7 @@ from dew.batch import (
     VALIDITY_FIELD,
     Coordinates,
     coordinates,
+    document_firsts,
     document_ranks,
     document_starts,
     padded_rows,
@@ -235,11 +236,14 @@ class ModelInputs:
     def slice_tokens(self, start: int | None = None, stop: int | None = None) -> ModelInputs:
         """Slice the tokens and token fields to slots `start:stop`; media features keep their indices."""
         selection = slice(start, stop)
-        # A field may be a tree of arrays, as `coordinates` is; each of its arrays is sliced alike.
-        return replace(self,
-            tokens=self.tokens[:, selection],
-            token_fields={name: jax.tree.map(lambda leaf: leaf[:, selection], value)
-                          for name, value in self.token_fields.items()})
+        # A field may be a tree of arrays, as `coordinates` is; each of its arrays is sliced alike, but
+        # its documents' firsts, which index the slots, are rebuilt from the sliced starts by their reader.
+        def sliced(value):
+            value = jax.tree.map(lambda leaf: leaf[:, selection], value)
+            return replace(value, firsts=None) if isinstance(value, Coordinates) else value
+
+        return replace(self, tokens=self.tokens[:, selection],
+                       token_fields={name: sliced(value) for name, value in self.token_fields.items()})
 
     def align_left(self, left_padding: jax.Array) -> ModelInputs:
         """Rotate each row so its real tokens start at slot 0 and its `left_padding` slots move to the end.
@@ -254,9 +258,14 @@ class ModelInputs:
         def shift(value: jax.Array) -> jax.Array:
             return rotate_rows(value, left_padding)
 
+        def shifted(value):
+            # The documents' firsts index the slots, not along them: rebuilt from the rotated starts.
+            if isinstance(value, Coordinates):
+                return jax.tree.map(shift, replace(value, firsts=None))
+            return jax.tree.map(shift, value)
+
         return replace(self, tokens=shift(self.tokens),
-                            token_fields={name: jax.tree.map(shift, value)
-                                          for name, value in self.token_fields.items()})
+                            token_fields={name: shifted(value) for name, value in self.token_fields.items()})
 
     def kwargs(self) -> dict[str, jax.Array | Mapping[str, jax.Array]]:
         """Return the keyword arguments for a native model call, without the tokens.
@@ -307,14 +316,22 @@ def rotate_rows(values: jax.Array, shifts: jax.Array) -> jax.Array:
     return jnp.take_along_axis(values, slots.reshape(slots.shape + (1,) * (values.ndim - 2)), axis=1)
 
 
-def cu_seqlens(begins: jax.Array, sequences: int) -> jax.Array:
+def cu_seqlens(begins: jax.Array, sequences: int, firsts: jax.Array | None = None) -> jax.Array:
     """The cumulative offsets of the varlen sequences over the `[B * S]`
     tokens of `begins` `[B, S]`, which marks each sequence's first token: a
     kernel's `cu_seqlens` `[sequences + 1]`, the sequences past the marked
-    ones empty at the end. Every row's first token begins one."""
+    ones empty at the end. Every row's first token begins one. They come from
+    each row's documents' first slots, the batch's `firsts`
+    (`Coordinates.firsts`) where given, offset by their rows and sorted: no
+    scan over the flattened tokens, whose split over a mesh XLA runs a token
+    a loop iteration (row 1897)."""
     rows, length = begins.shape
-    first = begins.at[:, 0].set(True).reshape(-1)
-    starts = jnp.nonzero(first, size=sequences, fill_value=rows * length)[0]
+    if firsts is None:
+        firsts = document_firsts(begins, -(-sequences // rows))
+    placed = jnp.where(firsts < length, firsts + jnp.arange(rows, dtype=jnp.int32)[:, None] * length,
+                       rows * length).reshape(-1)
+    starts = jnp.sort(placed)[:sequences]
+    starts = jnp.pad(starts, (0, sequences - starts.shape[0]), constant_values=rows * length)
     return jnp.concatenate([starts, jnp.full((1,), rows * length, starts.dtype)]).astype(jnp.int32)
 
 
@@ -678,9 +695,13 @@ def _continued_layout(value: Coordinates, valid: jax.Array, width: int) -> Coord
 
     starts = None if value.starts is None else jnp.concatenate(
         [value.starts, jnp.zeros((len(value.starts), width), value.starts.dtype)], axis=1)
+    # No document starts in the response: each row's firsts stand, past its last now `width` further.
+    length = None if value.starts is None else value.starts.shape[1]
+    firsts = None if value.firsts is None else jnp.where(value.firsts < length, value.firsts,
+                                                         length + width)
     return replace(value, valid=continued(value.valid, _response_validity),
                    positions=continued(value.positions, _response_positions),
-                   segments=continued(value.segments, _response_document), starts=starts,
+                   segments=continued(value.segments, _response_document), starts=starts, firsts=firsts,
                    right_padded=False)
 
 
