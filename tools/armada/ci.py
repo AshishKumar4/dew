@@ -165,16 +165,31 @@ COLLECT_TASKS = 4
 SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
-SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/session.py",
-          "tools/armada/child_groups.py", "tools/armada/split.py", "tools/armada/executed.py",
-          "tools/armada/followed.py")
-"""The files every test file's key covers whole, beside tests/ and src/'s data, every lock (a GPU node
-builds its environment from its CUDA lock) and the environment's own inputs, which .armada.json
-names (`environment_files`): what every test process runs or reads, the session it runs in, the
-process group it runs as and the plugins loaded into it among them. The plan's own code (this file)
-runs outside the tests, so a change to it reruns none of them; nor does the durations record
-(`session.DURATIONS`), which only a split file's groups are cut from, so a group's key covers its own
-file's entries alone (`cache_key`)."""
+SHARED = ("pyproject.toml", "constraints.txt", "tools/armada/session.py", "tools/armada/child_groups.py",
+          "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py")
+"""The files every test file's key covers whole, beside every lock (a GPU node builds its environment
+from its CUDA lock), the environment's own inputs, which .armada.json names (`environment_files`), and
+.armada.json's parts a test process sees (`armada_seen`): what every test process runs or reads, the
+session it runs in, the process group it runs as and the plugins loaded into it among them. The plan's
+own code (this file) runs outside the tests, so a change to it reruns none of them; nor does the
+durations record (`session.DURATIONS`), which only a split file's groups are cut from, so a group's key
+covers its own file's entries alone (`cache_key`). A fixture or a package's data is the input of each
+file whose run read it, and of its directory's other files (`inputs`), none of every file's."""
+ARMADA_SEEN = ("environment", "environments", "env")
+""".armada.json's parts a test process runs in, beside its task's command and secrets (`armada_seen`):
+its pool, size, target, plan and the task's deadline and mode decide where and when tasks run, never
+what a test sees (owner, 2026-10-27: a pool change reran every file)."""
+
+
+def armada_seen(text: str | None) -> str:
+    """The parts of .armada.json (`text`, or None where there is none) a test process sees: its
+    environments, their variables (`ARMADA_SEEN`), and its task's command and secrets, as one text."""
+    if text is None:
+        return "missing"
+    config = json.loads(text)
+    task = config.get("task", {})
+    return json.dumps({**{part: config.get(part) for part in ARMADA_SEEN},
+                       "command": task.get("command"), "secrets": task.get("secrets")}, sort_keys=True)
 
 
 def environment_files() -> list[str]:
@@ -198,23 +213,20 @@ CACHE_PREFIX = f"testcache/format-{RECORD_FORMAT}"
 
 
 def shared(python: str) -> str:
-    """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock, every
-    non-Python file under tests/ and src/ (a fixture, a package's data), and the names of the Python
-    files under tests/ but its test modules and of src/'s own entries, whose arrival can change what an
-    import finds (a conftest.py, a helper or a top-level package that shadows another), which a record
-    does not see. A module within a package under src/ is its importers' input alone, with its
-    package's other modules (`inputs`), and a test module is no other file's: so a train that loses a
-    head runs again only what that head's modules reached."""
+    """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock,
+    .armada.json's parts a test process sees (`armada_seen`), and the names of the Python files under
+    tests/ but its test modules and of src/'s own entries, whose arrival can change what an import finds
+    (a conftest.py, a helper or a top-level package that shadows another), which a record does not see.
+    A module within a package under src/ is its importers' input alone, with its package's other modules
+    (`inputs`), a test module is no other file's, and a fixture or a package's data is its readers'
+    (`inputs`): so a train that loses a head runs again only what that head's files reached (owner,
+    2026-10-27: one fixture re-recorded reran all 1,300 rows)."""
     digest = hashlib.sha256(python.encode())
-    for top in ("tests", "src"):
-        for path in sorted(Path(top).rglob("*")):
-            if not path.is_file() or "__pycache__" in path.parts or path == session.DURATIONS:
-                continue
-            if path.suffix == ".py" and (top == "src" or path.name.startswith("test_")):
-                continue
+    for path in sorted(Path("tests").rglob("*.py")):
+        if "__pycache__" not in path.parts and not path.name.startswith("test_"):
             digest.update(str(path).encode())
-            if path.suffix != ".py":
-                digest.update(hashlib.sha256(path.read_bytes()).digest())
+    armada = Path(".armada.json")
+    digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
         digest.update(name.encode() + contents(name))
     return digest.hexdigest()
@@ -260,12 +272,20 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     import it tried now finds), or an __init__.py added to a namespace package on the way to one, which
     executes as the import passes, changes its key; one added to a package it never imported does not.
     tools/ itself is among them, as a test puts it, or a directory under it, on sys.path and imports a tool
-    by its name, which a package added there shadows; src/'s own entries every key covers (`shared`)."""
+    by its name, which a package added there shadows; src/'s own entries every key covers (`shared`).
+    A data file it read under tests/ or src/ brings its directory's other data files: a fixture is a
+    directory a native reader reads beside the files Python opens (a tokenizer's tokenizer.json, a
+    checkpoint's weights through safetensors' safe_open), which no audit event names."""
     packages = {str(parent) for path in depends
                 if path.startswith(("src/", "tools/")) and path.endswith(".py")
                 for parent in Path(path).parents
                 if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src")}
-    return sorted({name, *depends, *packages})
+    beside = {str(sibling) for path in depends
+              if path.startswith(("tests/", "src/")) and not path.endswith(".py") and Path(path).is_file()
+              for sibling in Path(path).parent.iterdir()
+              if sibling.is_file() and sibling.suffix != ".py" and not sibling.name.startswith(".")
+              and sibling != session.DURATIONS}
+    return sorted({name, *depends, *packages, *beside})
 
 
 def cpu_class() -> str:
@@ -505,7 +525,15 @@ def policy(base: str) -> str:
     no pulled head had touched, under a policy that reran every file that read any tool)."""
     changed = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"], check=True,
                              capture_output=True, text=True).stdout.split()
-    whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".python-version"}
+    if ".armada.json" in changed:
+        before = subprocess.run(["git", "show", f"{base}:.armada.json"], capture_output=True, text=True,
+                                check=False)
+        armada = Path(".armada.json")
+        if armada_seen(before.stdout if before.returncode == 0 else None) == armada_seen(
+                armada.read_text() if armada.is_file() else None):
+            changed.remove(".armada.json")  # where and when tasks run, never what a test sees
+    whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".armada.json",
+             ".python-version"}
     if any(name in whole or not (name.startswith(PLACED) or name in PLACED_FILES) for name in changed):
         return "off"
     return "on"
