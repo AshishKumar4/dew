@@ -363,6 +363,10 @@ filterwarnings = [
     # Qwix 0.1.8 aliases a flax name flax removed; scoped to qwix so the same
     # warning from dew's own code still fails the run.
     'ignore:.VariableState. was removed:DeprecationWarning:qwix',
+    # jaxlib (0.12) builds the native type of a trace event's stats, with no __module__, the first time a
+    # process reads one, and CPython warns of it in the reading frame, dew.telemetry.trace's: a native
+    # abort under the errors above, and no deprecation of Dew's. Scoped to the message.
+    'ignore:builtin type event_stats has no __module__ attribute:DeprecationWarning',
 ]
 
 [tool.coverage.run]
