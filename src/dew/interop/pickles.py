@@ -29,8 +29,8 @@ import ml_dtypes
 import numpy as np
 
 from dew.cache import dew_cache_dir
-from dew.files import stat_identity
-from dew.interop.safetensors_io import WEIGHTS_FILE, own, weight_files, write_file, write_index
+from dew.files import staged, stat_identity
+from dew.interop.safetensors_io import WEIGHTS_FILE, own, write_file, write_index
 
 if TYPE_CHECKING:
     import torch
@@ -39,6 +39,9 @@ STEMS = ("pytorch_model",)
 """The stem of transformers' pickle checkpoint and of its index."""
 
 SUFFIX = ".bin"
+
+PUBLISHED_WHOLE = "published whole"
+"""The conversion cache's layout, in its key: each conversion one folder published by one rename."""
 
 CONVERT_SPACE = "https://huggingface.co/spaces/safetensors/convert"
 """SFconvertbot's space, which opens a repo's safetensors conversion as a pull request."""
@@ -49,24 +52,27 @@ def converted(directory: Path, shards: Sequence[str]) -> Path:
 
     The first call for these files converts them, which needs torch: the
     `pickles` extra. One shard becomes model.safetensors. Several become
-    numbered shards and an index, written last, so a folder whose files
-    `weight_files` selects is a finished conversion. Each file is published
-    atomically, so a failed conversion leaves nothing a later load would
-    read.
+    numbered shards and an index. The folder is published whole, by one
+    rename of a folder written beside it (`dew.files.staged`), so a folder
+    that is there is a finished conversion that no later call changes:
+    processes converting the same files at once each write their own, and the
+    first published stands. Where they wrote one folder file by file, a
+    process listing it while another replaced a file in it could find no
+    weights on an overlay filesystem (a pool loading one release from a
+    shared ~/.cache), and a failed conversion leaves nothing a later load
+    would read.
     """
     identity = [[name, *stat_identity(directory / name)] for name in shards]
-    target = (
-        Path(dew_cache_dir()) / "converted" / hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:32]
-    )
-    if target.is_dir() and weight_files({entry.name for entry in target.iterdir()}, "",
-                                        lambda name: json.loads((target / name).read_text())):
+    # The cache's layout is in the key, so a folder an earlier layout wrote file by file is never read.
+    key = json.dumps([PUBLISHED_WHOLE, identity])
+    target = Path(dew_cache_dir()) / "converted" / hashlib.sha256(key.encode()).hexdigest()[:32]
+    if target.is_dir():
         return target
     if importlib.util.find_spec("torch") is None:
         raise ImportError(
             f"{directory} holds PyTorch pickles ({', '.join(shards)}), and converting them needs torch: "
             f"pip install 'dewml[torch]', or open their safetensors conversion at {CONVERT_SPACE} "
             "and load its refs/pr/N revision")
-    target.mkdir(parents=True, exist_ok=True)
     outputs = (
         [WEIGHTS_FILE]
         if len(shards) == 1
@@ -74,13 +80,14 @@ def converted(directory: Path, shards: Sequence[str]) -> Path:
     )
     weight_map: dict[str, str] = {}
     owner: dict[str, str] = {}
-    for shard, output in zip(shards, outputs, strict=True):
-        tensors = _state_dict(directory / shard)
-        own(owner, tensors, shard, directory)
-        write_file(tensors, target / output, {"format": "pt"})
-        weight_map.update(dict.fromkeys(tensors, output))
-    if len(shards) > 1:
-        write_index(target, weight_map)
+    with staged(target) as written:
+        for shard, output in zip(shards, outputs, strict=True):
+            tensors = _state_dict(directory / shard)
+            own(owner, tensors, shard, directory)
+            write_file(tensors, written / output, {"format": "pt"})
+            weight_map.update(dict.fromkeys(tensors, output))
+        if len(shards) > 1:
+            write_index(written, weight_map)
     return target
 
 

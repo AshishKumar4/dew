@@ -18,14 +18,7 @@ from dew.batch import Batch
 from dew.data.pipeline import Windows
 from dew.data.sources.base import Read, Rows, ShardManifest, View, _indexed_manifest
 from dew.data.sources.tokens import TokenFiles
-
-
-def _aligned(row: Batch, fields: tuple[str, ...]) -> Batch:
-    """The fields of one document, refusing alignment drift before joining documents."""
-    tokens = {name: np.asarray(row[name]) for name in fields}
-    if len({len(value) for value in tokens.values()}) != 1:
-        raise ValueError("causal window fields have different record lengths")
-    return tokens
+from dew.data.steps.generic import aligned
 
 
 class TokenSpan(Protocol):
@@ -44,9 +37,9 @@ class IndexedWindows:
 
     @classmethod
     def from_records(cls, rows: Sequence[Batch], windows: Windows) -> IndexedWindows:
-        aligned = [_aligned(row, windows.fields) for row in rows]
+        held = [aligned(row, windows.fields) for row in rows]
         tokens = {
-            name: np.concatenate([row[name] for row in aligned]) if aligned else np.zeros(0, np.int32)
+            name: np.concatenate([row[name] for row in held]) if held else np.zeros(0, np.int32)
             for name in windows.fields
         }
         return cls(tokens, windows.seq_len, windows.stride or windows.seq_len)
@@ -123,7 +116,7 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
             )
             if len(windows):
                 break
-            row = _aligned(next(self._read), self._windows.fields)
+            row = aligned(next(self._read), self._windows.fields)
             self._held = {
                 name: np.concatenate([self._held[name], row[name]])
                 for name in self._windows.fields

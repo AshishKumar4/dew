@@ -15,6 +15,7 @@ import optax
 import pytest
 from flax import linen as nn
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
@@ -265,6 +266,7 @@ def test_a_multi_axis_target_steps_as_its_flattened_matrix_does():
         return {"the output": forward, "lora_A's gradient": gradient["lora_A"],
                 "lora_B's gradient": gradient["lora_B"]}
 
+    @as_given
     def oracle(x, kernel, bias, a, b, cotangent):
         dtype = x.dtype.type
         rows, seed = x.reshape(16, 48), cotangent.reshape(16, 30)

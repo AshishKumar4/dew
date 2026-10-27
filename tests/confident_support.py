@@ -6,6 +6,7 @@ row sums to 0. The tests hold each derivative to it from float64, a confident la
 """
 
 import numpy as np
+from reference_error import as_given
 
 
 def confident(margin: float, seed: int, label: int = 0, *, width: int = 7,
@@ -18,6 +19,7 @@ def confident(margin: float, seed: int, label: int = 0, *, width: int = 7,
     return (np.concatenate([others[:, :label], lead, others[:, label:]], axis=-1).astype(np.float32),)
 
 
+@as_given
 def label_derivative(rows: np.ndarray, label: int = 0) -> np.ndarray:
     """The label loss's derivative by eq. 7 in NumPy, in the rows' own dtype, for the label at column
     `label`: each other class's `exp(z_j - z_label - softplus(-m))`, and the label's entry their sum's

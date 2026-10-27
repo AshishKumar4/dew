@@ -8,7 +8,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, float64_replay
+from float64_replay import float64_replay
+from reference_error import assert_as_exact
 
 
 def _widened_uniform(key, shape, lo, hi):

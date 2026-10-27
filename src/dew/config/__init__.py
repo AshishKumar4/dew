@@ -79,7 +79,7 @@ from dew.registry import (
 )
 from dew.state import TrainState
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
-from dew.training.budget import Pause, run_length, run_steps
+from dew.training.budget import Pause, budget_tokens, run_length, run_steps
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Summary
 from dew.training.profiling import ProfileWindow
@@ -592,9 +592,11 @@ class TrainerConfig:
         return trainer, dataset, trainer.total_steps(dataset)
 
     def total_steps(self, dataset: Loader) -> int | None:
-        """Return the step cap from `steps`, `epochs` or `examples`, None for a token-only run
-        (`run_steps`, the one policy a direct fit applies too)."""
-        return run_steps(dataset, self.steps, self.epochs, self.tokens, self.accumulation, self.examples)
+        """Return the step cap from `steps`, `epochs` or `examples`, None for a run its tokens bound
+        alone, its own or where its data's schedule ends (`budget_tokens`; `run_steps`, the one policy
+        a direct fit applies too, which refuses a schedule to an objective counting no tokens)."""
+        tokens = budget_tokens(dataset, self.tokens)
+        return run_steps(dataset, self.steps, self.epochs, tokens, self.accumulation, self.examples)
 
     def total_updates(self, dataset: Loader) -> int | None:
         """Return the optimizer updates the run takes over `dataset` as `RunConfig.train` finalizes it,
