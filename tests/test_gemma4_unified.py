@@ -394,20 +394,6 @@ def recorded_leaves(stored) -> set[str]:
     return {name.removeprefix("backward.shape.") for name in stored if name.startswith("backward.shape.")}
 
 
-def grouped(stored, group: str):
-    """The backward recording with `group`'s leaves alone: each per-leaf entry, its verdict seeds' and
-    its pilots', of a leaf in the group, and every entry no leaf names (its seeds, draws' digests,
-    provenance)."""
-    leaves = recorded_leaves(stored)
-
-    def kept(key):
-        rest = key.removeprefix("backward.").removeprefix("pilot.")
-        _, _, leaf = rest.partition(".")
-        return leaf not in leaves or in_group(leaf, group)
-
-    return {key: value for key, value in stored.items() if not key.startswith("backward.") or kept(key)}
-
-
 def test_the_backward_groups_hold_every_recorded_leaf_once():
     """Every recorded backward leaf is in exactly one group, so the groups' tests check every leaf."""
     leaves = recorded_leaves(recording(FIXTURE / "backward.npz"))
@@ -422,14 +408,15 @@ def test_unified_backward_follows_the_recorded_reference(source, group):
     evidence from its recorded float64 truth over the recorded seeds (check 1), Dew's own float64 path
     held to the recorded truth's sketch."""
     ours, _, _, draw = gradient_functions(source, group)
-    stored = grouped(recording(FIXTURE / "backward.npz"), group)
+    stored = recording(FIXTURE / "backward.npz")
     with jax.enable_x64(new_val=True):
         native = Pretrained.load(FIXTURE, dtype="float64", param_dtype="float64", attention_impl="reference")
         native_truth = gradient_functions((native, source[1], source[2]), group)[0]
     seeds = int(stored["backward.seeds"])
     recorded_draw, reference, truth = indexed_recording(
         stored, "backward", seeds, inputs_of=windows(lambda seed: draw(seed)[0], BACKWARD_WINDOW),
-        truth_fn=over_windows(native_truth))
+        truth_fn=over_windows(native_truth),
+        leaves=tuple(sorted(leaf for leaf in recorded_leaves(stored) if in_group(leaf, group))))
     assert_as_exact(as_given(lambda index, inputs: over_windows(ours)(inputs)), reference, recorded_draw,
                     f"Gemma4 Unified recorded backward, {group}", seeds=seeds, truth_fn=truth)
 
