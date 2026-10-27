@@ -17,6 +17,7 @@ from model_support import TINY_DECODER
 from token_support import token_rows
 
 from dew.objectives.lm import LMObjective
+from dew.optim import OptimConfig
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
 
@@ -78,6 +79,46 @@ def test_compiling_ahead_takes_a_mesh_of_compile_only_gpus():
 
     with pytest.raises(ValueError):
         compile_ahead(fine_tune(MeshSpec(fsdp=8).build()), token_rows(VOCAB, BATCH, SEQ_LEN + 1))
+
+
+ACCUMULATION_CELLS = [("sm80", "bfloat16"), ("sm90", "float32")]
+"""Each generation and each compute dtype once (testing.md's pairwise settings): a bfloat16 step reads
+its parameters through narrow copies on a GPU (`dew.training.narrow`), a float32 step reads them whole."""
+
+WIDE_MLP = {**TINY_DECODER, "emb_features": 64, "mlp_features": 2048}
+"""A decoder whose parameters, 3.3 MB in float32, dwarf what a row of 16 tokens keeps for its backward:
+each buffer of a value a parameter is then larger than one microbatch's activations."""
+
+
+@pytest.mark.parametrize(("generation", "dtype"), ACCUMULATION_CELLS)
+def test_an_accumulating_step_holds_its_gradient_sum_and_no_other_buffer_a_parameter(generation, dtype):
+    """Row 1900: a step that pools four microbatches into a commit, compiled ahead for a GPU, holds
+    beyond the step that commits each one its window's gradient sum, a value a parameter in the
+    parameter's dtype, among its arguments, and no more temporaries than one microbatch's activations,
+    as XLA's memory analysis of both programs states them. A resident copy of the parameters, a second
+    gradient buffer or a narrow copy kept beside the sum, each two bytes a parameter or more, exceeds
+    that: row 1661's 14 GB on a 4B run surfaced only on a GPU, and this finds its kind on a CPU host."""
+    from dew.training.ahead import compile_ahead, compile_only_gpus
+
+    model = models.build("causal_transformer", vocab_size=VOCAB, **WIDE_MLP, num_kv_heads=2, dtype=dtype)
+
+    def ahead(accumulation: int, rows: int):
+        trainer = Trainer(LMObjective(model, SEQ_LEN), OptimConfig(optimizer="adamw", learning_rate=1e-3),
+                          key=jax.random.key(0), mesh=MeshSpec().build(compile_only_gpus(generation, 1)),
+                          layout=Layout(min_shard=TINY_SHARD), split=1, accumulation=accumulation)
+        trainer.validate(steps=8)
+        return compile_ahead(trainer, token_rows(VOCAB, rows, SEQ_LEN + 1))
+
+    one, window, two_rows = ahead(1, 1), ahead(4, 1), ahead(1, 2)
+    shapes = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, SEQ_LEN), jnp.int32))["params"]
+    gradient = sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(shapes))
+    held = 4 * token_rows(VOCAB, 1, SEQ_LEN + 1)["text"].nbytes
+    activations = two_rows.temp_bytes - one.temp_bytes
+    # The cell can tell: half the sum, a narrow copy's two bytes a parameter, is more than it allows.
+    assert 0 < activations < gradient / 2
+    # The window's arguments: its gradient sum, and at most a token row a microbatch it holds to replay.
+    assert window.argument_bytes - one.argument_bytes <= gradient + held
+    assert window.temp_bytes - one.temp_bytes <= activations
 
 
 @pytest.mark.gpu(reason="loads and runs a step compiled ahead on this host's own GPU")
