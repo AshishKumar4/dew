@@ -62,12 +62,22 @@ import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import float64_twin
 from reference_error import as_given, assert_as_exact, widened
-from test_architectures import CASES as ARCHITECTURES, MASK, TEXT_FEATURES, TEXT_TOKENS, VOCAB
+from test_architectures import (
+    CASES as ARCHITECTURES,
+    LM,
+    MASK,
+    SEQ_LEN,
+    TEXT_FEATURES,
+    TEXT_TOKENS,
+    VOCAB,
+    Case,
+)
 from tiny_models import build_model, tiny_inputs
 from tool_support import load
 
 from dew.interop import Pretrained, hf_decoders
 from dew.lora import LoRA
+from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.autoencoders.kl import AutoencoderKL, posterior_latent
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -610,7 +620,7 @@ GRADIENT_COVERING: dict[str, tuple[str, int]] = {
     "hybrid stacks": ("qwen35-tiny", 8),
     "vision towers": ("gemma4-unified-native-tiny", 8),
     "hyper-connections": ("deepseek-v4-tiny", 32),
-    "attention residuals": ("kimi-k3-tiny", 8),
+    "attention residuals": ("causal_transformer+attention_residuals", 8),
     "looped (Dory)": ("dory-tiny", 64),
     "diffusion language models": ("dream-tiny", 8),
     "per-layer inputs and AltUp (Gemma 3n)": ("causal_transformer+gemma3n", 32),
@@ -630,7 +640,8 @@ armada. Each member stands for the others of its class:
 - hybrid stacks: qwen35-native, qwen35-blocks, causal_transformer+qwen35, glm5-next;
 - vision towers: gemma4-tiny-mm, gemma3n-vision, llama4-native;
 - hyper-connections: deepseek-v41;
-- attention residuals (depth attention over earlier layers' outputs): none other;
+- attention residuals (depth attention over earlier layers' outputs): kimi-k3, whose KDA leaves need
+  2048 paired seeds (A_log and dt_bias, a recomputed scan's rounding apart from the saved one's);
 - looped (Dory): none other;
 - diffusion language models: llada2, diffusion-gemma-sft, diffusion-gemma-workflow;
 - per-layer inputs and AltUp: gemma3n-vision;
@@ -782,8 +793,16 @@ def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
                     truth_fn=whole(float64_twin(plain)))
 
 
-RECOMPUTED = [case for case in ARCHITECTURES
-              if not case.is_jepa and isinstance(models.build(case.architecture, **case.config), Recomputing)]
+ATTENTION_RESIDUALS = Case("causal_transformer", {**LM, "num_layers": 4,
+                                                  "attention_residuals": AttentionResiduals(block_size=2)},
+                           seq_len=SEQ_LEN, label="attention_residuals")
+"""Kimi K3's attention residuals (the one `AttentionResiduals` module kimi-k3-tiny runs) over plain
+attention at the language cases' size, two blocks of two layers: the attention-residual class's member of
+`GRADIENT_COVERING`, standing for kimi-k3-tiny, whose KDA recurrence's gradient needs 2048 paired
+seeds."""
+RECOMPUTED = [*(case for case in ARCHITECTURES if not case.is_jepa
+                and isinstance(models.build(case.architecture, **case.config), Recomputing)),
+              ATTENTION_RESIDUALS]
 
 
 def _inputs(case) -> tuple:
