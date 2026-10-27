@@ -284,14 +284,13 @@ def _half_mahalanobis_jvp(primals, tangents):
     value, mean, variance = primals
     along_value, along_mean, along_variance = tangents
     difference, shift, (quotient, power) = _divergence_parts(value, mean, variance)
-    axes = tuple(range(1, value.ndim))
-    # The residual's products with the tangents summed at the row's widest shift, then over the
-    # variance's significand, a division of one value a row, and restored once: in range, every shift
-    # zero, the plain `sum(residual * tangent) / variance`, bit for bit.
-    widest = jnp.max(shift, axis=axes)
+    # The residual over the variance's power of two, in range wherever the derivative is, its products
+    # with the tangents summed, then over the variance's significand, one division a row: the plain
+    # `sum(residual * tangent) / variance` in range, bit for bit, the powers of two exact. Reverse mode
+    # meets the same factors in the other order, the residual's scale applied last.
     level, spread = _split(variance)
-    along = (_scaled(difference, shift - expand(widest, shift)) * (along_value - along_mean)).sum(axis=axes)
-    moved = _scaled(along / level, widest - spread)
+    scaled = _scaled(difference, shift - expand(spread, shift))
+    moved = (scaled * (along_value - along_mean)).sum(axis=tuple(range(1, value.ndim))) / level
     stretch = _scaled(*_quotient(-quotient, power, variance))
     return _half_mahalanobis(value, mean, variance), moved + stretch * along_variance
 
