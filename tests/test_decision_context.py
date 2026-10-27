@@ -127,6 +127,62 @@ def opened(variables, value: float = 1.0):
     return {**tree, "params": jax.tree_util.tree_map_with_path(gate, tree["params"])}
 
 
+def windows_of(objective: DecisionObjective, rows, count: int = 6) -> list[dict]:
+    """The first `count` training windows `objective`'s data packs of `rows`, three rows a window at
+    most: a window's packing alone, the bounds a backbone's cross-attention reads not yet lifted."""
+    from dew.decision.layout import Bounds
+
+    held = DecisionObjective.bounds
+
+    def three(self) -> Bounds:
+        return dataclasses.replace(held.fget(self), segments=3)
+
+    DecisionObjective.bounds = property(three)
+    try:
+        reader = decision_rows(rows, None, objective=objective.data(), tokens=objective.layout.max_len)
+        return list(itertools.islice(reader.train(DataPartition()), count))
+    finally:
+        DecisionObjective.bounds = held
+
+
+@pytest.mark.parametrize("grouped", [False, True], ids=["rows", "unit"])
+def test_rows_that_carry_a_context_pack_several_a_window_each_beside_its_own(grouped):
+    """Rows that carry a context pack several a window as rows without one do, each row's context
+    laid end to end along the context in the order the rows stand and numbered as `segments` numbers
+    its row (`context_segments`, 0 for padding), a row with no context holding none: every row's
+    context is its own example's, under a layout of a row an example and under a unit of rows that
+    train together (row 1885)."""
+    from dew.decision import Group, GroupedExamples
+
+    objective = conditioned()
+    if grouped:
+        objective = DecisionObjective(objective.model.backbone, tokenizer=ByteTokenizer(), specials=SPECIALS,
+                                      context_encoder="table", consistency=0.5)
+        pairs = [(examples()[index], examples()[index + 1]) for index in range(0, 12, 2)]
+        rows = [GroupedExamples(pair, groups=(Group("pick", {f"{member}.pick": {option: option for option in
+                                                                                  "abc"}
+                                                             for member in range(2)}),)) for pair in pairs]
+        owned = [example for pair in pairs for example in pair]
+    else:
+        rows = owned = examples()
+    notes = {text: note for text, _, note in ROWS}
+    several = 0
+    for window in windows_of(objective, rows):
+        segments, contexts = np.asarray(window["segments"]), np.asarray(window["context_segments"])
+        tokens, context = np.asarray(window["tokens"]), np.asarray(window["context"])
+        for batch_row in range(len(segments)):
+            standing = [number for number in np.unique(segments[batch_row]) if number > 0]
+            several += len(standing) > 1
+            assert set(np.unique(contexts[batch_row])) - {0} <= set(standing)
+            for number in standing:
+                text = bytes(tokens[batch_row][segments[batch_row] == number].astype(np.uint8)).decode(
+                    errors="replace")
+                (state,) = {example.state for example in owned if example.state in text}
+                read = bytes(context[batch_row][contexts[batch_row] == number].astype(np.uint8)).decode()
+                assert (notes[state] or "") in read and (read == "") == (notes[state] is None), (state, read)
+    assert several, "no window held more than one row"
+
+
 def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_does():
     """The cross-attention blocks start from zero gates, so a decision over the backbone with them
     answers a row, with its context or without, as the backbone alone does: on par from float64 (check
