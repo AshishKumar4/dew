@@ -7,6 +7,7 @@ proceeds alone to deadlock its peers at the next collective. The trainer reports
 """
 
 import dataclasses
+import gzip
 import json
 import sys
 from pathlib import Path
@@ -118,18 +119,14 @@ def stop_capture(profiler: "Profiler", loss: "jax.Array | None") -> None:
 def traced_steps(capture: Path) -> tuple[int, ...]:
     """The steps a capture's training annotations hold (`jax.profiler.StepTraceAnnotation`, which a fit
     names `train`), each by the steps the run had taken as it began, its `step_num`, in order, read from
-    the capture's native trace (`jax.profiler.ProfileData`)."""
-    import jax
-
+    the capture's native trace as it exports it (`*.trace.json.gz`). Reading an event's stats through
+    `jax.profiler.ProfileData` instead crashed the process on this jaxlib (a CPU capture's annotations)."""
     steps = set()
-    for trace in capture.glob("plugins/profile/*/*.xplane.pb"):
-        # The planes, lines and events are views into the trace's data, which is held while they are read.
-        data = jax.profiler.ProfileData.from_file(str(trace))
-        for plane in data.planes:
-            for line in plane.lines:
-                for event in line.events:
-                    if event.name == "train":
-                        steps.update(int(str(value)) for name, value in event.stats if name == "step_num")
+    for trace in capture.glob("plugins/profile/*/*.trace.json.gz"):
+        with gzip.open(trace, "rt") as stream:
+            events = json.load(stream)["traceEvents"]
+        steps.update(int(event["args"]["step_num"]) for event in events
+                     if event.get("name") == "train" and "step_num" in event.get("args", {}))
     return tuple(sorted(steps))
 
 
