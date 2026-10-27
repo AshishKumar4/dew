@@ -171,8 +171,12 @@ def test_an_elastic_read_whose_map_rejects_records_reads_one_readers_order(count
                  .shuffle(5).repeat(None).filter_map(OddOnly()).map(Squared()).batch(BATCH))
         return built.elastic() if elastic else built
 
-    one = [rows(batch) for batch in listed(reader(chain(), 0, 1), 6)]
-    shares = [[rows(batch) for batch in listed(reader(chain(), index, count), 6)] for index in range(count)]
+    def squared(batch) -> list[tuple[int, int]]:
+        return list(zip(batch["id"], batch["squared"], strict=True))
+
+    one = [squared(batch) for batch in listed(reader(chain(), 0, 1), 6)]
+    shares = [[squared(batch) for batch in listed(reader(chain(), index, count), 6)]
+              for index in range(count)]
     for step, whole in enumerate(one):
         assert sorted(row for share in shares for row in share[step]) == sorted(whole)
         assert all(ident % 2 for ident, *_ in whole)
