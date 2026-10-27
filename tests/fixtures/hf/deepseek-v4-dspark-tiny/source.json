@@ -5,7 +5,7 @@
   "path": "inference/model.py"
  },
  "transformers": {
-  "version": "5.16.1"
+  "version": "5.17.0"
  },
  "seed": 0,
  "tied_selections": 8
