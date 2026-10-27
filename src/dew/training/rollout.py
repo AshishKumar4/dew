@@ -34,9 +34,11 @@ class Rollout(Protocol):
     shows them in `shown`, as an objective does.
 
     A rollout whose calls change more than the batch they return (its metrics,
-    a log, rollouts in flight) may have `branch()`, a context manager a cooldown
-    branch's calls run inside, on the branch's states, after which the rollout
-    stands as the run left it (`_branched`). One without it is called alike there.
+    a log, a journal, rollouts in flight) may have `branch(name)`, a context
+    manager a cooldown branch's calls run inside, on the branch's states, `name`
+    the branch's own (`cooldown-<step>`, the step it branches at), after which
+    the rollout stands as the run left it (`_branched`). One without it is
+    called alike there.
     """
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
@@ -69,11 +71,12 @@ def rolled_out(rollout: Rollout | None, state: TrainState, batch: Batch, mesh: M
     return batch
 
 
-def _branched(rollout: Rollout | None) -> contextlib.AbstractContextManager:
-    """The context a cooldown branch's rollout calls run in: the rollout's `branch()`, which a rollout
-    is any callable and a plain function has none of, so the trainer reads it at this boundary."""
+def _branched(rollout: Rollout | None, name: str) -> contextlib.AbstractContextManager:
+    """The context the cooldown branch `name`'s rollout calls run in: the rollout's `branch(name)`,
+    which a rollout is any callable and a plain function has none of, so the trainer reads it at this
+    boundary."""
     branch = getattr(rollout, "branch", None)
-    return contextlib.nullcontext() if branch is None else branch()
+    return contextlib.nullcontext() if branch is None else branch(name)
 
 
 def _reported(rollout: Rollout | None, metrics: Sequence[Metric]) -> dict[str, Shown]:

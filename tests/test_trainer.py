@@ -1260,67 +1260,52 @@ def cooldown_run(schedule, steps: int, accumulation: int, tracker=None, cooldown
                        cooldowns=cooldowns)
 
 
-@pytest.mark.parametrize("accumulation", [1, 2])
-def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the_run_as_it_was(accumulation):
-    """A linear cooldown of four updates from the fourth of a warmup-stable-decay run is the run whose
-    decay begins there: the branch's `cooldown_val/loss`, recorded at the step it branched from, is that
-    run's final `val/loss` bit for bit (its rates, 2^-4 times 1, 3/4, 1/2 and 1/4, exact), and the run
-    it branched from ends where a run with no cooldown ends, its parameters bit for bit."""
-    from dew.optim import Linear
-    from dew.telemetry.records import FitStarted
-    from dew.training.cooldown import Cooldowns
-
-    peak, at = 2.0 ** -4, 4 * accumulation
-    stable = Linear(peak, decay_start=64, decay_steps=128)
-    tracker = RecordingTracker()
-    branched = cooldown_run(stable, 3 * at, accumulation, tracker,
-                            Cooldowns(at=(at,), length=at, shape="linear"))
-    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
-              if "cooldown_val/loss" in scalars}
-    decayed = RecordingTracker()
-    cooldown_run(Linear(peak, decay_start=4, decay_steps=8), 2 * at, accumulation, decayed)
-    finals = [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars]
-    assert cooled == {at: finals[-1]}
-    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
-    assert started.cadences["cooldowns.at"] == [at]
-    plain = cooldown_run(stable, 3 * at, accumulation)
-    for ours, theirs in zip(jax.tree.leaves(branched.variables), jax.tree.leaves(plain.variables),
-                            strict=True):
-        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
-
-
-class SteppedRollout:
-    """A rollout that hands the batch back, noting the step of every state it is called on."""
+class NoisedTargets:
+    """A rollout whose batch is its state's and key's: the targets moved by noise its key draws, scaled
+    by its state's step, noting every step it is called at."""
 
     def __init__(self):
         self.steps: list[int] = []
 
     def __call__(self, state, batch, key):
         self.steps.append(int(state.step))
-        return batch
+        noise = np.asarray(jax.random.normal(key, np.shape(batch["y"])), np.float32)
+        return {**batch, "y": np.asarray(batch["y"]) + np.float32(0.01) * (1 + int(state.step)) * noise}
 
 
-def test_a_rollout_runs_cooldown_branch_draws_its_batches_from_the_branchs_states():
-    """A rollout run's cooldown branch calls the rollout on the branch's own states, from the step it
-    branched at, and trains on what it returns: with a rollout that hands the batch back, its
-    `cooldown_val/loss` is the same run's with no rollout to the bit, and the run trains on as one with
-    no cooldown, its rollout called on the run's states again from that step."""
+@pytest.mark.parametrize("rollout", [False, True], ids=["batches", "rollout"])
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the_run_as_it_was(
+        accumulation, rollout):
+    """A linear cooldown of four updates from the fourth of a warmup-stable-decay run is the run whose
+    decay begins there: the branch's `cooldown_val/loss`, recorded at the step it branched from, is that
+    run's final `val/loss` bit for bit (its rates, 2^-4 times 1, 3/4, 1/2 and 1/4, exact), and the run
+    it branched from ends where a run with no cooldown ends, its parameters bit for bit. With a rollout
+    whose batches are its states' and keys' (`NoisedTargets`), the branch trains on what the rollout
+    draws from the branch's own states, as the decayed run trains on what it draws from its own, and
+    the run draws from its states again from the step it branched at."""
     from dew.optim import Linear
+    from dew.telemetry.records import FitStarted
     from dew.training.cooldown import Cooldowns
 
-    at, stable = 4, Linear(2.0 ** -4, decay_start=64, decay_steps=128)
-    cooldowns = Cooldowns(at=(at,), length=at, shape="linear")
-    plain, rolled, rollout = RecordingTracker(), RecordingTracker(), SteppedRollout()
-    unrolled = cooldown_run(stable, 3 * at, 1, plain, cooldowns)
-    branched = cooldown_run(stable, 3 * at, 1, rolled, cooldowns, rollout=rollout)
-    assert rollout.steps == [*range(at), *range(at, 2 * at), *range(at, 3 * at)]
-
-    def cooled(tracker):
-        return {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
-                if "cooldown_val/loss" in scalars}
-
-    assert cooled(rolled) == cooled(plain) != {}
-    for ours, theirs in zip(jax.tree.leaves(branched.variables), jax.tree.leaves(unrolled.variables),
+    peak, at = 2.0 ** -4, 4 * accumulation
+    stable = Linear(peak, decay_start=64, decay_steps=128)
+    tracker, drawn = RecordingTracker(), NoisedTargets() if rollout else None
+    branched = cooldown_run(stable, 3 * at, accumulation, tracker,
+                            Cooldowns(at=(at,), length=at, shape="linear"), rollout=drawn)
+    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
+              if "cooldown_val/loss" in scalars}
+    decayed = RecordingTracker()
+    cooldown_run(Linear(peak, decay_start=4, decay_steps=8), 2 * at, accumulation, decayed,
+                 rollout=NoisedTargets() if rollout else None)
+    finals = [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars]
+    assert cooled == {at: finals[-1]}
+    if drawn is not None:
+        assert drawn.steps == [*range(at), *range(at, 2 * at), *range(at, 3 * at)]
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert started.cadences["cooldowns.at"] == [at]
+    plain = cooldown_run(stable, 3 * at, accumulation, rollout=NoisedTargets() if rollout else None)
+    for ours, theirs in zip(jax.tree.leaves(branched.variables), jax.tree.leaves(plain.variables),
                             strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 

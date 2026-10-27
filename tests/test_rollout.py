@@ -227,7 +227,7 @@ def test_a_schedulers_branch_calls_reach_no_log_and_leave_the_runs_metrics():
                                        sampling=Sampling(temperature=0.0), log=records.append)
     rollout(FakeState(params, updates=3), prompt_batch(), jax.random.key(1))
     run = dict(rollout.metrics)
-    with rollout.branch():
+    with rollout.branch("cooldown-4"):
         branched = rollout(FakeState(params, updates=5), prompt_batch(), jax.random.key(2))
     assert [record.updates for record in records] == [3]
     assert rollout.metrics == run

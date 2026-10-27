@@ -129,6 +129,7 @@ import numpy as np
 
 from dew._coordination import agreed
 from dew.batch import Batch, Variables
+from dew.cleanup import attempted
 from dew.data.dataset import DataPartition, Loader, tapped
 from dew.distributed.batches import first_reader_batch, shard_batch
 from dew.nn.inputs import local_rows, mesh_of
@@ -544,6 +545,7 @@ class RolloutScheduler:
         self.estimator, self.truncation, self.credit, self.log = estimator, truncation, credit, log
         self.support_capacity = support_capacity
         self.metrics: dict[str, float] = {}
+        self._branch: str | None = None
 
     @classmethod
     def sampled(cls, objective: TokenScorer, reward: Reward, *,
@@ -581,22 +583,28 @@ class RolloutScheduler:
         self.acquisition.close()
 
     @contextlib.contextmanager
-    def branch(self) -> Iterator[None]:
-        """The calls of a cooldown branch (`dew.training.rollout`): drawn under the branch's states, its
-        records reach no `log`, and the run's latest `metrics` stand after it. The run closes its own
-        stream for the branch and opens it again at its position after (`Trainer.fit`), and an
-        asynchronous acquisition's stream cancels the rollouts in flight as it opens (`tasks`): the
-        run's as the branch's opens, which the branch's weights would otherwise finish, and the
-        branch's, cancelled here, as it ends. The engines serve the branch's weights meanwhile, and
-        the run's again from its next call (`Asynchronous.begin`: a served version ahead of the run's
-        updates is out of date)."""
-        metrics, log = self.metrics, self.log
-        self.log = None
+    def branch(self, name: str) -> Iterator[None]:
+        """The calls of the cooldown branch `name` (`dew.training.rollout`): drawn under the branch's
+        states, on its own branch of a collector's records (`Snapshot.branch`: an `EpisodeJournal`'s
+        cohorts, which a resumed branch reads back as its own), its records reach no `log`, and the
+        run's latest `metrics` stand after it. The run closes its own stream for the branch and opens
+        it again at its position after (`Trainer.fit`), and an asynchronous acquisition's stream
+        cancels the rollouts in flight as it opens (`tasks`): the run's as the branch's opens, which
+        the branch's weights would otherwise finish, and the branch's, cancelled here, as it ends. The
+        engines serve the branch's weights meanwhile, and the run's again from its next call
+        (`Asynchronous.begin`: a served version ahead of the run's updates is out of date)."""
+        metrics, log, branch = self.metrics, self.log, self._branch
+        self.log, self._branch = None, name
         try:
             yield
-        finally:
+        except BaseException as failure:
+            # The branch's failure stays the one raised; a cancellation's is noted on it.
+            attempted([("cancelling the branch's rollouts", self.close)], primary=failure)
+            raise
+        else:
             self.close()
-            self.metrics, self.log = metrics, log
+        finally:
+            self.metrics, self.log, self._branch = metrics, log, branch
 
     def _replace(self, group: _Group, sample: _Sample, cause: str, tally: _Tally) -> None:
         """Draw a sample that cannot join its group again, or abandon the group where the
@@ -716,7 +724,7 @@ class RolloutScheduler:
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> dict[str, np.ndarray]:
         mesh = mesh_of(state.variables)
         partition = DataPartition() if mesh is None else DataPartition.of(mesh)
-        snapshot = Snapshot(state.variables, int(state.step), int(state.updates), key)
+        snapshot = Snapshot(state.variables, int(state.step), int(state.updates), key, self._branch)
         self.acquisition.begin(snapshot, partition)
         entries = _within(mesh, "rollout preparation", lambda: self.acquisition.entries(batch, self.tasks_of))
         acquiring = self.acquisition.acquires(partition)

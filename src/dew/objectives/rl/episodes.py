@@ -576,7 +576,9 @@ class EpisodeCollector:
         def open_journal():
             from .journal import policy_digest
 
-            cohort = repr((snapshot.step, tuple(np.asarray(jax.random.key_data(snapshot.key)).tolist())))
+            clock = (snapshot.step, tuple(np.asarray(jax.random.key_data(snapshot.key)).tolist()))
+            # A cooldown branch's cohorts are its own, apart from the run's at the same step and key.
+            cohort = repr(clock if snapshot.branch is None else (snapshot.branch, *clock))
             fingerprint = repr((signature.tobytes().hex(), tasks.tolist(), processes, rank,
                                 policy_digest(snapshot.variables)))
             return journal_stack.enter_context(journal.open(cohort, fingerprint, binding))

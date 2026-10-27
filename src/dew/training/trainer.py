@@ -1823,8 +1823,9 @@ class Trainer(Generic[Loss, Effects]):
         counted = Interval(time.time(), None, tokens_before_log=interval.real_tokens)
         starts = self._stage_starts
         cooled, done, cut = state, 0, False
-        # A rollout run's branch draws its batches from the branch's own states (`rollout._branched`).
-        with _branched(self.rollout):
+        # A rollout run's branch draws its batches from the branch's own states (`rollout._branched`),
+        # named by the step it branches at, which a resume that runs it again branches at too.
+        with _branched(self.rollout, f"cooldown-{run.current}"):
             branched.train = self._prefetched(plan, branched, plan.dataset.train(run.partition), position)
             try:
                 while (done < steps and not (cut := run.notice.reached())
