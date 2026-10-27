@@ -390,9 +390,9 @@ def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, mon
     """Gemma 2's tanh on the logits, against the equation on a hand-computed
     case: reference and xla agree with it, and 'auto' resolves a softcapped
     call to that same math even where cudnn would otherwise run (bf16 inputs,
-    an 8-wide head, a gpu backend), on a kernel that takes the cap (the
-    template on Hopper, which runs it since 3dfddf5c0, the reference path
-    elsewhere), while cudnn raises a ValueError naming the implementation.
+    an 8-wide head, a gpu backend), check 1 on whatever kernel it runs (the
+    accuracy gate decides, never one kernel's equality to another's), while
+    cudnn raises a ValueError naming the implementation.
     A cap of 2 on logits of order 10 changes the weights by a wide margin;
     an uncapped path moves the output. Each path is on par with the equation
     from its float64 run over drawn calls (check 1)."""
@@ -429,17 +429,7 @@ def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, mon
     monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
     assert_as_exact(attention('auto', dtype=jnp.bfloat16), jax.jit(bf16_equation), draw,
                     "routed bf16 softcap", seeds=SEEDS['routed softcap'], truth_fn=equation)
-    from dew.nn.kernels import generation
-
     halves = (query.astype(jnp.bfloat16), key.astype(jnp.bfloat16), value.astype(jnp.bfloat16))
-    with generation.routes() as found:
-        routed = scaled_dot_product_attention(*halves, causal=True, softcap=2.0)
-    # 'auto' runs the capped softmax on the kernel its route names, one that takes the cap (the template on
-    # Hopper, the reference path elsewhere), never cuDNN, which would drop it: its output that kernel's own.
-    (kernel,) = {route.kernel for route in found if route.choice == 'attention'}
-    assert kernel in ('template', 'reference'), kernel
-    plain = scaled_dot_product_attention(*halves, causal=True, softcap=2.0, implementation=kernel)
-    np.testing.assert_array_equal(np.asarray(routed), np.asarray(plain))
     with pytest.raises(ValueError):
         scaled_dot_product_attention(*halves, causal=True, softcap=2.0, implementation='cudnn')
 
