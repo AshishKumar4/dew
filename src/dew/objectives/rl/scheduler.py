@@ -113,6 +113,7 @@ on its own.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import threading
@@ -578,6 +579,24 @@ class RolloutScheduler:
     def close(self) -> None:
         """Cancel every rollout in flight. The caller closes the source; this method does not."""
         self.acquisition.close()
+
+    @contextlib.contextmanager
+    def branch(self) -> Iterator[None]:
+        """The calls of a cooldown branch (`dew.training.rollout`): drawn under the branch's states, its
+        records reach no `log`, and the run's latest `metrics` stand after it. The run closes its own
+        stream for the branch and opens it again at its position after (`Trainer.fit`), and an
+        asynchronous acquisition's stream cancels the rollouts in flight as it opens (`tasks`): the
+        run's as the branch's opens, which the branch's weights would otherwise finish, and the
+        branch's, cancelled here, as it ends. The engines serve the branch's weights meanwhile, and
+        the run's again from its next call (`Asynchronous.begin`: a served version ahead of the run's
+        updates is out of date)."""
+        metrics, log = self.metrics, self.log
+        self.log = None
+        try:
+            yield
+        finally:
+            self.close()
+            self.metrics, self.log = metrics, log
 
     def _replace(self, group: _Group, sample: _Sample, cause: str, tally: _Tally) -> None:
         """Draw a sample that cannot join its group again, or abandon the group where the

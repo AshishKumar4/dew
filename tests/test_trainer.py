@@ -1251,10 +1251,10 @@ def test_a_cadence_may_be_a_share_of_the_run(tmp_path, written, expected):
 
 
 def cooldown_run(schedule, steps: int, accumulation: int, tracker=None, cooldowns=None,
-                 directory=None) -> TrainState:
+                 directory=None, rollout=None) -> TrainState:
     """Regression on AdamW at `schedule` for `steps`, scored once at its end, with any `cooldowns`,
-    checkpointed in `directory` where one is given."""
-    trainer = make_trainer(directory, tracker=tracker, accumulation=accumulation,
+    checkpointed in `directory` where one is given, its batches through any `rollout`."""
+    trainer = make_trainer(directory, tracker=tracker, accumulation=accumulation, rollout=rollout,
                            optimizer=OptimConfig(optimizer="adamw", learning_rate=schedule))
     return trainer.fit(dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps,
                        cooldowns=cooldowns)
@@ -1285,6 +1285,42 @@ def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the
     assert started.cadences["cooldowns.at"] == [at]
     plain = cooldown_run(stable, 3 * at, accumulation)
     for ours, theirs in zip(jax.tree.leaves(branched.variables), jax.tree.leaves(plain.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+class SteppedRollout:
+    """A rollout that hands the batch back, noting the step of every state it is called on."""
+
+    def __init__(self):
+        self.steps: list[int] = []
+
+    def __call__(self, state, batch, key):
+        self.steps.append(int(state.step))
+        return batch
+
+
+def test_a_rollout_runs_cooldown_branch_draws_its_batches_from_the_branchs_states():
+    """A rollout run's cooldown branch calls the rollout on the branch's own states, from the step it
+    branched at, and trains on what it returns: with a rollout that hands the batch back, its
+    `cooldown_val/loss` is the same run's with no rollout to the bit, and the run trains on as one with
+    no cooldown, its rollout called on the run's states again from that step."""
+    from dew.optim import Linear
+    from dew.training.cooldown import Cooldowns
+
+    at, stable = 4, Linear(2.0 ** -4, decay_start=64, decay_steps=128)
+    cooldowns = Cooldowns(at=(at,), length=at, shape="linear")
+    plain, rolled, rollout = RecordingTracker(), RecordingTracker(), SteppedRollout()
+    unrolled = cooldown_run(stable, 3 * at, 1, plain, cooldowns)
+    branched = cooldown_run(stable, 3 * at, 1, rolled, cooldowns, rollout=rollout)
+    assert rollout.steps == [*range(at), *range(at, 2 * at), *range(at, 3 * at)]
+
+    def cooled(tracker):
+        return {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
+                if "cooldown_val/loss" in scalars}
+
+    assert cooled(rolled) == cooled(plain) != {}
+    for ours, theirs in zip(jax.tree.leaves(branched.variables), jax.tree.leaves(unrolled.variables),
                             strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 

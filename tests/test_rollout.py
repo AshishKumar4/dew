@@ -218,6 +218,25 @@ def test_a_sampled_rollout_packs_its_completions():
         np.testing.assert_array_equal(np.asarray(out[key]), np.asarray(again[key]))
 
 
+def test_a_schedulers_branch_calls_reach_no_log_and_leave_the_runs_metrics():
+    """A cooldown branch's calls (`RolloutScheduler.branch`) draw as any call does, under the branch's
+    states, but their records reach no log, and the run's latest metrics stand after the branch."""
+    objective, records = tiny_objective(), []
+    params = objective.init(jax.random.key(0))
+    rollout = RolloutScheduler.sampled(objective, Calls(), groups=GROUPS, max_new_tokens=NEW_TOKENS,
+                                       sampling=Sampling(temperature=0.0), log=records.append)
+    rollout(FakeState(params, updates=3), prompt_batch(), jax.random.key(1))
+    run = dict(rollout.metrics)
+    with rollout.branch():
+        branched = rollout(FakeState(params, updates=5), prompt_batch(), jax.random.key(2))
+    assert [record.updates for record in records] == [3]
+    assert rollout.metrics == run
+    plain = rollout(FakeState(params, updates=5), prompt_batch(), jax.random.key(2))
+    assert [record.updates for record in records] == [3, 5]
+    for name, value in plain.items():
+        np.testing.assert_array_equal(np.asarray(branched[name]), np.asarray(value), name)
+
+
 def test_a_prompts_group_is_the_policys_continuations_of_one_request():
     """A rollout draws each prompt's group as the policy's `groups`
     continuations of one request under its key: one prefill, and the chains

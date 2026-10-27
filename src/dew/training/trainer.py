@@ -67,7 +67,6 @@ from dew.distributed.batches import (
     batch_signature,
     placed_abstract,
     prefetched_bytes,
-    shard_batch,
     split_fields,
 )
 from dew.distributed.host import snapshot
@@ -188,7 +187,7 @@ from dew.training.planning import (
     whole_step,
 )
 from dew.training.profiling import ProfileWindow, owned_capture, start_capture, stop_capture
-from dew.training.rollout import Rollout, _reported, _rollout_metrics
+from dew.training.rollout import Rollout, _branched, _reported, _rollout_metrics, rolled_out
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, rankings
@@ -1432,9 +1431,7 @@ class Trainer(Generic[Loss, Effects]):
                 if batch is None:
                     self._display.note(f"The training data ran out at step {run.current}")
                     break
-                if self.rollout is not None:
-                    batch, sampled = self._rolled_out(state, batch)
-                    interval.rollout_seconds += sampled
+                batch = rolled_out(self.rollout, state, batch, self.device_mesh, self._marked, interval)
                 device, _ = split_fields(batch)
                 inputs = self.objective.inputs
                 if not compiled and self.rollout is None and inputs is not None:
@@ -1618,8 +1615,7 @@ class Trainer(Generic[Loss, Effects]):
         state, shardings = placed()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
-        check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(state.opt_state),
-                       rollout=self.rollout is not None)
+        check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(state.opt_state))
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
@@ -1822,33 +1818,36 @@ class Trainer(Generic[Loss, Effects]):
             run.train.close()
         branched = FitRun(run.started, current=run.current, partition=run.partition, reads=run.reads,
                           compiled=run.compiled)
-        branched.train = self._prefetched(plan, branched, plan.dataset.train(run.partition), position)
         # The branch's own clock of committed tokens, from the run's, which a schedule's stages end at
         # as the run's do (`_scheduled`); the stages it begins are its own, the run's kept as they were.
         counted = Interval(time.time(), None, tokens_before_log=interval.real_tokens)
         starts = self._stage_starts
         cooled, done, cut = state, 0, False
-        try:
-            while (done < steps and not schedule_ended(plan.dataset.token_ends, lambda: counted.real_tokens)
-                   and not (cut := run.notice.reached())):
-                self._scheduled(plan, branched, counted)
-                assert branched.train is not None
-                batch = agreed_next("cooldown read", branched.train)
-                if batch is None:
-                    break
-                device, _ = split_fields(batch)
-                step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
-                                                     reported=run.current)
-                factor = decay(shape, done // self.accumulation, steps // self.accumulation)
-                scaled = scaled_rates(cooled.opt_state, held, factor)
-                cooled, loss, aux, finite, _, committed = step(dataclasses.replace(cooled, opt_state=scaled),
-                                                              device)
-                counted.count(batch, None, loss, finite, committed, aux)
-                done, branched.current = done + 1, branched.current + 1
-        finally:
-            self._stage_starts = starts
-            if branched.train is not None:
-                branched.train.close()
+        # A rollout run's branch draws its batches from the branch's own states (`rollout._branched`).
+        with _branched(self.rollout):
+            branched.train = self._prefetched(plan, branched, plan.dataset.train(run.partition), position)
+            try:
+                while (done < steps and not (cut := run.notice.reached())
+                       and not schedule_ended(plan.dataset.token_ends, lambda: counted.real_tokens)):
+                    self._scheduled(plan, branched, counted)
+                    assert branched.train is not None
+                    batch = agreed_next("cooldown read", branched.train)
+                    if batch is None:
+                        break
+                    batch = rolled_out(self.rollout, cooled, batch, self.device_mesh, self._marked, counted)
+                    device, _ = split_fields(batch)
+                    step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
+                                                         reported=run.current)
+                    factor = decay(shape, done // self.accumulation, steps // self.accumulation)
+                    scaled = scaled_rates(cooled.opt_state, held, factor)
+                    cooled, loss, aux, finite, _, committed = step(
+                        dataclasses.replace(cooled, opt_state=scaled), device)
+                    counted.count(batch, None, loss, finite, committed, aux)
+                    done, branched.current = done + 1, branched.current + 1
+            finally:
+                self._stage_starts = starts
+                if branched.train is not None:
+                    branched.train.close()
         run.cooling = pending if cut else None
         if cut:
             self._display.note(f"Preempted inside the cooldown from step {run.current}, which a resume runs")
@@ -2181,20 +2180,6 @@ class Trainer(Generic[Loss, Effects]):
                 _log.debug("train/mfu is not reported for %s: %s", type(self.objective).__name__, missing)
         counted = prepare_counts(self.objective, batch, count_model=False)
         return counted if self._refusal is None else uncounted(counted)
-
-    def _rolled_out(self, state: TrainState, batch: Batch) -> tuple[Batch, float]:
-        """Sample one batch through the rollout, with the seconds it took.
-
-        Host-side and untraceable: sampling, scoring, advantages. The key
-        folds the step key once more, keeping the rollout's draws off the
-        step's stream; both are checkpointed, so a resumed run samples
-        forward. Fixed shapes mean the step still compiles once.
-        """
-        began = time.perf_counter()
-        assert self.rollout is not None
-        key = jax.random.fold_in(jax.random.fold_in(state.key, state.step), 1)
-        batch = shard_batch(self.device_mesh, self._marked(self.rollout(state, batch, key)))
-        return batch, time.perf_counter() - began
 
     def _compiled_for(self, compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]],
                       state: TrainState, batch: Batch, run: FitRun,
