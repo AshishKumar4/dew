@@ -32,7 +32,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic
+from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic, resources
 from dew.nn.kernels.templates.attention import Hooks, KeySpans, Param, Split, output_hooked, padded_call
 from dew.nn.kernels.templates.attention_mosaic_program import (
     Tiles,
@@ -90,16 +90,16 @@ def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype) -> T
     """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): its consumers and
     query blocks, and the widest of the family's key extents (`extents`) that divides the plain key tile, so
     the plain launch's padded keys are whole tiles of it, whose live set a consumer's registers hold
-    (`mosaic.live_registers`): its shifted and unshifted sums of `columns` value columns fp32 carried, beside
-    a step's logits and weights fp32 and the two products the step forms (`algebra.stepped`). None where
-    none fits: the plain launch is then illegal at `tiles` (`MosaicForward.legal`)."""
+    (`resources.live_registers`): its shifted and unshifted sums of `columns` value columns fp32 carried,
+    beside a step's logits and weights fp32 and the two products the step forms (`algebra.stepped`). None
+    where none fits: the plain launch is then illegal at `tiles` (`MosaicForward.legal`)."""
     budget = family.registers(tiles.consumers)
     rows = tiles.block_q
     carried = [(rows, columns, jnp.float32)] * 2
 
     def held(block: int) -> bool:
         stepped = [(rows, block, jnp.float32)] * 2 + [(rows, columns, jnp.float32)] * 2
-        return mosaic.live_registers(family, carried, stepped) <= budget
+        return resources.live_registers(family, carried, stepped) <= budget
 
     blocks = [block for block in extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
     return next((dataclasses.replace(tiles, block_k=block) for block in blocks if held(block)), None)

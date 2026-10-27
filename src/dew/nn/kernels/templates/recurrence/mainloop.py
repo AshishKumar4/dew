@@ -56,7 +56,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn import precision
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
-from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90
+from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, resources
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs the mainloop by off a GPU of a family it claims (a CPU): wgmma's,
@@ -486,8 +486,8 @@ class _Held:
     phases: Sequence = ()
 
     def registers(self, family: mosaic.Family) -> int:
-        """A consumer thread's registers at the program's peak (`mosaic.live_registers`)."""
-        return mosaic.live_registers(family, self.carried, *self.phases)
+        """A consumer thread's registers at the program's peak (`resources.live_registers`)."""
+        return resources.live_registers(family, self.carried, *self.phases)
 
 
 def _f32(rows: int, columns: int) -> tuple:
@@ -520,7 +520,7 @@ class Launch:
     """A launch as planned (`planned`): its name (`recurrence_states`, ...), its programs and each one's
     threads (its bundle's warpgroups, `Family.warpgroups`), the shared memory a program allocates (its
     streams' slots and barriers and its staging tiles, as its bundle declares them), the registers a consumer
-    thread holds at its program's peak (`mosaic.live_registers` of the tiles it states), its steps, the
+    thread holds at its program's peak (`resources.live_registers` of the tiles it states), its steps, the
     chunks in flight, the bytes a step streams in, a program's tensor FLOPs and exponentials, and the bytes
     it reads and writes in global memory."""
 
@@ -543,15 +543,15 @@ _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned"
 
 def _allocated(family: mosaic.Family, *allocations, reduces: bool = True, after: tuple = ()) -> int:
     """The bytes of shared memory a program of `allocations` takes, as Mosaic GPU's resource estimate counts
-    them (`mosaic.allocated`, `mosaic.BARRIER_BYTES`): each tile's (a ring's stages one tile), a pipelined
-    family's streams' stages of each tile (`mosaic_sm80.Pipeline`, which `emit_pipeline` allocates in its
-    walk's own scope: a program's walks one after another, the largest of them; an A100's states launch
-    asked for 16 KiB less than their sum, its memory entered beside its chunks), each barrier's, and where
-    the program `reduces`, the scratch the family's compiler parameters reserve for a reduction across warps
+    them (`resources.allocated`, `resources.BARRIER_BYTES`): each tile's (a ring's stages one tile), a
+    pipelined family's streams' stages of each tile (`mosaic_sm80.Pipeline`, which `emit_pipeline` allocates
+    in its walk's own scope: a program's walks one after another, the largest of them; an A100's states launch
+    asked for 16 KiB less than their sum, its memory entered beside its chunks), each barrier's, and where the
+    program `reduces`, the scratch the family's compiler parameters reserve for a reduction across warps
     (`Family.reduction_scratch`), which the estimate takes for a kernel with any reduction and none without
-    (an A100's solve launch asked for its tiles' 90112 bytes alone, SE-family-a100-0c8018352). Tiles a
-    program scopes `after` its walks, each `(shape, dtype)`, take the larger of them and the walks' on a
-    family that scopes its walks apart (`_walks_scoped`), else their sum."""
+    (an A100's solve launch asked for its tiles' 90112 bytes alone, SE-family-a100-0c8018352). Tiles a program
+    scopes `after` its walks, each `(shape, dtype)`, take the larger of them and the walks' on a family that
+    scopes its walks apart (`_walks_scoped`), else their sum."""
     barrier, tile = (plgpu.Barrier, plgpu.ClusterBarrier), type(plgpu.SMEM((1,), jnp.float32))
 
     def leaf(x) -> bool:
@@ -560,7 +560,7 @@ def _allocated(family: mosaic.Family, *allocations, reduces: bool = True, after:
     sizes, pipelines, barriers = [], [0], 0
     for x in jax.tree.leaves(allocations, is_leaf=leaf):
         if isinstance(x, mosaic_sm80.Pipeline):
-            pipelines.append(mosaic.allocated(*(x.stages * math.prod(shape) * jnp.dtype(dtype).itemsize
+            pipelines.append(resources.allocated(*(x.stages * math.prod(shape) * jnp.dtype(dtype).itemsize
                                                 for shape, dtype in x.blocks.values())))
         elif isinstance(x, barrier):
             barriers += math.prod(np.atleast_1d(x.num_barriers))
@@ -568,11 +568,11 @@ def _allocated(family: mosaic.Family, *allocations, reduces: bool = True, after:
             sizes.append(math.prod(x.shape) * jnp.dtype(x.dtype).itemsize)
     scoped = [math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in after]
     if _walks_scoped(family):
-        pipelines += [mosaic.allocated(size) for size in scoped]
+        pipelines += [resources.allocated(size) for size in scoped]
     else:
         sizes += scoped
     scratch = [family.reduction_scratch] if reduces and family.reduction_scratch else []
-    return mosaic.allocated(*sizes, *scratch) + max(pipelines) + mosaic.BARRIER_BYTES * barriers
+    return resources.allocated(*sizes, *scratch) + max(pipelines) + resources.BARRIER_BYTES * barriers
 
 
 def _inverse_flops() -> float:
@@ -630,11 +630,11 @@ def held_programs(family: mosaic.Family, target: generation.GpuTarget, shared: i
     """The programs of a launch staging `shared` bytes a multiprocessor of `target` holds at once: the most
     its registers hold (`Family.programs`, at a thread's whole registers: ptxas's count passes the stated,
     an H100's states launch's 138 registers against 123, which held it to one program a multiprocessor,
-    SE-family-h100-8def67e3e) whose shares of its shared memory each hold one (`mosaic.program_shared`),
+    SE-family-h100-8def67e3e) whose shares of its shared memory each hold one (`resources.program_shared`),
     at least one."""
     budget = generation.shared_budget(target)
     return next((programs for programs in range(family.programs(1), 1, -1)
-                 if shared <= mosaic.program_shared(budget, programs)), 1)
+                 if shared <= resources.program_shared(budget, programs)), 1)
 
 
 def _persisted(call: _Call, blocks: dict, staging: tuple, tiles: int, *, reduces: bool) -> tuple[int, int]:

@@ -47,7 +47,7 @@ from jax.extend import core as jax_core
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, bundles, cost, mosaic
+from .templates import base, bundles, cost, mosaic, resources
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import Product
 
@@ -529,22 +529,22 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                 and self.derived(ba, target) is not None)
 
     def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
-        # A consumer thread's live set (`mosaic.tile_registers`), and where a prologue rewrites its share of
-        # the rows' stage, that share in fp32 beside the accumulator (ptxas spilled 384 bytes at a normed
+        # A consumer thread's live set (`resources.tile_registers`), and where a prologue rewrites its share
+        # of the rows' stage, that share in fp32 beside the accumulator (ptxas spilled 384 bytes at a normed
         # 192 x 128 forward and 156 at a normed 128 x 192 kernel gradient the plain estimate held: the
         # compile gate's H100 run).
         dtype = ba.arguments['tokens'].dtype
         family, block = mosaic_gpu.family_of(config, dtype), (config.block_m, config.block_n, config.block_k)
         # A transposed matrix (the input gradient's) is loaded a step deep and sliced in registers
-        # (`mosaic_sm80.Mma.products`, `mosaic.tile_registers`).
+        # (`mosaic_sm80.Mma.products`, `resources.tile_registers`).
         transposed = bool(ba.arguments.get('trans_rhs', False))
-        plain = mosaic.tile_registers(family, config.warpgroups, block, dtype, transposed=transposed)
+        plain = resources.tile_registers(family, config.warpgroups, block, dtype, transposed=transposed)
         if ba.arguments['hooks'].prologue is None:
             return plain
         # The rows' stage a consumer rewrites: its share of a product's rows by the step, or of a kernel
         # gradient's depth by the step's rows, `block_m` by `block_k` over the consumers either way.
         share = config.block_m * config.block_k // config.warpgroups
-        return plain + -(-share // mosaic.THREADS)
+        return plain + -(-share // resources.THREADS)
 
     def register_budget(self, config: mosaic_gpu.Tiles) -> int:
         # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`).
@@ -646,7 +646,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return _hooks_lower(ba, dtype, mosaic_gpu_lowering.mosaic_lowering_rules[plgpu_core.WGxWG_SEMANTICS])
 
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles, target) -> int:
-        # Each allocation a program scopes, rounded up to Mosaic's alignment (`mosaic.allocated`): each
+        # Each allocation a program scopes, rounded up to Mosaic's alignment (`resources.allocated`): each
         # stream's stages (both operand blocks and each prologue side's tile), each output's staging (every
         # output's at once, the columns its family stages at once: `mosaic.Family.output_columns`), each
         # epilogue side's two staging copies (`mosaic.staging`), and the barriers: each stream stage's two
@@ -670,8 +670,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # mma.sync's too, though its output's staging is scoped after its pipeline's stages: Mosaic places
         # both at once (an L4 refused 114688 bytes for a 98304-byte pipeline and its 16384-byte output,
         # GEN4-gpu-l4).
-        return (mosaic.allocated(*(config.stages * stream for stream in streams), *staged, *sides)
-                + mosaic.BARRIER_BYTES * barriers)
+        return (resources.allocated(*(config.stages * stream for stream in streams), *staged, *sides)
+                + resources.BARRIER_BYTES * barriers)
 
     @staticmethod
     @abc.abstractmethod
@@ -681,7 +681,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def program_shared(self, config: mosaic_gpu.Tiles, target) -> int:
         # The programs a multiprocessor runs at once share its shared memory.
-        return mosaic.program_shared(super().program_shared(config, target), config.programs)
+        return resources.program_shared(super().program_shared(config, target), config.programs)
 
     def _launched(self, config: mosaic_gpu.Tiles, interpret: bool) -> int:
         """The programs the persistent kernel launches: the tile's programs on each multiprocessor
@@ -746,7 +746,7 @@ class MosaicTgmm(_Mosaic):
         """`_Mosaic.legal` on one multiprocessor a tile (`mosaic_gpu.tgmm` takes no pair), a family whose
         products read registers loading its transposed stage in whole roles of rows (the step, `block_k`: a
         32-row stage failed to cast to the 64-row layout, ns-regs2), and with `exact_sums` a second fp32
-        accumulator, the running sum beside a step's, in each consumer's live set (`mosaic.tile_registers`)
+        accumulator, the running sum beside a step's, in each consumer's live set (`resources.tile_registers`)
         within its family's registers."""
         if config.cluster != 1 or not super().legal(ba, config, target):
             return False
@@ -757,8 +757,8 @@ class MosaicTgmm(_Mosaic):
             return True
         dtype = ba.arguments['tokens'].dtype
         block = (config.block_m, config.block_n, config.block_k)
-        running = -(-config.block_m * config.block_n // config.warpgroups // mosaic.THREADS)
-        return (mosaic.tile_registers(family, config.warpgroups, block, dtype) + running
+        running = -(-config.block_m * config.block_n // config.warpgroups // resources.THREADS)
+        return (resources.tile_registers(family, config.warpgroups, block, dtype) + running
                 <= family.registers(config.warpgroups))
 
     @staticmethod

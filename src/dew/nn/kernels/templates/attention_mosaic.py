@@ -19,7 +19,7 @@ import tokamax
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
+from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, resources
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     NATURAL,
@@ -91,16 +91,16 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
 def _staged(allocations) -> int:
     """The shared memory a program's `allocations` take, as `Family.scoped` takes them (`plgpu.SMEM` arrays
     and `plgpu.Barrier`s, its streams' allocations among them, nested in sequences and mappings): every
-    array rounded up to the toolkit's alignment (`mosaic.allocated`), then every barrier
-    (`mosaic.BARRIER_BYTES`), as JAX's Pallas Mosaic GPU lowering lays a kernel's arrays out and its barriers
-    after them."""
+    array rounded up to the toolkit's alignment (`resources.allocated`), then every barrier
+    (`resources.BARRIER_BYTES`), as JAX's Pallas Mosaic GPU lowering lays a kernel's arrays out and its
+    barriers after them."""
     arrays, barriers = [], 0
     for allocation in jax.tree.leaves(allocations):
         if isinstance(allocation, plgpu.Barrier):
             barriers += int(np.prod(allocation.num_barriers))
         else:
             arrays.append(math.prod(allocation.shape) * jnp.dtype(allocation.dtype).itemsize)
-    return mosaic.allocated(*arrays) + mosaic.BARRIER_BYTES * barriers
+    return resources.allocated(*arrays) + resources.BARRIER_BYTES * barriers
 
 
 @dataclasses.dataclass(frozen=True)
@@ -284,13 +284,13 @@ class MosaicForward(_Mainloop[Tiles]):
 
 
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool) -> int:
-    """The registers a forward consumer holds at `tiles` (`mosaic.live_registers`): its weighted values' sums
-    `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A training
-    forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the operands'
-    dtype; its peak walk holds less."""
+    """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
+    sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
+    training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
+    operands' dtype; its peak walk holds less."""
     block_q, block_k = tiles.block_q, tiles.block_k
     step = [(block_q, block_k, jnp.float32)] + [(block_q, block_k, dtype)] * (2 if residuals else 1)
-    return mosaic.live_registers(family, [(block_q, value_width, jnp.float32)], step)
+    return resources.live_registers(family, [(block_q, value_width, jnp.float32)], step)
 
 
 @overload
@@ -359,20 +359,20 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
 
 def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
                         accurate: bool, dq: bool) -> int:
-    """The registers a backward launch's consumer holds at `config` (`mosaic.live_registers`): a dQ consumer's
-    dQ sums `[bq, D]` fp32 carried (and the accurate form's keyed sums), beside a step's logits and output
-    cotangents' products fp32, then its score cotangents fp32 and their parts in the operands' dtype; a dK/dV
-    consumer's dK and dV sums `[bk, D]`, `[bk, Dv]` fp32 carried, beside a step's two products, and a fused
-    launch's dQ tile `[bq, D]` fp32."""
+    """The registers a backward launch's consumer holds at `config` (`resources.live_registers`): a dQ
+    consumer's dQ sums `[bq, D]` fp32 carried (and the accurate form's keyed sums), beside a step's logits and
+    output cotangents' products fp32, then its score cotangents fp32 and their parts in the operands' dtype; a
+    dK/dV consumer's dK and dV sums `[bk, D]`, `[bk, Dv]` fp32 carried, beside a step's two products, and a
+    fused launch's dQ tile `[bq, D]` fp32."""
     block_q, block_k = config.block_q, config.block_k
     products = [(block_q, block_k, jnp.float32)] * 2
     if dq:
         carried = [(block_q, width, jnp.float32)] * (2 if accurate else 1)
         cotangents = [(block_q, block_k, jnp.float32), *[(block_q, block_k, dtype)] * _parts(accurate, dtype)]
-        return mosaic.live_registers(family, carried, products, cotangents)
+        return resources.live_registers(family, carried, products, cotangents)
     carried = [(block_k, width, jnp.float32), (block_k, value_width, jnp.float32)]
     fused = [(block_q, width, jnp.float32)] if config.fused else []
-    return mosaic.live_registers(family, carried, products, fused)
+    return resources.live_registers(family, carried, products, fused)
 
 
 @dataclasses.dataclass(frozen=True)

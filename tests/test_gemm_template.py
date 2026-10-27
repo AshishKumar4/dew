@@ -19,7 +19,7 @@ from reference_error import as_given, assert_as_exact, with_gradients
 from tuned import each_config
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import mosaic, product
+from dew.nn.kernels.templates import product, resources
 from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, mosaic_tpu, template, triton_dense
 
 pytestmark = pytest.mark.kernel
@@ -1273,7 +1273,7 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
         # the registers a cooperative consumer has (232) or a lone warpgroup's (255). The generated tile
         # holds them; a tile that does not is no legal pin.
         [tile] = launch.fitting(exact, target)
-        assert 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups) < mosaic.CONSUMER_REGISTERS
+        assert 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups) < resources.CONSUMER_REGISTERS
         narrow, wide = (mosaic_gpu.Tiles(128, width, 64, 2, 1, warpgroups=2) for width in (128, 256))
         assert launch.legal(exact, narrow, target) and launch.legal(plain, narrow, target)  # 128 a thread
         assert not launch.legal(exact, wide, target) and launch.legal(plain, wide, target)  # 256

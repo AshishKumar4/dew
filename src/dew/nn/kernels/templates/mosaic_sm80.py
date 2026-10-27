@@ -15,7 +15,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import cost, mosaic
+from dew.nn.kernels.templates import cost, mosaic, resources
 
 _TILING: Callable[[tuple[int, int]], object] = plgpu.TilingTransform
 _SWIZZLE: Callable[[int], object] = plgpu.SwizzleTransform
@@ -82,6 +82,7 @@ class Mma(mosaic.Family):
     # its register model does not count what they hold, and its derived tiles spilled (ns-regs2: sm86's
     # normed forward 16 bytes, exact sums 136).
     counts_hooks = False
+    walks_scoped = True  # `emit_pipeline` allocates each walk's slots in its own scope
     bounded_loads = False
     role_rows = 4 * 16
     operands_in_registers = True
@@ -127,12 +128,12 @@ class Mma(mosaic.Family):
         # keeps one program (`mosaic_gpu.derived`). On an A100 two took 0.73 to 0.93 of one program's
         # time, a product's geomean over 6 grouped and 4 dense rows, their outputs bitwise one program's
         # (CONSUMERS2); two consumers in one program took 1.04 to 1.50 (CONSUMERS1).
-        return cost.REGISTERS // (consumers * mosaic.THREADS * self.registers(consumers))
+        return cost.REGISTERS // (consumers * resources.THREADS * self.registers(consumers))
 
     def column_unit(self, dtype) -> int:
         # Its stores move a row through registers, laid over the role's threads, one element or more each.
         del dtype
-        return mosaic.THREADS
+        return resources.THREADS
 
     def depths(self, dtype) -> tuple[int, ...]:
         # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).

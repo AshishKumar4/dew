@@ -3,8 +3,8 @@ delta rule's selector's 'mosaic_gpu' kernel (`recurrence_chunk.GATED_DELTA`).
 
 Its config is the forward's tiles (`mainloop.Tiles`), derived from the call's shape and the device's and
 its bundle's facts (`Mosaic.derived`): the widest value block whose carried memory and step tiles a thread's
-registers hold (`mosaic.live_registers`) and whose states launch fills the device's multiprocessors, with as
-many chunks in flight as every launch's shared memory
+registers hold (`resources.live_registers`) and whose states launch fills the device's multiprocessors,
+with as many chunks in flight as every launch's shared memory
 allows a block of the device (`staged_bytes`: each launch's streams and staging tiles as its bundle declares
 them, `mainloop.planned`, the fast backward's with the forward's where a call takes it). Nothing is
 measured, tabled, swept or ranked: a GPU no row names derives its tiles from its own facts, and a measured
@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import tokamax
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import base, bundles, cost, mosaic
+from dew.nn.kernels.templates import base, bundles, cost, mosaic, resources
 from dew.nn.kernels.templates.recurrence import mainloop
 
 INTERPRETED_GENERATION = "sm90"
@@ -117,7 +117,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def registers(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> int | None:
         """The most registers a consumer thread of any of the forward's launches holds (`Launch.registers`,
-        each launch's stated tiles, `mosaic.live_registers`): a legal config's launches spill nothing. The
+        each launch's stated tiles, `resources.live_registers`): a legal config's launches spill nothing. The
         fast backward's launches are held to the same budget where its rule takes them
         (`mainloop.backward_holds`), the portable math's gradient where they are not."""
         target = self.launched()
@@ -211,7 +211,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
                 ) -> mainloop.Tiles | None:
         """`block`'s tiles with the widest output block legal beside it (`Tiles.block_o`), at the deepest
         ring of the states launch's steps of which a multiprocessor holds as many programs as one stage's
-        (`states_held`; `mosaic.deepest`, within `Family.most_shared` over a step's bytes), else one stage;
+        (`states_held`; `resources.deepest`, within `Family.most_shared` over a step's bytes), else one stage;
         None where no output block is legal beside it. The ring deepest alone held an A100's states launch
         to one program a multiprocessor, where its registers held three (SE-family-a100-8c5b5b16a)."""
         family = bundle(target, _dtype(ba))
@@ -223,7 +223,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
             return None
         programs = self.states_held(ba, shallowest, target)
         step = self._states(ba, shallowest, target).step_bytes
-        deepest = mosaic.deepest(lambda stages: dataclasses.replace(shallowest, stages=stages),
+        deepest = resources.deepest(lambda stages: dataclasses.replace(shallowest, stages=stages),
                                  lambda tiles: (self.legal(ba, tiles, target)
                                                 and self.states_held(ba, tiles, target) >= programs),
                                  family.most_shared // max(step, 1))
