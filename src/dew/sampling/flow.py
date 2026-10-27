@@ -276,19 +276,23 @@ def _half_mahalanobis(value: jax.Array, mean: jax.Array, variance: jax.Array) ->
 
 @_half_mahalanobis.defjvp
 def _half_mahalanobis_jvp(primals, tangents):
-    """The plain formula's tangent, `sum(slope * (t_value - t_mean)) + stretch * t_variance`, its
-    coefficients the derivatives `(value - mean) / variance` per element and `-term / variance` per row,
-    each formed from the residual and the term as they are held, shifted to range (`_divergence_parts`),
-    and restored once, as the KL's reverse mode forms them (`_kl_pullback`): finite wherever the
-    derivative is. It is linear in the tangents, so reverse mode transposes it, and its coefficients
-    are functions of the primals, so it differentiates again."""
+    """The plain formula's tangent, `sum((value - mean) * (t_value - t_mean)) / variance - term * t_variance
+    / variance`, formed from the residual and the term as they are held, shifted to range
+    (`_divergence_parts`), and restored once: finite wherever the derivative is. It is linear in the
+    tangents, so reverse mode transposes it, and its coefficients are functions of the primals, so it
+    differentiates again."""
     value, mean, variance = primals
     along_value, along_mean, along_variance = tangents
     difference, shift, (quotient, power) = _divergence_parts(value, mean, variance)
+    axes = tuple(range(1, value.ndim))
+    # The residual's products with the tangents summed at the row's widest shift, then over the
+    # variance's significand, a division of one value a row, and restored once: in range, every shift
+    # zero, the plain `sum(residual * tangent) / variance`, bit for bit.
+    widest = jnp.max(shift, axis=axes)
     level, spread = _split(variance)
-    slope = _scaled(divided(difference, expand(level, difference)), shift - expand(spread, difference))
+    along = (_scaled(difference, shift - expand(widest, shift)) * (along_value - along_mean)).sum(axis=axes)
+    moved = _scaled(along / level, widest - spread)
     stretch = _scaled(*_quotient(-quotient, power, variance))
-    moved = (slope * (along_value - along_mean)).sum(axis=tuple(range(1, value.ndim)))
     return _half_mahalanobis(value, mean, variance), moved + stretch * along_variance
 
 
