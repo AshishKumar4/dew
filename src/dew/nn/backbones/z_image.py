@@ -276,7 +276,12 @@ class ZImageTransformer(nn.Module):
         # Slots past a row's padded prompt are masked; they sit at the origin.
         leading = jnp.where(slots[None] < spans[:, None], slots[None] + 1, 0)
         caption_positions = jnp.stack([leading, jnp.zeros_like(leading), jnp.zeros_like(leading)], axis=-1)
-        table = (self.axes_dims, self.axes_lens, self.rope_theta)
+        # Each axis's table reaches every position the call takes, `axes_lens` at least: a prompt's
+        # image sits one past its padded span, the grid's rows and columns at their own indices, and
+        # a row's rotation is its own position's however long the table, so a call past the published
+        # lengths rotates at its own places rather than at the last row's.
+        reach = tuple(map(max, self.axes_lens, (budget + 2, rows, columns)))
+        table = (self.axes_dims, reach, self.rope_theta)
         image_rotation = _rotation(image_positions, *table, at_least_fp32(image.dtype))
         caption_rotation = _rotation(caption_positions, *table, at_least_fp32(image.dtype))
         whole_image = jnp.full((batch,), image_span, jnp.int32)
