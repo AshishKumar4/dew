@@ -424,25 +424,30 @@ def test_a_quantized_memorys_update_rounds_from_its_own_stream():
     assert not np.array_equal(np.asarray(drawn[0]), np.asarray(other[0]))
 
 
-def test_serving_quantization_refuses_a_memorys_moving_inner_weights():
-    """Serving quantization (`quantize_for_serving`) stores each weight a rule selects quantized, and the
-    products read the stored values; Dew does not yet serve a memory's W_0 stored quantized, which a
-    pattern selecting its inner weights is refused for at init (`QuantizedServingRefused`). One
-    selecting the memory's projections alone serves them, the served decoder computing what quantized
-    training computed, bit for bit."""
+def test_a_served_memory_computes_the_quantized_memory_from_its_stored_w0():
+    """Serving quantization (`quantize_for_serving`) of every inner Dense of two memory layers stores
+    each head's W_0 quantized, the steps starting from the float it decodes to (`decoded_stored`), and
+    rounds every product of the moving weights as quantized training does (`moving_weights`): the
+    served decoder, and the same tree after a round trip through the host, computes bit for bit what
+    quantized training (`Quantization.apply`) computes over the decoded W_0. Serving the projections
+    alone computes what quantized training of them computes."""
     pytest.importorskip("qwix")
-    from dew.nn.memory import QuantizedServingRefused
-    from dew.quantization import Quantization, quantize_for_serving
+    from dew.quantization import Annotated, Quantization, decoded_stored, quantize_for_serving
 
     model = decoder()
     ids = jax.random.randint(jax.random.key(1), (ROWS, LENGTH), 0, 37)
     variables = model.init(jax.random.key(0), ids)
-    with pytest.raises(QuantizedServingRefused):
-        quantize_for_serving(model, variables, Quantization(patterns=(INNER,)), ids)
-    spec = Quantization(patterns=(r".*self_attn/[qkvo]_proj",))
-    served, held = quantize_for_serving(model, variables, spec, ids)
-    np.testing.assert_array_equal(np.asarray(served.apply(held, ids)),
-                                  np.asarray(spec.apply(model).apply(variables, ids)))
+    for patterns in ((INNER,), (r".*self_attn/[qkvo]_proj",)):
+        spec = Quantization(patterns=patterns)
+        served, held = quantize_for_serving(model, variables, spec, ids)
+        stored = [leaf for leaf in jax.tree.leaves(held, is_leaf=lambda leaf: isinstance(leaf, Annotated))
+                  if isinstance(leaf, Annotated)]
+        assert stored
+        logits = np.asarray(served.apply(held, ids))
+        reloaded = jax.tree.map(jnp.asarray, jax.device_get(held))
+        np.testing.assert_array_equal(np.asarray(served.apply(reloaded, ids)), logits)
+        decoded = {**variables, "params": decoded_stored(held)["params"]}
+        np.testing.assert_array_equal(logits, np.asarray(spec.apply(model).apply(decoded, ids)))
 
 
 def test_a_qwix_quantized_linear_memory_leaves_the_recurrence():

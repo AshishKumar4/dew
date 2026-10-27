@@ -43,8 +43,10 @@ input quantization at an inner site (`dew.quantization`) rounds that site's inpu
 alike, and Qwix's quantized training quantizes every product of the moving weights, its stochastic
 rounding drawing from each token's key. A frozen FP8 record's codes at an inner kernel stand for W_0's
 kernel, as they decode: in a memory only W_0 is frozen, and each application multiplies the state the
-steps move from it. Qwix's serving quantization of the inner weights is refused: Dew does not yet serve
-a memory's W_0 stored quantized (`QuantizedServingRefused`).
+steps move from it. Qwix's serving quantization stores W_0 quantized, which the steps start from as the
+float it decodes to (`dew.quantization.decoded_stored`); each product of the moving weights rounds as
+quantized training rounds it (`dew.quantization.moving_weights`), so a served memory computes what the
+quantized memory computes from the stored W_0.
 
 A linear memory (`LinearMemory`) on its given target, with no momentum, no orthogonalized or slow
 weights and each token reading its own step, whose heads each compute the linear map of their input by
@@ -71,7 +73,6 @@ from typing import ClassVar, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn, traverse_util
 from flax.core import lift
 from flax.linen.transforms import lift_direct_transform
@@ -86,7 +87,7 @@ from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.optim import _orthogonalized
-from dew.quantization import decoded_frozen_fp8, quantized_products
+from dew.quantization import decoded_frozen_fp8, decoded_stored, moving_weights, quantized_products
 
 from .attention import FORWARD_MODE, LayerNorm
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, sequence_blocks
@@ -338,8 +339,8 @@ class InContextMemory(nn.Module):
         frozen FP8 kernel is W_0's as its codes decode (`dew.quantization.decoded_frozen_fp8`): in a
         memory only W_0 is frozen, and every application multiplies the state the steps move from it.
 
-        A weight stored quantized for serving (Qwix's, `dew.quantization.quantize_for_serving`) is
-        refused (`QuantizedServingRefused`): Dew does not yet serve a memory's W_0 stored quantized."""
+        A weight stored quantized for serving (Qwix's, `dew.quantization.quantize_for_serving`) decodes
+        to the float its values and scales hold (`decoded_stored`), the W_0 the steps move from."""
         networks = [getattr(self, f"head_{head}") for head in range(self.heads)]
         if self.is_initializing():
             for network in networks:
@@ -347,12 +348,10 @@ class InContextMemory(nn.Module):
         wide = at_least_fp32(self.dtype)
         heads = []
         for network in networks:
-            variables = dict(decoded_frozen_fp8(dict(nn.meta.unbox(network.variables))))
-            flat = traverse_util.flatten_dict(dict(variables.pop("params", {})))
-            weights = {path: leaf for path, leaf in flat.items() if isinstance(leaf, jax.Array | np.ndarray)}
-            if len(weights) < len(flat):
-                raise QuantizedServingRefused("/".join(network.path),
-                                              sorted("/".join(path) for path in flat.keys() - weights.keys()))
+            variables = dict(decoded_stored(decoded_frozen_fp8(dict(nn.meta.unbox(network.variables)))))
+            # Every inner weight is an array now: frozen FP8 codes and stored quantized kernels decoded.
+            weights = {path: jnp.asarray(leaf) for path, leaf
+                       in traverse_util.flatten_dict(dict(variables.pop("params", {}))).items()}
             unknown = sorted(set(self.slow) - {path[0] for path in weights})
             if unknown:
                 raise ValueError(f"slow names {unknown}, which are none of the network's parameters "
@@ -580,7 +579,10 @@ class InContextMemory(nn.Module):
             x = x.astype(dtype)
         rngs = {} if keys is None else {name: jax.random.fold_in(jax.random.wrap_key_data(key), use)
                                         for name, key in keys.items()}
-        out = _substituted(head.network, {**head.collections, "params": params}, rngs, x)
+        # The weights move from W_0 each call, so a serving quantization rounds their products as quantized
+        # training does, no stored copy of them existing.
+        with moving_weights():
+            out = _substituted(head.network, {**head.collections, "params": params}, rngs, x)
         if not isinstance(out, jax.Array):
             raise TypeError(f"an in-context memory's network maps a vector to one, got {type(out).__name__}")
         return out
@@ -733,23 +735,6 @@ class InContextMemory(nn.Module):
         return reads
 
 
-class QuantizedServingRefused(ValueError):
-    """An in-context memory refusing inner weights stored quantized for serving (Qwix's, at the head
-    network `network`'s `leaves`): Dew does not yet serve a memory's W_0 stored quantized, which its
-    steps would start from as the weights the stored values decode to, each product of the moving
-    weights quantized afresh. Its projections serve; quantized training
-    (`dew.quantization.Quantization.apply`) quantizes every product of the moving weights."""
-
-    def __init__(self, network: str, leaves: list[str]):
-        super().__init__(f"{network}'s weights {leaves} are stored quantized for serving, and Dew does not "
-                         "yet serve an in-context memory's W_0 stored quantized; select its projections "
-                         "for serving, or train it quantized")
-        self.network, self.leaves = network, leaves
-
-    def __reduce__(self):
-        return type(self), (self.network, self.leaves)
-
-
 class _Head(NamedTuple):
     """One head's network as a call computes it: the child at its scope (`network`), the parameters it
     holds at W_0 (`held`: the `slow` ones and an adapter's A factors), its other collections as stored
@@ -895,4 +880,4 @@ def _composed(first: tuple, second: tuple) -> tuple:
 
 
 __all__ = ["CARRY", "Gate", "InContextMemory", "LinearMemory", "MLPMemory", "Objective",
-           "QuantizedServingRefused", "ResidualMemory"]
+           "ResidualMemory"]
