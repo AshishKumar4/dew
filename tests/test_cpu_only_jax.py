@@ -10,7 +10,7 @@ import sys
 import pytest
 
 from dew.builds import newest_build
-from dew.devices import cpu_only_refusal, nvidia_gpus
+from dew.devices import cpu_only_refusal, nvidia_gpus, xla_flag
 
 
 def stand_in(directory, printed: str, status: int = 0):
@@ -28,6 +28,55 @@ def stand_in(directory, printed: str, status: int = 0):
 def test_nvidia_smi_reads_as_the_driver_and_the_least_sm(tmp_path, monkeypatch, printed, status, gpus):
     monkeypatch.setenv("PATH", stand_in(tmp_path, printed, status))
     assert nvidia_gpus() == gpus
+
+
+def test_a_host_with_no_nvidia_smi_lists_no_gpu(tmp_path, monkeypatch):
+    """Where no nvidia-smi is on PATH, no GPU is listed, and nothing runs to ask."""
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert nvidia_gpus() is None
+
+
+def test_a_bare_xla_flag_reads_true_and_its_last_occurrence_wins(monkeypatch):
+    """`xla_flag` reads XLA_FLAGS as XLA's own parser does: a bare `--name` is 'true', a repeated flag
+    its last value, and an absent one None."""
+    monkeypatch.setenv("XLA_FLAGS", "--xla_a --xla_b=1 --xla_b=2 --xla_c=x --xla_c")
+    read = [xla_flag(name) for name in ("xla_a", "xla_b", "xla_c", "xla_d")]
+    assert read == ["true", "2", "true", None]
+
+
+LATE = """
+import logging
+import os
+
+records = []
+
+
+class Kept(logging.Handler):
+    def emit(self, record):
+        records.append(record)
+
+
+logging.getLogger("dew").addHandler(Kept())
+import jax
+
+jax.devices()
+before = os.environ.get("XLA_FLAGS")
+import dew
+assert os.environ.get("XLA_FLAGS") == before, "import dew set XLA flags no open backend reads"
+assert [(record.name, record.levelno) for record in records] == [("dew.devices", logging.WARNING)], records
+"""
+
+
+def test_dew_imported_after_the_backend_opened_warns_and_sets_no_flag():
+    """A process that opens JAX's backend before `import dew`: Dew's numerical policy can no longer
+    take effect, so the import logs one warning of it, with the restart that applies it, and leaves
+    XLA_FLAGS as it was."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, (os.path.join(root, "src"),
+                                                                     os.environ.get("PYTHONPATH"))))}
+    done = subprocess.run([sys.executable, "-c", LATE], capture_output=True, text=True, env=env,
+                          timeout=300, cwd=root)
+    assert done.returncode == 0, done.stderr[-2000:]
 
 
 REFUSED = 3

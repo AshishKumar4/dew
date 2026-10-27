@@ -223,6 +223,97 @@ def test_a_decision_mixture_states_its_weights_and_the_manifest_that_made_it(tmp
     assert held is not None
 
 
+TEAM = {"type": "choice", "instructions": "Which team?", "criteria": ["billing", "technical"]}
+
+
+def team_rows(states) -> str:
+    """JSON lines of a decision a state each, answered billing."""
+    return "".join(json.dumps({"state": state, "questions": {"team": TEAM}, "answers": {"team": "billing"}})
+                   + "\n" for state in states)
+
+
+def test_a_decision_corpus_reads_the_shards_its_manifest_names(tmp_path):
+    """`corpus` reads a corpus's split from the shards its manifest lists, each by the size and digest
+    it declares, an `Example` a row; a split the manifest names no shards for, and no JSONL file of,
+    is None."""
+    import hashlib
+
+    from dew.data.compile import iterate
+    from dew.decision.data import corpus
+
+    (tmp_path / "a").mkdir()
+    shards = []
+    for index, states in enumerate((["one", "two"], ["three"])):
+        payload = team_rows(states).encode()
+        (tmp_path / "a" / f"{index}.jsonl").write_bytes(payload)
+        shards.append({"path": f"a/{index}.jsonl", "bytes": len(payload),
+                       "sha256": hashlib.sha256(payload).hexdigest()})
+    manifest = {"files": {"a": {"train": {"shards": shards}}}, "slots": {"questions": 1, "options": 2}}
+    (tmp_path / "mixture.json").write_text(json.dumps(manifest))
+    train = corpus(str(tmp_path), "a", "train")
+    assert train is not None
+    assert [row["example"].state for row in iterate(train, read="memory")] == ["one", "two", "three"]
+    assert corpus(str(tmp_path), "a", "held") is None
+
+
+def test_a_decision_mixture_reads_the_manifest_its_descriptor_pins(tmp_path):
+    """A descriptor replaces a mixture's manifest where it names the canonical manifest it was made
+    from and keeps every raw corpus's digest: the mixture reads its weights, and its rows' fingerprint
+    holds the descriptor's URL and digest. One made from another manifest, or changing a raw corpus,
+    is refused."""
+    import hashlib
+
+    from dew.decision.data import mixture
+
+    (tmp_path / "a.jsonl").write_text(team_rows(["one"]))
+    (tmp_path / "b.jsonl").write_text(team_rows(["two"]))
+    files = {"a": {"train": {"sha256": "a-raw"}}, "b": {"train": {"sha256": "b-raw"}}}
+    (tmp_path / "mixture.json").write_text(json.dumps({"weights": {"a": 1.0, "b": 1.0}, "files": files}))
+    (tmp_path / "manifest.sha256").write_text("canonical\n")
+
+    def described(name: str, **changes) -> str:
+        replaced = {"weights": {"a": 1.0, "b": 0.0}, "files": files,
+                    "provenance": {"original_manifest_sha": "canonical"}, **changes}
+        (tmp_path / name).write_text(json.dumps(replaced))
+        return str(tmp_path / name)
+
+    pinned = described("descriptor.json")
+    train, held = mixture(str(tmp_path), descriptor=pinned)
+    assert train.facts()["mixture_weights"] == {"a": 1.0} and held is None
+    digest = hashlib.sha256((tmp_path / "descriptor.json").read_bytes()).hexdigest()
+    assert train.source.fingerprint()["descriptor"] == {"url": pinned, "sha256": digest}
+    with pytest.raises(ValueError):
+        mixture(str(tmp_path), descriptor=described("other.json",
+                                                    provenance={"original_manifest_sha": "another"}))
+    with pytest.raises(ValueError):
+        mixture(str(tmp_path), descriptor=described("changed.json",
+                                                    files={**files, "a": {"train": {"sha256": "edited"}}}))
+
+
+def test_an_example_reads_soft_targets_by_option_and_refuses_a_malformed_one():
+    """A row's target distribution is its question's option order as a list or a mapping keyed by
+    option, the gold its most likely option; a mapping of other keys, a target neither list nor
+    mapping, a label of no option's key or index, and a flat table's float or bool label read as its
+    text are each as `Example.of` and the table parse say."""
+    from dew.data.compile import iterate
+    from dew.decision.data import Example
+
+    keyed = Example.of({"state": "s", "questions": {"team": TEAM},
+                        "targets": {"team": {"technical": 0.75, "billing": 0.25}}})
+    listed = Example.of({"state": "s", "questions": {"team": TEAM}, "targets": {"team": [0.25, 0.75]}})
+    assert keyed.targets == listed.targets == {"team": (0.25, 0.75)}
+    assert keyed.labels() == {"team": 1}
+    for target in ({"billing": 0.5, "sales": 0.5}, "technical"):
+        with pytest.raises(ValueError):
+            Example.of({"state": "s", "questions": {"team": TEAM}, "targets": {"team": target}})
+    for label in (1.5, True, None):
+        with pytest.raises(ValueError):
+            Example.of({"state": "s", "questions": {"team": TEAM}, "answers": {"team": label}})
+    rows = Memory([{"text": "a", "label": 1.5}, {"text": "b", "label": 2.5}])
+    examples = [row["example"] for row in iterate(rows.pipe(decisions, question="team"), read="memory")]
+    assert [example.answers["team"] for example in examples] == ["1.5", "2.5"]
+
+
 def test_a_named_validation_split_reads_the_source_s_own_split():
     """A holdout of the store's own named split (`holdout(split="validation")`) opens it through the
     source's `with_split`, and the decisions over it read that split's rows; a source with no native

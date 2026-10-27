@@ -525,3 +525,60 @@ def test_a_journals_plot_draws_training_beside_validation_each_at_its_own_steps(
     tracker.close()
     written = sorted(path.name for path in (tmp_path / "run").glob("*.svg"))
     assert len(written) == 4 and len({name.rpartition("-")[0] for name in written}) == 3
+
+
+TERMINAL = """
+import logging
+import sys
+
+sys.path.insert(0, "tests")
+from affine_run import fit_one_step
+from rich.console import Console
+
+from dew.logging import display_console
+
+fit_one_step()
+log = logging.getLogger("dew.terminal")
+try:
+    raise ValueError("the traceback's own words")
+except ValueError:
+    log.exception("a warning with its traceback")
+with display_console(Console(file=sys.stdout, force_terminal=True, soft_wrap=True)):
+    log.warning("a warning on the panel's console")
+log.warning("a warning back on stderr")
+"""
+
+
+def test_a_run_in_a_terminal_logs_on_rich_handlers_and_the_panel_takes_them():
+    """A run in a pseudo-terminal installs Dew's rich stderr handler: a warning with a traceback
+    prints its line and then the traceback as rich renders it, and the live panel's console takes the
+    handler's records while it shows (`display_console`), handing them back after."""
+    import os
+    import pty
+    import subprocess
+    import sys
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, (os.path.join(root, "src"),
+                                                                     os.environ.get("PYTHONPATH")))),
+           "COLUMNS": "200", "TERM": "xterm-256color"}
+    leader, follower = pty.openpty()
+    child = subprocess.Popen([sys.executable, "-c", TERMINAL], stdin=follower, stdout=follower,
+                             stderr=follower, env=env, cwd=root)
+    os.close(follower)
+    printed = []
+    while True:
+        try:
+            chunk = os.read(leader, 1 << 16)
+        except OSError:
+            # The terminal closes, as the child exits, with EIO.
+            break
+        if not chunk:
+            break
+        printed.append(chunk)
+    os.close(leader)
+    assert child.wait(timeout=300) == 0
+    text = b"".join(printed).decode(errors="replace")
+    for words in ("a warning with its traceback", "Traceback", "the traceback's own words",
+                  "a warning on the panel's console", "a warning back on stderr"):
+        assert words in text, text[-3000:]
