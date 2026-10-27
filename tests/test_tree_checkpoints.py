@@ -1,7 +1,8 @@
 """A mapping saved in place of a train state checkpoints, resumes and is retained as a train state is."""
-import contextlib
-import os
+import json
+import subprocess
 import sys
+import textwrap
 
 import jax
 import jax.numpy as jnp
@@ -10,40 +11,6 @@ import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.checkpoints import Checkpoints, Keep, Ranking
-
-TOUCHES = frozenset({"open", "os.listdir", "os.scandir", "os.mkdir", "os.rename", "os.remove", "os.rmdir",
-                     "os.truncate", "shutil.rmtree", "shutil.copyfile", "shutil.move"})
-"""The interpreter's audit events a store on the local filesystem is read and written through."""
-
-_watched: list | None = None
-
-
-def _audited(event: str, arguments: tuple) -> None:
-    if _watched is not None and event in TOUCHES:
-        _watched.append((event, arguments))
-
-
-sys.addaudithook(_audited)
-
-
-@contextlib.contextmanager
-def store_touches(root):
-    """Every read and write of the store under `root` while held, as the interpreter's audit events
-    record them at the filesystem's boundary (`TOUCHES`): `(event, path)` for each, nothing patched."""
-    global _watched
-    root, seen = os.fspath(root), []
-    touched: list[tuple[str, str]] = []
-    _watched = seen
-    try:
-        yield touched
-    finally:
-        _watched = None
-        for event, arguments in seen:
-            path = arguments[0] if arguments else None
-            if isinstance(path, bytes):
-                path = os.fsdecode(path)
-            if isinstance(path, (str, os.PathLike)) and os.path.abspath(os.fspath(path)).startswith(root):
-                touched.append((event, os.path.relpath(os.fspath(path), root)))
 
 
 def tree(seed: int = 0):
@@ -191,19 +158,60 @@ def test_a_reader_beside_the_run_lists_each_step_as_it_commits(tmp_path):
     np.testing.assert_array_equal(reader.restore(step=2)[0]["x"], np.full((3,), 2))
 
 
-def test_a_listing_after_a_restore_and_close_opens_nothing(tmp_path):
-    """A reader that restored a step and closed lists the committed steps without reopening the store:
-    observed at the filesystem's boundary (`store_touches`), the listing lists directories and opens no
-    file of the store, and writes, moves or removes nothing there, as the restore before it did read
-    the step's files."""
-    writer = Checkpoints(str(tmp_path))
+LISTING = textwrap.dedent("""
+    import json, os, sys
+    import jax.numpy as jnp
+    from dew.checkpoints import Checkpoints
+
+    root = os.path.realpath(sys.argv[1])
+    writer = Checkpoints(root)
     writer.save(1, {"x": jnp.full((3,), 1)})
     writer.wait()
-    reader = Checkpoints(str(tmp_path))
-    with store_touches(tmp_path) as restoring:
-        reader.restore(step=1)
-    assert any(event == "open" for event, _ in restoring)
+    reader = Checkpoints(root)
+    seen, watching = [], []
+
+    def readable(argument):
+        if isinstance(argument, (str, bytes, os.PathLike)):
+            return os.fsdecode(argument)
+        return argument if isinstance(argument, int) else None
+
+    def audited(event, arguments):
+        if watching:
+            seen.append((watching[-1], event, [readable(argument) for argument in arguments[:2]]))
+
+    sys.addaudithook(audited)
+    watching.append("restore")
+    reader.restore(step=1)
+    watching.pop()
     reader.close()
-    with store_touches(tmp_path) as listing:
-        assert reader.committed() == [1]
-    assert listing and {event for event, _ in listing} <= {"os.listdir", "os.scandir"}, listing
+    watching.append("listing")
+    listed = reader.committed()
+    watching.pop()
+    print(json.dumps({"listed": listed, "root": root, "seen": seen}))
+""")
+"""A process that saves a step, restores it, closes and lists, every filesystem event of the restore
+and of the listing recorded at the interpreter's boundary (its audit events: an `open` by path or by
+descriptor, a listing, a move's both paths, a truncation, a removal), its hook its own."""
+
+WRITES = frozenset({"os.mkdir", "os.rename", "os.remove", "os.rmdir", "os.truncate", "os.chmod",
+                    "shutil.rmtree", "shutil.copyfile", "shutil.move", "os.link", "os.symlink"})
+"""The audit events that change a filesystem."""
+
+
+def test_a_listing_after_a_restore_and_close_opens_nothing(tmp_path):
+    """A reader that restored a step and closed lists the committed steps without reopening the store:
+    observed at the interpreter's filesystem boundary in a process of its own (`LISTING`), the listing
+    lists directories and opens no file anywhere, by path or by descriptor, and writes, moves or removes
+    nothing anywhere, as the restore before it did open the step's files. A file's metadata read (a
+    stat) is no audit event and no part of the claim."""
+    finished = subprocess.run([sys.executable, "-c", LISTING, str(tmp_path)], capture_output=True,
+                              text=True, timeout=600, check=False)
+    assert finished.returncode == 0, finished.stderr
+    report = json.loads(finished.stdout.splitlines()[-1])
+    assert report["listed"] == [1]
+    restored = [(event, paths) for phase, event, paths in report["seen"] if phase == "restore"]
+    assert any(event == "open" and isinstance(paths[0], str) and paths[0].startswith(report["root"])
+               for event, paths in restored)
+    listing = [(event, paths) for phase, event, paths in report["seen"] if phase == "listing"]
+    changed = [entry for entry in listing if entry[0] == "open" or entry[0] in WRITES]
+    assert listing and not changed, listing

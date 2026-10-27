@@ -171,10 +171,12 @@ def test_an_autoencoder_with_two_outputs_trains_and_its_record_trains_it_again_i
 
 
 def test_the_autoencoders_evidence_bound_falls_over_independent_runs():
-    """The two-output experiment's objective (tests/autoencoder_experiment.py) trained forty steps at
-    its learning rate halves its held-out evidence bound over independent runs (`assert_learns`), each
-    run from its own key on its own points of the experiment's plane."""
-    from autoencoder_experiment import FEATURES, Autoencoder, evidence_bound
+    """The two-output experiment (tests/autoencoder_experiment.py), its objective and optimizer built
+    from its own run configuration, trained its forty steps halves its held-out evidence bound over
+    independent runs (`assert_learns`), each from its own key on its own points of the experiment's
+    plane."""
+    import autoencoder_experiment
+    from autoencoder_experiment import FEATURES
 
     plane = np.random.default_rng(0).normal(size=(2, FEATURES)) / np.sqrt(2)
 
@@ -183,11 +185,12 @@ def test_the_autoencoders_evidence_bound_falls_over_independent_runs():
         x = rng.normal(size=(rows, 2)) @ plane + rng.normal(0, 0.05, (rows, FEATURES))
         return {"x": x.astype(np.float32)}
 
-    objective = Supervised(Autoencoder(), evidence_bound, inputs=InputSpec(Field("x", (FEATURES,))))
-    drop = learned(objective, optax.adam(1e-2),
+    config = autoencoder_experiment.run()
+    objective = config.objective.build(model=config.model.build())
+    drop = learned(objective, config.optim.build(config.trainer.steps),
                    lambda run: dataset(train=lambda run=run: Replaying(lambda step: points([run, step])),
                                        batch=32),
-                   lambda run: points([run, 10_000], rows=256), steps=40, margin=2)
+                   lambda run: points([run, 10_000], rows=256), steps=config.trainer.steps, margin=2)
     assert_learns(lambda runs: {"training halves the held-out evidence bound": drop[runs]},
                   "the autoencoder experiment", units=RUNS)
 

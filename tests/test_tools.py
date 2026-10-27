@@ -944,15 +944,18 @@ def test_a_private_first_party_attribute_is_no_seam_whatever_its_name(tmp_path):
             "def test_private(monkeypatch):\n"
             "    monkeypatch.setattr(Store, '_open', lambda self: None)\n"
             "def test_public(monkeypatch):\n"
-            "    monkeypatch.setattr(store, 'open', lambda path: None)\n"),
+            "    monkeypatch.setattr(store, 'open', lambda path: None)\n"
+            "def test_a_seams_own_private(monkeypatch):\n"
+            "    monkeypatch.setattr('sparx.store.os._exit', lambda code: None)\n"),
     })
     assert found == [("tests/test_store.py", 4, "SLOP008")]
 
 
 def test_a_frozen_rendering_spacing_is_reported_and_its_content_claims_are_not(tmp_path):
-    """SLOP011: a rendering compared whole with a string, or with a list of strings, holding a run of
-    two or more spaces between words is a spacing snapshot (row 1878); its words and numbers looked for,
-    a one-space string compared, and a column end measured are not."""
+    """SLOP011: a rendering (its text read through `plain`, `table()`, captured output or `str`)
+    compared whole with a string, or with a list of strings, holding a run of two or more spaces between
+    words is a spacing snapshot (row 1878); its words and numbers looked for, a one-space string
+    compared, a column end measured, and parsed data that holds two spaces are not."""
     found = _linted(tmp_path, {
         "src/sparx/graph.py": "EDGES = 1\n",
         "tests/test_graph.py": (
@@ -961,7 +964,9 @@ def test_a_frozen_rendering_spacing_is_reported_and_its_content_claims_are_not(t
             "    assert table.plain == 'data 4,824 rows  ·  0 rejected'\n"
             "    assert '4,824' in table.split()\n"
             "    assert table.title == 'data rows'\n"
-            "    assert table.index('b') + 1 == len('   a  b')\n"),
+            "    assert table.index('b') + 1 == len('   a  b')\n"
+            "    assert json.loads(payload) == ['a  b']\n"
+            "    assert parsed.name == 'two  spaces'\n"),
     })
     assert found == [("tests/test_graph.py", line, "SLOP011") for line in (2, 3)]
 

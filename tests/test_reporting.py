@@ -428,7 +428,13 @@ def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counte
     line = data_line(display.corpus_counts)
     assert line is not None
     # One label: its count, unnamed, and the rejected total, with no reason and no truncation.
-    assert "tiny-shakespeare" not in line.plain and "4,824" in words(line) and "0" in words(line)
+    said = words(line)
+
+    def follows(said, value, label):
+        return any(said[at:at + 2] == [value, label] for at in range(len(said) - 1))
+
+    assert "tiny-shakespeare" not in line.plain
+    assert follows(said, "4,824", "rows") and follows(said, "0", "rejected")
     assert "(" not in line.plain and "%" not in line.plain
     # mix(web, code).filter(f): the corpora count the rows they fed the mix, the mixture the rows
     # f kept, and f's drops are the mixture's.
@@ -443,7 +449,8 @@ def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counte
     named = [said[said.index(label) + 1] for label in ("web", "code", "mixture")]
     assert named == ["3,000", "1,824", "4,700"]
     assert said.index("web") < said.index("code") < said.index("mixture")
-    assert "127" in said and "15.5%" in said
+    assert follows(said, "4,700", "rows") and follows(said, "127", "rejected")
+    assert follows(said, "15.5%", "truncated")
     reasons = mixture.plain[mixture.plain.index("(") + 1:mixture.plain.index(")")]
     assert {tuple(reason.split()) for reason in reasons.split(",")} == {("too_long", "3"),
                                                                         ("filtered", "124")}
