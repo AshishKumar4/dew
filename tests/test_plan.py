@@ -651,3 +651,49 @@ def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():
         assert fingerprint(raw.view(first)) != fingerprint(raw.view(second))
         assert fingerprint(raw.view(first)) == fingerprint(raw.copy().view(first))
 
+
+
+class Refused(jax.errors.JaxRuntimeError):
+    """An XLA refusal with its status code, as a GPU's compiler raises it."""
+    def __init__(self, code: str, message: str):
+        super().__init__(f"{code}: {message}")
+        self.code = code
+
+    @property
+    def error_code_string(self):
+        return self.code
+
+
+AUTOTUNED = ("All configs failed during profiling or were excluded from selection.\nFailures (2):\n"
+             "EXECUTION FAILED: {}: Out of memory while trying to allocate 7.83GiB on GPU_0_bfc.\n"
+             "EXECUTION FAILED: RESOURCE_EXHAUSTED: Out of memory while trying to allocate 7.83GiB.")
+
+
+@pytest.mark.parametrize(("code", "message", "refused"), [
+    ("RESOURCE_EXHAUSTED", "XLA:TPU's temporaries past HBM", True),
+    ("NOT_FOUND", AUTOTUNED.format("RESOURCE_EXHAUSTED"), True),
+    ("NOT_FOUND", AUTOTUNED.format("INTERNAL"), False),
+    ("NOT_FOUND", "no config for this fusion", False),
+    ("INTERNAL", "a ptxas failure", False)],
+    ids=["exhausted", "autotuned-out-of-memory", "autotuned-otherwise", "not-found", "internal"])
+def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, refused):
+    """XLA's refusal for memory, which the plan reads as the rung's miss and climbs past
+    (`compiled_if_it_fits`), is RESOURCE_EXHAUSTED, or a GPU GEMM autotuner's NOT_FOUND where every config
+    it profiled ran out of memory, as an A100's did at a whole head's GEMM (node receipt
+    TL-a100-offload-1338-d); a config that failed otherwise, or any other error, is raised."""
+    from dew.training.memory import compiled_if_it_fits
+
+    error = Refused(code, message)
+
+    class Program:
+        def compile(self, options):
+            raise error
+
+    refusals = []
+    if refused:
+        assert compiled_if_it_fits(Program(), None, refusals) is None
+        assert refusals == [error]
+    else:
+        with pytest.raises(jax.errors.JaxRuntimeError) as raised:
+            compiled_if_it_fits(Program(), None, refusals)
+        assert raised.value is error and refusals == []

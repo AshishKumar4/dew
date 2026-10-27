@@ -464,8 +464,8 @@ def remat_policy(
 
 DECODER_REMAT: tuple[RematPolicy | None, ...] = (
     None, REMAT_POLICIES['all_but_delta_memory'], REMAT_POLICIES['minimal_with_scan_and_conv'],
-    REMAT_POLICIES['minimal_with_conv'], REMAT_POLICIES['minimal'], REMAT_POLICIES['minimal_offloaded'],
-    REMAT_POLICIES['save_dot_except_mlp'], REMAT_POLICIES['full'])
+    REMAT_POLICIES['minimal_with_conv'], REMAT_POLICIES['minimal'], REMAT_POLICIES['save_dot_except_mlp'],
+    REMAT_POLICIES['full'])
 """What a decoder recomputes in its backward pass when its step does not fit,
 weakest first; each rung is slower and holds less (docs/performance.md). On
 Qwen 3.5-0.8B at 8 x 3072 on an A100, 'minimal' cost 14.7% a token over none
@@ -477,11 +477,7 @@ step that does not fit recomputes the rest of a layer before its scan (on an
 A100 an 8-layer Mamba-2 decoder's bf16 step over 16,384 tokens took 145.6 ms
 there and 149.4 ms at 'minimal_with_conv', for 1.1 GB more at its peak,
 docs/performance.md); 'minimal_with_conv' keeps the conv alone. A decoder
-without a recurrence skips both, as it would compile 'minimal''s step.
-'minimal_offloaded' keeps 'minimal''s residuals in pinned host memory and
-recomputes what 'minimal' does; a plan that keeps it is timed against the
-first rung above it that keeps everything on the device
-(`dew.training.planning.FitSearch`). A
+without a recurrence skips both, as it would compile 'minimal''s step. A
 decoder's own remat is where it starts, and it moves up one rung at a time
 (`CausalTransformer.recompute_more`),
 past a rung that keeps nothing more of its layers' names than the next, never

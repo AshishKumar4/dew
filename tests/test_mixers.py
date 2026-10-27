@@ -405,11 +405,10 @@ def test_a_mixers_refusal_names_its_kind_and_entries_across_a_process_boundary()
 
 
 @pytest.mark.parametrize("kind, rungs", [
-    ("attention", [None, "minimal", "minimal_offloaded", "save_dot_except_mlp", "full"]),
-    ("mamba2", [None, "minimal_with_scan_and_conv", "minimal_with_conv", "minimal", "minimal_offloaded",
-                "full"]),
+    ("attention", [None, "minimal", "save_dot_except_mlp", "full"]),
+    ("mamba2", [None, "minimal_with_scan_and_conv", "minimal_with_conv", "minimal", "full"]),
     ("gated_delta_net", [None, "all_but_delta_memory", "minimal_with_scan_and_conv", "minimal_with_conv",
-                         "minimal", "minimal_offloaded", "full"]),
+                         "minimal", "full"]),
 ])
 def test_a_decoder_climbs_only_the_remat_rungs_its_layers_mark(kind, rungs):
     """`recompute_more` passes a rung that keeps the same of the decoder's marked names as the rung
