@@ -62,7 +62,7 @@ from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.documents import document_mask
 from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
-from dew.nn.kv_cache import KVCache, cache_positions, cached_validity, write_cache
+from dew.nn.kv_cache import KVCache, cache_positions, cached_validity, open_kv_cache, write_cache
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from dew.nn.mla import IndexerFront
 from dew.nn.precision import at_least_fp32, float32_dot_general
@@ -532,6 +532,10 @@ class DeepseekV4Attention(FakeQuantizing):
     candidate_block_size: int | None = None
     query_norm: bool = True
     kv_qat: bool = False
+    kv_cache: KVCache = dataclasses.field(default_factory=KVCache)
+    """The window cache's storage layout (`dew.nn.kv_cache`), paged or quantized: the shared key head
+    stored as the attention cache's keys and its values, the keys read back in their own basis. The
+    compressor's entries, buffers and index keys stay one compact row each, a row's state."""
     norm_eps: float = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
@@ -695,14 +699,12 @@ class DeepseekV4Attention(FakeQuantizing):
                  else jnp.asarray(attention_metadata.valid, bool))
         batch, length, _ = x.shape
         cache = None
-        cached_key = None
+        append = None
         if decode:
-            if valid is None and length > self.max_seq_len:
-                raise ValueError(f"{length} tokens exceed max_seq_len={self.max_seq_len}")
-            slots, allocated = cache_positions(self, batch, length, valid)
-            cache = (slots, self.max_seq_len, allocated)
-            cached_key = self.variable('cache', 'cached_key', jnp.zeros,
-                                       (batch, self.max_seq_len, self.head_dim), x.dtype)
+            # The window's shared key head is the attention cache's keys and its values, one head.
+            shape = jax.ShapeDtypeStruct((batch, length, 1, self.head_dim), x.dtype)
+            slots, append = open_kv_cache(self, shape, self.max_seq_len, valid=valid, layout=self.kv_cache)
+            cache = (slots, self.max_seq_len, append.allocated)
             if positions is None:
                 positions = slots
         positions = jnp.arange(length) if positions is None else jnp.asarray(positions)
@@ -725,11 +727,11 @@ class DeepseekV4Attention(FakeQuantizing):
         allowed = jnp.broadcast_to(visibility_mask(
             length, length, causal=True, sliding_window=self.sliding_window, segment_ids=segment_ids,
             key_valid=None if decode else valid)[:, 0], (batch, length, length))
-        if cache is not None and cached_key is not None:
-            slots, _, allocated = cache
-            if allocated:
-                cached_key.value = write_cache(cached_key.value, keys, slots)
-            keys = cached_key.value
+        values = keys
+        if cache is not None and append is not None:
+            slots = cache[0]
+            stored, values = append(keys[:, :, None], keys[:, :, None])
+            keys, values = append.plain(stored)[:, :, 0], values[:, :, 0]
             allowed = causal_attention_mask(
                 slots, keys.shape[1], self.sliding_window,
                 key_valid=cached_validity(self, keys.shape[1]))[:, 0]
@@ -745,9 +747,10 @@ class DeepseekV4Attention(FakeQuantizing):
                 entries, selected = self.compress(x, q_resid, selected_positions, cos, sin, cache, valid)
             if entries.shape[1]:
                 keys = jnp.concatenate([keys, entries], axis=1)
+                values = jnp.concatenate([values, entries], axis=1)
                 allowed = jnp.concatenate([allowed, selected], axis=-1)
 
-        output = self._attend(query, keys, allowed, cos, sin)
+        output = self._attend(query, keys, values, allowed, cos, sin)
         return output if valid is None else jnp.where(valid[..., None], output, 0)
 
     def _queries(self, x, cos, sin, place):
@@ -771,13 +774,13 @@ class DeepseekV4Attention(FakeQuantizing):
         keys = constrain(_rotate_rope(checkpoint_name(projected, 'kv_proj'), cos, sin), RESIDUAL)
         return self.fp8(keys, 32) if self.kv_qat else keys
 
-    def _attend(self, query, keys, allowed, cos, sin):
+    def _attend(self, query, keys, values, allowed, cos, sin):
         batch, length = query.shape[:2]
         # One shared key/value head under every query head, its logits in fp32 scaled after the
         # product, the per-head sink beside them, softmax in fp32 and the sink dropped (:708-736).
-        shared = keys[:, :, None]
-        context = reference_attention(query, shared, shared, mask=allowed[:, None], sinks=self.sinks,
-                                      precision=self.precision, wide_logits=True)
+        # A quantized cache reads its keys and values back each as stored; otherwise they are one.
+        context = reference_attention(query, keys[:, :, None], values[:, :, None], mask=allowed[:, None],
+                                      sinks=self.sinks, precision=self.precision, wide_logits=True)
         # The values are the rotated keys, so the rope slice of the output is
         # turned back at the query's position (:853-859).
         context = _rotate_rope(checkpoint_name(context, 'context'), cos, -sin)
@@ -856,7 +859,7 @@ class DSparkAttention(DeepseekV4Attention):
             jnp.broadcast_to(window[:, None], (batch, length, main_keys.shape[1])),
             jnp.ones((batch, length, length), bool)], axis=-1)
         keys = jnp.concatenate([main_keys, self._window_keys(x, cos, sin, place)], axis=1)
-        return self._attend(query, keys, allowed, cos, sin)
+        return self._attend(query, keys, keys, allowed, cos, sin)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -917,8 +920,10 @@ class DeepseekV4Mixer(MixerBase):
             raise ValueError("a deepseek_v4 layer attends a sliding window, not a chunk")
         if ctx.kv_shared and self.compressor != 'csa2':
             raise ValueError("of the deepseek_v4 kinds only CSA2 shares its entries across layers")
-        ctx.refuse("deepseek_v4", {"kv_cache": ctx.kv_cache != KVCache()},
-                   "it keeps its own compressed cache, which takes no kv_cache layout")
+        if attention is DSparkAttention:
+            ctx.refuse("deepseek_v4", {"kv_cache": ctx.kv_cache != KVCache()},
+                       "a DSpark stage keeps the target's context in a window cache of its own, which "
+                       "takes no kv_cache layout")
         ctx.refuse("deepseek_v4", ctx.policies(),
                    "its attention keeps sinks of its own, softmaxes in fp32 and projects out through "
                    "grouped low-rank heads, without a softcap, value scale, bias or dropout")
@@ -947,6 +952,7 @@ class DeepseekV4Mixer(MixerBase):
             candidate_block_size=self.candidate_block_size,
             query_norm=self.query_norm,
             kv_qat=self.kv_qat,
+            **({} if attention is DSparkAttention else {"kv_cache": ctx.kv_cache}),
             norm_eps=ctx.norm_eps,
             dtype=ctx.dtype,
             precision=ctx.precision)

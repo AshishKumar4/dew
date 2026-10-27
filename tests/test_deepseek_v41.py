@@ -45,6 +45,7 @@ from dew.interop.hf_decoders import families, translate_config, translate_wrappe
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS, fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
+from dew.nn.kv_cache import KVCache
 from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
 from tools.deepseek_v41_numerics import QUANTIZERS, unquantized, vision_bundle, vision_run
@@ -299,6 +300,22 @@ def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
         _, logits, _ = plain.apply(loaded.variables, whole, drawn[row:row + 1], decode=False,
                                    method="draft")
         assert distance(jnp.stack(scored, 1)[row], logits[0]) <= 2 * FACTOR * rounding("draft_logits")
+
+
+@pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
+def test_a_paged_window_cache_decodes_what_the_compact_cache_decodes(source, quantized):
+    """The tiny V4.1 checkpoint's window cache takes the decoder's layout: paged, it draws the compact
+    cache's greedy tokens at the same format, full precision and quantized, its compressors' entries,
+    buffers and index keys kept compact beside it."""
+    loaded, plain, reference = source
+    prompts = jnp.asarray(reference["input_ids"])[:, :7]
+
+    def decoded(layout: KVCache) -> np.ndarray:
+        return np.asarray(generate(plain.with_kv_cache(layout), loaded.variables, prompts, 9,
+                                   key=jax.random.key(1), sampling=Sampling(temperature=0)).tokens)
+
+    np.testing.assert_array_equal(decoded(KVCache(quantized=quantized, page_size=4)),
+                                  decoded(KVCache(quantized=quantized)))
 
 
 def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers():
