@@ -3,17 +3,19 @@
 The estimate is the loss's gradient in expectation where the loss is quadratic in each layer's output
 and every unit's loss reads its own output alone: an antithetic pair's reward is then exactly the
 derivative along its jitter. Over many independent steps' keys, the estimates are the gradient JAX
-computes in expectation, whatever layout a dense call contracts and in bfloat16 sites as in float32:
-Student's t-test rejects in no coordinate. A language model's estimate is its configured objective's,
-a z-loss among its terms, and a routed decoder's statistics take theirs. An update read in two
-microbatches estimates what its batch whole does, each example's jitter its own. A run trains with no
-derivative of its model taken, a batch norm's statistics kept as the clean loss keeps them, a
-rematerialized decoder estimated as its unrolled twin is, and a model whose layers are mapped is refused.
-The estimator's settings are its constructor's, which a run's record holds.
+computes in expectation, whatever layout a dense call contracts, in bfloat16 sites as in float32, and
+for statistics that are a tuple: Student's t-test rejects in no coordinate. A language model's estimate
+is its configured objective's, a z-loss among its terms, a tied head's rows the batch only predicts
+included; a routed decoder's statistics take theirs, and an indexer's warm-up its whole KL. An update
+read in two microbatches estimates what its batch whole does, each example's jitter its own. A run
+trains with no derivative of its model taken, a batch norm's statistics kept as the clean loss keeps
+them, a rematerialized decoder estimated as its unrolled twin is, and a model whose layers are mapped is
+refused. The estimator's settings are its constructor's, which a run's record holds.
 """
 
 import dataclasses
 import json
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -24,13 +26,14 @@ from flax import linen as nn
 from reference_error import as_given, assert_as_exact, seeds_for
 from scipy import stats
 
+from dew.batch import FROZEN
 from dew.config import ObjectiveConfig
 from dew.data import Memory
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
-from dew.objectives.base import Step
-from dew.objectives.lm import LMObjective
+from dew.objectives.base import Objective, Ratio, Step
+from dew.objectives.lm import IndexerTraining, LMObjective
 from dew.objectives.perturbation import NodePerturbation
 from dew.objectives.routing import ExpertBalance
 from dew.objectives.supervised import CrossEntropy, Supervised
@@ -112,12 +115,13 @@ def rows(sample: tuple[int, ...], seed: int = 0, count: int = 16) -> dict[str, n
 
 def gradient(objective, variables, batch, key) -> dict:
     """The derivative of the objective's reduced loss in its trained parameters, as the trainer asks for
-    it of one microbatch: the estimate, for a perturbing objective."""
+    it of one microbatch (`Objective._loss` reads its statistics): the estimate, for a perturbing
+    objective."""
     step = Step(jnp.asarray(0), key, None)
 
     def reduced(params):
-        loss = objective.loss({**variables, "params": params}, batch, step)
-        return objective.reduce_loss(loss[0] if isinstance(loss, tuple) else loss)[0]
+        stats, _ = objective._loss({**variables, "params": params}, batch, step)
+        return objective.reduce_loss(stats)[0]
 
     return jax.grad(reduced)(variables["params"])
 
@@ -204,6 +208,101 @@ def test_a_language_models_estimate_is_its_configured_objectives():
                        ("Dense_1", "kernel"), ("Dense_1", "bias")):
         assert rejected(estimates[name][leaf], truth[name][leaf]) > 1e-9, (name, leaf)
     assert rejected(estimates["Dense_1"]["bias"], without["Dense_1"]["bias"]) < 1e-9
+
+
+def test_a_tied_heads_rows_the_batch_only_predicts_are_estimated():
+    """A decoder whose head is its embedding, tied, read as a matrix its loss contracts, over rows of the
+    ids 1 to 6 alone: the rows of the ids 7 to 12, which no input looks up and every prediction's
+    normalizer reads, take their estimate from that read, its matrix jittered there alone and added to
+    the lookup's estimate: over 256 steps' keys it is the analytic gradient of those rows in expectation
+    (the t-test rejects in no coordinate), where the lookup's alone would leave them at zero."""
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=8, dtype="float32")
+    objective = ForwardLM(model, seq_len=6, draws=4, weight_draws=64, weight_sigma=0.01)
+    variables = objective.init(jax.random.key(0))
+    batch = {"text": jnp.asarray(np.random.default_rng(3).integers(1, 7, (8, 7)), jnp.int32)}
+    estimates = estimated(objective, variables, batch)
+    truth = gradient(LMObjective(model, seq_len=6), variables, batch, jax.random.key(0))
+    predicted = truth["embed_tokens"]["embedding"][7:]
+    assert float(jnp.max(jnp.abs(predicted))) > 0
+    assert rejected(estimates["embed_tokens"]["embedding"][:, 7:], predicted) > 1e-9
+
+
+class TwoTerms(NamedTuple):
+    """Two statistics an objective reduces together, with no `Aux`."""
+
+    fit: Ratio
+    size: Ratio
+
+
+class TwoTermFit(Objective[TwoTerms]):
+    """A fit of `Linear`'s outputs to their targets, its loss the mean squared error and half the mean
+    squared output, two statistics its reduction adds."""
+
+    def __init__(self):
+        self.model = self.bind_model(Linear())
+
+    def fresh_variables(self, key, held):
+        return self.model.init(key, jnp.zeros((1, 3)))
+
+    def loss(self, variables, batch, step):
+        outputs = self.model.apply(variables, batch["x"])
+        return TwoTerms(self.row_mean(squared(outputs, batch), batch),
+                        self.row_mean(jnp.sum(jnp.square(outputs), -1), batch))
+
+    def reduce_loss(self, stats):
+        fit, active = stats.fit.mean()
+        size, _ = stats.size.mean()
+        return fit + 0.5 * size, active
+
+
+class ForwardTwoTerms(NodePerturbation, TwoTermFit):
+    """`TwoTermFit` trained by node perturbation."""
+
+
+def test_statistics_that_are_a_tuple_without_aux_are_estimated_whole():
+    """An objective whose statistics are a tuple of two `Ratio`s and no `Aux` keeps its statistics
+    whole: over 256 steps' keys the estimates of its two dense layers and its scale are `jax.grad`'s of
+    its reduction of both in expectation (the t-test rejects in no coordinate)."""
+    objective = ForwardTwoTerms(draws=64)
+    variables = objective.init(jax.random.key(0))
+    batch = {name: jnp.asarray(value) for name, value in rows((3,)).items()}
+    estimates = estimated(objective, variables, batch)
+    truth = gradient(TwoTermFit(), variables, batch, jax.random.key(0))
+    for path in (*((name, leaf) for name in ("Dense_0", "Dense_1") for leaf in ("kernel", "bias")),
+                 ("scale",)):
+        drawn, exact = estimates, truth
+        for key in path:
+            drawn, exact = drawn[key], exact[key]
+        assert rejected(drawn, exact) > 1e-9, path
+
+
+def test_an_indexer_warmup_trains_its_indexer_alone_without_backpropagation():
+    """An indexer's warm-up, whose KL is no token's prediction, is estimated from its whole statistics:
+    the estimate is its indexer's own tree, finite, and two steps of a run move every indexer weight and
+    leave every frozen weight as it was, bit for bit."""
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, head_dim=16,
+                              mlp_features=64, max_seq_len=16,
+                              mixer={"class": "mla", "fields": {
+                                  "q_lora_rank": 8, "kv_lora_rank": 8, "qk_nope_head_dim": 8,
+                                  "qk_rope_head_dim": 8, "v_head_dim": 8, "index_topk": None,
+                                  "index_n_heads": 2, "index_head_dim": 16}})
+    objective = ForwardLM(model, 16, indexer=IndexerTraining("warmup"), draws=2)
+    start = objective.init(jax.random.key(0))
+    tokens = np.random.default_rng(0).integers(0, 64, (8, 17)).astype(np.int32)
+    estimate = jax.jit(lambda key: gradient(objective, start, {"text": jnp.asarray(tokens)}, key))(
+        jax.random.key(1))
+    assert jax.tree.structure(estimate) == jax.tree.structure(start["params"])
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(estimate))
+    trainer = Trainer(objective, optax.adam(1e-2), key=0, layout=LAYOUT)
+    initial = jax.tree.map(np.asarray, trainer.initial_state().variables)
+    state = trainer.fit(Memory([{"text": row} for row in tokens]).repeat().batch(8), steps=2)
+    for moved, held in zip(jax.tree.leaves(state.variables["params"]), jax.tree.leaves(initial["params"]),
+                           strict=True):
+        assert not np.array_equal(np.asarray(moved), held)
+    for kept, held in zip(jax.tree.leaves(state.variables[FROZEN]), jax.tree.leaves(initial[FROZEN]),
+                          strict=True):
+        np.testing.assert_array_equal(np.asarray(kept), held)
 
 
 def test_a_routed_decoder_trains_its_composite_statistics_without_backpropagation():
