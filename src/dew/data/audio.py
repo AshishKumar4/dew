@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import Literal
+from typing import ClassVar, Literal
 
 import grain.python as grain
 import numpy as np
@@ -37,6 +37,8 @@ class DecodeAudio(grain.MapTransform):
     rejects: bool = True
     """Whether a file that does not read, or under `missing="reject"` lacks sound, is dropped
     (`filter_map`) rather than an error."""
+    external: ClassVar[bool] = True
+    """A file a record names by path is read from storage (`dew.data.pipeline.External`)."""
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """Mono samples at `sample_rate` over the window and `context` either side, under `to`, with

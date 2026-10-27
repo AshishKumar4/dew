@@ -3682,12 +3682,12 @@
     {
      "repo": "huggingface/diffusers",
      "version": "0.34.0",
-     "runs": "diffusers"
+     "runs": "diffusers-0.34"
     },
     {
      "repo": "huggingface/transformers",
      "version": "5.16.1",
-     "runs": "transformers"
+     "runs": "diffusers-0.34"
     }
    ],
    "note": "Includes UMT5 prompt states and pipeline walks (final latents and decoded frames), each in float32 as the pipeline runs and in float64 (diffusers_wan_reference.float64), and float32/float64 UniPC scheduler replays."
@@ -3698,7 +3698,7 @@
     {
      "repo": "huggingface/diffusers",
      "version": "0.34.0",
-     "runs": "diffusers"
+     "runs": "diffusers-0.34"
     }
    ],
    "note": "Float64 oracle widens upstream float32 casts, tools/diffusers_wan_reference.py:95."

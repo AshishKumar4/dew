@@ -78,7 +78,9 @@ def mp_sum(a: jax.Array, b: jax.Array, t: float = 0.5) -> jax.Array:
 
     This is Eq. 88 of the EDM2 paper.
     """
-    return (a + t * (b - a)) / math.sqrt((1 - t) ** 2 + t ** 2)
+    # IEEE division, as EDM2's PyTorch divides: XLA takes a division by a constant as a product with
+    # its rounded reciprocal.
+    return divided(a + t * (b - a), math.sqrt((1 - t) ** 2 + t ** 2))
 
 
 def mp_cat(a: jax.Array, b: jax.Array, t: float = 0.5) -> jax.Array:

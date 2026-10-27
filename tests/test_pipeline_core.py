@@ -7,6 +7,7 @@ import itertools
 import json
 import multiprocessing
 import os
+import threading
 import weakref
 from uuid import uuid4
 
@@ -23,7 +24,7 @@ from dew import position
 from dew.batch import VALID_ROWS
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
-from dew.data.dataset import DataPartition, Loading
+from dew.data.dataset import GRAIN_KILL_SECONDS, DataPartition, Loading
 from dew.data.mixing import TokenDeficit, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
@@ -685,6 +686,64 @@ def test_worker_boundary_keeps_downstream_record_steps_and_exact_positions(worke
         resumed.close()
 
 
+def operators(dataset) -> int:
+    """The Grain datasets `dataset` reads through, itself included."""
+    seen, pending = set(), [dataset]
+    while pending:
+        node = pending.pop()
+        if id(node) not in seen:
+            seen.add(id(node))
+            pending.extend(node.parents)
+    return len(seen)
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_adjacent_record_steps_read_through_one_grain_operator(read):
+    """Adjacent record steps lower as one Grain operator, as tf.data fuses maps and filters: a draw,
+    a map, a filter and two maps read through as many Grain datasets as the filter alone, and make
+    the records the steps make one after another."""
+    built = []
+
+    def watched(dataset):
+        built.append(dataset)
+        return dataset
+
+    def read_through(chain):
+        built.clear()
+        rows = list(chain.grain(watched, identity="watched@1").read(read).loading(READ))
+        return operators(built[0]), rows
+
+    alone, kept = read_through(Pipeline(source(8)).filter(odd_id))
+    steps = Pipeline(source(8)).random_map(WideDraw()).map(Shift(1)).filter(odd_id).map(Shift(10))
+    fused, made = read_through(steps.map(Tagged()))
+    assert fused == alone
+    assert [int(row["id"]) for row in kept] == [1, 3, 5, 7]
+    assert [(int(row["id"]), int(row["tag"])) for row in made] == [(id, id * 10) for id in (11, 13, 15, 17)]
+
+
+def odd_id(row) -> bool:
+    return bool(int(row["id"]) % 2)
+
+
+@dataclasses.dataclass(frozen=True)
+class Thread:
+    """The record with the thread that ran this step on it, under `field`."""
+
+    field: str
+
+    def __call__(self, row):
+        return {**row, self.field: threading.get_ident()}
+
+
+def test_a_step_after_a_filter_runs_on_the_thread_that_ran_the_steps_before_it():
+    """A step written after a filter runs where the steps before it ran, on the read's own threads,
+    where it once ran alone in the reading process after the filter's records were counted out."""
+    chain = Pipeline(source(16)).map(Thread("before")).filter(odd_id).map(Thread("after"))
+    rows = list(chain.read("indexed").loading(Loading(workers=0, threads=4, read_buffer=4)))
+    assert [int(row["id"]) for row in rows] == list(range(1, 16, 2))
+    assert all(row["after"] == row["before"] != threading.get_ident() for row in rows)
+
+
 def test_worker_processes_read_a_global_order_in_the_batches_one_process_reads():
     """Each worker reads whole batches of an indexed order by index, and the
     reader interleaves them back into the order one process reads."""
@@ -701,24 +760,47 @@ def test_worker_processes_read_a_global_order_in_the_batches_one_process_reads()
     assert batches(2) == batches(0)
 
 
-def test_automatic_loading_sizes_an_indexed_read_buffer_by_the_batches_it_holds(monkeypatch):
-    """An indexed order's read buffer holds whole batches, so automatic
-    loading sizes it by a batch: 2 MiB holds four batches of eight 64 KiB
-    rows, where sized by a row it would hold sixteen."""
-    import grain.experimental as gx
+@pytest.mark.parametrize("bound", ["cpus", "memory"])
+def test_automatic_loading_starts_no_more_workers_than_the_hosts_cpus_and_memory_hold(monkeypatch, bound):
+    """Automatic loading sizes its workers from the CPUs this process may run on and the memory it
+    may take, together. On two CPUs of a 64-core machine it reads in at most two workers; in 512
+    MiB, at most two, each a process of its own that imports the program again. Grain's pick read
+    every core the machine has and counted a worker's memory as one batch, so it started 64 workers
+    in both."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(2 if bound == "cpus" else 16)))
+    budget = {"cpus": 4096, "memory": 512}[bound]
+    loading = Loading(workers="auto", ram_budget_mb=budget)
+    data = compile(Pipeline(source(64)).repeat().batch(8), loading=loading)
+    reader = data.train(DataPartition())
+    try:
+        workers = reader.stop_seconds / GRAIN_KILL_SECONDS - 1
+    finally:
+        reader.close()
+    assert workers <= 2
 
-    chosen = []
-    pick = gx.pick_performance_config
 
-    def recorded(*args, **kwargs):
-        config = pick(*args, **kwargs)
-        chosen.append(config.read_options.prefetch_buffer_size)
-        return config
+def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_the_memory():
+    """Each worker holds its `worker_buffer` batches and its `read_buffer` reads in a process of its
+    own, within half the memory the process may take; a read is a batch where the order is read by
+    batch, a record where it streams. Eight 64 KiB rows make a 512 KiB batch: 2 MiB holds four reads
+    of a batch and no worker, and half a host's memory that holds two and a half workers holds two,
+    reading by the batch or by the record. Workers take each CPU where there is more than one, at
+    most `max_workers`."""
+    from dew.data.dataset import WORKER_PROCESS_BYTES, Host
 
-    monkeypatch.setattr(gx, "pick_performance_config", recorded)
-    rows = Memory(tuple({"x": np.zeros(16384, np.float32)} for _ in range(64)))
-    compile(Pipeline(rows).repeat().batch(8), loading=Loading(workers="auto", ram_budget_mb=2, max_workers=1))
-    assert chosen == [4]
+    rows = grain.MapDataset.source([{"x": np.zeros((8, 16384), np.float32)}] * 6).to_iter_dataset()
+    auto = Loading(workers="auto", worker_buffer=2)
+    small = dataclasses.replace(auto, ram_budget_mb=2).resolved(rows, reads=1, host=Host(8, 2**40))
+    assert (small.workers, small.read_buffer) == (0, 4)
+    held = WORKER_PROCESS_BYTES + 2 * 2**19 + 16 * 2**19
+    roomy = auto.resolved(rows, reads=1, host=Host(8, 2 * (2 * held + held // 2)))
+    assert (roomy.workers, roomy.read_buffer) == (2, 16)
+    streamed = auto.resolved(rows, reads=8, host=Host(8, 2 * (2 * held + held // 2)))
+    assert streamed.workers == 2 and streamed.read_buffer == 16
+    assert auto.resolved(rows, reads=1, host=Host(3, 2**40)).workers == 3
+    assert auto.resolved(rows, reads=1, host=Host(1, 2**40)).workers == 0
+    assert dataclasses.replace(auto, max_workers=1).resolved(rows, reads=1, host=Host(8, 2**40)).workers == 1
 
 
 def test_a_validation_pass_starts_at_most_one_worker_per_batch(monkeypatch):

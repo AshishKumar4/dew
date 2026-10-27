@@ -40,10 +40,8 @@ class Scalar:
         self.value = value
 
     @classmethod
-    def from_run(cls, directory, *, ema=None, step=None, mesh=None, layout=None, dtype=None,
-                 param_dtype=None):
-        from dew.checkpoints import Checkpoints
-        variables = Checkpoints(directory).variables(ema=ema, step=step, mesh=mesh, layout=layout)
+    def from_saved(cls, run, *, ema=None, mesh=None, layout=None, dtype=None, param_dtype=None):
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout)
         return cls(float(variables["params"]["w"]))
 
 

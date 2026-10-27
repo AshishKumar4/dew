@@ -108,7 +108,7 @@ The byte vocabulary has no Hugging Face tokenizer files, so the loaded task has 
 
 ## Weights
 
-For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline`, the tasks' `from_run` and `from_pretrained`, `objective.pipeline` and `Pretrained.from_run` all default to `ema=None`, which uses the EMA copy when the run or state has one and the live weights otherwise. DPO, GRPO and PPO keep a frozen reference in the EMA slot, so their pipelines always use the trained policy and never the reference. PPO's pipeline also leaves out the critic.
+For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline`, the tasks' `from_run` and `from_saved`, `objective.pipeline` and `Pretrained.from_run` all default to `ema=None`, which uses the EMA copy when the run or state has one and the live weights otherwise. DPO, GRPO and PPO keep a frozen reference in the EMA slot, so their pipelines always use the trained policy and never the reference. PPO's pipeline also leaves out the critic.
 
 `objective.pipeline(state)` picks weights by the same rule and keeps the arrays where the trainer already placed them. `LMObjective.policy(params, sampling)` returns a `TextGeneration` over the given parameter tree, and GRPO rollouts sample with that task. `task.bind(variables)` makes a task over another set of variables. It copies the mapping structure but shares the array buffers, so do not change or donate those arrays while a task uses them.
 
@@ -138,11 +138,11 @@ On the RTX 4080, the 176M text-to-image model then holds 183 MiB of denoiser wei
 ```python
 import jax.numpy as jnp
 
-from dew.inference import TextToImage
+import dew
 from dew.quantization import Quantization
 
-pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
-                                   revision="8d891d967319e51cd0e73d3e5b7c29d68a238b52")
+pipe = dew.pipeline("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
+                    revision="8d891d967319e51cd0e73d3e5b7c29d68a238b52")
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```

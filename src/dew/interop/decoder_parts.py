@@ -1590,6 +1590,12 @@ class Packed:
     """Config-derived count of the runs the parts are interleaved in, as in
     MiMo-V2.6's fused qkv, pre-sharded over its key heads."""
 
+    @property
+    def viewed(self) -> bool:
+        """Whether `split` gives views of the source tensor, which a lazy read keeps unread: every
+        record but one whose parts are interleaved in runs (`chunks`), which it copies."""
+        return self.chunks is None
+
     def split(self, name: str, tensor: np.ndarray,
               config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
         """The parts of the source tensor `name`, as views of it, or copies

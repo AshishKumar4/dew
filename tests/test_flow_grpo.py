@@ -1106,27 +1106,51 @@ def _below_normal(values):
     return (values.astype(np.float32).view(np.uint32) >> 23 & 0xFF) == 0
 
 
+BAND = 16
+"""The binades one check-1 leaf of the KL's outputs spans: rows whose truths lie further apart are
+judged as leaves of their own, so a small row is not read as a large one's float64 zero."""
+
+
 def _assert_kl_outputs(dew, plain, truth, bounds, label):
-    """Each output of `_kl_derivatives` against the float64 truth, as the gate rules (rows 1722 and
-    1778): where the plain float32 arm (`_plain_kl`) is finite, on par with it (check 1, its rows and
-    zero rows included); where it overflows, finite wherever the truth is a normal float32 and within
-    the derived bound of the truth (`_kl_bounds`); infinite of its sign past the largest float32, and
-    zero or subnormal below the least, by the truth's place in float32's range (`_kinds`)."""
+    """Each output of `_kl_derivatives` against the float64 truth, element by element as the gate rules
+    (rows 1722 and 1778): where the plain float32 arm (`_plain_kl`) is finite, on par with it (the grid's
+    one-draw rule, `assert_as_exact_as_the_reference` at FACTOR until the gate's switch-over to PARITY;
+    unscaled, its rows whole and its zero rows included, each band of `BAND` binades of the rows' sizes a
+    leaf of its own, an element the plain arm leaves out of a row taking the truth in both arms); where
+    it overflows, finite wherever the truth is a normal float32 and within the derived bound of the
+    truth (`_kl_bounds`); infinite of its sign past the largest float32, zero or subnormal below the
+    least, by the truth's place in float32's range (`_kinds`); and near either end (`edge`), the bound's
+    or the end's: infinite of its sign above, zero or subnormal below."""
     for name, exact in truth.items():
         value, reference, kinds = np.asarray(dew[name]), np.asarray(plain[name]), _kinds(exact)
-        held = np.isfinite(reference) & (kinds != "over")
+        # A truth below float32's least normal, or near either end, is held by its kind below.
+        held = np.isfinite(reference) & ((kinds == "normal") | (exact == 0))
+        mine, theirs = np.where(held, value, exact), np.where(held, reference, exact)
+        axes = tuple(range(1, exact.ndim))
+        size = np.max(np.abs(exact), axis=axes) if axes else np.abs(exact)
+        band = np.frexp(size)[1] // BAND
         # Where the plain arm and Dew both give the float64 value there is no error to compare.
-        measured = held & ~((value == exact) & (reference == exact))
-        if measured.any():
-            assert_as_exact_as_the_reference(value[measured], reference[measured], exact[measured],
-                                             f"{label}: {name}")
-        unheld = ~np.isfinite(reference) & (kinds == "normal")
-        assert np.all(np.isfinite(value[unheld])), name
+        apart = (mine != exact) | (theirs != exact)
+        measured = np.any(apart, axis=axes) if axes else apart
+        for level in np.unique(band[measured]):
+            rows = measured & (band == level)
+            assert_as_exact_as_the_reference(mine[rows], theirs[rows], exact[rows],
+                                             f"{label}: {name}, rows near 2**{level * BAND}")
         magnitudes, roundings = bounds[name]
+        unheld = ~np.isfinite(reference) & ((kinds == "normal") | (exact == 0))
+        assert np.all(np.isfinite(value[unheld])), name
         assert_fp32_reduction_bound(value[unheld], exact[unheld], magnitudes[unheld], roundings)
         over = kinds == "over"
         assert np.all(np.isinf(value[over]) & (np.sign(value[over]) == np.sign(exact[over]))), name
         assert np.all(_below_normal(value[kinds == "below"])), name
+        edge = kinds == "edge"
+        top = edge & (np.abs(exact) > 1)
+        bounded = top & ~(np.isinf(value) & (np.sign(value) == np.sign(exact)))
+        assert np.all(np.isfinite(value[bounded])), name
+        assert_fp32_reduction_bound(value[bounded], exact[bounded], magnitudes[bounded], roundings)
+        bottom = edge & ~top & ~_below_normal(value)
+        assert np.all(np.isfinite(value[bottom])), name
+        assert_fp32_reduction_bound(value[bottom], exact[bottom], magnitudes[bottom], roundings)
 
 
 KL_LEVELS = (-126, -125, -100, -63, -26, -1, 0, 1, 26, 63, 100, 126, 127)
@@ -1141,16 +1165,18 @@ FIXED_ROWS = (
      (1 + 2.0**-23) * 2.0**-125, 1),
     ([2.0**60, 2.0**60, 0], [2.0**-100, 0, 0], 1, [1, -1, 0], [0, 0, 0], 0, 1),
     ([1, 0, 0], [0, 0, 0], 1, [2.0**100, 0, 0], [2.0**-100, 0, 0], 2.0**101, 1),
-    # Train 201's cancelling maximum; trains 192's and 195's; the variance tangent over the variance.
-    ([2.0**126, 2.0**-26, 0], [2.0**126, 0, 0], 2.0**-52, [0, 2.0**-26, 0], [0, 0, 0], 0, 1),
-    ([0.5, 0.5, 0], [0, 0, 0], 2.0**-126, [16, -16, 0], [-16, 16, 0], 2.0**-126, 2.0**-126),
-    ([2.0**63, 0, 0], [0, 0, 0], 2.0**32, [2.0**66, 0, 0], [0, 0, 0], 0, 1),
-    ([1, 1, 0], [0, 0, 0], 1, [1, 0, 0], [0, 1, 0], 1, 2.0**127),
-    ([2.0**63, 0, 0], [0, 0, 0], 2.0**32, [4, 0, 0], [1, 1, 0], 2.0**-126, 1),
     # Variances near float32's largest, whose double overflows, and near its least.
     ([1e18, 0, 0], [0, 0, 0], 2.5e38, [4, 0, 0], [4, 0, 0], 1e30, 0.7),
     ([0.5, 0, 0], [0, 0, 0], 2.0**-126, [4, 0, 0], [-4, 0, 0], 2.0**-126, 2.0**-126),
     ([2.0**127, 0, 0], [-2.0**127, 0, 0], float(np.finfo(np.float32).max), [1, 0, 0], [0, 0, 0], 0, 1),
+    # A product the plain sum flushes beside largest ones that cancel (train 208, 1806): Dew may lose
+    # it as plain does, and no more.
+    ([2.0**45, 2.0**45, 2.0**-73], [0, 0, 0], 2.0**-21, [2.0**81, -2.0**81, 2.0**-73], [0, 0, 0], 0, 1),
+    # A KL just under float32's largest (train 208), and two rows of far different sizes, the second's
+    # VJP not hiding the first's.
+    ([2.0**64, 0, 0], [0, 0, 0], 0.5 + 2.0**-24, [1, 0, 0], [0, 0, 0], 0, 1),
+    ([1, 1, 0], [0, 0, 0], 1, [1, 0, 0], [0, 0, 0], 0, 1),
+    ([2.0**100, 0, 0], [0, 0, 0], 3, [1, 0, 0], [0, 0, 0], 0, 1),
 )
 """Rows every grid holds, beside its drawn ones."""
 
@@ -1160,8 +1186,9 @@ def _kl_grid():
     a signed significand in [1, 2) at a level of `KL_LEVELS`, or zero, drawn apart per coordinate, every
     level met in every operand; in a third of the rows the mean's largest coordinate is the
     reference's (a cancelling maximum, its survivors at their own levels), in another third the
-    tangents' largest cancel likewise; and `FIXED_ROWS`. Every input is a normal float32 or zero:
-    XLA:CPU reads a subnormal input as zero, which no float64 truth of the input's own value does."""
+    tangents' largest cancel likewise; and `FIXED_ROWS` and `REVIEWED`'s rows. Every input is a normal
+    float32 or zero: XLA:CPU reads a subnormal input as zero, which no float64 truth of the input's own
+    value does."""
     rng = np.random.default_rng(1778)
     rows = 3 * 4096
 
@@ -1184,7 +1211,13 @@ def _kl_grid():
             operand[2 * rows // 3 + index, index % 3] = np.ldexp(np.float32(1.75), level)
         for operand in (variance, variance_tangent, cotangent):
             operand[2 * rows // 3 + index] = np.ldexp(np.float32(1.75), level)
-    fixed = [np.asarray(column, np.float32) for column in zip(*FIXED_ROWS, strict=True)]
+    def padded(case):
+        """A reviewed input's one row in three coordinates."""
+        return tuple(np.pad(np.asarray(value, np.float64)[0], (0, 3 - len(value[0])))
+                     if isinstance(value[0], list) else value[0] for value in case)
+
+    rows_given = FIXED_ROWS + tuple(padded(case) for case in REVIEWED.values())
+    fixed = [np.asarray(column, np.float32) for column in zip(*rows_given, strict=True)]
     drawn_inputs = (mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent)
     return tuple(np.concatenate([draws, row]) for draws, row in zip(drawn_inputs, fixed, strict=True))
 
