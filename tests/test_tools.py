@@ -1718,3 +1718,29 @@ def test_every_remote_code_release_carries_the_fields_its_loader_reads(monkeypat
         for name, (repo, revision, files, auto) in load(tool).RELEASES.items():
             assert (repo.count("/"), len(revision), auto.startswith("Auto")) == (1, 40, True), name
             assert files and all(file.endswith(".py") for file in files), name
+
+
+def test_a_float64_twin_rotates_by_its_whole_complex_table():
+    """A float64 twin keeps a complex table its constructor computes complex (Llama 4's vision
+    `freqs_ci`): it rotates by the table's cosines and sines both, so its output is the float64
+    product of its input and the table, which a table cast to a real dtype is not."""
+    import torch
+
+    from tools.torch_precision import float64, float64_twin
+
+    class Rotation(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            angles = torch.arange(1, 5).float()
+            self.table = torch.nn.Buffer(torch.polar(torch.ones_like(angles), angles), persistent=False)
+            self.gain = torch.nn.Parameter(torch.ones(4))
+
+        def forward(self, pairs):
+            return torch.view_as_real(torch.view_as_complex(pairs.float()) * self.table * self.gain)
+
+    pairs = torch.from_numpy(np.random.default_rng(0).standard_normal((4, 2)))
+    with float64():
+        rotated = float64_twin(Rotation(), Rotation)(pairs)
+    angles = torch.arange(1, 5, dtype=torch.float64)
+    table = torch.polar(torch.ones_like(angles), angles)
+    assert torch.equal(rotated, torch.view_as_real(torch.view_as_complex(pairs) * table))
