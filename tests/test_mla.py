@@ -552,8 +552,9 @@ def test_a_deepseek_checkpoint_scaled_by_llama3_loads_and_rotates_its_latents_by
                               "high_freq_factor": 4.0, "original_max_position_embeddings": 4}
     (tmp_path / "config.json").write_text(json.dumps(config))
     loaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
-    reference = AutoModelForCausalLM.from_pretrained(tmp_path, dtype=torch.float32,
-                                                     attn_implementation="eager").eval()
+    # The eager experts, which run in float64 too: the grouped kernel takes float32 or narrower.
+    reference = AutoModelForCausalLM.from_pretrained(
+        tmp_path, dtype=torch.float32, attn_implementation="eager", experts_implementation="eager").eval()
     ids = np.load(source / "input_ids.npy")
     given = torch.from_numpy(ids.astype(np.int64))
     with torch.no_grad():
