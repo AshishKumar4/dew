@@ -1,6 +1,6 @@
 """dew.telemetry.trace: a device's traced window, its busy time the union of its kernels."""
 
-from dew.telemetry.trace import window_split
+from dew.telemetry.trace import Kernel, communication_totals, window_split
 
 
 def test_a_traced_window_splits_into_compute_exposed_collectives_and_idle():
@@ -35,3 +35,11 @@ def test_a_tpus_collective_ops_are_its_communication():
     split = window_split([("fusion.1", 0, 10), ("all-reduce-start.2", 5, 12), ("all-reduce-done.2", 12, 15),
                           ("convolution.3", 15, 20)])
     assert (split["compute"], split["communication"], split["exposed_communication"]) == (15, 10, 5)
+
+
+def test_a_tpus_collective_op_has_its_own_and_its_exposed_time():
+    """Each HLO collective's own time and the part no compute ran beside count a TPU's op named after it,
+    which carries no hlo_op stat, as they count a GPU's NCCL kernel by that stat."""
+    device = [Kernel("fusion.1", 0, 10, 10, ()), Kernel("all-reduce.2", 5, 15, 10, ())]
+    totals = communication_totals([device])
+    assert (totals["all_reduce"], totals["all_reduce_exposed"]) == (10, 5)

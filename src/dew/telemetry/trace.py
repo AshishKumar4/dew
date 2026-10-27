@@ -185,8 +185,12 @@ def window_totals[Time: (int, float)](
 
 
 def hlo_collective(event: Kernel) -> str | None:
-    """The HLO collective (`COLLECTIVES`) an NCCL kernel ran for, from XLA's hlo_op stat, which tells
-    apart the all-to-all and collective-permute that NCCL runs as the same SendRecv kernel."""
+    """The HLO collective (`COLLECTIVES`) an event ran for: the op it is named after, as a TPU's ops are
+    (`all-reduce.1`), or, for an NCCL kernel, XLA's hlo_op stat, which tells apart the all-to-all and
+    collective-permute that NCCL runs as the same SendRecv kernel."""
+    named = collective(event.name.split(".", 1)[0])
+    if named is not None:
+        return named
     for name, value in event.stats:
         if name == "hlo_op" and isinstance(value, str):
             spelled = value.replace("_", "-")
