@@ -155,6 +155,9 @@ class Encoding:
             row["blocks"] = np.asarray(encoded.blocks, np.int32)
         if self.context_length is not None:
             row["context"] = np.asarray(encoded.context or (), np.int32)
+            if self.grouped:
+                # A row of its own is a unit of one row, its context that row's (`_unit_row`).
+                row["context_row"] = np.zeros(len(row["context"]), np.int32)
         return row
 
 
