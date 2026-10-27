@@ -1013,7 +1013,7 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
     return scaled
 
 
-def _integer_convolution_on_cuda[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array]:
+def _integer_convolution_on_cuda(op: Callable[..., jax.Array]) -> Callable[..., jax.Array]:
     """Qwix's quantized convolution `op` with an integer product computed in float32 on CUDA.
 
     Qwix 0.1.8 convolves two integer operands into an int32 accumulator
@@ -1030,7 +1030,7 @@ def _integer_convolution_on_cuda[**P](op: Callable[P, jax.Array]) -> Callable[P,
     def integer(arg) -> bool:
         return isinstance(arg, qwix.QArray) and jnp.issubdtype(arg.qvalue.dtype, jnp.integer)
 
-    def convolved(lhs, rhs, *args: P.args, **kwargs: P.kwargs) -> jax.Array:
+    def convolved(lhs, rhs, *args, **kwargs) -> jax.Array:
         if not (integer(lhs) and integer(rhs)):
             return op(lhs, rhs, *args, **kwargs)
 
