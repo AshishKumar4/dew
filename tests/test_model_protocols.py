@@ -561,9 +561,9 @@ def _call(model, variables, inputs, **apply) -> jax.Array:
     return model.apply(variables, *inputs, **apply)
 
 
-def _stepped(model, variables, inputs, **apply) -> tuple[jax.Array, dict]:
-    """A step's forward and its gradient in every floating parameter."""
-    output = _call(model, variables, inputs, **apply)
+def _stepped(model, variables, inputs, **apply) -> dict:
+    """A step's gradient in every floating parameter, along a cotangent drawn at its output's shape."""
+    output = jax.eval_shape(lambda: _call(model, variables, inputs, **apply))
     cotangent = jax.random.normal(jax.random.key(1), output.shape, jnp.float32).astype(output.dtype)
     flat = flatten_dict(variables["params"])
     floats = {path: leaf for path, leaf in flat.items() if jnp.issubdtype(leaf.dtype, jnp.inexact)}
@@ -573,7 +573,7 @@ def _stepped(model, variables, inputs, **apply) -> tuple[jax.Array, dict]:
         params = unflatten_dict({**held, **trained})
         return jnp.sum(_call(model, {**variables, "params": params}, inputs, **apply) * cotangent)
 
-    return output, jax.grad(loss)(floats)
+    return jax.grad(loss)(floats)
 
 
 def _rungs(model) -> list:
@@ -598,6 +598,7 @@ GRADIENT_COVERING: dict[str, tuple[str, int]] = {
     "hybrid stacks": ("qwen35-tiny", 8),
     "vision towers": ("gemma4-unified-native-tiny", 8),
     "hyper-connections": ("deepseek-v4-tiny", 32),
+    "attention residuals": ("kimi-k3-tiny", 8),
     "looped (Dory)": ("dory-tiny", 64),
     "diffusion language models": ("dream-tiny", 8),
     "per-layer inputs and AltUp (Gemma 3n)": ("causal_transformer+gemma3n", 64),
@@ -615,8 +616,9 @@ armada. Each member stands for the others of its class:
   nemotron-h-moe-latent, causal_transformer+gemma4_moe, +glm4_moe, +gpt_oss and +llama4;
 - linear and recurrent mixers: nemotron-h, kimi-linear;
 - hybrid stacks: qwen35-native, qwen35-blocks, causal_transformer+qwen35, glm5-next;
-- vision towers: gemma4-tiny-mm, gemma3n-vision, llama4-native, kimi-k3;
+- vision towers: gemma4-tiny-mm, gemma3n-vision, llama4-native;
 - hyper-connections: deepseek-v41;
+- attention residuals (depth attention over earlier layers' outputs): none other;
 - looped (Dory): none other;
 - diffusion language models: llada2, diffusion-gemma-sft, diffusion-gemma-workflow;
 - per-layer inputs and AltUp: gemma3n-vision;
@@ -679,19 +681,12 @@ def _climbs_and_restores(name: str, model, variables, inputs, **apply) -> None:
     written = model.apply(variables, *inputs, mutable=True, **apply)[1].keys()
     twin, wide_variables = float64_twin(model), widened(variables)
 
-    # Applied as the step applies them: some models read their ids on the host.
-    def forward_truth(*inputs):
-        with jax.enable_x64(new_val=True):
-            wide = _call(twin, wide_variables, widened(inputs), **apply)
-            return np.asarray(wide, np.float64)
+    # Plain functions of the inputs, which the gate compiles, the truths under x64 over inputs it widens.
+    def forward(rung, variables=variables):
+        return lambda *inputs: _call(rung, variables, inputs, **apply)
 
-    def stepped(rung):
-        return lambda *inputs: _stepped(rung, variables, inputs, **apply)[1]
-
-    def gradient_truth(*inputs):
-        with jax.enable_x64(new_val=True):
-            return jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
-                                _stepped(twin, wide_variables, widened(inputs), **apply)[1])
+    def stepped(rung, variables=variables):
+        return lambda *inputs: _stepped(rung, variables, inputs, **apply)
 
     top = rungs[-1]
     record = top.recompute_record()
@@ -699,12 +694,11 @@ def _climbs_and_restores(name: str, model, variables, inputs, **apply) -> None:
     def draw(seed):
         return _redrawn(inputs, seed)
 
-    assert_as_exact(lambda *inputs: _call(top, variables, inputs, **apply),
-                    lambda *inputs: _call(model, variables, inputs, **apply), draw, f"forward at {record}",
-                    seeds=RUNG_SEEDS, truth_fn=forward_truth)
+    assert_as_exact(forward(top), forward(model), draw, f"forward at {record}", seeds=RUNG_SEEDS,
+                    truth_fn=forward(twin, wide_variables))
     if name in GRADIENT_SEEDS:
         assert_as_exact(stepped(top), stepped(model), draw, f"gradient at {record}",
-                        seeds=GRADIENT_SEEDS[name], truth_fn=gradient_truth)
+                        seeds=GRADIENT_SEEDS[name], truth_fn=stepped(twin, wide_variables))
     assert top.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written
 
 

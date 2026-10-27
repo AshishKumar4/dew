@@ -29,8 +29,8 @@ from jax.custom_derivatives import SymbolicZero
 from dew.nn.precision import at_least_fp32
 
 __all__ = ["cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative", "label_entry",
-           "log_probs", "probabilities", "rescaled", "segment_log_partition", "soft_cross_entropy",
-           "target_loss"]
+           "log_probs", "partition", "probabilities", "rescaled", "segment_log_partition",
+           "soft_cross_entropy", "target_loss"]
 
 
 def widened(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -83,13 +83,24 @@ def cross_entropy(logits: jax.Array, labels: jax.Array, where: jax.Array | None 
     return _label_loss(widened(logits, where), labels)
 
 
+def partition(logits: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Each row's maximum over the last axis, the sum of its exponentials scaled to it, and those
+    exponentials: the terms every whole-row label loss takes its log partition from (`target_loss`;
+    `cross_entropy`, `dew.objectives.lm.chunked`'s whole head).
+
+    The maximum is finite, as `jax.nn.logsumexp` takes one: an infinite maximum shifts by 0, so a row
+    holding +inf scores +inf, and an all -inf row's partition is -inf, never inf - inf.
+    """
+    largest = jnp.max(logits, axis=-1)
+    peak = jnp.where(jnp.isfinite(largest), largest, 0)
+    shifted = jnp.exp(logits - peak[..., None])
+    return peak, jnp.sum(shifted, axis=-1), shifted
+
+
 @jax.custom_jvp
 def _label_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
-    # An infinite maximum, a row excluded whole, shifts by 0, as `jax.nn.logsumexp` shifts.
-    peak = jnp.max(logits, axis=-1, keepdims=True)
-    peak = jnp.where(jnp.isfinite(peak), peak, 0.0)
-    label = jnp.take_along_axis(logits, labels[..., None], axis=-1)[..., 0]
-    return target_loss(peak[..., 0], jnp.sum(jnp.exp(logits - peak), axis=-1), label)
+    peak, mass, _ = partition(logits)
+    return target_loss(peak, mass, jnp.take_along_axis(logits, labels[..., None], axis=-1)[..., 0])
 
 
 @_label_loss.defjvp
