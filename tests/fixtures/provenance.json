@@ -2969,7 +2969,7 @@
     },
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     },
     {
@@ -3605,7 +3605,7 @@
      "runs": "torch"
     }
    ],
-   "note": "OneCycleLR, ExponentialLR and CosineAnnealingLR values over their steps, and a grouped Adam run with coupled weight decay, a beta1 cycle and a clamp, in float32 on CPU."
+   "note": "OneCycleLR, ExponentialLR and CosineAnnealingLR values over their steps, and a grouped Adam run with coupled weight decay, a beta1 cycle and a clamp, in float64 on float32 initial parameters and gradients, on CPU."
   },
   "tread": {
    "tool": "tools/tread_reference.py",

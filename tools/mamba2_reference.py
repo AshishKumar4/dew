@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import transformers
-from hf_reference import FIXTURES, write_tiny
+from hf_reference import FIXTURES, transformers_record, write_tiny
 from torch_precision import float64
 from transformers.models.mamba2.configuration_mamba2 import Mamba2Config
 from transformers.models.mamba2.modeling_mamba2 import (
@@ -44,7 +44,6 @@ from transformers.models.mamba2.modeling_mamba2 import (
 )
 
 SSD = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mamba2"
-TRANSFORMERS_REVISION = "93c8b7b485963a10800c91f55304db6be211c2bd"
 SEED = 2024
 # The scan fixture's geometry: batch, tokens, heads, head dim, groups, state, chunk.
 B, S, H, P, G, N, CHUNK = 2, 70, 4, 6, 2, 5, 32
@@ -158,7 +157,7 @@ def write_mamba2_tiny(name: str = "mamba2-tiny") -> None:
     write_tiny(name, model, seed=SEED)
     directory = FIXTURES / name
     (directory / "source.json").write_text(json.dumps({
-        "transformers": {"version": transformers.__version__, "revision": TRANSFORMERS_REVISION},
+        "transformers": transformers_record(),
         "seed": SEED,
     }, indent=1) + "\n")
     (directory / "model.safetensors").chmod(0o644)
@@ -225,7 +224,7 @@ def write_seeded() -> None:
         stored.update(record_case(site, draw, evaluate, lambda inputs, site=site: mamba2_run(site, inputs),
                                   store_inputs=False, summary=True))
     stored["provenance"] = provenance(
-        f"transformers {transformers.__version__}", TRANSFORMERS_REVISION, "cpu",
+        f"transformers {transformers.__version__}", transformers_record()["revision"], "cpu",
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded",
         truth="transformers reference in torch float64 through tools/torch_precision.py")
     destination = SSD / "ssd_seeded.npz"

@@ -190,7 +190,10 @@ def _record_starts(file: BinaryIO, size: int, parts: int, kind: Format) -> list[
     `k` at the first record at or after the even cut `size * k / parts`, or after the record the
     part before it starts at where that is further on. A record longer than the cuts apart (a
     10,000-character first line, say) moves the cuts it holds on to the records after it rather
-    than onto one another; a file of fewer records than parts has as many parts as records."""
+    than onto one another. Where that leaves the last cuts no record after them (a long last
+    record), the parts before them split at the records they hold after their first, one from
+    each part in turn. So a file has as many parts as it holds records, up to `parts`, and a file
+    of none (empty, or JSON lines all blank) has none."""
     starts: list[int] = []
     for part in range(parts):
         cut = size * part // parts
@@ -198,7 +201,18 @@ def _record_starts(file: BinaryIO, size: int, parts: int, kind: Format) -> list[
         if at >= size:
             break
         starts.append(at)
-    return starts
+    walks = list(itertools.pairwise([*starts, size]))
+    while len(starts) < parts and walks:
+        walked = []
+        for start, stop in walks:
+            if len(starts) == parts:
+                break
+            at = _record_start(file, start + 1, kind)
+            if at < stop:
+                starts.append(at)
+                walked.append((at, stop))
+        walks = walked
+    return sorted(starts)
 
 
 def _record_start(file: BinaryIO, offset: int, kind: Format) -> int:
@@ -716,8 +730,8 @@ class Files(Dataset):
         file: each file a share of the parts by its bytes, each part the records that start from
         its cut on (`_record_starts`), so each part holds a record and a reader or worker given
         one reads. A file of fewer records than its share keeps a part for each and hands the rest
-        to the files that hold more, by their bytes; a store of fewer records than parts is
-        refused."""
+        to the files that hold more, by their bytes, and a file of none (blank JSON lines) takes no
+        part; a store of fewer records than parts is refused."""
         sizes = [integer(self._header(url)["size"], "file bytes") for url in self.paths]
         parts = {number: 1 for number, size in enumerate(sizes) if size}
         starts: dict[int, list[int]] = {}
@@ -747,7 +761,7 @@ class Files(Dataset):
         for number, held in sorted(starts.items()):
             url = self.paths[number]
             shards.extend(Shard(self._shard_id(number, url, start), url, start, stop)
-                          for start, stop in zip(held, [*held[1:], sizes[number]], strict=True))
+                          for start, stop in itertools.pairwise([*held, sizes[number]]))
         if len(shards) < count:
             raise ValueError(f"{self.describe()} holds {len(shards)} records for {count} readers × workers; "
                              "read it with fewer")
