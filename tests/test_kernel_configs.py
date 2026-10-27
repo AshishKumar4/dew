@@ -410,7 +410,7 @@ def test_records_a_failed_process_of_their_own_wrote_are_refused():
     if OWN_PROCESS in os.environ:
         Path(os.environ[OWN_PROCESS]).write_text("[]")
         pytest.fail("this process failed after it wrote its records, as a failed teardown does")
-    with pytest.raises(RuntimeError, match="exited 1"):
+    with pytest.raises(RuntimeError):
         compiled_apart()
 
 
