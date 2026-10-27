@@ -210,7 +210,8 @@ def resketched(stored: Mapping[str, np.ndarray], site: str, *, inputs_of, truth_
     SKETCH_VERSION is returned as it is."""
     if int(stored.get(f"{site}.sketch_version", 1)) == SKETCH_VERSION:
         return dict(stored)
-    draw, _, truth = indexed_recording(stored, site, int(stored[f"{site}.seeds"]), inputs_of=inputs_of,
+    # A plain dict, so a run sketching recordings again (`reference_error.RESKETCH`) reads this one as it is.
+    draw, _, truth = indexed_recording(dict(stored), site, int(stored[f"{site}.seeds"]), inputs_of=inputs_of,
                                        truth_fn=truth_fn)
     result = dict(stored)
     pilots = len(stored.get(f"{site}.pilot.input_digest", ()))

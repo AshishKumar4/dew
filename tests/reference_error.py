@@ -67,6 +67,7 @@ import dataclasses
 import functools
 import hashlib
 import math
+import os
 from collections.abc import Sequence
 
 import jax
@@ -1633,14 +1634,46 @@ def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWES
                          f"{len(errors)} seeds recorded, {len(errors) // 4} a half of each block")
 
 
-def recording(path) -> dict[str, np.ndarray]:
+class Recording(dict):
+    """A recording read whole (`recording`), which keeps the fixture's path it was read from."""
+    path = None
+
+
+def recording(path) -> Recording:
     """A recording of a reference over seeds (`indexed_recording`'s `stored`), read whole: where a pin
     holds it, from the fetched store's local copy, checked against the pin; else from the file at
     `path`, as git holds one of at most 1 MiB (tools/fetched_fixtures.py)."""
     from tool_support import load
 
     with np.load(load("fetched_fixtures").local(path), allow_pickle=False) as stored:
-        return dict(stored)
+        found = Recording(stored)
+    found.path = path
+    return found
+
+
+RESKETCH = "DEW_RESKETCH"
+"""Set, a test reading a summarized recording of an older sketch's version through `indexed_recording`
+sketches it again first (`recorded_references.resketched`, each seed's truth held to its old sketch) and
+saves it in its fixture's place (tools/fetched_fixtures.py `save`: a committed file rewritten, a fetched one
+stored and pinned anew for `upload`), so one run of the suite's recorded sites moves their recordings to
+SKETCH_VERSION through the sites' own draws and float64 paths."""
+
+
+def _sketched_again(stored: Recording, site: str, inputs_of, truth_fn) -> Recording:
+    """`stored` sketched again at SKETCH_VERSION and saved over its fixture, where RESKETCH asks (`RESKETCH`),
+    the fixture's other sites' entries as they are on disk."""
+    from tool_support import load
+
+    fixtures = load("fetched_fixtures")
+    again = load("recorded_references").resketched(stored, site, inputs_of=inputs_of, truth_fn=truth_fn)
+    with np.load(fixtures.local(stored.path), allow_pickle=False) as on_disk:
+        saved = dict(on_disk)
+    saved.update({key: value for key, value in again.items() if key.startswith(f"{site}.")})
+    pin = fixtures.pins().get(fixtures.fixture(stored.path), {})
+    fixtures.save(stored.path, saved, reference=pin.get("reference", ""), license=pin.get("license", ""))
+    found = Recording(again)
+    found.path = stored.path
+    return found
 
 
 def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: int = 0,
@@ -1773,6 +1806,12 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     judged in groups, each its own test, reads each group so, its Dew arm and truth giving that group's
     leaves. Check 1 judges every leaf on its own tails, so a group draws its second stage on its own
     leaves' account alone, which looks at a passing leaf no more often than the whole site would."""
+    if (os.environ.get(RESKETCH) and getattr(stored, "path", None) is not None
+            and any(name.startswith(f"{site}.sketch.") for name in stored)
+            and int(stored.get(f"{site}.sketch_version", 1)) < SKETCH_VERSION):
+        if leaves is not None:
+            raise ValueError(f"{site}: a recording is sketched again read whole, not for some of its leaves")
+        stored = _sketched_again(stored, site, inputs_of, truth_fn)
     if leaves is not None:
         stored = _of_leaves(stored, site, leaves)
     if any(name.startswith(f"{site}.sketch.") for name in stored):
