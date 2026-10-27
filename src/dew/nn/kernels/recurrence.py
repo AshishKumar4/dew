@@ -38,7 +38,7 @@ from dew.nn.precision import (
 
 from ..sharding import explicit_spec
 from . import chunked_launch, norm_swiglu, short_conv, tuning
-from .generation import INHERENT, Refusal, triton_runs
+from .generation import INHERENT, Refusal, linear_tangent, triton_runs
 
 
 @dataclasses.dataclass(frozen=True)
@@ -310,22 +310,18 @@ def skipped(hooks: Hooks, out, value, given: dict, work):
     return out + _skip(given['skip'].astype(work), value.astype(work)) if hooks.skip else out
 
 
-@jax.custom_vjp
-def _skip(skip, value):
-    """`D v` of the skip `D` `[Hv]` and values `[..., Hv, Dv]`, whose gradient in `D` sums every token's and
-    value's product as a product (at `float32_products`' precision) rather than one reduction over them
-    all: XLA:CPU's reduction, without YNNPACK's fusions, summed a chunked call's `B S Dv` products in turn,
-    2.1 times the token-by-token recurrence's distance from float64 (Mamba2's rated decay,
-    test_recurrence_stability after the gate compiled both arms without them)."""
+def _skip_product(skip, value):
+    """`D v`: the skip `D` `[Hv]` against values `[..., Hv, Dv]`."""
     return skip[:, None] * value
 
 
 def _skip_forward(skip, value):
-    return _skip(skip, value), (skip, value)
+    return _skip_product(skip, value), (skip, value)
 
 
-def _skip_backward(residual, grad):
-    skip, value = residual
+def _skip_backward(saved, operands, grad):
+    del operands
+    skip, value = saved
     # Rows an Explicit axis splits contract into `D`'s own placement, which JAX cannot infer from a
     # contraction over a split dimension (a data-parallel layout's hybrid, test_parallelism_matrix).
     placed = explicit_spec(value)
@@ -337,7 +333,13 @@ def _skip_backward(residual, grad):
     return summed.astype(skip.dtype), (grad * skip[:, None]).astype(value.dtype)
 
 
-_skip.defvjp(_skip_forward, _skip_backward)
+_skip = linear_tangent(_skip_forward, _skip_backward, _skip_product)
+"""`D v` (`_skip_product`) differentiated at every order (`generation.linear_tangent`): forward mode the
+product's own tangent, reverse mode its gradient in `D` summing every token's and value's product as a
+product (at `float32_products`' precision) rather than one reduction over them all: XLA:CPU's reduction,
+without YNNPACK's fusions, summed a chunked call's `B S Dv` products in turn, 2.1 times the token-by-token
+recurrence's distance from float64 (Mamba2's rated decay, test_recurrence_stability after the gate compiled
+both arms without them). A custom VJP alone refused `jax.jvp` through a decode step's reference."""
 
 
 def normed(hooks: Hooks, out, given: dict, work):

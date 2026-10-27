@@ -257,3 +257,26 @@ def test_a_write_gate_without_the_delta_rule_scales_what_the_token_writes():
                         functools.partial(one_tap_draw, dtype), f'one-tap {jnp.dtype(dtype).name}',
                         seeds=ONE_TAP_SEEDS[dtype],
                         truth_fn=jax.jit(functools.partial(recurrence.step_reference, one_tap)))
+
+
+def test_the_skip_takes_forward_and_reverse_mode():
+    """The skip `D v` (`recurrence.skipped`) under `jax.jvp` and `jax.linearize` takes the product's own
+    tangent, bit for bit, and under `jax.grad` its reverse rule's gradient in `D`, the product's summed
+    over every token and value (a decode step's reference reaches it: a custom VJP alone refused
+    `jax.jvp`)."""
+    keys = jax.random.split(jax.random.key(5), 4)
+    skip, value = jax.random.normal(keys[0], (3,)), jax.random.normal(keys[1], (2, 7, 3, 5))
+    directions = jax.random.normal(keys[2], (3,)), jax.random.normal(keys[3], (2, 7, 3, 5))
+    hooks = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+
+    def skipped(skip, value):
+        return recurrence.skipped(hooks, jnp.zeros_like(value), value, {'skip': skip}, jnp.float32)
+
+    found = jax.jit(lambda *a: jax.jvp(skipped, a, directions))(skip, value)
+    want = jax.jit(lambda *a: jax.jvp(lambda d, v: d[:, None] * v, a, directions))(skip, value)
+    jax.tree.map(np.testing.assert_array_equal, found, want)
+    linearized = jax.jit(lambda *a: jax.linearize(skipped, *a)[1](*directions))(skip, value)
+    np.testing.assert_array_equal(linearized, want[1])
+    # Its reverse rule's gradient held to float64 by test_recurrence_stability's rated sites.
+    gradient = jax.jit(jax.grad(lambda d: jnp.sum(skipped(d, value) * value)))(skip)
+    assert gradient.shape == skip.shape and bool(jnp.all(jnp.isfinite(gradient)))
