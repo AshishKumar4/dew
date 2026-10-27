@@ -239,3 +239,60 @@ def test_a_reference_exactly_zero_on_a_residue_row_does_not_measure_it():
     close = np.where(np.arange(len(truth))[:, None] == 1, [1.6e-40, -1.6e-40, 1.5e-40], reference)
     _, _, worst, _, (rows, _, _), _ = _paired("leaf", mine, leaf_summary(close, truth))
     assert 1 not in rows.tolist() and worst > 50
+
+
+def test_a_row_the_truth_does_not_resolve_measures_nothing():
+    """Where the truth's own spread on a row of float64 zero (`_truth_spread`) is past its size over
+    ROW_FACTOR², the row is the zero rows' (ledger 1856): Dew's noise there, 1e8 of a row the
+    reference's noise happened to land under, is held to the reference's own noise on it. A row the
+    truth resolves stays measured: Dew 2^-60 off a row of 2^-100 the reference holds still fails, and so
+    does one 1.6 times the reference's error on a resolved row."""
+    from reference_error import ROW_FACTOR, _paired, leaf_summary, pooled_zero_rows
+
+    truth = np.asarray([[1 / 3, -2 / 3, 0.1], [4.3e-25, -4.3e-25, 4.3e-25]])
+    reference = np.asarray([truth[0], [1.6e-25, -1.6e-25, 1.6e-25]], np.float32)
+    dew = np.asarray([truth[0], [6e-17, -6e-17, 6e-17]], np.float32)
+    unresolved = np.asarray([[0.0] * 3, [4e-25] * 3])
+    _, _, worst, their_worst, evidence, _ = _paired("leaf", leaf_summary(dew, truth, unresolved),
+                                                    leaf_summary(reference, truth, unresolved))
+    assert evidence[0].tolist() == [1] and worst - their_worst <= np.log(ROW_FACTOR)
+    # Resolved, the same row is measured, and the noise reads 1e8 of it.
+    resolved = np.zeros_like(truth)
+    _, _, worst, their_worst, evidence, _ = _paired("leaf", leaf_summary(dew, truth, resolved),
+                                                    leaf_summary(reference, truth, resolved))
+    assert evidence[0].tolist() == [] and worst - their_worst > np.log(ROW_FACTOR)
+
+    exact = np.asarray([[1.0], [2.0 ** -100]])
+    tiny_dew, tiny_reference = (np.asarray([[1 + 2.0 ** -23], [row]]) for row in (2.0 ** -60, 0.0))
+    _, _, _, _, evidence, _ = _paired("leaf", leaf_summary(tiny_dew, exact, np.zeros_like(exact)),
+                                      leaf_summary(tiny_reference, exact, np.zeros_like(exact)))
+    assert [row for row, *_ in pooled_zero_rows([evidence] * 8)] == [1]
+
+
+def test_check_one_resolves_rows_on_the_truths_own_spread_where_asked():
+    """`assert_as_exact(..., resolve_rows=True)` evaluates the truth again on inputs moved one float64
+    unit and judges as before where the truth resolves every row: equal arms pass, a Dew 1.6 times the
+    reference's error everywhere fails, and so does one 2^-10 off."""
+    import jax
+    import jax.numpy as jnp
+    from reference_error import GateFailure, as_given, assert_as_exact
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return tuple(rng.standard_normal(shape).astype(np.float32) for shape in ((16, 32), (32, 8)))
+
+    def product(x, w):
+        return {"y": jnp.dot(x, w, precision="highest")}
+
+    @as_given
+    def farther(x, w):
+        # Dew's error from float64 1.6 times the reference's on every element, every row resolved.
+        truth = np.asarray(x, np.float64) @ np.asarray(w, np.float64)
+        return {"y": truth + 1.6 * (np.asarray(jax.jit(product)(x, w)["y"], np.float64) - truth)}
+
+    assert_as_exact(jax.jit(product), jax.jit(product), draw, "resolved", seeds=8, resolve_rows=True)
+    with pytest.raises(GateFailure):
+        assert_as_exact(jax.jit(lambda x, w: {"y": product(x, w)["y"] * (1 + 2.0 ** -10)}), jax.jit(product),
+                        draw, "resolved", seeds=8, resolve_rows=True)
+    with pytest.raises(GateFailure):
+        assert_as_exact(farther, jax.jit(product), draw, "resolved", seeds=8, resolve_rows=True)

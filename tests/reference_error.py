@@ -924,6 +924,7 @@ class RecordedLeaf:
     dtype: str
     zero_sizes: np.ndarray | None = None
     worst_log: float | None = None
+    zero_spreads: np.ndarray | None = None
 
     @property
     def log_worst(self) -> float:
@@ -932,9 +933,11 @@ class RecordedLeaf:
         return self.worst_log if self.worst_log is not None else float(_log_over(self.worst, 1.0))
 
 
-def leaf_summary(reference, truth) -> RecordedLeaf:
+def leaf_summary(reference, truth, spread=None) -> RecordedLeaf:
     """`RecordedLeaf` of a leaf against its float64 truth: check 1's evidence of the reference's leaf, or
-    of Dew's (`_drawn` reads both so, a recorded reference's as recorded). An empty leaf is exact."""
+    of Dew's (`_drawn` reads both so, a recorded reference's as recorded). An empty leaf is exact. With
+    the truth's `spread` (`_truth_spread`), each row of float64 zero keeps its RMS, how far the truth
+    itself moves there (`_paired`)."""
     dtype = str(jnp.dtype(getattr(reference, "dtype", np.asarray(reference).dtype)))
     reference, truth = np.asarray(reference, np.float64), np.asarray(truth, np.float64)
     if not reference.size:
@@ -951,11 +954,43 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
                         float(np.max(_over(rows[sized], sizes[sized]))) if sized.any() else 0.0,
                         np.flatnonzero(~sized), rows[~sized],
                         finite=bool(np.isfinite(reference).all() and np.isfinite(truth).all()), dtype=dtype,
-                        zero_sizes=own[~sized], worst_log=logged)
+                        zero_sizes=own[~sized], worst_log=logged,
+                        zero_spreads=None if spread is None else _scaled_rms(
+                            np.asarray(spread, np.float64).reshape(-1, truth.shape[-1]))[~sized])
+
+
+SPREAD_DRAWS = 2
+"""The perturbed evaluations of a truth `_truth_spread` takes."""
+
+
+def _ulp_moved(inputs, seed: int):
+    """`inputs` with each float moved one float64 unit, up or down by `seed`'s draw: a float64 rounding
+    of every input."""
+    rng = np.random.default_rng([0x1856, seed])
+
+    def moved(leaf):
+        leaf = np.asarray(leaf)
+        if not np.issubdtype(leaf.dtype, np.floating):
+            return leaf
+        return np.nextafter(leaf, np.where(rng.random(leaf.shape) < 0.5, -np.inf, np.inf)).astype(leaf.dtype)
+    return jax.tree.map(moved, inputs)
+
+
+def _truth_spread(truth_fn, wide, truth):
+    """How far `truth_fn` moves from `truth` on `wide`, its float64 inputs, each moved by one float64
+    unit (`_ulp_moved`), element by element the largest over SPREAD_DRAWS draws: the truth's own
+    uncertainty where its inputs' rounding reaches it, conditioning included."""
+    spread = None
+    for seed in range(SPREAD_DRAWS):
+        moved = jax.tree.map(lambda one, other: np.abs(np.asarray(one, np.float64)
+                                                       - np.asarray(other, np.float64)),
+                             truth_fn(*_ulp_moved(wide, seed)), truth)
+        spread = moved if spread is None else jax.tree.map(np.maximum, spread, moved)
+    return spread
 
 
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
-           library_fn=None, library_leaves: Sequence[str] = ()) -> _Draws:
+           library_fn=None, library_leaves: Sequence[str] = (), resolve_rows: bool = False) -> _Draws:
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
@@ -974,16 +1009,18 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
 
     def truth_of(inputs):
         with jax.enable_x64(new_val=True):
-            return (truth_fn or reference_fn)(*widened(inputs))
+            wide = widened(inputs)
+            truth = (truth_fn or reference_fn)(*wide)
+            return truth, (_truth_spread(truth_fn or reference_fn, wide, truth) if resolve_rows else None)
 
     for at, seed in enumerate(seeds):
         inputs = draw(seed)
-        truth = truth_of(inputs)
+        truth, spread = truth_of(inputs)
         if reference_seeds is None:
-            their_inputs, their_truth = inputs, truth
+            their_inputs, their_truth, their_spread = inputs, truth, spread
         else:
             their_inputs = draw(reference_seeds[at])
-            their_truth = truth_of(their_inputs)
+            their_truth, their_spread = truth_of(their_inputs)
         if orders is None:
             ordered = [(inputs, their_inputs)]
         else:
@@ -1000,9 +1037,10 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             for at_arm, arm in enumerate(arms):
                 # The reference against itself on the same inputs is one evaluation (`seeds_for`'s
                 # sizing); the library arm runs on Dew's own inputs.
-                here, true_here = (theirs_at, their_truth) if arm is reference_fn else (mine_at, truth)
+                here, true_here, spread_here = ((theirs_at, their_truth, their_spread) if arm is reference_fn
+                                                else (mine_at, truth, spread))
                 other = dew if dew_fn is arm and here is mine_at else arm(*here)
-                evidence = _evidence(dew, other, truth, true_here)
+                evidence = _evidence(dew, other, truth, true_here, spread, spread_here)
                 rows[at_arm] = evidence if rows[at_arm] is None else [
                     (first[0], first[1], float(np.fmax(first[2], later[2])),
                      float(np.fmax(first[3], later[3])), first[4], first[5] and later[5])
@@ -1023,8 +1061,9 @@ def _leaf_paths(tree) -> list[str]:
     return [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(tree)]
 
 
-def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
-    """One draw's `_paired` evidence of every leaf of `dew` and `reference` against their truths. The
+def _evidence(dew, reference, truth, their_truth, spread=None, their_spread=None) -> list[tuple]:
+    """One draw's `_paired` evidence of every leaf of `dew` and `reference` against their truths, each
+    truth's spread (`_truth_spread`) where given. The
     trees are held alike first: Dew's, the reference's (a recorded one's leaves `RecordedLeaf`) and
     both truths the same leaves at the same paths, and each leaf the shape of its truth, so no leaf is
     paired with another's truth or compared through broadcasting."""
@@ -1033,9 +1072,12 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
         if _leaf_paths(tree) != paths:
             raise AssertionError(f"{name}'s leaves are {_leaf_paths(tree)}, the truth's {paths}")
     row = []
-    for (path, leaf), their_leaf, true, their_true in zip(jax.tree_util.tree_leaves_with_path(dew),
-                                                          jax.tree.leaves(reference), jax.tree.leaves(truth),
-                                                          jax.tree.leaves(their_truth), strict=True):
+    count = len(jax.tree.leaves(truth))
+    spreads = jax.tree.leaves(spread) if spread is not None else [None] * count
+    their_spreads = jax.tree.leaves(their_spread) if their_spread is not None else [None] * count
+    for (path, leaf), their_leaf, true, their_true, moved, their_moved in zip(
+            jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
+            jax.tree.leaves(their_truth), spreads, their_spreads, strict=True):
         recorded = isinstance(their_leaf, RecordedLeaf)
         shapes = {"dew": np.shape(leaf), "the reference's truth": np.shape(their_true)}
         if not recorded:
@@ -1044,7 +1086,7 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
             if shape != np.shape(true):
                 raise AssertionError(f"{jax.tree_util.keystr(path)}: {name}'s shape is {shape}, the truth's "
                                      f"{np.shape(true)}")
-        their = their_leaf if recorded else leaf_summary(their_leaf, their_true)
+        their = their_leaf if recorded else leaf_summary(their_leaf, their_true, their_moved)
         if np.size(leaf) == 0:
             # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
             # reference's dtype (its shape is held above; the truth's dtype, float64, is its own), it
@@ -1056,7 +1098,7 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = (recorded or their_truth is truth
                   or np.array_equal(np.asarray(true), np.asarray(their_true)))
-        row.append(_paired(jax.tree_util.keystr(path), leaf_summary(leaf, true), their, paired=paired))
+        row.append(_paired(jax.tree_util.keystr(path), leaf_summary(leaf, true, moved), their, paired=paired))
     return row
 
 
@@ -1071,7 +1113,13 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     measures it (ledger 1831: two arithmetics broke that tie, and Dew's ordinary rounding on a residue
     row read 1e8 of the row). That is an engineering definition of a measured row, not a proof of
     float64's accuracy on it; a sum that cancels to float64's residue is never measured so, and a
-    product far below its leaf, which float64 holds to its own precision, is.
+    product far below its leaf, which float64 holds to its own precision, is. Where the site asks the
+    truth's own spread on its rows (`resolve_rows`), a row is measured only where the truth resolves
+    it too: its spread under float64 rounding of its inputs at most its size over ROW_FACTOR², so the
+    truth's uncertainty there sits a ROW_FACTOR under the least the row rule tells apart (ledger 1856:
+    a Sinkhorn gradient's rows, eps times the derivative of a residual below float64's resolution,
+    which JAX's and torch's float64 put 2 times apart and each float32 arm leaves as noise, read as
+    measured wherever the reference's noise landed under them).
     A measured row is judged at its own size as any row is, its error over its size entering both worst
     rows: against the reference's worst row over the leaf, which holds it with less power than the zero
     rows' rule held it against the reference's own error on it. Both arms are classified alike, from the
@@ -1089,10 +1137,13 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
                              f"{unrecorded[:4]}")
     sizes = (dict(zip(theirs.zero_rows.tolist(), theirs.zero_sizes.tolist(), strict=True))
              if theirs.zero_sizes is not None else {})
+    # The truth's own spread on each row (`resolve_rows`): a row it does not resolve measures nothing.
+    held = mine.zero_spreads if mine.zero_spreads is not None else theirs.zero_spreads
+    spreads = {} if held is None else dict(zip(mine.zero_rows.tolist(), held.tolist(), strict=True))
     worst, their_worst, zero = mine.log_worst, theirs.log_worst, []
     for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True):
         size = sizes.get(at, 0.0)
-        if at_zero[at] < size:
+        if at_zero[at] < size and spreads.get(at, 0.0) <= size / ROW_FACTOR ** 2:
             worst = max(worst, float(_log_over(error, size)))
             their_worst = max(their_worst, float(_log_over(at_zero[at], size)))
         else:
@@ -1234,7 +1285,7 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> N
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
                     orders=None, library_fn=None, library_row: int | None = None,
-                    library_leaves: Sequence[str] = ()) -> None:
+                    library_leaves: Sequence[str] = (), resolve_rows: bool = False) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1285,7 +1336,12 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
 
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
-    (tests/certified.py)."""
+    (tests/certified.py).
+
+    `resolve_rows` evaluates the truth again on its inputs each moved one float64 unit (`_truth_spread`)
+    and counts a row of float64 zero as measured only where the truth resolves it (`_paired`), for a
+    site whose tiny rows are below what float64 itself resolves; a row it does not resolve keeps the
+    zero rows' rule. The truth then runs SPREAD_DRAWS more times a draw."""
     if seeds < FEWEST_SEEDS:
         raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
                                     f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
@@ -1301,7 +1357,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
 
     def drawn(start, stop):
         draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
-                       library_fn=library_fn, library_leaves=library_leaves)
+                       library_fn=library_fn, library_leaves=library_leaves, resolve_rows=resolve_rows)
         narrow_leaves[:] = [name for name, width in zip(draws.names, draws.widths, strict=True)
                             if width in NARROW_FACTORS]
         return draws
@@ -1505,7 +1561,8 @@ def recording(path) -> dict[str, np.ndarray]:
 def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: int = 0,
               truth_fn=None, two_stage: bool = True, dew_fn=None, orders=None,
               paired: bool = False, library_fn=None,
-              library_leaves: Sequence[str] = ()) -> list[tuple[str, int, list[str]]]:
+              library_leaves: Sequence[str] = (),
+              resolve_rows: bool = False) -> list[tuple[str, int, list[str]]]:
     """Check 1 run `runs` times on an equally exact pair, the reference against itself on disjoint
     draws: each run's verdict, "pass", "over" or "inconclusive", the stage it reached and its findings
     (`_judgement`'s, each naming its leaf and rule), a run judged as `assert_as_exact` judges a site
@@ -1522,7 +1579,7 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     arms compile themselves where they are programs, and a fault injects itself on the host.
     `library_fn` judges each run against the larger of the reference's error and that library arm's
     on `library_leaves`, as `assert_as_exact` does (paired runs: the library arm is measured on Dew's
-    own draws)."""
+    own draws); `resolve_rows` as `assert_as_exact`'s."""
     if paired and dew_fn is None:
         raise ValueError("a paired null run takes its other implementation, `dew_fn`")
     verdicts = []
@@ -1534,7 +1591,7 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
             return _drawn(dew_fn or reference_fn, reference_fn, draw, range(base + start, base + stop),
                           truth_fn, orders=orders,
                           reference_seeds=None if paired else range(base + span + start, base + span + stop),
-                          library_fn=library_fn, library_leaves=library_leaves)
+                          library_fn=library_fn, library_leaves=library_leaves, resolve_rows=resolve_rows)
 
         over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage)
         verdicts.append((_verdict(over, unresolved), stage, [str(finding) for finding in over + unresolved]))
