@@ -681,6 +681,7 @@ CONTRACTS = {
     "erf_inv": _rounding("erf_inv", None),
     "reduce_sum": _reduced_sum,
     "dot_general": _dot,
+    "is_finite": _moved(lambda params, a: np.isfinite(a)),
     "eq": _compared(lambda params, a, b: np.equal(a, b)),
     "ne": _compared(lambda params, a, b: np.not_equal(a, b)),
     "lt": _compared(lambda params, a, b: np.less(a, b)),
@@ -717,7 +718,8 @@ that hold it, `fmt` the result's float format (None for an integer or boolean re
 primitive within the lane's measured reach for it (`LEVELS`, `lane`: correctly rounded, faithful or a
 stated number of steps past, as the lane computes it); a sum within its bound in any order; an integer
 operation wrapped to its width; or a result with no rounding at all, bit for bit (a move of data, a
-sign operation, a comparison), every operand read as the lane reads it (`Lane.flushes`). A primitive
+sign operation, a comparison, a predicate of the value as stored: `is_finite`), every operand read as
+the lane reads it (`Lane.flushes`). A primitive
 missing here cannot be certified, which fails the site's coverage, as does an integer result of a
 primitive with no integer form (`div`, `sqrt`, a transcendental)."""
 
@@ -727,8 +729,10 @@ def certified(fn, *arguments) -> tuple:
     bind, its own compiled program, under its equation's own context), and each held to its contract
     (CONTRACTS) on the operands it was given: `(outputs, findings)`, the outputs as that run computed
     them, and every equation whose result breaks its contract or that has none, by its path, with its
-    first element that breaks. This certifies the op-by-op program; a fused program's internals are
-    check 1's."""
+    first element that breaks. A call is certified through its body, a jit's, a cond's branch, a
+    rematerialised body, and a high-level primitive's lowering (a `jax.experimental.hijax` primitive,
+    `to_lojax`, as JAX lowers it), each one primitive at a time. This certifies the op-by-op program; a
+    fused program's internals are check 1's."""
     import jax
 
     closed, shape = jax.make_jaxpr(fn, return_shape=True)(*arguments)
@@ -759,6 +763,12 @@ def _run(jaxpr, consts, arguments, findings, where: str = "") -> list:
                 results = _run(branch.jaxpr, branch.consts, operands[1:], findings, at + "/")
             elif body is not None:
                 results = _run(*body, operands, findings, at + "/")
+            elif hasattr(eqn.primitive, "to_lojax"):
+                # A high-level primitive is the program it lowers to, as JAX lowers it.
+                import jax
+
+                lowered = jax.make_jaxpr(functools.partial(eqn.primitive.to_lojax, **eqn.params))(*operands)
+                results = _run(lowered.jaxpr, lowered.consts, operands, findings, at + "/")
             else:
                 results = eqn.primitive.bind(*operands, **eqn.params)
                 results = list(results) if eqn.primitive.multiple_results else [results]
