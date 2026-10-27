@@ -193,3 +193,121 @@ def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_pat
     restored, _ = Checkpoints(str(local)).restore()
     for left, right in zip(jax.tree.leaves(original), jax.tree.leaves(restored), strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+
+class RankedRun(Run):
+    """A W&B run as `promote` reads it: where it lives, its summary and, in a sweep, the sweep's id."""
+
+    def __init__(self, summary, *, sweep_id=None, id="current"):
+        super().__init__()
+        self.summary, self.sweep_id, self.id = summary, sweep_id, id
+        self.entity, self.project = "team", "flowers"
+
+
+class Other:
+    """Another run of the project or sweep, as `wandb.Api` lists it."""
+
+    def __init__(self, id, summary):
+        self.id, self.summary = id, summary
+
+
+class Api:
+    """`wandb.Api`, holding the project's runs, a sweep's and the artifacts published, by their paths:
+    what `ranked` lists and what `downloaded` fetches, each download wandb's own (`downloaded`)."""
+
+    def __init__(self, project, sweeps, published, target):
+        self.project, self.sweeps, self.published, self.target = project, sweeps, published, target
+        self.asked = []
+
+    def runs(self, path, filters=None):
+        self.asked.append(("runs", path, filters))
+        return self.project
+
+    def sweep(self, path):
+        self.asked.append(("sweep", path))
+        return types.SimpleNamespace(runs=self.sweeps[path])
+
+    def artifact(self, reference, type=None):
+        name, alias = reference.rsplit(":", 1)
+        return self.fetched(self.published[(name, alias)])
+
+    def run(self, path):
+        logged = [self.fetched(artifact) for artifact in self.published[path]]
+        return types.SimpleNamespace(logged_artifacts=lambda: logged)
+
+    def fetched(self, logged):
+        def download(root=None):
+            return downloaded(logged, self.target)
+
+        return types.SimpleNamespace(type=logged.type, download=download)
+
+
+def test_a_sweeps_best_run_is_promoted_to_the_registry_and_loads_in_one_call_from_it(tmp_path, monkeypatch):
+    """FlaxDiff's W&B workflow on a tiny LM run. `promote` ranks the run by its summary's metric among
+    the best three of its project's runs (those whose summary holds the metric) or of its sweep's: ranked
+    first it publishes, aliased "best" in the registry; second, it publishes with no alias; past the
+    third, or tied with the third, it publishes nothing. A configured run's `trainer.promote` names the
+    rule and requires its W&B sink. `dew.pipeline("wandb:...")` then loads the promoted run in one call,
+    from the registry by its alias and from the W&B run by its path, as the task the run directory itself
+    loads: its continuation is the run's, token for token."""
+    import numpy as np
+    import optax
+    import wandb as library
+
+    import dew
+    from dew.config import TrainerConfig
+    from dew.data import Loading, Memory
+    from dew.data.compile import compile
+    from dew.io import Promotion
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.sampling import Sampling
+    from dew.training import Trainer, Wandb
+
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    model = CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=16, dtype="float32", attention_impl="xla")
+    rows = [{"text": (np.arange(9, dtype=np.int32) + index) % 16} for index in range(8)]
+    run = tmp_path / "run"
+    checkpoints = Checkpoints(str(run))
+    Trainer(LMObjective(model, seq_len=8), optax.sgd(1.0), key=0, checkpoints=checkpoints).fit(
+        compile(Memory(rows).shuffle(0).repeat().batch(8), read="memory",
+                loading=Loading(workers=0, threads=1, read_buffer=1)), steps=2, log_every=100)
+    checkpoints.wait()
+    step = checkpoints.path(2)
+    project = [Other("a", {"val/loss": 1.0}), Other("b", {"val/loss": 2.0}), Other("c", {"val/loss": 3.0}),
+               Other("d", {}), Other("current", {"val/loss": 0.1})]
+    published = {}
+    api = Api(project, {"team/flowers/sweep": project[1:3]}, published, tmp_path / "download")
+    monkeypatch.setattr(library, "Api", lambda: api)
+
+    def promoted(value, *, sweep_id=None, top=3):
+        tracker = Tracker()
+        tracker.run = RankedRun({"val/loss": value}, sweep_id=sweep_id)
+        logged = dew.io.promote(str(step), "tiny", tracker=tracker, metric="val/loss", top=top)
+        return logged, tracker.run.linked
+
+    first, linked = promoted(0.5)
+    assert isinstance(first, library.Artifact) and linked == [(first, "wandb-registry-model/tiny", ("best",))]
+    second, linked = promoted(1.5)
+    assert second is not None and linked == [(second, "wandb-registry-model/tiny", ())]
+    assert promoted(2.5, top=2) == (None, []) and promoted(3.0) == (None, [])
+    assert api.asked[-1] == ("runs", "team/flowers", None)
+    # In a sweep the run is ranked among the sweep's runs alone, ahead of both.
+    swept, linked = promoted(1.5, sweep_id="sweep", top=1)
+    assert swept is not None and linked[0][2] == ("best",)
+    assert api.asked[-1] == ("sweep", "team/flowers/sweep")
+    with pytest.raises(ValueError):
+        TrainerConfig(steps=1, promote=Promotion("val/loss"))
+    configured = TrainerConfig(steps=1, wandb=Wandb(project="flowers"), promote=Promotion("val/loss", top=2))
+    assert configured.promote == Promotion("val/loss", top=2)
+
+    published.update({("wandb-registry-model/tiny", "best"): first, "team/flowers/current": [first]})
+    prompt = np.arange(1, 5, dtype=np.int32)[None, :]
+    greedy = Sampling(temperature=0)
+    own = dew.pipeline(str(run))(prompt, 4, key=0, sampling=greedy).tokens
+    for source in ("wandb:wandb-registry-model/tiny:best", "wandb:team/flowers/current"):
+        shutil.rmtree(tmp_path / "download", ignore_errors=True)
+        loaded = dew.pipeline(source)
+        np.testing.assert_array_equal(np.asarray(loaded(prompt, 4, key=0, sampling=greedy).tokens),
+                                      np.asarray(own))
