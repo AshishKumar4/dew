@@ -3,6 +3,7 @@ GPU, with the install that fixes it (`dew.devices`), and `import dew`
 does not. The GPU is nvidia-smi's answer, so a stand-in nvidia-smi plays every
 machine on a host without one."""
 
+import json
 import os
 import subprocess
 import sys
@@ -10,7 +11,7 @@ import sys
 import pytest
 
 from dew.builds import newest_build
-from dew.devices import cpu_only_refusal, nvidia_gpus, xla_flag
+from dew.devices import nvidia_gpus, xla_flag
 
 
 def stand_in(directory, printed: str, status: int = 0):
@@ -137,23 +138,76 @@ def test_a_run_stops_where_the_gpu_would_sit_idle_and_import_dew_does_not(tmp_pa
     assert done.returncode == (0 if platforms == "cpu" else REFUSED), done.stderr[-2000:]
 
 
+PROBED = """
+import json
+import os
+import sys
+
+from dew.devices import CPUOnlyJax, cpu_only_refusal, cuda_builds, cuda_driver_version, nvidia_gpus
+from dew.training import prepare_process
+
+seen = (nvidia_gpus(), cuda_builds(), cuda_driver_version())
+try:
+    prepare_process(multi_host=False)
+except CPUOnlyJax as refused:
+    print(json.dumps({"seen": seen, "refusal": str(refused), "helper": cpu_only_refusal(os.environ, *seen)}))
+    sys.exit(0)
+sys.exit(1)
+"""
+
+STAND_IN_DRIVER = """
+#include <stdlib.h>
+int cuDriverGetVersion(int *version) {
+    *version = atoi(getenv("DEW_STAND_IN_CUDA"));
+    return 0;
+}
+"""
+
+
 @pytest.mark.parametrize("driver, cuda, newest", [
     ("580.82.07", 13000, "cuda13"),    # a driver that runs CUDA 13.0 itself
     ("570.124.06", 13000, "cuda13"),   # an older one under NVIDIA's forward-compatibility package
     ("570.124.06", 12080, "cuda12"),   # the same driver without it: CUDA 12.8
     ("580.82.07", None, None),         # GPUs listed, and no CUDA driver library loads
 ])
-def test_a_build_runs_where_the_user_mode_driver_runs_its_cuda(driver, cuda, newest):
+@pytest.mark.parametrize("installed", ["cuda13", "cuda12"])
+def test_a_build_runs_where_the_user_mode_driver_runs_its_cuda(tmp_path, driver, cuda, newest, installed):
     """JAX's cuda13 build starts where the CUDA version the user-mode driver reports is 13.0 or
     newer, as its plugin checks: a 580 driver's own, or a 570's under NVIDIA's cuda-compat, whose
     kernel driver's major is then no bar. A CUDA 12.8 user-mode driver runs the cuda12 build alone,
-    and a machine whose driver library does not load runs none."""
-    gpus = (driver, (9, 0))
-    for installed in (["cuda13"], ["cuda12"]):
-        runs = cuda is not None and newest is not None and (installed == ["cuda12"] or newest == "cuda13")
-        assert (cpu_only_refusal({}, gpus, installed, cuda) is None) == runs
+    and a machine whose driver library does not load runs none. Each through `prepare_process` on a
+    machine of stand-ins: nvidia-smi listing the driver's SM 9.0 GPU, a user-mode driver library
+    reporting `cuda`, and the build's JAX plugin installed. JAX opens on the CPU beside them, so the
+    setup refuses, with the install that fixes it where the installed build cannot run and the plain
+    refusal where it can."""
+    runs = cuda is not None and newest is not None and (installed == "cuda12" or newest == "cuda13")
+    plugin = tmp_path / "plugins" / "jax_plugins" / f"xla_{installed}"
+    plugin.mkdir(parents=True)
+    # A plugin JAX finds and that registers no backend, so JAX opens on the CPU.
+    (plugin / "__init__.py").write_text("def initialize():\n    pass\n")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = {key: value for key, value in os.environ.items() if key != "JAX_PLATFORMS"}
+    env["PATH"] = stand_in(tmp_path, f"{driver}, 9.0\\n")
+    env["CUDA_VISIBLE_DEVICES"] = "999"
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (os.path.join(root, "src"), str(tmp_path / "plugins"),
+                                                      os.environ.get("PYTHONPATH"))))
     if cuda is not None:
-        assert newest_build(gpus, cuda) == newest
+        (tmp_path / "driver.c").write_text(STAND_IN_DRIVER)
+        subprocess.run(["cc", "-shared", "-fPIC", "-o", str(tmp_path / "libcuda.so.1"),
+                        str(tmp_path / "driver.c")], check=True)
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(filter(None, (str(tmp_path),
+                                                              os.environ.get("LD_LIBRARY_PATH"))))
+        env["DEW_STAND_IN_CUDA"] = str(cuda)
+    done = subprocess.run([sys.executable, "-c", PROBED], capture_output=True, text=True, env=env,
+                          timeout=300, cwd=root)
+    assert done.returncode == 0, done.stderr[-2000:]
+    probed = json.loads(done.stdout.strip().splitlines()[-1])
+    assert probed["seen"] == [[driver, [9, 0]], [installed], cuda]
+    assert (probed["helper"] is None) == runs
+    if not runs:
+        assert probed["refusal"] == probed["helper"]
+    if cuda is not None:
+        assert newest_build((driver, (9, 0)), cuda) == newest
 
 
 ROUTED = """
