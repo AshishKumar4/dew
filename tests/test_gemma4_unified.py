@@ -208,8 +208,8 @@ def gradient_functions(source):
     @as_given
     def ours(inputs):
         """Each row's program over its own length (`native_observations`), compiled once a length
-        rather than once a window's lengths, and the rows' observations collected on the device: every
-        row is dispatched before any is read, so the rows' programs run side by side."""
+        rather than once a window's lengths, and the rows' observations collected on the device, every
+        row dispatched before any is read."""
         observed = []
         for row in range(inputs["input/input_ids"].shape[0]):
             prefix = f"native/{row}/"
