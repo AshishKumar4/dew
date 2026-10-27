@@ -528,14 +528,14 @@ def test_sliding_attention_decode_matches_the_full_sequence():
 def hybrid(**overrides):
     """Qwen3.5's stack at toy size: three gated-delta-net layers, one gated
     full-attention layer with a partial rotary."""
-    return tiny(num_layers=4, num_kv_heads=2, head_dim=8, output_gate=True,
-                partial_rotary_factor=0.5,
-                layer_types=('linear_attention',) * 3 + ('full_attention',),
-                kinds={'linear_attention': {'mixer': {
-                    'class': 'gated_delta_net', 'fields': {'linear_num_key_heads': 2,
-                    'linear_num_value_heads': 4, 'linear_key_head_dim': 6,
-                    'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}}},
-                **overrides)
+    return tiny(**{'num_layers': 4, 'num_kv_heads': 2, 'head_dim': 8, 'output_gate': True,
+                   'partial_rotary_factor': 0.5,
+                   'layer_types': ('linear_attention',) * 3 + ('full_attention',),
+                   'kinds': {'linear_attention': {'mixer': {
+                       'class': 'gated_delta_net', 'fields': {'linear_num_key_heads': 2,
+                       'linear_num_value_heads': 4, 'linear_key_head_dim': 6,
+                       'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}}},
+                   **overrides})
 
 
 def test_learned_positions_continue_from_the_models_own_count_whatever_its_first_layer(rng):
