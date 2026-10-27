@@ -454,7 +454,8 @@ class DiffusionRunConfig(RunConfig):
             attention_impl=str(self.model.fields.get("attention_impl", "auto")),
             size=self.sample_field().shape[:-1],
             variables=variables, mesh=placement.get("mesh"), layout=placement.get("layout"),
-            text_only=placement.get("text_only", False), prediction_depths=placement.get("prediction_depths"))
+            text_only=placement.get("text_only", False), prediction_depths=placement.get("prediction_depths"),
+            modeling_overrides=placement.get("modeling_overrides"))
 
     def _process(self, convention: Process | None) -> Process:
         """The preset's process, which must be of the kind the pretrained
