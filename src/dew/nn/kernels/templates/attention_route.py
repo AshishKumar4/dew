@@ -20,7 +20,7 @@ from typing import Literal, overload
 import jax
 import jax.numpy as jnp
 
-from dew.nn.kernels import generation
+from dew.nn.kernels import generation, selection
 from dew.nn.kernels.templates import attention_mosaic, attention_portable, attention_triton
 from dew.nn.kernels.templates.attention import ACCURATE, NATURAL, Gradients, Hooks, KeySpans, Split
 
@@ -136,20 +136,43 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     ...
 
 
+MAINLOOPS = ("mosaic", "triton", "portable")
+"""The template's mainloops, which `generation.chosen(attention_mainloop=...)` names for every template call
+in its block: Mosaic GPU's, the frozen Triton one's, the plain-JAX one's."""
+
+
+def _mainloop(declined: str | None, spans: KeySpans) -> str:
+    """The mainloop a pass runs: the one `generation.chosen(attention_mainloop=...)` names, which must take
+    the call (`selection.KernelRefused` naming why it does not: off a GPU, or Mosaic's own reason
+    `declined`, or the Triton mainloop's refusal of the spans), else the first that takes it here: Mosaic
+    GPU's, Triton's, the plain-JAX one's."""
+    triton = "the call runs off a GPU" if not _on_gpu() else attention_triton.refused(spans)
+    mosaic = "the call runs off a GPU" if not _on_gpu() else declined
+    reasons = {"mosaic": mosaic, "triton": triton, "portable": None}
+    named = selection.forced("attention_mainloop")
+    if named is not None:
+        if named not in MAINLOOPS:
+            raise ValueError(f"attention_mainloop {named!r}: the template's mainloops are "
+                             f"{', '.join(MAINLOOPS)}")
+        if reasons[named] is not None:
+            raise selection.KernelRefused("attention_mainloop", named,
+                                          [generation.Refusal(named, str(reasons[named]))])
+        return named
+    return next(name for name in MAINLOOPS if reasons[name] is None)
+
+
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
              config: _Config, *, residuals: bool):
-    """The forward on the first mainloop that takes the call here: Mosaic GPU's (the template), Triton's,
-    the plain-JAX one's."""
+    """The forward on its mainloop (`_mainloop`)."""
     form = {"scale": config.scale, "natural": config.natural}
     declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=residuals,
                                                  **form) if _on_gpu() else None
-    if _on_gpu() and declined is None:
-        _report('mosaic')
+    mainloop = _mainloop(declined, spans)
+    _report(mainloop, declined)
+    if mainloop == 'mosaic':
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=residuals, **form)
-    if _on_gpu() and attention_triton.refused(spans) is None:
-        _report('triton', declined)
+    if mainloop == 'triton':
         return attention_triton.forward(query, key, value, spans, hooks, residuals=residuals, **form)
-    _report('portable', declined)
     return attention_portable.attend(query, key, value, spans, hooks, block_q=PLAIN_TILE, block_k=PLAIN_TILE,
                                      pad=PLAIN_TILE, residuals=residuals, **form)
 
@@ -168,32 +191,32 @@ _attend.defvjp(_attend_forward, _attend_backward)
 
 def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
               dout: jax.Array, residuals: Residuals, config: _Config) -> Gradients:
-    """The backward from the forward's residuals on the first mainloop that takes the call here: Mosaic
-    GPU's, Triton's, the plain-JAX one's; its key's and value's gradients unrounded where the call narrowed
-    them (`_Config.operand_dtype`)."""
+    """The backward from the forward's residuals on its mainloop (`_mainloop`); its key's and value's
+    gradients unrounded where the call narrowed them (`_Config.operand_dtype`)."""
     call = (query, key, value, spans, hooks, dout)
     form = {"scale": config.scale, "natural": config.natural, "accurate": config.accurate}
     rounded = config.operand_dtype is None
     declined = (attention_mosaic.backward_declined(*call, residuals=residuals, **form) if _on_gpu()
                 else None)
-    if _on_gpu() and declined is None:
-        _report('mosaic')
+    mainloop = _mainloop(declined, spans)
+    _report(mainloop, declined)
+    if mainloop == 'mosaic':
         return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, **form)
-    if _on_gpu() and attention_triton.refused(spans) is None:
-        _report('triton', declined)
+    if mainloop == 'triton':
         return attention_triton.backward(*call, residuals=residuals, rounded=rounded, **form)
-    _report('portable', declined)
     return attention_portable.backward(*call, block_q=PLAIN_TILE, block_k=PLAIN_TILE, pad=PLAIN_TILE,
                                        residuals=residuals, rounded=rounded, **form)
 
 
 def _report(kernel: str, declined: str | None = None) -> None:
-    """Report the mainloop a pass of the template runs (`generation.route`, 'attention_mainloop'): Mosaic
-    GPU's on a GPU, else the plain-JAX one's; a GPU pass off Mosaic's names why it `declined` the call
+    """Report the mainloop a pass of the template runs (`generation.route`, 'attention_mainloop'): the one
+    `generation.chosen` names, else Mosaic GPU's on a GPU, else the plain-JAX one's; a GPU pass off Mosaic's
+    names why it `declined` the call
     (`attention_mosaic.forward_declined`, `backward_declined`: each refusal's own reason and ledger row),
     undeclared, so the kernel-route audit holds it unexplained until a row or a fix answers it."""
-    preferred = 'mosaic' if _on_gpu() else 'portable'
-    refusal = None if declined is None else generation.Refusal('mosaic', declined)
+    preferred = selection.forced('attention_mainloop') or ('mosaic' if _on_gpu() else 'portable')
+    refusal = (None if declined is None or kernel == preferred
+               else generation.Refusal('mosaic', declined))
     generation.route('attention_mainloop', kernel=kernel, preferred=preferred, refusal=refusal)
 
 
