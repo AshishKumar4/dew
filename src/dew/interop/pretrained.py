@@ -1933,10 +1933,13 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
+    if prediction_depths is not None:
+        # Before a wrapper's language model is taken out of it, by the wrapper's own names: a discarded
+        # depth's spellings are neither read nor compared (`_language_model_tensors`).
+        held = route if language is None else WrapperRoute(language)
+        tensors = _kept_tensors(tensors, config, held, prediction_depths)
     if language is not None:
         tensors = _language_model_tensors(tensors, language)
-    if prediction_depths is not None:
-        tensors = _kept_tensors(tensors, config, route, prediction_depths)
     translated = _translated(config, route, tensors, directory, dtype=dtype, param_dtype=param_dtype,
                              attention_impl=attention_impl, max_seq_len=max_seq_len, streaming=streaming)
     model, variables, record, built, layouts, retained, export_adapter = translated.built

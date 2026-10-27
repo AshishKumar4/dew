@@ -353,7 +353,10 @@ def _shared_partition(outputs, normalizer, group: tuple[str, ...]):
     (`_vocabulary_split`): the shards' sums moved to the largest maximum and added, and log Z formed from
     them once. Each shard's softmax then takes its columns' shares, and the target's entry from the rest,
     against the whole row's maximum and sums, as the whole head's are. The first output must be the
-    target's logit (`picked`), which another shard's columns do not move."""
+    target's logit (`picked`), which another shard's columns do not move; the whole row's is the sum of
+    the shards' (one holds it), and the loss is taken from it against the whole row's maximum and sum
+    (`dew.nn.categorical.target_loss`), so neither term rounds at the logits' magnitude before the
+    subtraction that cancels them, where log Z less the target did."""
     if not group:
         return outputs, normalizer
     first, best, log_z = outputs
@@ -361,17 +364,22 @@ def _shared_partition(outputs, normalizer, group: tuple[str, ...]):
     larger = jax.lax.pmax(peak, group)
     mass = jax.lax.psum(rescaled(peak, mass, larger), group)
     rests = jax.lax.psum(rescaled(peak, rests, larger), group)
-    return (first, best, (larger + jnp.log(mass)).reshape(log_z.shape)), (larger, mass, rests)
+    loss = target_loss(larger, mass, jax.lax.psum(first, group))
+    outputs = (loss.reshape(first.shape), best, (larger + jnp.log(mass)).reshape(log_z.shape))
+    return outputs, (larger, mass, rests)
 
 
 def _shared_cotangents(cotangents, group: tuple[str, ...]):
-    """A head's output cotangents with log Z's summed over `group`: the whole row's log Z is every
-    shard's output (`_shared_partition`), and each device's cotangent of it is that of its own tokens,
-    which the shards' columns all move."""
+    """A head's output cotangents with the loss's and log Z's summed over `group`: the whole row's loss
+    and log Z are every shard's outputs (`_shared_partition`), and each device's cotangent of them is
+    that of its own tokens, which the shards' columns all move. The loss is log Z less the target's
+    logit, so its cotangent reaches the target's logit negated and log Z's as it is, the softmax's
+    shares and the target's one-hot each from its own term (`_softmax_cotangent`'s `picked`)."""
     if not group:
         return cotangents
     first, best, partition = cotangents
-    return first, best, jax.lax.psum(partition, group)
+    loss = jax.lax.psum(first, group)
+    return -loss, best, jax.lax.psum(partition, group) + loss
 
 
 def _capped(raw, cap, columns: _Columns, temperature: float):
@@ -1142,8 +1150,10 @@ def _vocabulary_split(hidden, table, targets, excluded, cap, columns, group: tup
     shard's softmax shares round against the whole row's as the whole
     head's do, where a logsumexp of the shards' own log partitions gave
     every column of a shard the rounding of that shard's share of the row.
-    The target's logit is the sum of theirs (one shard holds it), the
-    prediction the best of their best columns. Differentiated through the
+    The loss is taken in the head from the target's logit, the sum of
+    theirs (one shard holds it), against the row's maximum and sum
+    (`dew.nn.categorical.target_loss`); the prediction is the best of their
+    best columns. Differentiated through the
     shard_map as written, and correct unchecked: after the combine each
     device keeps its own tokens, so a psum's cotangent, summed over the
     group, is every device's share of it, as the head sums log Z's
@@ -1158,13 +1168,12 @@ def _vocabulary_split(hidden, table, targets, excluded, cap, columns, group: tup
     labels = jax.lax.all_gather(targets.reshape(count), group, axis=0, tiled=True) - offset
     # The excluded column, like the targets, in this device's own numbering.
     local_excluded = None if excluded is None else excluded - offset
-    # The head's first output is each token's target logit (`picked`), not its loss, which is log
-    # Z less it: a shard's softmax then takes the shard's share w of the row's mass and the target's
-    # one-hot apart, each from its own term, where the loss's gradient would reach it as
-    # (1 + (w - 1)), which rounds away the low bits of a small share.
-    picked, predicted, whole = head(states, table, labels, local_excluded, cap, columns, picked=True,
+    # The head picks each token's target logit (`picked`) and takes the loss from it over the group
+    # (`_shared_partition`); its backward gives a shard's softmax the shard's share w of the row's mass
+    # and the target's one-hot apart, each from its own term (`_shared_cotangents`), where the loss's
+    # gradient would reach it as (1 + (w - 1)), which rounds away the low bits of a small share.
+    losses, predicted, whole = head(states, table, labels, local_excluded, cap, columns, picked=True,
                                     group=group)
-    target = jax.lax.psum(picked, group)
     start = jax.lax.axis_index(group) * count
 
     def own(value):
@@ -1179,7 +1188,7 @@ def _vocabulary_split(hidden, table, targets, excluded, cap, columns, group: tup
         # argmax over the whole row picks the first.
         predicted = own(jax.lax.pmin(jnp.where(best == top, predicted + offset,
                                                jnp.iinfo(jnp.int32).max), group))
-    return own(whole - target), predicted, own(whole)
+    return own(losses), predicted, own(whole)
 
 
 SUPPORT_BLOCK = 1 << 15

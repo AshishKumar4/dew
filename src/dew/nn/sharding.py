@@ -19,8 +19,10 @@ projection with no side worth naming) gets the shape heuristic, which
 places it on its largest divisible axis.
 
 This module also defines the functions that read the mesh in context:
-`pipeline_stages` for the decoder's stage count, `microbatches` for the
+`pipeline_stages` for a pipeline's stage count, `microbatches` for the
 schedule the trainer sets in context around its compiled step,
+`in_pipeline_stage` for whether a stage's body is tracing, whose vmap holds
+the stage axis,
 `sequence_shards` for how many ways attention and the Mamba-2 mixer split a
 sequence, and `manual_map` for their `shard_map`s, whose rows split over the
 axes `dew.mesh.row_axes` names.
@@ -140,6 +142,27 @@ def microbatches() -> int:
         return pipeline_stages()
     schedule.pipelined = True
     return pipeline_stages() if schedule.count is None else schedule.count
+
+
+_STAGED: contextvars.ContextVar[bool] = contextvars.ContextVar('pipeline_stage', default=False)
+
+
+@contextlib.contextmanager
+def pipeline_stage() -> Iterator[None]:
+    """Trace one stage's body inside a pipeline over the stage axis, whose vmap places the stage axis
+    (`dew.nn.backbones.decoder_stack.run_pipeline`)."""
+    token = _STAGED.set(True)
+    try:
+        yield
+    finally:
+        _STAGED.reset(token)
+
+
+def in_pipeline_stage() -> bool:
+    """Whether a pipeline stage's body is tracing (`pipeline_stage`): the stage axis is its vmap's
+    there, and an automatic mesh axis like any other everywhere else, where whatever runs outside
+    the pipeline runs on every stage."""
+    return _STAGED.get()
 
 
 @dataclasses.dataclass
