@@ -99,13 +99,12 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.12.0.1.post27,<0.12.1`.
+Dew requires `jax>=0.12.0.1.post28,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
 
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502)), so two checkouts share one compiled kernel. JAX is removing its Pallas Triton backend and takes no change to it, so this fix stays in the build while Dew runs Pallas Triton.
-- `linear_call` batches (an all-unmapped call stays unmapped), and differentiates in its residuals, which the experts' fused SwiGLU route needs.
 - The device-to-host transfer guard holds on a CPU array's implicit host read (`float`, `item`, `np.asarray`, its buffer) as on an accelerator's copy, which a steady state's guard needs on the CPU suite.
 - Pallas Triton divides 16-bit floats and computes `erf_inv` through float32, correctly rounded, which a GEMM template's prologue dividing in bfloat16 needs on CUDA.
 - A `custom_vjp` call (and Mosaic GPU's `custom_jvp` call) in a Pallas Triton or Mosaic GPU kernel lowers as its primal function, which a template's score hook through a `jax.custom_vjp` needs.
@@ -114,6 +113,7 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - Mosaic GPU and Pallas Mosaic GPU lower `ceil` and `floor`, which a template's Mosaic kernel that rounds a value needs on an H100.
 - Pallas Mosaic GPU lowers `add_any` and `integer_pow` of every integer exponent, which the Mosaic attention backward under a score hook needs: a hook's transposed pullback sums its cotangents, and a temperature's backward raises it to the power -2.
 - Mosaic GPU's layout inference solves groups of unknowns that no constraint relates separately, so sm80's `mma.sync` GEMM tiles find their layouts.
+- A Mosaic GPU MMA may state its warpgroup's warp split (`plgpu.mma(..., m_warps=...)`), for Ampere GEMM tiles that split their warps 2 x 2.
 - A platform-dependent conditional whose lowering keeps one branch lowers that branch inline, so a collective inside it is not a runtime conditional; on the CPU, devices diverged on such a conditional.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
@@ -179,7 +179,7 @@ torchvision from the wrong index. A package extra cannot select an index.
 
 The `profile` extra installs XProf, never 2.23.2. XProf 2.23.2 declares `setuptools<70`, and PyTorch 2.13 and later declare `setuptools>=77.0.3`, so 2.23.2 can't be installed beside the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
 
-FlashAttention comes as Dew's own wheel, `dew-flash-attn-cu12` or `dew-flash-attn-cu13` (kernels/flash_attn), for the CUDA major of your jax: FlashAttention-2 for sm8x and sm120, and FlashAttention-3 for Hopper (sm90). The `cuda12` and `cuda13` extras install it on Linux x86_64, the one platform it is built for. With it installed, `"auto"` runs it on the GPUs whose measured kernel it is, for the calls `dew.nn.attention.flash_refusal` admits; a call it turns down on such a GPU is logged once, with why.
+FlashAttention comes as Dew's own wheel, `dew-flash-attn-cu12` or `dew-flash-attn-cu13` (kernels/flash_attn), for the CUDA major of your jax: FlashAttention-2 for sm8x and sm120, and FlashAttention-3 for Hopper (sm90). The `cuda12` and `cuda13` extras install it on Linux x86_64. With it installed, `"auto"` runs it on the GPUs whose measured kernel it is, for the calls `dew.nn.attention.flash_refusal` admits; a call it turns down on such a GPU is logged once, with why.
 
 tokamax comes with Dew: Dew's Pallas kernels take the config they derive from the GPU's facts, which is fast without tuning. The opt-in tuner (`dew.nn.kernels.tuning`), `python tools/kernel_picks.py` or `Trainer(tune_kernels=True)`, times a few tested variants of each kernel's config on a GPU it has to itself and stores the fastest for the GPU model; a later compile takes those picks, else the nearest measured shape's, else the derived config, and measures nothing. And `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Earlier releases pin `typeguard==2.13.3`, which tyro excludes, so installing one by hand breaks every recipe's command line.
 
