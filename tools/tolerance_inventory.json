@@ -493,10 +493,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_optim_schedules.py": {
-   "comparisons": 4,
-   "lane": "Training"
-  },
   "tests/test_optional_ema.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"

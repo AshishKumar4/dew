@@ -28,11 +28,6 @@ WEIGHT_DECAY = 1e-2
 """The reference run's kernel decay (tools/torch_optim_reference.py)."""
 
 
-def values(schedule, steps: int) -> np.ndarray:
-    built = schedule.schedule(steps)
-    return np.asarray([built(count) for count in range(steps)], np.float64)
-
-
 def assert_torchs(schedule, steps: int, torch_values, label: str) -> None:
     """`schedule` over `steps` is torch's (`torch_values`, float64): Dew's run in float64 within the
     float64 rounding of its own chain of operations (`chain_roundings`) of torch's."""
@@ -107,33 +102,24 @@ def run(solver: optax.GradientTransformation, initial, grads) -> dict[str, list[
     return trace
 
 
-def torch_run():
-    names = ("kernel", "scale", "delay")
-    initial = {name: jnp.asarray(TORCH[f"initial/{name}"]) for name in names}
-    grads = {name: jnp.asarray(TORCH[f"grads/{name}"]) for name in names}
-    return initial, grads, {name: TORCH[f"params/{name}"] for name in names}
-
-
-# optax computes Adam's bias corrections `1 - b ** t` in float32 and torch in
-# float64. At b2 = 0.999 that is a relative error of 1.3e-5 in the second
-# moment's correction and 6.4e-6 in each step, so a group's bound is that
-# error over twelve steps of its largest rate, with room for rounding. Run in
-# float64, Dew's positions are within 4.6e-7 of torch's float32 ones.
-PARAMETER_ATOL = {"kernel": 1e-6, "scale": 1e-6, "delay": 1e-5}
+NAMES = ("kernel", "scale", "delay")
 
 
 def test_grouped_adam_is_torchs_adam_with_param_groups_a_momentum_cycle_and_a_clamp():
     """Twelve updates over six epochs: Adam with coupled weight decay and
     the beta1 cycle on the kernel, the cycle alone on the scale, and the
-    clamped positions on a cosine from 0.1, against torch's two Adams and
-    their schedulers. Largest differences observed: 3.6e-7 on the kernel,
-    1.2e-7 on the scale and 5.0e-6 on the positions, whose rate is twenty
-    times higher."""
-    initial, grads, expected = torch_run()
-    trace = run(snn_delays_config().build(EPOCHS * PER_EPOCH), initial, grads)
-    for name, reference in expected.items():
-        np.testing.assert_allclose(np.stack(trace[name]), reference, rtol=0, atol=PARAMETER_ATOL[name],
-                                   err_msg=name)
+    clamped positions on a cosine from 0.1, are torch's two Adams and their
+    schedulers: Dew's run in float64 is torch's (`params/`, float64) to the
+    float64 rounding of its own chain of operations (the oracle rule)."""
+    with jax.enable_x64(new_val=True):
+        initial = {name: jnp.asarray(TORCH[f"initial/{name}"], jnp.float64) for name in NAMES}
+        grads = {name: jnp.asarray(TORCH[f"grads/{name}"], jnp.float64) for name in NAMES}
+        solver = snn_delays_config().build(EPOCHS * PER_EPOCH)
+        trace = run(solver, initial, grads)
+        roundings = chain_roundings(jax.make_jaxpr(
+            lambda initial, grads: run(solver, initial, grads))(initial, grads))
+    for name in NAMES:
+        assert_computes_the_oracle(np.stack(trace[name]), TORCH[f"params/{name}"], name, roundings=roundings)
 
 
 def test_a_bounded_group_clamps_its_parameters_and_no_others():
@@ -147,7 +133,20 @@ def test_a_bounded_group_clamps_its_parameters_and_no_others():
     moved = stepped(params, updates, initial, state)
     # The clamp is exact: the bounds themselves, where the step overshot them.
     np.testing.assert_array_equal(moved["delay"], [0.0, 3.0])
-    np.testing.assert_allclose(moved["kernel"], [-0.45, 3.45], rtol=1e-5)
+    # The kernel takes Adam's first step unclamped, 0.5 * g / (|g| + 1e-8) off: Dew's step in float64 is
+    # that formula's to its own float64 rounding (the oracle rule).
+    with jax.enable_x64(new_val=True):
+        wide = {name: jnp.asarray(value, jnp.float64) for name, value in params.items()}
+        widened = {name: jnp.asarray(value, jnp.float64) for name, value in grads.items()}
+
+        def step(params, grads):
+            first = solver.init(params)
+            updates, state = solver.update(grads, first, params)
+            return stepped(params, updates, first, state)
+        kernel = np.asarray(step(wide, widened)["kernel"])
+        roundings = chain_roundings(jax.make_jaxpr(step)(wide, widened))
+    adam = np.asarray([0.05, 2.95]) - 0.5 * np.asarray([1.0, -1.0]) / (1.0 + 1e-8)
+    assert_computes_the_oracle(kernel, adam, "the unbounded kernel", roundings=roundings)
 
 
 @pytest.mark.parametrize("schedule", [

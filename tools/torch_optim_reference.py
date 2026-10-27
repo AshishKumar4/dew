@@ -22,8 +22,10 @@ second `Adam` steps delay positions under `CosineAnnealingLR` from 0.1,
 clamped to [0, 3] after each step as DCLS's `clamp_parameters` does.
 Both schedulers step once an epoch of `PER_EPOCH` updates over `EPOCHS`
 epochs. Every update reads the gradients stored under `grads/<name>`, so no
-loss is involved, and `params/<name>` holds the parameters after each.
-Everything runs in float32.
+loss is involved, and `params/<name>` holds the parameters after each. The
+initial parameters and gradients are float32 values; the run is torch's in
+float64 on them, the oracle Dew's run in float64 is held to
+(tests/test_optim_schedules.py).
 
     python tools/torch_optim_reference.py
 """
@@ -98,7 +100,7 @@ def grouped_run() -> dict[str, np.ndarray]:
     # them into the bounds and holds them there.
     grads["delay"] = np.abs(grads["delay"]) * np.asarray([1, 1, -1, -1, -1], np.float32)
 
-    params = {name: torch.nn.Parameter(torch.tensor(value)) for name, value in initial.items()}
+    params = {name: torch.nn.Parameter(torch.tensor(value, dtype=torch.float64)) for name, value in initial.items()}
     weights = torch.optim.Adam([{"params": [params["kernel"]], "weight_decay": WEIGHT_DECAY},
                                 {"params": [params["scale"]], "weight_decay": 0.0}],
                                lr=5e-3, foreach=False)
@@ -109,7 +111,7 @@ def grouped_run() -> dict[str, np.ndarray]:
     trace: dict[str, list[np.ndarray]] = {name: [] for name in params}
     for step in range(updates):
         for name, param in params.items():
-            param.grad = torch.tensor(grads[name][step])
+            param.grad = torch.tensor(grads[name][step], dtype=torch.float64)
         weights.step()
         delays.step()
         with torch.no_grad():
