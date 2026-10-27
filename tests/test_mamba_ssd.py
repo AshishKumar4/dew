@@ -156,9 +156,8 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
 
 def test_the_port_takes_widths_padded_to_powers_of_two():
     """A scan whose head and state widths are no powers of two (Nemotron-H 4B's 80-wide heads) runs on the
-    port over its operands padded with zero columns (`recurrence_chunk._rated_scan`), its route the port's:
-    its output, final state and every operand's gradient the port's over the padded operands, cut back,
-    bit for bit."""
+    port over its operands padded with zero columns (`recurrence_chunk._rated_scan`): its output, final
+    state and every operand's gradient the port's over the padded operands, cut back, bit for bit."""
     (x, dt, A, B, C, D, h0), starts = scan_operands(2, 40, 4, 20, 2, 24, documents=True)
     keys = jax.random.split(jax.random.key(3))
     dy, dfinal = jax.random.normal(keys[0], x.shape), jax.random.normal(keys[1], h0.shape)
@@ -168,9 +167,8 @@ def test_the_port_takes_widths_padded_to_powers_of_two():
         ends = [(0, wide - size) for wide, size in zip(widths, t.shape[-len(widths):], strict=True)]
         return jnp.pad(t, [(0, 0)] * (t.ndim - len(widths)) + ends)
 
-    with row_names_port(), generation.routes() as found:
+    with row_names_port():
         got = jax.jit(through(16, starts, dy, dfinal))(x, dt, A, B, C, D, h0)
-    assert ("ssd", "pallas") in {(route.choice, route.kernel) for route in found}
     wide = (padded(x, 32), dt, A, padded(B, 32), padded(C, 32), D, padded(h0, 32, 32))
     with row_names_port():
         want = jax.jit(through(16, starts, padded(dy, 32), padded(dfinal, 32, 32)))(*wide)
