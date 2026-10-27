@@ -1660,6 +1660,202 @@
     }
    ]
   },
+  "hf/gemma3n-native-tiny/logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    },
+    {
+     "repo": "huggingface/pytorch-image-models",
+     "version": "1.0.30",
+     "runs": "timm"
+    }
+   ],
+   "note": "float64 gemma3n-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma3n-native-tiny/pixel_gradient_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    },
+    {
+     "repo": "huggingface/pytorch-image-models",
+     "version": "1.0.30",
+     "runs": "timm"
+    }
+   ],
+   "note": "float64 gemma3n-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma3n-native-tiny/training_f64.json": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    },
+    {
+     "repo": "huggingface/pytorch-image-models",
+     "version": "1.0.30",
+     "runs": "timm"
+    }
+   ],
+   "note": "float64 gemma3n-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma3n-native-tiny/updated_logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    },
+    {
+     "repo": "huggingface/pytorch-image-models",
+     "version": "1.0.30",
+     "runs": "timm"
+    }
+   ],
+   "note": "float64 gemma3n-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma4-native-tiny/logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 gemma4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma4-native-tiny/pixel_gradient_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 gemma4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma4-native-tiny/training_f64.json": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 gemma4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma4-native-tiny/updated_logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 gemma4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/llama4-native-tiny/logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 llama4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/llama4-native-tiny/pixel_gradient_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 llama4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/llama4-native-tiny/training_f64.json": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 llama4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/llama4-native-tiny/updated_logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 llama4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/qwen35-native-tiny/logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 qwen35-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/qwen35-native-tiny/pixel_gradient_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 qwen35-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/qwen35-native-tiny/training_f64.json": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 qwen35-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/qwen35-native-tiny/updated_logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 qwen35-native-tiny: the reference's float64 twin over the stored encoding."
+  },
   "hf/gemma4-ple/logits.npy": {
    "tool": "tools/gemma4_tiny_reference.py",
    "sources": [
