@@ -52,7 +52,10 @@ class EpisodeId:
     """The identity of one sample within an attempt, reproducible from checkpointed work.
 
     `task` is the task id, `attempt` the trainer step that collected the
-    sample, `sample` its global index, and `seed` the key data drawn for it.
+    sample, `sample` its global index, `seed` the key data drawn for it, and
+    `branch` the cooldown branch that drew it (`Snapshot.branch`), None for
+    the run's own: a branch draws at the run's steps and keys under other
+    weights, and its episodes are its own.
     The harness can use this identity for its own idempotency records. Dew
     does not guarantee exactly-once external effects across process failure.
     """
@@ -61,6 +64,7 @@ class EpisodeId:
     attempt: int
     sample: int
     seed: tuple[int, ...]
+    branch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -559,7 +563,8 @@ class EpisodeCollector:
                 sample = (rank * tasks.size + index) * samples + group
                 draw = jax.random.fold_in(snapshot.key, sample)
                 slots.append(EpisodeProgress(EpisodeId(int(task), snapshot.step, int(sample),
-                    tuple(int(value) for value in np.asarray(jax.random.key_data(draw)))), self.sampling))
+                    tuple(int(value) for value in np.asarray(jax.random.key_data(draw))), snapshot.branch),
+                    self.sampling))
         return slots
 
     def _bound_journal(self, journal_stack: ExitStack, snapshot: Snapshot, tasks: np.ndarray,

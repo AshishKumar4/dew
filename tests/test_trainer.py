@@ -1302,6 +1302,11 @@ def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the
     assert cooled == {at: finals[-1]}
     if drawn is not None:
         assert drawn.steps == [*range(at), *range(at, 2 * at), *range(at, 3 * at)]
+        # The branch trains on the rollout's batches, not the stream's: the run with none scores otherwise.
+        unrolled = RecordingTracker()
+        cooldown_run(stable, 3 * at, accumulation, unrolled, Cooldowns(at=(at,), length=at, shape="linear"))
+        assert {step: scalars["cooldown_val/loss"] for step, scalars in unrolled.scalars
+                if "cooldown_val/loss" in scalars} != cooled
     started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
     assert started.cadences["cooldowns.at"] == [at]
     plain = cooldown_run(stable, 3 * at, accumulation, rollout=NoisedTargets() if rollout else None)
