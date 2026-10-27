@@ -94,13 +94,23 @@ def interpreted(grid: list[tuple], chosen: set[tuple]) -> list:
             for values in grid]
 
 
+INTERPRETED_HEADS = {'one sequence': {'key_heads': 1, 'value_heads': 2, 'value_width': 64},
+                     'packed documents': {'value_heads': 2}}
+"""Off a GPU, the cases' heads and values narrowed to what each still checks (one sequence two key blocks and
+a key head's group of value heads, packed documents their starts on and off the chunks' grid): the
+interpreted gradient of one sequence took 300 to 390 s and of packed documents 535 to 688, past the suite's
+240 a test (row 1850); narrowed, 131 s and 336 s: one value head, or two chunks, left the packed log decay
+unresolved within 40 seeds, its extra seeds taking 784 and 934 s."""
+
+
 def geometry(case: str) -> dict:
-    """Case `case`'s operands as `SHAPES` gives them, shortened off a GPU of a family a bundle claims
-    (`INTERPRETED_LENGTH`)."""
+    """Case `case`'s operands as `SHAPES` gives them, shortened and narrowed off a GPU of a family a bundle
+    claims (`INTERPRETED_LENGTH`, `INTERPRETED_HEADS`)."""
     shape = SHAPES[case]
     if mainloop.family_of() is not None:
         return shape
-    return {**shape, 'rows': 1, 'length': min(shape['length'], INTERPRETED_LENGTH)}
+    return {**shape, 'rows': 1, 'length': min(shape['length'], INTERPRETED_LENGTH),
+            **INTERPRETED_HEADS.get(case, {})}
 
 
 def draw(dtype, seed: int, *, rows: int, length: int, key_heads: int, value_heads: int, key_width: int,
