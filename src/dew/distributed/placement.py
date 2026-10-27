@@ -759,8 +759,12 @@ def _implied_collectives(mesh: Mesh, rows: tuple[str, ...], split: set[str]) -> 
     An axis whose devices each compute their own share of a batch, its rows (`rows`) or the
     sequence axis's positions, sums the step's loss and the gradients of what it holds whole
     (all-reduce). Where it also splits a variable (`split`), it gathers the variable whole to use
-    it (all-gather), and a row axis sums each gradient into its shares (reduce-scatter), as fully
-    sharded data parallelism does. An axis that splits a variable and no batch, tensor, sums the
+    it (all-gather) and sums each gradient into its shares (reduce-scatter), as fully sharded data
+    parallelism does: a row axis, and the sequence axis, which holds the state in shares beside
+    fsdp (`STATE_AXES`). These are the GPU's step's: XLA:CPU partitions a gradient's sum into
+    shares as a whole sum each device slices (all-reduce), which no GPU program runs (a sequence
+    axis of two H100s reduce-scatters, tests/test_layout_validation.py). An axis that splits a
+    variable and no batch, tensor, sums the
     partial products of the width it splits (all-reduce). The stage axis hands each microbatch's
     activations on (collective-permute). How the experts on the expert axis meet their tokens, an
     all-to-all or a gather by the layer's dispatch (`dew.nn.moe`), and the attention's exchange
@@ -774,9 +778,7 @@ def _implied_collectives(mesh: Mesh, rows: tuple[str, ...], split: set[str]) -> 
         shares = axis in rows or axis == SEQUENCE_AXIS
         ops = ["all-reduce"] if shares or axis in split else []
         if shares and axis in split and axis != EXPERT_AXIS:
-            ops.append("all-gather")
-            if axis in rows:
-                ops.append("reduce-scatter")
+            ops += ["all-gather", "reduce-scatter"]
         if axis == STAGE_AXIS:
             ops.append("collective-permute")
         if ops:

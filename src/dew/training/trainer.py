@@ -1211,9 +1211,10 @@ class Trainer(Generic[Loss, Effects]):
         stages = self.device_mesh.shape.get(STAGE_AXIS, 1)
         if stages > 1 and not schedule.pipelined:
             raise LayoutRefused(
-                f"the stage axis of {stages} holds a pipeline's stages of a decoder's layer "
-                f"stack, and {type(self.objective).__name__}'s model runs no pipeline, so every "
-                f"stage would compute the whole step; give those devices to the data or fsdp axis")
+                f"the stage axis of {stages} holds a pipeline's stages of a stack of like layers (a "
+                f"decoder's, a DiT's or a ViT's blocks, a UNet level's transformers) that it splits "
+                f"evenly, and {type(self.objective).__name__}'s model runs none, so every stage would "
+                f"compute the whole step; give those devices to the data or fsdp axis")
 
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
         from dew.distributed.host import transfer
