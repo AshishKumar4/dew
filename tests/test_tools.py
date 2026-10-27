@@ -950,7 +950,32 @@ ROW_1878_LINTS = {
     "SLOP011": ({
         "src/sparx/graph.py": "EDGES = 1\n",
         "tests/test_graph.py": (
-            "def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
+            "def test_table(table):\n"
+            "    assert report.table().splitlines() == ['   a  b', 'x  1  2']\n"
+            "    assert table.plain == 'data 4,824 rows  ·  0 rejected'\n"
+            "    assert '4,824' in table.split()\n"
+            "    assert table.title == 'data rows'\n"
+            "    assert table.index('b') + 1 == len('   a  b')\n"
+            "    assert json.loads(payload) == ['a  b']\n"
+            "    assert parsed.name == 'two  spaces'\n"),
+    }, "tests/test_graph.py", (2, 3)),
+}
+"""Row 1878's two lint cases, by code: the files linted, the file the findings are in, their lines.
+SLOP008: a private attribute of a first-party object is the code under test, so replacing it is
+reported even where its name holds a seam's (`Checkpoints._open`); a public seam of the same name and a
+standard-library module's own private attribute are not. SLOP011: a rendering (its text read through
+`plain`, `table()`, captured output or `str`) compared whole with a string, or a list of strings, with a
+run of two or more spaces between words is a spacing snapshot; its words and numbers looked for, a
+one-space string, a column end measured and parsed data holding two spaces are not."""
+
+
+@pytest.mark.parametrize("code", sorted(ROW_1878_LINTS))
+def test_row_1878s_lints_report_their_cases_and_spare_the_rest(code, tmp_path):
+    files, where, lines = ROW_1878_LINTS[code]
+    assert _linted(tmp_path, files) == [(where, line, code) for line in lines]
+
+
+def test_a_test_that_skips_on_its_own_packages_import_is_reported(tmp_path):
     """SLOP015: a test that reaches its own package through `pytest.importorskip`,
     however it imports the skip, turns an import the package breaks into a skip; an
     optional dependency's skip, or a package that only shares the prefix, is not reported."""
