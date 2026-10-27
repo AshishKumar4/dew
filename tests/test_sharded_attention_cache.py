@@ -18,6 +18,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from dew.cache import enable_compilation_cache
 from dew.nn.attention import scaled_dot_product_attention
 from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
+from dew.training._lowering import custom_calls
 enable_compilation_cache(sys.argv[1])
 count_compilation_cache()
 rng = np.random.default_rng(0)
@@ -33,11 +34,11 @@ mesh = jax.make_mesh((2,), ('data',))
 with jax.set_mesh(mesh):
     rows = NamedSharding(mesh, P('data'))
     arrays = [jax.device_put(x, rows) for x in (q, k, v)]
-    text = step.lower(*arrays).as_text()
+    partitioner = any(call.target == "CustomSPMDPartitioning" for call in custom_calls(step.lower(*arrays)))
     sharded = step(*arrays)
 np.save(sys.argv[2], np.stack([np.asarray(x, np.float32) for x in sharded[1]]))
 same = all(np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(whole[1], sharded[1]))
-print(json.dumps({**compilation_cache_counts(), "partitioner": "CustomSPMDPartitioning" in text,
+print(json.dumps({**compilation_cache_counts(), "partitioner": partitioner,
                   "same": same}))
 """
 
