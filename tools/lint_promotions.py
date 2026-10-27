@@ -4,26 +4,31 @@ constructor computed rounded to float32 (a rotary `inv_freq`, Gemma's `embed_sca
 truth's twin is built inside tools/torch_precision.py's `float64`, by its `float64_twin`.
 
 A promotion is `.double()`, `.to(...)` or `.type(...)` at float64 (`torch.float64`, `torch.double`, or a
-name bound only to one) on a module, or the unbound `torch.nn.Module.double(module)` and its `to` and
-`type`, or a call of a function of the file that promotes its parameter to another
-(`walk(model, ..., dtype)`), given a module there and float64 as the dtype. A module is what the file
-proves one, flow by flow in each scope: a constructor's result (a class the file imports, `torch.nn`'s
-and transformers' among them, a capitalized attribute of anything, or a class the file defines on such
-a base), a library's reader (`from_pretrained`, `from_config`, `from_single_file`), a deep copy of a
-module, a module-preserving call on one (`eval()`, `cpu()`, `to(device)`), a function of the file that
-returns one, and a name or attribute chain bound to any of these until it is bound to something else.
-A forward's result, an attribute of a module (a tensor or a submodule) and an item of one are not, nor
-is a module built inside `float64` or `widened` (entered by a `with`, or on a stack of contexts, or a
-context a condition picks from them, whose branch the promotion's own condition is read to share), or
-at float64 by its `dtype`. Blind spots: a module
-the file receives (a parameter, a factory it is passed, an attribute another method set), a loop's
-target, and a submodule promoted by its attribute.
+name bound only to one, however many names deep) on a module, or the unbound
+`torch.nn.Module.double(module)` and its `to` and `type` (of anything: a module it is given is never
+proven safe), or a call of a function of the file that promotes its parameter to another
+(`walk(model, ..., dtype)`, any of its promotions), given a module there and float64 as the dtype. A
+module is what the file proves one, flow by flow in each scope: a constructor's result (a class the
+file imports, `torch.nn`'s and transformers' among them, a capitalized attribute of anything, or a class
+the file defines on such a base), a library's reader (`from_pretrained`, `from_config`,
+`from_single_file`), a deep copy of a module, a module-preserving call on one (`eval()`, `cpu()`,
+`to(device)`), a function of the file any definition of which returns one where it returns, and a name
+or attribute chain bound to any of these until it is bound to something else, a parameter's name
+shadowing any around it. A forward's result, an attribute of a module (a tensor or a submodule) and an
+item of one are not, nor is a module built where a float64 context is active (`WIDE`): in a `with`
+block's own statements (a function defined there runs later, outside it), after a statement of the
+block entering one on the block's own stack of contexts, or where a condition picks one, for a
+promotion under the same condition. Nor is a `torch.nn` module built at a float64 `dtype`, whose
+constructor honors it; a reader or another library's class given one may still compute its tables in
+float32 (transformers' Qwen3 rotary `inv_freq`), so it is not exempt. Blind spots: a module the file
+receives (a parameter, a factory it is passed, an attribute another method set), a loop's target, and
+a submodule promoted by its attribute.
 """
 
 from __future__ import annotations
 
 import ast
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 
 import lint_scopes as scopes
 
@@ -43,8 +48,10 @@ READERS = frozenset({"from_pretrained", "from_config", "from_single_file"})
 TENSORS = frozenset({"Parameter", "Buffer", "Size"})
 """Classes whose instances are tensors or shapes, not modules: with every name ending in `Tensor`."""
 
-WIDE = ("torch_precision.float64", "torch_precision.widened")
-"""The contexts a module built in computes its constructor's values in float64."""
+WIDE = ("torch_precision.float64", "torch_precision.widened", "block_override_reference.oracle_precision")
+"""The contexts a module built in computes its constructor's values in float64: the shared ones, and the
+block references' own, which takes float64 the default dtype and widens the float32 constructors
+(`arange`, `tensor`, `zeros`, `ones`, `full` and their `_like`s) a constructor's tables are built by."""
 
 
 class _File:
@@ -54,49 +61,87 @@ class _File:
 
     def __init__(self, tree: ast.Module, parent: Sequence[str]):
         self.tables = {id(node): table for node, table in scopes.scoped(tree.body, {}, list(parent))}
-        self.wide = {id(node) for block in ast.walk(tree) if isinstance(block, ast.With | ast.AsyncWith)
-                     for statement in self._widened(block) for node in ast.walk(statement)}
+        # Each node built where a float64 context is active, by the condition that picks it ("" where
+        # none does), and each promotion's guards: the tests of the conditions it runs under.
+        self.wide: dict[int, str] = {}
+        for block in ast.walk(tree):
+            if isinstance(block, ast.With | ast.AsyncWith):
+                condition, statements = self._widened(block)
+                self.wide.update({id(node): condition for statement in statements
+                                  for node in _executed(statement)})
+        self.guards: dict[int, set[str]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.IfExp | ast.If):
+                test = ast.dump(node.test)
+                for branch in [node.body] if isinstance(node, ast.IfExp) else node.body:
+                    for inner in _executed(branch):
+                        self.guards.setdefault(id(inner), set()).add(test)
         classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
         self.classes: set[str] = set()
-        functions = {node.name: node for node in ast.walk(tree)
-                     if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
+        # Every definition of a name: a call of it is read as any of them, so none escapes another.
+        functions: dict[str, list[ast.FunctionDef | ast.AsyncFunctionDef]] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                functions.setdefault(node.name, []).append(node)
         self.factories: set[str] = set()
-        self.promoters = {name: found for name, function in functions.items()
-                          if (found := _promoter(function)) is not None}
+        self.promoters = {name: found for name, defined in functions.items()
+                          if (found := [each for function in defined for each in _promoter(function)])}
         grown = True
         while grown:
             before = (len(self.classes), len(self.factories))
             self.classes |= {node.name for node in classes if any(
                 self._constructs(base) or (isinstance(base, ast.Name) and base.id in self.classes)
                 for base in node.bases)}
-            self.factories |= {name for name, function in functions.items() if any(
-                self.module(returned.value, _modules(self, function.body, frozenset()))
-                for returned in scopes.own(function) if isinstance(returned, ast.Return) and returned.value)}
+            for name, defined in functions.items():
+                for function in defined:
+                    returned: list[bool] = []
+                    _modules(self, function.body, {}, returns=returned,
+                             parameters=scopes.arguments(function))
+                    if any(returned):
+                        self.factories.add(name)
             grown = (len(self.classes), len(self.factories)) != before
 
     def resolved(self, node: ast.expr) -> str:
         return scopes.resolved(node, self.tables.get(id(node), {}))
 
-    def _widened(self, block: ast.With | ast.AsyncWith) -> list[ast.stmt]:
-        """The statements of a `with` block that run inside a float64 context: all of them where one
-        of its items is one, else those after a statement entering one on a stack of contexts
-        (`scope.enter_context(float64())`)."""
-        if any(self._wide(item.context_expr) for item in block.items):
-            return block.body
+    def _widened(self, block: ast.With | ast.AsyncWith) -> tuple[str, list[ast.stmt]]:
+        """The statements of a `with` block that run inside a float64 context, and the condition that
+        picks it ("" where none does): all of them where one of its items is one, else those after a
+        statement of the block's own that enters one on the block's own stack of contexts
+        (`scope.enter_context(float64())`, `scope` the block's)."""
+        for item in block.items:
+            condition = self._wide(item.context_expr)
+            if condition is not None:
+                return condition, block.body
+        stacks = {item.optional_vars.id for item in block.items if isinstance(item.optional_vars, ast.Name)}
         for at, statement in enumerate(block.body):
-            if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
-                   and node.func.attr == "enter_context" and node.args and self._wide(node.args[0])
-                   for node in ast.walk(statement)):
-                return block.body[at + 1:]
-        return []
+            call = statement.value if isinstance(statement, ast.Expr) else None
+            if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
+                    and call.func.attr == "enter_context" and isinstance(call.func.value, ast.Name)
+                    and call.func.value.id in stacks and call.args):
+                condition = self._wide(call.args[0])
+                if condition is not None:
+                    return condition, block.body[at + 1:]
+        return "", []
 
-    def _wide(self, node: ast.expr) -> bool:
-        """Whether a `with` item is a float64 context (WIDE), or one where a condition picks it, as
-        `float64() if wide else nullcontext()` does for the arm the condition widens."""
+    def _wide(self, node: ast.expr) -> str | None:
+        """Whether a `with` item is a float64 context (WIDE): "" where it always is, the dumped
+        condition where a condition picks it (`float64() if wide else nullcontext()`), else None."""
         if isinstance(node, ast.IfExp):
-            return self._wide(node.body) or self._wide(node.orelse)
+            if self._wide(node.body) == "" and self._wide(node.orelse) is None:
+                return ast.dump(node.test)
+            return None
         called = self.resolved(node.func) if isinstance(node, ast.Call) else ""
-        return any(called == path or called.endswith("." + path) for path in WIDE)
+        return "" if any(called == path or called.endswith("." + path) for path in WIDE) else None
+
+    def built_wide(self, node: ast.AST) -> bool:
+        """Whether `node` is built where a float64 context is always active."""
+        return self.wide.get(id(node)) == ""
+
+    def guarded(self, built: ast.AST, call: ast.AST) -> bool:
+        """Whether a promotion `call` runs only under the condition that widened the build `built`."""
+        condition = self.wide.get(id(built))
+        return bool(condition) and condition in self.guards.get(id(call), set())
 
     def _constructs(self, node: ast.expr) -> bool:
         """Whether `node` names a class: an imported name, or an attribute of anything
@@ -110,9 +155,9 @@ class _File:
         aliased = isinstance(node, ast.Name) and node.id in aliases
         return spelled or aliased or self.resolved(node) in FLOAT64
 
-    def module(self, node: ast.expr | None, held: frozenset[str]) -> bool:
+    def module(self, node: ast.expr | None, held: Mapping[str, ast.AST]) -> bool:
         """Whether `node` evaluates to a module the file proves one (`held`: the names and attribute
-        chains bound to one where `node` is)."""
+        chains bound to one where `node` is, each with the construction it was bound from)."""
         if node is None:
             return False
         if isinstance(node, ast.IfExp):
@@ -132,8 +177,10 @@ class _File:
             return True
         built = ((isinstance(function, ast.Name) and function.id in self.classes | self.factories)
                  or self._constructs(function) or method in READERS)
-        # A module built in float64, inside its context or at its dtype, computed its constructor's values so.
-        return built and id(node) not in self.wide and not _at_float64(self, node)
+        # A module built in float64, inside its context or (torch.nn's) at its dtype, computed its
+        # constructor's values so; one built where a condition picks the context is narrow unless the
+        # promotion shares the condition (`_promotes`).
+        return built and not self.built_wide(node) and not _at_float64(self, node)
 
 
 def _key(node: ast.expr) -> str | None:
@@ -150,11 +197,12 @@ Promoter = tuple[int, str, int | None, str | None]
 for `double()`)."""
 
 
-def _promoter(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Promoter | None:
-    """The first parameter a function promotes (`Promoter`): by `double()`, or by `to` or `type` to
+def _promoter(function: ast.FunctionDef | ast.AsyncFunctionDef) -> list[Promoter]:
+    """Every parameter a function promotes (`Promoter`): by `double()`, or by `to` or `type` to
     another of its parameters, positionally or as `dtype`."""
     names = [argument.arg for argument in (*function.args.posonlyargs, *function.args.args)]
     named = {argument.arg for argument in scopes.arguments(function)}
+    found: list[Promoter] = []
     for node in scopes.own(function):
         if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
                 and node.func.attr in PROMOTIONS and isinstance(node.func.value, ast.Name)
@@ -163,11 +211,11 @@ def _promoter(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Promoter | No
         promoted = node.func.value.id
         place = names.index(promoted) if promoted in names else -1
         if node.func.attr == "double":
-            return place, promoted, None, None
-        for dtype in (*node.args, *(keyword.value for keyword in node.keywords if keyword.arg == "dtype")):
-            if isinstance(dtype, ast.Name) and dtype.id in named:
-                return place, promoted, names.index(dtype.id) if dtype.id in names else -1, dtype.id
-    return None
+            found.append((place, promoted, None, None))
+        dtypes = (*node.args, *(keyword.value for keyword in node.keywords if keyword.arg == "dtype"))
+        found.extend((place, promoted, names.index(dtype.id) if dtype.id in names else -1, dtype.id)
+                     for dtype in dtypes if isinstance(dtype, ast.Name) and dtype.id in named)
+    return found
 
 
 def _argument(call: ast.Call, place: int | None, name: str | None) -> ast.expr | None:
@@ -178,9 +226,18 @@ def _argument(call: ast.Call, place: int | None, name: str | None) -> ast.expr |
 
 
 def _at_float64(file: _File, call: ast.Call) -> bool:
-    """Whether a constructor or reader is given a float64 `dtype` (or transformers' `torch_dtype`)."""
-    return any(keyword.arg in ("dtype", "torch_dtype") and file.float64(keyword.value, frozenset())
-               for keyword in call.keywords)
+    """Whether a `torch.nn` module, whose constructor honors its `dtype`, is built at float64."""
+    return file.resolved(call.func).startswith("torch.nn.") and any(
+        keyword.arg == "dtype" and file.float64(keyword.value, frozenset()) for keyword in call.keywords)
+
+
+def _executed(node: ast.AST | Sequence[ast.AST]) -> Iterator[ast.AST]:
+    """Every node that runs where `node` does: a function, lambda or class defined there is its own
+    statement, its body running later, elsewhere."""
+    for each in node if isinstance(node, list) else [node]:
+        yield each
+        if not isinstance(each, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef):
+            yield from _executed(list(ast.iter_child_nodes(each)))
 
 
 def _bound(target: ast.expr, value: ast.expr | None) -> list[tuple[str, ast.expr | None]]:
@@ -202,6 +259,8 @@ def _rebinds(node: ast.AST) -> list[str]:
     a loop's or a `with`'s target, an import."""
     if isinstance(node, ast.For | ast.AsyncFor):
         return [key for key, _ in _bound(node.target, None)]
+    if isinstance(node, ast.Return):
+        return []
     if isinstance(node, ast.withitem) and node.optional_vars is not None:
         return [key for key, _ in _bound(node.optional_vars, None)]
     if isinstance(node, ast.Import | ast.ImportFrom):
@@ -216,6 +275,9 @@ def _events(body: Sequence[ast.stmt]) -> list[ast.AST]:
     for node in scopes.nodes_of(body):
         if isinstance(node, ast.For | ast.AsyncFor | ast.Call):
             events.append(((node.lineno, node.col_offset), id(node), node))
+        elif isinstance(node, ast.Return):
+            # A return reads the bindings where it is, after its value's own calls.
+            events.append(((node.end_lineno or node.lineno, node.end_col_offset or 0), id(node), node))
         elif isinstance(node, ast.withitem):
             ended = node.context_expr
             events.append(((ended.end_lineno or ended.lineno, ended.end_col_offset or 0), id(node), node))
@@ -224,56 +286,73 @@ def _events(body: Sequence[ast.stmt]) -> list[ast.AST]:
     return [node for *_, node in sorted(events, key=lambda event: event[:2])]
 
 
-def _aliases(file: _File, body: Sequence[ast.stmt], around: frozenset[str]) -> frozenset[str]:
-    """The names a scope binds only to a FLOAT64 dtype, with those around it it does not bind."""
+def _aliases(file: _File, body: Sequence[ast.stmt], around: frozenset[str],
+             parameters: Sequence[ast.arg] = ()) -> frozenset[str]:
+    """The names a scope binds only to a FLOAT64 dtype, with those around it it does not bind (its
+    `parameters` among them)."""
     values: dict[str, list[ast.expr | None]] = {}
     for node in scopes.nodes_of(body):
         if isinstance(node, ast.Assign | ast.AnnAssign):
             for target in node.targets if isinstance(node, ast.Assign) else [node.target]:
                 for key, value in _bound(target, node.value):
                     values.setdefault(key, []).append(value)
-    bound = set(scopes.binders(scopes.nodes_of(body)))
-    mine = {name for name, assigned in values.items()
-            if all(value is not None and file.float64(value, frozenset()) for value in assigned)}
-    return frozenset(mine | (around - bound))
+    bound = set(scopes.binders(scopes.nodes_of(body), parameters))
+    inherited = around - bound
+    mine: set[str] = set()
+    while True:
+        # However many names deep: an alias of an alias.
+        known = frozenset(mine | inherited)
+        grown = {name for name, assigned in values.items()
+                 if all(value is not None and file.float64(value, known) for value in assigned)}
+        if grown == mine:
+            return frozenset(mine | inherited)
+        mine = grown
 
 
-def _modules(file: _File, body: Sequence[ast.stmt], around: frozenset[str],
-             promotions: list[ast.Call] | None = None, aliases: frozenset[str] = frozenset()
-             ) -> frozenset[str]:
+def _modules(file: _File, body: Sequence[ast.stmt], around: Mapping[str, ast.AST],
+             promotions: list[ast.Call] | None = None, aliases: frozenset[str] = frozenset(),
+             returns: list[bool] | None = None, parameters: Sequence[ast.arg] = ()) -> dict[str, ast.AST]:
     """The names and attribute chains bound to a module at the end of a scope's `body` (`around`: those
-    of the scopes around it the scope does not bind), each promotion of one appended to `promotions`."""
-    bound = set(scopes.binders(scopes.nodes_of(body)))
-    held = {key for key in around if key.split(".")[0] not in bound}
+    of the scopes around it the scope does not bind, its `parameters` among them), each promotion of
+    one appended to `promotions`, and whether each return returns one to `returns`."""
+    bound = set(scopes.binders(scopes.nodes_of(body), parameters))
+    held = {key: origin for key, origin in around.items() if key.split(".")[0] not in bound}
     for node in _events(body):
         if isinstance(node, ast.Call):
-            if promotions is not None and _promotes(file, node, frozenset(held), aliases):
+            if promotions is not None and _promotes(file, node, held, aliases):
                 promotions.append(node)
+            continue
+        if isinstance(node, ast.Return):
+            if returns is not None:
+                returns.append(file.module(node.value, held))
             continue
         if isinstance(node, ast.Assign | ast.AnnAssign):
             pairs = [pair for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
                      for pair in _bound(target, node.value)]
         else:
             pairs = [(key, None) for key in _rebinds(node)]
-        now = frozenset(held)
+        now = dict(held)
         for key, value in pairs:
-            held = {kept for kept in held if kept != key and not kept.startswith(key + ".")}
+            held = {kept: origin for kept, origin in held.items()
+                    if kept != key and not kept.startswith(key + ".")}
             if file.module(value, now):
-                held.add(key)
-    return frozenset(held)
+                held[key] = _origin(value, now)
+    return held
 
 
-def _promotes(file: _File, call: ast.Call, held: frozenset[str], aliases: frozenset[str]) -> bool:
+def _promotes(file: _File, call: ast.Call, held: Mapping[str, ast.AST], aliases: frozenset[str]) -> bool:
     """Whether `call` promotes a module to float64: bound, on a module the file proves one; unbound, a
     class's `double`, `to` or `type` given the module first; or a function of the file that promotes
     its parameter (`_promoter`), given a module there and float64 as the dtype it promotes to."""
     function = call.func
     if isinstance(function, ast.Name) and function.id in file.promoters:
-        place, promoted, dtype_place, dtype = file.promoters[function.id]
-        if not file.module(_argument(call, place, promoted), held):
-            return False
-        given = None if dtype is None else _argument(call, dtype_place, dtype)
-        return dtype is None or (given is not None and file.float64(given, aliases))
+        for place, promoted, dtype_place, dtype in file.promoters[function.id]:
+            if not file.module(_argument(call, place, promoted), held):
+                continue
+            given = None if dtype is None else _argument(call, dtype_place, dtype)
+            if dtype is None or (given is not None and file.float64(given, aliases)):
+                return True
+        return False
     if not isinstance(function, ast.Attribute) or function.attr not in PROMOTIONS:
         return False
     arguments = list(call.args)
@@ -283,10 +362,30 @@ def _promotes(file: _File, call: ast.Call, held: frozenset[str], aliases: frozen
             return False
     elif not file.module(function.value, held):
         return False
+    elif file.guarded(_origin(function.value, held), call):
+        # Built where a condition picks a float64 context, and promoted under that condition.
+        return False
     if function.attr == "double":
         return True
     dtypes = [*arguments, *(keyword.value for keyword in call.keywords if keyword.arg == "dtype")]
     return any(file.float64(dtype, aliases) for dtype in dtypes)
+
+
+def _origin(node: ast.AST, held: Mapping[str, ast.AST]) -> ast.AST:
+    """The construction a module expression comes from: through a module-preserving chain
+    (`Linear(4, 4).eval().cpu()`), a conditional's branches, and a name bound to one (`held`)."""
+    while True:
+        if isinstance(node, ast.IfExp):
+            node = node.body
+        elif isinstance(node, ast.NamedExpr):
+            node = node.value
+        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+              and node.func.attr in PRESERVING):
+            node = node.func.value
+        elif isinstance(node, ast.expr) and _key(node) in held:
+            return held[_key(node)]
+        else:
+            return node
 
 
 def _scopes(body: Sequence[ast.stmt]) -> Iterator[ast.FunctionDef | ast.AsyncFunctionDef]:
@@ -303,13 +402,14 @@ def promotions(tree: ast.Module, parent: Sequence[str]) -> Iterator[ast.Call]:
     file = _File(tree, parent)
     found: list[ast.Call] = []
 
-    def walk(body: Sequence[ast.stmt], around: frozenset[str], around_aliases: frozenset[str]) -> None:
-        aliases = _aliases(file, body, around_aliases)
-        held = _modules(file, body, around, found, aliases)
+    def walk(body: Sequence[ast.stmt], around: Mapping[str, ast.AST], around_aliases: frozenset[str],
+             parameters: Sequence[ast.arg] = ()) -> None:
+        aliases = _aliases(file, body, around_aliases, parameters)
+        held = _modules(file, body, around, found, aliases, parameters=parameters)
         for function in _scopes(body):
-            walk(function.body, held, aliases)
+            walk(function.body, held, aliases, scopes.arguments(function))
 
-    walk(tree.body, frozenset(), frozenset())
+    walk(tree.body, {}, frozenset())
     yield from sorted(found, key=lambda node: (node.lineno, node.col_offset))
 
 

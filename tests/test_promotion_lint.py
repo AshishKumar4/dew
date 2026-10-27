@@ -57,6 +57,43 @@ PROMOTIONS = {
         "import torch\ndef walk(model, dtype):\n    return model.to(dtype)\n"
         "def main(given):\n    walk(given, torch.float64)\n"
         "    walk(torch.nn.Linear(4, 4), torch.float32)", 0),
+    "a reader given a float64 dtype, whose tables it may still build in float32": (
+        "import torch\nfrom transformers import AutoModelForCausalLM\n"
+        "model = AutoModelForCausalLM.from_config(config, dtype=torch.float64).double()", 1),
+    "built where a condition picks float64, promoted unconditionally": (
+        "import contextlib\nimport torch\nfrom tools.torch_precision import float64\ndef run(wide):\n"
+        "    with float64() if wide else contextlib.nullcontext():\n"
+        "        model = torch.nn.Linear(4, 4)\n    model.double()", 1),
+    "built where a condition picks float64, promoted under another": (
+        "import contextlib\nimport torch\nfrom tools.torch_precision import float64\n"
+        "def run(wide, other):\n    with float64() if wide else contextlib.nullcontext():\n"
+        "        model = torch.nn.Linear(4, 4)\n    model = model.double() if other else model", 1),
+    "built after an inner stack's float64 has closed": (
+        "import contextlib\nimport torch\nfrom tools.torch_precision import float64\n"
+        "with contextlib.ExitStack() as outer:\n    with contextlib.ExitStack() as inner:\n"
+        "        inner.enter_context(float64())\n    model = torch.nn.Linear(4, 4)\n    model.double()", 1),
+    "a factory defined inside float64, called after it": (
+        "import torch\nfrom tools.torch_precision import float64\nwith float64():\n"
+        "    def build():\n        return torch.nn.Linear(4, 4)\nbuild().double()", 1),
+    "a helper that moves its module, then promotes it": (
+        "import torch\ndef walk(model, device, dtype):\n    model = model.to(device)\n"
+        "    return model.to(dtype)\nwalk(torch.nn.Linear(4, 4), 'cpu', torch.float64)", 1),
+    "a dtype alias of an alias": ("import torch\nFIRST = torch.float64\nSECOND = FIRST\n" + LINEAR
+                                  + "model.to(SECOND)", 1),
+    "a factory named as a method elsewhere": (
+        "import torch\ndef build():\n    return torch.nn.Linear(4, 4)\nclass Case:\n"
+        "    def build(self):\n        return torch.zeros(3)\nbuild().double()", 1),
+    "a factory returning a module before rebinding the name": (
+        "import torch\ndef build(flag):\n    net = torch.nn.Linear(4, 4)\n    if flag:\n"
+        "        return net\n    net = torch.zeros(4)\n    return net\nbuild(True).double()", 1),
+    "a parameter shadowing a module of the file's": (
+        LINEAR + "def convert(model):\n    return model.double()", 0),
+    "a parameter shadowing a dtype alias": (
+        "import torch\nWIDE = torch.float64\ndef convert(WIDE):\n"
+        "    torch.nn.Linear(4, 4).to(WIDE)", 0),
+    "a module built inside the block references' own float64": (
+        "import torch\nfrom block_override_reference import oracle_precision\nwith oracle_precision():\n"
+        "    model = torch.nn.Linear(4, 4).double()", 0),
     "a forward's result": (LINEAR + "logits = model(x)\nlogits.double()\nmodel(x).double()", 0),
     "a tensor's deep copy": ("import copy\nweights = copy.deepcopy(tensor)\nweights.double()", 0),
     "a module's tensor attribute and item": (LINEAR + "model.weight.double()\n"

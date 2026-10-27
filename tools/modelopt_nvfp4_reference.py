@@ -175,11 +175,13 @@ def tiny(*, mixed: bool = False) -> None:
     missing, unexpected = reference.load_state_dict(state, strict=False)
     assert missing == ["lm_head.weight"] and not unexpected, (missing, unexpected)
     reference.tie_weights()
+    # The float64 truth is the reference's twin (`float64_twin`), built inside `float64` so its rotary
+    # tables are float64's, each input quantizer registered on its layer in both.
+    wide = float64_twin(reference)
     direct_float = torch.Tensor.float
     original_to = torch.Tensor.to
-    hooks, hooked = [], []
+    hooks = []
     for stem in quantized:
-        module = reference.get_submodule(stem)
         if stem + '.input_scale' not in stored:
             continue
         overall = stored[stem + ".input_scale"]
@@ -202,14 +204,10 @@ def tiny(*, mixed: bool = False) -> None:
                 arrays[stem + "/forward_sm89_qdq"] = author_qdq(value, overall, corrected=False).cpu().numpy()
             return (output,)
 
-        hooks.append(module.register_forward_pre_hook(input_hook))
-        hooked.append((stem, input_hook))
+        hooks += [model.get_submodule(stem).register_forward_pre_hook(input_hook)
+                  for model in (reference, wide)]
     with torch.no_grad():
         arrays["logits"] = reference(ids, use_cache=False).logits.cpu().numpy()
-    # The float64 truth is the reference's twin (`float64_twin`), built inside `float64` so its rotary
-    # tables are float64's, with the same input quantizers on the same layers.
-    wide = float64_twin(reference)
-    hooks += [wide.get_submodule(stem).register_forward_pre_hook(hook) for stem, hook in hooked]
     with float64(), torch.no_grad():
         arrays["logits_f64"] = wide(ids, use_cache=False).logits.cpu().numpy()
     for hook in hooks:
