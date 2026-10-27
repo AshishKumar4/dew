@@ -10,6 +10,7 @@ from dew.distributed.placement import Layout, MeshSpec
 from dew.objectives.base import Aux, EMASpec, Metric, Objective, Step
 
 from .budget import Pause, Plateau
+from .cooldown import Cooldowns
 from .evaluation import EvalSuite, Evaluation
 from .observe import Observe
 from .profiling import ProfileWindow
@@ -19,7 +20,7 @@ from .tracker import LocalTracker, MLflowTracker, TensorBoardTracker, Tracker, T
 from .trainer import Rollout, Trainer
 from .transaction import ema_update
 
-__all__ = ["Aux", "Best", "Checkpoints", "EMASpec", "EvalSuite", "Evaluation", "Keep",
+__all__ = ["Aux", "Best", "Checkpoints", "Cooldowns", "EMASpec", "EvalSuite", "Evaluation", "Keep",
            "Layout", "LocalTracker", "MLflowTracker", "MeshSpec", "Metric", "Objective", "Observe", "Pause",
            "Plateau", "Preempted", "ProfileWindow", "Rollout", "Step", "TensorBoardTracker",
            "Tracker", "Trackers", "Trainer", "Wandb", "WandbTracker", "ema_update",

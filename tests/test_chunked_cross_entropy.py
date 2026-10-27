@@ -479,6 +479,48 @@ def split_scores(model, wide_model, shape, vocab: int, objective_of, adjusted, l
 
 
 @pytest.mark.mesh(devices=2)
+def test_a_vocabulary_split_heads_loss_is_taken_against_the_rows_maximum():
+    """Split over the vocabulary on a mesh, a head whose logits lie near 4096 (a bias of 2**12) gives
+    each token's loss on par with the whole logits' loss taken against the row's maximum and sum, log
+    of the mass less the target's distance below the peak (`dew.nn.categorical.target_loss`), over drawn
+    heads (check 1): log Z less the target rounded at the logits' magnitude before the subtraction that
+    cancels it."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.nn.categorical import target_loss
+    from dew.training import MeshSpec
+
+    def draw(seed):
+        states, matrix, targets = inputs(vocab=512, features=16, tokens=(4, 5), seed=seed)
+        scale, bias = columns(512, seed)
+        return (*eighths(states, matrix), scale, bias + 2.0**12, targets)
+
+    def losses(states, matrix, scale, bias, targets):
+        head = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale)
+        return chunked_cross_entropy(states, head, targets, 4, tile=RAGGED)[0]
+
+    def whole(states, matrix, scale, bias, targets):
+        logits = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale).logits(states)
+        peak = jnp.max(logits, axis=-1)
+        mass = jnp.sum(jnp.exp(logits - peak[..., None]), axis=-1)
+        return target_loss(peak, mass, jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0])
+
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    specs = (P('fsdp'), P(None, 'fsdp'), P('fsdp'), P('fsdp'), P())
+    run = jax.jit(losses)
+
+    @as_given
+    def split(*terms):
+        with jax.set_mesh(mesh), jax.default_matmul_precision('highest'):
+            placed = [jax.device_put(term, NamedSharding(mesh, spec)) for term, spec in
+                      zip(terms, specs, strict=True)]
+            return np.asarray(run(*placed))
+
+    assert_as_exact(split, under('highest', whole), draw, 'vocabulary-split loss near 4096',
+                    seeds=SEEDS['vocabulary split'])
+
+
+@pytest.mark.mesh(devices=2)
 def test_vocabulary_split_slices_the_bias_with_its_table_columns():
     from dew.objectives.lm import LMObjective
 
@@ -989,9 +1031,50 @@ def test_the_head_gradient_accumulates_every_token_tile_before_it_rounds(dtype):
         loss, *wide = pulled(full)(states.astype(jnp.float32), matrix.astype(jnp.float32), targets, cotangent)
         return loss, *(gradient.astype(dtype) for gradient in wide)
 
+    @jax.jit
+    def logits_cotangent(states, matrix, targets, cotangent):
+        """The fp32 logits' cotangent the site's loss gives under the drawn cotangent."""
+        logits = OutputTable(matrix, vocab_major=False, precision=precision).logits(states)
+
+        def loss(logits):
+            picked = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
+            return jnp.mean(jax.nn.logsumexp(logits, axis=-1) - picked)
+
+        return jax.vjp(loss, logits)[1](cotangent)[0]
+
+    tile_product = jax.jit(lambda states, logits: jnp.einsum("tf,tv->fv", states, logits,
+                                                             precision=precision))
+    reference = jax.jit(once)
+    # The tiled head's pieces, from the site's own constants: 4 chunks of 17 columns, so blocks of
+    # ceil(17 / 4) = 5 columns, each over token tiles of RAGGED's 128.
+    columns_wide, tokens_tall = -(-17 // 4), RAGGED[0]
+
+    @as_given
+    def library(states, matrix, targets, cotangent):
+        """The library arm (BIBLE §7's exception, row 1543): the oracle's loss and state gradient, and
+        its head gradient as the tiled head takes it, one fp32 product a block of its columns by a token
+        tile, through the library, on the site's own logits' cotangent, the pieces summed exactly in
+        float64 on the host and rounded to `dtype` once; the gate holds it to the head gradient alone
+        (`library_leaves`), the loss and the state gradient the oracle's. On an H100 PCIe a 128-token
+        tile's product rounds 1.85 times as far from float64 as the 257-token whole product (per element
+        3.8-7.3e-9 RMS against 1.9-4.5e-9, both cuBLASLt at beta 0 with a 32 MiB workspace;
+        TL-h100-tokentiles-1725),
+        which no combining of the tiles repairs."""
+        loss, d_hidden, _ = reference(states, matrix, targets, cotangent)
+        wide_states = states.astype(jnp.float32)
+        d_logits = logits_cotangent(wide_states, matrix.astype(jnp.float32), targets, cotangent)
+        d_head = np.zeros(matrix.shape, np.float64)
+        for first in range(0, matrix.shape[1], columns_wide):
+            for start in range(0, states.shape[0], tokens_tall):
+                d_head[:, first:first + columns_wide] += np.asarray(tile_product(
+                    wide_states[start:start + tokens_tall],
+                    d_logits[start:start + tokens_tall, first:first + columns_wide]), np.float64)
+        return loss, d_hidden, d_head.astype(dtype)
+
     drawn = with_cotangent(draw, full)
-    assert_as_exact(jax.jit(pulled(tiled)), jax.jit(once), drawn, f"{dtype} token tiles",
-                    seeds=SEEDS["token tiles"], truth_fn=pulled(full))
+    assert_as_exact(jax.jit(pulled(tiled)), reference, drawn, f"{dtype} token tiles",
+                    seeds=SEEDS["token tiles"], truth_fn=pulled(full), library_fn=library,
+                    library_row=1543, library_leaves=("[2]",))
     _, d_hidden, d_head = pulled(tiled)(*drawn(0))
     assert d_hidden.dtype == d_head.dtype == dtype
 

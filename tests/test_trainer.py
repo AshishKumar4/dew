@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import itertools
 import json
+import math
 import os
 import subprocess
 import sys
@@ -1242,6 +1243,171 @@ def test_a_cadence_may_be_a_share_of_the_run(tmp_path, written, expected):
     scored = sorted({step for step, scalars in tracker.scalars if "often/spread" in scalars})
     assert (logged, scored) == expected
     assert sorted({step for step, scalars in tracker.scalars if "own/spread" in scalars}) == [2, 4, 6, 8]
+
+
+def cooldown_run(schedule, steps: int, accumulation: int, tracker=None, cooldowns=None,
+                 directory=None) -> TrainState:
+    """Regression on AdamW at `schedule` for `steps`, scored once at its end, with any `cooldowns`,
+    checkpointed in `directory` where one is given."""
+    trainer = make_trainer(directory, tracker=tracker, accumulation=accumulation,
+                           optimizer=OptimConfig(optimizer="adamw", learning_rate=schedule))
+    return trainer.fit(dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps,
+                       cooldowns=cooldowns)
+
+
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the_run_as_it_was(accumulation):
+    """A linear cooldown of four updates from the fourth of a warmup-stable-decay run is the run whose
+    decay begins there: the branch's `cooldown_val/loss`, recorded at the step it branched from, is that
+    run's final `val/loss` bit for bit (its rates, 2^-4 times 1, 3/4, 1/2 and 1/4, exact), and the run
+    it branched from ends where a run with no cooldown ends, its parameters bit for bit."""
+    from dew.optim import Linear
+    from dew.telemetry.records import FitStarted
+    from dew.training.cooldown import Cooldowns
+
+    peak, at = 2.0 ** -4, 4 * accumulation
+    stable = Linear(peak, decay_start=64, decay_steps=128)
+    tracker = RecordingTracker()
+    branched = cooldown_run(stable, 3 * at, accumulation, tracker,
+                            Cooldowns(at=(at,), length=at, shape="linear"))
+    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
+              if "cooldown_val/loss" in scalars}
+    decayed = RecordingTracker()
+    cooldown_run(Linear(peak, decay_start=4, decay_steps=8), 2 * at, accumulation, decayed)
+    finals = [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars]
+    assert cooled == {at: finals[-1]}
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert started.cadences["cooldowns.at"] == [at]
+    plain = cooldown_run(stable, 3 * at, accumulation)
+    for ours, theirs in zip(jax.tree.leaves(branched.variables), jax.tree.leaves(plain.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+@pytest.mark.parametrize("best", [False, True], ids=["unranked", "weights-best"])
+def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path, best):
+    """A preemption that reaches a run as it branches into a cooldown stops it at the step the branch
+    left from, its state as it stood there, unscored, and saved whole in the step's one save, though a
+    weights-only best would have kept the step's weights alone; the resume runs the branch again first,
+    recording the score an uninterrupted run records, and trains on to the parameters a run with no
+    cooldown reaches, bit for bit."""
+    from dew.optim import Linear
+    from dew.training import Best
+    from dew.training.cooldown import Cooldowns
+
+    stable, cooldowns = Linear(2.0 ** -4, decay_start=64, decay_steps=128), Cooldowns(at=(4,), length=4)
+    uninterrupted = RecordingTracker()
+    cooldown_run(stable, 12, 1, uninterrupted, cooldowns)
+    expected = {step: scalars["cooldown_val/loss"] for step, scalars in uninterrupted.scalars
+                if "cooldown_val/loss" in scalars}
+    optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
+    # The notice step 3's log sends reaches the run after step 4, as its branch begins.
+    stopped = Preempting(3)
+    weights = Best(lambda scores: scores["val/loss"], weights_only=True)
+    ranked = {"eval_every": 4, "best": weights} if best else {"eval_every": 12}
+    with pytest.raises(Preempted):
+        make_trainer(tmp_path, tracker=stopped, optimizer=optimizer).fit(
+            dataset(val=val_batches(2)), steps=12, log_every=1, cooldowns=cooldowns, **ranked)
+    assert not any("cooldown_val/loss" in scalars for _, scalars in stopped.scalars)
+    assert Checkpoints(str(tmp_path / "run")).latest == 4
+    resumed = RecordingTracker()
+    state = cooldown_run(stable, 12, 1, resumed, cooldowns, tmp_path)
+    assert {step: scalars["cooldown_val/loss"] for step, scalars in resumed.scalars
+            if "cooldown_val/loss" in scalars} == expected
+    plain = cooldown_run(stable, 12, 1)
+    for ours, theirs in zip(jax.tree.leaves(state.variables), jax.tree.leaves(plain.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+@pytest.mark.parametrize("saves", ["final", "none", "weights-best"])
+def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume(tmp_path, saves):
+    """A cooldown at the run's last step runs after the step's final save, and one a preemption cuts
+    short stays pending beside the checkpoints (`Checkpoints.cooldown`), its step written whole even
+    where the run writes no final checkpoint or its best's weights alone: the resume runs it,
+    recording what an uninterrupted run records, and completes the run, and a fit of the completed run
+    runs nothing again."""
+    from dew.optim import Linear
+    from dew.training import Best
+    from dew.training.cooldown import Cooldowns
+
+    stable, cooldowns = Linear(2.0 ** -4, decay_start=64, decay_steps=128), Cooldowns(at=(8,), length=4)
+    uninterrupted = RecordingTracker()
+    cooldown_run(stable, 8, 1, uninterrupted, cooldowns)
+    expected = {step: scalars["cooldown_val/loss"] for step, scalars in uninterrupted.scalars
+                if "cooldown_val/loss" in scalars}
+    assert list(expected) == [8]
+    optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
+    best = Best(lambda scores: scores["val/loss"], weights_only=True) if saves == "weights-best" else None
+    with pytest.raises(Preempted):
+        make_trainer(tmp_path, tracker=Preempting(7), optimizer=optimizer).fit(
+            dataset(val=val_batches(2)), steps=8, log_every=1, eval_every=8, cooldowns=cooldowns,
+            checkpoint_final=saves == "final", best=best)
+    assert Checkpoints(str(tmp_path / "run")).latest == 8
+    assert Checkpoints(str(tmp_path / "run")).cooldown(8) is not None
+    resumed, again = RecordingTracker(), RecordingTracker()
+    cooldown_run(stable, 8, 1, resumed, cooldowns, tmp_path)
+    assert {step: scalars["cooldown_val/loss"] for step, scalars in resumed.scalars
+            if "cooldown_val/loss" in scalars} == expected
+    assert Checkpoints(str(tmp_path / "run")).cooldown(8) is None
+    cooldown_run(stable, 8, 1, again, cooldowns, tmp_path)
+    assert not any("cooldown_val/loss" in scalars for _, scalars in again.scalars)
+
+
+def test_a_cooldown_resolves_its_points_and_lengths_as_shares_of_the_run():
+    """A cooldown's point is a step or a share of the run, resolved as a cadence's is, and its length a
+    step count or a share of the steps the run has taken; it decays as 1 - sqrt(u / U), or linearly."""
+    from dew.training.cadence import Tokens
+    from dew.training.cooldown import Cooldowns, resolved
+
+    cooldowns = Cooldowns(at=("25%", 6), length="50%")
+    assert [branch.at for branch in cooldowns.branches(16, None, 1)] == [4, 6]
+    (shared,) = Cooldowns(at=("25%",)).branches(None, 96, 1)
+    assert shared.at == Tokens(24) and shared.due(3, 30, 20) and not shared.due(4, 50, 30)
+    assert cooldowns.steps(4, 1) == 2 and cooldowns.steps(12, 2) == 6
+    assert [cooldowns.factor(update, 4) for update in range(4)] == [1.0, 0.5, 1.0 - math.sqrt(0.5),
+                                                                    1.0 - math.sqrt(0.75)]
+    linear = Cooldowns(at=(4,), shape="linear")
+    assert [linear.factor(update, 4) for update in range(4)] == [1.0, 0.75, 0.5, 0.25]
+    # A branch a run kept pending is refused where a resume's updates do not divide its steps.
+    with pytest.raises(ValueError):
+        resolved({"step": 4, "steps": 3, "shape": "linear"}, 2)
+
+
+@pytest.mark.parametrize("refused", ["unscored", "unheld", "computed", "inside"])
+def test_a_cooldown_a_run_could_not_score_or_decay_is_refused(refused):
+    """A run with no validation to score its branches, an optimizer whose state holds no learning rate
+    (plain SGD) or one Optax computes from a step count at each update (an injected schedule function),
+    and a point inside an update's window are each refused before the run trains."""
+    from dew.training.cooldown import Cooldowns
+
+    computed = optax.inject_hyperparams(optax.sgd)(learning_rate=optax.linear_schedule(0.1, 0.0, 8))
+    optimizers = {"unheld": optax.sgd(0.1), "computed": computed}
+    trainer = make_trainer(optimizer=optimizers.get(refused, OptimConfig()),
+                           accumulation=2 if refused == "inside" else 1)
+    at = 3 if refused == "inside" else 4
+    with pytest.raises(ValueError):
+        trainer.fit(dataset(val=val_batches(2)), steps=8, eval_every=None if refused == "unscored" else 8,
+                    cooldowns=Cooldowns(at=(at,)))
+
+
+def test_a_cooldown_of_an_injected_constant_rate_is_the_run_that_decays_there():
+    """An optax optimizer injecting a constant rate (`optax.inject_hyperparams`) holds it in its state
+    as an OptimConfig does, and a linear cooldown from it is the run whose injected schedule decays
+    there, its score bit for bit."""
+    from dew.training.cooldown import Cooldowns
+
+    peak = 2.0 ** -4
+    decaying = optax.join_schedules([optax.constant_schedule(peak), optax.linear_schedule(peak, 0.0, 4)], [4])
+    tracker, decayed = RecordingTracker(), RecordingTracker()
+    for optimizer, steps, sink, cooldowns in (
+            (optax.inject_hyperparams(optax.sgd)(learning_rate=peak), 12, tracker,
+             Cooldowns(at=(4,), length=4, shape="linear")),
+            (optax.inject_hyperparams(optax.sgd)(learning_rate=decaying), 8, decayed, None)):
+        make_trainer(tracker=sink, optimizer=optimizer).fit(
+            dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps, cooldowns=cooldowns)
+    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
+              if "cooldown_val/loss" in scalars}
+    assert cooled == {4: [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars][-1]}
 
 
 def test_the_run_start_records_the_cadences_and_warmups_it_resolved(tmp_path):
