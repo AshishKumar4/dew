@@ -156,8 +156,9 @@ def test_a_model_that_maps_its_layers_is_refused():
 
 
 def test_a_language_models_units_are_its_tokens_next_token_losses():
-    """A decoder's unit losses are each target's next-token cross entropy from its own logits, on par with
-    NumPy's float32 log-softmax of the same logits from its float64 one (check 1), zero at a pad target."""
+    """A decoder's unit losses are each target's next-token cross entropy from its own logits, zero at a
+    pad target: on par with optax's float32 cross entropy of the same logits, from their float64 one
+    (check 1)."""
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
                               mlp_features=32, max_seq_len=8, dtype="float32")
     objective = LMObjective(model, seq_len=6, pad_id=0)
@@ -170,18 +171,24 @@ def test_a_language_models_units_are_its_tokens_next_token_losses():
         step = Step(jnp.asarray(0), jax.random.key(0), None)
         return objective.unit_losses(variables, {"text": tokens}, step)
 
-    def cross_entropy(tokens, dtype):
-        logits = np.asarray(model.apply(variables, jnp.asarray(tokens[:, :-1])), dtype)
-        targets = tokens[:, 1:]
-        shifted = logits - logits.max(-1, keepdims=True)
-        losses = np.log(np.exp(shifted).sum(-1)) - np.take_along_axis(shifted, targets[..., None], -1)[..., 0]
-        return np.where(targets == 0, dtype(0), losses)
+    def logits(tokens):
+        return model.apply(variables, jnp.asarray(tokens[:, :-1]))
 
-    numpy = as_given(lambda tokens: cross_entropy(tokens, np.float32))
-    exact = as_given(lambda tokens: cross_entropy(tokens, np.float64))
+    @jax.jit
+    def optaxs(tokens):
+        losses = optax.losses.softmax_cross_entropy_with_integer_labels(logits(tokens), tokens[:, 1:])
+        return jnp.where(tokens[:, 1:] == 0, 0, losses)
+
+    def exact(tokens):
+        wide, targets = np.asarray(logits(tokens), np.float64), tokens[:, 1:]
+        shifted = wide - wide.max(-1, keepdims=True)
+        losses = np.log(np.exp(shifted).sum(-1)) - np.take_along_axis(shifted, targets[..., None], -1)[..., 0]
+        return np.where(targets == 0, 0.0, losses)
+
     label = "lm unit losses"
-    assert_as_exact(jax.jit(dews), numpy, draw, label, seeds=seeds_for(numpy, draw, label, truth_fn=exact),
-                    truth_fn=exact)
+    truth = as_given(exact)
+    assert_as_exact(jax.jit(dews), optaxs, draw, label, seeds=seeds_for(optaxs, draw, label, truth_fn=truth),
+                    truth_fn=truth)
 
 
 class ForwardLM(NodePerturbation, LMObjective):
