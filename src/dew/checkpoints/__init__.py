@@ -70,7 +70,7 @@ from orbax.checkpoint.checkpoint_manager import AsyncOptions, MultiprocessingOpt
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
 from dew import _records, position
-from dew._coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
+from dew._coordination import agreed, broadcast_from_process_zero, from_every_process, seen_by_every_process
 from dew._hashing import fmix32
 from dew._records import JSON, duration, json_value, record, share
 from dew.batch import PARAMETER_ROOTS, Variables
@@ -524,7 +524,7 @@ REPLICA_CHUNK = 64 * 2 ** 20
 def replicas(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
     """Each process's slices of every array leaf of `tree`, as a digest keyed by the process's index:
     two processes whose digests agree hold the same slices, so either's local checkpoint restores the
-    other (`Checkpoints._recovered`)."""
+    other (`Checkpoints._reads_local`)."""
     held: dict[int, set] = {}
     for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]:
         if isinstance(leaf, jax.Array) and leaf.sharding is not None:
@@ -545,7 +545,7 @@ def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
     meshes over the same devices in another order give each process other slices.
     Which of this process's devices holds a slice is not part of it: a restore reads
     each slice by its index, and a process holding the slices another held reads
-    that one's directory (`Checkpoints._recovered`)."""
+    that one's directory (`Checkpoints._reads_local`)."""
     def owned(leaf) -> str:
         slices = leaf.sharding.addressable_devices_indices_map(leaf.shape)
         held = sorted({tuple((index.start, index.stop) for index in indices) for indices in slices.values()})
@@ -1101,12 +1101,12 @@ class Checkpoints:
 
         It is None when the step's objective declares no inference record."""
         step = self.pinned(step)
-        local = step == self._local_latest()
+        local = self._reads_local(step)
         custom = self._step_metadata(step, local=local).custom_metadata or {}
         return json_value(custom.get('artifact'), 'artifact')
 
     def control(self, step: int) -> dict:
-        if step == self._local_latest():
+        if self._reads_local(step):
             custom = self._open_local().metadata(step).custom_metadata or {}
         else:
             self.kept()
@@ -1233,56 +1233,78 @@ class Checkpoints:
         return self._local_manager
 
     def _local_latest(self) -> int | None:
-        """Return the local step every process holds, or None.
+        """Return the newest local step every process holds or can take, or None.
 
         Each process keeps one local step, its newest; a resume can read a
         local step only if every process has it, so the processes agree
         here. A host that lost its copy, or was killed before its write of
-        the newest step landed, takes a surviving replica's: the copy of a
-        process holding the same slices of every array (`_recovered`). Where
-        no survivor holds a lost process's slices, the whole pool resumes
-        from the persistent checkpoint.
+        the newest step landed, can take a surviving replica's: the copy of
+        a process holding the same slices of every array (`_local_plan`),
+        sent as the step is read (`_reads_local`). Where no survivor holds a
+        lost process's slices, the whole pool resumes from the persistent
+        checkpoint. Asking moves nothing.
         """
+        plan = self._local_plan()
+        return None if plan is None else plan[0]
+
+    def _local_plan(self) -> tuple[int, dict[int, list[int]]] | None:
+        """The newest local step and the copies that would give every process it: each surviving donor
+        to the processes without it that hold its slices of every array (the step's `replicas`, read
+        from the first survivor's record, so every process plans alike); None where some process could
+        take it from no survivor, or no process holds a local step."""
         if self.local_directory is None:
             return None
         steps = from_every_process(self._open_local().latest_step())
         newest = max((step for step in steps if step is not None), default=None)
-        if newest is None or (steps.count(newest) < len(steps) and not self._recovered(steps, newest)):
+        if newest is None:
             return None
-        return newest
-
-    def _recovered(self, steps: list[int | None], step: int) -> bool:
-        """Whether every process that holds no local `step` took a surviving replica's copy of it: a
-        process whose slices of every array another's equal (the step's `replicas`), that one's whole
-        local directory sent to it over the pool's devices (`_received`), as Orbax's emergency
-        checkpointing restores a lost host. Every process agrees on the copies as one plan, read from
-        the first survivor's record of the step."""
-        survivors = [process for process, held in enumerate(steps) if held == step]
+        survivors = [process for process, held in enumerate(steps) if held == newest]
+        lost = [process for process, held in enumerate(steps) if held != newest]
+        if not lost:
+            return newest, {}
         first = survivors[0]
-        mine = (self._open_local().metadata(step).custom_metadata or {}).get("replicas") \
+        mine = (self._open_local().metadata(newest).custom_metadata or {}).get("replicas") \
             if jax.process_index() == first else None
         replicas = from_every_process(mine)[first]
         if not isinstance(replicas, dict):
-            return False
-        donors = {}
-        for process in (process for process, held in enumerate(steps) if held != step):
+            return None
+        donors: dict[int, list[int]] = {}
+        for process in lost:
             twin = next((survivor for survivor in survivors
                          if replicas.get(str(survivor)) == replicas.get(str(process))), None)
             if twin is None or str(process) not in replicas:
-                return False
-            donors[process] = twin
-        if jax.process_index() in donors and self._local_manager is not None:
+                return None
+            donors.setdefault(twin, []).append(process)
+        return newest, donors
+
+    def _reads_local(self, step: int) -> bool:
+        """Whether `step` is read from the local directories: the newest local step every process holds
+        or can take (`_local_plan`), unless some process would take it from a replica and the
+        persistent directory holds it whole, as every process agrees. Where it is read there, every
+        process is first given it: each donor's whole local directory sent once to the processes it
+        gives the step (`_received`), as Orbax's emergency checkpointing restores a lost host. Every
+        process takes part; where every process holds the step already, nothing moves."""
+        plan = self._local_plan()
+        if plan is None or plan[0] != step:
+            return False
+        _, donors = plan
+        if donors and broadcast_from_process_zero(self._complete(step)):
+            return False
+        if any(jax.process_index() in recipients for recipients in donors.values()):
             # The manager read this process's directory, which the copy replaces.
             opened, self._local_manager = self._local_manager, None
-            opened.close()
-        for process, donor in donors.items():
-            self._received(donor, process)
+            if opened is not None:
+                opened.close()
+        for donor, recipients in donors.items():
+            self._received(donor, recipients)
         return True
 
-    def _received(self, donor: int, recipient: int) -> None:
-        """Send process `donor`'s local directory to process `recipient`, in place of its own: a tar of
-        it broadcast over the pool's devices in chunks of `REPLICA_CHUNK` bytes, which every process
-        takes part in as a collective."""
+    def _received(self, donor: int, recipients: list[int]) -> None:
+        """Send process `donor`'s local directory to each of `recipients`, in place of their own: a tar
+        of it broadcast over the pool's devices in chunks of `REPLICA_CHUNK` bytes, which every process
+        takes part in as a collective. Each host step, the tar, a chunk's read and its writes, and the
+        directory's installation, is agreed before the next collective (`agreed`), so a process whose
+        disk fails raises with its peers rather than leaving them in a broadcast it never joins."""
         import tarfile
         import tempfile
 
@@ -1290,20 +1312,32 @@ class Checkpoints:
 
         me, directory = jax.process_index(), epath.Path(self.local_path)
         with tempfile.TemporaryFile() as archive:
-            if me == donor:
+            def packed() -> int | None:
+                if me != donor:
+                    return None
                 with tarfile.open(fileobj=archive, mode="w") as tar:
                     tar.add(str(directory), arcname=".")
-            size = from_every_process(archive.tell() if me == donor else None)[donor]
-            archive.seek(0)
-            for _ in range(math.ceil(size / REPLICA_CHUNK)):
-                piece = np.zeros(REPLICA_CHUNK, np.uint8)
-                if me == donor:
-                    read = archive.read(REPLICA_CHUNK)
-                    piece[:len(read)] = np.frombuffer(read, np.uint8)
+                size = archive.tell()
+                archive.seek(0)
+                return size
+
+            size = from_every_process(agreed("replica archive", packed))[donor]
+            for chunk in range(math.ceil(size / REPLICA_CHUNK)):
+                def read() -> np.ndarray:
+                    piece = np.zeros(REPLICA_CHUNK, np.uint8)
+                    if me == donor:
+                        held = archive.read(REPLICA_CHUNK)
+                        piece[:len(held)] = np.frombuffer(held, np.uint8)
+                    return piece
+
+                piece = agreed(f"replica chunk {chunk} read", read)
                 sent = np.asarray(multihost_utils.broadcast_one_to_all(piece, is_source=me == donor))
-                if me == recipient:
-                    archive.write(sent.tobytes())
-            if me == recipient:
+                agreed(f"replica chunk {chunk} write",
+                       lambda sent=sent: archive.write(sent.tobytes()) if me in recipients else None)
+
+            def installed() -> None:
+                if me not in recipients:
+                    return
                 archive.truncate(size)
                 archive.seek(0)
                 if directory.exists():
@@ -1311,6 +1345,8 @@ class Checkpoints:
                 directory.mkdir(parents=True)
                 with tarfile.open(fileobj=archive, mode="r") as tar:
                     tar.extractall(str(directory), filter="data")
+
+            agreed("replica installation", installed)
 
     def _complete(self, step: int) -> bool:
         if step in self._committed:
@@ -1348,7 +1384,7 @@ class Checkpoints:
         That is this process's local directory when the step is the local one
         every process holds, and the persistent directory otherwise.
         """
-        return self.local_path if step == self._local_latest() else self.directory
+        return self.local_path if self._reads_local(step) else self.directory
 
     def save(
         self,
@@ -1708,14 +1744,14 @@ class Checkpoints:
         reads the step from. It is None for a state saved outside `fit`,
         which trained on no ladder.
         """
-        checkpointer = self._open_local() if step == self._local_latest() else self._open()
+        checkpointer = self._open_local() if self._reads_local(step) else self._open()
         return json_value((checkpointer.metadata(step).custom_metadata or {}).get('rung'), 'rung')
 
     def boxed(self, step: int | str | None = None) -> dict[tuple[str, ...], LogicalAxes]:
         """The axes the model at `step` boxed on its own parameters, as `save`
         recorded them; a checkpoint saved without them has none."""
         resolved = self.pinned(step)
-        snapshot = self._step_metadata(resolved, local=resolved == self._local_latest())
+        snapshot = self._step_metadata(resolved, local=self._reads_local(resolved))
         recorded = (snapshot.custom_metadata or {}).get('boxed') or []
         if not isinstance(recorded, list):
             raise ValueError(f"step {resolved}'s boxed axes are a list of path and names records, "
@@ -1810,7 +1846,7 @@ class Checkpoints:
         shape/dtype tree, and an unset field as None.
         """
         step = self.pinned(step)
-        snapshot = self._step_metadata(step, local=step == self._local_latest())
+        snapshot = self._step_metadata(step, local=self._reads_local(step))
         metadata = _item_metadata(snapshot)
         stored = {name: None if value is None else
                   jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype), value)
@@ -1833,7 +1869,7 @@ class Checkpoints:
     def accumulation_template(self, step: int):
         """Return the persisted pending-array shapes, without reading their values."""
         from dew.state import CHECKPOINTED, Accumulation
-        metadata = _item_metadata(self._step_metadata(step, local=step == self._local_latest()))
+        metadata = _item_metadata(self._step_metadata(step, local=self._reads_local(step)))
         missing = set(CHECKPOINTED).difference(metadata.keys())
         if missing:
             raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
@@ -1849,7 +1885,7 @@ class Checkpoints:
         """The data position the reader of `share` resumes from at `step` (`read_position`), read
         alone, before any state is restored: a run opens its data there and reads its first batch
         while its state is still unplaced (`Trainer.fit`). None where the step saved no position."""
-        from_local = step == self._local_latest()
+        from_local = self._reads_local(step)
         snapshot = self._step_metadata(step, local=from_local)
         metadata = _item_metadata(snapshot)
         if 'position' not in metadata or (snapshot.custom_metadata or {}).get('tree'):
@@ -1888,7 +1924,7 @@ class Checkpoints:
         and no data, it is None.
         """
         step = self.pinned(step)
-        from_local = step == self._local_latest()
+        from_local = self._reads_local(step)
         checkpointer = self._open_local() if from_local else self._open()
         where = self.local_path if from_local else self.path(step)
         if from_local and template is None and jax.process_count() > 1:

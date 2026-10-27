@@ -689,6 +689,11 @@ def failing_local_directory(checkpoints, directory: Path | None, step: int):
 def mode_fit(args) -> dict:
     import jax
 
+    if args.replica_chunk is not None:
+        # A replica's directory sent over many broadcasts, not the one its few kilobytes take.
+        import dew.checkpoints
+
+        dew.checkpoints.REPLICA_CHUNK = args.replica_chunk
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size,
                             local_dir=args.local_dir, local_every=args.local_every)
     checkpoints = trainer.checkpoints
@@ -2395,6 +2400,8 @@ def parse_args(argv=None):
     parser.add_argument("--observe-every", type=int, help="fit observes its parameters every so many steps")
     parser.add_argument("--local-dir", help="every process's local checkpoint directory")
     parser.add_argument("--local-every", type=int)
+    parser.add_argument("--replica-chunk", type=int,
+                        help="the bytes of one broadcast of a replica's local directory (REPLICA_CHUNK)")
     parser.add_argument("--records", type=int, default=BATCH * 16)
     parser.add_argument("--block-after", type=int,
                         help="batches to hand out before waiting to be killed")

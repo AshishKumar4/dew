@@ -1114,16 +1114,16 @@ def test_a_killed_pool_resumes_from_the_newer_local_checkpoint(tmp_path, killed_
 @pytest.mark.distributed
 def test_a_host_that_lost_its_local_checkpoint_takes_a_replicas_copy(tmp_path, killed_local_pool):
     """Each process's devices of the killed pool hold every slice of the state (fsdp within a process,
-    data across them), so a process whose local directory is gone, as a replaced host's is, takes the
-    other's copy of local step eight, sent over the pool's devices: both resume from local step
-    eight, not persistent step six, process one at its own data position, and land on the parameters
-    of the run nobody killed."""
+    data across them), so process zero, its local directory gone as a replaced host's is, takes
+    process one's copy of local step eight, sent over the pool's devices in broadcasts of 4 KiB: both
+    resume from local step eight, not persistent step six, each at its own data position, and land on
+    the parameters of the run nobody killed."""
     directory = tmp_path / "killed"
     shutil.copytree(killed_local_pool, directory)
-    shutil.rmtree(directory / "local" / "process1")
+    shutil.rmtree(directory / "local" / "process0")
     whole = run_pool("fit", tmp_path / "whole", 2, **local_flags(tmp_path / "whole-run"))
 
-    resumed = run_pool("fit", tmp_path / "resumed", 2, **local_flags(directory))
+    resumed = run_pool("fit", tmp_path / "resumed", 2, **local_flags(directory, replica_chunk=4096))
 
     for index, report in enumerate(resumed):
         assert report["holds_whole_state"]
@@ -1135,6 +1135,24 @@ def test_a_host_that_lost_its_local_checkpoint_takes_a_replicas_copy(tmp_path, k
         assert report["dataset_state"] == whole[index]["dataset_state"]
         assert_identical_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
                                     dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+@pytest.mark.distributed
+def test_a_pool_whose_persistent_step_is_newer_moves_no_local_copy(tmp_path):
+    """A finished run's persistent step nine is newer than its local step eight, so a host that lost its
+    local directory resumes, with every other, from step nine, and no replica's copy of step eight
+    moves to it: its local directory stays empty."""
+    finished = run_pool("fit", tmp_path / "finished", 2, **local_flags(tmp_path))
+    assert all(report["local_steps"] == [LAST_LOCAL_STEP] for report in finished)
+    shutil.rmtree(tmp_path / "local" / "process1")
+
+    resumed = run_pool("fit", tmp_path / "resumed", 2, **local_flags(tmp_path))
+
+    for report in resumed:
+        assert report["restored_step"] == STEPS
+        assert report["restored_from"] == str(worker.checkpoint_dir(tmp_path / "run", "local"))
+    assert resumed[0]["local_steps"] == [LAST_LOCAL_STEP]
+    assert resumed[1]["local_steps"] == []
 
 
 @pytest.fixture(scope="module")
