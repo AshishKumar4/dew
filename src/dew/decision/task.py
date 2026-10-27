@@ -577,22 +577,24 @@ class Decide(SavedRunTask):
         The options are cut into near-equal groups of at most `group`, and each
         group's winner goes on, until one group is left to answer the question
         (Laya's `predict_tournament`). A finalist's probabilities cover only the last
-        round's options.
+        round's options. Each question plays its own rounds: one whose finalists fit a
+        group waits for the others' final unchanged, so its answer is the one it gets
+        asked alone, whatever else the call asks.
         """
         if group < 2:
             raise ValueError("a tournament groups at least two options")
         remaining = {name: list(question.options) for name, question in questions.items()
                      if isinstance(question, Choice) and len(question.options) > group}
-        while any(len(options) > group for options in remaining.values()):
+        while playing := {name: options for name, options in remaining.items() if len(options) > group}:
             rounds = {}
-            for name, options in remaining.items():
+            for name, options in playing.items():
                 parts = -(-len(options) // group)
                 for part in range(parts):
                     chosen = options[part * len(options) // parts:(part + 1) * len(options) // parts]
                     rounds[f"{name}/{part}"] = _restricted(questions[name], chosen)
             answers = self(state, rounds)
-            remaining = {name: [_choice(answers[key]) for key in rounds if key.rsplit("/", 1)[0] == name]
-                         for name in remaining}
+            remaining |= {name: [_choice(answers[key]) for key in rounds if key.rsplit("/", 1)[0] == name]
+                          for name in playing}
         final = {name: _restricted(question, remaining[name]) if name in remaining else question
                  for name, question in questions.items()}
         return self(state, final)

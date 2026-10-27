@@ -203,6 +203,23 @@ def test_a_tournament_takes_each_group_winner_to_the_final(decide):
     assert final.probabilities.shape == (4,)
 
 
+def test_a_questions_tournament_is_its_own_beside_a_longer_one(decide):
+    """Each question plays its own rounds: beside a question of fourteen options, which takes two rounds
+    of groups of three, one of five options plays one round and waits for the final with its two
+    winners, so it is answered as it is asked alone, over its two finalists, not split again to one."""
+    request = CASES["many_options"]
+    question = Question.from_wire(request["questions"]["intent"])
+    assert isinstance(question, Choice)
+    described = dict(zip(question.options, question.descriptions, strict=True))
+    short = Choice(question.instructions, {option: described[option] for option in question.options[:5]})
+    alone = decide.tournament(request["state"], {"short": short}, group=3)["short"]
+    beside = decide.tournament(request["state"], {"short": short, "intent": question}, group=3)
+    assert len(alone.options) == 2
+    assert beside["short"].options == alone.options
+    np.testing.assert_array_equal(beside["short"].probabilities, alone.probabilities)
+    assert len(beside["intent"].options) <= 3
+
+
 def synthetic(temperature: float, count: int, options: int, seed: int) -> list[Scored]:
     """Answers whose labels are drawn from softmax(z / temperature)."""
     rng = np.random.default_rng(seed)
