@@ -303,39 +303,47 @@ def test_a_mamba2_layer_lowers_its_ssd_scan_on_each_shard_of_a_tpu_mesh():
 Shapes = set[tuple[int, ...]]
 
 
-def _mosaic_calls(rows: int, devices: int) -> tuple[list[str], Shapes, Shapes]:
-    """The Mosaic GPU calls' operand and result types, in order, of a bf16 gated delta net's forward and
-    gradient over `rows` sequences of 128 tokens, lowered for an assumed H100 over an abstract mesh of
-    `devices` splitting its rows (the recurrence template takes the H100's training cell), the shapes its
-    explicit collectives reduce, and its parameters' shapes."""
-    import re
-
+def _packed_step(rows: int, devices: int) -> tuple[str, Shapes]:
+    """A bf16 gated delta net's forward and gradient over `rows` rows of 128 tokens, each three packed
+    documents, its token coordinates built in the step as a trainer builds them once a batch
+    (`dew.batch.coordinates`), lowered for an assumed H100 over an abstract mesh of `devices` splitting its
+    rows (the recurrence template takes the H100's training cell): the lowered program, and its parameters'
+    shapes."""
     from jax.sharding import AbstractMesh, AxisType
 
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata, MixerCall
     from dew.nn.linear import GatedDeltaNet
 
     layer = GatedDeltaNet(256, 1, 2, 128, 128, dtype=jnp.bfloat16)
     x = jax.ShapeDtypeStruct((rows, 128, 256), jnp.bfloat16)
+    segments = np.repeat(np.searchsorted([40, 100], np.arange(128), side="right")[None] + 1, rows, axis=0)
     variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
 
-    def loss(variables, x):
-        return jnp.asarray(layer.apply(variables, x)).astype(jnp.float32).sum()
+    def loss(variables, x, segments):
+        metadata = AttentionMetadata(coordinates=coordinates(segments=segments, max_segments=3))
+        return jnp.asarray(layer.apply(variables, x, MixerCall(metadata=metadata))).astype(jnp.float32).sum()
 
     device = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90").abstract_device
     mesh = AbstractMesh((devices,), ("data",), axis_types=(AxisType.Auto,), abstract_device=device)
+    given = jax.ShapeDtypeStruct(segments.shape, jnp.int32)
     with assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        lowered = jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=("cuda",))
-    lines = lowered.as_text().splitlines()
-    calls = [line.rsplit(" : ", 1)[-1] for line in lines if re.search(r"custom_call @mosaic_gpu", line)]
-    collective = r"stablehlo\.(all_reduce|all_gather|all_to_all|reduce_scatter|collective_permute)"
-    reduced = set()
+        traced = jax.jit(jax.value_and_grad(loss)).trace(variables, x, given)
+    text = traced.lower(lowering_platforms=("cuda",)).as_text()
+    return text, {_squeezed(leaf.shape) for leaf in jax.tree.leaves(variables)}
+
+
+def _typed(lines: list[str], pattern: str) -> list[tuple[int, ...]]:
+    """The result shape of each op whose line matches `pattern`, read from the type that ends its op."""
+    import re
+
+    shapes = []
     for i, line in enumerate(lines):
-        if re.search(collective, line):
-            # The op's type follows its region: `(tensor<512x4xf32>) -> tensor<512x4xf32>`.
-            typed = next(later for later in lines[i:] if re.search(r"\) : \(tensor<", later))
-            dims = re.search(r"-> tensor<([0-9x]+)x[a-z]", typed).group(1)
-            reduced.add(_squeezed(int(d) for d in dims.split("x")))
-    return calls, reduced, {_squeezed(leaf.shape) for leaf in jax.tree.leaves(variables)}
+        if re.search(pattern, line):
+            typed = next(later for later in lines[i:] if re.search(r"\) -> tensor<", later))
+            dims = re.search(r"-> tensor<([0-9x]*)x?[a-z]", typed).group(1)
+            shapes.append(tuple(int(d) for d in dims.split("x") if d))
+    return shapes
 
 
 def _squeezed(shape) -> tuple[int, ...]:
@@ -344,16 +352,29 @@ def _squeezed(shape) -> tuple[int, ...]:
     return tuple(size for size in shape if size != 1)
 
 
-def test_the_recurrence_templates_kernels_take_each_devices_own_rows():
-    """A gated delta net's recurrence template on a mesh splitting its rows runs on each device's rows
-    (`recurrence_chunk.template_rule`, a per-shard map): its forward's and gradient's Mosaic GPU calls,
-    lowered for an H100 over two devices and two sequences, are the calls of one device over one sequence,
-    operand for operand, and its only collectives are its parameters' gradients' sums; on the whole batch
-    every device of a 2xH100 FSDP run ran them on the global rows, beside 40 GB of gathers a microbatch
-    (row 1897)."""
-    (sharded, reduced, parameters), (local, _, _) = _mosaic_calls(rows=2, devices=2), _mosaic_calls(1, 1)
-    assert sharded and sharded == local, (sharded, local)
-    # The only collectives the program states: data parallelism's sums of a parameter's gradient.
+def test_a_packed_recurrence_runs_on_each_devices_own_rows():
+    """A packed gated delta net on a mesh splitting its rows runs on each device's rows: lowered for an
+    H100 over two devices and two rows, its recurrence template's Mosaic GPU calls are one device's over
+    one row, operand for operand (`recurrence_chunk.template_rule`, a per-shard map); no scan runs along
+    the batch's flattened tokens, whose split over a mesh XLA's GPU partitioner expands into a loop a token
+    (the packed documents' offsets come from the batch's `Coordinates.firsts`, a sort of each row's slots);
+    and its only collectives are its parameters' gradients' sums. On the whole batch every device of a
+    2xH100 FSDP run ran the template on the global rows, and each layer's offsets took 97 loops of a
+    token an iteration (row 1897, bible 7's multi-device lowering)."""
+    import re
+
+    (sharded, parameters), (local, _) = _packed_step(rows=2, devices=2), _packed_step(rows=1, devices=1)
+
+    def calls(text):
+        return [line.rsplit(" : ", 1)[-1] for line in text.splitlines()
+                if re.search(r"custom_call @mosaic_gpu", line)]
+
+    assert calls(sharded) and calls(sharded) == calls(local)
+    lines = sharded.splitlines()
+    scanned = _typed(lines, r"call @cumsum|stablehlo\.reduce_window")
+    assert all(2 * 128 not in shape for shape in scanned), scanned
+    collective = r"stablehlo\.(all_reduce|all_gather|all_to_all|reduce_scatter|collective_permute)"
+    reduced = {_squeezed(shape) for shape in _typed(lines, collective)}
     assert reduced <= parameters, (reduced, parameters)
 
 
