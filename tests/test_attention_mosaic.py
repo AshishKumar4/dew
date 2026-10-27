@@ -13,10 +13,10 @@ import dataclasses
 import functools
 import os
 
+import lane_environment
 import jax
 import jax.numpy as jnp
 import numpy as np
-import lane_environment
 import pytest
 from generation_support import INTERPRETS, lowers
 from jax.sharding import Mesh
