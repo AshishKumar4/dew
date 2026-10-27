@@ -634,6 +634,46 @@ def test_a_dropping_call_traced_for_an_assumed_gpu_runs_the_plain_jax_mainloop()
     assert [route.kernel for route in found if route.choice == "attention_mainloop"] == ["portable"]
 
 
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axes, dimension, local", [({"data": 2}, 0, 2), ({"tensor": 2}, 2, 2)],
+                         ids=["rows", "heads"])
+def test_the_mosaic_mainloop_lowers_on_each_shards_own_rows_and_heads(axes, dimension, local):
+    """A causal bf16 call over four rows of four heads that names the template, its forward and backward
+    lowered for an H100 on a mesh splitting its rows or its heads in two (`generation.gpu_mesh`): every
+    Mosaic launch takes each shard's own rows or heads, half the call's (`attention._per_shard`), so no
+    device runs the global batch, and no gather brings another shard's queries, keys or values to it (bible
+    §7: a new accelerator route qualifies through its real target lowering on a multi-device mesh)."""
+    import math
+    import re
+
+    from jax.sharding import AxisType, NamedSharding
+
+    from dew.nn.attention import scaled_dot_product_attention
+
+    devices = jax.make_mesh(tuple(axes.values()), tuple(axes), axis_types=(AxisType.Auto,) * len(axes),
+                            devices=jax.devices()[:math.prod(axes.values())])
+    mesh = generation.gpu_mesh(devices, "sm90")
+    shape = jax.ShapeDtypeStruct((4, 128, 4, 64), jnp.bfloat16)
+    split = PartitionSpec("data") if "data" in axes else PartitionSpec(None, None, "tensor")
+    placed = jax.ShapeDtypeStruct(shape.shape, shape.dtype, sharding=NamedSharding(mesh, split))
+
+    def loss(query, key, value):
+        out = scaled_dot_product_attention(query, key, value, causal=True, implementation="template")
+        return out.astype(jnp.float32).sum()
+
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2))).trace(placed, placed, placed).lower(
+            lowering_platforms=("cuda",))
+    text = lowered.as_text(debug_info=False)
+    launches = re.findall(r'custom_call @mosaic_gpu_v2\(.*?\) .*?: \((tensor<[^>]*>)', text)
+    assert launches, "the template lowers no Mosaic launch"
+    for operand in launches:
+        extents = [int(extent) for extent in operand.removeprefix("tensor<").split("x")[:-1]]
+        if len(extents) == 4:
+            assert extents[dimension] == local, operand
+    assert "all_gather" not in text and "all_to_all" not in text
+
+
 def test_the_mainloop_is_the_shared_selectors_choice():
     """The template's mainloop is an op of the shared selector (`attention_route.MAINLOOP`,
     `selection.select`), one chooser for its preference, its named choice and its route: on a GPU Mosaic
