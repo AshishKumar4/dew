@@ -1160,18 +1160,20 @@ class Trainer(Generic[Loss, Effects]):
                        out_shardings=(moving, replicated, replicated, replicated, replicated, replicated),
                        donate_argnums=0)
 
-    def _lowered_for(self, state: TrainState, batch: Batch, generation: str) -> jax.stages.Lowered:
+    def _lowered_for(self, state: TrainState, batch: Batch, generation: str,
+                     devices: Mesh | None = None) -> jax.stages.Lowered:
         """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered
         for one (`dew.training._lowering`), on whatever devices this process has.
 
         It traces on an abstract mesh of that GPU's devices, from which JAX's Pallas lowering reads the
-        GPU, at the base rung and the plan's first split: a run that does not fit splits its batch or
-        recomputes more, no other kernel. A CPU-owned state's step realizes its parameters on the host
-        as it runs, and is not lowered."""
+        GPU, or on `devices`, compile-only GPUs that XLA compiles it for (`dew.training.ahead`), at the
+        base rung and the plan's first split: a run that does not fit splits its batch or recomputes
+        more, no other kernel. A CPU-owned state's step realizes its parameters on the host as it
+        runs, and is not lowered."""
         if self.host_master:
             raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
                              "the variables on the host")
-        mesh = gpu_mesh(self.device_mesh, generation)
+        mesh = gpu_mesh(self.device_mesh, generation) if devices is None else devices
         self._at_base_rung(batch)
         with assumed(generation), self._traced_on(mesh) as schedule:
             state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
@@ -1183,9 +1185,9 @@ class Trainer(Generic[Loss, Effects]):
             placement = batch_shardings(mesh, batch)
             replicated = NamedSharding(mesh, P())
             jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
-            return jitted.trace(*apart(placed_shapes(prepared, shardings)), placed_shapes(batch, placement),
-                                jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)).lower(
-                lowering_platforms=('cuda',))
+            traced = jitted.trace(*apart(placed_shapes(prepared, shardings)), placed_shapes(batch, placement),
+                                  jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated))
+            return traced.lower() if devices is not None else traced.lower(lowering_platforms=('cuda',))
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies

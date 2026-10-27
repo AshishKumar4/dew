@@ -22,63 +22,14 @@ import jax.experimental.topologies as topologies
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-from dew.nn.kernels.generation import assumed, capability, gpu_mesh, gpu_target
-
-THREADS_PER_MULTIPROCESSOR = {(8, 0): 2048, (9, 0): 2048, (10, 0): 2048}
-"""Resident threads a multiprocessor holds by compute capability, 1536 on the others the targets name
-(CUDA C++ Programming Guide, "Technical Specifications per Compute Capability")."""
+from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target
+from dew.training.ahead import compile_only_gpus
 
 REFUSED = re.compile(r"Shared memory size limit exceeded: requested (\d+)")
 """XLA's refusal of a Triton kernel whose shared memory a block of the GPU does not hold."""
 
 KERNEL = re.compile(r"kCustomKernel .*? shared_memory: (\d+) bytes")
 """A custom (Triton) kernel's line in XLA's thunk sequence, with the shared bytes it launches with."""
-
-
-def target_config(generation: str) -> str:
-    """The `gpu_device_info` XLA compiles for, from the CUDA `generation`'s target
-    (`generation.TARGETS`): its compute capability, the shared memory a block may opt into, its
-    multiprocessors, clock and bandwidth; CUDA's per-capability limits for the rest. The fields past
-    the capability and shared memory only steer XLA's own fusions, never a Triton kernel's code."""
-    target, version = gpu_target(generation), capability(generation)
-    facts = (target.shared_limit, target.multiprocessors, target.clock_hz, target.memory_bandwidth)
-    if version is None or any(fact is None for fact in facts):
-        raise ValueError(f"no CUDA target states {generation!r}'s compile facts")
-    major, minor = version
-    shared, multiprocessors, clock, bandwidth = facts
-    return f"""gpu_device_info {{
-  threads_per_block_limit: 1024
-  threads_per_warp: 32
-  shared_memory_per_block: 49152
-  shared_memory_per_core: {shared + 1024}
-  threads_per_core_limit: {THREADS_PER_MULTIPROCESSOR.get((major, minor), 1536)}
-  core_count: {multiprocessors}
-  fpus_per_core: {64 if (major, minor) == (8, 0) else 128}
-  block_dim_limit_x: 2147483647
-  block_dim_limit_y: 65535
-  block_dim_limit_z: 65535
-  memory_bandwidth: {int(bandwidth)}
-  clock_rate_ghz: {clock / 1e9}
-  shared_memory_per_block_optin: {shared}
-  cuda_compute_capability {{
-    major: {major}
-    minor: {minor}
-  }}
-  registers_per_core_limit: 65536
-  registers_per_block_limit: 65536
-}}
-platform_name: "CUDA"
-device_description_str: "{target.device_kind}"
-"""
-
-
-@functools.cache
-def compile_only_gpus(generation: str, count: int = 1) -> tuple:
-    """`count` compile-only devices of the CUDA `generation`, none attached: XLA's CUDA backend compiles a
-    program over them, a mesh's collectives included, as for that many of the generation's GPUs."""
-    topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=target_config(generation),
-                                            topology=f"1x1x{count}")
-    return tuple(topology.devices[:count])
 
 
 @functools.cache
