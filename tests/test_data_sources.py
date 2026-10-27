@@ -541,6 +541,102 @@ def test_one_small_file_streams_to_every_reader_each_reading_its_own_lines(tmp_p
                  loading=Loading(workers=0))
 
 
+@dataclasses.dataclass(frozen=True)
+class LineOrTarFiles:
+    """A native writer of a record format no suffix of its name spells as `Files` infers one: the
+    rows' `text` as lines of a `.txt` file ("text"), or as each key's `txt` member of a `.tar`
+    ("webdataset"), a file for each batch it is handed."""
+
+    format: str
+
+    def write(self, rows, directory, filesystem):
+        for number, batch in enumerate(rows):
+            texts = batch.column("text").to_pylist()
+            if self.format == "text":
+                payload = "".join(text + "\n" for text in texts).encode()
+            else:
+                archive = io.BytesIO()
+                with tarfile.open(fileobj=archive, mode="w") as tar:
+                    for index, text in enumerate(texts):
+                        member = tarfile.TarInfo(f"{number:06d}-{index:06d}.txt")
+                        member.size = len(text.encode())
+                        tar.addfile(member, io.BytesIO(text.encode()))
+                payload = archive.getvalue()
+            suffix = "txt" if self.format == "text" else "tar"
+            with filesystem.open_output_stream(f"{directory}/part-{number:06d}.{suffix}") as stream:
+                stream.write(payload)
+
+
+@pytest.mark.parametrize("kind", ["text", "webdataset"])
+def test_a_native_writers_export_reads_back_by_the_format_its_manifest_commits(tmp_path, kind):
+    """An export commits the record format its writer states, and `Files` reads the export by that
+    value, whatever a suffix would spell: text lines and WebDataset members, which a reader that
+    looked the format up by a suffix (`data.text`, `data.webdataset`) refused."""
+    texts = [f"record {index}" for index in range(10)]
+    manifest = export(Memory([{"text": text} for text in texts]), str(tmp_path), format=LineOrTarFiles(kind),
+                      rows_per_shard=4)
+    assert manifest["format"] == kind
+    stored = Files(str(tmp_path))
+    rows = list(stored.records("memory"))
+    read = [row["text"].removesuffix("\n") if kind == "text" else row["txt"].decode() for row in rows]
+    assert read == texts
+
+
+def test_a_writer_of_a_format_no_reader_opens_is_refused_before_it_commits(tmp_path):
+    """A writer stating a record format `Files` has no reader for is refused before anything is
+    written: an export's manifest is committed once, so one committed under such a format could
+    never be read, nor written again, there."""
+    with pytest.raises(ValueError):
+        export(Memory([{"text": "one"}]), str(tmp_path), format=LineOrTarFiles("tfrecord"))
+    assert not (tmp_path / "_dew_manifest.json").exists() and not list(tmp_path.rglob("part-*"))
+
+
+def ids_per_reader(path: Path, readers: int, kind: str = "jsonl") -> list[list[int]]:
+    """The ids each of `readers` readers of a streamed read of the store at `path` reads."""
+    stored = Files(str(path), format=kind)
+    shares = []
+    for share in range(readers):
+        partition = DataPartition(share, readers)
+        rows = streamed(stored.manifest(), partition=partition, loading=Loading(workers=0))
+        shares.append([row["id"] if kind == "jsonl" else json.loads(row["text"])["id"] for row in rows])
+    return shares
+
+
+@pytest.mark.parametrize("kind", ["jsonl", "text"])
+def test_a_long_first_record_moves_the_cuts_it_holds_on_to_the_records_after_it(tmp_path, kind):
+    """Four records, the first 10,000 characters long, read by four readers: the even cuts that fall
+    inside the first record move on to the records after it, so each reader reads one record of its
+    own, where they collapsed into one another, left two parts and the read was refused."""
+    lines = [json.dumps({"id": index, "pad": "x" * (10_000 if index == 0 else index)}) for index in range(4)]
+    (tmp_path / "rows.jsonl").write_text("".join(line + "\n" for line in lines))
+    shares = ids_per_reader(tmp_path / "rows.jsonl", 4, kind)
+    assert sorted(len(ids) for ids in shares) == [1, 1, 1, 1]
+    assert sorted(itertools.chain(*shares)) == [0, 1, 2, 3]
+
+
+def test_a_file_of_fewer_records_than_its_byte_share_hands_its_other_parts_to_another(tmp_path):
+    """A store of two files is cut by their bytes: a file of one long record holds one part, and the
+    parts its bytes would have given it go to the file of many short records, so every reader of
+    four reads, where the read was refused."""
+    (tmp_path / "long.jsonl").write_text(json.dumps({"id": 0, "pad": "x" * 10_000}) + "\n")
+    (tmp_path / "short.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(1, 9)))
+    shares = ids_per_reader(tmp_path, 4)
+    assert all(shares)
+    assert sorted(itertools.chain(*shares)) == list(range(9))
+
+
+def test_no_part_of_a_json_lines_file_starts_on_blank_lines_alone(tmp_path):
+    """Blank lines hold no JSON record: a cut that falls among them moves on to the next record, so
+    no reader is handed a part of blank lines alone and reads nothing."""
+    blank = "\n" * 3000
+    records = [json.dumps({"id": index}) for index in range(4)]
+    lines = [records[0], blank, *records[1:]]
+    (tmp_path / "rows.jsonl").write_text("".join(line + "\n" for line in lines))
+    shares = ids_per_reader(tmp_path / "rows.jsonl", 4)
+    assert sorted(len(ids) for ids in shares) == [1, 1, 1, 1]
+    assert sorted(itertools.chain(*shares)) == [0, 1, 2, 3]
+
+
 def test_a_corrupt_export_manifest_is_refused_and_never_falls_back_to_raw_shards():
     root = Store(f"memory://corrupt-export-{uuid4().hex}")
     export(Memory([{"id": 1}]), root.url)
