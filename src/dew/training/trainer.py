@@ -281,22 +281,22 @@ class Trainer(Generic[Loss, Effects]):
         from dew.nn.inputs import request_key
         self.seed = int(key) if isinstance(key, (int, np.integer)) and not isinstance(key, bool) else None
         self.key = request_key(key)
-        self.mesh, self.layout = mesh, layout
+        self.mesh = mesh
+        self.layout = layout
         self._microbatches = microbatches
         self.accumulation = accumulation
         self.split = split
         self._loss_scale = loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
-        self.checkpoints, self.tracker = checkpoints, tracker
-        self.step, self.rollout = step, rollout
-        self.tune_kernels = tune_kernels
+        self.checkpoints = checkpoints
+        self.tracker, self.step, self.rollout = tracker, step, rollout
         if record and step is not None:
             raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
                              "build them with Step(record=True)")
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
-        self.lower_for = lower_for
+        self.lower_for, self.tune_kernels = lower_for, tune_kernels
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
         # `fit` keeps them beside each step. The program is the step as handed to XLA, before GSPMD partitions
         # it, and the executable the step as compiled, whose memory analysis a benchmark reads.
