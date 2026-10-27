@@ -68,6 +68,10 @@ class Dimmed:
         image = np.asarray(row["image"])
         return {**row, "image": (image * rng.uniform(0.5, 1.0)).astype(image.dtype)}
 
+    def declared(self, facts):
+        # The image keeps its shape and dtype.
+        return facts
+
 
 def read(chain):
     return chain.read("memory").loading(Loading(workers=0))
@@ -86,8 +90,10 @@ def lm(root: Path, drawn: bool) -> RunConfig:
 
 def decision(root: Path, drawn: bool) -> RunConfig:
     table = root / "tickets.csv"
-    tickets = [("charged twice for March", "billing"), ("the site is down", "technical"),
-               ("how much is the pro plan", "sales"), ("refund my last invoice", "billing")] * 8
+    asked = [("charged twice for March", "billing"), ("the site is down", "technical"),
+             ("how much is the pro plan", "sales"), ("refund my last invoice", "billing")]
+    # Each ticket its own text, so the held-out split, cut by a row's content, holds some of each.
+    tickets = [(f"{text}, ticket {index}", label) for index in range(8) for text, label in asked]
     with table.open("w", newline="") as file:
         writer = csv.writer(file)
         writer.writerow(["text", "label"])
@@ -138,6 +144,8 @@ def jepa(root: Path, drawn: bool) -> RunConfig:
 
 
 KINDS = {"lm": lm, "decision": decision, "diffusion": diffusion, "jepa": jepa}
+ADAPTED = {"lm": ("q_proj",), "decision": ("q_proj",), "diffusion": ("ada_proj",), "jepa": ("up_proj",)}
+"""A module of each kind's model a `lora` adapts."""
 DEFAULT_METRICS = {"lm": "val/perplexity", "decision": "val/accuracy"}
 """A metric each kind scores where `val_metrics` names none, for the kinds that score one."""
 
@@ -154,17 +162,18 @@ def scalars(run: Path) -> dict[int, dict[str, float]]:
 @pytest.mark.mesh(devices=8)
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_every_trainer_option_set_on_the_command_line_reaches_the_kinds_run(kind, tmp_path):
-    """`dew train` over a kind's run.json with its options set (`--set`): two steps pooled into one
-    update commit once, at the second step's end (`train/grad_norm`), under a dynamic loss scale
-    (`train/loss_scale`) and the learning rate set (`train/learning_rate`); every step is logged and
-    scored on the held split, with no metric the kind would score by default and the summary named
-    formed from the scores; and the run's one checkpoint kept is its last, in the directory named."""
+    """`dew train` over a kind's run.json with its options set (`--set`): four steps pooled two to an
+    update commit at the second's and the fourth's end (`train/grad_norm`), under a dynamic loss
+    scale (`train/loss_scale`) and the learning rate set (`train/learning_rate`); every step is
+    logged and scored on the held split, with no metric the kind would score by default and the
+    summary named formed from the scores; and every step's checkpoint is kept, four, where the
+    default keeps the latest two and the best, in the directory named."""
     record = tmp_path / "record"
     KINDS[kind](tmp_path, drawn=False).save(str(record))
     runs = tmp_path / "runs"
-    settings = {"trainer.name": "set", "trainer.checkpoint_dir": str(runs), "trainer.steps": "2",
+    settings = {"trainer.name": "set", "trainer.checkpoint_dir": str(runs), "trainer.steps": "4",
                 "trainer.accumulation": "2", "trainer.log_every": "1", "trainer.eval_every": "1",
-                "trainer.checkpoint_every": "1", "trainer.keep": "1", "trainer.dynamic_scale": "True",
+                "trainer.checkpoint_every": "1", "trainer.keep": "4", "trainer.dynamic_scale": "True",
                 "trainer.multi_host": "False", "trainer.compilation_cache_dir": "None",
                 "optim.learning_rate": str(RATE), "val_metrics": "[]",
                 "val_summaries": json.dumps([{"name": "board", "weights": {"val/loss": 1},
@@ -173,15 +182,15 @@ def test_every_trainer_option_set_on_the_command_line_reaches_the_kinds_run(kind
                  *(flag for path, value in settings.items() for flag in ("--set", f"{path}={value}"))]) == 0
     run = runs / "set"
     logged = scalars(run)
-    assert {step for step, row in logged.items() if "train/loss" in row} == {1, 2}
-    assert [step for step, row in logged.items() if "train/grad_norm" in row] == [2]
-    for step in (1, 2):
+    assert {step for step, row in logged.items() if "train/loss" in row} == {1, 2, 3, 4}
+    assert sorted(step for step, row in logged.items() if "train/grad_norm" in row) == [2, 4]
+    for step in (1, 2, 3, 4):
         row = logged[step]
         assert row["train/learning_rate"] == pytest.approx(RATE)
         assert "train/loss_scale" in row
         assert row[f"{Summary.SPLIT}/board"] == row["val/loss"]
         assert DEFAULT_METRICS.get(kind) not in row
-    assert sorted(path.name for path in run.iterdir() if path.name.isdigit()) == ["2"]
+    assert sorted(path.name for path in run.iterdir() if path.name.isdigit()) == ["1", "2", "3", "4"]
 
 
 def trained(run: RunConfig, root: Path, name: str, **fields):
@@ -211,7 +220,8 @@ def test_a_kinds_key_data_seed_mesh_and_adapter_reach_what_it_trains(kind, tmp_p
     assert first["train/loss"] != reordered["train/loss"]
     assert any(len(leaf.sharding.device_set) > 1 and not leaf.sharding.is_fully_replicated
                for leaf in jax.tree.leaves(base.variables["params"]))
-    adapted, _ = trained(run, tmp_path, "adapted", trainer={"key": 1}, lora=LoRA(rank=2))
+    adapted, _ = trained(run, tmp_path, "adapted", trainer={"key": 1},
+                         lora=LoRA(rank=2, modules=ADAPTED[kind]))
     assert FROZEN in adapted.variables
     factors = sum(leaf.size for leaf in jax.tree.leaves(adapted.variables["params"]))
     assert 0 < factors < sum(leaf.size for leaf in held)
