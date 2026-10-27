@@ -318,6 +318,36 @@ def test_a_paged_window_cache_decodes_what_the_compact_cache_decodes(source, qua
                                   decoded(KVCache(quantized=quantized)))
 
 
+@pytest.mark.parametrize("quantized", [None, "int8", "float8_e4m3fn"])
+def test_a_paged_drafting_cache_drafts_what_the_compact_cache_drafts(source, quantized):
+    """The DSpark drafter's window cache takes the decoder's layout: after a prefill and a verified
+    stretch recorded into it, a paged cache drafts the compact cache's logits at the same format, bit
+    for bit, its context written as the stage's keys and values and read back in their basis."""
+    from dew.sampling.text import decode_ops, prefill_state
+
+    loaded, plain, reference = source
+    ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
+
+    def drafted(layout: KVCache) -> np.ndarray:
+        model = plain.with_kv_cache(layout)
+        ops = decode_ops(model, loaded.variables, 0, 0)
+        state, _ = prefill_state(model, loaded.variables, ModelInputs(ids[:, :prompt]), ops)
+        keep = jnp.arange(3)[None, :] < jnp.asarray([3, 1])[:, None]
+        state, _, context = ops.verify(state, ids[:, prompt:prompt + 3], keep)
+        state = ops.record(state, context, keep)
+        scored = []
+
+        def choose(index, logits):
+            scored.append(logits)
+            return jnp.argmax(logits, axis=-1)
+
+        ops.draft(state, ids[:, prompt + 3], choose)
+        return np.asarray(jnp.stack(scored, 1))
+
+    np.testing.assert_array_equal(drafted(KVCache(quantized=quantized, page_size=4)),
+                                  drafted(KVCache(quantized=quantized)))
+
+
 def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers():
     """Two Reindex layers of one kind in a row stay two runs of one under
     scan_layers, so the Reuse layer after them attends the second one's

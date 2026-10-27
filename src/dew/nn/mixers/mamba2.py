@@ -60,13 +60,13 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from dew.mesh import SEQUENCE_AXIS, LayoutRefused, logical_spec
-from dew.nn.attention import unweighted_rmsnorm
+from dew.nn.attention import repeat_kv_heads, unweighted_rmsnorm
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
 from dew.nn.kernels.generation import triton_runs
-from dew.nn.kernels.recurrence import Hooks, Step, step_reference
+from dew.nn.kernels.recurrence import Hooks
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY, Chunk, chunk
 from dew.nn.linear import DepthwiseConv1d, causal_conv1d, held_conv1d, held_scan, real_tail
 from dew.nn.mixer_base import MixerBase, MixerContext
@@ -133,27 +133,31 @@ SSD = Hooks(decay='scalar', rated=True, delta=False, skip=True)
 
 
 def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
-    """One token at a time, `mamba2_selective_state_update` (modeling_mamba2.py:192-251): the
-    recurrence template's decode step (`step_reference`, the `SSD` form) as a scan over time, in fp32
-    (the input's own dtype where it is wider). Operands and results as `chunk_ssd`'s, the state in the
-    template's key-major layout inside; a token `starts` marks sees a zero state."""
+    """One token at a time, `mamba2_selective_state_update`
+    (modeling_mamba2.py:192-251) as a scan over time, in fp32 (the input's
+    own dtype where it is wider). Operands and results as `chunk_ssd`'s; a
+    token `starts` marks sees a zero state."""
     work = at_least_fp32(jnp.result_type(x, B, C))
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, heads, head_dim = x.shape
-    held = (jnp.zeros((batch, heads, B.shape[-1], head_dim), work) if state is None
-            else jnp.swapaxes(jnp.asarray(state, work), -1, -2))
+    # The `H // G` heads of one group read the same B and C, the reference's `repeat_interleave`.
+    B, C = repeat_kv_heads(B, heads), repeat_kv_heads(C, heads)
+    if state is None:
+        state = jnp.zeros((batch, heads, head_dim, B.shape[-1]), work)
     if starts is None:
         starts = jnp.zeros((batch, length), jnp.bool_)
 
-    def one_token(held, token):
-        x_t, dt_t, B_t, C_t, start = token                  # [B, H, P], [B, H], [B, G, N], [B]
-        held = jnp.where(start[:, None, None, None], 0.0, held)
-        out, _, held = step_reference(SSD, Step(held, query=C_t, key=B_t, value=x_t, beta=dt_t, rate=A,
-                                                skip=D), dtype=work)
-        return held, out
+    def one_token(s, step):
+        x_t, dt_t, B_t, C_t, start = step                   # [B, H, P], [B, H], [B, H, N], [B]
+        decay = jnp.where(start[:, None], 0.0, jnp.exp(dt_t * A))
+        s = s * decay[..., None, None] + (dt_t[..., None] * x_t)[..., None] * B_t[..., None, :]
+        read = float32_einsum('bhps,bhs->bhp', s, C_t)
+        return s, read + x_t * D[None, :, None]
 
-    final, out = jax.lax.scan(one_token, held, tuple(jnp.moveaxis(t, 1, 0) for t in (x, dt, B, C, starts)))
-    return jnp.moveaxis(out, 0, 1), jnp.swapaxes(final, -1, -2)
+    final, out = jax.lax.scan(
+        one_token, jnp.asarray(state, work),
+        tuple(jnp.moveaxis(t, 1, 0) for t in (x, dt, B, C, starts)))
+    return jnp.moveaxis(out, 0, 1), final
 
 
 class MambaRMSNormGated(nn.Module):

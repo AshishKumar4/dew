@@ -1020,10 +1020,11 @@ def _integer_convolution_on_cuda(op: Callable[..., jax.Array]) -> Callable[..., 
     (`qarray.get_accumulator_and_result_type`), and XLA:GPU runs no s8 x s8 -> s32
     convolution at any precision (UNIMPLEMENTED on an A100, jax 0.12) while it
     runs s8 x s8 -> f32. On CUDA the operands' integer values convolve as float32
-    instead: each product of two int8 values is exact in float32, and their sums
-    are exact while they stay under 2**24, every contraction of up to 1040 terms
-    (a 3x3 kernel over 115 input channels), past which each rounds once. Every
-    other platform convolves the integers as Qwix does."""
+    instead: each product of two int8 codes is exact in float32, at most 2**14 in
+    magnitude (Qwix's symmetric int8 reaches -128), so every contraction of up to
+    1024 terms sums exactly, and a longer one rounds only where a partial sum passes
+    2**24, which int32 would have held exactly. Every other platform convolves the
+    integers as Qwix does."""
     qwix = _qwix()
 
     def integer(arg) -> bool:
