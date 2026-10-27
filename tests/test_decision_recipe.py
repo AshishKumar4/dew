@@ -210,19 +210,19 @@ def test_a_relabelled_table_reads_its_new_labels_not_the_store_s_class_names():
 TEAM = {"type": "choice", "instructions": "Which team?", "criteria": ["billing", "technical"]}
 
 
-def asked(state: str, **gold) -> dict:
+def ticket(state: str, **gold) -> dict:
     """A row asking which team takes `state`, with its `answers` or `targets` for that question."""
     stated = {kind: {"team": value} for kind, value in gold.items()}
     return {"state": state, "questions": {"team": TEAM}, **stated}
 
 
 ROWS = {
-    "tickets/0": [asked("charged twice", answers="billing"), asked("site down", answers="technical")],
-    "tickets/1": [asked("refund please", targets={"technical": 0.25, "billing": 0.75}),
-                  asked("error 500", answers=1)],
-    "tickets.held": [asked("billed again", answers="billing"), asked("login broken", answers="technical")],
-    "billing": [asked("invoice wrong", answers="billing"), asked("double charge", answers=0)],
-    "legacy": [asked("fax broken", answers="technical")],
+    "tickets/0": [ticket("charged twice", answers="billing"), ticket("site down", answers="technical")],
+    "tickets/1": [ticket("refund please", targets={"technical": 0.25, "billing": 0.75}),
+                  ticket("error 500", answers=1)],
+    "tickets.held": [ticket("billed again", answers="billing"), ticket("login broken", answers="technical")],
+    "billing": [ticket("invoice wrong", answers="billing"), ticket("double charge", answers=0)],
+    "legacy": [ticket("fax broken", answers="technical")],
 }
 """A decision mixture's files by their names in its directory, each a JSONL file of these rows: the
 `tickets` corpus's two training shards and its held rows, and the `billing` and `legacy` corpora."""
@@ -367,7 +367,7 @@ def test_a_decision_corpus_of_one_file_reads_through_every_loading_worker(tmp_pa
     from dew.data.dataset import DataPartition
     from dew.decision.data import corpus
 
-    rows = [asked(f"ticket {index}", answers=["billing", "technical"][index % 2]) for index in range(24)]
+    rows = [ticket(f"ticket {index}", answers=["billing", "technical"][index % 2]) for index in range(24)]
     (tmp_path / "mixture.json").write_text(json.dumps({"weights": {"a": 1.0}, "slots": {"questions": 1,
                                                                                          "options": 2}}))
     (tmp_path / "a.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
