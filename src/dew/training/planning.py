@@ -247,7 +247,7 @@ class Planned:
     options and reads the parameters through narrow copies, and the rung it compiled
     at, as a record and as the objective's modules, head tile and whether that
     head is fused. `profiled` is the runs and the bytes of the profile that guided its executable
-    (`guided`), None where none did."""
+    (`profile_guided`), None where none did."""
     split: int
     candidate: Candidate
     executable: jax.stages.Compiled
@@ -373,11 +373,11 @@ def pgle_runs() -> int:
     (`jax_enable_pgle`, `jax_pgle_profiling_runs`), 0 where it is off. JAX's jit guides the programs it
     compiles at a call; a step the plan compiles ahead of its run (`Lowered.compile`) is no such call,
     which JAX compiles for the profile's sake (command buffers off) and never guides, so the trainer
-    guides it (`guided`)."""
+    guides it (`profile_guided`)."""
     return jax.config.jax_pgle_profiling_runs if jax.config.jax_enable_pgle else 0
 
 
-def guided(planned: Planned, profile: bytes, runs: int, mesh: Mesh) -> Planned:
+def profile_guided(planned: Planned, profile: bytes, runs: int, mesh: Mesh) -> Planned:
     """`planned` with its program compiled again under the options its executable compiled under, guided
     by `profile` of `runs` runs (`Timer.profiled`) as JAX's jit guides AutoPGLE's (XLA's feedback-directed
     `fdo_profile`, which JAX shares across a pool's processes), and held to the fit check the plan passed:

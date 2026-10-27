@@ -183,9 +183,9 @@ from dew.training.planning import (
     Planned,
     Timer,
     faster,
-    guided,
     pgle_runs,
     plan_step,
+    profile_guided,
     read_whole,
     settled,
     splits,
@@ -968,7 +968,7 @@ class Trainer(Generic[Loss, Effects]):
         splits or spans devices, left open and unrecorded, is timed by `timed`
         (`fit`) against the batch whole a rung up, and the faster kept. Where JAX's AutoPGLE is on
         (`jax_enable_pgle`), `timed` profiles the plan's first runs on a copy of the state, and the
-        same program compiles again guided by that profile (`dew.training.planning.guided`).
+        same program compiles again guided by that profile (`dew.training.planning.profile_guided`).
         """
         if self.lower_for is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
@@ -1085,7 +1085,7 @@ class Trainer(Generic[Loss, Effects]):
         planned = plans[broadcast_from_process_zero(faster(seconds) if seconds else 0)]
         if (runs := pgle_runs()) and timed is not None:
             profile = timed.profiled(self._runner(planned, mesh), planned, mesh, runs)
-            planned = guided(planned, profile, runs, mesh)
+            planned = profile_guided(planned, profile, runs, mesh)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         self.validation = self._validation(planned.candidate.prepared)

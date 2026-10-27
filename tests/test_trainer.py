@@ -232,7 +232,7 @@ def lm_data() -> Pipeline:
     return Pipeline(Memory({"text": rows})).repeat().batch(LM_ROWS)
 
 
-def lm_trainer(tmp_path=None, **kwargs) -> Trainer:
+def budget_lm_trainer(tmp_path=None, **kwargs) -> Trainer:
     model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
                               mlp_features=32, max_seq_len=12, dtype="float32")
     return make_trainer(tmp_path, objective=LMObjective(model, seq_len=LM_CONTEXT), **kwargs)
@@ -248,7 +248,8 @@ def test_a_token_budget_reads_its_count_off_the_devices_as_often_in_a_longer_run
     def reads(steps: int) -> int:
         caplog.clear()
         with jax.transfer_guard_device_to_host("log_explicit"), caplog.at_level(logging.WARNING):
-            state = lm_trainer(accumulation=accumulation).fit(lm_data(), tokens=steps * LM_ROWS * LM_CONTEXT)
+            trainer = budget_lm_trainer(accumulation=accumulation)
+            state = trainer.fit(lm_data(), tokens=steps * LM_ROWS * LM_CONTEXT)
         assert int(state.step) == steps
         return sum("shape=(2,), dtype=uint32" in record.getMessage() for record in caplog.records)
 
@@ -261,9 +262,9 @@ def test_a_token_budget_resumed_inside_an_update_ends_where_an_unbroken_run_does
     whose commit reaches it, as a run that never stopped does, not a step later, where its own steps
     alone would have reached it."""
     budget = 4 * LM_ROWS * LM_CONTEXT
-    unbroken = lm_trainer(tmp_path / "unbroken", accumulation=2).fit(lm_data(), tokens=budget)
-    lm_trainer(tmp_path / "broken", accumulation=2).fit(lm_data(), steps=3)
-    resumed = lm_trainer(tmp_path / "broken", accumulation=2).fit(lm_data(), tokens=budget)
+    unbroken = budget_lm_trainer(tmp_path / "unbroken", accumulation=2).fit(lm_data(), tokens=budget)
+    budget_lm_trainer(tmp_path / "broken", accumulation=2).fit(lm_data(), steps=3)
+    resumed = budget_lm_trainer(tmp_path / "broken", accumulation=2).fit(lm_data(), tokens=budget)
     assert int(unbroken.step) == int(resumed.step) == 4
 
 
@@ -285,7 +286,7 @@ def test_a_schedule_trains_each_stage_at_the_row_length_it_lays_out(tmp_path):
     length, compiled when its first batch arrives, and commits every target of both stages, two steps
     of 8 x 6, then steps of 8 x 10."""
     tracker = RecordingTracker()
-    lm_trainer(tracker=tracker).fit(context_schedule(tmp_path, 10), steps=4, log_every=1)
+    budget_lm_trainer(tracker=tracker).fit(context_schedule(tmp_path, 10), steps=4, log_every=1)
     committed = [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars]
     assert committed == [LM_ROWS * LM_CONTEXT] * 2 + [LM_ROWS * 10] * 2
 
@@ -293,9 +294,9 @@ def test_a_schedule_trains_each_stage_at_the_row_length_it_lays_out(tmp_path):
 def test_a_schedule_stage_past_the_models_context_is_refused(tmp_path):
     """A stage whose windows hold thirteen inputs, past the model's max_seq_len of twelve, is refused
     once its rows arrive, where a stage of twelve trains."""
-    lm_trainer().fit(context_schedule(tmp_path / "held", 12), steps=4)
+    budget_lm_trainer().fit(context_schedule(tmp_path / "held", 12), steps=4)
     with pytest.raises(ValueError):
-        lm_trainer().fit(context_schedule(tmp_path / "past", 13), steps=4)
+        budget_lm_trainer().fit(context_schedule(tmp_path / "past", 13), steps=4)
 
 
 @pytest.mark.parametrize("variant", ["ema", "accumulation", "schedule", "dynamic_scale", "checkpoints"])

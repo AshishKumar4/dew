@@ -174,7 +174,7 @@ class DataPublish:
         return 0
 
 
-def configured(named: str, trust: tuple[str, ...]) -> RunConfig:
+def run_named(named: str, trust: tuple[str, ...]) -> RunConfig:
     """The run `named` names: a Python file's `run` (a run config or a function returning one), under
     the file's own name where it names none, or a `run.json`. What trains is what the record reads
     back as, so its run.json trains the same run; a chain the record cannot describe trains as Python
@@ -208,7 +208,7 @@ class Train:
     """Packages outside Dew whose modules a `run.json` may import."""
 
     def run_command(self) -> int:
-        configured(self.run, self.trust).assigned(self.set).run()
+        run_named(self.run, self.trust).assigned(self.set).run()
         return 0
 
 
@@ -234,7 +234,7 @@ class Profile:
     def run_command(self) -> int:
         from dew.training.runtime import run_timestamp
 
-        run = configured(self.run, self.trust).assigned(self.set)
+        run = run_named(self.run, self.trust).assigned(self.set)
         out = self.out or str(Path("profiles", run.trainer.name or Path(self.run).stem, run_timestamp()))
         report = run.profile(out, warmup=self.warmup, steps=self.steps)
         Path(out, "report.json").write_text(json.dumps(dataclasses.asdict(report), indent=2) + "\n")
