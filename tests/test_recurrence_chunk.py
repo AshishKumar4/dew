@@ -498,3 +498,44 @@ def test_the_portable_rule_takes_forward_mode_at_its_public_seam(packed):
     gradient = jax.grad(lambda *a: sum(jnp.vdot(x, c) for x, c in zip(rule(*a), cotangent, strict=True)),
                         argnums=range(5))(*operands)
     assert all(bool(jnp.all(jnp.isfinite(x))) for x in gradient)
+
+
+@pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
+def test_the_portable_rule_takes_nested_differentiation(packed):
+    """`chunk_delta_rule` under forward over reverse (`jax.jvp` of `jax.grad`), reverse over forward
+    (`jax.grad` of `jax.jvp`) and two forwards (`jax.jvp` of `jax.jvp`), which raised before (rows 1861: its
+    saved bool resets took a bool tangent, not float0's; 1862: its pullback gave six cotangents of seven
+    operands): each runs and is finite, and two forwards, the chunked math's tangent both times, are the
+    math's own bit for bit."""
+    keys = jax.random.split(jax.random.key(13), 7)
+    rows, length, heads, width = 1, 37, 2, 8
+    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) for k in keys[:3])
+    g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
+    starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
+    direction = jax.random.normal(keys[6], query.shape)
+
+    def rule(query):
+        return recurrence_chunk.chunk_delta_rule(query, key, value, g, beta, chunk_size=CHUNK, starts=starts)
+
+    def math(query):
+        state, delta = jnp.zeros((rows, heads, width, width)), True
+        return recurrence_chunk._chunk_delta_rule(query, key, value, g, beta, state, CHUNK, starts, delta,
+                                                  width ** -0.5, jnp.dtype(jnp.float32))
+
+    def loss(fn, query):
+        out, final = fn(query)
+        return jnp.sum(out ** 2) + jnp.sum(final ** 2)
+
+    def tangent(fn, query):
+        return jax.jvp(functools.partial(loss, fn), (query,), (direction,))[1]
+
+    def nested(fn):
+        forward_over_reverse = jax.jvp(jax.grad(functools.partial(loss, fn)), (query,), (direction,))[1]
+        reverse_over_forward = jax.grad(functools.partial(tangent, fn))(query)
+        twice = jax.jvp(functools.partial(tangent, fn), (query,), (direction,))[1]
+        return forward_over_reverse, reverse_over_forward, twice
+
+    found, want = jax.jit(lambda: nested(rule))(), jax.jit(lambda: nested(math))()
+    assert all(bool(jnp.all(jnp.isfinite(x))) for x in found)
+    np.testing.assert_array_equal(found[2], want[2])

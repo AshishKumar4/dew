@@ -446,8 +446,11 @@ def _portable_rule(chunk_size: int, delta: bool, scale: float, dtype: jnp.dtype)
                                      dtype)
 
     def backward(saved, operands, cotangent):
-        # `starts` has no tangent space: its cotangent is none.
-        return _chunk_delta_backward(chunk_size, delta, scale, dtype, saved, cotangent)[:6]
+        # Every operand's cotangent, as the portable rule's pullback gives them (`linear_tangent` checks the
+        # trees agree): `starts` has no tangent space, its cotangent float0's zero, or none without it.
+        starts = operands[6]
+        cotangents = _chunk_delta_backward(chunk_size, delta, scale, dtype, saved, cotangent)[:6]
+        return (*cotangents, None if starts is None else np.zeros(starts.shape, jax.dtypes.float0))
 
     def portable(query, key, value, g, beta, state, starts):
         return _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
