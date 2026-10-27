@@ -288,12 +288,14 @@ def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dt
     """The registers a forward consumer holds at `tiles` (`resources.live_registers`): its weighted values'
     sums `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype. A
     training forward (`_trained`, at its anchor known) holds the other keys' weights beside them too, in the
-    operands' dtype, and the tile's key indices int32 its anchor test compares (TWOPASS5-h100: uncounted, 64 x 128 on
-    two consumers derived and spilled, 6.6 ms against 64 x 64's 1.06); its peak walk holds less."""
+    operands' dtype, and the key indices int32 its anchor test compares, a thread's one per column its
+    fragment holds, which its fragment's two rows share (an MMA accumulator's layout: half the tile's words;
+    TWOPASS5-h100: uncounted, 64 x 128 on two consumers derived and spilled, 6.6 ms against 64 x 64's 1.06);
+    its peak walk holds less."""
     block_q, block_k = tiles.block_q, tiles.block_k
     step = [(block_q, block_k, jnp.float32)] + [(block_q, block_k, dtype)] * (2 if residuals else 1)
     if residuals:
-        step.append((block_q, block_k, jnp.int32))
+        step.append((block_q // 2, block_k, jnp.int32))
     return resources.live_registers(family, [(block_q, value_width, jnp.float32)], step)
 
 
