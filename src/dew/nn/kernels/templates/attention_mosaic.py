@@ -386,8 +386,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     """The template's backward on this mainloop (`gradients`) over the call's own arrays (`backward` gives
     them): its queries, keys, values and output cotangent, its spans' arrays, its score hook's parameters, its
     initial state (`Initial`, or None) and a training forward's residuals (`forward`'s). Returns its
-    gradients (`Gradients`). Its config comes from the family's facts and the call's extents (`derived`: two
-    launches), legal within the device's block and a consumer's registers (`legal`)."""
+    gradients (`Gradients`). Its config comes from the family's facts and the call's extents (`derived`: one
+    launch for a hookless fast-form call, two for the accurate form, a hooked call and deterministic mode),
+    legal within the device's block and a consumer's registers (`legal`)."""
 
     HOOKS = ("score_mod",)
     DIFFERENTIATED = True
@@ -487,7 +488,8 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     `residuals` (its maxima, denominators, anchor keys and split sums): D about each query's anchor from the
     split sums (`algebra.split_delta`), a dQ launch and a dK/dV launch, and `dq_finish`'s refinement between
     them, in the form `accurate` names; or the fast form's one launch (`BackwardTiles.fused`,
-    `_launch_backward`), which a hookless call runs where a pin or an opt-in tuning run names it. Every
+    `_launch_backward`), a hookless call's derived default outside deterministic mode
+    (`MosaicBackward.derived`). Every
     call form of bf16 operands, under every score hook and the initial state. The output hook is no part of
     it: a differentiated call applies `output_mod` past the kernel, where its own derivative runs, and passes
     `dout` before it. `interpret` runs it on the CPU, as a GPU of the family `generation.assumed` names."""
