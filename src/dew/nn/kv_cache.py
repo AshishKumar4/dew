@@ -40,6 +40,7 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import scipy.linalg
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
@@ -172,10 +173,7 @@ def hadamard(size: int) -> jax.Array:
     if size < 1 or size & (size - 1):
         raise ValueError(f"an int8 KV cache rotates keys by a Hadamard matrix, which needs a "
                          f"power-of-two head_dim; got {size}. quantized='float8_e4m3fn' takes any width")
-    matrix = jnp.ones((1, 1), jnp.float32)
-    while matrix.shape[0] < size:
-        matrix = jnp.block([[matrix, matrix], [matrix, -matrix]])
-    return matrix / math.sqrt(size)
+    return jnp.asarray(scipy.linalg.hadamard(size), jnp.float32) / math.sqrt(size)
 
 
 def rotated(values: jax.Array, rotation: jax.Array) -> jax.Array:
