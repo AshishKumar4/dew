@@ -29,7 +29,7 @@ from rl_support import clipped_surrogate, token_mean
 
 from dew.batch import part
 from dew.data.dataset import Loader
-from dew.objectives.base import Ratio, Step
+from dew.objectives.base import Step
 from dew.objectives.rl import EpisodeCollector, EpisodeStatus, PPOObjective, PPORollout, ValueHead
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
 from dew.objectives.rl.sessions import BEHAVIOR_LOG_PROBS_KEY, OLD_LOG_PROBS_KEY
@@ -339,6 +339,70 @@ def test_composite_objective_and_parameter_gradients_match_verl():
             assert difference < 2e-6, f"verl {name} gradient maximum difference {difference}"
 
 
+def ppo_equations(objective, options):
+    """verl's PPO loss written out for the actor `options` the scenarios set, over the policy's and the
+    frozen reference's scores and the critic's values (the models' own forwards), every term at the
+    scores' precision: the dual-clipped surrogate (`compute_policy_loss`), the k3 KL to the reference
+    clamped as `kl_penalty_forward` clamps it, the rollout's sequence and geometric rejection
+    (`compute_rollout_rejection_mask`, seq_sum_k1 and seq_mean_k1) over each packed chain, token-mean or
+    session-mean weights, and half the larger squared value error against the clipped one
+    (`compute_value_loss`), added at the value coefficient. Log ratios are clamped to +-20 before their
+    exponential, as verl's `negative_approx_kl` is."""
+    actor = objective.actor
+
+    def chains(values, mask, segments):
+        """Each token's chain's total of `values` and count of trained tokens."""
+        ids = jnp.arange(int(segments.max()) + 1)
+        member = (segments[..., None] == ids) & (mask[..., None] != 0)
+        totals = jnp.sum(jnp.where(member, values[..., None], 0), axis=1, keepdims=True)
+        counts = jnp.sum(member, axis=1, keepdims=True).astype(values.dtype)
+        pick = segments[..., None] == ids
+        return jnp.sum(jnp.where(pick, totals, 0), -1), jnp.sum(jnp.where(pick, counts, 0), -1)
+
+    def loss(variables, ema, batch):
+        policy = actor.packed_log_probs(part(variables, "policy"), batch)
+        frozen = actor.packed_log_probs(part(ema, "policy"), batch)
+        dtype = policy.dtype
+        column = {key: jnp.asarray(batch[key]).astype(dtype) for key in (
+            "response_mask", OLD_LOG_PROBS_KEY, BEHAVIOR_LOG_PROBS_KEY, "advantages")}
+        mask, old, behavior, advantages = (column[key] for key in (
+            "response_mask", OLD_LOG_PROBS_KEY, BEHAVIOR_LOG_PROBS_KEY, "advantages"))
+        segments = jnp.asarray(batch["segment_ids"])
+        keep = jnp.ones_like(mask)
+        for band, geometric in ((options.get("sequence_mask"), False), (options.get("geometric_mask"), True)):
+            if band is not None:
+                total, count = chains(jnp.clip(behavior - old, -20, 20), mask, segments)
+                statistic = total / (count + 1e-8) if geometric else total
+                inside = (statistic >= np.log(band[0])) & (statistic <= np.log(band[1]))
+                keep = keep * jnp.where(inside | (mask == 0), 1, 0).astype(dtype)
+        ratio = jnp.exp(jnp.clip(policy - old, -20, 20))
+        bounded_ratio = jnp.clip(ratio, 1 - actor.epsilon_low, 1 + actor.epsilon_high)
+        clipped = jnp.maximum(-advantages * ratio, -advantages * bounded_ratio)
+        surrogate = jnp.where(advantages < 0, jnp.minimum(-advantages * actor.dual_clip, clipped), clipped)
+        drift = jnp.clip(frozen - policy, -20, 20)
+        kl = jnp.clip(jnp.exp(drift) - drift - 1, -10, 10)
+        effective = mask * keep
+        weights = (effective if options.get("aggregation", "token-mean") == "token-mean"
+                   else jnp.asarray(batch["session_weights"]).astype(dtype) * keep * (effective != 0))
+        mass = jax.lax.stop_gradient(jnp.sum(weights))
+        terms = jnp.where(weights != 0, surrogate + actor.beta * kl, 0) * weights
+        policy_loss = jnp.where(mass > 0, jnp.sum(terms) / jnp.where(mass > 0, mass, 1), 0)
+        values = objective.values(variables, batch).astype(dtype)
+        returns, recorded = (jax.lax.stop_gradient(jnp.asarray(batch[key]).astype(dtype))
+                             for key in (RETURNS_KEY, OLD_VALUES_KEY))
+        bounded = jnp.clip(values, recorded - objective.value_clip, recorded + objective.value_clip)
+        value_terms = .5 * jnp.maximum(jnp.square(values - returns), jnp.square(bounded - returns))
+        value_loss = jnp.sum(jnp.where(mask != 0, value_terms, 0) * mask) / jnp.sum(mask)
+        return policy_loss + objective.value_coefficient * value_loss
+
+    return loss
+
+
+ACTOR_CONTROL_SEEDS = 16
+"""Check 1's declared seeds for PPO's composed loss under each actor control, sized by `seeds_for` on
+armada."""
+
+
 @pytest.mark.parametrize("options", [
     {},
     {"aggregation": "session-mean"},
@@ -347,42 +411,49 @@ def test_composite_objective_and_parameter_gradients_match_verl():
     {"aggregation": "session-mean", "sequence_mask": (.8, 1.2), "geometric_mask": (.8, 1.2)},
 ], ids=["default", "sessions", "sequence", "geometric", "combined"])
 def test_actor_controls_leave_the_critics_normalization_and_gradient_unchanged(options):
+    """PPO's loss and every gradient leaf under each actor control are as exact as verl's PPO loss written
+    out (`ppo_equations`) over rollouts each declared seed draws (check 1), the truth those equations in
+    float64 over the same rollout and weights: the controls reshape the actor's terms and leave the
+    critic's normalization and gradient its own. A rollout whose behavior sits far from its old policy
+    is rejected whole by either band, so the actor contributes nothing and the critic carries the loss."""
     trainer, rollout = build_ppo(**options)
     objective = rollout.objective
     state = trainer.initial_state()
-    batch = rollout(state, {"task_id": np.array([31], np.int32)}, jax.random.key(23))
-    old = objective.actor.packed_log_probs(part(state.variables, "policy"), batch)
-    mask = jnp.asarray(batch["response_mask"])
-    batch = {**batch, OLD_LOG_PROBS_KEY: old, BEHAVIOR_LOG_PROBS_KEY: old - 2 * mask}
+    rolled = functools.cache(lambda seed: rollout(state, {"task_id": np.array([31], np.int32)},
+                                                  jax.random.key(seed)))
+
+    def draw(seed):
+        batch = rolled(int(seed))
+        old = objective.actor.packed_log_probs(part(state.variables, "policy"), batch)
+        mask = jnp.asarray(batch["response_mask"])
+        return {**batch, OLD_LOG_PROBS_KEY: old, BEHAVIOR_LOG_PROBS_KEY: old - 2 * mask},
+
     step = Step(jnp.array(0), jax.random.key(1), state.averaged)
-    policy_step = Step(step.step, step.key, part(step.ema, "policy"))
 
-    def expected(params):
-        variables = {**state.variables, "params": params}
-        actor, _ = objective.actor.loss(part(variables, "policy"), batch, policy_step)
-        terms = clipped_value_loss_terms(objective.values(variables, batch), batch[RETURNS_KEY],
-                                         batch[OLD_VALUES_KEY], objective.value_clip)
-        critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), jnp.sum(mask))
-        if not options:
-            return Ratio(actor.total + objective.value_coefficient * critic.total, actor.mass).mean()[0]
-        return actor.mean()[0] + objective.value_coefficient * critic.mean()[0]
+    def dew(batch):
+        value, gradient = jax.value_and_grad(
+            lambda params: objective.scalar_loss({**state.variables, "params": params}, batch, step)[0])(
+            state.variables["params"])
+        return {"loss": value, "gradient": gradient}
 
-    def actual(params):
-        return objective.scalar_loss({**state.variables, "params": params}, batch, step)[0]
+    def equations(variables, ema, batch):
+        written = ppo_equations(objective, options)
+        def scored(params):
+            return written({**variables, "params": params}, ema, batch)
+        value, gradient = jax.value_and_grad(scored)(variables["params"])
+        return {"loss": value, "gradient": gradient}
 
-    want, want_gradient = jax.value_and_grad(expected)(state.variables["params"])
-    got, got_gradient = jax.value_and_grad(actual)(state.variables["params"])
-    np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
-    for observed, reference in zip(jax.tree.leaves(got_gradient),
-                                   jax.tree.leaves(want_gradient), strict=True):
-        np.testing.assert_allclose(observed, reference, rtol=1e-6, atol=1e-7)
-    _, aux = objective.scalar_loss(state.variables, batch, step)
-    critic = token_mean(clipped_value_loss_terms(objective.values(state.variables, batch),
-                        batch[RETURNS_KEY], batch[OLD_VALUES_KEY], objective.value_clip), mask)
-    np.testing.assert_allclose(aux.metrics["critic/loss"], critic, rtol=1e-6)
-    if "sequence_mask" in options or "geometric_mask" in options:
-        assert float(aux.metrics["pg"]) == 0
-        np.testing.assert_allclose(got, objective.value_coefficient * critic, rtol=1e-6)
+    def wider(leaf):
+        return leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf
+
+    with jax.enable_x64(new_val=True):
+        assert_as_exact(dew, lambda batch: equations(state.variables, state.averaged, batch), draw,
+                        f"PPO actor controls {options}", seeds=ACTOR_CONTROL_SEEDS,
+                        truth_fn=lambda batch: equations(
+                            *jax.tree.map(wider, (state.variables, state.averaged, batch))))
+        if "sequence_mask" in options or "geometric_mask" in options:
+            _, aux = objective.scalar_loss(state.variables, draw(0)[0], step)
+            assert float(aux.metrics["pg"]) == 0
 
 
 @pytest.mark.parametrize("coefficient", [0., .5])
