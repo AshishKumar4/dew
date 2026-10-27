@@ -131,7 +131,7 @@ from dew.training._fit import (
 )
 from dew.training._lowering import Lowered, generation_of, topology_devices
 from dew.training.budget import Pause, Plateau, run_length, run_steps, run_tokens
-from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved
+from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     check_batch,
@@ -1413,7 +1413,7 @@ class Trainer(Generic[Loss, Effects]):
         run.committed = plan.real(interval)
         if run.cooling is not None and not plan.ended(run.current, plan.real(interval)):
             # A branch a preemption cut short runs again before the run reads on from where it stood.
-            state, cut = self._cooled(plan, run, state, shardings, position, run.cooling)
+            state, cut = self._cooled(plan, run, interval, state, shardings, position, run.cooling)
             if cut:
                 run.preempted = run.current
                 return self._wind_down(plan, run, interval, state, shardings, position, profiler)
@@ -1627,7 +1627,7 @@ class Trainer(Generic[Loss, Effects]):
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
         check_branches(bool(plan.branches) or pending, plan.suites, settable=settable_rates(state.opt_state),
-                       rollout=self.rollout is not None, scheduled=plan.dataset.token_ends is not None)
+                       rollout=self.rollout is not None)
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
@@ -1776,8 +1776,8 @@ class Trainer(Generic[Loss, Effects]):
             checkpoints.cooling(branch)
         if ending:
             run.cooling, branch = branch, None
-        state, cut = (state, False) if branch is None else self._cooled(plan, run, state, shardings, position,
-                                                                         branch)
+        state, cut = (state, False) if branch is None else self._cooled(plan, run, interval, state, shardings,
+                                                                         position, branch)
         # Asked at every step on every process, as JAX's agreement needs, before the step's save, so a
         # stop's save is its one save, whole; the last step ends the run. A pause falls on the same step
         # on every process, so where it is reached none asks.
@@ -1804,8 +1804,9 @@ class Trainer(Generic[Loss, Effects]):
             return True, state
         return False, state
 
-    def _cooled(self, plan: FitPlan, run: FitRun, state: TrainState, shardings: Placement[TrainState],
-                position: bytes | None, pending: Pending) -> tuple[TrainState, bool]:
+    def _cooled(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState,
+                shardings: Placement[TrainState], position: bytes | None,
+                pending: Pending) -> tuple[TrainState, bool]:
         """Train the cooldown branch `pending` from `state`, on the run's batches from its data `position`,
         by the run's own compiled steps at the rates its state holds times the branch's decay
         (`scaled_rates`); score every suite on it as `cooldown_<split>` at the run's step, and discard
@@ -1824,16 +1825,22 @@ class Trainer(Generic[Loss, Effects]):
             checkpoints.cooling(pending)
         moving, frozen = apart(state)
         restore, step_at = snapshot(moving), jax.device_put(np.asarray(int(at), at.dtype), at.sharding)
-        reading = run.train is not None
+        reading, run.ahead = run.train is not None, None
         if run.train is not None:
             run.train.close()
-        run.ahead = None
         branched = FitRun(run.started, current=run.current, partition=run.partition, reads=run.reads,
                           compiled=run.compiled)
         branched.train = self._prefetched(plan, branched, plan.dataset.train(run.partition), position)
+        # The branch's own clock of committed tokens, from the run's, which a schedule's stages end at
+        # as the run's do (`_scheduled`); the stages it begins are its own, the run's kept as they were.
+        counted = Interval(time.time(), None, tokens_before_log=interval.real_tokens)
+        starts = self._stage_starts
         cooled, done, cut = state, 0, False
         try:
-            while done < steps and not (cut := run.notice.reached()):
+            while (done < steps and not schedule_ended(plan.dataset.token_ends, counted.real_tokens)
+                   and not (cut := run.notice.reached())):
+                self._scheduled(plan, branched, counted)
+                assert branched.train is not None
                 batch = agreed_next("cooldown read", branched.train)
                 if batch is None:
                     break
@@ -1842,25 +1849,28 @@ class Trainer(Generic[Loss, Effects]):
                                                      reported=run.current)
                 factor = decay(shape, done // self.accumulation, steps // self.accumulation)
                 scaled = scaled_rates(cooled.opt_state, held, factor)
-                cooled = step(dataclasses.replace(cooled, opt_state=scaled), device)[0]
+                cooled, loss, aux, finite, _, committed = step(dataclasses.replace(cooled, opt_state=scaled),
+                                                              device)
+                counted.count(batch, None, loss, finite, committed, aux)
                 done, branched.current = done + 1, branched.current + 1
         finally:
-            branched.train.close()
+            self._stage_starts = starts
+            if branched.train is not None:
+                branched.train.close()
         run.cooling = pending if cut else None
         if cut:
             self._display.note(f"Preempted inside the cooldown from step {run.current}, which a resume runs")
         elif done < steps:
             self._display.note(f"The training data ran out {done} steps into the cooldown from step "
                                f"{run.current}, which records no score")
-        elif not cut:
+        else:
             suites = {f"cooldown_{name}": suite for name, suite in plan.suites.items()}
             self._evaluation(dataclasses.replace(plan, suites=suites, summaries=()),
                              dataclasses.replace(cooled, step=step_at), shardings, {})
         if checkpoints is not None and not cut:
             checkpoints.cooling(None)
-        for leaf in jax.tree.leaves(apart(cooled)[0]):
-            if not leaf.is_deleted():
-                leaf.delete()
+        for leaf in (leaf for leaf in jax.tree.leaves(apart(cooled)[0]) if not leaf.is_deleted()):
+            leaf.delete()
         restored = together(restore(), frozen)
         if reading:
             run.train = self._prefetched(plan, run, plan.dataset.train(run.partition), position)
@@ -2001,7 +2011,7 @@ class Trainer(Generic[Loss, Effects]):
         if run.cooling is not None and run.preempted is None and run.paused is None:
             # The last step's branch, its main model scored and saved first, which a resume from the
             # step runs again where a preemption cuts it short.
-            state, cut = self._cooled(plan, run, state, shardings, position, run.cooling)
+            state, cut = self._cooled(plan, run, interval, state, shardings, position, run.cooling)
             if cut and checkpoints is not None and interval.resumable != current:
                 # Whatever the final-save policy, the step the branch resumes from is written whole.
                 run.other += self._saved_checkpoint(checkpoints, current, state, position, interval,
