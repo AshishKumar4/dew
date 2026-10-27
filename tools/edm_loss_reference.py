@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import sys
 import types
 from pathlib import Path
 
@@ -133,7 +134,10 @@ def draw(seed: int) -> dict[str, np.ndarray]:
 
 
 def main() -> None:
+    sys.path.insert(0, str(FIXTURE.parents[2] / "tests"))
+    import jax
     from recorded_references import provenance, record_case, save
+    from test_edm_loss import edm2_loss, edm_loss
 
     stub_torch_utils()
     torch.manual_seed(5)
@@ -170,9 +174,11 @@ def main() -> None:
         return tuple(results)
 
     arrays = {}
-    for which in ("edm", "edm2"):
+    for which, dew in (("edm", jax.jit(edm_loss)), ("edm2", jax.jit(edm2_loss))):
+        # Sized paired, as check 1 judges: the training sigma's lognormal spread makes each arm's
+        # error heavy-tailed across draws alike.
         arrays.update(record_case(which, draw, lambda inputs, which=which: evaluated(inputs, which),
-                                  store_inputs=False))
+                                  store_inputs=False, dew=dew))
     written = save(FIXTURE, {**arrays, "provenance": provenance(
         "NVlabs/edm, NVlabs/edm2", f"{EDM}, {EDM2}", "cpu", "python tools/edm_loss_reference.py",
         torch=torch.__version__)}, reference="NVlabs/edm, NVlabs/edm2",

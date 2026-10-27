@@ -17,6 +17,7 @@ take linear maps of it) and in the uncertainty head's weight are held on
 par with NVlabs' own by check 1, over the seeds the recording holds
 (tests/fixtures/edm_loss/seeds.npz, each seed's inputs drawn again here).
 """
+import functools
 from pathlib import Path
 
 import jax
@@ -25,7 +26,7 @@ import numpy as np
 import optax
 import pytest
 from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
-from tool_support import load
+from tool_support import run_from
 
 from dew.diffusion.presets import EDM
 from dew.diffusion.schedules import expand
@@ -57,11 +58,19 @@ def per_element(process, inputs, weights, uncertainty=None, offset=0.0):
     return jnp.transpose(2 * loss, (0, 3, 1, 2))
 
 
+@functools.cache
+def generator():
+    """tools/edm_loss_reference.py, whose seeded draw the recorded inputs are drawn again by, loaded as
+    a script from its directory."""
+    with run_from("edm_loss_reference", "tools") as module:
+        return module
+
+
 def recorded_site(site: str):
     """`site`'s draw, recorded reference and truth over its declared seeds (`indexed_recording`), each
     seed's inputs drawn again (tools/edm_loss_reference.py's `draw`), and the count."""
     seeds = declared_seeds(SEEDS)[site]
-    return (*indexed_recording(recording(SEEDS), site, seeds, inputs_of=load("edm_loss_reference").draw),
+    return (*indexed_recording(recording(SEEDS), site, seeds, inputs_of=generator().draw),
             seeds)
 
 

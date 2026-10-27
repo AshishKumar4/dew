@@ -3,6 +3,7 @@
 sampler, interval-limited CFG against Kynkaanniemi et al.'s own sampler
 (`tools/guidance_reference.py`), and CFG++ against its paper's update."""
 
+import functools
 import itertools
 import json
 from pathlib import Path
@@ -14,7 +15,7 @@ import pytest
 from diffusion_support import apg_walked
 from flax import linen as nn
 from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
-from tool_support import load
+from tool_support import run_from
 
 from dew.diffusion import (
     DirectPredictionTransform,
@@ -29,6 +30,14 @@ from dew.sampling import APG, CFG, DDIM, Autoguidance, CFGPlusPlus, Heun, sample
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "guidance"
 APG_SEEDS = FIXTURES / "apg_seeds.npz"
 WALK_SEEDS = FIXTURES / "walk_seeds.npz"
+
+
+@functools.cache
+def generator():
+    """tools/guidance_reference.py, whose seeded draws the recorded sites' inputs are drawn again by,
+    loaded as a script from its directory."""
+    with run_from("guidance_reference", "tools") as module:
+        return module
 
 
 def recorded_site(site: str, inputs_of):
@@ -85,7 +94,7 @@ def test_apg_keeps_diffusers_projection_precision_on_raw_predictions(name):
         return walk.step(x, jnp.ones(x.shape[0]), 0, walk.init(x))[0][0]
 
     draw, recorded, truth, seeds = recorded_site(f"projection.{name}",
-                                                 load("guidance_reference").projection_draw(name))
+                                                 generator().projection_draw(name))
     def dew(index, inputs):
         return {"result": projected(inputs["conditional"], inputs["unconditional"])}
 
@@ -122,7 +131,7 @@ def test_autoguidance_walks_edm2s_guided_sampler():
                                  key=jax.random.PRNGKey(0), times=np.arange(steps, -1, -1, dtype=np.float32),
                                  final_denoise=False)}
 
-    draw, recorded, truth, seeds = recorded_site("autoguidance", load("guidance_reference").noise_draw)
+    draw, recorded, truth, seeds = recorded_site("autoguidance", generator().noise_draw)
     assert_as_exact(lambda index, inputs: walked(inputs["noise"]), recorded, draw, "autoguidance",
                     seeds=seeds, truth_fn=truth)
 
@@ -154,8 +163,7 @@ def test_interval_cfg_walks_the_papers_sampler(name):
     ramp = np.arange(steps, dtype=np.float64) / (steps - 1)
     sigmas = np.append((80.0 ** (1 / 7) + ramp * (0.002 ** (1 / 7) - 80.0 ** (1 / 7))) ** 7, 0.0)
     process = Process(SigmaGrid(sigmas, sigmas, 80.0), DirectPredictionTransform())
-    generator = load("guidance_reference")
-    rows = generator.SHAPE[0]
+    rows = generator().SHAPE[0]
     conditional, unconditional = (float(strength) for strength in arrays["strengths"])
     denoise = process.denoiser(Labelled(), {}, {"label": jnp.full((rows,), conditional)},
                                {"label": jnp.full((rows,), unconditional)})
@@ -167,7 +175,7 @@ def test_interval_cfg_walks_the_papers_sampler(name):
                                  key=jax.random.PRNGKey(0), times=np.arange(steps, -1, -1, dtype=np.float32),
                                  final_denoise=False)}
 
-    draw, recorded, truth, seeds = recorded_site(f"interval.{name}", generator.noise_draw)
+    draw, recorded, truth, seeds = recorded_site(f"interval.{name}", generator().noise_draw)
     assert_as_exact(lambda index, inputs: walked(inputs["noise"]), recorded, draw, name, seeds=seeds,
                     truth_fn=truth)
 
