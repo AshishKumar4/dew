@@ -539,46 +539,64 @@ from dew.logging import display_console
 
 fit_one_step()
 log = logging.getLogger("dew.terminal")
+log.warning("marker-before")
 try:
-    raise ValueError("the traceback's own words")
+    raise ValueError("marker-exception")
 except ValueError:
-    log.exception("a warning with its traceback")
+    log.exception("marker-traceback")
 with display_console(Console(file=sys.stdout, force_terminal=True, soft_wrap=True)):
-    log.warning("a warning on the panel's console")
-log.warning("a warning back on stderr")
+    log.warning("marker-during")
+log.warning("marker-after")
 """
 
 
 def test_a_run_in_a_terminal_logs_on_rich_handlers_and_the_panel_takes_them():
-    """A run in a pseudo-terminal installs Dew's rich stderr handler: a warning with a traceback
-    prints its line and then the traceback as rich renders it, and the live panel's console takes the
-    handler's records while it shows (`display_console`), handing them back after."""
+    """A run whose stderr is a pseudo-terminal installs Dew's rich stderr handler: its records go to
+    that terminal, a record with a traceback drawn as rich draws one, in its panel; while the live
+    panel shows, its console takes the handler's records (`display_console`), here the run's stdout,
+    and hands them back after. Each marker reaches the one destination it should, once."""
     import os
     import pty
+    import selectors
     import subprocess
     import sys
+    import time
 
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, (os.path.join(root, "src"),
                                                                      os.environ.get("PYTHONPATH")))),
            "COLUMNS": "200", "TERM": "xterm-256color"}
     leader, follower = pty.openpty()
-    child = subprocess.Popen([sys.executable, "-c", TERMINAL], stdin=follower, stdout=follower,
-                             stderr=follower, env=env, cwd=root)
+    child = subprocess.Popen([sys.executable, "-c", TERMINAL], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=follower, env=env, cwd=root)
     os.close(follower)
-    printed = []
-    while True:
-        try:
-            chunk = os.read(leader, 1 << 16)
-        except OSError:
-            # The terminal closes, as the child exits, with EIO.
-            break
-        if not chunk:
-            break
-        printed.append(chunk)
-    os.close(leader)
-    assert child.wait(timeout=300) == 0
-    text = b"".join(printed).decode(errors="replace")
-    for words in ("a warning with its traceback", "Traceback", "the traceback's own words",
-                  "a warning on the panel's console", "a warning back on stderr"):
-        assert words in text, text[-3000:]
+    terminal, deadline = [], time.monotonic() + 300
+    try:
+        with selectors.DefaultSelector() as waiting:
+            waiting.register(leader, selectors.EVENT_READ)
+            while time.monotonic() < deadline:
+                if not waiting.select(timeout=max(deadline - time.monotonic(), 0)):
+                    continue
+                try:
+                    chunk = os.read(leader, 1 << 16)
+                except OSError:
+                    # The terminal closes, as the child exits, with EIO.
+                    break
+                if not chunk:
+                    break
+                terminal.append(chunk)
+        assert child.stdout is not None
+        stdout = child.stdout.read().decode(errors="replace")
+        assert child.wait(timeout=max(deadline - time.monotonic(), 1)) == 0
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        os.close(leader)
+    stderr = b"".join(terminal).decode(errors="replace")
+    markers = ("marker-before", "marker-traceback", "marker-after", "marker-during")
+    assert [stderr.count(marker) for marker in markers] == [1, 1, 1, 0]
+    assert [stdout.count(marker) for marker in markers] == [0, 0, 0, 1]
+    # The traceback's exception, drawn in rich's panel, which a plain stream handler's text has no
+    # frame for.
+    assert "marker-exception" in stderr and "\u256d" in stderr and "\u2570" in stderr

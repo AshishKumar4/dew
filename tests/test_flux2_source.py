@@ -118,23 +118,24 @@ def flux2_arms(source, arrays, record, name):
         guidance = fixture["guidance"] + shift
         return ({**drawn, "times": fixture["times"], "guidance": guidance},)
 
+    guided = fixture["guidance"].size > 0
+
+    @jax.jit
+    def walk(latent, context, times, guidance, params, probe):
+        """The forward and its gradients, one program for every draw of the case."""
+        def forward(latent, context, params):
+            batch = latent.shape[0]
+            image = latent.reshape(batch, rows, columns, -1)
+            out = model.apply({"params": params}, image, times,
+                              DenoisingCondition(context, guidance=guidance if guided else None))
+            return out.reshape(batch, rows * columns, -1)
+
+        return with_gradients(forward)(latent, context, params, probe)
+
     @as_given
     def native(inputs):
-        batch = inputs["latent"].shape[0]
-        guidance = jnp.asarray(inputs["guidance"]) if inputs["guidance"].size else None
-
-        @jax.jit
-        def walk(latent, context, params, probe):
-            def forward(latent, context, params):
-                image = latent.reshape(batch, rows, columns, -1)
-                out = model.apply({"params": params}, image, inputs["times"],
-                                  DenoisingCondition(context, guidance=guidance))
-                return out.reshape(batch, rows * columns, -1)
-
-            return with_gradients(forward)(latent, context, params, probe)
-
-        out, grad_latent, grad_context, grad_params = walk(inputs["latent"], inputs["context"], params,
-                                                           inputs["probe"])
+        out, grad_latent, grad_context, grad_params = walk(
+            inputs["latent"], inputs["context"], inputs["times"], inputs["guidance"], params, inputs["probe"])
         return out, grad_latent, grad_context, {
             tensor: np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()}
 

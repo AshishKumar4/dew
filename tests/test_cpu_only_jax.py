@@ -158,7 +158,9 @@ sys.exit(1)
 STAND_IN_DRIVER = """
 #include <stdlib.h>
 int cuDriverGetVersion(int *version) {
-    *version = atoi(getenv("DEW_STAND_IN_CUDA"));
+    const char *answered = getenv("DEW_STAND_IN_CUDA");
+    if (answered == NULL || *answered == 0) return 3;  /* CUDA_ERROR_NOT_INITIALIZED: no answer */
+    *version = atoi(answered);
     return 0;
 }
 """
@@ -177,7 +179,8 @@ def test_a_build_runs_where_the_user_mode_driver_runs_its_cuda(tmp_path, driver,
     kernel driver's major is then no bar. A CUDA 12.8 user-mode driver runs the cuda12 build alone,
     and a machine whose driver library does not load runs none. Each through `prepare_process` on a
     machine of stand-ins: nvidia-smi listing the driver's SM 9.0 GPU, a user-mode driver library
-    reporting `cuda`, and the build's JAX plugin installed. JAX opens on the CPU beside them, so the
+    reporting `cuda`, or failing the query where none answers, whatever library the host holds, and
+    the build's JAX plugin installed. JAX opens on the CPU beside them, so the
     setup refuses, with the install that fixes it where the installed build cannot run and the plain
     refusal where it can."""
     runs = cuda is not None and newest is not None and (installed == "cuda12" or newest == "cuda13")
@@ -193,13 +196,14 @@ def test_a_build_runs_where_the_user_mode_driver_runs_its_cuda(tmp_path, driver,
     env["CUDA_VISIBLE_DEVICES"] = "999"
     env["PYTHONPATH"] = os.pathsep.join(filter(None, (os.path.join(root, "src"), str(tmp_path / "plugins"),
                                                       os.environ.get("PYTHONPATH"))))
-    if cuda is not None:
-        (tmp_path / "driver.c").write_text(STAND_IN_DRIVER)
-        subprocess.run(["cc", "-shared", "-fPIC", "-o", str(tmp_path / "libcuda.so.1"),
-                        str(tmp_path / "driver.c")], check=True)
-        env["LD_LIBRARY_PATH"] = os.pathsep.join(filter(None, (str(tmp_path),
-                                                              os.environ.get("LD_LIBRARY_PATH"))))
-        env["DEW_STAND_IN_CUDA"] = str(cuda)
+    (tmp_path / "driver.c").write_text(STAND_IN_DRIVER)
+    driver_library = tmp_path / "libcuda.so.1"
+    subprocess.run(["cc", "-shared", "-fPIC", "-o", str(driver_library), str(tmp_path / "driver.c")],
+                   check=True)
+    # The stand-in is the driver library the loader finds first, ahead of any the host holds.
+    env["LD_LIBRARY_PATH"] = os.pathsep.join(filter(None, (str(tmp_path),
+                                                          os.environ.get("LD_LIBRARY_PATH"))))
+    env["DEW_STAND_IN_CUDA"] = "" if cuda is None else str(cuda)
     done = subprocess.run([sys.executable, "-c", PROBED], capture_output=True, text=True, env=env,
                           timeout=300, cwd=root)
     assert done.returncode == 0, done.stderr[-2000:]

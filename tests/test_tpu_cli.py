@@ -2,6 +2,7 @@
 
 import json
 import os
+import shlex
 import subprocess
 import time
 from dataclasses import replace
@@ -592,24 +593,41 @@ def tree(tmp_path, monkeypatch):
     return root
 
 
-def commands(fake: Fake, verb: str) -> list[str]:
-    """The remote commands the fake was asked to run over ssh, in order, the venv prefix off."""
-    return [next(part.split("=", 1)[1] for part in call if part.startswith("--command="))
-            .removeprefix(env_prefix()) for call in only(fake.gcloud_calls(), verb)
-            if any(part.startswith("--command=") for part in call)]
+def commands(fake: Fake, verb: str) -> list[tuple[str, str, str]]:
+    """The remote commands the fake was asked to run over ssh, sorted, each its TPU, its worker and
+    the command, the venv prefix off: a fan-out's workers run at once, in any order."""
+    def value(call, flag):
+        return next(part.split("=", 1)[1] for part in call if part.startswith(f"--{flag}="))
+
+    ran = [call for call in only(fake.gcloud_calls(), verb)
+           if any(part.startswith("--command=") for part in call)]
+    return sorted((call[4].split("@")[-1], value(call, "worker"),
+                   value(call, "command").removeprefix(env_prefix())) for call in ran)
 
 
-def test_list_asks_every_configured_zone_and_reports_none_found(fake):
-    """`list` asks each configured zone's listing once, the TPUs found in any; with none it reports
-    none and succeeds."""
+def each(command: str, name: str = "slice", workers: int = 2) -> list[tuple[str, str, str]]:
+    """`command` run once on each of a TPU's workers, as `commands` reads them."""
+    return [(name, str(worker), command) for worker in range(workers)]
+
+
+def test_list_asks_every_configured_zone_and_reports_none_found(fake, capsys):
+    """`list` asks each configured zone's listing once and reports every TPU found in any, its name,
+    type, state and zone; with none it reports no row and succeeds."""
     fake.offer("slice", "us-central2-b")
-    fake.offer("other", "us-east1-d")
+    fake.offer("other", "us-east1-d", dict(NODE, state="STOPPED"))
     assert run("list") == 0
     assert zones_seen(only(fake.gcloud_calls(), "list"), "list") == list(CONFIG.zones)
+    header, *rows = capsys.readouterr().out.splitlines()
+    assert header.split()[:6] == ["NAME", "TYPE", "STATE", "HEALTH", "WORKERS", "ZONE"]
+    assert sorted((cells[0], cells[1], cells[2], cells[5]) for cells in map(str.split, rows)) == [
+        ("other", "v5litepod-16", "STOPPED", "us-east1-d"),
+        ("slice", "v5litepod-16", "READY", "us-central2-b")]
     fake.state["nodes"] = {}
     fake.flush()
     assert run("list", "--zone", "europe-west4-a") == 0
     assert zones_seen(only(fake.gcloud_calls(), "list"), "list")[-1] == "europe-west4-a"
+    shown = capsys.readouterr().out.splitlines()
+    assert not any(line.startswith(("NAME", "slice", "other")) for line in shown)
 
 
 def test_attach_disk_attaches_the_disk_then_mounts_it_on_every_worker(fake):
@@ -618,10 +636,8 @@ def test_attach_disk_attaches_the_disk_then_mounts_it_on_every_worker(fake):
     assert only(fake.gcloud_calls(), "attach-disk") == [gcloud(
         "compute", "tpus", "tpu-vm", "attach-disk", "slice", "--zone=us-central2-b",
         "--disk=projects/my-project/zones/us-central2-b/disks/data", "--mode=read-only")]
-    mounts = [call for call in only(fake.gcloud_calls(), "ssh")
-              if any("sudo -n bash" in part for part in call)]
-    assert sorted(part for call in mounts for part in call if part.startswith("--worker=")) == [
-        "--worker=0", "--worker=1"]
+    mount = f"sudo -n bash -c {shlex.quote(tpu_setup.disk_startup_script(read_only=True))}"
+    assert commands(fake, "ssh") == each(mount)
 
 
 def test_copy_sends_a_directory_recursively_to_every_worker(fake, tmp_path):
@@ -651,9 +667,7 @@ def test_setup_from_source_syncs_installs_and_checks_every_workers_devices(fake,
     assert len(fake.rsync_calls()) == 2
     assert [call[4:6] for call in only(fake.gcloud_calls(), "scp")] == [
         [str(config_dir() / "setup-slice.sh"), "you@slice:~/dew-setup.sh"]]
-    ran = commands(fake, "ssh")
-    assert ran.count("bash ~/dew-setup.sh") == 2
-    assert sum("jax.device_count" in command for command in ran) == 2
+    assert commands(fake, "ssh") == sorted(each("bash ~/dew-setup.sh") + each(tpu_setup.DEVICE_COUNT))
     fake.offer("slice", "us-central2-b", devices="8 8")
     assert run("setup", "slice") == 1
 
@@ -661,11 +675,10 @@ def test_setup_from_source_syncs_installs_and_checks_every_workers_devices(fake,
 def test_train_syncs_starts_the_recipe_on_every_worker_and_follows_worker_zero(fake, tree):
     fake.offer("slice", "us-central2-b")
     assert run("train", "slice", "--job", "j1", "--", "recipes/lm/train.py", "--steps", "3") == 0
-    ran = commands(fake, "ssh")
     recipe = "python recipes/lm/train.py --steps 3 --trainer.multi-host True"
-    assert sorted(command for command in ran if "nohup" in command) == sorted(
-        tpu_setup.detached(recipe, "j1", index, home_dir="tree") for index in (0, 1))
-    assert ran[-1] == tpu_setup.tail("j1", 0, follow=True)
+    assert commands(fake, "ssh") == sorted(
+        [("slice", str(index), tpu_setup.detached(recipe, "j1", index, home_dir="tree")) for index in (0, 1)]
+        + [("slice", "0", tpu_setup.tail("j1", 0, follow=True))])
     with pytest.raises(SystemExit):
         run("train", "slice")
 
@@ -673,10 +686,11 @@ def test_train_syncs_starts_the_recipe_on_every_worker_and_follows_worker_zero(f
 def test_run_detached_starts_a_named_job_and_logs_reads_its_tail(fake):
     fake.offer("slice", "us-central2-b")
     assert run("run", "slice", "--detach", "--job", "j2", "--", "echo", "hi") == 0
-    assert sum("nohup" in command and "j2/worker-" in command for command in commands(fake, "ssh")) == 2
+    started = [("slice", str(index), tpu_setup.detached("echo hi", "j2", index)) for index in (0, 1)]
+    assert commands(fake, "ssh") == started
     assert run("logs", "slice", "j2", "--worker", "all", "--lines", "5") == 0
-    tails = sorted(command for command in commands(fake, "ssh") if command.startswith("tail "))
-    assert tails == [f"tail -n 5 {tpu_setup.log_path('j2', index)}" for index in (0, 1)]
+    tails = [("slice", str(index), tpu_setup.tail("j2", index, follow=False, lines=5)) for index in (0, 1)]
+    assert commands(fake, "ssh") == sorted(started + tails)
     with pytest.raises(SystemExit):
         run("run", "slice")
 
@@ -685,8 +699,7 @@ def test_status_and_reset_ask_every_worker(fake):
     fake.offer("slice", "us-central2-b")
     assert run("status", "slice") == 0
     assert run("reset", "slice") == 0
-    ran = commands(fake, "ssh")
-    assert ran.count(tpu_setup.STATUS) == 2 and ran.count(tpu_setup.RESET) == 2
+    assert commands(fake, "ssh") == sorted(each(tpu_setup.STATUS) + each(tpu_setup.RESET))
 
 
 def test_create_queued_spot_goes_through_the_queued_resources_api(fake):
@@ -704,15 +717,21 @@ def test_spawn_creates_sets_up_and_starts_a_command_on_each_tpu(fake):
     assert run("spawn", "pool", "2", "--spot", "--", "echo", "hi") == 0
     created = sorted(call[4] for call in only(fake.gcloud_calls(), "create"))
     assert created == ["pool-0", "pool-1"]
-    assert sum("nohup" in command and "echo hi" in command for command in commands(fake, "ssh")) == 4
+    started = [(name, worker, command) for name, worker, command in commands(fake, "ssh")
+               if "nohup" in command]
+    assert [(name, worker) for name, worker, _ in started] == [
+        ("pool-0", "0"), ("pool-0", "1"), ("pool-1", "0"), ("pool-1", "1")]
 
 
 def test_help_lists_the_config_defaults_a_command_reads(fake, capsys):
     with pytest.raises(SystemExit) as done:
         run("spawn", "--help")
     assert done.value.code == 0
-    shown = capsys.readouterr().out
-    assert all(f"  {field}" in shown for field in tpu_cli.Spawn.reads)
+    shown = dict(line.split(None, 1) for line in capsys.readouterr().out.splitlines()
+                 if line.startswith("  ") and len(line.split(None, 1)) == 2)
+    expected = {field: ", ".join(value) if isinstance(value, tuple) else (value or "(unset)")
+                for field, value in ((field, getattr(CONFIG, field)) for field in tpu_cli.Spawn.reads)}
+    assert {field: shown[field].strip() for field in expected} == expected
 
 
 def test_a_tpu_no_zone_lists_and_one_not_ready_are_refused(fake):
@@ -724,5 +743,8 @@ def test_a_tpu_no_zone_lists_and_one_not_ready_are_refused(fake):
     assert sorted(zones_seen(only(fake.gcloud_calls(), "list"), "list")) == sorted(CONFIG.zones)
     assert json.loads((config_dir() / "zones.json").read_text()) == {}
     fake.offer("slice", "us-central2-b", dict(NODE, state="TERMINATED"))
+    listed = len(only(fake.gcloud_calls(), "list"))
     with pytest.raises(SystemExit):
         run("start", "slice")
+    # One listing finds the zone, one after the start finds it TERMINATED: no poll waits on it.
+    assert len(only(fake.gcloud_calls(), "list")) - listed == 2

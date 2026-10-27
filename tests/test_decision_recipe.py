@@ -263,6 +263,7 @@ def test_a_decision_mixture_reads_the_manifest_its_descriptor_pins(tmp_path):
     is refused."""
     import hashlib
 
+    from dew.data.compile import iterate
     from dew.decision.data import mixture
 
     (tmp_path / "a.jsonl").write_text(team_rows(["one"]))
@@ -280,6 +281,8 @@ def test_a_decision_mixture_reads_the_manifest_its_descriptor_pins(tmp_path):
     pinned = described("descriptor.json")
     train, held = mixture(str(tmp_path), descriptor=pinned)
     assert train.facts()["mixture_weights"] == {"a": 1.0} and held is None
+    # The mixture reads the corpus the descriptor weights and none it weighs at nothing.
+    assert [row["example"].state for row in iterate(train, read="memory")] == ["one"]
     digest = hashlib.sha256((tmp_path / "descriptor.json").read_bytes()).hexdigest()
     assert train.source.fingerprint()["descriptor"] == {"url": pinned, "sha256": digest}
     with pytest.raises(ValueError):
