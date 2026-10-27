@@ -279,8 +279,8 @@ def test_statistics_that_are_a_tuple_without_aux_are_estimated_whole():
 
 def test_an_indexer_warmup_trains_its_indexer_alone_without_backpropagation():
     """An indexer's warm-up, whose KL is no token's prediction, is estimated from its whole statistics:
-    the estimate is its indexer's own tree, finite, and two steps of a run move every indexer weight and
-    leave every frozen weight as it was, bit for bit."""
+    the estimate is its indexer's own tree, finite, a run's second step moves every indexer weight, and
+    its frozen weights after one step and two are a backpropagated warm-up's, bit for bit."""
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, head_dim=16,
                               mlp_features=64, max_seq_len=16,
                               mixer={"class": "mla", "fields": {
@@ -294,15 +294,18 @@ def test_an_indexer_warmup_trains_its_indexer_alone_without_backpropagation():
         jax.random.key(1))
     assert jax.tree.structure(estimate) == jax.tree.structure(start["params"])
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(estimate))
-    trainer = Trainer(objective, optax.adam(1e-2), key=0, layout=LAYOUT)
-    initial = jax.tree.map(np.asarray, trainer.initial_state().variables)
-    state = trainer.fit(Memory([{"text": row} for row in tokens]).repeat().batch(8), steps=2)
-    for moved, held in zip(jax.tree.leaves(state.variables["params"]), jax.tree.leaves(initial["params"]),
-                           strict=True):
-        assert not np.array_equal(np.asarray(moved), held)
-    for kept, held in zip(jax.tree.leaves(state.variables[FROZEN]), jax.tree.leaves(initial[FROZEN]),
-                          strict=True):
-        np.testing.assert_array_equal(np.asarray(kept), held)
+    def trained(objective, steps):
+        data = Memory([{"text": row} for row in tokens]).repeat().batch(8)
+        return Trainer(objective, optax.adam(1e-2), key=0, layout=LAYOUT).fit(data, steps=steps).variables
+
+    once, twice = trained(objective, 1), trained(objective, 2)
+    backpropagated = trained(LMObjective(model, 16, indexer=IndexerTraining("warmup")), 2)
+    for moved, held in zip(jax.tree.leaves(twice["params"]), jax.tree.leaves(once["params"]), strict=True):
+        assert not np.array_equal(np.asarray(moved), np.asarray(held))
+    frozen = [jax.tree.leaves(variables[FROZEN]) for variables in (twice, once, backpropagated)]
+    for kept, *others in zip(*frozen, strict=True):
+        for other in others:
+            np.testing.assert_array_equal(np.asarray(kept), np.asarray(other))
 
 
 def test_a_routed_decoder_trains_its_composite_statistics_without_backpropagation():
