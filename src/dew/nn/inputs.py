@@ -32,6 +32,7 @@ from dew.batch import (
     with_validity,
 )
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS
+from dew.nn.scatter import gather_positions
 from dew.nn.sharding import explicit_spec, rows_like
 
 if TYPE_CHECKING:
@@ -320,7 +321,7 @@ def rotate_rows(values: jax.Array, shifts: jax.Array) -> jax.Array:
     reads slot `(i + shift) % S`, so a row's first `shift` slots move to its end, and a negative
     count rotates it back."""
     slots = (jnp.arange(values.shape[1])[None, :] + shifts[:, None]) % values.shape[1]
-    return jnp.take_along_axis(values, slots.reshape(slots.shape + (1,) * (values.ndim - 2)), axis=1)
+    return gather_positions(values, slots)
 
 
 def cu_seqlens(begins: jax.Array, sequences: int, firsts: jax.Array | None = None) -> jax.Array:

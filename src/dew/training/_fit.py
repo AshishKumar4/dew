@@ -97,6 +97,8 @@ class FitPlan:
     local_every: Cadence
     metrics: Sequence[Metric]
     preview: bool
+    scored_to: str | None = None
+    """Where each evaluation writes every validation batch's scoring artifacts (`Evaluation.run`)."""
     best: tuple[Best, ...] = ()
     stop: Plateau | None = None
     pause: tuple[int | None, int | None] = (None, None)

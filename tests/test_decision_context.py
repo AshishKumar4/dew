@@ -181,44 +181,64 @@ def test_rows_that_carry_a_context_pack_several_a_window_each_beside_its_own(gro
     assert several, "no window held more than one row"
 
 
+def test_a_unit_whose_contexts_outgrow_a_windows_trains_its_examples_apart():
+    """Grouped examples train as one unit where a window holds their rows' contexts end to end
+    (`DecisionObjective.context_window`), and apart where their contexts outgrow it, as where their
+    tokens do: each fits a window alone, so none is cut or left out."""
+    from dew.decision import Group, GroupedExamples
+    from dew.decision.rows import Fit
+
+    backbone = conditioned().model.backbone
+    objective = DecisionObjective(backbone, tokenizer=ByteTokenizer(), specials=SPECIALS,
+                                  context_encoder="table", consistency=0.5, segments=3, context_window=32)
+    [fit] = [step for step in objective.data().train if isinstance(step, Fit)]
+    group = (Group("pick", {f"{member}.pick": {option: option for option in "abc"} for member in range(2)}),)
+    noted = examples()
+    # Notes of 29 and 27 tokens outgrow a window of 32; one of 5 beside none does not.
+    long, short = (GroupedExamples(pair, groups=group)
+                   for pair in ((noted[0], noted[2]), (noted[3], noted[5])))
+    assert "decision_unit" in fit.map({"example": short})
+    apart = fit.map({"example": long})
+    assert "decision_unit" not in apart and len(apart["decision_rows"]) == 2
+
+
 PACKED_CONTEXT_SEEDS = 8
 """Check 1's declared seeds for packed rows reading their own contexts against each row alone, sized
 paired (`seeds_for` with the packed windows as `dew_fn`) on armada."""
 
 
-@pytest.mark.parametrize("encoder", ["table", "backbone"])
-def test_packed_rows_each_read_their_own_context_as_each_does_alone(encoder):
-    """Rows that carry a context, three packed a window, decide each row's options as the row does in a
-    window of its own beside its context alone, through the unmodified objective, its cross-attention
-    open (every gate 1): each row's tokens read its own context and no other row's, the context read
-    through the token table and through the backbone's own pass over each context as its own
-    document, the real options' logits on par from float64 (check 1, over drawn parameters)."""
-    from test_decision_packing import owners
-
+def packed_arms(packed: DecisionObjective, alone: DecisionObjective, rows):
+    """The arms of check 1 between `packed`'s windows of `rows` and `alone`'s windows of one row each:
+    Dew's, the reference's, the parameters' draw (every cross-attention gate open) and the float64 truth,
+    each arm every row's real options' logits through the unmodified objective, keyed by the row's own
+    tokens' text and its context's, each question owned by the row the packer placed it in
+    (`question_rows`)."""
     from dew.decision.task import laid_out
 
-    rows = examples()[:12]
-    packed, alone = conditioned(encoder=encoder, segments=3), conditioned(encoder=encoder, segments=1)
     windows = {name: windows_of(objective, rows, count=12)
                for name, objective in (("packed", packed), ("alone", alone))}
     assert max(int(np.max(window["segments"])) for window in windows["packed"]) > 1, "no window packed two"
 
     def scored(objective, batches, variables) -> dict[str, np.ndarray]:
-        """Each row's real options' logits, keyed by its state's text."""
+        """Each row's real options' logits, keyed by its tokens' text."""
         forward = COMPILED.setdefault((id(objective.model), "packed"), without_ynn(
             lambda variables, inputs: objective.model.logits(variables, inputs)))
         logits = {}
         for batch in batches:
-            inputs = laid_out(batch, objective.bounds.segments)
+            inputs = laid_out(batch, objective.bounds.segments, spans_in_context=objective.schema_in_context)
             held = np.asarray(forward(variables, inputs))
-            options, owned = np.asarray(batch["options"]), owners(batch)
+            options, owners = np.asarray(batch["options"]), np.asarray(batch["question_rows"])
+            # Rows that carry no context read none.
+            contexts = np.asarray(batch.get("context_segments", np.zeros((len(owners), 0), np.int32)))
+            context = np.asarray(batch.get("context", contexts))
             for window, segments in enumerate(np.asarray(batch["segments"])):
                 for row in range(1, int(segments.max()) + 1):
                     own = np.asarray(batch["tokens"])[window][segments == row]
-                    text = bytes(own.astype(np.uint8)).decode(errors="replace")
-                    (state,) = {example.state for example in rows if example.state in text}
-                    asked = owned[window] == row
-                    logits.setdefault(state, held[window][asked][options[window][asked]])
+                    read = context[window][contexts[window] == row]
+                    asked = owners[window] == row
+                    key = b"\0".join(bytes(part.astype(np.uint8)) for part in (own, read))
+                    real = options[window][asked]
+                    logits.setdefault(key.decode(errors="replace"), held[window][asked][real])
         return dict(sorted(logits.items()))
 
     def arm(objective, batches):
@@ -236,8 +256,26 @@ def test_packed_rows_each_read_their_own_context_as_each_does_alone(encoder):
     def draw(seed):
         return (opened(initialized(jax.random.key(seed))),)
 
-    assert_as_exact(arm(packed, windows["packed"]), arm(alone, windows["alone"]), draw,
-                    f"packed contexts by {encoder}", seeds=PACKED_CONTEXT_SEEDS, truth_fn=truth)
+    return arm(packed, windows["packed"]), arm(alone, windows["alone"]), draw, truth
+
+
+def assert_packed_as_alone(packed: DecisionObjective, alone: DecisionObjective, rows, what: str, seeds: int):
+    """Check 1 (over drawn parameters, float64 truth): `packed`'s windows of `rows` decide each row's real
+    options as `alone`'s windows of one row each do (`packed_arms`)."""
+    dew, reference, draw, truth = packed_arms(packed, alone, rows)
+    assert_as_exact(dew, reference, draw, what, seeds=seeds, truth_fn=truth)
+
+
+@pytest.mark.parametrize("encoder", ["table", "backbone"])
+def test_packed_rows_each_read_their_own_context_as_each_does_alone(encoder):
+    """Rows that carry a context, three packed a window, decide each row's options as the row does in a
+    window of its own beside its context alone, through the unmodified objective, its cross-attention
+    open (every gate 1): each row's tokens read its own context and no other row's, the context read
+    through the token table and through the backbone's own pass over each context as its own
+    document, the real options' logits on par from float64 (check 1, over drawn parameters)."""
+    packed, alone = conditioned(encoder=encoder, segments=3), conditioned(encoder=encoder, segments=1)
+    assert_packed_as_alone(packed, alone, examples()[:12], f"packed contexts by {encoder}",
+                           PACKED_CONTEXT_SEEDS)
 
 
 def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_does():

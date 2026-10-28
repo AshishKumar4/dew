@@ -64,6 +64,71 @@ class Accuracy:
 
 
 @dataclass(frozen=True)
+class MacroF1:
+    """The mean over classes of each class's F1, the classes those the split's answered questions are
+    or are answered as (sklearn's `f1_score(average="macro")`): a class is a question's option
+    (`Decisions.classes`), the same in every batch and split that asks it, so each class's true and
+    false positives and false negatives add over the whole pass before its F1 is taken."""
+
+    name = "macro_f1"
+    reads = Decisions
+    shown = Shown(better="higher")
+
+    def __call__(self, artifact: Artifact, batch: Batch, /) -> dict[int, np.ndarray]:
+        """Return each class's true positives, false positives and false negatives in the batch."""
+        if not isinstance(artifact, Decisions) or artifact.classes is None:
+            raise TypeError("macro F1 reads Decisions that carry each option's class (a run's rows)")
+        scored = np.asarray(artifact.scored, bool)
+        lanes = np.asarray(artifact.classes, np.int64)[scored]
+        classes = (lanes[..., 0] << 32) | (lanes[..., 1] & 0xFFFFFFFF)
+        probabilities = np.where(np.asarray(artifact.options, bool)[scored],
+                                 np.asarray(artifact.probabilities, np.float64)[scored], -1.0)
+        rows = np.arange(len(classes))
+        predicted = classes[rows, probabilities.argmax(axis=-1)]
+        gold = classes[rows, np.asarray(artifact.labels)[scored]]
+        counts: dict[int, np.ndarray] = {}
+        for guess, truth in zip(predicted.tolist(), gold.tolist(), strict=True):
+            if guess == truth:
+                counts.setdefault(truth, np.zeros(3, np.int64))[0] += 1
+            else:
+                counts.setdefault(guess, np.zeros(3, np.int64))[1] += 1
+                counts.setdefault(truth, np.zeros(3, np.int64))[2] += 1
+        return counts
+
+    def merge(self, accumulated: dict[int, np.ndarray],
+              contribution: dict[int, np.ndarray]) -> dict[int, np.ndarray]:
+        merged = dict(accumulated)
+        for key, counts in contribution.items():
+            merged[key] = merged[key] + counts if key in merged else counts
+        return merged
+
+    def finalize(self, accumulated: dict[int, np.ndarray]) -> float:
+        scores = [2 * true / (2 * true + false + missed) for true, false, missed in accumulated.values()]
+        return float(np.mean(scores)) if scores else float("nan")
+
+
+@dataclass(frozen=True)
+class ScoredQuestions:
+    """How many questions with a known answer the split scored, the count every other metric of it
+    is taken over."""
+
+    name = "scored_questions"
+    reads = Decisions
+    shown = Shown()
+
+    def __call__(self, artifact: Artifact, batch: Batch, /) -> int:
+        if not isinstance(artifact, Decisions):
+            raise TypeError(f"a decision metric reads Decisions, not {type(artifact).__name__}")
+        return int(np.sum(np.asarray(artifact.scored, bool)))
+
+    def merge(self, accumulated: int, contribution: int) -> int:
+        return accumulated + contribution
+
+    def finalize(self, accumulated: int) -> float:
+        return float(accumulated)
+
+
+@dataclass(frozen=True)
 class ECE:
     """Expected calibration error: the gap between the top probability and the accuracy.
 
