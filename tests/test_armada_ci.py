@@ -1210,9 +1210,10 @@ def test_a_changed_workflow_reruns_only_the_files_that_read_it(ci, tmp_path, mon
 
 
 def test_a_run_that_read_its_limits_runs_again_where_they_change(ci, tmp_path, monkeypatch, cache_worker):
-    """A test whose run read its cgroup's CPU or memory limit (dew.data's `Host.current` sizes loading by them)
-    keys those limits: on a container of other limits its row is not reused though nothing else changed, and a
-    file that read none is reused (row 1998; Main, 2026-10-28: a row green on 4 vCPUs was reused on 8)."""
+    """A test whose run read its cgroup's CPU or memory limit (dew.data's `Host.current` sizes loading by
+    them) keys those limits: on a container of other limits its row is not reused though nothing else
+    changed, and a file that read none is reused (row 1998; Main, 2026-10-28: a row green on 4 vCPUs was
+    reused on 8)."""
     cgroup = tmp_path.parent / f"{tmp_path.name}-cgroup"
     cgroup.mkdir()
     (cgroup / "cpu.max").write_text("400000 100000\n")

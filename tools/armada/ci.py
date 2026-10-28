@@ -87,6 +87,7 @@ refused (`report`), its coverage partial. A target well under CI's keeps tasks s
 import argparse
 import ast
 import concurrent.futures
+import functools
 import hashlib
 import heapq
 import importlib.util
@@ -99,6 +100,7 @@ import sys
 import threading
 import time
 import tomllib
+import types
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from pathlib import Path
@@ -255,7 +257,12 @@ def built(path: Path) -> bool:
 def contents(name: str) -> bytes:
     """The hash of file `name`'s bytes, of directory `name`'s entries' names but its hidden ones and a
     build's (`built`), or b"missing". A fetched fixture's payload is the digest its manifest pins, whether
-    it is downloaded here or not, so a planner that never fetches it keys it as a task does."""
+    it is downloaded here or not, so a planner that never fetches it keys it as a task does. An execution
+    limit a run read (followed.py's `LIMITS`: "limit:cpu", "limit:memory") is the one binding this process
+    (host.py's `limit`): a row green on 4 vCPUs is not reused on 8, nor on a planner, which reads its own (row
+    1998, Main 2026-10-28)."""
+    if name.startswith("limit:"):
+        return hashlib.sha256(host().limit(name).encode()).digest()
     path = Path(name)
     manifest = path.parent / (path.name + FETCHED)
     if path.name and manifest.is_file():
@@ -298,15 +305,20 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     return sorted({name, *depends, *packages})
 
 
-def cpu_class() -> str:
-    """This host's CPU microarchitecture, the one class the records, the tests' compilation cache and
-    the shared XLA bundles key it by (host.py beside this file, loaded by its path, as this file puts
-    nothing on sys.path)."""
+@functools.cache
+def host() -> types.ModuleType:
+    """host.py beside this file, loaded by its path, as this file puts nothing on sys.path."""
     spec = importlib.util.spec_from_file_location("dew_host", Path(__file__).with_name("host.py"))
     assert spec is not None and spec.loader is not None
-    host = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(host)
-    return host.cpu_class()
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def cpu_class() -> str:
+    """This host's CPU microarchitecture, the one class the records, the tests' compilation cache and
+    the shared XLA bundles key it by (`host`)."""
+    return host().cpu_class()
 
 
 def device_class(network: bool = False) -> str:

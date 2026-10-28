@@ -38,6 +38,9 @@ HIDDEN_INPUTS = (".github", ".armada.json", ".python-version", ".gitattributes")
 """The checkout's hidden entries a test may read as any of its files (a workflow, the run's settings), each
 the input of the files that read it alone; any other hidden entry (.git, an environment, a cache) is none."""
 READS = {"open", "os.listdir", "os.scandir"}
+LIMITS = {"cpu.max": "limit:cpu", "memory.max": "limit:memory"}
+"""The cgroup files that set a process's execution limits, by the input a run that read one keys: host.py's
+`LIMITS`, which this module cannot import (it runs inside every test process, before the checkout's tools)."""
 """Audit events of a read: a file opened, a directory listed."""
 IMPORTING = {"<frozen importlib._bootstrap>", "<frozen importlib._bootstrap_external>", "<frozen zipimport>"}
 """The import system's frozen modules, which list the directories it imports from."""
@@ -99,7 +102,12 @@ def read(event: str, args: tuple, root: str) -> str | None:
             return None
     elif listing_tool(sys._getframe(2).f_code.co_filename):
         return None
-    return placed(os.path.abspath(os.fsdecode(path if path is not None else ".")), root)
+    name = os.path.abspath(os.fsdecode(path if path is not None else "."))
+    # A cgroup's CPU quota or memory limit read: the run keys the limit that binds it (host.py's `limit`).
+    cgroup = os.environ.get("DEW_CGROUP_ROOT", "/sys/fs/cgroup")
+    if os.path.basename(name) in LIMITS and name.startswith(cgroup.rstrip(os.sep) + os.sep):
+        return LIMITS[os.path.basename(name)]
+    return placed(name, root)
 
 
 def placed(name: str, root: str) -> str | None:
