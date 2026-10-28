@@ -1946,10 +1946,14 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     tiles |= _vector_blocks(call, "gate", "low", "column_gate", "column_low")
     # The local scores, then their product with the output's gradient.
     work = Work(2 * CHUNK * CHUNK * (width + value_width), exponentials=CHUNK * CHUNK)
-    # The local scores, their decays and masks and their narrow form, and their product and its cast.
-    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * 2 + _masks(CHUNK, CHUNK) + _held(held, CHUNK, CHUNK)
-                               + [_f32(CHUNK, value_width)] + _held(held, CHUNK, value_width)
-                               + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),))
+    # The local scores, their decays and masks; then their narrow form's product with the output's gradient
+    # and its cast (`algebra.local_gradient`: the scores are narrowed before the product): as one phase, an
+    # H100's model stated 248 registers where ptxas needed 136, an A100's 280 against 160.
+    held_tiles = _Held(phases=(
+        [_f32(CHUNK, CHUNK)] * 2 + _masks(CHUNK, CHUNK)
+        + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),
+        _held(held, CHUNK, CHUNK) + [_f32(CHUNK, value_width)] + _held(held, CHUNK, value_width)
+        + _fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, value_width))))
     return _kernel(program, call, out_type=held.shape(call.heads * value_width),
                    grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=tiles, stages=1,
                    live=_taken(7), work=work, held=held_tiles, staging=_staging(held, (CHUNK, CHUNK)),
