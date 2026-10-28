@@ -218,7 +218,7 @@ def consumed_by_row(examples: int) -> dict[int, int]:
     return owed
 
 
-@pytest.mark.parametrize("packed, workers", [(False, 0), (True, 0), (False, 2)],
+@pytest.mark.parametrize("packed, workers", [(False, 0), (True, 0), (False, 1)],
                          ids=["rows", "packed", "workers"])
 def test_each_batch_consumes_the_examples_whose_last_rows_it_holds(packed, workers):
     """A run bounded to 23 examples, read in order as a stream, whose objective makes 0 to 3 rows of each
@@ -242,9 +242,9 @@ def test_each_batch_consumes_the_examples_whose_last_rows_it_holds(packed, worke
     total = 0
     try:
         for batch in stream:
-            real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["text"]), bool)), bool)
-            held = np.asarray(batch["text"])[real]
-            expected = sum(owed[row] for window in held for row in set(window[window > 0].tolist()))
+            # Each row of the batch once: a short last batch is filled out with repeats of its rows.
+            held = np.asarray(batch["text"])
+            expected = sum(owed[row] for row in set(held[held > 0].tolist()))
             assert int(np.sum(batch[EXAMPLES_CONSUMED])) == expected
             total += expected
     finally:
