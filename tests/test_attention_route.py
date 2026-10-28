@@ -400,7 +400,8 @@ def test_the_accurate_form_is_one_option_away():
     """`generation.chosen(attention_form='accurate')` runs every template call in the accurate form (natural
     logits and the accurate products, `attention_route.FORMS`), its forward and gradients bitwise a call's
     that names that form, and 'fast' runs the default, a call's that names none; the two forms differ; a
-    form the template does not have is refused."""
+    form the template does not have is refused. Bit for bit by construction: the choice resolves to the
+    named form's arguments before the call traces, so the two calls trace one program."""
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
     query, key, value, _, dout = drawing(QUERIES, KEYS, jnp.float32, sinks=False)(0)
 
