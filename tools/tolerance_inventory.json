@@ -278,11 +278,11 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoder_moe.py": {
-   "comparisons": 16,
+   "comparisons": 15,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoders.py": {
-   "comparisons": 20,
+   "comparisons": 18,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_opt.py": {
@@ -438,7 +438,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_moe.py": {
-   "comparisons": 12,
+   "comparisons": 10,
    "lane": "Models, Serving & RL"
   },
   "tests/test_moe_biased_exchange.py": {
