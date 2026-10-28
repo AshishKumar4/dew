@@ -1463,7 +1463,7 @@ class Trainer(Generic[Loss, Effects]):
                     run.reads[signature] = step_reads(self.executable, signature)
                 interval.compiles = len(compiled)
                 if len(compiled) > known:
-                    self._warm_evaluations(plan, state, shardings)
+                    self._warm_evaluations(plan, state, shardings, first=not known)
                 if not known:
                     # Rebound once the step is compiled, so the first tick measures steps, not the compile.
                     interval.last_log_time = time.time()
@@ -2062,7 +2062,8 @@ class Trainer(Generic[Loss, Effects]):
             checkpoints.wait()
         return state
 
-    def _warm_evaluations(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState]) -> None:
+    def _warm_evaluations(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState], *,
+                          first: bool) -> None:
         """Compile the programs the run's evaluations run beside a step's compile, where any runs
         between steps (`FitPlan.evaluates_midway`): every suite warms (`Evaluation.run`'s `warm`),
         its preview included, and nothing is reported.
@@ -2072,10 +2073,17 @@ class Trainer(Generic[Loss, Effects]):
         records), counted against the run's goodput. A new training shape can change the modules
         the programs run (the fit ladder's rung), so each step compiled warms them again. The
         training values a ranking reads ride on the first evaluation that reads them, whose gather
-        of them compiles there."""
+        of them compiles there. Where none runs between steps, the run's `first` compile reads each
+        split's first batch for its declaration alone (`admit_split`)."""
         if plan.evaluates_midway:
             with region("evaluate"):
                 self._evaluation(plan, state, shardings, {}, warm=True)
+        elif first:
+            # A split scored only at the end is read once here, so its undeclared inputs are refused
+            # before an update; its programs compile where it is scored.
+            from dew.training.evaluation import admit_split
+            for split, suite in plan.suites.items():
+                admit_split(self.objective, suite.data, self.device_mesh, split)
 
     def _evaluation(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState],
                     training: Mapping[str, jax.Array], names: Sequence[str] | None = None, *,

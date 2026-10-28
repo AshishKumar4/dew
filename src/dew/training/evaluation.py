@@ -27,7 +27,14 @@ from dew.artifacts import Artifact, Artifacts
 from dew.batch import VALID_ROWS, Batch, Variables
 from dew.data.dataset import Closeable, DataPartition, Reader, rows_of, take_rows
 from dew.data.pipeline import Dataset
-from dew.distributed.batches import row_origins, shard_batch, shared_host_fields, split_fields, with_host
+from dew.distributed.batches import (
+    batch_signature,
+    row_origins,
+    shard_batch,
+    shared_host_fields,
+    split_fields,
+    with_host,
+)
 from dew.distributed.placement import MeshSpec
 from dew.objectives.base import Effects, Loss, Metric, Objective, Shown, Step, TrainingScalar
 from dew.training.cadence import Tokens
@@ -373,6 +380,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
     source = iterator = None
     last = None
     scored = records = 0
+    seen: set = set()
     try:
         def open_source() -> None:
             # Each name is bound as it is built, so a failure part way
@@ -389,6 +397,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
             if not available:
                 break
             held, last, batch = _covered(mesh, held, last, scored)
+            _admitted(objective, batch, seen)
             # This rank's own real rows, counted on the host; the pool's count
             # is summed once after the split.
             records += int(np.sum(held[VALID_ROWS]))
@@ -429,6 +438,41 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
     finally:
         _close_source(iterator if iterator is not None else source)
     return scores, previews, scored, records
+
+
+def _admitted(objective: Objective[Loss, Effects], batch: Batch, seen: set) -> None:
+    """Check a batch of a shape the split has not shown (`seen`) against what the objective declares
+    (`InputSpec.check`), as a training step checks its own (`Trainer.fit`)."""
+    inputs = objective.inputs
+    device, _ = split_fields(batch)
+    signature = batch_signature(device)
+    if inputs is None or signature in seen:
+        return
+    seen.add(signature)
+    agreed("validation input declaration", lambda: inputs.check(device))
+
+
+def admit_split(objective: Objective[Loss, Effects], batches: Reader, mesh: Mesh, split: str) -> None:
+    """Read a validation split's first batch and check it against what the objective declares
+    (`_admitted`), before a run that scores the split only past its first step trains on: a split of
+    undeclared inputs is refused before an update, not after training. Its later batches are checked
+    as they are scored."""
+    if objective.inputs is None:
+        return
+    source = iterator = None
+    try:
+        def open_source() -> None:
+            nonlocal source, iterator
+            source = batches(DataPartition.of(mesh))
+            iterator = iter(source)
+
+        agreed(f"{split} iterator construction", open_source)
+        assert iterator is not None
+        held, _ = _next_batch(iterator, 0)
+        if held is not None:
+            _admitted(objective, held, set())
+    finally:
+        _close_source(iterator if iterator is not None else source)
 
 
 WARM_BATCHES = 2

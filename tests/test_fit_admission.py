@@ -101,3 +101,24 @@ def test_a_batch_of_a_shape_the_run_has_not_stepped_is_checked_against_its_decla
     data = Loader(train=lambda partition: Replaying(batch_at), val=None, batch=8, records=None)
     with pytest.raises(ValueError):
         trainer.fit(data, steps=2, log_every=1)
+
+
+@pytest.mark.parametrize("eval_every", [None, 5], ids=["at-the-end", "midway"])
+def test_a_validation_split_of_undeclared_inputs_is_refused_before_the_run_trains(eval_every):
+    """A model that reads any width trains on the three-wide inputs its objective declares, and its
+    validation split is five wide: the split is read before the run updates, whether it is scored
+    every five steps or only at the end, and the run is refused there, its training stream read no
+    further than its first batches. Before, only training batches were checked, and an end-only split
+    was first read after training (AT-03)."""
+    def batch(width: int, seed: int) -> dict:
+        x = np.random.default_rng(seed).normal(size=(8, width)).astype(np.float32)
+        return {"x": x, "y": x[:, :2]}
+
+    stream = Replaying(lambda step: batch(3, step))
+    objective = Supervised(Pooled(), lambda outputs, batch: (outputs - batch["y"]) ** 2,
+                           inputs=InputSpec(Field("x", (3,))))
+    data = Loader(train=lambda partition: stream, val=lambda partition: [batch(5, 0), batch(5, 1)], batch=8,
+                  records=None)
+    with pytest.raises(ValueError):
+        Trainer(objective, optax.sgd(0.1), key=0).fit(data, steps=40, log_every=1, eval_every=eval_every)
+    assert stream.position < 10
