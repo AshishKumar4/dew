@@ -1330,6 +1330,40 @@ def mode_evaluation_replicas(args) -> dict:
     return {"measured": measured, "no_consumer": unconsumed}
 
 
+def mode_evaluation_kept(args) -> dict:
+    """A pass of no metrics whose decisions only process 0 is asked to keep (`scored_to`): every rank
+    scores the batches root writes, so the pool meets at each collective and the pass ends."""
+    import jax
+    import jax.numpy as jnp
+    import optax
+
+    from dew.artifacts import Representations
+    from dew.data.dataset import Loader
+    from dew.objectives.base import Aux, Objective
+    from dew.training import Trainer
+
+    class Rows(Objective):
+        def fresh_variables(self, key, held):
+            return {"params": {"offset": jnp.zeros(())}}
+
+        def loss(self, variables, batch, step):
+            return jnp.mean((batch["x"] + variables["params"]["offset"]) ** 2), Aux({})
+
+        def evaluate(self, params, batch, step):
+            return Representations(features=batch["x"], labels=batch["x"][:, 0])
+
+    trainer = Trainer(Rows(), optax.sgd(.01), key=jax.random.key(0))
+    state, _, _ = trainer.place()
+    batch = {"x": np.arange(4, dtype=np.float32)[:, None]}
+    data = Loader(train=lambda partition: iter([batch]), val=lambda partition: iter([batch, batch]),
+                  records=8, batch=4)
+    kept = Path(args.run_dir) / "kept"
+    result = Evaluation.run(trainer.objective, state.variables, data.val, key=state.key, loss=True,
+                            scored_to=kept if jax.process_index() == 0 else None, mesh=trainer.device_mesh)
+    written = sorted(path.name for path in kept.iterdir()) if kept.is_dir() else []
+    return {"scores": result.scalars, "written": written}
+
+
 def mode_evaluation_clocks(args) -> dict:
     """Each rank evaluates the text-to-image diffusion objective's validation
     loss from its own clocks, rank 1's ahead of rank 0's: the loss draws its

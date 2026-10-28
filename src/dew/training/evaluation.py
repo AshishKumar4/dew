@@ -188,7 +188,8 @@ class Evaluation:
         `scored_to`, a directory, takes every batch's scoring artifacts, process 0 writing each batch's
         real rows (a decision run's `Decisions`) as `<scored_to>/<split>-<batch>.npz`
         (`dew.training.tracker.write_artifact`), so a pass's metrics pool exactly offline, across
-        batches and splits; a warming pass writes none.
+        batches and splits; a warming pass writes none. Process 0's `scored_to` is the pool's: every
+        process scores the batches it writes, whatever it was given.
 
         The scores are broadcast to every process. Previews stay on process 0, and
         there is at most one objective preview, however long the validation split
@@ -214,11 +215,15 @@ class Evaluation:
         previews: tuple[Artifact, ...] = ()
         scored = records = 0
         written = None if scored_to is None or warm else Path(scored_to) / split
-        if batches is not None and (metrics or preview_enabled or loss or written is not None):
+        # Root writes what it is asked to keep, and every process scores the batches it writes, so each
+        # runs the same collectives: root's ask is the pool's.
+        kept = bool(broadcast_from_process_zero(root and written is not None))
+        if batches is not None and (metrics or preview_enabled or loss or kept):
             scores, previews, scored, records = _score_split(
                 objective, variables, batches, context, mesh, metrics=metrics, split=split,
                 root=root, preview_enabled=preview_enabled, score_key=score_key,
-                preview_key=preview_key, loss=loss, warm=warm, written=written)
+                preview_key=preview_key, loss=loss, warm=warm, written=written if root else None,
+                kept=kept)
         scores.update(training_scores)
         elapsed = time.perf_counter() - started
         scores, elapsed = broadcast_from_process_zero((scores, elapsed))
@@ -364,7 +369,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                  context: Step, mesh: Mesh | None, *, metrics: Sequence[Metric],
                  split: str, root: bool, preview_enabled: bool,
                  score_key: jax.Array, preview_key: jax.Array, loss: bool = False,
-                 warm: bool = False, written: Path | None = None
+                 warm: bool = False, written: Path | None = None, kept: bool = False
                  ) -> tuple[dict[str, float], tuple[Artifact, ...], int, int]:
     """Score every record of a validation split, or its first `WARM_BATCHES`
     batches unfinalized where `warm`.
@@ -375,7 +380,9 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
     Every rank walks these phases in the same order. The pass ends when no
     rank has a batch left; until then a rank that has drained scores a copy
     of its last batch whose rows are all repeats (`_covered`), so it meets
-    its peers at every collective.
+    its peers at every collective. Where the pool keeps the pass's decisions
+    (`kept`, root's ask), every rank scores each batch and root writes it
+    to `written`.
     """
     summaries = _Accumulators()
     loss_sums = _LossSums()
@@ -396,7 +403,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
         agreed("iterator construction", open_source)
         assert iterator is not None and mesh is not None
         # A pass that writes its scoring artifacts evaluates its batches, whatever metrics it scores.
-        evaluating = bool(metrics) or written is not None
+        evaluating = bool(metrics) or kept
         while True:
             held, available = _next_batch(iterator, scored)
             if not available:
@@ -426,7 +433,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                                       preview_key=preview_key, scored=produced, root=root)
             produced = batch = None
             scored += 1
-            if (not metrics and not loss and written is None) or (warm and scored == WARM_BATCHES):
+            if (not metrics and not loss and not kept) or (warm and scored == WARM_BATCHES):
                 break
         # Processes on one data share (a replicated stage or sequence axis)
         # read the same rows, so the pool counts each share once.
