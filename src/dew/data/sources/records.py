@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import io
+import itertools
 import threading
+import weakref
 from collections import OrderedDict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -24,6 +26,8 @@ _MAX_OPEN_SHARDS = Loading().threads
 class _OpenedShard:
     reader: ArrayRecords
     reads: int = 0
+    used: int = 0
+    """When a read last asked for it, on the process's clock of reads (`ShardReaders._clock`)."""
 
 
 class ShardReaders[K]:
@@ -33,13 +37,22 @@ class ShardReaders[K]:
     open until their reads drain; with as many readers as read threads, a thread asking for a new
     shard holds none, so at least one retained reader is idle and can release its mirror before the
     new open. More read threads than retained readers queue on missing shard opens until a reader
-    drains. Readers retired by close still occupy that bound until their reads drain."""
+    drains. Readers retired by close still occupy that bound until their reads drain.
+
+    The idle readers of every source a process reads are bounded together by the same count
+    (`_trim`): a mixture of hundreds of sources keeps the files one source keeps, the least recently
+    read closed as others are read, while each source's own reads never wait on another's."""
+
+    _live: weakref.WeakSet[ShardReaders] = weakref.WeakSet()
+    _clock = itertools.count()
+    _trimming = threading.Lock()
 
     def __init__(self, open: Callable[[K], ArrayRecords], limit: int = _MAX_OPEN_SHARDS):
         self.open, self.limit = open, limit
         self._opened: OrderedDict[K, _OpenedShard] = OrderedDict()
         self._retired: list[_OpenedShard] = []
         self._lock = threading.Condition(threading.Lock())
+        ShardReaders._live.add(self)
 
     def read(self, key: K, row: int) -> Batch | bytes | None:
         """Row `row` of shard `key`'s reader, opened for it where none is."""
@@ -50,7 +63,8 @@ class ShardReaders[K]:
                 and all(opened.reads for opened in self._opened.values())
             ):
                 self._lock.wait()
-            if key not in self._opened:
+            opening = key not in self._opened
+            if opening:
                 if len(self._opened) + len(self._retired) >= self.limit:
                     idle = next(held for held, opened in self._opened.items() if not opened.reads)
                     self._opened.pop(idle).reader.close()
@@ -58,6 +72,7 @@ class ShardReaders[K]:
             self._opened.move_to_end(key)
             opened_shard = self._opened[key]
             opened_shard.reads += 1
+            opened_shard.used = next(ShardReaders._clock)
         try:
             return opened_shard.reader[row]
         finally:
@@ -69,22 +84,44 @@ class ShardReaders[K]:
                         self._retired.remove(opened_shard)
                         opened_shard.reader.close()
                     self._lock.notify_all()
+            if opening:
+                ShardReaders._trim()
 
-    def close(self, held: Callable[[K], bool] = lambda key: True) -> None:
-        """Close every idle reader of a key `held` names, retiring busy ones until their reads drain."""
+    @classmethod
+    def _trim(cls) -> None:
+        """Close the least recently read idle readers of every source in the process past the bound
+        one source keeps (`_MAX_OPEN_SHARDS`), as a read opens another: the idle readers then number
+        at most that and the reads in flight. It holds one source's lock at a time, never while it
+        waits for another's, so no read waits on a source it does not read."""
+        with cls._trimming:
+            idle = []
+            for readers in list(cls._live):
+                with readers._lock:
+                    idle.extend((opened.used, id(readers), key, readers)
+                                for key, opened in readers._opened.items() if not opened.reads)
+            idle.sort(key=lambda entry: entry[:2])
+            for _, _, key, readers in idle[:max(0, len(idle) - _MAX_OPEN_SHARDS)]:
+                with readers._lock:
+                    opened = readers._opened.get(key)
+                    if opened is not None and not opened.reads:
+                        readers._opened.pop(key).reader.close()
+                        readers._lock.notify_all()
+
+    def close(self) -> None:
+        """Close every idle reader, retiring busy ones until their reads drain."""
         with self._lock:
-            for key in [key for key in self._opened if held(key)]:
-                opened = self._opened.pop(key)
+            for opened in self._opened.values():
                 if opened.reads:
                     self._retired.append(opened)
                 else:
                     opened.reader.close()
+            self._opened.clear()
             self._lock.notify_all()
 
 
 class ArrayRecords:
-    """Read shards concurrently, the readers every source of the process holds open bounded together
-    (`_OPEN_SHARDS`): a mixture of hundreds of sources holds the readers one source does.
+    """Read shards concurrently, retaining as many readers as default read threads (`ShardReaders`),
+    and as many idle readers as that with every other source the process reads.
 
     Shuffled indexed reads reuse the LRU across Loading's in-flight read width.
     Non-native shards need a mirror with room for that many physical shards.
@@ -107,6 +144,7 @@ class ArrayRecords:
         ):
             raise ValueError("ArrayRecord counts must name every physical shard with a nonnegative row count")
         self._pins = []
+        self._shards = ShardReaders(self._shard)
 
     def _shard(self, shard: int) -> ArrayRecords:
         """Physical shard `shard`'s own reader, checked against its producer's row count."""
@@ -153,7 +191,7 @@ class ArrayRecords:
             raise IndexError(index)
         if self.counts is not None:
             shard, row = self.ranges.locate(index)
-            return _OPEN_SHARDS.read((self, shard), row)
+            return self._shards.read(shard, row)
         payload = self.reader[index]
         if not self.record_codec:
             return payload
@@ -173,16 +211,11 @@ class ArrayRecords:
     def __setstate__(self, state: Mapping[str, object]) -> None:
         self.__dict__.update(state)
         self._pins = []
+        self._shards = ShardReaders(self._shard)
 
     def close(self) -> None:
-        _OPEN_SHARDS.close(lambda key: key[0] is self)
+        self._shards.close()
         self.__dict__.pop("reader", None)
         for pin in self._pins:
             pin.close()
         self._pins.clear()
-
-
-_OPEN_SHARDS: ShardReaders[tuple[ArrayRecords, int]] = ShardReaders(lambda key: key[0]._shard(key[1]))
-"""The ArrayRecord shard readers this process holds open, of every source it reads, keyed by source
-and shard: at most Loading's default read threads (`_MAX_OPEN_SHARDS`), however many sources a run
-mixes."""
