@@ -32,6 +32,7 @@ from dew.nn.precision import (
     float32_products,
     l2norm,
     products_dtype,
+    rms_statistics,
     stochastic_bf16,
 )
 
@@ -164,9 +165,9 @@ def gated(gates: Gates, gate, log_a, bias, beta):
 
 
 def gated_rms(out, z, weight, norm: OutputNorm):
-    """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`,
-    the mean a product by the reciprocal, as XLA's."""
-    inverse = jax.lax.rsqrt(jnp.sum(out * out, axis=-1, keepdims=True) * (1.0 / out.shape[-1]) + norm.epsilon)
+    """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`, its
+    inverse RMS the one statistic every norm takes (`rms_statistics`)."""
+    inverse = rms_statistics(out, norm.epsilon)[1]
     return out * inverse * weight * norm_swiglu.activation_and_slope(z, norm.activation)[0]
 
 
