@@ -12,6 +12,7 @@ from typing import NamedTuple
 import jax
 import jax.extend.core as jax_core
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 
@@ -231,30 +232,49 @@ def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
     return traced
 
 
-ORDERED = frozenset({"iota", "rev", "sort", "cumsum", "cumprod", "cummax", "cummin", "cumlogsumexp"})
-"""The operations whose entries depend on their place along an axis though their shape is the tile's
-(`pointwise`)."""
-
-
 def pointwise(hooks: Hooks) -> bool:
-    """Whether the score hook and its pullback are pointwise in a tile's entries, so a program whose tiles
-    hold their keys as rows (`[bk, bq]`, the dK/dV program's) runs them as the reference's `[bq, bk]` ones
-    do: traced on a tile of unequal sides, every value of each operation is a scalar or the whole tile, and
-    none orders an axis (`ORDERED`). A hook that indexes, slices, reshapes or reduces an axis (a query's
-    coordinate read off its tile's first column) is not."""
-    tile = (16, 32)
+    """Whether the score hook is one function of its tile's entries however the tile is held, so a program
+    whose tiles hold their keys as rows (`[bk, bq]`, the dK/dV program's) runs it as the reference's
+    `[bq, bk]` ones do (`_pointwise`)."""
+    params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
+    return not callable(hooks.score_mod) or _pointwise(hooks.score_mod, params)
 
-    def entire(jaxpr: jax_core.Jaxpr) -> bool:
-        for eqn in jaxpr.eqns:
-            shapes = [getattr(var.aval, "shape", ()) for var in (*eqn.invars, *eqn.outvars)]
-            if eqn.primitive.name in ORDERED or any(shape not in ((), tile) for shape in shapes):
-                return False
-            if not all(entire(inner) for inner in jax_core.jaxprs_in_params(eqn.params)):
-                return False
-        return True
 
-    return all(entire(jaxpr) for jaxpr in _hook_jaxprs(Hooks(hooks.score_mod, hooks.score_params), tile, 1,
-                                                        differentiated=True))
+@functools.lru_cache(maxsize=256)
+def _pointwise(score_mod, params: tuple) -> bool:
+    """`pointwise` of `score_mod` under parameters of `params`' kinds and dtypes: its logits and slopes
+    (`algebra.scored`) on a tile of unequal sides, of distinct entries and coordinates, and on that tile's
+    transpose agree entry for entry, bit for bit. A hook that reads an axis of its tile (indexes, slices,
+    reduces or orders it, or takes a constant of its shape) does not, nor one whose values a tile cannot
+    settle before the call (closed over another trace's)."""
+    draw = np.random.default_rng(0)
+    rows, columns = 16, 32
+
+    def entries(kind: Kind, dtype) -> np.ndarray:
+        # A parameter as `_param` gives it: a head's scalar, a query's along the rows, a key's along the
+        # columns, a tile's its own.
+        shape = {Kind.HEAD: (), Kind.QUERY: (rows, 1), Kind.KEY: (1, columns)}.get(kind, (rows, columns))
+        values = (draw.standard_normal(shape) if jnp.issubdtype(dtype, jnp.floating)
+                  else draw.integers(-64, 64, shape))
+        return np.broadcast_to(values, () if kind == Kind.HEAD else (rows, columns)).astype(dtype)
+
+    tile = (draw.standard_normal((rows, columns)).astype(np.float32),
+            np.broadcast_to(np.arange(rows, dtype=np.int32)[:, None] + 5, (rows, columns)),
+            np.broadcast_to(np.arange(columns, dtype=np.int32)[None, :] + 3, (rows, columns)),
+            *(entries(kind, dtype) for kind, dtype in params))
+
+    def scored(arrays) -> list[np.ndarray]:
+        logits, slopes = algebra.scored(score_mod, *map(jnp.asarray, arrays[:3]),
+                                        tuple(map(jnp.asarray, arrays[3:])), slopes=True)
+        return [np.asarray(value) for value in (logits, *slopes)]
+
+    try:
+        with jax.ensure_compile_time_eval(), jax.default_device(jax.devices("cpu")[0]):
+            held, flipped = scored(tile), scored([array.T for array in tile])
+    except (jax.errors.ConcretizationTypeError, jax.errors.TracerArrayConversionError,
+            jax.errors.UnexpectedTracerError):
+        return False
+    return all(np.array_equal(one, other.T, equal_nan=True) for one, other in zip(held, flipped, strict=True))
 
 
 def _primitives(jaxpr: jax_core.Jaxpr) -> set[str]:
