@@ -11,7 +11,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import _records
-from dew.interop.unread import equal, held, valued
+from dew.interop.unread import Stored, equal, held, valued
 from dew.registry import dtype_name, resolve_dtype, storage_name
 
 if TYPE_CHECKING:
@@ -65,7 +65,7 @@ AUTO = "auto"
 """The param_dtype that stores a checkpoint's parameters in its own dtype."""
 
 
-def declared_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarray]) -> str:
+def declared_dtype(config: Mapping[str, object], tensors: Mapping[str, Stored]) -> str:
     """The compute dtype a checkpoint declares, which its packed FP8 or FP4
     payloads decode to under param_dtype 'auto': config.json's `dtype`
     (`torch_dtype` before transformers 5.0), else the dtype of the first
@@ -125,7 +125,7 @@ def decoding_storage(model: nn.Module, variables: Mapping) -> Mapping:
     return jax.tree_util.tree_map_with_path(stored, variables)
 
 
-def checkpoint_array(tensor, param_dtype: str = "float32") -> np.ndarray:
+def checkpoint_array(tensor: Stored, param_dtype: str = "float32") -> Stored:
     """Cast a stored floating array directly, without an FP32 intermediate."""
     leaf = held(tensor)
     return leaf.astype(checkpoint_dtype(leaf.dtype, param_dtype), copy=False)
@@ -164,7 +164,7 @@ def insert[LeafT](tree: Tree[LeafT], path: tuple[str, ...], leaf: LeafT, name: s
         raise ValueError(f"{name} lands on {'/'.join(path)}, which another tensor already fills")
 
 
-def source_alias(tensors: Mapping[str, np.ndarray], owners: dict[tuple[str, ...], str],
+def source_alias(tensors: Mapping[str, Stored], owners: dict[tuple[str, ...], str],
                  path: tuple[str, ...], name: str) -> None:
     """Compare source aliases before casting, since unequal values can round alike."""
     previous = owners.setdefault(path, name)
@@ -196,7 +196,7 @@ def swapped(values: np.ndarray) -> np.ndarray:
     return out.reshape(*lead, columns, rows)
 
 
-def _copy(stored: np.ndarray, dtype: np.dtype, order: tuple[int, ...] | None) -> np.ndarray:
+def _copy(stored: Stored, dtype: np.dtype, order: tuple[int, ...] | None) -> Stored:
     """Cast in contiguous source order before copying the native layout, a
     swap of the last two axes (every linear kernel) in tiles (`swapped`)."""
     leaf = stored.astype(dtype, copy=False)
@@ -209,8 +209,8 @@ def _copy(stored: np.ndarray, dtype: np.dtype, order: tuple[int, ...] | None) ->
     return np.ascontiguousarray(leaf.transpose(order))
 
 
-def _leaves[LeafT](tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype: str,
-                   read: Callable[[np.ndarray, np.dtype, tuple[int, ...] | None], LeafT]
+def _leaves[LeafT](tensors: Mapping[str, Stored], path_of: TensorPath, param_dtype: str,
+                   read: Callable[[Stored, np.dtype, tuple[int, ...] | None], LeafT]
                    ) -> Iterator[tuple[str, tuple[str, ...], LeafT, tuple[int, ...] | None]]:
     """Choose native paths, layout and precision for an eager or mapped reader.
 
@@ -284,8 +284,8 @@ def _layout(component: str, name: str, shape: tuple[int, ...], path: tuple[str, 
                         _orders(path, len(shape))[1])
 
 
-def translate_parameters(tensors: Mapping[str, np.ndarray], path_of: TensorPath,
-                         param_dtype: str = "float32") -> ParamTree:
+def translate_parameters[A: (np.ndarray, Stored)](tensors: Mapping[str, A], path_of: TensorPath,
+                                                  param_dtype: str = "float32") -> Tree[A]:
     """Read host-built parameters without creating deferred placement recipes.
 
     Repeated paths compare at their storage precision.
@@ -293,8 +293,8 @@ def translate_parameters(tensors: Mapping[str, np.ndarray], path_of: TensorPath,
     return placed(tensors, path_of, param_dtype)[0]
 
 
-def placed(tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype: str = "float32"
-           ) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
+def placed[A: (np.ndarray, Stored)](tensors: Mapping[str, A], path_of: TensorPath,
+                                    param_dtype: str = "float32") -> tuple[Tree[A], tuple[WeightLayout, ...]]:
     """`translate_parameters`' tree, with the layout that writes each tensor it placed back
     under its own name from its path in that tree; a tensor `path_of` leaves out has none.
     It is `record_layouts`' binding pass (`_bound`) with each tensor read whole, under no
@@ -302,9 +302,9 @@ def placed(tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype: 
     return _bound("", tensors, path_of, (), param_dtype, _copy)
 
 
-def _bound[LeafT](component: str, tensors: Mapping[str, np.ndarray], path_of: TensorPath,
+def _bound[LeafT](component: str, tensors: Mapping[str, Stored], path_of: TensorPath,
                   prefix: tuple[str, ...], param_dtype: str,
-                  read: Callable[[np.ndarray, np.dtype, tuple[int, ...] | None], LeafT]
+                  read: Callable[[Stored, np.dtype, tuple[int, ...] | None], LeafT]
                   ) -> tuple[dict, tuple[WeightLayout, ...]]:
     """The one binding pass, eager (`placed`) or mapped (`record_layouts`): each tensor
     `path_of` places, read by `read` into its leaf, source aliases sharing the leaf of the
@@ -320,7 +320,7 @@ def _bound[LeafT](component: str, tensors: Mapping[str, np.ndarray], path_of: Te
     return parameters, tuple(layouts)
 
 
-def _aliased(tensors: Mapping[str, np.ndarray], path_of: TensorPath
+def _aliased(tensors: Mapping[str, Stored], path_of: TensorPath
              ) -> tuple[dict[tuple[str, ...], str], TensorPath]:
     """The first tensor each path holds, filled as the returned `path_of` is asked, which
     compares each later alias with it before any cast (`source_alias`)."""
@@ -344,7 +344,7 @@ def nested(layouts: tuple[WeightLayout, ...], depth: int, *keys: str) -> tuple[W
                  for layout in layouts)
 
 
-def record_layouts(component: str, tensors: Mapping[str, np.ndarray], path_of: TensorPath,
+def record_layouts(component: str, tensors: Mapping[str, Stored], path_of: TensorPath,
                    prefix: tuple[str, ...], *, param_dtype: str = "float32", lazy: bool = False
                    ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
     """Bind native leaves and the layouts that rebuild every source tensor.
@@ -356,7 +356,7 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray], path_of: T
     """
     from dew.interop.streaming import SourceLeaf, materialize
 
-    def mapped(stored: np.ndarray, dtype: np.dtype, order: tuple[int, ...] | None) -> np.ndarray | SourceLeaf:
+    def mapped(stored: Stored, dtype: np.dtype, order: tuple[int, ...] | None) -> Stored | SourceLeaf:
         return (_copy(stored, dtype, order) if order is not None and stored.ndim != 2
                 else SourceLeaf((stored,), dtype, transposed=order is not None))
 

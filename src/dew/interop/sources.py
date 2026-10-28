@@ -35,7 +35,7 @@ from dew.interop.safetensors_io import (
     stored_spec,
     weight_files,
 )
-from dew.interop.unread import unread
+from dew.interop.unread import Unread, unread
 
 
 def load_shards(directory: Path) -> dict[str, np.ndarray]:
@@ -319,7 +319,7 @@ def _hub_header(name: str, revision: str, file: str) -> dict[str, tuple[list[int
     return {tensor_name: (list(tensor.shape), tensor.dtype) for tensor_name, tensor in header.tensors.items()}
 
 
-def stored_tensors(source: SourceReference, root: Path) -> LazyTensors | None:
+def stored_tensors(source: SourceReference, root: Path) -> LazyTensors[Unread] | None:
     """`source`'s weight tensors at the snapshot `root` (`snapshot(weights=False)`) as their shapes and
     dtypes alone, read from their safetensors headers (`StoredWeights.specs`, a Hub source's over HTTP
     and cached), what a load without its weights translates: each tensor an `Unread` array, its shape

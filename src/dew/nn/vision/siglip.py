@@ -15,7 +15,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
 from dew.batch import Variables
-from dew.interop.unread import held
+from dew.interop.unread import Stored, held
 from dew.interop.weights import checkpoint_array, in_params
 from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
@@ -149,7 +149,7 @@ GEMMA_PROJECTOR_TENSORS = {
 
 
 def translate_gemma_projector_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+    hf_tensors: Mapping[str, Stored], *, param_dtype: str = "float32"
 ) -> tuple[Variables, tuple[WeightLayout, ...]]:
     """A Gemma projector's two tensors into its parameter tree, with the layouts that write them
     back.

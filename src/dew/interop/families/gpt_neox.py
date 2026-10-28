@@ -22,7 +22,7 @@ from dew.interop.decoder_parts import (
     renamed_path,
     ungated_mlp,
 )
-from dew.interop.unread import equal
+from dew.interop.unread import Stored, equal
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.rope import inverse_frequencies
 
@@ -51,8 +51,8 @@ def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     return config
 
 
-def _gpt_neox_buffers(tensors: Mapping[str, np.ndarray],
-                      config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+def _gpt_neox_buffers(tensors: Mapping[str, Stored],
+                      config: Mapping[str, object] | None = None) -> Mapping[str, Stored]:
     """The checkpoint without its fixed attention buffers, each checked: the causal mask, the mask
     sentinel and the rotary frequencies, which the config computes."""
     if config is None:

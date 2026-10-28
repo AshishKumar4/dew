@@ -3,22 +3,25 @@
 `Pretrained.load(weights=False)` reads a source's safetensors headers and fetches no tensor's bytes. Its
 readers run as a load with weights runs them, on `Unread` arrays in place of the stored tensors: every
 NumPy operation on one is evaluated abstractly (`jax.eval_shape` on the operation's `jax.numpy`
-counterpart), so a split, a transpose, a cast or a decode computes the shape and dtype its result would
-have, and nothing else. What would need a value, a branch on one, a conversion to a Python number or a
-NumPy array, raises `PayloadUnread`: a reader that checks or decides on values reads none here, and says
-so, rather than computing on values it was not given.
+counterpart, in NumPy's own dtypes), so a split, a transpose, a cast or a decode computes the shape and
+dtype its result would have, and nothing else. What would need a value, a branch on one, a conversion
+to a Python number or a NumPy array, raises `PayloadUnread`: a reader that checks or decides on values
+reads none here, and says so, rather than computing on values it was not given. A reader takes and
+gives `Stored`, the stored tensor it holds either way.
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Collection, Mapping
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from types import EllipsisType
+from typing import TYPE_CHECKING, NoReturn
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from numpy.typing import ArrayLike, DTypeLike
+from typing_extensions import TypeIs
 
 if TYPE_CHECKING:
     from dew.interop.safetensors_io import LazyTensors
@@ -29,55 +32,88 @@ class PayloadUnread(LookupError):
     and dtype alone: whatever asked checks or decides on values, which this load does not read."""
 
 
-def _abstract(value):
-    return jax.ShapeDtypeStruct(value.shape, value.dtype) if isinstance(value, Unread) else value
+type Operand = (ArrayLike | DTypeLike | Unread | slice | EllipsisType | None
+                | Sequence[Operand] | Mapping[str, Operand])
+"""What a NumPy function takes and gives: arrays (an `Unread` among them), scalars, dtypes, shapes, axes
+and indices, and sequences and keywords of them."""
+
+type Traced = jax.Array | tuple[Traced, ...] | list[Traced]
+"""What a `jax.numpy` function gives: an array, or a sequence of them."""
+
+type Abstract = Unread | tuple[Abstract, ...] | list[Abstract]
+"""What NumPy gives of `Unread` operands: arrays of the shapes and dtypes its values would have."""
 
 
-def evaluated(function: Callable, *args, **kwargs):
+def evaluated(function: Callable[..., Traced], *args: Operand, **kwargs: Operand) -> Abstract:
     """`function`'s result on `args` and `kwargs` with every `Unread` among them abstract: `Unread`
-    arrays of the shapes and dtypes it would return, its other values as they are."""
+    arrays of the shapes and dtypes it would return."""
     leaves, tree = jax.tree.flatten((args, kwargs), is_leaf=lambda leaf: isinstance(leaf, Unread))
-    held = [index for index, leaf in enumerate(leaves) if isinstance(leaf, Unread)]
+    unread_at = [index for index, leaf in enumerate(leaves) if isinstance(leaf, Unread)]
 
-    def run(*abstract):
+    def run(*abstract: jax.Array) -> Traced:
         filled = list(leaves)
-        for index, value in zip(held, abstract, strict=True):
+        for index, value in zip(unread_at, abstract, strict=True):
             filled[index] = value
         given, named = jax.tree.unflatten(tree, filled)
         return function(*given, **named)
 
     # The stored dtypes as NumPy holds them: float64 and int64 stay so.
     with jax.enable_x64(new_val=True):
-        shapes = jax.eval_shape(run, *(_abstract(leaves[index]) for index in held))
-    return jax.tree.map(lambda leaf: Unread(leaf.shape, leaf.dtype)
-                        if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, shapes)
+        shapes = jax.eval_shape(run, *(jax.ShapeDtypeStruct(leaves[index].shape, leaves[index].dtype)
+                                       for index in unread_at))
+    return jax.tree.map(lambda leaf: Unread(leaf.shape, leaf.dtype), shapes)
 
 
-def _dtype_of(value) -> np.dtype | type:
+def _array(function: Callable[..., Traced], *args: Operand, **kwargs: Operand) -> Unread:
+    """`evaluated` of a `function` that gives one array."""
+    shapes = evaluated(function, *args, **kwargs)
+    if not isinstance(shapes, Unread):
+        raise TypeError(f"{function} gives {type(shapes).__name__}, not one array")
+    return shapes
+
+
+def _dtype_of(value: ArrayLike) -> np.dtype | type:
     """A ufunc operand's dtype as NumPy resolves loops by, a Python scalar's type kept weak (NEP 50)."""
     if isinstance(value, (bool, int, float, complex)):
         return type(value)
     return value.dtype if isinstance(value, Unread) else np.asarray(value).dtype
 
 
-def _cast(value, dtype: np.dtype):
-    """`value` in `dtype`, an `Unread` as one."""
+def _cast(value: ArrayLike, dtype: np.dtype) -> ArrayLike:
+    """`value` in `dtype`, an `Unread` as one, a Python scalar as it is (NumPy keeps it weak)."""
+    if isinstance(value, (bool, int, float, complex)):
+        return value
     return value.astype(dtype) if isinstance(value, Unread) else np.asarray(value).astype(dtype)
 
 
-def _retyped(shapes, dtypes):
-    """`shapes`' `Unread` results in `dtypes`, the dtypes NumPy computes them in."""
+def _retyped(shapes: Abstract, dtypes: tuple[np.dtype, ...]) -> Abstract:
+    """`shapes`' arrays in `dtypes`, the dtypes NumPy computes them in."""
     if isinstance(shapes, Unread):
         return Unread(shapes.shape, dtypes[0])
-    return type(shapes)(Unread(shape.shape, dtype) for shape, dtype in zip(shapes, dtypes, strict=True))
+    return tuple(_retyped(shape, (dtype,)) for shape, dtype in zip(shapes, dtypes, strict=True))
 
 
-def _counterpart(function, name: str):
-    held = getattr(jnp, name, None)
-    if held is None:
+def _counterpart(name: str) -> Callable[..., Traced]:
+    """`jax.numpy`'s function of NumPy's `name`, which runs abstractly."""
+    function = getattr(jnp, name, None)
+    if function is None:
         raise PayloadUnread(f"numpy.{name} has no abstract counterpart, so it cannot run on a tensor "
                             "a load without its weights holds")
-    return held
+    return function
+
+
+class _Operator:
+    """An operator of `Unread`'s as NumPy's `ufunc` runs it, with the operands swapped where
+    `reflected`: `Unread.__array_ufunc__` runs it abstractly."""
+
+    def __init__(self, ufunc: np.ufunc, *, reflected: bool = False):
+        self.ufunc = ufunc
+        self.reflected = reflected
+
+    def __get__(self, array: Unread, owner: type[Unread]) -> Callable[[ArrayLike], Unread]:
+        if self.reflected:
+            return lambda other: self.ufunc(other, array)
+        return lambda other: self.ufunc(array, other)
 
 
 class Unread:
@@ -86,9 +122,9 @@ class Unread:
     __slots__ = ("dtype", "shape")
     __array_priority__ = 1000
 
-    def __init__(self, shape, dtype):
-        self.shape = tuple(int(size) for size in shape)
-        self.dtype = np.dtype(dtype)
+    def __init__(self, shape: Collection[int], dtype: DTypeLike):
+        self.shape: tuple[int, ...] = tuple(int(size) for size in shape)
+        self.dtype: np.dtype = np.dtype(dtype)
 
     def __repr__(self) -> str:
         return f"Unread({self.shape}, {self.dtype})"
@@ -112,46 +148,45 @@ class Unread:
     def __len__(self) -> int:
         return self.shape[0]
 
-    def __array__(self, dtype=None, copy=None):
+    def __array__(self, dtype: DTypeLike | None = None, copy: bool | None = None) -> NoReturn:
         raise PayloadUnread(f"{self!r}: a NumPy array of its values was asked, which a load without its "
                             "weights does not read")
 
-    def _refused(self, *_):
+    def _refused(self) -> NoReturn:
         raise PayloadUnread(f"{self!r}: a Python value of it was asked, which a load without its weights "
                             "does not read")
 
-    __bool__ = __float__ = __int__ = __index__ = __complex__ = _refused
+    __bool__ = __float__ = __int__ = __index__ = __complex__ = tolist = _refused
 
-    def item(self, *_):
+    def item(self, *index: int) -> NoReturn:
         self._refused()
 
-    def tolist(self):
+    # Python's `==` answers one bool of the values; NumPy's elementwise `==`, `np.equal`, runs on an
+    # Unread abstractly.
+    def __eq__(self, other) -> NoReturn:
         self._refused()
 
-    def __array_ufunc__(self, ufunc, method, *inputs, **kwargs):
+    def __ne__(self, other) -> NoReturn:
+        self._refused()
+
+    def __array_ufunc__(self, ufunc: np.ufunc, method: str, *inputs: ArrayLike,
+                        **kwargs: Operand) -> Abstract:
         if kwargs.get("out") is not None:
             raise PayloadUnread(f"numpy.{ufunc.__name__} writes into an array, which a tensor a load "
                                 "without its weights holds cannot fill")
-        counterpart = _counterpart(ufunc, ufunc.__name__)
+        counterpart = _counterpart(ufunc.__name__)
         if method != "__call__":
             return evaluated(getattr(counterpart, method), *inputs, **kwargs)
         # NumPy's own loop for these operands (its promotion, not JAX's lattice), run abstractly.
-        given = tuple(_dtype_of(value) for value in inputs)
-        *operands, results = ufunc.resolve_dtypes((*given, *(None,) * ufunc.nout))
-        cast = [value if isinstance(value, (bool, int, float, complex)) else _cast(value, dtype)
-                for value, dtype in zip(inputs, operands, strict=True)]
-        shapes = evaluated(counterpart, *cast, **kwargs)
-        return _retyped(shapes, (results,) if ufunc.nout == 1 else ufunc.resolve_dtypes(
-            (*given, *(None,) * ufunc.nout))[ufunc.nin:])
+        resolved = ufunc.resolve_dtypes((*(_dtype_of(value) for value in inputs), *(None,) * ufunc.nout))
+        cast = [_cast(value, dtype) for value, dtype in zip(inputs, resolved[:ufunc.nin], strict=True)]
+        return _retyped(evaluated(counterpart, *cast, **kwargs), resolved[ufunc.nin:])
 
-    def __array_function__(self, func: Callable[..., Any], types: Collection[type[Any]],
-                           args: tuple[Any, ...], kwargs: dict[str, Any]) -> object:
-        if func in (np.asarray, np.ascontiguousarray):
-            dtype = kwargs.get("dtype", args[1] if len(args) > 1 else None)
-            return self if dtype is None else self.astype(dtype)
+    def __array_function__(self, func: Callable[..., Operand], types: Collection[type],
+                           args: tuple[Operand, ...], kwargs: dict[str, Operand]) -> Operand:
         if func in _METADATA:
             return _METADATA[func](*args, **kwargs)
-        shapes = evaluated(_counterpart(func, func.__name__), *args, **kwargs)
+        shapes = evaluated(_counterpart(func.__name__), *args, **kwargs)
         if func in _PROMOTING:
             # NumPy's promotion of its operands, not JAX's lattice.
             operands = [value for value in jax.tree.leaves((args, kwargs), is_leaf=lambda leaf: isinstance(
@@ -161,115 +196,112 @@ class Unread:
                                 is_leaf=lambda leaf: isinstance(leaf, Unread))
         return shapes
 
-    def __getitem__(self, index):
-        return evaluated(lambda array, index: array[index], self, index)
+    def __getitem__(self, index: Operand) -> Unread:
+        return _array(lambda array, index: array[index], self, index)
 
-    def __setitem__(self, index, value):
+    def __setitem__(self, index: Operand, value: ArrayLike) -> None:
         # A write keeps the array's shape and dtype; it is checked to fit where it writes.
-        evaluated(lambda array, index, value: array.at[index].set(value), self, index, value)
+        _array(lambda array, index, value: array.at[index].set(value), self, index, value)
 
-    def __getattr__(self, name: str):
+    def __getattr__(self, name: str) -> Callable[..., Unread]:
         # The array methods NumPy readers call (`all`, `any`, `mean`, `clip`, ...), as `jax.Array`'s.
         if name.startswith("_") or not callable(getattr(jax.Array, name, None)):
             raise AttributeError(name)
-        return lambda *args, **kwargs: evaluated(
+        return lambda *args, **kwargs: _array(
             lambda array, *given, **named: getattr(array, name)(*given, **named), self, *args, **kwargs)
 
-    def __iter__(self):
+    def __iter__(self) -> Iterator[Unread]:
         return (self[position] for position in range(len(self)))
 
-    def reshape(self, *shape, **kwargs):
-        return evaluated(lambda array: array.reshape(*shape, **kwargs), self)
+    def reshape(self, *shape: int | tuple[int, ...], order: str = "C") -> Unread:
+        return _array(lambda array: array.reshape(*shape, order=order), self)
 
-    def transpose(self, *axes):
-        return evaluated(lambda array: array.transpose(*axes), self)
+    def transpose(self, *axes: int | tuple[int, ...]) -> Unread:
+        return _array(lambda array: array.transpose(*axes), self)
 
-    def swapaxes(self, first, second):
-        return evaluated(lambda array: array.swapaxes(first, second), self)
+    def swapaxes(self, first: int, second: int) -> Unread:
+        return _array(lambda array: array.swapaxes(first, second), self)
 
-    def astype(self, dtype, **_):
+    def astype(self, dtype: DTypeLike, *, copy: bool = True) -> Unread:
         return Unread(self.shape, dtype)
 
-    def view(self, dtype=None):
+    def view(self, dtype: DTypeLike | None = None) -> Unread:
         # NumPy's geometry: the last axis holds as many of the new items as its bytes do.
         target = self.dtype if dtype is None else np.dtype(dtype)
         if target.itemsize == self.itemsize:
             return Unread(self.shape, target)
-        bytes_held = self.shape[-1] * self.itemsize
+        bytes_held = self.shape[-1] * self.itemsize if self.shape else 0
         if not self.shape or bytes_held % target.itemsize:
             raise ValueError(f"{self!r} cannot be viewed as {target}: its last axis holds {bytes_held} bytes")
         return Unread((*self.shape[:-1], bytes_held // target.itemsize), target)
 
-    def copy(self, *_):
+    def copy(self, order: str = "C") -> Unread:
         return self
 
     @property
-    def T(self):
+    def T(self) -> Unread:
         return self.transpose()
 
-    def __neg__(self):
-        return np.negative(self)
+    # NumPy and JAX keep the dtype of each of these, but the absolute of a complex array (a float).
+    def __neg__(self) -> Unread:
+        return _array(jnp.negative, self)
 
-    def __invert__(self):
-        return np.invert(self)
+    def __invert__(self) -> Unread:
+        return _array(jnp.invert, self)
 
-    def __abs__(self):
-        return np.absolute(self)
+    def __abs__(self) -> Unread:
+        return _array(jnp.absolute, self)
+
+    __add__, __radd__ = _Operator(np.add), _Operator(np.add, reflected=True)
+    __sub__, __rsub__ = _Operator(np.subtract), _Operator(np.subtract, reflected=True)
+    __mul__, __rmul__ = _Operator(np.multiply), _Operator(np.multiply, reflected=True)
+    __truediv__, __rtruediv__ = _Operator(np.true_divide), _Operator(np.true_divide, reflected=True)
+    __floordiv__, __rfloordiv__ = _Operator(np.floor_divide), _Operator(np.floor_divide, reflected=True)
+    __mod__, __rmod__ = _Operator(np.remainder), _Operator(np.remainder, reflected=True)
+    __pow__, __rpow__ = _Operator(np.power), _Operator(np.power, reflected=True)
+    __matmul__, __rmatmul__ = _Operator(np.matmul), _Operator(np.matmul, reflected=True)
+    __and__, __rand__ = _Operator(np.bitwise_and), _Operator(np.bitwise_and, reflected=True)
+    __or__, __ror__ = _Operator(np.bitwise_or), _Operator(np.bitwise_or, reflected=True)
+    __xor__, __rxor__ = _Operator(np.bitwise_xor), _Operator(np.bitwise_xor, reflected=True)
+    __lshift__, __rlshift__ = _Operator(np.left_shift), _Operator(np.left_shift, reflected=True)
+    __rshift__, __rrshift__ = _Operator(np.right_shift), _Operator(np.right_shift, reflected=True)
+    __lt__, __le__ = _Operator(np.less), _Operator(np.less_equal)
+    __gt__, __ge__ = _Operator(np.greater), _Operator(np.greater_equal)
 
 
-def held(value: ArrayLike, dtype: DTypeLike | None = None, *, contiguous: bool = False) -> np.ndarray:
-    """`np.asarray(value, dtype)` (`np.ascontiguousarray` with `contiguous`), an `Unread` kept one: the
-    array a reader goes on with, values or not, an `Unread` standing in for its array."""
-    create = np.ascontiguousarray if contiguous else np.asarray
+type Stored = np.ndarray | Unread
+"""A stored tensor as a reader holds it: its values, or, of a load without its weights, its shape and
+dtype alone (`Unread`), each going through the reader's NumPy."""
+
+
+def held(value: ArrayLike | Unread, dtype: DTypeLike | None = None, *, contiguous: bool = False) -> Stored:
+    """`np.asarray(value, dtype)` (`np.ascontiguousarray` with `contiguous`), an `Unread` kept one, cast
+    to `dtype`: the stored tensor a reader goes on with, values or not."""
     if isinstance(value, Unread):
-        # NumPy's array-creation protocol (NEP 35): an Unread answers as itself, cast to `dtype`.
-        return create(value, dtype, like=value)
-    return create(value, dtype)
+        return value if dtype is None else value.astype(dtype)
+    return np.ascontiguousarray(value, dtype) if contiguous else np.asarray(value, dtype)
 
 
-def equal(first, second) -> bool:
+def valued(value: Stored) -> TypeIs[np.ndarray]:
+    """Whether `value` holds its values, not an `Unread`: a check on values runs where they are held,
+    and a load without its weights checks the shapes alone."""
+    return not isinstance(value, Unread)
+
+
+def equal(first: Stored, second: Stored) -> bool:
     """Whether `first` and `second` hold equal values, as `np.array_equal`; where either is `Unread`,
     whether their shapes are, all a load without its weights can check."""
-    if valued(first, second):
-        return bool(np.array_equal(first, second))
-    return tuple(np.shape(first) if valued(first) else first.shape) == tuple(
-        np.shape(second) if valued(second) else second.shape)
+    if isinstance(first, Unread) or isinstance(second, Unread):
+        return tuple(first.shape) == tuple(second.shape)
+    return bool(np.array_equal(first, second))
 
 
-def lookup(table: np.ndarray, index):
+def lookup(table: np.ndarray, index: Stored) -> Stored:
     """`table[index]` along its first axis, `index` an integer array of codes; an `Unread` index gives
     an `Unread` of the result's shape and dtype (NumPy's own `take` reads its index)."""
     if isinstance(index, Unread):
-        return evaluated(lambda codes: jnp.take(jnp.asarray(table), codes, axis=0), index)
+        return _array(lambda codes: jnp.take(jnp.asarray(table), codes, axis=0), index)
     return np.take(table, index, axis=0)
-
-
-def valued(*values) -> bool:
-    """Whether each of `values` holds its values, none `Unread`: a check on values runs where they are
-    held, and a load without its weights checks the shapes alone."""
-    return not any(isinstance(value, Unread) for value in values)
-
-
-def _operator(name: str):
-    """The operator and its reflection that run NumPy's `name` ufunc on an `Unread`."""
-    def operate(self, other):
-        return getattr(np, name)(self, other)
-
-    def reflected(self, other):
-        return getattr(np, name)(other, self)
-    return operate, reflected
-
-
-for _dunder, _ufunc in (("add", "add"), ("sub", "subtract"), ("mul", "multiply"), ("truediv", "true_divide"),
-                        ("floordiv", "floor_divide"), ("mod", "remainder"), ("pow", "power"),
-                        ("matmul", "matmul"), ("and", "bitwise_and"), ("or", "bitwise_or"),
-                        ("xor", "bitwise_xor"), ("lshift", "left_shift"), ("rshift", "right_shift")):
-    _forward, _backward = _operator(_ufunc)
-    setattr(Unread, f"__{_dunder}__", _forward)
-    setattr(Unread, f"__r{_dunder}__", _backward)
-for _dunder, _ufunc in (("lt", "less"), ("le", "less_equal"), ("gt", "greater"), ("ge", "greater_equal"),
-                        ("eq", "equal"), ("ne", "not_equal")):
-    setattr(Unread, f"__{_dunder}__", _operator(_ufunc)[0])
 
 
 _PROMOTING = frozenset({np.concatenate, np.stack, np.hstack, np.vstack, np.append, np.where, np.dot,
@@ -277,17 +309,32 @@ _PROMOTING = frozenset({np.concatenate, np.stack, np.hstack, np.vstack, np.appen
 """The NumPy functions whose result takes its operands' promoted dtype, which NumPy's lattice gives
 (an int32 beside a float32 is float64 there, float32 in JAX's)."""
 
-_METADATA = {np.shape: lambda array: array.shape, np.ndim: lambda array: array.ndim,
-             np.size: lambda array, axis=None: array.size if axis is None else array.shape[axis],
-             np.result_type: lambda *arrays: np.result_type(*(
-                 array.dtype if isinstance(array, Unread) else array for array in arrays))}
+
+def _shape_of(array: Stored) -> tuple[int, ...]:
+    return tuple(array.shape)
+
+
+def _rank_of(array: Stored) -> int:
+    return len(array.shape)
+
+
+def _size_of(array: Stored, axis: int | None = None) -> int:
+    return math.prod(array.shape) if axis is None else array.shape[axis]
+
+
+def _result_type_of(*arrays: ArrayLike | DTypeLike) -> np.dtype:
+    return np.result_type(*(array.dtype if isinstance(array, Unread) else array for array in arrays))
+
+
+_METADATA: dict[Callable[..., Operand], Callable[..., Operand]] = {
+    np.shape: _shape_of, np.ndim: _rank_of, np.size: _size_of, np.result_type: _result_type_of}
 """The NumPy functions an `Unread` answers from its shape and dtype, which hold what they return."""
 
 
-def unread(specs: Mapping[str, jax.ShapeDtypeStruct]) -> LazyTensors:
+def unread(specs: Mapping[str, jax.ShapeDtypeStruct]) -> LazyTensors[Unread]:
     """`specs`' tensors as a load without its weights holds them: each an `Unread` of its shape and
-    dtype, standing in for the array a reader takes (`held`), its NumPy run on it abstractly."""
+    dtype, its readers' NumPy run on it abstractly."""
     # The safetensors reader's module reads weights through this one.
     from dew.interop.safetensors_io import LazyTensors
 
-    return LazyTensors(specs, lambda name: held(Unread(specs[name].shape, specs[name].dtype)))
+    return LazyTensors(specs, lambda name: Unread(specs[name].shape, specs[name].dtype))

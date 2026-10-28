@@ -48,7 +48,7 @@ from dew.interop.decoder_parts import (
     translated,
     yarn_record,
 )
-from dew.interop.unread import held, valued
+from dew.interop.unread import Stored, held, valued
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
@@ -1073,8 +1073,8 @@ def _v4_spelling(name: str) -> str:
     return block + renamed
 
 
-def deepseek_v4_prepare(tensors: Mapping[str, np.ndarray],
-                          _config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
+def deepseek_v4_prepare(tensors: Mapping[str, Stored],
+                          _config: Mapping[str, object] | None = None) -> dict[str, Stored]:
     """Reshape the grouped output projection and the hash table as the tree holds them.
 
     `DeepseekV4GroupedLinear` stores one block per head group in a matrix of

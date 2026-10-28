@@ -60,7 +60,7 @@ from dew.interop.decoder_parts import (
     translated,
 )
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
-from dew.interop.unread import equal, held
+from dew.interop.unread import Stored, equal, held
 from dew.interop.weights import checkpoint_dtype, insert, nested
 from dew.nn import audio as audio_nn, vision as vision_nn
 from dew.nn.attention_residuals import AttentionResiduals
@@ -446,14 +446,14 @@ def _renamed(checked: Checked, names: Mapping[str, str]) -> Checked:
             for name, group in checked.items() if name in local}
 
 
-def _equal(read: Callable[[str], np.ndarray], first: str, second: str, checked: Checked) -> bool:
+def _equal(read: Callable[[str], Stored], first: str, second: str, checked: Checked) -> bool:
     """Whether source tensors `first` and `second` hold equal values: known where `checked` joins
     them, else read and compared; of a load without its weights, whether their shapes and dtypes are
     (`valued`)."""
     return second in checked.get(first, frozenset()) or equal(read(first), read(second))
 
 
-def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], record,
+def _wrapper_sources(names: Collection[str], read: Callable[[str], Stored], record,
                      checked: Checked = NOTHING_CHECKED):
     """Route source names once, checking any names that claim one local leaf.
     The table retains names, not decoded arrays, so read can be a codec accessor.
@@ -492,7 +492,7 @@ def language_model_config(hf_config: Mapping[str, object]) -> Mapping[str, objec
     return text
 
 
-def language_model_names(names: Collection[str], read: Callable[[str], np.ndarray], record: WrapperFields,
+def language_model_names(names: Collection[str], read: Callable[[str], Stored], record: WrapperFields,
                          checked: Checked = NOTHING_CHECKED) -> dict[str, str]:
     """Each tensor name of a wrapper's language model, as its text family reads it, to the wrapper's
     name of it (`wrapper_route`). The media towers' names are not among them, nor read: only the
@@ -501,7 +501,7 @@ def language_model_names(names: Collection[str], read: Callable[[str], np.ndarra
     return _wrapper_sources(own, read, record, checked)[0]["language_model"]
 
 
-def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], config,
+def _text_aliases(names: Collection[str], read: Callable[[str], Stored], config,
                   tied_head_names: tuple[str, str] = ('lm_head.weight', 'model.embed_tokens.weight'),
                   checked: Checked = NOTHING_CHECKED) -> tuple[tuple[str, str], ...]:
     """Check tied-head/MTP values and return the verified source relationships.
@@ -556,7 +556,7 @@ def _tied_names(family: "DecoderFamily", config, names: Collection[str]) -> tupl
     return head_name, embedding_name if found is None else found
 
 
-def _denoiser_sources(names: Collection[str], read: Callable[[str], np.ndarray], *,
+def _denoiser_sources(names: Collection[str], read: Callable[[str], Stored], *,
                       text_only: bool, checked: Checked = NOTHING_CHECKED):
     """Return the shared text names, preferring the encoder as the weight map does.
     Alias-only inspection of a complete source leaves media validation to its
@@ -599,7 +599,7 @@ def alias_groups(aliases: Collection[tuple[str, str]]) -> tuple[frozenset[str], 
     return tuple(set(groups.values()))
 
 
-def validate_source_aliases(names: Collection[str], read: Callable[[str], np.ndarray],
+def validate_source_aliases(names: Collection[str], read: Callable[[str], Stored],
                             config: Mapping[str, object], *, media: bool) -> tuple[tuple[str, str], ...]:
     """Return the pairs of source tensor names that hold equal values.
 
@@ -629,7 +629,7 @@ def validate_source_aliases(names: Collection[str], read: Callable[[str], np.nda
 
 
 def translate_wrapper_weights(
-    hf_tensors: Mapping[str, np.ndarray],
+    hf_tensors: Mapping[str, Stored],
     record: WrapperFields,
     *,
     param_dtype: str = "float32",
@@ -662,7 +662,7 @@ def wrapper_source_depths(record: WrapperFields) -> Callable[[str], int | None]:
 
 
 def read_wrapper(
-    hf_tensors: Mapping[str, np.ndarray],
+    hf_tensors: Mapping[str, Stored],
     record: WrapperFields,
     *,
     param_dtype: str = "float32",
@@ -784,7 +784,7 @@ def held_depths(fields: dict, params: Mapping[str, object]) -> None:
 
 
 def translate_weights(
-    hf_tensors: Mapping[str, np.ndarray],
+    hf_tensors: Mapping[str, Stored],
     config: DecoderFields,
     model_type: str | DecoderFamily | None = None,
     *,
@@ -799,7 +799,7 @@ def translate_weights(
 
 
 def read_decoder(
-    hf_tensors: Mapping[str, np.ndarray],
+    hf_tensors: Mapping[str, Stored],
     config: DecoderFields,
     model_type: str | DecoderFamily | None = None,
     *,
@@ -866,7 +866,7 @@ def read_decoder(
 
 
 def translate_denoiser_weights(
-    hf_tensors: Mapping[str, np.ndarray],
+    hf_tensors: Mapping[str, Stored],
     config: DecoderFields,
     *,
     param_dtype: str = "float32",

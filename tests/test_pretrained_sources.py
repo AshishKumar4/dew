@@ -451,8 +451,10 @@ def test_a_tensor_a_load_without_its_weights_holds_has_shapes_and_no_values():
     assert np.concatenate([Unread((2,), np.int32), np.ones(3, np.float32)]).dtype == np.float64
     assert Unread((2, 3), np.float32).view(np.uint8).shape == (2, 12)
     assert Unread((4, 8), np.float32).dot(Unread((8, 2), np.float32)).shape == (4, 2)
+    # NumPy's elementwise `==` is `np.equal`; Python's `==` would answer one bool of the values.
+    assert np.equal(codes, 0).shape == (4, 8) and (-decoded).dtype == np.float32
     for asked in (lambda: bool(np.array_equal(codes, codes)), lambda: float(decoded[0, 0]),
-                  lambda: np.asarray(codes), lambda: np.isfinite(decoded).all() or None,
+                  lambda: codes == 0, lambda: np.asarray(codes), lambda: np.isfinite(decoded).all() or None,
                   lambda: np.zeros((4, 8)) + np.asarray(decoded)):
         with pytest.raises(PayloadUnread):
             asked()
