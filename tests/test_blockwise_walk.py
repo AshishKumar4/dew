@@ -27,7 +27,8 @@ def test_a_blockwise_walk_generates_what_llada2s_release_generates():
     holds its mask-token logit out (the recording's hook), as Dew's walk draws no mask token. The prompts
     walked together, left-padded to one width, generate the same, as does each prompt right-padded, its
     response past its padding: a row reads no padding and no other row. Each row reports its useful
-    refinements: at least one and at most `steps` a block its response reaches."""
+    refinements: at `top_k` 1 every block is whole after its first step (each draw certain, past the
+    threshold), so one a block its response reaches, through its end token's where it draws one."""
     recorded = json.loads((FIXTURES / "llada2-tiny" / "generate.json").read_text())
     settings = recorded["settings"]
     source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="reference")
@@ -51,14 +52,17 @@ def test_a_blockwise_walk_generates_what_llada2s_release_generates():
         # The prompt right-padded by two: its response follows the padding.
         right = generated(ModelInputs(jnp.asarray([row["prompt"] + [0, 0]], jnp.int32), {
             "attention_mask": jnp.asarray([[True] * len(row["prompt"]) + [False, False]])}))
+        # The blocks the response reaches, counted from the prompt's first token: through its end token's,
+        # where it draws one, else its last's.
+        last = (row["generated"].index(settings["eos_id"]) if settings["eos_id"] in row["generated"]
+                else budget - 1)
+        reached = (len(row["prompt"]) + last) // block - len(row["prompt"]) // block + 1
         for generation, at, start in ((alone, 0, len(row["prompt"])), (together, index, width),
                                       (right, 0, len(row["prompt"]) + 2)):
             length = int(generation.lengths[at])
             response = np.asarray(generation.tokens)[at, start:start + length]
             assert response.tolist() == row["generated"], (row["prompt"], at, response.tolist())
-        # The blocks the response reaches: those through its last token's, counted from the prompt's first.
-        reached = (len(row["prompt"]) + budget - 1) // block - len(row["prompt"]) // block + 1
-        assert reached <= int(alone.decoder_steps[0]) <= steps * reached, (row["prompt"], alone.decoder_steps)
+            assert int(generation.decoder_steps[at]) == reached, (row["prompt"], at, generation.decoder_steps)
 
 
 def _release_reveal(confidence: np.ndarray, quota: int, threshold: float) -> np.ndarray:
