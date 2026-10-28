@@ -6,6 +6,7 @@ batches pin host Coordinates; packed text pins documents cut into pieces that sh
 token, where 66beb5305 lost each piece's first next-token target. The other cases pin 66beb5305.
 """
 
+import dataclasses
 import gzip
 import hashlib
 import importlib.util
@@ -14,13 +15,11 @@ import json
 from pathlib import Path
 
 import cv2
-import jax
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import tensorflow_datasets as tfds
-from array_record.python.array_record_module import ArrayRecordWriter
 from token_support import write_token_corpus
 
 from dew.data import Memory, images, phases, presets
@@ -44,14 +43,38 @@ tests/test_data.py holds a video listing to itself across workers and a resume."
 
 
 def _digest(batch):
-    leaves = []
-    for value in jax.tree.leaves(batch):
-        array = np.asarray(value)
-        encoded = (json.dumps(array.tolist(), sort_keys=True).encode()
-                   if array.dtype.hasobject else array.tobytes())
-        leaves.append({"shape": list(array.shape), "dtype": array.dtype.str,
-                       "sha256": hashlib.sha256(encoded).hexdigest()})
-    return {"tree": str(jax.tree.structure(batch)), "leaves": leaves}
+    """The batch's public fields: each array's shape, dtype and content digest by its path, and each
+    record's static facts (`Coordinates`' `max_segments` and `right_padded`) by theirs, not the tree's
+    spelling. A field that is None holds nothing and adds no entry, where a renamed field or a changed
+    static fact still changes the digest (Main, 10-27: a field added to Coordinates once re-recorded
+    142 tree strings whose leaves had not moved)."""
+    fields = {}
+
+    def walk(value, path):
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for key in sorted(value):
+                walk(value[key], f"{path}[{key!r}]")
+        elif isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                walk(item, f"{path}[{index}]")
+        elif dataclasses.is_dataclass(value):
+            for field in dataclasses.fields(value):
+                item = getattr(value, field.name)
+                if field.metadata.get("pytree_node", True):
+                    walk(item, f"{path}.{field.name}")
+                else:
+                    fields[f"{path}.{field.name}"] = {"static": item}
+        else:
+            array = np.asarray(value)
+            encoded = (json.dumps(array.tolist(), sort_keys=True).encode()
+                       if array.dtype.hasobject else array.tobytes())
+            fields[path] = {"shape": list(array.shape), "dtype": array.dtype.str,
+                            "sha256": hashlib.sha256(encoded).hexdigest()}
+
+    walk(batch, "")
+    return fields
 
 
 def _oracle():
@@ -65,15 +88,8 @@ def _oracle():
 
 
 def _image_sources(root, pixels):
-    image_root = root / "images"
-    image_root.mkdir()
-    writer = ArrayRecordWriter(str(image_root / "00.array_record"), "group_size:1")
-    for row in pixels:
-        writer.write(pack_dict_of_byte_arrays({"image": row["image"].tobytes(),
-                                               "shape": np.asarray([16, 16], "<i4").tobytes(),
-                                               "caption": row["caption"].encode(),
-                                               "label": np.asarray(row["label"], np.int32).tobytes()}))
-    writer.close()
+    """`pixels` as the frozen reference wrote them (`image_records`), and as a parquet of PNGs."""
+    image_root = _oracle().image_records(root, pixels, pack_dict_of_byte_arrays)
     image_file = root / "images.parquet"
     pq.write_table(pa.Table.from_pylist([
         {**row, "image": {"bytes": cv2.imencode(".png", row["image"][..., ::-1])[1].tobytes(), "path": None}}

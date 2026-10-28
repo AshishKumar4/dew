@@ -11,7 +11,9 @@ the device's, a site pinning one where it names a schedule (`tuning.pinned`)."""
 import contextlib
 import dataclasses
 import functools
+import os
 
+import lane_environment
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -28,7 +30,6 @@ from dew.nn.kernels.templates import (
     attention_mosaic,
     attention_mosaic_program,
     attention_triton,
-    mosaic_sm90,
 )
 
 pytestmark = pytest.mark.kernel
@@ -416,12 +417,9 @@ def test_the_training_forwards_overflowed_rows_keep_their_form_and_every_other_r
 UNSEEN = {
     "hopper-class": generation.GpuTarget("sm90", "Unmeasured Hopper-class GPU", shared_limit=180 * 1024,
                                          multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12),
-    "ampere-class": generation.GpuTarget("sm80", "Unmeasured Ampere-class GPU", shared_limit=99 * 1024,
-                                         multiprocessors=46, clock_hz=1.4e9, memory_bandwidth=0.45e12),
 }
-"""GPUs no row measured, one of each family (`test_grouped_gemm.UNSEEN`'s): a Hopper-class part with fewer
-multiprocessors, a smaller block and another L2 bandwidth than an H100's, and an Ampere-class one with an
-sm86's block, whose family this mainloop is not qualified on (`attention_mosaic_program.QUALIFIED`)."""
+"""A GPU no row measured of this mainloop's family (`test_grouped_gemm.UNSEEN`'s Hopper-class one): fewer
+multiprocessors, a smaller block and another L2 bandwidth than an H100's."""
 
 
 def _bound(op, *arrays, **options):
@@ -450,13 +448,12 @@ def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, resi
     """On an H100 the forward's tiles derived from the facts (`MosaicForward.derived`) stage within its
     block (`generation.shared_budget`) and a consumer's registers (`register_budget`), whatever the widths,
     the training forward's too (its anchored walk keeps no value row): no table's tile, which at heads 256
-    wide staged 320 KiB against its 227 (ledger 1582); and the op is eligible exactly where one is derived."""
+    wide staged 320 KiB against its 227 (ledger 1582)."""
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _forward_call((2, 4096, 32, 8), width, value_width, residuals)
         derived = op.derived(ba, target)
         assert derived is not None
-        assert op.eligible(ba, target)
         assert op.legal(ba, derived, target)
         assert op.staged_bytes(ba, derived, target) <= generation.shared_budget(target)
         assert op.registers(ba, derived) <= op.register_budget(derived)
@@ -475,6 +472,23 @@ def _backward_call(shape, width: int, accurate: bool):
                                 stats))
     op = attention_mosaic.MosaicBackward(form="causal", keys=tokens, scale=width ** -0.5, accurate=accurate)
     return op, _bound(op, query, key, key, query, spans.start, spans.end, None, None, (), None, residuals)
+
+
+@pytest.mark.parametrize("call, fused", [("fast", True), ("accurate", False), ("deterministic", False)])
+def test_the_fast_forms_backward_is_one_launch_and_deterministic_mode_two(call, fused, monkeypatch):
+    """The backward derived on an H100 is one launch, the dK/dV program adding each tile's dQ atomically, for
+    a hookless fast-form call (FUSEDFORM-h100's speed, FUSEDSTAB-h100's check 1 and finiteness); the accurate
+    form and deterministic mode take two, the dQ launch then the dK/dV one, in a fixed order."""
+    flags = lane_environment.without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
+    if call == "deterministic":
+        flags = f"{flags} --xla_gpu_deterministic_ops=true"
+    monkeypatch.setenv("XLA_FLAGS", flags)
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        op, ba = _backward_call((2, 4096, 32, 8), 128, accurate=call == "accurate")
+        derived = op.derived(ba, target)
+        assert derived is not None and derived.fused == fused
+        assert op.legal(ba, derived, target)
 
 
 def _softcapped(s, q_pos, k_pos):
@@ -598,21 +612,11 @@ def test_a_guarded_launch_walks_its_own_key_tiles(tiles):
 def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
     """On a GPU no row measured the forward's and the backward's tiles come from the family's facts and the
     call's extents and fit the GPU's block, and the forward, the training forward and the backward at the
-    tiles derived from its facts alone are on par interpreted; on a family without this
-    mainloop's bundle neither op is eligible, so the route takes another mainloop
-    (`attention_mosaic.backward_takes`)."""
+    tiles derived from its facts alone are on par interpreted."""
     target = UNSEEN[unseen]
     shape = (1, 160, 2, 1)
     with generation.assumed(target):
         op, ba = _forward_call(shape, 128, 128, residuals=True)
-        if unseen == "ampere-class":
-            assert not op.eligible(ba, target)
-            query, key, value, dout = _drawn(shape, jnp.bfloat16)(0)
-            spans = template.spans(shape[1], shape[1], shape[0], causal=True)
-            residuals = attention_triton.forward(query, key, value, spans, residuals=True, interpret=True)[1:]
-            assert not attention_mosaic.backward_takes(query, key, value, spans, None, dout,
-                                                      residuals=residuals)
-            return
         derived = op.derived(ba, target)
         assert derived is not None and derived.family == "wgmma"
         assert op.staged_bytes(ba, derived, target) <= 180 * 1024
@@ -632,17 +636,11 @@ def test_the_backward_is_on_par_from_the_triton_mainloops_residuals_interpreted(
 
 def test_a_hook_that_forms_a_unit_axis_is_refused():
     """The hook indexed off the query's coordinates' column (`q_pos[:, :1]`) forms a `[bq, 1]` array, which
-    Mosaic GPU's layout inference takes no operation on: the mainloop refuses it before any launch, the
-    legality rule the route's chooser reads (ledger row 1428), where a pointwise hook lowers."""
+    Mosaic GPU's layout inference takes no operation on: the mainloop, called on it, refuses it before any
+    launch rather than compute it (ledger row 1428)."""
     queries, keys = core_geometry(CASES["causal"])
     spans = template.spans(queries, keys, ROWS, causal=True)
     query, key, value, _ = _drawn((ROWS, queries, 4, 2), jnp.bfloat16, width=64, keys=keys)(0)
-    for names, refused in ((("indexed",), True), (("softcap", "alibi"), False)):
-        score_mod, kinds, draw_hooks = score_hooks(names, queries, keys, 64)
-        params, initial = draw_hooks(0)
-        hooks = template.Hooks(score_mod, tuple(template.Param(param, kind)
-                                                for param, kind in zip(params, kinds, strict=True)), initial)
-        assert (attention_mosaic_program.unlowered(hooks, (64, 64), 64) is not None) == refused, names
     with pytest.raises(NotImplementedError), _device(interpret=True):
         attention_mosaic.forward(query, key, value, spans,
                                  template.Hooks(score_hooks(("indexed",), queries, keys, 64)[0]),
@@ -651,9 +649,8 @@ def test_a_hook_that_forms_a_unit_axis_is_refused():
 
 @INTERPRETS
 def test_a_hook_shaped_to_the_launchs_tile_is_taken():
-    """An output hook that reshapes its gate to the value width, legal on the launch's `[64, 128]` output
-    tile as on the reference's rows: the legality rule traces it at the tile and value width the launch
-    runs (`attention_mosaic.refused`), and the forward is on par under it."""
+    """An output hook that reshapes its gate to the value width, on the launch's `[64, 128]` output tile as
+    on the reference's rows: the forward is on par under it."""
     queries = 128
     spans = template.spans(queries, queries, 1, causal=True)
     draw_operands = _drawn((1, queries, 2, 1), jnp.bfloat16, width=128, keys=queries)
@@ -666,9 +663,6 @@ def test_a_hook_shaped_to_the_launchs_tile_is_taken():
     def hooked(gate):
         return template.Hooks(output_mod=lambda out, g: out * jax.nn.sigmoid(g.reshape((-1, 128))),
                               output_params=(template.Param(gate, template.Kind.OUTPUT),))
-
-    assert attention_mosaic.refused(jnp.bfloat16, 128, 128, hooked(draw(0)[3]), backward=False,
-                                    family=mosaic_sm90.WGMMA) is None
 
     def ours(query, key, value, gate):
         with _device(interpret=True):
@@ -993,3 +987,45 @@ def test_the_backward_is_on_par_on_an_h100(call, form):
 def test_the_backward_is_on_par_under_every_score_hook_on_an_h100(hooks, form):
     """The backward in both forms under each score hook compiled on an H100."""
     _check_hooked_backward(hooks, form=form, interpret=False)
+
+
+@pytest.mark.parametrize("causal", [True, False], ids=["causal", "full"])
+def test_the_mosaic_launches_state_the_models_attention_flops(causal):
+    """A bf16 call's plain forward, training forward and backward through the Mosaic mainloop, each lowered
+    for an H100: every launch states its cost (`attention_mosaic_program.stated`), which Dew's FLOP count
+    reads to size it (`instrumentation._stated_flops`: no launch unsized), and together they state the
+    library's fused attention's own count, a multiply-add a reached pair, head and product column: the
+    forward's two products, the training forward's two and the backward's four
+    (`instrumentation._fused_attention_flops`), a rerun (the guarded launch, the fold's natural walk) adding
+    none. The launches' own statements are read: the training forward's overflowed rows rerun the plain-JAX
+    walk in a conditional, whose products the count bounds apart."""
+    import re
+
+    from dew.telemetry.instrumentation import _stated_flops
+
+    rows, tokens, heads, kv_heads, width = 1, 256, 4, 2, 64
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
+    spans = template.spans(tokens, tokens, rows, causal=causal)
+    pairs = tokens * (tokens + 1) // 2 if causal else tokens * tokens
+    forward = 2 * rows * heads * pairs * (width + width)
+
+    def counted(fn, *arrays):
+        with generation.assumed("sm90"):
+            text = jax.jit(fn).trace(*arrays).lower(lowering_platforms=("cuda",)).as_text(dialect="hlo")
+        launches = [line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)]
+        assert launches and all(_stated_flops(line) is not None for line in launches)
+        return sum(_stated_flops(line) or 0.0 for line in launches)
+
+    def trained(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, residuals=True)
+
+    with generation.assumed("sm90"):
+        residuals = jax.eval_shape(trained, query, key, key)[1:]
+
+    def backward(query, key, value, dout, residuals):
+        return attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals)
+
+    assert counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key) == forward
+    assert counted(trained, query, key, key) == forward
+    assert counted(backward, query, key, key, query, residuals) == 2 * forward

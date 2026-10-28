@@ -26,130 +26,28 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
-QWEN2_MOE = FIXTURES / 'qwen2-moe-tiny'
+ROUTED = {'qwen2-moe-tiny': 'Qwen2-MoE', 'granitemoe-tiny': 'Granite MoE', 'minimax-m2-tiny': 'MiniMax-M2'}
+"""Routed decoders whose recorded fixtures carry the reference's float32 and float64 logits, whole,
+padded and cached: Qwen2-MoE's fused experts and shared gate, Granite MoE's packed experts, MiniMax-M2's
+router state, recorded from the corrected reference."""
 
 
-def test_qwen2_moe_logits_match_the_reference():
-    model, variables = fp32_decoder(QWEN2_MOE)
-    ids = np.load(QWEN2_MOE / 'input_ids.npy')
-    reference = np.load(QWEN2_MOE / 'logits.npy')
-    truth = np.load(QWEN2_MOE / 'logits_f64.npy')
-    logits = np.asarray(model.apply(variables, ids))
-    assert_as_exact_as_the_reference(logits, reference, truth, 'Qwen2-MoE logits')
+@pytest.mark.parametrize('name', (*ROUTED, 'minimax-m2-fp8-tiny'))
+def test_a_routed_decoders_logits_match_the_reference(name):
+    directory = FIXTURES / name
+    model, variables = fp32_decoder(directory)
+    reference = np.load(directory / 'logits.npy')
+    logits = np.asarray(model.apply(variables, np.load(directory / 'input_ids.npy')))
+    truth = np.load(directory / 'logits_f64.npy')
+    assert_as_exact_as_the_reference(logits, reference, truth, f'{name} logits')
     np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
-    print('Qwen2-MoE RMS ratio', distance(logits, truth) / distance(reference, truth))
 
 
-def test_qwen2_moe_decode_matches_the_reference():
-    model, variables = fp32_decoder(QWEN2_MOE)
-    ids = np.load(QWEN2_MOE / 'input_ids.npy')
-    state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
-    out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
-    pieces = [np.asarray(out)]
-    for index in range(4, ids.shape[1]):
-        out, state = model.apply({**variables, **state}, ids[:, index:index + 1],
-                                 decode=True, mutable=['cache'])
-        pieces.append(np.asarray(out))
-    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1),
-        np.load(QWEN2_MOE / 'logits.npy'), np.load(QWEN2_MOE / 'logits_f64.npy'), 'Qwen2-MoE cache')
-
-
-def test_qwen2_moe_padded_routing_matches_the_reference():
-    model, variables = fp32_decoder(QWEN2_MOE)
-    arrays = np.load(QWEN2_MOE / 'padded.npz')
-    logits = np.asarray(model.apply(
-        variables, arrays['input_ids'], positions=arrays['position_ids'],
-        attention_mask=arrays['attention_mask']))
-    valid = arrays['attention_mask']
-    assert_as_exact_as_the_reference(logits[valid], arrays['logits'][valid],
-                                     arrays['logits_f64'][valid], 'Qwen2-MoE padded')
-    print('Qwen2-MoE padded RMS ratio', distance(logits[valid], arrays['logits_f64'][valid])
-          / distance(arrays['logits'][valid], arrays['logits_f64'][valid]))
-
-
-def test_qwen2_moe_export_keeps_fused_experts_and_shared_gate(tmp_path):
-    loaded = Pretrained.load(str(QWEN2_MOE), dtype='float32', attention_impl='reference')
-    loaded.save(tmp_path / 'export')
-    again = Pretrained.load(str(tmp_path / 'export'), dtype='float32', attention_impl='reference')
-    for path, leaf in flat_tree(loaded.variables).items():
-        np.testing.assert_array_equal(leaf, flat_tree(again.variables)[path])
-    assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config('qwen2-moe-tiny')
-
-
-GRANITEMOE = FIXTURES / 'granitemoe-tiny'
-
-
-def test_granitemoe_logits_match_the_reference():
-    model, variables = fp32_decoder(GRANITEMOE)
-    ids = np.load(GRANITEMOE / 'input_ids.npy')
-    reference = np.load(GRANITEMOE / 'logits.npy')
-    truth = np.load(GRANITEMOE / 'logits_f64.npy')
-    logits = np.asarray(model.apply(variables, ids))
-    assert_as_exact_as_the_reference(logits, reference, truth, 'Granite MoE logits')
-    np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
-    print('Granite MoE RMS ratio', distance(logits, truth) / distance(reference, truth))
-
-
-def test_granitemoe_prefill_and_steps_match_the_reference():
-    model, variables = fp32_decoder(GRANITEMOE)
-    ids = np.load(GRANITEMOE / 'input_ids.npy')
-    state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
-    out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
-    pieces = [np.asarray(out)]
-    for index in range(4, ids.shape[1]):
-        out, state = model.apply({**variables, **state}, ids[:, index:index + 1],
-                                 decode=True, mutable=['cache'])
-        pieces.append(np.asarray(out))
-    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1),
-        np.load(GRANITEMOE / 'logits.npy'), np.load(GRANITEMOE / 'logits_f64.npy'), 'Granite MoE cache')
-
-
-def test_granitemoe_padded_routing_matches_the_reference():
-    model, variables = fp32_decoder(GRANITEMOE)
-    arrays = np.load(GRANITEMOE / 'padded.npz')
-    logits = np.asarray(model.apply(
-        variables, arrays['input_ids'], positions=arrays['position_ids'],
-        attention_mask=arrays['attention_mask']))
-    valid = arrays['attention_mask']
-    assert_as_exact_as_the_reference(logits[valid], arrays['logits'][valid],
-                                     arrays['logits_f64'][valid], 'Granite MoE padded')
-    print('Granite MoE padded RMS ratio', distance(logits[valid], arrays['logits_f64'][valid])
-          / distance(arrays['logits'][valid], arrays['logits_f64'][valid]))
-
-
-def test_granitemoe_export_keeps_packed_experts_and_tied_head(tmp_path):
-    from safetensors.numpy import load_file
-
-    loaded = Pretrained.load(str(GRANITEMOE), dtype='float32', attention_impl='reference')
-    loaded.save(tmp_path / 'export')
-    tensors = load_file(str(tmp_path / 'export/model.safetensors'))
-    assert 'model.layers.0.block_sparse_moe.input_linear.weight' in tensors
-    assert 'lm_head.weight' not in tensors
-    again = Pretrained.load(str(tmp_path / 'export'), dtype='float32', attention_impl='reference')
-    for path, leaf in flat_tree(loaded.variables).items():
-        np.testing.assert_array_equal(leaf, flat_tree(again.variables)[path])
-    assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config('granitemoe-tiny')
-
-
-MINIMAX_M2 = FIXTURES / 'minimax-m2-tiny'
-
-
-@pytest.mark.parametrize('name', ('minimax-m2-tiny', 'minimax-m2-fp8-tiny'))
-def test_minimax_m2_logits_match_the_corrected_reference(name):
+@pytest.mark.parametrize('name', ROUTED)
+def test_a_routed_decoders_prefill_and_token_steps_match_the_reference(name):
     directory = FIXTURES / name
     model, variables = fp32_decoder(directory)
     ids = np.load(directory / 'input_ids.npy')
-    reference = np.load(directory / 'logits.npy')
-    truth = np.load(directory / 'logits_f64.npy')
-    logits = np.asarray(model.apply(variables, ids))
-    assert_as_exact_as_the_reference(logits, reference, truth, 'MiniMax-M2 logits')
-    np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
-    print(name, 'RMS ratio', distance(logits, truth) / distance(reference, truth))
-
-
-def test_minimax_m2_prefill_and_token_steps_match_the_corrected_reference():
-    model, variables = fp32_decoder(MINIMAX_M2)
-    ids = np.load(MINIMAX_M2 / 'input_ids.npy')
     state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
     out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
     pieces = [np.asarray(out)]
@@ -157,30 +55,43 @@ def test_minimax_m2_prefill_and_token_steps_match_the_corrected_reference():
         out, state = model.apply({**variables, **state}, ids[:, index:index + 1],
                                  decode=True, mutable=['cache'])
         pieces.append(np.asarray(out))
-    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1),
-        np.load(MINIMAX_M2 / 'logits.npy'), np.load(MINIMAX_M2 / 'logits_f64.npy'), 'MiniMax-M2 cache')
+    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1), np.load(directory / 'logits.npy'),
+                                     np.load(directory / 'logits_f64.npy'), f'{ROUTED[name]} cache')
 
 
-def test_minimax_m2_padded_routing_matches_the_corrected_reference():
-    model, variables = fp32_decoder(MINIMAX_M2)
-    arrays = np.load(MINIMAX_M2 / 'padded.npz')
+@pytest.mark.parametrize('name', ROUTED)
+def test_a_routed_decoders_padded_routing_matches_the_reference(name):
+    model, variables = fp32_decoder(FIXTURES / name)
+    arrays = np.load(FIXTURES / name / 'padded.npz')
     logits = np.asarray(model.apply(
         variables, arrays['input_ids'], positions=arrays['position_ids'],
         attention_mask=arrays['attention_mask']))
     valid = arrays['attention_mask']
     assert_as_exact_as_the_reference(logits[valid], arrays['logits'][valid],
-                                     arrays['logits_f64'][valid], 'MiniMax-M2 padded')
-    print('MiniMax-M2 padded RMS ratio', distance(logits[valid], arrays['logits_f64'][valid])
-          / distance(arrays['logits'][valid], arrays['logits_f64'][valid]))
+                                     arrays['logits_f64'][valid], f'{ROUTED[name]} padded')
 
 
-def test_minimax_m2_export_keeps_source_weights_and_router_state(tmp_path):
-    loaded = Pretrained.load(str(MINIMAX_M2), dtype='float32', attention_impl='reference')
+@pytest.mark.parametrize('name', ROUTED)
+def test_a_routed_decoders_export_reloads_its_weights_and_source_config(name, tmp_path):
+    """The export reloads to the same weights and writes the source's config, Qwen2-MoE's fused experts
+    and shared gate, Granite MoE's packed experts and MiniMax-M2's router state included."""
+    loaded = Pretrained.load(str(FIXTURES / name), dtype='float32', attention_impl='reference')
     loaded.save(tmp_path / 'export')
     again = Pretrained.load(str(tmp_path / 'export'), dtype='float32', attention_impl='reference')
     for path, leaf in flat_tree(loaded.variables).items():
         np.testing.assert_array_equal(leaf, flat_tree(again.variables)[path])
-    assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config('minimax-m2-tiny')
+    assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config(name)
+
+
+def test_granitemoe_export_writes_packed_experts_and_ties_its_head(tmp_path):
+    """Granite MoE's export writes its experts packed and its head tied, as its source does."""
+    from safetensors.numpy import load_file
+
+    Pretrained.load(str(FIXTURES / 'granitemoe-tiny'), dtype='float32', attention_impl='reference').save(
+        tmp_path / 'export')
+    tensors = load_file(str(tmp_path / 'export/model.safetensors'))
+    assert 'model.layers.0.block_sparse_moe.input_linear.weight' in tensors
+    assert 'lm_head.weight' not in tensors
 
 
 # --------------------------------------------------------------------------
@@ -346,24 +257,34 @@ def test_the_glm4_moe_mtp_depth_matches_the_reference_composition():
     observed max |logit difference| 3.2e-06 with identical argmax. Swapping
     the two norms, the order today's from-scratch code had, disagrees."""
 
-    model, variables = fp32_decoder(GLM4_MOE)
-    ids = jnp.asarray(np.load(GLM4_MOE / "input_ids.npy"), jnp.int32)
-    reference = np.load(GLM4_MOE / "mtp_logits.npy")
-    depth = variables["params"]["mtp_0"]
-    assert set(depth) == {"enorm", "hnorm", "eh_proj", "block", "final_norm"}
-    assert depth["block"]["mlp"]["experts"]["gate_proj"]["kernel"].shape == (8, 32, 16)
+    variables, depth, depth_logits = mtp_depth(GLM4_MOE, experts=(8, 32, 16))
     assert "mtp_0" in variables["moe"]
-
-    hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
-    logits = np.asarray(model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0])
-    difference = float(np.max(np.abs(logits - reference)))
-    assert difference < 1e-4, f"max |mtp logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
     swapped = {**variables, "params": {**variables["params"], "mtp_0": {
         **depth, "enorm": depth["hnorm"], "hnorm": depth["enorm"]}}}
-    other = np.asarray(model.apply(swapped, hidden, ids, method=CausalTransformer.mtp_logits)[0])
-    assert float(np.max(np.abs(other - reference))) > 1e-2
+    other = depth_logits(swapped)
+    assert float(np.max(np.abs(other - np.load(GLM4_MOE / "mtp_logits.npy")))) > 1e-2
+
+
+def mtp_depth(directory, *, experts):
+    """A checkpoint's MTP depth, loaded as `mtp_0` with its routed experts' `experts` shape, computing
+    the reference composition's recorded logits over the fixture's ids (mtp_logits.npy): its variables,
+    the depth's parameters and the depth's logits under any variables."""
+    model, variables = fp32_decoder(directory)
+    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+    depth = variables["params"]["mtp_0"]
+    assert set(depth) == {"enorm", "hnorm", "eh_proj", "block", "final_norm"}
+    assert depth["block"]["mlp"]["experts"]["gate_proj"]["kernel"].shape == experts
+
+    def depth_logits(held):
+        hidden = model.apply(held, ids, method=CausalTransformer.hidden_states)
+        return np.asarray(model.apply(held, hidden, ids, method=CausalTransformer.mtp_logits)[0])
+
+    logits, reference = depth_logits(variables), np.load(directory / "mtp_logits.npy")
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |mtp logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    return variables, depth, depth_logits
 
 
 # --------------------------------------------------------------------------
@@ -444,18 +365,7 @@ def test_the_glm_moe_dsa_mtp_depth_matches_the_reference_composition():
     GlmMoeDsaDecoderLayer): tolerance 1e-4, observed max |logit difference|
     6.7e-06 with identical argmax."""
 
-    model, variables = fp32_decoder(GLM_MOE_DSA)
-    ids = jnp.asarray(np.load(GLM_MOE_DSA / "input_ids.npy"), jnp.int32)
-    reference = np.load(GLM_MOE_DSA / "mtp_logits.npy")
-    depth = variables["params"]["mtp_0"]
-    assert set(depth) == {"enorm", "hnorm", "eh_proj", "block", "final_norm"}
-    assert depth["block"]["mlp"]["experts"]["gate_proj"]["kernel"].shape == (8, 32, 12)
-
-    hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
-    logits = np.asarray(model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0])
-    difference = float(np.max(np.abs(logits - reference)))
-    assert difference < 1e-4, f"max |mtp logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    mtp_depth(GLM_MOE_DSA, experts=(8, 32, 12))
 
 
 def test_glm_moe_dsa_decodes_what_it_computes_in_one_pass():

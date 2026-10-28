@@ -28,7 +28,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.megablox.gmm import make_group_metadata
 
-from dew.nn.kernels.templates.gemm import rows_padded
+from dew.nn.kernels.templates.gemm import cost, rows_padded
 
 LANES = 128
 """A vreg's lanes: Mosaic TPU tiles a block's minor dimensions by them (a block of two dimensions or more
@@ -136,9 +136,10 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
     def out_index(column, slot, step, group_offsets, group_ids, m_tile_ids):
         return m_tile_ids[slot], column
 
+    out_shape = tuple(jax.ShapeDtypeStruct((m, width), dtype) for dtype in dtypes)
     outs = pl.pallas_call(
         kernel,
-        out_shape=tuple(jax.ShapeDtypeStruct((m, width), dtype) for dtype in dtypes),
+        out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             in_specs=[pl.BlockSpec((block_m, block_k), lhs_index),
@@ -150,6 +151,9 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
             scratch_shapes=[pltpu.VMEM((block_m, block_n), jnp.float32)]),
         compiler_params=_compiler_params(),
         interpret=interpret,
+        cost_estimate=cost(2 * rows * depth * width, lhs, rhs, *prologue_operands, *epilogue_operands,
+                           *out_shape),
+        name="dew_gmm",
     )(*metadata, lhs, rhs, *prologue_operands, *epilogue_operands)
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
@@ -225,9 +229,10 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
     def out_index(column, block, slot, group_offsets, group_ids, m_tile_ids):
         return group_ids[slot], block, column
 
+    out_shape = jax.ShapeDtypeStruct((groups, depth, width), jnp.dtype(out_dtype))
     return pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct((groups, depth, width), jnp.dtype(out_dtype)),
+        out_shape=out_shape,
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
             in_specs=[pl.BlockSpec((block_k, block_m), rows_index),
@@ -238,6 +243,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
             scratch_shapes=[pltpu.VMEM((block_m, block_n), jnp.float32)]),
         compiler_params=_compiler_params(),
         interpret=interpret,
+        cost_estimate=cost(2 * rows * depth * width, lhs, rhs, *prologue_operands, out_shape),
+        name="dew_tgmm",
     )(*metadata, lhs, rhs, *prologue_operands)
 
 

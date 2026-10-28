@@ -103,8 +103,8 @@ class SingleReader(Protocol):
 
 @runtime_checkable
 class TokenGeometry(Protocol):
-    """A record step whose rows each hold `max_length` tokens, which a token
-    budget divides into rows (`TokenBudget`)."""
+    """A record step, or a stage that lays rows out (`Pack`, `Windows`), whose rows each hold
+    `max_length` tokens, which a token budget divides into rows (`TokenBudget`)."""
 
     @property
     def max_length(self) -> int: ...
@@ -171,7 +171,12 @@ class Configured:
     reads before it binds; binding it to a step that drops or expands records is refused.
     `measures` measures a fact it needs over each store it reads, in a memory read: the whole store,
     below any holdout, so the parts a run trains and scores on agree; a store's own statement of it
-    gives way to the measure, and a mixture's step binds the largest of its stores'."""
+    gives way to the measure, and a mixture's step binds the largest of its stores'. `random` and
+    `expands` state what the step it binds to is, before it binds: a random map's, and an expansion's
+    of a record into several (`Expansion`); binding to another is refused. An objective's step that
+    expands is marked as one that makes several rows of each source example (`examples`, set where the
+    objective places it): it runs after the chain's record order, a run's `examples=` bound stands
+    before it, and the expansion it binds to carries the mark (`FlatMap.examples`)."""
 
     factory: Callable[[Mapping[str, object]], RecordStep | pygrain.RandomMapTransform | Expansion]
     needs: tuple[str, ...]
@@ -179,6 +184,8 @@ class Configured:
     random: bool = False
     one_to_one: bool = False
     measures: Measure | None = None
+    expands: bool = False
+    examples: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -252,6 +259,10 @@ class FlatMap:
     step: ExpandStep
     identity: str | None = None
     configured: Bound | None = None
+    examples: bool = False
+    """Whether this is an objective's step that makes several rows of each source example (a decision
+    layout's row a question): a corpus counts its source examples before it (`Accepted`), and a run's
+    `examples=` bound stands before it (`dew.data.compile._bounded`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -329,6 +340,12 @@ class Pack:
 
         return windowed(facts, self.seq_len - 1, self.fields, packed=True, along=self.along)
 
+    @property
+    def max_length(self) -> int:
+        """The inputs each window holds, its last token their target, which a token budget divides
+        into rows (`TokenGeometry`)."""
+        return self.seq_len - 1
+
     def __post_init__(self) -> None:
         if self.policy == "concat" and (self.segments is not None or self.along):
             raise ValueError("concatenated packing cuts documents across windows; it takes no "
@@ -354,6 +371,11 @@ class Windows:
         from dew.data.facts import windowed
 
         return windowed(facts, self.seq_len, self.fields, packed=False)
+
+    @property
+    def max_length(self) -> int:
+        """The inputs each window holds, which a token budget divides into rows (`TokenGeometry`)."""
+        return self.seq_len
 
     def __post_init__(self) -> None:
         if self.seq_len < 1 or (self.stride is not None and self.stride < 1) or not self.fields:
@@ -1115,6 +1137,10 @@ class ObjectiveData:
     packed: tuple[RecordStep, ...] = ()
     train_batch: tuple[HostStep, ...] = ()
     evaluate_batch: tuple[HostStep, ...] = ()
+    geometry: RecordStep | None = None
+    """The rows the objective reads where a chain lays out none of its own, after its other record
+    steps; rows a chain packs or cuts into windows (`Pack`, `Windows`) keep the length it gives them, as
+    a schedule's stages each give theirs (`dew.data.compile.objective_steps`)."""
 
 
 type _Step = RecordStep | RandomStep | HostStep | Configured | ExpandStep | ColumnStep

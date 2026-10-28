@@ -10,19 +10,19 @@ import dataclasses
 from collections.abc import Callable, Collection, Mapping
 from typing import TYPE_CHECKING, ClassVar
 
-import numpy as np
 from flax import linen as nn
 
 from dew import _records
 from dew.batch import Variables
 from dew.interop.decoder_parts import read_rope_theta
+from dew.interop.unread import Stored
 from dew.interop.weights import placed
 from dew.registry import Record, projectors, towers
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
 
-type Reader = Callable[[Mapping[str, np.ndarray], Callable[[str], tuple[str, ...] | None], str],
+type Reader = Callable[[Mapping[str, Stored], Callable[[str], tuple[str, ...] | None], str],
                        tuple[Variables, tuple[WeightLayout, ...]]]
 """A tower's tensors into its variables in a storage dtype, with the layouts that write them back:
 `dew.interop.weights.placed`, or a patch-folding ViT's `translate_vit_weights`."""
@@ -41,7 +41,7 @@ class TowerLayout:
     path: Callable[[str], tuple[str, ...] | None]
     read: Reader = placed
 
-    def variables(self, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+    def variables(self, hf_tensors: Mapping[str, Stored], param_dtype: str
                   ) -> tuple[Variables, tuple[WeightLayout, ...]]:
         """The tower's variables from its tensors, in the requested storage, and the layouts that
         write each tensor it placed back from them; a tensor the tower does not compute with, as
@@ -69,7 +69,7 @@ class ProjectorLayout:
             raise ValueError(f"unknown projector tensor {name!r}")
         return self.tensors[name]
 
-    def variables(self, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+    def variables(self, hf_tensors: Mapping[str, Stored], param_dtype: str
                   ) -> tuple[Variables, tuple[WeightLayout, ...]]:
         """The projector's parameters, in the requested storage, and the layouts that write its
         tensors back from them."""

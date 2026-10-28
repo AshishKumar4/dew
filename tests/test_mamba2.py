@@ -237,6 +237,28 @@ def test_the_layer_decodes_as_it_prefills(reference, geometry):
     as_exact(decoded, parallel, wide_apply(module, variables, hidden), "decoded")
 
 
+def test_the_layer_takes_forward_mode(reference, geometry):
+    """`jax.jvp` through the layer, as MeanFlow and consistency training trace a model: its tangent along a
+    seeded direction of the reference's input on par from float64 with the same product its reverse mode
+    gives (the Jacobian `jax.jacrev` builds, contracted with the direction). The D skip's custom VJP refused
+    forward mode on every target (row 1933), so a hybrid with Mamba-2 layers trained on neither."""
+    module = layer(geometry)
+    variables = layer_params(reference)
+    hidden = jnp.asarray(reference["layer.hidden"])
+    direction = jnp.asarray(np.random.default_rng(1933).standard_normal(hidden.shape, np.float32))
+
+    def tangent(x, d):
+        return jax.jvp(lambda x: module.apply(variables, x), (x,), (d,))[1]
+
+    def reverse(x, d):
+        jacobian = jax.jacrev(lambda x: module.apply(variables, x))(x)
+        return jnp.tensordot(jacobian, d, axes=d.ndim)
+
+    as_exact(jax.jit(tangent)(hidden, direction), jax.jit(reverse)(hidden, direction),
+             in_float64(lambda x, d: jax.jvp(lambda x: module.clone(dtype=jnp.float64).apply(
+                 widened(variables), x), (x,), (d,))[1], hidden, direction), "the layer's tangent")
+
+
 def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):
     """A row paused on padding neither writes its state nor advances its
     conv history, and its padded slots emit zero: the other row's stream,

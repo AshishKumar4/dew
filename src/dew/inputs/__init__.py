@@ -60,6 +60,17 @@ class Field:
         if any(axis < 0 or axis >= len(self.shape) for axis in self.variable_axes):
             raise ValueError("variable field axes must index its per-sample shape")
 
+    @classmethod
+    def of(cls, key: str, batch: Batch) -> Field:
+        """The field `key` at the per-example shape `batch` holds under it, a `ModelInputs`'s its token
+        rows', read from shapes alone."""
+        value = batch[key]
+        return cls(key, tuple(np.shape(value.tokens if isinstance(value, ModelInputs) else value)[1:]))
+
+    def held(self, batch: Batch) -> tuple[int, ...]:
+        """The per-example shape `batch` holds under this field (`of`)."""
+        return Field.of(self.key, batch).shape
+
 
 @dataclass(frozen=True)
 class Condition:
@@ -157,8 +168,7 @@ class InputSpec:
                 continue
             if declared.key not in batch:
                 raise ValueError(f"objective.inputs needs field {declared.key!r} in the training batch")
-            value = batch[declared.key]
-            actual = np.shape(value.tokens if isinstance(value, ModelInputs) else value)[1:]
+            actual = declared.held(batch)
             matches = len(actual) == len(declared.shape) and all(
                 0 < size <= bound if axis in declared.variable_axes else size == bound
                 for axis, (size, bound) in enumerate(zip(actual, declared.shape, strict=True))

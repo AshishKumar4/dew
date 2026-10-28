@@ -155,6 +155,9 @@ class Encoding:
             row["blocks"] = np.asarray(encoded.blocks, np.int32)
         if self.context_length is not None:
             row["context"] = np.asarray(encoded.context or (), np.int32)
+            if self.grouped:
+                # A row of its own is a unit of one row, its context that row's (`_unit_row`).
+                row["context_row"] = np.zeros(len(row["context"]), np.int32)
         return row
 
 
@@ -278,7 +281,8 @@ class Fit(pygrain.MapTransform):
                 },
             }
             if self.layout.joint
-            else {"decision_rows": fitted}
+            # The example is truncated where any of its rows is: the counts go by source examples.
+            else {"decision_rows": fitted, "_dew_truncated": any(row.truncated for row in fitted)}
         )
 
     def _rows(self, example: Example, asked: Mapping[str, Question]) -> tuple[FittedRow, ...] | Rejected:
@@ -312,7 +316,7 @@ class Fit(pygrain.MapTransform):
                 continue
             rows.extend(fitted)
         if rows:
-            return {"decision_rows": tuple(rows)}
+            return {"decision_rows": tuple(rows), "_dew_truncated": any(row.truncated for row in rows)}
         return Rejected("unfit" if "unfit" in reasons else "unlabelled")
 
     def _longest(self, row: FittedRow) -> int:
@@ -343,11 +347,10 @@ class Fit(pygrain.MapTransform):
         """Grouped examples' rows as one unit, which the packer places in one window: each example's
         rows as the layout lays them out, with the example's index (`FittedUnit`), a row of each of its
         labelled and grouped questions under a layout of a question a row, its one row under a joint
-        layout. A unit with no labelled question, or that no window holds (its tokens, rows or
-        questions past the window's), is rejected."""
-        if self.context_length is not None:
-            raise ValueError("a backbone that reads context packs one row a window, so rows that train "
-                             "together do not fit one; train them without context or without groups")
+        layout. A unit with no labelled question is rejected. One that no window holds (its tokens,
+        rows or questions past the window's), or one of whose examples fits no row, trains its examples
+        apart (`_apart`), as rows of their own that no consistency term ties: its labelled examples that
+        fit are kept, where a unit dropped whole dropped them with it."""
         if not any(example.labels() for example in grouped.examples):
             return Rejected("unlabelled")
         rows: list[tuple[int, FittedRow]] = []
@@ -360,14 +363,14 @@ class Fit(pygrain.MapTransform):
                      {name: question for name, question in example.questions.items() if name in named})
             fitted = self._rows(example, asked)
             if isinstance(fitted, Rejected):
-                return fitted
+                return self._apart(grouped)
             rows.extend((index, row) for row in fitted)
         length = sum(self._longest(row) for _, row in rows)
         questions = sum(len(row.names) for _, row in rows)
         bounds = self.bounds
         if length > self.layout.max_len or (bounds is not None and (len(rows) > bounds.segments
                                                                     or questions > bounds.questions)):
-            return Rejected("unfit")
+            return self._apart(grouped)
         options = max(len(grouped.examples[index].questions[name].options)
                       for index, row in rows for name in row.names)
         return {"decision_unit": FittedUnit(grouped, tuple(rows)), "_dew_length": length,
@@ -391,9 +394,13 @@ def _unit_row(encoded: Sequence[Batch]) -> Batch:
     rows. Each row's spans stay its own; the window counts them from where the row starts in it
     (`PackedRows`)."""
     joined = {name: np.concatenate([np.asarray(row[name]) for row in encoded])
-              for name in encoded[0] if name not in ("row", "question_row", "unit_rows")}
+              for name in encoded[0] if name not in ("row", "question_row", "unit_rows", "context_row")}
     joined["row"] = np.concatenate([np.full(len(row["tokens"]), index, np.int32)
                                     for index, row in enumerate(encoded)])
+    if "context" in encoded[0]:
+        # Each row's context laid end to end as its tokens are, each token's row beside it.
+        joined["context_row"] = np.concatenate([np.full(len(row["context"]), index, np.int32)
+                                                for index, row in enumerate(encoded)])
     joined["question_row"] = np.concatenate([np.full(len(row["kinds"]), index, np.int32)
                                              for index, row in enumerate(encoded)])
     joined["unit_rows"] = np.zeros(len(encoded), np.int32)
@@ -511,13 +518,17 @@ def _along_fields(element: Batch, when: tuple[str, ...] = ("always", "trained"))
 def packing(layout: Layout, bounds: Bounds, context_length: int | None = None, grouped: bool = False) -> Pack:
     """Rows of `layout` packed first-fit into windows of its `max_len`, each
     window's rows, questions and options within `bounds` (`Layout.bounds`),
-    and with a `context_length` each row's context along an axis of that
-    many tokens."""
+    and with a `context_length` each row's context along an axis of its own,
+    room for `bounds.segments` contexts of that many tokens, end to end in the
+    order their rows stand (`PackedRows`' `context_segments`)."""
     parallel = isinstance(layout, QuestionLayout) and layout.parallel
     blocked = isinstance(layout, QuestionLayout) and layout.blocks
     along = tuple((name, bounds.questions) for name in _along(layout, grouped))
     if context_length is not None:
-        along = (*along, ("context", context_length))
+        along = (*along, ("context", bounds.segments * context_length))
+        if grouped:
+            # Each context token's row in its unit, as `row` numbers the tokens'.
+            along = (*along, ("context_row", bounds.segments * context_length))
     if grouped:
         # A unit of rows packs as one document, one entry a row on an axis of the window's rows.
         along = (*along, ("unit_rows", bounds.segments))
@@ -549,16 +560,28 @@ def _unit_rows(element: Batch, units: np.ndarray, owned: np.ndarray
     each token's position in its row."""
     if "row" not in element:
         return units, owned, np.asarray(element["tokens_positions"])
-    inner, question_inner = np.asarray(element["row"]), np.asarray(element["question_row"])
-    width = int(max(inner.max(initial=0), question_inner.max(initial=0))) + 1
-    keys = units.astype(np.int64) * width + inner
-    numbered = np.unique(keys[units > 0])
-    segments = np.where(units > 0, np.searchsorted(numbered, keys) + 1, 0).astype(units.dtype)
-    question_keys = owned.astype(np.int64) * width + question_inner
-    owners = np.where(owned > 0, np.searchsorted(numbered, question_keys) + 1, 0).astype(owned.dtype)
+    numbered = _numbered(element, units)
+    segments = numbered(units, element["row"])
+    owners = numbered(owned, element["question_row"])
     starts = np.concatenate([[0], np.cumsum(np.bincount(segments)[1:])])
     positions = np.where(segments > 0, np.arange(len(segments)) - starts[np.maximum(segments - 1, 0)], 0)
     return segments, owners, positions.astype(np.int32)
+
+
+def _numbered(element: Batch, units: np.ndarray) -> Callable[[np.ndarray, np.ndarray], np.ndarray]:
+    """How a window numbers its rows from its packer's documents (`units`) and each token's row in its
+    unit (`row`): from 1 in the order they stand, 0 for padding, for anything along the window that
+    names its unit and its row in it (a question, a context token)."""
+    inner = np.asarray(element["row"])
+    width = int(max(inner.max(initial=0), np.asarray(element["question_row"]).max(initial=0),
+                    np.asarray(element.get("context_row", inner)).max(initial=0))) + 1
+    standing = np.unique((units.astype(np.int64) * width + inner)[units > 0])
+
+    def numbered(documents: np.ndarray, rows: np.ndarray) -> np.ndarray:
+        keys = documents.astype(np.int64) * width + np.asarray(rows)
+        return np.where(documents > 0, np.searchsorted(standing, keys) + 1, 0).astype(np.int32)
+
+    return numbered
 
 
 def _window_groups(element: Batch, owners: np.ndarray, options: np.ndarray
@@ -614,9 +637,12 @@ class PackedRows(pygrain.MapTransform):
             # Each row keeps its own blocks where the window packed it; the padding is in none.
             laid["blocks"] = np.where(segments > 0, np.asarray(element["blocks"]), -1).astype(np.int32)
         if "context" in element:
-            # A conditioned window holds one row (`DecisionObjective.bounds`), whose context it is.
+            # Each row's context in the order the rows stand, numbered as `segments` numbers its row.
+            contexts = np.asarray(element["context_segment_ids"])
             laid["context"] = element["context"]
-            laid["context_lengths"] = np.int32(np.count_nonzero(np.asarray(element["context_segment_ids"])))
+            laid["context_segments"] = (_numbered(element, units)(contexts, element["context_row"])
+                                        if "row" in element else contexts.astype(np.int32))
+            laid["context_lengths"] = np.int32(np.count_nonzero(contexts))
         if self.option_slots is not None:
             laid["option_slots"], laid["slotted"] = compacted(options, self.option_slots)
         return laid

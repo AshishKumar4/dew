@@ -97,8 +97,7 @@ def dense_training_flops(lengths: np.ndarray, inputs: int, outputs: int, *,
         raise ValueError("dense training FLOPs need nonnegative matrix widths and adapter rank")
     forward = 2 * inputs * outputs
     adapter = 2 * adapter_rank * (inputs + outputs)
-    per_token = frozen_training_flops(forward, 0 if trainable else forward, adapter)
-    return float(np.sum(real_lengths(lengths)) * per_token)
+    return per_real_token(lengths, frozen_training_flops(forward, 0 if trainable else forward, adapter))
 
 
 def attention_flops(lengths: np.ndarray, heads: int, key: int, value: int, *, causal: bool,
@@ -146,6 +145,11 @@ def _attention_products(pairs: np.ndarray, heads: int, key: int, value: int) -> 
     return float(2 * heads * (key + value) * np.sum(pairs))
 
 
+def per_real_token(lengths: np.ndarray, flops: float) -> float:
+    """`flops` for each real token of `lengths`' rows."""
+    return float(np.sum(real_lengths(lengths)) * flops)
+
+
 def delta_flops(lengths: np.ndarray, heads: int, key: int, value: int) -> float:
     """The delta rule's recurrent function, not one implementation's work.
 
@@ -155,7 +159,7 @@ def delta_flops(lengths: np.ndarray, heads: int, key: int, value: int) -> float:
     and remat are hardware work, not model work, just as FlashAttention's
     tiling changes no model attention count. GDN and KDA use this same rule.
     """
-    return float(np.sum(real_lengths(lengths)) * 6 * heads * key * value)
+    return per_real_token(lengths, 6 * heads * key * value)
 
 
 def ssd_flops(lengths: np.ndarray, heads: int, state: int, channels: int) -> float:
@@ -164,4 +168,4 @@ def ssd_flops(lengths: np.ndarray, heads: int, state: int, channels: int) -> flo
     Unlike the delta rule, SSD has no value-correction read. Its scalar
     decay/scaling is pointwise work, excluded like GDN's decay and gates.
     """
-    return float(np.sum(real_lengths(lengths)) * 4 * heads * state * channels)
+    return per_real_token(lengths, 4 * heads * state * channels)

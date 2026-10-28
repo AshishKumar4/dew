@@ -985,17 +985,20 @@ np.save(out, logits.to(torch.float32).numpy())
     return np.load(out)
 
 
+def assert_transformers_reads_the_export(model, variables, export, tmp_path) -> None:
+    """`model`'s export to `export` is a checkpoint transformers reads, computing Dew's logits over the
+    Qwen3 fixture's ids."""
+    PretrainedDecoder.from_model(model, variables).save(export)
+    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
+    ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+    difference = float(np.max(np.abs(transformers_logits(export, ids, tmp_path) - ours)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+
+
 def test_our_export_loads_in_transformers_with_the_same_logits(tmp_path):
     """The export is a real HF checkpoint: transformers reads it and agrees."""
     model, variables = fp32_decoder(FIXTURES / "qwen3-tiny")
-    export = tmp_path / "exported"
-    PretrainedDecoder.from_model(model, variables).save(export)
-
-    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
-    ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(transformers_logits(export, ids, tmp_path) - ours)))
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert_transformers_reads_the_export(model, variables, tmp_path / "exported", tmp_path)
 
 
 def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rng):
@@ -1004,13 +1007,7 @@ def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rn
     does and a biased export is a checkpoint it reads."""
     model, variables = biased_qwen3(rng)
     export = tmp_path / "biased"
-    PretrainedDecoder.from_model(model, variables).save(export)
-
-    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
-    ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(transformers_logits(export, ids, tmp_path) - ours)))
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert_transformers_reads_the_export(model, variables, export, tmp_path)
 
     again, reloaded = fp32_decoder(export)
     assert again == model
@@ -1068,15 +1065,17 @@ def _diffusion_fp32(name):
             np.load(directory / "logits.npy"), np.load(directory / "logits_f64.npy"))
 
 
-def test_llada_logits_match_the_released_model_code():
-    """fp32 parity with LLaDA's own modeling_llada.py (GSAI-ML/LLaDA-8B-Base
-    at 0f2787f, run by tools/remote_code_reference.py under transformers
-    4.46.3) on a tiny random-weight checkpoint, held to the float64 rule:
-    Dew's RMS error from the release's float64 logits at most twice the
-    release's own fp32 error. A causal model on the same weights misses by
-    1.5, so the fixture exercises full attention."""
-    model, variables, ids, reference, truth = _diffusion_fp32("llada-tiny")
-    assert_as_exact_as_the_reference(model.apply(variables, ids), reference, truth, "llada-tiny logits")
+@pytest.mark.parametrize("name", ["llada-tiny", "dream-tiny"])
+def test_a_diffusion_decoders_logits_match_the_released_model_code(name):
+    """fp32 parity with the release's own modeling code, LLaDA's modeling_llada.py
+    (GSAI-ML/LLaDA-8B-Base at 0f2787f) and Dream's modeling_dream.py
+    (Dream-org/Dream-v0-Base-7B at 6572adb), each run by
+    tools/remote_code_reference.py under transformers 4.46.3 on a tiny
+    random-weight checkpoint, held to the float64 rule. A causal model on the
+    same weights misses by more than 1 (1.5 for LLaDA, 4.9 for Dream), so the
+    fixtures exercise full attention."""
+    model, variables, ids, reference, truth = _diffusion_fp32(name)
+    assert_as_exact_as_the_reference(model.apply(variables, ids), reference, truth, f"{name} logits")
     causal = model.clone(causal=True)
     assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
 
@@ -1354,18 +1353,6 @@ def test_glm5_next_prefill_and_token_steps_match_parallel(glm5_next_source):
     actual = np.concatenate(pieces, axis=1)
     assert scaled_difference(actual, full) < 1e-4
     np.testing.assert_array_equal(actual.argmax(-1), full.argmax(-1))
-
-
-def test_dream_logits_match_the_released_model_code():
-    """fp32 parity with Dream's own modeling_dream.py (Dream-org/Dream-v0-Base-7B
-    at 6572adb, run by tools/remote_code_reference.py under transformers
-    4.46.3) on a tiny random-weight checkpoint, held to the float64 rule. A
-    causal model on the same weights misses by 4.9, so the fixture exercises
-    full attention."""
-    model, variables, ids, reference, truth = _diffusion_fp32("dream-tiny")
-    assert_as_exact_as_the_reference(model.apply(variables, ids), reference, truth, "dream-tiny logits")
-    causal = model.clone(causal=True)
-    assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
 
 
 @pytest.mark.parametrize("mode", ["frozen", "trainable"])

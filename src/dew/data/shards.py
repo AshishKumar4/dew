@@ -10,9 +10,9 @@ from collections.abc import Callable, Mapping
 import grain.experimental as experimental
 import grain.python as grain
 
-from dew._records import boolean, record
+from dew._records import boolean
 
-from .dataset import LONG_RUN, DataPartition, Loading, logged_run
+from .dataset import LONG_RUN, DataPartition, Loading, logged_run, restore_parent
 from .sources.base import Shard, ShardManifest
 
 _log = logging.getLogger(__name__)
@@ -134,7 +134,7 @@ class _WatchedIterator(grain.DatasetIterator):
         return {"parent": self.input_parent.get_state(), "yielded": self.yielded}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self.input_parent.set_state(record(state["parent"], "shard position"))
+        restore_parent(self.input_parent, state, "parent", "shard position")
         self.yielded = boolean(state["yielded"], "shard yielded")
 
     def close(self) -> None:

@@ -33,6 +33,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
+from dew._records import record
 from dew.batch import VALID_ROWS, Batch, padded_rows
 from dew.mesh import LayoutRefused, batch_axes
 
@@ -752,13 +753,14 @@ class Loader:
         return steps
 
     def example_steps(self, examples: int, window: int = 1) -> int:
-        """The steps that read the `examples` records this loader's training read is bounded to
-        (`examples`), its last batch short where they end inside one, in whole updates of `window`
-        steps. A global order's plan counts them ahead (`order_records`); one read in its own
-        order, as a pack that runs as rows arrive makes, is counted by reading it once to its end, on
-        the host. Refused where the read is bounded to another count, in a pool, whose processes
-        split the short batch the examples end in unevenly, so each would end at a step of its own,
-        and where the last steps would make no whole update, so some examples would train nothing."""
+        """The steps that read the `examples` source examples this loader's training read is bounded to
+        (`examples`), with every row the objective makes of each, its last batch short where they end
+        inside one, in whole updates of `window` steps. A global order's plan counts them ahead
+        (`order_records`); one read in its own order, as a pack that runs as rows arrive makes, or one
+        an objective expands after the bound, is counted by reading it once to its end, on the host.
+        Refused where the read is bounded to another count, in a pool, whose processes split the short
+        batch the examples end in unevenly, so each would end at a step of its own, and where the last
+        steps would make no whole update, so some examples would train nothing."""
         if self.examples != examples:
             held = "not bounded" if self.examples is None else f"bounded to {self.examples}"
             raise ValueError(f"examples={examples} reads a training chain bounded to that many records "
@@ -810,6 +812,13 @@ class Checkpointable(Protocol):
     def get_state(self) -> Position: ...
 
     def set_state(self, state: Position) -> None: ...
+
+
+def restore_parent(parent: pygrain.DatasetIterator, state: Mapping[str, object], key: str,
+                   what: str) -> None:
+    """Set `parent`, the stream a wrapper reads, to the position the wrapper's own `state` saved for it
+    under `key`, `what` naming it where the record is no position."""
+    parent.set_state(record(state[key], what))
 
 
 @runtime_checkable
