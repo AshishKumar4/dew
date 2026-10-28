@@ -163,7 +163,8 @@ def test_a_handed_validation_batch_is_shared_alike_by_every_reader():
     read = native(columns, training=False)
     shares = [next(read(DataPartition(index=index, count=2))) for index in range(2)]
     assert [rows_of(share) for share in shares] == [3, 3]
-    assert sum(int(np.sum(share[VALID_ROWS])) for share in shares) == 5
+    # A share that holds only real rows marks none, as a reader's batch does (`FilledBatch`).
+    assert sum(int(np.sum(share.get(VALID_ROWS, np.ones(rows_of(share), bool)))) for share in shares) == 5
 
 
 def test_a_trainer_validated_before_it_fits_trains_from_its_seed():
