@@ -81,7 +81,7 @@ jobs:
       run: |
         base=$(git merge-base HEAD origin/main)
         # A train's gates start before lanes' runs, as its suite does.
-        case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*) priority=--priority=10 ;; *) priority= ;; esac
+        case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*) priority=--priority=10 ;; ci/stage-*) priority=--priority=5 ;; *) priority= ;; esac
         grep -v '^#' tools/check_gates | cut -f1 | armada map --commit=${{ github.sha }} --items=- --size=medium \
           $priority --label="lint-$GITHUB_REF_NAME" -- \
           sh -c 'venv=$PWD/.venv-$(tr -d "\n" < .python-version); PYTHON=$venv/bin/python PATH=$venv/bin:$PATH BASE="$1" sh tools/check.sh --gate "$2"' \
@@ -227,6 +227,7 @@ jobs:
       group: >-
         ${{ (startsWith(github.ref_name, 'ci/full-whole-') && 'armada-whole')
         || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && 'armada-base')
+        || (startsWith(github.ref_name, 'ci/stage-') && 'armada-stage')
         || 'armada' }}
       cancel-in-progress: false
       queue: max
@@ -272,9 +273,12 @@ jobs:
         # (owner, bible §4); one priority for both, so the suite never recalls its own gangs' containers. A push to
         # base/kernels, a base/<producer> promote and the background whole suite run at a lane's whole-suite priority
         # (-10, verdict.sh's) within their pool of 48, so they never take containers from a train, a precheck or a
-        # lane's targeted run (Main, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger).
+        # lane's targeted run (Main, 2026-10-28: base pushes ran at 0, outside the lanes' lease ledger). A train staged
+        # on the testing train's tip (ci/stage-*, its own concurrency group above) runs beside it, at 5: it publishes
+        # only after that train, so it takes what that train leaves (owner and Main, 2026-10-28).
         case "$GITHUB_REF_NAME" in
           ci/batch-*|ci/fix-*) priority=--priority=10 ;;
+          ci/stage-*) priority=--priority=5 ;;
           ci/base-*|base/kernels|ci/full-whole-*) priority=--priority=-10 ;;
           *) priority= ;;
         esac
