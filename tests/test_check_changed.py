@@ -79,25 +79,26 @@ def test_the_registrys_gates_run_together_or_one_at_a_time(tmp_path):
     assert check(root, "--gate", "a-gate-no-line-names").returncode != 0
 
 
-def test_the_ratchet_gate_alone_fetches_the_history_it_reads_into_a_shallow_clone(tmp_path):
-    """A gate run on its own container (the lanes' lint gate on armada) has a shallow checkout: the ratchet
-    fetches main's history itself, and holds the inventory to the ref BASE names."""
+def test_the_ratchet_gate_alone_holds_the_inventory_to_the_base_its_checkout_carries(tmp_path):
+    """A gate run on its own container (the lanes' lint gate on armada) has a checkout that carries its
+    commit's history and is given BASE, its merge-base with main, with no origin/main and no reachable
+    origin: the ratchet holds the inventory to BASE, fetching nothing (Main, 2026-10-28: the gates'
+    fetches of main over HTTPS failed lanes' lint)."""
     root = checkout(tmp_path)
     git(root, "checkout", "-q", "main")
-    shallow = tmp_path / "shallow"
-    git(tmp_path, "clone", "-q", "--depth=1", root.as_uri(), str(shallow))
-    assert subprocess.run(["git", "rev-parse", "--is-shallow-repository"], cwd=shallow, capture_output=True,
-                          text=True, check=True).stdout.strip() == "true"
-    ratchet = check(shallow, "--gate", "ratchet")
-    assert ratchet.returncode == 0, ratchet.stdout + ratchet.stderr
-    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=shallow, capture_output=True, text=True,
+    carried = tmp_path / "carried"
+    git(tmp_path, "clone", "-q", root.as_uri(), str(carried))
+    git(carried, "remote", "set-url", "origin", str(tmp_path / "unreachable"))
+    git(carried, "update-ref", "-d", "refs/remotes/origin/main")
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=carried, capture_output=True, text=True,
                           check=True).stdout.strip()
-    assert check(shallow, "--gate", "ratchet", BASE=head).returncode == 0
+    ratchet = check(carried, "--gate", "ratchet", BASE=head)
+    assert ratchet.returncode == 0, ratchet.stdout + ratchet.stderr
     # Dropping the held comparison's entry loosens nothing; adding a held file the base lacks does.
-    (shallow / "tools/tolerance_inventory.json").write_text(
+    (carried / "tools/tolerance_inventory.json").write_text(
         inventory({**HELD, "tests/test_other.py": {"comparisons": 1, "lane": "Data", "by": "2099-01-01"}}))
-    git(shallow, "commit", "-qam", "a head that holds one more comparison")
-    assert check(shallow, "--gate", "ratchet", BASE=head).returncode == 1
+    git(carried, "commit", "-qam", "a head that holds one more comparison")
+    assert check(carried, "--gate", "ratchet", BASE=head).returncode == 1
 
 
 def test_a_head_touching_the_inventory_or_deleting_a_file_it_names_fails_its_changed_check(tmp_path):
