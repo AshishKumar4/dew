@@ -25,9 +25,10 @@ reads), so run it there:
       safetensors numpy huggingface_hub
   /tmp/remote/bin/python tools/remote_code_reference.py
 
-MiMo-V2.6's code reads transformers 5's masking and rotary utilities (its
-config records 5.3.0), so mimo-v2-tiny runs under Dew's locked environment
-(transformers 5.16.1), with --draw the first time: the release's own class
+MiMo-V2.6's code reads transformers 5's masking and rotary utilities, calling
+`create_causal_mask(input_embeds=...)`, which 5.2.0 renamed (its config records
+5.3.0, which refuses it), so mimo-v2-tiny runs under transformers 5.1.0, with
+--draw the first time: the release's own class
 draws the fixture's weights (every parameter, the sinks and the balancing
 bias too, from N(0, 0.1^2) at seed 0, as the class leaves the sinks empty)
 and its token ids, written in the class's split layout:
@@ -39,6 +40,21 @@ null (`reference_source.record_padding`), as padding.json beside it. It reads
 the release's code and config alone, under each release's transformers as
 above:
   /tmp/remote/bin/python tools/remote_code_reference.py --padding llada-tiny dream-tiny
+
+LFM3's code (lfm3-tiny, lfm3-biased-tiny) runs under transformers 5.18.0 on
+(tests/fixtures/hf/lfm3-tiny/source.json).
+
+`--record` records each release over seeds at its sites (tests/remote_code_draws.py's `SITES`,
+`record_case(..., summary=True)`), as `released.npz` beside the fixture, which
+tests/test_remote_code_releases.py holds Dew to by check 1: Dew's side runs in Dew's environment, and
+the release's, served over a pipe (`--serve`), under `--release-python`, its own transformers':
+  PYTHONPATH=src python tools/remote_code_reference.py lfm3-tiny lfm3-biased-tiny --record \
+      --release-python <a Python with transformers 5.18.0>
+  PYTHONPATH=src python tools/remote_code_reference.py mimo-v2-tiny --record --release-python <5.1.0>
+  PYTHONPATH=src python tools/remote_code_reference.py dream-tiny llada-tiny --record \
+      --release-python <4.46.3>
+`--opens <export>` checks a Dew export of the fixture opens through the release's own loader as the
+release does (`opens`).
 """
 
 import argparse
