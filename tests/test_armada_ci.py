@@ -1851,7 +1851,8 @@ def test_the_lint_job_runs_every_gate_on_armada_against_the_merge_base(tmp_path)
     bin_dir.mkdir()
     (bin_dir / "armada").write_text(f'#!/bin/sh\necho "$*" > {tmp_path}/words\ncat > {tmp_path}/items\n')
     (bin_dir / "armada").chmod(0o755)
-    for ref, priority in (("fix/lane", []), ("ci/batch-abc-1", ["--priority=10"])):
+    for ref, priority in (("fix/lane", []), ("ci/batch-abc-1", ["--priority=10"]),
+                          ("ci/stage-abc-1", ["--priority=5"])):
         script = step["run"].replace("${{ github.sha }}", "a" * 40).replace("${{ github.ref_name }}", ref)
         environment = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GITHUB_REF_NAME": ref}
         ran = subprocess.run(["bash", "-c", script], cwd=checkout, capture_output=True, text=True, timeout=60,
@@ -1876,4 +1877,6 @@ def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priorit
     for ref in ("base/kernels", "ci/base-abc-1", "ci/full-whole-1"):
         assert priority(ref) == ["--priority=-10"], ref
     assert priority("ci/batch-abc-1") == ["--priority=10"]
+    # A train staged on the testing train's tip runs beside it, below it (owner and Main, 2026-10-28).
+    assert priority("ci/stage-abc-1") == ["--priority=5"]
     assert priority("fix/lane") == []
