@@ -32,7 +32,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.artifacts import TokenScores
-from dew.batch import Variables, real_slots, thaw
+from dew.batch import Batch, Variables, real_slots, thaw
 from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
@@ -139,6 +139,10 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
+
+    def row_tokens(self, batch: Batch) -> int | None:
+        """The tokens of each row, every one of them a slot the corruption may mask."""
+        return self.inputs.sample.held(batch)[-1] if self.inputs is not None else None
 
     def loss(self, variables, batch, step: Step):
         nelbo, aux, _ = self._scored(variables, batch, step, train=step.training)
