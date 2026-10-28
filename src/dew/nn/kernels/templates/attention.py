@@ -1103,24 +1103,23 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
               residuals: tuple[jax.Array, jax.Array, jax.Array, Split], *, block: int,
               scale: float | None = None, rounded: bool = True) -> Gradients:
     """The template's backward of its forward under the output's cotangent `dout` `[B, Q, H, Dv]`, from the
-    forward's `residuals` (each query's maximum and denominator `[B, H, Q]`, its anchor key, the first
-    holding the keys' maximum, `[B, H, Q]` int32, and its split sums, `Split`), through a mainloop's
-    `launch` (the Triton one, `attention_triton.backward`; the plain-JAX one,
-    `attention_portable.backward`): the call padded to whole `block`s (`padded_call`), `launch(query, key,
-    value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value, others, own, others_total,
-    total, start, end, query_ids, key_ids, score_params, *, score_mod, score_kinds, score_dtypes, scale,
-    prescale)` giving dQ, the softmax's rows (`D - c`, `c`, `m`, `T`, the keys' mass), each query's
-    anchor key as it chose it, the dQ program's hook gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's
-    (`DKV_GRADS`); each gradient fp32, then rounded to its input's dtype. D is taken two ways, about 0 and
-    about the anchor key's `v_c · dO`, each query the nearer, from the forward's split sums
-    (`attention_algebra.split_delta`) or a first pass of the dQ launch's own over the keys at the
-    forward's maximum (`off_anchor_delta`): the anchor key's `dP - c` enters as exactly 0; the main pass
-    then refines D once from its own sums for the dK/dV launch and the head, query and initial state's
-    gradients (`attention_algebra.refinement`). The output hook is no part of it: a differentiated call
-    applies `output_mod` past the kernel, where its own derivative runs, and passes `dout` before it.
-    Deterministic where `launch` writes every gradient element from one program (the two-launch schedules: a
-    head parameter's partial sums added in a fixed order and a key head's query heads summed in XLA); the
-    Mosaic one-launch schedule adds dQ's tiles atomically, in their arrival order."""
+    forward's `residuals` (each query's maximum and denominator `[B, H, Q]`, its anchor key, the first holding
+    the keys' maximum, `[B, H, Q]` int32, and its split sums, `Split`), through a mainloop's `launch` (the
+    Triton one, `attention_triton.backward`; the plain-JAX one, `attention_portable.backward`): the call
+    padded to whole `block`s (`padded_call`), `launch(query, key, value, dout, peak0, total0, initial_term,
+    maximum, key_index, anchor_value, others, own, others_total, total, start, end, query_ids, key_ids,
+    score_params, *, score_mod, score_kinds, score_dtypes, scale, prescale)` giving dQ, the softmax's rows (`D
+    - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it chose it, the dQ program's hook
+    gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's (`DKV_GRADS`); each gradient fp32, then
+    rounded to its input's dtype. D is taken two ways, about 0 and about the anchor key's `v_c · dO`, each
+    query the nearer, from the forward's split sums (`attention_algebra.split_delta`) or a first pass of the
+    dQ launch's own over the keys at the forward's maximum (`off_anchor_delta`): the anchor key's `dP - c`
+    enters as exactly 0; the main pass then refines D once from its own sums for the dK/dV launch and the
+    head, query and initial state's gradients (`attention_algebra.refinement`). The output hook is no part of
+    it: a differentiated call applies `output_mod` past the kernel, where its own derivative runs, and passes
+    `dout` before it. Deterministic where `launch` writes every gradient element from one program (the
+    two-launch schedules: a head parameter's partial sums added in a fixed order and a key head's query heads
+    summed in XLA); the Mosaic one-launch schedule adds dQ's tiles atomically, in their arrival order."""
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
         raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
