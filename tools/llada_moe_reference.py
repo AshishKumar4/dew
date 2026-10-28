@@ -172,23 +172,35 @@ PROMPTS = (3, 5, 8)
 
 def generated(name: str, workspace: Path) -> None:
     """The release's own `generate` of prompts drawn at `PROMPTS`' lengths (ids past the end token, the mask
-    token aside) under `GENERATE`, written as generate.json beside the fixture with the releases it ran."""
+    token aside) under `GENERATE`, written as generate.json beside the fixture with the releases it ran.
+
+    Its head's mask-token logit is held at -inf (a forward hook on `lm_head`, which its forward calls): the
+    release's `generate` draws over the whole vocabulary, so a position whose best token is the mask token
+    keeps it, a mask in its output, where Dew's walk draws no mask token (`DiscreteDenoiser`, MDLM's
+    carry-over); with it held out, the two walks draw from one distribution, every block, visibility,
+    position and reveal the release's."""
     import transformers
 
     config = json.loads((FIXTURES / name / 'config.json').read_text())
     model = released_model(name, workspace).float()
+    mask = config['mask_token_id']
+
+    def no_mask(module, inputs, logits):
+        return logits.index_fill(-1, torch.tensor([mask]), float('-inf'))
+
+    model.lm_head.register_forward_hook(no_mask)
     ids = np.setdiff1d(np.arange(GENERATE["eos_id"] + 1, config['vocab_size']), [config['mask_token_id']])
     rng = np.random.default_rng(1061)
     rows = []
     for length in PROMPTS:
         prompt = rng.choice(ids, length)
-        tokens = model.generate(inputs=torch.from_numpy(prompt[None]).long(), temperature=0.0,
-                                mask_id=config['mask_token_id'], **GENERATE)
+        tokens = model.generate(inputs=torch.from_numpy(prompt[None]).long(), temperature=0.0, mask_id=mask,
+                                **GENERATE)
         rows.append({"prompt": prompt.tolist(), "generated": tokens[0].tolist()})
     repo, revision = RELEASES[name][:2]
     record = {"reference": f"{repo}@{revision}", "transformers": transformers.__version__,
               "torch": torch.__version__, "command": f"tools/llada_moe_reference.py --generate {name}",
-              "settings": GENERATE, "mask_id": config['mask_token_id'], "rows": rows}
+              "settings": GENERATE, "mask_id": mask, "mask_logit": "held at -inf", "rows": rows}
     (FIXTURES / name / 'generate.json').write_text(json.dumps(record, indent=1) + '\n')
     print(name, rows, flush=True)
 
