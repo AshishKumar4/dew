@@ -332,6 +332,40 @@ def test_the_mosaic_launches_state_their_work(training):
     assert sum(_stated_flops(line) or 0.0 for line in launches) >= model * (2 if training else 1)
 
 
+def test_each_launch_lowers_once_however_many_layers_call_it():
+    """Two layers' bf16 gated delta rules of one shape, their forward and gradient, lowered for an H100: each of
+    the template's distinct launches is one Mosaic GPU call in the lowered program, which both layers call
+    (`mainloop._lowered_once`), as many as one layer's. Each call site traced, lowered and serialized its own
+    kernel: a Qwen3.5-4B step's first update waited 30 minutes on its layers' identical kernels (row 2102)."""
+    import re
+
+    rows, length, key_heads, value_heads, width = 1, 256, 2, 4, 128
+    operands = [jax.ShapeDtypeStruct((rows, length, key_heads, width), jnp.bfloat16)] * 2 + [
+        jax.ShapeDtypeStruct((rows, length, value_heads, width), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.float32),
+        jax.ShapeDtypeStruct((rows, length, value_heads), jnp.bfloat16)]
+
+    def layers(count: int):
+        def run(query, key, value, g, beta):
+            total = jnp.float32(0.0)
+            for layer in range(count):
+                # Each layer's own queries, as each layer projects its own.
+                out = mosaic_rule(query * (layer + 1), key, value, g, beta, tiles=mainloop.Tiles(32, 1))[0]
+                total = total + out.astype(jnp.float32).sum()
+            return total
+
+        return jax.grad(run, argnums=(0, 1, 2))
+
+    def kernels(count: int) -> int:
+        with generation.assumed("sm90"):
+            text = jax.jit(layers(count)).trace(*operands).lower(lowering_platforms=("cuda",)).as_text(
+                dialect="hlo")
+        return len([line for line in text.splitlines() if re.search(r'custom_call_target="mosaic_gpu', line)])
+
+    one = kernels(1)
+    assert one > 0 and kernels(2) == one
+
+
 def test_a_gated_delta_net_named_onto_the_template_matches_the_portable_rule():
     """A layer naming the template (`generation.chosen(gated_delta_rule='mosaic_gpu')`): its output on par
     from float64 with the portable rule's (the layer's own float64 forward the truth). The layer computes
