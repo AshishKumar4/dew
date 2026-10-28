@@ -445,10 +445,9 @@ ATTENTION = Op[AttentionCase]('attention', (
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
 ), _attention_preferred, _hosted, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
-kernel (`_attention_preferred`: the template on a family with a routed Mosaic mainloop), then flash, triton,
-cuDNN, splash, xla and the reference path, the first that takes the call. The template comes last, after
-the reference path, which takes every call, so it runs where the preference names it (a templated family's
-calls) or a call names it."""
+kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,
+splash, xla and the reference path, the first that takes the call. The template comes last, after the
+reference path, which takes every call, so it runs where the preference names it or a call names it."""
 
 
 
