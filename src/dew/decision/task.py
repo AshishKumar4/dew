@@ -509,8 +509,8 @@ class Decide(SavedRunTask):
 
     @functools.cached_property
     def _probe(self) -> list[Encoded]:
-        """The layout's shortest row: one one-option question about an empty state."""
-        return self.layout.rows(self.tokenizer, self.specials, "", {"q": Choice("x", ["0"])})
+        """The layout's shortest row (`Layout.shortest`), which every pass shape holds."""
+        return [self.layout.shortest(self.tokenizer, self.specials)]
 
     def _seen(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
               context: JSON | None = None) -> tuple[dict[str, Answer], Usage]:

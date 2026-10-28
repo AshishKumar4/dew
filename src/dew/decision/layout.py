@@ -400,6 +400,14 @@ class Layout:
         counted as unfit, and a task refuses it."""
         return len(row.tokens) <= self.max_len
 
+    def shortest(self, encoder: Tokenizer, specials: Specials) -> Encoded:
+        """The shortest row this layout lays out: one one-option question about an empty state, laid
+        out with room to spare, so that nothing is cut (`bounds`)."""
+        roomy = dataclasses.replace(self, max_len=1 << 30)
+        # Named as `bounds` names its first question, whose name a schema writes.
+        return roomy.rows(encoder, specials, "", {"q0": Choice("x", ["0"])},
+                          tokens=self.state(encoder, specials, ""))[0]
+
     def bounds(self, encoder: Tokenizer, specials: Specials, context_length: int | None = None) -> Bounds:
         """The most rows, questions and options a window of `max_len` tokens
         packs, from the fewest tokens each takes in this layout: a row of one
@@ -414,7 +422,7 @@ class Layout:
         and options are those a context of `context_length` tokens holds."""
         roomy = dataclasses.replace(self, max_len=1 << 30)
         empty = self.state(encoder, specials, "")
-        probe = roomy.rows(encoder, specials, "", {"q": Choice("x", ["0"])}, tokens=empty)
+        probe = [self.shortest(encoder, specials)]
         in_context = probe[0].spans_in_context
         if in_context and context_length is None:
             raise ValueError("a layout that reads its questions in the row's context is bounded by the "

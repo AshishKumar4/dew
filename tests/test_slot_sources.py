@@ -269,7 +269,8 @@ def test_a_block_slot_source_trains_checkpoints_exports_and_serves_its_updated_r
     exported = Decide.from_pretrained(tmp_path / "updated", dtype="float32", attention_impl="xla")
     question = {"team": Choice("Which team?", ["billing", "technical"])}
     rows = loaded.layout.rows(loaded.tokenizer, loaded.specials, request["state"], question)
-    np.testing.assert_array_equal(loaded.scored(rows), exported.scored(rows))
+    # Under the run's layout, whose window declares the pass's shape (`Decide.pass_shapes`): one program.
+    np.testing.assert_array_equal(loaded.scored(rows), replace(exported, layout=loaded.layout).scored(rows))
     server = ScoringServer.from_task(*exported.scoring())
     first, second = server.submit(request), server.submit(request)
     server.step()
