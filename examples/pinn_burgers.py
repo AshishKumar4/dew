@@ -101,9 +101,12 @@ class BurgersProfile(Residuals):
     def profile(self, variables, eta):
         """U at one eta: the learned part made odd, and the known tail."""
         y = jnp.sinh(eta)
-        # y^(1/3) (y / (1 + y))^15 as one power, so its derivatives at eta = 0, where the points start,
-        # are its own zeros rather than a negative power of zero times zero.
-        tail = -(y ** (LAMBDA / (1 + LAMBDA) + TAIL)) / (1 + y) ** TAIL
+        # y^(1/3) (y / (1 + y))^15 with the powers of y combined, (y / (1 + y))^(15 + 1/3) (1 + y)^(1/3):
+        # its derivatives at eta = 0, where the points start, are its own zeros rather than a negative
+        # power of zero times zero, and each factor stays bounded at sinh(c), where y^(15 + 1/3) and a
+        # quotient's (1 + y)^30 would overflow its derivatives.
+        power = LAMBDA / (1 + LAMBDA)
+        tail = -((y / (1 + y)) ** (TAIL + power)) * (1 + y) ** power
         learned = self.model.apply(variables, jnp.stack([eta, -eta]))
         return learned[0] - learned[1] + tail
 
