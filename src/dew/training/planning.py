@@ -355,8 +355,9 @@ def faster(timings: Sequence[Sequence[float]]) -> int:
 @dataclasses.dataclass
 class Trials:
     """Trial runs of a plan's steps on `batch` from `state`, each on a copy of the state as it stood
-    (`run`): a frontier's timing (`seconds`), where `frontier` asks for it, and AutoPGLE's profile of the
-    plan admitted (`profiled`). A state the trials own (`owned`, `fit`'s) is stepped by the first trial
+    (`run`): an offline frontier's timing (`seconds`), where `frontier` asks for it, and AutoPGLE's
+    profile of the plan admitted (`profiled`). Live compilation never invokes `seconds`. A state the
+    trials own (`owned`, `fit`'s) is stepped by the first trial
     and deleted, each later trial stepping a fresh copy from the host, so the devices hold one state at a
     time, and `state` is then a copy as it stood, for the run to go on from. One they borrow (a compile
     given none, `Trainer.compile`) is never stepped and stays `state`: each trial steps a copy beside it,
@@ -543,7 +544,6 @@ class FitSearch[LossT, EffectsT]:
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh)
-        self.started = self.remat_rung()
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
         self.required = compiler_options(*self.objective.towers()) or None
 
