@@ -24,25 +24,16 @@ from episode_support import (
     trained_batch,
     verify,
 )
+from process_support import running
 
 from dew.objectives.rl import EpisodeStatus
 
 
-def alive(pid):
-    """Whether `pid` still runs. A zombie has ended: it waits only for its reaper, which for an orphan may
-    be a child subreaper that reaps when its own job ends, as a GPU node's job runner does."""
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except FileNotFoundError:
-        return False
-    return stat.rsplit(")", 1)[1].split()[0] != "Z"
-
-
 def wait_gone(pids, seconds=5.):
     deadline = time.monotonic() + seconds
-    while any(alive(pid) for pid in pids) and time.monotonic() < deadline:
+    while any(running(pid) for pid in pids) and time.monotonic() < deadline:
         time.sleep(.02)
-    return [pid for pid in pids if alive(pid)]
+    return [pid for pid in pids if running(pid)]
 
 
 def test_worker_round_trip_and_process_group_cleanup():
@@ -51,7 +42,7 @@ def test_worker_round_trip_and_process_group_cleanup():
         initial = session.reset()
         assert initial.context == (START,) and initial.status == EpisodeStatus.RUNNING
         pids = json.loads(initial.detail)
-        assert len(pids) == 2 and all(alive(pid) for pid in pids)
+        assert len(pids) == 2 and all(running(pid) for pid in pids)
         after_call = session.step(action(initial.context, CALL_THREE, EOS))
         assert after_call.context == (START, CALL_THREE, EOS, NINE)
         final = session.step(action(after_call.context, 5, EOS))
@@ -75,7 +66,7 @@ def test_parent_death_kills_the_worker(tmp_path):
                               env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
     assert parent.stdout is not None
     worker = int(parent.stdout.readline())
-    assert alive(worker)
+    assert running(worker)
     parent.send_signal(signal.SIGKILL)
     parent.wait()
     assert wait_gone([worker]) == []

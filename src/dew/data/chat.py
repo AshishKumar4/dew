@@ -88,15 +88,14 @@ def _role(raw: object, where: str) -> Role:
     return role
 
 
-def _text(raw: object, name: str, where: str) -> str:
-    if not isinstance(raw, str):
-        raise ValueError(f"{where}: {name} is a string, got {raw!r}")
-    return raw
+_KINDS = {str: "a string", Mapping: "an object"}
+"""What a message's field is said to be where it is something else (`_typed`)."""
 
 
-def _mapping(raw: object, name: str, where: str) -> Mapping[str, object]:
-    if not isinstance(raw, Mapping):
-        raise ValueError(f"{where}: {name} is an object, got {raw!r}")
+def _typed[T](raw: object, kind: type[T], name: str, where: str) -> T:
+    """`raw`, a message's field `name`, as the `kind` it has to be, or refused at `where`."""
+    if not isinstance(raw, kind):
+        raise ValueError(f"{where}: {name} is {_KINDS[kind]}, got {raw!r}")
     return raw
 
 
@@ -115,7 +114,7 @@ def _records(raw: object, name: str, where: str) -> list[Mapping[str, object]]:
             raise ValueError(f"{where}: {name} is not JSON: {exc}") from None
     if not isinstance(raw, list):
         raise ValueError(f"{where}: {name} is a list, got {raw!r}")
-    return [_mapping(entry, f"an entry of {name}", where) for entry in raw]
+    return [_typed(entry, Mapping, f"an entry of {name}", where) for entry in raw]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -133,10 +132,10 @@ class ContentPart:
 
     @classmethod
     def parse(cls, part: Mapping[str, object], where: str) -> ContentPart:
-        kind = _text(part.get("type"), "a content part's type", where)
+        kind = _typed(part.get("type"), str, "a content part's type", where)
         fields = {key: value for key, value in part.items() if key != "type"}
         if kind == "text":
-            _text(fields.get("text"), "a text part's text", where)
+            _typed(fields.get("text"), str, "a text part's text", where)
         return cls(kind, fields)
 
     def as_template(self) -> Mapping[str, object]:
@@ -172,7 +171,7 @@ class ToolCall:
         outer = {key: value for key, value in call.items() if value is not None}
         function = outer.pop("function", None)
         if function is not None:
-            body = dict(_mapping(function, "a tool call's function", where))
+            body = dict(_typed(function, Mapping, "a tool call's function", where))
             body = {key: value for key, value in body.items() if value is not None}
         else:
             body = {key: outer.pop(key) for key in ("name", "arguments") if key in outer}
@@ -182,7 +181,7 @@ class ToolCall:
             raise ValueError(
                 f"{where}: a tool call carries id, type and function; "
                 f"unknown fields {sorted(outer)}")
-        name = _text(body.pop("name", None), "a tool call's name", where)
+        name = _typed(body.pop("name", None), str, "a tool call's name", where)
         arguments = body.pop("arguments", None)
         if body:
             raise ValueError(
@@ -203,8 +202,8 @@ class ToolCall:
                 f"object, got {arguments!r}")
         return cls(
             name, dict(arguments),
-            None if call_id is None else _text(call_id, "a tool call's id", where),
-            _text(kind, "a tool call's type", where))
+            None if call_id is None else _typed(call_id, str, "a tool call's id", where),
+            _typed(kind, str, "a tool call's type", where))
 
     def as_template(self) -> Mapping[str, object]:
         call: dict[str, object] = {
@@ -268,8 +267,8 @@ class Message:
                  if key not in RESERVED and value is not None}
         return cls(
             role, parts, tool_calls,
-            None if call_id is None else _text(call_id, "tool_call_id", where),
-            None if name is None else _text(name, "name", where),
+            None if call_id is None else _typed(call_id, str, "tool_call_id", where),
+            None if name is None else _typed(name, str, "name", where),
             extra)
 
     def as_template(self) -> Mapping[str, object]:
@@ -354,7 +353,7 @@ class Conversation:
                     raise ValueError(
                         f"{at}: content part {part.type!r} requires a processor; "
                         "text tokenizers accept only text parts")
-                texts.append(_text(part.fields.get("text"), "a text part's text", at))
+                texts.append(_typed(part.fields.get("text"), str, "a text part's text", at))
             rows.append({**row, "content": "".join(texts)})
         return rows
 

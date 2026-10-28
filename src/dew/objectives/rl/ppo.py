@@ -12,7 +12,7 @@ import numpy as np
 from flax import linen as nn, struct
 
 from dew._coordination import agreed, from_every_process
-from dew.batch import Variables, part
+from dew.batch import Batch, Variables, part
 from dew.distributed.batches import shard_batch
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.dense import Dense
@@ -157,6 +157,10 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         *actor, self.critic = modules
         self.actor.substitute(actor)
+
+    def row_tokens(self, batch: Batch) -> int | None:
+        """The actor's tokens a row, of the rows the actor and the critic both read."""
+        return self.actor.row_tokens(batch)
 
     def projected(self, params: Variables, *, updated: bool) -> Variables:
         """The actor's projection of the policy's tree, and the critic's of its own."""

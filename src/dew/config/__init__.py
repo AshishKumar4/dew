@@ -48,7 +48,7 @@ from dew import registry
 from dew._coordination import agree_process_phase, agreed
 from dew._records import JSON, duration, is_share, record, recorded_duration
 from dew.cache import dew_cache_dir
-from dew.checkpoints import RUN_FILE, Checkpoints, Keep
+from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
 from dew.data.compile import fitted
@@ -83,7 +83,7 @@ from dew.training.budget import Pause, budget_tokens, run_length, run_steps
 from dew.training.cooldown import Cooldowns
 from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Summary
-from dew.training.profiling import ProfileWindow
+from dew.training.profiling import ProfileReport, ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
 from dew.training.selection import Best
@@ -380,6 +380,9 @@ class TrainerConfig:
     checkpoint_dir: str = "./checkpoints"
     keep: Annotated[int | Keep, _keep_argument()] = Keep.latest
     """The number of latest checkpoints kept, besides the best one (`Keep`'s own default)."""
+    resume: Resume = "auto"
+    """Whether the run continues its directory's latest checkpoint: where there is one, "require" for a
+    job that must not start afresh, or "never" for one that must not continue another (`Trainer.fit`)."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """The metric name and ranking policy; None selects validation loss or training loss."""
     update_tokens: int | None = None
@@ -400,8 +403,10 @@ class TrainerConfig:
     rate or a schedule with its own explicit step horizon.
     """
     examples: int | None = None
-    """The run length as the first this many records of the data, each read once, counted before
-    they are packed (`Trainer.fit`'s `examples`); `steps` or `epochs` set it instead."""
+    """The run length as the first this many source examples of the data, each read once with every
+    row it makes: the records the chain makes in its own order, counted before they are packed and
+    before an objective makes several rows of one (a decision layout's row a question)
+    (`Trainer.fit`'s `examples`); `steps` or `epochs` set it instead."""
     stop: Annotated[Pause, tyro.conf.subcommand("pause")] | None = None
     """End the run at a fraction of its length, to resume it later as if it had never stopped
     (`Pause`): `--trainer.stop.fraction 0.5`."""
@@ -1314,6 +1319,48 @@ class RunConfig:
                                 f"{_chain_label(prepared.run.data)}/date-{run_timestamp()}")
         return prepared.train(name)
 
+    def profile(self, directory: str | None = None, *, warmup: int = 20, steps: int = 10,
+                capture: ProfileWindow | None = None) -> ProfileReport | None:
+        """Train this run afresh under `directory` for `warmup` steps, then a window of `steps` more traced
+        (`ProfileWindow`), and report where the window's steps spent their time (`ProfileReport`), written
+        as `report.json` beside XProf's own reports. The warmup is whole windows, at least one, so the step
+        compiles before the window and the window is one log interval. The run keeps its own settings but
+        those that would read or write outside the window, which a profile drops together: its length,
+        stop, checkpoints, the checkpoint ranking (`best`), its cooldowns, the validation splits it names
+        and their metrics and summaries (a split its chain holds out scores after the window), and its W&B
+        sink. `directory` unset is profiles/<the run's name>/<the time
+        it starts>, read once the process is prepared, as `run` reads a run's name. The run's own
+        directory is left as it is. `capture` gives the capture's options (its `host_tracer_level`,
+        `python_tracer_level` and `activity_cap`; its directory and steps are the profile's). Raises
+        ValueError for a directory that holds this run's profile already. The report is process zero's,
+        which logs the run; None on the others."""
+        from dew.training import prepare_process, run_timestamp
+
+        name = self.trainer.name or "profile"
+        warmup = max(1, -(-warmup // steps)) * steps
+        trainer = dataclasses.replace(
+            self.trainer, name=name, resume="never", steps=warmup + steps, epochs=None, tokens=None,
+            examples=None, stop=None, best=None, cooldowns=None, log_every=steps, eval_every=None,
+            checkpoint_every=None, checkpoint_final=False, wandb=None, publish=False)
+        prepare_process(None, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir)
+        # The report names its paths whole, wherever it is read from.
+        directory = os.path.abspath(directory or os.path.join("profiles", name, run_timestamp()))
+        if (Path(directory) / name / "tracking").exists():
+            raise ValueError(f"{directory} holds a profile of {name} already; give the profile a directory "
+                             "of its own")
+        window = os.path.join(directory, "capture")
+        captured = dataclasses.replace(capture or ProfileWindow(window, steps), directory=window, steps=steps,
+                                       warmup=warmup)
+        trainer = dataclasses.replace(trainer, checkpoint_dir=directory, profile=captured)
+        profiled = dataclasses.replace(self, validation=None, val_metrics=None, val_summaries=(),
+                                       trainer=trainer)
+        profiled.prepare().train(name)
+        if jax.process_index() != 0:
+            return None
+        report = ProfileReport.read(Path(directory), name, Path(window), warmup=warmup, steps=steps)
+        Path(directory, "report.json").write_text(json.dumps(dataclasses.asdict(report), indent=2) + "\n")
+        return report
+
     def recorded(self, objective: Objective[Loss, Effects]) -> Self:
         """Return this config as the record of the run that trains `objective`.
 
@@ -1416,9 +1463,10 @@ class RunConfig:
             local = _local_tracker(checkpoints.directory, name)
             tracker = Trackers(local, *(() if wandb_tracker is None else (wandb_tracker,)))
             def check_resumed() -> None:
-                """Refuse a checkpoint of another run under the name, on every rank."""
+                """Refuse a checkpoint of another run under the name, or a directory `resume` refuses
+                (`Checkpoints.resumed`), on every rank, before the record is written over it."""
                 saved = epath.Path(checkpoints.directory) / RUN_FILE
-                if checkpoints.latest is not None and saved.exists():
+                if checkpoints.resumed(trainer.resume) is not None and saved.exists():
                     self.check_resume(json.loads(saved.read_text()))
 
             def record_run() -> None:
@@ -1454,6 +1502,7 @@ class RunConfig:
                 checkpoint_final=trainer.checkpoint_final,
                 metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
                 best=trainer.best_policies(), stop=trainer.stop, cooldowns=trainer.cooldowns,
+                resume=trainer.resume,
                 # A run that names no metrics and validates no split has no suite to score.
                 validation=validation if suites is None else suites or None, summaries=self.val_summaries,
             )

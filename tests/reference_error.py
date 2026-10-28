@@ -496,14 +496,22 @@ def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
     truth = np.asarray(truth, np.float64)
     if truth.ndim < 2:
         return np.zeros(0), np.zeros(0)
+    return _row_sizes(truth, terms)[1], _rows_rms(np.asarray(value, np.float64) - truth, truth.shape[-1])
 
-    def rms(values):
-        return _scaled_rms(np.reshape(values, (-1, truth.shape[-1])))
 
-    sizes = rms(truth) if terms is None else np.maximum(rms(truth), rms(terms))
+def _rows_rms(values, width: int) -> np.ndarray:
+    """Each row's RMS of `values`, a row `width` wide (`_scaled_rms`)."""
+    return _scaled_rms(np.reshape(values, (-1, width)))
+
+
+def _row_sizes(truth: np.ndarray, terms=None) -> tuple[np.ndarray, np.ndarray]:
+    """A truth leaf's rows, of rank two or more: each row's own RMS, and its size as `row_errors` reads
+    it, the RMS (or, with `terms`, the larger of it and its terms') where it is past RESOLUTION of the
+    leaf, else zero."""
+    own = _rows_rms(truth, truth.shape[-1])
+    sized = own if terms is None else np.maximum(own, _rows_rms(terms, truth.shape[-1]))
     leaf = max(distance(truth, 0), 0.0 if terms is None else distance(terms, 0))
-    sizes = np.where(sizes > RESOLUTION * leaf, sizes, 0.0)
-    return sizes, rms(np.asarray(value, np.float64) - truth)
+    return own, np.where(sized > RESOLUTION * leaf, sized, 0.0)
 
 
 def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tuple[str, float, str]]:
@@ -932,25 +940,43 @@ class RecordedLeaf:
         return self.worst_log if self.worst_log is not None else float(_log_over(self.worst, 1.0))
 
 
-def leaf_summary(reference, truth) -> RecordedLeaf:
+@dataclasses.dataclass(frozen=True)
+class _TruthRows:
+    """What `leaf_summary` reads of a truth leaf alone, read once a draw for both arms (`_evidence`):
+    each row's own RMS (`_scaled_rms`), its size (the RMS where it is past RESOLUTION of the leaf, else
+    zero: `row_errors`'s), and whether every value is finite."""
+
+    own: np.ndarray
+    sizes: np.ndarray
+    finite: bool
+
+    @staticmethod
+    def of(truth: np.ndarray) -> "_TruthRows":
+        own, sizes = _row_sizes(truth) if truth.ndim >= 2 else (np.zeros(0), np.zeros(0))
+        return _TruthRows(own, sizes, bool(np.isfinite(truth).all()))
+
+
+def leaf_summary(reference, truth, rows_of: _TruthRows | None = None) -> RecordedLeaf:
     """`RecordedLeaf` of a leaf against its float64 truth: check 1's evidence of the reference's leaf, or
-    of Dew's (`_drawn` reads both so, a recorded reference's as recorded). An empty leaf is exact."""
+    of Dew's (`_drawn` reads both so, a recorded reference's as recorded). An empty leaf is exact.
+    `rows_of` is the truth's own rows (`_TruthRows.of`), where a caller has read them already."""
     dtype = str(jnp.dtype(getattr(reference, "dtype", np.asarray(reference).dtype)))
     reference, truth = np.asarray(reference, np.float64), np.asarray(truth, np.float64)
     if not reference.size:
         assert truth.shape == reference.shape, (f"an empty leaf {reference.shape} against a truth "
                                                 f"{truth.shape}")
         return RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=True, dtype=dtype)
-    sizes, rows = row_errors(reference, truth)
-    sized = sizes > 0
+    held = rows_of or _TruthRows.of(truth)
     # Each row's own size by the arithmetic its errors take (`_scaled_rms`), so an arm exactly zero on a
-    # row is exactly its size from it.
-    own = _scaled_rms(truth.reshape(-1, truth.shape[-1])) if truth.ndim >= 2 else np.zeros(0)
+    # row is exactly its size from it: `row_errors`' sizes and errors, the truth's read once.
+    sizes, own = held.sizes, held.own
+    rows = _rows_rms(reference - truth, truth.shape[-1]) if truth.ndim >= 2 else np.zeros(0)
+    sized = sizes > 0
     logged = float(np.max(_log_over(rows[sized], sizes[sized]))) if sized.any() else LOG_ZERO
     return RecordedLeaf(float(np.mean(np.square(reference - truth))),
                         float(np.max(_over(rows[sized], sizes[sized]))) if sized.any() else 0.0,
                         np.flatnonzero(~sized), rows[~sized],
-                        finite=bool(np.isfinite(reference).all() and np.isfinite(truth).all()), dtype=dtype,
+                        finite=bool(np.isfinite(reference).all()) and held.finite, dtype=dtype,
                         zero_sizes=own[~sized], worst_log=logged)
 
 
@@ -1028,6 +1054,11 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
     trees are held alike first: Dew's, the reference's (a recorded one's leaves `RecordedLeaf`) and
     both truths the same leaves at the same paths, and each leaf the shape of its truth, so no leaf is
     paired with another's truth or compared through broadcasting."""
+    # Every leaf on the host in one transfer a tree, not one a leaf (`leaf_summary` reads them on the host);
+    # one truth stays one tree, as the draw gave it.
+    shared = their_truth is truth
+    dew, reference, truth = jax.device_get((dew, reference, truth))
+    their_truth = truth if shared else jax.device_get(their_truth)
     paths = _leaf_paths(truth)
     for name, tree in (("dew", dew), ("the reference", reference), ("the reference's truth", their_truth)):
         if _leaf_paths(tree) != paths:
@@ -1044,7 +1075,10 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
             if shape != np.shape(true):
                 raise AssertionError(f"{jax.tree_util.keystr(path)}: {name}'s shape is {shape}, the truth's "
                                      f"{np.shape(true)}")
-        their = their_leaf if recorded else leaf_summary(their_leaf, their_true)
+        # A truth's rows are read once a draw, for both arms where the two truths are the same values.
+        same = their_true is true
+        rows_of = None if not np.size(true) else _TruthRows.of(np.asarray(true, np.float64))
+        their = their_leaf if recorded else leaf_summary(their_leaf, their_true, rows_of if same else None)
         if np.size(leaf) == 0:
             # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
             # reference's dtype (its shape is held above; the truth's dtype, float64, is its own), it
@@ -1056,7 +1090,8 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = (recorded or their_truth is truth
                   or np.array_equal(np.asarray(true), np.asarray(their_true)))
-        row.append(_paired(jax.tree_util.keystr(path), leaf_summary(leaf, true), their, paired=paired))
+        mine = leaf_summary(leaf, true, rows_of)
+        row.append(_paired(jax.tree_util.keystr(path), mine, their, paired=paired))
     return row
 
 
@@ -1403,7 +1438,7 @@ def recorded_pilots(reference_fn, draw, count: int):
 
 
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
-              truth_fn=None, dew_fn=None) -> int:
+              truth_fn=None, dew_fn=None, orders=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
     interval is no wider than PARITY in every leaf, on the count's own draws and again on as many more
     (`_confirmed`): a doubling stops at the first count whose draws resolve, and where a leaf's errors
@@ -1431,7 +1466,9 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     Each draw is evaluated once however many doublings the sizing takes: a count's draws are its
     predecessor's and the seeds it adds, twice the count of them with the confirming block, the
     reference compared with itself takes its seeds 0 to four times the count (each block's first half
-    against its second), and the reference on the same inputs runs once."""
+    against its second), and the reference on the same inputs runs once. `orders` sizes a site whose
+    verdict sweeps them (`assert_as_exact`'s `orders`): each seed's evidence is its draw's over every
+    order, as the verdict reads it."""
     if dew_fn is not None and getattr(reference_fn, "recorded", False):
         pilots = getattr(reference_fn, "pilots", None)
         if pilots is None:
@@ -1452,7 +1489,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
         held = 0 if drawn is None else len(drawn.theirs)
         block = 2 * count if dew_fn is None else count
         fresh = _drawn(dew_fn or reference_fn, reference_fn, draw, range(first + held, first + 2 * block),
-                       truth_fn)
+                       truth_fn, orders=orders)
         drawn = fresh if drawn is None else drawn.joined(fresh)
         wide = _confirmed(drawn.names, drawn.theirs, count, None if dew_fn is None else drawn.mine)
         if not wide:
@@ -1596,7 +1633,30 @@ def input_digest(inputs) -> np.uint64:
     return np.frombuffer(digest.digest()[:8], np.uint64)[0]
 
 
-def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn=None):
+LEAF_ENTRIES = ("reference", "truth", "mse", "worst", "finite", "sketch", "zero_rows", "zero_errors",
+                "zero_offsets", "shape", "dtype")
+"""The kinds of a recording's entries kept one a leaf, `<site>.<kind>.<leaf>` (a pilot's
+`<site>.pilot.<kind>.<leaf>`): a full recording's outputs and truths, a summarized one's evidence and
+sketches. Every other entry (inputs, digests, counts, provenance) is the whole recording's."""
+
+
+def _of_leaves(stored, site: str, leaves) -> dict:
+    """`stored` with the entries of `leaves` alone of those kept one a leaf (LEAF_ENTRIES), verdict and
+    pilot alike, and every entry the whole recording shares; a leaf the recording lacks is refused."""
+    wanted, found, kept = set(leaves), set(), {}
+    for key, value in stored.items():
+        kind, _, name = key.removeprefix(f"{site}.").removeprefix("pilot.").partition(".")
+        if key.startswith(f"{site}.") and kind in LEAF_ENTRIES and name:
+            if name not in wanted:
+                continue
+            found.add(name)
+        kept[key] = value
+    if wanted - found:
+        raise ValueError(f"{site}: the recording holds no leaves {sorted(wanted - found)}")
+    return kept
+
+
+def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn=None, leaves=None):
     """`assert_as_exact`'s draw, reference and truth for a reference recorded over seeds, where it cannot
     run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.reference.<name>` and
     `<site>.truth.<name>`, and `<site>.input.<name>` unless `inputs_of(seed)` draws a seed's inputs again
@@ -1623,7 +1683,14 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
     truth has a row of float64 zero the recording's had not is refused. Its reference and truth are
     host functions, called as check 1 calls them, not traced. Where it holds pilots (`<site>.pilot.`,
     `merge_shards`), seeds from SIZING_FROM on read them, and its reference carries them
-    (`recorded_pilots`'s `.pilots`), so a paired sizing of it takes those draws alone (`seeds_for`)."""
+    (`recorded_pilots`'s `.pilots`), so a paired sizing of it takes those draws alone (`seeds_for`).
+
+    With `leaves`, the recording is read for those leaves alone (`_of_leaves`): a site whose leaves are
+    judged in groups, each its own test, reads each group so, its Dew arm and truth giving that group's
+    leaves. Check 1 judges every leaf on its own tails, so a group draws its second stage on its own
+    leaves' account alone, which looks at a passing leaf no more often than the whole site would."""
+    if leaves is not None:
+        stored = _of_leaves(stored, site, leaves)
     if any(name.startswith(f"{site}.sketch.") for name in stored):
         return _summarized(stored, site, seeds, inputs_of, truth_fn)
 

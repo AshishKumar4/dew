@@ -939,6 +939,7 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
+                          context_segments=given("context_segments"),
                           blocks=given("blocks"), max_segments=max_segments,
                           spans_in_context=spans_in_context)
 
