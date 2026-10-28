@@ -315,8 +315,10 @@ def _dkv_step(walk: _Backward, resident: tuple, powered, rows_of, staged, coords
     q_first = index * tiles.block_q
     # The logits' queries the forward's own, by its power (`by_power`), staged as the product's operand: the
     # keys by it would differ where one leaves bf16's range (a key of 2^-126 under a power of 2^-9).
-    queries = q_slot if powered is None else family.staged(
-        by_power(family.tile_of(q_slot), walk.spec.prescale), powered)
+    queries = q_slot
+    if powered is not None:
+        family.staged(by_power(family.tile_of(q_slot), walk.spec.prescale), powered)
+        queries = powered
     s = family.product(k_smem, queries.transpose((1, 0)), shape)
     dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
     params = params_of(q_first, s)
