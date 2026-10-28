@@ -222,14 +222,16 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     question's logits and the parameters' gradients each row gives alone where its window packed it,
     through Qwen3.5's Gated DeltaNet conv and state and its attention, and through the head, within
     the float64 gate: no state, attention, pooled span or last-token feature crosses a row. The float64
-    truth is the rows in windows of their own in float64.
+    truth is the rows in windows of their own in float64, on the reference attention (the template takes
+    fp32, bf16 and fp16).
 
     The reference runs the same kernels at the same shapes as the window (`rows_alone`), so this
     holds what packing does; on a GPU the delta rule runs on its port in both, and its algorithm's
     parity with fla is held at the layer, against fla's own packed sequences (test_fla_gdn,
     test_fla_kda)."""
     objective = objective_for(arm)
-    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
+    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64,
+                                                                         attention_impl="reference"),
                                           objective.model.head.clone(dtype=jnp.float64)), PACKING_SEEDS[arm],
                               PACKING_WINDOWS.get(arm, 2))
 
