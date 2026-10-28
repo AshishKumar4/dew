@@ -106,7 +106,10 @@ tpu = ["libtpu==0.0.50.*", "requests"]
 profile = ["xprof>=2.23.1,!=2.23.2,<3"]
 # dew.quantization: quantized training and serving. Qwix declares
 # jax, jaxlib and flax>=0.12.0 unpinned, which the pins above satisfy.
-quantization = ["qwix==0.1.8"]
+# Dew's build of it (pypi.dewml.dev): 0.1.8, get_current_rule reaching a nested
+# provider where the outer one's rules match nothing, and a public
+# qwix.is_quantized(model).
+quantization = ["qwix==0.1.8.post2"]
 test = [
     "pytest",
     # tools/armada/ci.py's coverage report: branch coverage of src/dew over the suite on armada.
@@ -330,7 +333,7 @@ markers = [
     "gpu(reason): tests only a cuda device runs; tests/conftest.py skips them on any other backend, and a GPU session runs them with -m gpu",
     "tpu(reason): tests only a tpu runs; tests/conftest.py skips them on any other backend, and the TPU tier (dew-ops' dewops.node.tpu, a Colab TPU at main's tip after each train) runs them with -m tpu",
     "torchax: tests whose code imports torchax, which renames torch's privateuse1 backend process-wide; CI runs these files in tasks of their own (tools/armada/ci.py)",
-    "whole_suite: tests too long for a train's run of what changed, which CI runs where nothing is reused (the daily run, a full-* branch, a change every test reads) (tools/armada/ci.py)",
+    "whole_suite: tests too long for a train's run of what changed, which CI runs on the whole suite's run alone (DEW_WHOLE_SUITE, set on ci/full-whole-* branches) and sets aside on every other run, a policy-off train's too (tools/armada/ci.py)",
     "kernel: tests of a GPU kernel's code (Pallas, Triton, fla): the CPU suite lowers and interprets them, and the kernel lab's GPU tier runs every one, with every gpu test, on each target GPU before the kernel lands, but for check 1 on the TPU SSD kernel, which no user runs on a GPU",
 ]
 # A warning is a failure waiting to be reported, so the ones dew is
