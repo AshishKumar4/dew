@@ -1015,7 +1015,8 @@ class Trainer(Generic[Loss, Effects]):
             lower, lambda candidate: step_options(self.objective, candidate.micro,
                                                   candidate.prepared.variables, mesh),
             self.objective, mesh, self._xla_defaults, self._narrow,
-            None if self._base_rung is None else self._base_rung[1], resumed)
+            None if self._base_rung is None else self._base_rung[1], resumed,
+            advise=recorded is None and resumed is None)
         plans, probes = search.plans(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
             # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
@@ -1038,7 +1039,7 @@ class Trainer(Generic[Loss, Effects]):
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
             keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
-        self.plan = settled(planned, plans, seconds, probes)
+        self.plan = settled(planned, plans, seconds, probes, search.cheaper_fit)
         if planned.split != candidates[0] or seconds:
             _log.info("the step fits the devices in the plan %s", self.plan)
         return planned.released(), flops

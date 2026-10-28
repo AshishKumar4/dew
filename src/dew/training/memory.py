@@ -26,7 +26,7 @@ from dew.distributed.placement import parameter_axes
 from dew.mesh import batch_axes, mesh_axes
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
-from dew.nn.protocols import Recomputing, TritonGemm
+from dew.nn.protocols import Recomputing, RematChoosing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
 
@@ -484,6 +484,36 @@ def remat_half[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list |
     objective.substitute([entry.module if module is None else module
                           for module, entry in zip(half, entries, strict=True)])
     return held
+
+
+def remat_below[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list[list]:
+    """The modules the objective trains at each rung of their remat ladders below where they stand,
+    cheapest first, each the list `objective.substitute` takes: every trained module put at no
+    recomputation (`RematChoosing.with_remat`) and moved up its own ladder a rung at a time
+    (`Recomputing.recompute_more`), as the fit search climbs, until the rung they stand at. Empty where
+    a trained module chooses no remat, stands at no recomputation, or off its ladder, where no rung is
+    below it."""
+    entries = objective.program_key()
+    trained = [entry.trained and isinstance(entry.module, Recomputing) for entry in entries]
+    if not any(trained) or not all(isinstance(entry.module, RematChoosing)
+                                   for entry, chosen in zip(entries, trained, strict=True) if chosen):
+        return []
+
+    def records(modules) -> list:
+        return [module.recompute_record() if chosen else None
+                for module, chosen in zip(modules, trained, strict=True)]
+    here = records([entry.module for entry in entries])
+    modules = [entry.module.with_remat(None) if chosen else entry.module
+               for entry, chosen in zip(entries, trained, strict=True)]
+    below: list[list] = []
+    while records(modules) != here:
+        below.append(modules)
+        stronger = [module.recompute_more() if chosen else module
+                    for module, chosen in zip(modules, trained, strict=True)]
+        if any(module is None for module in stronger):
+            return []
+        modules = stronger
+    return below
 
 
 def remat_more[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:

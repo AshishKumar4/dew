@@ -45,6 +45,7 @@ from dew.training.memory import (
     head_tile_of,
     recompute_more,
     recompute_record,
+    remat_below,
     remat_half,
     remat_more,
     rung_record,
@@ -476,14 +477,21 @@ class Forecast:
 
 
 def settled(planned: Planned, plans: Sequence[Planned], seconds: Sequence[Sequence[float]],
-            probes: Sequence[Probe]) -> dict[str, JSON]:
+            probes: Sequence[Probe], cheaper: Probe | None = None) -> dict[str, JSON]:
     """The record of `planned`, of `plans` a frontier timed at `seconds` a
     step (none where one plan fit first): every compile the search made,
-    `probes`, each timed plan's split, rows, rung and seconds, and the
-    planned step's kernels (`KernelReport.record`: each dispatch's route
-    and each kernel's lowered launches), which the run log states."""
+    `probes`, each timed plan's split, rows, rung and seconds, the planned
+    step's kernels (`KernelReport.record`: each dispatch's route and each
+    kernel's lowered launches), which the run log states, and the cheapest
+    remat rung below the run's own that fits too (`FitSearch.cheaper`),
+    which the run is told of."""
     _log.info("the step's %s", planned.candidate.kernels.summary())
+    if cheaper is not None:
+        _log.warning("the run sets remat %r, and %s fits the devices too with %s bytes to spare, recomputing "
+                     "less: set remat to it to train faster", planned.rung["remat"], cheaper.named(),
+                     cheaper.headroom)
     return {**planned.record(), "kernels": planned.candidate.kernels.record(),
+            "cheaper": None if cheaper is None else cheaper.record(),
             "probes": [probe.record() for probe in probes],
             "timed": [{**plan.record(), "seconds": min(took)}
                       for plan, took in zip(plans, seconds, strict=True)] if seconds else None}
@@ -540,9 +548,15 @@ class FitSearch[LossT, EffectsT]:
     """The plan the search last found to fit: its candidate, executable and the options it compiled under."""
     dropped: str | None = None
     """The rung (`rung`) the narrow copies were dropped at."""
+    advise: bool = False
+    """Whether a plan at the remat the run set itself asks the rungs below it (`cheaper`): not where it
+    continues a recorded or resumed plan."""
+    cheaper_fit: Probe | None = None
+    """The cheapest remat rung below the plan's own that fits its split too, where `cheaper` found one."""
 
     def __post_init__(self):
         self.factor = temporaries_factor(self.mesh)
+        self.started = self.remat_rung()
         # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
         self.required = compiler_options(*self.objective.towers()) or None
 
@@ -557,6 +571,8 @@ class FitSearch[LossT, EffectsT]:
         if split is None or self.fitted is None:
             raise RuntimeError(unplanned(self.probes)) from (self.refusals[-1] if self.refusals else None)
         plans = [self.found(split)]
+        if self.advise and self.remat_rung() == self.started:
+            self.cheaper_fit = self.cheaper(split)
         if (frontier and opens_frontier(split, candidates[0], self.mesh)
               and self.onward(lambda: remat_more(self.objective))):
             self.objective.tile_head()
@@ -618,6 +634,27 @@ class FitSearch[LossT, EffectsT]:
                          "here the resumed run computes otherwise than the run it continues", self.resumed)
             self.resumed = None
         return False
+
+    def cheaper(self, split: int) -> Probe | None:
+        """The cheapest remat rung below the plan's that fits `split` too, compiled at each rung below it
+        from the cheapest (`remat_below`) until one fits, the plan's own rung left as it was. A run that
+        sets its remat keeps it, as the search starts there and only climbs (`planned`); this tells it
+        what a cheaper one would cost in memory instead (row 2026)."""
+        held = [entry.module for entry in self.objective.program_key()]
+        try:
+            for modules in remat_below(self.objective):
+                self.objective.substitute(modules)
+                candidate = self.lower(split, self.narrow)
+                options = self.required if self.xla_defaults else self.options(candidate)
+                executable = compiled_if_it_fits(candidate.lowered, options, self.refusals)
+                fit, headroom = step_fits(executable, self.mesh, candidate.held)
+                probe = Probe.read(split, candidate, self.current(), fit, headroom, executable)
+                self.probes.append(probe)
+                if fit:
+                    return probe
+            return None
+        finally:
+            self.objective.substitute(held)
 
     def climb(self) -> bool:
         # The first rung drops the narrow copies, two bytes a parameter held all run for 1-2% of a step.

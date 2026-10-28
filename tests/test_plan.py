@@ -9,6 +9,7 @@ import contextlib
 import dataclasses
 import functools
 import gc
+import logging
 import struct
 import weakref
 from collections.abc import Callable, Iterator
@@ -943,3 +944,34 @@ def test_a_gemm_autotuner_out_of_memory_is_a_refusal_for_memory(code, message, r
     except jax.errors.JaxRuntimeError as raised:
         outcome = raised
     assert (outcome, refusals) == ((None, [error]) if refused else (error, []))
+
+
+def test_a_run_that_sets_its_remat_keeps_it_and_is_told_of_the_cheapest_rung_below_that_fits(
+        monkeypatch, caplog):
+    """A run that sets remat 'full' with room for 'minimal' and not for no recomputation trains at
+    'full', as it asked, and its plan record and its log name 'minimal', the cheapest rung below that
+    fits, with its headroom; no recomputation is asked and misses on the way (row 2026). Before, a run's
+    own remat was the plan's whole story."""
+    free(monkeypatch, needs(monkeypatch, lm(split=1, remat=REMAT_POLICIES["minimal"])))
+    trainer = lm(split=1, remat=REMAT_POLICIES["full"])
+    with caplog.at_level(logging.WARNING, logger="dew.training.planning"):
+        trained(trainer, steps=0)
+    assert trainer.plan["remat"] == "full" and trainer.objective.model.remat == REMAT_POLICIES["full"]
+    cheaper = trainer.plan["cheaper"]
+    assert (cheaper["remat"], cheaper["fits"]) == ("minimal", True) and cheaper["headroom"] >= 0
+    assert [(probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]][-2:] == [
+        (None, False), ("minimal", True)]
+    assert any("'minimal'" in record.getMessage() for record in caplog.records)
+
+
+def test_a_run_at_no_recomputation_or_climbed_by_its_search_asks_no_rung_below(monkeypatch):
+    """A run whose search climbed from no recomputation, and one at no recomputation, has no cheaper
+    rung to be told of: its plan record names none."""
+    free(monkeypatch, needs(monkeypatch, lm(split=1, remat=REMAT_POLICIES["minimal"])))
+    trainer = lm(split=1)
+    trained(trainer, steps=0)
+    free(monkeypatch, LIMIT)
+    assert trainer.plan["cheaper"] is None
+    unclimbed = lm(split=1)
+    trained(unclimbed, steps=0)
+    assert unclimbed.plan["remat"] is None and unclimbed.plan["cheaper"] is None
