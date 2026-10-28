@@ -23,7 +23,6 @@ import pytest
 from model_support import decode_through
 from reference_error import (
     FACTOR,
-    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     declared_seeds,
@@ -31,6 +30,7 @@ from reference_error import (
     recording,
     widened,
 )
+from sequence_split_support import SPLIT_ROWS, assert_split_as_whole
 from ssd_support import mamba2_draw, mamba2_run
 
 from dew.accuracy import distance
@@ -279,32 +279,6 @@ def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):
     assert not jnp.any(padded[1][~valid[1]])
 
 
-SPLIT_ROWS = {
-    # Every slot real, as a pool of processes fills validity where no producer padded.
-    "all_valid": (np.ones(32, bool), None),
-    # Right-padded: real tokens first, the tail padding inside the last two shards.
-    "right_padded": (np.arange(32) < 21, None),
-    # Left-padded: a prompt's padding in front, across the first shard and into the second.
-    "left_padded": (np.arange(32) >= 11, None),
-    # Gaps inside a document, one at a shard's cut, and a shard holding a single real token, fewer
-    # than the conv's three-token history: its next shard reads the ones before it too.
-    "gaps": (~np.isin(np.arange(32), [2, 7, 8, 13, 16, 17, 18, 19, 20, 21, 22, 25]), None),
-    # Packed documents with gaps between and inside them, one starting on a shard's first real token.
-    "packed": (~np.isin(np.arange(32), [5, 6, 14, 15, 30, 31]),
-               np.repeat([1, 1, 2, 3], [5, 11, 8, 8])),
-    # A whole interior shard of padding with real tokens on both sides: the history and the state
-    # cross it unchanged.
-    "empty_shard": (~((np.arange(32) >= 8) & (np.arange(32) < 16)), None),
-    # The same with one document continuing across the empty shard and another starting after it.
-    "empty_shard_packed": (~((np.arange(32) >= 8) & (np.arange(32) < 16)),
-                           np.repeat([1, 2], [20, 12])),
-}
-"""Each row of the sequence split's check: its real tokens and its documents (None for one)."""
-
-SPLIT_BATCH = 8
-"""The rows a sequence-split draw holds: every parameter's gradient, the heads' `D` and `A_log` too,
-sums over all of them."""
-
 SPLIT_SEEDS = {"all_valid": 64, "right_padded": 128, "left_padded": 128, "gaps": 128, "packed": 256,
                "empty_shard": 256, "empty_shard_packed": 64}
 """Each row's declared draws, sized by `seeds_for` on armada paired with the unsplit layer: the two arms
@@ -317,47 +291,10 @@ that the unsplit layer against itself resolves none of them within 512 draws."""
 @pytest.mark.parametrize("row", sorted(SPLIT_ROWS))
 def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_ones(reference, geometry, row):
     """Under a sequence axis of 4, the layer runs rows with padding as `held_scan` runs them on one
-    device: a padded slot neither reads nor advances the conv or the state, each real token's conv
-    reading the real tokens before it in its document across gaps and shards, and padded slots emit
-    zero. Output and input gradient are check 1's against the unsplit layer, from float64, over drawn
-    hidden states, and so are the parameters' gradients. A pool of processes always carries
-    validity, so this is every multi-host run."""
-    module = layer(geometry)
-    variables = layer_params(reference)
-    valid, segments = SPLIT_ROWS[row]
-    fields = {"valid": jnp.asarray(np.broadcast_to(valid, (SPLIT_BATCH, 32)))}
-    if segments is not None:
-        fields["segments"] = jnp.asarray(np.broadcast_to(segments, (SPLIT_BATCH, 32)), jnp.int32)
-    call = MixerCall(AttentionMetadata(coordinates=coordinates(**fields)))
-    width = geometry["hidden_size"]
-
-    def draw(seed):
-        rng = np.random.default_rng([0x5E9, seed])
-        return (rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32),
-                rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32))
-
-    def run(model, params, mesh=None):
-        def pulled(hidden, cotangent):
-            out, pull = jax.vjp(lambda params, hidden: model.apply(params, hidden, call), params, hidden)
-            return out, *pull(cotangent)
-        if mesh is None:
-            return jax.jit(pulled)
-        @as_given
-        def split(hidden, cotangent):
-            with jax.set_mesh(mesh):
-                return jax.jit(pulled)(hidden, cotangent)
-        return split
-
-    @as_given
-    def truth(hidden, cotangent):
-        with jax.enable_x64(new_val=True):
-            return run(module.clone(dtype=jnp.float64), widened(variables))(*widened((hidden, cotangent)))
-
-    mesh = MeshSpec(sequence=4).build(jax.devices()[:4])
-    assert_as_exact(run(module, variables, mesh), run(module, variables), draw,
-                    f"mamba2 split over the sequence, {row}", seeds=SPLIT_SEEDS[row], truth_fn=truth)
-    split = run(module, variables, mesh)(*draw(0))[0]
-    assert not np.any(np.asarray(split)[:, ~valid])
+    device (`assert_split_as_whole`). A pool of processes always carries validity, so this is every
+    multi-host run."""
+    assert_split_as_whole(layer(geometry), layer_params(reference), row, SPLIT_SEEDS[row],
+                          f"mamba2 split over the sequence, {row}", width=geometry["hidden_size"])
 
 
 @pytest.mark.mesh

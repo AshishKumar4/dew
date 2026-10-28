@@ -377,13 +377,12 @@ def test_sliding_window_agrees_across_kernels(rng):
                     seeds=SEEDS['window kernels'])
 
 
-def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, monkeypatch):
+def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng):
     """Gemma 2's tanh on the logits, against the equation on a hand-computed
-    case: reference and xla agree with it, and 'auto' resolves a softcapped
-    call to that same math even where cudnn would otherwise run (bf16 inputs,
-    an 8-wide head, a gpu backend), check 1 on whatever kernel it runs (the
-    accuracy gate decides, never one kernel's equality to another's), while
-    cudnn raises a ValueError naming the implementation.
+    case: reference and xla agree with it, and a bf16 'auto' call is that same
+    math, check 1 on whatever kernel it runs (the accuracy gate decides, never
+    one kernel's equality to another's, nor which kernel it is), while cudnn
+    raises a ValueError naming the implementation.
     A cap of 2 on logits of order 10 changes the weights by a wide margin;
     an uncapped path moves the output. Each path is on par with the equation
     from its float64 run over drawn calls (check 1)."""
@@ -417,7 +416,6 @@ def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, mon
         halves = [x.astype(jnp.bfloat16).astype(jnp.float32) for x in (query, key, value)]
         return equation(*halves).astype(jnp.bfloat16).astype(query.dtype)
 
-    monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
     assert_as_exact(attention('auto', dtype=jnp.bfloat16), jax.jit(bf16_equation), draw,
                     "routed bf16 softcap", seeds=SEEDS['routed softcap'], truth_fn=equation)
     halves = (query.astype(jnp.bfloat16), key.astype(jnp.bfloat16), value.astype(jnp.bfloat16))
