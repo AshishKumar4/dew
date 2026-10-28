@@ -1342,8 +1342,13 @@ def fitted[Entry](
     named = {"val": validation} if isinstance(validation, Dataset) else validation
     # Every chain the run reads binds the widths measured over them all (`run_widths`), each measured
     # once, as its read prepares it, and read on from there.
-    scored = {name: _held_measure(entry._chain(), objective) for name, entry in (named or {}).items()
-              if isinstance(entry, Dataset)}
+    # Each held chain is measured in the batches it is read in: its own, else training's (`held`), where
+    # training states its batch ahead; a token budget's rows are counted as it compiles.
+    trained = (next((stage.size for stage in dataset._chain().stages if isinstance(stage, BatchStage)), None)
+               if isinstance(dataset, Dataset) else dataset.batch)
+    held_chains = {name: _held_batched(entry._chain(), trained, unbatched=trained is None)
+                   for name, entry in (named or {}).items() if isinstance(entry, Dataset)}
+    scored = {name: _held_measure(chain, objective) for name, chain in held_chains.items()}
     if isinstance(dataset, Dataset):
         chain = dataset._chain()
         trained = chain if examples is not None else _endless(chain)
@@ -1403,24 +1408,29 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
     refused. A pass reads every record: a batch it fills only in part keeps the records it holds,
     filled out with copies its `VALID_ROWS` marks, where a training read would drop them. `measured`
     is the chain as its run's widths measured it (`_held_measure`), which it reads as it stands."""
-    chain = dataset._chain()
+    chain = _held_batched(dataset._chain(), batch)
     if measured is None:
         measured = _held_measure(chain, objective)
-
-    def batched(pipeline: Pipeline) -> Pipeline:
-        if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in pipeline.stages):
-            if batch is None:
-                raise ValueError(f"{_name(chain)} states no batch; batch it (`.batch(n)`) or give batch=")
-            pipeline = pipeline.batch(batch, drop_remainder=False)
-        return dataclasses.replace(pipeline, stages=tuple(
-            dataclasses.replace(stage, drop_remainder=False) if isinstance(stage, (BatchStage, TokenBudget))
-            else stage for stage in pipeline.stages))
-
     # The chain's own batch is the one it is read in; validation's `batch` adds none to it.
-    measured = dataclasses.replace(measured, branches=tuple(map(batched, measured.branches)))
     return validation(measured.branches[0], batch=1, objective=objective, read=_held_read(chain),
                       loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed, widths=widths,
                       measured=measured)
+
+
+def _held_batched(chain: Pipeline, batch: int | None, *, unbatched: bool = False) -> Pipeline:
+    """A held `chain` in its own batches, else in batches of `batch`, each keeping a short last one; one
+    that states neither is refused, or left as it is where it may be (`unbatched`, a batch not yet
+    known). It is batched before it is measured (`_held_measure`), so an objective's batch steps follow
+    its batch as they do in training."""
+    if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
+        if batch is None and unbatched:
+            return chain
+        if batch is None:
+            raise ValueError(f"{_name(chain)} states no batch; batch it (`.batch(n)`) or give batch=")
+        chain = chain.batch(batch, drop_remainder=False)
+    return dataclasses.replace(chain, stages=tuple(
+        dataclasses.replace(stage, drop_remainder=False) if isinstance(stage, (BatchStage, TokenBudget))
+        else stage for stage in chain.stages))
 
 
 def _held_read(chain: Pipeline) -> Read:
