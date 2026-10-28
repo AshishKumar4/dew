@@ -171,4 +171,5 @@ def test_a_lazy_packages_modules_read_through_it_as_an_eager_packages_did(packag
     script = (f"import importlib, {package}\n"
               f"assert getattr({package}.{module}, {name!r}) is getattr(importlib.import_module("
               f"'{package}.{module}'), {name!r})\n")
-    subprocess.run([sys.executable, "-c", script], check=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    subprocess.run([sys.executable, "-c", script], check=True,
+                   env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)})
