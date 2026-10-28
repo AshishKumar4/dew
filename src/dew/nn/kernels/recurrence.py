@@ -251,6 +251,20 @@ def read(hooks: Hooks, operands, *, optional: tuple[str, ...] = ()) -> dict:
     return {name: array for name, array in given.items() if array is not None}
 
 
+def _activated(pre, conv: Conv):
+    """The conv's sums `pre` activated as `conv` says: SiLU, or as they are."""
+    return pre if conv.activation is None else pre * jax.nn.sigmoid(pre)
+
+
+def _split(convolved, key_heads: int, value_heads: int, key_width: int, value_width: int):
+    """A conv's channels `[rows, C]` as the queries and keys `[rows, Hk, Dk]` and the values `[rows, Hv,
+    Dv]` they hold, in that order: the one splitter the reference's conv and its one-tap form share."""
+    rows = convolved.shape[0]
+    query, key, value = jnp.split(convolved, [key_heads * key_width, 2 * key_heads * key_width], axis=-1)
+    return (query.reshape(rows, key_heads, key_width), key.reshape(rows, key_heads, key_width),
+            value.reshape(rows, value_heads, value_width))
+
+
 def _prologue(hooks: Hooks, given: dict, work):
     """The reference's queries `[rows, Hv, Dk]`, keys, values `[rows, Hv, Dv]`, each in `work`, and
     the moved history (None without a conv): the conv's sums in `work` over the history rounded to
@@ -262,12 +276,8 @@ def _prologue(hooks: Hooks, given: dict, work):
         key_heads = _pieces(hooks, value_heads, key_width, value_width, token.shape[-1])
         window = jnp.concatenate([held.astype(token.dtype), token[:, None]], axis=1).astype(work)
         pre = jnp.sum(window * jnp.swapaxes(given['taps'].astype(work), 0, 1)[None], axis=1)
-        convolved = pre if hooks.conv.activation is None else pre * jax.nn.sigmoid(pre)
-        rows = token.shape[0]
-        split = [key_heads * key_width, 2 * key_heads * key_width]
-        query, key, value = jnp.split(convolved, split, axis=-1)
-        query, key = (x.reshape(rows, key_heads, key_width) for x in (query, key))
-        value = value.reshape(rows, value_heads, value_width)
+        query, key, value = _split(_activated(pre, hooks.conv), key_heads, value_heads, key_width,
+                                   value_width)
         # The history and the token, then all but the oldest: a one-tap conv holds none.
         history = jnp.concatenate([held, token[:, None].astype(held.dtype)], axis=1)[:, 1:]
     else:
@@ -673,15 +683,13 @@ def _one_tap(hooks: Hooks, conv: Conv, operands: Step, given: dict, dtype):
     without a conv, the output in the token's dtype unless `dtype` names another, the empty history
     returned as it came."""
     token = given['token']
-    rows, (value_heads, key_width, value_width) = token.shape[0], given['state'].shape[1:]
+    value_heads, key_width, value_width = given['state'].shape[1:]
     key_heads = _pieces(hooks, value_heads, key_width, value_width, token.shape[-1])
     work = at_least_fp32(token.dtype)
     pre = token.astype(work) * given['taps'][:, 0].astype(work)
-    convolved = pre if conv.activation is None else pre * jax.nn.sigmoid(pre)
-    query, key, value = jnp.split(convolved, [key_heads * key_width, 2 * key_heads * key_width], axis=-1)
-    unconvolved = dataclasses.replace(
-        operands, token=None, held=None, taps=None, query=query.reshape(rows, key_heads, key_width),
-        key=key.reshape(rows, key_heads, key_width), value=value.reshape(rows, value_heads, value_width))
+    query, key, value = _split(_activated(pre, conv), key_heads, value_heads, key_width, value_width)
+    unconvolved = dataclasses.replace(operands, token=None, held=None, taps=None, query=query, key=key,
+                                      value=value)
     out, _, state = step(dataclasses.replace(hooks, conv=None), unconvolved,
                          dtype=token.dtype if dtype is None else dtype)
     return out, given['held'], state
