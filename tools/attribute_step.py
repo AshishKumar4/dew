@@ -322,27 +322,30 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         "xprof_steps": report_table(reports / "input_pipeline_analyzer.json", 1)[1][:8],
     }
     if model_flops:
-        # Utilization of the step's busy device time, the union of its kernels (`program_window`), a
-        # diagnostic beside the canonical MFU over wall time (docs/design/training.md), none without an
-        # accelerator timeline. It names its precision: mfu_bf16, model FLOPs over the bf16 peak, which
-        # is utilization only when every GEMM is bf16 and otherwise a bf16-equivalent throughput;
-        # mfu_mixed, each GEMM's FLOPs over its own precision's peak, the true utilization, null where
-        # an FP8 GEMM runs on a device with no FP8 peak in Dew's table.
         seconds = timeline["busy"] / steps / 1e9 if timeline else None
-        fp8 = fp8_gflop * 1e9
-        throughput = round(model_flops / seconds / 1e12, 2) if seconds else None
-        result.update(model_flops_per_step=model_flops, fp8_gemm_flops_per_step=fp8,
-                      bf16_equiv_throughput_tflops=throughput)
-        result["mfu_bf16_of_device_time"] = (
-            round(model_flops / seconds / (peak * 1e9), 4) if peak and seconds else None)
-        if seconds and peak and not fp8:
-            result["mfu_mixed_of_device_time"] = result["mfu_bf16_of_device_time"]
-        elif seconds and peak and fp8_peak and fp8 <= model_flops:
-            share = ((model_flops - fp8) / (peak * 1e9) + fp8 / (fp8_peak * 1e9)) / seconds
-            result["mfu_mixed_of_device_time"] = round(share, 4)
-        else:
-            result["mfu_mixed_of_device_time"] = None
+        result.update(utilization(model_flops, fp8_gflop * 1e9, seconds, peak, fp8_peak))
     return result
+
+
+def utilization(model_flops: float, fp8: float, seconds: float | None, peak: float | None,
+                fp8_peak: float | None) -> dict:
+    """Utilization of the step's busy device time, `seconds` (the union of its kernels,
+    `program_window`), a diagnostic beside the canonical MFU over wall time (docs/design/training.md),
+    none without an accelerator timeline. It names its precision: mfu_bf16, model FLOPs over the bf16
+    peak, which is utilization only when every GEMM is bf16 and otherwise a bf16-equivalent
+    throughput; mfu_mixed, each GEMM's FLOPs over its own precision's peak (`fp8` the FP8 GEMMs'), the
+    true utilization, null where an FP8 GEMM runs on a device with no FP8 peak in Dew's table."""
+    throughput = round(model_flops / seconds / 1e12, 2) if seconds else None
+    mfu_bf16 = round(model_flops / seconds / (peak * 1e9), 4) if peak and seconds else None
+    if seconds and peak and not fp8:
+        mixed = mfu_bf16
+    elif seconds and peak and fp8_peak and fp8 <= model_flops:
+        mixed = round(((model_flops - fp8) / (peak * 1e9) + fp8 / (fp8_peak * 1e9)) / seconds, 4)
+    else:
+        mixed = None
+    return {"model_flops_per_step": model_flops, "fp8_gemm_flops_per_step": fp8,
+            "bf16_equiv_throughput_tflops": throughput, "mfu_bf16_of_device_time": mfu_bf16,
+            "mfu_mixed_of_device_time": mixed}
 
 
 def gemm_precision(row: dict, known: HloInstruction | None) -> str:
