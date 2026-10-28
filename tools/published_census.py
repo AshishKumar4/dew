@@ -21,6 +21,7 @@ refusals, each a row, then the bases that load), and prints the table.
 """
 
 import argparse
+import itertools
 import json
 import os
 import subprocess
@@ -81,16 +82,24 @@ def resolved(repos: Sequence[str]) -> list[tuple[str, str]]:
 
 def loaded(repo: str, revision: str, env: dict[str, str] | None = None) -> Row:
     """`repo` at `revision` loaded without its weights in a process of its own (`_LOAD`) under `env`
-    (this process's by default), as a census row: a refusal is its exception's last line, the Hub's
-    when the exception is one of `huggingface_hub`'s errors."""
+    (this process's by default), as a census row: a refusal is the exception the process ended on
+    (`ended_on`), the Hub's when it is one of `huggingface_hub`'s errors."""
     done = subprocess.run([sys.executable, "-c", _LOAD, repo, revision], env=env, capture_output=True,
                           text=True, check=False)
     if done.returncode == 0:
         return Row(repo, revision, "loads", parameters=int(done.stdout.split()[-1]))
-    lines = done.stderr.strip().splitlines()
-    reason = lines[-1] if lines else f"exit {done.returncode}"
+    reason = ended_on(done.stderr) or f"exit {done.returncode}"
     return Row(repo, revision, "hub" if reason.startswith("huggingface_hub.errors.") else "refused",
                reason=reason)
+
+
+def ended_on(stderr: str) -> str:
+    """The exception a Python process's `stderr` ends on, as its last traceback states it: the first
+    unindented line after the traceback's frames, its type and message, the message's further lines
+    joined to it."""
+    tail = stderr.rsplit("Traceback (most recent call last):", 1)[-1].splitlines()
+    stated = itertools.dropwhile(lambda line: not line.strip() or line.startswith(" "), tail)
+    return " ".join(line.strip() for line in stated if line.strip())
 
 
 def census(bases: Sequence[tuple[str, str]], *, jobs: int = 2,
