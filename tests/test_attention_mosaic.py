@@ -70,7 +70,7 @@ FORM_TILES = attention_mosaic.Tiles(64, 64, 2, 2)
 """The call forms' tiles: the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
 pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams."""
 HEAD_WIDTHS = ((64, 128), (128, 64), (80, 48))
-"""The (query, value) head widths the forward is checked at: a value wider than its query, a narrower one, and
+"""The (query, value) head widths the forward and the backward are checked at: a value wider than its query, a narrower one, and
 both off a power of two (80 and 48 pad to 128 and 64, `attention.padded_call`)."""
 
 
@@ -243,14 +243,16 @@ def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form
 
 def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys: int | None = None,
                     residuals_from=None, target: generation.GpuTarget | None = None,
-                    config: attention_mosaic.BackwardTiles | None = None):
+                    config: attention_mosaic.BackwardTiles | None = None, width: int = 128,
+                    value_width: int | None = None):
     """The backward in the form `form` names (`BACKWARD_FORMS`; None, the default form at `config`, else its
-    derived one) over the call form `call` of `shape` (its keys `keys`) on `target` (`_device`), from the
-    training forward's residuals at its pick: this mainloop's, or `residuals_from`'s (another mainloop's
-    `forward`, as the route feeds the Triton mainloop's)."""
+    derived one) over the call form `call` of `shape` (its keys `keys`, its query heads `width` wide and its
+    value heads `value_width`) on `target` (`_device`), from the training forward's residuals at its pick:
+    this mainloop's, or `residuals_from`'s (another mainloop's `forward`, as the route feeds the Triton
+    mainloop's)."""
     keys = shape[1] if keys is None else keys
     spans = template.spans(shape[1], keys, shape[0], **CALLS[call])
-    draw = _drawn(shape, jnp.bfloat16, keys=keys)
+    draw = _drawn(shape, jnp.bfloat16, width, keys=keys, value_width=value_width)
     accurate, config = (False, config) if form is None else BACKWARD_FORMS[form]
     trained = attention_mosaic.forward if residuals_from is None else residuals_from
 
@@ -318,6 +320,15 @@ def test_the_forward_is_on_par_at_head_widths_interpreted(width, value_width):
     `FORM_TILES`, under the interpreter."""
     _check_forward("causal", jnp.bfloat16, SHAPES["interpreted"], natural=False, interpret=True, width=width,
                    value_width=value_width, tiles=FORM_TILES)
+
+
+@INTERPRETS
+@pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
+def test_the_backward_is_on_par_at_head_widths_interpreted(width, value_width):
+    """The backward in its derived form of query heads `width` wide and value heads `value_width` over a
+    causal call, under the interpreter: dK and dV each at its own head width."""
+    _check_backward("causal", SHAPES["interpreted"], form=None, interpret=True, width=width,
+                    value_width=value_width)
 
 
 @INTERPRETS
@@ -918,6 +929,16 @@ def test_the_forward_is_on_par_at_head_widths_on_an_h100(width, value_width):
     `FORM_TILES`, compiled on an H100."""
     _check_forward("causal", jnp.bfloat16, SHAPES["compiled"], natural=False, interpret=False, width=width,
                    value_width=value_width, tiles=FORM_TILES)
+
+
+@ON_HOPPER
+@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
+@pytest.mark.parametrize(("width", "value_width"), HEAD_WIDTHS)
+def test_the_backward_is_on_par_at_head_widths_on_an_h100(width, value_width):
+    """The backward in its derived form of query heads `width` wide and value heads `value_width` over a
+    causal call, compiled on an H100."""
+    _check_backward("causal", SHAPES["compiled"], form=None, interpret=False, width=width,
+                    value_width=value_width)
 
 
 @ON_HOPPER

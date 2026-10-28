@@ -160,8 +160,6 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
         return f"the Mosaic backward takes bf16 operands, not {jnp.dtype(dtype)}"
     if jnp.dtype(dtype) not in sixteen:
         return f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(dtype)}"
-    if backward and width != value_width:
-        return "the Mosaic backward stages dK and dV through one buffer: equal head widths"
     if backward and not transposable(hooks):
         return ("the Mosaic backward holds its tiles keys first, and its score hook takes an axis of them by "
                 "an operation no layout rule takes (`layout.RULES`)")

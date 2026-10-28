@@ -52,15 +52,16 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
 def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
                      parts: int, stages: int) -> tuple[list, dict]:
     """The dK/dV program's allocations as `Family.scoped` takes them, in `_dkv_launch`'s order: its
-    consumers' resident keys and values; a fused launch's score cotangents' `parts`
-    staged for dQ's product (`algebra.cotangent_parts`); dK's and dV's output stage, which a fused launch's
-    dQ tiles take too (fp32); each consumer's stage for its key gradients' sums; the two loads' barriers; and
-    its query and output-cotangent streams in `stages` slots (`Family.streams`)."""
+    consumers' resident keys and values; a fused launch's score cotangents' `parts` staged for dQ's product
+    (`algebra.cotangent_parts`); dK's output stage, which a fused launch's dQ tiles take too, and dV's (the
+    one stage where the widths agree), fp32; each consumer's stage for its key gradients' sums; the two loads'
+    barriers; and its query and output-cotangent streams in `stages` slots (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
     staged = [plgpu.SMEM((consumers, parts, block_k, block_q), dtype)] if config.fused else []
     scoped = [plgpu.SMEM((consumers, block_k, width), dtype),
               plgpu.SMEM((consumers, block_k, value_width), dtype), *staged,
               plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32),
+              *([] if value_width == width else [plgpu.SMEM((consumers, block_k, value_width), jnp.float32)]),
               plgpu.SMEM((consumers, block_k), jnp.float32),
               plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers)]
     blocks = {"queries": ((block_q, width), dtype), "douts": ((block_q, value_width), dtype)}
@@ -369,13 +370,15 @@ def _unread_tiles(family: mosaic.Family, store_tiles, count: int, shape: tuple[i
         store_tiles(tile * shape[1], [zeros] * count)
 
 
-def _dkv_scoped(refs, *, fused: bool) -> tuple:
+def _dkv_scoped(refs, *, fused: bool, widths: bool) -> tuple:
     """The dK/dV program's allocations (`_dkv_allocations`) by role: its resident keys and values, its staged
-    score cotangents (None unless `fused`), its output and key gradients' stages and its two loads'
-    barriers."""
+    score cotangents (None unless `fused`), dK's output stage and dV's (dK's where the head `widths` agree),
+    its key gradients' stage and its two loads' barriers."""
     keys, values, refs = refs[0], refs[1], refs[2:]
     staged, refs = (refs[0], refs[1:]) if fused else (None, refs)
-    return keys, values, staged, *refs
+    dk_stage, refs = refs[0], refs[1:]
+    dv_stage, refs = (dk_stage, refs) if widths else (refs[0], refs[1:])
+    return keys, values, staged, dk_stage, dv_stage, *refs
 
 
 def _keys_last(arrays, kinds) -> tuple[jax.Array, ...]:
@@ -387,16 +390,18 @@ def _keys_last(arrays, kinds) -> tuple[jax.Array, ...]:
 
 def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, dout):
     """The dK/dV program `entry`'s launch (`Family.kernel`) over `query` `[B, Qp, H, D]` and `key` and
-    `value` `[B, Kp, Hk, D]`: dK and dV `[B, Kp, H, D]` fp32 out, then each of `graded`'s, a key's `[B, H,
-    Kp]` and a tile's keys first `[B, H, Kp, Qp]`, fp32; a program a query head's pair of key blocks."""
+    `value` `[B, Kp, Hk, D]`: dK and dV `[B, Kp, H, D]` fp32 out, each at its head width, then each of
+    `graded`'s, a key's `[B, H, Kp]` and a tile's keys first `[B, H, Kp, Qp]`, fp32; a program a query
+    head's pair of key blocks."""
     batch, queries, heads, width = query.shape
     keys_padded, value_width = key.shape[1], value.shape[-1]
     family, consumers = walk.program.family, walk.consumers
-    gradient = jax.ShapeDtypeStruct((batch, keys_padded, heads, width), jnp.float32)
+    dk, dv = (jax.ShapeDtypeStruct((batch, keys_padded, heads, depth), jnp.float32)
+              for depth in (width, value_width))
     grad_shapes = {Kind.KEY: jax.ShapeDtypeStruct((batch, heads, keys_padded), jnp.float32),
                    Kind.TILE: jax.ShapeDtypeStruct((batch, heads, keys_padded, queries), jnp.float32)}
     return family.kernel(
-        entry, out_type=(gradient, gradient, *(grad_shapes[kind] for kind in graded)),
+        entry, out_type=(dk, dv, *(grad_shapes[kind] for kind in graded)),
         grid=(heads, keys_padded // (consumers * walk.program.tiles.block_k), batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
         approx_math=walk.approx_math, name="attention_dkv_fused" if walk.fused else "attention_dkv",
@@ -436,7 +441,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         dq_ref, refs = (refs[0], refs[1:]) if walk.fused else (None, refs)
         dk_ref, dv_ref, *refs = refs
         grad_refs, refs = refs[:len(graded)], refs[len(graded):]
-        k_smem, v_smem, staged, out_smem, rows_smem, k_loaded, v_loaded = _dkv_scoped(refs, fused=walk.fused)
+        k_smem, v_smem, staged, out_smem, dv_smem, rows_smem, k_loaded, v_loaded = _dkv_scoped(
+            refs, fused=walk.fused, widths=value_width == width)
         key_refs = [ref for ref, kind in zip(grad_refs, graded, strict=True) if kind == Kind.KEY]
         tile_refs = [ref for ref, kind in zip(grad_refs, graded, strict=True) if kind == Kind.TILE]
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
@@ -488,8 +494,12 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             # The tiles past this block's last reader its partner reads.
             family.passed(streams, hi, streamed[1], first=streamed[0])
             out = (row, pl.ds(k_first, block_k), head)
-            family.stored((dk, dv), (dk_ref.at[out], dv_ref.at[out]),
-                          smem=out_smem.at[index, pl.ds(0, block_k)])
+            if dv_smem is out_smem:
+                family.stored((dk, dv), (dk_ref.at[out], dv_ref.at[out]),
+                              smem=out_smem.at[index, pl.ds(0, block_k)])
+            else:
+                family.stored((dk,), (dk_ref.at[out],), smem=out_smem.at[index, pl.ds(0, block_k)])
+                family.stored((dv,), (dv_ref.at[out],), smem=dv_smem.at[index])
             if key_refs:
                 # Each key gradient, the walk's row sums, to the `[B, H, Kp]` outputs.
                 views = tuple(ref.at[row, head, pl.ds(k_first, block_k)] for ref in key_refs)
