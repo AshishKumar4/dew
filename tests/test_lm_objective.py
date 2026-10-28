@@ -846,8 +846,9 @@ def test_evaluation_weights_follow_loss_role():
 # --- z-loss: PaLM's log-partition penalty ---------------------------------
 
 
-Z_TERM_SEEDS = 64
-"""Check 1's declared seeds for the z loss and its term, each a scalar of a token batch."""
+Z_TERM_SEEDS = 256
+"""Check 1's declared seeds for the z loss and its term, each a scalar of a token batch, sized by
+`seeds_for` paired with the objective on the CPU."""
 
 
 def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
