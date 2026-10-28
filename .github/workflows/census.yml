@@ -1,7 +1,8 @@
 name: Published bases census
 
-# Daily, the Hub's most downloaded and trending text and multimodal bases loaded without their weights
-# (tools/published_census.py, ledger 1891): each refusal a row of the run's summary, before a user meets it.
+# Daily, the Hub's most downloaded and trending text and multimodal models loaded without their weights
+# (tools/hf_coverage.py census and loads, ledger 1891): each refusal a row of the run's summary, before a
+# user meets it.
 on:
   workflow_dispatch:
     inputs:
@@ -39,11 +40,15 @@ jobs:
           cache-dependency-glob: locks/cpu.txt
       - name: Install dependencies
         run: sh tools/install_environment.sh cpu --system
-      - name: Load each base without its weights
-        run: python tools/published_census.py --top "$TOP" --output census
-      - name: Report the census
+      - name: List the models and read their configs
+        run: |
+          python tools/hf_coverage.py census census "$TOP" --tags text-generation image-text-to-text \
+            --orders downloads trending_score --filters transformers safetensors
+      - name: Load each model without its weights
+        run: python tools/hf_coverage.py loads census
+      - name: Report the loads
         if: always()
-        run: cat census/census.md >> "$GITHUB_STEP_SUMMARY"
+        run: cat census/loads.md >> "$GITHUB_STEP_SUMMARY"
       - name: Upload the census
         if: always()
         uses: actions/upload-artifact@v4
