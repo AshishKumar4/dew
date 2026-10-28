@@ -112,6 +112,31 @@ def test_a_real_token_budget_counts_each_microbatch_without_padding(log_every, a
                 if "train/tokens" in scalars] == logged
 
 
+def test_a_runs_start_reports_each_phase_it_took_once(caplog):
+    """A run's start logs each phase as it starts and with the seconds it took when it ends (the data's
+    preparation, the step's compile, the evaluations' warming), and reports each phase's seconds once,
+    beside its first logged step's scalars, none after."""
+    import logging
+
+    tracker = RecordingTracker()
+    trainer = make_trainer(objective=Features(), tracker=tracker)
+    with caplog.at_level(logging.INFO, logger="dew.training.startup"):
+        trainer.fit(dataset(val=val_batches(3)), steps=3, log_every=1, eval_every=2)
+    took = [record.getMessage() for record in caplog.records if " took " in record.getMessage()]
+    assert [message.split(" took ")[0] for message in took] == [
+        "preparing the data", "compiling the step", "warming the evaluations"]
+    reported = [{name: value for name, value in scalars.items() if name.startswith("startup/")}
+                for _, scalars in tracker.scalars]
+    [first] = [phases for phases in reported if phases]
+    assert set(first) == {"startup/data_seconds", "startup/compile_seconds", "startup/warm_seconds"}
+    assert all(seconds >= 0 for seconds in first.values()) and reported[0] == first
+    # A run that logs no step reports its start with its outcome, once.
+    quiet = RecordingTracker()
+    make_trainer(objective=Features(), tracker=quiet).fit(dataset(), steps=2, log_every=100)
+    started = [name for _, scalars in quiet.scalars for name in scalars if name.startswith("startup/")]
+    assert sorted(started) == ["startup/compile_seconds", "startup/data_seconds", "startup/warm_seconds"]
+
+
 def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
     state = make_trainer(objective=TokenRegression()).fit(dataset(), steps=2, tokens=30)
     assert int(state.step) == 2
