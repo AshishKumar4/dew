@@ -1,0 +1,53 @@
+name: Published bases census
+
+# Daily, the Hub's most downloaded and trending text and multimodal bases loaded without their weights
+# (tools/published_census.py, ledger 1891): each refusal a row of the run's summary, before a user meets it.
+on:
+  workflow_dispatch:
+    inputs:
+      top:
+        description: Models listed per pipeline tag and order
+        required: false
+        default: "40"
+        type: string
+  schedule:
+    - cron: "41 7 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: census-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      JAX_PLATFORMS: cpu
+      PYTHONDONTWRITEBYTECODE: "1"
+      TOP: ${{ inputs.top || '40' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: .python-version
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: locks/cpu.txt
+      - name: Install dependencies
+        run: sh tools/install_environment.sh cpu --system
+      - name: Load each base without its weights
+        run: python tools/published_census.py --top "$TOP" --output census
+      - name: Report the census
+        if: always()
+        run: cat census/census.md >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the census
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: census
+          path: census/
+          if-no-files-found: error
