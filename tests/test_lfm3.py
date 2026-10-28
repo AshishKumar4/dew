@@ -71,11 +71,7 @@ def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, san
     loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
     model, variables = loaded.model, loaded.variables
     if not sandwich:
-        config = json.loads((TINY / 'config.json').read_text())
-        plain = tmp_path / 'plain'
-        plain.mkdir()
-        (plain / 'config.json').write_text(json.dumps({**config, 'use_sandwich_norm': False}))
-        model = Pretrained.load(plain, dtype='float32', attention_impl='reference', weights=False).model
+        model = model.clone(sandwich_norms=False)
         variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
     ids = jnp.asarray(fixture('input_ids'), jnp.int32)
     expected = np.asarray(model.apply(variables, ids))
