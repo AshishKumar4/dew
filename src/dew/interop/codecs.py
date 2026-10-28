@@ -602,6 +602,9 @@ def dequantize_fp8_blocks(weight: np.ndarray, scale_inv: np.ndarray,
         raise ValueError(
             f"a {weight.shape} weight in {rows} x {cols} blocks takes a "
             f"{blocks} scale, got {scale_inv.shape}")
+    if not unread.valued(weight, scale_inv):
+        # Of a load without its weights: the decoded weight's shape and dtype, no block row read.
+        return weight.astype(np.float32)
     # Scaled one block row at a time, so no scale array of the weight's size
     # is ever built.
     out = weight.astype(np.float32)

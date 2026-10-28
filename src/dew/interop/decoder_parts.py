@@ -24,7 +24,7 @@ from dew._model_types import SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
-from dew.interop.unread import valued
+from dew.interop.unread import equal, held, valued
 from dew.interop.weights import check_tree
 from dew.nn.activations import GatedActivation, Situ
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -1663,24 +1663,25 @@ def split_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed],
         packing = next((packing for packing in packed if name.endswith(packing.name)), None)
         parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
         for part, value in parts.items():
-            held = split.setdefault(part, value)
-            if held is not value:
-                _held_twice(name, part, held, value)
+            kept = split.setdefault(part, value)
+            if kept is not value:
+                _held_twice(name, part, kept, value)
     return split
 
 
-def _held_twice(name: str, part: str, held, value) -> None:
+def _held_twice(name: str, part: str, kept, value) -> None:
     """Refuse a second tensor for `part`, the stored tensor `name`'s, unless it is the one held.
 
     A fused tensor and a part stored under its own name, such as Qwen's
     `experts.gate_up_proj` beside `experts.gate_proj`, both hold that part,
     and the tree has one leaf for it, so the two must be the same tensor, of
-    one dtype and equal values; any other pair is refused, whichever the
-    checkpoint lists first."""
-    held, value = np.asarray(held), np.asarray(value)
-    if held.dtype != value.dtype or not np.array_equal(held, value):
+    one dtype and equal values (of a load without its weights, equal shapes:
+    `equal`); any other pair is refused, whichever the checkpoint lists
+    first."""
+    kept, value = held(kept), held(value)
+    if kept.dtype != value.dtype or not equal(kept, value):
         raise ValueError(f"{name} holds {part} as {value.dtype}, which another of the "
-                         f"checkpoint's tensors holds as a different {held.dtype} tensor")
+                         f"checkpoint's tensors holds as a different {kept.dtype} tensor")
 
 
 class Part(NamedTuple):

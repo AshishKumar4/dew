@@ -444,6 +444,13 @@ def test_a_tensor_a_load_without_its_weights_holds_has_shapes_and_no_values():
     decoded = lookup(np.arange(256, dtype=np.float32), codes) * np.float32(0.5)
     assert (decoded.shape, decoded.dtype) == ((4, 8), np.float32)
     assert np.shape(decoded) == (4, 8) and decoded.astype(np.float16).dtype == np.float16
+    # NumPy's own dtypes and geometry: an int32 beside a float32 is float64, a weak Python scalar keeps
+    # the array's dtype, and a byte view widens the last axis by the item's bytes.
+    assert np.add(Unread((2,), np.int32), np.ones(2, np.float32)).dtype == np.float64
+    assert (Unread((2,), np.uint8) + 1).dtype == np.uint8
+    assert np.concatenate([Unread((2,), np.int32), np.ones(3, np.float32)]).dtype == np.float64
+    assert Unread((2, 3), np.float32).view(np.uint8).shape == (2, 12)
+    assert Unread((4, 8), np.float32).dot(Unread((8, 2), np.float32)).shape == (4, 2)
     for asked in (lambda: bool(np.array_equal(codes, codes)), lambda: float(decoded[0, 0]),
                   lambda: np.asarray(codes), lambda: np.isfinite(decoded).all() or None,
                   lambda: np.zeros((4, 8)) + np.asarray(decoded)):

@@ -53,6 +53,25 @@ def evaluated(function: Callable, *args, **kwargs):
                         if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, shapes)
 
 
+def _dtype_of(value) -> np.dtype | type:
+    """A ufunc operand's dtype as NumPy resolves loops by, a Python scalar's type kept weak (NEP 50)."""
+    if isinstance(value, (bool, int, float, complex)):
+        return type(value)
+    return value.dtype if isinstance(value, Unread) else np.asarray(value).dtype
+
+
+def _cast(value, dtype: np.dtype):
+    """`value` in `dtype`, an `Unread` as one."""
+    return value.astype(dtype) if isinstance(value, Unread) else np.asarray(value).astype(dtype)
+
+
+def _retyped(shapes, dtypes):
+    """`shapes`' `Unread` results in `dtypes`, the dtypes NumPy computes them in."""
+    if isinstance(shapes, Unread):
+        return Unread(shapes.shape, dtypes[0])
+    return type(shapes)(Unread(shape.shape, dtype) for shape, dtype in zip(shapes, dtypes, strict=True))
+
+
 def _counterpart(function, name: str):
     held = getattr(jnp, name, None)
     if held is None:
@@ -113,8 +132,17 @@ class Unread:
         if kwargs.get("out") is not None:
             raise PayloadUnread(f"numpy.{ufunc.__name__} writes into an array, which a tensor a load "
                                 "without its weights holds cannot fill")
-        held = _counterpart(ufunc, ufunc.__name__)
-        return evaluated(held if method == "__call__" else getattr(held, method), *inputs, **kwargs)
+        counterpart = _counterpart(ufunc, ufunc.__name__)
+        if method != "__call__":
+            return evaluated(getattr(counterpart, method), *inputs, **kwargs)
+        # NumPy's own loop for these operands (its promotion, not JAX's lattice), run abstractly.
+        given = tuple(_dtype_of(value) for value in inputs)
+        *operands, results = ufunc.resolve_dtypes((*given, *(None,) * ufunc.nout))
+        cast = [value if isinstance(value, (bool, int, float, complex)) else _cast(value, dtype)
+                for value, dtype in zip(inputs, operands, strict=True)]
+        shapes = evaluated(counterpart, *cast, **kwargs)
+        return _retyped(shapes, (results,) if ufunc.nout == 1 else ufunc.resolve_dtypes(
+            (*given, *(None,) * ufunc.nout))[ufunc.nin:])
 
     def __array_function__(self, func: Callable[..., Any], types: Collection[type[Any]],
                            args: tuple[Any, ...], kwargs: dict[str, Any]) -> object:
@@ -123,7 +151,15 @@ class Unread:
             return self if dtype is None else self.astype(dtype)
         if func in _METADATA:
             return _METADATA[func](*args, **kwargs)
-        return evaluated(_counterpart(func, func.__name__), *args, **kwargs)
+        shapes = evaluated(_counterpart(func, func.__name__), *args, **kwargs)
+        if func in _PROMOTING:
+            # NumPy's promotion of its operands, not JAX's lattice.
+            operands = [value for value in jax.tree.leaves((args, kwargs), is_leaf=lambda leaf: isinstance(
+                leaf, Unread)) if isinstance(value, (Unread, np.ndarray, np.generic))]
+            promoted = np.result_type(*(_dtype_of(value) for value in operands))
+            return jax.tree.map(lambda leaf: Unread(leaf.shape, promoted), shapes,
+                                is_leaf=lambda leaf: isinstance(leaf, Unread))
+        return shapes
 
     def __getitem__(self, index):
         return evaluated(lambda array, index: array[index], self, index)
@@ -136,7 +172,8 @@ class Unread:
         # The array methods NumPy readers call (`all`, `any`, `mean`, `clip`, ...), as `jax.Array`'s.
         if name.startswith("_") or not callable(getattr(jax.Array, name, None)):
             raise AttributeError(name)
-        return lambda *args, **kwargs: evaluated(lambda array: getattr(array, name)(*args, **kwargs), self)
+        return lambda *args, **kwargs: evaluated(
+            lambda array, *given, **named: getattr(array, name)(*given, **named), self, *args, **kwargs)
 
     def __iter__(self):
         return (self[position] for position in range(len(self)))
@@ -154,9 +191,14 @@ class Unread:
         return Unread(self.shape, dtype)
 
     def view(self, dtype=None):
-        if dtype is None or np.dtype(dtype).itemsize == self.itemsize:
-            return Unread(self.shape, self.dtype if dtype is None else dtype)
-        return evaluated(lambda array: jax.lax.bitcast_convert_type(array, dtype), self)
+        # NumPy's geometry: the last axis holds as many of the new items as its bytes do.
+        target = self.dtype if dtype is None else np.dtype(dtype)
+        if target.itemsize == self.itemsize:
+            return Unread(self.shape, target)
+        bytes_held = self.shape[-1] * self.itemsize
+        if not self.shape or bytes_held % target.itemsize:
+            raise ValueError(f"{self!r} cannot be viewed as {target}: its last axis holds {bytes_held} bytes")
+        return Unread((*self.shape[:-1], bytes_held // target.itemsize), target)
 
     def copy(self, *_):
         return self
@@ -229,6 +271,11 @@ for _dunder, _ufunc in (("lt", "less"), ("le", "less_equal"), ("gt", "greater"),
                         ("eq", "equal"), ("ne", "not_equal")):
     setattr(Unread, f"__{_dunder}__", _operator(_ufunc)[0])
 
+
+_PROMOTING = frozenset({np.concatenate, np.stack, np.hstack, np.vstack, np.append, np.where, np.dot,
+                        np.matmul, np.tensordot, np.einsum, np.outer, np.kron})
+"""The NumPy functions whose result takes its operands' promoted dtype, which NumPy's lattice gives
+(an int32 beside a float32 is float64 there, float32 in JAX's)."""
 
 _METADATA = {np.shape: lambda array: array.shape, np.ndim: lambda array: array.ndim,
              np.size: lambda array, axis=None: array.size if axis is None else array.shape[axis],
