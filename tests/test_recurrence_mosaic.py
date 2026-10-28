@@ -458,8 +458,8 @@ class Unbudgeted(template.Mosaic):
 
 
 GATE_GROUPS = [(name, dtype, training, packed) for name in RESOURCE_SHAPES
-               for dtype in (jnp.bfloat16, jnp.float32) for packed in (False, True) for training in (False, True)
-               if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
+               for dtype in (jnp.bfloat16, jnp.float32) for packed in (False, True)
+               for training in (False, True) if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
                and not (training and (name, dtype) != ('qwen3.5-27b-gdn', jnp.bfloat16))]
 """The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group:
 every geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the gated delta
@@ -579,10 +579,18 @@ def planned_failures(found: list, plans: dict) -> list[str]:
             if kernel['shared'] is not None and not kernel['shared'] <= planned(record, kernel)]
 
 
-@pytest.mark.parametrize('group', GATE_GROUPS, ids=lambda group: (
-    f"{group[0]}-{jnp.dtype(group[1]).name}-{'training' if group[2] else 'forward'}"
-    f"{'-packed' if group[3] else ''}"))
-@pytest.mark.parametrize('target', ['sm80', 'sm90'])
+def _gated(target: str, group: tuple):
+    """The gate's test of `target` and `group`: an A100's Kimi forward, whose refused launches spill (its
+    model and ptxas agreeing on the refusal), compiles past a group's two minutes (136 seconds), so it runs
+    on the whole suite."""
+    name, dtype, training, packed = group
+    label = f"{target}-{name}-{jnp.dtype(dtype).name}-{'training' if training else 'forward'}"
+    marks = [pytest.mark.whole_suite] if target == 'sm80' and RESOURCE_SHAPES[name][4] else []
+    return pytest.param(target, group, marks=marks, id=label + ('-packed' if packed else ''))
+
+
+@pytest.mark.parametrize('target, group', [_gated(target, group) for target in ('sm80', 'sm90')
+                                           for group in GATE_GROUPS])
 def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides(target, group):
     """The mainloop's launches (`compiled_cases`), compiled by Mosaic for a compile-only A100 and H100 on this
     CPU (tests/kernel_compile.py): every launch compiles within the multiprocessor's shared memory (163 KB,
