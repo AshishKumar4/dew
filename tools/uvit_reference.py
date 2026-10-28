@@ -8,7 +8,7 @@ initialization (and rounded to bfloat16-representable values, so the fixture
 compresses). Each is called as U-ViT's continuous-time SDE calls it, on the
 time t times 999, and the tool records, against a fixed cotangent, the
 gradients of the image, the text states and every parameter: once in float32
-and once in float64 (`diffusers_wan_reference.widened`, which widens the
+and once in float64 (`torch_precision.widened`, which widens the
 sinusoids' float32 `arange` and `.float()`), the truth tests/reference_error.py
 measures both from. Attention runs U-ViT's "math" mode: its "flash" mode
 casts q, k and v to float32.
@@ -23,23 +23,20 @@ Run with the Dew test environment's torch, on CPU:
     python tools/uvit_reference.py OUTPUT.npz
 """
 
-import importlib.util
-import json
+import importlib
 import sys
-import types
 from pathlib import Path
 
 import ml_dtypes
 import numpy as np
 import torch
-from reference_source import CACHE as UPSTREAM, verified
+from reference_source import package, published_files, saved_fixture
 
 REPO, COMMIT = "baofff/U-ViT", "ce551708dc9cde9818d2af7d84dfadfeb7bd9034"
 FILES = {
     "libs/timm.py": "f1e414e5060038baba231ba30959bb1274839ebb1ba7649d3564288731a6babd",
     "libs/uvit_t2i.py": "2537800bd7251ea68f268b9125f5fbbfc64c1680bbc659767f37c737da468894",
 }
-CACHE = UPSTREAM / "U-ViT" / COMMIT
 CASES = {
     "published": {"img_size": 8, "patch_size": 2, "in_chans": 4, "embed_dim": 32, "depth": 4, "num_heads": 4,
                   "mlp_ratio": 4, "qkv_bias": False, "mlp_time_embed": False, "clip_dim": 12,
@@ -54,19 +51,8 @@ SEED = 47
 
 def uvit():
     """U-ViT's libs at `COMMIT`, as the package `uvit_libs`, in its math attention."""
-    package = types.ModuleType("uvit_libs")
-    package.__path__ = []
-    sys.modules["uvit_libs"] = package
-    modules = {}
-    for path, digest in FILES.items():
-        local = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{path}", CACHE / path, digest)
-        name = "uvit_libs." + Path(path).stem
-        spec = importlib.util.spec_from_file_location(name, local)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-        modules[name] = module
-    t2i = modules["uvit_libs.uvit_t2i"]
+    package("uvit_libs", published_files(REPO, COMMIT, FILES) / "libs")
+    t2i = importlib.import_module("uvit_libs.uvit_t2i")
     t2i.ATTENTION_MODE = "math"
     return t2i
 
@@ -86,7 +72,7 @@ def walk(model, inputs, probe, dtype):
 
 
 def main():
-    from diffusers_wan_reference import widened
+    from torch_precision import float64_twin, widened
 
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
@@ -118,16 +104,16 @@ def main():
                        for name, value in model.state_dict().items()})
         single = walk(model, inputs, probe, torch.float32)
         record.update({f"fp32.{key}": value for key, value in single.items()})
+        wide = float64_twin(model, lambda config=config: t2i.UViT(**config))
         with widened():
-            truth = walk(model, inputs, probe, torch.float64)
+            truth = walk(wide, inputs, probe, torch.float64)
         record.update({f"fp64.{key}": value for key, value in truth.items()})
         arrays.update({f"{case}/{key}": value for key, value in record.items()})
         gap = np.abs(record["fp32.output"] - record["fp64.output"]).max()
         print(f"{case}: output {tuple(shape)}, fp32 off float64 by {gap:.3g}")
     meta = {"repo": REPO, "commit": COMMIT, "files": FILES, "cases": CASES, "times": TIMES,
             "torch": torch.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(sys.argv[1], **arrays)
+    saved_fixture(Path(sys.argv[1]), arrays, meta)
     print(f"{sys.argv[1]}: {Path(sys.argv[1]).stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays")
 
 

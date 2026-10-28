@@ -34,7 +34,6 @@ Run with the Dew test environment's diffusers 0.34.0 and torch, on CPU:
 from __future__ import annotations
 
 import contextlib
-import copy
 import json
 import sys
 from dataclasses import dataclass, field
@@ -45,10 +44,12 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from torch_precision import default_dtype, dtype_widened, float_as, replaced, wide, widened_to
-from reference_releases import RELEASES, require
+from diffusers_reference_helpers import recording, restore_transformers_names
+from reference_releases import RELEASES
+from torch_precision import default_dtype, float64, float64_twin, widened
 
-DIFFUSERS = RELEASES["diffusers"]["diffusers"]
+COHORT = "diffusers-0.34"
+DIFFUSERS = RELEASES[COHORT]["diffusers"]
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/wan-source"
 BASE = {"patch_size": [1, 2, 2], "num_attention_heads": 2, "attention_head_dim": 12, "in_channels": 4,
         "out_channels": 4, "text_dim": 20, "freq_dim": 16, "ffn_dim": 40, "num_layers": 2,
@@ -109,55 +110,6 @@ def float64_scheduler(module: ModuleType):
         yield
 
 
-@contextlib.contextmanager
-def widened():
-    """The reference in float64: every float32 pin of the Wan modules
-    widened, which are their `.float()`, `.to(torch.float32)` and
-    `.type(torch.float32)` casts (Nemotron-H's router pins the last), the
-    sinusoids' float32 `arange`, a float32 `torch.tensor` or `torch.full`
-    (the tables a model builds from Python numbers, Phi-3's LongRoPE factors
-    among them), the UniPC scheduler's float32 sigma table, and float64 the
-    default dtype."""
-    from unittest.mock import patch
-
-    from diffusers.schedulers import scheduling_unipc_multistep
-    from torch.utils._device import _device_constructors
-
-    # `torch.device(...)` as a context places only the constructors in a set
-    # torch builds once, on first use. Built inside this block it would hold
-    # the arange below for the rest of the process, and every later
-    # meta-device init (transformers' from_pretrained) would make arange's
-    # tensors on the CPU beside the meta ones; so it is built first.
-    _device_constructors()
-    type_ = torch.Tensor.type
-
-    def widened_type(self, dtype=None, *args, **kwargs):
-        return type_(self, *(() if dtype is None else (wide(dtype),)), *args, **kwargs)
-
-    with (replaced(float_as(torch.float64), (torch.Tensor, "to", widened_to(torch.Tensor.to)),
-                   (torch.Tensor, "type", widened_type), (torch, "arange", dtype_widened(torch.arange)),
-                   (torch, "tensor", dtype_widened(torch.tensor)),
-                   (torch, "full", dtype_widened(torch.full))),
-          default_dtype(torch.float64), patch.object(scheduling_unipc_multistep, "np", Float64Library(np))):
-        yield
-
-
-@contextlib.contextmanager
-def widened_softmax():
-    """`softmax(..., dtype=torch.float32)`, the pin transformers' eager
-    attention and routers carry, in float64."""
-    with replaced((torch.nn.functional, "softmax", dtype_widened(torch.nn.functional.softmax))):
-        yield
-
-
-@contextlib.contextmanager
-def float64():
-    """A transformers model built and run in float64: `widened` and
-    `widened_softmax` together."""
-    with widened(), widened_softmax():
-        yield
-
-
 def walk(model, inputs: dict[str, torch.Tensor], probe: torch.Tensor, dtype) -> dict[str, np.ndarray]:
     """One call at `dtype` and the gradients of `sum(output * probe)` with
     respect to the latents, the prompt states and every parameter."""
@@ -195,8 +147,9 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     arrays = {key: value.numpy() for key, value in inputs.items()}
     arrays["probe"] = probe.numpy()
     arrays.update({f"fp32.{key}": value for key, value in walk(model, inputs, probe, torch.float32).items()})
+    wide = float64_twin(model)
     with widened():
-        widest = walk(model, inputs, probe, torch.float64)
+        widest = walk(wide, inputs, probe, torch.float64)
         arrays.update({f"fp64.{key}": value for key, value in widest.items()})
     half = WanTransformer3DModel.from_pretrained(root / name / "transformer", torch_dtype=torch.bfloat16)
     with torch.no_grad():
@@ -209,18 +162,8 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     return arrays
 
 
-def output_root(destination: str) -> Path:
-    import diffusers
-
-    require("diffusers")
-    torch.set_num_threads(2)
-    root = Path(destination)
-    root.mkdir(parents=True, exist_ok=True)
-    return root
-
-
 def transformer(destination: str) -> None:
-    root = output_root(destination)
+    root = recording(destination, COHORT)
     arrays: dict[str, np.ndarray] = {}
     for name, case in CASES.items():
         arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})
@@ -312,6 +255,7 @@ def scheduler_replay() -> dict[str, np.ndarray]:
     model evaluation per step a guided Wan walk makes, from a fixed latent:
     its timesteps and every step's sample, in float32 and widened."""
     from diffusers import UniPCMultistepScheduler
+    from diffusers.schedulers import scheduling_unipc_multistep
 
     config = json.loads((SOURCE / "scheduler" / "scheduler_config.json").read_text())
     arrays: dict[str, np.ndarray] = {}
@@ -321,7 +265,11 @@ def scheduler_replay() -> dict[str, np.ndarray]:
         outputs = torch.randn((steps, *x_T.shape), generator=generator)
         arrays[f"replay.{steps}.x_T"], arrays[f"replay.{steps}.outputs"] = x_T.numpy(), outputs.numpy()
         for precision, dtype in (("fp32", torch.float32), ("fp64", torch.float64)):
-            with widened() if dtype == torch.float64 else contextlib.nullcontext():
+            with contextlib.ExitStack() as scope:
+                if dtype == torch.float64:
+                    # The model's pins and the scheduler module's tables, widened through every step.
+                    scope.enter_context(widened())
+                    scope.enter_context(float64_scheduler(scheduling_unipc_multistep))
                 scheduler = UniPCMultistepScheduler.from_config(config)
                 scheduler.set_timesteps(steps)
                 x, latents = x_T.to(dtype), []
@@ -362,14 +310,21 @@ def pipeline(destination: str) -> None:
     the whole pipeline in float64 (`float64`: the Wan modules' float32 pins,
     the call's float32 latents and the UniPC tables widened with it), under
     `_f64` names."""
-    root = output_root(destination)
+    root = recording(destination, COHORT)
     pipe = build_pipeline(root)
     generator = torch.Generator().manual_seed(SEED + 9)
     shape = (len(PROMPTS), PIPELINE_VAE["z_dim"], (FRAMES - 1) // 4 + 1, HEIGHT // 8, WIDTH // 8)
     latents = torch.randn(shape, generator=generator)
     arrays: dict[str, np.ndarray] = {"x_T": latents.numpy(), **encoded_and_walked(pipe, latents)}
-    with float64():
-        arrays.update(encoded_and_walked(copy.deepcopy(pipe).to(torch.float64), latents.double(), "_f64"))
+    from diffusers.schedulers import scheduling_unipc_multistep
+
+    # The scheduler's tables are its module's own, widened around every call the walk makes into it.
+    from diffusers import WanPipeline
+
+    # Read back from what it saved, inside `float64`, so every module's constructor computes in float64.
+    with float64(), float64_scheduler(scheduling_unipc_multistep):
+        wide = WanPipeline.from_pretrained(root / "pipeline", torch_dtype=torch.float64)
+        arrays.update(encoded_and_walked(wide, latents.double(), "_f64"))
     arrays.update(scheduler_replay())
     record = {"diffusers": DIFFUSERS, "torch": torch.__version__, "seed": SEED, "transformer": PIPELINE,
               "vae": PIPELINE_VAE, "prompts": PROMPTS, "frames": FRAMES, "height": HEIGHT, "width": WIDTH,
@@ -381,8 +336,6 @@ def pipeline(destination: str) -> None:
 
 
 if __name__ == "__main__":
-    from diffusers_reference_helpers import restore_transformers_names
-
     # The pipeline walk needs `WanPipeline` itself.
     restore_transformers_names()
     if len(sys.argv) > 3 and sys.argv[1] == "bundle":

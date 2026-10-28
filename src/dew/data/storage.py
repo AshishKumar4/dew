@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import functools
 import hashlib
 import io
@@ -33,9 +32,10 @@ from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
+from dew._records import JSON, json_value
 from dew.cache import dew_cache_dir
-from dew.data.retention import LocalRetention
-from dew.records import JSON, json_value
+from dew.data.retention import LocalRetention, evictable, read_pin
+from dew.files import write_atomically
 
 
 class PreconditionFailed(FileExistsError):
@@ -56,6 +56,42 @@ class ObjectInfo(TypedDict):
 
 class ObjectRef(ObjectInfo):
     path: str
+
+
+def object_info(payload: bytes | io.BufferedReader) -> ObjectInfo:
+    """The size and SHA-256 of `payload`, bytes, or a file read from its start in bounded chunks."""
+    if isinstance(payload, bytes):
+        return {"bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+    payload.seek(0)
+    digest = hashlib.file_digest(payload, "sha256")
+    size = payload.tell()
+    payload.seek(0)
+    return {"bytes": size, "sha256": digest.hexdigest()}
+
+
+def matching(found: ObjectInfo, expected: Mapping[str, object], url: str) -> None:
+    """Refuse an object at `url` whose size and digest, `found`, are not what was committed for it."""
+    if found["bytes"] != expected["bytes"] or found["sha256"] != expected["sha256"]:
+        raise OSError(f"committed object is corrupt: {url}; bytes={found['bytes']}, "
+                      f"sha256={found['sha256']}, expected bytes={expected['bytes']}, "
+                      f"sha256={expected['sha256']}")
+
+
+def commit_export(
+    root: Store, *, format: str, codec: int | None, rows: int, files: list[Mapping[str, object]],
+    metadata: Mapping[str, object] | None = None, certified: Mapping[str, JSON] | None = None,
+) -> Mapping[str, object]:
+    """Commit the manifest of an export at `root`, its `files` already written there: its schema,
+    format, record codec, rows, files and metadata, and what its producer `certified` of its rows (an
+    export its count rules and partitioning; a directory of existing ArrayRecord shards nothing);
+    then the success marker its digest names. An export (`dew.data.sinks.export`) and existing
+    shards provisioned in place (`Files.provision`) both commit through it."""
+    manifest = {"schema": 1, "format": format, "codec": codec, "rows": rows, **(certified or {}),
+                "files": files, "metadata": dict(metadata or {})}
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    root.child("_dew_manifest.json").put_if_absent(encoded)
+    root.child("_SUCCESS").put_if_absent(hashlib.sha256(encoded).hexdigest().encode())
+    return manifest
 
 
 class TransportStats(TypedDict):
@@ -206,8 +242,7 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                     reservation.unlink(missing_ok=True)
 
     def _dew_pin(self, local: Path, started: float) -> _PinnedReader:
-        pin = local.with_name(local.name + ".pin").open("a+b")
-        fcntl.flock(pin.fileno(), fcntl.LOCK_SH)
+        pin = read_pin(local.with_name(local.name + ".pin"))
         os.utime(local, None)
         self._dew_wait += time.monotonic() - started
         return _PinnedReader(io.FileIO(str(local), "r"), pin)
@@ -216,14 +251,10 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         previous = self._metadata.cached_files[-1].get(path)
         if previous is None:
             return True
-        pin_path = Path(self.storage[-1]) / (previous["fn"] + ".pin")
-        with pin_path.open("a+b") as pin:
-            try:
-                fcntl.flock(pin.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return False
-            self.pop_from_cache(path)
-        return True
+        with evictable(Path(self.storage[-1]) / (previous["fn"] + ".pin")) as free:
+            if free:
+                self.pop_from_cache(path)
+            return free
 
     def _dew_download(self, path: str, local: Path, size: int, version: str) -> None:
         descriptor, temporary = tempfile.mkstemp(dir=local.parent, prefix=".download-" + local.name + "-")
@@ -278,10 +309,8 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         for _, path, local, size in sorted(candidates):
             if used + needed <= self._dew_max_bytes:
                 break
-            with (directory / (local.name + ".pin")).open("a+b") as pin:
-                try:
-                    fcntl.flock(pin.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
+            with evictable(directory / (local.name + ".pin")) as free:
+                if not free:
                     continue
                 self.pop_from_cache(path)
                 used -= size
@@ -354,6 +383,20 @@ def content_version(fs: AbstractFileSystem, path: str, size: int) -> str:
 def local(fs: AbstractFileSystem) -> bool:
     """Whether `fs` is this host's own disk, whose paths are where it mounted a file."""
     return isinstance(fs, LocalFileSystem)
+
+
+def on_gcs(fs: AbstractFileSystem) -> bool:
+    """Whether `fs` is Google Cloud Storage, which ArrayRecord's and Arrow's own readers open by URL."""
+    return bool({"gs", "gcs"}.intersection(_protocols(fs)))
+
+
+def in_memory(fs: AbstractFileSystem) -> bool:
+    """Whether `fs` is fsspec's in-process memory store: neither this host's disk nor the network."""
+    return "memory" in _protocols(fs)
+
+
+def _protocols(fs: AbstractFileSystem) -> tuple[str, ...]:
+    return (fs.protocol,) if isinstance(fs.protocol, str) else tuple(fs.protocol)
 
 
 @dataclass(frozen=True)
@@ -478,19 +521,20 @@ class Store:
         if not local(fs):
             fs.pipe_file(path, payload)
             return
-        with tempfile.NamedTemporaryFile(dir=str(Path(path).parent), delete=False) as pending:
-            pending.write(payload)
-            pending.flush()
-            os.fsync(pending.fileno())
-        os.replace(pending.name, path)
+        write_atomically(path, payload)
 
     def verified(self, payload: bytes) -> ObjectInfo:
+        """Write `payload` here where nothing is, and read it back as written."""
         self.put_if_absent(payload)
-        found = self.read()
-        digest = hashlib.sha256(payload).hexdigest()
-        if len(found) != len(payload) or hashlib.sha256(found).hexdigest() != digest:
-            raise OSError(f"uploaded object did not verify: {self.url}")
-        return {"bytes": len(payload), "sha256": digest}
+        written = object_info(payload)
+        matching(object_info(self.read()), written, self.url)
+        return written
+
+    def checked(self, committed: Mapping[str, object]) -> bytes:
+        """This object's bytes, refused unless they are the size and digest `committed` states."""
+        payload = self.read()
+        matching(object_info(payload), committed, self.url)
+        return payload
 
     @property
     def remote(self) -> bool:
@@ -502,43 +546,40 @@ class Store:
         """Create this object from `payload`, or accept the byte-identical
         object an earlier attempt created, and return the stored version.
 
-        Other bytes already at the URL are refused with a ValueError. A failed
-        transfer, or an object this call created that reads back otherwise, is
-        an OSError, tried again up to `retries` times, a longer wait before
-        each, before it is raised.
+        Other bytes already at the URL are refused with a ValueError. An object
+        this call created that reads back otherwise is read again, up to
+        `retries` times, a longer wait before each, then an OSError: no
+        transport checks what a write left. A failed transfer raises at once,
+        after the transport's own retries (s3fs's, gcsfs's, huggingface_hub's).
         """
-        for attempt in range(retries + 1):
-            try:
-                return self._put_immutable(payload)
-            except OSError:
-                if attempt == retries:
-                    raise
-                time.sleep(min(0.25 * 2**attempt, 10))
-        raise AssertionError("the last attempt returns or raises")
-
-    def _put_immutable(self, payload: bytes) -> str:
-        """One attempt of `put_immutable`."""
         try:
             self.put_if_absent(payload)
         except PreconditionFailed:
             created = False
         else:
             created = True
-        found = self.get_versioned()
-        if found.data == payload:
-            return found.version
-        if created:
-            raise OSError(f"uploaded object did not verify: {self.url}")
-        raise ValueError(f"an immutable object already holds other bytes: {self.url}")
+        for attempt in range(retries + 1):
+            if attempt:
+                time.sleep(min(0.25 * 2 ** (attempt - 1), 10))
+            found = self.get_versioned()
+            if found.data == payload:
+                return found.version
+            if not created:
+                raise ValueError(f"an immutable object already holds other bytes: {self.url}")
+        raise OSError(f"uploaded object did not verify: {self.url}")
 
     def _backend(self) -> tuple[AbstractFileSystem, str, str]:
         fs, path = self.resolve()
         while isinstance(fs, CachingFileSystem):
             fs = fs.fs
-        protocol = "conditional" if issubclass(type(fs), ConditionalWrites) else fs.protocol
-        schemes = (protocol,) if isinstance(protocol, str) else protocol
-        for scheme in ("conditional", "file", "memory", "s3", "gs", "gcs", "hf"):
-            if scheme in schemes:
+        if issubclass(type(fs), ConditionalWrites):
+            return fs, path, "conditional"
+        if local(fs):
+            return fs, path, "file"
+        if in_memory(fs):
+            return fs, path, "memory"
+        for scheme in ("s3", "gs", "gcs", "hf"):
+            if scheme in _protocols(fs):
                 return fs, path, scheme
         raise ValueError(f"conditional publication is unavailable for {self.url}")
 
@@ -620,11 +661,7 @@ class Store:
                 if previous != version:
                     raise PreconditionFailed(self.url)
                 if scheme == "file":
-                    with tempfile.NamedTemporaryFile(dir=str(Path(path).parent), delete=False) as pending:
-                        pending.write(payload)
-                        pending.flush()
-                        os.fsync(pending.fileno())
-                    os.replace(pending.name, path)
+                    write_atomically(path, payload)
                 else:
                     fs.pipe_file(path, payload)
                 return hashlib.sha256(payload).hexdigest()
@@ -635,31 +672,24 @@ class Store:
                 raise PreconditionFailed(self.url) from error
         if isinstance(fs, S3FileSystem):
             from botocore.exceptions import ClientError
-            from fsspec.asyn import sync
 
-            bucket, key, _ = fs.split_path(path)
-
-            async def put_s3() -> str:
-                client = await fs.set_session()
-                try:
-                    outcome = await client.put_object(
-                        Bucket=bucket,
-                        Key=key,
-                        Body=payload,
-                        **({"IfNoneMatch": "*"} if version is None else {"IfMatch": version}),
-                    )
-                except ClientError as error:
-                    if error.response["ResponseMetadata"]["HTTPStatusCode"] in (409, 412):
-                        raise PreconditionFailed(self.url) from error
-                    raise
-                return outcome["ETag"]
-
-            loop = fs.loop
-            if loop is None:
+            if fs.loop is None:
                 raise ValueError("Dew storage needs synchronous S3 filesystem options")
-            version = sync(loop, put_s3)
+            bucket, key, _ = fs.split_path(path)
+            # Through s3fs's own call, which adds the profile's arguments (its server-side encryption,
+            # a KMS key, SSE-C) and its bucket's regional client, as every other write of it does.
+            try:
+                outcome = fs.call_s3("put_object", Bucket=bucket, Key=key, Body=payload,
+                                     **({"IfNoneMatch": "*"} if version is None else {"IfMatch": version}))
+            except OSError as error:
+                # s3fs translates the refused condition; botocore's answer stays the error's cause.
+                cause = error.__cause__
+                if isinstance(cause, ClientError) and cause.response.get(
+                        "ResponseMetadata", {}).get("HTTPStatusCode") in (409, 412):
+                    raise PreconditionFailed(self.url) from error
+                raise
             fs.invalidate_cache()
-            return version
+            return outcome["ETag"]
         if isinstance(fs, GCSFileSystem):
             bucket, key, _ = fs.split_path(path)
             # The JSON API's upload root beside the API root the filesystem reads (`base`).
@@ -716,10 +746,14 @@ class Store:
 
 @functools.cache
 def _registered() -> None:
-    """Register the profiles the storage config names (DEW_STORAGE_CONFIG, else
-    ~/.config/dew/storage.toml) with fsspec, once, as the first store resolves: the configuration is
-    read where it is first used, so a broken one fails that store, not the import."""
-    config = Path(os.environ.get("DEW_STORAGE_CONFIG", "~/.config/dew/storage.toml")).expanduser()
+    """Register the profiles the storage config names (DEW_STORAGE_CONFIG, else storage.toml in Dew's
+    configuration directory, `dew.cache.dew_config_dir`) with fsspec, once, as the first store
+    resolves: the configuration is read where it is first used, so a broken one fails that store,
+    not the import."""
+    from dew.cache import dew_config_dir
+
+    named = os.environ.get("DEW_STORAGE_CONFIG")
+    config = Path(named).expanduser() if named else dew_config_dir() / "storage.toml"
     if config.is_file():
         for name, values in tomllib.loads(config.read_text()).items():
             options = dict(values)

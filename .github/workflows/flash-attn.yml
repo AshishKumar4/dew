@@ -1,5 +1,6 @@
 # Builds kernels/flash_attn's wheels, FlashAttention-2 for JAX, for each CUDA
-# major, on the CUDA toolkit's own glibc-2.28 image; no GPU is needed to build.
+# major on x86_64 and on aarch64 (the GH200's Grace), through cuda-wheels.yml,
+# which kernels/cutlass's wheels share.
 # The wheels are this run's artifacts. It runs for a release tag or by hand: a
 # build takes about an hour, so a kernel change builds its wheel on a GPU node
 # or the PC while its lane works, and a branch push builds none.
@@ -7,7 +8,7 @@
 # A tag flash-attn-v<version> releases them: the build checks that the tag is
 # the version kernels/flash_attn/pyproject.toml carries and that both wheels
 # pass twine's checks, and one publish job per CUDA major uploads that major's
-# wheel to PyPI, the cu12 one as dew-flash-attn-cu12 and the cu13 one as
+# two wheels to PyPI, the cu12 ones as dew-flash-attn-cu12 and the cu13 ones as
 # dew-flash-attn-cu13. Trusted publishing: PyPI accepts this workflow's
 # short-lived OIDC token, so the repository holds no PyPI secret. PyPI takes
 # one pending publisher per (repository, workflow, environment), so each
@@ -27,47 +28,10 @@ permissions:
 
 jobs:
   wheel:
-    runs-on: ubuntu-latest
-    timeout-minutes: 300
-    strategy:
-      matrix:
-        include: &variants
-        - cuda: "12.9.1"
-          environment: pypi
-          project: dew-flash-attn-cu12
-        - cuda: "13.0.0"
-          environment: pypi-cu13
-          project: dew-flash-attn-cu13
-    container: nvidia/cuda:${{ matrix.cuda }}-devel-rockylinux8
-    defaults:
-      run:
-        shell: bash
-    steps:
-    - name: Install the build tools
-      # The image's GCC 8 is older than nvcc's C++17 needs.
-      run: |
-        dnf install -y -q git python3.12 python3.12-pip gcc-toolset-12-gcc-c++
-        python3.12 -m pip install --quiet cmake ninja twine
-    - uses: actions/checkout@v4
-    - name: The tag is the version the wheel carries
-      if: startsWith(github.ref, 'refs/tags/flash-attn-v')
-      run: |
-        version=$(sed -n 's/^version = "\(.*\)"$/\1/p' kernels/flash_attn/pyproject.toml)
-        test "$GITHUB_REF_NAME" = "flash-attn-v$version" || {
-          echo "the tag is $GITHUB_REF_NAME and kernels/flash_attn carries $version"; exit 1; }
-    - name: Build
-      env:
-        PYTHON: python3.12
-        JOBS: "4"
-      run: |
-        source /opt/rh/gcc-toolset-12/enable
-        sh kernels/flash_attn/build.sh
-    - name: Check the wheel as PyPI will
-      run: python3.12 -m twine check --strict kernels/flash_attn/dist/*.whl
-    - uses: actions/upload-artifact@v4
-      with:
-        name: dew-flash-attn-cuda${{ matrix.cuda }}
-        path: kernels/flash_attn/dist/*.whl
+    uses: ./.github/workflows/cuda-wheels.yml
+    with:
+      package: flash_attn
+      tag: flash-attn
 
   publish:
     needs: wheel
@@ -75,7 +39,14 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        include: *variants
+        # Each CUDA major's project and environment, one publish job a major.
+        include:
+        - cuda: "12"
+          environment: pypi
+          project: dew-flash-attn-cu12
+        - cuda: "13"
+          environment: pypi-cu13
+          project: dew-flash-attn-cu13
     environment:
       name: ${{ matrix.environment }}
       url: https://pypi.org/p/${{ matrix.project }}
@@ -84,13 +55,16 @@ jobs:
     steps:
     - uses: actions/download-artifact@v4
       with:
-        name: dew-flash-attn-cuda${{ matrix.cuda }}
+        pattern: dew-flash-attn-cuda${{ matrix.cuda }}.*-*
+        merge-multiple: true
         path: dist/
-    - name: The wheel is this project's
+    - name: The wheels are this project's, one a machine
       # The CUDA major's build names its wheel after its project, which PyPI refuses under another's publisher.
       run: |
         ls dist/
-        test "$(ls dist/ | wc -l)" = 1
-        ls dist/ | grep -q "^$(echo '${{ matrix.project }}' | tr - _)-"
+        test "$(ls dist/ | wc -l)" = 2
+        test "$(ls dist/ | grep -c "^$(echo '${{ matrix.project }}' | tr - _)-")" = 2
+        ls dist/ | grep -q "_x86_64.whl$"
+        ls dist/ | grep -q "_aarch64.whl$"
     - name: Publish
       uses: pypa/gh-action-pypi-publish@release/v1

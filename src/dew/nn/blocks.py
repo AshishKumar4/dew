@@ -1,6 +1,6 @@
 """The convolutional and embedding pieces the UNets and the DiT sandwich share."""
 
-import math
+import functools
 from collections.abc import Callable
 from functools import partial
 
@@ -12,12 +12,16 @@ from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
 from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.dropout import Dropout
 
+from . import activations
 from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
-from .precision import at_least_fp32
-from .sharding import constrain, explicit_spec, whole_spec
+from .kernels.generation import linear_tangent
+from .precision import at_least_fp32, float32_dot_general, float32_einsum
+from .rope import sinusoid_frequencies, sinusoids
+from .sharding import constrain, explicit_spec, rows_taken, whole_spec
 
 
 def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
@@ -36,25 +40,31 @@ def _table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
     """`table[ids]` in `dtype`, the table's rows gathered before the cast so
     the gradient accumulates in the table's dtype: casting the table first
     would scatter-add repeated tokens' cotangents in bf16. Under an Explicit
-    axis splitting the ids, the rows are placed as the ids are."""
-    placed = explicit_spec(ids, table.ndim - 1)
-    rows = jnp.take(table, ids, axis=0) if placed is None else table.at[ids].get(out_sharding=placed)
-    return rows.astype(dtype)
+    axis splitting the ids, the rows are placed as the ids are (`rows_taken`)."""
+    return rows_taken(table, ids).astype(dtype)
 
 
-# `jax.custom_vjp` is generic in its return type, and a `functools.partial`
-# decorator loses that binding, so it is built by hand, as `ssd_chunk_scan` is.
-table_rows = jax.custom_vjp(_table_rows, nondiff_argnums=(2,))
+def table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
+    """`table[ids]` in `dtype` (`_table_rows`) differentiated at every order (`generation.linear_tangent`):
+    reverse mode adds each token's cotangent to its row in the table's dtype (`_table_rows_backward`), forward
+    mode (`jax.jvp`, `jax.linearize`) takes the gather's own tangent, which a custom VJP alone refused (row
+    1869, audit NN-06); the ids are not differentiable."""
+    return _rows(jnp.dtype(dtype))(table, ids)
 
 
-def _table_rows_forward(table: jax.Array, ids: jax.Array, dtype: Dtype):
-    return table_rows(table, ids, dtype), (table, ids)
+@functools.cache
+def _rows(dtype: jnp.dtype) -> Callable:
+    """The lookup in `dtype` as one function of the table and the ids (`table_rows`)."""
+    def forward(table, ids):
+        return _table_rows(table, ids, dtype), (table, ids)
+
+    return linear_tangent(forward, _table_rows_backward, lambda table, ids: _table_rows(table, ids, dtype))
 
 
-def _table_rows_backward(dtype: Dtype, residuals: tuple[jax.Array, jax.Array],
-                         cotangent: jax.Array) -> tuple[jax.Array, None]:
-    del dtype
-    table, ids = residuals
+def _table_rows_backward(saved: tuple[jax.Array, jax.Array], operands: tuple, cotangent: jax.Array
+                         ) -> tuple:
+    del operands
+    table, ids = saved
     # The gradient adds each token's cotangent to its row. Under a batch
     # split GSPMD scattered each device's tokens into a table-sized buffer
     # and summed the buffers across devices: a table's worth of traffic
@@ -67,11 +77,13 @@ def _table_rows_backward(dtype: Dtype, residuals: tuple[jax.Array, jax.Array],
         cotangent, ids = _whole(cotangent), _whole(ids)
     rows = cotangent.astype(table.dtype)
     placed = explicit_spec(ids)
+    # The ids are integers: their cotangent is float0's zero, as the lookup's own pullback gives it.
+    untouched = np.zeros(ids.shape, jax.dtypes.float0)
     if placed is None:
-        return jnp.zeros_like(table).at[ids].add(rows), None
+        return jnp.zeros_like(table).at[ids].add(rows), untouched
     # Each device scatters its own rows and the sums are added across the axis.
     summed = jax.sharding.NamedSharding(placed.mesh, jax.typeof(table).sharding.spec)
-    return jnp.zeros_like(table).at[ids].add(rows, out_sharding=summed), None
+    return jnp.zeros_like(table).at[ids].add(rows, out_sharding=summed), untouched
 
 
 def _whole(x: jax.Array) -> jax.Array:
@@ -80,8 +92,6 @@ def _whole(x: jax.Array) -> jax.Array:
     placed = whole_spec(x, x.ndim)
     return constrain(x if placed is None else jax.sharding.reshard(x, placed), (None,) * x.ndim)
 
-
-table_rows.defvjp(_table_rows_forward, _table_rows_backward)
 
 
 def modulation(conditioning, features: int, pieces: int, *, name: str, silu: bool = True,
@@ -92,8 +102,9 @@ def modulation(conditioning, features: int, pieces: int, *, name: str, silu: boo
     projects the conditioning as it is (FlaxDiff 0.2's DiT); `zero_init` starts it at zero,
     adaLN-Zero's identity block at the start of training."""
     return Dense(pieces * features, use_bias=bias, dtype=dtype, precision=precision, name=name,
-                 kernel_init=nn.initializers.zeros if zero_init else nn.initializers.lecun_normal())(
-        nn.silu(conditioning) if silu else conditioning)
+                 kernel_init=nn.initializers.zeros if zero_init else nn.initializers.lecun_normal(),
+                 dot_general=float32_dot_general)(
+        activations.silu(conditioning) if silu else conditioning)
 
 
 class Modulation(nn.Module):
@@ -128,19 +139,39 @@ class Modulation(nn.Module):
         return jnp.split(projected, self.pieces, axis=-1)
 
 
+def padded_row(padding_idx: int | None, rows: int) -> int | None:
+    """The row of a table of `rows` that `padding_idx` names, as torch's `nn.Embedding` reads it: a
+    negative id counts from the table's end, one outside the table is refused, and None names none."""
+    if padding_idx is None:
+        return None
+    if not -rows <= padding_idx < rows:
+        raise ValueError(f"padding_idx {padding_idx} is outside the table of {rows} rows")
+    return padding_idx % rows
+
+
 class TokenEmbedding(nn.Embed):
     """Token lookup with cotangent accumulation in the parameter dtype."""
+
+    padding_idx: int | None = None
+    """The id whose row this lookup reads but never trains, as torch's `nn.Embedding(padding_idx=...)`
+    leaves it: the row's gradient takes nothing from the places that read that id. A negative id
+    counts from the table's end, as torch counts it; one outside the table is refused. None trains
+    every row it reads."""
 
     def __call__(self, inputs: jax.Array) -> jax.Array:
         if not jnp.issubdtype(inputs.dtype, jnp.integer):
             raise ValueError("Input type must be an integer or unsigned integer.")
         if self.num_embeddings == 1:
             values = jnp.broadcast_to(self.embedding, (*inputs.shape, self.features))
-            promoted, = self.promote_dtype(values, dtype=self.dtype, inexact=False)
-            if promoted is None:
+            rows, = self.promote_dtype(values, dtype=self.dtype, inexact=False)
+            if rows is None:
                 raise ValueError("Embedding dtype promotion must return an array")
-            return promoted
-        return table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
+        else:
+            rows = table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
+        padding = padded_row(self.padding_idx, self.num_embeddings)
+        if padding is None:
+            return rows
+        return jnp.where((inputs == padding)[..., None], jax.lax.stop_gradient(rows), rows)
 
 
 class FourierEmbedding(nn.Module):
@@ -175,8 +206,7 @@ class FourierEmbedding(nn.Module):
         # into whatever scalar the caller scaled `x` by (EDM's 1/4) and the
         # sin/cos arguments round differently.
         angular = jax.lax.optimization_barrier(2 * jnp.pi * self.frequencies.value)
-        emb = x[:, None] * angular[None, :]
-        return jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
+        return sinusoids(x[:, None] * angular[None, :])
 
 
 def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, cosine_first: bool = True):
@@ -190,34 +220,35 @@ def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, 
     half = features // 2
     if features % 2 or half <= shift:
         raise ValueError("Time embedding width must be even and exceed twice the frequency shift")
-    # Scale the whole exponent before dividing, as the published models do;
-    # the other order moves a sine by 1e-5 near timestep 1000. Take exp on
-    # the host in float64 so the table does not vary with the backend.
-    width = np.dtype(dtype).type
-    exponent = np.arange(half, dtype=width) * width(-math.log(10000.0)) / width(half - shift)
-    frequencies = jnp.asarray(np.exp(exponent.astype(np.float64)).astype(width))
-    phase = jnp.asarray(time, width).reshape(-1, 1) * frequencies[None]
-    first, second = (jnp.cos(phase), jnp.sin(phase)) if cosine_first else (jnp.sin(phase), jnp.cos(phase))
-    return jnp.concatenate([first, second], axis=-1)
+    frequencies = jnp.asarray(sinusoid_frequencies(half, half - shift, dtype=dtype, exponential=True))
+    return sinusoids(jnp.asarray(time, dtype).reshape(-1, 1) * frequencies[None], cosine_first=cosine_first)
 
 
 class TimeProjection(nn.Module):
     """Two dense layers with the activation after each."""
     features: int
-    activation: Callable = jax.nn.gelu
+    activation: Callable = activations.gelu_tanh
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.nowrap
+    def _mlp(self, input_features: int):
+        from .mlp import GatedMLP  # mlp reads this module's initializers
+
+        return GatedMLP(self.features, self.features, in_features=input_features,
+                        activation=self.activation, activation_after=True, use_bias=True,
+                        names=("DenseGeneral_0", "DenseGeneral_1"), dtype=self.dtype,
+                        precision=self.precision)
+
+    @nn.nowrap
     def model_flops(self, lengths, input_features: int) -> float:
-        return projection_flops(lengths, input_features + self.features, self.features)
+        return self._mlp(input_features).model_flops(lengths)
 
     @nn.compact
     def __call__(self, x):
-        dense = partial(DenseGeneral, self.features,
-                        dtype=self.dtype, precision=self.precision)
-        x = self.activation(dense()(x))
-        return self.activation(dense()(x))
+        mlp = self._mlp(x.shape[-1])
+        nn.share_scope(self, mlp)
+        return mlp(x)
 
 
 def torch_nearest_resize(x, height: int, width: int):
@@ -273,6 +304,15 @@ def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.n
     return matrix.astype(np.float32)
 
 
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+"""The ImageNet pixel statistics, per RGB channel, that encoders trained on ImageNet read their
+inputs under: transformers' `IMAGENET_DEFAULT_MEAN` and `IMAGENET_DEFAULT_STD`, written out since
+importing those runs `transformers.utils`, which imports torch where it is installed (transformers
+5.16.1, utils/generic.py), and image sampling imports this module with neither
+(tests/test_imports.py)."""
+
+
 def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False):
     """Resample `[B, H, W, C]` to `height` by `width` as torch's
     `F.interpolate(mode="bicubic", align_corners=False)` does.
@@ -283,19 +323,23 @@ def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False)
     reference only through this arithmetic."""
     rows = _torch_bicubic_weights(x.shape[1], height, antialias)
     columns = _torch_bicubic_weights(x.shape[2], width, antialias)
-    return jnp.einsum("oh,bhwc,pw->bopc", rows, x, columns, precision=jax.lax.Precision.HIGHEST)
+    return float32_einsum("oh,bhwc,pw->bopc", rows, x, columns, precision=jax.lax.Precision.HIGHEST)
 
 
 class Upsample(nn.Module):
-    """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`."""
+    """Nearest-neighbour upsampling by `scale`, then a 3x3 convolution to `features`, a module named `conv`
+    (its parameters' path, as the model owning them publishes it: a UNet's `Conv_0`, a KL autoencoder's
+    `conv`)."""
     features: int
     scale: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    conv: str = "Conv_0"
 
     @nn.nowrap
     def _convolution(self, **scope):
-        return Conv(self.features, (3, 3), dtype=self.dtype, precision=self.precision, **scope)
+        return Conv(self.features, (3, 3), dtype=self.dtype, precision=self.precision,
+                    **({"name": self.conv} if "parent" not in scope else {}), **scope)
 
     @nn.nowrap
     def model_flops(self, lengths, input_features: int) -> float:
@@ -338,10 +382,11 @@ class Downsample(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    """Norm, activation, convolution, the projected time embedding added,
-    norm, activation, convolution, plus the input (through a 1x1 convolution
-    when the width changes). `norm_groups` of 0 swaps the group norms for
-    RMS norms."""
+    """Norm, activation, convolution, the projected time embedding added
+    where the call gives one (an AutoencoderKL's blocks take none), norm,
+    activation, convolution, plus the input (through a 1x1 convolution when
+    the width changes). `norm_groups` of 0 swaps the group norms for RMS
+    norms."""
     features: int
     kernel_size: tuple = (3, 3)
     activation: Callable = jax.nn.swish
@@ -350,6 +395,9 @@ class ResidualBlock(nn.Module):
     precision: PrecisionLike = None
     norm_epsilon: float = 1e-4
     dropout: float = 0.0
+    shortcut: str = "residual_conv"
+    """The 1x1 convolution's name: Dew's UNets' `residual_conv`, or an AutoencoderKL's
+    `conv_shortcut`, under which diffusers' Flax checkpoints load and are written as they are."""
 
     @nn.nowrap
     def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -375,21 +423,23 @@ class ResidualBlock(nn.Module):
         self.norm2 = norm()
 
     @nn.compact
-    def __call__(self, x: jax.Array, temb: jax.Array, *, train: bool = False):
+    def __call__(self, x: jax.Array, temb: jax.Array | None = None, *, train: bool = False):
         conv = partial(Conv, features=self.features, kernel_size=self.kernel_size,
                        strides=(1, 1), dtype=self.dtype, precision=self.precision)
         out = conv(name="conv1")(self.norm1(x))
 
-        temb = DenseGeneral(features=self.features, name="temb_projection",
-                            dtype=self.dtype, precision=self.precision)(temb)
-        out = out + temb[:, None, None, :]
+        if temb is not None:
+            temb = DenseGeneral(features=self.features, name="temb_projection",
+                                dtype=self.dtype, precision=self.precision,
+                                dot_general=float32_dot_general)(temb)
+            out = out + temb[:, None, None, :]
 
         out = self.norm2(out)
         if self.dropout:
-            out = nn.Dropout(self.dropout)(out, deterministic=not train)
+            out = Dropout(self.dropout)(out, deterministic=not train)
         out = conv(name="conv2")(out)
 
         residual = x
         if residual.shape != out.shape:
-            residual = conv(kernel_size=(1, 1), name="residual_conv")(residual)
+            residual = conv(kernel_size=(1, 1), name=self.shortcut)(residual)
         return out + residual

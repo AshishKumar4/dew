@@ -122,11 +122,9 @@ When a rank fails between steps, for example because its data loader raised, its
 
 A rank can also stall without failing, for example when it is blocked on a read, or in a compile that waits for its peers. Then every process stays alive and none of them reports anything, while the others wait inside a collective or a communicator's setup. For this case a GPU pool bounds each device execution with XLA's execution watchdog: `prepare_process` sets `--xla_gpu_execution_terminate_timeout=30m` when the CUDA plugin is present and the run has not set that flag. A process whose step, or whose sampling loop, runs longer than that ends, and the launcher, `srun` or the scheduler stops the rest. If you know how long your steps take, set a tighter value in `XLA_FLAGS` or through the recipe's `xla_flags`.
 
-The watchdog bounds device executions only. Before the collectives of a phase agreement, such as a checkpoint save or the end of `fit`, the ranks meet on the host. So a rank that arrives first waits on the host for one that is still busy with host work, for example process 0 uploading the final checkpoint to Weights & Biases. If it waited on the device instead, it would sit inside a collective and the watchdog would end it. `AGREEMENT_PATIENCE_SECONDS` in `dew.coordination` bounds that host wait at one day. A rank that stalls in host work before an agreement can hold its peers for that long, so lower the value when your host phases are short.
+The watchdog bounds device executions only. Before the collectives of a phase agreement, such as a checkpoint save or the end of `fit`, the ranks meet on the host. So a rank that arrives first waits on the host for one that is still busy with host work, for example process 0 uploading the final checkpoint to Weights & Biases. If it waited on the device instead, it would sit inside a collective and the watchdog would end it. `dew.distributed.agreement_patience(seconds)` bounds that host wait, one day by default. A rank that stalls in host work before an agreement can hold its peers for that long, so lower it when your host phases are short.
 
-A pool keeps JAX's persistent compilation cache. jax 0.11.2 keys a cached executable by a fingerprint of the compiling process's accelerator topology, which on a GPU describes the device down to its NVLink links, and only process 0 writes entries. On one four-GPU host with an NVLink pair and a PCIe pair, ranks 0 and 1 found a step in a shared cache while ranks 2 and 3 compiled it, and that compile waited forever for its peers' shares of the sharded autotuning.
-
-Dew's JAX build fixes this (reported as jax-ml/jax#40940; [Dew's JAX build](../installation.md#dews-jax-build)). A computation that spans processes hashes the fingerprints of all of them, so every rank loads the same entry, as long as every process compiles for the same accelerators: the same platform and runtime, CUDA driver, cuDNN and cuBLAS, and the same device kinds, compute capability and core count. A pool whose processes differ in any of these compiles those computations without the cache, and JAX logs which processes differ.
+A pool keeps JAX's persistent compilation cache. JAX keys a cached executable by a fingerprint of the compiling process's accelerator topology, which on a GPU describes the devices down to their NVLink links, and XLA compiles for those links: its GPU all-reduce takes the NVLink kernel where they allow it. So every process of a GPU pool needs the same topology. jaxlib 0.12 checks this as the pool starts ([openxla/xla#49677](https://github.com/openxla/xla/pull/49677)): a process whose fingerprint differs from process 0's fails distributed initialization, where it would otherwise compile programs that diverge from its peers' and wait in a collective. On one four-GPU host with an NVLink pair and a PCIe pair, run each pair as a pool of its own. `XLA_PJRT_GPU_VALIDATE_TOPOLOGY=false` turns the check off and brings that wait back. On the CPU a process's topology is its own devices, so a CPU pool's processes key a step apart: process 0, which writes the cache's entries, loads its steps from it, and the others compile theirs again, as upstream JAX does.
 
 ## Mesh layout across nodes
 
@@ -138,7 +136,7 @@ Hybrid sharding keeps fsdp inside a node and replicates across nodes, so only on
 ```python
 import jax
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec
@@ -161,7 +159,7 @@ On GPU hosts whose device ids run host by host, `jax.make_mesh` already puts the
 
 With `replicas=1`, `jax.make_mesh` places the devices, which is what you want on a single node or a single TPU slice. To choose which devices share an axis, pass them to `spec.build(devices)`. It fills the mesh with the list in the order you give, row-major over `MESH_AXES`, so the last axes get neighbouring entries. For example, on a machine whose NVLink pairs are GPUs 0-1 and 2-3, `[0, 2, 1, 3]` puts a two-way tensor axis across the pairs instead of inside them. `jax.make_mesh` would sort GPU devices by id and lose that order.
 
-Hybrid sharding keeps a full copy of the parameters and optimizer state on every replica group. Plain fsdp across all nodes divides them by the total device count instead. Choose hybrid sharding when one node's memory holds the sharded state, and plain fsdp when it does not.
+Hybrid sharding keeps a full copy of the parameters and optimizer state on every replica group. Plain fsdp across all nodes divides them by the total device count instead. Choose hybrid sharding when one node's memory holds the sharded state, and plain fsdp when it does not. `Trainer.validate` reads, on a CPU host, what each GPU would hold under either mesh, and refuses the one whose state a GPU cannot hold ([checking a distributed run](../concepts/distributed.md#checking-a-distributed-run)).
 
 ## Sequence parallelism
 
@@ -231,11 +229,11 @@ Each fsdp group spans the two hosts of its replica. With `--mesh '{"fsdp": 2}'` 
 - a failing process stops the pool, including a rank whose loader fails in the middle of `fit` and a rank that stalls without failing;
 - a pool refuses a checkpoint directory its processes do not share;
 - two pools started together get a port each;
-- a pool's second run loads, on every process, the step its first run compiled.
+- a pool's second run loads the step its first run compiled, on process 0, and on every process of a GPU pool.
 
 On a GPU run, the tests marked `mesh(devices=2)` take one GPU per process.
 
-`tools/layout_parity.py` runs every layout of every model family against one device, in one process or under `dew launch`. It compares the loss and each gradient leaf with the one-device reference, within the reference's own deviation when the batch's sums are reordered, and it compares the devices' FLOPs with one device's FLOPs split evenly. A layout that Dew refuses by design, such as a stage axis over a DiT, raises `dew.nn.sharding.LayoutRefused` with the reason and a layout that does run. The tool lists those rows separately, and it exits nonzero only on a mismatch, repeated work or another error. `--prepare` computes each model's one-device reference into a `--references` directory in a one-device job, so a later run of the layouts on every device does not compute the references itself.
+`tools/layout_parity.py` runs every layout of every model family against one device, in one process or under `dew launch`. It compares the loss and each gradient leaf with the one-device reference, within the reference's own deviation when the batch's sums are reordered, and it compares the devices' FLOPs with one device's FLOPs split evenly. A layout that Dew refuses by design, such as a stage axis over a DiT, raises `dew.mesh.LayoutRefused` with the reason and a layout that does run. The tool lists those rows separately, and it exits nonzero only on a mismatch, repeated work or another error. `--prepare` computes each model's one-device reference into a `--references` directory in a one-device job, so a later run of the layouts on every device does not compute the references itself.
 
 ## Tested configurations
 

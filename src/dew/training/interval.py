@@ -10,6 +10,7 @@ the counters each cadence owns.
 from __future__ import annotations
 
 import dataclasses
+import math
 import time
 from collections.abc import Mapping
 from typing import NamedTuple, Protocol, runtime_checkable
@@ -18,9 +19,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import Batch
 from dew.data.dataset import rows_of
-from dew.objectives.base import Batch
-from dew.telemetry.instrumentation import NO_FLOPS, StepFlops
+from dew.nn.precision import at_least_fp32
+from dew.state import Accumulation
+from dew.telemetry.instrumentation import NO_FLOPS, StepFlops, model_flops_utilization
 from dew.training.display import TrainingDisplay
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
 from dew.training.transaction import Committed
@@ -33,23 +36,16 @@ COMMITTED_TOKENS = "committed_tokens"
 """The checkpoint control field that holds a run's tokens, those its committed updates trained on."""
 
 
-def committed_tokens(control: dict, budget: int | None) -> int | None:
+def committed_tokens(control: dict) -> int:
     """The tokens a checkpoint's `control` says its run's committed updates trained on, taken out of
-    it, 0 where it counted none, and None where it cannot say: a checkpoint that counted every
-    step's tokens (`tokens`, before runs counted commits), a rejected attempt's and an unfinished
-    window's among them, or one resumed from such a checkpoint, which keeps the count unknown. A
-    run of steps resumes from it and keeps the count unknown in its own checkpoints; a run whose
-    length is its tokens (`budget`) cannot, and is refused."""
-    legacy = control.pop("tokens", None)
-    if COMMITTED_TOKENS in control:
-        return int(control.pop(COMMITTED_TOKENS))
-    if legacy is None:
-        return 0
-    if budget is not None:
-        raise ValueError(f"this checkpoint's run counted every step's tokens, not those its committed "
-                         f"updates trained on, so a run of tokens={budget} cannot resume from it; resume "
-                         "it by steps, or train afresh")
-    return None
+    it, 0 where it counted none. A checkpoint whose control counts every step's tokens under
+    `tokens`, a field runs wrote before they counted commits, is refused by name: its count holds
+    rejected attempts and unfinished windows, and no count of this Dew's reads it."""
+    if "tokens" in control:
+        raise ValueError("this checkpoint counts every step's tokens under 'tokens', a field runs wrote "
+                         f"before they counted their committed updates' ({COMMITTED_TOKENS!r}); resume it "
+                         "under the Dew release that wrote it, or train afresh from its weights")
+    return int(control.pop(COMMITTED_TOKENS, 0))
 
 
 class Book(NamedTuple):
@@ -77,7 +73,7 @@ def fresh_book(loss: jax.Array) -> Book:
     Counters on any other device would move to the step's devices at every count,
     and `bookkeep` would compile again.
     """
-    dtype = jnp.promote_types(loss.dtype, jnp.float32)
+    dtype = at_least_fp32(loss.dtype)
     zeros = (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32),
              np.zeros((), dtype), np.zeros((2,), np.uint32), np.zeros((), dtype), np.zeros((), np.int32))
     return Book(*jax.device_put(zeros, loss.sharding))
@@ -92,7 +88,7 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committe
     either on the host between logging ticks.
     """
     bad_run = jnp.where(finite, 0, book.bad_run + 1)
-    dtype = jnp.promote_types(loss.dtype, jnp.float32)
+    dtype = at_least_fp32(loss.dtype)
     norms, commits = book.norms, book.commits
     if committed is not None:
         norms, commits = norms + committed.norm.astype(dtype), commits + committed.count
@@ -126,7 +122,9 @@ class Interval:
     last_log_time: float
     last_saved: int | None
     tokens_before_log: int = 0
-    tokens_known: bool = True
+    resumable: int | None = None
+    """The step of the last checkpoint a resume can read, its whole state (`Checkpoints.latest`), where
+    `last_saved` may be a save of weights alone."""
     logged_tokens: jax.Array | None = None
     book: Book | None = None
     fresh: Book | None = None
@@ -177,27 +175,32 @@ class Interval:
             checked_streak(int(on_host(streak, step)), step, display)
 
     @classmethod
-    def resumed(cls, control: dict, budget: int | None, *, last_saved: int | None) -> Interval:
+    def resumed(cls, control: dict, *, last_saved: int | None) -> Interval:
         """An interval from now on, its token clock read off a checkpoint's `control`
-        (`committed_tokens`), which it takes the clock's fields out of."""
-        counted = committed_tokens(control, budget)
-        return cls(time.time(), last_saved=last_saved, tokens_before_log=counted or 0,
-                   tokens_known=counted is not None)
+        (`committed_tokens`), which it takes the clock's field out of."""
+        return cls(time.time(), last_saved=last_saved, tokens_before_log=committed_tokens(control),
+                   resumable=last_saved)
 
     @property
     def token_control(self) -> dict[str, int]:
         """The token clock a checkpoint keeps (`Checkpoints.control`): the committed updates' real
-        tokens, or, where the run resumed a checkpoint that could not say (`committed_tokens`), the
-        count under the field that says so, so every checkpoint after it keeps saying so."""
-        return {COMMITTED_TOKENS if self.tokens_known else "tokens": self.real_tokens}
+        tokens."""
+        return {COMMITTED_TOKENS: self.real_tokens}
 
     @property
     def real_tokens(self) -> int:
         """Lifetime real tokens: the runs before this fit's, its logged
         intervals' and the current interval's, read from the devices."""
+        return self.clocked(None)[0]
+
+    def clocked(self, window: Accumulation | None) -> tuple[int, int]:
+        """The lifetime real tokens (`real_tokens`) and the tokens an update's open `window` holds
+        (`Accumulation.tokens`; 0 for none), in one read off the devices."""
         counted = [tokens for tokens in (self.logged_tokens, self.book.tokens if self.tokens_counted and
                                          self.book is not None else None) if tokens is not None]
-        return self.tokens_before_log + sum(_TokenCount.host(tokens) for tokens in jax.device_get(counted))
+        read, held = jax.device_get((counted, None if window is None else window.tokens))
+        return (self.tokens_before_log + sum(_TokenCount.host(tokens) for tokens in read),
+                0 if held is None else _TokenCount.host(held))
 
     def take(self, step: int, loss: jax.Array, aux: Mapping[str, jax.Array], accepted: jax.Array,
              copies: tuple[jax.Array | None, jax.Array | None],
@@ -226,11 +229,48 @@ class Interval:
                                       norms=self.fresh.norms, commits=self.fresh.commits)
         return taken
 
-    def saved(self, step: int) -> None:
-        """Start the next checkpoint interval after the one saved at `step`."""
+    def saved(self, step: int, *, resumable: bool = True) -> None:
+        """Start the next checkpoint interval after the one saved at `step`, a step a resume can read
+        where `resumable`."""
         self.last_saved, self.steps = step, 0
+        if resumable:
+            self.resumable = step
         if self.book is not None and self.fresh is not None:
             self.book = self.book._replace(loss=self.fresh.loss)
+
+
+@dataclasses.dataclass
+class TokenClock:
+    """The committed-token clock as a fit's loop reads it (`dew.training._fit.FitPlan.committed`): `read`,
+    the count at its last read off the devices (`Interval.clocked`), and `bound`, above any count the
+    steps since can have brought it to, so the loop reads it again only where that reaches what a
+    budget, a cadence or a schedule reads next, and otherwise dispatches each step without waiting on
+    the last.
+
+    Committed tokens grow only by what an update's window held: `held` is the tokens the window open at
+    the last read held then, read with the count (`Accumulation.tokens`), and the most each step since
+    can add, its rows' tokens (`Objective.row_tokens`). So the bound holds however the windows fall, a
+    resumed run's restored window, a ramp's or a schedule's dropped one included. A step of no declared
+    tokens leaves it unknown (None) until the next read."""
+
+    read: int = 0
+    held: int | None = 0
+    """The most the window open at the last read and the steps since can commit; None where unknown."""
+
+    @property
+    def bound(self) -> int | None:
+        """The most the committed tokens can be after the latest step, or None where unknown."""
+        return None if self.held is None else self.read + self.held
+
+    def stepped(self, per_row: int | None, rows: int) -> None:
+        """Count a step of `rows` rows, each committing at most `per_row` tokens, None where they declare
+        none."""
+        self.held = None if self.held is None or per_row is None else self.held + per_row * rows
+
+    def reread(self, read: int, pending: int) -> None:
+        """Take `read`, the committed tokens off the devices after the latest step, and `pending`, those
+        of the window then open."""
+        self.read, self.held = read, pending
 
 
 @jax.jit
@@ -347,3 +387,51 @@ def checked_streak(streak: int, step: int, display: TrainingDisplay) -> None:
             f"ending near step {step}, stopping")
     if streak:
         display.note(f"Non-finite loss for {streak} step(s) before {step}", style="red")
+
+
+def throughput(elapsed: float, steps: int, samples: int, flops: StepFlops | None, devices: int, *,
+               waited: float = 0.0, compiling: float = 0.0,
+               training_flops: float | None = None, tokens: float | None = None) -> dict[str, float]:
+    """Compute the interval's rates from the records it read and its FLOPs, on a mesh of `devices`.
+
+    The FLOPs are the ones the compiler measured for each step's own
+    shape; `flops` is None when a shape's measurement was unavailable.
+    train/flops is the objective's analytical training work on real rows a
+    step, over the whole mesh, on any device: 3*forward for full FT,
+    explicit frozen/trainable matrix work for PEFT. train/mfu is that work
+    over the whole mesh's peak, where the device's peak is known. train/hfu keeps hardware HLO
+    work including remat; train/hlo_flops_util is the former HLO model
+    count with recomputation removed (`StepFlops.utilizations`). No HLO
+    count substitutes for MFU.
+
+    `compiling` is the seconds the interval spent compiling the step for
+    shapes it met for the first time (a bucket length, a ramp's stage).
+    The rates are over the rest of `elapsed`, so a step that compiled
+    does not read as a slow step, and the compile is reported on its own
+    as train/compile_s. `waited` is the seconds the loop waited on its
+    next batch, reported per step as train/data_wait_ms. The loop
+    dispatches steps ahead of the device, so a wait the device's queued
+    work covers costs no device time; a wait near the step time is a
+    stalled input.
+    """
+    stepping = elapsed - compiling
+    if stepping <= 0 or steps <= 0:
+        return {}
+    step_time = stepping / steps
+    scalars = {"train/step_time_ms": step_time * 1000,
+               "train/samples_per_sec": samples / stepping,
+               "train/data_wait_ms": waited / steps * 1000}
+    if compiling > 0:
+        scalars["train/compile_s"] = compiling
+    if tokens is not None:
+        scalars["train/tokens"] = float(tokens) / steps
+        scalars["train/tokens_per_s"] = float(tokens) / stepping
+    # A batch whose work could not be counted carries NaN (`_counted_batch`),
+    # so an interval holding one, on any process, reports no train/flops or train/mfu.
+    if training_flops is not None and math.isfinite(training_flops):
+        scalars["train/flops"] = float(training_flops) / steps
+        per_device = float(training_flops) / devices
+        utilization = model_flops_utilization(per_device / steps, step_time)
+        if utilization is not None:
+            scalars["train/mfu"] = utilization
+    return scalars if flops is None else {**scalars, **flops.utilizations(steps, step_time)}

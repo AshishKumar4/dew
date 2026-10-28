@@ -4,28 +4,33 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import hashlib
 import itertools
-import json
-import random
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from types import UnionType
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeAliasType, runtime_checkable
+from typing import ClassVar, Protocol, runtime_checkable
 
 import numpy as np
-import tyro
 
-from dew.data.dataset import Batch, Records
-from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline, Stage
-from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed, _uncounted
+from dew.batch import Batch
+from dew.data.dataset import Records
+from dew.data.generation import Generation, RowId, _GenerationSource, _row_key, _shard_inputs, _source_ids
+from dew.data.pipeline import Dataset, Pipeline, with_stores
+from dew.data.sources.base import (
+    Read,
+    Rows,
+    Shard,
+    ShardManifest,
+    Source,
+    View,
+    _indexed_manifest,
+    _uncounted,
+    stated,
+)
 from dew.data.sources.codec import content_fingerprint
-from dew.records import integer
-
-if TYPE_CHECKING:
-    from dew.data.sources.files import Format
 
 _INDEXED_READS: tuple[Read, ...] = ("memory", "indexed")
 _BY_INDEX = ("reads by index, under read='memory' or 'indexed'; a stream holds out a hash fraction "
-             "(HoldOut(fraction=..., by='hash'), or Dataset.holdout(fraction)) or nothing (validation=None)")
+             "(holdout(fraction)) or nothing")
 """Why a holdout that picks records by their index refuses a streamed read, and what streams."""
 
 
@@ -43,39 +48,46 @@ def _named_split(source: Source, name: str) -> Source:
 
 
 @dataclasses.dataclass(frozen=True)
-class _SliceRecords:
+class RecordSlice(View[Source]):
+    """The records [`start`, `stop`) of `source`, by index (`holdout(records=)`): the first `start`
+    held out of the part a run trains on, or those a run scores. A run's record names it."""
+
+    rows: ClassVar[Rows] = "selected"
     reads: ClassVar[tuple[Read, ...]] = _INDEXED_READS
-    refusal: ClassVar[str] = f"a records= or index-fraction holdout {_BY_INDEX}"
+    refusal: ClassVar[str] = f"a records= holdout {_BY_INDEX}"
     source: Source
     start: int
     stop: int | None = None
-
-    def consumed(self, read: Read) -> _SliceRecords:
-        return dataclasses.replace(self, source=_consumed(self.source, read))
-
-    def label(self) -> str:
-        return self.source.label()
 
     def describe(self) -> str:
         return f"{self.source.describe()}[{self.start}:{self.stop}]"
 
     def fingerprint(self) -> Mapping[str, object]:
-        return {**self.source.fingerprint(), "slice": [self.start, self.stop]}
-
-    def supports(self, read: Read) -> bool:
-        return read in self.reads and self.source.supports(read)
+        return _selected(self.source, "slice", {"slice": [self.start, self.stop]})
 
     def records(self, read: Read):
         from dew.data.dataset import SourceSlice
 
         records = self.source.records(read)
-        stop = len(records) if self.stop is None else self.stop
-        if not 0 <= self.start <= stop <= len(records):
-            raise ValueError(f"{self.describe()} exceeds the source's {len(records)} records")
-        return SourceSlice(records, self.start, stop)
+        return SourceSlice(records, *self.bounds(len(records)))
+
+    def admits(self, position: int, row: Batch | bytes | None) -> bool:
+        """Whether the record at `position` among its source's is in this slice."""
+        return self.start <= position and (self.stop is None or position < self.stop)
+
+    def admitted(self, records: int) -> None:
+        """Refuse a slice past the `records` it was offered (`bounds`)."""
+        self.bounds(records)
+
+    def bounds(self, records: int) -> tuple[int, int]:
+        """The first and the one past the last of `records` it keeps, refusing a slice past them."""
+        stop = records if self.stop is None else self.stop
+        if not 0 <= self.start <= stop <= records:
+            raise ValueError(f"{self.describe()} exceeds the source's {records} records")
+        return self.start, stop
 
     def metadata(self) -> Mapping[str, object]:
-        return {**_uncounted(self.source.metadata()), **({"held_out": self.start} if self.start else {})}
+        return {**super().metadata(), **({"held_out": self.start} if self.start else {})}
 
     def lengths(self) -> np.ndarray | None:
         lengths = self.source.lengths()
@@ -99,19 +111,6 @@ def _inside(row: Batch | bytes, low: float, high: float, key: str | None) -> boo
 
 
 @dataclasses.dataclass(frozen=True)
-class _HashRows:
-    low: float
-    high: float
-    held: bool
-    key: str | None = None
-
-    def __call__(self, row: Batch) -> bool:
-        """Whether `row` is in this part: the other part's rows are no rejection, as a memory read
-        holds none of them."""
-        return _inside(row, self.low, self.high, self.key) == self.held
-
-
-@dataclasses.dataclass(frozen=True)
 class _SelectedRow:
     rows: Records
 
@@ -120,62 +119,65 @@ class _SelectedRow:
 
 
 @dataclasses.dataclass(frozen=True)
-class _HashSource:
+class HashPart(View[Source]):
     """The rows of `source` whose identity (its `key` field, or its content)
     hashes into [`low`, `high`) of the unit interval (`held`), or the rows
     that do not: a row is in exactly one part, the same in every run, read,
-    machine and resume."""
+    machine and resume (`holdout(fraction)`). A run's record names it."""
 
+    rows: ClassVar[Rows] = "selected"
     reads: ClassVar[tuple[Read, ...]] = ("memory", "streamed")
     refusal: ClassVar[str] = ("a hash holdout reads every row to place it, under read='memory' or "
-                              "'streamed'; an indexed read holds out records= or an index fraction")
+                              "'streamed'; an indexed read holds out records=")
     source: Source
     low: float
     high: float
     held: bool
     key: str | None = None
 
-    def consumed(self, read: Read) -> _HashSource:
-        return dataclasses.replace(self, source=_consumed(self.source, read))
-
-    def label(self) -> str:
-        return self.source.label()
-
     def describe(self) -> str:
         part = f"[{self.low},{self.high}),held={self.held},key={self.key}"
         return f"{self.source.describe()} hash holdout={part}"
 
     def fingerprint(self) -> Mapping[str, object]:
-        return {**self.source.fingerprint(), "holdout": [self.low, self.high], "held": self.held,
-                "key": self.key, "content_hash": "sha256:sorted-mappings-v1"}
-
-    def supports(self, read: Read) -> bool:
-        return read in self.reads and self.source.supports(read)
+        part = {"holdout": [self.low, self.high], "held": self.held, "key": self.key,
+                "content_hash": "sha256:sorted-mappings-v1"}
+        return _selected(self.source, "hash", part)
 
     def records(self, read: Read):
         import grain.python as grain
 
         rows = self.source.records(read)
-        keys = tuple(index for index in range(len(rows)) if (row := rows[index]) is not None
-                     and _inside(row, self.low, self.high, self.key) == self.held)
+        keys = tuple(index for index in range(len(rows)) if self.keeps(rows[index]))
         return grain.MapDataset.source(keys).map(_SelectedRow(rows))
 
-    def metadata(self) -> Mapping[str, object]:
-        return _uncounted(self.source.metadata())
+    def keeps(self, row: Batch | bytes | None) -> bool:
+        """Whether this part holds `row`: one that is there, its identity in the part."""
+        return row is not None and _inside(row, self.low, self.high, self.key) == self.held
+
+    def admits(self, position: int, row: Batch | bytes | None) -> bool:
+        """Whether this part holds `row`, wherever it is (`keeps`)."""
+        return self.keeps(row)
+
+    def admitted(self, records: int) -> None:
+        """Any number of rows holds a hash part."""
 
     def lengths(self) -> np.ndarray | None:
         return None
 
     def manifest(self) -> ShardManifest:
         """The source's shards, each read through the hash. Which of a shard's rows the hash keeps
-        is known only once they are read, so no shard states its rows."""
+        is known only once they are read, so no shard states its rows; the rows it keeps stream in
+        the order its source's do, which is its index order where theirs is (`records`)."""
         manifest = self.source.manifest()
         subdivide = manifest.subdivide
         return ShardManifest(_unsized(manifest.shards), functools.partial(self._reader, manifest),
-                             None if subdivide is None else functools.partial(_unsized_parts, subdivide))
+                             None if subdivide is None else functools.partial(_unsized_parts, subdivide),
+                             index_ordered=manifest.index_ordered)
 
     def _reader(self, manifest: ShardManifest, shard: Shard):
-        return manifest.reader(shard).filter(_HashRows(self.low, self.high, self.held, self.key))
+        # The other part's rows are no rejection, as a memory read holds none of them.
+        return manifest.reader(shard).filter(self.keeps)
 
 
 def _unsized(shards: Sequence[Shard]) -> tuple[Shard, ...]:
@@ -184,18 +186,6 @@ def _unsized(shards: Sequence[Shard]) -> tuple[Shard, ...]:
 
 def _unsized_parts(subdivide: Callable[[int], tuple[Shard, ...]], count: int) -> tuple[Shard, ...]:
     return _unsized(subdivide(count))
-
-
-def _rebased(dataset: Dataset, store: Callable[[Source], Source]) -> Pipeline:
-    """`dataset` with each of its stores read through `store`, its steps unchanged."""
-    chain = dataset._chain()
-    source = chain.source
-    if isinstance(source, (Mixture, Phases)):
-        children = tuple(_rebased(child, store) for child in source.pipelines)
-        source = dataclasses.replace(source, pipelines=children)
-    else:
-        source = store(source)
-    return dataclasses.replace(chain, source=source)
 
 
 def holdout(dataset: Dataset, fraction: float | None = None, *, key: str | None = None,
@@ -208,206 +198,196 @@ def holdout(dataset: Dataset, fraction: float | None = None, *, key: str | None 
         names = (split,) if isinstance(split, str) else split
         if not names or len(set(names)) != len(names):
             raise ValueError(f"holdout split= names one or more distinct splits, not {split!r}")
-        held = (_rebased(dataset, functools.partial(_named_split, name=name)) for name in names)
-        return _rebased(dataset, lambda source: source), *held
+        held = (with_stores(dataset._chain(), functools.partial(_named_split, name=name)) for name in names)
+        return with_stores(dataset._chain(), lambda source: source), *held
     if records is not None:
         if records < 1:
             raise ValueError(f"holdout records= is at least 1, not {records}")
-        return (_rebased(dataset, lambda source: _SliceRecords(source, records)),
-                _rebased(dataset, lambda source: _SliceRecords(source, 0, records)))
+        return (with_stores(dataset._chain(), lambda source: RecordSlice(source, records)),
+                with_stores(dataset._chain(), lambda source: RecordSlice(source, 0, records)))
     shares = (fraction,) if fraction is not None else tuple(named.values())
     if any(not 0 < share < 1 for share in shares) or sum(shares) >= 1:
         raise ValueError(f"held-out fractions are each in (0, 1) and sum under 1, not {shares}")
     bounds = np.concatenate([[0.0], np.cumsum(shares)]).tolist()
-    trained = _rebased(dataset, lambda source: _HashSource(source, 0.0, bounds[-1], held=False, key=key))
-    held = (functools.partial(_HashSource, low=low, high=high, held=True, key=key)
+    chain = dataset._chain()
+    trained = with_stores(chain, lambda source: HashPart(source, 0.0, bounds[-1], held=False, key=key))
+    held = (functools.partial(HashPart, low=low, high=high, held=True, key=key)
             for low, high in itertools.pairwise(bounds))
-    return (trained, *(_rebased(dataset, part) for part in held))
+    return (trained, *(with_stores(chain, part) for part in held))
 
 
-type SourceValue = Source | str | Sequence[Batch] | Mapping[str, Sequence]
-type Validation = HoldOut | Split | Pipeline | Source | str | Sequence[Batch] | Mapping[str, Sequence] | None
+_SELECTIONS = (HashPart, RecordSlice)
 
 
-def source_argument(annotation: type | UnionType | TypeAliasType):
-    def read(words):
-        from dew.registry import from_record
+def selecting(source: Source) -> Iterator[tuple[tuple[RecordSlice | HashPart, ...], Source]]:
+    """`source`, then each source its holdout selections select from, down to their store, each with
+    the selections above it, outermost first."""
+    above: tuple[RecordSlice | HashPart, ...] = ()
+    while True:
+        yield above, source
+        if not isinstance(source, (RecordSlice, HashPart)):
+            return
+        above, source = (*above, source), source.source
 
-        word = words[0]
-        if word == "None":
-            return None
-        if word.startswith(("{", "[")):
-            value = json.loads(word)
-            return (
-                from_record(annotation, value, dtypes=False)
-                if isinstance(value, Mapping) and "class" in value
-                else value
-            )
-        return word
 
-    def write(value):
-        from dew.registry import to_record
-
-        return [
-            value
-            if isinstance(value, str)
-            else "None"
-            if value is None
-            else json.dumps(to_record(value, None))
-        ]
-
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="URL|JSON",
-        instance_from_str=read,
-        is_instance=lambda value: value is None
-        or isinstance(value, (str, Source, Mapping, Sequence))
-        or dataclasses.is_dataclass(value),
-        str_from_instance=write,
-    )
+def _selected(source: Source, kind: str, selection: Mapping[str, object]) -> Mapping[str, object]:
+    """A selection's identity: what it selects, of its source's identity, so selections stacked on
+    one another each keep their own."""
+    return {"selection": kind, "of": source.fingerprint(), **selection}
 
 
 @dataclasses.dataclass(frozen=True)
-class HoldOut:
-    records: int | None = None
-    fraction: float | None = None
-    by: Literal["index", "hash", "random"] = "index"
-    most: int | None = None
-    seed: int = 0
+class SelectedGeneration(View[Source]):
+    """The rows `generation` holds for the inputs of `source`, the source it was published from, that
+    the holdout `selections` keep (outermost first, `source` below the last), in their order: the
+    generation standing in for its steps under selections written before it, each picking the
+    inputs it picks uncached (`dew.data.analysis._in_place`). The selections name the part, as the
+    run wrote them; `source` is read as the fill read it (`_consumed`), numbering its inputs by
+    their place in a memory or indexed read (`placing`), or by its shards' rows in a stream, as the
+    fill did (`_source_ids`). Ids that name other inputs than the fill's are refused, never read as none."""
 
-    def __post_init__(self) -> None:
-        if (self.records is None) == (self.fraction is None):
-            raise ValueError("HoldOut needs records or fraction, exactly one")
-        if self.records is not None and self.records < 0:
-            raise ValueError("HoldOut records must be nonnegative")
-        if self.fraction is not None and not 0 <= self.fraction < 1:
-            raise ValueError("HoldOut fraction must be in [0, 1)")
-
-
-@dataclasses.dataclass(frozen=True)
-class Split:
-    name: str = "validation"
-
-
-@dataclasses.dataclass(frozen=True)
-class _RandomSource:
-    reads: ClassVar[tuple[Read, ...]] = _INDEXED_READS
-    refusal: ClassVar[str] = f"a random holdout {_BY_INDEX}"
+    rows: ClassVar[Rows] = "derived"
+    generation: Generation
+    selections: tuple[RecordSlice | HashPart, ...]
     source: Source
-    split: HoldOut
-    held: bool
-
-    def consumed(self, read: Read) -> _RandomSource:
-        return dataclasses.replace(self, source=_consumed(self.source, read))
+    placing: Read
 
     def label(self) -> str:
-        return self.source.label()
+        return self.selections[0].label()
 
     def describe(self) -> str:
-        return f"{self.source.describe()} random holdout={self.split!r},held={self.held}"
+        return f"generation:{self.generation.url} for {self.selections[0].describe()}"
 
     def fingerprint(self) -> Mapping[str, object]:
-        return {**self.source.fingerprint(), "holdout": dataclasses.asdict(self.split), "held": self.held}
+        generation = _GenerationSource(self.generation).fingerprint()
+        return {**generation, "selected": self.selections[0].fingerprint()}
 
+    # Every read reads the generation's rows; placing them reads `source` by `placing` whatever the run reads.
     def supports(self, read: Read) -> bool:
-        return read in self.reads and self.source.supports(read)
+        return self.source.supports(self.placing)
 
-    def _indices(self, count: int) -> tuple[int, ...]:
-        size = (
-            self.split.records
-            if self.split.records is not None
-            else int(count * (self.split.fraction or 0.0))
-        )
-        size = min(size, self.split.most) if self.split.most is not None else size
-        order = list(range(count))
-        random.Random(self.split.seed).shuffle(order)
-        chosen = set(order[:size])
-        return tuple(index for index in range(count) if (index in chosen) == self.held)
+    def can_provision(self, read: Read) -> bool:
+        from dew.data.analysis import _provisioner
 
-    def records(self, read: Read):
-        import grain.python as grain
+        return _provisioner(self.source, self.placing) is not None
 
-        rows = self.source.records(read)
-        return grain.MapDataset.source(self._indices(len(rows))).map(_SelectedRow(rows))
+    def provision(self) -> SelectedGeneration:
+        from dew.data.analysis import _provisioner
 
-    def metadata(self) -> Mapping[str, object]:
-        return _uncounted(self.source.metadata())
+        preparer = _provisioner(self.source, self.placing)
+        if preparer is None:
+            raise ValueError(f"{self.source.describe()} can't prepare the {self.placing} read that places "
+                             "its inputs")
+        preparer.provision()
+        return self
 
-    def lengths(self) -> np.ndarray | None:
-        lengths = self.source.lengths()
-        return None if lengths is None else lengths[list(self._indices(len(lengths)))]
+    def records(self, read: Read) -> Records:
+        return _Placed(self.generation, self._dense).rows()
 
     def manifest(self) -> ShardManifest:
-        raise ValueError(self.refusal)
+        # A worker reads the placed rows alone (`_Placed`), not the store that placed them.
+        return _indexed_manifest(self, self.generation.url, 4096, _Placed(self.generation, self._dense))
 
+    def metadata(self) -> Mapping[str, object]:
+        """The selections' facts, as uncached (what they hold out included), with this part's rows and
+        the generation's count rules."""
+        rules = _GenerationSource(self.generation).metadata()
+        return {**_uncounted(self.selections[0].metadata()), "rows": len(self._dense),
+                "accepted_rows": len(self._dense),
+                **({"count_rules": rules["count_rules"]} if "count_rules" in rules else {})}
 
-_SELECTIONS = (_HashSource, _SliceRecords, _RandomSource)
+    def stated(self) -> Mapping[str, object]:
+        return _uncounted(stated(self.source))
 
+    @functools.cached_property
+    def whole(self) -> Source:
+        """The generation's rows for every input: the whole store this part's measured facts are
+        measured over (`dew.data.analysis._stated`), as uncached they are over the store below its
+        selections."""
+        return self.generation.source()
 
-def selecting(source: Source | Mixture | Phases) -> Iterator[Source | Mixture | Phases]:
-    """`source`, then each source its holdout selections select from, down to their store."""
-    yield source
-    if isinstance(source, _SELECTIONS):
-        yield from selecting(source.source)
+    def order_fingerprints(self) -> Mapping[str, str]:
+        """Which of the generation's rows this part reads, in their order."""
+        return {"selected": hashlib.sha256(np.ascontiguousarray(self._dense, np.int64).tobytes()).hexdigest()}
 
+    def lengths(self) -> np.ndarray | None:
+        """None: a part packs as it does uncached, where the steps the generation stands for come
+        between it and the pack."""
+        return None
 
-def rebased(source: Source | Mixture | Phases, replacement: Source,
-            under: Source | Mixture | Phases | None = None) -> Source:
-    """The holdout selections of `source` above `under`, its store by default, around `replacement`."""
-    if source is not under and isinstance(source, _SELECTIONS):
-        return dataclasses.replace(source, source=rebased(source.source, replacement, under))
-    return replacement
+    @functools.cached_property
+    def _dense(self) -> np.ndarray:
+        """The indices of the generation's rows of the inputs the selections keep. The generation's
+        rows are its inputs' outputs in input order (`_publish`), so they are walked in step with
+        the inputs (`_admitted`), each row the next input's that names it."""
+        admitted = self._admitted()
+        dense = []
+        current, kept = None, False
+        index = inputs = 0
+        for page in range(len(self.generation.manifest["row_pages"])):
+            for entry in self.generation._rows(page):
+                while entry["id"] != current:
+                    current, kept = next(admitted, (None, False))
+                    inputs += current is not None
+                    if current is None:
+                        raise ValueError(
+                            f"generation {self.generation.url} holds input {entry['id']}, which "
+                            f"{self.source.describe()} doesn't name by its {self.placing} read here (a "
+                            "stream names its inputs by where it read their shards, a memory or indexed read "
+                            "by their place), so the holdout written before it can't pick its inputs "
+                            "from it; read it where it was filled, or publish it again from a "
+                            f"{self.placing} read")
+                if kept:
+                    dense.append(index)
+                index += 1
+        inputs += sum(1 for _ in admitted)
+        filled = self.generation.manifest["inputs"]
+        if inputs != filled:
+            raise ValueError(f"generation {self.generation.url} was filled from {filled} inputs, and "
+                             f"{self.source.describe()} holds {inputs} here, so the holdout written before "
+                             "it can't pick its inputs from it")
+        return np.asarray(dense, np.int64)
 
-
-def _source(
-    value: SourceValue | Mapping[str, float], *, split: str = "train", format: Format | None = None
-) -> Source:
-    from dew.data.sources import source
-
-    return source(value, split=split, format=format)
-
-
-def _split(source: Source, split: Split) -> Source:
-    """`source`'s own split `split.name`."""
-    return _named_split(source, split.name)
-
-
-def _branches(
-    value: SourceValue | Mapping[str, float],
-    validation: Validation,
-    *,
-    split: str,
-    prefix: tuple[Stage, ...],
-    format: Format | None = None,
-) -> tuple[Pipeline, Pipeline | None]:
-    source = _source(value, split=split, format=format)
-    held: Source | None = None
-    train = Pipeline(source, prefix)
-    if isinstance(validation, Pipeline):
-        return train, validation
-    if isinstance(validation, HoldOut):
-        if validation.by == "random":
-            train = Pipeline(_RandomSource(source, validation, held=False), prefix)
-            held = _RandomSource(source, validation, held=True)
-        elif validation.by == "hash":
-            if validation.fraction is None:
-                raise ValueError("hash HoldOut needs fraction=")
-            train = Pipeline(_HashSource(source, 0.0, validation.fraction, held=False), prefix)
-            held = _HashSource(source, 0.0, validation.fraction, held=True)
+    def _admitted(self) -> Iterator[tuple[str, bool]]:
+        """Each input of `source`, by the key the fill gave it (`_row_key`), and whether the selections
+        keep it: they apply innermost first as the inputs stream past, each at its own position among
+        the inputs the ones within it admitted (`admits`); only a hash holdout reads the rows."""
+        inner = self.selections[::-1]
+        hashed = any(isinstance(selection, HashPart) for selection in inner)
+        if self.placing != "streamed":
+            records = self.source.records(self.placing)
+            inputs: Iterator[tuple[RowId, Batch | bytes | None]] = (
+                (index, records[index] if hashed else None) for index in range(len(records)))
+        elif hashed:
+            manifest = self.source.manifest()
+            inputs = (pair for shard in manifest.shards for pair in _shard_inputs(manifest, shard))
         else:
-            count = validation.records
-            if count is None:
-                facts = source.metadata()
-                if "rows" not in facts:
-                    raise ValueError(f"fraction HoldOut of {source.describe()} needs authoritative rows")
-                if validation.fraction is None:
-                    raise ValueError("fraction HoldOut needs fraction=")
-                count = int(integer(facts["rows"], "rows") * validation.fraction)
-            train = Pipeline(_SliceRecords(source, count), prefix)
-            held = _SliceRecords(source, 0, count) if count else None
-    elif isinstance(validation, Split):
-        held = _split(source, validation)
-    elif validation is not None:
-        held = _source(validation, format=format)
-    evaluated = None if held is None else Pipeline(held, prefix)
-    return train, evaluated
+            inputs = ((row_id, None) for row_id in _source_ids(self.source, streamed=True))
+        reached = [0] * len(inner)
+        for row_id, row in inputs:
+            admitted = True
+            for level, selection in enumerate(inner):
+                position, reached[level] = reached[level], reached[level] + 1
+                if not selection.admits(position, row):
+                    admitted = False
+                    break
+            yield _row_key(row_id), admitted
+        for level, selection in enumerate(inner):
+            selection.admitted(reached[level])
+
+
+@dataclasses.dataclass(frozen=True)
+class _Placed:
+    """The rows of `generation` at `indices`: a selected generation's records (`rows`), and the reader
+    of a shard of them a worker takes, holding nothing of the store that placed them."""
+
+    generation: Generation
+    indices: np.ndarray
+
+    def rows(self):
+        import grain.python as grain
+
+        return grain.MapDataset.source(self.indices).map(_SelectedRow(self.generation))
+
+    def __call__(self, shard: Shard):
+        return self.rows()[shard.start : shard.stop].to_iter_dataset()

@@ -7,13 +7,6 @@
 # the working tree.
 set -f
 . tools/lint_inputs.sh
-# The staged Python files under `paths`, NUL-separated; Git's `*` crosses directories.
-staged() {
-    for path in "$@"; do
-        case $path in *.py) set -- "$@" "$path" ;; *) set -- "$@" "$path/*.py" ;; esac
-        shift
-    done
-    git diff --cached --name-only --diff-filter=ACMR -z -- "$@"
-}
-staged $ruff_inputs | xargs -0r python -m ruff check --quiet || exit 1
-staged $(python tools/lint_slop.py --print-roots) | JAX_PLATFORMS=cpu xargs -0r python tools/lint_slop.py || exit 1
+python_changed --cached $ruff_inputs | xargs -0r python -m ruff check --quiet || exit 1
+python_changed --cached $(python tools/lint_slop.py --print-roots) |
+    JAX_PLATFORMS=cpu xargs -0r python tools/lint_slop.py || exit 1

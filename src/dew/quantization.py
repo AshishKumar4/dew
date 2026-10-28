@@ -34,11 +34,11 @@ forms, and `patterns` is its `quant_cfg_path`, written inline as the regexes
 Qwix matches. The backward fields are Qwix's finer-grained version of the
 same idea.
 
-Three MaxText settings have no equivalent, and `dtype` accepts neither of
-the first two. Static activation scaling (`fp8_full`) needs a calibration
-pass that Dew has no hook for, `nanoo_fp8` uses AMD-only kernels, and
-KV-cache quantization has nothing to read it here because the cache holds
-the compute dtype.
+Two MaxText settings have no equivalent, and `dtype` accepts neither.
+Static activation scaling (`fp8_full`) needs a calibration pass that Dew
+has no hook for, and `nanoo_fp8` uses AMD-only kernels. KV-cache
+quantization is not a weight quantization: the cache's own layout stores
+int8 or float8 keys and values (`dew.nn.kv_cache`).
 
 Qwix comes with the `quantization` extra (`pip install "dewml[quantization]"`).
 It is imported inside the calls that need it, and without the package those
@@ -46,15 +46,17 @@ calls raise an error that names the extra.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import importlib
 import inspect
 import math
 import re
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -62,16 +64,16 @@ import numpy as np
 from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
-from dew.cache import QUANTIZED_TRACE
-from dew.nn.fake_quant import correctly_rounded_divide
-from dew.nn.kernels.generation import backend
-from dew.nn.precision import asks_default_precision
+from dew.cache import INTERCEPTED, QUANTIZED_TRACE
+from dew.nn.dense import _contractions, _linear_site
+from dew.nn.kernels.generation import backend, linear_map
+from dew.nn.precision import accumulated, at_least_fp32, bf16_dot_general, correctly_rounded_divide
 
 if TYPE_CHECKING:
-    from qwix import QuantizationProvider
+    from qwix import QArray, QtProvider, QuantizationProvider
 
+    from dew.batch import Variables
     from dew.diffusion.process import Conditioning
-    from dew.objectives.base import Variables
 
 QuantizedDtype = Literal["int8", "fp8"]
 """The gemm dtypes a run trains with: int8 on any backend, fp8 where the
@@ -80,9 +82,22 @@ backend lowers it (measured in docs/performance.md)."""
 Rounding = Literal["uniform", "low_bit_uniform"]
 """How a quantized gradient rounds: Qwix's two stochastic modes."""
 
-CALIBRATIONS = ("absmax", "minmax", "rms", "fixed")
-"""The weight calibration methods Qwix parses, before an optional `,args`
-suffix (`qwix/_src/qconfig.py`, `QuantizationRule`)."""
+
+UNQUANTIZED = {
+    "dew.nn.ssm.diagonal_recurrence":
+        "a diagonal recurrence's chunk products, powers of its pole compounded over every step",
+    "dew.nn.attention_residuals.depth_mixed":
+        "depth attention's fp32 softmax over earlier layers' outputs and their weighted sum",
+    "dew.nn.quantizers.nearest_codewords":
+        "a vector quantizer's codeword distances, whose argmax a rounded product reorders",
+    "dew.nn.kv_cache.rotated": "the rotation a quantized cache applies before it rounds keys and values",
+    "dew.lora._updated": "an adapter's factor product merged into the kernel it updates, a weight and not an "
+                         "activation",
+}
+"""The functions whose products a quantized model keeps in float, at the precision they pin, each
+with why. Every other product a rule matches quantizes, whatever precision it pins: a quantized
+product has none to honour. The providers run each through Qwix's intercept map (`_providers`), as
+Qwix runs `pallas_call`, and inside a handler Qwix leaves the products unintercepted."""
 
 def entry_methods(model: nn.Module) -> tuple[str, ...]:
     """Every method of `model`'s class that a caller can enter it through,
@@ -118,10 +133,10 @@ class Quantization:
     wins. `'.*mlp.*'` quantizes the feed-forward blocks and leaves attention
     in fp32; the default quantizes every matmul of the wrapped methods."""
     calibration: str = "absmax"
-    """The weight calibration method, in the form Qwix parses.
-
-    It is a method name, one of `absmax`, `minmax`, `rms` or `fixed`, with an
-    optional `,args` suffix, for example `absmax,0.8`."""
+    """The weight calibration method, in the form Qwix parses (`absmax,0.8`,
+    for example). Dew keeps no copy of its grammar: Qwix refuses a method it
+    does not know where it first quantizes a matched weight, not when this
+    spec is built."""
     tile_size: int | None = None
     """The number of elements per tile for sub-channel scales along the contraction axis.
 
@@ -152,11 +167,6 @@ class Quantization:
                 raise ValueError(
                     f"quantization pattern {pattern!r} does not compile: "
                     f"{error}") from error
-        method = self.calibration.split(",", 1)[0]
-        if method not in CALIBRATIONS:
-            raise ValueError(
-                f"calibration is one of {list(CALIBRATIONS)}, with an optional "
-                f"`,args` suffix, got {self.calibration!r}")
         if self.tile_size is not None and self.tile_size < 1:
             raise ValueError(
                 f"tile_size counts elements per tile, got {self.tile_size}")
@@ -169,6 +179,14 @@ class Quantization:
                 "bwd_stochastic_rounding is 'uniform', 'low_bit_uniform' or "
                 f"unset, got {self.bwd_stochastic_rounding!r}")
 
+    def rule_for(self, scope: Sequence[str]) -> int | None:
+        """The index of the pattern that quantizes the module at `scope` (its path of names), the
+        first whose regex fully matches the `/`-joined path as Qwix matches it, or None for a module
+        no pattern selects."""
+        joined = "/".join(scope)
+        return next((index for index, pattern in enumerate(self.patterns) if re.fullmatch(pattern, joined)),
+                    None)
+
     def apply(self, model: nn.Module) -> nn.Module:
         """Return a copy of `model` whose trunk matmuls train in this spec's dtype.
 
@@ -176,10 +194,20 @@ class Quantization:
         each of its `entry_methods` wrapped. Everything
         the registry, the objective and the checkpoint code read from the
         model therefore still works. Invalid settings were already refused
-        when the spec was constructed. Without Qwix installed, the call raises
-        an error that names the extra.
+        when the spec was constructed, all but the calibration method, which
+        Qwix parses where it first quantizes a matched weight. Without Qwix
+        installed, the call raises an error that names the extra.
         """
         return _qwix_wrapped(model, _providers()[0](_rules(self, training=True)), self)
+
+
+@runtime_checkable
+class QuantizedClass(Protocol):
+    """A model class Qwix made for a `Quantization` (`_quantized`), which `_dew_quantization` names for the
+    programs that run it (`dew.nn.kernels.options.compiler_options` reads its dtypes,
+    `dew.inference.projections` its rules); a wrapper's class over it inherits it."""
+
+    _dew_quantization: ClassVar[Quantization]
 
 
 def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Quantization) -> nn.Module:
@@ -205,26 +233,92 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Qua
 
 def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantization) -> nn.Module:
     """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in the class Qwix
-    makes for the call, a `QuantizedClass` of `spec` (`dew.nn.kernels.options.compiler_options`),
-    each method tracing what it calls under the key `QUANTIZED_TRACE` gives the provider."""
-    methods = entry_methods(model)
-    quantized = _qwix().quantize_model(model, provider, methods=methods)
-    layer = type(quantized)
+    makes for the call, a `QuantizedClass` of `spec`,
+    each method tracing what it calls under the provider's kind and `spec` in `QUANTIZED_TRACE`, which
+    names `spec` as its policy for the layers that read its rules (`quantized_products`)."""
+    quantized = quantize_with(model, provider, methods=entry_methods(model),
+                              key=(type(provider).__name__, spec), policy=spec)
+    layer: Any = type(quantized)
     layer._dew_quantization = spec
-    key = (type(provider).__name__, spec)
-    for name in methods:
-        setattr(layer, name, _keyed(getattr(layer, name), key))
     return quantized
 
 
+def quantize_with(model: nn.Module, provider: QuantizationProvider, *,
+                  methods: Sequence[str] = ("__call__",), key: Hashable | None = None,
+                  policy: Quantization | None = None) -> nn.Module:
+    """Qwix's `quantize_model(model, provider, methods=methods)`, each of `methods` tracing what it
+    calls under `key` in `QUANTIZED_TRACE` (by default the provider's kind and the provider): the
+    way Dew runs a model Qwix quantizes with a provider of its own, so Qwix owns the products the
+    thread tracing it forms (`dew.nn.precision.accumulated`) and no other thread's, and its traces
+    stay apart from the plain model's. `key` is the caller's, opaque; `policy` is the `Quantization`
+    the provider follows, whose rules a layer reads (`quantized_products`), or None for a provider whose
+    rules Dew does not know."""
+    quantized = _qwix().quantize_model(model, provider, methods=methods)
+    layer = type(quantized)
+    trace = QuantizedTrace((type(provider).__name__, provider) if key is None else key, policy)
+    for name in methods:
+        setattr(layer, name, _keyed(getattr(layer, name), trace))
+    return quantized
+
+
+@dataclasses.dataclass(frozen=True)
+class QuantizedTrace:
+    """What a quantized model's methods trace under (`QUANTIZED_TRACE`, which jit's cache keys on): the
+    caller's opaque cache `key`, and the `Quantization` its provider follows (`policy`), or None for a
+    provider whose rules Dew does not know."""
+
+    key: Hashable
+    policy: Quantization | None
+
+
 def _keyed[**Arguments, Result](method: Callable[Arguments, Result],
-                                 key: Hashable) -> Callable[Arguments, Result]:
-    """`method` run under `key` in `QUANTIZED_TRACE`."""
+                                 trace: QuantizedTrace) -> Callable[Arguments, Result]:
+    """`method` run under `trace` in `QUANTIZED_TRACE`."""
     @functools.wraps(method)
     def keyed(*args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
-        with QUANTIZED_TRACE(key):
+        with QUANTIZED_TRACE(trace), INTERCEPTED(new_value=True):
             return method(*args, **kwargs)
     return keyed
+
+
+@dataclasses.dataclass(frozen=True)
+class QuantizedProducts:
+    """How the Qwix quantization a call runs under changes the products of a submodule and of the
+    modules under it (`quantized_products`). `inputs`: their activations quantize, or their gradients
+    do, so the submodule is no linear map of its input, which a layer that applies it to another
+    operand (MLA's absorbed kv_b_proj) needs it to be; a weight-only rule with float gradients leaves it
+    linear, by its quantized matrix. `weights`: their weights quantize, so the submodule multiplies by
+    no weight it holds, which a layer that moves its weights (an in-context memory's recurrence) needs
+    it to. `stochastic`: their gradients quantize and round stochastically, so a call that runs their
+    backward draws the `stochastic_rounding` stream (an in-context memory's inner steps)."""
+
+    inputs: bool
+    weights: bool
+    stochastic: bool = False
+
+
+def quantized_products(module: nn.Module, name: str) -> QuantizedProducts:
+    """How the Qwix quantization the call runs under (`QUANTIZED_TRACE`) changes the products of the
+    bound `module`'s submodule `name` and the modules under it (`QuantizedProducts`), as its policy's
+    rules select their paths: the submodule's own, and the scope of each parameter it holds."""
+    trace: QuantizedTrace | None = QUANTIZED_TRACE.value
+    if trace is None:
+        return QuantizedProducts(inputs=False, weights=False)
+    policy = trace.policy
+    if policy is None:
+        # A trace that names no policy (a provider of the caller's own) may quantize anything.
+        return QuantizedProducts(inputs=True, weights=True, stochastic=True)
+    scope = (*module.path, name)
+    params = flatten_dict(dict(module.variables.get("params", {}).get(name, {})))
+    scopes = {scope, *((*scope, *leaf[:-1]) for leaf in params)}
+    if all(policy.rule_for(path) is None for path in scopes):
+        return QuantizedProducts(inputs=False, weights=False)
+    # Whether a product the rule selects rounds stochastically, a weight-only rule's matmuls among them,
+    # is its operation's, which no parameter states: a rule that rounds stochastically counts as
+    # drawing the stream (a weight-only rule over a convolution's products alone draws none).
+    return QuantizedProducts(inputs=not policy.weight_only or policy.bwd_qtype is not None, weights=True,
+                             stochastic=policy.bwd_qtype is not None
+                             and policy.bwd_stochastic_rounding is not None)
 
 
 def _qwix(module: str = "qwix") -> ModuleType:
@@ -262,23 +356,28 @@ codes for the forward product, `[out, in]`, and for the input gradient,
 `[in, out]`, each beside one float32 scale a row (`frozen_fp8_leaves`)."""
 
 
-def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, np.ndarray]:
+def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, jax.Array | np.ndarray]:
     """A frozen `[in, out]` kernel packed once for both products it takes part
     in, each direction's rows scaled on their own by the one FP8 block cast
-    (`dew.interop.codecs.quantize_fp8_blocks` over `(1, width)` blocks): the
+    (`dew.interop.codecs.fp8_block_cast` over `(1, width)` blocks), on the
+    kernel's resident devices without a host gather; a host input stays on the host: the
     forward's `[out, in]` rows contract the input, the input gradient's
     `[in, out]` rows the output's cotangent. A forward row's scale is a
     contracting-axis scale of the other direction, so the two are quantized
     apart. The two E4M3 copies replace the kernel in the train state
     (`frozen_fp8_kernel` decodes it back), two bytes a parameter, a bf16
     kernel's, so the gain over a bf16 base is the products' rate."""
-    from dew.interop.codecs import quantize_fp8_blocks
+    from jax import core
 
-    kernel = np.asarray(kernel, np.float32)
+    from dew.interop.codecs import fp8_block_cast, quantize_fp8_blocks
+
+    resident = isinstance(kernel, (jax.Array, core.Tracer))
+    kernel = jnp.asarray(kernel, jnp.float32) if resident else np.asarray(kernel, np.float32)
     if kernel.ndim != 2:
         raise ValueError(f"a frozen FP8 site packs a two-axis [in, out] kernel, got shape {kernel.shape}")
-    forward, forward_scale = quantize_fp8_blocks(kernel.T, (1, kernel.shape[0]))
-    dgrad, dgrad_scale = quantize_fp8_blocks(kernel, (1, kernel.shape[1]))
+    cast = fp8_block_cast if resident else quantize_fp8_blocks
+    forward, forward_scale = cast(kernel.T, (1, kernel.shape[0]))
+    dgrad, dgrad_scale = cast(kernel, (1, kernel.shape[1]))
     return dict(zip(FROZEN_FP8, (forward, forward_scale, dgrad, dgrad_scale), strict=True))
 
 
@@ -291,50 +390,120 @@ def frozen_fp8_kernel(leaves: Mapping[str, jax.typing.ArrayLike]) -> jax.Array:
     return (forward.astype(jnp.float32) * jnp.asarray(leaves[FROZEN_FP8[1]], jnp.float32)).T
 
 
+def decoded_frozen_fp8(variables: Variables) -> Variables:
+    """`variables` with each frozen FP8 site's kernel decoded from its packed codes into `params`
+    (`frozen_fp8_kernel`) and its codes gone: the float tree the record packed, which a merge sums an
+    adapter into (`dew.lora.Adapter.merge`) and an in-context memory starts from as its W_0
+    (`dew.nn.memory`). Every other `QUANTIZATION` leaf, an input's scale, stays; the collection goes
+    when the codes were all it held."""
+    held = flatten_dict(dict(variables.get(QUANTIZATION, {})))
+    sites = {path[:-1] for path in held if path[-1] == FROZEN_FP8[0]}
+    if not sites:
+        return variables
+    kernels = {(*site, "kernel"): frozen_fp8_kernel({leaf: jnp.asarray(held[(*site, leaf)])
+                                                     for leaf in FROZEN_FP8}) for site in sites}
+    rest = {path: leaf for path, leaf in held.items() if not (path[:-1] in sites and path[-1] in FROZEN_FP8)}
+    decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
+    decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **kernels})
+    return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
+
+
+MOVING: contextvars.ContextVar[bool] = contextvars.ContextVar("dew.quantization.MOVING", default=False)
+"""Whether the products a trace forms multiply by moving weights (`moving_weights`)."""
+
+
+@contextlib.contextmanager
+def moving_weights() -> Iterator[None]:
+    """Trace a module's products at weights a layer moves from their stored values each call (an
+    in-context memory's network at the state its steps move from W_0): serving quantization multiplies
+    them as quantized training does, each rounded to its rule's dtype at each product and its gradient
+    rounded as the rule's backward fields ask (`_serving_provider`), as no stored quantized copy of a
+    moving weight exists. The products of every other weight are as the provider forms them."""
+    token = MOVING.set(True)
+    try:
+        yield
+    finally:
+        MOVING.reset(token)
+
+
+def decoded_stored(variables: Variables) -> Variables:
+    """`variables` with each weight serving quantization stores quantized (`Annotated`, Qwix's
+    post-training annotation) decoded by Qwix's public `dequantize` into the float its values and
+    scales hold: the stored weight a layer that moves its weights starts from (`dew.nn.memory`'s W_0),
+    every other leaf as it is."""
+    params = flatten_dict(dict(variables.get("params", {})),
+                          is_leaf=lambda _, leaf: isinstance(leaf, Annotated))
+    if not any(isinstance(leaf, Annotated) for leaf in params.values()):
+        return variables
+    dequantize = _qwix().dequantize
+    decoded = {path: dequantize(leaf.array) if isinstance(leaf, Annotated) else leaf
+               for path, leaf in params.items()}
+    return {**variables, "params": unflatten_dict(decoded)}
+
+
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
     """`values @ rows.T`, `[M, K]` by E4M3 `[N, K]`, in float32: `values`'
-    rows cast by the FP8 block cast, the codes widened in the dot and both
-    rows' scales applied after it, the form XLA's GPU compiler rewrites to an
-    FP8 GEMM (cuBLASLt)."""
+    rows cast by the FP8 block cast, both sides' codes multiplied exactly and
+    summed in fp32 (`dew.nn.precision.bf16_dot_general`: an E4M3 code is a
+    bf16 value) and both rows' scales applied after. The widened codes are
+    held apart from the product (an optimization barrier), so XLA's GPU
+    compiler does not rewrite it to an FP8 GEMM: Hopper's FP8 tensor cores
+    keep a narrower running sum, and at 512 x 4096 x 4096 on an H100 that
+    GEMM lay 291 times the dequantized float32 product's distance from
+    float64 at the highest precision and 3011 times at the default, where
+    this product lies at 0.53 times it, in 1.7 times the FP8 GEMM's time
+    (receipts ig-fp8-probe3, 4 and 5). The FP8 GEMM returns with a kernel
+    whose sum keeps float32's accuracy (ledger 1625)."""
     from dew.interop.codecs import fp8_block_cast
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
-    product = jax.lax.dot_general(codes.astype(jnp.float32), rows.astype(jnp.float32),
-                                  (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+    held_codes, held_rows = jax.lax.optimization_barrier(
+        (codes.astype(jnp.bfloat16), rows.astype(jnp.bfloat16)))
+    product = bf16_dot_general(held_codes, held_rows, (((1,), (1,)), ((), ())))
     return product * scales * row_scales.T
 
 
-@jax.custom_vjp
+@jax.custom_jvp
 def frozen_fp8_product(x: jax.Array, forward: jax.Array, forward_scale: jax.Array, dgrad: jax.Array,
                        dgrad_scale: jax.Array) -> jax.Array:
     """`x @ kernel` in float32, `[M, in]` by a frozen kernel packed as
     `frozen_fp8_leaves`: FP8 products forward and for `x`'s gradient, and no
-    gradient for the kernel, which is frozen."""
+    gradient for the kernel, which is frozen. Forward mode (`jax.jvp`, MeanFlow's
+    target) takes the input's tangent times the decoded kernel
+    (`frozen_fp8_kernel`) in float32, the map the FP8 products stand for, and
+    reverse mode runs the FP8 input gradient (`_frozen_fp8_tangent`)."""
     return _fp8_rows(x, forward, forward_scale)
 
 
-def _frozen_fp8_forward(x, forward, forward_scale, dgrad, dgrad_scale):
-    # The input's dtype rides as an empty array, a residual JAX can hold.
-    return _fp8_rows(x, forward, forward_scale), (jnp.zeros((0,), x.dtype), dgrad, dgrad_scale)
+@frozen_fp8_product.defjvp
+def _frozen_fp8_tangent(primals, tangents):
+    """The product's tangent along `x`'s, the packed leaves frozen whatever their tangents: the
+    direction times the decoded forward rows in float32 at the highest precision, a linear map whose
+    transpose is the FP8 input gradient, in `x`'s dtype (`generation.linear_map`). Its residuals are
+    the packed leaves and an empty array of `x`'s dtype, all a backward reads, so a staged pullback, a
+    remat or a scan keeps no copy of `x`."""
+    x, forward, forward_scale, dgrad, dgrad_scale = primals
 
+    def tangent(residuals, direction):
+        rows, row_scales = (jax.lax.stop_gradient(leaf) for leaf in residuals[:2])
+        decoded = rows.astype(jnp.float32) * row_scales.astype(jnp.float32)
+        return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ())),
+                                             precision=jax.lax.Precision.HIGHEST),
+                           direction.astype(jnp.float32), decoded, preferred_element_type=jnp.float32)
 
-def _frozen_fp8_backward(residuals, cotangent):
-    like, dgrad, dgrad_scale = residuals
-    return _fp8_rows(cotangent, dgrad, dgrad_scale).astype(like.dtype), None, None, None, None
+    def transposed(residuals, cotangent):
+        _, _, rows, row_scales, like = residuals
+        return _fp8_rows(cotangent, rows, row_scales).astype(like.dtype)
 
-
-frozen_fp8_product.defvjp(_frozen_fp8_forward, _frozen_fp8_backward)
+    residuals = (forward, forward_scale, dgrad, dgrad_scale, jnp.zeros((0,), x.dtype))
+    return frozen_fp8_product(*primals), linear_map(tangent, transposed, residuals, tangents[0])
 
 
 def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
     """The bound Dense `module`'s output from its frozen FP8 leaves, its
     kernel unread: the product (`frozen_fp8_product`) over the input's
     trailing axis, its bias added in float32, in the dtype the Dense
-    computes in. A module asking for more than the default matmul
-    precision is refused, which an FP8 product cannot honour."""
-    if not asks_default_precision(module.precision):
-        raise ValueError(f"{'/'.join(module.path)} asks for {module.precision} matmul precision, which "
-                         "its frozen FP8 product cannot honour")
+    computes in."""
     leaves = [module.get_variable(QUANTIZATION, leaf) for leaf in FROZEN_FP8]
     product = frozen_fp8_product(inputs.reshape(-1, inputs.shape[-1]), *leaves)
     if module.use_bias:
@@ -582,15 +751,13 @@ class InputQuantization:
         """`model` computing under this record's frozen FP8 sites, and under
         the input quantization it already computes under, if any: one
         wrapper, so one interceptor, serves both."""
-        from dew.registry import wrapper_layers
+        from dew.registry import rebuilt, wrapper_layers
 
         _, layers = wrapper_layers(type(model))
         held = layers[0]._dew_wrapper() if layers else None
         if not isinstance(held, InputQuantization):
             return self.apply(model)
-        unwrapped = layers[0]._dew_wrapped(**{field.name: getattr(model, field.name)
-                                              for field in dataclasses.fields(model)
-                                              if field.init and field.name not in ("parent", "name")})
+        unwrapped = rebuilt(layers[0]._dew_wrapped, model)
         joined = dataclasses.replace(held, frozen_fp8=self.frozen_fp8, measured_on=self.measured_on)
         return joined.apply(unwrapped)
 
@@ -611,6 +778,8 @@ class InputQuantization:
         is otherwise unchanged, so its dtype, accumulation precision, output
         sharding and the bias placement stay as the model defines them.
         """
+        from dew.registry import rebuilt
+
         base, record = type(model), self
         if any("_dew_input_quantization" in vars(layer) for layer in base.__mro__):
             raise ValueError(f"{base.__name__} already computes under its checkpoint's input quantization")
@@ -629,19 +798,23 @@ class InputQuantization:
             if context.method_name == "nonlinear_input":
                 # A layer asks whether its submodule is linear in its input
                 # (`MultiHeadLatentAttention.nonlinear_input`): one that
-                # rounds its input or multiplies in FP8 is not.
+                # rounds its input or multiplies in FP8, or holds a module
+                # that does, is not.
                 name = args[0] if args else kwargs["name"]
-                child = getattr(module, name)
-                return next_fun(*args, **kwargs) or (record.quantizer(child) is not None
-                                                     or child.has_variable(QUANTIZATION, FROZEN_FP8[0]))
-            calls = context.method_name == "__call__"
+                held = flatten_dict(dict(getattr(module, name).variables.get(QUANTIZATION, {})))
+                return next_fun(*args, **kwargs) or any(
+                    path[-1] in (*INPUT_SCALES.values(), FROZEN_FP8[0]) for path in held)
+            calls = context.method_name in ("__call__", "_linear")
             quantizer = record.quantizer(module) if calls else None
             frozen = calls and module.has_variable(QUANTIZATION, FROZEN_FP8[0])
             if quantizer is None and not frozen:
                 return next_fun(*args, **kwargs)
+            if not _linear_site(context, "/".join(module.path)):
+                return next_fun(*args, **kwargs)
             # A Linear's input arrives first or by its parameter's name.
             inputs = args[0] if args else kwargs["inputs"]
-            if not _trailing_contraction(module, inputs.ndim):
+            contracted, batch_dims = _contractions(module, inputs.ndim)
+            if batch_dims or contracted != (inputs.ndim - 1,):
                 raise ValueError(f"{'/'.join(module.path)} holds an input scale or a frozen FP8 kernel, "
                                  "which a Linear contracting its input's trailing axis alone reads")
             if quantizer is not None:
@@ -666,7 +839,7 @@ class InputQuantization:
                 return record.quantizer(module)
 
             def apply(self, variables, *args, **kwargs):
-                with nn.intercept_methods(quantize_inputs):
+                with INTERCEPTED(new_value=True), nn.intercept_methods(quantize_inputs):
                     return super().apply(variables, *args, **kwargs)
 
             def init_with_output(self, *args, **kwargs):
@@ -674,9 +847,7 @@ class InputQuantization:
                 return output, ({**variables, QUANTIZATION: record.declared()} if record.sites else variables)
 
         InputQuantized.__name__ = InputQuantized.__qualname__ = base.__name__
-        return InputQuantized(**{field.name: getattr(model, field.name)
-                                 for field in dataclasses.fields(model)
-                                 if field.init and field.name not in ("parent", "name")})
+        return rebuilt(InputQuantized, model)
 
 
 def _site_kernel(tree: Variables, site: str) -> jax.typing.ArrayLike:
@@ -699,9 +870,9 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     stored tree, `/`-joined) is timed both ways, forward and input
     gradient, by `dew.telemetry.benchmark.samples` on a GPU the process holds
     alone: bf16 operands as a bf16 Dense multiplies them, and the FP8
-    products `frozen_fp8_dense` runs. On an H100 FP8 won from about 2048
-    inputs and outputs and lost below: 0.70x at 1024 by 1024, 1.10x at 4096
-    by 4096, 1.47x at 4096 by 12288 (docs/performance.md). The record names
+    products `frozen_fp8_dense` runs. Those multiply the codes as bf16 values
+    (`_fp8_rows`), slower than a bf16 Dense, so no site measures faster until
+    an FP8 kernel keeps fp32's sums (ledger 1625; docs/performance.md). The record names
     the sites and the generation, so a run reproduces the choice; a GPU
     without FP8 tensor cores is refused by name.
 
@@ -715,21 +886,21 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     so a rank whose tree lacks one is refused with its peers rather than
     leaving them at the measurement's agreement.
     """
-    from dew import cache, coordination
-    from dew.nn.kernels.generation import device_generation, gpu_target
+    from dew import _coordination, cache
+    from dew.nn.kernels.generation import device_generation, fp8_tensor_cores
 
     def planned() -> dict:
         return {"tokens": tokens,
                 "shapes": {site: list(np.shape(_site_kernel(variables["params"], site))) for site in sites}}
 
-    plan = coordination.agreed_same("frozen FP8 sites to measure", planned)
+    plan = _coordination.agreed_same("frozen FP8 sites to measure", planned)
     shapes = {site: tuple(shape) for site, shape in plan["shapes"].items()}
 
     def decided() -> dict | None:
         if jax.process_index() != 0:
             return None
         generation = device_generation()
-        if gpu_target(generation).fp8_peak is None:
+        if not fp8_tensor_cores(generation):
             raise ValueError(f"{generation} has no FP8 tensor cores to run a frozen base in FP8 on")
         if not cache.measures_picks():
             raise ValueError("frozen FP8 sites are measured on a GPU the process holds alone, and this "
@@ -738,8 +909,8 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
         faster = {shape: _fp8_faster(shape, tokens) for shape in sorted(set(shapes.values()))}
         return {"sites": [site for site in sites if faster[shapes[site]]], "generation": generation}
 
-    record = coordination.broadcast_from_process_zero(
-        coordination.agreed("measuring frozen FP8 sites", decided))
+    record = _coordination.broadcast_from_process_zero(
+        _coordination.agreed("measuring frozen FP8 sites", decided))
     return InputQuantization(frozen_fp8=tuple(record["sites"]), measured_on=record["generation"])
 
 
@@ -772,17 +943,6 @@ def _fp8_faster(shape: tuple[int, ...], tokens: int) -> bool:
                for fn, args in ((bf16, (x, kernel.astype(jnp.bfloat16), cotangent)),
                                 (fp8, (x, cotangent, leaves)))]
     return timings[1] < timings[0]
-
-
-def _trailing_contraction(module: nn.Module, ndim: int) -> bool:
-    """Whether `module` is a Linear that contracts its rank-`ndim` input's trailing axis alone."""
-    match module:
-        case nn.Dense():
-            return True
-        case nn.DenseGeneral(axis=axis, batch_dims=batch_dims):
-            axes = (axis,) if isinstance(axis, int) else tuple(axis)
-            return not batch_dims and sorted(a % ndim for a in axes) == [ndim - 1]
-    return False
 
 
 def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
@@ -895,19 +1055,84 @@ def _scaled_in_float32[**P](op: Callable[P, jax.Array]) -> Callable[P, jax.Array
     return scaled
 
 
+def _integer_convolution_on_cuda(op: Callable[..., jax.Array]) -> Callable[..., jax.Array]:
+    """Qwix's quantized convolution `op` with an integer product computed in float32 on CUDA.
+
+    Qwix 0.1.8 convolves two integer operands into an int32 accumulator
+    (`qarray.get_accumulator_and_result_type`), and XLA:GPU runs no s8 x s8 -> s32
+    convolution at any precision (UNIMPLEMENTED on an A100, jax 0.12) while it
+    runs s8 x s8 -> f32. On CUDA the operands' integer values convolve as float32
+    instead: each product of two int8 codes is exact in float32, at most 2**14 in
+    magnitude (Qwix's symmetric int8 reaches -128), so every contraction of up to
+    1024 terms sums exactly, and a longer one rounds only where a partial sum passes
+    2**24, which int32 would have held exactly. Every other platform convolves the
+    integers as Qwix does."""
+    qwix = _qwix()
+
+    def integer(arg) -> bool:
+        return isinstance(arg, qwix.QArray) and jnp.issubdtype(arg.qvalue.dtype, jnp.integer)
+
+    def convolved(lhs, rhs, *args, **kwargs) -> jax.Array:
+        if not (integer(lhs) and integer(rhs)):
+            return op(lhs, rhs, *args, **kwargs)
+
+        def in_float32(lhs, rhs):
+            widened = (dataclasses.replace(arg, qvalue=arg.qvalue.astype(jnp.float32)) for arg in (lhs, rhs))
+            return op(*widened, *args, **kwargs)
+
+        return jax.lax.platform_dependent(lhs, rhs, cuda=in_float32,
+                                          default=lambda lhs, rhs: op(lhs, rhs, *args, **kwargs))
+
+    return convolved
+
+
+def _qt_operand(operand, config, dimension_numbers, *, for_lhs: bool):
+    """`operand` quantized as Qwix's training forward quantizes it (0.1.8
+    `conv_general_qt_fwd`'s `_quantize_operand`), or as it is where its
+    configuration quantizes nothing."""
+    conv_general = _qwix("qwix._src.core.conv_general")
+    qarray = _qwix("qwix._src.core.qarray")
+    numerics = _qwix("qwix._src.core.numerics")
+    side = "lhs" if for_lhs else "rhs"
+    qtype = getattr(config, f"{side}_qtype")
+    if not (qtype and numerics.should_quantize(operand.dtype)):
+        return operand
+    method = getattr(config, f"{side}_calibration_method")
+    how = conv_general.get_how_to_quantize(dimension_numbers=dimension_numbers, for_lhs=for_lhs,
+                                           qtype=qtype, calibration_method=method)
+    if getattr(config, f"{side}_disable_channelwise_axes"):
+        how = dataclasses.replace(how, channelwise_axes=[])
+    calibration = qarray.calibrate(operand, how)
+    if (collect := getattr(config, f"{side}_collect_quant_stat")) is not None:
+        calibration = collect(calibration)
+    scale, zero_point = qarray.compute_scale_zero_point(calibration, qtype)
+    return qarray.quantize_with_scale_zero_point(operand, qtype, scale, zero_point)
+
+def _qt_forward(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
+                feature_group_count, batch_group_count, out_sharding):
+    """Qwix's training forward with the integer convolution XLA:GPU runs
+    (`_integer_convolution_on_cuda`): the product and the quantized operands
+    the backward reads."""
+    conv_general = _qwix("qwix._src.core.conv_general")
+    integer_convolution = _integer_convolution_on_cuda(conv_general.conv_general_dilated)
+    numbers = jax.lax.conv_dimension_numbers(lhs.shape, rhs.shape, dimension_numbers)
+    operands = (_qt_operand(lhs, config, numbers, for_lhs=True),
+                _qt_operand(rhs, config, numbers, for_lhs=False))
+    return integer_convolution(*operands, window_strides, padding, lhs_dilation, rhs_dilation, numbers,
+                               feature_group_count, batch_group_count, out_sharding), operands
+
+
 @functools.cache
 def _grouped_convolution_gradient() -> type:
-    """Qwix's quantized-training provider with Dew's gradient for a grouped
-    convolution; importing Qwix here keeps it optional."""
+    """Qwix's quantized-training provider with Dew's quantized convolution;
+    importing Qwix here keeps it optional."""
     qwix = _qwix()
-    conv_general_qt = _qwix("qwix._src.core.conv_general_qt")
 
     @functools.partial(jax.custom_vjp, nondiff_argnums=tuple(range(2, 11)))
     def grouped_conv_qt(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
                         dimension_numbers, feature_group_count, batch_group_count, out_sharding):
-        return conv_general_qt.conv_general_qt_fwd(
-            lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
-            feature_group_count, batch_group_count, out_sharding)[0]
+        return _qt_forward(lhs, rhs, config, window_strides, padding, lhs_dilation, rhs_dilation,
+                           dimension_numbers, feature_group_count, batch_group_count, out_sharding)[0]
 
     def straight_through(config, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                          feature_group_count, batch_group_count, out_sharding, residuals, g):
@@ -925,7 +1150,7 @@ def _grouped_convolution_gradient() -> type:
         _, transpose = jax.vjp(convolve, *operands)
         return transpose(g)
 
-    grouped_conv_qt.defvjp(conv_general_qt.conv_general_qt_fwd, straight_through)
+    grouped_conv_qt.defvjp(_qt_forward, straight_through)
 
     class GroupedConvolutionGradient(qwix.QtProvider):
         """Differentiates a quantized grouped convolution, which Qwix's
@@ -934,16 +1159,21 @@ def _grouped_convolution_gradient() -> type:
         the kernel's grouped shape, which only fits one group, so `jax.grad`
         raised for the hybrid DiT's depthwise convolutions.
 
-        The forward is Qwix's. The backward is the one Qwix computes for an
+        The forward is Qwix's with the integer convolution XLA:GPU runs
+        (`_integer_convolution_on_cuda`), for an ungrouped convolution too:
+        Qwix's own convolves its int8 operands into int32, which an A100 and
+        an H100 cannot run. The backward is the one Qwix computes for an
         ungrouped convolution with float gradients: the float convolution's
         transpose at the dequantized operands the forward computed with,
         here JAX's own, which handles groups. Qwix's quantized gradients
-        (`bwd_qtype`) for a grouped convolution are refused.
+        (`bwd_qtype`) run Qwix's own convolution, refused on a GPU, and for a
+        grouped convolution everywhere.
 
         An ungrouped convolution with quantized activations quantizes its
-        float32 operands and returns the input's dtype, so Qwix scales its
-        8-bit product in float32 as `GroupScaledConvolution` does a grouped
-        one's. From bf16 operands Qwix scaled it in bf16, and XLA:GPU, which
+        operands in at least float32 (`at_least_fp32`, float64 for float64
+        ones) and returns the input's dtype, so Qwix scales its 8-bit product
+        in float32 as `GroupScaledConvolution` does a grouped one's, and a
+        float64 run keeps float64 throughout. From bf16 operands Qwix scaled it in bf16, and XLA:GPU, which
         lowers an int8 convolution only with a float32 result, failed to
         compile a bf16 int8 convolution (`UNIMPLEMENTED: Can't lower one or
         more integer convolutions`, the RTX 4080)."""
@@ -966,12 +1196,18 @@ def _grouped_convolution_gradient() -> type:
                 return super().conv_general_dilated(
                     lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
                     feature_group_count, batch_group_count, precision, preferred_element_type, out_sharding)
-            if feature_group_count == 1:
+            if feature_group_count == 1 and rule.bwd_qtype is not None:
+                if backend() == "gpu":
+                    raise ValueError(
+                        "Qwix 0.1.8's quantized gradients of a convolution (bwd_qtype) convolve two int8 "
+                        "operands into an int32 accumulator, which XLA:GPU cannot run (UNIMPLEMENTED on "
+                        "an A100); leave bwd_qtype unset, whose float gradients Dew computes")
+                wide = at_least_fp32(jnp.result_type(lhs, rhs))
                 return super().conv_general_dilated(
-                    lhs.astype(jnp.float32), rhs.astype(jnp.float32), window_strides, padding, lhs_dilation,
+                    lhs.astype(wide), rhs.astype(wide), window_strides, padding, lhs_dilation,
                     rhs_dilation, dimension_numbers, feature_group_count, batch_group_count, precision,
                     preferred_element_type, out_sharding).astype(lhs.dtype)
-            if rule.bwd_qtype is not None:
+            if feature_group_count > 1 and rule.bwd_qtype is not None:
                 raise ValueError(
                     "Qwix 0.1.8 cannot compute the quantized gradients of a grouped convolution, so Dew "
                     "refuses bwd_qtype for one; leave bwd_qtype unset, or leave the convolution out of "
@@ -980,9 +1216,18 @@ def _grouped_convolution_gradient() -> type:
             if rule.tile_size:
                 raise ValueError("subchannel is not supported for conv_general_dilated.")
             rule, op_id = self._get_current_rule_and_op_id("conv_general_dilated")
-            return grouped_conv_qt(lhs, rhs, self._create_conv_general_qt_config(rule, op_id, lhs, rhs),
-                                   window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
-                                   feature_group_count, batch_group_count, out_sharding)
+            if feature_group_count == 1:
+                # Quantized from at least float32 and returned in the input's dtype, so the 8-bit product
+                # is scaled in at least float32 (the class docstring), float64 where the operands are.
+                wide = at_least_fp32(jnp.result_type(lhs, rhs))
+                lhs, rhs, dtype = lhs.astype(wide), rhs.astype(wide), lhs.dtype
+            else:
+                dtype = None
+            config = self._create_conv_general_qt_config(rule, op_id, lhs, rhs)
+            convolved = grouped_conv_qt(lhs, rhs, config, window_strides, padding, lhs_dilation,
+                                        rhs_dilation, dimension_numbers, feature_group_count,
+                                        batch_group_count, out_sharding)
+            return convolved if dtype is None else convolved.astype(dtype)
 
     return GroupedConvolutionGradient
 
@@ -1036,10 +1281,7 @@ def _group_scaled_convolution() -> type:
             unwrapped model after its zero-initialized fusion kernels'
             first update (ColabPlan-2, the RTX 4080)."""
             rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
-            precision = inspect.signature(dew_conv._conv_general_dilated).bind(
-                lhs, rhs, *args, **kwargs).arguments.get("precision")
-            # One pinned past the default runs unquantized (`conv_general_dilated`), in Dew's own form.
-            if rule is None or rule.weight_qtype is None or not asks_default_precision(precision):
+            if rule is None or rule.weight_qtype is None:
                 return dew_conv._conv_general_dilated(lhs, rhs, *args, **kwargs)
             return self.conv_general_dilated(lhs, rhs, *args, **kwargs)
 
@@ -1052,17 +1294,11 @@ def _group_scaled_convolution() -> type:
                                  precision: jax.lax.PrecisionLike = None,
                                  preferred_element_type: jax.typing.DTypeLike | None = None,
                                  out_sharding: jax.sharding.NamedSharding | None = None) -> jax.Array:
-            """The convolution under the call's contract, as `ComplexInFloat` keeps a matmul's: one
-            that pins a precision past the default has no quantized form and runs unquantized at
-            it, and a quantized one returns the result dtype it asks for, its operands widened to it
-            first, which is exact for the narrower floats it accumulates."""
+            """The convolution under the call's contract, as `ComplexInFloat` keeps a matmul's: a
+            quantized one returns the result dtype it asks for, its operands widened to it first,
+            which is exact for the narrower floats it accumulates."""
             rule, _ = self._get_current_rule_and_op_id("conv_general_dilated", only_rule=True)
             quantized = rule is not None and rule.weight_qtype is not None
-            if quantized and not asks_default_precision(precision):
-                return jax.lax.conv_general_dilated(
-                    lhs, rhs, window_strides, padding, lhs_dilation, rhs_dilation, dimension_numbers,
-                    feature_group_count, batch_group_count, precision=precision,
-                    preferred_element_type=preferred_element_type, out_sharding=out_sharding)
             returned = jnp.dtype(preferred_element_type or lhs.dtype)
             if quantized:
                 lhs, rhs = _widened((lhs, rhs), preferred_element_type)
@@ -1088,6 +1324,153 @@ def _group_scaled_convolution() -> type:
 
 
 @functools.cache
+def _complex_in_float() -> type:
+    """The providers' shared base (`ComplexInFloat`): a complex matmul unquantized, and the call's contract
+    honoured on a quantized one (`_providers`)."""
+    qwix = _qwix()
+
+    class ComplexInFloat(qwix.QuantizationProvider):
+        """Passes a matmul with a complex operand through unquantized, and
+        honours the call's contract on a quantized one, which Qwix 0.1.8
+        drops (qwix/_src/providers/qt.py:96-97,130-132, ptq.py:177-180,244):
+        a result dtype by widening the operands to it, exact for the
+        narrower floats it accumulates, and an output sharding by
+        constraining the result where the provider drops it. The functions
+        `UNQUANTIZED` names run unquantized, through the intercept map; any
+        other matmul a rule matches quantizes, whatever precision it pins."""
+
+        keeps_out_sharding: ClassVar[bool] = False
+
+        def get_intercept_map(self):
+            # A handler that calls its function again runs the original with this provider's
+            # interception off for the thread (qwix/_src/interception.py:361-387), so none of
+            # its products quantize.
+            functions = {name: getattr(importlib.import_module(module), function)
+                         for name in UNQUANTIZED for module, _, function in [name.rpartition(".")]}
+            return {**super().get_intercept_map(), **functions}
+
+        def _matched(self, op: str) -> bool:
+            rule, _ = self._get_current_rule_and_op_id(op, only_rule=True)
+            return rule is not None and rule.weight_qtype is not None
+
+        def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
+                        preferred_element_type=None, *, out_sharding=None):
+            if not _real(lhs.dtype, rhs.dtype):
+                return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
+                                           preferred_element_type=preferred_element_type,
+                                           out_sharding=out_sharding)
+            if not self._matched("dot_general"):
+                return super().dot_general(lhs, rhs, dimension_numbers, precision,
+                                           preferred_element_type, out_sharding=out_sharding)
+            kept = out_sharding if self.keeps_out_sharding else None
+            out = super().dot_general(*_widened((lhs, rhs), preferred_element_type), dimension_numbers,
+                                      out_sharding=kept)
+            return _honoured(out, preferred_element_type, None if kept is not None else out_sharding)
+
+        def einsum(self, einsum_str, *operands, **kwargs):
+            # Qwix 0.1.8 quantizes a two-operand einsum alone and raises on any other
+            # (qwix/_src/providers/qt.py:119-121), which runs here as the unwrapped model runs it.
+            if len(operands) != 2 or not _real(*(operand.dtype for operand in operands)):
+                return jnp.einsum(einsum_str, *operands, **kwargs)
+            if not self._matched("einsum"):
+                return super().einsum(einsum_str, *operands, **kwargs)
+            preferred = kwargs.pop("preferred_element_type", None)
+            out_sharding = kwargs.pop("out_sharding", None)
+            kwargs.pop("precision", None)
+            out = super().einsum(einsum_str, *_widened(operands, preferred), **kwargs)
+            return _honoured(out, preferred, out_sharding)
+
+    return ComplexInFloat
+
+
+@functools.cache
+def _serving_provider() -> type:
+    """The serving provider (`_providers`): Qwix's post-training quantization with Dew's grouped
+    convolution, its products scaled in float32 (`_scaled_in_float32`), a quantized kernel no rule matches
+    multiplied by its own recorded recipe, and a quantized kernel's scales promoted with the module's."""
+    qwix = _qwix()
+
+    class PtqProvider(_group_scaled_convolution(), _complex_in_float(), qwix.PtqProvider):
+        keeps_out_sharding: ClassVar[bool] = True  # ptq.py:180 passes it on
+
+        def __init__(self, rules: Sequence[object], moving: Sequence[object]) -> None:
+            super().__init__(
+                rules, _dot_general_fn=_scaled_in_float32(qwix.dot_general),
+                _einsum_fn=_scaled_in_float32(qwix.einsum),
+                _conv_general_dilated_fn=_scaled_in_float32(
+                    _integer_convolution_on_cuda(qwix.conv_general_dilated)))
+            # The training provider over the spec's training rules, which forms a moving weight's
+            # products (`moving_weights`).
+            self._moving = _providers()[0](moving)
+
+        def _moved(self, op: str, weight) -> QtProvider | None:
+            """The training provider that multiplies `weight` where it is a moving weight a rule matches
+            (`moving_weights`), rounded at each product, as no stored copy of it exists; None for any
+            other weight."""
+            if not MOVING.get() or isinstance(weight, Annotated) or not self._matched(op):
+                return None
+            return self._moving
+
+        def _recorded(self, op: str, weight) -> bool:
+            """Whether `weight` is a stored quantized kernel that reaches `op` with no rule matching
+            it, as an unpacked task's member does under a rule that names its packed group
+            (`dew.inference.projections.unpacked`): it multiplies by the recipe it records, its
+            activation unquantized, where every rule leaves activations so; a rule that quantizes
+            them records no recipe a member could take, which refuses."""
+            if not isinstance(weight, Annotated) or self._matched(op):
+                return False
+            if any(rule.act_qtype is not None for rule in self._rules):
+                raise ValueError(f"a quantized kernel reached a {op} no rule matches, and the rules quantize "
+                                 "activations, whose recipe the kernel does not record; name its members in "
+                                 "the patterns")
+            return True
+
+        def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
+                        preferred_element_type=None, *, out_sharding=None):
+            if (moving := self._moved("dot_general", rhs)) is not None:
+                return moving.dot_general(lhs, rhs, dimension_numbers, precision, preferred_element_type,
+                                          out_sharding=out_sharding)
+            if not self._recorded("dot_general", rhs):
+                return super().dot_general(lhs, rhs, dimension_numbers, precision, preferred_element_type,
+                                           out_sharding=out_sharding)
+            out = self._dot_general_fn(*_widened((lhs, rhs.array), preferred_element_type),
+                                       dimension_numbers, out_sharding=out_sharding)
+            return _honoured(out, preferred_element_type, None)
+
+        def conv_general_dilated(self, lhs, rhs, *args, **kwargs):
+            if (moving := self._moved("conv_general_dilated", rhs)) is not None:
+                return moving.conv_general_dilated(lhs, rhs, *args, **kwargs)
+            return super().conv_general_dilated(lhs, rhs, *args, **kwargs)
+
+        def einsum(self, einsum_str, *operands, **kwargs):
+            if len(operands) == 2 and (moving := self._moved("einsum", operands[1])) is not None:
+                return moving.einsum(einsum_str, *operands, **kwargs)
+            if len(operands) != 2 or not self._recorded("einsum", operands[1]):
+                return super().einsum(einsum_str, *operands, **kwargs)
+            preferred = kwargs.pop("preferred_element_type", None)
+            out_sharding = kwargs.pop("out_sharding", None)
+            out = self._einsum_fn(einsum_str, *_widened((operands[0], operands[1].array), preferred))
+            return _honoured(out, preferred, out_sharding)
+
+        def promote_dtype(self, *args, **kwargs):
+            # Qwix 0.1.8 passes a quantized kernel through, and its wrapper's own `astype` raises on
+            # the QArray inside it (`flax_util.update_boxed` accepts boxes and arrays only): the
+            # QArray's scales take the dtype, wherever the wrapper holds it.
+            promoted = super().promote_dtype(*args, **kwargs)
+            dtype = kwargs.get("dtype")
+            if dtype is None:
+                return promoted
+
+            def quantized(value) -> bool:
+                return isinstance(value, qwix.QArray)
+
+            return jax.tree.map(lambda value: value.astype(dtype) if quantized(value) else value,
+                                promoted, is_leaf=quantized)
+
+    return PtqProvider
+
+
+@functools.cache
 def _providers() -> tuple[type, type]:
     """Qwix's quantized-training and serving providers with Dew's grouped
     convolution; importing Qwix here keeps it optional.
@@ -1106,85 +1489,76 @@ def _providers() -> tuple[type, type]:
     the plain bf16 176M DiT forward at batch 24 on the RTX 4080). And it
     scales two quantized operands' product in float32
     (`_scaled_in_float32`)."""
-    qwix = _qwix()
-    group_scaled = _group_scaled_convolution()
 
-    class ComplexInFloat(qwix.QuantizationProvider):
-        """Passes a matmul with a complex operand through unquantized, and
-        honours the call's contract on a quantized one, which Qwix 0.1.8
-        drops (qwix/_src/providers/qt.py:96-97,130-132, ptq.py:177-180,244):
-        a result dtype by widening the operands to it, exact for the
-        narrower floats it accumulates, and an output sharding by
-        constraining the result where the provider drops it. A matmul that
-        pins an accumulation precision past the default, as Dew's fp32
-        zones and its vocabulary head do, has no quantized form and runs
-        unquantized at that precision."""
-
-        keeps_out_sharding: ClassVar[bool] = False
-
-        def _matched(self, op: str) -> bool:
-            rule, _ = self._get_current_rule_and_op_id(op, only_rule=True)
-            return rule is not None and rule.weight_qtype is not None
-
-        def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
-                        preferred_element_type=None, *, out_sharding=None):
-            if not _real(lhs.dtype, rhs.dtype):
-                return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
-                                           preferred_element_type=preferred_element_type,
-                                           out_sharding=out_sharding)
-            if not self._matched("dot_general"):
-                return super().dot_general(lhs, rhs, dimension_numbers, precision,
-                                           preferred_element_type, out_sharding=out_sharding)
-            if not asks_default_precision(precision):
-                return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
-                                           preferred_element_type=preferred_element_type,
-                                           out_sharding=out_sharding)
-            kept = out_sharding if self.keeps_out_sharding else None
-            out = super().dot_general(*_widened((lhs, rhs), preferred_element_type), dimension_numbers,
-                                      out_sharding=kept)
-            return _honoured(out, preferred_element_type, None if kept is not None else out_sharding)
-
-        def einsum(self, einsum_str, *operands, **kwargs):
-            if not _real(*(operand.dtype for operand in operands)):
-                return jnp.einsum(einsum_str, *operands, **kwargs)
-            if not self._matched("einsum"):
-                return super().einsum(einsum_str, *operands, **kwargs)
-            if not asks_default_precision(kwargs.get("precision")):
-                return jnp.einsum(einsum_str, *operands, **kwargs)
-            preferred = kwargs.pop("preferred_element_type", None)
-            out_sharding = kwargs.pop("out_sharding", None)
-            kwargs.pop("precision", None)
-            out = super().einsum(einsum_str, *_widened(operands, preferred), **kwargs)
-            return _honoured(out, preferred, out_sharding)
-
-    class QtProvider(group_scaled, ComplexInFloat, _grouped_convolution_gradient()):
+    class QtProvider(_group_scaled_convolution(), _complex_in_float(), _grouped_convolution_gradient()):
         pass
 
-    class PtqProvider(group_scaled, ComplexInFloat, qwix.PtqProvider):
-        keeps_out_sharding: ClassVar[bool] = True  # ptq.py:180 passes it on
+    return QtProvider, _serving_provider()
 
-        def __init__(self, rules: Sequence[object]) -> None:
-            super().__init__(
-                rules, _dot_general_fn=_scaled_in_float32(qwix.dot_general),
-                _einsum_fn=_scaled_in_float32(qwix.einsum),
-                _conv_general_dilated_fn=_scaled_in_float32(qwix.conv_general_dilated))
 
-        def promote_dtype(self, *args, **kwargs):
-            # Qwix 0.1.8 passes a quantized kernel through, and its wrapper's own `astype` raises on
-            # the QArray inside it (`flax_util.update_boxed` accepts boxes and arrays only): the
-            # QArray's scales take the dtype, wherever the wrapper holds it.
-            promoted = super().promote_dtype(*args, **kwargs)
-            dtype = kwargs.get("dtype")
-            if dtype is None:
-                return promoted
+@runtime_checkable
+class Annotated(Protocol):
+    """A serving tree's quantized kernel as Qwix's post-training quantization annotates it: the QArray
+    (`array`) with the recipe it was quantized by (`how`), a dataclass of those fields."""
 
-            def quantized(value) -> bool:
-                return isinstance(value, qwix.QArray)
+    array: QArray
+    how: object
 
-            return jax.tree.map(lambda value: value.astype(dtype) if quantized(value) else value,
-                                promoted, is_leaf=quantized)
 
-    return QtProvider, PtqProvider
+def split_columns(leaf, widths: Sequence[int], *, axis: int = -1) -> list:
+    """`leaf` split into one leaf a member along `axis` by `widths`, a packed projection's kernel
+    taken back into its members' (`dew.inference.projections.unpacked`): a plain array, host or
+    device, as `np.split` or `jnp.split` would; a Qwix QArray with its values split and each scale
+    and zero point split as its own axis is, shared (one entry) kept whole by every member, per
+    channel split at the same columns, per tile at the tiles' (a member that would cut a tile is
+    refused); and the serving tree's wrapper of one (Qwix's annotated array, `array` its field) as
+    the QArray inside it, its recipe kept, where no other field of it holds an array that would need
+    a split of its own. A leaf this process can materialize whole (fully addressable, or replicated
+    with an addressable copy) splits on the host and returns host arrays; any other splits where it
+    lives. The widths are positive and sum to `leaf`'s size along `axis`, or the split is refused."""
+    edges = np.cumsum(widths)[:-1].tolist()
+
+    def checked(size: int):
+        if not widths or min(widths) < 1 or sum(widths) != size:
+            raise ValueError(f"members {list(widths)} do not partition an axis of {size}")
+
+    def arrays(value, ratio: int = 1):
+        if value is None:
+            return [None] * len(widths)
+        if isinstance(value, jax.Array) and not (value.is_fully_addressable or (
+                value.is_fully_replicated and value.sharding.has_addressable_devices)):
+            return jnp.split(value, [edge // ratio for edge in edges], axis=axis)
+        return np.split(np.asarray(value), [edge // ratio for edge in edges], axis=axis)
+
+    if isinstance(leaf, (jax.Array, np.ndarray)):
+        checked(leaf.shape[axis])
+        return arrays(leaf)
+    qwix = _qwix()
+    if isinstance(leaf, qwix.QArray):
+        total = leaf.qvalue.shape[axis]
+        checked(total)
+
+        def scaled(value):
+            if value is None or value.shape[axis] == 1:
+                return [value] * len(widths)
+            tile = total // value.shape[axis]
+            if any(width % tile for width in widths):
+                raise ValueError(f"members {list(widths)} cut the scales' tiles of {tile} columns")
+            return arrays(value, tile)
+
+        parts = zip(arrays(leaf.qvalue), scaled(leaf.scale), scaled(leaf.zero_point), strict=True)
+        return [dataclasses.replace(leaf, qvalue=value, scale=scale, zero_point=zero)
+                for value, scale, zero in parts]
+    if (isinstance(leaf, Annotated) and isinstance(leaf.array, qwix.QArray) and dataclasses.is_dataclass(leaf)
+            and not isinstance(leaf, type)):
+        others = [field.name for field in dataclasses.fields(leaf) if field.name != "array"
+                  and isinstance(getattr(leaf, field.name), (jax.Array, np.ndarray))]
+        if others:
+            raise TypeError(f"a {type(leaf).__name__} holds arrays beside its kernel ({', '.join(others)}), "
+                            "whose split is not this one")
+        return [dataclasses.replace(leaf, array=part)
+                for part in split_columns(leaf.array, widths, axis=axis)]
+    raise TypeError(f"a {type(leaf).__name__} is not a packed kernel this splits")
 
 
 def _rules(spec: Quantization, training: bool) -> list:
@@ -1233,7 +1607,9 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     under `Quantization.apply` does, and a matmul of two quantized operands
     runs in the quantized dtype. `args` and `kwargs` are one example call of
     the model, which Qwix traces abstractly to find the kernels its
-    matmuls read. `spec`'s backward fields have nothing to do here.
+    matmuls read. A weight a layer moves from its stored value each call (an in-context memory's
+    W_0) is stored quantized too, and its moving products round as quantized training rounds them
+    (`moving_weights`), its backward fields included: those are the only products they rule here.
 
     A weight-only spec leaves convolutions in float: Qwix 0.1.8's serving
     provider quantizes a convolution's weights only together with its
@@ -1246,7 +1622,7 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     JAX parameters keep their placement through Qwix's operations.
     """
     rules = _rules(spec, training=False)
-    served = _quantized(model, _providers()[1](rules), spec)
+    served = _quantized(model, _providers()[1](rules, _rules(spec, training=True)), spec)
     def initialized(scope: core.Scope, supplied: Variables):
         # Initialization lets Qwix annotate each weight with its quantization
         # recipe. Seed the scope first so data-dependent module layouts, such
@@ -1261,4 +1637,5 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     return served, {**variables, "params": parameters}
 
 
-__all__ = ["InputQuantization", "Quantization"]
+__all__ = ["InputQuantization", "Quantization", "QuantizedProducts", "QuantizedTrace", "decoded_stored",
+           "moving_weights", "quantize_with", "split_columns"]

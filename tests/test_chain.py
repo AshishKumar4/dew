@@ -12,7 +12,6 @@ data or settings fails the run before its first stage trains.
 """
 
 import dataclasses
-import functools
 import json
 from pathlib import Path
 
@@ -21,13 +20,15 @@ import numpy as np
 import optax
 import pytest
 from bank_support import identical
-from episode_support import GROUPS, PROMPT, RESPONSE, SAMPLING, TURNS, Harness, ToolPolicy, verify
+from episode_support import SAMPLING, Harness, verify
 from flax import linen as nn
 from rl_support import TinyHead
+from tool_policy import GROUPS, PROMPT, RESPONSE, TURNS, ToolPolicy
 
-from dew.config.data import ChatData, PreferenceData, PromptData, RecordsData, TextData
+from dew.batch import part
+from dew.data import Memory, presets
+from dew.data.sources.files import Files
 from dew.data.text import tokenizer_for
-from dew.objectives.base import part
 from dew.objectives.distillation import TEACHER
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import ValueHead
@@ -37,6 +38,17 @@ from recipes.chain import Episodes, Recipe, Stage, Teacher
 TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"
 LAYOUT = Layout(min_shard=1, tolerance=1.0)
 
+
+
+class TupleShapes:
+    """Keeps each record and restates the shapes of the fields it declares as tuples."""
+
+    def __call__(self, record):
+        return record
+
+    def declared(self, facts):
+        fields = facts.get("fields", {})
+        return {**facts, "fields": {name: tuple(shape) for name, shape in fields.items()}}
 
 @dataclasses.dataclass(frozen=True)
 class Loaded:
@@ -76,15 +88,17 @@ def pair_records():
 
 
 def pairs():
-    return PreferenceData(source=tuple(json.loads(row) for row in pair_records()), seq_len=4)
+    return Memory([json.loads(row) for row in pair_records()]).pipe(presets.preferences, seq_len=4, batch=8)
 
 
 def chat(tmp_path):
-    return ChatData(source=chat_parquet(tmp_path), tokenizer=str(TOKENIZER), seq_len=31, long="chunk")
+    return Files(chat_parquet(tmp_path), format="parquet").pipe(
+        presets.sft, str(TOKENIZER), seq_len=31, batch=8, messages="prompt", long="chunk")
 
 
 def stages(tmp_path):
-    return (Stage(name="sft", data=chat(tmp_path), steps=1), Stage(name="dpo", data=pairs(), steps=1))
+    return (Stage(name="sft", loss="sft", data=chat(tmp_path), steps=1),
+            Stage(name="dpo", loss="dpo", data=pairs(), steps=1))
 
 
 def test_each_stage_continues_the_last(tmp_path):
@@ -92,7 +106,7 @@ def test_each_stage_continues_the_last(tmp_path):
     stage trains (its parameters move off the first stage's), and its frozen
     reference is the first stage's final tree."""
     recipe = Recipe(TinyHead(vocab_size=8), optax.sgd(0.1), jax.random.key(0),
-                    stages(tmp_path), str(tmp_path / "chain"), batch=8, layout=LAYOUT)
+                    stages(tmp_path), str(tmp_path / "chain"), layout=LAYOUT)
 
     states = recipe.run()
 
@@ -111,14 +125,14 @@ def test_pretraining_and_distillation_hand_on_the_decoder_alone(tmp_path):
     vocab = tokenizer_for(str(TOKENIZER)).vocab_size
     held = LMObjective(TinyHead(vocab_size=vocab), 31).init(jax.random.key(7))
     teacher = Teacher(Loaded(TinyHead(vocab_size=vocab), held), alpha=0.5, temperature=2.0)
-    text = TextData(source=tuple({"text": "the quick brown fox jumps over the lazy dog"} for _ in range(16)),
-                    tokenizer=str(TOKENIZER), seq_len=8, token_holdout=None)
+    text = Memory([{"text": "the quick brown fox jumps over the lazy dog"}] * 16).pipe(
+        presets.lm, str(TOKENIZER), seq_len=8, batch=8)
     recipe = Recipe(TinyHead(vocab_size=vocab), optax.sgd(0.1), jax.random.key(0), (
-        Stage(name="pretraining", data=text, steps=1),
-        Stage(name="dpo", data=pairs(), steps=1),
-        Stage(name="sft", data=chat(tmp_path), steps=1, teacher=teacher),
-        Stage(name="aligned", data=pairs(), steps=1),
-    ), str(tmp_path / "chain"), batch=8, layout=LAYOUT)
+        Stage(name="pretraining", loss="pretrain", data=text, steps=1),
+        Stage(name="dpo", loss="dpo", data=pairs(), steps=1),
+        Stage(name="sft", loss="sft", data=chat(tmp_path), steps=1, teacher=teacher),
+        Stage(name="aligned", loss="dpo", data=pairs(), steps=1),
+    ), str(tmp_path / "chain"), layout=LAYOUT)
 
     states = recipe.run()
 
@@ -138,13 +152,13 @@ def test_a_ppo_stage_acts_in_its_environment_and_hands_on_its_policy(tmp_path):
     harness = Harness()
     episodes = Episodes(harness, verify, ValueHead(ToolPolicy()), max_prompt_tokens=PROMPT,
                         max_turns=TURNS, gamma=.97, lam=.9)
-    tasks = RecordsData(source=tuple({"task_id": index} for index in range(8)))
+    tasks = Memory([{"task_id": index} for index in range(8)]).batch(8)
     recipe = Recipe(ToolPolicy(), optax.sgd(.05), jax.random.key(19), (
-        Stage(name="dpo", data=pairs(), steps=1),
-        Stage(name="ppo", data=tasks, steps=1, beta=.03, groups=GROUPS, max_new_tokens=RESPONSE,
+        Stage(name="dpo", loss="dpo", data=pairs(), steps=1),
+        Stage(name="ppo", loss="ppo", data=tasks, steps=1, beta=.03, groups=GROUPS, max_new_tokens=RESPONSE,
               sampling=SAMPLING, episodes=episodes),
-        Stage(name="aligned", data=pairs(), steps=1),
-    ), str(tmp_path / "chain"), batch=8, layout=LAYOUT)
+        Stage(name="aligned", loss="dpo", data=pairs(), steps=1),
+    ), str(tmp_path / "chain"), layout=LAYOUT)
 
     states = recipe.run()
 
@@ -165,47 +179,61 @@ def leaning(vocab: int, letter: int, eos: int) -> np.ndarray:
 
 
 def test_a_grpo_stage_scores_decoded_text_and_stops_at_the_tokenizer_eos(tmp_path):
-    """DPO, GRPO, then DPO on a bigram policy that draws "a" then EOS, or
-    EOS at once. Of the 8 * 4 completions the reward reads, each is "a" or
-    empty as the prompts' tokenizer decodes it, and both occur: EOS stopped
-    every one inside the four-token budget, where sampling past it would
-    have decoded EOS text or a second "a". GRPO trains on the differing
-    rewards, its reference is the first stage's final tree, and the last
-    stage's reference is GRPO's."""
+    """One bigram policy that draws "a" then EOS, or EOS at once, pretrained on text, tuned on
+    conversations, reinforced by GRPO and aligned by DPO in one run of the recipe, each stage in its
+    own checkpoint directory and starting from the last one's final tree. SFT's rows of the table no
+    conversation trains hold pretraining's values, not the start's. Of the 8 * 4 completions GRPO's
+    reward reads, each is "a" or empty as the prompts' tokenizer decodes it, and both occur: EOS
+    stopped every one inside the four-token budget, where sampling past it would have decoded EOS
+    text or a second "a". GRPO trains on the differing rewards, its reference is SFT's final tree,
+    and the last stage's reference is GRPO's."""
     tokenizer = tokenizer_for(str(TOKENIZER))
     letter, = tokenizer.encode("a", add_special_tokens=False)
     assert tokenizer.eos_id is not None
-    model = ToolPolicy(vocab_size=tokenizer.vocab_size, max_seq_len=12,
-                       logits=functools.partial(leaning, tokenizer.vocab_size, letter, tokenizer.eos_id))
+    start = leaning(tokenizer.vocab_size, letter, tokenizer.eos_id)
+    model = ToolPolicy(vocab_size=tokenizer.vocab_size, max_seq_len=32, logits=lambda: start)
     read = []
 
     def reward(text, record):
         read.append(text)
         return float(len(text))
 
-    prompts = PromptData(source=tuple({"prompt": "hi"} for _ in range(8)), tokenizer=str(TOKENIZER),
-                         max_prompt_len=8, long="truncate")
+    text = Memory([{"text": "the quick brown fox jumps over the lazy dog"}] * 16).pipe(
+        presets.lm, str(TOKENIZER), seq_len=8, batch=8)
+    # A source may state a field's shape as a tuple, as `Torch(known=)` passes it on; the stage reads
+    # the prompt's length from it as from the preset's list.
+    prompts = Memory([{"prompt": "hi"}] * 8).pipe(presets.prompts, str(TOKENIZER), max_prompt_len=8, batch=8,
+                                                  long="truncate").map(TupleShapes())
     states = Recipe(model, optax.sgd(.1), jax.random.key(0), (
-        Stage(name="dpo", data=pairs(), steps=1),
-        Stage(name="grpo", data=prompts, steps=1, beta=.01, reward=reward, max_new_tokens=4),
-        Stage(name="aligned", data=pairs(), steps=1),
-    ), str(tmp_path / "chain"), batch=8, layout=LAYOUT).run()
+        Stage(name="pretraining", loss="pretrain", data=text, steps=1),
+        Stage(name="sft", loss="sft", data=chat(tmp_path), steps=1),
+        Stage(name="grpo", loss="grpo", data=prompts, steps=1, beta=.01, reward=reward, max_new_tokens=4),
+        Stage(name="aligned", loss="dpo", data=pairs(), steps=1),
+    ), str(tmp_path / "chain"), layout=LAYOUT).run()
 
+    assert [path.name for path in sorted((tmp_path / "chain").iterdir())] == [
+        "aligned", "grpo", "pretraining", "sft"]
+    pretrained, tuned = (np.asarray(state.variables["params"]["table"]) for state in states[:2])
+    assert moved(states[0].variables, {"params": {"table": start}})
+    assert moved(states[1].variables, states[0].variables)
+    # A row pretraining moved and no conversation reaches holds its pretrained values after SFT.
+    carried = np.all(tuned == pretrained, axis=1) & np.any(pretrained != start, axis=1)
+    assert carried.any()
     assert len(read) == 8 * 4
     assert set(read) == {"", "a"}
-    identical(states[1].ema, states[0].variables)
-    assert moved(states[1].variables, states[0].variables)
     identical(states[2].ema, states[1].variables)
+    assert moved(states[2].variables, states[1].variables)
+    identical(states[3].ema, states[2].variables)
 
 
 def test_a_mislinked_chain_is_refused_before_anything_trains(tmp_path):
     """Each refused stage follows a sound one, and the run fails before the
     sound stage writes its directory."""
     model, optim, key = TinyHead(vocab_size=8), optax.sgd(0.1), jax.random.key(0)
-    text = TextData(source=({"text": "hi"},), tokenizer=str(TOKENIZER))
-    prompts = PromptData(source=tuple(json.loads(row) for row in ("{}",)), tokenizer=str(TOKENIZER),
-        long="truncate")
-    tasks = RecordsData(source=({"task_id": 0},))
+    text = Memory([{"text": "hi"}]).pipe(presets.lm, str(TOKENIZER), seq_len=8, batch=1)
+    prompts = Memory([{"prompt": "hi"}]).pipe(presets.prompts, str(TOKENIZER), max_prompt_len=8, batch=1,
+                                              long="truncate")
+    tasks = Memory([{"task_id": 0}]).batch(1)
     episodes = Episodes(Harness(), verify, ValueHead(ToolPolicy()), max_prompt_tokens=PROMPT,
                         max_turns=TURNS, gamma=1., lam=1.)
     teacher = Teacher(Loaded(model, {}), alpha=0.5, temperature=1.0)
@@ -213,21 +241,26 @@ def test_a_mislinked_chain_is_refused_before_anything_trains(tmp_path):
     with pytest.raises(ValueError):
         Recipe(model, optim, key, (), str(tmp_path))
     with pytest.raises(ValueError):
-        Stage(name="x", data=chat(tmp_path), steps=0)
+        Stage(name="x", loss="sft", data=chat(tmp_path), steps=0)
     with pytest.raises(TypeError):
         Teacher(model, alpha=0.5, temperature=1.0)
     refused = (
-        Stage(name="x", data=chat(tmp_path), beta=0.1),
-        Stage(name="x", data=text, beta=0.1),
-        Stage(name="x", data=prompts),
-        Stage(name="x", data=tasks),
-        Stage(name="x", data=pairs(), episodes=episodes),
-        Stage(name="x", data=pairs(), teacher=teacher),
+        Stage(name="x", loss="sft", data=chat(tmp_path), beta=0.1),
+        Stage(name="x", loss="pretrain", data=text, beta=0.1),
+        Stage(name="x", loss="grpo", data=prompts),
+        Stage(name="x", loss="ppo", data=tasks),
+        Stage(name="x", loss="dpo", data=pairs(), episodes=episodes),
+        Stage(name="x", loss="dpo", data=pairs(), teacher=teacher),
+        # A stage's data must carry its loss's fields: preference pairs are no SFT conversations, and
+        # token windows carry no roles for SFT to score the assistant's turns by.
+        Stage(name="x", loss="sft", data=pairs()),
+        Stage(name="x", loss="sft", data=text),
+        Stage(name="x", loss="grpo", data=text, reward=len),
         # PPO actions end at an EOS, and this stage's sampling names none.
-        Stage(name="x", data=tasks, max_new_tokens=RESPONSE, episodes=episodes),
+        Stage(name="x", loss="ppo", data=tasks, max_new_tokens=RESPONSE, episodes=episodes),
     )
     for stage in refused:
         with pytest.raises(ValueError):
-            Recipe(ToolPolicy(), optim, key, (Stage(name="dpo", data=pairs()), stage),
+            Recipe(ToolPolicy(), optim, key, (Stage(name="dpo", loss="dpo", data=pairs()), stage),
                    str(tmp_path / "chain")).run()
     assert not (tmp_path / "chain").exists()

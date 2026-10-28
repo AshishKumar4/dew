@@ -6,7 +6,7 @@ A Dew training run is built from four objects, each responsible for one part of 
 |---|---|---|
 | Model, a `flax.linen.Module` | The forward computation and the shapes of its variables | You need a new architecture. The built-in ones are classes in `dew.nn.backbones`. |
 | `Objective` | Initializing the variables, the loss, evaluation outputs, and which weights keep a moving average | You need a loss Dew does not have. |
-| `Dataset` | The iterators that yield training and validation batches | Your data does not fit a built-in reader. |
+| `Dataset` | The records, from a source through your steps and a preset, in batches | Always: a source and a preset, plus any steps of your own. |
 | `Trainer` | The device mesh, the compiled step, the optimizer update, the moving average, checkpoints and logging | Never; it is configured, not subclassed. |
 
 `Trainer.fit` returns a `TrainState`, the numerical state of the run: the variables, the optimizer state, the root random key, the step counters and the moving-average copy. Continuing a run also needs the data position, which checkpoints store beside the state, and the configuration that built the objective and trainer (a recipe writes it to `run.json`).
@@ -16,14 +16,12 @@ A Dew training run is built from four objects, each responsible for one part of 
 This trains a small decoder on one repeated sentence and generates from it. It downloads nothing and runs on a CPU.
 
 ```python
-from dew.data import Loading
-from dew.config.data import RecordsData, loader
 import jax
 import numpy as np
 
-from dew import Dataset, Trainer
-from dew.config import OptimConfig
-from dew.data import ByteTokenizer
+from dew import Trainer
+from dew.optim import OptimConfig
+from dew.data import ByteTokenizer, Memory
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling, generate
@@ -31,7 +29,7 @@ from dew.sampling import Sampling, generate
 tokenizer = ByteTokenizer()
 text = tokenizer.encode("dew trains jax models. " * 3)
 rows = np.tile(np.asarray(text[:65], np.int32), (8, 1))
-data = loader(RecordsData(source={"text": rows}), batch=8, read="memory", loading=Loading(workers=0))
+data = Memory({"text": rows}).repeat().batch(8)
 
 model = CausalTransformer(
     vocab_size=tokenizer.vocab_size,
@@ -130,9 +128,9 @@ Dew ships objectives for autoregressive language modeling (`LMObjective`), image
 
 ## Dataset
 
-`Dataset(train, val, records, batch)` holds two functions. `train(partition)` opens training batches; `val(partition)` opens one finite validation pass. `DataPartition` names the process's share of the global batch. The example compiles a `Records` recipe over column arrays with `load(..., read="memory")`; it reshuffles each epoch and saves the consumed position in checkpoints.
+A `Dataset` is one chain: a source (`Memory`, `Files`, `Hub` or `TFDS`), the steps that read its records, and a preset or `batch(n)` that ends it. `Trainer.fit` compiles it into a `Loader` of two functions: `train(partition)` opens training batches and `val(partition)` opens one finite validation pass. `DataPartition` names the process's share of the global batch. The example's chain is a `Memory` source over column arrays, repeated and batched, and checkpoints save its consumed position.
 
-`Text`, `Images` and the other recipes construct Pipelines; `load(recipe, batch=..., read=...)` compiles them into a Dataset. Images arrive as uint8 arrays in `[0, 255]` and token windows as int32 IDs under `"text"`. A custom order uses Pipeline and compile directly. [Training data](concepts/data.md) covers read modes, storage, mixtures and exact resume.
+The presets in `dew.data.presets` prepare one kind of record for a model and end in `batch`: images arrive as uint8 arrays in `[0, 255]` and token windows as int32 IDs under `"text"`. A custom order writes the chain's verbs itself. [Training data](concepts/data.md) covers read modes, storage, mixtures and exact resume.
 
 ![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](assets/data-pipeline-light.svg)
 ![Dataset to global batch: train(partition) opens an iterator of host batches, and shard_batch assembles each into one jax.Array split over the mesh's batch axes.](assets/data-pipeline-dark.svg)

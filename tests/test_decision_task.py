@@ -3,19 +3,22 @@
 import base64
 import io
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from decision_support import decision_rows
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
 from steady_state import steady_state
 
+from dew.artifacts import Decisions
 from dew.decision import (
     Abstention,
     Binning,
     Budget,
+    Calibration,
     Choice,
     Decide,
     EntropyConfidence,
@@ -25,6 +28,7 @@ from dew.decision import (
     Temperatures,
 )
 from dew.decision.calibration import softmax
+from dew.decision.metrics import Answered
 from dew.decision.task import decoded_images
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
@@ -35,6 +39,59 @@ CASES = json.loads((FIXTURES / "cases.json").read_text())
 @pytest.fixture(scope="module")
 def decide() -> Decide:
     return Decide.from_pretrained(TINY, attention_impl="xla")
+
+
+def test_a_decision_source_loads_through_pretrained_and_its_declared_pipeline(decide, tmp_path):
+    """A Laya component release loads through the public source loader, including a subfolder,
+    and its declared task retains the same answers through export."""
+    from shutil import copytree
+
+    from dew import pipeline
+    from dew.interop import Pretrained
+
+    copytree(TINY, tmp_path / "release")
+    bundle = Pretrained.load(tmp_path, subfolder="release", dtype="float32", attention_impl="xla")
+    task = replace(Decide.of(bundle), name=decide.name)
+    request = CASES["quickstart"]
+    assert task.systemone(request) == decide.systemone(request)
+    original = jax.tree.map(lambda value: np.asarray(value).copy(), bundle.variables)
+    for _ in range(2):
+        assert_same_rounded_answers(replace(bundle.pipeline(), name=decide.name).systemone(request),
+                                    decide.systemone(request), "borrowed bundle task")
+    for held, expected in zip(jax.tree.leaves(bundle.variables), jax.tree.leaves(original), strict=True):
+        np.testing.assert_array_equal(held, expected)
+    bundle.save(tmp_path / "export", variables=bundle.variables, max_shard_size="10KB")
+    served = pipeline(str(tmp_path / "export"), dtype="float32")
+    assert_same_rounded_answers(replace(served, name=decide.name).systemone(request),
+                                decide.systemone(request), "public source pipeline")
+
+
+_ANSWERED = """
+import json
+import sys
+from dew.decision import Decide
+task = Decide.from_pretrained("dew/tiny-laya", subfolder="release", attention_impl="xla")
+print(json.dumps(task.systemone(json.loads(sys.argv[1]))))
+"""
+
+
+def test_a_hub_folder_release_answers_under_the_name_it_was_asked_by(tmp_path):
+    """A release in a folder of a Hub repo answers under the repo and folder it was loaded by, not
+    the cache directory it resolved to, as Laya's server names the model it serves."""
+    import os
+    import subprocess
+    import sys
+    from shutil import copytree
+
+    from interop_support import hub_cache
+
+    copytree(TINY, tmp_path / "repo" / "release")
+    hub_cache(tmp_path / "hub", "dew/tiny-laya", tmp_path / "repo")
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu"}
+    run = subprocess.run([sys.executable, "-c", _ANSWERED, json.dumps(CASES["quickstart"])],
+                         capture_output=True, text=True, env=env)
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert json.loads(run.stdout.splitlines()[-1])["model"] == "dew/tiny-laya/release"
 
 
 def assert_same_rounded_answers(found: dict, expected: dict, case: str) -> None:
@@ -146,6 +203,24 @@ def test_a_tournament_takes_each_group_winner_to_the_final(decide):
     assert final.probabilities.shape == (4,)
 
 
+def test_a_questions_tournament_is_its_own_beside_a_longer_one(decide):
+    """Each question plays its own rounds: beside a question of fourteen options, which takes two rounds
+    of groups of three, one of five options plays one round and waits for the final with its two
+    winners, the finalists it reaches alone, not split again to one; its answer's probabilities cover
+    those finalists."""
+    request = CASES["many_options"]
+    question = Question.from_wire(request["questions"]["intent"])
+    assert isinstance(question, Choice)
+    described = dict(zip(question.options, question.descriptions, strict=True))
+    short = Choice(question.instructions, {option: described[option] for option in question.options[:5]})
+    alone = decide.tournament(request["state"], {"short": short}, group=3)["short"]
+    beside = decide.tournament(request["state"], {"short": short, "intent": question}, group=3)
+    assert len(alone.options) == 2
+    assert beside["short"].options == alone.options
+    assert len(beside["short"].probabilities) == len(alone.options)
+    assert len(beside["intent"].options) <= 3
+
+
 def synthetic(temperature: float, count: int, options: int, seed: int) -> list[Scored]:
     """Answers whose labels are drawn from softmax(z / temperature)."""
     rng = np.random.default_rng(seed)
@@ -209,16 +284,33 @@ def test_a_temperature_fit_does_not_depend_on_a_common_logit_shift():
             assert _temperature(held) == pytest.approx(1.0, rel=1e-6)
 
 
-def test_abstention_keeps_the_accepted_answers_within_the_target_error():
+def served(calibration, question, scored):
+    """The answers `calibration` serves rather than abstains on."""
+    return [held for held in scored
+            if not calibration.abstains(question, calibration.probabilities(question, held.logits))]
+
+
+def test_abstention_keeps_the_answers_it_serves_within_the_target_error():
     scored = synthetic(1.0, 2000, 4, seed=2)
     temperatures = Temperatures.fit(scored, bucket_minimum=100)
-    gate = Abstention.fit(scored, temperatures, target_error=0.1)
-    threshold = gate.threshold("choice", 4)
-    assert threshold is not None
-    tops = [round(float(softmax(held.logits, temperatures.of("choice", 4)).max()), 4) for held in scored]
-    accepted = [held for held, top in zip(scored, tops, strict=True) if top >= threshold]
+    calibration = Calibration(temperatures, abstention=Abstention.fit(scored, temperatures, target_error=0.1))
+    accepted = served(calibration, Choice("pick", [f"o{index}" for index in range(4)]), scored)
+    assert accepted
     errors = sum(int(np.argmax(held.logits)) != held.label for held in accepted)
     assert (errors + 1) / (len(accepted) + 1) <= 0.1
+
+
+def test_abstention_serves_every_answer_its_fit_accepted():
+    """Ninety-nine right answers at a confidence of 0.89997 and one wrong at 0.90002: the fit accepts
+    all hundred within a 10% target, and serving accepts the same hundred, not the wrong one alone."""
+    question = Choice("pick", ["a", "b"])
+
+    def answered(top, right):
+        return Scored(question.kind, np.asarray([np.log(top / (1 - top)), 0.0]), np.eye(2)[0 if right else 1])
+
+    scored = [answered(0.89997, right=True)] * 99 + [answered(0.90002, right=False)]
+    calibration = Calibration(abstention=Abstention.fit(scored, Temperatures(), target_error=0.1))
+    assert len(served(calibration, question, scored)) == 100
 
 
 def test_binning_maps_each_bin_to_its_accuracy():
@@ -247,17 +339,19 @@ def passed(objective, variables, examples):
     import jax
     import jax.numpy as jnp
 
+    from dew.batch import VALID_ROWS
     from dew.data.dataset import DataPartition
     from dew.decision.task import laid_out
-    from dew.objectives.base import VALID_ROWS, Step
+    from dew.objectives.base import Step
 
     step = Step(jnp.asarray(0), jax.random.key(0), None)
-    rows = []
-    from dew.data.compile import validation
-    from dew.decision.data import Decisions as DecisionRecipe
+    found = []
+    from dew.data import Memory
+    from dew.data.compile import held
+    from dew.decision import decisions
 
-    pipeline, _, _ = DecisionRecipe(source=examples).pipelines()
-    reader = validation(pipeline, batch=8, objective=objective.data(), read="memory")
+    rows = Memory([{"example": example} for example in examples]).pipe(decisions).read("memory")
+    reader = held(rows, objective=objective.data(), batch=8)
     for batch in reader(DataPartition()):
         probabilities = np.asarray(objective.evaluate(variables, batch, step).probabilities)
         logits = np.asarray(objective._logits(variables, laid_out(batch, objective.bounds.segments)))
@@ -265,9 +359,9 @@ def passed(objective, variables, examples):
         for window in np.flatnonzero(batch.get(VALID_ROWS, np.ones(len(batch["kinds"]), bool))):
             for slot in np.flatnonzero(batch["questions"][window]):
                 count = int(batch["options"][window, slot].sum())
-                rows.append((int(batch["kinds"][window, slot]), logits[window, slot, :count],
-                             probabilities[window, slot, :count]))
-    return rows
+                found.append((int(batch["kinds"][window, slot]), logits[window, slot, :count],
+                              probabilities[window, slot, :count]))
+    return found
 
 
 def float32_softmax(logits, temperature):
@@ -277,11 +371,18 @@ def float32_softmax(logits, temperature):
     return shifted / shifted.sum()
 
 
+TEMPERED_SEEDS = 16
+"""Check 1's declared seeds for the tempered probabilities, sized by `seeds_for` (2026-10-21, on armada)."""
+
+
 def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
     """The pass divides each question's logits by the temperature its answer
     uses, which the released checkpoint sets away from 1: every row chooses
-    what the task answers, its probabilities are as exact as float32's own
-    tempered softmax of the same logits, and score reports that pass."""
+    what the task answers, its probabilities are on par with float32's own
+    tempered softmax of the same logits over drawn weights (check 1), and
+    score reports that pass."""
+    import jax
+
     from dew.decision import KINDS, DecisionObjective
 
     temperatures = decide.calibration.temperatures
@@ -291,14 +392,34 @@ def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
     rows = passed(DecisionObjective(decide, temperatures=temperatures), decide.variables, examples)
     assert [int(np.argmax(found)) for _, _, found in rows] == [
         int(np.argmax(answer.probabilities)) for answer in answers]
-    divided = [(logits, temperatures.of(KINDS[kind].kind, len(logits))) for kind, logits, _ in rows]
-    assert_as_exact_as_the_reference(
-        np.concatenate([found for _, _, found in rows]),
-        np.concatenate([float32_softmax(logits, scale) for logits, scale in divided]),
-        np.concatenate([softmax(logits.astype(np.float64), scale) for logits, scale in divided]),
-        "tempered probabilities")
+    objective = DecisionObjective(decide, temperatures=temperatures)
+
+    def draw(seed):
+        # The checkpoint's weights, each moved by a relative 1e-2 of its own: logits near its own.
+        keys = iter(jax.random.split(jax.random.key(seed), len(jax.tree.leaves(decide.variables))))
+
+        def moved(leaf):
+            if not np.issubdtype(leaf.dtype, np.floating):
+                return np.asarray(leaf)
+            return np.asarray(leaf * (1 + 1e-2 * jax.random.normal(next(keys), leaf.shape)), leaf.dtype)
+
+        return (jax.tree.map(moved, decide.variables),)
+
+    def tempered(variables, softmax_of):
+        # The pass runs the checkpoint's model on weights of its dtypes, which a float64 truth's widened.
+        variables = jax.tree.map(lambda leaf, like: np.asarray(leaf).astype(like.dtype), variables,
+                                 decide.variables)
+        return np.concatenate([softmax_of(logits, temperatures.of(KINDS[kind].kind, len(logits)))
+                               for kind, logits, _ in passed(objective, variables, examples)])
+
+    assert_as_exact(as_given(lambda variables: np.concatenate(
+                        [found for _, _, found in passed(objective, variables, examples)])),
+                    as_given(lambda variables: tempered(variables, float32_softmax)), draw,
+                    "tempered probabilities", seeds=TEMPERED_SEEDS,
+                    truth_fn=lambda variables: tempered(variables, lambda logits, scale: softmax(
+                        logits.astype(np.float64), scale)))
     scores = decide.score(examples)
-    assert set(scores) == {"accuracy", "ece", "aurc", "log_loss"}
+    assert set(scores) == {"accuracy", "macro_f1", "ece", "aurc", "log_loss", "brier", "scored_questions"}
     assert scores["accuracy"] == pytest.approx(np.mean([int(np.argmax(answer.probabilities)) == 0
                                                         for answer in answers]))
     # A second score runs the forward the first compiled.
@@ -347,19 +468,36 @@ def test_an_objective_from_a_calibrated_task_validates_without_its_temperatures(
     assert not np.array_equal(np.concatenate(plain), np.concatenate([found for _, _, found in tempered]))
 
 
-def test_an_example_refuses_an_answer_its_question_cannot_give():
+@pytest.mark.parametrize("kind, question, gold", [
+    ("answers", "urgency", "legal"),
+    ("answers", "urgency", 4),
+    ("answers", "urgency", 2.0),
+    ("answers", "urgency", True),
+    ("targets", "unasked", [0.5, 0.5]),
+    ("answers", "department", "billing"),
+    ("targets", "department", [0.5, 0.5]),
+    ("targets", "department", [0.9, 0.3, -0.2]),
+    ("targets", "department", [0.6, 0.3, 0.3]),
+    ("targets", "department", {"billing": 0.6, "legal": 0.4}),
+    ("targets", "department", 0.6),
+], ids=["an-option-it-does-not-offer", "an-index-past-its-options", "a-float", "a-bool",
+        "a-target-for-a-question-it-does-not-ask", "an-answer-beside-a-target", "a-target-of-another-length",
+        "a-negative-chance", "chances-that-do-not-sum-to-one", "a-target-keyed-by-options-it-does-not-offer",
+        "a-target-of-one-number"])
+def test_an_example_refuses_gold_that_scores_no_option_of_its_question(kind, question, gold):
+    """A row's gold names an option of a question the row asks: an answer by its key or its index, a
+    target a distribution over every option, in the question's order or keyed by option, and one or the
+    other for a question. The row trains on that gold, and the same row with one answer or target
+    changed so it scores no option of its question, or a question it does not ask, is refused rather
+    than trained with its gold dropped or scored against an option it does not offer."""
+    questions = CASES["quickstart"]["questions"]
+    row = {"state": "x", "questions": questions, "answers": {"urgency": 2},
+           "targets": {"department": {"technical": 0.25, "billing": 0.5, "sales": 0.25}}}
+    valid = Example.of(row)
+    assert valid.labels() == {"department": 0, "urgency": 2}
+    np.testing.assert_array_equal(valid.distribution("department"), [0.5, 0.25, 0.25])
     with pytest.raises(ValueError):
-        Example.of({"state": "x", "questions": CASES["quickstart"]["questions"],
-                    "answers": {"department": "legal"}})
-
-
-def test_an_example_refuses_a_target_for_a_question_it_does_not_ask():
-    """A row's target, like its answer, names a question the row asks; one
-    naming another question is refused rather than dropped, which would
-    train the row as asked and unscored."""
-    with pytest.raises(ValueError):
-        Example.of({"state": "x", "questions": CASES["quickstart"]["questions"],
-                    "targets": {"unasked": [0.5, 0.5]}})
+        Example.of({**row, kind: {**row[kind], question: gold}})
 
 
 def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
@@ -402,9 +540,10 @@ def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(deci
     the adapted task does, the merged sum rounded once into each kernel
     (`assert_same_rounded_answers`), and differently from the task without the
     adapter."""
+    from dew.batch import part
     from dew.decision.model import DecisionModel
     from dew.lora import LoRA
-    from dew.objectives.base import joined, part
+    from dew.objectives.base import joined
 
     backbone = part(decide.variables, "backbone")
     adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(decide.model.backbone, backbone, key=1)
@@ -431,14 +570,11 @@ def test_dew_export_writes_a_decision_run_in_the_tasks_own_release(decide, tmp_p
 
     from dew.checkpoints import Checkpoints
     from dew.cli.main import Export
-    from dew.config.data import loader
     from dew.decision import DecisionObjective
-    from dew.decision.data import Decisions as DecisionRecipe
     from dew.training.trainer import Trainer
 
     objective = DecisionObjective(decide)
-    data = loader(DecisionRecipe(source=answered() * 2, validation=answered()), batch=8, read="memory",
-                  objective=objective.data())
+    data = decision_rows(answered() * 2, 8, answered(), objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path / "run"), keep=1)
     Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
         data, steps=1, log_every=100, checkpoint_every=1, eval_every=100)
@@ -473,6 +609,199 @@ def test_a_released_checkpoint_keeps_its_option_budget(decide, tmp_path):
 
 
 def test_a_released_checkpoint_refuses_what_its_layout_cannot_hold(decide, tmp_path):
+    """A gated task, and a task whose row order or blocks Laya's config cannot state, are refused before
+    anything is written; Laya's own order, named, saves as the release's."""
     gated = decide.gated(0.5)
     with pytest.raises(ValueError):
         gated.save_pretrained(tmp_path)
+    for chosen in ({"order": "state_first"}, {"order": "re_read"}, {"blocks": True}):
+        with pytest.raises(ValueError):
+            replace(decide, layout=replace(decide.layout, **chosen)).save_pretrained(tmp_path / "chosen")
+        assert not (tmp_path / "chosen").exists()
+    replace(decide, layout=replace(decide.layout, order="question_first")).save_pretrained(tmp_path / "own")
+    assert Decide.from_pretrained(tmp_path / "own", attention_impl="xla").layout == decide.layout
+
+
+MESH_SEEDS = 8
+"""Check 1's declared seeds for a task's logits on a mesh against one device's."""
+
+
+@dataclass(frozen=True)
+class Recorded:
+    """A metric that records each answered question's probabilities over its real options as a pass
+    evaluates them (`Answered`), in the pass's order, and scores nothing."""
+
+    found: list
+    name = "recorded"
+    reads = Decisions
+
+    def __call__(self, artifact, batch, /) -> float:
+        answered = Answered.of(artifact)
+        self.found.extend(row[real] for row, real in zip(answered.probabilities, answered.options,
+                                                         strict=True))
+        return 0.0
+
+    def merge(self, accumulated: float, contribution: float, /) -> float:
+        return accumulated
+
+    def finalize(self, accumulated: float, /) -> float:
+        return accumulated
+
+
+@pytest.mark.mesh
+def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
+    """A task whose weights are placed on a mesh of every device scores its examples there, its rows
+    split over the mesh's row axes, as a run's validation splits them, rather than handing one device's
+    inputs to weights on several: a pass of three rows, the task's budget, is rounded up to a multiple
+    of the devices the mesh splits rows over. Each answered question's probabilities as its score
+    evaluates them (`Evaluation.run`), and its logits as its calibration reads them (`_scored`), are on
+    par from float64 with the task's on one device (check 1), and its metrics are the ones it scores
+    there."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training import MeshSpec
+
+    examples = answered()
+    mesh = MeshSpec().build(jax.devices())
+    task = replace(decide, budget=Budget(rows=3))
+    wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64", attention_impl="xla"),
+                   budget=task.budget)
+
+    def evaluated(on: Decide) -> np.ndarray:
+        found: list = []
+        on.score(examples, [Recorded(found)])
+        return np.concatenate(found)
+
+    def held_logits(on: Decide) -> np.ndarray:
+        return np.concatenate([scored.logits for scored in on._scored(on._held(examples, on._mesh))])
+
+    def spread(variables) -> Decide:
+        return replace(task, variables=jax.device_put(variables, NamedSharding(mesh, PartitionSpec())))
+
+    def draw(seed):
+        key = jax.random.key(seed)
+        return (jax.tree.map(lambda leaf: leaf * (1 + 0.05 * jax.random.normal(key, np.shape(leaf))),
+                             decide.variables),)
+
+    @as_given
+    def alone(variables) -> np.ndarray:
+        return held_logits(replace(task, variables=variables))
+
+    def truth(variables) -> np.ndarray:
+        return held_logits(replace(wide, variables=variables))
+
+    assert_as_exact(as_given(lambda variables: held_logits(spread(variables))), alone, draw,
+                    "scored on a mesh",
+                    seeds=MESH_SEEDS, truth_fn=truth)
+    assert_as_exact(as_given(lambda variables: evaluated(spread(variables))),
+                    as_given(lambda variables: evaluated(replace(task, variables=variables))), draw,
+                    "evaluated on a mesh", seeds=MESH_SEEDS,
+                    truth_fn=lambda variables: evaluated(replace(wide, variables=variables)))
+    alone, scores = task.score(examples), spread(decide.variables).score(examples)
+    assert set(scores) == set(alone) and all(np.isfinite(value) for value in scores.values())
+    assert scores["accuracy"] == alone["accuracy"]
+
+
+def trained_runs(decide, tmp_path, count: int, *, name: str = "run") -> list[str]:
+    """`count` runs of the task trained apart, one more step each, from one head (the task's own, held):
+    each a checkpoint of its own, as averaging reads them."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.decision import DecisionObjective
+    from dew.training.trainer import Trainer
+
+    runs = []
+    for index in range(count):
+        objective = DecisionObjective(decide)
+        data = decision_rows(answered() * 2, 8, answered(), objective=objective.data())
+        directory = str(tmp_path / f"{name}{index}")
+        checkpoints = Checkpoints(directory, keep=1)
+        Trainer(objective, optax.adam(1e-3), key=index, checkpoints=checkpoints).fit(
+            data, steps=index + 1, log_every=100, checkpoint_every=index + 1, eval_every=100)
+        checkpoints.wait()
+        runs.append(directory)
+    return runs
+
+
+def test_runs_that_share_a_head_average_as_the_checkpoints_average_them_and_refit_their_temperatures(
+        decide, tmp_path):
+    """Runs trained apart from one held head average: the task's weights are the runs' fp32 mean as
+    any run's average takes it (`dew.checkpoints.averaged`), each floating leaf float64's mean of the
+    two rounded to fp32; the task's weights record every run's step and read, so no one run's
+    directory may hold its calibration (`save` refuses), and `calibrate_on` refits it as the average's
+    own calibration."""
+    from etils import epath
+
+    from dew.checkpoints import averaged
+
+    runs = trained_runs(decide, tmp_path, 2)
+    tasks = [Decide.from_run(run) for run in runs]
+    two = Decide.averaged(runs)
+    trees = (two.variables, averaged(runs).variables, tasks[0].variables, tasks[1].variables)
+    for leaf, general, one, other in zip(*(jax.tree.leaves(tree) for tree in trees), strict=True):
+        assert np.array_equal(np.asarray(leaf), np.asarray(general))
+        if np.issubdtype(np.asarray(leaf).dtype, np.floating):
+            halves = (np.asarray(one, np.float64) + np.asarray(other, np.float64)) / 2
+            assert np.array_equal(np.asarray(leaf), halves.astype(np.float32))
+    assert two.weights is not None
+    assert [entry[0] for entry in two.weights.averaged] == [str(epath.Path(run)) for run in runs]
+    assert two.calibration == Calibration()
+    with pytest.raises(ValueError):
+        two.save(runs[0])
+    # Enough held-out answers that every question kind clears its calibration minimum (TYPE_MINIMUM).
+    held_out = answered() * 10
+    calibrated = Decide.averaged(runs, calibrate_on=held_out)
+    assert calibrated.calibration != Calibration()
+    assert calibrated.calibration == two.calibrated(held_out).calibration
+
+
+def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_path):
+    """Runs average where their recorded task settings are one task's: a run laid out otherwise does
+    not average with the others, nor does a single run."""
+    runs = trained_runs(decide, tmp_path, 1)
+    with pytest.raises(ValueError):
+        Decide.averaged(runs)
+    other = replace(decide, layout=replace(decide.layout, head_max_len=decide.layout.head_max_len // 2))
+    runs += trained_runs(other, tmp_path, 1, name="other")
+    with pytest.raises(ValueError):
+        Decide.averaged(runs)
+
+
+@pytest.mark.parametrize("kind", ["marker", "state-first"])
+def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decide, tmp_path, kind):
+    """An average of runs, its temperatures refit on held-out answers, saves to a directory of its own
+    as a run (`save`), which `from_run` and `dew.pipeline` read back with its weights, calibration and
+    provenance, answering every case as the task it was: under Laya's markers and a layout of the state
+    first (the joint release's in test_decision_joint_checkpoint). Saving it there again keeps it; a
+    run's own directory, which holds other weights, refuses it."""
+    import dataclasses
+
+    from dew.decision import StateFirstLayout
+    from dew.inference.loading import pipeline
+
+    if kind == "state-first":
+        decide = replace(decide, layout=StateFirstLayout(max_len=decide.layout.max_len,
+                                                         head_max_len=decide.layout.head_max_len))
+    runs = trained_runs(decide, tmp_path, 2)
+    held_out = answered() * 10
+    task = Decide.averaged(runs, calibrate_on=held_out)
+    assert task.calibration != Calibration()
+    directory = str(tmp_path / "averaged")
+    task.save(directory)
+    for reloaded in (Decide.from_run(directory), pipeline(directory)):
+        assert isinstance(reloaded, Decide)
+        assert reloaded.layout == task.layout and reloaded.weights == task.weights
+        assert reloaded.calibration == task.calibration
+        for leaf, own in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(task.variables),
+                             strict=True):
+            assert np.array_equal(np.asarray(leaf), np.asarray(own))
+        for request in CASES.values():
+            questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
+            found, expected = reloaded(request["state"], questions), task(request["state"], questions)
+            assert found.keys() == expected.keys()
+            for name in expected:
+                np.testing.assert_equal(dataclasses.asdict(found[name]), dataclasses.asdict(expected[name]))
+    Decide.from_run(directory).save(directory)
+    with pytest.raises(ValueError):
+        task.save(runs[0])

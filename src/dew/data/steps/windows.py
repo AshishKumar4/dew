@@ -8,24 +8,17 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping, Sequence
-from typing import Protocol
+from typing import ClassVar, Protocol
 
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew._records import integers, record
+from dew.batch import Batch
 from dew.data.pipeline import Windows
-from dew.data.sources.base import Read, ShardManifest, _indexed_manifest
+from dew.data.sources.base import Read, Rows, ShardManifest, View, _indexed_manifest
 from dew.data.sources.tokens import TokenFiles
-from dew.records import integers, record
-
-
-def _aligned(row: Batch, fields: tuple[str, ...]) -> Batch:
-    """The fields of one document, refusing alignment drift before joining documents."""
-    tokens = {name: np.asarray(row[name]) for name in fields}
-    if len({len(value) for value in tokens.values()}) != 1:
-        raise ValueError("causal window fields have different record lengths")
-    return tokens
+from dew.data.steps.generic import aligned
 
 
 class TokenSpan(Protocol):
@@ -44,9 +37,9 @@ class IndexedWindows:
 
     @classmethod
     def from_records(cls, rows: Sequence[Batch], windows: Windows) -> IndexedWindows:
-        aligned = [_aligned(row, windows.fields) for row in rows]
+        held = [aligned(row, windows.fields) for row in rows]
         tokens = {
-            name: np.concatenate([row[name] for row in aligned]) if aligned else np.zeros(0, np.int32)
+            name: np.concatenate([row[name] for row in held]) if held else np.zeros(0, np.int32)
             for name in windows.fields
         }
         return cls(tokens, windows.seq_len, windows.stride or windows.seq_len)
@@ -67,47 +60,50 @@ class IndexedWindows:
 
 
 @dataclasses.dataclass(frozen=True)
-class WindowSource:
-    original: TokenFiles
+class WindowSource(View[TokenFiles]):
+    """Causal windows of `length` tokens, `stride` apart, over a token store's tokens."""
+
+    rows: ClassVar[Rows] = "derived"
+    source: TokenFiles
     tokens: TokenSpan
     length: int
     stride: int
 
-    def label(self) -> str:
-        return self.original.label()
-
     def describe(self) -> str:
-        return f"{self.original.describe()} causal windows={self.length},stride={self.stride}"
+        return f"{self.source.describe()} causal windows={self.length},stride={self.stride}"
+
+    @property
+    def max_length(self) -> int:
+        """The inputs each window holds, which a token budget divides into rows
+        (`dew.data.pipeline.TokenGeometry`)."""
+        return self.length
 
     def fingerprint(self) -> Mapping[str, object]:
-        return {**self.original.fingerprint(), "window": self.length, "stride": self.stride}
-
-    def supports(self, read: Read) -> bool:
-        return self.original.supports(read)
+        return {**self.source.fingerprint(), "window": self.length, "stride": self.stride}
 
     def can_provision(self, read: Read) -> bool:
-        return self.original.can_provision(read)
+        return self.source.can_provision(read)
 
     def provision(self) -> WindowSource:
         """Provision the token store, whose length index these windows need
         to read it by span."""
-        self.original.provision()
+        self.source.provision()
         return self
 
     def records(self, read: Read) -> IndexedWindows:
         if read == "memory":
-            self.original.records(read)
+            self.source.records(read)
         return IndexedWindows({"text": self.tokens}, self.length, self.stride, "int32")
 
     def metadata(self) -> Mapping[str, object]:
         count = len(self.records("indexed"))
-        return {**self.original.metadata(), "rows": count, "valid_targets": count * self.length}
+        return {**super().metadata(), "rows": count, "valid_targets": count * self.length}
 
     def lengths(self) -> np.ndarray | None:
         return None
 
     def manifest(self) -> ShardManifest:
-        return _indexed_manifest(self, self.describe(), self.describe(), 1024)
+        return _indexed_manifest(self, self.describe(), 1024)
 
 
 class _WindowIterator(grain.DatasetIterator[Batch]):
@@ -126,7 +122,7 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
             )
             if len(windows):
                 break
-            row = _aligned(next(self._read), self._windows.fields)
+            row = aligned(next(self._read), self._windows.fields)
             self._held = {
                 name: np.concatenate([self._held[name], row[name]])
                 for name in self._windows.fields

@@ -21,6 +21,7 @@ import io
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from html import escape
 from pathlib import Path
 from typing import Literal
 
@@ -31,7 +32,9 @@ __all__ = ["THEMES", "Figure", "Shape", "bars", "curve", "heatmap", "images", "p
 Role = Literal["text", "muted", "rule", "surface", "raised", "accent", "accent_fill", "warm",
                "warm_fill", "tint0", "tint1", "tint2", "tint3", "none"]
 
-# The site's colors (site/src/styles/theme.css), and the tints of the docs' figures.
+# The colors a figure draws with. The site's stylesheet takes the roles they share from here
+# (site/scripts/gen_theme.py writes them into site/src/styles/theme.css); warm, its fill and the tints
+# are the figures' own.
 THEMES: dict[str, dict[str, str]] = {
     "light": {"text": "#16282b", "muted": "#4d6763", "rule": "#c9d9d5", "surface": "#f2f6f5",
               "raised": "#ffffff", "accent": "#0b7d71", "accent_fill": "#d3f1ec", "warm": "#b45f06",
@@ -93,10 +96,6 @@ class Shape:
     text: str = ""
     children: list[Shape] = field(default_factory=list)
     keyframes: str = ""
-
-
-def _escape(text: str) -> str:
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
 
 
 class Figure:
@@ -257,9 +256,9 @@ class Figure:
         names = {id(shape): f"f{uid}-{index}" for index, shape in enumerate(animated)}
         keyframes = "".join(f"@keyframes {names[id(shape)]}{{{shape.keyframes}}}" for shape in animated)
         body = "".join(_markup(shape, names, self.seconds) for shape in self.shapes)
-        label = f'<title>{_escape(self.label)}</title>' if self.label else ""
+        label = f'<title>{escape(self.label)}</title>' if self.label else ""
         width, height = _number(self.width), _number(self.height)
-        named = f' aria-label="{_escape(self.label)}"' if self.label else ""
+        named = f' aria-label="{escape(self.label)}"' if self.label else ""
         return (f'<svg xmlns="http://www.w3.org/2000/svg" class="dew-figure" viewBox="0 0 {width} {height}" '
                 f'width="{width}" height="{height}" role="img"{named}>'
                 f'{label}<style>{STYLE}{keyframes}</style>{body}</svg>')
@@ -285,10 +284,10 @@ def _markup(shape: Shape, names: Mapping[int, str], seconds: float) -> str:
     style = dict(shape.style)
     if shape.keyframes:
         style["animation"] = f"{names[id(shape)]} {_number(seconds)}s ease-in-out infinite"
-    attributes = "".join(f' {name}="{_escape(css)}"' for name, css in shape.attributes.items())
+    attributes = "".join(f' {name}="{escape(css)}"' for name, css in shape.attributes.items())
     if style:
-        attributes += f' style="{_escape(";".join(f"{name}:{css}" for name, css in style.items()))}"'
-    inside = _escape(shape.text) + "".join(_markup(child, names, seconds) for child in shape.children)
+        attributes += f' style="{escape(";".join(f"{name}:{css}" for name, css in style.items()))}"'
+    inside = escape(shape.text) + "".join(_markup(child, names, seconds) for child in shape.children)
     return f"<{shape.tag}{attributes}>{inside}</{shape.tag}>" if inside else f"<{shape.tag}{attributes}/>"
 
 
@@ -300,6 +299,26 @@ def _ticks(low: float, high: float, count: int = 4) -> np.ndarray:
     step = 10 ** np.floor(np.log10(span / count))
     step *= next(factor for factor in (1, 2, 2.5, 5, 10) if span / (step * factor) <= count)
     return np.arange(np.ceil(low / step) * step, high + step / 2, step)
+
+
+SERIES: tuple[Role, ...] = ("accent", "text", "muted")
+"""The colors of a chart's series, in order: neutral only, since warm means wrong. Past the third, a line is
+dashed."""
+
+
+def _axes(figure: Figure, xs: Sequence[tuple[float, float]], ys: Sequence[tuple[float, float]], *,
+          x_label: str, y_label: str, left: float, right: float, bottom: float) -> None:
+    """A Cartesian chart's frame: a rule across the plot and a label at each `(tick, y)` of `ys`, a label
+    under it at each `(tick, x)` of `xs`, and the two axes' names."""
+    for tick, tick_y in ys:
+        figure.line(left, tick_y, figure.width - right, tick_y, color="rule", width=1)
+        figure.text(left - 8, tick_y + 5, f"{tick + 0:g}", size=SMALL, color="muted", anchor="end")
+    for tick, tick_x in xs:
+        figure.text(tick_x, figure.height - bottom + 20, f"{tick + 0:g}", size=SMALL, color="muted",
+                    anchor="middle")
+    figure.text((left + figure.width - right) / 2, figure.height - 6, x_label, size=TEXT, color="muted",
+                anchor="middle")
+    figure.text(left, 20, y_label, size=TEXT, color="muted")
 
 
 def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
@@ -352,24 +371,16 @@ def curve(series: Mapping[str, Sequence[float]], *, x_label: str, y_label: str,
         return (left + (width - left - right) * (step - first) / max(final - first, 1),
                 height - bottom - (height - top - bottom) * (y - low) / (high - low))
 
-    for tick in _ticks(low, high):
-        _, tick_y = at(first, tick)
-        figure.line(left, tick_y, width - right, tick_y, color="rule", width=1)
-        figure.text(left - 8, tick_y + 5, f"{tick + 0:g}", size=SMALL, color="muted", anchor="end")
-    for tick in _ticks(first, final, 4):
-        tick_x, _ = at(tick, low)
-        figure.text(tick_x, height - bottom + 20, f"{tick + 0:g}", size=SMALL, color="muted", anchor="middle")
-    figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
-    figure.text(left, 20, y_label, size=TEXT, color="muted")
+    _axes(figure, [(tick, at(tick, low)[0]) for tick in _ticks(first, final, 4)],
+          [(tick, at(first, tick)[1]) for tick in _ticks(low, high)], x_label=x_label, y_label=y_label,
+          left=left, right=right, bottom=bottom)
     if omitted:
         values_word = "value" if omitted == 1 else "values"
         figure.text(width - right, 20, f"{omitted} nonfinite {values_word} left out", size=SMALL,
                     color="muted", anchor="end")
-    # Neutral colors only, since warm means wrong; past three series the lines are dashed.
-    colors: tuple[Role, ...] = ("accent", "text", "muted")
     for index, (name, (xs, ys)) in enumerate(drawn_points.items()):
-        color = colors[index % len(colors)]
-        dash = "6 4" if index >= len(colors) else None
+        color = SERIES[index % len(SERIES)]
+        dash = "6 4" if index >= len(SERIES) else None
         window = min(smooth, len(ys))
         lines = [(ys, 2.25)]
         if window > 1:
@@ -543,19 +554,12 @@ def points(series: Mapping[str, Sequence[tuple[float, float]]], *, x_label: str,
         marks = np.array([m * 10.0 ** d for d in decades for m in steps])
         return marks[(np.log10(marks) >= low[k]) & (np.log10(marks) <= high[k])]
 
-    for tick in ticks(1):
-        _, tick_y = at(every[0, 0], tick)
-        figure.line(left, tick_y, width - right, tick_y, color="rule", width=1)
-        figure.text(left - 8, tick_y + 5, f"{tick + 0:g}", size=SMALL, color="muted", anchor="end")
-    for tick in ticks(0):
-        tick_x, _ = at(tick, every[0, 1])
-        figure.text(tick_x, height - bottom + 20, f"{tick + 0:g}", size=SMALL, color="muted", anchor="middle")
-    figure.text((left + width - right) / 2, height - 6, x_label, size=TEXT, color="muted", anchor="middle")
-    figure.text(left, 20, y_label, size=TEXT, color="muted")
-    colors: tuple[Role, ...] = ("accent", "text", "muted")
+    _axes(figure, [(tick, at(tick, every[0, 1])[0]) for tick in ticks(0)],
+          [(tick, at(every[0, 0], tick)[1]) for tick in ticks(1)], x_label=x_label, y_label=y_label,
+          left=left, right=right, bottom=bottom)
     legend_x = left
     for index, (name, dots) in enumerate(values.items()):
-        color = colors[index % len(colors)]
+        color = SERIES[index % len(SERIES)]
         placed = [at(x, y) for x, y in dots]
         if not joined:
             figure.circle(legend_x + 5, 40, 5, fill=color)
@@ -570,7 +574,7 @@ def points(series: Mapping[str, Sequence[tuple[float, float]]], *, x_label: str,
                                                                        f"{to_y - y:.1f}px)"}})
             continue
         with figure.group() as group:
-            figure.polyline(placed, color=color, width=1.25, dash="5 4" if index >= len(colors) else None)
+            figure.polyline(placed, color=color, width=1.25, dash="5 4" if index >= len(SERIES) else None)
             for x, y in placed:
                 figure.circle(x, y, 4.5, fill=color)
             end_x, end_y = placed[-1]

@@ -113,6 +113,12 @@ def kernels(args):
     return rows
 
 
+def lax_convolution():
+    """The model's depthwise convolutions as lax's dilated form, which a step benchmark runs inside
+    (benchmark_step's `within`), its peak processes too."""
+    return dilated_form(partial(reference, precision=None))
+
+
 def step(args):
     import benchmark_step
     from benchmark_cases import Case
@@ -125,12 +131,11 @@ def step(args):
         config['remat'] = True
     cases = [Case('hybrid_dit', config, batch_size=batch, image_size=32, channels=4)
              for batch in ((16, 32) if args.batch_size is None else (args.batch_size,))]
-    lax = args.implementation == 'lax'
-    with dilated_form(partial(reference, precision=None)) if lax else contextlib.nullcontext():
-        rows = benchmark_step.main(benchmark_step.BenchmarkConfig(
-            cases=cases, steps=args.repeats, warmup=5,
-            profile_dir=str(args.output.parent / args.implementation), profile_steps=5,
-            json_out=str(args.output), dtype=args.dtype))
+    rows = benchmark_step.main(benchmark_step.BenchmarkConfig(
+        cases=cases, steps=args.repeats, warmup=5,
+        profile_dir=str(args.output.parent / args.implementation), profile_steps=5,
+        json_out=str(args.output), dtype=args.dtype,
+        within='benchmark_depthwise:lax_convolution' if args.implementation == 'lax' else None))
     for row, case in zip(rows, cases, strict=True):
         profile = args.output.parent / args.implementation / case.label.replace(' ', '_') / 'process0'
         row.update(convolution_profile(profile))
@@ -139,7 +144,7 @@ def step(args):
 
 
 def convolution_profile(directory):
-    from trace_window import device_events
+    from dew.telemetry.trace import device_events
 
     native = 0.0
     for events in device_events(directory)[0].values():
@@ -154,11 +159,10 @@ def convolution_profile(directory):
 
 
 def checkpoint(args):
+    import dew
     from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
-    from dew.sampling import TextToImage
 
-    pipeline = TextToImage.from_pretrained('dewml/hybrid-dit-176m',
-                                           revision='4b322022189373fd9086313241269aa5cea92b86')
+    pipeline = dew.pipeline('dewml/hybrid-dit-176m', revision='8d891d967319e51cd0e73d3e5b7c29d68a238b52')
     prompt = 'a watercolor painting of a mountain lake at sunrise'
 
     def sample(dilated=None):

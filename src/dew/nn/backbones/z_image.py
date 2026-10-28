@@ -27,10 +27,10 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
-from dew.nn.blocks import sinusoidal_time
+from dew.nn.blocks import modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
 from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.sharding import logical_axes
@@ -122,8 +122,8 @@ class ZImageBlock(nn.Module):
         if not self.modulation:
             x = x + norm("attention_norm2")(attention(norm("attention_norm1")(x)))
             return x + norm("ffn_norm2")(feed_forward(norm("ffn_norm1")(x)))
-        modulated = Dense(self.modulation_features, dtype=self.dtype, precision=self.precision,
-                          name="modulation")(embedded)[:, None]
+        modulated = modulation(embedded, self.features, 4, name="modulation", silu=False, dtype=self.dtype,
+                               precision=self.precision)[:, None]
         scale, gate, scale_mlp, gate_mlp = jnp.split(modulated, 4, axis=-1)
         attended = attention(norm("attention_norm1")(x) * (1 + scale))
         x = x + jnp.tanh(gate) * norm("attention_norm2")(attended)
@@ -192,8 +192,8 @@ class ZImageTransformer(nn.Module):
         count = sum(projection_flops(lengths if name in ('x_embedder', 'final_linear') else
                                      context_lengths if name == 'cap_embedder' else rows, *shape)
                     for name, shape in maps.items())
-        image_block = ZImageBlock(self.dim, self.n_heads, parent=None)
-        text_block = ZImageBlock(self.dim, self.n_heads, modulation=False, parent=None)
+        image_block = self._block(parent=None)
+        text_block = self._block(modulation=False, parent=None)
         # Learned pad slots are visible architectural tokens, not masked batch padding.
         image_span = (np.ceil(image / MULTIPLE) * MULTIPLE).astype(np.int64)
         context_span = (np.ceil(context / MULTIPLE) * MULTIPLE).astype(np.int64)
@@ -201,18 +201,31 @@ class ZImageTransformer(nn.Module):
                                           + text_block.model_flops(context_span))
         return count + self.n_layers * image_block.model_flops(image_span + context_span)
 
+    @nn.nowrap
+    def _block(self, **where) -> ZImageBlock:
+        """A block as the model runs it, an image or joint one or, `modulation=False`, a caption one,
+        named by `where` (or unbound, `parent=None`, where a FLOP count reads it): one factory, so the
+        count and the execution build the same block."""
+        return ZImageBlock(self.dim, self.n_heads, epsilon=self.norm_eps, dtype=self.dtype,
+                           precision=self.precision, attention_impl=self.attention_impl, **where)
+
     def _embedded_time(self, time, dtype):
         """`TimestepEmbedder` of the source's time, (1000 - time) / 1000 times
         `t_scale`: 256 sinusoids, cosines first, 1024 wide inside, and
         `min(dim, 256)` out."""
         width = at_least_fp32(self.dtype)
-        source_time = (1000.0 - jnp.asarray(time, width)) / 1000.0 * self.t_scale
+        # The scale folded on the host and rounded once (exactly 1 at the published 1000): a division
+        # by a constant left in the program is any XLA backend's to rewrite as a product with its
+        # inexact reciprocal, which moves the time's sinusoids, and every modulation they drive, off
+        # the source's value (measured twice as far from float64 on JAX 0.12's CPU as on 0.11's).
+        source_time = (1000.0 - jnp.asarray(time, width)) * jnp.asarray(self.t_scale / 1000.0, width)
         features = sinusoidal_time(source_time, FREQUENCIES, dtype=width).astype(dtype)
         maps = self.projections(0, 0)
-        hidden = Dense(maps['t_embedder_1'][1], dtype=self.dtype, precision=self.precision,
-                       name="t_embedder_1")(features)
-        return Dense(maps['t_embedder_2'][1], dtype=self.dtype, precision=self.precision,
-                     name="t_embedder_2")(nn.silu(hidden))
+        mlp = GatedMLP(maps['t_embedder_1'][1], maps['t_embedder_2'][1], in_features=features.shape[-1],
+                        activation=nn.silu, use_bias=True, names=("t_embedder_1", "t_embedder_2"),
+                        dtype=self.dtype, precision=self.precision)
+        nn.share_scope(self, mlp)
+        return mlp(features)
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
@@ -245,13 +258,13 @@ class ZImageTransformer(nn.Module):
         pad_caption = self.param("cap_pad_token", nn.initializers.zeros, (1, self.dim))
         maps = self.projections(x.shape[-1], conditioning.context.shape[-1])
         image = Dense(maps['x_embedder'][1], dtype=self.dtype, precision=self.precision,
-                      name="x_embedder")(patchify(x, 2))
+                      name="x_embedder", dot_general=float32_dot_general)(patchify(x, 2))
         image = jnp.concatenate(
             [image, jnp.broadcast_to(pad_image.astype(image.dtype), (batch, image_span - count, self.dim))],
             axis=1,
         )
         caption = Dense(maps['cap_embedder'][1], dtype=self.dtype, precision=self.precision,
-                        name="cap_embedder")(
+                        name="cap_embedder", dot_general=float32_dot_general)(
             RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="cap_norm")(context))
         caption = jnp.where(mask[..., None], caption, pad_caption.astype(caption.dtype))
 
@@ -263,31 +276,30 @@ class ZImageTransformer(nn.Module):
         # Slots past a row's padded prompt are masked; they sit at the origin.
         leading = jnp.where(slots[None] < spans[:, None], slots[None] + 1, 0)
         caption_positions = jnp.stack([leading, jnp.zeros_like(leading), jnp.zeros_like(leading)], axis=-1)
-        table = (self.axes_dims, self.axes_lens, self.rope_theta)
+        # Each axis's table reaches every position the call takes, `axes_lens` at least: a prompt's
+        # image sits one past its padded span, the grid's rows and columns at their own indices, and
+        # a row's rotation is its own position's however long the table, so a call past the published
+        # lengths rotates at its own places rather than at the last row's.
+        reach = tuple(map(max, self.axes_lens, (budget + 2, rows, columns)))
+        table = (self.axes_dims, reach, self.rope_theta)
         image_rotation = _rotation(image_positions, *table, at_least_fp32(image.dtype))
         caption_rotation = _rotation(caption_positions, *table, at_least_fp32(image.dtype))
         whole_image = jnp.full((batch,), image_span, jnp.int32)
-        block = {"epsilon": self.norm_eps, "dtype": self.dtype, "precision": self.precision,
-                 "attention_impl": self.attention_impl}
-
         for index in range(self.n_refiner_layers):
-            image = ZImageBlock(self.dim, self.n_heads, name=f"noise_refiner_{index}", **block)(
-                image, image_rotation, whole_image, embedded)
+            image = self._block(name=f"noise_refiner_{index}")(image, image_rotation, whole_image, embedded)
         for index in range(self.n_refiner_layers):
-            caption = ZImageBlock(
-                self.dim, self.n_heads, modulation=False, name=f"context_refiner_{index}", **block
-            )(caption, caption_rotation, spans)
+            caption = self._block(modulation=False, name=f"context_refiner_{index}")(
+                caption, caption_rotation, spans)
         joined = jnp.concatenate([image, caption], axis=1)
         rotation = tuple(jnp.concatenate(pair, axis=1)
                          for pair in zip(image_rotation, caption_rotation, strict=True))
         for index in range(self.n_layers):
-            joined = ZImageBlock(self.dim, self.n_heads, name=f"layers_{index}", **block)(
-                joined, rotation, image_span + spans, embedded)
+            joined = self._block(name=f"layers_{index}")(joined, rotation, image_span + spans, embedded)
 
-        scale = 1 + Dense(maps['final_modulation'][1], dtype=self.dtype, precision=self.precision,
-                          name="final_modulation")(nn.silu(embedded))[:, None]
+        scale = 1 + modulation(embedded, self.dim, 1, name="final_modulation", dtype=self.dtype,
+                               precision=self.precision)[:, None]
         out = Dense(maps['final_linear'][1], dtype=self.dtype, precision=self.precision,
-                    name="final_linear")(
+                    name="final_linear", dot_general=float32_dot_general)(
             layer_norm(self.dtype)(joined[:, :count]) * scale)
         return -unpatchify(out, 2, *x.shape[1:])
 

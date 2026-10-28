@@ -22,7 +22,7 @@
   "relative_attention_num_buckets": 16,
   "scale_decoder_outputs": true,
   "tie_word_embeddings": true,
-  "transformers_version": "5.16.1",
+  "transformers_version": "5.17.0",
   "use_cache": false,
   "vocab_size": 72
 }

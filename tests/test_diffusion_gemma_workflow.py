@@ -49,15 +49,28 @@ def test_public_generation_override_keeps_canvas_semantics():
         np.testing.assert_array_equal(result.decoder_steps, reference["stopped_steps"])
 
 
+def test_block_generation_reads_its_ids_as_every_parser_of_ids_does():
+    """A NumPy pad id generates as the Python one does (`dew.batch.token_id`), and a fraction or
+    a flag where an id goes is refused before the loop runs."""
+    bundle = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
+    process = BlockProcess(canvas_length=4, vocab_size=64, max_steps=4)
+    python = process.generate(bundle.model, bundle.variables, [[2, 5, 7]], 4, key=0, pad_token_id=0)
+    arrays = process.generate(bundle.model, bundle.variables, [[2, 5, 7]], 4, key=0, pad_token_id=np.int64(0))
+    np.testing.assert_array_equal(arrays.tokens, python.tokens)
+    for wrong in ({"pad_token_id": 0.5}, {"eos_token_ids": (True,)}):
+        with pytest.raises(ValueError):
+            process.generate(bundle.model, bundle.variables, [[2, 5, 7]], 4, key=0, **wrong)
+
+
 def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(tmp_path):
     import jax.numpy as jnp
     import optax
 
     import dew
+    from dew.batch import FROZEN
     from dew.inference import BlockGeneration
-    from dew.inference.pipeline import place
+    from dew.inference.loading import place
     from dew.nn.diffusion_gemma import DiffusionGemma
-    from dew.objectives.base import FROZEN
     from dew.objectives.diffusion.block import BlockDiffusionObjective
     from dew.training import Checkpoints, Trainer
 
@@ -110,7 +123,7 @@ def assert_transformers_reads(export, model, variables, reference):
     from test_block_diffusion import prefill
     from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     def theirs(dtype):
         loaded, report = DiffusionGemmaForBlockDiffusion.from_pretrained(
@@ -204,7 +217,10 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
         reference = {name: stored[name] for name in stored.files}
     assert_transformers_reads(tmp_path / "export", exported.model, exported.variables, reference)
 
-    again = Pretrained.load(str(tmp_path / "export"), dtype="float32", attention_impl="xla")
+    # At the run's own cache length, so both reads are one program on the same values: a longer cache
+    # sums each query's keys over other tiles, which a GPU rounds otherwise.
+    again = Pretrained.load(str(tmp_path / "export"), dtype="float32", attention_impl="xla",
+                            max_seq_len=exported.model.max_seq_len)
     assert again.model.conditioner == exported.model.conditioner
     assert again.model.canvas_length == exported.model.canvas_length
 

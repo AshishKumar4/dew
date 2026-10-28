@@ -1,40 +1,37 @@
 """Block recomputation preserves training, stateful collections and checkpoints.
 
-JAX 0.11.1 CPU: with both models stepping from the same variables and
-optimizer state, the two momentum-SGD steps observed maximum differences of
-4.8e-7 in loss, 1.4e-5 in gradients and optimizer state, 6.0e-8 in updated
-variables, 3.1e-5 in reported metrics and 7.6e-6 in per-head QK maxima,
-across the eight shape/scan cases. Momentum SGD keeps update differences on
-the gradient scale; Adam can amplify roundoff-size gradients near AltUp
-zero-initialized scales. The same tests also run on JAX 0.10.2 and on one
-RTX 4080 (without the four simulated-mesh cases). Cached decoding is bitwise
-identical.
-
-The named policies recompute the same block from more or fewer saved
-residuals: against `full`, on the dense shape with MTP and dropout, the
-loss is bitwise identical on CPU and differs by one float32 ulp (4.8e-7)
-on an RTX 4080, and the gradients differ by at most 8.4e-7 over the
-eighteen policy/scan cases (CPU, JAX 0.11.1), from the saved values
-entering fusions the recomputed ones do not. The offloaded policies run on
-the CPU backend, whose lowering of a host transfer is the identity, so
-their residuals are typed in host memory space and compile to the same
-program as their saved counterparts; the transfer itself needs a GPU or TPU.
+A recomputed block is the plain block's arithmetic in another order, so each claim is check 1 between
+the two over drawn decoders, both from the plain block's float64 run: a committed step's variables,
+optimizer state, loss, gradients, metrics and per-head QK maxima, on one device and across pipeline
+stages, and each named policy's loss and gradients against `full`. Cached decoding is bitwise
+identical, and a checkpoint restores across remat policies value for value. The offloaded policies run
+on the CPU backend, whose lowering of a host transfer is the identity, so their residuals are typed in
+host memory space and compile to the same program as their saved counterparts; the transfer itself
+needs a GPU or TPU.
 """
+
+import contextlib
+import functools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import selection_margins
+from model_support import largest_difference
+from reference_error import as_given, assert_as_exact, without_ynn
 
 from dew.checkpoints import Checkpoints
+from dew.distributed.batches import shard_batch
+from dew.distributed.placement import Layout, MeshSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import pipeline_microbatches
-from dew.objectives.base import Step
+from dew.objectives.base import Step, model_rngs
 from dew.objectives.lm import LMObjective
-from dew.training.distributed import Layout, MeshSpec, shard_batch
-from dew.training.state import TrainState
+from dew.objectives.routing import ExpertBalance
+from dew.state import TrainState
 from dew.training.transaction import write_back
 
 SHAPES = {
@@ -62,16 +59,10 @@ def batch():
                                 jnp.int32)}
 
 
-def difference(left, right):
-    return max(float(jnp.max(jnp.abs(a - b))) for a, b in zip(
-        jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
-
-
 def objective_for(model):
     sparse = model.mixture is not None
-    return LMObjective(model, 8, qk_stats=True,
-                       balance_rate=0.01 if sparse else None,
-                       aux_loss_alpha=0.001 if sparse else None,
+    return LMObjective(model, 8,
+                       balance=ExpertBalance(balance_rate=0.01, aux_loss_alpha=0.001) if sparse else None,
                        mtp_weight=0.2 if model.num_nextn_predict_layers else None)
 
 
@@ -82,7 +73,7 @@ def training_step(model):
     optimizer = optax.sgd(1e-3, momentum=0.9)
 
     def step(variables, state, tokens, key):
-        info = Step(jnp.zeros((), jnp.int32), key, None)
+        info = Step(jnp.zeros((), jnp.int32), key, None, qk_stats=True)
         (loss, aux), grads = jax.value_and_grad(
             lambda params: objective.scalar_loss({**variables, "params": params},
                                        tokens, info),
@@ -105,52 +96,117 @@ def train_state(step, variables, opt_state, key):
                       window_size=jnp.asarray(1, jnp.int32))
 
 
+STEP_SEEDS = 8
+"""Check 1's declared seeds for a recomputed block's committed step against the plain block's (`seeds_for`,
+paired: both arms are one decoder's arithmetic, saved or recomputed), and for its forward."""
+
+SIZED_STEP_SEEDS = {("mla", False): 16, ("altup", True): 128}
+"""The steps that size past STEP_SEEDS (`seeds_for`, paired): the latent-attention block unscanned, and
+the scanned AltUp block, whose initialized draws (zero momentum) spread its step's error wider."""
+
+
+def wide_step(model):
+    """`training_step` on `model` in float64: the truth of a remat check 1."""
+    return training_step(model.clone(dtype=jnp.float64))[0]
+
+
+def drawn_steps(plain, stepped, *, routed: bool, within=contextlib.nullcontext, place=None):
+    """Each seed's draw of a committed step's inputs: the decoder initialized from the seed, its
+    optimizer state, the batch and the step's key. An even seed's decoder is initialized, its momentum
+    zero; an odd seed's has taken one plain step under its own key, its momentum a step's. A routed
+    decoder takes the seed's first draw whose routing clears `selection_margins.MARGIN` in the step's
+    own training forward (its dropout, its prediction depth) and in the inference forward the forward
+    check reads, each `within` the step's context on the inputs as `place` lays them out, so its
+    float32 runs and its float64 run route alike; routing
+    near a tie is the router's own tests'. `stepped` is `training_step(plain)`, compiled once for the
+    draws and the reference arm."""
+    run, solver = stepped
+    ids = batch()["text"][:, :-1]
+    initialized = jax.jit(lambda key: plain.init(key, ids))
+    objective = objective_for(plain)
+    scored = jax.jit(lambda variables, tokens, key: objective.token_scores(
+        variables, tokens, train=True, rngs=model_rngs(key, training=True), routing=True,
+        depths=objective.mtp_weight is not None, qk_stats=True).routing)
+    inferred = jax.jit(lambda variables, tokens: objective.token_scores(
+        variables, tokens, routing=True).routing)
+
+    def phase(primed: bool):
+        def keyed(seed):
+            variables = initialized(jax.random.key(seed))
+            key = jax.random.key(seed + (1 << 20))
+            state = solver.init(variables["params"])
+            if primed:
+                variables, state, *_ = run(variables, state, batch(), key)
+            # The key travels as its bits, which a float64 truth's widening leaves as they are.
+            return variables, state, batch(), jax.random.key_data(jax.random.fold_in(key, 1))
+        return selection_margins.clearing(keyed, clears) if routed else keyed
+
+    def clears(inputs):
+        variables, _, tokens, key = inputs
+        laid = (variables, tokens) if place is None else place(variables, tokens)
+        with within():
+            sown = [scored(laid[0], laid[1]["text"], jax.random.wrap_key_data(key)),
+                    inferred(laid[0], laid[1]["text"])]
+        return all(selection_margins.routing_margin(jax.device_get(one), variables.get("moe", {}), 2)
+                   >= selection_margins.MARGIN for one in sown)
+
+    initial, primed = phase(primed=False), phase(primed=True)
+    return lambda seed: (primed if seed % 2 else initial)(seed)
+
+
+def committed(step):
+    """A step's committed values as check 1 compares them: the variables and optimizer state it leaves,
+    its loss and gradients, and the metrics and per-head QK maxima it reports."""
+    def run(variables, state, tokens, key):
+        moved, next_state, loss, grads, aux = step(variables, state, tokens, jax.random.wrap_key_data(key))
+        return moved, next_state, loss, grads, aux.metrics, aux.qk_stats
+    return run
+
+
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("scan", [False, True])
 def test_recomputed_blocks_train_the_same_model(shape, scan):
     """Dropout, MTP, MoE balancing and shared K/V retain their derivatives.
 
-    Each step hands both models the same variables and optimizer state, the
-    plain model's from the previous step, with a fresh key, and compares the
-    committed step including the deferred router-bias effects. Independent
-    chains cannot be compared past one step: recomputation changes rounding
-    in the backward pass (3e-8 in the updated variables here), and one
-    token's second and third router scores in layer 1 of the sparse model
-    were 1.6e-7 apart at the second step, so that step routed the token to
-    a different expert and moved the loss by 6e-4.
-    """
+    Both models start from the same initialized variables and the same
+    plain forward, and over drawn decoders, one plain step on, the remat
+    model's committed step (its variables, optimizer state, loss, gradients,
+    metrics and QK maxima, the deferred router-bias effects included) is on
+    par with the plain model's, both from the plain step's float64 run
+    (check 1). The router's slot counts are integers, routed alike. Chains
+    are compared a step at a time: recomputation changes rounding in the
+    backward pass, and a token within rounding of a routing tie moves to
+    another expert at the next step."""
     plain = model_for(shape, scan_layers=scan)
     remat = plain.clone(remat='full')
-    tokens = batch()
-    ids = tokens["text"][:, :-1]
+    ids = batch()["text"][:, :-1]
     variables = plain.init(jax.random.key(0), ids)
     recomputed = remat.init(jax.random.key(0), ids)
     assert jax.tree.structure(variables) == jax.tree.structure(recomputed)
-    assert difference(variables, recomputed) == 0
-    assert difference(jax.jit(plain.apply)(variables, ids),
-                      jax.jit(remat.apply)(variables, ids)) < 2e-5
-    run, solver = training_step(plain)
+    assert largest_difference(variables, recomputed) == 0
+    stepped = training_step(plain)
+    run, _ = stepped
     rerun, _ = training_step(remat)
-    state = solver.init(variables["params"])
-    original = variables
-    for index in range(2):
-        key = jax.random.fold_in(jax.random.key(4), index)
-        moved, next_state, loss, grads, aux = run(variables, state, tokens, key)
-        recomputed, other_state, other_loss, other_grads, other_aux = rerun(
-            variables, state, tokens, key)
-        assert abs(float(loss - other_loss)) < 2e-5
-        assert difference(grads, other_grads) < 3e-5
-        assert difference(moved, recomputed) < 2e-5
-        assert difference(next_state, other_state) < 2e-5
-        assert difference(aux.metrics, other_aux.metrics) < 1e-4
-        assert difference(aux.qk_stats, other_aux.qk_stats) < 1e-4
-        if shape == "sparse":
-            # Router slot counts are integers; recomputation routes identically.
-            assert difference(aux.effects, other_aux.effects) == 0
-        variables, state = moved, next_state
-    assert difference(original["params"], variables["params"]) > 1e-4
+    draw = drawn_steps(plain, stepped, routed=shape == "sparse")
+    wide = plain.clone(dtype=jnp.float64)
+    assert_as_exact(lambda variables, *_: remat.apply(variables, ids),
+                    lambda variables, *_: plain.apply(variables, ids), draw,
+                    f"a recomputed {shape} block's forward, scan {scan}", seeds=STEP_SEEDS,
+                    truth_fn=jax.jit(lambda variables, *_: wide.apply(variables, ids)))
+    assert_as_exact(committed(rerun), committed(run), draw,
+                    f"a recomputed {shape} block's step, scan {scan}",
+                    seeds=SIZED_STEP_SEEDS.get((shape, scan), STEP_SEEDS),
+                    truth_fn=committed(wide_step(plain)))
+    moved, state, tokens, key = draw(0)
+    key = jax.random.wrap_key_data(key)
+    after, _, _, _, aux = run(moved, state, tokens, key)
+    _, _, _, _, other_aux = rerun(moved, state, tokens, key)
+    assert not np.array_equal(after["params"]["embed_tokens"]["embedding"],
+                              moved["params"]["embed_tokens"]["embedding"])
     if shape == "sparse":
-        assert difference(original["moe"], variables["moe"]) > 0
+        np.testing.assert_array_equal(jax.tree.leaves(aux.effects), jax.tree.leaves(other_aux.effects))
+        assert not all(np.array_equal(a, b) for a, b in zip(
+            jax.tree.leaves(after["moe"]), jax.tree.leaves(moved["moe"]), strict=True))
 
 
 @pytest.mark.parametrize("shape", ["dense", "shared", "altup"])
@@ -166,7 +222,7 @@ def test_remat_prefills_and_appends_the_same_cache(shape, scan):
                                        decode=True, mutable=["cache"])
         actual, recomputed_cache = remat.apply(remat_vars, ids[:, start:end],
                                                decode=True, mutable=["cache"])
-        assert difference(actual, expected) == 0
+        assert largest_difference(actual, expected) == 0
 
         plain_vars = {**plain_vars, **cache}
         remat_vars = {**remat_vars, **recomputed_cache}
@@ -176,30 +232,50 @@ def test_remat_prefills_and_appends_the_same_cache(shape, scan):
 @pytest.mark.parametrize("shape", ["dense", "sparse"])
 @pytest.mark.parametrize("scan", [False, True])
 def test_recomputed_pipeline_preserves_updates_and_sown_values(shape, scan):
+    """Over drawn decoders, the remat model's committed step across two
+    pipeline stages of two microbatches each, on par with the plain model's
+    (check 1), both from the plain step's float64 run across the same
+    stages."""
     plain = model_for(shape, scan_layers=scan, num_nextn_predict_layers=0)
     remat = plain.clone(remat='full')
     # Eight rows split four ways over data x fsdp hold two a device, which
     # two microbatches divide.
-    mesh_spec = MeshSpec(fsdp=2, stage=2)
-    mesh = mesh_spec.build()
-    tokens = shard_batch(mesh, batch())
-    variables = plain.init(jax.random.key(0), batch()["text"][:, :-1])
-    variables = jax.device_put(variables, Layout(min_shard=16).shardings(mesh, variables))
-    run, solver = training_step(plain)
+    mesh = MeshSpec(fsdp=2, stage=2).build()
+    stepped = training_step(plain)
+    run, _ = stepped
     rerun, _ = training_step(remat)
-    state = solver.init(variables["params"])
-    with jax.set_mesh(mesh), pipeline_microbatches(2):
-        left = run(variables, state, tokens, jax.random.key(7))
-        right = rerun(variables, state, tokens, jax.random.key(7))
-    assert abs(float(left[2] - right[2])) < 2e-5
-    assert difference(left[0], right[0]) < 2e-5
-    assert difference(left[3], right[3]) < 3e-5
-    assert difference(left[4].qk_stats, right[4].qk_stats) < 1e-4
-    assert difference(left[4].metrics, right[4].metrics) < 1e-4
+
+    def place(variables, tokens):
+        laid = jax.device_put(variables, Layout(min_shard=16).shardings(mesh, variables))
+        return laid, shard_batch(mesh, tokens)
+
+    @contextlib.contextmanager
+    def staged():
+        with jax.set_mesh(mesh), pipeline_microbatches(2):
+            yield
+
+    def placed(step):
+        # Both arms are Dew's programs, each compiled once as the gate compiles two Dew arms (row 1801).
+        compiled = without_ynn(committed(step))
+
+        def on_mesh(variables, state, tokens, key):
+            variables, tokens = place(variables, tokens)
+            with staged():
+                return jax.device_get(compiled(variables, state, tokens, key))
+        return on_mesh
+
+    draw = drawn_steps(plain, stepped, routed=shape == "sparse", within=staged, place=place)
+    assert_as_exact(as_given(placed(rerun)), as_given(placed(run)), draw,
+                    f"a recomputed {shape} pipeline's step, scan {scan}", seeds=STEP_SEEDS,
+                    truth_fn=placed(wide_step(plain)))
 
 
 @pytest.mark.parametrize("saved_remat", [None, 'full'])
 def test_checkpoint_resumes_with_remat_switched(tmp_path, saved_remat):
+    """A checkpoint saved under one remat policy restores, value for value, into a template of the other,
+    and the other model steps from it as from the state saved: the restore is exact, and so is the same
+    program on the same values (that the two policies train alike is
+    `test_recomputed_blocks_train_the_same_model`'s)."""
     model = model_for("shared", scan_layers=True, remat=saved_remat)
     variables = model.init(jax.random.key(0), batch()["text"][:, :-1])
     run, optimizer = training_step(model)
@@ -218,43 +294,63 @@ def test_checkpoint_resumes_with_remat_switched(tmp_path, saved_remat):
     restored, position = checkpoints.restore(template)
     assert position is None
     assert int(restored.step) == 1 and int(restored.updates) == 1
-    expected = run(state.variables, state.opt_state, batch(), state.key)
+    for saved, loaded in zip(jax.tree.leaves((state.variables, state.opt_state)),
+                             jax.tree.leaves((restored.variables, restored.opt_state)), strict=True):
+        np.testing.assert_array_equal(loaded, saved)
     resume, _ = training_step(resumed_model)
     actual = resume(restored.variables, restored.opt_state, batch(), restored.key)
-    assert abs(float(actual[2] - expected[2])) < 2e-5
-    assert difference(actual[0], expected[0]) < 2e-5
+    expected = resume(state.variables, state.opt_state, batch(), state.key)
+    assert np.isfinite(actual[2])
+    for got, want in zip(jax.tree.leaves(actual[:4]), jax.tree.leaves(expected[:4]), strict=True):
+        np.testing.assert_array_equal(got, want)
 
 
 NAMED = [name for name in REMAT_POLICIES if name != 'full']
 
+POLICY_SEEDS = 8
+"""Check 1's declared seeds for a named policy's loss and gradients against `full`'s (`seeds_for`,
+paired)."""
 
-def gradient_step(model, variables, key):
+
+def gradient_step(model):
+    """The objective's loss, its reports and its gradient in the parameters, from drawn variables and a
+    step key."""
     objective = objective_for(model)
 
-    def loss(params):
-        info = Step(jnp.zeros((), jnp.int32), key, None)
-        return objective.scalar_loss({**variables, "params": params}, batch(), info)
+    def step(variables, key):
+        def loss(params):
+            info = Step(jnp.zeros((), jnp.int32), jax.random.wrap_key_data(key), None, qk_stats=True)
+            return objective.scalar_loss({**variables, "params": params}, batch(), info)
 
-    return jax.jit(jax.value_and_grad(loss, has_aux=True))(variables["params"])
+        (value, aux), grads = jax.value_and_grad(loss, has_aux=True)(variables["params"])
+        # Perplexity is the cross entropy's exponential, which magnifies the same rounding; its
+        # logarithm is the cross entropy itself, so the metrics compare in cross-entropy units.
+        metrics = {name: jnp.log(metric) if name == "perplexity" else metric
+                   for name, metric in aux.metrics.items()}
+        return value, grads, metrics
+    return step
+
+
+@functools.cache
+def against_full(scan):
+    """`full`'s decoder, its draws, and its step compiled once for every policy: the reference arm and,
+    in float64, the truth."""
+    full = model_for("dense", scan_layers=scan, remat='full')
+    initialized = jax.jit(lambda key: full.init(key, batch()["text"][:, :-1]))
+
+    def draw(seed):
+        return initialized(jax.random.key(seed)), jax.random.key_data(jax.random.key(seed + (1 << 20)))
+
+    return full, draw, gradient_step(full), jax.jit(gradient_step(full.clone(dtype=jnp.float64)))
 
 
 @pytest.mark.parametrize("policy", NAMED)
 @pytest.mark.parametrize("scan", [False, True])
 def test_named_policies_train_the_same_model_as_full(policy, scan):
     """Saved and offloaded residuals feed the backward pass the values the
-    recomputation would have produced, dropout and MTP included."""
-    full = model_for("dense", scan_layers=scan, remat='full')
-    variables = full.init(jax.random.key(0), batch()["text"][:, :-1])
-    key = jax.random.key(4)
-    (loss, aux), grads = gradient_step(full, variables, key)
-    (other_loss, other_aux), other_grads = gradient_step(
-        full.clone(remat=policy), variables, key)
-    assert abs(float(loss - other_loss)) < 2e-6
-    assert difference(grads, other_grads) < 2e-6
-    for name, value in aux.metrics.items():
-        other = other_aux.metrics[name]
-        if name == "perplexity":
-            # Compare in cross-entropy units; exp magnifies the same rounding.
-            np.testing.assert_allclose(np.log(value), np.log(other), atol=2e-6, rtol=0)
-        else:
-            np.testing.assert_allclose(value, other, atol=1e-5, rtol=0)
+    recomputation would have produced, dropout and MTP included: over drawn
+    decoders and keys, a named policy's loss, gradients and metrics on par
+    with `full`'s, both from `full`'s float64 run (check 1)."""
+    full, draw, reference, truth = against_full(scan)
+    assert_as_exact(gradient_step(full.clone(remat=policy)), reference, draw,
+                    f"{policy} against full, scan {scan}", seeds=POLICY_SEEDS, truth_fn=truth)

@@ -39,15 +39,13 @@ class Export:
     config derived from the model, and otherwise the source's own `save`
     writes it. `writes` is the family a derived export saves as when it is
     not the source's: a multi-head GPTBigCode computes GPT-2's model, so it
-    saves as GPT-2, in GPT-2's tensors. `bound` holds a fixture that has no
-    float64 logits to an absolute fp32 bound and every argmax. `masked`
-    reads the export as a masked LM, which takes no cache.
+    saves as GPT-2, in GPT-2's tensors. `masked` reads the export as a masked
+    LM, which takes no cache.
     """
 
     fixture: str
     derived: bool = False
     writes: str | None = None
-    bound: float | None = None
     masked: bool = False
 
     @property
@@ -70,10 +68,9 @@ EXPORTS = (
     Export('phi-tiny', derived=True),
     Export('phi3-tiny', derived=True),
     Export('bloom-tiny'),
-    # These fixtures have no float64 logits, so the dense-family fp32 bound.
-    Export('gpt2-tiny', bound=1e-4),
-    Export('gpt-neox-tiny', bound=1e-4),
-    Export('opt-tiny', bound=1e-4),
+    Export('gpt2-tiny'),
+    Export('gpt-neox-tiny'),
+    Export('opt-tiny'),
     Export('gpt-neo-tiny'),
     Export('mimo-v2-flash-tiny'),
     Export('mamba-tiny', derived=True),
@@ -106,13 +103,9 @@ def test_an_untrained_export_reads_in_transformers_and_reloads_bit_for_bit(case,
         expected = reference(torch.from_numpy(ids).long(),
                              **({} if case.masked else {'use_cache': False})).logits.numpy()
     actual = np.asarray(loaded.model.apply(loaded.variables, ids))
-    if case.bound is None:
-        _, terms = float64_forward(loaded.model, loaded.variables, ids)
-        assert_as_exact_as_the_reference(actual, expected, np.load(directory / 'logits_f64.npy'),
-                                         f'{case.fixture} export', terms=terms)
-    else:
-        np.testing.assert_allclose(actual, expected, atol=case.bound, rtol=0)
-        np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
+    _, terms = float64_forward(loaded.model, loaded.variables, ids)
+    assert_as_exact_as_the_reference(actual, expected, np.load(directory / 'logits_f64.npy'),
+                                     f'{case.fixture} export', terms=terms)
 
     if case.writes is None:
         assert_same_stored_tensors(load_shards(tmp_path), load_shards(directory))
@@ -124,7 +117,7 @@ class Training:
     """One causal source's training step.
 
     `state` names the collections the source loads beside `params`, such as
-    MiniMax-M2's routing bias, which a step without `balance_rate` leaves
+    MiniMax-M2's routing bias, which a step without `balance` leaves
     where the checkpoint put it. `images` trains on the fixture's prompts with
     their images, one on the first row and two on the second, so the vision
     tower and the projector train with the language model.

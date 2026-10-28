@@ -38,12 +38,10 @@ SCHEDULERS = (
 )
 
 
-def build(base, destination):
-    require("diffusers-pipelines")
-    pipe, params = FlaxStableDiffusionPipeline.from_pretrained(
-        base, local_files_only=True, safety_checker=None, feature_extractor=None)
-    ids = pipe.prepare_inputs(["dog", "cat"])
-    context = pipe.text_encoder(ids, params=params["text_encoder"])[0]
+def guided(pipe, params):
+    """The pipeline's UNet over the prompts' states, "dog" unconditioned and "cat" at guidance 3,
+    compiled."""
+    context = pipe.text_encoder(pipe.prepare_inputs(["dog", "cat"]), params=params["text_encoder"])[0]
 
     @jax.jit
     def predict(sample, time):
@@ -52,6 +50,14 @@ def build(base, destination):
         negative, positive = jnp.split(output, 2)
         return negative + 3.0 * (positive - negative)
 
+    return predict
+
+
+def build(base, destination):
+    require("diffusers-pipelines")
+    pipe, params = FlaxStableDiffusionPipeline.from_pretrained(
+        base, local_files_only=True, safety_checker=None, feature_extractor=None)
+    predict = guided(pipe, params)
     noise = np.asarray(jax.random.normal(jax.random.PRNGKey(17), (1, 4, 8, 8)))
     arrays = {"noise": noise.transpose(0, 2, 3, 1)}
     for name, cls, options in SCHEDULERS:
@@ -95,15 +101,7 @@ def truth(base, destination):
         pipe.scheduler = FlaxDDIMScheduler.from_pretrained(base, subfolder="scheduler", dtype=jnp.float64)[0]
         params = jax.tree.map(lambda x: jnp.asarray(x, jnp.float64)
                               if jnp.issubdtype(jnp.asarray(x).dtype, jnp.floating) else x, params)
-        context = pipe.text_encoder(pipe.prepare_inputs(["dog", "cat"]), params=params["text_encoder"])[0]
-
-        @jax.jit
-        def predict(sample, time):
-            output = pipe.unet.apply({"params": params["unet"]}, sample, jnp.broadcast_to(time, (2,)),
-                                     encoder_hidden_states=context).sample
-            negative, positive = jnp.split(output, 2)
-            return negative + 3.0 * (positive - negative)
-
+        predict = guided(pipe, params)
         noise = arrays["noise"].transpose(0, 3, 1, 2).astype(np.float64)
         for name, cls, options in SCHEDULERS:
             with float64_scheduler(sys.modules[cls.__module__]):

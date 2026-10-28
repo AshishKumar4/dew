@@ -21,12 +21,13 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from functools import partial
 from typing import TYPE_CHECKING
 
-import numpy as np
-
-from dew import records
+from dew import _records
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_parts import record_bool, record_int
+from dew.interop.unread import Stored
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
@@ -58,17 +59,8 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
     checks the rest against. The backbone's attention geometry is
     `mixer_decoder`'s; the SSD layer reads its own heads from the mixer value.
     """
-    if hf_config.get("model_type", MODEL_TYPE) != MODEL_TYPE:
-        raise ValueError(f"model_type {hf_config.get('model_type')!r} is not {MODEL_TYPE!r}")
     read = {"model_type", "num_hidden_layers"} if used is None else used
-
-    def integer(key: str, default: int) -> int:
-        read.add(key)
-        return records.integer(hf_config.get(key, default), key)
-
-    def flag(key: str, *, default: bool) -> bool:
-        read.add(key)
-        return records.boolean(hf_config.get(key, default), key)
+    integer, boolean = partial(record_int, hf_config, used=read), partial(record_bool, hf_config, used=read)
 
     hidden, expand = integer("hidden_size", 4096), integer("expand", 2)
     heads, head_dim = integer("num_heads", 128), integer("head_dim", 64)
@@ -95,20 +87,20 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
         if not isinstance(limit, (list, tuple)) or len(limit) != 2:
             raise ValueError(f"time_step_limit is a (lower, upper) pair, got {limit!r}")
         lower, upper = (math.inf if isinstance(bound, float) and bound == math.inf
-                        else records.number(bound, "time_step_limit") for bound in limit)
+                        else _records.number(bound, "time_step_limit") for bound in limit)
     mixer = Mamba2Mixer(
         num_heads=heads, head_dim=head_dim,
         state_size=integer("state_size", 128),
         n_groups=integer("n_groups", 8),
         conv_kernel=integer("conv_kernel", 4),
         chunk_size=integer("chunk_size", 256),
-        use_bias=flag("use_bias", default=False),
-        use_conv_bias=flag("use_conv_bias", default=True),
+        use_bias=boolean("use_bias", default=False),
+        use_conv_bias=boolean("use_conv_bias", default=True),
         time_step_limit=(lower, upper))
     return mixer_decoder(hf_config, hidden, mixer, vocab_size=integer("vocab_size", 32768),
                          num_layers=integer("num_hidden_layers", 64),
-                         tie_embeddings=flag("tie_word_embeddings", default=False),
-                         residual_in_fp32=flag("residual_in_fp32", default=True))
+                         tie_embeddings=boolean("tie_word_embeddings", default=False),
+                         residual_in_fp32=boolean("residual_in_fp32", default=True))
 
 
 def mixer_decoder(hf_config: Mapping[str, object], hidden: int, mixer: MixerBase, *, vocab_size: int,
@@ -121,7 +113,7 @@ def mixer_decoder(hf_config: Mapping[str, object], hidden: int, mixer: MixerBase
     return native_fields(CausalTransformer)(
         vocab_size=vocab_size, emb_features=hidden, num_layers=num_layers, num_heads=1, num_kv_heads=1,
         head_dim=hidden, mlp_features=0, qk_norm=False,
-        norm_eps=records.number(hf_config.get("layer_norm_epsilon", 1e-5), "layer_norm_epsilon"),
+        norm_eps=_records.number(hf_config.get("layer_norm_epsilon", 1e-5), "layer_norm_epsilon"),
         tie_embeddings=tie_embeddings, residual_in_fp32=residual_in_fp32, mixer=mixer)
 
 
@@ -206,7 +198,7 @@ def config_from_mamba_ssm(config: Mapping[str, object]) -> Mapping[str, object]:
     if unknown:
         raise ValueError(f"mamba_ssm config fields {unknown} are not MambaConfig's; remove them or load a "
                          "transformers Mamba2 conversion of the checkpoint")
-    ssm = records.record(config["ssm_cfg"], "ssm_cfg")
+    ssm = _records.record(config["ssm_cfg"], "ssm_cfg")
     if ssm.get("layer") != "Mamba2":
         raise ValueError(f"ssm_cfg layer {ssm.get('layer', 'Mamba1')!r} is not Mamba2; only mamba_ssm's "
                          "Mamba2 checkpoints read as the mamba2 family")
@@ -225,11 +217,11 @@ def config_from_mamba_ssm(config: Mapping[str, object]) -> Mapping[str, object]:
     fields = {field: ssm.get(key, default) for key, (field, default) in _SSM_FIELDS.items()}
     if "dt_limit" in ssm:
         fields["time_step_limit"] = ssm["dt_limit"]
-    hidden, expand, head_dim = (records.integer(value, name) for name, value in (
+    hidden, expand, head_dim = (_records.integer(value, name) for name, value in (
         ("d_model", config["d_model"]), ("expand", fields["expand"]), ("headdim", fields["head_dim"])))
     # MambaConfig's defaults.
-    vocab = records.integer(config.get("vocab_size", 50277), "vocab_size")
-    multiple = records.integer(config.get("pad_vocab_size_multiple", 8), "pad_vocab_size_multiple")
+    vocab = _records.integer(config.get("vocab_size", 50277), "vocab_size")
+    multiple = _records.integer(config.get("pad_vocab_size_multiple", 8), "pad_vocab_size_multiple")
     return {"model_type": MODEL_TYPE, "hidden_size": hidden, "num_hidden_layers": config["n_layer"],
             "num_heads": hidden * expand // head_dim, **fields,
             "vocab_size": vocab + (-vocab % multiple),
@@ -238,10 +230,15 @@ def config_from_mamba_ssm(config: Mapping[str, object]) -> Mapping[str, object]:
             "bos_token_id": 0, "pad_token_id": 0, "eos_token_id": 0}
 
 
-def tensors_from_mamba_ssm(tensors: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """Rename a mamba_ssm state dict to the port's names.
+def tensors_from_mamba_ssm(tensors: Mapping[str, Stored]) -> Mapping[str, Stored]:
+    """Rename a mamba_ssm state dict to the port's names, each tensor read only when it is read.
 
     `Mamba2Model.load_hook` (modeling_mamba2.py) is the whole rename:
     `embedding.` becomes `embeddings.` wherever a name holds it.
     """
-    return {name.replace("embedding.", "embeddings."): tensor for name, tensor in tensors.items()}
+    from dew.interop.safetensors_io import LazyTensors, tensor_specs
+
+    specs = tensor_specs(tensors)
+    names = {name.replace("embedding.", "embeddings."): name for name in specs}
+    return LazyTensors({renamed: specs[name] for renamed, name in names.items()},
+                       lambda renamed: tensors[names[renamed]])

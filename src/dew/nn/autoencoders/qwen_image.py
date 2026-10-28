@@ -24,17 +24,24 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
 
-from dew import records
-from dew.interop.components import bind_component, component_source
-from dew.objectives.base import Variables
+from dew import _records
+from dew.batch import Variables
+from dew.interop.components import bind_component
+from dew.interop.weights import indexed_path
 
-from .api import ModuleAutoEncoder
+from ..activations import silu
+from ..blocks import Upsample
+from .api import LatentNormalization, ModuleAutoEncoder, published_source
 from .kl import posterior_latent
-from .vae import FlaxDownsample2D, FlaxUpsample2D
+from .vae import FlaxDownsample2D
 from .wan import WanMidBlock, WanResidualBlock, WanRMSNorm, causal_conv
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
+
+
+PUBLISHED = ("AutoencoderKLQwenImage21",)
+"""The `_class_name` a published AutoencoderKLQwenImage21's config states."""
 
 
 def _conv(features: int, kernel: int, dtype: Dtype, name: str | None) -> nn.Module:
@@ -76,7 +83,7 @@ class _Upsampler(nn.Module):
     def __call__(self, x):
         if self.temporal:
             _TimeConv(self.features, 2 * self.features, name="time_conv")()
-        return FlaxUpsample2D(self.features, dtype=jnp.dtype(self.dtype), name="resample")(x)
+        return Upsample(self.features, 2, dtype=jnp.dtype(self.dtype), conv="conv", name="resample")(x)
 
 
 def _average_down(x, features: int, temporal: bool, spatial: int):
@@ -158,7 +165,7 @@ class _Encoder(nn.Module):
                            index != last and self.temporal_downsample[index], index != last,
                            self.dtype, name=f"down_blocks_{index}")(x)
         x = WanMidBlock(widths[-1], self.dtype, name="mid_block")(x)
-        x = nn.silu(WanRMSNorm(widths[-1], 4, self.dtype, name="norm_out")(x))
+        x = silu(WanRMSNorm(widths[-1], 4, self.dtype, name="norm_out")(x))
         return _conv(self.moments, 3, self.dtype, "conv_out")(x)
 
 
@@ -180,7 +187,7 @@ class _Decoder(nn.Module):
             x = _UpBlock(widths[index], widths[index + 1], self.num_res_blocks,
                          index != last and self.temporal_upsample[index], index != last,
                          self.dtype, name=f"up_blocks_{index}")(x)
-        x = nn.silu(WanRMSNorm(widths[-1], 4, self.dtype, name="norm_out")(x))
+        x = silu(WanRMSNorm(widths[-1], 4, self.dtype, name="norm_out")(x))
         return _conv(self.image_channels, 3, self.dtype, "conv_out")(x)
 
 
@@ -220,9 +227,9 @@ class QwenImageVAE(nn.Module):
             self.dtype,
         )
 
-    def encode(self, x, key=None):
-        """The posterior mean, or a draw from it when `key` is given."""
-        return posterior_latent(self.quant_conv(self.encoder(x)), key)
+    def encode(self, x, key=None, noise=None):
+        """The posterior mean, or a draw from it when `key` or `noise` is given."""
+        return posterior_latent(self.quant_conv(self.encoder(x)), key, noise)
 
     def decode(self, z):
         return jnp.clip(self.decoder(self.post_quant_conv(z)), -1.0, 1.0)
@@ -257,19 +264,19 @@ def qwen_image_vae_fields(config: Mapping[str, object]) -> QwenImageVAEFields:
     if config.get("patch_size") is not None:
         raise ValueError(f"The Qwen-Image VAE's patchified layout is not implemented, got "
                          f"patch_size {config.get('patch_size')!r}")
-    base_dim = records.integer(config.get("base_dim"), "base_dim")
+    base_dim = _records.integer(config.get("base_dim"), "base_dim")
     decoder_base_dim = (base_dim if config.get("decoder_base_dim") is None
-                        else records.integer(config["decoder_base_dim"], "decoder_base_dim"))
-    dim_mult = records.integers(config.get("dim_mult"), "dim_mult")
+                        else _records.integer(config["decoder_base_dim"], "decoder_base_dim"))
+    dim_mult = _records.integers(config.get("dim_mult"), "dim_mult")
     halving = config.get("temperal_downsample")
     if not isinstance(halving, (list, tuple)):
         raise ValueError(f"temperal_downsample={halving!r}: this field is a list of flags")
-    temporal = tuple(records.boolean(halves_time, "temperal_downsample") for halves_time in halving)
+    temporal = tuple(_records.boolean(halves_time, "temperal_downsample") for halves_time in halving)
     if not dim_mult or len(temporal) != len(dim_mult) - 1:
         raise ValueError(f"temperal_downsample needs one flag per downsampling level of dim_mult {dim_mult}, "
                          f"got {temporal}")
-    image_channels = records.integer(config.get("in_channels"), "in_channels")
-    if records.integer(config.get("out_channels"), "out_channels") != image_channels:
+    image_channels = _records.integer(config.get("in_channels"), "in_channels")
+    if _records.integer(config.get("out_channels"), "out_channels") != image_channels:
         raise ValueError("The Qwen-Image VAE must reconstruct its input channels: in_channels "
                          f"{image_channels} against out_channels {config.get('out_channels')}")
     spatial = config.get("scale_factor_spatial")
@@ -289,9 +296,9 @@ def qwen_image_vae_fields(config: Mapping[str, object]) -> QwenImageVAEFields:
             raise ValueError(f"Decoder level {index} cannot duplicate {decoder[index]} channels into "
                              f"{decoder[index + 1]}")
     return QwenImageVAEFields(base_dim=base_dim, decoder_base_dim=decoder_base_dim,
-                              latent_channels=records.integer(config.get("z_dim"), "z_dim"),
+                              latent_channels=_records.integer(config.get("z_dim"), "z_dim"),
                               dim_mult=dim_mult,
-                              num_res_blocks=records.integer(config.get("num_res_blocks"), "num_res_blocks"),
+                              num_res_blocks=_records.integer(config.get("num_res_blocks"), "num_res_blocks"),
                               temporal_downsample=temporal, image_channels=image_channels)
 
 
@@ -322,13 +329,7 @@ def qwen_image_vae_path(name: str, ndim: int) -> tuple[str, ...]:
     leaf = parts.pop()
     if ndim not in _LEAF_RANK[leaf]:
         raise ValueError(f"{name!r} has {ndim} axes, not {' or '.join(map(str, _LEAF_RANK[leaf]))}")
-    path: list[str] = []
-    for part in parts:
-        if part.isdigit() and path and path[-1] in _INDEXED:
-            path[-1] = f"{path[-1]}_{part}"
-        else:
-            path.append(part)
-    return (*path, "kernel" if leaf == "weight" else leaf)
+    return (*indexed_path(parts, indexed=_INDEXED), "kernel" if leaf == "weight" else leaf)
 
 
 class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
@@ -336,34 +337,22 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
     latent normalization, `(z - latents_mean) / latents_std` on the way out
     and `z * latents_std + latents_mean` on the way in."""
 
-    record_name = 'qwen_image'
-    record_module = QwenImageVAE
-
     def __init__(self, *, model: QwenImageVAE, params: Variables,
                  latents_mean: Sequence[float], latents_std: Sequence[float]):
         super().__init__(model, params)
-        self.latents_mean = np.asarray(latents_mean, np.float32)
-        self.latents_std = np.asarray(latents_std, np.float32)
+        mean, std = np.asarray(latents_mean, np.float32), np.asarray(latents_std, np.float32)
         expected = (model.latent_channels,)
-        if self.latents_mean.shape != expected or self.latents_std.shape != expected:
+        if mean.shape != expected or std.shape != expected:
             raise ValueError(
-                f"latents_mean {self.latents_mean.shape} and latents_std {self.latents_std.shape} "
+                f"latents_mean {mean.shape} and latents_std {std.shape} "
                 f"must both hold one value per latent channel {expected}"
             )
+        # The pipeline divides by the standard deviation and multiplies back.
+        self.normalization = LatentNormalization({'latents_mean': mean, 'latents_std': std}, mean, std,
+                                                 divides=True)
 
     def record_arguments(self) -> dict:
-        return {'latents_mean': self.latents_mean, 'latents_std': self.latents_std}
-
-    # The base class's shift and scale stay 0 and 1, so its encode and decode
-    # only flatten video around the batch calls here.
-    def encode(self, params, x, key=None):
-        latent = super().encode(params, x, key=key)
-        return (latent - self.latents_mean.astype(latent.dtype)) / self.latents_std.astype(latent.dtype)
-
-    def decode(self, params, z):
-        return super().decode(
-            params, z * self.latents_std.astype(z.dtype) + self.latents_mean.astype(z.dtype)
-        )
+        return dict(self.normalization.record)
 
 
 def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
@@ -376,11 +365,7 @@ def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revisio
     in the shape it declares. Supplied `params` are bound without a weight read;
     `lazy` leaves read ones `SourceLeaf`s for a placement to read
     (`dew.interop.weights.record_layouts`)."""
-    directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
-    if config.get("_class_name") != "AutoencoderKLQwenImage21":
-        raise ValueError(
-            f"{directory} holds a {config.get('_class_name')}, not an AutoencoderKLQwenImage21"
-        )
+    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=params is None)
     model = QwenImageVAE(**qwen_image_vae_fields(config), dtype=compute)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)

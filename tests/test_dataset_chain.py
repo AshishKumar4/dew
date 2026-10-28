@@ -9,12 +9,13 @@ from dataclasses import dataclass
 import grain.python as grain
 import numpy as np
 import pytest
+from sampling_gate import assert_draws_as_declared
 
 from dew.data import Dataset, Files, Loading, Memory, from_grain, from_hf, from_iter, mix, text
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, GlobalStream
-from dew.data.pipeline import Configured, ObjectiveData, Rejected
+from dew.data.pipeline import Configured, ObjectiveData, Pipeline, Rejected
 from dew.data.plan import Manifest
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
@@ -90,10 +91,34 @@ def test_filtered_memory_roots_compact_before_global_counts_and_share_cuts(grain
             reader.close()
 
 
+HOLDOUT_SHARES = (0.85, 0.05, 0.1)
+"""The 3-way holdout's requested shares: train, validation and test."""
+
+HOLDOUT_SEEDS = 64
+"""The holdout-shares site's declared corpora, each of HOLDOUT_RECORDS records (the sampling gate's)."""
+
+HOLDOUT_RECORDS = 500
+"""The records of each drawn corpus the holdout's shares are counted over."""
+
+
+def test_a_holdouts_parts_take_their_shares_as_a_fair_draw_would():
+    """Over drawn corpora (their identities a seed's own), a 3-way holdout's parts take their requested
+    shares as a fair draw would (the sampling gate): a record's identity hashes it into its part as a
+    uniform draw would, so no part is favoured."""
+
+    def counts(seed):
+        corpus = Memory(rows(f"s{seed}", HOLDOUT_RECORDS))
+        parts = corpus.holdout(val=HOLDOUT_SHARES[1], test=HOLDOUT_SHARES[2])
+        return np.asarray([sum(1 for _ in iterate(part, read="memory", loading=READ)) for part in parts])
+
+    assert_draws_as_declared(counts, HOLDOUT_SHARES, "holdout shares", seeds=HOLDOUT_SEEDS)
+
+
 def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_read():
-    """A 3-way holdout: the parts are disjoint and together every record, each about its share,
-    the same whether the store is read whole or streamed, with the steps replayed on each."""
-    corpus = Memory(rows("a", 4000)).map(lambda row: {**row, "seen": True})
+    """A 3-way holdout: the parts are disjoint and together every record, the same whether the store
+    is read whole or streamed, with the steps replayed on each (their shares,
+    `test_a_holdouts_parts_take_their_shares_as_a_fair_draw_would`)."""
+    corpus = Memory(rows("a", 400)).map(lambda row: {**row, "seen": True})
     train, val, test = corpus.holdout(val=0.05, test=0.1)
 
     def keys(part, read):
@@ -102,10 +127,9 @@ def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_
 
     parts = [keys(part, "memory") for part in (train, val, test)]
     assert [keys(part, "streamed") for part in (train, val, test)] == parts
-    assert sum(map(len, parts)) == len(set().union(*parts)) == 4000
-    assert [len(part) / 4000 for part in parts] == pytest.approx([0.85, 0.05, 0.1], abs=0.02)
+    assert sum(map(len, parts)) == len(set().union(*parts)) == 400
     # With a key, a document's other versions land in its part: the split follows "i" alone.
-    revised = Memory([{**row, "origin": "a2"} for row in rows("a", 4000)])
+    revised = Memory([{**row, "origin": "a2"} for row in rows("a", 400)])
     revised = revised.map(lambda row: {**row, "seen": True})
     by_key = [{i for _, i in keys(part, "memory")} for part in corpus.holdout(0.1, key="i")]
     assert by_key == [{i for _, i in keys(part, "memory")} for part in revised.holdout(0.1, key="i")]
@@ -320,36 +344,24 @@ def test_eager_fetch_keeps_a_memory_plan_volatile_until_its_generation_is_sealed
 
 
 @pytest.mark.parametrize(("selection", "read"), [("fraction", "memory"), ("fraction", "streamed"),
-                                               ("records", "memory"), ("records", "indexed"),
-                                               ("random", "memory"), ("random", "indexed")])
+                                               ("records", "memory"), ("records", "indexed")])
 def test_a_sealed_generation_keeps_its_holdout_selection_in_training_and_validation(tmp_path,
                                                                                  selection, read):
-    """Generation promotion splits its accepted rows, not the original inputs or the full generation."""
-    from dew.config.data import RecordsData, loader
-    from dew.data.holdout import HoldOut
-
+    """A holdout of a chain whose steps a published generation stands for splits the store's inputs,
+    as it does uncached, and reads the generation's rows of the inputs each part keeps: the first
+    five inputs held out are the accepted ones among them, not the generation's first five rows."""
     source = Memory(rows("fetched", 64))
     generation = fetched_generation(source.filter_map(FetchLike()), tmp_path)
-    if selection == "random":
-        holdout = HoldOut(records=5, by="random", seed=37)
-        recipe = RecordsData(generation.source(), validation=holdout)
-        train, held, _ = recipe.pipelines()
-        data = loader(recipe, batch=2, read=read, loading=READ)
-    else:
-        cached = source.filter_map(FetchLike()).cache(generation)
-        train, held = (cached.holdout(0.25, key="i") if selection == "fraction"
-                       else cached.holdout(records=5))
-        data = compile(train.batch(2), validation=held.batch(2, drop_remainder=False),
-                       read=read, loading=READ)
+    cached = source.filter_map(FetchLike()).cache(generation)
+    train, held = cached.holdout(0.25, key="i") if selection == "fraction" else cached.holdout(records=5)
+    data = compile(train.batch(2), validation=held.batch(2, drop_remainder=False), read=read, loading=READ)
     accepted = {index for index in range(64) if index % 3}
     parts = [{int(row["i"]) for row in iterate(part, read=read, loading=READ)} for part in (train, held)]
     assert all(parts)
     assert parts[0].isdisjoint(parts[1])
     assert parts[0] | parts[1] == accepted
     if selection == "records":
-        assert parts[1] == set(sorted(accepted)[:5])
-    if selection == "random":
-        assert len(parts[1]) == 5
+        assert parts[1] == {index for index in range(5) if index % 3}
     training, validation = data.train(DataPartition()), data.val(DataPartition())
     try:
         trained = {int(index) for batch in itertools.islice(training, len(accepted)) for index in batch["i"]}
@@ -760,10 +772,99 @@ def test_a_mixtures_grain_step_drops_rows_it_rejects_and_counts_them(read):
     assert data.statistics()["data/rejected/mixture/odd"] > 0
 
 
+@dataclasses.dataclass(frozen=True)
+class Tagged:
+    """Marks a record as read from the second corpus."""
+
+    def __call__(self, row):
+        return {**row, "tagged": True}
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_stats_reports_the_records_a_second_tokens_and_padding_of_packed_rows(read):
+    """Token documents of differing lengths packed into rows of 16: stats reports the tokens
+    the rows hold, all the documents' (one of them id 0, a token like any other), the share of
+    the rows' places that pad them, and the records it read a second; rows with no token ids
+    report none of those two."""
+    lengths = [5, 7, 3, 9, 11, 2, 6, 8]
+    documents = Memory([{"text": np.arange(length, dtype=np.int32)} for length in lengths]).named("docs")
+    counts = documents.pack(16).read(read).loading(READ).stats(records=100)
+    packed = counts["data/rows/docs"]
+    assert counts["data/tokens"] == sum(lengths)
+    assert counts["data/padding"] == (16 * packed - sum(lengths)) / (16 * packed)
+    assert 0 < counts["data/records_per_second"] < float("inf")
+    plain = Memory(rows("a", 4)).named("plain").read(read).loading(READ).stats(records=4)
+    assert "data/tokens" not in plain and "data/padding" not in plain
+    # Rows stored packed, their documents and validity beside them: a place of segment 0 or
+    # marked invalid pads its row.
+    stored = Memory({"text": [np.arange(9, dtype=np.int32)] * 2,
+                     "text_segment_ids": [np.asarray([1, 1, 1, 2, 2, 2, 2, 2, 0], np.int32)] * 2,
+                     "text_attention_mask": [np.asarray([1] * 8 + [0], bool),
+                                             np.asarray([1] * 7 + [0, 0], bool)]}).named("stored")
+    held = stored.read(read).loading(READ).stats(records=2)
+    assert held["data/tokens"] == 8 + 7
+    assert held["data/padding"] == (1 + 2) / 18
+
+
+@dataclasses.dataclass(frozen=True)
+class Twice:
+    """Each record of a group twice, as columns."""
+
+    def __call__(self, columns):
+        return {name: [value for value in values for _ in range(2)] for name, values in columns.items()}
+
+
+@dataclasses.dataclass(frozen=True)
+class Keep:
+    """Keeps every record, though it may drop one."""
+
+    rejects = True
+
+    def __call__(self, row):
+        return row
+
+
+def test_show_prints_the_chain_as_written_then_the_records_and_leaves_a_reader_where_it_was(capsys):
+    """`show` prints the store and each verb as the chain wrote it, a preset's expanded steps and
+    a verb that drops or expands records under its own name, then the first records as a reader
+    makes them; a reader open beside it reads on as one never shown would."""
+    from dew.data import presets
+
+    pictures = Memory([{"image": np.full((8, 8, 3), index, np.uint8), "label": index % 2}
+                       for index in range(6)])
+    chain = pictures.pipe(presets.images, 4, batch=2, augment=True).loading(READ)
+    data = compile(chain, read="indexed", loading=READ)
+    reader, untouched = data.train(DataPartition()), data.train(DataPartition())
+    try:
+        next(reader)
+        chain.show(count=1)
+        rest, expected = next(reader), (next(untouched), next(untouched))[1]
+        for name in expected:
+            np.testing.assert_array_equal(np.asarray(rest[name]), np.asarray(expected[name]))
+    finally:
+        reader.close()
+        untouched.close()
+    lines = capsys.readouterr().out.splitlines()
+    written = [line.strip() for line in lines[:6]]
+    assert written[0].startswith("Memory")
+    assert [line.split("(")[0] for line in written[1:]] == [
+        ".filter_map", ".map", ".random_map", ".batch", ".map"]
+    assert "DecodeImage" in written[1] and "Resize" in written[2] and "AugmentationKey" in written[3]
+    assert written[4] == ".batch(2)" and "DeviceAugment" in written[5] and "device" in written[5]
+    assert "uint8[2, 4, 4, 3]" in "".join(lines[6:])
+
+    grouped = Memory(rows("a", 4)).named("a").flat_map(Twice(), batched=True, batch_size=2)
+    grouped.filter_map(Keep()).loading(READ).show(count=1)
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1].strip() == ".flat_map(Twice(), batched=True, batch_size=2)"
+    assert lines[2].strip().startswith(".filter_map(Keep")
+
+
 def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
     """A memory read runs a corpus's steps before its repeat and reads the rest as it goes: every
     row it delivers was cut short after the repeat, so its truncated share is one, whatever the
-    rows the memory read held before."""
+    rows the memory read held before, and the cut's record counts the row and the three tokens it
+    removed of the field it cut."""
     from dew.data.steps.text import LengthPolicy
 
     rows = Memory([{"text": np.arange(5, dtype=np.int32)} for _ in range(4)])
@@ -778,6 +879,42 @@ def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
     counts = data.statistics()
     assert counts["data/rows/memory"] == 1
     assert counts["data/truncated/memory"] == 1.0
+    assert counts["data/cut/memory/text"] == counts["data/cut_examples/memory/text"] == 1
+    assert counts["data/cut_removed/memory/text"] == 3
+
+
+def test_successive_cuts_of_a_record_compose_in_its_record():
+    """Two cuts of one field, a text of 9 tokens cut to 6 and then to 2, record the 7 tokens they removed
+    of one row, not the last cut's 4; a cut of another field stands beside them, its own row counted, and
+    the loader's counters read the composed record."""
+    from dew.data.steps.text import LengthPolicy
+
+    rows = Memory([{"text": np.arange(9, dtype=np.int32), "label": np.arange(5, dtype=np.int32)}])
+    chain = (rows.map(LengthPolicy(6)).map(LengthPolicy(2)).map(LengthPolicy(3, field="label"))
+             .batch(1))
+    data = compile(chain, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
+    stream = data.train(DataPartition())
+    try:
+        next(stream)
+    finally:
+        stream.close()
+    counts = data.statistics()
+    assert counts["data/cut/memory/text"] == 1 and counts["data/cut_removed/memory/text"] == 7
+    assert counts["data/cut/memory/label"] == 1 and counts["data/cut_removed/memory/label"] == 2
+
+
+def test_a_rendered_prompt_kept_to_its_length_counts_the_start_it_removed():
+    """A prompt longer than its length, kept by its end (`long="truncate"`), records the cut: its row
+    cut short, one row and the tokens of its start removed, as every length policy does."""
+    from dew.data.prompts import LENGTH_KEY
+    from dew.data.steps.chat import RenderPrompt
+
+    prompt = {"prompt": "a prompt of many bytes"}
+    rendered = RenderPrompt("byte", max_prompt_len=8, long="truncate").map(prompt)
+    whole = RenderPrompt("byte", max_prompt_len=64).map(prompt)
+    removed = int(whole[LENGTH_KEY]) - 8
+    assert removed > 0 and rendered["_dew_truncated"] and rendered["_dew_cut"] == {"prompt": (1, removed)}
+    assert "_dew_cut" not in whole
 
 
 def test_a_character_filter_and_caption_dropout_keep_and_empty_their_records():
@@ -1053,7 +1190,7 @@ def test_column_verbs_preserve_simultaneous_renames_and_selection(read):
 
 
 def _stamped(facts):
-    """A run-scoped step that writes the run's row count into each record."""
+    """A step that writes the row count its facts state into each record."""
     count = facts["rows"]
     return lambda row: {**row, "rows": np.int32(count)}
 
@@ -1068,3 +1205,98 @@ def test_a_fact_two_corpora_state_differently_reaches_no_run_step_whatever_anoth
     with pytest.raises(ValueError):
         compile(mix(members).map(Configured(_stamped, needs=("rows",), scope="run")).batch(1),
                 read="indexed", loading=Loading(workers=0))
+
+
+class _Dropping(grain.MapTransform):
+    """Keeps even ids; says it drops the rest."""
+
+    rejects = True
+
+    def map(self, element):
+        from dew.data.pipeline import Rejected
+
+        return element if int(element["id"]) % 2 == 0 else Rejected("odd")
+
+
+class _Doubled:
+    """Each record twice."""
+
+    def flat_map(self, element):
+        return [element, element]
+
+
+class _Noised(grain.RandomMapTransform):
+    """Adds a draw from the record's generator."""
+
+    def random_map(self, element, rng):
+        return {**element, "noise": int(rng.integers(0, 1000))}
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_an_objectives_configured_step_over_a_mixture_binds_to_each_corpus_own_facts(read):
+    """An objective's configured step that neither draws nor expands runs on each corpus before the
+    mixture, bound to the facts that corpus states: corpora of 2 and 3 records, which share no row
+    count, each stamp their own."""
+    members = [Memory([{"size": np.int32(size)}] * size, identity=f"corpus {size}") for size in (2, 3)]
+    objective = ObjectiveData(train=(Configured(_stamped, needs=("rows",)),))
+    loader = compile(mix(members).batch(1), objective=objective, read=read, loading=READ)
+    stream = loader.train(DataPartition())
+    try:
+        batches = list(itertools.islice(stream, 10))
+    finally:
+        stream.close()
+    assert len(batches) == 10 and {int(batch["size"][0]) for batch in batches} == {2, 3}
+    for batch in batches:
+        np.testing.assert_array_equal(batch["rows"], batch["size"])
+
+
+def test_a_configured_step_states_whether_it_expands_and_binding_to_another_is_refused():
+    """As a configured step states that it draws, it states that it expands a record into several
+    (`Configured.expands`): one stated so reads each record as its expansion makes it, and one that
+    binds to an expansion unstated, or states one and binds to a map, is refused before it reads."""
+    rows = Pipeline(Memory([{"id": np.int32(index)} for index in range(4)]))
+    doubled = compile(rows.map(Configured(lambda facts: _Doubled(), needs=(), expands=True)).batch(8),
+                      read="memory", loading=READ).train(DataPartition())
+    try:
+        assert sorted(next(doubled)["id"].tolist()) == [0, 0, 1, 1, 2, 2, 3, 3]
+    finally:
+        doubled.close()
+    for configured in (Configured(lambda facts: _Doubled(), needs=()),
+                       Configured(lambda facts: (lambda row: row), needs=(), expands=True)):
+        with pytest.raises(ValueError):
+            compile(rows.map(configured).batch(2), read="memory", loading=READ)
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_an_objectives_record_steps_read_as_the_verbs_that_name_what_they_are(read):
+    """An objective's record steps, a dropping one, an expanding one and a drawing one, train on what
+    the verbs for what they are, `filter_map`, `flat_map` and `random_map`, written where the objective
+    reads the records, make of them: before their batch, a pass of 8 kept and doubled in 4 batches."""
+    from dew.data.pipeline import ObjectiveData, Pipeline
+
+    rows = Pipeline(Memory([{"id": index} for index in range(16)]))
+    steps = (_Dropping(), _Doubled(), _Noised())
+    written = rows.filter_map(steps[0]).flat_map(steps[1]).random_map(steps[2]).batch(4)
+    expected = compile(written, read=read, loading=READ, seed=5).train(DataPartition())
+    trained = compile(rows.batch(4), objective=ObjectiveData(train=steps), read=read, loading=READ,
+                      seed=5).train(DataPartition())
+    try:
+        for batch, reference in zip(itertools.islice(trained, 4), itertools.islice(expected, 4), strict=True):
+            for field in ("id", "noise"):
+                np.testing.assert_array_equal(batch[field], reference[field])
+    finally:
+        expected.close()
+        trained.close()
+
+
+def test_the_defaults_a_verb_and_its_stage_take_are_the_same_value():
+    """A verb written without its settings and the stage it makes written without them are one:
+    the same stage, so the same plan."""
+    from dew.data.pipeline import Interleave, Pack, Pipeline, Prefetch, Windows, Workers
+
+    rows = Pipeline(Memory([{"text": np.arange(4)}]))
+    assert rows.interleave().stages[-1] == Interleave()
+    assert rows.pack(8).stages[-1] == Pack(8)
+    assert rows.windows(8).stages[-1] == Windows(8)
+    assert rows.prefetch().stages[-1] == Prefetch()
+    assert rows.workers(2).stages[-1] == Workers(2)

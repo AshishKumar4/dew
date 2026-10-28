@@ -18,9 +18,7 @@ import tyro
 
 from dew import Checkpoints, Field, InputSpec, Trainer
 from dew.artifacts import uint8_pixels
-from dew.config import OptimConfig
-from dew.config.data import PreferenceData, TextData, loader
-from dew.data import Loading
+from dew.data import Memory, presets
 from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import CausalTransformer, SimpleDiT
@@ -28,6 +26,7 @@ from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.objectives.rl import DPOObjective
+from dew.optim import OptimConfig
 from dew.sampling import Euler, Sampling, generate
 
 
@@ -38,18 +37,14 @@ class Config:
 
 
 def language_model(out: Path):
-    """Train and resume a decoder on a repeating eight-symbol vocabulary."""
-    tokens = out / "tokens"
-    tokens.mkdir()
-    for split, repeats in (("train", 256), ("val", 32)):
-        np.tile(np.array([1, 2, 3, 4], dtype=np.uint8), repeats).tofile(
-            tokens / f"{split}.bin")
-    (tokens / "meta.json").write_text(json.dumps({
-        "tokenizer": "demo-symbols", "vocab_size": 8, "dtype": "uint8",
-        "train_tokens": 1024, "val_tokens": 128, "eos_id": None,
-    }))
-    data = loader(TextData(source=str(tokens), seq_len=8), batch=8, read="memory",
-                validation_records=8, loading=Loading(workers=0, threads=1, read_buffer=2))
+    """Train and resume a decoder on a repeating stream of four symbols from an eight-symbol vocabulary."""
+    symbols = np.array([1, 2, 3, 4], dtype=np.int32)
+    # The ids are the records' text already, so the lm preset takes no tokenizer, and one stream with
+    # no document ends is cut into windows (pack=None).
+    data = Memory([{"text": np.tile(symbols, 256)}]).repeat().pipe(
+        presets.lm, None, seq_len=8, batch=8, pack=None)
+    validation = Memory([{"text": np.tile(symbols, 32)}]).pipe(
+        presets.lm, None, seq_len=8, batch=8, pack=None, records=8)
     model = CausalTransformer(
         vocab_size=8, emb_features=16, num_layers=1,
         num_heads=2, mlp_features=32, max_seq_len=16,
@@ -60,14 +55,14 @@ def language_model(out: Path):
     checkpoints = Checkpoints(str(out / "lm-checkpoints"))
     trainer = Trainer(objective, optimizer, key=jax.random.key(0),
                       checkpoints=checkpoints)
-    first = trainer.fit(data, steps=20, log_every=10,
+    first = trainer.fit(data, validation=validation, steps=20, log_every=10,
                         eval_every=20, checkpoint_every=20,
                         metrics=(Perplexity(),))
     first_step = int(first.step)
     # A new Trainer restores model, optimizer, random key, and read position.
     resumed = Trainer(objective, optimizer, key=jax.random.key(0),
                       checkpoints=checkpoints)
-    state = resumed.fit(data, steps=24, log_every=4,
+    state = resumed.fit(data, validation=validation, steps=24, log_every=4,
                         eval_every=4, checkpoint_every=4,
                         metrics=(Perplexity(),))
     prompt = jnp.array([[1, 2]], dtype=jnp.int32)
@@ -87,8 +82,7 @@ def preferences(model, pretrained):
     """Start DPO from the trained policy; freeze that policy as the reference."""
     row = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 6, 4],
            "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1, 1]}
-    data = loader(PreferenceData(source=(row,) * 8, seq_len=4), batch=8, read="memory",
-                loading=Loading(workers=0, threads=1, read_buffer=2))
+    data = Memory([row] * 8).repeat().pipe(presets.preferences, seq_len=4, batch=8)
     # The objective predicts three next tokens from each four-ID sequence.
     objective = DPOObjective(model, seq_len=3, beta=0.1, variables=pretrained)
     reference = jax.tree.map(lambda x: np.array(x, copy=True), pretrained)

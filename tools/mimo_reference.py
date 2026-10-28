@@ -20,10 +20,7 @@ Each array file stores fp32 and float64 references, IEEE products.
 """
 
 import argparse
-import importlib.util
 import json
-import sys
-import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -70,18 +67,11 @@ bounded at 30 frames the segments batch as [20], [20, 5] and [13], the last alon
 
 def mimo_module():
     """MiMo's modeling module, fetched at MIMO_REVISION and imported as a package beside its config."""
-    from huggingface_hub import hf_hub_download
+    from reference_source import hub_modules
 
-    package = types.ModuleType("mimo_v2")
-    package.__path__ = []
-    sys.modules["mimo_v2"] = package
-    for name in ("configuration_mimo_v2", "modeling_mimo_v2"):
-        path = hf_hub_download(MIMO_REPO, f"{name}.py", revision=MIMO_REVISION)
-        spec = importlib.util.spec_from_file_location(f"mimo_v2.{name}", path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[f"mimo_v2.{name}"] = module
-        spec.loader.exec_module(module)
-    return sys.modules["mimo_v2.modeling_mimo_v2"]
+    _, modeling = hub_modules("mimo_v2", MIMO_REPO, MIMO_REVISION,
+                              ("configuration_mimo_v2.py", "modeling_mimo_v2.py"))
+    return modeling
 
 
 def scatter(module: torch.nn.Module, seed: int) -> None:
@@ -134,7 +124,7 @@ def write(directory: Path, config: dict, tower: dict, projector: dict, arrays: d
 def write_mimo_vision_tiny() -> None:
     """MiMo ViT: the trunk sequence (the merger's input, caught by a hook) and the merger's output,
     the merger's biases zero as the release stores none."""
-    from diffusers_wan_reference import float64
+    from torch_precision import float64
 
     modeling = mimo_module()
     config = SimpleNamespace(**MIMO_VISION)
@@ -199,7 +189,7 @@ def write_mel() -> None:
 
 
 def write_mimo_audio_tiny() -> None:
-    from diffusers_wan_reference import float64
+    from torch_precision import float64
 
     modeling = mimo_module()
     grouping = modeling._at_group_by_length

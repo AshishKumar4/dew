@@ -49,6 +49,111 @@ def test_repeated_token_gradients_accumulate_in_master_precision(dtype):
     np.testing.assert_array_equal(gradient, expected)
 
 
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_token_lookup_takes_forward_mode_and_nested_derivatives(dtype):
+    """The lookup under `jax.jvp` and `jax.linearize` with respect to its table takes the gather's own
+    tangent, bit for bit, where its custom VJP alone refused forward mode (row 1869, audit NN-06), and forward
+    over reverse is the gather's own; its gradient still accumulates in the table's dtype (the test above)."""
+    model = TokenEmbedding(5, 3, dtype=dtype)
+    ids = jnp.asarray([[0, 4, 4, 2]], jnp.int32)
+    table = model.init(jax.random.key(6), ids)["params"]["embedding"]
+    direction = jax.random.normal(jax.random.key(7), table.shape, table.dtype)
+
+    def lookup(table):
+        return model.apply({"params": {"embedding": table}}, ids)
+
+    def gathered(table):
+        return table[ids].astype(dtype)
+
+    found = jax.jit(lambda t: jax.jvp(lookup, (t,), (direction,)))(table)
+    want = jax.jit(lambda t: jax.jvp(gathered, (t,), (direction,)))(table)
+    jax.tree.map(np.testing.assert_array_equal, found, want)
+    linearized = jax.jit(lambda t: jax.linearize(lookup, t)[1](direction))(table)
+    np.testing.assert_array_equal(linearized, want[1])
+
+    def nested(fn):
+        def loss(table):
+            return jnp.sum(fn(table).astype(jnp.float32) ** 2)
+
+        return jax.jit(lambda t: jax.jvp(jax.grad(loss), (t,), (direction,))[1])(table)
+
+    # Both scatter-add the rows in the table's dtype, in the ids' order.
+    np.testing.assert_array_equal(nested(lookup), nested(gathered))
+
+
+@pytest.mark.parametrize("vocab, padding_idx", [(5, 0), (5, 4), (5, -1), (5, -5), (1, 0), (1, -1)])
+def test_a_padding_rows_lookups_train_it_no_more_than_torchs(vocab, padding_idx):
+    """`padding_idx` leaves the row its id names untrained by every lookup of it, as torch's
+    `nn.Embedding(padding_idx=...)` does, a negative id counted from the table's end and a table of
+    one row alike: the gradient under a drawn cotangent of small integers is torch's to the bit, each
+    row the sum of its lookups' cotangents, exact in float32 in any order. An id outside the table is
+    refused."""
+    import torch
+
+    ids = np.asarray([[0, vocab - 1, 0], [vocab - 1, 0, vocab - 1]])
+    cotangent = np.random.default_rng(7).integers(-8, 8, (*ids.shape, 3)).astype(np.float32)
+    model = TokenEmbedding(vocab, 3, padding_idx=padding_idx)
+    variables = model.init(jax.random.key(4), jnp.asarray(ids, jnp.int32))
+
+    def loss(parameters):
+        return jnp.sum(model.apply({"params": parameters}, jnp.asarray(ids, jnp.int32)) * cotangent)
+
+    ours = jax.grad(loss)(variables["params"])["embedding"]
+    reference = torch.nn.Embedding(vocab, 3, padding_idx=padding_idx)
+    with torch.no_grad():
+        reference.weight.copy_(torch.from_numpy(np.asarray(variables["params"]["embedding"])))
+    (reference(torch.from_numpy(ids)) * torch.from_numpy(cotangent)).sum().backward()
+    np.testing.assert_array_equal(np.asarray(ours), reference.weight.grad.numpy())
+    assert not np.any(np.asarray(ours)[padding_idx])
+    with pytest.raises(ValueError):
+        TokenEmbedding(vocab, 3, padding_idx=vocab).init(jax.random.key(4), jnp.asarray(ids, jnp.int32))
+
+
+@pytest.mark.parametrize("family", ["clip-token", "clip-position", "clip-vision", "siglip",
+                                    "gemma3n", "decision", "joint"])
+def test_family_embedding_gradients_sum_repeated_ids_in_master_precision(family):
+    """Each family's own configured table receives a cancelling sequence of repeated-ID
+    cotangents. Its fp32 master retains contributions lost by accumulation in bf16."""
+    from dew.decision.head import DecisionHead, JointSchemaHead
+    from dew.nn.text_encoders import CLIPTextTransformer, CLIPVisionTransformer
+    from dew.nn.vision.gemma3n import Gemma3nProjector
+    from dew.nn.vision.siglip import SiglipVision
+
+    dtype = jnp.bfloat16
+    clip = CLIPTextTransformer(vocab_size=3, hidden_size=2, num_layers=0, num_heads=1,
+                               max_position_embeddings=3, dtype=dtype)
+    choices = {
+        "clip-token": (clip, lambda module, ids: module.token_embedding(ids), "token_embedding"),
+        "clip-position": (clip, lambda module, ids: module.position_embedding(ids), "position_embedding"),
+        "clip-vision": (CLIPVisionTransformer(hidden_size=2, num_layers=0, num_heads=1,
+                                             image_size=2, patch_size=1, dtype=dtype),
+                        lambda module, ids: module.trunk.position_table(ids), "position_table"),
+        "siglip": (SiglipVision(hidden_size=2, num_layers=0, num_heads=1,
+                                image_size=2, patch_size=1).build().clone(dtype=dtype),
+                   lambda module, ids: module.position_table(ids), "position_table"),
+        "gemma3n": (Gemma3nProjector(2, 2, vocab_size=3, dtype=dtype),
+                    lambda module, ids: module.embedding(ids), "embedding"),
+        "decision": (DecisionHead(2, layers=0, dtype=dtype),
+                     lambda module, ids: module.type_embedding(ids), "type_embedding"),
+        "joint": (JointSchemaHead(2, width=2, heads=1, layers=0, routing_layers=0, dtype=dtype),
+                  lambda module, ids: module.type_embedding(ids), "type_embedding"),
+    }
+    model, lookup, name = choices[family]
+    ids = jnp.asarray([0, 0, 0, 0, 1], jnp.int32)
+    cotangent = jnp.asarray([[1, -1], [2**-8, -2**-8], [2**-8, -2**-8], [-1, 1], [2, 3]], dtype)
+    variables = model.init(jax.random.key(5), ids, method=lookup)
+
+    def loss(params):
+        outputs = model.apply({"params": params}, ids, method=lookup)
+        return jnp.sum(outputs.astype(jnp.float32) * cotangent.astype(jnp.float32))
+
+    gradient = jax.jit(jax.grad(loss))(variables["params"])[name]["embedding"]
+    expected = np.zeros(gradient.shape, np.float32)
+    np.add.at(expected, np.asarray(ids), np.asarray(cotangent, np.float32))
+    assert gradient.dtype == jnp.float32
+    np.testing.assert_array_equal(gradient, expected)
+
+
 @struct.dataclass
 class Moments:
     errors: Ratio
@@ -215,7 +320,7 @@ def test_scaled_native_gradients_preserve_update_and_restart(tmp_path, parameter
 @pytest.mark.parametrize("seq_aux", [False, True])
 def test_router_reductions_preserve_float64_scores(seq_aux):
     from dew.nn.moe import global_router_loss, sequence_router_losses
-    from dew.objectives.lm.objective import router_moments
+    from dew.objectives.routing import router_moments
 
     def balance_loss(scores, indices):
         if seq_aux:
@@ -239,7 +344,7 @@ def test_router_reductions_preserve_float64_scores(seq_aux):
         np.testing.assert_allclose(gradient, expected_gradient, rtol=0, atol=1e-15)
 
 
-def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
+def test_optimizer_dtype_overflow_backs_off_and_drops_its_window():
     import dataclasses
 
     class Cancellation(Objective):
@@ -267,15 +372,50 @@ def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
     prefix, _, _, _, accepted, _ = step(initial, batch)
     assert bool(accepted)
     # The step consumes the state, so the prefix is read before the rejected step.
-    prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
     prefix_params = jax.tree.map(np.asarray, prefix.variables)
-    # Each finalized contribution fits fp16; their fp32 sum does not.
+    # Each finalized contribution fits fp16; their fp32 sum does not. The rejection drops the window,
+    # its accepted first microbatch with it (`dropped_window`).
     rejected, loss, _, finite, accepted, _ = step(prefix, {"first": jnp.zeros((), dtype=bool)})
     assert bool(finite) and float(loss) == 0 and not bool(accepted)
-    assert int(rejected.step) == 2 and int(rejected.microstep) == 1 and int(rejected.updates) == 0
+    assert int(rejected.step) == 2 and int(rejected.microstep) == 0 and int(rejected.updates) == 0
     assert float(rejected.scale.scale) == .5
-    compare(rejected.accumulation, prefix_accumulation, exact=True)
+    assert all(not np.any(np.asarray(leaf)) for leaf in rejected.accumulation.statistics)
     compare(rejected.variables, prefix_params, exact=True)
+
+
+@pytest.mark.parametrize("decay", [0.5, 0.999, 0.9999])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_an_ema_leaf_the_step_left_alone_keeps_its_average_bit_for_bit(dtype, decay):
+    """`ema_update` of a leaf whose live value is its average returns that average bit for bit, at any
+    decay, however its program fuses the update: a parameter no gradient moved keeps its EMA as it was."""
+    from dew.averaging import ema_update
+
+    average = jnp.asarray(np.random.default_rng(0).standard_normal(4096), dtype)
+    kept = jax.jit(ema_update)({"w": average}, {"w": average}, decay)["w"]
+    assert kept.dtype == average.dtype and np.array_equal(np.asarray(kept), np.asarray(average))
+
+
+def test_an_ema_of_finite_leaves_of_opposite_signs_stays_their_finite_average():
+    """`ema_update` between finite leaves returns their weighted average wherever it is finite, at the ends
+    of fp32's range too: an average of 2**127 and a live value of -(2**127) at decay 0.5 average to exactly 0,
+    where their difference alone overflows."""
+    from dew.averaging import ema_update
+
+    average = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 3e38], jnp.float32)
+    live = jnp.asarray([-(2.0 ** 127), 2.0 ** 127, -3e38], jnp.float32)
+    updated = jax.jit(ema_update)({"w": average}, {"w": live}, 0.5)["w"]
+    assert np.array_equal(np.asarray(updated), np.zeros(3, np.float32))
+
+
+def test_an_ema_of_a_leaf_the_step_left_alone_is_nan_at_a_nan_decay():
+    """`ema_update` at a NaN decay returns NaN, a leaf the step left as it was among them, as the weighted
+    sum does: the resulting state's finiteness check sees the bad decay, rather than a select that keeps the
+    leaf hiding it."""
+    from dew.averaging import ema_update
+
+    leaf = jnp.asarray([1.0, -2.0], jnp.float32)
+    updated = jax.jit(ema_update)({"w": leaf}, {"w": leaf}, jnp.float32(np.nan))["w"]
+    assert np.isnan(np.asarray(updated)).all()
 
 
 @pytest.mark.parametrize("parameter_kind", ["bfloat16", "mixed", "float64", "mixed64"])
@@ -291,6 +431,7 @@ def test_x64_router_bias_storage_survives_updates_and_restart(tmp_path, bias_dty
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives import Step
     from dew.objectives.lm import LMObjective
+    from dew.objectives.routing import ExpertBalance
     with jax.enable_x64():
         model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1,
                                   num_heads=2, mlp_features=16, max_seq_len=8,
@@ -298,7 +439,7 @@ def test_x64_router_bias_storage_survives_updates_and_restart(tmp_path, bias_dty
         initial = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4), jnp.int32))
         initial["moe"] = jax.tree.map(lambda x: x.astype(bias_dtype), initial["moe"])
         objective = LMObjective(model, 4, variables=initial, head_chunks=1,
-                                balance_rate=.02, aux_loss_alpha=.1, seq_aux=False)
+                                balance=ExpertBalance(balance_rate=.02, aux_loss_alpha=.1, seq_aux=False))
         checkpoints = Checkpoints(str(tmp_path / "router"))
         def build():
             return Trainer(objective, optax.sgd(.01), key=jax.random.PRNGKey(2),

@@ -22,6 +22,7 @@ from typing import Annotated, ClassVar
 
 import tyro
 
+from dew.cache import dew_config_dir
 from dew.cli import config, ssh_config, tpu_setup
 from dew.cli.gcloud import Gcloud, Node, Tpu, emit, exit_code
 
@@ -229,13 +230,18 @@ def _sync(tpu: Tpu, cfg: config.TpuConfig, count: int, excludes: Sequence[str],
 
 
 def _hosts(tpu: Tpu, count: int) -> list[str]:
-    """The address of each worker. A dry run names them instead."""
+    """The address of each of `count` workers. A dry run names them instead."""
     if tpu.gcloud.dry_run:
         return [f"<worker-{index}-ip>" for index in range(count)]
+    return _addresses(tpu)
+
+
+def _addresses(tpu: Tpu) -> list[str]:
+    """Each worker's external address, or its internal one where it has none, from one describe."""
     node = tpu.describe()
     if node is None:
         raise _missing(tpu)
-    return [ip or node.internal_ips[index] for index, ip in enumerate(node.ips)]
+    return [ip or internal for ip, internal in zip(node.ips, node.internal_ips, strict=True)]
 
 
 def _job_id(name: str) -> str:
@@ -348,9 +354,10 @@ class Create(Named):
         if disk:
             source = f"projects/{_project(gcloud, cfg)}/zones/{zone}/disks/{disk}"
             args.append(f"--data-disk=mode=read-write,source={source}")
-            args.append(f"--metadata-from-file=startup-script={_startup_script()}")
+            args.append(f"--metadata-from-file=startup-script={_startup_script(gcloud.dry_run)}")
         gcloud.run(gcloud.argv(*args), capture=False, check=True)
-        config.cache_zone(self.name, zone)
+        if not gcloud.dry_run:
+            config.cache_zone(self.name, zone)
 
         tpu = Tpu(gcloud, self.name, zone, cfg.ssh_user)
         emit(f"{self.name} in {zone}: {api_type} on {config.worker_count(kind)} worker(s)")
@@ -358,11 +365,13 @@ class Create(Named):
         return 0
 
 
-def _startup_script() -> Path:
-    """The data disk mount script, on disk because gcloud reads it from a file."""
-    path = config.config_dir() / "disk-startup.sh"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(tpu_setup.disk_startup_script())
+def _startup_script(dry_run: bool) -> Path:
+    """The data disk mount script, on disk because gcloud reads it from a file; a dry run names
+    the file without writing it."""
+    path = dew_config_dir() / "disk-startup.sh"
+    if not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(tpu_setup.disk_startup_script())
     return path
 
 
@@ -482,14 +491,8 @@ class SshConfig(Named):
 
     def run(self, rest: list[str]) -> int:
         cfg, gcloud, tpu = self.opened()
-        if gcloud.dry_run:
-            addresses = [f"<worker-{index}-ip>" for index in range(_slice(tpu, cfg)[0])]
-        else:
-            node = tpu.describe()
-            if node is None:
-                raise _missing(tpu)
-            addresses = [ip or internal for ip, internal in zip(node.ips, node.internal_ips,
-                                                                  strict=True)]
+        # A live slice's addresses take one describe; a dry run's count reads the config.
+        addresses = _hosts(tpu, _slice(tpu, cfg)[0]) if gcloud.dry_run else _addresses(tpu)
         block = ssh_config.block(self.name, addresses, cfg.ssh_user or getpass.getuser())
         if gcloud.dry_run:
             emit(f"# {ssh_config.path()}")
@@ -651,9 +654,10 @@ class Setup(Named):
             gcs_bucket=cfg.gcs_bucket if self.gcs_bucket is None else self.gcs_bucket,
             git_key=self.git_key is not None,
         )
-        path = config.config_dir() / f"setup-{self.name}.sh"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(script)
+        path = dew_config_dir() / f"setup-{self.name}.sh"
+        if not gcloud.dry_run:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(script)
 
         copy = gcloud.run(tpu.scp_argv([str(path)], f"{tpu.host}:~/dew-setup.sh", worker="all"),
                           capture=False)

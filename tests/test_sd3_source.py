@@ -303,16 +303,12 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     step and the resume unchanged, and the export writes it back where the
     source keeps it, so a reload recomputes the trained model exactly.
     """
-    from diffusion_support import image_batch, trained_step
+    from diffusion_support import image_batch, source_objective, trained_step
 
     from dew.checkpoints import Checkpoints
     from dew.interop.pretrained import Pretrained
-    from dew.objectives.diffusion import DiffusionObjective
 
-    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
-    objective = DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
-                                   autoencoder=loaded.autoencoder, variables=loaded.variables,
-                                   unconditional_prob=0.0, ema_decay=None, steps=2)
+    loaded, objective = source_objective(source)
     batch = image_batch(loaded, [{"text": "a red cat", "second": "a blue dog", "third": "a green bird"}])
     initial, state = trained_step(objective, batch, Checkpoints(str(tmp_path / "run")))
     # The step moved weights and left the buffer alone.

@@ -3,56 +3,37 @@
 The claim is parity, not plausibility: the same weights and the same token ids
 through the reference implementation and through dew have to produce the same
 hidden states and the same pooled row, and the same pixels the same projected
-image embedding. tools/clip_reference.py writes the fixtures under torch and
-transformers, including a tiny random-weight checkpoint whose outputs are
-committed, so the comparison runs in CI without a download.
-
-Tolerances and the differences actually observed, fp32 on CPU:
-
-- tiny checkpoint: max |hidden state difference| 1.4e-06, max |pooled
-  difference| 9.5e-07, tolerance 4e-6, on hidden states reaching 2.8. Through
-  the projection heads, max |text embedding difference| 7.2e-07 on values
-  reaching 2.5 and max |image embedding difference| 4.8e-07 on values
-  reaching 2.8, the pixel values bit-identical.
-- clip-vit-large-patch14: max |hidden state difference| 1.9e-04 (mean 1.0e-06,
-  median 6.0e-07), max |pooled difference| 4.8e-06, tolerance 1e-3, on hidden
-  states reaching 33.1. Through the heads, max |text embedding difference|
-  3.8e-06 on values reaching 14.2 and max |image embedding difference|
-  1.2e-05 (mean 1.1e-06) on values reaching 6.6.
-
-That last residue is fp32 rounding in CLIP's outlier channels, not a different
-computation, and the reference carries more of it than the gap between the two:
-transformers' own fp32 output differs from its fp64 output by 2.8e-04 on the
-same prompts, and run in fp64 on both sides the two agree to 2.8e-13
-(8.4e-15 relative). tools/clip_reference.py --fp64 writes that reference and
-its docstring carries the dew side of the comparison.
+image embedding. Every output is on par with transformers' own float32 output
+from its float64 one over the same weights (`transformers_clip`), over drawn
+prompts and images (check 1, tests/reference_error.py). tools/clip_reference.py
+writes the fixtures under torch and transformers, including a tiny
+random-weight checkpoint whose token ids, pixels and float32 outputs are
+committed; the float32 and float64 reference outputs are computed here, so the
+comparison runs in CI without a download.
 
 What rounds differently at all is one rearrangement: dew's attention kernel
 divides the query by sqrt(head_dim) before the logits, where the reference
 multiplies the logits after (modeling_clip.py, eager_attention_forward).
 """
 
+import functools
 import json
-import os
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
+import jax
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact
 
 from dew.inputs import CLIPText, Condition, Field, InputSpec, T5Text
 from dew.nn.text_encoders import CLIPModel, translate_config
+from dew.registry import to_record
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "clip"
 TINY = FIXTURES / "tiny"
 REAL = FIXTURES / "large-patch14"
-TOLERANCE = 4e-6
-"""Under three times the tiny checkpoint's largest residue, and five times under
-what a final norm off by one part in 2^17 moves its states by."""
-# The real checkpoint's outlier channels reach 33, where an fp32 sum carries
-# more error than this whole test asks for.
-REAL_TOLERANCE = 1e-3
 
 
 def reference(directory):
@@ -79,8 +60,111 @@ def image_processor(directory_or_repo):
     return CLIPImageProcessorPil.from_pretrained(str(directory_or_repo))
 
 
-def largest_difference(actual, expected) -> float:
-    return float(np.max(np.abs(np.asarray(actual, np.float32) - expected)))
+SEEDS = {'tiny text tower': 8, 'tiny encode': 8, 'tiny text projection': 8, 'tiny image embeddings': 8,
+         'quick_gelu image embeddings': 8, 'gelu image embeddings': 8,
+         'gelu_pytorch_tanh image embeddings': 8, 'real text tower': 16, 'real embeddings': 8,
+         'T5 bfloat16 hidden states': 8, 'image transform': 8}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
+WORDS = ("a", "red", "bird", "two", "cats", "on", "mat", "painted", "x", "blue", "sky", "of", "the", "dog")
+"""The words a drawn prompt is made of."""
+
+
+def drawn_prompts(seed: int, rows: int = 4) -> list[str]:
+    """`rows` prompts of up to eleven drawn words, the empty one among the draws."""
+    rng = np.random.default_rng([0xC11, seed])
+    return [" ".join(rng.choice(WORDS, rng.integers(0, 12))) for _ in range(rows)]
+
+
+def text_draw(encoder):
+    """Check 1's draw of drawn prompts' token ids and masks, as `encoder` (anything with a
+    `tokenize`) tokenizes them."""
+    def draw(seed):
+        tokens = encoder.tokenize(drawn_prompts(seed))
+        return ({name: np.asarray(tokens[name], np.int32) for name in ("input_ids", "attention_mask")},)
+    return draw
+
+
+def image_draw(directory_or_repo, shape):
+    """Check 1's draw of uint8 images of `shape` through `directory_or_repo`'s own processor."""
+    processor = image_processor(directory_or_repo)
+
+    def draw(seed):
+        images = np.random.RandomState(seed).randint(0, 256, shape, dtype=np.uint8)
+        return ({"pixel_values": processor(images=images, return_tensors="np")["pixel_values"]},)
+    return draw
+
+
+@functools.cache
+def reference_clip(source, dtype):
+    """transformers' CLIPModel over `source`'s weights at `dtype`, float64's the float32 one's twin
+    (`float64_twin`), built under `float64`."""
+    import torch
+    from transformers import CLIPModel as ReferenceCLIP
+
+    from tools.torch_precision import float64_twin
+
+    if dtype == torch.float64:
+        return float64_twin(reference_clip(source, torch.float32))
+    return ReferenceCLIP.from_pretrained(str(source), attn_implementation="eager").to(dtype).eval()
+
+
+def precision(dtype):
+    """transformers at `dtype`: under `float64` for float64, every float32 pin of it widened."""
+    import contextlib
+
+    import torch
+
+    from tools.torch_precision import float64
+
+    return float64() if dtype == torch.float64 else contextlib.nullcontext()
+
+
+def transformers_clip(source, inputs, dtype, names):
+    """transformers' CLIPModel over `source`'s weights at `dtype`, float64 built and run under
+    `float64`: of its text tower's states and pooled row and its text embeddings for `inputs`' token
+    ids and mask, and its image embeddings for their pixel values, the outputs `names`, at `dtype`."""
+    import torch
+
+    model = reference_clip(source, dtype)
+    outputs = {}
+    with precision(dtype), torch.no_grad():
+        if {"last_hidden_state", "pooler_output", "text_embeds"} & set(names):
+            ids, mask = (torch.from_numpy(np.asarray(inputs[name], np.int64))
+                         for name in ("input_ids", "attention_mask"))
+            text = model.text_model(input_ids=ids, attention_mask=mask)
+            outputs.update(last_hidden_state=text.last_hidden_state, pooler_output=text.pooler_output)
+            # `get_text_features`' projection of the pooled row, without running the tower again.
+            outputs["text_embeds"] = model.text_projection(text.pooler_output)
+        if {"image_embeds", "vision_hidden_state", "vision_pooler_output"} & set(names):
+            pixels = torch.from_numpy(np.asarray(inputs["pixel_values"])).to(dtype)
+            vision = model.vision_model(pixel_values=pixels)
+            outputs.update(vision_hidden_state=vision.last_hidden_state,
+                           vision_pooler_output=vision.pooler_output,
+                           image_embeds=model.visual_projection(vision.pooler_output))
+    return {name: outputs[name].numpy() for name in names}
+
+
+def text_tower(encoder):
+    """`encoder`'s text transformer on a draw's token ids and mask: its states and its pooled row."""
+    apply = jax.jit(encoder.transformer.apply)
+
+    def run(inputs):
+        outputs = apply(encoder.params, inputs["input_ids"], inputs["attention_mask"])
+        return {"last_hidden_state": outputs.last_hidden_state, "pooler_output": outputs.pooler_output}
+    return run
+
+
+def assert_as_exact_as_transformers(ours, names, source, draw, label: str) -> None:
+    """Check 1: each of `ours(inputs)`' outputs, `names`, on par with transformers' float32 one from its
+    float64 one over `draw`'s inputs."""
+    import torch
+
+    def theirs(dtype):
+        return as_given(lambda inputs: transformers_clip(source, inputs, dtype, names))
+
+    assert_as_exact(as_given(lambda inputs: {name: np.asarray(value)
+                                             for name, value in ours(inputs).items()}),
+                    theirs(torch.float32), draw, label, seeds=SEEDS[label], truth_fn=theirs(torch.float64))
 
 
 def hidden(encoder, ids, mask) -> np.ndarray:
@@ -112,18 +196,13 @@ def test_translating_inside_a_module_keeps_its_native_parameter_names():
 
 def test_tiny_checkpoint_matches_the_reference():
     """Both towers of a CLIP checkpoint in one file, the text one loaded out of
-    it, run on the reference's own token ids."""
+    it, run on drawn prompts' token ids; on the reference's own, its pooled
+    row is the end of text's state, not the largest id's."""
     expected = reference(TINY)
     encoder = CLIPText.from_pretrained(str(TINY))
-
+    assert_as_exact_as_transformers(text_tower(encoder), ("last_hidden_state", "pooler_output"), TINY,
+                                    text_draw(encoder), "tiny text tower")
     outputs = encoder.transformer.apply(encoder.params, expected["input_ids"], expected["attention_mask"])
-
-    hidden = float(np.max(np.abs(np.asarray(outputs.last_hidden_state, np.float32)
-                                 - expected["last_hidden_state"])))
-    pooled = float(np.max(np.abs(np.asarray(outputs.pooler_output, np.float32)
-                                 - expected["pooler_output"])))
-    assert hidden < TOLERANCE, f"max |hidden state difference| {hidden:.3e}"
-    assert pooled < TOLERANCE, f"max |pooled difference| {pooled:.3e}"
 
     ids = expected["input_ids"]
     rows = np.arange(ids.shape[0])
@@ -145,10 +224,12 @@ def test_the_encoder_loads_and_encodes():
 
     assert np.array_equal(tokens["input_ids"], expected["input_ids"])
     assert np.array_equal(np.asarray(context.mask), expected["attention_mask"])
-    difference = float(np.max(np.abs(np.asarray(context.hidden, np.float32)
-                                     - expected["last_hidden_state"])))
-    assert difference < TOLERANCE, f"max |hidden state difference| {difference:.3e}"
     assert encoder.captions(tokens)[0] == "a red bird"
+
+    def encoded(inputs):
+        return {"last_hidden_state": encoder.encode(encoder.params, inputs).hidden}
+
+    assert_as_exact_as_transformers(encoded, ("last_hidden_state",), TINY, text_draw(encoder), "tiny encode")
 
 
 def test_the_json_fields_rebuild_an_encoder_that_agrees():
@@ -157,10 +238,10 @@ def test_the_json_fields_rebuild_an_encoder_that_agrees():
     equal fields and equal outputs."""
     spec = InputSpec(Field("image", (8, 8, 3)),
                      {"textcontext": Condition(CLIPText.from_pretrained(str(TINY)))})
-    data = spec.to_json()
+    data = to_record(spec, InputSpec)
 
 
-    restored = InputSpec.from_json(data)
+    restored = InputSpec.bound(data)
     assert restored.sample == spec.sample
     encoder, rebuilt = spec.conditions["textcontext"].encoder, restored.conditions["textcontext"].encoder
     tokens = encoder.tokenize(prompts(TINY))
@@ -188,7 +269,7 @@ def test_padding_is_masked_where_the_reference_masks_it():
 
     assert np.array_equal(baseline[real], refilled[real])
     assert np.array_equal(baseline[real], unmasked[real])
-    assert np.max(np.abs(baseline[~real] - unmasked[~real])) > 1.0
+    assert not np.array_equal(baseline[~real], unmasked[~real])
 
 
 def test_attention_stays_causal():
@@ -205,7 +286,7 @@ def test_attention_stays_causal():
     moved = hidden(encoder, changed, mask)
 
     assert np.array_equal(baseline[:, :position], moved[:, :position])
-    assert np.max(np.abs(baseline[:, position] - moved[:, position])) > 0.1
+    assert not (baseline[:, position] == moved[:, position]).all(axis=-1).any()
 
 
 def test_legacy_eos_token_id_pools_the_argmax_row():
@@ -228,36 +309,80 @@ def test_legacy_eos_token_id_pools_the_argmax_row():
 def test_tiny_checkpoint_text_projection_matches_the_reference():
     """`get_text_features` is the pooled row through `text_projection`, which
     the metrics score with; the head is loaded out of the same file."""
-    expected = reference(TINY)
     model = CLIPModel.from_pretrained(str(TINY))
 
-    embeds = model.get_text_features(expected["input_ids"], expected["attention_mask"])
+    def projected(inputs):
+        return {"text_embeds": model.get_text_features(inputs["input_ids"], inputs["attention_mask"])}
 
-    difference = largest_difference(embeds, expected["text_embeds"])
-    assert difference < TOLERANCE, f"max |text embedding difference| {difference:.3e}"
+    assert_as_exact_as_transformers(projected, ("text_embeds",), TINY,
+                                    text_draw(CLIPText.from_pretrained(str(TINY))), "tiny text projection")
 
 
-def test_tiny_checkpoint_image_embeddings_match_the_reference():
-    """The vision tower on the reference's own pixel values, through
+@pytest.mark.parametrize("fringe", [0, 1])
+def test_tiny_checkpoint_image_embeddings_match_the_reference(fringe, tmp_path):
+    """The vision tower on drawn images' pixel values, through
     `visual_projection`. The images are taller than wide, so the processor's
-    resize and centre crop both run, and its pixel values have to be the
-    reference's exactly since it is the reference's own processor."""
+    resize and centre crop both run, and on the reference's own images its
+    pixel values have to be the reference's exactly since it is the
+    reference's own processor."""
     expected = reference(TINY)
-    model = CLIPModel.from_pretrained(str(TINY))
+    source = tmp_path / "clip"
+    shutil.copytree(TINY, source)
+    config = fixture_config(source)
+    config["vision_config"]["image_size"] += fringe
+    (source / "config.json").write_text(json.dumps(config))
+    model = CLIPModel.from_pretrained(str(source))
 
     pixel_values = image_processor(TINY)(
         images=synthetic_images(TINY), return_tensors="np")["pixel_values"]
     assert np.array_equal(pixel_values, expected["pixel_values"])
-    embeds = model.get_image_features(pixel_values)
+    shape = tuple(json.loads((TINY / "prompts.json").read_text())["images"]["shape"])
+    original_draw = image_draw(TINY, shape)
 
-    difference = largest_difference(embeds, expected["image_embeds"])
-    assert difference < TOLERANCE, f"max |image embedding difference| {difference:.3e}"
+    def fringed(pixels):
+        return np.pad(pixels, ((0, 0), (0, 0), (0, fringe), (0, fringe)), constant_values=100)
 
+    def draw(seed):
+        inputs, = original_draw(seed)
+        return ({"pixel_values": fringed(inputs["pixel_values"])},)
+
+    def observed(module, pixels):
+        tower = module.vision_model(pixels)
+        return {"image_embeds": module.visual_projection(tower.pooler_output),
+                "vision_hidden_state": tower.last_hidden_state, "vision_pooler_output": tower.pooler_output}
+
+    forward = jax.jit(lambda pixels: model.module.apply(model.variables, pixels, method=observed))
+    names = ("image_embeds", "vision_hidden_state", "vision_pooler_output")
+    assert_as_exact_as_transformers(lambda inputs: forward(inputs["pixel_values"]), names,
+                                    source, draw,
+                                    "tiny image embeddings")
+
+    pixel_values = fringed(pixel_values)
     baseline = model.module.apply(
         model.variables, pixel_values, method=lambda clip, pixels: clip.vision_model(pixels))
     moved = model.module.apply(model.variables, np.flip(pixel_values, axis=-1),
                                method=lambda clip, pixels: clip.vision_model(pixels))
-    assert np.max(np.abs(np.asarray(baseline.pooler_output) - np.asarray(moved.pooler_output))) > 0.1
+    assert not (np.asarray(baseline.pooler_output) == np.asarray(moved.pooler_output)).all(axis=-1).any()
+
+
+@pytest.mark.parametrize("hidden_act", ["quick_gelu", "gelu", "gelu_pytorch_tanh"])
+def test_a_vision_tower_runs_the_activation_its_config_names(hidden_act, tmp_path):
+    """The vision tower's MLP runs the `hidden_act` its config names, as the text tower's does
+    (`tower_activation`): the tiny checkpoint's image embeddings under each activation are on par
+    with transformers' own float32 ones from its float64 ones over drawn images (check 1)."""
+    copy = tmp_path / "tiny"
+    shutil.copytree(TINY, copy)
+    config = fixture_config(copy)
+    config["vision_config"]["hidden_act"] = hidden_act
+    (copy / "config.json").write_text(json.dumps(config))
+    model = CLIPModel.from_pretrained(str(copy))
+    shape = tuple(json.loads((TINY / "prompts.json").read_text())["images"]["shape"])
+
+    def embedded(inputs):
+        return {"image_embeds": model.get_image_features(inputs["pixel_values"])}
+
+    assert_as_exact_as_transformers(embedded, ("image_embeds",), copy, image_draw(TINY, shape),
+                                    f"{hidden_act} image embeddings")
 
 
 SAFETY_CROP = {"size": {"shortest_edge": 224}, "crop_size": {"height": 224, "width": 224}}
@@ -278,30 +403,33 @@ def test_clip_image_transform_matches_the_reference_processor(config, height, wi
 
     from dew.inputs.diffusion import CLIPImageTransform
 
-    pixels = np.random.RandomState(0).randint(0, 256, (1, height, width, 3), dtype=np.uint8)
+    processor, transform = CLIPImageProcessorPil(**config), CLIPImageTransform.from_config(config)
+    resized = CLIPImageProcessorPil(**config, do_rescale=False, do_normalize=False)
 
-    expected = CLIPImageProcessorPil(**config)(list(pixels), return_tensors="np")["pixel_values"]
-    actual = np.asarray(CLIPImageTransform.from_config(config)(pixels))
+    def draw(seed):
+        return (np.random.RandomState(seed).randint(0, 256, (1, height, width, 3), dtype=np.uint8),)
 
-    np.testing.assert_allclose(actual, expected, atol=1e-6)
+    def normalized(pixels):
+        """The processor's resized and cropped integers, rescaled and normalized in float64."""
+        crop = np.asarray(resized(list(np.asarray(pixels, np.uint8)), return_tensors="np")["pixel_values"],
+                          np.float64)
+        mean, std = (np.asarray(value, np.float64)[:, None, None] for value in (processor.image_mean,
+                                                                                processor.image_std))
+        return (crop * processor.rescale_factor - mean) / std
 
-
-def real_checkpoint_is_available() -> bool:
-    if os.environ.get("DEW_NETWORK_TESTS") == "1":
-        return True
-    from huggingface_hub import try_to_load_from_cache
-    repo = json.loads((REAL / "prompts.json").read_text())["repo"]
-    return isinstance(try_to_load_from_cache(repo, "model.safetensors"), str)
+    assert_as_exact(as_given(lambda pixels: np.asarray(transform(pixels))),
+                    as_given(lambda pixels: processor(list(pixels), return_tensors="np")["pixel_values"]),
+                    draw,
+                    f"image transform {height}x{width}", seeds=SEEDS['image transform'], truth_fn=normalized)
 
 
 @pytest.mark.network
-@pytest.mark.skipif(not real_checkpoint_is_available(),
-                    reason="openai/clip-vit-large-patch14 is neither cached nor "
-                           "DEW_NETWORK_TESTS=1")
 def test_the_real_checkpoint_matches_the_reference():
     """The flagship: twelve layers of clip-vit-large-patch14, fp32, from the
     checkpoint's own safetensors, against what transformers computes for the
-    same prompts."""
+    same prompts. Its outlier channels reach 33, where an fp32 sum carries
+    errors of 2.8e-4: transformers' own float32 states lie that far from its
+    float64 ones, and the rule holds Dew to them."""
     expected = reference(REAL)
     repo = json.loads((REAL / "prompts.json").read_text())["repo"]
     encoder = CLIPText.from_pretrained(repo)
@@ -309,56 +437,60 @@ def test_the_real_checkpoint_matches_the_reference():
     tokens = encoder.tokenize(prompts(REAL))
     assert np.array_equal(np.asarray(tokens["input_ids"], np.int32),
                           expected["input_ids"])
-    outputs = encoder.transformer.apply(encoder.params, tokens["input_ids"],
-                                        tokens["attention_mask"])
-
-    hidden = float(np.max(np.abs(np.asarray(outputs.last_hidden_state, np.float32)
-                                 - expected["last_hidden_state"])))
-    pooled = float(np.max(np.abs(np.asarray(outputs.pooler_output, np.float32)
-                                 - expected["pooler_output"])))
-    assert hidden < REAL_TOLERANCE, f"max |hidden state difference| {hidden:.3e}"
-    assert pooled < REAL_TOLERANCE, f"max |pooled difference| {pooled:.3e}"
+    assert_as_exact_as_transformers(text_tower(encoder), ("last_hidden_state", "pooler_output"), repo,
+                                    text_draw(encoder), "real text tower")
 
 
 @pytest.mark.network
-@pytest.mark.skipif(not real_checkpoint_is_available(),
-                    reason="openai/clip-vit-large-patch14 is neither cached nor "
-                           "DEW_NETWORK_TESTS=1")
 def test_the_real_checkpoint_embeddings_match_the_reference():
     """Both heads of clip-vit-large-patch14, the twenty-four vision layers
     behind one of them, against what transformers computes for the same
-    prompts and the same synthetic images."""
-    expected = reference(REAL)
+    drawn prompts and drawn images (check 1)."""
     repo = json.loads((REAL / "prompts.json").read_text())["repo"]
     model = CLIPModel.from_pretrained(repo)
 
-    pixel_values = image_processor(repo)(
-        images=synthetic_images(REAL), return_tensors="np")["pixel_values"]
-    image_embeds = model.get_image_features(pixel_values)
-    text_embeds = model.get_text_features(expected["input_ids"], expected["attention_mask"])
+    shape = tuple(json.loads((REAL / "prompts.json").read_text())["images"]["shape"])
+    draw = image_draw(repo, shape)
 
-    image = largest_difference(image_embeds, expected["image_embeds"])
-    text = largest_difference(text_embeds, expected["text_embeds"])
-    assert image < REAL_TOLERANCE, f"max |image embedding difference| {image:.3e}"
-    assert text < REAL_TOLERANCE, f"max |text embedding difference| {text:.3e}"
+    def embedded(inputs):
+        return {"image_embeds": model.get_image_features(inputs["pixel_values"]),
+                "text_embeds": model.get_text_features(inputs["input_ids"], inputs["attention_mask"])}
+
+    from transformers import CLIPTokenizer
+
+    # The checkpoint's tokenizer alone, padded and truncated as `CLIPText.tokenize` does.
+    tokenizer = CLIPTokenizer.from_pretrained(repo)
+    prompts_of = text_draw(SimpleNamespace(tokenize=lambda texts: tokenizer(
+        texts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True,
+        return_tensors="np")))
+
+    def drawn(seed):
+        # Drawn images and drawn prompts, each its own draw of the seed.
+        return ({**draw(seed)[0], **prompts_of(seed)[0]},)
+
+    assert_as_exact_as_transformers(embedded, ("image_embeds", "text_embeds"), repo, drawn, "real embeddings")
 
 
 def test_a_t5_tower_computes_in_its_compute_dtype_as_the_reference_does():
     """FP32 masters under `dtype=bfloat16`: the token and relative-bias tables
     are read in bfloat16, as transformers' T5 reads its own in the dtype the
-    model runs in, so the residual stream every block adds to is bfloat16
-    (the tables read at their FP32 storage had kept it FP32). The last hidden
-    state is as exact as transformers' bfloat16 encoder from its float64 one
-    (tests/reference_error.py's rule); observed 6.6e-3 and 6.8e-3 RMS."""
-    import jax
+    model runs in, so the residual stream every block adds to is bfloat16, and
+    every site the forward calls returns bfloat16.
+    Every position of the last hidden state the conditioner hands on, padded
+    rows included (the mask holds keys out, not rows), is on par with
+    transformers' bfloat16 encoder from its float64 one built and run under
+    `float64`, over drawn prompts (check 1)."""
     import jax.numpy as jnp
     import torch
     from transformers import T5EncoderModel
+
 
     directory = Path(__file__).resolve().parent / "fixtures/t5/tiny"
     expected = reference(directory)
     ids, mask = expected["input_ids"], expected["attention_mask"]
     encoder = T5Text.from_pretrained(str(directory), dtype=jnp.bfloat16)
+    # Every site the forward calls returns bfloat16: the tables read at their FP32 storage had kept
+    # the residual stream FP32, which only beats the bfloat16 reference.
     _, state = encoder.transformer.apply(encoder.params, jnp.asarray(ids), jnp.asarray(mask),
                                          capture_intermediates=True, mutable=["intermediates"])
     sites = {name: site for name, site in state["intermediates"].items() if name != "__call__"}
@@ -368,14 +500,26 @@ def test_a_t5_tower_computes_in_its_compute_dtype_as_the_reference_does():
             assert output.dtype == jnp.bfloat16, name
 
     def transformers(dtype):
-        model = T5EncoderModel.from_pretrained(directory, dtype=dtype).eval()
-        with torch.no_grad():
-            return model(input_ids=torch.from_numpy(ids.astype(np.int64)),
-                         attention_mask=torch.from_numpy(mask.astype(np.int64))).last_hidden_state.float().numpy()
+        with precision(dtype):
+            model = T5EncoderModel.from_pretrained(directory, dtype=dtype).eval()
 
-    real = mask.astype(bool)
-    assert_as_exact_as_the_reference(hidden(encoder, ids, mask)[real], transformers(torch.bfloat16)[real],
-                                     transformers(torch.float64)[real], "T5 bfloat16 hidden states")
+        @as_given
+        def run(inputs):
+            ids, mask = (torch.from_numpy(np.asarray(inputs[name], np.int64))
+                         for name in ("input_ids", "attention_mask"))
+            with precision(dtype), torch.no_grad():
+                states = model(input_ids=ids, attention_mask=mask)
+            states = states.last_hidden_state
+            # bfloat16's values held in float32, which holds them exactly.
+            return {"last_hidden_state": (states.float() if dtype == torch.bfloat16 else states).numpy()}
+        return run
+
+    @as_given
+    def ours(inputs):
+        return {"last_hidden_state": hidden(encoder, inputs["input_ids"], inputs["attention_mask"])}
+
+    assert_as_exact(ours, transformers(torch.bfloat16), text_draw(encoder), "T5 bfloat16 hidden states",
+                    seeds=SEEDS['T5 bfloat16 hidden states'], truth_fn=transformers(torch.float64))
 
 
 @pytest.mark.parametrize("kind", ["clip-text", "clip", "t5"])

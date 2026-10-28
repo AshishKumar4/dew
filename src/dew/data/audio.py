@@ -7,12 +7,14 @@ A sound file reads as a video's track does, so a pure-audio dataset is
 from __future__ import annotations
 
 import dataclasses
-from typing import Literal
+from collections.abc import Mapping
+from typing import ClassVar, Literal
 
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew.batch import Batch
+from dew.data.facts import shaped, unshaped
 from dew.data.pipeline import Rejected
 from dew.data.video import local_file, window
 
@@ -35,6 +37,19 @@ class DecodeAudio(grain.MapTransform):
     rejects: bool = True
     """Whether a file that does not read, or under `missing="reject"` lacks sound, is dropped
     (`filter_map`) rather than an error."""
+    external: ClassVar[bool] = True
+    """A file a record names by path is read from storage (`dew.data.pipeline.External`)."""
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Mono samples at `sample_rate` over the window and `context` either side, under `to`, with
+        their validity: `audio_seconds` long."""
+        seconds = facts.get("seconds")
+        if not isinstance(seconds, (int, float)):
+            return unshaped(facts, self.to, f"{self.to}_valid")
+        heard = seconds + 2 * self.context
+        samples = round(heard * self.sample_rate)
+        return {**shaped(shaped(facts, self.to, [samples]), f"{self.to}_valid", [samples]),
+                "sample_rate": self.sample_rate, "audio_seconds": heard}
 
     def __post_init__(self) -> None:
         if self.missing not in ("reject", "silence"):

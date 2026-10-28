@@ -8,19 +8,21 @@ directory, so the whole load is checked against its transformers logits.
 """
 
 import json
+import multiprocessing
+import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import jax
 import ml_dtypes
 import numpy as np
 import pytest
+import torch
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained, sources
-
-torch = pytest.importorskip("torch")
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "hf" / "mamba2-tiny"
 
@@ -62,6 +64,66 @@ def test_a_pickle_checkpoint_converts_once_and_then_loads_without_torch(tmp_path
     assert float(np.max(np.abs(logits(first) - reference))) < 1e-5
     assert len(conversions) == 1 and sorted((cache / "dew" / "converted").iterdir()) == conversions
     assert jax.tree.all(jax.tree.map(np.array_equal, first.variables, second.variables))
+
+
+def _converting(root: str, worker: int, rounds: int, barrier) -> None:
+    """One pool process: each round, once every process is at the barrier, convert and read that round's
+    pickle (`sources.tensor_file`, as a release's readout loads), each failure to find its weights written
+    to the worker's own report. Any other failure aborts the barrier, so no peer waits on this process."""
+    os.environ["XDG_CACHE_HOME"] = str(Path(root) / "cache")
+    from dew.interop import sources
+
+    missing = []
+    try:
+        for round_ in range(rounds):
+            barrier.wait()
+            try:
+                sources.tensor_file(Path(root) / f"release-{round_}" / "readout_head.pt")
+            except FileNotFoundError as failure:
+                missing.append(f"{round_}: {failure}")
+    except BaseException:
+        barrier.abort()
+        raise
+    (Path(root) / f"report-{worker}.json").write_text(json.dumps(missing))
+
+
+def test_processes_converting_one_pickle_at_once_each_read_its_weights():
+    """A pool's processes loading one release's pickle at once each convert it and read the conversion,
+    round after round, under a cache on the filesystem Dew's own cache lies on (a pool's ~/.cache): an
+    overlay in CI, where a listing of the folder another process was replacing a file in found no weights
+    (eight processes, forty rounds: some forty misses before the conversion was published whole, none
+    under a tmpfs). Each conversion is published whole, so every read finds its weights."""
+    from dew.cache import dew_cache_dir
+
+    rounds, workers = 8, 8
+    # Beside Dew's own cache, on its filesystem: the home directory's unless XDG_CACHE_HOME moves it.
+    caches = Path(dew_cache_dir()).parent
+    caches.mkdir(parents=True, exist_ok=True)
+    root = tempfile.mkdtemp(dir=caches, prefix="dew-pickle-race-")
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(workers)
+    pool = []
+    try:
+        for round_ in range(rounds):
+            release = Path(root) / f"release-{round_}"
+            release.mkdir()
+            torch.save({f"w{index}": torch.randn(64, 64) for index in range(8)}, release / "readout_head.pt")
+        for worker in range(workers):
+            pool.append(context.Process(target=_converting, args=(root, worker, rounds, barrier)))
+            pool[-1].start()
+        for process in pool:
+            process.join()
+        assert [process.exitcode for process in pool] == [0] * workers
+        missing = [line for worker in range(workers)
+                   for line in json.loads((Path(root) / f"report-{worker}.json").read_text())]
+        assert not missing, missing[:3]
+    finally:
+        barrier.abort()
+        for process in pool:
+            if process.is_alive():
+                process.terminate()
+            process.join()
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_sharded_pickles_read_through_their_index_in_their_stored_dtype(tmp_path, cache):

@@ -2,7 +2,7 @@
 
 This page records the original API design and how it was built. The statistics-first C01/C02 cutover replaced its scalar-loss, MultiSteps, mutable-router and checkpoint-field examples. Its registry decorators and name records were later replaced by import paths and static aliases (`dew.registry`). For contracts you can run, read the [current core API](../reference/core-api.md) and the [objective guide](../concepts/objectives.md).
 
-Design record, 2026-09-03. The code blocks are design sketches, not runnable code. The examples describe the revisions they cite. [Training](training.md), [data](data.md) and [post-training](post-training.md) define the binding topic contracts; the [roadmap](../roadmap.md) owns implementation and qualification work.
+Design record, 2026-09-03. The code blocks are design sketches, not runnable code. The examples describe the revisions they cite.
 
 ## 0. The decisions
 
@@ -36,7 +36,7 @@ The seams named in `CONTRIBUTING.md:9` are crossed in these places, all confirme
 | The trainer publishes and deletes | `save()` pushes to the W&B registry, ranks the run against the W&B API and removes the local checkpoint (`objective_trainer.py:531-565, 388-529`). |
 | Constructors have effects | `SimpleTrainer.__init__` enables the compile cache, builds the mesh, opens W&B, downloads an artifact, creates the Orbax manager and restores state (`trainer.py:89-217`). `ConditionalInputConfig.__post_init__` runs the encoder (`inputs/__init__.py:26-31`). |
 | Data is a dict protocol | Six loaders return `{"train", "train_len", "val", "val_len", "local_batch_size", "global_batch_size"}`; `fit` reads them by name (`trainer.py:599-604`). |
-| Sharding is a string table | `DEFAULT_LOGICAL_PARAM_AXES` keyed on trailing module names (`training/distributed.py:63-91`), read again by Muon grouping (`training/optim.py:95`). A rename in a model file changes both, silently. |
+| Sharding is a string table | `DEFAULT_LOGICAL_PARAM_AXES` keyed on trailing module names (`training/distributed.py:63-91`), read again by Muon grouping (`optim.py:95`). A rename in a model file changes both, silently. |
 | One fact, two owners | The training schedule holds the transform for min-SNR (`schedules/common.py:22,58`) while the objective receives the transform again; presets return a 3-tuple (`transforms.py:157`). Gradient accumulation lives in `OptimConfig`, `optax.MultiSteps` and the trainer. |
 | Randomness is an object | `RandomMarkovState` (`random_state.py`) appears in schedules, every sampler, the objective and the trainer state, and is checkpointed. |
 
@@ -71,7 +71,6 @@ class Registry(Mapping[str, T]):
 models     = Registry[type[nn.Module]]("model")
 presets    = Registry[type[Preset]]("preset")
 samplers   = Registry[type[Solver]]("sampler")
-datasets   = Registry[type[Recipe]]("dataset")
 encoders   = Registry[type[ConditionEncoder]]("encoder")
 metrics    = Registry[Callable[..., Metric]]("metric")
 objectives = Registry[type[Objective]]("objective")
@@ -107,6 +106,8 @@ class Aux:
     metrics: dict[str, jax.Array]
     variables: Variables | None = None     # non-parameter collections to write back
 ```
+
+`Variables` and `Batch`, the two open mappings, are `dew.batch`'s, the batch contract every layer imports from one module: a variables tree and its frozen split (`FROZEN`, `merge`), a batch of named arrays, and the rows and tokens it carries (`VALID_ROWS`, `EXAMPLE_ROWS`, `padded_rows`, `Coordinates`). The mesh's axis names, its default rule table and the axes a batch's rows split over (`MESH_AXES`, `BATCH_AXES`, `DEFAULT_RULES`, `logical_spec`, `row_axes`, `batch_axes`) are `dew.mesh`'s.
 
 `metrics`, `dynamic_scale`, `rngs`, `best_loss` and `epoch` leave the checkpoint (decision 7). `dynamic_scale` becomes a trainer setting and its state a trainer-owned leaf outside the objective's tree.
 
@@ -153,7 +154,7 @@ state = trainer.fit(data, steps=100_000, log_every=100, eval_every=2_000,
                     checkpoint_every=5_000, metrics=(metrics["fid"](), metrics["clip_score"]()))
 ```
 
-The trainer keeps what `CONTRIBUTING.md:9` gives it: mesh, compiled step, EMA, checkpoints, logging. The compiled step is `objective_trainer.py:237-299` with `Step` in place of positional `ema_params` and `rng`, plus the `Aux.variables` write-back. `fit` is step-based; `steps = epochs * data.steps_per_epoch` is a recipe's line. Publishing becomes `dew.io.publish(checkpoints.latest(), ...)`, called by a recipe after `fit`. Validation exceptions propagate (fixed in `6b747dc`).
+The trainer keeps what `CONTRIBUTING.md:9` gives it: mesh, compiled step, EMA, checkpoints, logging. The compiled step is `objective_trainer.py:237-299` with `Step` in place of positional `ema_params` and `rng`, plus the `Aux.variables` write-back. `fit` is step-based; `steps = data.epoch_steps(epochs)` is a recipe's line, counting the step an epoch's short last batch takes where its order reads on (`Loader.tail`). Publishing becomes `dew.io.publish(checkpoints.latest(), ...)`, called by a recipe after `fit`. Validation exceptions propagate (fixed in `6b747dc`).
 
 ```python
 class Tracker(Protocol):
@@ -240,14 +241,15 @@ class Dataset:
     @property
     def steps_per_epoch(self) -> int | None: ...
 
-from dew.data import TFDS
-from dew.config.data import ImageData, loader
+from dew.data import TFDS, presets
+from dew.data.compile import compile
 
-data = loader(ImageData(source=TFDS("oxford_flowers102"), image_size=128),
-            batch=32, read="memory", provision=True)
+train, val = TFDS("oxford_flowers102").holdout(split="validation")
+data = compile(train.shuffle(0).repeat().pipe(presets.images, 128, batch=32, augment=True),
+               validation=val.pipe(presets.images, 128, batch=32), read="memory", provision=True)
 ```
 
-One registry replaces `datasetMap`, `onlineDatasetMap` and `mediaDatasetMap` (`data/registry.py`). The per-process batch size is computed in one place that raises on `batch % processes` (done in `f3ea98b`). A stream without `get_state` trains, and its resume is refused unless it declares replay (`replayed`, `from_iter(replay=True)`).
+The chain replaces `datasetMap`, `onlineDatasetMap` and `mediaDatasetMap`: a store and the presets and steps it is piped through ([the data design](data.md)). The per-process batch size is computed in one place that raises on `batch % processes` (done in `f3ea98b`). A stream without `get_state` trains, and its resume is refused unless it declares replay (`replayed`, `from_iter(replay=True)`).
 
 ### 3.8 Distributed
 
@@ -269,11 +271,53 @@ Same table and the same `logical_axes` and `_mesh_spec` machinery (`training/dis
 ### 3.10 Inference
 
 ```python
-pipe = pipelines.TextToImage.from_run("runs/flowers")            # manifest and checkpoint, EMA by default
-pipe = pipelines.TextToImage.from_pretrained("user/flowers-dit")  # hub export, same manifest
+pipe = inference.TextToImage.from_run("runs/flowers")  # manifest and checkpoint, EMA by default
+pipe = dew.pipeline("user/flowers-dit")                # hub export, same manifest
 images = pipe(["a water lily", "a sunflower"], steps=40, guidance=4.0, sampler=samplers.Heun(), key=key)
 text = generate(model, params, prompt, 300, key=key, sampling=Sampling(temperature=0.8)).tokens
 ```
+
+A loaded model is ready to run. `Pretrained.load` without a mesh or layout places its variables on JAX's
+default device, as a `jnp` array is placed, one leaf at a time; with a mesh it places them there.
+Keeping them on the host is an explicit request (`on_host=True`), for a caller that places them
+itself, such as an export or a run that trains the source. A run that starts from a source reads it where
+its start keeps it (`TrainerConfig.source_placement`). A source the run keeps frozen, under an adapter,
+loads onto the trainer's mesh, sharded as the layout shards the state, and the start shares those arrays.
+A decoder's leaves are read shard by shard; a quantized or packed checkpoint, a tower or a projector is
+decoded whole on the host first. A source the run trains stays on the host, since the start copies what
+it trains; so does one for a state that lives on the host or keeps its frozen tree whole. A run that
+resumes from its own checkpoint reads no weights.
+
+`Pretrained.load(source, text_only=True)` takes a multimodal wrapper's language model alone, as its
+text family's own checkpoint states it: the wrapper's text config typed as its text model, with the
+wrapper's head policy, dtype, modeling overrides and generation ids, and the language model's tensors
+under the text family's names. No tower, projector or audio encoder is built or read; the bundle is a
+decoder with the tokenizer, saves as that text checkpoint, and names no Hub origin, since the id alone
+loads the wrapper. A decoder or a fallback source is text already and loads as it is. A diffusion
+pipeline, a family that reads its media bundle as one decoder (DeepSeek-V4.1), and a quantized wrapper
+are refused. A checkpoint that holds none of the prediction depths its config names loads as its trunk;
+one holding some of them must hold all. `prediction_depths` chooses how many the load builds: None
+the ones the checkpoint holds, 0 none, `n` the first `n`; a DSpark drafter, whose stages draft as
+one with its heads on the last, is kept whole or at 0 not at all. The load reads the source as the checkpoint of those depths alone, its config's counts cut
+before routing and the others' tensors dropped before any is read, and saves as that checkpoint,
+with or without `text_only`. A run passes both through `--source.text-only` and
+`--source.prediction-depths` (`RunConfig.source`), whatever kind of run it is, and the load's
+`modeling_overrides` through `--source.attention`, each layer kind causal or block_bidirectional;
+a diffusion pipeline, which no override reaches, refuses them.
+
+Serving is one engine of kinds (`dew.inference.Engine`). A kind (`Kind`) admits waiting requests
+within its own bounds, runs them with one bounded device call a `step`, and settles each request's
+`Timed` future. The engine steps each busy kind once a turn from one thread, so a long queue of one
+kind never holds another back, and it orders a kind's weight reload with its steps. Two kinds ship:
+autoregressive generation's `Server`, a slot scheduler over a resident cache, and `ScoringServer`, a
+task answered by forward passes over its requests' rows. A scoring task (`Scoring`) holds no
+weights. It lays a request out as rows at submission (`admit`, refusing one alone, a ValueError), says
+which rows one pass holds (`fits`), runs a pass over the weights the server hands it (`forward`), and
+reads a request's answer off its rows' outputs (`answer`). The server runs one pass a step over the
+waiting rows oldest first, so a request whose rows outrun a pass carries the rest to the next turn.
+It binds each request to the (task, weights) pair that admitted it, so a reload swaps both at once
+for what is submitted after. `Decide.scoring()` gives a decision task as such a task, and
+`Decide.systemone` over a list of bodies is served by the same server.
 
 ## 4. The three examples in this API
 
@@ -358,7 +402,7 @@ The mixer keeps its recurrent state in the `cache` collection, exactly as the KV
 | --- | --- |
 | Alternating or multi-optimizer updates (GAN, actor-critic) | Not one `loss`. `Trainer(step=make_my_step)` replaces the compiled step and is the one documented place for a custom step. |
 | Tensor or sequence parallel | `MeshSpec(tensor=N)` and rules are cheap; correct TP needs `with_sharding_constraint` on activations inside each model. Per-architecture work. |
-| Pipeline parallel | Out of scope. |
+| Pipeline parallel | `MeshSpec(stage=N)` runs GPipe over a stack of like layers (a decoder's, a DiT's, a JEPA's, a UNet level's transformers; `decoder_stack.run_pipeline`); everything outside the stacks runs on every stage, and no 1F1B schedule is built. |
 | Non-grain data | `Dataset.train` is any callable returning an iterator; without `get_state` the run cannot checkpoint its position and `fit` says so. |
 
 ## 8. How to build against this design
@@ -368,7 +412,7 @@ The mixer keeps its recurrent state in the `cache` collection, exactly as the KV
 - A new sampler is a `Solver` with a `step`. It states which schedules it integrates.
 - A new metric is a function `(artifact, batch) -> value` behind `@metrics(name)`.
 - A new tracker implements `Tracker` and registers renderers with `singledispatch`.
-- A new recipe is a frozen dataclass implementing Recipe.pipelines(), registered as a dataset alias. All execution goes through Pipeline and compile.
+- A new data preset is a function that takes a dataset, then its settings, and returns a dataset (`dew.data.presets`); a run pipes its store through it. All execution goes through Pipeline and compile.
 
 ## 10. What may be condensed
 

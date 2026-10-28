@@ -6,6 +6,7 @@ configuration and checkpoint files; no external model implementation runs.
 """
 
 import json
+import logging
 import os
 from collections.abc import Sequence
 from functools import partial
@@ -13,13 +14,17 @@ from pathlib import Path
 from typing import Literal
 
 import flax.linen as nn
-import jax
 import jax.numpy as jnp
 import numpy as np
+from flax.typing import Dtype
 
-from dew.interop.weights import ParamTree, translate_parameters
-from dew.nn.attention import GroupNorm, projected_heads, projected_output, scaled_dot_product_attention
+from dew.interop.weights import ParamTree, indexed_path, stored_shape, translate_parameters
+from dew.nn.attention import GroupNorm, NormalAttention
+from dew.nn.autoencoders.api import check_class
+from dew.nn.blocks import ResidualBlock, Upsample
 from dew.nn.conv import Conv
+
+_log = logging.getLogger(__name__)
 
 
 def _conv(features: int, dtype, name: str) -> Conv:
@@ -27,28 +32,11 @@ def _conv(features: int, dtype, name: str) -> Conv:
     return Conv(features, (3, 3), strides=(1, 1), padding=((1, 1), (1, 1)), dtype=dtype, name=name)
 
 
-class FlaxUpsample2D(nn.Module):
-    """Double each spatial axis by nearest-neighbour resize, then a 3x3 conv."""
-
-    in_channels: int
-    dtype: jnp.dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, hidden_states):
-        batch, height, width, channels = hidden_states.shape
-        hidden_states = jax.image.resize(
-            hidden_states,
-            shape=(batch, height * 2, width * 2, channels),
-            method="nearest",
-        )
-        return _conv(self.in_channels, self.dtype, "conv")(hidden_states)
-
-
 class FlaxDownsample2D(nn.Module):
     """Halve each spatial axis with a stride-2 3x3 conv, padded on the far side."""
 
     in_channels: int
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, hidden_states):
@@ -57,57 +45,37 @@ class FlaxDownsample2D(nn.Module):
                     name="conv")(jnp.pad(hidden_states, pad_width=pad))
 
 
-class FlaxResnetBlock2D(nn.Module):
-    """Run two group-normed 3x3 convolutions and add the input back, through
-    a 1x1 convolution when the block changes the channel count."""
-
-    in_channels: int
-    out_channels: int
-    groups: int = 32
-    dtype: jnp.dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, hidden_states):
-        residual = hidden_states
-        hidden_states = GroupNorm(self.groups, activation=nn.swish, dtype=self.dtype,
-                                  name="norm1")(hidden_states)
-        hidden_states = _conv(self.out_channels, self.dtype, "conv1")(hidden_states)
-        hidden_states = GroupNorm(self.groups, activation=nn.swish, dtype=self.dtype,
-                                  name="norm2")(hidden_states)
-        hidden_states = _conv(self.out_channels, self.dtype, "conv2")(hidden_states)
-        if self.in_channels != self.out_channels:
-            residual = Conv(self.out_channels, kernel_size=(1, 1), strides=(1, 1), padding="VALID",
-                            dtype=self.dtype, name="conv_shortcut")(residual)
-        return hidden_states + residual
+def _resnet(features: int, groups: int, dtype, name: str | None = None) -> ResidualBlock:
+    """An AutoencoderKL resnet: the shared residual block called without a time
+    embedding, with diffusers' norms (1e-6, then SiLU) and its 1x1 shortcut
+    under the checkpoint's `conv_shortcut`."""
+    return ResidualBlock(features, norm_groups=groups, norm_epsilon=1e-6, dtype=dtype,
+                         shortcut="conv_shortcut", name=name)
 
 
 class FlaxAttentionBlock(nn.Module):
     """Attend over an image's pixels as a sequence, with a residual.
 
     One head as wide as the channels, which is what every AutoencoderKL
-    mid-block runs, through the shared attention core
-    (`dew.nn.attention.scaled_dot_product_attention`), which picks the kernel
-    and runs the softmax in fp32. Its logits are scaled by 1/sqrt(channels),
-    the scale diffusers splits over the query and the key: the same function,
-    rounded in another order.
+    mid-block runs, as an ordinary attention (`NormalAttention`) whose
+    projections keep the block's own flat `query/key/value/proj_attn` and
+    share its scope. Its logits are scaled by 1/sqrt(channels), the scale
+    diffusers splits over the query and the key: the same function, rounded
+    in another order.
     """
 
     channels: int
     num_groups: int = 32
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
-    @nn.compact
+    def setup(self):
+        self.group_norm = GroupNorm(self.num_groups, dtype=self.dtype)
+        self.attention = NormalAttention(self.channels, 1, self.channels, dtype=self.dtype, flat=True,
+                                         names=("query", "key", "value", "proj_attn"))
+        nn.share_scope(self, self.attention)
+
     def __call__(self, hidden_states):
-        residual = hidden_states
-        batch, height, width, channels = hidden_states.shape
-        hidden_states = GroupNorm(self.num_groups, dtype=self.dtype, name="group_norm")(hidden_states)
-        hidden_states = hidden_states.reshape((batch, height * width, channels))
-        query, key, value = (projected_heads(hidden_states, name, 1, self.channels, flat=True,
-                                             dtype=self.dtype)
-                             for name in ("query", "key", "value"))
-        hidden_states = projected_output(scaled_dot_product_attention(query, key, value), "proj_attn",
-                                         self.channels, flat=True, dtype=self.dtype)
-        return hidden_states.reshape((batch, height, width, channels)) + residual
+        return self.attention(self.group_norm(hidden_states)) + hidden_states
 
 
 class _Level(nn.Module):
@@ -115,23 +83,22 @@ class _Level(nn.Module):
     only the first changing the channel count, then the level's resampling,
     `downsamplers_0` or `upsamplers_0`, which the last level does without."""
 
-    in_channels: int
     out_channels: int
     num_layers: int
     groups: int
     resample: Literal["down", "up"] | None
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, hidden_states):
         for index in range(self.num_layers):
-            hidden_states = FlaxResnetBlock2D(self.in_channels if index == 0 else self.out_channels,
-                                              self.out_channels, self.groups, self.dtype,
-                                              name=f"resnets_{index}")(hidden_states)
+            hidden_states = _resnet(self.out_channels, self.groups, self.dtype,
+                                    f"resnets_{index}")(hidden_states)
         if self.resample == "down":
             return FlaxDownsample2D(self.out_channels, dtype=self.dtype, name="downsamplers_0")(hidden_states)
         if self.resample == "up":
-            return FlaxUpsample2D(self.out_channels, dtype=self.dtype, name="upsamplers_0")(hidden_states)
+            return Upsample(self.out_channels, 2, dtype=self.dtype, conv="conv",
+                            name="upsamplers_0")(hidden_states)
         return hidden_states
 
 
@@ -141,16 +108,15 @@ class FlaxUNetMidBlock2D(nn.Module):
 
     in_channels: int
     resnet_groups: int = 32
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, hidden_states):
-        resnet = partial(FlaxResnetBlock2D, self.in_channels, self.in_channels, self.resnet_groups,
-                         self.dtype)
-        hidden_states = resnet(name="resnets_0")(hidden_states)
+        resnet = partial(_resnet, self.in_channels, self.resnet_groups, self.dtype)
+        hidden_states = resnet("resnets_0")(hidden_states)
         hidden_states = FlaxAttentionBlock(self.in_channels, self.resnet_groups, self.dtype,
                                            name="attentions_0")(hidden_states)
-        return resnet(name="resnets_1")(hidden_states)
+        return resnet("resnets_1")(hidden_states)
 
 
 class FlaxEncoder(nn.Module):
@@ -165,14 +131,14 @@ class FlaxEncoder(nn.Module):
     block_out_channels: Sequence[int] = (64,)
     layers_per_block: int = 2
     norm_num_groups: int = 32
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, sample):
         channels = self.block_out_channels
         sample = _conv(channels[0], self.dtype, "conv_in")(sample)
         for index, width in enumerate(channels):
-            sample = _Level(channels[max(index - 1, 0)], width, self.layers_per_block, self.norm_num_groups,
+            sample = _Level(width, self.layers_per_block, self.norm_num_groups,
                             "down" if index != len(channels) - 1 else None, self.dtype,
                             name=f"down_blocks_{index}")(sample)
         sample = FlaxUNetMidBlock2D(channels[-1], self.norm_num_groups, self.dtype, name="mid_block")(sample)
@@ -192,7 +158,7 @@ class FlaxDecoder(nn.Module):
     block_out_channels: Sequence[int] = (64,)
     layers_per_block: int = 2
     norm_num_groups: int = 32
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, sample):
@@ -200,8 +166,8 @@ class FlaxDecoder(nn.Module):
         sample = _conv(channels[0], self.dtype, "conv_in")(sample)
         sample = FlaxUNetMidBlock2D(channels[0], self.norm_num_groups, self.dtype, name="mid_block")(sample)
         for index, width in enumerate(channels):
-            sample = _Level(channels[max(index - 1, 0)], width, self.layers_per_block + 1,
-                            self.norm_num_groups, "up" if index != len(channels) - 1 else None, self.dtype,
+            sample = _Level(width, self.layers_per_block + 1, self.norm_num_groups,
+                            "up" if index != len(channels) - 1 else None, self.dtype,
                             name=f"up_blocks_{index}")(sample)
         sample = GroupNorm(self.norm_num_groups, activation=nn.swish, dtype=self.dtype,
                            name="conv_norm_out")(sample)
@@ -209,6 +175,7 @@ class FlaxDecoder(nn.Module):
 
 
 _VAE_ATTENTION = {"to_q": "query", "to_k": "key", "to_v": "value"}
+_FLAX_ATTENTION = {flax: torch for torch, flax in _VAE_ATTENTION.items()}
 
 
 def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
@@ -223,28 +190,11 @@ def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
     """
     parts = torch_name.split(".")
     leaf = "bias" if parts[-1] == "bias" else ("scale" if rank == 1 else "kernel")
-    parts = parts[:-1]
-    path = []
-    index = 0
-    while index < len(parts):
-        name = parts[index]
-        following = parts[index + 1] if index + 1 < len(parts) else None
-        if name == "to_out":
-            # to_out.0 is the projection; there is no second entry.
-            path.append("proj_attn")
-            index += 2
-            continue
-        if name in _VAE_ATTENTION:
-            path.append(_VAE_ATTENTION[name])
-            index += 1
-            continue
-        if following is not None and following.isdigit():
-            path.append(f"{name}_{following}")
-            index += 2
-            continue
-        path.append(name)
-        index += 1
-    return (*path, leaf)
+    names = parts[:-1]
+    # to_out.0 is the projection, the module's last; there is no second entry.
+    if names[-2:] == ["to_out", "0"]:
+        names[-2:] = ["proj_attn"]
+    return (*indexed_path(_VAE_ATTENTION.get(name, name) for name in names), leaf)
 
 
 def translate_vae_weights(torch_tensors: ParamTree) -> ParamTree:
@@ -343,11 +293,10 @@ def _check_weights(modelname: str, candidates: list[Candidate], index: int) -> N
             "load once with the Hub online, or put the weight file in the cache")
 
 
-def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict | None:
-    """The first candidate with a config and weights, as `load_pretrained_vae`
-    reads it, or None. Every miss is appended to `errors`, so the caller can
-    raise the last one."""
-    from flax.serialization import msgpack_restore
+def _located(modelname: str, revision: str, params) -> tuple[Path, dict, str] | None:
+    """The first candidate with a config and weights, as `located_vae` finds it: its directory in the
+    Hub's cache, its config and its weight file's name (fetched where `params` are not supplied); None
+    where no candidate has both. A candidate's miss is logged."""
     from huggingface_hub import hf_hub_download
     from huggingface_hub.errors import EntryNotFoundError, RevisionNotFoundError
 
@@ -356,35 +305,41 @@ def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict 
         try:
             config_path = hf_hub_download(modelname, "config.json",
                                           revision=candidate_revision, subfolder=subfolder)
+            # A foreign autoencoder's config is refused before any of its weights is fetched.
+            with open(config_path) as handle:
+                config = json.load(handle)
+            check_class(config, PUBLISHED, modelname, nameless=True)
             # Candidate eligibility must match a source load even when a
             # config exists in a revision that carries no matching weights.
             if params is not None:
                 _check_weights(modelname, candidates, index)
-            weights_path = None if params is not None else hf_hub_download(
-                modelname, weights, revision=candidate_revision, subfolder=subfolder)
-        except (EntryNotFoundError, RevisionNotFoundError) as e:
-            errors.append(e)
+            else:
+                hf_hub_download(modelname, weights, revision=candidate_revision, subfolder=subfolder)
+        except (EntryNotFoundError, RevisionNotFoundError) as missing:
+            _log.debug("%s has no VAE at %s (%s)", modelname, (weights, candidate_revision, subfolder),
+                       missing)
             continue
-        with open(config_path) as handle:
-            config = json.load(handle)
-        if weights_path is None:
-            return {"config": config, "params": params}
-        if weights == FLAX_WEIGHTS:
-            with open(weights_path, "rb") as handle:
-                return {"config": config, "params": msgpack_restore(handle.read())}
-        return {"config": config, "params": _read_vae_weights(Path(config_path).parent)}
+        return Path(config_path).parent, config, weights
     return None
 
 
-def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) -> dict:
-    """Read a pretrained AutoencoderKL's config and params, local or from the Hub.
+PUBLISHED = ("AutoencoderKL", "FlaxAutoencoderKL")
+"""The `_class_name`s an AutoencoderKL's config states, diffusers' and its Flax port's; an older config
+names none (`check_class`'s `nameless`)."""
+
+
+def located_vae(modelname: str, revision: str = "bf16", *, params=None) -> tuple[Path, dict, str]:
+    """Where a standalone AutoencoderKL's config and weights are, local or on the Hub: its directory, its
+    config and its weight file's name (`FLAX_WEIGHTS` or `TORCH_WEIGHTS`).
 
     Two weight layouts reach the same tree. The SD1-era repos ship flax
     `diffusion_flax_model.msgpack`, sometimes under a `vae` subfolder on a
     `flax`/`bf16` revision. Every 16-channel VAE (SD3.5, Flux) ships torch
-    `diffusion_pytorch_model.safetensors` only, which `translate_vae_weights`
-    reads. Supplied `params` are authoritative: only the configuration and
-    the repository's file metadata are read then, never weight bytes.
+    `diffusion_pytorch_model.safetensors` only. A local directory holding
+    both reads the flax layout. Supplied `params` are authoritative: only the
+    configuration and the repository's file metadata are read then, never
+    weight bytes. A config naming another autoencoder's class is refused by
+    that name before any weight is read (`check_class`).
 
     `revision` names the flax layout when it is one of `FLAX_REVISIONS`, and
     the torch path then reads the repo's default branch. Any other revision
@@ -395,40 +350,51 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) 
         directory = Path(modelname)
         with open(directory / "config.json") as handle:
             config = json.load(handle)
-        return {"config": config, "params": _read_vae_weights(directory) if params is None else params}
-
-    errors: list[Exception] = []
-    loaded = _load_from_hub(modelname, revision, params, errors)
-    if loaded is not None:
-        return loaded
-    last_error = errors[-1] if errors else None
+        check_class(config, PUBLISHED, directory, nameless=True)
+        return directory, config, FLAX_WEIGHTS if (directory / FLAX_WEIGHTS).exists() else TORCH_WEIGHTS
+    located = _located(modelname, revision, params)
+    if located is not None:
+        return located
     pinned = revision not in FLAX_REVISIONS
     raise FileNotFoundError(
         f"no VAE weights in {modelname}"
         + (f" at revision {revision!r}" if pinned else "")
         + ": neither flax diffusion_flax_model.msgpack nor torch "
         "diffusion_pytorch_model.safetensors"
-    ) from last_error
+    )
 
 
-def _read_vae_weights(directory: Path) -> dict:
-    """Read the params in `directory`, whichever of the two layouts it holds."""
+def flax_vae(msgpack: Path) -> tuple[dict, dict[str, tuple[int, ...]]]:
+    """diffusers' Flax VAE params in `msgpack`, the tree this module's is, and each leaf's diffusers
+    tensor name with the shape the torch layout stores it in (`_vae_path`'s inverse, `stored_shape`),
+    the layouts a bound tree writes back by (`bind_component`'s `shapes`)."""
     from flax.serialization import msgpack_restore
+    from flax.traverse_util import flatten_dict
 
-    msgpack = directory / "diffusion_flax_model.msgpack"
-    if msgpack.exists():
-        with open(msgpack, "rb") as handle:
-            restored = msgpack_restore(handle.read())
-        if not isinstance(restored, dict):
-            raise ValueError(f"{msgpack} does not hold a param tree")
-        return restored
-    from dew.interop.safetensors_io import read_weights
+    restored = msgpack_restore(msgpack.read_bytes())
+    if not isinstance(restored, dict):
+        raise ValueError(f"{msgpack} does not hold a param tree")
+    shapes = {}
+    for path, leaf in flatten_dict(restored).items():
+        if not isinstance(leaf, np.ndarray):
+            raise ValueError(f"{msgpack}: {'/'.join(path)} holds no array")
+        name, shape = _torch_name(path), stored_shape(path, leaf.shape)
+        if _vae_path(name, len(shape)) != path:
+            raise ValueError(f"{msgpack}: {'/'.join(path)} names no diffusers tensor ({name} reads into "
+                             f"{'/'.join(_vae_path(name, len(shape)))})")
+        shapes[name] = shape
+    return restored, shapes
 
-    try:
-        tensors: ParamTree = dict(read_weights(directory))
-    except FileNotFoundError as error:
-        raise FileNotFoundError(
-            f"no VAE weights in {directory}: neither diffusion_flax_model.msgpack "
-            "nor diffusion_pytorch_model.safetensors (or its index)") from error
-    # A diffusers name has no '/', so the flat table is the one translated.
-    return translate_vae_weights(tensors)
+
+def _torch_name(path: tuple[str, ...]) -> str:
+    """The diffusers tensor name a leaf at `path` of this tree reads from (`_vae_path`'s inverse)."""
+    *names, leaf = path
+    tokens: list[str] = []
+    for name in names:
+        if name == "proj_attn":
+            tokens += ["to_out", "0"]
+            continue
+        name = _FLAX_ATTENTION.get(name, name)
+        head, _, index = name.rpartition("_")
+        tokens += [head, index] if head and index.isdigit() else [name]
+    return ".".join([*tokens, "bias" if leaf == "bias" else "weight"])

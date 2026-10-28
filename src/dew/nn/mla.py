@@ -25,11 +25,10 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.mesh import LogicalAxes
 from dew.nn.attention import (
     LayerNorm,
     RMSNorm,
-    cache_positions,
-    cached_validity,
     causal_attention_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
@@ -38,52 +37,62 @@ from dew.nn.attention import (
 from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
-from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
-from dew.nn.kv_cache import KVCache, write_cache
+from dew.nn.inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of, document_reach
+from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
 
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
-from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import at_least_fp32
-from dew.nn.rope import YarnScaling, deinterleaved, rotate, yarn_query_scale, yarn_rope_freqs
-from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
-from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
+from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
+from dew.nn.precision import (
+    at_least_fp32,
+    compensated_add,
+    compensated_sum,
+    float32_dot_general,
+    float32_einsum,
+)
+from dew.nn.rope import (
+    LongRopeScaling,
+    Scaling,
+    YarnScaling,
+    deinterleaved,
+    rotary_freqs,
+    rotate,
+    yarn_query_scale,
+)
+from dew.nn.sharding import RESIDUAL, constrain, down_projection, logical_axes
+from dew.nn.sparse_selection import (
+    index_agreements,
+    index_scores,
+    selection_mask,
+    sparse_latent_attention,
+    top_k_selection,
+)
+from dew.quantization import quantized_products
 
 
-def open_mla_cache(module: nn.Module, names: tuple[str, str], first, second, index_keys,
-                   max_seq_len: int, *, valid=None):
-    """Open a compact per-row decode cache of two tensors, `first` and `second`
-    under `names`, and of the sparse indexer's keys when `index_keys` is given.
+def open_latent_cache(module: nn.Module, key, value_dim: int, index_keys, max_seq_len: int, *, valid=None,
+                      layout: KVCache):
+    """Open a sparse latent attention's decode cache: its expanded keys and values, as DeepSeek V3.2
+    stores them, through the attention cache (`open_kv_cache`) in `layout`, and the sparse indexer's
+    keys beside them where `index_keys` is given (None on a layer that owns no indexer and reads
+    another layer's selection), one compact row each, which a paged server keeps as a row's state.
+    Returns the [B, S] slots, an `append` that writes the new rows and returns the whole cache, the
+    index keys last or None, and the attention cache's own append, whose `query` puts a query in the
+    basis the stored keys are in."""
+    positions, written = open_kv_cache(module, key, max_seq_len, valid=valid, value_dim=value_dim,
+                                       layout=layout)
+    cached_index = None if index_keys is None else module.variable(
+        "cache", "cached_index", jnp.zeros, (key.shape[0], max_seq_len, index_keys.shape[-1]),
+        index_keys.dtype)
 
-    Dense MLA caches its latent and the latent's rotary part; the sparse
-    variants cache the expanded keys and values, as DeepSeek V3.2 stores
-    them. `index_keys` is None on a layer that owns no indexer and reads
-    another layer's selection. Returns the [B, S] slots and an `append` that
-    writes the new rows and returns the whole cache, the index keys last or
-    None.
-    """
-    batch, length = first.shape[:2]
-    if valid is None and length > max_seq_len:
-        raise ValueError(f"{length} tokens do not fit a cache of {max_seq_len}.")
-    cached = [module.variable("cache", name, jnp.zeros, (batch, max_seq_len, *array.shape[2:]), array.dtype)
-              for name, array in zip(names, (first, second), strict=True)]
-    cached_index = None
-    if index_keys is not None:
-        cached_index = module.variable("cache", "cached_index", jnp.zeros,
-                                       (batch, max_seq_len, index_keys.shape[-1]), index_keys.dtype)
-    positions, allocated = cache_positions(module, batch, length, valid)
+    def append(new_key, new_value, new_index_keys):
+        full_key, full_value = written(new_key, new_value)
+        if cached_index is not None and written.allocated:
+            cached_index.value = write_cache(cached_index.value, new_index_keys, written.positions)
+        return full_key, full_value, None if cached_index is None else cached_index.value
 
-    def append(new_first, new_second, new_index_keys):
-        if allocated:
-            for variable, rows in zip(cached, (new_first, new_second), strict=True):
-                variable.value = write_cache(variable.value, rows, positions)
-            if cached_index is not None:
-                cached_index.value = write_cache(cached_index.value, new_index_keys, positions)
-        full_index = None if cached_index is None else cached_index.value
-        return cached[0].value, cached[1].value, full_index
-
-    return positions, append
+    return positions, append, written
 
 
 INDEXER = 'indexer'
@@ -94,6 +103,11 @@ INDEXER_COLLECTION = 'indexer'
 """The collection an attention layer sows its per-query indexer KL under
 when a caller opens it, as the LM objective does to train the indexer."""
 
+SELECTIONS = 'selections'
+"""The collection V3.2's lightning indexer sows its scores and its heads' agreements before their relu
+under when a caller opens it (`SparseIndexer.scores`), as a selection's margin does to read how near a
+tie each key sits; never at initialization, so no variable tree holds it."""
+
 INDEXER_EPS = 1e-8
 """MaxText's `EPS` (src/maxtext/utils/globals.py at 538fe7a3), which its
 `calculate_indexer_loss` adds to the target's normaliser and inside both
@@ -101,7 +115,8 @@ logarithms of the KL."""
 
 
 def indexer_kl(scores, query, key, keep, scale: float):
-    """Per query, KL of the indexer's softmax from the attention: `[B, S]`, fp32.
+    """Per query, KL of the indexer's softmax from the attention: `[B, S]`, at least fp32 (float64
+    for float64 inputs, so a float64 truth computes it in float64).
 
     The indexer's objective (arXiv 2512.02556, eq. 3 and 4; MaxText
     `calculate_indexer_loss`): the target is the main attention's distribution
@@ -115,23 +130,29 @@ def indexer_kl(scores, query, key, keep, scale: float):
     target gives no mass contributes zero, and the gradient is the
     reference's, which the epsilon moves beyond float32 rounding.
     """
-    masked = jnp.finfo(jnp.float32).min
+    wide = at_least_fp32(jnp.result_type(scores, query, key))
+    masked = jnp.finfo(wide).min
     batch, length, total = scores.shape
     keep = jnp.broadcast_to(keep, (batch, length, total))
-    query = jax.lax.stop_gradient(query).astype(jnp.float32) * scale
-    key = jax.lax.stop_gradient(key).astype(jnp.float32)
+    query = jax.lax.stop_gradient(query).astype(wide) * scale
+    key = jax.lax.stop_gradient(key).astype(wide)
 
     def head(summed, projections):
         q, k = projections
-        logits = jnp.where(keep, jnp.einsum('bsd,btd->bst', q, k), masked)
-        return summed + jax.nn.softmax(logits, axis=-1), None
+        product = float32_einsum('bsd,btd->bst', q, k)
+        probabilities = jax.nn.softmax(jnp.where(keep, product, masked), axis=-1)
+        return compensated_add(summed, (probabilities, jnp.zeros_like(probabilities))), None
 
-    summed, _ = jax.lax.scan(
-        head, jnp.zeros((batch, length, total), jnp.float32),
-        (jnp.moveaxis(query, 2, 0), jnp.moveaxis(key, 2, 0)))
-    target = summed / (jnp.sum(summed, axis=-1, keepdims=True) + INDEXER_EPS)
-    indexer = jax.nn.softmax(jnp.where(keep, scores.astype(jnp.float32), masked), axis=-1)
-    return jnp.sum(target * (jnp.log(target + INDEXER_EPS) - jnp.log(indexer + INDEXER_EPS)), axis=-1)
+    # The heads, the target's normalization over the keys and each query's KL over them all sum
+    # rounded once (`compensated_add`, `compensated_sum`): plain sums biased the KL upward, 1.67
+    # times MaxText's error from float64, which sums its heads at once at H times this footprint.
+    zeros = jnp.zeros((batch, length, total), wide)
+    (high, low), _ = jax.lax.scan(head, (zeros, zeros), (jnp.moveaxis(query, 2, 0), jnp.moveaxis(key, 2, 0)))
+    summed = high + low
+    target = summed / (compensated_sum(summed, (summed.ndim - 1,))[..., None] + INDEXER_EPS)
+    indexer = jax.nn.softmax(jnp.where(keep, scores.astype(wide), masked), axis=-1)
+    divergence = target * (jnp.log(target + INDEXER_EPS) - jnp.log(indexer + INDEXER_EPS))
+    return compensated_sum(divergence, (divergence.ndim - 1,))
 
 
 def _rotate(interleave: bool, part, freqs_cos, freqs_sin):
@@ -139,6 +160,46 @@ def _rotate(interleave: bool, part, freqs_cos, freqs_sin):
     indexer), left in the reference's half layout, or half-split ones (V3.2's
     indexer)."""
     return rotate(deinterleaved(part) if interleave else part, freqs_cos, freqs_sin)
+
+
+class IndexerFront:
+    """The lightning indexers' shared front end, mixed into each (V3.2's `SparseIndexer`, GLM's
+    k-pool, DeepSeek V4's CSA2): the query residual projected by `wq_b` into `n_heads` heads of
+    `head_dim`, the hidden state by `weights_proj` into a weight a head, and the queries scored
+    against keys by `index_scores`, at least in fp32 and under the indexer's `precision`, the inputs
+    detached as the references detach them. Each indexer declares its own keys (`wk` and its
+    `k_norm`) beside these, turns its queries as its reference does, and selects as it does."""
+
+    # The fields of the module this mixes into, which declares them; a mixin's annotations are no
+    # dataclass fields of their own.
+    n_heads: int
+    head_dim: int
+    dtype: Dtype | None
+    precision: PrecisionLike
+
+    def declare_front(self) -> Callable[..., Dense]:
+        """Declare `wq_b` and `weights_proj`, from the indexer's `setup`, and return the bias-free
+        projection at its `dtype` and `precision` they are, for the indexer's own keys."""
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
+        self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
+        self.weights_proj = dense(self.n_heads, name='weights_proj')
+        return dense
+
+    def queries(self, q_resid):
+        """The indexer's queries `[B, S, n_heads, head_dim]` of the detached query residual."""
+        batch, length = q_resid.shape[:2]
+        return self.wq_b(jax.lax.stop_gradient(q_resid)).reshape(batch, length, self.n_heads, self.head_dim)
+
+    def weighed(self, agreements, hidden):
+        """Scores `[B, S, T]` of the heads' `agreements` (`index_agreements`), weighted by
+        `weights_proj` of the detached `hidden` (`index_scores`)."""
+        return index_scores(agreements, self.weights_proj(jax.lax.stop_gradient(hidden)), self.head_dim,
+                            self.precision)
+
+    def scored(self, query, keys, hidden):
+        """`query`'s scores against `keys` `[B, S, T]` (`weighed`)."""
+        return self.weighed(index_agreements(query, keys, self.precision), hidden)
 
 
 @logical_axes({
@@ -149,7 +210,7 @@ def _rotate(interleave: bool, part, freqs_cos, freqs_sin):
     # Maps the hidden states onto one weight per indexer head.
     ("weights_proj",): ("embed", "index"),
 })
-class SparseIndexer(nn.Module):
+class SparseIndexer(IndexerFront, nn.Module):
     """DeepSeek sparse attention's lightning indexer: a score per query and key.
 
     `modeling_deepseek_v32.DeepseekV32Indexer`: `wq_b` reads the query residual,
@@ -175,14 +236,11 @@ class SparseIndexer(nn.Module):
                 f"the indexer rotates a {self.rope_head_dim}-wide rope slice "
                 f"out of heads of width {self.head_dim}, so the heads have "
                 "to be wider")
-        dense = functools.partial(
-            Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
-        self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
+        dense = self.declare_front()
         self.wk = dense(self.head_dim, name='wk')
         # A LayerNorm with weight and bias at a hardcoded 1e-6: the reference
         # names no config for it (modeling_deepseek_v32.py, DeepseekV32Indexer).
         self.k_norm = LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm')
-        self.weights_proj = dense(self.n_heads, name='weights_proj')
 
     def keys(self, hidden):
         """The indexer's keys for these hidden states: `[B, S, head_dim]`."""
@@ -207,15 +265,16 @@ class SparseIndexer(nn.Module):
         fp32: the head weighting multiplies by `n_heads ** -0.5` in fp32 in
         the reference, and the relu keeps only the positive agreements.
         """
-        hidden = jax.lax.stop_gradient(hidden)
-        q_resid = jax.lax.stop_gradient(q_resid)
-        batch, length, _ = hidden.shape
-        query = self.wq_b(q_resid).reshape(
-            batch, length, self.n_heads, self.head_dim)
-        q_rot, q_pass = jnp.split(query, [self.rope_head_dim], axis=-1)
+        q_rot, q_pass = jnp.split(self.queries(q_resid), [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
             [_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
-        return index_scores(query, keys, self.weights_proj(hidden), self.precision)
+        agreements = index_agreements(query, keys, self.precision)
+        scores = self.weighed(agreements, hidden)
+        if not self.is_initializing():
+            # Kept only where a caller opens the collection, as a selection's margin does.
+            self.sow(SELECTIONS, "scores", scores)
+            self.sow(SELECTIONS, "agreements", agreements)
+        return scores
 
     def select(self, scores, keep):
         """The top-k keys of each query among those `keep` allows, as
@@ -240,9 +299,10 @@ class MultiHeadLatentAttention(nn.Module):
     """DeepSeek's multi-head latent attention, dense or sparse.
 
     decode=True runs against the cache like the standard mixer; `positions` and
-    `segment_ids` behave as there. `yarn`, the layer's YaRN ramp, transforms
-    `rope_theta`, the layer's base, and its mscale pre-scales the query; the
-    mixer resolves both through `MixerContext`. The two latent norms are the model's RMSNorm, as the
+    `segment_ids` behave as there. `rope_scaling`, the layer's one rope scaling
+    (`MixerContext.rotary_scaling`: YaRN, Llama 3.1's ramp or LongRoPE),
+    transforms `rope_theta`, the layer's base, at every rotation it makes, and
+    a YaRN ramp's mscale pre-scales the query. The two latent norms are the model's RMSNorm, as the
     reference builds them from the layer's one norm class.
 
     `index_n_heads` and `index_head_dim` put the indexer beside the attention
@@ -274,7 +334,7 @@ class MultiHeadLatentAttention(nn.Module):
     causal: bool = True
     rope_theta: float = 10000.0
     rope_interleave: bool = True
-    yarn: YarnScaling | None = None
+    rope_scaling: Scaling | None = None
     # DeepSeek and GLM norm the latents at RMSNorm's 1e-6 default whatever
     # the trunk's rms_norm_eps says (modeling_deepseek_v3.py:392,404,
     # modeling_glm_moe_dsa.py:349,361).
@@ -291,6 +351,9 @@ class MultiHeadLatentAttention(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
+    kv_cache: KVCache = dataclasses.field(default_factory=KVCache)
+    """The decode cache's storage layout (`dew.nn.kv_cache`), paged or quantized, over the latents
+    or, under the sparse layout, the expanded keys."""
     rotary: bool = True
     """False is Kimi K3's MLA (`mla_use_nope`, modeling_kimi_linear.py:396-437
     of moonshotai/Kimi-K3 at f831ab6): the decoupled rope head is kept as
@@ -298,6 +361,7 @@ class MultiHeadLatentAttention(nn.Module):
     output_gate: bool = False
     """Kimi K3's `mla_use_output_gate`: the heads' output times
     `sigmoid(g_proj(x))` before `o_proj` (modeling_kimi_linear.py:398-401, 470-472)."""
+    force_fp32_for_softmax: bool = True
 
     def setup(self):
         if self.qk_rope_head_dim % 2:
@@ -328,7 +392,7 @@ class MultiHeadLatentAttention(nn.Module):
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         dense = functools.partial(
             Dense, use_bias=self.attention_bias, dtype=self.dtype,
-            precision=self.precision)
+            precision=self.precision, dot_general=float32_dot_general)
         norm = functools.partial(
             RMSNorm, epsilon=self.norm_eps,
             scale_offset=self.scale_offset,
@@ -338,24 +402,25 @@ class MultiHeadLatentAttention(nn.Module):
             # attention_bias says; only the low-rank projections do.
             self.q_proj = Dense(
                 self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
-                precision=self.precision, name='q_proj')
+                precision=self.precision, name='q_proj', dot_general=float32_dot_general)
         else:
             self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
             self.q_a_layernorm = norm(name='q_a_layernorm')
             self.q_b_proj = Dense(
                 self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
-                precision=self.precision, name='q_b_proj')
+                precision=self.precision, name='q_b_proj', dot_general=float32_dot_general)
         self.kv_a_proj_with_mqa = dense(
             self.kv_lora_rank + self.qk_rope_head_dim, name='kv_a_proj_with_mqa')
         self.kv_a_layernorm = norm(name='kv_a_layernorm')
         self.kv_b_proj = Dense(
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             use_bias=False, dtype=self.dtype, precision=self.precision,
-            name='kv_b_proj')
+            name='kv_b_proj', dot_general=float32_dot_general)
         self.o_proj = dense(self.emb_features, name='o_proj')
         if self.output_gate:
             self.g_proj = Dense(self.num_heads * self.v_head_dim, use_bias=False,
-                                dtype=self.dtype, precision=self.precision, name='g_proj')
+                                dtype=self.dtype, precision=self.precision, name='g_proj',
+                                dot_general=float32_dot_general)
         if self.index_n_heads is not None and self.index_head_dim is not None:
             if self.q_lora_rank is None:
                 raise ValueError(
@@ -428,11 +493,11 @@ class MultiHeadLatentAttention(nn.Module):
         """The softmax-scale ratio the query carries into the kernel.
 
         The kernel scales by `1 / sqrt(qk_head_dim)` itself; YaRN's mscale
-        rides on the query, so a plain rope carries exactly 1.0.
+        rides on the query, so any other rope carries exactly 1.0.
         """
-        if self.yarn is None:
+        if not isinstance(self.rope_scaling, YarnScaling):
             return 1.0
-        return yarn_query_scale(self.yarn)
+        return yarn_query_scale(self.rope_scaling)
 
     def _queries(self, x, place: LogicalAxes):
         """`[B, S, H, nope+rope]` queries and the residual the indexer reads,
@@ -440,7 +505,7 @@ class MultiHeadLatentAttention(nn.Module):
         batch, length, _ = x.shape
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # The projections carry the names a remat policy saves or offloads
-        # (decoder_block.RESIDUALS); kv_b_proj is the fused K/V one.
+        # (mixer_base.RESIDUALS); kv_b_proj is the fused K/V one.
         if self.q_lora_rank is None:
             q_resid = None
             queries = self.q_proj(x)
@@ -463,7 +528,7 @@ class MultiHeadLatentAttention(nn.Module):
         latent, rot = jnp.split(compressed, [self.kv_lora_rank], axis=-1)
         return constrain(self.kv_a_layernorm(latent), RESIDUAL), constrain(rot, RESIDUAL)
 
-    def _rotated(self, q_rot, rot, positions):
+    def _rotated(self, q_rot, rot, positions, reach=None):
         """Rotate the query's and the latent's rope heads at `positions`.
 
         Returns the rotated pair and the angles, which the indexer rotates
@@ -473,9 +538,9 @@ class MultiHeadLatentAttention(nn.Module):
         """
         if not self.rotary:
             return q_rot, rot, None, None
-        freqs_cos, freqs_sin = yarn_rope_freqs(
-            positions, self.qk_rope_head_dim, self.rope_theta, self.yarn,
-            dtype=at_least_fp32(q_rot.dtype))
+        freqs_cos, freqs_sin = rotary_freqs(
+            positions, self.qk_rope_head_dim, self.rope_theta, rope_scaling=self.rope_scaling,
+            dtype=at_least_fp32(q_rot.dtype), reach=reach)
         return (_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin),
                 _rotate(self.rope_interleave, rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :],
                 freqs_cos, freqs_sin)
@@ -492,35 +557,41 @@ class MultiHeadLatentAttention(nn.Module):
         return jnp.concatenate([nope, rot], axis=-1), values
 
     @nn.compact
-    def __call__(self, x, call: MixerCall = PLAIN_CALL):
-        decode, kv_store, attention_metadata = call.decode, call.kv_store, call.metadata
-        causal, mask, objective = self.causal, None, None
-        implementation = self.attention_impl
+    def __call__(self, x, call: MixerCall = PLAIN_CALL, prediction_phase: PredictionPhase = "ordinary"):
+        """Project, cache and attend through the latent shell with the kind's candidate selection."""
         batch, length, _ = x.shape
+        self._check_call(call, batch, length)
+        place = down_projection(x, (self.q_lora_rank or 0) + self.kv_lora_rank + self.qk_rope_head_dim)
+        queries, q_resid = self._queries(x, place)
+        latent, rot = self._latents(x, place)
+        decode, attention_metadata = call.decode, call.metadata
+        causal, mask, objective = self.causal, None, None
+        unselected = None
+        implementation = self.attention_impl
         tokens = coordinates_of(attention_metadata, batch, length)
         # Each token's logical place (`Coordinates.places`); a cached call's default is its slot.
         positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
         valid = None if attention_metadata is None else attention_metadata.valid
-        if attention_metadata is not None and attention_metadata.rotary_positions is not None:
-            raise ValueError("MLA does not implement multi-axis rotary positions")
+        row_valid = jnp.ones((batch, length), bool) if valid is None else jnp.asarray(valid, bool)
         logical_positions = positions
-        # The down-projections run where `down_projection` places them: on each
-        # tensor shard's own tokens where the link pays for gathering the
-        # latents back, which one residual gradient serves for both.
-        place = down_projection(x, (self.q_lora_rank or 0) + self.kv_lora_rank + self.qk_rope_head_dim)
-        queries, q_resid = self._queries(x, place)
         # jnp splits at indices where torch splits into sizes: one cut point,
         # since the widths add up exactly.
         q_pass, q_rot = jnp.split(
             queries, [self.qk_nope_head_dim], axis=-1)
-        latent, rot = self._latents(x, place)
+        query_basis = None
         if decode:
-            q_rot, key, value, mask = self._decode_step(
-                x, q_rot, rot, latent, q_resid, logical_positions, valid, kv_store)
+            q_rot, key, value, mask, query_basis = self._decode_step(
+                x, q_rot, rot, latent, q_resid, logical_positions, valid, call, prediction_phase)
+            if self.sparse:
+                unselected = self._empty_selection(mask[:, 0], row_valid)
             causal = False
         else:
             positions = jnp.arange(length) if positions is None else jnp.asarray(positions)
-            q_rot, rot, freqs_cos, freqs_sin = self._rotated(q_rot, rot, positions)
+            # Under LongRoPE a packed document picks its factors by its own furthest place
+            # (`document_reach`), so it rotates as it does alone.
+            reach = (document_reach(segment_ids, valid, positions)
+                     if isinstance(self.rope_scaling, LongRopeScaling) and segment_ids is not None else None)
+            q_rot, rot, freqs_cos, freqs_sin = self._rotated(q_rot, rot, positions, reach)
             if segment_ids is not None:
                 inside = document_mask(segment_ids)[:, None]
                 mask = inside
@@ -541,23 +612,21 @@ class MultiHeadLatentAttention(nn.Module):
                     keep = rows if keep is None else jnp.logical_and(keep, rows)
                 if keep is None:
                     keep = jnp.ones((1, length, length), jnp.bool_)
-                if valid is not None:
-                    # Selection and its objective range over real keys only.
-                    keep = jnp.logical_and(keep, jnp.asarray(valid, bool)[:, None, :])
-                index_scores = None
-                if self.indexed:
-                    assert q_resid is not None
-                    index_keys = self.indexer.rotated_keys(
-                        self.indexer.keys(x), freqs_cos, freqs_sin)
-                    index_scores = self.indexer.scores(
-                        x, q_resid, index_keys, freqs_cos, freqs_sin)
+                # Candidates carry every row even when all its keys are real; pooled indexers
+                # gather row-specific slot lists from this visibility.
+                keep = jnp.logical_and(keep, row_valid[:, None, :])
+                index_keys = (self._rotated_index_keys(self._index_keys(x, row_valid), freqs_cos, freqs_sin)
+                              if self.indexed else None)
+                selection, index_scores = self._selection(
+                    x, q_resid, index_keys, keep, freqs_cos, freqs_sin, call, row_valid,
+                    slots=positions, prediction_phase=prediction_phase)
                 if self.sparse:
-                    selection = self._select(index_scores, keep, kv_store)
                     if self._attends_sparsely(selection, length):
                         return self._output(self._sparse_attention(
                             q_pass, q_rot, latent, rot, selection, index_scores), x)
                     keep = selection_mask(selection, length)
                     mask, causal = keep[:, None], False
+                    unselected = self._empty_selection(keep, row_valid)
                 if (index_scores is not None and not self.is_initializing()
                         and self.is_mutable_collection(INDEXER_COLLECTION)):
                     objective = (index_scores, keep)
@@ -568,18 +637,108 @@ class MultiHeadLatentAttention(nn.Module):
             if not decode:
                 mask = mask & jnp.asarray(valid, bool)[:, None, None, :]
         query = self._scaled_query(q_pass, q_rot)
+        if query_basis is not None:
+            query = query_basis(query)
         if mask is not None and not decode:
             # Packed documents, row validity and the indexer's selection all
             # materialize a mask on the training path, so they take the xla
             # kernel, the way the standard mixer's own masks do. Decoding
             # runs no backward pass, so its cache mask keeps the fused path.
             implementation = kernel_for_materialized_mask(
-                implementation, query, key, dtype=self.dtype, precision=self.precision)
+                implementation, query, key, dtype=self.dtype, precision=self.precision,
+                force_fp32_for_softmax=self.force_fp32_for_softmax)
         if objective is not None:
             self._sow_indexer_kl(*objective, query, key)
+        return self._attend(query, key, value, x, mask, implementation, causal=causal,
+                            unselected=unselected, force_fp32_for_softmax=self.force_fp32_for_softmax)
+
+    def _check_call(self, call: MixerCall, batch: int, length: int) -> None:
+        if call.metadata is not None and call.metadata.rotary_positions is not None:
+            raise ValueError("MLA does not implement multi-axis rotary positions")
+
+    def _index_keys(self, x, valid):
+        return self.indexer.keys(x)
+
+    def _rotated_index_keys(self, keys, freqs_cos, freqs_sin):
+        return self.indexer.rotated_keys(keys, freqs_cos, freqs_sin)
+
+    def _selection(self, x, q_resid, index_keys, keep, freqs_cos, freqs_sin, call, row_valid, *,
+                    slots: jax.Array, allocated: bool = False, committed=None,
+                    prediction_phase: PredictionPhase = "ordinary"):
+        """Select candidates and retain the lightning scores for its optional training objective."""
+        scores = (self.indexer.scores(x, q_resid, index_keys, freqs_cos, freqs_sin)
+                  if self.indexed else None)
+        return (self._select(scores, keep, call.kv_store) if self.sparse else None), scores
+
+    def _empty_selection(self, selected, row_valid) -> jax.Array | None:
+        return None
+
+    def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, call,
+                      prediction_phase: PredictionPhase):
+        """One decode step's rotated query heads, its keys and values with the
+        cache's joined, the mask over them, and what puts the scaled query in the
+        basis the cached keys are in (None for none): the expanded keys and the
+        indexer's selection under the sparse layout, or the latents expanded
+        after the append under the dense one. `kv_cache`, the cache's layout,
+        stores either form paged or quantized."""
+        # The cache hands out the slots first, because the rope heads
+        # rotate at absolute positions: the queries at this step's slots
+        # and the appended latents at theirs, while the cached ones keep
+        # the angles of the slots they were written at.
+        if self.sparse:
+            allocated = self.has_variable("cache", "cache_index")
+            committed = self.get_variable("cache", "cache_index")
+            row_valid = jnp.ones(x.shape[:2], bool) if valid is None else jnp.asarray(valid, bool)
+            # Allocate from the actual projection's dtype and retain its one interceptor/dropout
+            # draw. Only the decoupled rope channels change once the cache supplies their slots.
+            key, value = self._expand(latent, rot)
+            index_keys = self._index_keys(x, row_valid) if self.indexed else None
+            positions, append, basis = open_latent_cache(self, key, self.v_head_dim, index_keys,
+                                                         self.max_seq_len, valid=valid, layout=self.kv_cache)
+            q_rot, rot, freqs_cos, freqs_sin = self._rotated(
+                q_rot, rot,
+                positions if logical_positions is None else logical_positions)
+            if self.rotary:
+                key = key.at[..., self.qk_nope_head_dim:].set(rot[:, :, None, :])
+            if index_keys is not None:
+                index_keys = self._rotated_index_keys(index_keys, freqs_cos, freqs_sin)
+            key, value, index_full = append(key, value, index_keys)
+            keep = self._visible(positions, key.shape[1])[:, 0]
+            selection, _ = self._selection(
+                x, q_resid, index_full, keep, freqs_cos, freqs_sin, call, row_valid, slots=positions,
+                allocated=allocated, committed=committed, prediction_phase=prediction_phase)
+            mask = selection_mask(selection, key.shape[1])[:, None]
+            query_basis = basis.query
+        else:
+            # The latent and its rotary part, one head each, as the attention cache's keys and values,
+            # the latents read back in their own basis, which the expansion reads.
+            positions, append = open_kv_cache(self, latent[:, :, None], self.max_seq_len, valid=valid,
+                                              value_dim=self.qk_rope_head_dim, layout=self.kv_cache)
+            q_rot, rot, _, _ = self._rotated(
+                q_rot, rot,
+                positions if logical_positions is None else logical_positions)
+            latent, rot = append(latent[:, :, None], rot[:, :, None])
+            latent, rot = append.store.plain(latent)[:, :, 0], rot[:, :, 0]
+            key, value = self._expand(latent, rot)
+            mask = self._visible(positions, key.shape[1])
+            query_basis = None
+        return q_rot, key, value, mask, query_basis
+
+    def _visible(self, slots, total: int):
+        """`[B, 1, T, total]`: which of the cache's `total` slots each query at `slots` sees, those up
+        to its own slot that hold a token."""
+        return causal_attention_mask(slots, total, key_valid=cached_validity(self, total))
+
+    def _attend(self, query, key, value, x, mask, implementation, *, causal: bool = False,
+                unselected=None, force_fp32_for_softmax: bool = True):
+        """The attention over `key` and `value` and its output projection, sowing the per-head
+        maxima QK-Clip reads where a caller opened the collection. A query `unselected` marks reads
+        every key alike, the mean of the values, as a selection that chose nothing does in the
+        reference, and `force_fp32_for_softmax` is a k-pool attention's own policy; a latent
+        attention's kind refuses any but the default (`latent_refusals`)."""
         # The per-head maxima the QK-Clip reads, with the nope width the
         # clip needs to split the latent projections: computed only when a
-        # caller opened the collection. Under the sparse indexer the mask
+        # caller opened the collection. Under a sparse selection the mask
         # holds the selected keys, so the maximum is over those.
         if self._qk_open():
             self.sow("qk", "max_logits", max_attention_logits(
@@ -587,55 +746,13 @@ class MultiHeadLatentAttention(nn.Module):
             self.sow("qk", "qk_nope", jnp.asarray(self.qk_nope_head_dim))
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
+            force_fp32_for_softmax=force_fp32_for_softmax,
             implementation=implementation, causal=causal, mask=mask)
+        if unselected is not None:
+            wide = value.astype(at_least_fp32(value.dtype))
+            uniform = jnp.mean(wide, axis=1, keepdims=True).astype(attention.dtype)
+            attention = jnp.where(unselected, uniform, attention)
         return self._output(attention, x)
-
-    def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, kv_store):
-        """One decode step's rotated query heads, its keys and values with the
-        cache's joined, and the mask over them: the expanded keys and the
-        indexer's selection under the sparse layout, or the latents expanded
-        after the append under the dense one."""
-        # The cache hands out the slots first, because the rope heads
-        # rotate at absolute positions: the queries at this step's slots
-        # and the appended latents at theirs, while the cached ones keep
-        # the angles of the slots they were written at.
-        if self.sparse:
-            # The cache is shaped by the expansion; its values are
-            # recomputed after rotation below, so only shapes flow here.
-            shape_key, shape_value = self._expand(latent, rot)
-            index_keys = self.indexer.keys(x) if self.indexed else None
-            positions, append = open_mla_cache(
-                self, ("cached_key", "cached_value"), shape_key, shape_value, index_keys,
-                self.max_seq_len, valid=valid)
-            q_rot, rot, freqs_cos, freqs_sin = self._rotated(
-                q_rot, rot,
-                positions if logical_positions is None else logical_positions)
-            if index_keys is not None:
-                index_keys = self.indexer.rotated_keys(index_keys, freqs_cos, freqs_sin)
-            key, value, index_full = append(
-                *self._expand(latent, rot), index_keys)
-            index_scores = None
-            if self.indexed:
-                assert q_resid is not None
-                index_scores = self.indexer.scores(
-                    x, q_resid, index_full, freqs_cos, freqs_sin)
-            keep = causal_attention_mask(
-                positions, key.shape[1],
-                key_valid=cached_validity(self, key.shape[1]))[:, 0]
-            mask = selection_mask(self._select(index_scores, keep, kv_store),
-                                  key.shape[1])[:, None]
-        else:
-            positions, append = open_mla_cache(
-                self, ("cached_latent", "cached_rot"), latent, rot, None,
-                self.max_seq_len, valid=valid)
-            q_rot, rot, _, _ = self._rotated(
-                q_rot, rot,
-                positions if logical_positions is None else logical_positions)
-            latent, rot, _ = append(latent, rot, None)
-            key, value = self._expand(latent, rot)
-            mask = causal_attention_mask(
-                positions, key.shape[-3], key_valid=cached_validity(self, key.shape[-3]))
-        return q_rot, key, value, mask
 
     def _qk_open(self) -> bool:
         return not self.is_initializing() and self.is_mutable_collection("qk")
@@ -651,13 +768,15 @@ class MultiHeadLatentAttention(nn.Module):
                 and not self.nonlinear_input("kv_b_proj"))
 
     def nonlinear_input(self, name: str) -> bool:
-        """Whether this call computes the submodule `name` other than as a
-        linear map of its input. The layer's own Dense is linear; a method
-        interceptor that changes that answers for itself: `dew.lora`'s dropout
-        draws on its targets' inputs, and a checkpoint's input quantization
-        (`dew.quantization`) rounds them."""
-        del name
-        return False
+        """Whether this call computes the submodule `name`, or a module under
+        it, other than as a linear map of its input. The layer's own Dense is
+        one unless the Qwix quantization the call runs under quantizes its
+        activations or gradients (`dew.quantization.quantized_products`); a
+        weight-only rule leaves it linear, by its quantized matrix, which the
+        absorbed path reads. A method interceptor that changes it answers for
+        itself: `dew.lora`'s dropout draws on its targets' inputs, and a
+        checkpoint's input quantization (`dew.quantization`) rounds them."""
+        return quantized_products(self, name).inputs
 
     def _scaled_query(self, q_pass, q_rot):
         """The whole query with YaRN's mscale on it, as every kernel reads it."""
@@ -716,7 +835,8 @@ def latent_refusals(ctx: MixerContext) -> Mapping[str, object]:
     """What a latent attention does not run of its layer's context: the
     attention policies it is asked (`MixerContext.policies`), the standard
     attention's value norm, keys as values, window, chunk, score scale and
-    partial rotation, and a cache other than its latents."""
+    partial rotation. Its cache takes the layer's layout (`kv_cache`), paged or
+    quantized, over its latents or its expanded keys."""
     return {
         **ctx.policies(),
         "v_norm": ctx.v_norm,
@@ -725,7 +845,6 @@ def latent_refusals(ctx: MixerContext) -> Mapping[str, object]:
         "attention_chunk": ctx.attention_chunk,
         "attention_scale": ctx.attention_scale,
         "partial_rotary_factor": ctx.partial_rotary_factor,
-        "kv_cache": ctx.kv_cache != KVCache(),
     }
 
 
@@ -734,15 +853,15 @@ class MLAMixer(MixerBase):
     """The `mla` kind: DeepSeek's latent attention under the reference's names.
 
     `mixer={"name": "mla", "fields": {...}}` takes a DeepSeek config.json's fields, so
-    translation renames nothing. The rope base and its YaRN ramp are the layer's
-    (`MixerContext.rope_theta` and `yarn`, the model's or its kind's). The context's GQA
+    translation renames nothing. The rope base and its scaling are the layer's
+    (`MixerContext.rope_theta` and `rotary_scaling`, the model's or its kind's). The context's GQA
     geometry and `qk_norm` are not read (the latent norms are always present).
     A `kv_shared` layer is GLM's IndexShare layer, which shares its provider's
     selection and so needs the kind to select. Dials this cannot honour (a
     values norm, a window, an attention scale, a partial rotary) are refused.
     """
 
-    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'o_proj', 'context')
+    residuals = ATTENTION_CONTEXT_RESIDUALS
 
     q_lora_rank: int | None = None
     kv_lora_rank: int = 512
@@ -790,7 +909,7 @@ class MLAMixer(MixerBase):
             causal=ctx.causal,
             rope_theta=ctx.rope_theta,
             rope_interleave=self.rope_interleave,
-            yarn=ctx.yarn,
+            rope_scaling=ctx.rotary_scaling(),
             scale_offset=ctx.scale_offset,
             scale_after_cast=ctx.scale_after_cast,
             attention_bias=ctx.attention_bias,
@@ -804,4 +923,5 @@ class MLAMixer(MixerBase):
             precision=ctx.precision,
             attention_impl=ctx.attention_impl,
             rotary=not self.mla_use_nope,
-            output_gate=self.mla_use_output_gate)
+            output_gate=self.mla_use_output_gate,
+            kv_cache=ctx.kv_cache)

@@ -17,7 +17,7 @@ recorded rather than run in the suite. Two halves, in two environments:
   the export whole, each weighted component loads with
   `output_loading_info` and has to report nothing, and the transformer runs
   the pipeline's own call (`transformer_call`) on fixed inputs in float32
-  and in float64 (`diffusers_wan_reference.float64`). The fixture holds the
+  and in float64 (`torch_precision.float64`). The fixture holds the
   SHA-256 of every exported file, the inputs and both outputs.
 
 The source's own float32 sinusoid table is kept as published: the float64
@@ -92,8 +92,9 @@ def consume(directory: Path, output: Path) -> None:
 
     sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
     from diffusers_qwen_image_reference import transformer_call
+    from reference_source import saved_fixture
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     export = directory / "export"
     index = json.loads((export / "model_index.json").read_text())
@@ -126,8 +127,7 @@ def consume(directory: Path, output: Path) -> None:
 
     meta = {"digests": digests(export), "grid": GRID, "diffusers": diffusers.__version__,
             "transformers": transformers.__version__, "torch": torch.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(output, **arrays)
+    saved_fixture(output, arrays, meta)
     gap = float(np.abs(arrays["fp32.output"] - arrays["fp64.output"]).max())
     print(f"{output}: fp32 off float64 by {gap:.3g}, {len(meta['digests'])} files")
 

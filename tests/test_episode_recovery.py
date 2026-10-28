@@ -14,18 +14,16 @@ import jax
 import numpy as np
 import pytest
 from episode_support import (
-    CALL_THREE,
-    EOS,
     IDENTITY,
-    NINE,
-    START,
     Harness,
     SquareSession,
     action,
     build,
+    cohort_snapshot,
     collect,
     environment,
 )
+from tool_policy import CALL_THREE, EOS, GROUPS, NINE, START
 
 from dew.objectives.rl import EpisodeJournal, RecoverableEnvironment, Transcript, session_of
 
@@ -34,13 +32,47 @@ WORKER = Path(__file__).with_name("episode_recovery_worker.py")
 
 
 def test_journal_refuses_a_different_policy_at_identical_clocks(tmp_path):
-    trainer, rollout = build(environment(), journal=EpisodeJournal(str(tmp_path)))
+    trainer, collector = build(environment(), journal=EpisodeJournal(str(tmp_path)))
     state = trainer.initial_state()
-    complete = collect(rollout, state)
-    assert collect(rollout, state) == complete
+    complete = collect(collector, state)
+    assert collect(collector, state) == complete
     changed = replace(state, variables=jax.tree.map(lambda value: value + .001, state.variables))
     with pytest.raises(ValueError):
-        collect(rollout, changed)
+        collect(collector, changed)
+
+
+def test_a_cooldown_branchs_cohorts_are_its_own_beside_the_runs_at_the_same_clocks(tmp_path):
+    """A cooldown branch draws at the run's steps and keys under its own weights: its cohorts are its
+    own (`Snapshot.branch`), so the run, drawing at those clocks after it, is not refused as another
+    policy, and a resumed branch reads its own turns back."""
+    from dew.objectives.rl.sessions import Task
+
+    trainer, collector = build(environment(), journal=EpisodeJournal(str(tmp_path)))
+    state = trainer.initial_state()
+    decayed = replace(state, variables=jax.tree.map(lambda value: value + .001, state.variables))
+    snapshot = cohort_snapshot(decayed, 23)
+    branch = collector.episodes(replace(snapshot, branch="cooldown-4"), [Task("31")], GROUPS)
+    assert collector.episodes(replace(snapshot, branch="cooldown-4"), [Task("31")], GROUPS) == branch
+    run = collect(collector, state)
+    assert collect(collector, state) == run
+    with pytest.raises(ValueError):
+        collect(collector, decayed)
+
+
+def test_journal_tells_apart_policies_whose_weights_are_equal_bytes_of_another_dtype():
+    """A policy's weights in float8_e4m3fn and the same bytes read as float8_e4m3fnuz are two
+    policies, which NumPy names by one '<V1' code: the journal's policy fingerprint keys each by its
+    named dtype, so a recovery under the other refuses, while the same weights match again."""
+    import ml_dtypes
+
+    from dew.objectives.rl.journal import policy_digest
+
+    bits = np.arange(64, dtype=np.uint8).reshape(8, 8)
+    weights = {"params": {"kernel": bits.view(ml_dtypes.float8_e4m3fn)}}
+    other = {"params": {"kernel": bits.view(ml_dtypes.float8_e4m3fnuz)}}
+    again = {"params": {"kernel": bits.copy().view(ml_dtypes.float8_e4m3fn)}}
+    assert policy_digest(weights) == policy_digest(again)
+    assert policy_digest(weights) != policy_digest(other)
 
 
 class Saying(SquareSession):
@@ -69,10 +101,10 @@ class Sayings(Harness):
 def test_a_journaled_episode_keeps_the_messages_its_environment_said(tmp_path):
     """Messages an environment gives in any mapping are kept as JSON: a journaled collection writes
     them and reads the same episodes back, and each call's transcript lists those before it."""
-    trainer, rollout = build(Sayings(), journal=EpisodeJournal(str(tmp_path)))
+    trainer, collector = build(Sayings(), journal=EpisodeJournal(str(tmp_path)))
     state = trainer.initial_state()
-    episodes = collect(rollout, state)
-    assert collect(rollout, state) == episodes
+    episodes = collect(collector, state)
+    assert collect(collector, state) == episodes
     for episode in episodes:
         said = [{"role": "user", "content": "square"},
                 *({"role": "tool", "content": turn.observation.detail} for turn in episode.transitions)]
@@ -123,10 +155,7 @@ def test_sigkill_resumes_completed_turns_and_produces_the_same_update(tmp_path):
     for before, after in zip(original, restored, strict=True):
         assert before["identity"] == after["identity"]
         assert before["reward"] == after["reward"]
-        for old, new in zip(before["transitions"], after["transitions"], strict=True):
-            old["action"].pop("_binding_id")
-            new["action"].pop("_binding_id")
-            assert old == new
+        assert before["transitions"] == after["transitions"]
 
     with environment()(IDENTITY) as first:
         assert isinstance(first, RecoverableEnvironment)

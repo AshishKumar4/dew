@@ -26,6 +26,7 @@ from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.layout import DecisionInputs, Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
 from dew.diffusion import presets
+from dew.distributed.batches import DevicePrefetchIterator
 from dew.inputs import Field, InputSpec
 from dew.interop.hf_decoders import translate_config
 from dew.lora import LoRA
@@ -47,8 +48,9 @@ from dew.nn.gemma4_moe import Gemma4Experts
 from dew.nn.gpt_oss import GptOssMLP
 from dew.nn.inputs import ModelInputs
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.kernels.generation import assumed
-from dew.nn.linear import GatedDeltaNet, recurrent_delta_rule, recurrent_gated_delta_rule
+from dew.nn.kernels.generation import assumed, gpu_target
+from dew.nn.kernels.recurrence_chunk import recurrent_delta_rule
+from dew.nn.linear import GatedDeltaNet, recurrent_gated_delta_rule
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
@@ -64,7 +66,6 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.lm.objective import batch_text
 from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
-from dew.training.distributed import DevicePrefetchIterator
 from dew.training.interval import Interval
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount, prepare_counts, step_counts
 
@@ -233,10 +234,12 @@ def test_decision_head_charges_options_and_evidence_not_a_vocabulary():
 
 
 def test_host_row_counts_add_to_objectives_total_without_padding():
+    """Each row commits the targets its loss scores: two documents of two tokens score one each, and
+    one of three scores two, while the FLOP count keeps their inputs."""
     objective = LMObjective(decoder(), seq_len=6, pad_id=0)
     batch = packed_batch()
     counted = prepare_counts(objective, batch, count_model=True)
-    np.testing.assert_array_equal(counted[TOKENS], _TokenCount.words([4, 3]))
+    np.testing.assert_array_equal(counted[TOKENS], _TokenCount.words([2, 2]))
     assert counted[TRAINING_FLOPS].sum() == objective.training_flops(None, batch)
     assert counted["text"] is batch["text"]
     with pytest.raises(ValueError):
@@ -374,7 +377,7 @@ def test_prefetch_counts_on_worker_then_step_reduces_global_rows():
     with DevicePrefetchIterator(iter([batch]), mesh, prepare=prepare) as source:
         placed = next(source)
         measured = jax.jit(step_counts)(placed)
-        assert _TokenCount.host(measured[TOKENS]) == 7
+        assert _TokenCount.host(measured[TOKENS]) == 4
         assert float(measured[TRAINING_FLOPS]) == objective.training_flops(None, batch)
     assert threads == ["dew-prefetch"]
 
@@ -419,8 +422,20 @@ def forward_products(function, *operands, state_mac: bool = False):
     return float(jaxpr_products(traced, state_mac=state_mac))
 
 
+def executed(cond) -> list:
+    """The branches of `cond` a run may take: of a platform choice (`jax.lax.platform_dependent`), the
+    one an accelerator runs."""
+    platforms = cond.params.get("branches_platforms")
+    if platforms is None:
+        return list(cond.params["branches"])
+    return [cond.params["branches"][next(index for index, names in enumerate(platforms)
+                                         if names is None or "cuda" in names)]]
+
+
 def jaxpr_products(graph, *, state_mac=False):
-    """Count a scan body once per iteration, and one executed cond branch."""
+    """Count a scan body once per iteration, and one executed cond branch: of a platform choice
+    (`jax.lax.platform_dependent`), the branch an accelerator runs, the model's own products, where a
+    CPU's sums them in float64 and spreads a bias by a product (`dew.nn.precision`)."""
     if isinstance(graph, dict):
         return sum(jaxpr_products(part, state_mac=state_mac) for part in graph.values())
     if isinstance(graph, tuple | list):
@@ -440,8 +455,7 @@ def jaxpr_products(graph, *, state_mac=False):
         if primitive == "scan":
             total += equation.params["length"] * jaxpr_products(equation.params["jaxpr"], state_mac=state_mac)
         elif primitive == "cond":
-            total += max(jaxpr_products(branch, state_mac=state_mac)
-                         for branch in equation.params["branches"])
+            total += max(jaxpr_products(branch, state_mac=state_mac) for branch in executed(equation))
         elif primitive == "dot_general":
             left = equation.invars[0].aval.shape
             contracted = equation.params["dimension_numbers"][0][0]
@@ -549,7 +563,8 @@ def test_analytical_count_equals_every_forward_dot_and_convolution(family):
 
 @pytest.mark.parametrize("kind", ["gdn", "kda", "ssd", "mamba"])
 def test_recurrent_state_macs_are_algorithm_independent_and_scan_aware(kind):
-    """Three delta MACs, two SSD/Mamba MACs, executed once per real token."""
+    """Three delta MACs (the prediction, the write and the readout of the updated state, `recurrence.update`)
+    and two SSD/Mamba MACs, executed once per real token."""
     batch, length, heads, key, value = 2, 7, 2, 3, 5
     q = jnp.ones((batch, length, heads, key))
     v = jnp.ones((batch, length, heads, value))
@@ -584,7 +599,8 @@ def test_remaining_recurrent_and_latent_modules_match_token_paths(model):
     """One-token recurrence has no chunk-prep products, and the convs
     compute no outputs over their zero history: the model's count is the
     full traced product count, with no tolerance to hide a missing learned
-    projection."""
+    projection. A delta rule's token reads its updated state (`recurrence.update`, rows 1859 and 1962),
+    the analytic rule's three state products (`delta_flops`) and no more."""
     x = jnp.ones((2, 1, 8))
     variables = model.init(jax.random.key(202), x)
     assert model.model_flops(np.array([1, 1])) == forward_products(model.apply, variables, x, state_mac=True)
@@ -611,7 +627,9 @@ def test_active_expert_products_match_the_executed_forward(kind):
     assert model.model_flops(lengths) == forward_products(model.apply, variables, *operands) + scalar_mix
 
 
-def test_accumulation_two_logs_the_real_tokens_of_both_microbatches():
+def test_accumulation_two_logs_the_scored_targets_of_both_microbatches():
+    """Rows of 3 and 5 real tokens score 2 and 4 targets each: an update of both microbatches
+    commits their targets, not their inputs."""
     import optax
 
     from dew.training import Trainer
@@ -627,8 +645,50 @@ def test_accumulation_two_logs_the_real_tokens_of_both_microbatches():
     trainer.fit(Loader(batches, None, batch=8, records=16), steps=2, log_every=2)
     ticks = [scalars for _, scalars in tracker.scalars if "train/tokens" in scalars]
     assert len(ticks) == 1
-    assert ticks[0]["train/tokens"] * 2 == 8 * (3 + 5)
+    assert ticks[0]["train/tokens"] * 2 == 8 * (2 + 4)
     assert ticks[0]["train/tokens_per_s"] > 0
+
+
+def test_a_token_budget_runs_until_the_targets_its_loss_scored_reach_it():
+    """Eight padded rows of 3 real tokens hold 24 inputs and score 16 targets a step, so a budget of
+    40 tokens ends at the step whose targets pass it, the third, not the second, where the inputs
+    would pass it."""
+    import optax
+
+    from dew.training import Trainer
+
+    def batches(partition):
+        while True:
+            yield {"text": np.broadcast_to((np.arange(7) < 3).astype(np.int32), (8, 7))}
+
+    objective = LMObjective(decoder().clone(num_layers=1), seq_len=6, pad_id=0)
+    state = Trainer(objective, optax.sgd(0.01), key=0).fit(Loader(batches, None, batch=8, records=None),
+                                                           tokens=40, log_every=1)
+    assert int(state.step) == 3
+
+
+def test_a_run_on_a_device_without_a_known_peak_still_reports_its_training_flops():
+    """train/flops, the step's analytical training work over the mesh, needs no device peak: a run
+    logs every step's count, the objective's own for its batch, on any device, and train/mfu only
+    where the device's peak is known, so on the CPU lane, whose devices have none, the count alone.
+    The counts are sums of float32 per-row shares, exact below 2**21 (a share is the count over
+    eight rows, three more bits), so they compare exactly."""
+    import optax
+
+    from dew.training import Trainer
+
+    batch = {"text": np.broadcast_to((np.arange(7) < 5).astype(np.int32), (8, 7))}
+    tracker = RecordingTracker()
+    objective = LMObjective(decoder().clone(num_layers=1), seq_len=6, pad_id=0)
+    work = objective.training_flops(None, batch)
+    assert 0 < work < 2**21
+    trainer = Trainer(objective, optax.sgd(0.01), key=0, tracker=tracker)
+    trainer.fit(Loader(lambda partition: iter([batch, batch]), None, batch=8, records=16), steps=2,
+                log_every=1)
+    logged = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
+    assert [scalars["train/flops"] for scalars in logged] == [work, work]
+    peak = gpu_target(jax.devices()[0].device_kind).bf16_peak
+    assert all(("train/mfu" in scalars) == (peak is not None) for scalars in logged)
 
 
 def test_s5_write_read_matches_the_native_scanned_path():

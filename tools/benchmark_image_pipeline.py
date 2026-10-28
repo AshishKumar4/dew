@@ -17,8 +17,10 @@ import importlib.metadata
 import io
 import itertools
 import json
+import os
 import platform
 import statistics
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,12 +33,16 @@ import tensorflow_datasets as tfds
 import tyro
 from PIL import Image
 
-from dew.config.data import Augment, ImageData, loader
-from dew.data import TFDS, Loading
+from dew.data import TFDS, Loading, images, presets
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
 from dew.data.image_codec import decode_image
 from dew.data.images import resize_image
+from dew.distributed.batches import split_fields
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import peak_memory
 
 
 @dataclass
@@ -53,6 +59,14 @@ class Config:
     training: bool = True
     """Also time the real Trainer's prefetched pixel-diffusion update."""
     out: Path | None = None
+    peak_run: str | None = None
+    """Run this mode's device pipeline (`PIPELINES`) alone, for its measured peak (tools/peak_memory.py),
+    writing nothing."""
+
+
+PIPELINES = {"flip_jitter": (1.0, 1.0), "crop_flip_jitter": (0.6, 1.0)}
+"""The augmentation modes the pipeline is timed in, each with its crop scale: each runs on the host and on the
+device, and the device's measured peak is taken of each."""
 
 
 def decoders(size):
@@ -125,23 +139,64 @@ def augmentation_accuracy():
             "bound": float(255 * 8 * np.finfo(np.float32).eps)}
 
 
+def device_steps(steps):
+    """The steps a loader leaves to the accelerator (`Loader.device`), applied to a batch's arrays
+    in one compiled function, as `Trainer.fit` applies them before its update; text fields stay
+    on the host."""
+
+    @jax.jit
+    def apply(arrays):
+        for step in steps:
+            arrays = step(arrays)
+        return arrays
+
+    def augmented(batch):
+        # The fields a device holds, as the step takes them: no array leaves the device to be read.
+        return apply(split_fields(batch)[0])
+
+    return augmented
+
+
+def flowers(config, backend, crop_scale=(1.0, 1.0)):
+    """Oxford Flowers in a run's order, each JPEG decoded by Dew at a reduced scale no smaller than
+    `config.image_size`, resized to it and captioned by class from a template, then cropped to
+    `crop_scale` of its area, flipped and colour-jittered on the `backend`, "host" or "device"; the
+    caption is dropped before a batch reaches the run."""
+    size = config.image_size
+    if backend == "device":
+        augment = images.DeviceAugment(size, crop_scale=crop_scale, flip=True, jitter=True)
+    elif crop_scale != (1.0, 1.0):
+        augment = images.RandomCrop(size, scale=crop_scale, flip=True, jitter=True)
+    else:
+        augment = (images.Flip(), images.ColorJitter())
+    source = TFDS("oxford_flowers102", path=config.flowers, split="all",
+                  decoders={"image": tfds.decode.SkipDecoding()})
+    chain = source.shuffle(0).repeat().pipe(presets.images, size, batch=config.batch, augment=augment,
+                                            draft=True, rejects=False,
+                                            caption=images.caption(templates=("a photo of a {}",)),
+                                            host=(images.EncodeCaptions(),))
+    return compile(chain, read="memory",
+                   loading=Loading(workers=0, threads=config.threads, read_buffer=2 * config.batch))
+
+
 def pipeline_timing(config, backend, crop_scale):
-    spec = ImageData(source=TFDS("oxford_flowers102", path=config.flowers, split="all"),
-                  image_size=config.image_size, caption_templates=("a photo of a {}",),
-                  augment=Augment(flip=True, jitter=True, backend=backend, crop_scale=crop_scale))
-    stream = loader(spec, batch=config.batch, read="memory",
-                  loading=Loading(workers=0, threads=config.threads,
-                      read_buffer=2 * config.batch)).train(DataPartition())
-    consume = jax.jit(lambda pixels: jnp.mean(pixels.astype(jnp.float32)))
+    data = flowers(config, backend, crop_scale)
+    stream = data.train(DataPartition())
+    augmented = device_steps(data.device)
+    reduce = jax.jit(lambda pixels: jnp.mean(pixels.astype(jnp.float32)))
+
+    def consume(batch):
+        return reduce(augmented(batch)["image"])
+
     durations, cpu_times = [], []
     try:
         for _ in range(config.warmup):
-            jax.block_until_ready(consume(next(stream)["image"]))
+            jax.block_until_ready(consume(next(stream)))
         for _ in range(config.repeats):
             cpu_started = time.process_time()
             started = time.perf_counter()
             for _ in range(config.steps):
-                jax.block_until_ready(consume(next(stream)["image"]))
+                jax.block_until_ready(consume(next(stream)))
             durations.append(time.perf_counter() - started)
             cpu_times.append(time.process_time() - cpu_started)
     finally:
@@ -156,15 +211,12 @@ def training_timing(config, backend):
     import optax
 
     from dew.diffusion.presets import EDM
+    from dew.distributed.batches import DevicePrefetchIterator
     from dew.inputs import Field, InputSpec
     from dew.nn.backbones import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Trainer
-    from dew.training.distributed import DevicePrefetchIterator
 
-    spec = ImageData(source=TFDS("oxford_flowers102", path=config.flowers, split="all"),
-                  image_size=config.image_size, caption_templates=("a photo of a {}",),
-                  augment=Augment(flip=True, jitter=True, backend=backend))
     model = SimpleDiT(patch_size=16, emb_features=32, num_layers=1, num_heads=4,
                       dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST, attention_impl="reference")
     objective = DiffusionObjective(model, EDM(regime="pixel"),
@@ -172,19 +224,21 @@ def training_timing(config, backend):
                                   ema_decay=None)
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0))
     state, _, _ = trainer.place()
-    source = loader(spec, batch=config.batch, read="memory",
-                  loading=Loading(workers=0, threads=config.threads, read_buffer=2 * config.batch)).train(
-                      DataPartition.of(trainer.device_mesh))
+    data = flowers(config, backend)
+    source = data.train(DataPartition.of(trainer.device_mesh))
+    # The loader's device steps, augmentation among them, run in their own compiled dispatch
+    # before each update; `Trainer.fit` runs them inside it.
+    augmented = device_steps(data.device)
     durations = []
     with DevicePrefetchIterator(source, trainer.device_mesh) as batches:
-        step = trainer.compile(state, next(batches))
+        step = trainer.compile(state, augmented(next(batches)))
         for _ in range(config.warmup):
-            state, loss, _, _, _, _ = step(state, next(batches))
+            state, loss, _, _, _, _ = step(state, augmented(next(batches)))
         jax.block_until_ready(state)
         for _ in range(config.repeats):
             started = time.perf_counter()
             for _ in range(config.steps):
-                state, loss, _, _, _, _ = step(state, next(batches))
+                state, loss, _, _, _, _ = step(state, augmented(next(batches)))
             jax.block_until_ready(state)
             durations.append(time.perf_counter() - started)
     if not np.isfinite(float(loss)):
@@ -197,6 +251,13 @@ def training_timing(config, backend):
 
 def main(config):
     cv2.setNumThreads(1)
+    if config.peak_run is not None:
+        pipeline_timing(config, "device", PIPELINES[config.peak_run])
+        return None
+    # Each mode's device pipeline's measured peak, in a process of its own, before this one opens a backend.
+    peaks = {} if config.decoder_only else {
+        mode: peak_memory.measured([os.path.abspath(__file__), *sys.argv[1:], "--peak-run", mode])
+        for mode in PIPELINES}
     source = TFDS("oxford_flowers102", path=config.flowers, split="all",
                   decoders={"image": tfds.decode.SkipDecoding()}).records("indexed")
     encoded = [source[index]["image"] for index in range(min(config.images, len(source)))]
@@ -225,9 +286,11 @@ def main(config):
             source[index]
         report["pipeline"] = {
             f"{backend}_{mode}": pipeline_timing(config, backend, scale)
-            for mode, scale in (("flip_jitter", (1.0, 1.0)), ("crop_flip_jitter", (0.6, 1.0)))
+            for mode, scale in PIPELINES.items()
             for backend in ("host", "device")
         }
+        for mode, peak in peaks.items():
+            report["pipeline"][f"device_{mode}"]["peak_device_bytes"] = None if None in peak else max(peak)
         if config.training:
             report["training"] = {backend: training_timing(config, backend) for backend in ("host", "device")}
     text = json.dumps(report, indent=2)

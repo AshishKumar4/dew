@@ -10,31 +10,41 @@ their keys through `index_scores` and select through `top_k_selection`,
 read, and `sparse_latent_attention` attends it without that mask.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 
-from dew.nn.precision import at_least_fp32
+from dew.nn.inputs import sequence_blocks
+from dew.nn.precision import accumulated, at_least_fp32, float32_einsum, float32_products
 from dew.nn.scatter import DROPPED
 
 
-def index_scores(query, keys, weights, precision=None):
-    """The lightning indexer's score of each query against each key,
-    `sum_h w_h relu(q_h . k) / sqrt(head_dim) / sqrt(n_heads)`, at least in
-    fp32 (`at_least_fp32`): queries `[B, S, H, D]` against keys `[B, T, D]`
-    every query shares or `[B, S, T, D]` per query, weighted by `weights`
-    `[B, S, H]`, as `[B, S, T]`. Both contractions take `precision`. The
-    V3.2 indexer scores its keys, GLM's k-pool its pooled keys and DeepSeek
-    V4 its compressed entries through it."""
-    heads, width = query.shape[-2:]
+def index_agreements(query, keys, precision=None):
+    """Each lightning indexer head's agreement of each query with each key, `q_h . k` before its relu,
+    at least in fp32 (`at_least_fp32`): queries `[B, S, H, D]` against keys `[B, T, D]` every query
+    shares or `[B, S, T, D]` per query, as `[B, S, H, T]`, under `precision`. A key every head
+    disagrees with scores zero (`index_scores`), however near zero its agreements sit."""
     wide = at_least_fp32(query.dtype)
     shared = 'bshd,btd->bsht' if keys.ndim == 3 else 'bshd,bstd->bsht'
-    scores = jnp.maximum(jnp.einsum(shared, query.astype(wide),
-                                    keys.astype(wide), precision=precision), 0) * width ** -0.5
+    return float32_einsum(shared, query.astype(wide), keys.astype(wide), precision=precision)
+
+
+def index_scores(agreements, weights, width: int, precision=None):
+    """The lightning indexer's score of each query against each key,
+    `sum_h w_h relu(q_h . k) / sqrt(head_dim) / sqrt(n_heads)`, at least in
+    fp32, from its heads' `agreements` `[B, S, H, T]` (`index_agreements`) of
+    queries `width` wide, weighted by `weights` `[B, S, H]`, as `[B, S, T]`;
+    the head sum takes `precision`. The V3.2 indexer scores its keys, GLM's
+    k-pool its pooled keys and DeepSeek V4 its compressed entries through it."""
+    heads, wide = agreements.shape[-2], agreements.dtype
+    scores = jnp.maximum(agreements, 0) * width ** -0.5
     # The head sum as a [1, H] by [H, T] product per query: written as the
     # einsum over the scores first, it ran a third slower forward and backward
     # on an H100 at the V3.2 indexer's 64 heads over 4096 keys.
     weighted = (weights.astype(wide) * heads ** -0.5)[..., None, :]
-    return jnp.matmul(weighted, scores, precision=precision).squeeze(-2)
+    return accumulated(functools.partial(jnp.matmul, precision=float32_products(wide, precision)),
+                       weighted, scores).squeeze(-2)
 
 
 def top_k_selection(scores, keep, top_k: int):
@@ -110,13 +120,12 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
     nothing reads.
     """
     batch, length, heads, _ = query_nope.shape
-    absorbed = jnp.einsum('bshn,rhn->bshr', query_nope, key_weight.astype(query_nope.dtype),
+    absorbed = float32_einsum('bshn,rhn->bshr', query_nope, key_weight.astype(query_nope.dtype),
                           precision=precision)
     blocks = -(-length // block)
 
     def blocked(x):
-        x = jnp.pad(x, [(0, 0), (0, blocks * block - length)] + [(0, 0)] * (x.ndim - 2))
-        return jnp.moveaxis(x.reshape(batch, blocks, block, *x.shape[2:]), 1, 0)
+        return sequence_blocks(x, block, blocks, leading=True)
 
     def gathered(table, where):
         return jax.vmap(lambda rows, at: rows[at])(table, where)
@@ -127,17 +136,17 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
         allowed, at = at >= 0, jnp.maximum(at, 0)
         keys, rots = gathered(latent, at), gathered(rot, at)
         wide = at_least_fp32(q_latent.dtype)
-        logits = (jnp.einsum('bqhr,bqkr->bqhk', q_latent, keys, precision=precision,
+        logits = (float32_einsum('bqhr,bqkr->bqhk', q_latent, keys, precision=precision,
                              preferred_element_type=wide)
-                  + jnp.einsum('bqhp,bqkp->bqhk', q_rot, rots, precision=precision,
+                  + float32_einsum('bqhp,bqkp->bqhk', q_rot, rots, precision=precision,
                                preferred_element_type=wide)) * scale
         logits = jnp.where(allowed[:, :, None, :], logits, jnp.finfo(wide).min)
         weights = jax.nn.softmax(logits, axis=-1).astype(keys.dtype)
-        return jnp.einsum('bqhk,bqkr->bqhr', weights, keys, precision=precision)
+        return float32_einsum('bqhk,bqkr->bqhr', weights, keys, precision=precision)
 
     context = jax.lax.map(attend, tuple(blocked(x) for x in (absorbed, query_rot, indices)))
     context = jnp.moveaxis(context, 0, 1).reshape(batch, blocks * block, heads, -1)[:, :length]
-    return jnp.einsum('bshr,rhv->bshv', context, value_weight.astype(context.dtype),
+    return float32_einsum('bshr,rhv->bshv', context, value_weight.astype(context.dtype),
                       precision=precision)
 
 

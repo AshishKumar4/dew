@@ -1,6 +1,6 @@
 """The actual Wan 2.1 video VAE, saved and walked, for tests/fixtures.
 
-A tiny `AutoencoderKLWan` from diffusers 0.34.0 is constructed with the
+A tiny `AutoencoderKLWan` from diffusers 0.39.0 is constructed with the
 published architecture's controls (four levels, two residual blocks each,
 time halved at the second and third downsampling, the mid-block attention)
 at narrow widths, saved with `save_pretrained` - its real config and its

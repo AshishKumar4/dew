@@ -6,7 +6,7 @@ its source archive checked against its SHA-256) converts the export with its
 own convert_hf_to_gguf.py to an F32 GGUF, and libllama, built from the same
 source for the CPU, computes the logits of every position of fixed ids with
 an F32 KV cache, flash attention off, on one thread. transformers runs the
-export in float64 (`diffusers_wan_reference.float64`) for the truth both
+export in float64 (`torch_precision.float64`) for the truth both
 are measured from.
 
 The decoder is a tiny Llama from the registry with weights on a grid of
@@ -253,7 +253,8 @@ def consume(directory: Path, converter_python: str) -> None:
     import transformers
     from transformers import AutoModelForCausalLM
 
-    from tools.diffusers_wan_reference import float64
+    from tools.reference_source import saved_fixture
+    from tools.torch_precision import float64
 
     source = fetch()
     program = build(source)
@@ -275,11 +276,10 @@ def consume(directory: Path, converter_python: str) -> None:
     meta = {"digests": digests(export_dir), "llama.cpp": COMMIT, "converter torch": converter[0],
             "converter transformers": converter[1], "truth transformers": transformers.__version__,
             "truth torch": torch.__version__}
-    FIXTURE.mkdir(parents=True, exist_ok=True)
     pieces, special = gguf_vocabulary(source, gguf)
     arrays = {"ids": IDS[None], "llama_cpp.fp32": theirs, "transformers.fp64": truth, "gguf.pieces": pieces,
-              "gguf.special": special, "meta": np.frombuffer(json.dumps(meta).encode(), np.uint8)}
-    np.savez_compressed(FIXTURE / "reference.npz", **arrays)
+              "gguf.special": special}
+    saved_fixture(FIXTURE / "reference.npz", arrays, meta)
     gap = float(np.sqrt(np.mean((theirs - truth) ** 2)))
     print(f"{FIXTURE / 'reference.npz'}: llama.cpp off float64 by {gap:.3g} (rms)")
 

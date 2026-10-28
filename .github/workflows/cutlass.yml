@@ -1,0 +1,70 @@
+# Builds kernels/cutlass's wheels, CUTLASS's grouped GEMMs for JAX, for each
+# CUDA major on x86_64 and on aarch64 (the GH200's Grace), through
+# cuda-wheels.yml, which kernels/flash_attn's wheels share. The wheels are this run's artifacts. It runs for a release tag or by
+# hand: a kernel change builds its wheel on a GPU node while its lane works,
+# and a branch push builds none.
+#
+# A tag cutlass-v<version> releases them: the build checks that the tag is the
+# version kernels/cutlass/pyproject.toml carries and that both wheels pass
+# twine's checks, and one publish job per CUDA major uploads that major's two
+# wheels to PyPI, the cu12 ones as dew-cutlass-cu12 and the cu13 ones as
+# dew-cutlass-cu13. Trusted publishing, as kernels/flash_attn's wheels are
+# published (flash-attn.yml): PyPI accepts this workflow's short-lived OIDC
+# token, so the repository holds no PyPI secret. Each project names this
+# repository, this workflow file and its own environment: `pypi-cutlass-cu12`
+# for cu12 and `pypi-cutlass-cu13` for cu13, each limited to cutlass-v* tags.
+# Only the publish jobs can mint the token, and they run no code from the
+# repository.
+
+name: CUTLASS wheels
+
+on:
+  push:
+    tags: [ "cutlass-v*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    uses: ./.github/workflows/cuda-wheels.yml
+    with:
+      package: cutlass
+      tag: cutlass
+
+  publish:
+    needs: wheel
+    if: startsWith(github.ref, 'refs/tags/cutlass-v')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        # Each CUDA major's project and environment, one publish job a major.
+        include:
+        - cuda: "12"
+          environment: pypi-cutlass-cu12
+          project: dew-cutlass-cu12
+        - cuda: "13"
+          environment: pypi-cutlass-cu13
+          project: dew-cutlass-cu13
+    environment:
+      name: ${{ matrix.environment }}
+      url: https://pypi.org/p/${{ matrix.project }}
+    permissions:
+      id-token: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: dew-cutlass-cuda${{ matrix.cuda }}.*-*
+        merge-multiple: true
+        path: dist/
+    - name: The wheels are this project's, one a machine
+      # The CUDA major's build names its wheel after its project, which PyPI refuses under another's publisher.
+      run: |
+        ls dist/
+        test "$(ls dist/ | wc -l)" = 2
+        test "$(ls dist/ | grep -c "^$(echo '${{ matrix.project }}' | tr - _)-")" = 2
+        ls dist/ | grep -q "_x86_64.whl$"
+        ls dist/ | grep -q "_aarch64.whl$"
+    - name: Publish
+      uses: pypa/gh-action-pypi-publish@release/v1

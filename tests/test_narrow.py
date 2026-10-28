@@ -115,8 +115,24 @@ def _keeping_gradients(optimizer):
     return optax.chain(kept, optimizer)
 
 
+def _decoder(*, scanned=False, remat=None, mixture=False, rows=8):
+    """`_trained`'s tied bf16 decoder over fp32 parameters, as its LM objective, and the batch of
+    `rows` rows it trains on."""
+    from dew.batch import TEXT_KEY
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.objectives.routing import ExpertBalance
+    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
+                              num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
+                              tie_embeddings=True, dtype=jnp.bfloat16, scan_layers=scanned, remat=remat,
+                              mixture={"experts": 4, "top_k": 2} if mixture else None)
+    objective = LMObjective(model, seq_len=8, pad_id=0,
+                            balance=ExpertBalance(aux_loss_alpha=.01) if mixture else None)
+    return objective, {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (rows, 9)), jnp.int32)}
+
+
 def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1, split=None,
-             mixture=False, rows=8, ragged=False, scanned=False):
+             mixture=False, rows=8, ragged=False, scanned=False, remat=None, longer=None):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
     one batch and then `padded` steps on a batch of padding alone, with
     `copies` on or off on this device's generation, on `mesh` with every
@@ -126,27 +142,28 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     every other row in padding, so no two neighbouring microbatches count
     as many tokens, whether a window reads steps or a step's parts. A
     `scanned` decoder of four layers runs them as one scan over their
-    stacked weights, each layer's stored apart. Returns the state, each
-    step's loss and the trainer."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.lm import TEXT_KEY, LMObjective
+    stacked weights, each layer's stored apart, and each block recomputes
+    as `remat` names. With `longer`, every other step reads a batch of that
+    many rows, whose shape the trainer plans apart. Returns the state, each
+    step's loss and the trainer, its plan the last shape's."""
+    from dew.batch import TEXT_KEY
     from dew.training import Layout, MeshSpec, Trainer
-    model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=4 if scanned else 2, num_heads=2,
-                              num_kv_heads=1, mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
-                              tie_embeddings=True, dtype=jnp.bfloat16, scan_layers=scanned,
-                              mixture={"experts": 4, "top_k": 2} if mixture else None)
-    objective = LMObjective(model, seq_len=8, pad_id=0, aux_loss_alpha=.01 if mixture else None)
-    batch = {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (rows, 9)), jnp.int32)}
+    objective, batch = _decoder(scanned=scanned, remat=remat, mixture=mixture, rows=rows)
+    long = longer and {TEXT_KEY: jnp.asarray(np.random.default_rng(1).integers(1, 64, (longer, 9)),
+                                             jnp.int32)}
     with chosen(narrow_copies='on' if copies else 'off'):
         trainer = Trainer(objective, optimizer, key=jax.random.key(0), mesh=mesh or MeshSpec(),
                           layout=Layout(min_shard=1, tolerance=1.0), accumulation=accumulation, split=split)
         state = trainer.initial_state()
-        step = trainer.compile(state, batch)
+        steps_by = {False: (trainer.compile(state, batch), None)}
+        if long:
+            steps_by[True] = (trainer.compile(state, long), long)
     shorter = {TEXT_KEY: batch[TEXT_KEY].at[::2, -3:].set(0)}
     trained = [shorter if ragged and index % 2 == 0 else batch for index in range(steps)]
     losses = []
-    for current in trained + [{TEXT_KEY: jnp.zeros_like(batch[TEXT_KEY])}] * padded:
-        state, loss, *_ = step(state, current)
+    for index, current in enumerate(trained + [{TEXT_KEY: jnp.zeros_like(batch[TEXT_KEY])}] * padded):
+        step, read = steps_by[bool(long) and index % 2 == 1]
+        state, loss, *_ = step(state, current if read is None else read)
         losses.append(np.asarray(loss))
     return state, losses, trainer
 
@@ -265,7 +282,7 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     them before its first call, so their bytes count beside the step with the
     prefetched batches: the headroom the check leaves is the step's own,
     `step_headroom` of the devices' free bytes, less the bytes held beside it."""
-    from dew.training.distributed import placed_bytes
+    from dew.distributed.placement import placed_bytes
     from dew.training.memory import step_headroom
 
     limit = 2 ** 40
@@ -286,10 +303,132 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     assert copies > 0 and held[0] - held[1] == copies
 
 
+def test_a_step_that_fits_only_without_its_copies_drops_them_before_it_recomputes(monkeypatch):
+    """The narrow copies are the fit ladder's first rung. In the geometry of row 1661's run, a window of
+    two steps under full recomputation, the backward adds each gradient into the window's sum as it is
+    made, so the copies, two bytes a parameter held all run, are bytes the step gives back: one that
+    does not fit with them drops them before it recomputes more, and its plan says so
+    (`narrow`), on devices whose free bytes lie between its footprints with and without them."""
+    free = 2 ** 39
+    monkeypatch.setattr(jax.Device, "memory_stats",
+                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
+
+    def trained(*, copies):
+        return _trained(optax.adam(1e-3), copies=copies, steps=1, accumulation=2, split=1, remat="full")
+
+    def used(*, copies):
+        return free - trained(copies=copies)[2].plan["probes"][0]["headroom"]
+
+    with_copies, without = used(copies=True), used(copies=False)
+    assert without < with_copies
+    free = (with_copies + without) // 2
+    state, _, trainer = trained(copies=True)
+    probes = trainer.plan["probes"]
+    assert [(probe["narrow"], probe["fits"]) for probe in probes] == [(True, False), (False, True)]
+    assert (trainer.plan["narrow"], trainer.plan["remat"], trainer.plan["split"]) == (False, "full", 1)
+    assert state.compute is None
+
+
+def test_a_fit_whose_state_fits_but_not_with_its_copies_trains_without_them(monkeypatch):
+    """Row 1661's run (1765): devices that hold the state a run keeps between steps, its parameters,
+    optimizer state and the window's accumulator, but not that state and its narrow bf16 copies. The
+    check `fit` makes before it places anything holds that state alone, which `validate` reports the
+    same with the copies on as off: the copies are the plan's first rung, dropped where the step does
+    not fit with them. On devices of that capacity, whose free bytes lie between the step's footprints
+    with and without its copies, fit trains, its plan without them."""
+    from test_layout_validation import capped
+    from token_support import repeated_token_batch
+
+    from dew.data.dataset import Loader
+    from dew.distributed.placement import placed_bytes
+    from dew.training import Layout, MeshSpec, Trainer
+
+    free = 2 ** 39
+    monkeypatch.setattr(jax.Device, "memory_stats",
+                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
+    geometry = {"steps": 1, "accumulation": 2, "split": 1, "remat": "full"}
+    narrow, _, trainer = _trained(optax.adam(1e-3), copies=True, **geometry)
+    with_copies = free - trainer.plan["probes"][0]["headroom"]
+    without = free - _trained(optax.adam(1e-3), copies=False, **geometry)[2].plan["probes"][0]["headroom"]
+    copies = placed_bytes(jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), narrow.compute))
+
+    def built(kind: type[Trainer] = Trainer) -> tuple[Trainer, dict]:
+        objective, batch = _decoder(remat="full")
+        return kind(objective, optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(),
+                    layout=Layout(min_shard=1, tolerance=1.0), accumulation=2, split=1), batch
+
+    def held(*, copies: bool) -> int:
+        run, batch = built()
+        with chosen(narrow_copies='on' if copies else 'off'):
+            return max(run.validate(batch).device_bytes.values())
+
+    state = held(copies=False)
+    assert copies > 0 and held(copies=True) == state
+    free = (with_copies + without) // 2
+    run, _ = built(capped(state + copies // 2))
+    stream = Loader(train=lambda partition: repeated_token_batch(64, 8, 9), val=None, records=None, batch=8)
+    with chosen(narrow_copies='on'):
+        run.fit(stream, steps=2)
+    probes = run.plan["probes"]
+    assert [(probe["narrow"], probe["fits"]) for probe in probes] == [(True, False), (False, True)]
+
+
+def test_a_plan_a_rung_above_its_dropped_copies_takes_them_back_where_they_fit(monkeypatch):
+    """A window of one step that recomputes nothing holds about as much without its copies as with them:
+    its backward keeps the whole gradient, in float32 where the copies' is bfloat16. Where it fits its
+    own rung neither way, the plan climbs past the rung that dropped them, and at the rung and split it
+    reaches it compiles the step with them once more and keeps them, as they fit there too."""
+    free = 2 ** 39
+    monkeypatch.setattr(jax.Device, "memory_stats",
+                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
+
+    def trained(*, copies):
+        return _trained(optax.adam(1e-3), copies=copies, steps=1, split=1, rows=64)
+
+    base = trained(copies=True)[2].plan["probes"][0]
+    free -= max(base["headroom"], trained(copies=False)[2].plan["probes"][0]["headroom"]) + 1
+    state, _, trainer = trained(copies=True)
+    probes, plan = trainer.plan["probes"], trainer.plan
+    assert [(probe["narrow"], probe["fits"]) for probe in probes[:2]] == [(True, False), (False, False)]
+    rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults")
+    planned = {key: plan[key] for key in rung}
+    fitted, last = probes[-2], probes[-1]
+    assert planned != {key: base[key] for key in rung}
+    assert [{key: probe[key] for key in rung} for probe in (fitted, last)] == [planned, planned]
+    assert [(probe["narrow"], probe["fits"]) for probe in (fitted, last)] == [(False, True), (True, True)]
+    assert plan["narrow"] and state.compute is not None
+
+
+def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads(monkeypatch):
+    """Each shape a run meets plans its copies itself (`_at_base_rung`): where a longer batch fits only
+    without them and a shorter one with them, the steps take turns, each reading the state as its own plan
+    compiled it, the copies dropped before the longer batch's step and built again before the shorter's,
+    and under plain SGD the run lands bitwise on the parameters and losses of one without copies."""
+    free = 2 ** 39
+    monkeypatch.setattr(jax.Device, "memory_stats",
+                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
+
+    def trained(*, copies, rows=8, longer=None, steps=0):
+        return _trained(optax.sgd(0.5), copies=copies, steps=steps, accumulation=2, split=1, remat="full",
+                        rows=rows, longer=longer)
+
+    def used(rows, *, copies):
+        return free - trained(copies=copies, rows=rows)[2].plan["probes"][0]["headroom"]
+
+    shorter, longer, longer_without = used(8, copies=True), used(64, copies=True), used(64, copies=False)
+    free = max(shorter, longer_without)
+    assert free < longer
+    narrow, losses, trainer = trained(copies=True, longer=64, steps=3)
+    assert not trainer.plan["narrow"] and narrow.compute is not None
+    plain, plain_losses, _ = trained(copies=False, longer=64, steps=3)
+    _assert_plain_update(narrow, losses, plain, plain_losses)
+
+
 def test_a_restored_state_drops_its_templates_copies():
     """The copies are of the template's own parameters; a restored state
     starts without and the step rebuilds them from what was restored."""
-    from dew.training.state import TrainState
+    from dew.state import TrainState
 
     zero, one = jnp.zeros((), jnp.int32), jnp.ones((), jnp.int32)
     template = TrainState(step=zero, microstep=zero, updates=zero, variables={"params": {"w": jnp.ones(2)}},

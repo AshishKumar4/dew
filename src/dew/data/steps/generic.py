@@ -1,4 +1,4 @@
-"""Field selection and record filtering shared by the typed recipes."""
+"""Field selection, formatting and record filtering, steps any chain takes."""
 
 from __future__ import annotations
 
@@ -9,8 +9,21 @@ import grain.python as grain
 import jax
 import numpy as np
 
-from dew.data.dataset import Batch
-from dew.records import record
+from dew._records import record
+from dew.batch import Batch
+
+
+def aligned(element: Batch, fields: tuple[str, ...], beside: tuple[str, ...] = ()) -> Batch:
+    """`element`'s `fields`, which hold one entry a token of the record and so one length, as arrays,
+    beside its `beside` fields, on axes of their own and read as they are. A record whose fields
+    differ in length is refused: packed or cut into windows, each field would be cut at other places,
+    one field's tokens standing beside another's from elsewhere, which no reader tells."""
+    tokens = {name: np.asarray(element[name]) for name in fields}
+    lengths = {name: len(value) for name, value in tokens.items()}
+    if len(set(lengths.values())) > 1:
+        raise ValueError(f"a record's token fields {list(fields)} hold one entry a token, so one length; "
+                         f"this record's hold {lengths}")
+    return {**tokens, **{name: element[name] for name in beside}}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -24,6 +37,15 @@ class Fields(grain.MapTransform):
     rename: tuple[tuple[str, str], ...] = ()
     remove: tuple[str, ...] = ()
     bookkeeping: bool = False
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """The shapes of the fields kept, under their new names."""
+        shapes = record(facts.get("fields", {}), "fields")
+        names = tuple(shapes) if self.names is None else self.names
+        kept = {name: shapes[name] for name in names if name in shapes and name not in self.remove}
+        renamed = dict(self.rename)
+        return {**facts, "fields": {**{name: shape for name, shape in kept.items() if name not in renamed},
+                                    **{new: kept[old] for old, new in self.rename if old in kept}}}
 
     def map(self, element: Batch) -> Batch:
         renamed = dict(self.rename)
@@ -45,7 +67,7 @@ class Coordinated(grain.MapTransform):
     """A packed training or validation batch with each window's documents as
     the model reads them: the `<ids>_segment_ids` and `<ids>_positions` a
     packer writes for its `fields` become `<ids>_coordinates`, the model's
-    `dew.nn.inputs.Coordinates` built on the host, holding at most
+    `dew.batch.Coordinates` built on the host, holding at most
     `max_segments` documents a row, or as many as a window holds tokens where
     None (static, so a compiled step is specialized to it). A window holding
     more than its read declared is refused, which a sequence kernel would run
@@ -56,7 +78,7 @@ class Coordinated(grain.MapTransform):
     max_segments: int | None
 
     def map(self, element: Batch) -> Batch:
-        from dew.nn.inputs import coordinates
+        from dew.batch import coordinates
 
         ids = self.fields[0]
         if f"{ids}_segment_ids" not in element:

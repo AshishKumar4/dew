@@ -22,17 +22,17 @@ import optax
 import pytest
 from affine_run import Replaying
 from flax import linen as nn
-from flax.traverse_util import flatten_dict
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
 from process_support import READ_ONLY, fresh, keeping_picks
-from reference_error import assert_leaves_as_exact, float64_terms
+from reference_error import as_given, assert_as_exact, widened, with_gradients, without_ynn
 
+from dew.batch import FROZEN
 from dew.data.dataset import Loader
-from dew.interop.codecs import dequantize_fp8_blocks, quantize_fp8_blocks
+from dew.interop.codecs import fp8_block_cast, quantize_fp8_blocks
 from dew.lora import LoRA, unadapted
-from dew.nn.kernels.generation import assumed, device_generation, gpu_target
-from dew.objectives.base import FROZEN
+from dew.nn.kernels.generation import assumed, device_generation, fp8_tensor_cores
 from dew.objectives.lm import LMObjective
 from dew.quantization import (
     FROZEN_FP8,
@@ -51,6 +51,25 @@ VOCAB, SEQ, BATCH = 64, 16, 8
 FEATURES, MLP = 64, 128
 FP8_SITES = ("q_proj", "gate_proj", "up_proj", "down_proj", "lm_head")
 """The FP8 sites, the untargeted vocabulary head among them."""
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_resident_frozen_kernel_packs_in_a_sharded_program():
+    """Packing a resident base executes in its sharded JAX program, without gathering the kernel
+    to NumPy. Both forward and input-gradient encodings equal the checkpoint codec's bytes."""
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    matrix = np.random.default_rng(37).normal(size=(32, 48)).astype(np.float32)
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("model",))
+    placed = jax.device_put(matrix, NamedSharding(mesh, P("model", None)))
+    actual = jax.jit(frozen_fp8_leaves)(placed)
+    hosted = frozen_fp8_leaves(matrix)
+    assert all(isinstance(leaf, np.ndarray) for leaf in hosted.values())
+    forward, forward_scale = quantize_fp8_blocks(matrix.T, (1, matrix.shape[0]))
+    backward, backward_scale = quantize_fp8_blocks(matrix, (1, matrix.shape[1]))
+    for key, expected in zip(FROZEN_FP8, (forward, forward_scale, backward, backward_scale), strict=True):
+        np.testing.assert_array_equal(np.asarray(actual[key]), expected)
+        np.testing.assert_array_equal(hosted[key], expected)
 
 
 def decoder(**overrides):
@@ -107,48 +126,204 @@ def calls(model, variables, inputs):
     return seen
 
 
-def operands(x, rows, scales):
-    """`x`'s rows through the host FP8 block cast, and the packed rows, in float64."""
-    codes, row_scales = quantize_fp8_blocks(np.asarray(x, np.float32), (1, x.shape[1]))
-    packed = dequantize_fp8_blocks(np.asarray(rows), np.asarray(scales), (1, rows.shape[1]))
-    cast = dequantize_fp8_blocks(codes, row_scales, (1, x.shape[1]))
-    return cast.astype(np.float64), packed.astype(np.float64)
+PRODUCT_SEEDS = 16
+SCANNED_SEEDS = 8
+"""The scanned stack's declared draws, sized by `seeds_for` (on armada)."""
+"""The frozen product's declared draws (check 1, `assert_as_exact`), sized by `seeds_for`: the fewest for
+which the float32 reference compared with itself resolves the factor."""
 
 
-def product_case():
-    """An input whose rows span twelve binades, a kernel packed, and an output cotangent."""
-    rng = np.random.default_rng(1)
+def product_case(seed=1):
+    """An input whose rows span twelve binades, a kernel packed, and an output cotangent:
+    `(x, forward, forward_scale, dgrad, dgrad_scale, cotangent)`."""
+    rng = np.random.default_rng(seed)
     x = jnp.asarray(rng.standard_normal((48, 96)) * np.exp2(rng.integers(-6, 6, (48, 1))), jnp.bfloat16)
     kernel = rng.standard_normal((96, 80)).astype(np.float32) * 0.05
     leaves = [jnp.asarray(value) for value in frozen_fp8_leaves(kernel).values()]
-    return x, leaves, jnp.asarray(rng.standard_normal((48, 80)), jnp.float32)
+    return x, *leaves, jnp.asarray(rng.standard_normal((48, 80)), jnp.float32)
 
 
-def assert_products_exact(x, leaves, cotangent, output, gradient):
-    """The forward and the input gradient are the float64 products of the FP8
-    block cast's rows to float32's order of summation; the input gradient
-    rounds once more, to the input's dtype."""
-    forward, forward_scale, dgrad, dgrad_scale = leaves
-    rows, packed = operands(x, forward, forward_scale)
-    cotangent_rows, packed_dgrad = operands(cotangent, dgrad, dgrad_scale)
-    with jax.enable_x64(new_val=True):
-        (truth, gradient_truth), (terms, gradient_terms) = float64_terms(
-            lambda a, b, c, d: (a @ b.T, c @ d.T), rows, packed, cotangent_rows, packed_dgrad)
-    truth, gradient_truth = np.asarray(truth), np.asarray(gradient_truth)
-    assert_leaves_as_exact(np.asarray(output), truth, truth, reductions=x.shape[1], terms=terms)
-    rounded = np.asarray(jnp.asarray(gradient_truth, gradient.dtype), np.float64)
-    assert_leaves_as_exact(np.asarray(gradient, np.float32), rounded, gradient_truth,
-                           reductions=forward.shape[0], terms=gradient_terms)
+def fp8_products(x, forward, forward_scale, dgrad, dgrad_scale, cotangent):
+    """Dew's frozen product and the input gradient it takes under `cotangent` (`with_gradients`)."""
+    product = with_gradients(lambda x: frozen_fp8_product(x, forward, forward_scale, dgrad, dgrad_scale))
+    return product(x, cotangent)
+
+
+def dequantized_products(x, forward, forward_scale, dgrad, dgrad_scale, cotangent):
+    """The reference arm: the FP8 block cast's rows of `x` and of the cotangent and the packed rows,
+    each dequantized, multiplied in float32 by XLA, the input gradient rounded to `x`'s dtype; the
+    same products Dew computes from the codes, with the scales applied before the dot rather than
+    after it."""
+    def product(values, rows, row_scales):
+        codes, scales = fp8_block_cast(values, (1, values.shape[1]))
+        cast = codes.astype(jnp.float32) * scales
+        return jnp.dot(cast, (rows.astype(jnp.float32) * row_scales).T, precision=jax.lax.Precision.HIGHEST,
+                       preferred_element_type=jnp.float32)
+
+    return product(x, forward, forward_scale), product(cotangent, dgrad, dgrad_scale).astype(x.dtype)
+
+
+def exactly(codes, scales) -> np.ndarray:
+    """What FP8 rows `codes` scaled a row by `scales` `[rows, 1]` stand for, in float64: each code times
+    its row's scale, unrounded."""
+    return np.asarray(codes).astype(np.float64) * np.asarray(scales).astype(np.float64)
+
+
+def exact_products(x, forward, forward_scale, dgrad, dgrad_scale, cotangent):
+    """The float64 products of the FP8 block cast's rows and the packed rows, each code times its scale
+    in float64, as the codes stand for them."""
+    def product(values, rows, row_scales):
+        codes, scales = quantize_fp8_blocks(np.asarray(values, np.float32), (1, values.shape[1]))
+        return exactly(codes, scales) @ exactly(rows, row_scales).T
+
+    return product(x, forward, forward_scale), product(cotangent, dgrad, dgrad_scale)
+
+
+def assert_products_exact(products, label):
+    """The forward and the input gradient `products` computes (`fp8_products`, placed as a run places
+    them) are on par with the dequantized float32 products over the site's draws (check 1), measured from
+    the float64 products of the FP8 block cast's rows."""
+    assert_as_exact(products, jax.jit(dequantized_products), product_case, label,
+                    seeds=PRODUCT_SEEDS, truth_fn=exact_products)
 
 
 def test_the_frozen_product_multiplies_the_cast_rows_exactly_and_trains_no_kernel():
     """Neither the packed kernel nor its scales take a gradient."""
-    x, leaves, cotangent = product_case()
-    output, pullback = jax.vjp(frozen_fp8_product, x, *leaves)
+    x, *leaves, cotangent = product_case()
+    _, pullback = jax.vjp(frozen_fp8_product, x, *leaves)
     gradients = pullback(cotangent)
-    assert_products_exact(x, leaves, cotangent, output, gradients[0])
     assert gradients[0].dtype == x.dtype and all(gradient is None or not np.any(gradient)
                                                  for gradient in gradients[1:])
+    assert_products_exact(jax.jit(fp8_products), "the frozen FP8 product")
+
+
+TANGENT_SEEDS = 16
+"""The forward-mode product's declared draws (check 1, `assert_as_exact`), sized by `seeds_for` (on
+armada): the fewest for which the float32 reference compared with itself resolves the factor."""
+
+
+def tangent_case(seed=1):
+    """`product_case`'s input and packed kernel, and a direction for the input: `(x, forward,
+    forward_scale, dgrad, dgrad_scale, direction)`."""
+    x, *leaves, _ = product_case(seed)
+    direction = jnp.asarray(np.random.default_rng([7, seed]).standard_normal(x.shape), x.dtype)
+    return x, *leaves, direction
+
+
+def tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
+    """Dew's frozen product in forward mode (`jax.jvp`): its value and its tangent along `direction`."""
+    return jax.jvp(lambda x: frozen_fp8_product(x, forward, forward_scale, dgrad, dgrad_scale), (x,),
+                   (direction,))
+
+
+# Both arms of the forward-mode check are Dew programs, compiled alike (docs/design/testing.md).
+fp8_tangents = without_ynn(tangents)
+
+
+@as_given
+def default_precision_tangents(*inputs):
+    """`fp8_tangents` compiled under JAX's default matmul precision, not the suite's highest
+    (`lane_environment`): the products state their own."""
+    with jax.default_matmul_precision("default"):
+        return fp8_tangents(*inputs)
+
+
+def decoded_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
+    """The reference arm: the dequantized forward product (`dequantized_products`) and the direction
+    times the decoded forward rows, each code times its row's scale, multiplied in float32 by XLA."""
+    codes, scales = fp8_block_cast(x, (1, x.shape[1]))
+    rows = forward.astype(jnp.float32) * forward_scale
+    value = jnp.dot(codes.astype(jnp.float32) * scales, rows.T, precision=jax.lax.Precision.HIGHEST,
+                    preferred_element_type=jnp.float32)
+    return value, jnp.dot(direction.astype(jnp.float32), rows.T, precision=jax.lax.Precision.HIGHEST,
+                          preferred_element_type=jnp.float32)
+
+
+def exact_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
+    """The float64 product of the cast rows (`exact_products`) and the direction times the decoded
+    forward rows in float64."""
+    codes, scales = quantize_fp8_blocks(np.asarray(x, np.float32), (1, x.shape[1]))
+    rows = exactly(forward, forward_scale)
+    return exactly(codes, scales) @ rows.T, np.asarray(direction, np.float64) @ rows.T
+
+
+def test_the_frozen_product_in_forward_mode_is_the_decoded_kernels_tangent():
+    """Forward mode (`jax.jvp`, MeanFlow's target) takes the product's value as the FP8 product and its
+    tangent as the input's direction times the decoded kernel (`frozen_fp8_kernel`), the linear map the
+    FP8 products stand for, each on par with the dequantized float32 products by check 1 from float64,
+    whatever JAX's default matmul precision; the packed leaves take no tangent."""
+    assert_as_exact(default_precision_tangents, without_ynn(decoded_tangents), tangent_case,
+                    "the frozen FP8 product in forward mode", seeds=TANGENT_SEEDS, truth_fn=exact_tangents)
+    x, *leaves, _ = tangent_case()
+    _, along_leaves = jax.jvp(frozen_fp8_product, (x, *leaves),
+                              (jnp.zeros_like(x), *(jnp.ones_like(leaf) for leaf in leaves)))
+    assert not np.any(np.asarray(along_leaves))
+
+
+def test_the_frozen_products_backward_keeps_its_packed_leaves_and_not_its_input():
+    """Reverse mode reads the input's dtype alone, so the residuals its pullback keeps (the leaves of
+    the `jax.vjp` pullback, a `jax.tree_util.Partial`) are the packed leaves and never the `[M, in]`
+    input, as a staged pullback, a remat or a scan would hold them."""
+    x, *leaves, _ = product_case()
+    _, pullback = jax.vjp(lambda x, *leaves: jnp.sum(frozen_fp8_product(x, *leaves)), x, *leaves)
+    saved = jax.tree.leaves(pullback)
+    assert saved
+    kept = [(leaf.shape, leaf.dtype) for leaf in saved]
+    assert (x.shape, x.dtype) not in kept, kept
+    assert all((held.shape, held.dtype) in kept for held in leaves[2:]), kept
+
+
+def test_meanflow_trains_an_adapter_over_an_fp8_base():
+    """MeanFlow's target is its model's JVP in time (`jax.jvp`), which runs through each frozen FP8 site
+    in forward mode, and its loss's gradient runs through them in reverse: Adam steps on an adapter over
+    a DiT whose MLP projections are FP8 sites keep the loss finite and move every factor the adapter
+    trains, and the packed base stays out of what trains."""
+    from dew.diffusion import presets
+    from dew.inputs import CharTable, Condition, Field, InputSpec
+    from dew.nn.backbones import SimpleDiT
+    from dew.objectives.base import Step
+    from dew.objectives.diffusion.few_step import MeanFlowObjective
+
+    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True)
+    inputs = InputSpec(Field("image", (4, 4, 3)),
+                       {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
+    plain = MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
+    variables = plain.model_variables(plain.init(jax.random.key(0)))
+    # adaLN-Zero's gates and output start at zero, where no gradient reaches the MLP; drawn weights let it.
+    leaves, structure = jax.tree.flatten(variables["params"])
+    keys = jax.random.split(jax.random.key(4), len(leaves))
+    variables = {**variables, "params": jax.tree.unflatten(structure, [
+        0.3 * jax.random.normal(key, leaf.shape, leaf.dtype)
+        for key, leaf in zip(keys, leaves, strict=True)])}
+    kernels = flatten_dict(variables["params"], sep="/")
+    named = tuple(path.removesuffix("/kernel") for path in kernels
+                  if path.endswith("/kernel") and path.split("/")[-2] in ("up_proj", "down_proj"))
+    assert named
+    fp8_base = InputQuantization(frozen_fp8=named, measured_on=device_generation())
+    adapter = LoRA(rank=2, modules=("up_proj",)).apply(model, variables, key=1, fp8_base=fp8_base)
+    assert set(sites(adapter)) == set(named)
+    # The objective's tree is the adapter's beside the condition encoders' own.
+    objective = MeanFlowObjective(adapter.model, presets.MeanFlow()(), inputs, ema_decay=None,
+                                  variables={**plain.init(jax.random.key(0)), **adapter.variables})
+    tree = objective.init(jax.random.key(0))
+    batch = {"image": np.asarray(jax.random.randint(jax.random.key(1), (4, 4, 4, 3), 0, 256), np.uint8),
+             **inputs.tokenize(["a", "b", "c", "d"])}
+
+    def loss(params, step):
+        return objective.scalar_loss({**tree, "params": params}, batch,
+                                     Step(step=jnp.asarray(step), key=jax.random.key(2), ema=None))[0]
+
+    optimizer = optax.adam(1e-2)
+    params, state = tree["params"], optimizer.init(tree["params"])
+    for step in range(3):
+        value, gradients = jax.value_and_grad(loss)(params, step)
+        assert np.isfinite(float(value))
+        updates, state = optimizer.update(gradients, state, params)
+        params = optax.apply_updates(params, updates)
+    assert QUANTIZATION in tree and all(path.endswith(("lora_A", "lora_B")) for path in
+                                        flatten_dict(tree["params"], sep="/"))
+    assert all(not np.array_equal(np.asarray(after), np.asarray(before)) for after, before in
+               zip(jax.tree.leaves(params), jax.tree.leaves(tree["params"]), strict=True))
 
 
 @pytest.mark.mesh(devices=2)
@@ -156,12 +331,18 @@ def test_split_over_fsdp_the_frozen_product_is_one_devices():
     """The input's rows and the packed kernel's split over fsdp, as a run
     places them, the product and the input gradient are the same exact
     products: a row's cast reads the row alone, wherever it lies."""
-    x, leaves, cotangent = product_case()
     mesh = jax.make_mesh((2,), ("fsdp",), (jax.sharding.AxisType.Auto,), devices=jax.devices()[:2])
     split = NamedSharding(mesh, PartitionSpec("fsdp", None))
-    x, cotangent, *leaves = jax.device_put((x, cotangent, *leaves), split)
-    output, pullback = jax.jit(lambda *args: jax.vjp(frozen_fp8_product, *args))(x, *leaves)
-    assert_products_exact(x, leaves, cotangent, output, pullback(cotangent)[0])
+    products = jax.jit(fp8_products)
+
+    @as_given
+    def placed(*arrays):
+        # Placed before the jit, as a run's arrays arrive: a device_put inside one constrains nothing.
+        arrays = jax.device_put(arrays, split)
+        assert all(array.sharding == split for array in arrays)
+        return products(*arrays)
+
+    assert_products_exact(placed, "the frozen FP8 product split over fsdp")
 
 
 @pytest.mark.parametrize("measured_on", [None, ELSEWHERE], ids=["here", "elsewhere"])
@@ -245,7 +426,7 @@ def test_a_merged_fp8_base_computes_the_kernels_its_training_moved():
     expected = np.asarray(model.apply({"params": merged["params"]}, ids()), np.float32)
     np.testing.assert_array_equal(np.asarray(unadapted(fp8.model).apply(merged, ids()), np.float32), expected)
     base = fp8.merge(fp8.variables)["params"]
-    assert np.abs(expected - np.asarray(model.apply({"params": base}, ids()), np.float32)).max() > 1e-3
+    assert not np.array_equal(expected, np.asarray(model.apply({"params": base}, ids()), np.float32))
 
 
 def test_a_resumed_fp8_base_run_trains_what_an_uninterrupted_one_does(tmp_path):
@@ -261,12 +442,31 @@ def test_the_scanned_stack_reads_each_layers_own_packed_kernel():
     """The scanned stack computes the looped one's output from the same
     variables, both jitted with the variables as arguments, as a step passes
     its state: closed over, the packed codes fold into a float32 GEMM where a
-    scan's traced ones take the FP8 one, which rounds its sums otherwise."""
+    scan's traced ones take the FP8 one, which rounds its sums otherwise. The
+    two on par over drawn tokens (check 1), from the plain decoder in float64
+    on the kernels the codes stand for (the adapter's deltas start at zero)."""
     _, fp8 = adapters()
     _, scanned = adapters(decoder(scan_layers=True))
-    looped = np.asarray(jax.jit(fp8.model.apply)(fp8.variables, ids()), np.float32)
-    np.testing.assert_allclose(np.asarray(jax.jit(scanned.model.apply)(fp8.variables, ids()), np.float32),
-                               looped, rtol=1e-6, atol=1e-6)
+    exact = jax.jit(decoder().clone(dtype=jnp.float64, attention_impl="reference").apply)
+    # The merged tree's layout, each packed site's kernel the one its forward codes stand for in float64
+    # (`exactly`), not the float32 decode `merge` stores.
+    base = flatten_dict(fp8.merge(fp8.variables)["params"])
+    packed = flatten_dict(fp8.variables[QUANTIZATION])
+    for path, codes in packed.items():
+        if path[-1] == FROZEN_FP8[0]:
+            base[(*path[:-1], "kernel")] = exactly(codes, packed[(*path[:-1], FROZEN_FP8[1])]).T
+    base = unflatten_dict(base)
+
+    def draw(seed):
+        return (jnp.asarray(np.random.default_rng([0xF8, seed]).integers(0, VOCAB, (BATCH, SEQ)), jnp.int32),)
+
+    def truth(tokens):
+        with jax.enable_x64(new_val=True):
+            return exact({"params": widened(base)}, tokens)
+
+    assert_as_exact(lambda tokens: jax.jit(scanned.model.apply)(fp8.variables, tokens),
+                    lambda tokens: jax.jit(fp8.model.apply)(fp8.variables, tokens), draw, "scanned FP8 stack",
+                    seeds=SCANNED_SEEDS, truth_fn=truth)
 
 
 def test_a_checkpoints_input_quantization_and_an_fp8_base_share_one_wrapper():
@@ -292,7 +492,7 @@ def test_a_checkpoints_input_quantization_and_an_fp8_base_share_one_wrapper():
     np.testing.assert_array_equal(np.asarray(output), np.asarray(expected.reshape(output.shape)))
 
 
-FP8_CORES = gpu_target(device_generation()).fp8_peak is not None
+FP8_CORES = fp8_tensor_cores(device_generation())
 
 
 @pytest.mark.skipif(FP8_CORES, reason="this GPU has FP8 tensor cores")
@@ -330,6 +530,7 @@ import numpy as np
 from dew import cache
 from dew.nn.kernels.generation import device_generation
 from dew.quantization import frozen_fp8_leaves, frozen_fp8_product, measured_fp8_sites
+from dew.telemetry.instrumentation import hlo_instructions
 
 if not cache.measures_picks():
     print(json.dumps(None))
@@ -347,9 +548,10 @@ def step(x, cotangent, *leaves):
 
 x = jnp.asarray(rng.standard_normal((8192, 4096)), jnp.bfloat16)
 cotangent = jnp.asarray(rng.standard_normal((8192, 12288)), jnp.bfloat16)
-text = jax.jit(step).lower(x, cotangent, *leaves).compile().as_text()
+program = hlo_instructions(jax.jit(step).lower(x, cotangent, *leaves).compile().as_text())
+gemms = sum(instruction.target == "__cublas$lt$matmul$f8" for instruction in program.values())
 print(json.dumps({"sites": list(measured.frozen_fp8), "measured_on": measured.measured_on,
-                  "generation": device_generation(), "fp8_gemms": text.count("__cublas$lt$matmul$f8")}))
+                  "generation": device_generation(), "fp8_gemms": gemms}))
 """
 """The qualification, run by a process of its own (`fresh`): the suite's deterministic ops keep its
 own process from measuring (`dew.cache.keeps_picks`)."""
@@ -357,17 +559,15 @@ own process from measuring (`dew.cache.keeps_picks`)."""
 
 @pytest.mark.gpu(reason="FP8 tensor cores and cuBLASLt's FP8 GEMM")
 @pytest.mark.skipif(not FP8_CORES, reason="this GPU has no FP8 tensor cores")
-def test_a_wide_site_measures_faster_in_fp8_and_compiles_to_an_fp8_gemm(tmp_path):
-    """On a GPU with FP8 tensor cores the wide projection measures faster in
-    FP8 and the narrow one does not (H100: 1.47x and 0.70x), and the frozen
-    product's forward and input gradient compile to cuBLASLt FP8 GEMMs at
-    that width. The packed leaves and the gradient are the step's arguments,
-    as a train state's are: XLA folds widened constant codes into a float32
-    GEMM. It runs in a process without the suite's deterministic ops, as a
-    run that measures does; a GPU shared with other work (`READ_ONLY`)
-    measures nothing, fairly, and skips."""
+def test_a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower(tmp_path):
+    """On a GPU with FP8 tensor cores the frozen product's forward and input gradient compile to no
+    cuBLASLt FP8 GEMM, whose running sum on Hopper is narrower than fp32's (`_fp8_rows`), even at the
+    wide projection, and the measurement records the sites it took on this generation. The packed
+    leaves and the gradient are the step's arguments, as a train state's are. It runs in a process
+    without the suite's deterministic ops, as a run that measures does; a GPU shared with other work
+    (`READ_ONLY`) measures nothing, fairly, and skips."""
     found = fresh(QUALIFY, cache_dir=tmp_path, flags=keeping_picks())
     if found is None:
         pytest.skip("this GPU is shared with other work (gpu-run -n 0.5), where no process measures")
-    assert found["sites"] == ["wide"] and found["measured_on"] == found["generation"]
-    assert found["fp8_gemms"] == 2
+    assert set(found["sites"]) <= {"wide", "narrow"} and found["measured_on"] == found["generation"]
+    assert found["fp8_gemms"] == 0

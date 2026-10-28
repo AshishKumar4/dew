@@ -6,26 +6,37 @@ tier runs them on the GPU, with the training shapes' tests: there each output's 
 distance is held to XLA's own by tests/reference_error.py's rule.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import tokamax
 from fla_gdn_support import CONV_SHAPES
 from reference_error import (
+    FACTOR,
+    assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_rounds_where_the_reference_does,
-    equations,
+    chain_roundings,
+    distance,
+    widened,
+    with_gradients,
     within,
 )
-from tuned import each_config, launches, timed
 
-from dew.nn.kernels import generation, short_conv, tuning
-from dew.nn.linear import causal_conv1d, conv_refusal, xla_conv1d
+from dew.nn.kernels import generation, short_conv
+from dew.nn.linear import causal_conv1d, xla_conv1d
 
 pytestmark = pytest.mark.kernel
 
 DELTA = ((32, 16), (32, 16), (32, None))
+SHARDED_SEEDS = 8
+"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
+`seeds_for`: the fewest for which one device compared with itself resolves the factor."""
+REFUSED_SEEDS = 8
+"""The declared draws of a conv the kernels do not take against XLA's conv (check 1), sized by `seeds_for`
+paired with the kernels' arm on armada: the most any of its 16-bit geometries took."""
 """A delta rule's queries, keys and values on two 16-wide heads: the keys and queries normalised."""
 
 
@@ -56,13 +67,16 @@ def cotangents(x, parts, dtype, seed=1):
 
 def run(conv, x, weights, shift, valid, parts, dtype, grads, activation=True, segments=None):
     """`conv`'s pieces and its gradients for `x`, the taps and the bias under `grads`."""
-    def loss(x, weights, shift):
-        out = conv(x, weights, activation, shift, valid=valid, segments=segments, parts=parts, dtype=dtype)
-        return sum(jnp.sum(piece.astype(jnp.float32) * grad.astype(jnp.float32))
-                   for piece, grad in zip(out, grads, strict=True)), out
+    def pieces(x, weights, shift):
+        return conv(x, weights, activation, shift, valid=valid, segments=segments, parts=parts, dtype=dtype)
 
-    (_, out), found = jax.value_and_grad(loss, argnums=(0, 1, 2), has_aux=True)(x, weights, shift)
-    return out, found
+    # Each piece pulls back its cotangent cast through float32 to the piece's dtype, as a float32 sum of
+    # their products pulls it back, through the gate (`reference_error.with_gradients`).
+    shapes = jax.eval_shape(pieces, x, weights, shift)
+    cotangents = tuple(grad.astype(jnp.float32).astype(shape.dtype)
+                       for grad, shape in zip(grads, shapes, strict=True))
+    out, *found = with_gradients(pieces)(x, weights, shift, cotangents)
+    return out, tuple(found)
 
 
 def kernel_conv(x, weights, activation, shift, *, valid, segments, parts, dtype):
@@ -77,6 +91,20 @@ def truth(x, weights, shift, valid, parts, grads, activation=True, segments=None
         wide = jax.tree.map(lambda a: None if a is None else jnp.asarray(a, jnp.float64), (x, weights, shift))
         return run(xla_conv1d, *wide, valid, parts, jnp.float64,
                    tuple(jnp.asarray(grad, jnp.float64) for grad in grads), activation, segments)
+
+
+def row_truth(x, weights, parts, grads, segments):
+    """`truth`'s pieces and gradients of `x` and the taps, on the host, a row at a time: each row's pieces and
+    input gradient its own, the taps' gradient the rows' summed in float64; a row's float64 conv the device
+    holds at once, not the batch's."""
+    rows = [jax.device_get(truth(x[i:i + 1], weights, None, None, parts,
+                                 tuple(grad[i:i + 1] for grad in grads),
+                                 segments=None if segments is None else segments[i:i + 1]))
+            for i in range(x.shape[0])]
+    pieces = tuple(np.concatenate([row[0][k] for row in rows]) for k in range(len(rows[0][0])))
+    dx = np.concatenate([row[1][0] for row in rows])
+    dtaps = functools.reduce(np.add, (np.asarray(row[1][1], np.float64) for row in rows))
+    return pieces, (dx, dtaps, *rows[0][1][2:])
 
 
 def assert_follows_xla(got, want, exact, label):
@@ -122,63 +150,6 @@ def test_the_kernels_compute_causal_conv1d(dtype, out, shape, parts, taps, bias,
             assert_follows_xla(grad, reference, value, f"d{name}")
 
 
-def configs(op) -> list:
-    """Every config of `op`'s space, as its key declares it for the CPU tests' delta conv
-    (`each_config` reads them from a lowering, which a CPU's interpreted kernels describe too)."""
-    x, weights, _, _ = operands(2, 37, DELTA)
-    grads = cotangents(x, DELTA, jnp.bfloat16)
-    return each_config(op, lambda x, weights: run(kernel_conv, x, weights, None, None, DELTA, jnp.bfloat16,
-                                                  grads), x, weights)
-
-
-def test_the_tuner_reads_times_and_stores_the_convs_launches():
-    """A right-padded delta conv and its gradients, traced as the tuner reads a program: one forward
-    launch and one backward launch a piece, each a tuner op keyed by its pieces; each timed on rows
-    whose every token is real (`KernelOp.operands`), so every token's output and the taps' gradients
-    are written, where the default operands' zero validity masks every token; and a pick for each
-    stored and read back as the tuner stores them, by the same launch and key."""
-    x, weights, _, kept = operands(2, 37, DELTA, valid=True)
-    grads = cotangents(x, DELTA, jnp.bfloat16)
-    found = launches(lambda x, weights: run(kernel_conv, x, weights, None, kept, DELTA, jnp.bfloat16, grads),
-                     x, weights)
-    assert sorted(type(ba.op).__name__ for ba in found) == ["ConvBackward"] * len(DELTA) + ["ConvForward"]
-    for ba in found:
-        written = timed(ba) if type(ba.op) is short_conv.ConvForward else timed(ba)[1:2]
-        for array in written:
-            assert np.all(np.any(np.asarray(array, np.float32) != 0, axis=-1)), type(ba.op).__name__
-    timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
-                                   metadata={})
-    keyed = [ba.op.keyed(ba) for ba in found]
-    stored = tokamax.AutotuningResult(jax.devices()[0].device_kind, tuple(
-        (ba, tuning.AutotuningData({ba.heuristics_config: timing})) for ba in keyed))
-    read = tokamax.AutotuningResult.loads(stored.dumps())
-    assert [(type(ba.op), ba.autotuning_cache_key) for ba, _ in read.data] == [
-        (type(ba.op), ba.autotuning_cache_key) for ba in keyed]
-
-
-@pytest.mark.parametrize("op", [short_conv.ConvForward, short_conv.ConvBackward])
-def test_every_config_of_the_kernels_computes_causal_conv1d(op):
-    """Each config of each launch's space (`tuning.pinned`) gives each piece and the gradients of the
-    projection and the taps as XLA computes them, over packed documents at a length that leaves runs and
-    a tile partly past the end: the configs order the tap gradients' sums, and every one is within the
-    gate the heuristic is."""
-    x, weights, _, _ = operands(2, 37, DELTA)
-    segments = documents(2, 37)
-    grads = cotangents(x, DELTA, jnp.bfloat16)
-    want, want_grads = run(xla_conv1d, x, weights, None, None, DELTA, jnp.bfloat16, grads, segments=segments)
-    exact, exact_grads = truth(x, weights, None, None, DELTA, grads, segments=segments)
-    found = configs(op)
-    assert len(found) > 1
-    for config in found:
-        with tuning.pinned({op: config}):
-            got, got_grads = run(kernel_conv, x, weights, None, None, DELTA, jnp.bfloat16, grads,
-                                 segments=segments)
-        for label, mine, theirs, value in zip(("q", "k", "v", "dx", "dtaps"), (*got, *got_grads[:2]),
-                                              (*want, *want_grads[:2]), (*exact, *exact_grads[:2]),
-                                              strict=True):
-            assert_follows_xla(mine, theirs, value, f"{config} {label}")
-
-
 def test_padding_tokens_are_zero_and_pass_no_gradient():
     """A right-padded row's padding slots come out zero and their cotangents reach nothing."""
     x, weights, _, kept = operands(2, 24, DELTA, valid=True)
@@ -191,25 +162,6 @@ def test_padding_tokens_are_zero_and_pass_no_gradient():
     assert jnp.array_equal(dx, moved_dx)
 
 
-def test_a_gpu_runs_the_kernels_both_ways():
-    """`causal_conv1d` on a GPU that runs Triton is the two kernels, in reverse mode too; forward mode
-    and a mesh-split operand keep XLA's."""
-    x, weights, _, _ = operands(1, 16, DELTA)
-
-    def loss(x):
-        return sum(jnp.sum(piece.astype(jnp.float32)) for piece in causal_conv1d(x, weights, parts=DELTA))
-
-    def kernels(fn, *args):
-        return {str(equation.params["name"]) for equation in equations(jax.make_jaxpr(fn)(*args))
-                if equation.primitive.name == "pallas_call"}
-
-    with generation.assumed("sm80"):
-        assert kernels(jax.grad(loss), x) == {"short_conv_forward", "short_conv_backward"}
-        assert not kernels(lambda x: jax.jvp(loss, (x,), (x,)), x)
-    with generation.assumed("cpu"):
-        assert not kernels(jax.grad(loss), x)
-
-
 @pytest.mark.parametrize("dtype, out, parts, taps", [
     (jnp.float64, jnp.float64, DELTA, 4),
     (jnp.float32, jnp.float64, DELTA, 4),
@@ -218,32 +170,46 @@ def test_a_gpu_runs_the_kernels_both_ways():
     (jnp.bfloat16, jnp.bfloat16, ((16, 16), (16, 16), (8, None)), 4),
     (jnp.bfloat16, jnp.bfloat16, DELTA, 12),
 ])
-def test_a_conv_the_kernels_do_not_take_runs_as_the_xla_conv(dtype, out, parts, taps):
-    """On a GPU whose row names the kernels, a conv they do not take (`conv_refusal`: float64, a piece
-    off its block, more taps than they hold) runs XLA's conv: the same values and gradients, and no
-    kernel launch."""
-    with jax.enable_x64(new_val=jnp.float64 in (dtype, out)):
-        keys = jax.random.split(jax.random.key(89), 3)
-        x = jax.random.normal(keys[0], (1, 8, sum(width for width, _ in parts))).astype(dtype)
-        taps = 0.3 * jax.random.normal(keys[1], (x.shape[-1], taps))
-        probe = [jax.random.normal(key, (1, 8, width)) for key, (width, _) in zip(
-            jax.random.split(keys[2], len(parts)), parts, strict=True)]
+def test_a_conv_the_kernels_do_not_take_runs(dtype, out, parts, taps):
+    """On a GPU whose row names the kernels, a conv they do not take (`short_conv.CONV`: float64, a piece
+    off its block, more taps than they hold) runs: its value and its gradients, in their operands'
+    dtypes, on par with XLA's conv over the draws (check 1), truth XLA's conv in float64. A float64 conv
+    has no truth finer than itself, so it is held by the oracle rule on a draw: each leaf within its own
+    dtype's rounding over the conv's chain of roundings of XLA's conv on the inputs widened."""
+    width, channels = sum(width for width, _ in parts), taps
 
-        def loss(conv):
-            def run(x, taps):
-                return sum(jnp.sum(piece.astype(jnp.float32) * weight) for piece, weight in zip(
-                    conv(x, taps, parts=parts, dtype=out), probe, strict=True))
-            return jax.value_and_grad(run, argnums=(0, 1))
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(89), seed), 3)
+        x = jax.random.normal(keys[0], (1, 8, width)).astype(dtype)
+        weights = 0.3 * jax.random.normal(keys[1], (width, channels))
+        probe = tuple(jax.random.normal(key, (1, 8, piece)) for key, (piece, _) in zip(
+            jax.random.split(keys[2], len(parts)), parts, strict=True))
+        return x, weights, probe
 
-        with generation.assumed("sm80"):
-            assert conv_refusal(x, taps, parts, out) is not None
-            launched = [equation for equation in equations(jax.make_jaxpr(loss(causal_conv1d))(x, taps))
-                        if equation.primitive.name == "pallas_call"]
-            got = jax.jit(loss(causal_conv1d))(x, taps)
-        want = jax.jit(loss(xla_conv1d))(x, taps)
-    assert not launched
-    for mine, theirs in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
-        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+    def loss(conv, out=out):
+        def run(x, weights, probe):
+            def scored(x, weights):
+                return sum(jnp.sum(piece.astype(weight.dtype) * weight) for piece, weight in zip(
+                    conv(x, weights, parts=parts, dtype=out), probe, strict=True))
+            return jax.value_and_grad(scored, argnums=(0, 1))(x, weights)
+        return run
+
+    with jax.enable_x64(new_val=jnp.float64 in (dtype, out)), generation.assumed("sm80"):
+        x, weights, probe = draw(0)
+        _, gradients = jax.jit(loss(causal_conv1d))(x, weights, probe)
+        assert [gradient.dtype for gradient in gradients] == [x.dtype, weights.dtype]
+        if out == jnp.float64:
+            found = jax.jit(loss(causal_conv1d))(x, weights, probe)
+            oracle = loss(xla_conv1d)(*widened((x, weights, probe)))
+            roundings = chain_roundings(jax.make_jaxpr(loss(causal_conv1d))(x, weights, probe))
+            for mine, exact in zip(jax.tree.leaves(found), jax.tree.leaves(oracle), strict=True):
+                scale = float(np.sqrt(np.mean(np.square(np.asarray(exact, np.float64)))))
+                bound = FACTOR * roundings * float(jnp.finfo(mine.dtype).eps) * scale
+                assert within(distance(mine, exact), bound), (distance(mine, exact), bound)
+            return
+        assert_as_exact(jax.jit(loss(causal_conv1d)), jax.jit(loss(xla_conv1d)), draw,
+                        f"a conv the kernels do not take: {jnp.dtype(dtype)}, {parts}, {taps} taps",
+                        seeds=REFUSED_SEEDS, truth_fn=loss(xla_conv1d, out=jnp.float64))
 
 
 @pytest.mark.gpu(reason="the training shapes' float64 distances are a GPU's")
@@ -253,9 +219,9 @@ def test_a_conv_the_kernels_do_not_take_runs_as_the_xla_conv(dtype, out, parts, 
 def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, packed):
     """A delta net's conv at its training width and length, bf16 projections into the bf16 operands
     fla's rule takes, and fp32 into fp32, whole rows and packed ones: each piece and gradient as exact as
-    XLA's own conv (`assert_as_exact_as_the_reference`), at each launch's heuristic and, at the 0.8b's
-    width, at every config of its space (`tuning.pinned`). Two rows: a row's tokens are the distances'
-    terms, and the 0.8b's eight held 28 GiB of an H100 at the float64 truth, two 7."""
+    XLA's own conv (`assert_as_exact_as_the_reference`), at each launch's config at that model's shapes.
+    Two rows: a row's tokens are the distances' terms, and the 0.8b's eight held 28 GiB of an H100 at
+    the float64 truth, two 7."""
     (_, length), parts = CONV_SHAPES[model]
     x, weights, _, _ = operands(2, length, parts, dtype=dtype)
     segments = documents(2, length) if packed else None
@@ -264,19 +230,19 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, pa
     def kernels(x, weights):
         return run(kernel_conv, x, weights, None, None, parts, dtype, grads, segments=segments)
 
-    want, want_grads = run(xla_conv1d, x, weights, None, None, parts, dtype, grads, segments=segments)
-    exact, exact_grads = truth(x, weights, None, None, parts, grads, segments=segments)
-    # Every config of each launch's space at the 0.8b's width, the heuristics at the other's.
-    pins = [{}] + ([{op: config} for op in (short_conv.ConvForward, short_conv.ConvBackward)
-                    for config in each_config(op, kernels, x, weights)] if model == "0.8b" else [])
-    for pin in pins:
-        with tuning.pinned(pin):
-            got, got_grads = kernels(x, weights)
-        labels = ("q", "k", "v", "dx", "dtaps")
-        # The gradients of the projection and the taps; there is no bias.
-        for label, mine, theirs, value in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
-                                              (*exact, *exact_grads[:2]), strict=True):
-            assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {pin} {label}")
+    # The reference's and the truth's leaves on the host as each is computed, and the truth a row at a time
+    # (`row_truth`): the 9b's packed rows peaked at 9.2 GiB of an A100, past a packed job's 8.9 GiB share
+    # where main's GPU tier ran them (row 1724, SE-conv1724-a100-fd8508b5a), 8.85 with the arrays on the
+    # host alone (SE-conv1724-a100-9419b90c1).
+    want, want_grads = jax.device_get(run(xla_conv1d, x, weights, None, None, parts, dtype, grads,
+                                          segments=segments))
+    exact, exact_grads = row_truth(x, weights, parts, grads, segments)
+    got, got_grads = kernels(x, weights)
+    labels = ("q", "k", "v", "dx", "dtaps")
+    # The gradients of the projection and the taps; there is no bias.
+    for label, mine, theirs, value in zip(labels, (*got, *got_grads[:2]), (*want, *want_grads[:2]),
+                                          (*exact, *exact_grads[:2]), strict=True):
+        assert_as_exact_as_the_reference(mine, theirs, value, f"{model} {label}")
 
 
 @pytest.mark.mesh(devices=2)
@@ -284,21 +250,26 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, pa
 def test_the_conv_keeps_the_kernel_contract_on_a_mesh_that_splits_rows(axis):
     """`causal_conv1d` over rows split two ways, as data or fsdp parallelism splits them, runs per shard
     (`sharded.assert_runs_per_shard`): its pieces, the l2-normalised queries and keys of a delta rule
-    over padded rows of packed documents, and the gradients of the input, the taps and the bias within
-    the float64 gate of one device's, and no operand moved between devices. On a GPU each shard is the
-    fused kernel."""
+    over padded rows of packed documents, and the gradients of the input, the taps and the bias on par
+    with one device's over the site's draws, and no operand moved between devices. On a GPU each shard
+    is the fused kernel."""
     from jax.sharding import Mesh, PartitionSpec
     from sharded import assert_runs_per_shard
 
-    x, weights, shift, valid = operands(4, 48, DELTA, dtype=jnp.float32, bias=True, valid=True)
-    segments = documents(4, 48)
-    grads = cotangents(x, DELTA, jnp.float32)
+    def draw(seed):
+        # Each role's stream its own: a draw's cotangents never replay another draw's input.
+        x, weights, shift, valid = operands(4, 48, DELTA, dtype=jnp.float32, bias=True, valid=True,
+                                            seed=3 * seed)
+        return (x, weights, shift, valid, documents(4, 48, seed=3 * seed + 2),
+                *cotangents(x, DELTA, jnp.float32, seed=3 * seed + 1))
 
     def gradients(x, weights, shift, valid, segments, *grads):
         return run(causal_conv1d, x, weights, shift, valid, DELTA, jnp.float32, grads, segments=segments)
 
-    expected = jax.tree.map(np.asarray, truth(x, weights, shift, valid, DELTA, grads, segments=segments))
+    def exact(x, weights, shift, valid, segments, *grads):
+        return truth(x, weights, shift, valid, DELTA, grads, segments=segments)
+
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     rows, whole = PartitionSpec(axis), PartitionSpec()
-    assert_runs_per_shard(gradients, (x, weights, shift, valid, segments, *grads),
-                          [rows, whole, whole, rows, rows, rows, rows, rows], mesh, expected)
+    assert_runs_per_shard(gradients, draw, [rows, whole, whole, rows, rows, rows, rows, rows], mesh,
+                          f"conv split over {axis}", seeds=SHARDED_SEEDS, truth_fn=exact)

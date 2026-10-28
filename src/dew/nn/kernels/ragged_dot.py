@@ -20,14 +20,16 @@
 ragged_dot.py` in the jax-v0.11.2 source tree (tag jax-v0.11.2, 32544801;
 license header above), which no jax wheel ships: `DEFAULT_BLOCK_M` through
 `_hyperparam_selection_rule`, restyled to this tree's lint gate and moved
-from `jax._src` imports to their public equivalents, with two lines of logic
-changed and marked `# Dew:`: tgmm's output cast, and gmm's
-zeroing when every group is empty. The file's `ragged_dot_general`
-adapter is left out: Dew calls the kernels itself, through
-`dew.nn.moe.expert_projection`'s custom VJP, the way MaxText calls megablox.
+from `jax._src` imports to their public equivalents, with lines of logic
+changed and marked `# Dew:`: the prologue and epilogue hooks with their side
+operands (`_side_tile`), tgmm's output cast, and gmm's zeroing when every
+group is empty. The file's `ragged_dot_general`
+adapter is left out: Dew calls the kernels itself, through the GEMM template
+(`templates.gemm.template`), which differentiates them, the way MaxText calls megablox.
 
 Every global load and store is masked on every dimension, rows included, and
-rows past the routed ones are written as zeros. The kernels multiply in
+each output past the routed rows is the epilogue of a zero accumulator, zero
+without one. The kernels multiply in
 `compute_dtype`, accumulate in `acc_dtype` and ignore any precision: with
 16-bit operands that is exact products summed in fp32, with fp32 operands
 the GPU's TF32 rate.
@@ -57,10 +59,6 @@ DEFAULT_BLOCK_K = 64
 # group. This "chunk" is not really tunable and it'll be further tiled with
 # block_m. It solves the problem of large groups or very few groups.
 CHUNK_M = 512  # block size to chunk rows into to increase SM participation for very large groups
-
-def cdiv(a, b):
-  return (a + b - 1) // b
-
 
 arange = partial(jnp.arange, dtype=np.int32)
 
@@ -126,13 +124,23 @@ def _make_gmm_group_metadata(
   )
 
 
+def _side_tile(ref, axes, origins: dict, masks: dict):
+  """Dew: a side operand's tile, loaded at the launch's own origins: each of its dimensions follows the
+  launch axis `axes` names ('rows', 'depth', 'columns'), its start, extent and mask from `origins` and
+  `masks`. A vector is one axis's, which the hook broadcasts itself."""
+  index = tuple(pl.ds(*origins[axis]) for axis in axes)
+  first, *rest = (masks[axis] for axis in axes)
+  mask = first[:, None] & rest[0][None, :] if rest else first
+  return plgpu.load(ref.at[index], mask=mask, other=0)
+
+
 def _gpu_ragged_dot_kernel(
   # inputs
   x_ref,  # [m, k]
   A_ref,  # [k, n] or [n, k]
   group_metadata_ref: GMMGroupLookupMetadata,
-  # outputs
-  y_ref,  # [k, n]
+  # Dew: the prologue's and the epilogue's side operands, then the outputs
+  *refs,
   # static problem shapes
   chunk_m: int,
   trans_rhs: bool,
@@ -140,7 +148,15 @@ def _gpu_ragged_dot_kernel(
   block: BlockSizes,  # hyperparameters
   compute_dtype: DTypeLike | None = None,
   acc_dtype: DTypeLike = np.float32,
+  prologue=None,
+  prologue_axes: tuple = (),
+  epilogue=None,
+  epilogue_axes: tuple = (),
+  exact_sums: bool = False,
 ):
+  prologue_refs = refs[:len(prologue_axes)]
+  epilogue_refs = refs[len(prologue_axes):len(prologue_axes) + len(epilogue_axes)]
+  out_refs = refs[len(prologue_axes) + len(epilogue_axes):]
   i, j = pl.program_id(0), pl.program_id(1)
   pid = SimpleNamespace(i=i, j=j, gi=group_metadata_ref.row_it2group[i])
   size = jax.tree.map(partial(np.array, dtype=np.int32), size)
@@ -169,6 +185,13 @@ def _gpu_ragged_dot_kernel(
       _load = partial(plgpu.load, other=0)
       mask = lhs_rows_mask[:, None] & inner_mask[None, :]
       x = _load(x_ref.at[lhs_rows_idx, inner_idx], mask=mask)
+      if prologue is not None:
+        # Dew: the prologue, on the loaded tile and its side operands' tiles.
+        tiles = [_side_tile(ref, axes, {'rows': (ridx, block.m), 'depth': (k * block.k, block.k)},
+                            {'rows': lhs_rows_mask, 'depth': inner_mask})
+                 for ref, axes in zip(prologue_refs, prologue_axes, strict=True)]
+        # Dew: the padding a hook made something of (1 / 0) is zero again before the product.
+        x = jnp.where(mask, prologue(x, *tiles), 0)
       if not trans_rhs:
         mask = inner_mask[:, None] & rhs_cols_mask[None, :]
         A = _load(A_ref.at[pid.gi, inner_idx, rhs_cols_idx], mask=mask)
@@ -181,21 +204,50 @@ def _gpu_ragged_dot_kernel(
           if not trans_rhs else
           (((1,), (1,)), ((), ()))  # transposed matmul product x @ y.T
       )
+      # Dew: the default precision named, so a configured one does not reach the kernel (TF32 for fp32).
       xA = lax.dot_general(
-          x, A, dimension_numbers=dim_nums, preferred_element_type=acc_dtype
+          x, A, dimension_numbers=dim_nums, precision=lax.Precision.DEFAULT, preferred_element_type=acc_dtype
       )
-      return acc + xA.astype(acc_dtype)
+      return _summed(acc, xA.astype(acc_dtype), group_sz > 0, exact_sums=exact_sums)
 
     acc = jnp.zeros((block.m, block.n), dtype=acc_dtype)
-    acc = lax.fori_loop(0, cdiv(size.k, block.k), inner_compute, acc)
-    acc = acc.astype(y_ref.dtype)
-    mask = lhs_rows_mask[:, None] & rhs_cols_mask[None, :]
-    plgpu.store(y_ref.at[lhs_rows_idx, rhs_cols_idx], acc, mask=mask)
-    return
+    acc = lax.fori_loop(0, pl.cdiv(size.k, block.k), inner_compute, acc)
+    stored(acc, ridx, lhs_rows_mask)
 
-  lax.fori_loop(0, cdiv(group_sz, block.m), outer_compute, None)
+  # Dew: the epilogue on each fp32 accumulator tile and its side operands' tiles, its outputs stored.
+  stored = partial(_store_epilogued, out_refs, epilogue, epilogue_refs, epilogue_axes, pid.j, block, size)
+  lax.fori_loop(0, pl.cdiv(group_sz, block.m), outer_compute, None)
+  _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype)
 
-  # zero out memory past sum(group_sizes) if we're the last kernel along m
+
+def _summed(acc, partial_sum, live, *, exact_sums: bool):
+  """Dew: the running fp32 sum plus a step's: with `exact_sums`, an IEEE add of the step's product summed
+  apart, which a tensor core's accumulation (truncating each add) leaves less exact; `live` (true for
+  every computed step, unknown to the compiler) keeps the add from folding into the MMA's accumulator."""
+  if exact_sums:
+    return acc + jnp.where(live, partial_sum, 0)
+  return acc + partial_sum
+
+
+def _store_epilogued(out_refs, epilogue, refs, axes_of, column_block, block, size, acc, row, rows_mask):
+  """Dew: each output of the epilogue on an fp32 accumulator tile at `row` and its side operands' tiles
+  (the accumulator itself without one), stored at its rows and the program's columns."""
+  cols_mask = (column_block * block.n + arange(block.n)) < size.n
+  outs = (acc,)
+  if epilogue is not None:
+    tiles = [_side_tile(ref, axes, {'rows': (row, block.m), 'columns': (column_block * block.n, block.n)},
+                        {'rows': rows_mask, 'columns': cols_mask})
+             for ref, axes in zip(refs, axes_of, strict=True)]
+    outs = epilogue(acc, *tiles)
+    outs = outs if isinstance(outs, tuple) else (outs,)
+  mask = rows_mask[:, None] & cols_mask[None, :]
+  for y_ref, out in zip(out_refs, outs, strict=True):
+    plgpu.store(y_ref.at[pl.ds(row, block.m), pl.ds(0, block.n)], out.astype(y_ref.dtype), mask=mask)
+
+
+def _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype):
+  """Dew: the rows past sum(group_sizes) sum nothing: by the last program along m, each output there is
+  the epilogue of a zero accumulator, zero without one (`stored`)."""
   last_offset = (
     group_metadata_ref.group_offsets[size.g - 1]
     + group_metadata_ref.group_sizes[size.g - 1]
@@ -208,19 +260,17 @@ def _gpu_ragged_dot_kernel(
     & (last_offset < size.m)
   )
   def _():
-    col_mask = (block.n * pid.j + arange(block.n)) < size.n
+    def store_empty(i, _):
+      row = last_offset + i * block.m
+      stored(jnp.zeros((block.m, block.n), acc_dtype), row, (row + arange(block.m)) < size.m)
 
-    def set_zero(i, _):
-      row_mask = (last_offset + i * block.m + arange(block.m)) < size.m
-      window = (pl.ds(last_offset + i * block.m, block.m), pl.ds(0, block.n))
-      mask = row_mask[:, None] & col_mask[None, :]
-      zero = jnp.zeros((block.m, block.n), dtype=y_ref.dtype)
-      plgpu.store(y_ref.at[*window], zero, mask=mask)
-
-    lax.fori_loop(0, cdiv(size.m - last_offset, block.m), set_zero, None)
+    lax.fori_loop(0, pl.cdiv(size.m - last_offset, block.m), store_empty, None)
 
 
-@jax.jit(static_argnums=list(range(3, 14)))
+@partial(jax.jit, static_argnames=(
+  "block_m", "block_k", "block_n", "trans_rhs", "interpret", "compute_dtype", "acc_dtype", "num_warps",
+  "num_stages", "chunk_m", "out_dtype", "prologue", "prologue_axes", "epilogue", "epilogue_axes",
+  "out_dtypes", "exact_sums"))
 def gmm(
   x: jax.Array,  # [m, k]
   A: jax.Array,  # [g, k, n]
@@ -236,8 +286,23 @@ def gmm(
   num_stages: int | None = None,
   chunk_m: int = CHUNK_M,
   out_dtype: DTypeLike | None = None,
-) -> jax.Array:
-  """Compute grouped matmul on GPU via a Pallas lowering."""
+  *,
+  prologue=None,
+  prologue_operands: tuple[jax.Array, ...] = (),
+  prologue_axes: tuple = (),
+  epilogue=None,
+  epilogue_operands: tuple[jax.Array, ...] = (),
+  epilogue_axes: tuple = (),
+  out_dtypes: tuple | None = None,
+  exact_sums: bool = False,
+) -> jax.Array | tuple[jax.Array, ...]:
+  """Compute grouped matmul on GPU via a Pallas lowering.
+
+  Dew: `prologue(tile, *side_tiles)` transforms each loaded `[block_m, block_k]` tile of `x` and
+  `epilogue(acc, *side_tiles)` each fp32 accumulator tile, returning one output or a tuple of them
+  (`out_dtypes`). Each side operand's dimensions follow the launch axes its `*_axes` entry names
+  (`_side_tile`): 'rows' and 'depth' for the prologue's, 'rows' and 'columns' for the epilogue's.
+  `exact_sums` adds each depth step's product into the fp32 sum by an IEEE add (`_summed`)."""
 
   msg = "This gmm kernel only supports either (m, k) x (g, k, n) -> (m, n) "
   msg += f"or (m, k) x (g, n, k) -> (m, n), but got {x.shape=} {A.shape=}"
@@ -266,6 +331,7 @@ def gmm(
   group_metadata = _make_gmm_group_metadata(
     group_sizes=group_sizes, m=size.m, chunk_m=chunk_m
   )
+  sides = (*prologue_operands, *epilogue_operands)
   in_specs = [
     pl.BlockSpec((size.m, size.k), lambda i, j: (0, 0)),
     A_spec,
@@ -273,10 +339,12 @@ def gmm(
       lambda x: pl.BlockSpec(x.shape, lambda *args: (0,) * x.ndim),
       group_metadata,
     ),
+    # Dew: each side operand whole; the kernel loads its tiles at its own origins.
+    *(pl.BlockSpec(side.shape, lambda i, j, ndim=side.ndim: (0,) * ndim) for side in sides),
   ]
-  out_shape = jax.ShapeDtypeStruct(
-    (size.m, size.n), dtype=out_dtype or x.dtype)
-  out_specs = pl.BlockSpec((size.m, block_n), lambda i, j: (0, j))
+  dtypes = out_dtypes or (out_dtype or x.dtype,)
+  out_shape = tuple(jax.ShapeDtypeStruct((size.m, size.n), dtype=dtype) for dtype in dtypes)
+  out_specs = tuple(pl.BlockSpec((size.m, block_n), lambda i, j: (0, j)) for _ in dtypes)
   grid_upper_bound = (size.m + chunk_m - 1) // chunk_m + size.g
   grid = (grid_upper_bound, pl.cdiv(size.n, block_n))
   block_sizes = BlockSizes(m=block_m, k=block_k, n=block_n)
@@ -285,9 +353,14 @@ def gmm(
     "acc_dtype": acc_dtype,
     "trans_rhs": trans_rhs,
     "chunk_m": chunk_m,
+    "prologue": prologue,
+    "prologue_axes": prologue_axes,
+    "epilogue": epilogue,
+    "epilogue_axes": epilogue_axes,
+    "exact_sums": exact_sums,
   }
   with jax.named_scope("pallas_triton_ragged_dot"):
-    return pl.pallas_call(
+    outs = pl.pallas_call(
       partial(
         _gpu_ragged_dot_kernel, size=size, block=block_sizes,
         **other_kws  # pyrefly: ignore[bad-argument-type]
@@ -301,7 +374,8 @@ def gmm(
         num_warps=num_warps, num_stages=num_stages
       ),
       name="pallas_triton_ragged_dot",
-    )(x, A, group_metadata)
+    )(x, A, group_metadata, *sides)
+  return outs if out_dtypes else outs[0]
 
 
 def _tgmm_ragged_dot_kernel(
@@ -310,17 +384,22 @@ def _tgmm_ragged_dot_kernel(
   y_ref,  # [k, n]
   group_sizes_ref,  # [g]
   group_offset_ref,  # [g]
-  # outputs
-  A_bar_ref,  # [g, k, n]
+  # Dew: the prologue's side operands, then the output [g, k, n]
+  *refs,
   # static problem shapes
   size: RaggedDotSizes,
   block: BlockSizes,  # hyperparameters
   compute_dtype: DTypeLike | None = None,
   acc_dtype: DTypeLike = np.float32,
+  prologue=None,
+  prologue_axes: tuple = (),
+  exact_sums: bool = False,
 ):
+  *prologue_refs, A_bar_ref = refs
   assert A_bar_ref.shape == (block.k, block.n)
-  pid =  SimpleNamespace(gi=pl.program_id(0), r=pl.program_id(1),
-                         c=pl.program_id(2))
+  # Dew: a group's output tiles launch together, its column tiles fastest, so a wave reads one group's
+  # rows from the L2 rather than each group's same tile (upstream put the group on the fastest axis).
+  pid = SimpleNamespace(c=pl.program_id(0), r=pl.program_id(1), gi=pl.program_id(2))
   size = jax.tree.map(partial(np.array, dtype=np.int32), size)
   group_sz = group_sizes_ref[pid.gi]
   compute_dtype = compute_dtype if compute_dtype is not None else x_ref.dtype
@@ -343,16 +422,23 @@ def _tgmm_ragged_dot_kernel(
 
       mask = xy_rows_mask[:, None] & k_mask[None, :]
       x = plgpu.load(x_ref.at[xy_rows_idx, k_idx], mask=mask, other=0)
+      if prologue is not None:
+        # Dew: the prologue, on the loaded rows of `x` and its side operands' tiles, then the rows
+        # past the group zeroed again, which no hook may bring back.
+        tiles = [_side_tile(ref, axes, {'rows': (ridx, block.m), 'depth': (pid.r * block.k, block.k)},
+                            {'rows': xy_rows_mask, 'depth': k_mask})
+                 for ref, axes in zip(prologue_refs, prologue_axes, strict=True)]
+        x = jnp.where(mask, prologue(x, *tiles), 0)
       mask = xy_rows_mask[:, None] & cols_mask[None, :]
       y = plgpu.load(y_ref.at[xy_rows_idx, cols_idx], mask=mask, other=0)
       x, y = x.astype(compute_dtype), y.astype(compute_dtype)
       dim_nums = (((0,), (0,)), ((), ()))
-      return acc + lax.dot_general(
-          x, y, dimension_numbers=dim_nums, preferred_element_type=acc_dtype
-      ).astype(acc.dtype)
+      partial_sum = lax.dot_general(x, y, dimension_numbers=dim_nums, precision=lax.Precision.DEFAULT,
+                                    preferred_element_type=acc_dtype)
+      return _summed(acc, partial_sum.astype(acc.dtype), group_sz > 0, exact_sums=exact_sums)
 
     acc = jnp.zeros((block.k, block.n), dtype=acc_dtype)
-    acc = lax.fori_loop(0, cdiv(group_sz, block.m), inner_compute, acc)
+    acc = lax.fori_loop(0, pl.cdiv(group_sz, block.m), inner_compute, acc)
     # Dew: upstream casts to y_ref's dtype, the second input's, which fails
     # to store whenever out_dtype differs from it (bf16 inputs, fp32 grad).
     acc = acc.astype(A_bar_ref.dtype)
@@ -367,7 +453,9 @@ def _tgmm_ragged_dot_kernel(
                 mask=rmask[:, None] & cmask[None, :])
 
 
-@jax.jit(static_argnums=list(range(3, 13)))
+@partial(jax.jit, static_argnames=(
+  "block_m", "block_n", "block_k", "interpret", "compute_dtype", "acc_dtype", "num_warps", "num_stages",
+  "chunk_m", "out_dtype", "prologue", "prologue_axes", "exact_sums"))
 def tgmm(
   x: jax.Array,  # [m, k]
   y: jax.Array,  # [m, n]
@@ -382,8 +470,17 @@ def tgmm(
   num_stages: int | None = None,
   chunk_m: int = CHUNK_M,
   out_dtype: DTypeLike | None = None,
+  *,
+  prologue=None,
+  prologue_operands: tuple[jax.Array, ...] = (),
+  prologue_axes: tuple = (),
+  exact_sums: bool = False,
 ) -> jax.Array:
-  """Compute grouped matmul on GPU via a Pallas lowering."""
+  """Compute grouped matmul on GPU via a Pallas lowering.
+
+  Dew: `prologue(rows, *side_tiles)` transforms each loaded `[block_m, block_k]` tile of `x`'s rows
+  before its transposed product; side operands as `gmm`'s, along 'rows' and 'depth'. `exact_sums` as
+  `gmm`'s."""
   del chunk_m
   msg = "This tgmm kernel only supports (m, k) x (m, n) -> (g, k, n), but got "
   msg += f"{x.shape=} {y.shape=}"
@@ -401,19 +498,21 @@ def tgmm(
 
   group_offsets = jnp.cumsum(group_sizes) - group_sizes
   in_specs = [
-    pl.BlockSpec((size.m, block_k), lambda i, r, c: (0, r)),
-    pl.BlockSpec((size.m, block_n), lambda i, r, c: (0, c)),
-    pl.BlockSpec((size.g,), lambda i, r, c: (0,)),
-    pl.BlockSpec((size.g,), lambda i, r, c: (0,)),
+    pl.BlockSpec((size.m, block_k), lambda c, r, i: (0, r)),
+    pl.BlockSpec((size.m, block_n), lambda c, r, i: (0, c)),
+    pl.BlockSpec((size.g,), lambda c, r, i: (0,)),
+    pl.BlockSpec((size.g,), lambda c, r, i: (0,)),
+    *(pl.BlockSpec(side.shape, lambda c, r, i, ndim=side.ndim: (0,) * ndim) for side in prologue_operands),
   ]
 
   out_shape = jax.ShapeDtypeStruct(
     (size.g, size.k, size.n), dtype=out_dtype or x.dtype)
-  out_specs = pl.BlockSpec((None, block_k, block_n), lambda i, r, c: (i, r, c))
-  grid = (size.g, pl.cdiv(size.k, block_k), pl.cdiv(size.n, block_n))
+  out_specs = pl.BlockSpec((None, block_k, block_n), lambda c, r, i: (i, r, c))
+  grid = (pl.cdiv(size.n, block_n), pl.cdiv(size.k, block_k), size.g)
 
   block_sizes = BlockSizes(m=block_m, k=block_k, n=block_n)
-  dtype_spec = {"compute_dtype": compute_dtype, "acc_dtype": acc_dtype}
+  dtype_spec = {"compute_dtype": compute_dtype, "acc_dtype": acc_dtype, "prologue": prologue,
+                "prologue_axes": prologue_axes, "exact_sums": exact_sums}
   with jax.named_scope("tgmm_ragged_dot"):
     return pl.pallas_call(
       partial(_tgmm_ragged_dot_kernel, size=size, block=block_sizes,
@@ -427,7 +526,7 @@ def tgmm(
         num_warps=num_warps, num_stages=num_stages
       ),
       name="tgmm_ragged_dot",
-    )(x, y, group_sizes, group_offsets)
+    )(x, y, group_sizes, group_offsets, *prologue_operands)
 
 
 def _hyperparam_selection_rule(dtype: np.dtype):

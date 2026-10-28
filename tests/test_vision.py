@@ -41,11 +41,11 @@ from reference_error import assert_as_exact_as_the_reference, float64_forward, i
 from safetensors.numpy import load_file
 
 from dew.nn.vision import (
-    PROJECTOR_PREFIX,
     gemma4,
     llama4,
     mimo,
     muse_glimmer,
+    projector_layout,
     projector_variables,
     qwen35,
     siglip,
@@ -70,21 +70,29 @@ def load_fixture(name):
     }
 
 
-def test_siglip_tower_matches_the_reference_implementation():
-    """fp32 parity on the tiny SigLIP trunk, and the positions are live: with
-    them zeroed the trunk leaves the reference by more than 0.01."""
-    fixture = load_fixture("siglip-tiny")
-    record = siglip.translate_siglip_vision_config(fixture["config"])
-    tower = towers.from_record(record).build()
-    variables, _ = tower_variables("siglip", fixture["tensors"], "float32")
+def assert_tower_with_live_positions(tower, variables, fixture, positions: str) -> None:
+    """`tower`'s features of the fixture's pixels within 1e-4 of its reference's everywhere, and,
+    with the parameters named `positions` zeroed, more than 0.01 away somewhere: the positions are
+    live."""
     assert np.max(np.abs(
         np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
     unpositioned = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: jnp.zeros_like(leaf)
-        if path[-1].key == "embedding" else leaf, variables)
+        lambda path, leaf: jnp.zeros_like(leaf) if path[-1].key == positions else leaf, variables)
     assert np.max(np.abs(
-        np.asarray(tower.apply(unpositioned, fixture["pixels"]))
-        - fixture["tower_ref"])) > 1e-2
+        np.asarray(tower.apply(unpositioned, fixture["pixels"])) - fixture["tower_ref"])) > 1e-2
+
+
+@pytest.mark.parametrize("name, family, translate, positions", [
+    ("siglip-tiny", "siglip", siglip.translate_siglip_vision_config, "embedding"),
+    ("llama4-vision-tiny", "llama4", llama4.translate_llama4_vision_config, "embedding"),
+], ids=["siglip", "llama4"])
+def test_a_tower_matches_the_reference_implementation(name, family, translate, positions):
+    """fp32 parity on the tiny SigLIP and Llama 4 trunks, and their positions (Llama 4's grid
+    positions) are live: with them zeroed the trunk leaves the reference by more than 0.01."""
+    fixture = load_fixture(name)
+    tower = towers.from_record(translate(fixture["config"])).build()
+    variables, _ = tower_variables(family, fixture["tensors"], "float32")
+    assert_tower_with_live_positions(tower, variables, fixture, positions)
 
 
 def test_a_siglip_tower_runs_any_layer_activation_and_an_inactive_dropout_as_the_reference_does():
@@ -95,6 +103,8 @@ def test_a_siglip_tower_runs_any_layer_activation_and_an_inactive_dropout_as_the
     import torch
     from transformers import SiglipVisionConfig, SiglipVisionModel
 
+    from tools.torch_precision import float64, float64_twin
+
     config = SiglipVisionConfig(hidden_size=32, intermediate_size=64, num_hidden_layers=2,
                                 num_attention_heads=4, image_size=28, patch_size=14, num_channels=3,
                                 hidden_act="quick_gelu", attention_dropout=0.1, layer_norm_eps=1e-6)
@@ -103,12 +113,11 @@ def test_a_siglip_tower_runs_any_layer_activation_and_an_inactive_dropout_as_the
     tensors = {name: tensor.numpy().copy() for name, tensor in reference.state_dict().items()}
     pixels = np.random.default_rng(11).random((2, 3, 28, 28)).astype(np.float32)
 
-    def features(dtype):
-        with torch.no_grad():
-            output = reference.to(dtype)(pixel_values=torch.from_numpy(pixels).to(dtype))
-        return output.last_hidden_state.numpy()
-
-    theirs, truth = features(torch.float32), features(torch.float64)
+    wide = float64_twin(reference)
+    with torch.no_grad():
+        theirs = reference(pixel_values=torch.from_numpy(pixels)).last_hidden_state.numpy()
+        with float64():
+            truth = wide(pixel_values=torch.from_numpy(pixels).double()).last_hidden_state.numpy()
     tower = towers.from_record(siglip.translate_siglip_vision_config(config.to_dict())).build()
     ours = np.asarray(tower.apply(tower_variables("siglip", tensors, "float32")[0], pixels))
     assert_as_exact_as_the_reference(ours, theirs, truth, "siglip quick_gelu features")
@@ -123,7 +132,7 @@ def test_gemma_projector_matches_the_reference_implementation():
     record = siglip.translate_gemma_projector_config(
         trunk["fields"], fixture["projector"]["text_width"],
         fixture["projector"]["mm_tokens_per_image"])
-    projector = projectors.from_record(record).build()
+    projector = projectors.from_record(record)
     variables = {"params": siglip.translate_gemma_projector_weights(
         fixture["projector_tensors"])[0]}
     assert np.max(np.abs(np.asarray(
@@ -137,29 +146,12 @@ def test_gemma_projector_matches_the_reference_implementation():
         - fixture["projector_ref"])) > 0.1
 
 
-def test_llama4_tower_matches_the_reference_implementation():
-    """fp32 parity on the tiny Llama 4 trunk, and the grid positions are live:
-    with them zeroed the trunk leaves the reference by more than 0.01."""
-    fixture = load_fixture("llama4-vision-tiny")
-    record = llama4.translate_llama4_vision_config(fixture["config"])
-    tower = towers.from_record(record).build()
-    variables, _ = tower_variables("llama4", fixture["tensors"], "float32")
-    assert np.max(np.abs(
-        np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
-    unpositioned = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: jnp.zeros_like(leaf)
-        if path[-1].key == "positional_embedding" else leaf, variables)
-    assert np.max(np.abs(
-        np.asarray(tower.apply(unpositioned, fixture["pixels"]))
-        - fixture["tower_ref"])) > 1e-2
-
-
 def test_llama4_projector_matches_the_reference_implementation():
     """fp32 parity on the tiny outer projector over the reference trunk
     output."""
     fixture = load_fixture("llama4-vision-tiny")
     record = llama4.translate_llama4_projector_config(fixture["projector"]["text_width"])
-    projector = projectors.from_record(record).build()
+    projector = projectors.from_record(record)
     variables = {"params": projector_variables("llama4", fixture["projector_tensors"], "float32")[0]}
     assert np.max(np.abs(np.asarray(
         projector.apply(variables, fixture["tower_ref"]))
@@ -211,7 +203,7 @@ def test_gemma4_projector_matches_the_reference_implementation():
     trunk = gemma4.translate_gemma4_vision_config(fixture["config"])
     record = gemma4.translate_gemma4_projector_config(
         trunk["fields"], fixture["projector"]["text_width"])
-    projector = projectors.from_record(record).build()
+    projector = projectors.from_record(record)
     variables = {"params": gemma4.translate_gemma4_projector_weights(
         fixture["projector_tensors"])[0]}
     assert np.max(np.abs(np.asarray(
@@ -267,7 +259,7 @@ def test_qwen35_projector_matches_the_reference_implementation():
     fixture = load_fixture("qwen35-vision-tiny")
     record = qwen35.translate_qwen35_projector_config(
         fixture["config"], fixture["projector"]["text_width"])
-    projector = projectors.from_record(record).build()
+    projector = projectors.from_record(record)
     variables = {"params": projector_variables("qwen3_5", fixture["projector_tensors"], "float32")[0]}
     assert np.max(np.abs(np.asarray(
         projector.apply(variables, fixture["tower_ref"]))
@@ -344,10 +336,17 @@ def test_mimo_tower_is_as_exact_as_the_reference():
                                          real(refs["tower"], grid), real(refs["tower_f64"], grid), "sinkless")
 
 
-def test_mimo_merger_is_as_exact_as_the_reference():
+@pytest.mark.parametrize("native", [False, True])
+def test_mimo_merger_is_as_exact_as_the_reference(native):
     config, _, projector_tensors, refs = shared_fixture("mimo-vision-tiny")
     record = mimo.translate_mimo_projector_config(config, config["text_config"]["hidden_size"])
-    projector = projectors.from_record(record).build()
+    projector = projectors.from_record(record)
+    if native:
+        vision = config["vision_config"]
+        projector = mimo.MiMoProjector(
+            hidden_size=vision["hidden_size"], spatial_merge_size=vision["spatial_merge_size"],
+            width=vision["hidden_size"] * vision["spatial_merge_size"] ** 2,
+            out_width=config["text_config"]["hidden_size"])
     variables = {"params": projector_variables("mimo", projector_tensors, "float32")[0]}
     out = projector.apply(variables, refs["tower"])
     grid = refs["grid"]
@@ -374,11 +373,11 @@ def test_muse_glimmer_tower_is_as_exact_as_the_reference():
 
 def test_muse_glimmer_projector_is_as_exact_as_the_reference():
     """The pixel shuffle channel by channel, the adapter's two activated maps, the projection and the
-    scale-free norm, each tensor named as the checkpoint router leaves it (`PROJECTOR_PREFIX`)."""
+    scale-free norm, each tensor named as the checkpoint router leaves it (`projector_layout`)."""
     config, _, projector_tensors, refs = shared_fixture("muse-glimmer-vision-tiny")
-    projector = projectors.from_record(muse_glimmer.translate_muse_glimmer_projector_config(config)).build()
+    projector = projectors.from_record(muse_glimmer.translate_muse_glimmer_projector_config(config))
     routed = {name[len(prefix):]: tensor for name, tensor in projector_tensors.items()
-              for prefix in PROJECTOR_PREFIX["muse_glimmer"] if name.startswith(prefix)}
+              for prefix in projector_layout("muse_glimmer").prefix if name.startswith(prefix)}
     variables = {"params": projector_variables("muse_glimmer", routed, "float32")[0]}
     out = projector.apply(variables, refs["tower"])
     grid = refs["grid"]

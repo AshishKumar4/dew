@@ -1,9 +1,9 @@
 """Engine-sourced sessions and the strict prefix-merge packer.
 
-A `Call` is what any recording gateway can supply for one model call: the
-prompt ids the engine read, the ids it sampled, their behavior
-log-probabilities, the finish reason and the policy version served when the
-request was submitted. A `Session` is one harness session: its calls in
+A `Call` is one model call of a session, its `Draw` (`dew.inference.rollouts`)
+as any recording gateway can supply it: the prompt ids the engine read, the
+ids it sampled, their behavior log-probabilities, the finish reason and the
+policy version served when the request was submitted. A `Session` is one harness session: its calls in
 submission order, with the verifier's verdict. A `SessionSource` turns tasks
 into sessions; Harbor runners, Polar clients and the in-process episode
 collector all sit behind it.
@@ -37,21 +37,23 @@ them. A `TRUNCATED` session follows the `truncation` policy:
 from __future__ import annotations
 
 import itertools
-import math
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
-from numbers import Real
 from types import MappingProxyType
-from typing import Protocol
+from typing import Protocol, SupportsFloat
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.typing import ArrayLike
 
+from dew._records import finite, json_value, record as section
+from dew.batch import Variables
 from dew.data.tokens import first_fit
-from dew.records import json_value, record as section
+from dew.inference.rollouts import Draw
+from dew.nn.inputs import local_rows
 from dew.rl import group_advantage, rloo_advantage
 
 IDS_KEY = "input_ids"
@@ -66,6 +68,10 @@ has none, the behavior log-probabilities stand in.
 BEHAVIOR_LOG_PROBS_KEY = "behavior_log_probs"
 """Actual sampling log-probabilities, including temperature/top-k and greedy selection."""
 ADVANTAGES_KEY = "advantages"
+TOKEN_REWARDS_KEY = "token_rewards"
+"""On a sampled id, the reward that lands on it: each call's step reward on its last sampled id, and
+the session's trained reward (`pack`'s `truncation`) on its last call's; 0 elsewhere. verl's
+token_level_rewards, which a critic's GAE reads."""
 SEGMENT_IDS_KEY = "text_segment_ids"
 """Which chain of its row each token belongs to, from 1; 0 is padding."""
 POSITIONS_KEY = "text_positions"
@@ -92,7 +98,6 @@ SUPPORT_COLUMNS_KEY = "support_columns"
 id whose support it belongs to; -1 on padding. A sampled id with no entry was
 drawn from the whole vocabulary."""
 
-FINISH_REASONS = frozenset({"stop", "tool_calls", "length", "abort"})
 TRUNCATIONS = ("mask", "score", "zero")
 """What a `TRUNCATED` session trains on; see the module docstring."""
 ESTIMATORS = ("group", "mean", "rloo")
@@ -104,6 +109,21 @@ CREDITS = ("session", "turn")
 return, every call alike; `turn`, one per call from the return still ahead of
 it, compared with the group's members' at the same turn."""
 
+
+
+def finite_reward(value: SupportsFloat) -> float:
+    """A verifier's or reward's score as a float: anything `float` takes (a bool's 1.0 and 0.0, a
+    NumPy or JAX scalar), refused unless finite (`records.finite`)."""
+    return finite(float(value), "a reward")
+
+
+def local_task_ids(batch: Mapping[str, ArrayLike]) -> np.ndarray:
+    """This process's `task_id` rows of `batch`, refused unless a nonempty vector of integers: the
+    rollout's task boundary, which the scheduler and native episode collection both read."""
+    ids = local_rows(batch["task_id"])
+    if ids.ndim != 1 or not ids.size or not np.issubdtype(ids.dtype, np.integer):
+        raise ValueError("task_id must be a nonempty vector of integer task identities")
+    return ids
 
 class Status(Enum):
     """How a session ended, which decides whether it trains.
@@ -129,23 +149,6 @@ class Status(Enum):
         trains depends on `pack`'s `truncation` policy.
         """
         return self in (Status.COMPLETED, Status.AGENT_ERROR)
-
-
-def _finite(message: str, value: object) -> float:
-    """Parse a boundary number: any finite real, numpy's included, as a float.
-
-    Records arrive from gateways, JSON and numpy arrays, so anything may land
-    here. A bool is a flag, not a score; it and every non-number, infinity
-    or nan raise a ValueError carrying `message`.
-    """
-    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
-        raise ValueError(f"{message}, got {value!r}")
-    return float(value)
-
-
-def _token_ids(name: str, ids: object) -> None:
-    if not isinstance(ids, tuple) or any(type(token) is not int or token < 0 for token in ids):
-        raise ValueError(f"{name} must be a tuple of nonnegative integer token ids")
 
 
 @dataclass(frozen=True)
@@ -179,81 +182,28 @@ def json_objects(values: object, name: str) -> tuple[Mapping[str, object], ...]:
 
 
 @dataclass(frozen=True)
-class Call:
-    """One model call as the engine served it.
-
-    `prompt_ids` are the ids the engine read and `sampled_ids` the ids it
-    sampled, including EOS when `finish_reason` is a natural stop.
-    `behavior_log_probs` holds the engine-reported log-probability of each
-    sampled id. `finish_reason` is `stop`, `tool_calls`, `length` or `abort`.
-    `version` is the policy version being served when the request was
-    submitted, which is the oldest policy that may have produced any of its
-    ids.
-
-    Two engine records are optional. `routed_experts` is the mixture's
-    routing for every id the engine forwarded, as
-    `[len(prompt_ids) + len(sampled_ids) - 1, layers, top_k]` expert ids in
-    the dtype the engine sent; the last sampled id is never forwarded. vLLM
-    calls this record `routed_experts` and SGLang
-    `meta_info.routed_experts`, and the trainer replays it
-    (`dew.nn.protocols.Routes`). `support` holds, for each sampled id, the token
-    ids the sampler's top-k/top-p filters kept (vLLM's `sampling_mask`).
-    With a support, the behavior log-probability is the filtered one, and
-    the trainer renormalizes over the same support. None means no filter.
+class Call(Draw):
+    """One model call of a session: its `Draw` as the engine served it, with what the environment
+    paid for it and the conversation it was asked in.
 
     `reward` is what the environment paid for this call, a step reward, or
     None. `transcript` is the call's conversation in the structure the
     harness spoke it (`Transcript`), where the source has one.
     """
 
-    prompt_ids: tuple[int, ...]
-    sampled_ids: tuple[int, ...]
-    behavior_log_probs: tuple[float, ...]
-    finish_reason: str
-    version: int
-    routed_experts: np.ndarray | None = field(default=None, compare=False)
-    support: tuple[tuple[int, ...], ...] | None = None
     reward: float | None = None
     transcript: Transcript | None = None
 
     def __post_init__(self) -> None:
-        _token_ids("prompt_ids", self.prompt_ids)
-        _token_ids("sampled_ids", self.sampled_ids)
-        if not self.prompt_ids:
-            raise ValueError("a model call reads at least one prompt id")
-        if (not isinstance(self.behavior_log_probs, tuple)
-                or len(self.behavior_log_probs) != len(self.sampled_ids)):
-            raise ValueError("a call needs one behavior log-probability per sampled id")
-        object.__setattr__(self, "behavior_log_probs", tuple(
-            _finite("behavior log-probabilities must be finite numbers", value)
-            for value in self.behavior_log_probs))
+        super().__post_init__()
         if self.reward is not None:
-            object.__setattr__(self, "reward", _finite("a call's reward is a finite number or None",
-                                                       self.reward))
-        if self.finish_reason not in FINISH_REASONS:
-            raise ValueError(f"finish_reason must be one of {sorted(FINISH_REASONS)}, "
-                             f"got {self.finish_reason!r}")
-        if type(self.version) is not int or self.version < 0:
-            raise ValueError("a call's policy version is a nonnegative integer")
-        if self.routed_experts is not None:
-            routed = np.array(self.routed_experts)
-            forwarded = len(self.prompt_ids) + len(self.sampled_ids) - 1
-            if (routed.ndim != 3 or routed.shape[0] != forwarded
-                    or not np.issubdtype(routed.dtype, np.integer)):
-                raise ValueError(
-                    f"routed_experts is [forwarded ids, layers, top_k] expert ids, "
-                    f"{forwarded} rows for this call; got {routed.dtype} {routed.shape}")
-            if routed.size and routed.min() < 0:
-                raise ValueError("routed_experts holds expert ids, which are nonnegative")
-            routed.setflags(write=False)
-            object.__setattr__(self, "routed_experts", routed)
-        if self.support is not None:
-            if not isinstance(self.support, tuple) or len(self.support) != len(self.sampled_ids):
-                raise ValueError("support holds one tuple of kept ids per sampled id")
-            for kept, token in zip(self.support, self.sampled_ids, strict=True):
-                _token_ids("each support", kept)
-                if token not in kept:
-                    raise ValueError(f"sampled id {token} lies outside its recorded support")
+            object.__setattr__(self, "reward", finite(self.reward, "a call's reward"))
+
+    @classmethod
+    def of(cls, draw: Draw, *, reward: float | None = None, transcript: Transcript | None = None) -> Call:
+        """`draw` as a session's call, paid `reward` and asked in `transcript`."""
+        return cls(**{name.name: getattr(draw, name.name) for name in fields(Draw)}, reward=reward,
+                   transcript=transcript)
 
 
 @dataclass(frozen=True)
@@ -291,14 +241,54 @@ class Session:
         if not isinstance(self.calls, tuple) or not all(isinstance(call, Call) for call in self.calls):
             raise TypeError("session calls must be a tuple of Call records")
         if self.reward is not None:
-            object.__setattr__(self, "reward", _finite("a session reward is a finite number or None",
-                                                       self.reward))
+            object.__setattr__(self, "reward", finite(self.reward, "a session reward"))
         if self.status.trainable and self.reward is None:
             raise ValueError(f"a {self.status.name} session is scored, so it needs a reward")
         for name in ("sample", "attempt"):
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"session {name} must be a nonnegative integer")
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    """The trainer's state at one rollout call, as an acquisition reads it: the `variables` the
+    step trains, its attempted `step` and committed `updates`, the call's `key`, and the `branch` it
+    is drawn on, a cooldown branch's name (`RolloutScheduler.branch`) or None for the run's own, which
+    keeps what a collector records of a branch's calls apart from the run's at the same step and key
+    (an `EpisodeJournal`'s cohorts)."""
+
+    variables: Variables
+    step: int
+    updates: int
+    key: jax.Array
+    branch: str | None = None
+
+
+class Collector(Protocol):
+    """Draws a call's sessions from the trainer's own variables (`RolloutScheduler.collected`).
+
+    `collect` draws `samples` sessions of each task from `snapshot.variables`
+    in one program every process of their mesh enters in the same order, and
+    returns them by task; every call it records was drawn under
+    `snapshot.updates`, with the raw likelihoods of exactly those variables,
+    the proximal policy. A failure that is not the drawn sessions' own (a
+    broken environment) raises on every process, and an infrastructure
+    failure of a session's reward or environment is that session's
+    INFRA_ERROR. On a data share's later reader it enters the draw but
+    neither scores nor returns it, an empty list: the share trains on its
+    first reader's sessions (`first_reader_batch`). `width` is the packed
+    row's ids and `rows(tasks, samples)` the rows a call of that many
+    sessions packs into.
+    """
+
+    @property
+    def width(self) -> int: ...
+
+    def rows(self, tasks: int, samples: int) -> int: ...
+
+    def collect(self, snapshot: Snapshot, tasks: Sequence[Task],
+                samples: int) -> Sequence[Sequence[Session]]: ...
 
 
 class SessionSource(Protocol):
@@ -346,18 +336,18 @@ class _Chain:
 
     def extend(self, call: Call, index: int, start: int) -> None:
         """Append `call`'s prompt from `start`, then its sampled ids."""
-        tail = len(call.prompt_ids) - start
-        self.tokens.extend(call.prompt_ids[start:])
+        tail = len(call.prompt) - start
+        self.tokens.extend(call.prompt[start:])
         self.behavior.extend([0.0] * tail)
         self.versions.extend([-1] * tail)
         self.calls.extend([-1] * tail)
-        self.tokens.extend(call.sampled_ids)
+        self.tokens.extend(call.tokens)
         self.behavior.extend(call.behavior_log_probs)
-        self.versions.extend([call.version] * len(call.sampled_ids))
-        self.calls.extend([index] * len(call.sampled_ids))
-        self.members.append((index, len(self.tokens) - len(call.sampled_ids), len(call.sampled_ids)))
+        self.versions.extend([call.version] * len(call.tokens))
+        self.calls.extend([index] * len(call.tokens))
+        self.members.append((index, len(self.tokens) - len(call.tokens), len(call.tokens)))
         self.supports.extend([None] * tail)
-        self.supports.extend(call.support if call.support is not None else [None] * len(call.sampled_ids))
+        self.supports.extend(call.support if call.support is not None else [None] * len(call.tokens))
         if call.routed_experts is not None:
             self.routing = call.routed_experts
 
@@ -369,7 +359,7 @@ def merges(chain: Sequence[int], call: Call) -> bool:
     included. A prompt that only starts with the previous prompt is refused.
     """
     size = len(chain)
-    return len(call.prompt_ids) >= size and tuple(call.prompt_ids[:size]) == tuple(chain)
+    return len(call.prompt) >= size and tuple(call.prompt[:size]) == tuple(chain)
 
 
 def chains(session: Session, index: int, width: int) -> list[_Chain]:
@@ -384,7 +374,7 @@ def chains(session: Session, index: int, width: int) -> list[_Chain]:
     """
     built: list[_Chain] = []
     for number, call in enumerate(session.calls):
-        size = len(call.prompt_ids) + len(call.sampled_ids)
+        size = len(call.prompt) + len(call.tokens)
         if size > width:
             raise ValueError(
                 f"session {session.task}/{session.group}/{session.sample} call {number} holds "
@@ -405,11 +395,17 @@ def check_truncation(truncation: str) -> None:
         raise ValueError(f"truncation must be one of {TRUNCATIONS}, got {truncation!r}")
 
 
+def _trains(status: Status, truncation: str) -> bool:
+    """Whether a session that ended with `status` trains under `truncation`: a trainable status
+    always, a truncated one unless its truncation policy masks it."""
+    return status.trainable or (status is Status.TRUNCATED and truncation != "mask")
+
+
 def _trained_reward(session: Session, truncation: str) -> float | None:
     """The reward `session` trains on under `truncation`, or None when it carries no loss."""
     if session.status.trainable:
         return session.reward
-    if session.status is not Status.TRUNCATED or truncation == "mask":
+    if not _trains(session.status, truncation):
         return None
     if truncation == "zero":
         return 0.0
@@ -554,7 +550,8 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     ids alone, and `behavior_log_probs`, `versions` and `call_index` are set
     on those ids. `advantages` holds, on each sampled id, its call's
     advantage, which `estimator` computes within its `(task, group)` over
-    `credit` (`advantages`).
+    `credit` (`advantages`), and `token_rewards` the rewards that land on
+    each sampled id (`TOKEN_REWARDS_KEY`).
     `session_weights` is one over the session's number of sampled ids on
     each of them and 0 elsewhere. It sums to the number of sessions, so
     `sum(weights * terms) / sum(weights)` is the mean over sessions of each
@@ -598,35 +595,61 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     session_index = np.full(shape, -1, np.int32)
     call_index = np.full(shape, -1, np.int32)
     advantage = np.zeros(shape, np.float32)
+    token_rewards = np.zeros(shape, np.float32)
     trainable = np.zeros(len(sessions), np.int64)
     for chain in built:
         trainable[chain.session] += sum(1 for call in chain.calls if call >= 0)
     weights = np.zeros(shape, np.float32)
-    for row, numbers in enumerate(placed):
-        start = 0
-        for segment, number in enumerate(numbers, start=1):
-            chain = built[number]
-            stop = start + len(chain.tokens)
-            span = slice(start, stop)
-            sampled = np.asarray(chain.calls) >= 0
-            ids[row, span] = chain.tokens
-            segments[row, span] = segment
-            positions[row, span] = np.arange(len(chain.tokens))
-            mask[row, span] = sampled
-            behavior[row, span] = chain.behavior
-            versions[row, span] = chain.versions
-            session_index[row, span] = chain.session
-            call_index[row, span] = chain.calls
-            advantage[row, span] = values[chain.session][_owners(chain)]
-            weights[row, span] = sampled / max(int(trainable[chain.session]), 1)
-            start = stop
+    for row, segment, start, chain in _spans(built, placed):
+        span = slice(start, start + len(chain.tokens))
+        sampled = np.asarray(chain.calls) >= 0
+        ids[row, span] = chain.tokens
+        segments[row, span] = segment
+        positions[row, span] = np.arange(len(chain.tokens))
+        mask[row, span] = sampled
+        behavior[row, span] = chain.behavior
+        versions[row, span] = chain.versions
+        session_index[row, span] = chain.session
+        call_index[row, span] = chain.calls
+        advantage[row, span] = values[chain.session][_owners(chain)]
+        weights[row, span] = sampled / max(int(trainable[chain.session]), 1)
+        session = sessions[chain.session]
+        for call, first, count in chain.members:
+            if count:
+                paid = session.calls[call].reward
+                trained = _trained_reward(session, truncation) if call == len(session.calls) - 1 else None
+                token_rewards[row, start + first + count - 1] = ((0.0 if paid is None else paid)
+                                                                 + (0.0 if trained is None else trained))
     return {
         IDS_KEY: ids, SEGMENT_IDS_KEY: segments, POSITIONS_KEY: positions,
         RESPONSE_MASK_KEY: mask, BEHAVIOR_LOG_PROBS_KEY: behavior, VERSIONS_KEY: versions,
         SESSION_INDEX_KEY: session_index, CALL_INDEX_KEY: call_index,
-        ADVANTAGES_KEY: advantage, SESSION_WEIGHTS_KEY: weights,
+        ADVANTAGES_KEY: advantage, TOKEN_REWARDS_KEY: token_rewards, SESSION_WEIGHTS_KEY: weights,
         **_engine_records(built, placed, shape, support_capacity),
     }
+
+
+def _spans(built: Sequence[_Chain], placed: Sequence[Sequence[int]]):
+    """Each placed chain as `(row, segment, start, chain)`: its packed row, its 1-based segment in
+    the row, the column its first id takes, and the chain, in packing order."""
+    for row, numbers in enumerate(placed):
+        start = 0
+        for segment, number in enumerate(numbers, start=1):
+            chain = built[number]
+            yield row, segment, start, chain
+            start += len(chain.tokens)
+
+
+def _empty_routing(shape: tuple[int, int], layout: tuple[int, ...], dtype) -> dict[str, np.ndarray]:
+    """The routing record's empty form over packed rows of `shape`: expert ids of zero `[*shape,
+    layers, top_k]` in the engines' dtype, and `routed` false, which the trainer reads as no record."""
+    return {ROUTED_EXPERTS_KEY: np.zeros((*shape, *layout), dtype), ROUTED_KEY: np.zeros(shape, bool)}
+
+
+def _empty_support(rows: int, capacity: int) -> dict[str, np.ndarray]:
+    """The support record's empty form: `rows` rows of `capacity` kept ids and their columns, -1."""
+    return {SUPPORT_KEY: np.full((rows, capacity), -1, np.int32),
+            SUPPORT_COLUMNS_KEY: np.full((rows, capacity), -1, np.int32)}
 
 
 def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
@@ -643,31 +666,22 @@ def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
     """
     records = [chain.routing for chain in built if chain.routing is not None]
     out: dict[str, np.ndarray] = {}
-    routed = covered = None
     if records:
         layout = {record.shape[1:] for record in records}
         if len(layout) != 1:
             raise ValueError(f"routed_experts disagree on [layers, top_k] across calls: {sorted(layout)}")
-        routed = np.zeros((*shape, *layout.pop()), np.result_type(*records))
-        covered = np.zeros(shape, bool)
+        out = _empty_routing(shape, layout.pop(), np.result_type(*records))
     kept: list[list[tuple[int, ...]]] = [[] for _ in range(shape[0])]
     owners: list[list[int]] = [[] for _ in range(shape[0])]
-    for row, numbers in enumerate(placed):
-        start = 0
-        for number in numbers:
-            chain = built[number]
-            if routed is not None and covered is not None and chain.routing is not None:
-                rows_covered = len(chain.routing)
-                routed[row, start:start + rows_covered] = chain.routing
-                covered[row, start:start + rows_covered] = True
-            for position, ids in enumerate(chain.supports):
-                if ids is not None:
-                    kept[row].append(ids)
-                    owners[row].append(start + position)
-            start += len(chain.tokens)
-    if routed is not None and covered is not None:
-        out[ROUTED_EXPERTS_KEY] = routed
-        out[ROUTED_KEY] = covered
+    for row, _, start, chain in _spans(built, placed):
+        if out and chain.routing is not None:
+            rows_covered = len(chain.routing)
+            out[ROUTED_EXPERTS_KEY][row, start:start + rows_covered] = chain.routing
+            out[ROUTED_KEY][row, start:start + rows_covered] = True
+        for position, ids in enumerate(chain.supports):
+            if ids is not None:
+                kept[row].append(ids)
+                owners[row].append(start + position)
     if any(kept):
         totals = [sum(len(group) for group in groups) for groups in kept]
         if support_capacity is None:
@@ -678,15 +692,14 @@ def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
         if max(totals) > support_capacity:
             raise ValueError(f"a row's recorded supports keep {max(totals)} ids, "
                              f"more than support_capacity {support_capacity}")
-        ids = np.full((shape[0], support_capacity), -1, np.int32)
-        columns = np.full((shape[0], support_capacity), -1, np.int32)
+        support = _empty_support(shape[0], support_capacity)
         for row, (groups, total) in enumerate(zip(kept, totals, strict=True)):
-            ids[row, :total] = np.fromiter((token for group in groups for token in group), np.int32, total)
-            columns[row, :total] = np.repeat(
+            support[SUPPORT_KEY][row, :total] = np.fromiter((token for group in groups for token in group),
+                                                            np.int32, total)
+            support[SUPPORT_COLUMNS_KEY][row, :total] = np.repeat(
                 np.asarray(owners[row], np.int32), [len(group) for group in groups]
             )
-        out[SUPPORT_KEY] = ids
-        out[SUPPORT_COLUMNS_KEY] = columns
+        out.update(support)
     return out
 
 
@@ -704,7 +717,7 @@ def agreed_records(packed: dict[str, np.ndarray], support_capacity: int | None) 
     nothing, a share's later reader, keeps nothing. Every process calls
     this, in the order of its other coordination rounds.
     """
-    from dew.coordination import from_every_process
+    from dew._coordination import from_every_process
 
     routed = packed.get(ROUTED_EXPERTS_KEY)
     pool = from_every_process({"routing": None if routed is None else [*routed.shape[2:], routed.dtype.name],
@@ -718,12 +731,10 @@ def agreed_records(packed: dict[str, np.ndarray], support_capacity: int | None) 
     filled = dict(packed)
     if layouts and routed is None:
         (layers, top_k, dtype), = layouts
-        filled[ROUTED_EXPERTS_KEY] = np.zeros((*shape, layers, top_k), np.dtype(dtype))
-        filled[ROUTED_KEY] = np.zeros(shape, bool)
+        filled.update(_empty_routing(shape, (layers, top_k), np.dtype(dtype)))
     if any(share["support"] for share in pool) and SUPPORT_KEY not in packed:
         assert support_capacity is not None, "a peer packed supports, which need a support_capacity"
-        filled[SUPPORT_KEY] = np.full((shape[0], support_capacity), -1, np.int32)
-        filled[SUPPORT_COLUMNS_KEY] = np.full((shape[0], support_capacity), -1, np.int32)
+        filled.update(_empty_support(shape[0], support_capacity))
     return filled
 
 
@@ -768,7 +779,10 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
       `masked/<name>`: share of all sampled ids that status masked, under
       the `truncation` policy `pack` used.
     - `reward/mean` over trained sessions at their trained reward, and
-      `reward/component/<name>` per verifier component.
+      `reward/component/<name>` per verifier component; `reward/observed`
+      the mean of every verifier score, whatever the session trains on, 0.0
+      where none was scored.
+    - `length/mean`, the mean count of sampled ids per session.
     - `latency/p50`, `p90`, `p99`, `max` over `latencies`, seconds per session.
     - `lag/mean`, `lag/max`: `version` minus each trainable id's version.
 
@@ -780,11 +794,11 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
     total = max(len(sessions), 1)
     sampled = dict.fromkeys(Status, 0)
     for session in sessions:
-        sampled[session.status] += sum(len(call.sampled_ids) for call in session.calls)
+        sampled[session.status] += sum(len(call.tokens) for call in session.calls)
     everything = max(sum(sampled.values()), 1)
     for status in Status:
         metrics[f"status/{status.value}"] = sum(session.status == status for session in sessions) / total
-        if not status.trainable and not (status is Status.TRUNCATED and truncation != "mask"):
+        if not _trains(status, truncation):
             metrics[f"masked/{status.value}"] = sampled[status] / everything
     segments = np.asarray(batch[SEGMENT_IDS_KEY])
     rows = np.arange(segments.shape[0])[:, None] * (segments.shape[1] + 1) + segments
@@ -795,6 +809,10 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
     metrics["pack/fill"] = float(np.mean(segments > 0))
     scored = [(session, reward) for session, reward in zip(sessions, rewards_of, strict=True)
               if reward is not None]
+    observed = [session.reward for session in sessions if session.reward is not None]
+    metrics["reward/observed"] = float(np.mean(observed, dtype=np.float32)) if observed else 0.0
+    metrics["length/mean"] = float(np.mean([sum(len(call.tokens) for call in session.calls)
+                                            for session in sessions])) if sessions else 0.0
     if scored:
         metrics["reward/mean"] = float(np.mean([reward for _, reward in scored]))
         components: dict[str, list[float]] = {}

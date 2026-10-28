@@ -20,15 +20,22 @@ def posterior_moments(moments: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
     return mean, jnp.clip(log_variance, -30.0, 20.0)
 
 
-def posterior_latent(moments: jnp.ndarray, key: jax.Array | None) -> jnp.ndarray:
-    """The posterior mean when `key` is None, else one draw from it (`posterior_moments`)."""
+def posterior_latent(moments: jnp.ndarray, key: jax.Array | None,
+                     noise: jnp.ndarray | None = None) -> jnp.ndarray:
+    """The posterior mean when `key` and `noise` are None, else one draw from it
+    (`posterior_moments`): `mean + deviation * noise`, a standard normal draw of
+    the mean's shape, drawn from `key` where `noise` is None. Raises
+    `ValueError` for a noise of another shape than the mean's."""
     mean, log_variance = posterior_moments(moments)
-    if key is None:
-        return mean
-    deviation = jnp.exp(0.5 * log_variance)
-    # Drawn in float32, as the rest of a step's draws are, whatever the
-    # moments' precision, so a float64 run draws the same numbers.
-    return mean + deviation * jax.random.normal(key, mean.shape, dtype=jnp.float32).astype(mean.dtype)
+    if noise is None:
+        if key is None:
+            return mean
+        # Drawn in float32, as the rest of a step's draws are, whatever the
+        # moments' precision, so a float64 run draws the same numbers.
+        noise = jax.random.normal(key, mean.shape, dtype=jnp.float32)
+    elif noise.shape != mean.shape:
+        raise ValueError(f"the posterior's noise is {noise.shape}, and its mean {mean.shape}")
+    return mean + jnp.exp(0.5 * log_variance) * noise.astype(mean.dtype)
 
 
 class AutoencoderKL(nn.Module):
@@ -55,15 +62,15 @@ class AutoencoderKL(nn.Module):
         """The model a diffusers `AutoencoderKL` config describes, computing in `dtype`. The stack
         computes SiLU, attention in the bottleneck, a decoder writing the image's channels and the
         plain encoder and decoder levels; a config asking for anything else is refused by name."""
-        from dew import records
+        from dew import _records
         from dew.interop.diffusion import flag
 
-        channels = records.integers(config["block_out_channels"], "block_out_channels")
+        channels = _records.integers(config["block_out_channels"], "block_out_channels")
         refused = [name for name, holds in (
             ("act_fn", config.get("act_fn", "silu") == "silu"),
             ("mid_block_add_attention", flag(config, "mid_block_add_attention", default=True)),
             ("out_channels", config.get("out_channels", 3) == config["in_channels"]),
-            *((field, records.strings(config.get(field) or [block] * len(channels), field)
+            *((field, _records.strings(config.get(field) or [block] * len(channels), field)
                == (block,) * len(channels))
               for field, block in (("down_block_types", "DownEncoderBlock2D"),
                                    ("up_block_types", "UpDecoderBlock2D"))),
@@ -73,14 +80,14 @@ class AutoencoderKL(nn.Module):
             raise ValueError(f"the KL autoencoder does not compute {named}")
         decoder = config.get("decoder_block_out_channels")
         return cls(channels=channels,
-                   latent_channels=records.integer(config["latent_channels"], "latent_channels"),
-                   image_channels=records.integer(config["in_channels"], "in_channels"),
-                   blocks_per_level=records.integer(config["layers_per_block"], "layers_per_block"),
-                   norm_groups=records.integer(config["norm_num_groups"], "norm_num_groups"),
+                   latent_channels=_records.integer(config["latent_channels"], "latent_channels"),
+                   image_channels=_records.integer(config["in_channels"], "in_channels"),
+                   blocks_per_level=_records.integer(config["layers_per_block"], "layers_per_block"),
+                   norm_groups=_records.integer(config["norm_num_groups"], "norm_num_groups"),
                    quantize=flag(config, "use_quant_conv", default=True),
                    post_quantize=flag(config, "use_post_quant_conv", default=True),
                    decoder_channels=(None if not decoder
-                                     else records.integers(decoder, "decoder_block_out_channels")),
+                                     else _records.integers(decoder, "decoder_block_out_channels")),
                    dtype=dtype)
 
     @property
@@ -117,8 +124,8 @@ class AutoencoderKL(nn.Module):
         moments = self.encoder(image)
         return self.quant_conv(moments) if self.quantize else moments
 
-    def encode(self, image, key=None):
-        return posterior_latent(self.moments(image), key)
+    def encode(self, image, key=None, noise=None):
+        return posterior_latent(self.moments(image), key, noise)
 
     def decode(self, latents):
         if self.post_quantize:

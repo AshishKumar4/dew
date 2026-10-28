@@ -37,8 +37,6 @@ import time
 import urllib.request
 from pathlib import Path
 
-from dew.config.data import loader
-
 CORPUS = ("https://huggingface.co/datasets/roneneldan/TinyStories/resolve/"
           "f54c09fd23315a6f9c86f9dc80f725de7d8f9c64/TinyStories-valid.txt")
 """TinyStories' validation split, about 19 MB of English, at a pinned revision."""
@@ -84,11 +82,23 @@ def corpus(cache: Path) -> Path:
     return tokens
 
 
+def windows(tokens: Path, batch: int):
+    """The token store's stream cut into windows of SEQ_LEN, in a run's order, in batches of `batch`,
+    read into memory."""
+    from dew.data import presets
+    from dew.data.compile import compile
+    from dew.data.sources import TokenFiles
+
+    order = TokenFiles(str(tokens)).shuffle(0).repeat()
+    return compile(order.pipe(presets.token_windows, seq_len=SEQ_LEN, batch=batch), read="memory")
+
+
 def collectives(hlo: str) -> dict:
-    """Each kind of collective (`instrumentation.COLLECTIVES`) in compiled HLO text: how many ops
+    """Each kind of collective (`dew.telemetry.trace.COLLECTIVES`) in compiled HLO text: how many ops
     there are, how many buffers they move (a combined collective is one op with a tuple of them),
     their bytes, and the sizes of the five largest ops. An async pair counts once, by its `-done`."""
-    from dew.telemetry.instrumentation import collective, hlo_instructions
+    from dew.telemetry.instrumentation import hlo_instructions
+    from dew.telemetry.trace import collective
 
     found: dict = {}
     for instruction in hlo_instructions(hlo).values():
@@ -213,12 +223,11 @@ def main() -> None:
     import optax
     from jax.experimental import multihost_utils
 
-    from dew.config.data import TextData
     from dew.data.dataset import DataPartition
+    from dew.distributed.batches import shard_batch
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import Layout, MeshSpec, Trainer
-    from dew.training.distributed import shard_batch
 
     shape = SHAPES[args.shape]
     platform = jax.devices()[0].platform
@@ -226,8 +235,7 @@ def main() -> None:
     target = shape["target"] if args.target is None else args.target
     tokens = corpus(args.cache)
     batch_size = shape["batch"] if args.batch is None else args.batch
-    data = loader(TextData(source=str(tokens), seq_len=SEQ_LEN), batch=batch_size, read="memory",
-        validation_records=4 * (batch_size))
+    data = windows(tokens, batch_size)
     model = CausalTransformer(**shape["model"], vocab_size=256, max_seq_len=SEQ_LEN + 1,
                               dtype=getattr(jnp, dtype), attention_impl="auto", scan_layers=args.scan_layers)
     trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=None),

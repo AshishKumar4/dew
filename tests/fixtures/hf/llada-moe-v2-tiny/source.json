@@ -1,0 +1,30 @@
+{
+ "released": {
+  "repo": "GSAI-ML/LLaDA-MoE-v2-30B-A3B-Base",
+  "revision": "2a513f7a4634e426b2ab030e6defb24001d0c847",
+  "files": [
+   "config.json",
+   "configuration_lladamoe_v2.py",
+   "modeling_lladamoe_v2.py"
+  ]
+ },
+ "instruct": {
+  "repo": "GSAI-ML/LLaDA-MoE-v2-30B-A3B-Instruct",
+  "revision": "97cfa32a580778df8d796c1faad72d22c8f8a6ba",
+  "same_config_and_modeling": true
+ },
+ "transformers": {
+  "version": "4.57.1"
+ },
+ "torch": {
+  "version": "2.9.0+cpu"
+ },
+ "generator": "tools/llada_moe_reference.py llada-moe-v2-tiny --draw",
+ "seed": 0,
+ "changes": "Small geometry keeps head_dim independent of hidden_size/num_attention_heads, the shared expert and scaling 2.5. The instantiated router softmaxes the selected logits, not every expert. The grouped router class in the same file is unused.",
+ "recording": {
+  "file": "released.npz",
+  "by": "tools/recorded_references.py record_case, summary",
+  "torch": "2.14.1+cpu"
+ }
+}

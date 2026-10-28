@@ -35,11 +35,19 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     # Ouro's remote code imports names transformers 5 dropped.
     "ouro": {"transformers": "4.56.2"},
     "timm": {"timm": "1.0.29"},
+    "torch": {"torch": "2.14.0"},
+    # GPT-OSS's exchange gradients, recorded on torch's CPU build (gpt_oss_reference.write_exchange_cases).
+    "gpt-oss-exchange": {"transformers": "5.16.1", "torch": "2.14.0"},
+    # fla's kernels and Qwen3.5's fla path, in their own environment (joint_checkpoint_reference.on_fla).
+    "fla": {"torch": "2.8.0", "transformers": "5.16.1", "fla-core": "0.5.2"},
     "diffusers": {"diffusers": tested("diffusers")},
     # The pipelines diffusers 0.34.0 builds read transformers 4's text towers.
     "diffusers-pipelines": {"diffusers": tested("diffusers"), "transformers": "4.49.0"},
     "diffusers-limits": {"diffusers": tested("diffusers"), "mpmath": "1.3.0"},
     "diffusers-0.40": {"diffusers": "0.40.0"},
+    # Wan 2.1's transformer and pipeline fixtures, recorded against diffusers 0.34.0, whose UniPC schedule a later
+    # release moves by a step (diffusers_wan_reference).
+    "diffusers-0.34": {"diffusers": "0.34.0", "transformers": "5.16.1"},
     "rae": {"diffusers": "0.40.0", "transformers": "4.57.1"},
     "gptqmodel": {"gptqmodel": "7.5.0"},
     "trl": {"trl": "1.12.0"},

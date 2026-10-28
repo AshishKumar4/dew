@@ -23,11 +23,11 @@ from recording import RecordingTracker
 
 from dew.cache import enable_compilation_cache
 from dew.data.dataset import Loader
+from dew.distributed.batches import shard_batch
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.telemetry.instrumentation import StepFlops, compiled_flops, hlo_flops
 from dew.training import Trainer
-from dew.training.distributed import shard_batch
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -405,7 +405,8 @@ def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move
     from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
     from tool_support import load
 
-    from dew.telemetry.instrumentation import collective, hlo_instructions
+    from dew.telemetry.instrumentation import hlo_instructions
+    from dew.telemetry.trace import collective
 
     mesh = Mesh(np.asarray(jax.devices()[:8]), ("data",))
 
@@ -428,6 +429,21 @@ def test_the_collectives_of_a_compiled_step_are_counted_with_the_bytes_they_move
         "all-gather": (1, 64 * 32 * 4), "all-reduce": (1, 16 * 4)}
 
 
+def test_an_instructions_result_is_read_as_its_element_type_and_dimensions():
+    """A compiled program that rounds an f32 array to bf16 reads an f32 parameter of the array's
+    dimensions and makes a bf16 result of them; a tuple's result names no element type."""
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    x = jnp.ones((3, 5), jnp.float32)
+    text = jax.jit(lambda x: (x.astype(jnp.bfloat16), jnp.sum(x))).lower(x).compile().as_text()
+    instructions = hlo_instructions(text).values()
+    results = {(instruction.op, instruction.element, instruction.dims) for instruction in instructions}
+    assert ("parameter", "f32", (3, 5)) in results
+    assert any(element == "bf16" and dims == (3, 5) for _, element, dims in results), results
+    tuples = [element for op, element, _ in results if op == "tuple"]
+    assert tuples and not any(tuples), results
+
+
 def test_a_collectives_bytes_are_as_xla_sizes_its_sub_byte_and_packed_results():
     """An XLA dump's all-gather of int4 arrays: one per byte unpacked, a scalar's included, and two per
     byte where the layout packs them (`E(4)`), each rounded up to a whole byte."""
@@ -437,3 +453,24 @@ def test_a_collectives_bytes_are_as_xla_sizes_its_sub_byte_and_packed_results():
   %gathered = (s4[3]{0}, u4[]{}, s4[3]{0:E(4)}, bf16[2,3]{1,0}) all-gather-done(%started)
 }"""
     assert hlo_instructions(module)["gathered"].buffers == (3, 1, 2, 12)
+
+
+def test_a_collectives_device_groups_are_read_in_every_form_xla_prints():
+    """Each form a CPU step's compiled HLO prints a collective's groups in, read as the positions
+    in the device assignment that take part together: listed, an iota laid out and transposed,
+    over a mesh's named axes, a permute's pairs, and every device at once."""
+    from dew.telemetry.instrumentation import hlo_instructions
+
+    module = """ENTRY %main (p: f32[8]) -> f32[8] {
+  %listed = f32[8]{0} all-reduce(f32[8]{0} %p), replica_groups={{0,1},{4,5},{2,3},{6,7}}
+  %iota = f32[8]{0} all-reduce(f32[8]{0} %p), replica_groups=[4,2]<=[2,2,2]T(2,1,0)
+  %named = f32[8]{0} all-gather(f32[2]{0} %p), replica_groups=mesh['fsdp'=4,'sequence'=2] {'fsdp'}
+  %pairs = f32[8]{0} collective-permute(f32[8]{0} %p), source_target_pairs={{1,0},{3,2},{5,4},{7,6}}
+  %every = f32[8]{0} all-reduce(f32[8]{0} %p), replica_groups={}
+}"""
+    assert {name: instruction.groups for name, instruction in hlo_instructions(module).items()} == {
+        "listed": ((0, 1), (4, 5), (2, 3), (6, 7)),
+        "iota": ((0, 4), (2, 6), (1, 5), (3, 7)),
+        "named": ((0, 2, 4, 6), (1, 3, 5, 7)),
+        "pairs": ((1, 0), (3, 2), (5, 4), (7, 6)),
+        "every": ()}

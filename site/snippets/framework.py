@@ -23,12 +23,12 @@ ROOT = Path(__file__).resolve().parents[2]
 def lm():
     # Begin snippet: lm
     from dew import Trainer
-    from dew.config import OptimConfig
-    from dew.data import load
+    from dew.data import Hub, presets
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
 
-    data = load("hf/winglian/tiny-shakespeare", batch=8, tokenizer="byte", seq_len=64)
+    data = Hub("winglian/tiny-shakespeare").shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=64, batch=8)
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                               mlp_features=64, max_seq_len=128)
     trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0)
@@ -41,16 +41,14 @@ def lm():
 def diffusion():
     # Begin snippet: diffusion
     from dew import Field, InputSpec, Trainer
-    from dew.config import OptimConfig
-    from dew.config.data import ImageData
-    from dew.data import Hub, Loading
+    from dew.data import Hub, presets
     from dew.diffusion.presets import Flow
     from dew.nn.backbones import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
+    from dew.optim import OptimConfig
     from dew.sampling import Euler
 
-    data = ImageData(Hub("uoft-cs/cifar10"), field="img", image_size=32).load(
-        batch=64, read="memory", provision=True, loading=Loading(workers=0))
+    data = Hub("uoft-cs/cifar10").shuffle(0).repeat().pipe(presets.images, 32, batch=64, field="img")
     model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=2)
     objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (32, 32, 3))),
                                    solver=Euler(), steps=4)
@@ -63,13 +61,11 @@ def diffusion():
 def jepa():
     # Begin snippet: jepa
     from dew import Field, Trainer
-    from dew.config import OptimConfig
-    from dew.config.data import ImageData
-    from dew.data import Hub, Loading
+    from dew.data import Hub, presets
     from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
+    from dew.optim import OptimConfig
 
-    data = ImageData(Hub("uoft-cs/cifar10"), field="img", image_size=32).load(
-        batch=64, read="memory", provision=True, loading=Loading(workers=0))
+    data = Hub("uoft-cs/cifar10").shuffle(0).repeat().pipe(presets.images, 32, batch=64, field="img")
     encoder = JepaEncoder(patch_size=4, emb_features=32, num_layers=1, num_heads=2)
     predictor = JepaPredictor(grid=(8, 8), emb_features=32, predictor_features=16,
                               num_layers=1, num_heads=2)
@@ -88,11 +84,10 @@ def grpo():
     import numpy as np
 
     from dew import LocalTracker, Trainer
-    from dew.config import OptimConfig
-    from dew.config.data import PromptData
-    from dew.data import Loading
+    from dew.data import Memory, presets
     from dew.nn.backbones import CausalTransformer
-    from dew.objectives.rl import GRPOObjective, SampledRollout
+    from dew.objectives.rl import GRPOObjective, RolloutScheduler
+    from dew.optim import OptimConfig
     from dew.sampling import Sampling
 
     def reward(completion, record):
@@ -102,13 +97,12 @@ def grpo():
 
     rng = np.random.default_rng(0)
     records = tuple({"prompt": rng.integers(0, 13, 4).tolist()} for _ in range(512))
-    data = PromptData(records, tokenizer="byte", max_prompt_len=4).load(
-        batch=8, read="memory", loading=Loading(workers=0))
+    data = Memory(records).shuffle(0).repeat().pipe(presets.prompts, "byte", max_prompt_len=4, batch=8)
     model = CausalTransformer(vocab_size=13, emb_features=64, num_layers=2, num_heads=4,
                               head_dim=16, mlp_features=128, max_seq_len=16)
     objective = GRPOObjective(model, seq_len=11, beta=0.02)
-    rollout = SampledRollout(objective, reward=reward, groups=4, max_new_tokens=8,
-                             sampling=Sampling(temperature=1.0))
+    rollout = RolloutScheduler.sampled(objective, reward, groups=4, max_new_tokens=8,
+                                       sampling=Sampling(temperature=1.0))
     tracker = LocalTracker("tracking")
     trainer = Trainer(objective, OptimConfig(learning_rate=1e-3), key=0, rollout=rollout, tracker=tracker)
     state = trainer.fit(data, steps=150, log_every=1)
@@ -128,15 +122,15 @@ def finetune():
     from dataclasses import replace
 
     from dew import Trainer
-    from dew.config import OptimConfig
-    from dew.data import load
+    from dew.data import Hub, presets
     from dew.interop import PretrainedDecoder
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
     from dew.sampling import Sampling
 
     name = "HuggingFaceTB/SmolLM2-135M-Instruct"
     model = PretrainedDecoder.load(name, dtype="float32", max_seq_len=256)
-    data = load("hf/winglian/tiny-shakespeare", batch=1, tokenizer=name, seq_len=64)
+    data = Hub("winglian/tiny-shakespeare").shuffle(0).repeat().pipe(presets.lm, name, seq_len=64, batch=1)
     state = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-4), key=0).fit(
         data, steps=20, log_every=5)
     before = model.text_generation(sampling=Sampling(temperature=0))
@@ -153,10 +147,10 @@ def pretrained():
     import jax.numpy as jnp
 
     from dew import Trainer
-    from dew.config import OptimConfig
-    from dew.data import load
+    from dew.data import Hub, presets
     from dew.interop import PretrainedDecoder
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
     from dew.sampling import Sampling
 
     bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", dtype=jnp.bfloat16, param_dtype=jnp.bfloat16,
@@ -164,7 +158,8 @@ def pretrained():
     task = bundle.text_generation(sampling=Sampling(temperature=0))
     print(task("The capital of France is", 12, key=0).text[0])
 
-    data = load("hf/winglian/tiny-shakespeare", batch=1, tokenizer="Qwen/Qwen3-0.6B", seq_len=64)
+    shakespeare = Hub("winglian/tiny-shakespeare").shuffle(0).repeat()
+    data = shakespeare.pipe(presets.lm, "Qwen/Qwen3-0.6B", seq_len=64, batch=1)
     trainer = Trainer(LMObjective(bundle, seq_len=64), OptimConfig(learning_rate=1e-5), key=0)
     state = trainer.fit(data, steps=1)
     bundle.save("export", variables=state.variables)
@@ -242,12 +237,12 @@ def mesh():
     jax.config.update("jax_num_cpu_devices", 4)
 
     from dew import MeshSpec, Trainer
-    from dew.config import OptimConfig
-    from dew.data import load
+    from dew.data import Hub, presets
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
 
-    data = load("hf/winglian/tiny-shakespeare", batch=8, tokenizer="byte", seq_len=64)
+    data = Hub("winglian/tiny-shakespeare").shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=64, batch=8)
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                               mlp_features=64, max_seq_len=128)
     trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
@@ -262,14 +257,14 @@ def mesh():
 def reliability():
     # Begin snippet: reliability
     from dew import Checkpoints, Trainer
-    from dew.config import OptimConfig
-    from dew.data import load
+    from dew.data import Hub, presets
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
     from dew.training import prepare_process
 
     prepare_process(multi_host=False, xla_flags="--xla_gpu_deterministic_ops=true")
-    data = load("hf/winglian/tiny-shakespeare", batch=8, tokenizer="byte", seq_len=64)
+    data = Hub("winglian/tiny-shakespeare").shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=64, batch=8)
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                               mlp_features=64, max_seq_len=128)
     objective = LMObjective(model, seq_len=64)
@@ -301,12 +296,12 @@ def reliability():
 def profile():
     # Begin snippet: profile
     from dew import ProfileWindow, Trainer
-    from dew.config import OptimConfig
-    from dew.data import load
+    from dew.data import Hub, presets
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
 
-    data = load("hf/winglian/tiny-shakespeare", batch=8, tokenizer="byte", seq_len=64)
+    data = Hub("winglian/tiny-shakespeare").shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=64, batch=8)
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                               mlp_features=64, max_seq_len=128)
     trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,

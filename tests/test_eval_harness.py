@@ -51,8 +51,9 @@ def _byte_tokenizer(bos: str):
     id = byte value, EOS 255, which is what `HFLM` needs to be handed. `bos`
     is "none"; "inserted", where every encoding starts with BOS, as Llama,
     Mistral and Gemma vocabularies do, and `HFLM` conditions first tokens on
-    it; or "declared", a BOS the tokenizer names but never inserts, as
-    GPT-2's."""
+    it; "declared", a BOS the tokenizer names but never inserts, as
+    GPT-2's; or "closing", no BOS and an EOS every encoding ends with, as
+    T5's."""
     from tokenizers import Tokenizer, decoders, models, pre_tokenizers, processors
     from transformers import PreTrainedTokenizerFast
     from transformers.convert_slow_tokenizer import bytes_to_unicode
@@ -63,6 +64,10 @@ def _byte_tokenizer(bos: str):
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)
     tokenizer.decoder = decoders.ByteLevel()
     if bos == "none":
+        return PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token=symbols[255])
+    if bos == "closing":
+        tokenizer.post_processor = processors.TemplateProcessing(
+            single=f"$A {symbols[255]}", special_tokens=[(symbols[255], 255)])
         return PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token=symbols[255])
     if bos == "inserted":
         tokenizer.post_processor = processors.TemplateProcessing(
@@ -83,7 +88,7 @@ def _pair(max_length: int, directory=None, *, bos: str = "none", source: bool = 
     from transformers import LlamaForCausalLM
 
     from dew.data.text import ByteTokenizer, HFTokenizer
-    from dew.inference.pipeline import RunProcessor
+    from dew.inference.loading import RunProcessor
     from dew.interop.pretrained import Pretrained
     from dew.interop.processors import Processor
     from dew.sampling import Sampling
@@ -156,14 +161,50 @@ def test_tokenization_controls_encode_as_lm_evals_own_model_does(bos, source, tm
     vocabulary without BOS, one that inserts it and one that names it
     without inserting it: the inserted BOS left off when the caller asks for
     no special tokens, or when the text already starts with the prefix
-    token's text, and the last ids kept."""
+    token's decoded text, and the last ids kept. With a BOS, a text that starts
+    with the BOS's own symbol, which the tokenizer reads as the BOS while its
+    decoded text is another byte, encodes as `HFLM`'s too."""
     ours, theirs = _pair(16, tmp_path, bos=bos, source=source)
     prefix = theirs.tokenizer.decode([theirs.prefix_token_id])
-    for text in ("the quick", prefix + "the quick"):
+    texts = ["the quick", prefix + "the quick"]
+    if bos != "none":
+        texts.append(theirs.tokenizer.convert_ids_to_tokens(theirs.prefix_token_id) + "the quick")
+    for text in texts:
         for special in (None, True, False):
             for keep in (None, 3):
                 assert (ours.tok_encode(text, add_special_tokens=special, left_truncate_len=keep)
                         == theirs.tok_encode(text, add_special_tokens=special, left_truncate_len=keep))
+
+
+@pytest.mark.parametrize("source", [False, True])
+def test_a_vocabulary_that_closes_a_sequence_scores_no_eos_it_never_wrote(source, tmp_path):
+    """A tokenizer that ends every encoding with an EOS, as T5's does: a scored context and its
+    continuation split at the context's end, the continuation its own ids and no EOS in either, since
+    a pair encodes as one row (`tok_encode`'s default opens a text and closes it with nothing). Asked
+    for its special tokens, the encoding is the tokenizer's own, its EOS after the text; asked for
+    none, the text's ids alone. (`HFLM`'s default keeps the EOS, so its context ends in an EOS and its
+    continuation starts one id late.)"""
+    ours, _ = _pair(16, tmp_path, bos="closing", source=source)
+    bare = list(b" quick")
+    context, continuation = ours._encode_pair("the ", "quick")
+    assert continuation == bare and context == list(b"the")
+    assert ours.tok_encode("the", add_special_tokens=True) == [*b"the", 255]
+    assert ours.tok_encode("the", add_special_tokens=False) == list(b"the")
+
+
+def test_a_task_that_names_no_eos_has_no_end_of_text_id_to_condition_on():
+    """The id an empty context is conditioned on is the task's EOS; a task whose sampling names none
+    is refused, rather than conditioned on id 0, some vocabulary's ordinary token."""
+    from dew.data.text import ByteTokenizer
+    from dew.inference.loading import RunProcessor
+    from dew.interop.pretrained import Pretrained
+    from dew.sampling import Sampling
+
+    loaded = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference", max_seq_len=16)
+    adapter = DewLM(TextGeneration(loaded.model, loaded.variables, RunProcessor(ByteTokenizer()),
+                                   sampling=Sampling()), batch_size=1)
+    with pytest.raises(ValueError):
+        _ = adapter.eot_token_id
 
 
 def test_options_the_adapter_cannot_honour_are_refused(run, adapter):

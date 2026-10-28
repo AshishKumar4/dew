@@ -1,33 +1,26 @@
 """JSON-compatible episode records for interchange and turn-boundary recovery."""
 
-import math
-from collections.abc import Callable, Mapping
+import functools
+import json
+from collections.abc import Mapping
+from dataclasses import asdict
 
-from dew.records import JSON, integer, integers, record as section, text
+import numpy as np
+
+from dew._records import finite, integer, integers, listed, record as section, text
+from dew.inference.rollouts import Draw
 from dew.sampling.text import Sampling
 
-from .episodes import Action, Episode, EpisodeId, EpisodeStatus, Observation, Transition
+from .episodes import Episode, EpisodeId, EpisodeStatus, Observation, Transition
+
+reals = functools.partial(listed, read=finite, what="a list of finite numbers")
+"""One list of finite numbers: a row's likelihoods (`listed`)."""
 
 
-def sequence[ItemT](value: object, read: Callable[[JSON], ItemT], key: str) -> tuple[ItemT, ...]:
-    """Read every entry of a JSON array, each one through `read`."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list")
-    return tuple(read(entry) for entry in value)
-
-
-def real(value: object, key: str) -> float:
-    """One score or likelihood, finite as no non-finite one is recorded."""
-    if not isinstance(value, (float, int)) or isinstance(value, bool) or not math.isfinite(value):
-        raise ValueError(f"{key}={value!r}: this field is a finite number")
-    return float(value)
-
-
-def reals(value: object, key: str) -> tuple[float, ...]:
-    """One list of finite numbers: a row's likelihoods."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list of finite numbers")
-    return tuple(real(entry, key) for entry in value)
+def record_json(value: Episode | Draw) -> str:
+    """`value` as JSON, its fields as `asdict` writes them and a draw's routing as nested lists of
+    expert ids: the text `episode_from_record` and `draw_record` read back."""
+    return json.dumps(asdict(value), allow_nan=False, default=np.ndarray.tolist)
 
 
 def observation_record(value: Mapping[str, object]) -> Observation:
@@ -35,30 +28,34 @@ def observation_record(value: Mapping[str, object]) -> Observation:
     reward = record["reward"]
     return Observation(integers(record["context"], "context"),
                        EpisodeStatus(integer(record["status"], "status")), text(record["detail"], "detail"),
-                       None if reward is None else real(reward, "reward"),
+                       None if reward is None else finite(reward, "reward"),
                        messages(record["messages"], "messages"))
 
 
-def messages(value: object, key: str) -> tuple[Mapping[str, object], ...]:
-    """A list of chat messages, each a JSON object, kept as written."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list of chat messages")
-    return tuple(section(message, key) for message in value)
+messages = functools.partial(listed, read=section, what="a list of chat messages")
+"""A list of chat messages, each a JSON object, kept as written (`listed`)."""
 
 
-def action_record(value: Mapping[str, object]) -> Action:
+def draw_record(value: Mapping[str, object], sampling: Sampling) -> Draw:
+    """Read a draw `asdict` wrote, checked to end as `sampling`, its episode's policy, ends one,
+    with the engine records it carries (routing as nested lists of expert ids, kept ids per
+    sampled id)."""
+    record = section(value, "draw")
+    raw, routed, support = record["raw_log_probs"], record["routed_experts"], record["support"]
+    return Draw(integers(record["prompt"], "prompt"), integers(record["tokens"], "tokens"),
+                reals(record["behavior_log_probs"], "behavior_log_probs"),
+                text(record["finish_reason"], "finish_reason"), integer(record["version"], "version"),
+                None if raw is None else reals(raw, "raw_log_probs"),
+                None if routed is None else np.asarray(routed),
+                None if support is None else listed(support, "support", read=integers,
+                                                    what="a list of token-id lists")).checked(sampling)
+
+
+def sampling_record(value: Mapping[str, object]) -> Sampling:
+    """Read the sampling policy `asdict` wrote, every control included."""
     from dew.registry import from_record
 
-    record = section(value, "action")
-    terminated, raw = record["terminated"], record["raw_log_probs"]
-    if not isinstance(terminated, bool):
-        raise ValueError("episode terminated must be a boolean")
-    return Action(integers(record["context"], "context"), integers(record["tokens"], "tokens"),
-                  None if raw is None else reals(raw, "raw_log_probs"),
-                  reals(record["behavior_log_probs"], "behavior_log_probs"),
-                  terminated, integer(record["policy_step"], "policy_step"),
-                  from_record(Sampling, section(record["sampling"], "sampling"), dtypes=False),
-                  _binding_id=text(record["_binding_id"], "_binding_id"))
+    return from_record(Sampling, value, dtypes=False)
 
 
 def episode_from_record(value: Mapping[str, object]) -> Episode:
@@ -66,15 +63,18 @@ def episode_from_record(value: Mapping[str, object]) -> Episode:
     record = section(value, "episode")
     identity = section(record["identity"], "identity")
     initial, reward = record["initial"], record["reward"]
+    sampling = sampling_record(section(record["sampling"], "sampling"))
     transitions = tuple(
-        Transition(action_record(section(turn["action"], "action")),
+        Transition(draw_record(section(turn["action"], "action"), sampling),
                    observation_record(section(turn["observation"], "observation")))
-        for turn in sequence(record["transitions"], lambda turn: section(turn, "transition"), "transitions"))
+        for turn in listed(record["transitions"], "transitions", read=section, what="a list of transitions"))
+    branch = identity.get("branch")
     return Episode(EpisodeId(integer(identity["task"], "task"), integer(identity["attempt"], "attempt"),
-                             integer(identity["sample"], "sample"), integers(identity["seed"], "seed")),
-                   integer(record["policy_step"], "policy_step"),
+                             integer(identity["sample"], "sample"), integers(identity["seed"], "seed"),
+                             None if branch is None else text(branch, "branch")),
+                   integer(record["policy_step"], "policy_step"), sampling,
                    None if initial is None else observation_record(section(initial, "initial")),
                    transitions, EpisodeStatus(integer(record["status"], "status")),
                    text(record["detail"], "detail"),
-                   None if reward is None else real(reward, "reward"),
+                   None if reward is None else finite(reward, "reward"),
                    _binding_id=text(record["_binding_id"], "_binding_id"))

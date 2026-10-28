@@ -40,12 +40,15 @@ from flax import linen as nn
 from typing_extensions import TypeVar
 
 from dew.artifacts import Artifacts
+from dew.batch import Batch, Variables, without
+from dew.nn import categorical
+from dew.nn.kernels.options import Held
+from dew.nn.precision import accumulated
 from dew.objectives.base import (
     OMITTED,
     TEACHER,
     UNREAD,
     Aux,
-    Batch,
     EMASpec,
     Objective,
     Omitted,
@@ -53,18 +56,16 @@ from dew.objectives.base import (
     ProgramModule,
     Ratio,
     Step,
-    Variables,
-    without,
 )
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
 
 if TYPE_CHECKING:
+    from dew._records import JSON
     from dew.data.pipeline import ObjectiveData
     from dew.data.text import Tokenizer
     from dew.inference.tasks import Processor
-    from dew.records import JSON
 
 PROJECTIONS = "distillation"
 """The params subtree holding the feature pairs' width projections."""
@@ -147,6 +148,14 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         """The student's real lengths of the batch it reads."""
         return self.student.real_lengths(batch)
 
+    def scored_tokens(self, batch: Batch) -> np.ndarray:
+        """The targets the student scores of the batch it reads."""
+        return self.student.scored_tokens(batch)
+
+    def row_tokens(self, batch: Batch) -> int | None:
+        """The tokens each row of the batch the student reads holds."""
+        return self.student.row_tokens(batch)
+
     def inference_record(self) -> JSON:
         """The student's record: a saved distillation loads as the student it trained, on the
         student's own tree, the teacher and the projections left unread (`UNREAD`)."""
@@ -161,6 +170,10 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         teacher = (program._replace(trained=False) for program in self.teacher.program_key())
         return tuple(program._replace(head_fused=False)
                      for program in (*self.student.program_key(), *teacher))
+
+    def towers(self) -> tuple[Held, ...]:
+        """The student's towers, then the teacher's."""
+        return (*self.student.towers(), *self.teacher.towers())
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         count = len(self.student.program_key())
@@ -259,21 +272,22 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         weights = student.weights.astype(jnp.float32)
         mass = statistics.mass
         counted = jnp.where(mass > 0, mass, 1)
-        divergence = optax.kl_divergence(jax.nn.log_softmax(student.logits / temperature),
-                                         jax.nn.softmax(teacher.logits / temperature))
-        soft = self.row_mean(divergence * weights, batch).total
+        divergence = categorical.kl_divergence(student.logits / temperature, teacher.logits / temperature)
+        soft = self.row_mean(divergence, batch, weights=weights).total
         total = (1 - alpha) * statistics.total + alpha * temperature ** 2 * soft
         reported = {**aux.metrics, "distill/alpha": alpha, "distill/temperature": temperature,
                     "distill/kl": soft / counted, "distill/soft_loss": temperature ** 2 * soft / counted,
-                    "distill/teacher_loss": self.row_mean(teacher.losses * weights, batch).total / counted}
+                    "distill/teacher_loss": (self.row_mean(teacher.losses, batch, weights=weights).total
+                                             / counted)}
         if self.features:
             projections = variables["params"].get(PROJECTIONS, {})
             distances = []
             for index, (own, other) in enumerate(zip(student.hidden, teacher.hidden, strict=True)):
                 if own.shape[-1] != other.shape[-1]:
-                    own = own.astype(jnp.float32) @ projections[f"projection_{index}"]
+                    own = accumulated(jnp.matmul, own.astype(jnp.float32), projections[f"projection_{index}"])
                 distances.append(self._distance(own, other))
-            feature = self.row_mean(jnp.stack(distances) * weights, batch, rows=1).total / len(self.features)
+            feature = (self.row_mean(jnp.stack(distances), batch, rows=1, weights=weights).total
+                       / len(self.features))
             total = total + beta * feature
             reported.update({"distill/beta": beta, "distill/feature": feature / counted})
         return Ratio(total, mass), replace(aux, metrics=reported)

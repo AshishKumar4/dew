@@ -22,13 +22,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew import records
+from dew import _records
+from dew._records import JSON
 from dew.diffusion.process import Process
-from dew.diffusion.schedules.common import GeneralizedNoiseScheduler, NoiseScheduler
+from dew.diffusion.schedules.common import GeneralizedNoiseScheduler, NoiseScheduler, ancestral_variance
+from dew.diffusion.schedules.cosine import cosine_beta_schedule
 from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
-from dew.diffusion.schedules.flow import RectifiedFlow
+from dew.diffusion.schedules.flow import RectifiedFlow, static_shift
+from dew.diffusion.schedules.karras import rho_ramp
 from dew.diffusion.transforms import PredictionTransform
-from dew.records import JSON
+from dew.nn.sharding import rows_taken
 
 if TYPE_CHECKING:
     from dew.diffusion.schedules.source_policy import FlowShift, Origin, SourcePolicy
@@ -52,16 +55,19 @@ class TabulatedVP(DiscreteNoiseScheduler):
         self.stride = stride
 
     def rates(self, t):
-        t = jnp.asarray(t, jnp.float32)
-        index = jnp.clip(t.astype(jnp.int32), 0, self.T - 1)
-        return (jnp.where(t < 0, self.final_rates[0], self.sqrt_alpha_cumprod[index]),
-                jnp.where(t < 0, self.final_rates[1], self.sqrt_one_minus_alpha_cumprod[index]))
+        return self._tabulated(t, self.final_rates, self.sqrt_alpha_cumprod,
+                               self.sqrt_one_minus_alpha_cumprod)
 
     def variances(self, t):
+        return self._tabulated(t, self.final_variances, self.alpha_cumprod, self.one_minus_alpha_cumprod)
+
+    def _tabulated(self, t, final, signal, noise):
+        """The tables' rows at each time's step, read where the time is (`rows_taken`), and `final`'s
+        pair past the grid's last step (a negative time)."""
         t = jnp.asarray(t, jnp.float32)
         index = jnp.clip(t.astype(jnp.int32), 0, self.T - 1)
-        return (jnp.where(t < 0, self.final_variances[0], self.alpha_cumprod[index]),
-                jnp.where(t < 0, self.final_variances[1], self.one_minus_alpha_cumprod[index]))
+        return (jnp.where(t < 0, final[0], rows_taken(signal, index)),
+                jnp.where(t < 0, final[1], rows_taken(noise, index)))
 
     def model_time(self, t):
         return jnp.maximum(jnp.asarray(t, jnp.float32), 0.0)
@@ -94,10 +100,12 @@ def _interpolate(x, xp, fp):
     """
     x = jnp.asarray(x, jnp.float32)
     i = jnp.clip(jnp.searchsorted(xp, x, side="right", method="compare_all"), 1, len(xp) - 1)
-    df = fp[i] - fp[i - 1]
-    dx = xp[i] - xp[i - 1]
+    # Each example's time reads the replicated grid at its own shard (`rows_taken`).
+    left, right = rows_taken(fp, i - 1), rows_taken(fp, i)
+    low, high = rows_taken(xp, i - 1), rows_taken(xp, i)
+    dx = high - low
     flat = jnp.abs(dx) <= np.spacing(np.finfo(np.float32).eps)
-    f = jnp.where(flat, fp[i - 1], fp[i - 1] + (x - xp[i - 1]) / jnp.where(flat, 1, dx) * df)
+    f = jnp.where(flat, left, left + (x - low) / jnp.where(flat, 1, dx) * (right - left))
     return jnp.where(x > xp[-1], fp[-1], jnp.where(x < xp[0], fp[0], f))
 
 
@@ -175,7 +183,7 @@ class _UniformGrid(_PairedGrid, NoiseScheduler):
     """
 
     def sample_t(self, key, n: int):
-        return jax.random.uniform(key, (n,), minval=0, maxval=self.T)
+        return jax.random.uniform(key, (n,), jnp.float32, 0, self.T)
 
     def weight(self, t):
         return jnp.ones_like(jnp.asarray(t, jnp.float32))
@@ -251,7 +259,7 @@ def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
     adds GeoDiff's sigmoid, and Heun adds the exponential alpha-bar. A table
     that does not have `count` finite entries in [0, 1] raises `ValueError`.
     """
-    length = records.integer(count, "num_train_timesteps")
+    length = _records.integer(count, "num_train_timesteps")
     if length < 1:
         raise ValueError("num_train_timesteps must be positive")
     if trained is not None:
@@ -259,8 +267,8 @@ def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
             raise ValueError("trained_betas must be a numeric sequence")
         betas = np.asarray(trained, np.float32)
     else:
-        first = records.number(start, "beta_start")
-        final = records.number(end, "beta_end")
+        first = _records.number(start, "beta_start")
+        final = _records.number(end, "beta_end")
         kind = named_choice(schedule, "beta_schedule", schedules)
         if kind == "linear":
             betas = _published_linspace(first, final, length)
@@ -269,11 +277,13 @@ def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
         elif kind == "sigmoid":
             ramp = _published_linspace(-6, 6, length)
             betas = 1 / (1 + np.exp(-ramp)) * (final - first) + first
-        else:
+        elif kind == "exp":
             steps = np.arange(length + 1, dtype=np.float64) / length
-            bars = (np.exp(steps * -12.0) if kind == "exp"
-                    else np.cos((steps + 0.008) / 1.008 * np.pi / 2) ** 2)
+            bars = np.exp(steps * -12.0)
             betas = np.minimum(1 - bars[1:] / bars[:-1], 0.999).astype(np.float32)
+        else:
+            # squaredcos_cap_v2 is Nichol and Dhariwal's table, which Diffusers casts to float32.
+            betas = cosine_beta_schedule(length).astype(np.float32)
     if betas.shape != (length,) or not np.all(np.isfinite(betas)) or np.any((betas < 0) | (betas > 1)):
         raise ValueError("The beta table must have num_train_timesteps finite entries in [0,1]")
     if zero_snr:
@@ -304,8 +314,7 @@ def empirical_mu(tokens: int, steps: int) -> float:
 
 def _shifted(flow: FlowShift, sigmas: np.ndarray, tokens: int | None, mu: float | None = None) -> np.ndarray:
     """The sigmas after this file's shift."""
-    base = flow.base(tokens, mu)
-    return base * sigmas / (1 + (base - 1) * sigmas)
+    return static_shift(flow.base(tokens, mu), sigmas)
 
 
 def _stretched(flow: FlowShift, sigmas: np.ndarray) -> np.ndarray:
@@ -352,8 +361,7 @@ def _transformed_sigmas(transform: str, low: float, high: float, steps: int,
     `low` and `high`."""
     ramp = np.linspace(0, 1, steps, dtype=np.float64)
     if transform == "karras":
-        low_inv, high_inv = low ** (1 / rho), high ** (1 / rho)
-        return (high_inv + ramp * (low_inv - high_inv)) ** rho
+        return rho_ramp(low ** (1 / rho), high ** (1 / rho), ramp, rho)
     if transform == "exponential":
         return np.exp(np.linspace(np.log(high), np.log(low), steps, dtype=np.float64))
     try:
@@ -444,7 +452,7 @@ def _flow_sigmas(policy: SourcePolicy, steps: int, sigma_min: float) -> tuple[np
     assert policy.flow_shift is not None
     shift = policy.flow_shift
     rising = 1.0 - np.linspace(1, 1 / policy.train_steps, steps + 1)
-    sigmas = np.flip(shift * rising / (1 + (shift - 1) * rising))[:-1].copy()
+    sigmas = np.flip(static_shift(shift, rising))[:-1].copy()
     terminal = (0.0 if policy.terminal == "zero"
                 else float(sigmas[-1]) if policy.grid_terminal else sigma_min)
     return np.append(sigmas, terminal), np.trunc(sigmas * policy.train_steps), 1.0
@@ -486,7 +494,7 @@ def _stage_grid(policy: SourcePolicy, betas: np.ndarray, steps: int) -> tuple[np
     levels = np.asarray(sigmas, np.float64)
     following = levels[1:]
     if policy.kind == "KDPM2AncestralDiscrete":
-        up = np.sqrt(following ** 2 * (levels[:-1] ** 2 - following ** 2) / levels[:-1] ** 2)
+        up = np.sqrt(ancestral_variance(levels[:-1], following))
         targets = np.sqrt(np.maximum(following ** 2 - up ** 2, 0.0))
     else:
         targets = following

@@ -59,19 +59,21 @@ def test_published_first_fit_matches_memory_windows_and_resumes_across_shares(tm
         np.stack([first, second], axis=1).reshape(whole.shape), whole), shares[0], shares[1], expected)
 
 
-def test_a_recipe_given_a_published_packing_reads_the_windows_its_memory_read_packs(tmp_path):
-    """A typed recipe given a generation published from its own windows and packing reads that
-    plan, shuffled as its default order: the same batches, leaf by leaf, as the recipe packing in
-    memory, and a resume at a saved position reads on as the uninterrupted run does."""
-    from dew.config.data import TextData, loader
+def test_the_lm_preset_given_a_published_packing_reads_the_windows_its_memory_read_packs(tmp_path):
+    """The lm preset given a generation published from its own rows reads that packing plan, shuffled
+    as a run orders the rows: the same batches, leaf by leaf, as the preset packing in memory, and a
+    resume at a saved position reads on as the uninterrupted run does."""
+    from dew.data import presets
 
     source = Memory(tuple({"text": "x" * size} for size in SIZES))
-    recipe = TextData(source=source, seq_len=8, pack="first-fit", packing_bins=3, eos=False,
-                      token_holdout=None)
-    train, _, _ = recipe.pipelines()
-    published = publish(train, Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
-    warm = loader(recipe, batch=2, seed=3, cache=published, read="indexed", loading=READ)
-    cold = loader(recipe, batch=2, seed=3, read="memory", loading=READ)
+
+    def rows(cache=None):
+        return source.pipe(presets.lm, "byte", seq_len=8, batch=None, pack="first-fit", bins=3, eos=False,
+                           cache=cache)
+
+    published = publish(rows(), Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
+    warm = compile(rows(published).shuffle(3).repeat().batch(2), seed=3, read="indexed", loading=READ)
+    cold = compile(rows().shuffle(3).repeat().batch(2), seed=3, read="memory", loading=READ)
     assert "packing" in warm.plan.manifest.source["sources"][0]
     left, right = warm.train(DataPartition()), cold.train(DataPartition())
     try:
@@ -138,3 +140,29 @@ def test_a_pack_places_documents_whole_and_refuses_one_its_window_cannot_hold(tm
     finally:
         left.close()
         right.close()
+
+
+def _unchanged(row):
+    return row
+
+
+def test_a_step_after_a_published_packing_reads_the_windows_facts_not_its_documents_counts(tmp_path):
+    """A run-scoped step written after a pack that a published generation plans reads the facts of
+    the windows it reads: their own row count, and none of the counts of the documents packed into
+    them, which describe rows the step never sees."""
+    from dew.data.pipeline import Configured
+
+    source = Memory(tuple({"text": "x" * size} for size in SIZES))
+    prefix = Pipeline(source).map(Tokenize()).flat_map(Chunks(9))
+    published = publish(prefix.pack(9, bins=3), Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
+    seen: dict[str, object] = {}
+
+    def configure(facts):
+        seen.update(facts)
+        return _unchanged
+
+    windows = compile(prefix.cache(published).pack(9, bins=3).map(Configured(configure, needs=("rows",),
+                                                                             scope="run")).repeat().batch(4),
+                      read="indexed", seed=3, loading=READ)
+    assert seen["rows"] == windows.records
+    assert not {"accepted", "accepted_rows", "windows"} & seen.keys()

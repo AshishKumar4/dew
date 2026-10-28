@@ -33,7 +33,7 @@ from flax import linen as nn
 
 from .attention import unweighted_rmsnorm
 from .flops import projection_flops
-from .precision import at_least_fp32
+from .precision import at_least_fp32, float32_einsum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,6 +97,12 @@ class DepthAttention(nn.Module):
         work = values.astype(wide)
         keys = unweighted_rmsnorm(work, self.norm_eps, implementation='xla')
         query = scale.astype(wide) * kernel[:, 0].astype(wide)
-        highest = jax.lax.Precision.HIGHEST
-        weights = jax.nn.softmax(jnp.einsum('bsnd,d->bsn', keys, query, precision=highest), axis=-1)
-        return jnp.einsum('bsn,bsnd->bsd', weights, work, precision=highest).astype(values.dtype)
+        return depth_mixed(keys, query, work).astype(values.dtype)
+
+
+def depth_mixed(keys: jax.Array, query: jax.Array, values: jax.Array) -> jax.Array:
+    """`values` `[B, S, n, D]` summed over their `n` sources by the softmax of `keys` (alike) against
+    `query` `[D]`, both contractions at full precision."""
+    highest = jax.lax.Precision.HIGHEST
+    weights = jax.nn.softmax(float32_einsum('bsnd,d->bsn', keys, query, precision=highest), axis=-1)
+    return float32_einsum('bsn,bsnd->bsd', weights, values, precision=highest)

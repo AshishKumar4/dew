@@ -34,11 +34,11 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 from tool_support import REPO_ROOT, load
 
-from dew.config import OptimConfig
+from dew.batch import TEXT_KEY
 from dew.interop import Pretrained
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
+from dew.optim import Cosine, OptimConfig, ParamGroup
 from dew.training import MeshSpec, Trainer
-from dew.training.optim import Cosine, ParamGroup
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -63,10 +63,11 @@ def test_lm_fine_tune_steps_are_as_exact_as_torch():
     pretrained = Pretrained.load(str(FIXTURES / "hf" / "qwen3-tiny"), dtype="float32",
                                  attention_impl="xla")
     objective = LMObjective(pretrained, width - 1, ema_decay=None)
-    schedule = Cosine(peak=options["lr_peak"], warmup_steps=options["warmup"], end=options["lr_end"],
-                      init=options["lr_init"])
+    schedule = Cosine(peak_value=options["lr_peak"], warmup_steps=options["warmup"],
+                      end_value=options["lr_end"],
+                      init_value=options["lr_init"])
     solver = OptimConfig(
-        optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-8}, schedule=schedule,
+        optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-8}, learning_rate=schedule,
         weight_decay=0.1, clip_grads=1.0, param_groups=(ParamGroup("all", ("*",)),)).build(steps)
     trainer = Trainer(objective, optax.chain(recorded_norm(), solver), key=jax.random.key(0),
                       mesh=MeshSpec(), checkpoints=None, tracker=None)
@@ -124,8 +125,8 @@ def test_packed_documents_give_every_step_the_work_counted_for_one(monkeypatch):
     it counts attention within each document only."""
     import json
 
+    from dew.batch import coordinates
     from dew.interop import translate_config
-    from dew.nn.inputs import coordinates
 
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
     common = load("reference_runs/common")

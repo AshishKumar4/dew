@@ -34,3 +34,5 @@ NEWREPO.md
 samples/
 .pytest_cache/
 build/
+# recorded fixtures over 1 MiB, fetched by tools/fetched_fixtures.py from their pins (*.fetched.json)
+/tests/fixtures/fetched/

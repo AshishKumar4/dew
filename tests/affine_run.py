@@ -12,8 +12,7 @@ from flax import linen as nn
 
 from dew.artifacts import Representations
 from dew.data.dataset import Loader
-from dew.objectives.base import Aux, EMASpec, Objective
-from dew.training import Checkpoints, Layout, Trainer
+from dew.objectives.base import Aux, EMASpec, Objective, mean_of_totals, merge_totals
 
 BATCH = 8
 FEATURES = 3
@@ -55,12 +54,6 @@ def batches():
     batch = {"x": x, "y": 2 * x[:, :2]}
     while True:
         yield batch
-
-
-def fit_one_step() -> None:
-    """One step of a plain run over `batches`, the least `Trainer.fit` that readies its process."""
-    Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0)).fit(
-        Loader(lambda partition: batches(), None, None, 8), steps=1, log_every=1)
 
 
 class Counting:
@@ -107,15 +100,6 @@ class Replaying:
         self.position = int(state)
 
 
-def frozen_trainer(tmp_path=None, **kwargs) -> Trainer:
-    """The regression's trainer with its average frozen at unit decay, the
-    reference a preference or RL objective reads, checkpointing under
-    `tmp_path` when one is given."""
-    checkpoints = None if tmp_path is None else Checkpoints(str(tmp_path / "run"))
-    return Trainer(Regression(ema_decay=1.0), optax.sgd(0.1), key=jax.random.key(0),
-                   layout=Layout(min_shard=1, tolerance=1.0), checkpoints=checkpoints, **kwargs)
-
-
 def dataset(train=Counting, val=None, batch=BATCH) -> Loader:
     """A dataset over fresh train and validation iterators, without an epoch count."""
     return Loader(train=lambda partition: train(),
@@ -156,8 +140,5 @@ class Spread:
         self.seen.append((np.asarray(artifact.features).shape, np.asarray(batch["x"]).shape))
         return float(jnp.std(artifact.features)), 1
 
-    def merge(self, accumulated, contribution):
-        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
-
-    def finalize(self, accumulated):
-        return accumulated[0] / accumulated[1]
+    merge = staticmethod(merge_totals)
+    finalize = staticmethod(mean_of_totals)

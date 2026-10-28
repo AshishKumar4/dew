@@ -11,13 +11,17 @@ architectures, or why no config was read (gated, missing). `classify`
 sorts every model into the route that loads it: a registered family (tier
 1, `hf_decoders.translate_config` or the wrapper table), a registered
 family's verified convention (tier 2, `verify.verify_mapping` on the shrunk
-config, no weights; run once per model_type), a GGUF repo's stub config, a
-refusal with its reason, or a refusal by design (`DrafterRefused`, a
+config, no weights), transformers' own forward run by torchax (tier 3,
+`torchax_fallback.admitted` on the same shrunk config), each run once per
+distinct config (`_probed`), a GGUF repo's stub config,
+a refusal with its reason, or a refusal by design (`DrafterRefused`, a
 speculative drafter that is no model on its own). Types
 transformers does not know (remote code only) have no reference to verify
 against and are counted apart. The shares are of downloads, over all types
 and over the most downloaded 200 and 50. Writes coverage.json.
 """
+
+from __future__ import annotations
 
 import json
 import sys
@@ -26,7 +30,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from dew.interop.verify import VerifiedMapping
+    from dew.interop.torchax_fallback import TorchAdmission
+    from dew.interop.verify import Unmapped, VerifiedMapping
 
 
 def census(out: Path, limit: int) -> None:
@@ -52,79 +57,117 @@ def census(out: Path, limit: int) -> None:
     (out / "census.json").write_text(json.dumps(rows))
 
 
-def _route(config: dict) -> tuple[str, str]:
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+ROUTES = ("tier 1", "tier 2", "tier 3", "gguf", "refused", "by design", "remote code")
+"""Every route `_route` sorts a model into, which each summary counts."""
 
-    from dew.interop import decoder_parts, hf_decoders
-    from dew.interop.codecs import source_quantization
 
-    try:
-        # load_pretrained reads the storage format first, and refuses one its
-        # codecs cannot decode (MLX's affine groups) before any family does.
-        source_quantization(config)
-    except ValueError as error:
-        return "refused", f"storage format: {error}"[:300]
+def _probed(config: dict) -> tuple[str, str]:
+    """The key a probe's verdict is kept under: the model_type and the whole config, so two configs
+    that differ in any field (BERT as a decoder and as an encoder, a requested attention backend) are
+    each probed, and two Hub copies of one config share one probe."""
+    return config["model_type"], json.dumps(config, sort_keys=True, default=str)
+
+
+class NoReference(ValueError):
+    """An unregistered model_type transformers has no class for, which the loader would ask it to verify
+    against (`classify`'s verifier): a repo of remote code."""
+
+
+def _route(config: dict, verified, admitted) -> tuple[str, str]:
+    """The census route of `config`: the loader's own decision on the config alone
+    (`dew.interop.pretrained.source_route`), and for a refusal, the refusal's own words. `verified`
+    checks an unregistered model_type against transformers, and `admitted` decides whether tier 3 runs
+    one it leaves unmapped, each once per type (`classify`)."""
+    from dew.interop import decoder_parts
+    from dew.interop.pretrained import (
+        DecoderRoute,
+        DiffusionGemmaRoute,
+        TorchRoute,
+        VerifiedRoute,
+        WrapperRoute,
+        source_route,
+    )
+
     if set(config) <= {"model_type", "architectures"}:
-        # A GGUF repo's stub config.json (MaziyarPanahi/Qwen3-0.6B-GGUF):
-        # load_pretrained names its GGUF files and gguf_file= before reading it.
+        # A GGUF repo's stub config.json (MaziyarPanahi/Qwen3-0.6B-GGUF): the loader reads its config
+        # from the GGUF file `gguf_file=` names, which the census does not fetch.
         return "gguf", "a stub config.json beside GGUF files"
     try:
-        hf_decoders.translate_config(config)
-        return "tier 1", "registered family"
+        route = source_route(config, verified=verified, admitted=admitted)
     except decoder_parts.DrafterRefused as error:
         return "by design", str(error)[:300]
-    except (KeyError, ValueError, TypeError) as error:
-        registered_error = f"{type(error).__name__}: {error}"
-    try:
-        hf_decoders.translate_wrapper_config(config)
-        return "tier 1", "registered wrapper"
-    except (KeyError, ValueError, TypeError) as error:
-        wrapper_error = f"{type(error).__name__}: {error}"
-    model_type = config.get("model_type")
-    if model_type in hf_decoders.families():
-        return "refused", f"registered family refuses this config: {registered_error}"[:300]
-    if "multimodal wrapper is registered" not in wrapper_error:
-        return "refused", f"registered wrapper refuses this config: {wrapper_error}"[:300]
-    if model_type not in CONFIG_MAPPING:
+    except NoReference:
         return "remote code", "transformers has no class for it"
-    return "tier 2?", ""
-
-
-def _probed(config: dict) -> "VerifiedMapping | str":
-    """The verified mapping of `config`'s model_type, or why it has none."""
-    from dew.interop import verify
-
-    try:
-        return verify.verify_mapping(config)
     except (KeyError, ValueError, TypeError) as error:
-        return str(error).split(": ", 1)[-1][:300]
-
-
-def _verified(config: dict, mapping: "VerifiedMapping | str") -> tuple[str, str]:
-    """The route of `config` through its model_type's verified `mapping`, which reads each model's own
-    config as it was verified and refuses a field that one does not carry."""
-    if isinstance(mapping, str):
-        return "refused", mapping
-    try:
-        mapping.translate(config, ())
-    except ValueError as error:
-        return "refused", str(error)[:300]
-    return "tier 2", f"{mapping.family} {mapping.error:.2e} <= {mapping.bound:.2e}"
+        return "refused", f"{type(error).__name__}: {error}"[:300]
+    match route:
+        case DecoderRoute():
+            return "tier 1", "registered decoder"
+        case WrapperRoute():
+            return "tier 1", "registered wrapper"
+        case DiffusionGemmaRoute():
+            return "tier 1", "registered diffusion_gemma"
+        case VerifiedRoute(verified=verified):
+            try:
+                # The census reads the config only; a verified mapping reads the tensors' names beside it.
+                verified.translate(config, ())
+            except ValueError as error:
+                return "refused", str(error)[:300]
+            return "tier 2", f"{verified.family} {verified.error:.2e} <= {verified.bound:.2e}"
+        case TorchRoute():
+            return "tier 3", "transformers' own forward, run by torchax"
 
 
 def classify(out: Path) -> None:
     rows = [row for row in json.loads((out / "census.json").read_text())
             if "config" in row and isinstance(row.get("model_type"), str)]
-    probed: dict[str, VerifiedMapping | str] = {}
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    from dew.interop import verify
+
+    probed: dict[tuple[str, str], VerifiedMapping | Unmapped | tuple[type[Exception], tuple]] = {}
+    admissions: dict[tuple[str, str], TorchAdmission | tuple[type[Exception], tuple]] = {}
+
+    def admitted(unmapped: Unmapped) -> TorchAdmission:
+        """`torchax_fallback.admitted`, once per shrunken config (`_probed`), its decision or its refusal
+        reused after as `verified` reuses its own."""
+        from dew.interop import torchax_fallback
+
+        key = _probed({**unmapped.fields, "model_type": unmapped.model_type})
+        if key not in admissions:
+            try:
+                admissions[key] = torchax_fallback.admitted(unmapped)
+            except (KeyError, ValueError, TypeError) as error:
+                admissions[key] = (type(error), error.args)
+        found = admissions[key]
+        if isinstance(found, tuple):
+            kind, arguments = found
+            raise kind(*arguments)
+        return found
+
+    def verified(config: dict) -> VerifiedMapping | Unmapped:
+        """`verify.verify_mapping`, run once per distinct config (`_probed`), its mapping, verdict or
+        refusal reused after; a refusal is kept as its type and arguments, not the probe's frames, and
+        raised afresh."""
+        model_type = config["model_type"]
+        if model_type not in CONFIG_MAPPING:
+            # Asked only once the loader has passed the storage format and the registered families.
+            raise NoReference(model_type)
+        key = _probed(config)
+        if key not in probed:
+            try:
+                probed[key] = verify.verify_mapping(config)
+            except (KeyError, ValueError, TypeError) as error:
+                probed[key] = (type(error), error.args)
+        found = probed[key]
+        if isinstance(found, tuple):
+            kind, arguments = found
+            raise kind(*arguments)
+        return found
+
     models = []
     for row in rows:
-        route, detail = _route(row["config"])
-        if route == "tier 2?":
-            # The probe runs once per model_type, on its most downloaded
-            # model that no registered family reads.
-            if row["model_type"] not in probed:
-                probed[row["model_type"]] = _probed(row["config"])
-            route, detail = _verified(row["config"], probed[row["model_type"]])
+        route, detail = _route(row["config"], verified, admitted)
         models.append({"id": row["id"], "model_type": row["model_type"], "downloads": row["downloads"],
                        "route": route, "detail": detail})
     types: dict[str, dict] = defaultdict(lambda: {"downloads": 0, "models": 0, "routes": defaultdict(int)})
@@ -144,7 +187,7 @@ def classify(out: Path) -> None:
         summary[scope] = {route: {"models": sum(model["route"] == route for model in scoped),
                                   "download_share": sum(model["downloads"] for model in scoped
                                                         if model["route"] == route) / downloads}
-                          for route in ("tier 1", "tier 2", "gguf", "refused", "by design", "remote code")}
+                          for route in ROUTES}
     report = [{"model_type": name, "downloads": entry["downloads"], "share": entry["downloads"] / total,
                "models": entry["models"], "routes": dict(entry["routes"]),
                "detail": next((model["detail"] for model in models

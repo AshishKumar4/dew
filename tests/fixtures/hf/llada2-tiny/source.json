@@ -1,0 +1,31 @@
+{
+ "released": {
+  "repo": "inclusionAI/LLaDA2.0-mini",
+  "revision": "dad945cac317da394b390f82c7b40691d8a881ed",
+  "files": [
+   "config.json",
+   "configuration_llada2_moe.py",
+   "modeling_llada2_moe.py"
+  ]
+ },
+ "flash": {
+  "repo": "inclusionAI/LLaDA2.0-flash",
+  "revision": "744c3f8c6c8317d2377d6d16d8a3d4be2caef563",
+  "same_eager_attention_and_router": true
+ },
+ "transformers": {
+  "version": "4.57.1"
+ },
+ "torch": {
+  "version": "2.9.0+cpu"
+ },
+ "generator": "tools/llada_moe_reference.py llada2-tiny --draw",
+ "seed": 0,
+ "attention": "Four-token blocks attend bidirectionally within a block and to every earlier block. The released forward requires an explicit 4-D additive mask.",
+ "sampling": "The released generate refines one block at a time, accepting sampled tokens above its threshold or the highest-confidence quota. Dew exposes its shared whole-response MDLM sampler, not that recipe.",
+ "recording": {
+  "file": "released.npz",
+  "by": "tools/recorded_references.py record_case, summary",
+  "torch": "2.14.1+cpu"
+ }
+}

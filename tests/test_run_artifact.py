@@ -9,17 +9,18 @@ import numpy as np
 import optax
 import pytest
 
+import dew
 from dew.checkpoints import Checkpoints
-from dew.config import ModelConfig
 from dew.data import Loading, Memory
 from dew.data.compile import compile
 from dew.data.dataset import Loader
 from dew.data.pipeline import Pipeline
 from dew.diffusion import schedules, transforms
 from dew.diffusion.process import Process
+from dew.inference.projections import unpacked
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
-from dew.registry import from_record, to_record
+from dew.registry import ModelConfig, from_record, to_record
 from dew.training import Trainer
 
 
@@ -54,8 +55,8 @@ def test_the_documented_model_records_itself_and_its_run_loads_back(tmp_path, mo
 
     from dew import Field, InputSpec
     from dew.diffusion.presets import Flow
+    from dew.inference import TextToImage
     from dew.objectives.diffusion import DiffusionObjective
-    from dew.sampling import TextToImage
 
     (tmp_path / "mymodels.py").write_text(
         documented_block("docs/key-concepts.md", "Your own model needs nothing to be recorded"))
@@ -124,10 +125,10 @@ def test_an_adapted_policy_run_loads_and_saves_the_policy_it_trained(kind, tmp_p
     rebuild write the files the trained adapter writes, byte for byte, and
     the loaded task and bundle hold the base draw bitwise under `frozen`
     and compute what the trained policy computes."""
+    from dew.batch import FROZEN, part
     from dew.inference import TextGeneration
     from dew.interop import Pretrained
     from dew.lora import Adapter, LoRA
-    from dew.objectives.base import FROZEN, part
     from dew.objectives.rl import DPOObjective, PPOObjective, ValueHead
 
     base = model()
@@ -197,9 +198,9 @@ class TinyDenoiser(flax.linen.Module):
 def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
     from dew import Field, InputSpec
     from dew.diffusion.presets import Flow
+    from dew.inference import TextToImage
     from dew.lora import LoRA
     from dew.objectives.diffusion import DiffusionObjective
-    from dew.sampling import TextToImage
 
     base = TinyDenoiser()
     sample = jnp.zeros((1, 4, 4, 3))
@@ -224,7 +225,9 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["text", "masked", "block"])
-def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypatch, kind):
+def test_a_hub_run_loads_as_its_task_at_the_requested_snapshot(tmp_path, monkeypatch, kind):
+    """`dew.pipeline`, the one loader of a run published to the Hub, pulls it at the revision asked for and
+    loads it as the task its objective declares, each token task's alike."""
     import huggingface_hub
     from flax.core import freeze
 
@@ -232,7 +235,7 @@ def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypat
     from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
     from dew.nn.diffusion_gemma import DiffusionGemma
     from dew.objectives.diffusion import BlockDiffusionObjective, MaskedDiffusionObjective
-    from dew.training import TrainState
+    from dew.state import TrainState
 
     if kind == "text":
         objective, task_type = LMObjective(model(), 8, ema_decay=None), TextGeneration
@@ -255,11 +258,16 @@ def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypat
         checkpoints = Checkpoints(str(tmp_path / name))
         checkpoints.save(0, state, None, artifact=objective.inference_record())
         checkpoints.wait()
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id, revision=None:
-                        str(tmp_path / ("main" if revision is None else {"pinned": "pinned"}[revision])))
-    task = task_type.from_pretrained("user/published-model", revision="pinned", ema=False)
-    assert jax.tree.structure(task.variables) == jax.tree.structure(freeze(selected))
-    for actual, expected in zip(jax.tree.leaves(task.variables), jax.tree.leaves(selected), strict=True):
+    def downloaded(repo_id, revision=None, allow_patterns=None):
+        return str(tmp_path / ("main" if revision is None else {"pinned": "pinned"}[revision]))
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", downloaded)
+    task = dew.pipeline("user/published-model", revision="pinned", ema=False)
+    assert isinstance(task, task_type)
+    # A loaded task holds its serving layout (projections packed); its canonical tree is the snapshot.
+    restored = unpacked(task.model, task.variables)
+    assert jax.tree.structure(restored) == jax.tree.structure(freeze(selected))
+    for actual, expected in zip(jax.tree.leaves(restored), jax.tree.leaves(selected), strict=True):
         np.testing.assert_array_equal(actual, expected)
 
 
@@ -287,7 +295,7 @@ def test_builtin_autoencoder_record_uses_the_saved_parameters():
                            dtype=jnp.float32)
     variables = module.init(jax.random.key(0), image)
     original = StableDiffusionVAE(model=module, params=variables['params'], dtype=jnp.float32)
-    rebuilt = AutoEncoder.from_json(original.to_json(), params=original.params)
+    rebuilt = AutoEncoder.bound(to_record(original, AutoEncoder), params=original.params)
     np.testing.assert_array_equal(original.encode(original.params, image),
                                   rebuilt.encode(rebuilt.params, image))
     latent = original.encode(original.params, image)

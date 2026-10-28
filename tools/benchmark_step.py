@@ -16,6 +16,13 @@ mesh's peak, or None where the model has no count. Each case is timed twice over
 steps: once with the asynchronous dispatch a real run uses, which gives
 ms/step, and once waiting on every step, which gives the p10/p50/p90 spread.
 
+A case's peak memory is measured, not planned: each device's allocator
+high-water over the case's run, native workspaces (cuBLAS, cuDNN, Mosaic
+scratch) included, read in a process of the case's own that loads every
+program from a compilation cache and compiles nothing (`measured_peak`,
+tools/peak_memory.py). XLA's plan of the step's arguments, outputs and
+temporaries stands beside it (`planned_device_bytes`).
+
 Two registry architectures are composites: `multimodal_transformer` wraps a
 decoder in an image tower and projector, and `diffusion_gemma` reads one
 decoder both ways for the official block-diffusion loss. A case builds those
@@ -46,11 +53,11 @@ Usage:
 
 import contextlib
 import dataclasses
+import importlib
 import io
 import json
 import os
 import sys
-import time
 from dataclasses import dataclass, field
 from typing import Annotated, Any, Literal
 
@@ -61,17 +68,19 @@ import tyro
 from dew.files import write_atomically
 from dew.nn.attention import AttentionImpl
 from dew.nn.flops import MissingFlopsCount
+from dew.pool import joins_pool, pool_cluster
 from dew.registry import models
-from dew.telemetry.instrumentation import COLLECTIVES, model_flops_utilization
+from dew.telemetry.benchmark import carried
+from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
+from dew.telemetry.trace import communication_totals, device_events, window_split
 from dew.training import Trainer
 from dew.training.memory import recompute_record
 from dew.training.runtime import prepare_process
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import peak_memory
 from benchmark_cases import (
-    TEXT_FEATURES as TEXT_FEATURES,
-    TEXT_TOKENS as TEXT_TOKENS,
     Case,
     canvas_split,
     cpu_smoke_cases,
@@ -80,20 +89,8 @@ from benchmark_cases import (
     mesh_label,
     small_cases,
 )
-from benchmark_models import (
-    Batch as Batch,
-    build_objective as build_objective,
-    build_trainer,
-    compiled_step,
-    decoder_objective as decoder_objective,
-    global_batch as global_batch,
-    image_tokens as image_tokens,
-    media_row as media_row,
-    media_values as media_values,
-    timed_steps,
-    trainer_mesh,
-)
-from trace_window import communication_totals, device_events, kernel_category, kernel_totals, window_split
+from benchmark_models import build_trainer, compiled_step, global_batch, timed_steps, trainer_mesh
+from trace_window import kernel_category, kernel_totals
 
 Row = dict[str, object]
 
@@ -198,6 +195,13 @@ class BenchmarkConfig:
     json_out: str | None = None
     quiet: bool = True
     """Silence the trainer's own prints, which are per-run noise here."""
+    within: str | None = None
+    """`module:function` (a module beside this tool), whose context manager every case runs inside, in this
+    process and each peak process: a diagnostic's swapped implementation (tools/benchmark_depthwise.py's
+    lax form)."""
+    peak_run: bool = False
+    """A case run in a process of its own for its measured peak (`measured_peak`), its compiles taken
+    from the cache that run names, measuring no peak of its own."""
 
 
 def build_cases(config: BenchmarkConfig) -> list[Case]:
@@ -245,8 +249,8 @@ def build_cases(config: BenchmarkConfig) -> list[Case]:
 def step_bytes(executable: jax.stages.Compiled | None) -> int | None:
     """The bytes one device holds while the compiled step runs, as XLA planned
     them: its arguments, the outputs not written over them, and the
-    temporaries. Per case, where the allocator's high-water mark only ever
-    grows over a sweep."""
+    temporaries; native workspaces (cuBLAS, cuDNN, a kernel's scratch) are
+    outside the plan, which `measured_peak` reads."""
     stats = None if executable is None else executable.memory_analysis()
     if stats is None:
         return None
@@ -296,14 +300,14 @@ def device_timeline(directory: str, steps: int, *, planes=None) -> dict[str, Any
 
 
 def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
-    """Each device's traced window split by `trace_window.window_split` into
+    """Each device's traced window split by `dew.telemetry.trace.window_split` into
     compute, every collective, the communication no compute kernel
     overlapped, and idle time ended by a host-to-device copy (input) or by
     anything else (host), averaged over the devices.
 
     `exposed_communication_ms_per_step` is the collective time no compute
     kernel on the same device ran beside: what overlap did not hide. Each
-    HLO collective (`instrumentation.COLLECTIVES`) gets its own time and exposed time,
+    HLO collective (`dew.telemetry.trace.COLLECTIVES`) gets its own time and exposed time,
     `all_to_all_ms_per_step` and `all_to_all_exposed_ms_per_step`, from the
     op each NCCL kernel ran for.
     """
@@ -313,7 +317,7 @@ def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     if not devices:
         raise ValueError(f"the trace under {directory} holds no device kernels")
 
-    totals = communication_totals(devices, COLLECTIVES)
+    totals = communication_totals(devices)
     totals.pop("busy")  # device_timeline's, over every device
     per_step = 1e-6 / steps / len(devices)
     window = totals.pop("window")
@@ -335,8 +339,24 @@ def training_work(trainer: Trainer, case: Case, step_time: float) -> tuple[float
     return flops, model_flops_utilization(flops / trainer.device_mesh.devices.size, step_time)
 
 
-def measure(case: Case, config: BenchmarkConfig) -> Row:
-    """Warm up, then time the compiled step over a fixed number of steps."""
+def measured_peak(case: Case, config: BenchmarkConfig) -> list[int | None]:
+    """Each local device's high-water over the case's run, measured (tools/peak_memory.py) in a process of
+    the case's own that loads its programs from a cache and compiles nothing. Run before this process
+    opens a backend, which would hold the device it needs."""
+    return peak_memory.measured(
+        [os.path.abspath(__file__), "--cases", json.dumps([dataclasses.asdict(case)]),
+         "--dtype", config.dtype, "--attention-impl", config.attention_impl, "--warmup", str(config.warmup),
+         "--steps", str(config.steps), "--fixed-batch" if config.fixed_batch else "--no-fixed-batch",
+         *(["--xla-flags", config.xla_flags] if config.xla_flags else []),
+         *(["--within", config.within] if config.within else []),
+         # The profiled steps are the case's too; their traces go apart from this process's.
+         *(["--profile-dir", os.path.join(config.profile_dir, "peak-run"), "--profile-steps",
+            str(config.profile_steps)] if config.profile_dir else []), "--peak-run"])
+
+
+def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None) -> Row:
+    """Warm up, then time the compiled step over a fixed number of steps. `peaks` is each device's
+    measured high-water (`measured_peak`), None in a pool."""
     if config.steps < 1:
         raise ValueError(f"--steps must be at least 1, got {config.steps}")
     trainer = build_trainer(case, config.attention_impl)
@@ -353,13 +373,9 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
         # does, so timing its individual iterations would time the dispatch and
         # not the step. These per-step numbers are a different quantity from
         # ms_per_step above, and each carries one synchronisation.
-        synced = []
-        for _ in range(config.steps):
-            step_start = time.perf_counter()
-            state, loss, is_finite = step(state)
-            loss.block_until_ready()
-            synced.append((time.perf_counter() - step_start) * 1e3)
-        p10, p50, p90 = np.percentile(synced, [10, 50, 90])
+        (state, loss, is_finite), synced = carried(lambda carry: step(carry[0]), (state, loss, is_finite),
+                                                   config.steps, each=True)
+        p10, p50, p90 = np.percentile(np.asarray(synced) * 1e3, [10, 50, 90])
 
         timeline = {}
         if config.profile_dir:
@@ -381,14 +397,16 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
                     if primary is None:
                         raise
                     primary.add_note(f"Profiler stop failed: {error!r}")
-            planes = device_events(directory)[0]
-            timeline = {**device_timeline(directory, config.profile_steps, planes=planes),
-                        **communication(directory, config.profile_steps, planes=planes)}
+            # A peak process traces the steps for their memory; their timeline is the case process's.
+            if not config.peak_run:
+                planes = device_events(directory)[0]
+                timeline = {**device_timeline(directory, config.profile_steps, planes=planes),
+                            **communication(directory, config.profile_steps, planes=planes)}
         flops = trainer.step_flops and trainer.step_flops.hardware
         step_time = elapsed / config.steps
         utilization = model_flops_utilization(flops, step_time)
         training_flops, mfu = training_work(trainer, case, step_time)
-        peak = step_bytes(trainer.executable)
+        planned = step_bytes(trainer.executable)
         row: Row = {
             "architecture": case.architecture,
             "batch_size": case.batch_size,
@@ -427,12 +445,13 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
             "utilization": utilization,
             "training_flops": training_flops,
             "mfu": mfu,
-            "peak_device_bytes": peak,
+            "planned_device_bytes": planned,
             "loss": float(loss),
             "finite": bool(is_finite),
             **timeline,
         }
-        return row
+    measured = None if peaks is None or None in peaks else max(peaks)
+    return {**row, "peak_device_bytes": measured, "peak_bytes_by_device": peaks}
 
 
 TABLE_COLUMNS = (
@@ -450,10 +469,12 @@ TABLE_COLUMNS = (
     ("utilization", "util %", 7, "{:.1f}"),
     ("mfu", "mfu %", 7, "{:.1f}"),
     ("peak_device_bytes", "peak GiB", 9, "{:.2f}"),
+    ("planned_device_bytes", "plan GiB", 9, "{:.2f}"),
 )
 # Units the table shows a column in: FLOPs as GFLOP, a fraction as a
 # percentage, bytes as GiB.
-TABLE_SCALE = {"flops_per_step": 1e-9, "utilization": 100.0, "mfu": 100.0, "peak_device_bytes": 2 ** -30}
+TABLE_SCALE = {"flops_per_step": 1e-9, "utilization": 100.0, "mfu": 100.0, "peak_device_bytes": 2 ** -30,
+               "planned_device_bytes": 2 ** -30}
 
 
 def format_table(rows: list[Row]) -> str:
@@ -477,17 +498,19 @@ def format_table(rows: list[Row]) -> str:
     return "\n".join(lines)
 
 
-def run(config: BenchmarkConfig) -> list[Row]:
+def run(config: BenchmarkConfig, peaks: list[list[int | None]] | None) -> list[Row]:
+    """Every case measured, with its devices' measured high-water (`measured_peak`) from `peaks`, one a
+    case in order; None in a pool."""
     rows: list[Row] = []
     # Every process of a pool measures its own devices; process 0 speaks.
     speaker = jax.process_index() == 0
-    for case in build_cases(config):
+    for index, case in enumerate(build_cases(config)):
         # The trainer narrates state generation and input shapes per case,
         # which buries the numbers this tool exists to print.
         sink = (contextlib.redirect_stdout(io.StringIO()) if config.quiet
                 else contextlib.nullcontext())
         with sink:
-            row = measure(case, config)
+            row = measure(case, config, None if peaks is None else peaks[index])
         rows.append(row)
         if not speaker:
             continue
@@ -513,9 +536,23 @@ def run(config: BenchmarkConfig) -> list[Row]:
     return rows
 
 
+def entered(within: str | None) -> contextlib.AbstractContextManager:
+    """The context `within` (`BenchmarkConfig.within`) names, or none."""
+    if within is None:
+        return contextlib.nullcontext()
+    module, _, function = within.partition(":")
+    return getattr(importlib.import_module(module), function)()
+
+
 def main(config: BenchmarkConfig) -> list[Row]:
-    # A step's compile seconds are a cold compile's, which no cached executable stands in for.
-    jax.config.update("jax_enable_compilation_cache", val=False)
+    if not config.peak_run and not jax.config.jax_compilation_cache_dir:
+        # Run alone, a step's compile seconds are a cold compile's, which no cached executable stands in for.
+        # A caller that names its cache (JAX_COMPILATION_CACHE_DIR: perf_gate's per-tree cache, whose later
+        # rounds load what its first compiled) keeps it, and its own switch (JAX_ENABLE_COMPILATION_CACHE).
+        jax.config.update("jax_enable_compilation_cache", val=False)
+    # Before this process opens a backend, which would hold the device each case's peak process needs.
+    measuring = not (joins_pool(None, pool_cluster(None)) or config.peak_run)
+    peaks = [measured_peak(case, config) for case in build_cases(config)] if measuring else None
     # Joins a `dew launch` pool when one launched this process, and applies
     # the flags before the backend opens either way.
     prepare_process(xla_flags=config.xla_flags)
@@ -525,7 +562,8 @@ def main(config: BenchmarkConfig) -> list[Row]:
               f"{jax.process_count()} process(es)")
         print(f"dtype {config.dtype}, attention_impl {config.attention_impl}, "
               f"XLA_FLAGS {os.environ.get('XLA_FLAGS', '')!r}")
-    rows = run(config)
+    with entered(config.within):
+        rows = run(config, peaks)
     if not speaker:
         return rows
     print()

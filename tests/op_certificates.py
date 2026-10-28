@@ -1,15 +1,22 @@
-"""Per-operation certificates (a prototype, not a gate the suite uses): each value a kernel rounds is
-checked on its own native parents against a contract for that one operation.
+"""Check 2 of the gate: every element within a certified roundoff bound for its own operation.
 
-A node of a kernel's graph (`dew.nn.kernels.graph`) is one value the kernel rounds and holds. Given
-the node's parents as the kernel computed them, its contract says what the native value may be:
+A site's computation runs one primitive at a time, each executed alone and natively, and each equation
+is held on the operands that execution gave it to its primitive's contract (tests/certified.py's
+`certified` and CONTRACTS, from this module's exact oracles):
 
-- an IEEE operation (add, sub, mul, fma, a correctly rounded divide or square root, a cast) must be
-  the round to nearest even of its exact result in its own format, subnormal cells included
-  (`Exact`);
-- an approximate or library primitive must be within its vendor-specified error of the true value
-  (`Ulps`);
-- a sum of n terms must be within the bound of the algorithm that sums it (`Sum`, `Dot`).
+- a rounding operation (add, sub, mul, divide, square root, a transcendental) must lie within the
+  reach the lane's own results show for it, measured on the lane (tests/certified.py's `lane`): the
+  round to nearest even of its exact result in its own format where the lane rounds so, one of the two
+  values of its format around the exact value (faithful), or a stated number of steps past them, its
+  operands and results read as the lane computes (flushing subnormals or not);
+- a cast between formats must be the round to nearest even of its value;
+- a sum of n terms, a dot product's included, must be within γ_n of its terms' magnitudes of their
+  exact sum, in any order;
+- a comparison, a selection, a move of data or an integer operation must be its result bit for bit.
+
+A primitive no contract covers fails the site (tests/certified.py's `assert_certified`). This
+certifies the program run one operation at a time; a fused program's internals are check 1's
+(tests/reference_error.py).
 
 The exact results come from exact arithmetic, not from float64 rounding: a product of two fp32 or
 bf16 values is exact in float64, a sum or a fused multiply-add is carried as a double-double by
@@ -283,7 +290,12 @@ EXP_BOUND = 2.0 ** -80
   25·(7 + 4 + 1)·1.6·2^-106 < 2^-97;
 - scaling by 2^k is exact (the results stay normal in float64).
 Total below 2^-88; the bound is 2^-80 to keep 2^8 of slack. Measured against mpmath at 300 bits on
-3,000 fp32 arguments over the range: 2^-94.7 at worst (tests/test_op_certificates.py holds it)."""
+3,000 fp32 arguments over the range: 2^-94.7 at worst (tests/test_op_certificates.py holds it).
+`_exp2_enclosed` holds it too: its reduced argument r = f·ln 2 for the fraction f = x - rint(x),
+|f| <= 1/2 and exact, is f·_LN2_HI exactly (`_two_product`, its low part at most 2^-55) plus
+f·_LN2_LO (below 2^-49, rounded within 2^-103), the two parts' sum rounded within 2^-103, and
+f·(_LN2_HI + _LN2_LO) is within 2^-99 of f·ln 2: r is within 2^-98 of f·ln 2, |r| <= 0.3466, so
+exp(r) within 2^-97.9 relative, and the same series and exact scaling by 2^rint(x) follow."""
 
 
 def ln2_enclosure(terms: int = 110) -> tuple[fractions.Fraction, fractions.Fraction]:
@@ -295,15 +307,62 @@ def ln2_enclosure(terms: int = 110) -> tuple[fractions.Fraction, fractions.Fract
     return partial, partial + rest
 
 
+def _exp_series(reduced_hi, reduced_lo, k):
+    """exp(r)·2^k for the double-double r, |r| <= 0.347, by its Taylor series in double-double."""
+    def constant(value):
+        return np.full_like(reduced_hi, value)
+
+    value_hi, value_lo = constant(_COEFFICIENTS[-1][0]), constant(_COEFFICIENTS[-1][1])
+    for hi, lo in reversed(_COEFFICIENTS[:-1]):
+        value_hi, value_lo = _dd_mul(value_hi, value_lo, reduced_hi, reduced_lo)
+        value_hi, value_lo = _dd_add(value_hi, value_lo, constant(hi), constant(lo))
+    return np.ldexp(value_hi, k.astype(np.int64)), np.ldexp(value_lo, k.astype(np.int64))
+
+
 def _exp_enclosed(x):
     """exp(x) for fp32 or bf16 x in [-110, 90], as a double-double within EXP_BOUND of it relative to it."""
     k = np.rint(x / float(_LN2))
-    reduced_hi, reduced_lo = _fast_two_sum(x - k * _LN2_HI, -k * _LN2_LO)
-    value_hi, value_lo = np.full_like(x, _COEFFICIENTS[-1][0]), np.full_like(x, _COEFFICIENTS[-1][1])
-    for hi, lo in reversed(_COEFFICIENTS[:-1]):
-        value_hi, value_lo = _dd_mul(value_hi, value_lo, reduced_hi, reduced_lo)
-        value_hi, value_lo = _dd_add(value_hi, value_lo, np.full_like(x, hi), np.full_like(x, lo))
-    return np.ldexp(value_hi, k.astype(np.int64)), np.ldexp(value_lo, k.astype(np.int64))
+    return _exp_series(*_fast_two_sum(x - k * _LN2_HI, -k * _LN2_LO), k)
+
+
+def _exp2_enclosed(x):
+    """2^x for fp32 or bf16 x in (-150, 128), as a double-double within EXP_BOUND of it relative to it:
+    2^f·2^n for x = n + f, n = rint(x), 2^f = exp(f·ln 2)."""
+    n = np.rint(x)
+    fraction = x - n
+    product, error = _two_product(fraction, _LN2_HI)
+    return _exp_series(*_fast_two_sum(product, error + fraction * _LN2_LO), n)
+
+
+def _enclosure_rounded(x, hi, lo, inside, beyond, exact, name: str, fmt: Format) -> np.ndarray:
+    """RN in `fmt` of a function at each of `x`, from its double-double enclosure `hi + lo` within
+    EXP_BOUND where `inside`: an element whose enclosure rounds one way takes that rounding, and
+    mpmath's interval `exact(iv, x)` at rising precision decides the rest. Outside, inf where `beyond`
+    and 0 elsewhere; NaN is NaN."""
+    slack = np.abs(hi) * EXP_BOUND
+    # Each end renormalized: `rounded` reads a double-double whose low part is within half an ulp of hi.
+    lower, upper = (rounded(*two_sum(hi, lo + offset), fmt) for offset in (-slack, slack))
+    result = np.where(inside, lower, np.where(beyond, np.inf, 0.0))
+    result = np.where(np.isnan(x), np.nan, result)
+    decided = ~inside | (lower == upper)
+    for index in np.flatnonzero(~decided):
+        for precision in (96, 192, 384, 768):
+            with interval_precision(precision) as iv:
+                ends = interval_ends(exact(iv, iv.mpf(float(x.flat[index]))), precision)
+            low_end, high_end = (fraction_rounded(end, fmt) for end in ends)
+            if low_end == high_end:
+                result.flat[index] = low_end
+                break
+        else:
+            raise ArithmeticError(f"{name}({x.flat[index]!r}) undecided at 768 bits")
+    return result
+
+
+EXP_RANGE = (-110.0, 90.0)
+"""Where exp's results in a format no wider than fp32 lie strictly between the same two neighbours:
+below it every exp is under exp(-110), below half fp32's least subnormal (bf16's is larger), so
+between +0 and the least subnormal, and above it every exp is over exp(90), past fp32's and bf16's
+largest finite values, so between the largest finite value and inf."""
 
 
 def exp_rounded(x, fmt: Format) -> np.ndarray:
@@ -311,26 +370,28 @@ def exp_rounded(x, fmt: Format) -> np.ndarray:
     with a proven relative bound (`_exp_enclosed`, EXP_BOUND) decides every element whose enclosure
     rounds one way, and mpmath's interval exp at rising precision decides the rest (exp of a nonzero
     rational is never a midpoint, so the precision needed is finite). No library exp is trusted.
-    Beyond [-110, 90] the result is 0 or inf in every format no wider than fp32 (exp(-110) is below
-    half fp32's least subnormal, exp(90) past its largest finite value); NaN is NaN."""
+    Beyond EXP_RANGE the result is 0 or inf in every format no wider than fp32; NaN is NaN."""
     x = np.asarray(x, np.float64)
-    inside = (x >= -110) & (x <= 90)
+    low, high = EXP_RANGE
+    inside = (x >= low) & (x <= high)
     hi, lo = _exp_enclosed(np.where(inside, x, 0.0))
-    slack = np.abs(hi) * EXP_BOUND
-    lower, upper = rounded(hi, lo - slack, fmt), rounded(hi, lo + slack, fmt)
-    result = np.where(x > 90, np.inf, np.where(x < -110, 0.0, lower))
-    result = np.where(np.isnan(x), np.nan, result)
-    decided = ~inside | (lower == upper)
-    for index in np.flatnonzero(~decided):
-        for precision in (96, 192, 384, 768):
-            with interval_precision(precision) as iv:
-                ends = interval_ends(iv.exp(iv.mpf(float(x.flat[index]))), precision)
-            low_end, high_end = (fraction_rounded(end, fmt) for end in ends)
-            if low_end == high_end:
-                result.flat[index] = low_end
-                break
-        else:
-            raise ArithmeticError(f"exp({x.flat[index]!r}) undecided at 768 bits")
+    return _enclosure_rounded(x, hi, lo, inside, x > high, lambda iv, value: iv.exp(value), "exp", fmt)
+
+
+def exp2_rounded(x, fmt: Format) -> np.ndarray:
+    """RN(2^x) in `fmt` for values of a format no wider than fp32, verified as `exp_rounded` is, from
+    `_exp2_enclosed`: 2^x of a non-integer rational is irrational, never a midpoint, and of an integer
+    is a power of two, rounded exactly (`fraction_rounded`, which takes a tie, half the least
+    subnormal, to even). At -150 and below the result is 0 in every format no wider than fp32 (2^-150
+    is half fp32's least subnormal, and bf16's is larger), at 128 and above inf; NaN is NaN."""
+    x = np.asarray(x, np.float64)
+    inside = (x > -150) & (x < 128)
+    whole = inside & (x == np.rint(x))
+    hi, lo = _exp2_enclosed(np.where(inside & ~whole, x, 0.0))
+    result = _enclosure_rounded(x, hi, lo, inside & ~whole, x >= 128,
+                                lambda iv, value: iv.exp(value * iv.log(2)), "exp2", fmt)
+    for index in np.flatnonzero(whole):
+        result.flat[index] = fraction_rounded(fractions.Fraction(2) ** int(x.flat[index]), fmt)
     return result
 
 

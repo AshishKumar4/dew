@@ -7,7 +7,9 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
-from dew.diffusion.schedules import divided, expand
+from dew.diffusion.schedules import expand
+from dew.diffusion.schedules.common import ancestral_variance
+from dew.nn.precision import divided
 
 from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator
 
@@ -46,7 +48,7 @@ def _ancestral(sigma_t, sigma_s):
     the level a deterministic step goes down to and the fresh noise that
     brings the marginal back to sigma_s, sigma_up capped at sigma_s as the
     source caps it."""
-    sigma_up = jnp.minimum(sigma_s, (sigma_s ** 2 * (sigma_t ** 2 - sigma_s ** 2) / sigma_t ** 2) ** 0.5)
+    sigma_up = jnp.minimum(sigma_s, ancestral_variance(sigma_t, sigma_s) ** 0.5)
     return (sigma_s ** 2 - sigma_up ** 2) ** 0.5, sigma_up
 
 @struct.dataclass
@@ -120,11 +122,12 @@ class Heun:
         with jax.ensure_compile_time_eval():
             sigmas = schedule.sigmas(jnp.asarray(times[:-1], jnp.float32))
             churned = (sigmas >= self.s_tmin) & (sigmas <= self.s_tmax)
-            if bool(jnp.any(churned & (sigmas * (1 + gamma) > schedule.sigma_max))):
+            top = schedule.sigma_range[1]
+            if bool(jnp.any(churned & (sigmas * (1 + gamma) > top))):
                 raise ValueError(
-                    f"the churn raises sigma past the schedule's top, {schedule.sigma_max}, "
+                    f"the churn raises sigma past the schedule's top, {top}, "
                     f"where the model has no time; keep s_tmax below "
-                    f"{schedule.sigma_max / (1 + gamma):.4g}")
+                    f"{top / (1 + gamma):.4g}")
         return jnp.asarray(gamma, jnp.float32)
 
     def step(self, x, t, t_next, denoised, eps, state, key, process, denoise):
@@ -182,7 +185,7 @@ class RK4:
         k2 = derivative(x + 0.5 * k1 * dt, sigma_t + 0.5 * dt)
         k3 = derivative(x + 0.5 * k2 * dt, sigma_t + 0.5 * dt)
         k4 = derivative(x + k3 * dt, sigma_t + dt)
-        return x + (k1 + 2 * k2 + 2 * k3 + k4) * dt / 6, state
+        return x + divided((k1 + 2 * k2 + 2 * k3 + k4) * dt, 6), state
 
 
 @struct.dataclass
@@ -263,26 +266,31 @@ class MultiStepDPM:
             dx_2 = (eps - last_eps) / (sigma_t - last_sigma)
             dx_2_last = (last_eps - older_eps) / (last_sigma - older_sigma)
             dx_3 = (dx_2 - dx_2_last) / (0.5 * ((sigma_t + last_sigma) - (last_sigma + older_sigma)))
-            return x + eps * dt + 0.5 * dx_2 * dt ** 2 + dx_3 * dt ** 3 / 6
+            return x + eps * dt + 0.5 * dx_2 * dt ** 2 + divided(dx_3 * dt ** 3, 6)
 
         next_x = lax.switch(jnp.minimum(count, 2), [first, second, third], None)
         return next_x, (eps, sigma_t, last_eps, last_sigma, count + 1)
 
 def _lagrange_integral(nodes: list, j: int, a, b):
     """The integral from a to b of the Lagrange basis polynomial that is 1 at
-    `nodes[j]` and 0 at the other nodes, in closed form."""
+    `nodes[j]` and 0 at the other nodes, in closed form on the step itself:
+    with x = a + (b - a) s, each factor (x - node_m) / (node_j - node_m) is
+    alpha_m + beta_m s, alpha_m = (a - node_m) / (node_j - node_m) and beta_m =
+    (b - a) / (node_j - node_m), ratios of the grid's own spacings, so it is
+    (b - a) times the integral over s in [0, 1] of their product. No power of
+    a sigma is formed (VE sigmas near 2**70 cube past float32's largest), no
+    spacing is measured against a wider one (a tiny step beside a distant
+    node keeps its coefficient), and an empty step integrates to zero with
+    the basis at its end as its derivative."""
+    width = b - a
     polynomial = [1.0]
-    scale = 1.0
     for m, node in enumerate(nodes):
         if m == j:
             continue
-        polynomial = [0.0, *polynomial]
-        polynomial = [polynomial[i] - node * (polynomial[i + 1] if i + 1 < len(polynomial) else 0.0)
-                      for i in range(len(polynomial))]
-        scale = scale * (nodes[j] - node)
-    integral = sum(coefficient * (b ** (i + 1) - a ** (i + 1)) / (i + 1)
-                   for i, coefficient in enumerate(polynomial))
-    return integral / scale
+        alpha, beta = (a - node) / (nodes[j] - node), width / (nodes[j] - node)
+        polynomial = [(polynomial[i] if i < len(polynomial) else 0.0) * alpha
+                      + (polynomial[i - 1] * beta if i > 0 else 0.0) for i in range(len(polynomial) + 1)]
+    return width * sum(coefficient / (i + 1) for i, coefficient in enumerate(polynomial))
 
 
 @struct.dataclass

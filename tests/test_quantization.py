@@ -5,10 +5,13 @@ everywhere, since construction never imports it.
 """
 
 import dataclasses
+import functools
 import itertools
 import os
 import subprocess
 import sys
+import types
+from collections.abc import Callable
 from importlib import import_module
 from pathlib import Path
 
@@ -18,15 +21,32 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound
+from flax.core import FrozenDict
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_fp32_reduction_bound,
+    with_gradients,
+)
+from token_support import token_rows
 
-from dew.config import ObjectiveConfig, OptimConfig
+from dew.config import ObjectiveConfig
+from dew.distributed.batches import shard_batch
+from dew.distributed.placement import Layout, MeshSpec
+from dew.lora import _updated as lora_update
+from dew.nn.attention_residuals import depth_mixed
+from dew.nn.blocks import torch_bicubic_resize
+from dew.nn.kv_cache import hadamard, rotated
+from dew.nn.precision import FP32_SUMS
+from dew.nn.quantizers import nearest_codewords
 from dew.nn.sharding import pipeline_microbatches
+from dew.nn.ssm import diagonal_recurrence
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.quantization import Quantization, quantize_for_serving
+from dew.optim import OptimConfig
+from dew.quantization import UNQUANTIZED, Quantization, quantize_for_serving, quantize_with
 from dew.registry import models
-from dew.training.distributed import Layout, MeshSpec, shard_batch
 
 import_module("dew.nn.backbones")  # registers the fixture kind
 
@@ -43,8 +63,7 @@ def tiny(**overrides):
 
 
 def token_batch():
-    rng = np.random.default_rng(0)
-    return {"text": rng.integers(0, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)}
+    return token_rows(VOCAB, BATCH, SEQ_LEN + 1)
 
 
 def quantized_forward(spec, **overrides):
@@ -58,21 +77,42 @@ def quantized_forward(spec, **overrides):
 @pytest.mark.parametrize("scan_layers", [False, True])
 def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
     """Dew's wrapping against the provider built by hand, over the layer
-    loop and over the scanned stack: identical compiled logits, and both
+    loop and over the scanned stack, the hand-built one traced under its own key (`quantize_with`),
+    as Dew traces every Qwix-quantized model so Qwix owns its products: identical compiled logits, and both
     away from the fp32 forward. The gap is the assertion: rules that never
-    reached a matmul would leave the fp32 numerics bitwise. Observed with
-    both layouts: wrapped and hand-built bitwise equal on CPU and on the RTX
-    4080, 1.2e-01 (CPU) and 1.3e-01 (RTX 4080) from fp32 on logits up to 3.9."""
+    reached a matmul would leave the fp32 numerics bitwise, so any bit moved
+    says they did. Observed with both layouts: wrapped and hand-built bitwise
+    equal on CPU and on the RTX 4080, 1.2e-01 (CPU) and 1.3e-01 (RTX 4080)
+    from fp32 on logits up to 3.9."""
     qwix = pytest.importorskip("qwix")
     model, qmodel, variables, ids = quantized_forward(Quantization(), scan_layers=scan_layers)
     rules = [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8,
                          act_qtype=jnp.int8)]
-    reference = qwix.quantize_model(model, qwix.QtProvider(rules))
+    reference = quantize_with(model, qwix.QtProvider(rules))
     plain = jax.jit(model.apply)(variables, ids)
     wrapped = jax.jit(qmodel.apply)(variables, ids)
     manual = jax.jit(reference.apply)(variables, ids)
-    assert float(jnp.max(jnp.abs(wrapped - manual))) == 0.0
-    assert float(jnp.max(jnp.abs(wrapped - plain))) > 1e-2
+    np.testing.assert_array_equal(wrapped, manual)
+    assert not np.array_equal(wrapped, plain)
+
+
+def test_a_dense_qwix_quantizes_directly_takes_its_gradient_on_a_cpu():
+    """A Dew Dense Qwix quantizes directly (`qwix.quantize_model`, outside `quantize_with`'s trace)
+    differentiates on a CPU: its product calls a backward of its own (a custom_vjp), so the float64
+    sums (`precision.accumulated`) leave it to Qwix, forward and backward, as on any platform."""
+    qwix = pytest.importorskip("qwix")
+    from dew.nn.dense import Dense
+
+    layer = Dense(8)
+    with jax.default_device(jax.devices("cpu")[0]):
+        x = jnp.asarray(np.random.default_rng(0).standard_normal((4, 16)), jnp.float32)
+        variables = layer.init(jax.random.key(0), x)
+        quantized = qwix.quantize_model(layer, qwix.QtProvider(
+            [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
+        loss = jax.grad(lambda variables: jnp.sum(quantized.apply(variables, x) ** 2))
+        gradients = jax.jit(loss)(variables)
+    kernel = np.asarray(gradients["params"]["kernel"])
+    assert np.all(np.isfinite(kernel)) and np.any(kernel)
 
 
 def test_quantized_and_plain_calls_of_one_shape_keep_their_own_products_in_one_process():
@@ -103,16 +143,26 @@ def test_quantized_and_plain_calls_of_one_shape_keep_their_own_products_in_one_p
     assert not np.array_equal(np.asarray(quantized.apply(variables, then)), plain(then))
 
 
+def test_qwix_refuses_an_unknown_calibration_where_it_first_quantizes_a_weight():
+    """Dew keeps no copy of Qwix's calibration grammar: a spec with a method Qwix does not know builds,
+    and the first forward that quantizes a matched weight raises, Qwix's own refusal."""
+    pytest.importorskip("qwix")
+    _, qmodel, variables, ids = quantized_forward(Quantization(calibration="not_a_method"))
+    with pytest.raises(ValueError):
+        qmodel.apply(variables, ids)
+
+
 def test_a_pattern_that_matches_nothing_quantizes_nothing():
     """A narrowed pattern is selective: a regex no module path matches runs
-    the fp32 numerics bitwise. A pattern that matched everything would move
-    the logits here, so the equality fails it. Observed on CPU: bitwise
-    equal."""
+    the fp32 numerics bitwise, as the unquantized model sums them where Qwix
+    owns its products (`FP32_SUMS`). A pattern that matched everything would
+    move the logits here, so the equality fails it."""
     pytest.importorskip("qwix")
     model, qmodel, variables, ids = quantized_forward(
         Quantization(patterns=(".*does_not_exist.*",)))
-    assert float(jnp.max(jnp.abs(
-        qmodel.apply(variables, ids) - model.apply(variables, ids)))) == 0.0
+    with jax.default_matmul_precision(FP32_SUMS):
+        plain = model.apply(variables, ids)
+    assert float(jnp.max(jnp.abs(qmodel.apply(variables, ids) - plain))) == 0.0
 
 
 def test_an_int8_trunk_trains_down():
@@ -145,6 +195,38 @@ def test_an_int8_trunk_trains_down():
     assert all(later < earlier for earlier, later in itertools.pairwise(losses)), losses
 
 
+CONVOLUTION_SEEDS = 64
+"""The quantized convolutions' declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`
+on armada."""
+
+
+def ungrouped_reference(qwix, settings: dict, group_width: int):
+    """Qwix's own quantized training of a grouped convolution written ungrouped, as a function of the
+    grouped kernel, the input and its group peaks (`peaks_of`, returned beside it): the kernel
+    block-diagonal, zero across groups, the input divided by the peaks as Dew divides it and the output
+    scaled back. The zeros quantize to zero and every group then peaks at 1, so the two quantize to the
+    same integers. The peaks are an argument, so a derivative holds them fixed, as Dew's does."""
+    from dew.nn.conv import Conv
+
+    features = settings["features"]
+    ungrouped = quantize_with(Conv(**settings), qwix.QtProvider(
+        [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
+    # Output channel o reads input channel i as its group's j-th: block[j, o, i].
+    block = (jnp.arange(features)[None, None, :]
+             == (jnp.arange(features)[None, :, None] // group_width) * group_width
+             + jnp.arange(group_width)[:, None, None])
+
+    def peaks_of(x):
+        rows = x.reshape(*x.shape[:-1], features // group_width, group_width)
+        peaks = jnp.max(jnp.abs(rows), axis=(1, 2, 4))
+        return jnp.repeat(peaks, group_width, axis=1)[:, None, None, :]
+
+    def reference(kernel, x, peaks):
+        block_diagonal = jnp.einsum("hwjo,joi->hwio", kernel, block.astype(kernel.dtype))
+        return ungrouped.apply({"params": {"kernel": block_diagonal}}, x / peaks) * peaks
+    return reference, peaks_of
+
+
 @pytest.mark.skipif(jax.default_backend() == "gpu",
                     reason="Dew refuses a grouped quantized convolution on a GPU; "
                            "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
@@ -153,47 +235,66 @@ def test_an_int8_trunk_trains_down():
 def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width, dtype):
     """A grouped convolution never adds one group's inputs into another's
     outputs, so each group's activations take their own int8 scale. Over 64
-    channels whose ranges span 1e-3 to 1, every output channel lands within
-    int8 rounding of float (depthwise and 4 channels per group), in float32
-    and in bf16 compute. The reference is the float32 convolution, at the
-    highest precision, of the inputs and kernel the module computes with.
+    channels whose ranges span 1e-3 to 1, depthwise and 4 channels per
+    group, in float32 and in bf16 compute, the quantized convolution is on
+    par (check 1) with Qwix's own quantization of it written ungrouped on
+    each group's range (`ungrouped_reference`), from the float64
+    convolution of the same inputs and kernel, each output channel its own
+    leaf, so a quiet group is judged on its own and not pooled with the loud
+    ones; and quantization moves every channel off the float convolution.
     One scale per example for all channels rounds the small groups to zero
     instead: observed on CPU before the fix, the worst channel 100%
-    (depthwise) and 107% (4 per group) off. Observed after: 1.0% and 1.2%
-    in float32, 1.1% and 1.2% in bf16 (1.1% and 1.4% while Qwix scaled the
-    bf16 product in bf16)."""
-    pytest.importorskip("qwix")
+    (depthwise) and 107% (4 per group) off, where the per-group quantization
+    is 1.0% to 1.4% off."""
+    qwix = pytest.importorskip("qwix")
     from dew.nn.conv import Conv
 
     features = 64
-    conv = Conv(features=features, kernel_size=(3, 3), padding="SAME",
-                feature_group_count=features // group_width, use_bias=False, dtype=dtype)
+    settings = {"features": features, "kernel_size": (3, 3), "padding": "SAME", "use_bias": False}
+    conv = Conv(**settings, feature_group_count=features // group_width, dtype=dtype)
+    reference, peaks_of = ungrouped_reference(qwix, {**settings, "dtype": dtype}, group_width)
     ranges = jnp.logspace(-3, 0, features)
-    x = (jax.random.normal(jax.random.key(0), (2, 8, 8, features)) * ranges).astype(dtype)
-    variables = jax.tree.map(
-        lambda leaf: leaf.astype(dtype).astype(jnp.float32), conv.init(jax.random.key(1), x)
-    )
-    with jax.default_matmul_precision("highest"):
-        plain = conv.clone(dtype=jnp.float32).apply(variables, x.astype(jnp.float32))
-    quantized = Quantization().apply(conv).apply(variables, x)
-    assert quantized.dtype == dtype
-    error = (jnp.sqrt(jnp.sum((quantized.astype(jnp.float32) - plain) ** 2, axis=(0, 1, 2)))
-             / jnp.sqrt(jnp.sum(plain ** 2, axis=(0, 1, 2))))
-    assert float(error.max()) < 0.02, np.asarray(error)
-    assert float(error.min()) > 0.0
+    init = jax.jit(conv.init)
+    quantized = Quantization().apply(conv)
+
+    def draw(seed):
+        x = (jax.random.normal(jax.random.key(2 * seed), (2, 8, 8, features)) * ranges).astype(dtype)
+        kernel = init(jax.random.key(2 * seed + 1), x)["params"]["kernel"].astype(dtype)
+        return x, kernel
+
+    def channels(output):
+        """Each output channel its own leaf, `[B, H, W]`."""
+        return {f"channel {index}": output[..., index] for index in range(features)}
+
+    def dew(x, kernel):
+        return channels(quantized.apply({"params": {"kernel": kernel}}, x))
+
+    def plain(x, kernel):
+        return channels(conv.clone(dtype=jnp.float64).apply({"params": {"kernel": kernel}}, x))
+
+    x, kernel = draw(0)
+    found = quantized.apply({"params": {"kernel": kernel}}, x)
+    assert found.dtype == dtype
+    unquantized = conv.apply({"params": {"kernel": kernel}}, x)
+    for index in range(features):
+        assert not np.array_equal(found[..., index], unquantized[..., index]), index
+    qwix_own = jax.jit(lambda x, kernel: channels(reference(kernel, x, peaks_of(x))))
+    label = f"grouped {group_width} {jnp.dtype(dtype).name} quantized convolution"
+    assert_as_exact(jax.jit(dew), qwix_own, draw, label,
+                    seeds=CONVOLUTION_SEEDS, truth_fn=plain)
 
 
-@pytest.mark.skipif(jax.default_backend() == "gpu",
-                    reason="Dew refuses a grouped quantized convolution on a GPU; "
-                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it")
-@pytest.mark.parametrize("groups", [1, 16])
-def test_a_quantized_convolution_keeps_its_calls_precision_and_result_dtype(groups):
-    """A quantized convolution keeps its call's contract, as a quantized matmul does: one pinned at
-    the highest precision, Dew's Conv and lax's alike, has no quantized form and runs unquantized at
-    it, bitwise the float convolution; one that asks for a float32 result from bf16 operands
-    returns float32, within int8's rounding of the float convolution. Before, both quantized and
-    returned the bf16 input's dtype."""
-    pytest.importorskip("qwix")
+@pytest.mark.parametrize("groups", [1, pytest.param(16, marks=pytest.mark.skipif(
+    jax.default_backend() == "gpu", reason="Dew refuses a grouped quantized convolution on a GPU; "
+                                           "test_a_gpu_refuses_grouped_quantized_convolutions covers it"))])
+def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision_it_pins(groups):
+    """A quantized convolution keeps its call's contract, as a quantized matmul does: one that asks
+    for a float32 result from bf16 operands returns float32, where before it returned the bf16
+    input's dtype, on par (check 1) with Qwix's own quantization of the convolution on each group's
+    range (`ungrouped_reference`) from the float64 convolution over drawn inputs and kernels; and one
+    pinned at the highest precision, Dew's Conv and lax's alike, quantizes as the same call unpinned
+    does, bit for bit, a quantized product having no precision to honour. Each is not the float
+    convolution: quantization reached it."""
     from flax import linen as nn
 
     from dew.nn.conv import Conv
@@ -211,20 +312,45 @@ def test_a_quantized_convolution_keeps_its_calls_precision_and_result_dtype(grou
                 feature_group_count=groups, precision=self.precision, preferred_element_type=self.preferred)
 
     x = jax.random.normal(jax.random.key(0), (2, 8, 8, 16)).astype(jnp.bfloat16)
-    pinned = (Conv(features=16, kernel_size=(3, 3), padding="SAME", feature_group_count=groups,
-                   use_bias=False, dtype=jnp.bfloat16, precision=jax.lax.Precision.HIGHEST),
-              Native(precision=jax.lax.Precision.HIGHEST))
-    for module in pinned:
-        variables = module.init(jax.random.key(1), x)
-        np.testing.assert_array_equal(Quantization().apply(module).apply(variables, x),
-                                      module.apply(variables, x))
+    settings = {"features": 16, "kernel_size": (3, 3), "padding": "SAME", "feature_group_count": groups,
+                "use_bias": False, "dtype": jnp.bfloat16}
+    variables = Native().init(jax.random.key(1), x)
+
+    def quantized(module):
+        return Quantization().apply(module).apply(variables, x)
+
+    for pinned, plain in ((Conv(**settings, precision=jax.lax.Precision.HIGHEST), Conv(**settings)),
+                          (Native(precision=jax.lax.Precision.HIGHEST), Native())):
+        found = quantized(pinned)
+        np.testing.assert_array_equal(found, quantized(plain))
+        assert not np.array_equal(found, plain.apply(variables, x))
     wide = Native(preferred=jnp.float32)
-    variables = wide.init(jax.random.key(1), x)
-    got = Quantization().apply(wide).apply(variables, x)
-    with jax.default_matmul_precision("highest"):
-        want = wide.apply(variables, x)
-    assert got.dtype == want.dtype == jnp.float32
-    assert 0.0 < float(jnp.linalg.norm(got - want) / jnp.linalg.norm(want)) < 0.02
+    found = quantized(wide)
+    assert found.dtype == jnp.float32
+    assert not np.array_equal(found, wide.apply(variables, x))
+    qwix = pytest.importorskip("qwix")
+    reference, peaks_of = ungrouped_reference(qwix, {key: value for key, value in settings.items()
+                                                     if key != "feature_group_count"}, 16 // groups)
+    widened = Quantization().apply(wide)
+
+    def draw(seed):
+        x = jax.random.normal(jax.random.key(2 * seed), (2, 8, 8, 16)).astype(jnp.bfloat16)
+        return x, wide.init(jax.random.key(2 * seed + 1), x)["params"]["kernel"].astype(jnp.bfloat16)
+
+    def plain(x, kernel):
+        return jax.lax.conv_general_dilated(x, kernel, (1, 1), "SAME", feature_group_count=groups,
+                                            dimension_numbers=("NHWC", "HWIO", "NHWC"))
+
+    # Qwix's own quantized training convolves its integers into int32, which XLA:GPU cannot run, so
+    # the reference runs on the CPU whatever the platform.
+    cpu, qwix_own = jax.devices("cpu")[0], jax.jit(lambda x, kernel: reference(kernel, x, peaks_of(x)))
+
+    @as_given
+    def on_cpu(x, kernel):
+        return qwix_own(*jax.device_put((x, kernel), cpu))
+
+    assert_as_exact(jax.jit(lambda x, kernel: widened.apply({"params": {"kernel": kernel}}, x)), on_cpu, draw,
+                    f"float32 result of {groups} groups", seeds=CONVOLUTION_SEEDS, truth_fn=plain)
 
 
 @pytest.mark.skipif(jax.default_backend() == "gpu",
@@ -260,31 +386,24 @@ def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(g
     settings = {"features": features, "kernel_size": (3, 3), "padding": "SAME",
                 "kernel_dilation": (dilation, dilation), "use_bias": False}
     grouped = Conv(**settings, feature_group_count=groups)
-    ungrouped = qwix.quantize_model(Conv(**settings), qwix.QtProvider(
-        [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
+    grouped_reference, peaks_of = ungrouped_reference(qwix, settings, group_width)
     x = jax.random.normal(jax.random.key(0), (2, 8, 8, features)) * jnp.logspace(-3, 0, features)
     kernel = grouped.init(jax.random.key(1), x)["params"]["kernel"]
     cotangent = jax.random.normal(jax.random.key(2), x.shape)
-    # Output channel o reads input channel i as its group's j-th: block[j, o, i].
-    block = (jnp.arange(features)[None, None, :]
-             == (jnp.arange(features)[None, :, None] // group_width) * group_width
-             + jnp.arange(group_width)[:, None, None]).astype(kernel.dtype)
-    peaks = jnp.max(jnp.abs(x.reshape(2, 8, 8, groups, group_width)), axis=(1, 2, 4))
-    peaks = jnp.repeat(peaks, group_width, axis=1)[:, None, None, :]
+    # The peaks are the input's own, held fixed as the derivative is taken, as Dew holds them.
+    peaks = peaks_of(x)
 
     def dew(kernel, x):
         return Quantization().apply(grouped).apply({"params": {"kernel": kernel}}, x)
 
     def reference(kernel, x):
-        block_diagonal = jnp.einsum("hwjo,joi->hwio", kernel, block)
-        return ungrouped.apply({"params": {"kernel": block_diagonal}}, x / peaks) * peaks
+        return grouped_reference(kernel, x, peaks)
 
     def plain(kernel, x):
         return grouped.apply({"params": {"kernel": kernel}}, x)
 
     def value_and_gradients(function):
-        out, transpose = jax.vjp(jax.jit(function), kernel, x)
-        return (out, *transpose(cotangent))
+        return with_gradients(jax.jit(function))(kernel, x, cotangent)
 
     def dequantized(array, for_lhs):
         how = conv_general.get_how_to_quantize(
@@ -317,7 +436,7 @@ def test_a_quantized_grouped_convolution_differentiates_as_qwix_does_ungrouped(g
     assert_fp32_reduction_bound(got[1], want[1], kernel_magnitude, int(np.prod(x.shape[:-1])))
     assert_fp32_reduction_bound(got[2], want[2], x_magnitude / peaks, 9 * group_width + 1)
     for got_part, float_part in zip(got[1:], float_[1:], strict=True):
-        assert 0.0 < float(jnp.linalg.norm(got_part - float_part) / jnp.linalg.norm(float_part)) < 0.02
+        assert not np.array_equal(got_part, float_part)
 
 
 QUANTIZED_CONVOLUTION = """
@@ -329,7 +448,7 @@ import numpy as np
 import qwix
 
 from dew.nn.conv import Conv
-from dew.quantization import Quantization
+from dew.quantization import Quantization, quantize_with
 
 dtype = sys.argv[1]
 # Without the bias, which the quantization leaves alone and a bf16
@@ -340,7 +459,7 @@ x = jax.random.normal(jax.random.key(0), (8, 16, 16, 4), jnp.bfloat16)
 variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), conv.init(jax.random.key(1), x))
 cotangent = jax.random.normal(jax.random.key(2), (8, 8, 8, 128), jnp.bfloat16)
 qtype = jnp.int8 if dtype == "int8" else jnp.float8_e4m3fn
-reference = qwix.quantize_model(Conv(**settings), qwix.QtProvider(
+reference = quantize_with(Conv(**settings), qwix.QtProvider(
     [qwix.QtRule(module_path=".*", weight_qtype=qtype, act_qtype=qtype)]))
 
 
@@ -404,12 +523,11 @@ def test_a_bf16_convolution_under_weight_only_quantization_trains_as_qwix_does()
     x = jax.random.normal(jax.random.key(0), (8, 16, 16, 4), jnp.bfloat16)
     variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), conv.init(jax.random.key(1), x))
     cotangent = jax.random.normal(jax.random.key(2), (8, 8, 8, 128), jnp.bfloat16)
-    reference = qwix.quantize_model(conv, qwix.QtProvider([qwix.QtRule(
+    reference = quantize_with(conv, qwix.QtProvider([qwix.QtRule(
         module_path=".*", weight_qtype=jnp.int8, op_names=("dot_general", "einsum", "dot"))]))
 
     def value_and_gradients(module):
-        out, transpose = jax.vjp(jax.jit(module.apply), variables, x)
-        return out, *transpose(cotangent)
+        return with_gradients(jax.jit(module.apply))(variables, x, cotangent)
 
     got = value_and_gradients(Quantization(weight_only=True).apply(conv))
     assert got[0].dtype == jnp.bfloat16
@@ -449,12 +567,11 @@ def test_a_convolution_no_rule_quantizes_computes_as_unwrapped_and_as_qwix_does(
     cotangent = jax.random.normal(jax.random.key(3), x.shape)
     pattern = "^(?!.*spatial_fusion).*"
     spec = Quantization(patterns=(pattern,))
-    direct = qwix.quantize_model(block, qwix.QtProvider(
+    direct = quantize_with(block, qwix.QtProvider(
         [qwix.QtRule(module_path=pattern, weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
 
     def value_and_gradients(module, variables):
-        out, transpose = jax.vjp(jax.jit(module.apply), variables, x)
-        return out, *transpose(cotangent)
+        return with_gradients(jax.jit(module.apply))(variables, x, cotangent)
 
     plain = value_and_gradients(block, variables)
     jax.tree.map(np.testing.assert_array_equal, value_and_gradients(spec.apply(block), variables), plain)
@@ -463,13 +580,32 @@ def test_a_convolution_no_rule_quantizes_computes_as_unwrapped_and_as_qwix_does(
     np.testing.assert_array_equal(jax.jit(served.apply)(served_variables, x), plain[0])
 
 
+def test_a_recorded_kernel_no_rule_matches_multiplies_by_its_own_recipe():
+    """A served kernel stored quantized that reaches a matmul under rules naming none of it, as an unpacked
+    task's member does under a rule naming its packed group, multiplies by the recipe it records: its
+    weight-only logits bit for bit those of the rules that quantized it. Rules that quantize activations
+    refuse it, whose recipe the kernel does not record."""
+    pytest.importorskip("qwix")
+    model, _, variables, ids = quantized_forward(Quantization(weight_only=True, patterns=(".*_proj",)))
+    quantized = Quantization(weight_only=True, patterns=(".*_proj",))
+    served, served_variables = quantize_for_serving(model, variables, quantized, ids)
+    nothing = Quantization(weight_only=True, patterns=("none",))
+    unmatched, _ = quantize_for_serving(model, variables, nothing, ids)
+    np.testing.assert_array_equal(jax.jit(unmatched.apply)(served_variables, ids),
+                                  jax.jit(served.apply)(served_variables, ids))
+    activations, _ = quantize_for_serving(model, variables, Quantization(patterns=("none",)), ids)
+    with pytest.raises(ValueError):
+        activations.apply(served_variables, ids)
+
+
 def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
     """Served weights are int8 values with their scales, and the served
     projections reproduce the quantized-training forward they were trained
-    under, away from fp32. Observed on CPU: served against wrapped 0.0 on
-    logits of order 3, 1.2e-01 from fp32. (Qwix's serving and training
-    providers quantize attention's matmuls of two activations differently:
-    with those quantized too, the two forwards differ by 3e-02.)"""
+    under bit for bit, away from fp32 (unquantized products would leave it
+    bitwise). Observed on CPU: 1.2e-01 from fp32 on logits of order 3.
+    (Qwix's serving and training providers quantize attention's matmuls of
+    two activations differently: with those quantized too, the two forwards
+    differ by 3e-02.)"""
     pytest.importorskip("qwix")
     spec = Quantization(patterns=(".*_proj",))
     model, qmodel, variables, ids = quantized_forward(spec)
@@ -477,8 +613,8 @@ def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
     dtypes = {leaf.dtype for leaf in jax.tree.leaves(served_variables["params"])}
     assert jnp.dtype(jnp.int8) in dtypes
     logits = served.apply(served_variables, ids)
-    assert float(jnp.max(jnp.abs(logits - qmodel.apply(variables, ids)))) < 1e-4
-    assert float(jnp.max(jnp.abs(logits - model.apply(variables, ids)))) > 1e-2
+    np.testing.assert_array_equal(logits, qmodel.apply(variables, ids))
+    assert not np.array_equal(logits, model.apply(variables, ids))
 
 
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
@@ -506,7 +642,7 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
     fields = {"op_names": ("dot_general", "einsum", "dot")} if weight_only else {}
     rules = [qwix.QuantizationRule(module_path=".*_proj", weight_qtype=qtype,
                                   act_qtype=None if weight_only else qtype, **fields)]
-    reference = qwix.quantize_model(model, qwix.PtqProvider(rules),
+    reference = quantize_with(model, qwix.PtqProvider(rules),
                                     methods=entry_methods(model))
     abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(0),
                                                jnp.zeros((1, 1), jnp.int32)))
@@ -517,7 +653,7 @@ def test_a_quantized_text_task_matches_qwix_direct_logits_and_generation(dtype, 
     expected_logits = jax.jit(reference.apply)(expected_variables, prompt)
     logits = jax.jit(served.model.apply)(served.variables, prompt)
     np.testing.assert_array_equal(logits, expected_logits)
-    assert float(jnp.max(jnp.abs(logits - model.apply(variables, prompt)))) > 1e-3
+    assert not np.array_equal(logits, model.apply(variables, prompt))
     assert jnp.dtype(qtype) in {leaf.dtype for leaf in jax.tree.leaves(served.variables)}
     assert jnp.dtype(qtype) not in {leaf.dtype for leaf in jax.tree.leaves(task.variables)}
     actual = served(prompt, key=7).host()
@@ -581,7 +717,7 @@ def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_
     fields = {"op_names": ("dot_general", "einsum", "dot")} if weight_only else {}
     rules = [qwix.QuantizationRule(module_path=FLUX_BLOCKS[0], weight_qtype=qtype,
                                   act_qtype=None if weight_only else qtype, **fields)]
-    reference = qwix.quantize_model(task.model, qwix.PtqProvider(rules),
+    reference = quantize_with(task.model, qwix.PtqProvider(rules),
                                     methods=entry_methods(task.model))
     example = task.prepare("", key=0, steps=1)
     own = {name: tree for name, tree in task.variables.items() if name not in ("encoders", "autoencoder")}
@@ -604,7 +740,7 @@ def test_a_quantized_image_task_matches_qwix_direct_prediction_and_samples(flux_
     wanted = jax.jit(reference.apply)(expected, latent, times, **example.conditions)
     np.testing.assert_array_equal(prediction, wanted)
     unquantized = task.model.apply(own, latent, times, **example.conditions)
-    assert float(jnp.abs(prediction - unquantized).max()) > 1e-3
+    assert not np.array_equal(prediction, unquantized)
     direct = dataclasses.replace(task, model=reference, variables={**task.variables, **expected})
     np.testing.assert_array_equal(served(["a red bird"], steps=2, key=1).host().images,
                                   direct(["a red bird"], steps=2, key=1).host().images)
@@ -627,7 +763,9 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
     task = TextGeneration(model, host, sampling=Sampling(temperature=0))
     served = task.quantized(spec)
     assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(served.variables))
-    reference = qwix.quantize_model(model, qwix.PtqProvider([
+    # The weights its generations read are placed once, a quantized kernel's buffers included.
+    assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(served.placed))
+    reference = quantize_with(model, qwix.PtqProvider([
         qwix.QuantizationRule(module_path=".*_proj", weight_qtype=jnp.int8,
                               op_names=("dot_general", "einsum", "dot"))]),
         methods=entry_methods(model))
@@ -641,15 +779,27 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
                                   expected(prompt, 3, key=7).host().tokens)
 
 
+PACKED_SEEDS = 256
+"""The packed quantized pipeline's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`
+on armada."""
+
+
 def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_model():
+    """`dew.pipeline` packs a decoder's projections before quantizing them; served packed, its logits
+    and its draws' log-likelihoods, a task's and a server's, are on par (check 1) with the canonical
+    tree's quantized the same way, over drawn prompts, from the quantized model's own float64 value:
+    the unquantized model in float64 over the canonical served weights dequantized exactly (int8
+    times scale in float64; weight-only, the activations are not quantized). The greedy draws are the
+    canonical ones, and their behaviour log-likelihoods its exact zeros."""
     from pathlib import Path
 
     import dew
     from dew.inference.serving import Server
     from dew.interop import Pretrained
+    from dew.quantization import Annotated
     from dew.sampling import Sampling
 
-    pytest.importorskip("qwix")
+    qwix = pytest.importorskip("qwix")
     directory = Path(__file__).parent / "fixtures/hf/llama-tiny"
     spec = Quantization(weight_only=True, patterns=(".*_proj",))
     canonical = Pretrained.load(directory, dtype="float32").text_generation(
@@ -657,18 +807,187 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
     packed = dew.pipeline(str(directory), dtype="float32")
     reference = canonical.quantized(spec)
     served = packed.quantized(spec)
-    tokens = jnp.asarray([[1, 2, 3]], jnp.int32)
-    np.testing.assert_allclose(served.model.apply(served.variables, tokens),
-                               reference.model.apply(reference.variables, tokens), atol=2e-6, rtol=2e-6)
-    expected = reference(tokens, 4, key=5).host()
-    actual = served(tokens, 4, key=5).host()
-    np.testing.assert_array_equal(actual.tokens, expected.tokens)
-    np.testing.assert_allclose(actual.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
-    np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=2e-6, rtol=2e-6)
     server = Server.from_task(served, slots=max(2, jax.device_count()), capacity=64)
-    drawn = server([[1, 2, 3]], 4, key=5)[0].host()
-    np.testing.assert_array_equal(drawn.tokens, expected.tokens)
-    np.testing.assert_allclose(drawn.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
+    vocab = canonical.model.vocab_size
+
+    def prompt_of(seed) -> np.ndarray:
+        return np.random.default_rng(int(seed)).integers(1, vocab, size=(1, 3)).astype(np.int32)
+
+    @functools.cache
+    def drawn(seed: int):
+        """The canonical task's, the packed task's and the packed server's draws from the seed's prompt."""
+        prompt = prompt_of(seed)
+        expected = reference(prompt, 4, key=seed).host()
+        actual = served(prompt, 4, key=seed).host()
+        from_server = server([prompt[0].tolist()], 4, key=seed)[0].host()
+        for found in (actual, from_server):
+            np.testing.assert_array_equal(found.tokens, expected.tokens)
+            np.testing.assert_array_equal(found.behavior_log_probs, expected.behavior_log_probs)
+        return expected, actual, from_server
+
+    def raw(generation):
+        return generation.raw_log_probs[0, :generation.lengths[0]]
+
+    @as_given
+    def packed_side(seed):
+        _, actual, from_server = drawn(int(seed))
+        return {"logits": np.asarray(served.model.apply(served.variables, prompt_of(seed))),
+                "task": raw(actual), "server": raw(from_server)}
+
+    @as_given
+    def canonical_side(seed):
+        expected, _, _ = drawn(int(seed))
+        return {"logits": np.asarray(reference.model.apply(reference.variables, prompt_of(seed))),
+                "task": raw(expected), "server": raw(expected)}
+
+    def exact(params):
+        """The served weights as the float64 values they hold: each quantized kernel's integers times
+        its scales, computed in float64."""
+        def value(node):
+            return qwix.dequantize(node.array.astype(jnp.float64)) if isinstance(node, Annotated) else node
+        return jax.tree.map(value, params, is_leaf=lambda node: isinstance(node, Annotated))
+
+    wide = canonical.model.clone(dtype=jnp.float64)
+
+    def truth(seed):
+        """The quantized model's float64 logits over the seed's prompt and its raw log-likelihood of
+        the canonical draw's tokens, teacher-forced."""
+        expected, _, _ = drawn(int(seed))
+        weights = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64)
+                               if np.issubdtype(np.asarray(leaf).dtype, np.floating) else leaf,
+                               {**reference.variables, "params": exact(reference.variables["params"])})
+        prompt = prompt_of(seed)
+        tokens = expected.tokens[0, expected.prompt_width:expected.prompt_width + expected.lengths[0]]
+        log_probs = jax.nn.log_softmax(wide.apply(weights, np.concatenate([prompt[0], tokens])[None])[0], -1)
+        width = prompt.shape[1]
+        picked = np.asarray(log_probs[np.arange(width - 1, width - 1 + len(tokens)), tokens])
+        return {"logits": np.asarray(wide.apply(weights, prompt)), "task": picked, "server": picked}
+
+    assert_as_exact(packed_side, canonical_side, lambda seed: (np.int32(seed),), "packed quantized pipeline",
+                    seeds=PACKED_SEEDS, truth_fn=truth)
+
+
+def test_a_program_finds_every_quantized_tower_its_models_hold():
+    """The options a program compiles with read the quantization of every model it is handed and every
+    tower those hold (`quantizations`): a quantized text transformer inside a condition's encoder record,
+    inside the tuple of a task's encoders, counts as a quantized denoiser handed alone does, and an
+    unquantized one adds nothing."""
+    from dew.nn.kernels.options import quantizations
+
+    pytest.importorskip("qwix")
+
+    @dataclasses.dataclass(frozen=True)
+    class Encoder:
+        transformer: nn.Module
+        params: dict
+
+    spec = Quantization(dtype="int8")
+    plain = tiny()
+    quantized = spec.apply(plain)
+    weights = {"params": {"kernel": np.zeros((2, 2), np.float32)}}
+    assert quantizations(plain, (("textcontext", Encoder(plain, weights)),)) == []
+    held = quantizations((("textcontext", Encoder(quantized, weights)),))
+    assert [found.dtype for found in held] == ["int8"]
+    assert quantizations(quantized) == held
+    # A FrozenDict makes each nested mapping as it is read: a tower behind fifty such siblings is found.
+    nested = FrozenDict({f"branch_{index}": {"leaf": {"value": np.zeros(())}} for index in range(50)}
+                        | {"tower": {"encoder": Encoder(quantized, weights)}})
+    assert [found.dtype for found in quantizations(nested)] == ["int8"]
+
+
+def test_a_diffusion_step_compiles_for_the_quantized_text_tower_it_encodes_with():
+    """A text-to-image objective's programs run its conditions' encoders and its autoencoder beside its
+    denoiser (`Objective.towers`), so the options its step and its samples compile with read a quantized
+    text tower (`compiler_options`) as they read a quantized denoiser."""
+    from pathlib import Path
+
+    from dew.diffusion import presets
+    from dew.inputs import Condition, Field, InputSpec
+    from dew.inputs.encoders import CLIPText
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.nn.kernels.options import quantizations
+    from dew.objectives.diffusion import DiffusionObjective
+
+    pytest.importorskip("qwix")
+    encoder = CLIPText.from_pretrained(str(Path(__file__).parent / "fixtures" / "clip" / "tiny"))
+
+    def objective(tower):
+        return DiffusionObjective(SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
+                                            mlp_ratio=1),
+                                  presets.Flow(), InputSpec(Field("image", (8, 8, 3)),
+                                                            {"textcontext": Condition(tower)}),
+                                  guidance=None, steps=2)
+
+    assert quantizations(*objective(encoder).towers()) == []
+    tower = Quantization(dtype="int8").apply(encoder.transformer)
+    quantized = dataclasses.replace(encoder, transformer=tower)
+    assert [found.dtype for found in quantizations(*objective(quantized).towers())] == ["int8"]
+
+
+SPLIT_SEEDS = 16
+"""The split quantized tree's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on
+armada."""
+
+
+def test_an_objective_over_a_quantized_packed_task_holds_the_canonical_tree():
+    """A task's tree quantized for serving holds its projections packed; an objective built over it, a
+    distillation teacher's, holds the model's canonical tree (`dew.inference.projections.unpacked`), each
+    member the packed kernel's columns quantized as they were (`split_columns`), and computes logits on
+    par (check 1) with the served task's over drawn prompts, from the quantized model's own float64
+    value: the unquantized model in float64 over the served packed weights dequantized exactly. A
+    rule that quantizes activations and names the packed site alone keeps that group packed, its members
+    named by no rule: the objective's forward is the served task's."""
+    from pathlib import Path
+
+    import dew
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective
+    from dew.quantization import Annotated
+
+    qwix = pytest.importorskip("qwix")
+    directory = Path(__file__).parent / "fixtures/hf/llama-tiny"
+    served = dew.pipeline(str(directory), dtype="float32").quantized(
+        Quantization(weight_only=True, patterns=(".*_proj",)))
+    assert "qkv_proj" in served.variables["params"]["layers_0"]["self_attn"]
+    held = LMObjective(served.model, 3, variables=served.variables).variables
+    layer, packed_layer = held["params"]["layers_0"], served.variables["params"]["layers_0"]
+    assert "qkv_proj" not in layer["self_attn"] and "gate_up_proj" not in layer["mlp"]
+    for (block, packed_name), names in ((("self_attn", "qkv_proj"), ("q_proj", "k_proj", "v_proj")),
+                                        (("mlp", "gate_up_proj"), ("gate_proj", "up_proj"))):
+        if packed_name not in packed_layer[block]:
+            continue
+        members = [qwix.dequantize(layer[block][name]["kernel"].array) for name in names]
+        np.testing.assert_array_equal(np.concatenate(members, axis=-1),
+                                      qwix.dequantize(packed_layer[block][packed_name]["kernel"].array))
+    canonical = Pretrained.load(directory, dtype="float32").model
+    wide = canonical.clone(dtype=jnp.float64)
+    vocab = canonical.vocab_size
+
+    def draw(seed):
+        return (np.random.default_rng([0x1313, seed]).integers(1, vocab, size=(2, 5)).astype(np.int32),)
+
+    def value(node):
+        """A leaf in float64: a quantized kernel its integers times its scales."""
+        if isinstance(node, Annotated):
+            return np.asarray(qwix.dequantize(node.array.astype(jnp.float64)), np.float64)
+        floating = np.issubdtype(np.asarray(node).dtype, np.floating)
+        return np.asarray(node, np.float64) if floating else np.asarray(node)
+
+    with jax.enable_x64(new_val=True):
+        weights = jax.tree.map(value, dict(served.variables),
+                               is_leaf=lambda node: isinstance(node, Annotated))
+
+    assert_as_exact(lambda tokens: served.model.apply(held, tokens),
+                    lambda tokens: served.model.apply(served.variables, tokens), draw,
+                    "split quantized tree", seeds=SPLIT_SEEDS,
+                    truth_fn=lambda tokens: wide.apply(weights, tokens))
+    packed_only = dew.pipeline(str(directory), dtype="float32").quantized(
+        Quantization(patterns=(".*/qkv_proj",)))
+    kept = LMObjective(packed_only.model, 3, variables=packed_only.variables).variables
+    assert "qkv_proj" in kept["params"]["layers_0"]["self_attn"]
+    tokens = draw(0)[0]
+    np.testing.assert_array_equal(packed_only.model.apply(kept, tokens),
+                                  packed_only.model.apply(packed_only.variables, tokens))
 
 
 def test_a_quantized_multimodal_task_keeps_its_processor_and_media():
@@ -725,7 +1044,8 @@ def test_quantized_training_differentiates_through_complex_matmuls_in_float():
     to the real Dense alone. Observed on CPU: bitwise equal, 2.1e-02 from fp32
     in the kernel's gradient. Before, Qwix quantized the real operand of a
     real-by-complex matmul, its backward returned a complex gradient for
-    that real operand, and `jax.grad` failed on it."""
+    that real operand, and `jax.grad` failed on it. The kernel's gradient is
+    not the float one: quantization reached the Dense."""
     qwix = pytest.importorskip("qwix")
     from flax import linen as nn
 
@@ -741,7 +1061,7 @@ def test_quantized_training_differentiates_through_complex_matmuls_in_float():
     model = Rotated()
     x = jax.random.normal(jax.random.key(0), (4, 16))
     variables = model.init(jax.random.key(1), x)
-    reference = qwix.quantize_model(model, qwix.QtProvider(
+    reference = quantize_with(model, qwix.QtProvider(
         [qwix.QtRule(module_path="proj", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
 
     def value_and_gradients(module):
@@ -752,17 +1072,20 @@ def test_quantized_training_differentiates_through_complex_matmuls_in_float():
     want = value_and_gradients(reference)
     jax.tree.map(np.testing.assert_array_equal, got, want)
     _, (kernel_gradient, _) = value_and_gradients(model)
-    error = jnp.linalg.norm(
-        got[1][0]["params"]["proj"]["kernel"] - kernel_gradient["params"]["proj"]["kernel"]
-    )
-    assert 0.0 < float(error / jnp.linalg.norm(kernel_gradient["params"]["proj"]["kernel"])) < 0.05
+    assert not np.array_equal(got[1][0]["params"]["proj"]["kernel"],
+                              kernel_gradient["params"]["proj"]["kernel"])
 
 
 def test_serving_leaves_complex_matmuls_in_float():
     """Qwix quantizes real values only; a complex matmul, like the S5 scan's
-    in the hybrid DiT, runs unquantized beside the quantized Dense, within
-    int8 rounding of float. Observed on CPU: 4e-03 relative."""
-    pytest.importorskip("qwix")
+    in the hybrid DiT, runs unquantized beside the quantized Dense: the
+    served forward is Qwix's own serving of the Dense alone, bit for bit, and
+    not the float forward. Observed on CPU: 4e-03 relative from float."""
+    import functools
+
+    from dew.quantization import entry_methods
+
+    qwix = pytest.importorskip("qwix")
     from flax import linen as nn
 
     class Rotated(nn.Module):
@@ -777,47 +1100,70 @@ def test_serving_leaves_complex_matmuls_in_float():
     x = jax.random.normal(jax.random.key(0), (4, 16))
     variables = model.init(jax.random.key(1), x)
     served, served_variables = quantize_for_serving(model, variables, Quantization(), x)
-    plain = model.apply(variables, x)
-    error = jnp.linalg.norm(served.apply(served_variables, x) - plain) / jnp.linalg.norm(plain)
-    assert 0.0 < float(error) < 0.02
+    reference = quantize_with(model, qwix.PtqProvider([qwix.QuantizationRule(
+        module_path="Dense_0", weight_qtype=jnp.int8, act_qtype=jnp.int8)]), methods=entry_methods(model))
+    abstract = jax.eval_shape(functools.partial(reference.init, jax.random.key(1), x))
+    expected = {**variables, "params": qwix.quantize_params(variables["params"], abstract["params"])}
+    found = served.apply(served_variables, x)
+    np.testing.assert_array_equal(found, reference.apply(expected, x))
+    assert not np.array_equal(found, model.apply(variables, x))
+
+
+PIPELINE_SEEDS = 512
+"""The quantized pipeline's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on
+armada."""
 
 
 @pytest.mark.mesh
 def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     """The int8 trunk over two stages on the eight simulated devices: finite
-    loss and gradients, and the loss within int8 rounding of the plain
-    wrapped loop's, the way the bf16 pipeline test holds its policy's
-    rounding. Observed on CPU: 1.6e-03 on a loss of order 5."""
+    loss and gradients, and the loss on par with the plain wrapped loop's
+    (check 1) from the unquantized model's float64 loss, over drawn weights
+    and tokens: the pipeline quantizes its microbatches as the loop
+    quantizes the batch, the way the bf16 pipeline test holds its policy's
+    rounding. (The gradients are not drawn: int8 rounding is
+    discontinuous, so a gradient's error from the float model jumps where a
+    value crosses a level, and the loop's own does not resolve within 512
+    seeds.)"""
     pytest.importorskip("qwix")
     model = tiny(num_layers=4)
-    variables = model.init(jax.random.key(0), jnp.ones((1, SEQ_LEN), jnp.int32))
     qmodel = Quantization().apply(model)
-    rows = np.random.default_rng(0).integers(0, VOCAB, size=(8, SEQ_LEN + 1)).astype(np.int32)
-    batch = {"text": rows}
+    info = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
+    init = jax.jit(model.init)
 
-    def run(spec, microbatches=None):
-        objective = LMObjective(qmodel, SEQ_LEN)
+    def draw(seed):
+        variables = init(jax.random.key(seed), jnp.ones((1, SEQ_LEN), jnp.int32))
+        rows = np.random.default_rng(seed).integers(0, VOCAB, size=(8, SEQ_LEN + 1)).astype(np.int32)
+        # A step's loss, taken with its backward under its own cotangent, one.
+        return variables, rows, np.float32(1)
+
+    def gradient(objective):
+        def step(params, variables, batch, cotangent):
+            return with_gradients(lambda params: objective.scalar_loss(
+                {**variables, "params": params}, batch, info)[0])(params, cotangent)
+        return jax.jit(step)
+
+    def runner(spec, microbatches=None):
         mesh = spec.build()
-        placed = jax.device_put(
-            variables, Layout(min_shard=256).shardings(mesh, variables))
-        placed_batch = shard_batch(mesh, batch)
-        info = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3),
-                    ema=None)
+        program = gradient(LMObjective(qmodel, SEQ_LEN))
 
-        def loss(params):
-            return objective.scalar_loss({**variables, "params": params},
-                                  placed_batch, info)
+        @as_given
+        def run(variables, rows, cotangent):
+            placed = jax.device_put(variables, Layout(min_shard=256).shardings(mesh, variables))
+            with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
+                value, grads = program(placed["params"], placed, shard_batch(mesh, {"text": rows}), cotangent)
+            return np.asarray(value), jax.tree.map(np.asarray, grads)
+        return run
 
-        with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
-            (value, _), grads = jax.jit(
-                jax.value_and_grad(loss, has_aux=True))(placed["params"])
-        return float(value), jax.tree.map(np.asarray, grads)
-
-    loss, _grads = run(MeshSpec(fsdp=8))
-    piped, piped_grads = run(MeshSpec(fsdp=4, stage=2), 2)
-    assert np.isfinite(loss) and np.isfinite(piped)
-    assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(piped_grads))
-    assert abs(loss - piped) < 1e-2 * max(1.0, abs(loss)), (loss, piped)
+    unquantized = gradient(LMObjective(model.clone(dtype=jnp.float64), SEQ_LEN))
+    loop, piped = runner(MeshSpec(fsdp=8)), runner(MeshSpec(fsdp=4, stage=2), 2)
+    loss, grads = piped(*draw(0))
+    assert np.isfinite(loss) and all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(grads))
+    assert_as_exact(as_given(lambda *inputs: {"loss": piped(*inputs)[0]}),
+                    as_given(lambda *inputs: {"loss": loop(*inputs)[0]}),
+                    draw, "quantized pipeline loss", seeds=PIPELINE_SEEDS,
+                    truth_fn=lambda variables, rows, cotangent: {"loss": np.asarray(unquantized(
+                        variables["params"], variables, {"text": rows}, cotangent)[0])})
 
 
 def test_stochastic_rounding_draws_from_its_own_stream():
@@ -851,8 +1197,9 @@ def test_an_objective_rounds_its_gradients_from_the_step_key():
     rounding: the step's key alone feeds Qwix's rounding stream, which the
     objective folds off the key it hands dropout. The same key repeats the
     gradients, as every process of a pool holds the same step key; another
-    key moves them, by far more than a repeat (GPU embedding scatters add
-    in any order), and deterministic rounding does not move with the key."""
+    key moves them, and deterministic rounding does not move with the key.
+    (The cuda lane runs the suite under --xla_gpu_deterministic_ops, so a
+    repeat is bitwise there too.)"""
     pytest.importorskip("qwix")
     batch = token_batch()
 
@@ -863,18 +1210,15 @@ def test_an_objective_rounds_its_gradients_from_the_step_key():
         return jax.jit(jax.grad(lambda params: objective.scalar_loss(
             {**variables, "params": params}, batch, step), has_aux=True))(variables["params"])[0]
 
-    def apart(first, second):
-        return max(float(jnp.max(jnp.abs(a - b)))
-                   for a, b in zip(jax.tree.leaves(first), jax.tree.leaves(second), strict=True))
-
     stochastic = Quantization(bwd_qtype="int8", bwd_stochastic_rounding="uniform")
     drawn = gradients(stochastic, jax.random.key(0))
     assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(drawn))
-    repeat = apart(drawn, gradients(stochastic, jax.random.key(0)))
-    moved = apart(drawn, gradients(stochastic, jax.random.key(1)))
+    jax.tree.map(np.testing.assert_array_equal, drawn, gradients(stochastic, jax.random.key(0)))
+    assert not all(np.array_equal(first, second) for first, second in zip(
+        jax.tree.leaves(drawn), jax.tree.leaves(gradients(stochastic, jax.random.key(1))), strict=True))
     fixed = Quantization(bwd_qtype="int8")
-    still = apart(gradients(fixed, jax.random.key(0)), gradients(fixed, jax.random.key(1)))
-    assert moved > 100 * max(repeat, still, 1e-9), (moved, repeat, still)
+    jax.tree.map(np.testing.assert_array_equal, gradients(fixed, jax.random.key(0)),
+                 gradients(fixed, jax.random.key(1)))
 
 
 # --------------------------------------------------------------------------
@@ -898,16 +1242,18 @@ def image_batches(batch):
 def diffusion_run(directory, batch=RUN_BATCH, **trainer):
     """The smallest unconditional diffusion run: a tiny DiT over 8-pixel
     images, one step, nothing written but the record."""
-    from dew.config import ModelConfig, TrainerConfig
-    from dew.config.data import ImageData
-    from dew.objectives.diffusion import DiffusionRunConfig
+    from diffusion_support import images_of
+
+    from dew.config import TrainerConfig
+    from dew.config.diffusion import DiffusionRunConfig
+    from dew.registry import ModelConfig
 
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,
                                          "num_layers": 1, "num_heads": 2, "dtype": "float32"}),
-        data=ImageData(source="tfds://oxford_flowers102", split="all", image_size=RES), text=None,
+        data=images_of("tfds://oxford_flowers102", RES, batch=batch), text=None,
             val_metrics=(),
-        trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory), batch_size=batch,
+        trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory),
                               steps=1, eval_every=None, checkpoint_every=None,
                               compilation_cache_dir=None, **trainer), objective=ObjectiveConfig("diffusion",
                               {"guidance": None, "steps": 2}))
@@ -968,23 +1314,92 @@ def test_the_trainer_knob_quantizes_what_a_distillation_trains_and_not_its_teach
                                   jax.jit(teacher.apply)(variables, tokens))
 
 
-def test_a_matmul_that_pins_its_precision_runs_unquantized_at_it():
-    """An accumulation precision past the default has no quantized form, so a
-    matmul that pins one, as an fp32 zone does, runs at it unquantized: its
-    output is the unquantized model's, where the default-precision one moves."""
-    pytest.importorskip("qwix")
-    x = jnp.linspace(-2, 2, 16, dtype=jnp.float32).reshape(2, 8).astype(jnp.bfloat16)
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("precision", [None, "highest"])
+def test_a_matmul_quantizes_whatever_precision_it_pins(precision, dtype):
+    """A quantized product has no precision to honour, so a matmul a rule matches quantizes
+    whatever precision it pins: a float32 model's layers pin float32 products
+    (`float32_products`) and quantize as a bfloat16 model's do."""
+    x = jnp.linspace(-2, 2, 16, dtype=jnp.float32).reshape(2, 8).astype(dtype)
+    model = nn.Dense(16, dtype=dtype, param_dtype=dtype, precision=precision)
+    variables = model.init(jax.random.key(0), x)
+    quantized = np.asarray(Quantization().apply(model).apply(variables, x), np.float32)
+    assert not np.array_equal(quantized, np.asarray(model.apply(variables, x), np.float32))
 
-    def outputs(precision):
-        model = nn.Dense(16, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16, precision=precision)
-        variables = model.init(jax.random.key(0), x)
-        return (np.asarray(Quantization().apply(model).apply(variables, x), np.float32),
-                np.asarray(model.apply(variables, x), np.float32))
 
-    pinned, plain = outputs("highest")
-    np.testing.assert_array_equal(pinned, plain)
-    quantized, plain = outputs(None)
-    assert not np.array_equal(quantized, plain)
+class Calls(nn.Module):
+    """A model whose call is `function` of its operands, for `Quantization.apply` to wrap."""
+
+    function: Callable[..., jax.Array]
+
+    def __call__(self, *operands):
+        return self.function(*operands)
+
+
+def zone_cases(dtype) -> dict[str, tuple[Callable[..., jax.Array], tuple, dict]]:
+    """Each `UNQUANTIZED` function, its operands in `dtype` and its keywords."""
+    rng = np.random.default_rng(0)
+
+    def normal(*shape):
+        return jnp.asarray(rng.standard_normal(shape), jnp.float32).astype(dtype)
+
+    pole = jnp.exp(jax.lax.complex(-jnp.linspace(0.05, 0.4, 4), jnp.linspace(0.3, 2.0, 4)))
+    # Each row of -1, 0 and 1 sits one step from one codeword and a step and 1/128 across from
+    # another: a gap of 2**-14 in squared distance, which the float scores, sums of multiples of
+    # 2**-14 below 2**7, hold exactly in either dtype, and an int8 product's rounding reorders.
+    whole = np.random.default_rng(1).integers(-1, 2, (64, 32)).astype(np.float32)
+    whole[:, -1] = 0
+    steps = np.eye(32, dtype=np.float32)[np.random.default_rng(2).integers(0, 31, 64)]
+    across = np.eye(32, dtype=np.float32)[-1] / 128
+    rows = jnp.asarray(whole, dtype)
+    codebook = jnp.asarray(np.concatenate([whole + steps, whole - steps + across]), dtype)
+    return {
+        "dew.nn.ssm.diagonal_recurrence": (diagonal_recurrence, (pole, normal(2, 12, 8)), {"chunk": 4}),
+        "dew.nn.attention_residuals.depth_mixed": (
+            depth_mixed, (normal(2, 3, 4, 8), normal(8), normal(2, 3, 4, 8)), {}),
+        "dew.nn.quantizers.nearest_codewords": (nearest_codewords, (rows, codebook), {}),
+        "dew.nn.kv_cache.rotated": (rotated, (normal(2, 4, 8), hadamard(8)), {}),
+        "dew.lora._updated": (lora_update, (normal(8, 6), normal(8, 2), normal(2, 6)), {"scale": 2.0}),
+    }
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("name", sorted(UNQUANTIZED))
+def test_a_function_the_model_keeps_in_float_runs_unquantized(name, dtype):
+    """Each function `UNQUANTIZED` names runs in a quantized model as in the unquantized one,
+    bitwise, in a float32 and a bfloat16 model, the unquantized one summing its products as Qwix's
+    do (`FP32_SUMS`), where a copy of its code under another name, which the table does not reach,
+    quantizes its products and moves."""
+    function, operands, keywords = zone_cases(dtype)[name]
+    copy = types.FunctionType(function.__code__, function.__globals__, f"{function.__name__}_copy",
+                              function.__defaults__, function.__closure__)
+    copy.__kwdefaults__ = function.__kwdefaults__
+
+    def ran(function, quantize: bool) -> np.ndarray:
+        model = Calls(functools.partial(function, **keywords))
+        # Qwix quantizes a product as it is traced, and jnp.matmul is jitted, so each run traces
+        # afresh: one that reused another's cached trace would take its products, quantized or not.
+        jax.clear_caches()
+        if quantize:
+            return np.asarray(Quantization().apply(model).apply({}, *operands))
+        with jax.default_matmul_precision(FP32_SUMS):
+            return np.asarray(model.apply({}, *operands))
+
+    plain = ran(function, quantize=False)
+    np.testing.assert_array_equal(ran(function, quantize=True), plain)
+    np.testing.assert_array_equal(ran(copy, quantize=False), plain)
+    assert not np.array_equal(ran(copy, quantize=True), plain)
+
+
+def test_an_einsum_of_three_operands_runs_as_the_unquantized_model_runs_it():
+    """Qwix quantizes a two-operand einsum alone and raises on any other, so the provider runs one
+    of three operands, torch's bicubic resampling among them, as the unquantized model does where
+    it sums as Qwix's products do (`FP32_SUMS`)."""
+    x = jnp.asarray(np.random.default_rng(0).standard_normal((1, 4, 5, 3)), jnp.float32)
+    model = Calls(functools.partial(torch_bicubic_resize, height=7, width=9))
+    with jax.default_matmul_precision(FP32_SUMS):
+        plain = model.apply({}, x)
+    np.testing.assert_array_equal(Quantization().apply(model).apply({}, x), plain)
 
 
 def assert_computed_as_on_the_host(run, label: str) -> None:
@@ -1021,10 +1436,11 @@ def with_triton_gemms(flow) -> None:
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
              if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_enable_triton_gemm"))]
     script = f"import {Path(__file__).stem} as tests; tests.{flow.__name__}()"
+    # pytest's own path (pyproject's `pythonpath`: the sources and the repository root) and this directory.
+    path = os.pathsep.join([str(here.parent / "src"), str(here.parent), str(here)])
     run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=1200,
                          cwd=here, env={**os.environ, "XLA_FLAGS": " ".join(flags),
-                                        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-                                        "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
+                                        "XLA_PYTHON_CLIENT_PREALLOCATE": "false", "PYTHONPATH": path})
     assert run.returncode == 0, run.stderr[-4000:]
 
 
@@ -1072,6 +1488,37 @@ def image_flow():
         return walked(placed(prepared, dtype), steps=2, key=1, decode=False).host().latents
 
     assert_computed_as_on_the_host(run, "an int8 image task's latents")
+
+
+def test_an_objective_encodes_through_an_int8_text_tower_as_the_host_does():
+    """A program an objective compiles (`Objective.program`) compiles for every tower it runs
+    (`Objective.towers`), so a prompt encoded there by an int8 CLIP tower, the denoiser beside it in float,
+    is as exact as the host's encoding. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(int8_tower_flow)
+
+
+def int8_tower_flow():
+    from dew.diffusion import presets
+    from dew.inputs import Condition, Field, InputSpec
+    from dew.inputs.encoders import CLIPText
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+
+    encoder = CLIPText.from_pretrained(str(Path(__file__).parent / "fixtures" / "clip" / "tiny"))
+    tower = Quantization(dtype="int8").apply(encoder.transformer)
+    tokens = encoder.tokenize(["a red bird", "a blue fish"])
+    held = jax.device_get(encoder.params)
+
+    def run(dtype):
+        encoding = dataclasses.replace(encoder, transformer=tower.clone(dtype=dtype))
+        objective = DiffusionObjective(
+            SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1, dtype=dtype),
+            presets.Flow(), InputSpec(Field("image", (8, 8, 3)), {"textcontext": Condition(encoding)}),
+            guidance=None, steps=2)
+        encode = objective.program("prompt encoding", objective.encode)
+        return encode({"textcontext": placed(held, dtype)}, {"textcontext": tokens})["textcontext"].hidden
+
+    assert_computed_as_on_the_host(run, "an int8 text tower's encoding")
 
 
 def test_an_int8_guide_walks_as_the_host_does():
@@ -1164,8 +1611,7 @@ def training_on_xla_default_options_flow():
 def assert_step_moves_by_the_hosts_gradient():
     """One SGD step of the trainer over a decoder quantized to int8 moves its weights by the gradient
     of its loss the host computes."""
-    from dew.config.data import RecordsData, loader
-    from dew.data import Loading
+    from dew.data import Loading, Memory
     from dew.training.trainer import Trainer
 
     # Eight rows, one on each of the host's eight test devices.
@@ -1173,8 +1619,8 @@ def assert_step_moves_by_the_hosts_gradient():
     batch = {"text": np.random.default_rng(0).integers(0, VOCAB, (8, length + 1)).astype(np.int32)}
     held = jax.device_get(tiny().init(jax.random.key(0), jnp.ones((1, length), jnp.int32)))
     objective = LMObjective(spec.apply(tiny()), seq_len=length, ema_decay=None, variables=held)
-    data = loader(RecordsData(source=[{"text": row} for row in batch["text"]]), batch=8,
-                  loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
+    rows = Memory([{"text": row} for row in batch["text"]]).read("memory")
+    data = rows.shuffle().repeat().batch(8).loading(Loading(workers=0, threads=1, read_buffer=1))
     state = Trainer(objective, optax.sgd(1.0), key=0).fit(data, steps=1, log_every=100)
     moved = jax.tree.map(lambda before, after: np.asarray(before, np.float64) - np.asarray(after, np.float64),
                          held["params"], jax.device_get(state.variables["params"]))
@@ -1199,3 +1645,54 @@ def assert_step_moves_by_the_hosts_gradient():
         with jax.enable_x64(new_val=True):
             truth = flat(jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), gradient(jnp.float64)))
     assert_as_exact_as_the_reference(flat(moved), reference, truth, "an int8 training step's gradient")
+
+
+@pytest.mark.parametrize("tile", [None, 16], ids=["per channel", "tiled"])
+def test_a_quantized_packed_kernel_splits_into_its_members_bit_for_bit(tile):
+    """A served task's packed query, key and value kernel, Qwix's quantized array in its serving wrapper,
+    split by its members' widths (`split_columns`): each member dequantizes to exactly the packed
+    kernel's dequantized columns, with the wrapper's recipe kept, with the input axis's scales per
+    channel or tiled; Qwix's other layouts split as exactly (scales tiled along the split, one shared
+    scale, a zero point, float8, the other axis), as plain host and device arrays do; a split that would
+    cut a tile, or whose widths do not partition the axis, is refused. A leaf this process cannot
+    materialize whole is `projections.unpacked`'s sharded tests' to cover."""
+    import json
+    from pathlib import Path
+
+    import dew
+    from dew.quantization import split_columns
+
+    qwix = pytest.importorskip("qwix")
+    directory = Path(__file__).parent / "fixtures/hf/llama-tiny"
+    served = dew.pipeline(str(directory), dtype="float32").quantized(
+        Quantization(weight_only=True, patterns=(".*_proj",), tile_size=tile))
+    packed = served.variables["params"]["layers_0"]["self_attn"]["qkv_proj"]["kernel"]
+    config = json.loads((directory / "config.json").read_text())
+    width = packed.array.qvalue.shape[-1]
+    heads, kv_heads = config["num_attention_heads"], config["num_key_value_heads"]
+    head = width // (heads + 2 * kv_heads)
+    widths = (heads * head, kv_heads * head, kv_heads * head)
+    members = split_columns(packed, widths)
+    whole = np.asarray(qwix.dequantize(packed.array))
+    edges = np.cumsum((0, *widths))
+    for member, start, stop in zip(members, edges[:-1], edges[1:], strict=True):
+        assert member.how == packed.how
+        np.testing.assert_array_equal(np.asarray(qwix.dequantize(member.array)), whole[..., start:stop])
+    layouts = {"tiled along the split": {"qtype": jnp.int8, "tiled_axes": {1: 16}},
+               "one scale shared": {"qtype": jnp.int8},
+               "a zero point": {"qtype": jnp.int8, "channelwise_axes": (1,), "calibration_method": "minmax"},
+               "float8": {"qtype": jnp.float8_e4m3fn, "channelwise_axes": (1,)}}
+    for name, how in layouts.items():
+        columns = qwix.quantize(jnp.asarray(whole), **how)
+        halves = split_columns(columns, (16, width - 16))
+        joined = np.concatenate([np.asarray(qwix.dequantize(half)) for half in halves], axis=1)
+        np.testing.assert_array_equal(joined, np.asarray(qwix.dequantize(columns)), err_msg=name)
+    rows = split_columns(qwix.quantize(jnp.asarray(whole), jnp.int8, channelwise_axes=(1,)), (16, 48), axis=0)
+    assert [part.qvalue.shape[0] for part in rows] == [16, 48]
+    for plain in (whole, jnp.asarray(whole)):
+        np.testing.assert_array_equal(np.concatenate(split_columns(plain, widths), axis=-1), whole)
+    with pytest.raises(ValueError):
+        split_columns(qwix.quantize(jnp.asarray(whole), jnp.int8, tiled_axes={1: 16}), (8, width - 8))
+    for wrong in ((), (16,), (16, width), (-16, width + 16)):
+        with pytest.raises(ValueError):
+            split_columns(packed, wrong)

@@ -10,9 +10,10 @@ Within-spread differences mean level, not evidence of a speedup.
 
 Use --torch-python /path/to/pinned/bin/python; the reference validates its
 complete lock before running. The caller's interpreter supplies Dew unless
---dew-python names another. --smoke exercises both real CPU steps and loss
-parity, but cannot pass a performance claim. The record contains both source
-commits, full environments, input hashes, timing windows and scoped peaks.
+--dew-python names another. --smoke exercises both real CPU steps, but cannot
+pass a performance claim. A pairing judges speed alone: whether the two compute
+the same loss is check 1's (tests/reference_error.py). The record contains both
+source commits, full environments, input hashes, timing windows and scoped peaks.
 """
 
 import argparse
@@ -52,7 +53,7 @@ def performance_verdict(dew: list[float], torch: list[float]) -> dict:
 
 
 def compare(records: dict[str, list[dict]], session: str, smoke: bool) -> dict:
-    """Refuse mismatched workloads, sessions or loss before considering speed."""
+    """Refuse mismatched workloads or sessions before considering speed."""
     from qwen35 import WHOLE_PEAK_SCOPE, workload
 
     reference = records["torch"][0]
@@ -89,18 +90,11 @@ def compare(records: dict[str, list[dict]], session: str, smoke: bool) -> dict:
                 raise ValueError("missing whole-run peak")
             if not record["checks"]["finite_losses"] or not record["checks"]["no_timing_window_compilation"]:
                 raise ValueError("non-finite loss or compilation in timing window")
-            loss = record["checks"]["loss_first"]
-            if not math.isclose(loss, reference["checks"]["loss_first"],
-                                rel_tol=2e-5 if smoke else 0.02, abs_tol=2e-6 if smoke else 1e-4):
-                raise ValueError(f"unmatched step-0 loss: {framework} {loss}, "
-                                 f"torch {reference['checks']['loss_first']}")
     rates = {framework: [record["steady"]["window_tokens_per_s"] for record in rounds]
              for framework, rounds in records.items()}
     decision = performance_verdict(rates["dew"], rates["torch"])
     return {**decision, "performance_claim_passed": decision["passed"] and not smoke,
             "speedup_claim_passed": decision["verdict"] == "faster" and not smoke,
-            "loss_parity": True, "loss_tolerance": {"relative": 2e-5 if smoke else 0.02,
-                                                     "absolute": 2e-6 if smoke else 1e-4},
             "window_tokens_per_s": rates,
             "mfu": {key: [row["steady"]["window_mfu"] for row in rows] for key, rows in records.items()},
             "whole_peak_bytes": {key: [row["memory"]["whole_peak_bytes"] for row in rows]
@@ -128,7 +122,8 @@ def arguments(argv=None):
 
 def run(args) -> int:
     """Fresh child processes release their device memory before their partner starts."""
-    from common import git_head, host, write_record
+    from common import host, write_record
+    from reference_source import git_head
 
     root = Path.cwd().resolve()
     args.out = args.out.resolve()

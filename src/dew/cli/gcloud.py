@@ -15,7 +15,7 @@ import threading
 import time
 from collections.abc import Iterable, Sequence
 
-from dew.records import JSON
+from dew._records import JSON
 
 DEAD_STATES = frozenset({"TERMINATED", "PREEMPTED", "DELETING"})
 """The states a TPU does not come back from to READY."""
@@ -101,29 +101,31 @@ class Gcloud:
             line.append(f"--project={self.project}")
         return line
 
-    def run(self, argv: Sequence[str], *, capture: bool = True,
-            check: bool = False) -> subprocess.CompletedProcess[str]:
-        """Run one command. A dry run prints it and reports success."""
+    def run(self, argv: Sequence[str], *, capture: bool = True, check: bool = False,
+            timeout: float | None = None) -> subprocess.CompletedProcess[str]:
+        """Run one command, killed after `timeout` seconds (`subprocess.TimeoutExpired`). A dry run
+        prints it and reports success."""
         argv = list(argv)
         if self.dry_run:
             emit(shlex.join(argv))
             return subprocess.CompletedProcess(argv, 0, "", "")
-        done = subprocess.run(argv, capture_output=capture, text=True)
+        done = subprocess.run(argv, capture_output=capture, text=True, timeout=timeout)
         if check and done.returncode:
             raise SystemExit(said(done) or f"{argv[0]} failed with code {done.returncode}")
         return done
 
-    def json(self, *args: str) -> JSON:
+    def json(self, *args: str, timeout: float | None = None) -> JSON:
         """Run a gcloud command that speaks JSON and parse it: None in a dry run, which prints the
         command instead. A failed command stops dew with gcloud's message, as an answer of nothing
         would read as nothing there (an authentication failure as no TPUs)."""
-        outcome = self.run(self.argv(*args, "--format=json"), check=True)
+        outcome = self.run(self.argv(*args, "--format=json"), check=True, timeout=timeout)
         return json.loads(outcome.stdout) if outcome.stdout.strip() else None
 
-    def nodes(self, zone: str) -> list[Node]:
-        """The TPUs `zone` lists: none in a dry run. A TPU absent from a listing gcloud gave is not
-        there, which a failed describe cannot say apart from gcloud failing."""
-        payload = self.json("compute", "tpus", "tpu-vm", "list", f"--zone={zone}")
+    def nodes(self, zone: str, timeout: float | None = None) -> list[Node]:
+        """The TPUs `zone` lists, asked for at most `timeout` seconds: none in a dry run. A TPU absent
+        from a listing gcloud gave is not there, which a failed describe cannot say apart from gcloud
+        failing."""
+        payload = self.json("compute", "tpus", "tpu-vm", "list", f"--zone={zone}", timeout=timeout)
         if payload is None:
             return []
         if not isinstance(payload, list):
@@ -231,26 +233,32 @@ class Tpu:
             args.append("--recurse")
         return self.vm(*args)
 
-    def describe(self) -> Node | None:
-        """This TPU as its zone lists it, or None where the zone has none of its name: not created
-        yet, or deleted."""
-        return next((node for node in self.gcloud.nodes(self.zone) if node.name == self.name), None)
+    def describe(self, timeout: float | None = None) -> Node | None:
+        """This TPU as its zone lists it, asked for at most `timeout` seconds, or None where the zone
+        has none of its name: not created yet, or deleted."""
+        return next((node for node in self.gcloud.nodes(self.zone, timeout) if node.name == self.name), None)
 
-    def ready(self) -> Node | None:
-        """This TPU once its zone lists it READY, asked every POLL_SECONDS for up to READY_TIMEOUT
+    def ready(self, wait: float = READY_TIMEOUT) -> Node | None:
+        """This TPU once its zone lists it READY, asked every POLL_SECONDS for up to `wait` seconds
         (none in a dry run): a queued resource lists its node only once it is provisioned."""
         if self.gcloud.dry_run:
             return None
-        deadline = time.monotonic() + READY_TIMEOUT
+        deadline = time.monotonic() + wait
+        state = "PENDING"
         while True:
-            node = self.describe()
+            # Each listing has what is left of the wait, so a hung gcloud cannot hold it past its end.
+            try:
+                node = self.describe(timeout=max(deadline - time.monotonic(), 0.0))
+            except subprocess.TimeoutExpired:
+                raise SystemExit(f"{self.name} is still {state} after {wait}s; gcloud did not "
+                                 "answer within the wait") from None
             state = node.state if node else "PENDING"
             if state == "READY":
                 return node
             if state in DEAD_STATES:
                 raise SystemExit(f"{self.name} is {state}")
             if time.monotonic() >= deadline:
-                raise SystemExit(f"{self.name} is still {state} after {READY_TIMEOUT}s")
+                raise SystemExit(f"{self.name} is still {state} after {wait}s")
             emit(f"{self.name} is {state}")
             time.sleep(POLL_SECONDS)
 

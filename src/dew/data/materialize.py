@@ -15,18 +15,32 @@ records the derived order facts a resume checks.
 
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import logging
 from collections.abc import Mapping, Sequence
+from typing import ClassVar
 
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.analysis import _analyzed, _identity, _label, _name
-from dew.data.dataset import Batch, Records
-from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _TokenSplit
+from dew._records import JSON, integer, json_value, record
+from dew.batch import Batch
+from dew.data.analysis import _analyzed, _identity, _label, _name, written
+from dew.data.dataset import Ranges, Records
+from dew.data.lowering import (
+    _cache_inputs,
+    _CachedOutputs,
+    _fill,
+    _Locality,
+    _outputs,
+    _packed,
+    _threads,
+    _TokenSplit,
+)
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
+    Artifact,
     FlatMap,
     Map,
     Mixture,
@@ -40,19 +54,19 @@ from dew.data.pipeline import (
     Windows,
 )
 from dew.data.plan import fingerprint
-from dew.data.sources.base import Read, ShardManifest, Source, _uncounted
-from dew.data.steps.generic import Fields
-from dew.data.steps.text import CountTargets, ValidTargets, targets_changed
-from dew.records import JSON, integer, json_value, record
+from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
+from dew.data.steps.text import CountRule, CountTargets, LayoutRule, ValidTargets, counted_window
 
 _log = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
-class _Memory:
-    """Accepted rows and their facts, keeping measured targets through field projections."""
+class _Memory(View[Source]):
+    """Accepted rows and their facts, keeping measured targets through field projections: the rows
+    a memory read of `source` made by running the pipeline's first stages (`ran`) over its rows."""
 
-    original: Source
+    rows: ClassVar[Rows] = "materialized"
+    source: Source
     held: tuple[Batch | bytes, ...]
     measured: np.ndarray | None
     derived: Mapping[str, str]
@@ -60,23 +74,16 @@ class _Memory:
     identifiers: tuple[tuple[int, ...], ...] = ()
     inputs: int = 0
     ran: tuple[Stage, ...] = ()
-    target_counts: tuple[int, ...] | None = None
-    documents: int | None = None
+    segments: int | None = None
     """The most documents a window holds where `ran` packs them, which its
     batches declare (`Coordinates.max_segments`)."""
-
-    def label(self) -> str:
-        return self.original.label()
-
-    def describe(self) -> str:
-        return self.original.describe()
 
     def fingerprint(self) -> Mapping[str, object]:
         """The rows as a memory read made them: the source it read, the
         derived order facts and the steps it ran, by what they compute. The
         manifest records those steps' modules in its environment."""
         return {
-            "materialized": self.original.fingerprint(),
+            "materialized": self.source.fingerprint(),
             "derived": self.derived,
             "steps": [_identity(stage).semantic() for stage in self.ran],
         }
@@ -90,7 +97,7 @@ class _Memory:
     def metadata(self) -> Mapping[str, object]:
         """Its source's facts, the counts only where it ran no stage over the source's rows, then
         the counts it measured."""
-        stated = self.original.metadata()
+        stated = self.source.metadata()
         return {**(_uncounted(stated) if self.ran else stated), **self.facts, "rows": len(self.held),
                 "accepted": len(self.held)}
 
@@ -98,16 +105,14 @@ class _Memory:
         return self.measured
 
     def locality(self) -> tuple[tuple[int, ...], bool]:
-        if not isinstance(self.original, _Locality) or any(
+        if not isinstance(self.source, _Locality) or any(
             len(identifier) != 1 for identifier in self.identifiers
         ):
             raise ValueError("block shuffle needs an unchanged physical shard index")
-        sizes, remote = self.original.locality()
-        ends = np.cumsum(sizes)
-        selected = np.bincount(
-            [int(np.searchsorted(ends, identifier[0], side="right")) for identifier in self.identifiers],
-            minlength=len(sizes),
-        )
+        sizes, remote = self.source.locality()
+        shards = Ranges(tuple(sizes))
+        selected = np.bincount([shards.holding(identifier[0]) for identifier in self.identifiers],
+                               minlength=len(sizes))
         return tuple(int(size) for size in selected), remote
 
     def manifest(self) -> ShardManifest:
@@ -130,7 +135,10 @@ def _materialize(
     if not isinstance(source, _Memory):
         counter.attempted = len(stored)
     lowering = _analyzed(pipeline, "memory", validation=not training)
-    rows, consumed = _memory_inputs(pipeline, source, stored, counter, lowering.cache)
+    # A cache among the eager stages fills over the whole source here; one after a view of the
+    # inputs is the lowering's, which reads it by input (`_Build.indexed`).
+    eager = lowering.cache if lowering.cache is not None and lowering.eager > lowering.cache else None
+    rows, consumed = _memory_inputs(pipeline, source, stored, counter, eager)
     return _memory_stages(
         pipeline, source, stored, rows, consumed, lowering.eager, counter, training=training
     )
@@ -142,16 +150,29 @@ def _memory_inputs(
     rows: list[tuple[tuple[int, ...], Record]] = []
     consumed = 0
     if artifact_at is not None:
+        # A cache the compiler placed numbers its rows as the maps it stands for do (`_memory_stages`):
+        # by input, as no map expands one (`dew.data.compile._automatic`).
+        stage = pipeline.stages[artifact_at]
+        automatic = isinstance(stage, Artifact) and stage.automatic
         filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory")
-        cached = filled.mapped(pygrain.MapDataset.source(stored), manifest, transform=prefix, source=source)
+        cached = filled.mapped(_cache_inputs(source, stored), manifest, transform=prefix, source=source)
         try:
-            for index in range(len(cached)):
-                outputs = cached[index]
+            if prefix.threads is None:
+                filling = [cached.record(index) for index in range(len(cached))]
+            else:
+                # A fetch with a pool of its own among the cached steps fills that many inputs at once.
+                pool = concurrent.futures.ThreadPoolExecutor(prefix.threads, thread_name_prefix="dew-step")
+                with pool:
+                    filling = list(pool.map(cached.record, range(len(cached))))
+            for index, outputs in enumerate(filling):
                 if not isinstance(outputs, tuple):
                     raise TypeError("cached input must return its tuple of expansion outputs")
                 for child, value in enumerate(_CachedOutputs().flat_map(outputs)):
                     if isinstance(value, Rejected):
                         counter.rejected[value.reason] += 1
+                    elif automatic:
+                        rows.append((source.identifiers[index] if isinstance(source, _Memory) else (index,),
+                                     value))
                     else:
                         rows.append(((index, child), value))
             cached.finish()
@@ -169,6 +190,16 @@ def _memory_inputs(
     return rows, consumed
 
 
+@dataclasses.dataclass(frozen=True)
+class _Fetched:
+    """What a stage makes of one identified row, run on a fetch's own pool."""
+
+    stage: Stage
+
+    def __call__(self, row: tuple[tuple[int, ...], Record]) -> tuple[Record, ...]:
+        return _outputs(self.stage, row[0][0], row[1])
+
+
 def _memory_stages(
     pipeline: Pipeline,
     source: Source,
@@ -182,40 +213,46 @@ def _memory_stages(
 ) -> Pipeline:
     derived: dict[str, str] = {}
     targets: Mapping[str, int] | None = None
-    documents = source.documents if isinstance(source, _Memory) else None
-    counted: dict[tuple[int, ...], int] | None = (
-        dict(zip(source.identifiers, source.target_counts, strict=True))
-        if isinstance(source, _Memory) and source.target_counts is not None
-        else None
-    )
+    # The source examples an objective's expansion read, where one ran here (`FlatMap.examples`).
+    examples: list[tuple[tuple[int, ...], Record]] | None = None
+    documents = source.segments if isinstance(source, _Memory) else None
+    # Whether the rows' targets are counted, which they carry (`recounted`, `counted_window`): by the
+    # memory read this one reads on from, a count step or a layout.
+    counting = isinstance(source, _Memory) and any(
+        isinstance(value, Mapping) and "_dew_valid_targets" in value for value in source.held)
+    # A count step a cache ran before the stages left (`_memory_inputs`) counted these rows too.
+    counting = counting or any(isinstance(stage, Map) and isinstance(stage.step, CountTargets)
+                               for stage in pipeline.stages[:consumed])
+    # The layout facts are numbered by the stages the chain wrote, a cache the compiler placed none.
+    placed = consumed - len(written(pipeline.stages[:consumed]))
     for stage in pipeline.stages[consumed:eager]:
+        counting = counting or isinstance(stage, (Windows, Pack)) or (
+            isinstance(stage, Map) and isinstance(stage.step, CountTargets))
         if isinstance(stage, TokenSplit):
             split = _TokenSplit(pygrain.MapDataset.source([value for _, value in rows]), stage)
-            if counted is not None:
-                counted = {(*rows[row][0], first, last): counted[rows[row][0]]
-                           for row, first, last in split.spans}
             spans = enumerate(split.spans)
             rows = [((*rows[row][0], first, last), split[index]) for index, (row, first, last) in spans]
         elif isinstance(stage, Windows):
             from dew.data.steps.windows import IndexedWindows
 
-            derived[f"accepted_before_windows_{consumed}"] = fingerprint(
+            derived[f"accepted_before_windows_{consumed - placed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
             )
+            rule = LayoutRule.of(record(value, "layout document") for _, value in rows)
             windows = IndexedWindows.from_records(
                 tuple(record(value, "window document") for _, value in rows), stage
             )
             derived["windows"] = fingerprint([windows.size, stage.seq_len, stage.stride])
             rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter,
-                                      stage.fields[0])
+                                      stage.fields[0], rule)
         elif isinstance(stage, Pack):
             from dew.data.packing import _Held, _PackedRows, refuse_overlong
 
-            derived[f"accepted_before_pack_{consumed}"] = fingerprint(
+            derived[f"accepted_before_pack_{consumed - placed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
             )
-            kept = Fields(stage.packed)
-            documents = tuple(kept.map(record(value, "packing document")) for _, value in rows)
+            rule = LayoutRule.of(record(value, "layout document") for _, value in rows)
+            documents = tuple(stage.document(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
             refuse_overlong(sizes, stage, source.describe())
             if stage.policy == "first-fit" and not stage.along:
@@ -226,66 +263,66 @@ def _memory_stages(
                 planned = plan.arrays
                 derived["packing"] = fingerprint([planned["order"].tolist(), planned["starts"].tolist()])
                 packed = _PackedRows(documents, plan)
-                rows = [((plan.at("accepted", index),), packed[index]) for index in range(len(packed))]
                 counter.rejected.update(["zero_targets"] * plan.at("totals", 1))
-                targets = {"valid_targets": plan.at("totals", 0)}
+                # The plan counts every target a window holds; windows of documents counted by a
+                # rule are counted by it (`_targeted`), as an indexed or streamed read's are.
+                rows, targets = _targeted([((plan.at("accepted", index),), packed[index])
+                                           for index in range(len(packed))], counter, stage.fields[0], rule)
             else:
                 # Only first-fit of tokens alone has an indexed plan; the rest is Grain's
                 # own packer, run once over the corpus as an indexed read streams it.
                 packed = list(_packed(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
                 derived["packing"] = fingerprint(sizes)
                 rows, targets = _targeted([((index,), value) for index, value in enumerate(packed)], counter,
-                                          stage.fields[0])
+                                          stage.fields[0], rule)
             ids = f"{stage.fields[0]}_segment_ids"
             documents = max((int(np.asarray(record(value, "packed window")[ids]).max(initial=0))
                              for _, value in rows), default=0)
         else:
+            if isinstance(stage, FlatMap) and stage.examples and examples is None:
+                # The corpus counts its source examples, so its counts are taken here, before an
+                # objective's step makes rows of them (`FlatMap.examples`), and not of the rows after.
+                examples = list(rows)
             expanded: list[tuple[tuple[int, ...], Record]] = []
-            expanded_counts: dict[tuple[int, ...], int] = {}
-            counts_targets = isinstance(stage, Map) and isinstance(stage.step, CountTargets)
-            for identifier, value in rows:
-                outputs = _outputs(stage, identifier[0], value, counts=counter)
+            threads = _threads((stage,))
+            if threads is None:
+                made = (_outputs(stage, identifier[0], value, counts=counter) for identifier, value in rows)
+            else:
+                # A fetch with a pool of its own runs that many records at once, in their order.
+                pool = concurrent.futures.ThreadPoolExecutor(threads, thread_name_prefix="dew-step")
+                with pool:
+                    made = iter(list(pool.map(_Fetched(stage), rows)))
+            for (identifier, _), outputs in zip(rows, made, strict=True):
                 for child, output in enumerate(outputs):
                     if isinstance(output, Rejected):
                         counter.rejected[output.reason] += 1
                     else:
                         output_id = (*identifier, child) if isinstance(stage, FlatMap) else identifier
                         expanded.append((output_id, output))
-                        if counts_targets:
-                            expanded_counts[output_id] = ValidTargets()(record(output, "counted row"))
-                        elif counted is not None:
-                            # A row's count holds while the step left the fields it was counted from;
-                            # where it changed one, the row's own targets, as `recounted` carries them.
-                            if (isinstance(value, Mapping) and isinstance(output, Mapping)
-                                    and targets_changed(value, output)):
-                                expanded_counts[output_id] = ValidTargets()(output)
-                            else:
-                                expanded_counts[output_id] = counted[identifier]
             rows = expanded
-            if counts_targets or counted is not None:
-                counted = expanded_counts
         consumed += 1
-    if counted is not None:
-        targets = {"valid_targets": sum(counted.values())}
+    if counting:
+        targets = {"valid_targets": sum(ValidTargets()(record(value, "counted row")) for _, value in rows)}
     if targets is not None and targets["valid_targets"] == 0 and training:
         raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
-    return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, counted,
-                         documents)
+    return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, targets, documents,
+                         counted=rows if examples is None else examples)
 
 
 def _targeted(
-    rows: list[tuple[tuple[int, ...], Record]], counter: CorpusCounts, field: str
+    rows: list[tuple[tuple[int, ...], Record]], counter: CorpusCounts, field: str, rule: CountRule | None
 ) -> tuple[list[tuple[tuple[int, ...], Record]], Mapping[str, int]]:
     """The windows a pack or windows stage made that hold a valid target of
-    their token `field`, and their counts before record steps rename or remove
-    their token fields."""
+    their token `field`, each counted by the rule their documents were (`counted_window`),
+    and their total, as an indexed or streamed read accepts them."""
 
     kept, total = [], 0
     for identifier, value in rows:
-        count = ValidTargets(field)(record(value, "packed window"))
+        window = counted_window(record(value, "packed window"), rule, field)
+        count = ValidTargets(field)(window)
         if count:
-            kept.append((identifier, value))
+            kept.append((identifier, window))
             total += count
         else:
             counter.rejected["zero_targets"] += 1
@@ -345,8 +382,9 @@ def _memory_order(
     counter: CorpusCounts,
     derived: dict[str, str],
     packed: Mapping[str, int] | None,
-    counted: Mapping[tuple[int, ...], int] | None,
     documents: int | None,
+    *,
+    counted: Sequence[tuple[tuple[int, ...], Record]],
 ) -> Pipeline:
     rows = [
         (identifier, value if isinstance(value, bytes) else record(value, "materialized record"))
@@ -361,10 +399,9 @@ def _memory_order(
     derived["fanouts"] = fingerprint(fanouts)
     if lengths is not None:
         derived["lengths"] = fingerprint(lengths)
-    counter.accepted = len(rows)
-    counter.truncated = sum(
-        bool(value.get("_dew_truncated", False)) for _, value in rows if not isinstance(value, bytes)
-    )
+    counter.counted_anew()
+    for _, value in counted:
+        counter.delivered(value if isinstance(value, bytes) else record(value, "counted record"))
     facts: Batch = _measured_bounds(
         [record(value, "measured row") for _, value in rows if not isinstance(value, bytes)]
     )
@@ -382,8 +419,7 @@ def _memory_order(
             facts,
             tuple(identifier for identifier, _ in rows),
             inputs,
-            pipeline.stages[:consumed],
-            None if counted is None else tuple(counted[identifier] for identifier, _ in rows),
+            written(pipeline.stages[:consumed]),
             documents,
         ),
         stages=remaining,

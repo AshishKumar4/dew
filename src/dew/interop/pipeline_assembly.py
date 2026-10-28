@@ -23,10 +23,11 @@ import jax
 import numpy as np
 from flax import linen as nn
 
-from dew import records
+from dew import _records
+from dew.batch import Variables
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceGrid, SourceSchedule
-from dew.inference.pipeline import place
+from dew.inference.loading import place
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.inputs.diffusion import (
     Composition,
@@ -39,25 +40,19 @@ from dew.inputs.diffusion import (
 from dew.interop import decoder_parts, hf_decoders as decoders, sources
 from dew.interop.components import bind_component
 from dew.interop.decoder_bindings import decoder_layouts
-from dew.interop.processors import (
-    HostProcessor as HostProcessor,
-    Processor as Processor,
-    ProcessorCall as ProcessorCall,
-)
 from dew.interop.safetensors_io import LazyTensors
 from dew.interop.sources import StoredWeights
-from dew.interop.streaming import WeightLayout
+from dew.interop.streaming import LazyTree, WeightLayout
 from dew.interop.weights import AUTO, ParamTree, source_alias
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import Variables
 from dew.registry import dtype_name, from_record, resolve_dtype
 from dew.sampling.guidance import CFG
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.training.distributed import Layout, MeshSpec
+    from dew.distributed.placement import Layout, MeshSpec
 
 
 def native_variables(parts: Mapping[str, Mapping[str, ParamTree]]) -> dict[str, dict[str, ParamTree]]:
@@ -134,7 +129,7 @@ def _call_policy(index: Mapping[str, object], denoiser: _Denoiser) -> _Call:
     if found.family != expected.family:
         raise ValueError(f"The declared pipeline {published!r} is a {found.family} pipeline, and "
                          f"this directory's denoiser belongs to {denoiser.pipeline!r}")
-    if published == "Flux2KleinPipeline" and records.boolean(
+    if published == "Flux2KleinPipeline" and _records.boolean(
         index.get("is_distilled", False), "is_distilled"
     ):
         # A step-distilled [klein] ignores its guidance scale.
@@ -339,7 +334,7 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
 
     With `lazy` every component's leaves are `SourceLeaf` recipes over the
     mapped files, for a placement to read one device shard at a time
-    (`dew.inference.pipeline.place`), but for the convolution kernels and a
+    (`dew.inference.loading.place`), but for the convolution kernels and a
     UNet's per-head attention kernels, which are read whole
     (`dew.interop.weights.record_layouts`). `text=False` binds the text
     encoder to no weights and leaves it out of the variables.
@@ -368,7 +363,7 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
     components.update({denoiser.component: denoiser.config, "vae": vae_config})
     height, width = _geometry(index, size)
     # AutoencoderKLWan declares no channel count; it reads RGB.
-    channels = records.integer(vae_config.get("in_channels", 3), "in_channels")
+    channels = _records.integer(vae_config.get("in_channels", 3), "in_channels")
     if denoiser.frames is None:
         sample = Field("image", (height, width, channels))
     else:
@@ -467,11 +462,8 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
     config = _component_config(directory, "unet")
     fields = diffusion.unet_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = fields.value
-
-    def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
-        params, layouts = diffusion.translate_unet_weights(
-            diffusion.component_tensors(directory, "unet"), model, param_dtype=param_dtype, lazy=lazy)
-        return {"params": params}, layouts
+    weights = _component_weights(directory, "unet", functools.partial(diffusion.translate_unet_weights,
+                                                                      model=model))
 
     pooled = model.additional_time_features > 0
     built = {"class": "unet_2d_condition",
@@ -488,7 +480,7 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
         patch=1,
         latent_input=model.in_channels,
         sample_size=_square(config),
-        context_width=records.integer(config.get("cross_attention_dim", 1280), "cross_attention_dim"),
+        context_width=_records.integer(config.get("cross_attention_dim", 1280), "cross_attention_dim"),
         pipeline="StableDiffusionXLPipeline" if pooled else "StableDiffusionPipeline",
     )
 
@@ -516,11 +508,23 @@ def _transformer_source(directory: Path, path_of: Callable[[str, int], tuple[str
     same layouts from the stored shapes alone (`_Denoiser.plan`)."""
     from dew.interop import diffusion
 
-    def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
-        params, layouts = diffusion.read_transformer(diffusion.component_tensors(directory, "transformer"),
-                                                     path_of, param_dtype=param_dtype, lazy=lazy)
-        return {"params": params}, layouts
+    weights = _component_weights(directory, "transformer", functools.partial(diffusion.read_transformer,
+                                                                             path_of=path_of))
     return weights, functools.partial(diffusion.transformer_layouts, path_of=path_of)
+
+
+def _component_weights(directory: Path, component: str,
+                       read: Callable[..., tuple[LazyTree, tuple[WeightLayout, ...]]]
+                       ) -> Callable[[str, bool], tuple[Variables, tuple[WeightLayout, ...]]]:
+    """A denoiser's `weights(param_dtype, lazy)`: its `component`'s tensors read by `read`, the
+    parameters under `params`, beside their layouts."""
+    from dew.interop import diffusion
+
+    def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        params, layouts = read(diffusion.component_tensors(directory, component), param_dtype=param_dtype,
+                               lazy=lazy)
+        return {"params": params}, layouts
+    return weights
 
 
 def _transformer_denoiser(name: str, model: nn.Module, fields: Mapping[str, object], config: dict,
@@ -676,7 +680,7 @@ def _component_config(directory: Path, name: str) -> dict:
 
 def _square(config: Mapping[str, object], default: int | None = None) -> tuple[int, int]:
     """A config's `sample_size`, one side of the square its pipeline renders."""
-    side = records.integer(config["sample_size"] if default is None else config.get("sample_size", default),
+    side = _records.integer(config["sample_size"] if default is None else config.get("sample_size", default),
                            "sample_size")
     return side, side
 
@@ -803,21 +807,21 @@ def _qwen_vl_text_config(config: Mapping[str, object]) -> dict:
     """
     if config.get("model_type") != "qwen3_vl":
         raise ValueError(f"Qwen-Image's text encoder is a qwen3_vl model, not {config.get('model_type')!r}")
-    text = dict(records.record(config["text_config"], "text_config"))
+    text = dict(_records.record(config["text_config"], "text_config"))
     if text.get("model_type") != "qwen3_vl_text":
         raise ValueError(f"A qwen3_vl text_config is qwen3_vl_text, not {text.get('model_type')!r}")
-    half = records.integer(text["head_dim"], "head_dim") // 2
+    half = _records.integer(text["head_dim"], "head_dim") // 2
     for key in ("rope_parameters", "rope_scaling"):
         entry = text.get(key)
         if isinstance(entry, Mapping):
             entry = dict(entry)
-            section = records.integers(entry.pop("mrope_section"), "mrope_section")
-            records.boolean(entry.pop("mrope_interleaved", False), "mrope_interleaved")
+            section = _records.integers(entry.pop("mrope_section"), "mrope_section")
+            _records.boolean(entry.pop("mrope_interleaved", False), "mrope_interleaved")
             if sum(section) != half:
                 raise ValueError(f"mrope_section {section} must cover the {half} channel pairs")
             text[key] = entry
     return {**text, "model_type": "qwen3",
-            "tie_word_embeddings": records.boolean(config.get("tie_word_embeddings", False),
+            "tie_word_embeddings": _records.boolean(config.get("tie_word_embeddings", False),
                                                    "tie_word_embeddings")}
 
 
@@ -968,16 +972,16 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
     from dew.data.text import pin_tokenizer
 
     config = _component_config(directory, "text_encoder")
-    kind = records.text(config.get("model_type"), "model_type")
+    kind = _records.text(config.get("model_type"), "model_type")
     pinned = pin_tokenizer(str(directory / "tokenizer"))
     known = _FLUX2_TEXT if pipeline == "flux2" else {"qwen3": _FLUX2_TEXT["qwen3"]}
     if kind not in known:
         raise ValueError(f"The {pipeline} text encoder is one of {sorted(known)}, not {kind!r}")
     template, layers = known[kind]
     multimodal = kind == "mistral3"
-    text = dict(records.record(config["text_config"], "text_config")) if multimodal else config
+    text = dict(_records.record(config["text_config"], "text_config")) if multimodal else config
     if multimodal:
-        text["tie_word_embeddings"] = records.boolean(config.get("tie_word_embeddings", False),
+        text["tie_word_embeddings"] = _records.boolean(config.get("tie_word_embeddings", False),
                                                       "tie_word_embeddings")
     record = decoders.translate_config(text)
     named = dtype_name(compute)
@@ -992,7 +996,7 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
         raise ValueError(f"{pipeline} reads hidden state {max(layers)}, which a {decoder.num_layers}-layer "
                          "encoder does not have before its final norm")
     encoder, layouts, retained = _bind_language_model(
-        directory, record, records.text(text["model_type"], "model_type"), _hidden_states_name(multimodal),
+        directory, record, _records.text(text["model_type"], "model_type"), _hidden_states_name(multimodal),
         lambda bound: HiddenStatesConditioner(
             decoder, pinned.transformers(), bound, str(directory),
             template=template, layers=layers, thinking=pipeline == "z_image", tokens=tokens,

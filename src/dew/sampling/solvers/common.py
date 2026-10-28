@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from typing import NamedTuple, Protocol
+from typing import NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import struct
 from typing_extensions import TypeVar
 
 from dew.diffusion.process import Process
@@ -40,9 +41,9 @@ class Solver(Protocol[StateT]):
         """Return the initial state for sampling from `x` over the concrete grid `times`.
 
         It checks the grid's endpoint domains at compile time. `key` is the
-        root key of the whole sampling run; only `DPMSolverSDE` reads it, for
-        its whole-trajectory Brownian tree. Each step draws from the folded key
-        passed to it.
+        root key of the whole sampling run, or a `RowSolver`'s `RowKeys`; only
+        `DPMSolverSDE` reads it, for its whole-trajectory Brownian tree. Each
+        step draws from the folded key passed to it.
         """
         ...
 
@@ -54,6 +55,26 @@ class Solver(Protocol[StateT]):
         algebra can name the pair for what it reads: the discrete solver takes
         log-probabilities where a Gaussian one takes eps.
         """
+        ...
+
+
+@struct.dataclass
+class RowKeys:
+    """One typed PRNG key per row of a batch, `keys` `[B]`, for a solver whose draws are row by row
+    (`RowSolver`): a row's draws are its own key's, whatever rows sample beside it, as they are
+    sampled alone, while the model still runs once over the batch."""
+
+    keys: jax.Array
+
+
+@runtime_checkable
+class RowSolver(Solver[StateT], Protocol[StateT]):
+    """A solver that draws each row by its own key (`RowKeys`): `sample` hands `step_rows` the
+    step's row keys where it hands `step` one key."""
+
+    def step_rows(self, x, t, t_next, denoised, eps, state, keys: jax.Array, process,
+                  denoise, /) -> tuple[jax.Array, StateT]:
+        """`step`, row `i` drawing from `keys[i]` alone."""
         ...
 
 

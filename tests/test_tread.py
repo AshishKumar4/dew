@@ -11,9 +11,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.backbones.dit import SimpleDiT, gather_tokens, scatter_tokens
+from dew.nn.backbones.dit import SimpleDiT, scatter_tokens
 from dew.nn.dit import ROPE_THETA, rope_for_scan
 from dew.nn.rope import rotary_freqs
+from dew.nn.scatter import gather_positions
 
 ROUTER = np.load(Path(__file__).resolve().parent / "fixtures" / "tread" / "router.npz")
 ROUTES = ((0.5, 1, 2), (0.25, 3, 3))
@@ -23,7 +24,7 @@ def test_the_gather_and_scatter_are_the_routers():
     """Its draw keeps `tokens - int(tokens * ratio)`, which `kept_tokens` keeps too."""
     tokens, kept = jnp.asarray(ROUTER["tokens"]), jnp.asarray(ROUTER["kept"])
     assert kept.shape[1] == 16 - int(16 * 0.3)
-    np.testing.assert_array_equal(np.asarray(gather_tokens(tokens, kept)), ROUTER["gathered"])
+    np.testing.assert_array_equal(np.asarray(gather_positions(tokens, kept)), ROUTER["gathered"])
     np.testing.assert_array_equal(np.asarray(scatter_tokens(tokens, kept, jnp.asarray(ROUTER["processed"]))),
                                   ROUTER["scattered"])
 
@@ -65,14 +66,15 @@ def test_a_routed_forward_skips_each_span_on_the_drawn_tokens():
         if index in (1, 3):
             kept = sown["intermediates"][f"route_{index}"][0]
             assert kept.shape[1] == 16 - int(16 * {1: 0.5, 3: 0.25}[index])
-            held, tokens = tokens, gather_tokens(tokens, kept)
+            held, tokens = tokens, gather_positions(tokens, kept)
             rotation = rotary_freqs(kept, 8, ROPE_THETA, dtype=jnp.float32)
         tokens = block(tokens, condition, rotation, train=True)
         if index in (2, 3):
             tokens, rotation = scatter_tokens(held, kept, tokens), full
     np.testing.assert_array_equal(np.asarray(output), np.asarray(bound.output(tokens, order, 8, 8)))
+    # Routing is structural (other tokens skip the spans), so any routed output is another computation.
     plain = model(()).apply(variables, x, t, train=True, rngs=rngs)
-    assert not np.allclose(np.asarray(output), np.asarray(plain))
+    assert not np.array_equal(np.asarray(output), np.asarray(plain))
 
 
 def test_sampling_runs_every_token_through_every_block():

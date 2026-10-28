@@ -14,7 +14,15 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from flax.core import freeze, unfreeze
-from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    float64_forward,
+    float64_terms,
+    torch_with_gradients,
+    widened,
+    with_gradients,
+)
 
 from dew.nn.attention import GroupNorm, LayerNorm, Stage
 from dew.nn.autoencoders.vae import FlaxEncoder, translate_vae_weights
@@ -49,9 +57,9 @@ def test_a_bf16_vae_block_rounds_where_diffusers_flax_vae_does(channels):
     convolution casts (vae_flax.py:154-209)."""
     from diffusers.models import vae_flax
 
-    from dew.nn.autoencoders.vae import FlaxResnetBlock2D
+    from dew.nn.autoencoders.vae import _resnet
 
-    ours = FlaxResnetBlock2D(*channels, groups=8)
+    ours = _resnet(channels[1], 8, jnp.float32)
     theirs = vae_flax.FlaxResnetBlock2D(*channels, groups=8)
     x = np.random.default_rng(5).standard_normal((2, 8, 8, channels[0])).astype(np.float32) * 3
     params = theirs.init(jax.random.key(0), jnp.asarray(x))
@@ -273,12 +281,13 @@ def test_strided_convolutions_keep_nested_vmap_and_its_vjp():
 
 @pytest.mark.parametrize("architecture, extra", [
     ("simple_dit", {}),
+    ("simple_dit", {"patch_bottleneck": 16}),
     ("hybrid_dit", {"ssm_attention_ratio": "all-attn"}),
     ("simple_mmdit", {}),
-], ids=["simple_dit", "hybrid_dit", "simple_mmdit"])
+], ids=["simple_dit", "simple_dit_bottleneck", "hybrid_dit", "simple_mmdit"])
 def test_a_scan_order_is_a_permutation_joint_attention_cannot_see(rng, architecture, extra):
-    """The hilbert and zigzag orders share one parameter tree (`hilbert_projection`
-    over raw patches) and differ only in the permutation the tokens travel in.
+    """The hilbert and zigzag orders share one parameter tree (the patch
+    embedding's) and differ only in the permutation the tokens travel in.
     Attention is permutation-equivariant and the MLP is per token, so on the
     same weights the two orders must agree once each is unpermuted back to the
     image: the sincos signal has to be permuted with the tokens, the rotation
@@ -297,6 +306,28 @@ def test_a_scan_order_is_a_permutation_joint_attention_cannot_see(rng, architect
     assert float(jnp.max(jnp.abs(out_hilbert))) > 0.1, "the perturbed weights produce no signal"
     # The two orders sum the same softmax in a different order: 2e-6 observed.
     assert float(jnp.max(jnp.abs(out_hilbert - out_zigzag))) < 1e-5
+
+
+def test_a_hilbert_uvit_computes_the_raster_uvits_image(rng):
+    """UViT's learned patch positions follow their patches into the scan
+    order (`scan_ordered`), as the patches' tokens do, so on the same weights
+    a Hilbert-ordered UViT computes the raster one's image, as exact as the
+    raster model computes it (`assert_as_exact_as_the_reference`, the truth
+    the raster model in float64), where positions added in raster order give
+    each moved patch another's (audit NN-A3). The grid is non-square, which a
+    transposed permutation fails on."""
+    x = jax.random.normal(rng, (2, 16, 32, 3))
+    temb = jnp.ones((2,))
+    context = text(tokens=8, features=32)
+    config = {"patch_size": 4, "emb_features": 64, "num_layers": 2, "num_heads": 2, "mlp_ratio": 2,
+              "image_size": 32, "text_tokens": 8}
+    raster = models.build("uvit", **config)
+    hilbert = models.build("uvit", scan_order="hilbert", **config)
+    params = jax.tree.map(lambda p: p + 0.05 * jax.random.normal(rng, p.shape),
+                          raster.init(rng, x, temb, context))
+    truth, terms = float64_forward(raster, params, x, temb, context)
+    scanned, rastered = (model.apply(params, x, temb, context) for model in (hilbert, raster))
+    assert_as_exact_as_the_reference(scanned, rastered, truth, "a Hilbert UViT's image", terms=terms)
 
 
 @pytest.mark.parametrize("scan_order", ["hilbert", "zigzag"])
@@ -340,14 +371,16 @@ def test_2d_fusion_convolves_the_grid_not_the_scan(rng, scan_order):
 
 
 def test_hilbert_patchify_roundtrip(rng):
-    """patchify returns patches in hilbert order plus the inverse permutation;
+    """Patches gathered into hilbert order come with the inverse permutation;
     unpatchify with that permutation must be an exact identity, on a grid
     that is not square and not a power of two on either side."""
-    from dew.nn.scan_orders import hilbert_patchify, hilbert_unpatchify
+    from dew.nn.dit import scan_ordered
+    from dew.nn.scan_orders import patchify, unscanned
 
     x = jax.random.normal(rng, (2, 12, 20, 3))
-    patches, inv_idx = hilbert_patchify(x, 4)
-    rec = hilbert_unpatchify(patches, inv_idx, 4, 12, 20, 3)
+    patches, inv_idx = scan_ordered(patchify(x, 4), "hilbert", 3, 5)
+    assert inv_idx is not None
+    rec = unscanned(patches, inv_idx, 4, 12, 20, 3)
     assert jnp.array_equal(rec, x)
 
 
@@ -554,22 +587,76 @@ def test_a_stage_without_dtype_computes_in_the_models_dtype(dtype, rng):
     np.testing.assert_array_equal(output, explicit.apply(variables, x))
 
 
+GROUP_NORM_SEEDS = 32
+"""The group norm's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
+
+
 @pytest.mark.parametrize("dtype", [None, jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape", [(2, 6, 16), (2, 4, 5, 16)])
-def test_group_norm_matches_flax_bit_for_bit(rng, dtype, shape):
+def test_group_norm_is_flax_s(rng, dtype, shape):
     """Without an activation, `dew.nn.attention.GroupNorm` is flax's
-    `nn.GroupNorm` op for op, with its parameter tree: its statistics in the
-    module's dtype, else the input's, at least fp32, and its result cast by
-    flax's dtype rule."""
-    x = jax.random.normal(rng, shape, jnp.float32) * 3 + 1
-    x = x.astype(jnp.bfloat16) if dtype is jnp.bfloat16 else x
+    `nn.GroupNorm`, with its parameter tree: its statistics in the module's
+    dtype, else the input's, at least fp32, and its result cast by flax's dtype
+    rule, as near float64 over drawn inputs and parameters as flax's (check 1,
+    `assert_as_exact`)."""
     ours, reference = GroupNorm(4, epsilon=1e-5, dtype=dtype), nn.GroupNorm(4, epsilon=1e-5, dtype=dtype)
+    x = jax.random.normal(rng, shape, jnp.float32)
     params, flax_params = ours.init(rng, x), reference.init(rng, x)
     assert jax.tree_util.tree_structure(params) == jax.tree_util.tree_structure(flax_params)
-    params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(rng, leaf.shape), params)
-    found, expected = ours.apply(params, x), reference.apply(params, x)
-    assert found.dtype == expected.dtype
-    assert jnp.array_equal(found, expected)
+    assert ours.apply(params, x.astype(dtype or jnp.float32)).dtype == reference.apply(
+        params, x.astype(dtype or jnp.float32)).dtype
+
+    def draw(seed):
+        """Inputs about 1 apart from zero at a spread of 3, in the module's dtype, and parameters
+        drawn about flax's initial ones."""
+        keys = jax.random.split(jax.random.key(seed), 3)
+        drawn = (jax.random.normal(keys[0], shape, jnp.float32) * 3 + 1).astype(dtype or jnp.float32)
+        leaves, tree = jax.tree.flatten(params)
+        moved = [leaf + 0.1 * jax.random.normal(key, leaf.shape) for leaf, key
+                 in zip(leaves, jax.random.split(keys[1], len(leaves)), strict=True)]
+        return np.asarray(drawn), jax.tree.unflatten(tree, [np.asarray(leaf) for leaf in moved])
+
+    def truth(drawn, moved):
+        return nn.GroupNorm(4, epsilon=1e-5, dtype=jnp.float64).apply(moved, drawn)
+
+    assert_as_exact(jax.jit(lambda drawn, moved: ours.apply(moved, drawn)),
+                    jax.jit(lambda drawn, moved: reference.apply(moved, drawn)), draw,
+                    f"group norm {dtype} {shape}", seeds=GROUP_NORM_SEEDS, truth_fn=truth)
+
+
+OFFSET_GROUP_NORM_SEEDS = 64
+"""The offset group norm's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
+
+
+def test_group_norm_is_as_exact_as_torch_s_where_a_group_s_mean_dwarfs_its_spread():
+    """A group's variance is its centered mean square, as torch's GroupNorm takes it: over activations a
+    hundred from zero at a spread of one, where E[x^2] - E[x]^2 cancels in fp32, the forward and the
+    gradients of the input, scale and bias along a drawn cotangent are on par (check 1) with torch's
+    float32 GroupNorm from flax's in float64."""
+    import torch
+
+    shape, groups = (2, 4, 4, 16), 4
+
+    def draw(seed):
+        """Activations a hundred from zero at a spread of one, a scale and bias about the initial ones,
+        and a cotangent."""
+        keys = jax.random.split(jax.random.key(seed), 4)
+        return (np.asarray(jax.random.normal(keys[0], shape, jnp.float32) + 100.0),
+                np.asarray(1.0 + 0.1 * jax.random.normal(keys[1], shape[-1:], jnp.float32)),
+                np.asarray(0.1 * jax.random.normal(keys[2], shape[-1:], jnp.float32)),
+                np.asarray(jax.random.normal(keys[3], shape, jnp.float32)))
+
+    def normalized(module):
+        def apply(x, scale, bias):
+            return module.apply({"params": {"scale": scale, "bias": bias}}, x)
+        return with_gradients(apply)
+
+    def torch_s(x, scale, bias):
+        return torch.nn.functional.group_norm(x.movedim(-1, 1), groups, scale, bias, eps=1e-6).movedim(1, -1)
+
+    assert_as_exact(normalized(GroupNorm(groups, epsilon=1e-6)), torch_with_gradients(torch_s),
+                    draw, "offset group norm", seeds=OFFSET_GROUP_NORM_SEEDS,
+                    truth_fn=normalized(nn.GroupNorm(groups, epsilon=1e-6, dtype=jnp.float64)))
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -581,7 +668,7 @@ def test_group_norm_activates_its_wide_output_before_its_one_cast(rng, dtype):
     x = (jax.random.normal(rng, (2, 4, 4, 16)) * 3).astype(dtype)
     ours = GroupNorm(4, activation=nn.swish, dtype=dtype)
     params = ours.init(rng, x)
-    wide = nn.swish(nn.GroupNorm(4).apply(params, x.astype(jnp.float32)))
+    wide = nn.swish(nn.GroupNorm(4, use_fast_variance=False).apply(params, x.astype(jnp.float32)))
     assert jnp.array_equal(ours.apply(params, x), wide.astype(dtype))
     # The pullback holds the input as it arrived, no wider activation.
     _, pullback = jax.vjp(lambda x: ours.apply(params, x), x)
@@ -589,25 +676,61 @@ def test_group_norm_activates_its_wide_output_before_its_one_cast(rng, dtype):
     assert held and {leaf.dtype for leaf in held} == {x.dtype}
 
 
+LAYER_NORM_SEEDS = 64
+"""The layer norm's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
+
+
 @pytest.mark.parametrize('use_scale,use_bias', [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize('dtype', [None, jnp.bfloat16, jnp.float32])
-def test_layer_norm_matches_flax_bit_for_bit(rng, use_scale, use_bias, dtype):
-    """`dew.nn.attention.LayerNorm` exists to change which values the backward
-    pass keeps, not which values the forward pass produces, so it computes
-    flax's `nn.LayerNorm` op for op: E[x] and E[x^2] in fp32, the variance
-    from the pair and clipped at zero, the weight folded into the inverse
-    deviation before it meets the centered activations, the result cast by
-    flax's own dtype rule. A flax release that changes any of those moves a
-    checkpoint's outputs, and this is where that shows."""
+def test_layer_norm_is_flax_s_keeping_only_its_input_for_the_backward(rng, use_scale, use_bias, dtype):
+    """`dew.nn.attention.LayerNorm` is flax's `nn.LayerNorm` under `nn.remat` saving nothing: the
+    same parameter tree and auto-named scope; its output and the gradients of its input and
+    parameters as near float64 over drawn inputs and parameters as flax's own (check 1); and its
+    pullback holds the input as it arrived, no wider copy of the activations."""
     x = jax.random.normal(rng, (2, 6, 16), jnp.float32)
     x = x.astype(jnp.bfloat16) if dtype is jnp.bfloat16 else x
     fields = {"epsilon": 1e-5, "use_scale": use_scale, "use_bias": use_bias, "dtype": dtype}
     ours, reference = LayerNorm(**fields), nn.LayerNorm(**fields)
     params, flax_params = ours.init(rng, x), reference.init(rng, x)
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), params) == jax.tree.map(
+        lambda leaf: (leaf.shape, leaf.dtype), flax_params)
 
-    assert jax.tree_util.tree_structure(params) == jax.tree_util.tree_structure(flax_params)
-    for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(flax_params), strict=True):
-        assert a.shape == b.shape and a.dtype == b.dtype
-    found, expected = ours.apply(params, x), reference.apply(flax_params, x)
-    assert found.dtype == expected.dtype
-    assert jnp.array_equal(found, expected)
+    class Named(nn.Module):
+        norm: type[nn.Module]
+
+        @nn.compact
+        def __call__(self, x):
+            return self.norm(**fields)(x)
+
+    assert jax.tree.structure(Named(LayerNorm).init(rng, x)) == jax.tree.structure(
+        Named(nn.LayerNorm).init(rng, x))
+
+    def draw(seed):
+        """Inputs about 1 apart from zero at a spread of 3, in the input's dtype, flax's initial
+        parameters moved about them, and a cotangent for the output."""
+        keys = jax.random.split(jax.random.key(seed), 3)
+        drawn = (jax.random.normal(keys[0], x.shape, jnp.float32) * 3 + 1).astype(x.dtype)
+        leaves, tree = jax.tree.flatten(params)
+        moved = [leaf + 0.1 * jax.random.normal(key, leaf.shape) for leaf, key
+                 in zip(leaves, jax.random.split(keys[1], len(leaves)), strict=True)]
+        cotangent = jax.random.normal(keys[2], x.shape, jnp.float32)
+        return np.asarray(drawn), jax.tree.unflatten(tree, [np.asarray(leaf) for leaf in moved]), \
+            np.asarray(cotangent)
+
+    def observed(module):
+        """The module's output and the gradients of its input and parameters, under a cotangent of the
+        output's own dtype."""
+        run = with_gradients(lambda value, variables: module.apply(variables, value))
+
+        def step(drawn, moved, cotangent):
+            return run(drawn, moved, cotangent.astype(jax.eval_shape(module.apply, moved, drawn).dtype))
+        return step
+
+    assert ours.apply(params, x).dtype == reference.apply(flax_params, x).dtype
+    wide = nn.LayerNorm(**{**fields, "dtype": jnp.float64})
+    assert_as_exact(jax.jit(observed(ours)), jax.jit(observed(reference)), draw,
+                    f"layer norm {dtype} scale={use_scale} bias={use_bias}", seeds=LAYER_NORM_SEEDS,
+                    truth_fn=observed(wide))
+    _, pullback = jax.vjp(lambda value: ours.apply(params, value), x)
+    held = [leaf for leaf in jax.tree.leaves(pullback) if np.size(leaf) == x.size]
+    assert held and {leaf.dtype for leaf in held} == {x.dtype}

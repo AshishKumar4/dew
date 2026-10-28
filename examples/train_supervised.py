@@ -25,10 +25,13 @@ import numpy as np
 import optax
 from flax import linen as nn
 
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.config.data import RecordsData
+from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
+from dew.data import Files
+from dew.data.steps.generic import Formatting
 from dew.inputs import Field, InputSpec
 from dew.objectives.supervised import Accuracy
+from dew.optim import OptimConfig
+from dew.registry import ModelConfig
 
 
 class MLP(nn.Module):
@@ -69,9 +72,11 @@ def run() -> RunConfig:
              "validation": spirals(data / "validation.jsonl", 256, 1)}
     return RunConfig(
         model=ModelConfig.from_model(MLP()),
-        data=RecordsData(source=files["train"], validation=files["validation"]),
+        # Formatting reads each JSON point as an array of numbers.
+        data=Files(files["train"]).map(Formatting()).shuffle(seed=0).repeat().batch(64),
+        validation=Files(files["validation"]).map(Formatting()).batch(64),
         objective=ObjectiveConfig("supervised", {
             "loss": cross_entropy, "metrics": (Accuracy(),), "inputs": InputSpec(Field("x", (2,)))}),
         optim=OptimConfig(learning_rate=3e-3),
-        trainer=TrainerConfig(steps=300, batch_size=64, log_every=50, eval_every=100,
+        trainer=TrainerConfig(steps=300, log_every=50, eval_every=100,
                               checkpoint_every=100))

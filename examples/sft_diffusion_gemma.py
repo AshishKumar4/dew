@@ -9,8 +9,8 @@ fetching one layer at a time. The 26B-A4B base has not been run through it:
         --chat data/tulu-3-sft.parquet --steps 2000
 
 `--chat` is an `hf://` Hub dataset, a `.jsonl` file or a parquet file of
-conversations, which is what the `ChatCanvasData` recipe reads and renders with
-the checkpoint's own chat template. Each assistant turn becomes one row: the
+conversations, which the `canvas` preset reads and renders with the
+checkpoint's own chat template. Each assistant turn becomes one row: the
 conversation before it is the clean prompt, and the turn alone fills the
 canvases the denoiser scores. The run writes the PEFT adapter directory
 `Adapter.save` produces, which transformers loads, then loads the base again
@@ -31,12 +31,12 @@ import jax.numpy as jnp
 import tyro
 
 import dew
-from dew.config import OptimConfig
-from dew.config.data import ChatCanvasData, loader
-from dew.data import Loading
+from dew.data import Dataset, presets
+from dew.data.sources import source as data_source
 from dew.interop import PretrainedBlockDecoder
 from dew.lora import LoRA
 from dew.objectives.diffusion.block import BlockDiffusionObjective
+from dew.optim import OptimConfig
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
@@ -77,7 +77,7 @@ class Config:
 
 def smoke_config(config: Config) -> Config:
     """The run over the committed tiny checkpoint, which carries the tokenizer
-    too, and the canned turns as the JSONL file the recipe reads line by line."""
+    too, and the canned turns as the JSONL file the preset reads line by line."""
     config.out.mkdir(parents=True, exist_ok=True)
     jsonl = config.out / "chat.jsonl"
     jsonl.write_text("".join(json.dumps({"messages": turns}) + "\n" for turns in CONVERSATIONS))
@@ -87,23 +87,26 @@ def smoke_config(config: Config) -> Config:
 
 def adapted_objective(config: Config) -> tuple[PretrainedBlockDecoder, BlockDiffusionObjective]:
     """The base with its adapter, and the SFT objective over it."""
-    source = PretrainedBlockDecoder.load(config.model, dtype=jnp.bfloat16, param_dtype=jnp.float32).adapt(
+    # On the host: the trainer streams the stack from there (Layout(host=...)).
+    source = PretrainedBlockDecoder.load(config.model, dtype=jnp.bfloat16, param_dtype=jnp.float32,
+                                         on_host=True).adapt(
         LoRA(rank=config.rank, modules=tuple(config.modules), alpha=config.alpha), key=0)
     # A host layout streams the stack one layer per scan iteration, so the
     # decoder runs as a scan; a plain loop's fetches would all be hoisted and
     # the whole base would land on the device this is keeping it off.
     scanned = source.model.clone(text=source.model.text.clone(scan_layers=True))
+    # The source over the scanned model, so the objective takes its weights and end-of-sequence ids.
     return source, BlockDiffusionObjective(
-        scanned, prompt_length=config.prompt_tokens,
-        num_canvases=config.canvases, variables=source.variables,
+        replace(source, model=scanned), prompt_length=config.prompt_tokens, num_canvases=config.canvases,
         pad_token_id=int(source.config["text_config"]["pad_token_id"]))
 
 
-def chat_rows(config: Config, objective: BlockDiffusionObjective) -> ChatCanvasData:
-    """`--chat` as the objective's rows, one per assistant turn, in its geometry."""
-    return ChatCanvasData(source=config.chat, tokenizer=config.model, prompt_length=objective.prompt_length,
-                          canvas_size=objective.canvas_size, canvases=objective.num_canvases,
-                          pad_id=objective.pad_token_id)
+def chat_rows(config: Config, objective: BlockDiffusionObjective, conversations: Dataset) -> Dataset:
+    """`conversations` as the objective's rows, one per assistant turn, in its geometry, in batches."""
+    return conversations.pipe(
+        presets.canvas, config.model, prompt_length=objective.prompt_length,
+        canvas_size=objective.canvas_size, canvases=objective.num_canvases, batch=config.batch_size,
+        pad_id=objective.pad_token_id)
 
 
 def main(config: Config) -> Path:
@@ -114,8 +117,7 @@ def main(config: Config) -> Path:
                          "dataset id, a .jsonl file or a parquet file")
 
     source, objective = adapted_objective(config)
-    data = loader(chat_rows(config, objective), batch=config.batch_size, read="memory",
-                  loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1))
+    data = chat_rows(config, objective, data_source(config.chat).shuffle(seed=0).repeat())
 
     checkpoints = Checkpoints(str(config.out / "checkpoints"), keep=1)
     trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(1),

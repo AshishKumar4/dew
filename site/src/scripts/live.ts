@@ -12,9 +12,9 @@ export const liveEnabled = Boolean(ENDPOINT && SITEKEY);
 
 export type Output =
 	| { type: 'stream'; name: 'stdout' | 'stderr'; text: string }
-	| { type: 'display'; text?: string; png?: string }
+	| { type: 'display'; text?: string; png?: string; display?: string; update?: boolean }
 	| { type: 'error'; ename: string; evalue: string; traceback: string[] }
-	| { type: 'clear' };
+	| { type: 'clear'; wait?: boolean };
 
 export interface Done {
 	status: 'ok' | 'error' | 'aborted';
@@ -171,11 +171,32 @@ export class LiveSession {
 // Rendering outputs, shared by the landing page and the tutorial pages.
 
 
-/** Append one output to `into`, the way the tutorial pages show recorded outputs. */
+/**
+ * Show one output in `into`, the way the tutorial pages show recorded outputs, as Jupyter shows a kernel's
+ * messages: clear_output(wait=True) clears when the next output arrives, and a display shown under an id is
+ * updated in place, every place the cell shows it. A display another cell showed is not updated: a notebook's
+ * cells share one kernel, but no page runs a notebook live yet (ledger 846).
+ */
 export function renderOutput(into: HTMLElement, output: Output): void {
 	if (output.type === 'clear') {
-		into.replaceChildren();
+		if (output.wait) {
+			into.dataset.clearNext = '';
+		} else {
+			delete into.dataset.clearNext;
+			into.replaceChildren();
+		}
 		return;
+	}
+	if (output.type === 'display' && output.update) {
+		const shown = displayed(output);
+		if (!shown || output.display === undefined) return;
+		const showing = into.querySelectorAll<HTMLElement>(`[data-display="${CSS.escape(output.display)}"]`);
+		showing.forEach((element, index) => element.replaceWith(index === 0 ? shown : shown.cloneNode(true)));
+		return;
+	}
+	if ('clearNext' in into.dataset) {
+		delete into.dataset.clearNext;
+		into.replaceChildren();
 	}
 	if (output.type === 'stream') {
 		const last = into.lastElementChild;
@@ -192,21 +213,32 @@ export function renderOutput(into: HTMLElement, output: Output): void {
 		return;
 	}
 	if (output.type === 'display') {
-		if (output.png) {
-			const image = document.createElement('img');
-			image.src = `data:image/png;base64,${output.png}`;
-			image.alt = output.text ?? '';
-			into.append(image);
-		} else if (output.text) {
-			const pre = document.createElement('pre');
-			pre.className = 'nb-result';
-			pre.textContent = output.text;
-			into.append(pre);
-		}
+		const shown = displayed(output);
+		if (shown) into.append(shown);
 		return;
 	}
 	const pre = document.createElement('pre');
 	pre.className = 'nb-error';
 	pre.textContent = terminalText(output.traceback.length > 0 ? output.traceback.join('\n') : `${output.ename}: ${output.evalue}`);
 	into.append(pre);
+}
+
+/** The element a display output shows, tagged with its id, or nothing when it holds nothing to show. */
+function displayed(output: Extract<Output, { type: 'display' }>): HTMLElement | undefined {
+	let shown: HTMLElement;
+	if (output.png) {
+		const image = document.createElement('img');
+		image.src = `data:image/png;base64,${output.png}`;
+		image.alt = output.text ?? '';
+		shown = image;
+	} else if (output.text) {
+		const pre = document.createElement('pre');
+		pre.className = 'nb-result';
+		pre.textContent = output.text;
+		shown = pre;
+	} else {
+		return undefined;
+	}
+	if (output.display !== undefined) shown.dataset.display = output.display;
+	return shown;
 }

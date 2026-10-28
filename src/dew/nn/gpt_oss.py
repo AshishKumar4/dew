@@ -10,7 +10,10 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
+from jax.ad_checkpoint import checkpoint_name
 
+from dew.mesh import LogicalAxes
+from dew.nn.activations import quick_gelu, swiglu_clamped
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, projection_flops
 from dew.nn.moe import (
@@ -22,7 +25,8 @@ from dew.nn.moe import (
     gather_expert_bias,
     renormalized_softmax,
 )
-from dew.nn.sharding import LogicalAxes, logical_axes
+from dew.nn.precision import float32_dot_general
+from dew.nn.sharding import logical_axes
 
 FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
     "gate_up_proj": ("exp", "embed", "mlp"),
@@ -87,13 +91,15 @@ class GptOssExperts(nn.Module):
         gate_up, gate_bias, down, down_bias = parameters
         projected = jnp.asarray(expert_projection(
             tokens, gate_up, sizes, dtype, self.implementation, self.precision))
-        projected = projected + gather_expert_bias(gate_bias, expert_ids, dtype)
-        gate = jnp.minimum(projected[..., ::2], 7.0)
-        up = jnp.clip(projected[..., 1::2], -7.0, 7.0)
-        activated = (up + 1) * (gate * jax.nn.sigmoid(gate * 1.702))
+        # The dense MLP's residual names, the interleaved gate and up one product as a packed MLP's
+        # (mlp.py), so one remat policy covers every MLP (mixer_base.RESIDUALS).
+        projected = checkpoint_name(checkpoint_name(
+            projected + gather_expert_bias(gate_bias, expert_ids, dtype), 'gate_proj'), 'up_proj')
+        gate, up = swiglu_clamped(projected[..., ::2], projected[..., 1::2], 7.0)
+        activated = (up + 1) * quick_gelu(gate)
         output = jnp.asarray(expert_projection(
             activated, down, sizes, dtype, self.implementation, self.precision))
-        return output + gather_expert_bias(down_bias, expert_ids, dtype)
+        return checkpoint_name(output + gather_expert_bias(down_bias, expert_ids, dtype), 'down_proj')
 
 
 @logical_axes({
@@ -135,7 +141,7 @@ class GptOssMLP(nn.Module):
     @nn.compact
     def __call__(self, x: jax.Array, routes: Routes | None = None) -> jax.Array:
         logits = Dense(self.num_local_experts, use_bias=True, dtype=self.dtype,
-                           precision=self.precision, name="router")(x)
+                           precision=self.precision, name="router", dot_general=float32_dot_general)(x)
         k = self.num_experts_per_tok
         indices = chosen_experts(lambda: jax.lax.top_k(logits, k)[1], (*logits.shape[:-1], k), routes)
         return GptOssExperts(

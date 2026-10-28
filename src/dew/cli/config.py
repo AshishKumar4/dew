@@ -1,4 +1,4 @@
-"""Defaults for dew tpu, kept in ~/.config/dew/tpu.toml.
+"""Defaults for dew tpu, kept in Dew's configuration directory (`dew.cache.dew_config_dir`), tpu.toml.
 
 Also holds what an accelerator type implies: runtime version, worker count and
 device count. Everything here is a pure function of strings, so the commands
@@ -9,14 +9,14 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import os
 import tomllib
 from pathlib import Path
 
 from filelock import FileLock
 
+from dew._records import JSON
+from dew.cache import dew_config_dir
 from dew.files import write_atomically
-from dew.records import JSON
 
 DEFAULT_ZONES = ("us-central2-b", "europe-west4-a", "us-east1-d")
 
@@ -52,18 +52,8 @@ class TpuConfig:
     python_version: str = "3.12"
 
 
-def config_dir() -> Path:
-    """Where tpu.toml and the zone cache live."""
-    override = os.environ.get("DEW_CONFIG_DIR")
-    if override:
-        return Path(override)
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg) if xdg else Path.home() / ".config"
-    return base / "dew"
-
-
 def config_path() -> Path:
-    return config_dir() / "tpu.toml"
+    return dew_config_dir() / "tpu.toml"
 
 
 def load(path: Path | None = None) -> TpuConfig:
@@ -106,7 +96,7 @@ def _toml(value: JSON | tuple[JSON, ...]) -> str:
 
 
 def zone_cache_path() -> Path:
-    return config_dir() / "zones.json"
+    return dew_config_dir() / "zones.json"
 
 
 def _zone_cache() -> dict[str, str]:

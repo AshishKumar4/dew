@@ -28,8 +28,10 @@ import tyro
 import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.inference.banks import SafetensorsBanks
 from dew.interop.hf_decoders import translate_config
-from dew.objectives.base import merge
+from dew.nn.inputs import ModelInputs
 from dew.registry import models
+from dew.sampling.text import decode_ops, prefill_state
+from dew.telemetry.benchmark import resident_memory
 from dew.training import Layout, MeshSpec
 
 
@@ -50,12 +52,8 @@ class DiskConfig:
 
 
 def resident_status():
-    with open("/proc/self/status") as handle:
-        wanted = {"VmRSS", "RssAnon", "RssFile", "VmHWM"}
-        return {name.rstrip(":"): int(rest.split()[0]) * 1024
-                for line in handle if (fields := line.split(None, 1))
-                and (name := fields[0].rstrip(":")) in wanted
-                for rest in fields[1:]}
+    memory = resident_memory()
+    return {name: memory[name] for name in ("VmRSS", "RssAnon", "RssFile", "VmHWM")}
 
 
 def storage_reads():
@@ -101,28 +99,36 @@ def measure(config: DiskConfig):
         print("non-decoder weights loaded", resident_status(), file=sys.stderr, flush=True)
         weight_bytes = sum(math.prod(leaf.shape) * np.dtype(leaf.dtype).itemsize
                            for leaf in jax.tree.leaves(source.shapes()))
-        cache = model.apply(variables, 1, method=model.init_cache, mutable=["cache"])[1]
+        cache = model.apply(variables, 1, method=model.init_cache, mutable=["cache"])[1]["cache"]
         prompt = jax.device_put(np.arange(config.prompt, dtype=np.int32)[None] % model.vocab_size, device)
-        prefill = jax.jit(lambda read, held, tokens: model.apply(
-            merge(read, held), tokens, decode=True, mutable=["cache"]))
-        decode = jax.jit(lambda read, held, token: model.apply(
-            merge(read, held), token, decode=True, mutable=["cache"]))
+        # The decoder's own prefill and one-token advance (`dew.sampling.text`), bound to the bank-backed
+        # weights inside each compiled call, so the benchmark times the generation path.
+        every = jnp.ones((1,), bool)
+
+        def prefill(read, held, tokens):
+            return prefill_state(model, read, ModelInputs(tokens), decode_ops(model, read, 0, None), held)[0]
+
+        def decode(read, state, token):
+            return decode_ops(model, read, 0, None).advance(state, token, every)
+
+        prefill, decode = jax.jit(prefill), jax.jit(decode)
 
         def run():
             started = time.perf_counter()
-            logits, held = jax.block_until_ready(prefill(variables, cache, prompt))
+            state = jax.block_until_ready(prefill(variables, cache, prompt))
             prefill_seconds = time.perf_counter() - started
             print("prefill seconds", prefill_seconds, "reads", source.stats(), file=sys.stderr, flush=True)
             started = time.perf_counter()
             emitted = []
             for _ in range(config.tokens):
-                token = jnp.argmax(logits[:, -1:], axis=-1).astype(jnp.int32)
-                emitted.append(token)
-                logits, held = decode(variables, held, token)
-            logits, held, emitted = jax.block_until_ready((logits, held, emitted))
+                token = jnp.argmax(state.logits, axis=-1).astype(jnp.int32)
+                emitted.append(token[:, None])
+                state = decode(variables, state, token)
+            state, emitted = jax.block_until_ready((state, emitted))
             print("decode seconds", time.perf_counter() - started, "reads", source.stats(),
                   file=sys.stderr, flush=True)
-            return prefill_seconds, time.perf_counter() - started, np.asarray(jnp.concatenate(emitted, axis=1))
+            decode_seconds = time.perf_counter() - started
+            return prefill_seconds, decode_seconds, np.asarray(jnp.concatenate(emitted, axis=1))
 
         if config.warmup:
             run()  # Also warms filesystem and retained rows.
@@ -130,8 +136,9 @@ def measure(config: DiskConfig):
             # Compile without an extra SSD sweep. Cache initialization has
             # already admitted retained rows; an unretained model larger
             # than RAM cannot stay warm in the filesystem cache anyway.
+            shapes = jax.eval_shape(prefill, variables, cache, prompt)
             prefill = prefill.lower(variables, cache, prompt).compile()
-            decode = decode.lower(variables, cache, jnp.zeros((1, 1), jnp.int32)).compile()
+            decode = decode.lower(variables, shapes, jnp.zeros((1,), jnp.int32)).compile()
         before = source.stats()
         before_io = storage_reads()
         if config.trace:
@@ -152,7 +159,8 @@ def measure(config: DiskConfig):
                   "tokens_per_second": config.tokens * config.repeats / decode_seconds,
                   "cache": dataclasses.asdict(after),
                   "measured_reads": {name: getattr(after, name) - getattr(before, name)
-                                     for name in ("hits", "misses", "bytes_read", "read_seconds", "wait_seconds")},
+                                     for name in ("hits", "misses", "bytes_read", "read_seconds",
+                                                  "wait_seconds")},
                   "storage_reads": {name: after_io[name] - before_io[name] for name in before_io},
                   "tokens": [run[2].tolist() for run in runs], "host": resident_status(),
                   "device_memory": device.memory_stats(),

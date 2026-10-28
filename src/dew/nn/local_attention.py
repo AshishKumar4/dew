@@ -1,12 +1,16 @@
 """Attention over nearby keys in memory linear in the sequence: sliding windows
-and chunked local attention, run as one flagged kernel call where a kernel
-takes the window, else as banded blocks of the span."""
+and chunked local attention, run as one whole call where the attention template
+takes it (its spans, a chunk each query's run of keys) or a kernel takes the
+window as a flag, else as banded blocks of the span."""
 
 import functools
 
 import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
+
+from dew.batch import valid_order
+from dew.mesh import SEQUENCE_AXIS, logical_spec
 
 from .attention import (
     SPLASH_LANES,
@@ -15,31 +19,18 @@ from .attention import (
     combined_attention_mask,
     cudnn_takes_mask,
     kernel_for_materialized_mask,
+    query_split,
     resolve_implementation,
     scaled_dot_product_attention,
     split_with_queries,
     tensor_shards,
 )
 from .documents import with_documents
-from .inputs import valid_order
+from .inputs import sequence_blocks
 from .kernels.selection import forced
-from .sharding import (
-    HEADS,
-    KV_HEADS,
-    SEQUENCE_AXIS,
-    explicit_spec,
-    logical_spec,
-    manual_map,
-    rows_like,
-    rows_spec,
-    sequence_shards,
-)
-
-
-def _blocks(x, block: int, blocks: int):
-    """`[B, S, ...]` padded at the end to `blocks * block` rows, as `[B, blocks, block, ...]`."""
-    x = jnp.pad(x, [(0, 0), (0, blocks * block - x.shape[1])] + [(0, 0)] * (x.ndim - 2))
-    return x.reshape(x.shape[0], blocks, block, *x.shape[2:])
+from .kernels.templates import attention as template
+from .sharding import HEADS, KV_HEADS, explicit_spec, manual_map, rows_like, rows_spec, sequence_shards
+from .visibility import same_chunk, visible
 
 
 def _banded(x, before=None):
@@ -73,14 +64,16 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     without them; `right_padded` says each row's valid slots come first
     (`AttentionMetadata.right_padded`).
 
-    No `[S, S]` array is built above two spans. A window flash, cudnn (no
+    No `[S, S]` array is built above two spans. A call the attention template
+    takes runs whole as its spans, which it walks tile by tile: the window, or
+    each query's run of its chunk's keys (`chunk_runs`), with the documents,
+    the valid keys, the sinks and the softcap. A window flash, cudnn (no
     sinks) or splash takes as a flag, without packing, runs there, skipping
-    blocks outside it.
-    Chunks that start at row multiples fold into the batch. Everything else
-    runs banded: query blocks of the span against their own block and the one
+    blocks outside it. Elsewhere chunks that start at row multiples fold into
+    the batch, and everything else runs banded: query blocks of the span against their own block and the one
     before under a `[W, 2W]` mask, so the logits are `[S, 2W]` per head. Banding
     pads to whole spans, so at most two spans take the dense call. A row with
-    padding among its tokens runs on its real tokens alone (`_compacted`), so
+    padding among its tokens runs on its real tokens alone (`compacted`), so
     a window's or a chunk's keys sit within the band, as the cache holds them.
     """
     if (window is None) == (chunk is None):
@@ -98,10 +91,15 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
         _local_attention, window=window, chunk=chunk, max_segments=max_segments, dtype=dtype,
         precision=precision, force_fp32_for_softmax=force_fp32_for_softmax, implementation=implementation,
         sinks=sinks, softcap=softcap)
-    # A window counts tokens by their distance alone, so only a chunk reads the places.
-    places = None if chunk is None else places
+    # A window counts tokens by their distance alone, so only a chunk reads the places, at 32 bits at
+    # least: a chunk past a narrower dtype's largest is no number of it.
+    if chunk is None or places is None:
+        places = None
+    else:
+        places = jnp.asarray(places)
+        places = places.astype(jnp.promote_types(places.dtype, jnp.int32))
     if valid is not None and not right_padded:
-        return _compacted(attend, query, key, value, places, segment_ids, valid)
+        return compacted(attend, query, key, value, places, segment_ids, valid)
     return attend(query, key, value, places=places, segment_ids=segment_ids, valid=valid)
 
 
@@ -119,6 +117,14 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
         implementation, query, key, dtype=dtype, precision=precision,
         force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
         causal=True, sliding_window=window, segment_ids=segment_ids, max_segments=max_segments)
+    if resolved == 'template':
+        # The template walks only the key tiles its spans reach, in memory linear in the sequence, so it
+        # takes the whole call: the window, or each query's run of its chunk's keys (`chunk_runs`), with
+        # the documents, the valid keys, the sinks and the softcap as they are, no band and no mask.
+        runs = (None if chunk is None
+                else chunk_runs(places, segment_ids, valid, query.shape[0], length, chunk))
+        return whole(implementation=implementation, causal=True, sliding_window=window,
+                     segment_ids=segment_ids, max_segments=max_segments, key_valid=valid, key_runs=runs)
     # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
     # its additive bias where cudnn runs (docs/performance.md: 16384 packed
     # tokens at window 4096 in 0.60 GiB of temporaries on an L4, where xla
@@ -150,6 +156,12 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     # slice is at least that long. A wider span takes the dense call, whose
     # mask the sequence exchange carries.
     halo = length % shards == 0 and length // shards >= span
+    if (length <= 2 * span or not halo) and chunk is None:
+        # A window over documents and real keys is the template's spans, which the whole call reads as
+        # they are where its kernel takes them, else as the mask they mean (`visibility_mask`).
+        return whole(implementation=implementation if implementation == 'auto' else masked, causal=True,
+                     sliding_window=window, segment_ids=segment_ids, max_segments=max_segments,
+                     key_valid=valid)
     if length <= 2 * span or not halo:
         # A mask pairs every query with every key, which an Explicit axis splitting both sides of it
         # would place twice, so the `[B, S]` fields it is built from are each device's whole.
@@ -183,9 +195,30 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     return checkpoint_name(out, 'attention_output')
 
 
-def _compacted(attend, query, key, value, places, segment_ids, valid):
+def chunk_runs(places, segment_ids, valid, rows: int, length: int, chunk: int) -> jax.Array:
+    """Each query's run of keys `[lo, hi)` `[B, S, 1, 2]` (`template.spans`' `runs`): its own chunk's keys
+    of `chunk` places at or before it within its document, chunked attention's, as the template's spans
+    take a chunk (`template.spans`' `chunk`, the one algorithm), one interval a query, which every
+    mainloop walks. `places` `[S]` or `[B, S]`, None for the row index. The keys `valid` `[B, S]` does not
+    mark are no document's (id 0, padding): a compacted row's padding sits after its tokens at places
+    that restart (`compacted`), which the search along a document's places would read as its own."""
+    positions = None
+    if places is not None:
+        place = jnp.broadcast_to(jnp.atleast_2d(jnp.asarray(places)), (rows, length))
+        positions = place, place
+    if valid is not None:
+        segment_ids = jnp.where(valid, 1 if segment_ids is None else segment_ids, 0)
+    spans = template.spans(length, length, rows, causal=True, chunk=chunk, positions=positions,
+                           segment_ids=segment_ids)
+    return jnp.stack([spans.start, spans.end], axis=-1)[:, :, None, :]
+
+
+def compacted(attend, query, key, value, places, segment_ids, valid):
     """`attend` over each row's real tokens moved to its front in order, their
-    places and documents with them, and its outputs moved back to their slots.
+    places and documents with them, and its outputs moved back to their slots:
+    the one move every attention over rows with padding among their tokens
+    shares, this module's local attention and a tier-3 model's attention
+    (`dew.interop.torchax_fallback`) alike.
 
     A window spans `window` tokens and a chunk `chunk` places, and padding
     among a row's tokens spreads them over more slots than the band before a
@@ -257,11 +290,11 @@ def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chun
     if placed is not None:
         split = jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(*placed.spec[:2]))
         fields = {name: jax.sharding.reshard(field, split) for name, field in fields.items()}
-    rows = logical_spec(("activation_batch", "activation_length"), (batch, length))
-    specs = [rows] * len(fields)
+    specs = [query_split(("activation_batch", "activation_length"), field, queries, query.shape)
+             for field in fields.values()]
     if sinks is not None:
         fields['sinks'] = sinks
-        specs.append(logical_spec(("activation_heads",), sinks.shape))
+        specs.append(query_split(("activation_heads",), sinks, queries, query.shape))
     names = tuple(fields)
     local_length = length // shards
     # Chunks that start at every shard's first row stay inside their shard.
@@ -309,7 +342,7 @@ def _local_blocks(kernel, query, key, value, *, window, chunk, places, segment_i
         return x.reshape(batch * blocks, width, *x.shape[3:])
 
     def row_blocks(x):
-        return _blocks(jnp.broadcast_to(jnp.asarray(x), (batch, length)), span, blocks)
+        return sequence_blocks(jnp.broadcast_to(jnp.asarray(x), (batch, length)), span, blocks)
 
     def preceding(index):
         # The halo field at `index`, as the one block before the first.
@@ -327,23 +360,20 @@ def _local_blocks(kernel, query, key, value, *, window, chunk, places, segment_i
                 keep = keep & row_blocks(jnp.asarray(valid, bool))[..., None, :]
             mask = keep.reshape(batch * blocks, 1, span, span)
             implementation = masked
-        out = kernel(*(folded(_blocks(x, span, blocks), span) for x in (query, key, value)),
+        out = kernel(*(folded(sequence_blocks(x, span, blocks), span) for x in (query, key, value)),
                      implementation=implementation, causal=True, mask=mask)
     else:
         rows = offset + jnp.arange(blocks * span).reshape(1, blocks, span)
         key_rows = jnp.concatenate([rows - span, rows], axis=-1)
         keep = ((key_rows[..., None, :] >= 0)
-                & (key_rows[..., None, :] <= rows[..., :, None]))
-        if window is not None:
-            keep = keep & (rows[..., :, None] - key_rows[..., None, :] < window)
+                & visible(rows[..., :, None], key_rows[..., None, :], causal=True, window=window))
         keep = jnp.broadcast_to(keep, (batch, blocks, span, 2 * span))
         if chunk is not None and places is None:
-            keep = keep & (rows[..., :, None] // chunk == key_rows[..., None, :] // chunk)
+            keep = keep & same_chunk(rows[..., :, None], key_rows[..., None, :], chunk)
         elif chunk is not None:
-            places = row_blocks(places) // chunk
-            earlier = preceding(2)
-            keep = keep & (places[..., :, None] == _banded(
-                places, None if earlier is None else earlier // chunk)[..., None, :])
+            blocked = row_blocks(places)
+            keep = keep & same_chunk(blocked[..., :, None], _banded(blocked, preceding(2))[..., None, :],
+                                     chunk)
         if segment_ids is not None:
             segments = row_blocks(segment_ids)
             keep = keep & ((segments[..., :, None] == _banded(segments, preceding(3))[..., None, :])
@@ -351,9 +381,9 @@ def _local_blocks(kernel, query, key, value, *, window, chunk, places, segment_i
         if valid is not None:
             keep = keep & _banded(row_blocks(jnp.asarray(valid, bool)),
                                   preceding(4))[..., None, :]
-        out = kernel(folded(_blocks(query, span, blocks), span),
-                     folded(_banded(_blocks(key, span, blocks), preceding(0)), 2 * span),
-                     folded(_banded(_blocks(value, span, blocks), preceding(1)), 2 * span),
+        out = kernel(folded(sequence_blocks(query, span, blocks), span),
+                     folded(_banded(sequence_blocks(key, span, blocks), preceding(0)), 2 * span),
+                     folded(_banded(sequence_blocks(value, span, blocks), preceding(1)), 2 * span),
                      implementation=masked,
                      mask=keep.reshape(batch * blocks, 1, span, 2 * span))
     unfolded = (batch, blocks * span, *out.shape[2:])

@@ -26,6 +26,7 @@ import pytest
 from interop_support import (
     assert_autoencoder_vjp,
     assert_layout_tensors,
+    channels_last,
     extract_fixture,
     fixture_arrays,
     scaled_gap,
@@ -52,21 +53,38 @@ def variant(request, source):
     return directory, load_rae(directory), fixture_arrays(directory / "reference.npz")
 
 
-def channels_last(array):
-    return np.asarray(array).transpose(0, 2, 3, 1)
+def test_every_computed_tensor_exports_and_reloads_after_an_encoder_update(variant, tmp_path):
+    import shutil
 
+    from dew.interop.decoder_parts import layout_tensors
+    from dew.interop.safetensors_io import save_sharded
 
-def test_every_computed_tensor_is_mapped_and_exports_bit_identical(variant):
-    directory, (_, params, layouts, _), _ = variant
+    directory, (autoencoder, params, layouts, _), reference = variant
     tensors = component_tensors(directory, "")
     read = {name: tensor for name, tensor in tensors.items() if not name.startswith(UNREAD)}
     assert_layout_tensors(layouts, {"autoencoder": params}, read, "vae/")
+    image = 2 * channels_last(reference["image"]) - 1
+    probe = channels_last(reference["probe_latent"])
+    gradient = jax.grad(lambda values: jnp.sum(autoencoder.encode(values, image) * probe))(params)
+    trained = jax.tree.map(lambda value, grad: value - 0.01 * grad, params, gradient)
+    expected = autoencoder.encode(trained, image)
+    assert not np.array_equal(expected, autoencoder.encode(params, image))
+    exported = layout_tensors({layout.name.removeprefix("vae/"): layout for layout in layouts},
+                              {"autoencoder": trained},
+                              retained={name: tensor for name, tensor in tensors.items()
+                                        if name.startswith(UNREAD)})
+    shutil.copyfile(directory / "config.json", tmp_path / "config.json")
+    save_sharded(exported, tmp_path, max_shard_size=20_000, stem="diffusion_pytorch_model")
+    restored, variables, _, _ = load_rae(tmp_path)
+    np.testing.assert_array_equal(restored.encode(variables, image), expected)
 
 
 def test_the_latent_matches_the_source(variant):
     """The normalized latent: the encoder's patch tokens as a grid, less the
     checkpoint's mean and over its deviation, per position where it gives
-    one per position."""
+    one per position. The DINOv2 and MAE checkpoints omit encoder_norm_mean
+    and encoder_norm_std, so their latents hold the encoder input's default
+    ImageNet statistics (`dew.nn.blocks.IMAGENET_MEAN`) to the source's."""
     _, (autoencoder, params, _, config), reference = variant
     image = channels_last(reference["image"])
     latent = autoencoder.encode(params, 2 * image - 1)
@@ -75,6 +93,8 @@ def test_the_latent_matches_the_source(variant):
     gap = scaled_gap(latent, expected)
     print(f"{config['encoder_type']} latent gap {gap:.3g}")
     assert gap < FORWARD
+    empty = autoencoder.encode(params, 2 * image[:0] - 1)
+    assert empty.shape == expected[:0].shape
 
 
 def test_the_decode_matches_the_source(variant):

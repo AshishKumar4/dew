@@ -14,9 +14,10 @@ the test's, takes the place of the transformer call, at the script's
 timestep (sigma times 1000); the script's latent packing and the model call
 itself are the transformer's and not the loss's.
 
-The draws are DiffusionObjective.loss's from `jax.random.key(KEY)`: its
-split's third key draws the training times, as `presets.Flow(shift=...)`'s
-schedule draws them, and the fourth the noise; sigma is the schedule's
+The draws come from `jax.random.key(KEY)`: its split's third key draws the
+training times, as `presets.Flow(shift=...)`'s schedule draws them, and the
+fourth the noise, which the test hands DiffusionObjective.loss by name
+(`Step.tape`); sigma is the schedule's
 noise rate at those times, so the script runs on Dew's own sigmas. The
 static shift that maps the drawn time to sigma is held on its own, against
 `FlowMatchEulerDiscreteScheduler(shift=3)`'s published grid, which lands

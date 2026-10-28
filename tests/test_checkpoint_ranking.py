@@ -4,6 +4,9 @@ Restoring the ranked training state is Dew's lifecycle; Orbax oracles storage an
 """
 import dataclasses
 import datetime
+import itertools
+import math
+from collections.abc import Iterator
 from typing import ClassVar
 
 import jax
@@ -12,15 +15,15 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Counting, dataset, val_batches
+from recording import RecordingTracker
 
 from dew.artifacts import TokenScores
 from dew.checkpoints import Checkpoints, Keep, Metrics, Ranking
 from dew.data.dataset import DataPartition
 from dew.objectives.base import Aux, Objective, Shown
 from dew.telemetry.records import FitEnded
-from dew.training import Trainer
-from dew.training.evaluation import MetricScores
-from dew.training.trainer import Best, Plateau
+from dew.training import Best, Plateau, Trainer
+from dew.training.evaluation import Evaluation, MetricScores, Summary
 
 
 class Overfit(Objective):
@@ -53,6 +56,25 @@ class Value:
 
     def finalize(self, value):
         return value
+
+
+@dataclasses.dataclass
+class Scripted:
+    """A lower-is-better metric that scores each evaluation it finalizes `scores`' next value, whatever
+    it reads: a warming pass, which finalizes nothing, takes none."""
+    name: str
+    scores: Iterator[float]
+    shown: Shown = dataclasses.field(default_factory=lambda: Shown(better='lower'))
+    reads = TokenScores
+
+    def __call__(self, artifact, batch):
+        return 0.0
+
+    def merge(self, left, right):
+        return left
+
+    def finalize(self, value):
+        return next(self.scores)
 
 
 def data():
@@ -154,6 +176,36 @@ def test_an_aggregate_reads_a_split_on_its_own_cadence_as_nan_where_it_was_not_s
     run.checkpoints.wait()
     assert run.checkpoints.resolve('best:aggregate:0') == 1
     assert run.checkpoints.resolve('best:aggregate:1') == 2
+
+
+@pytest.mark.parametrize("end", ["stream", "plateau"])
+def test_a_run_that_ends_off_a_rare_suites_cadence_is_ranked_by_it_at_its_last_step(tmp_path, end):
+    """Whatever ends a run, its last step is scored by every suite before its checkpoint is saved: a
+    training stream that runs out after four batches, or a plateau that stops the run at step 4. Both
+    suites rise as training does, so each one's best is the last step, which the frequent suite ranks
+    there; the rare suite, scored every third step, would never rank it from a checkpoint saved before
+    that suite scored it."""
+    from dew.training import EvalSuite
+
+    metric = Value('value', Shown(better='lower'))
+
+    class Ending(Counting):
+        def __next__(self):
+            if self.index == 4:
+                raise StopIteration
+            batch = super().__next__()
+            return {**batch, 'validation': np.zeros(len(batch['x']), bool)}
+
+    loaded = dataclasses.replace(data(), train=lambda partition: Ending()) if end == "stream" else data()
+    run = trainer(tmp_path / 'run')
+    state = run.fit(loaded, steps=10, log_every=1, eval_every=1, metrics=[metric],
+                    validation={'often': data().val, 'rare': EvalSuite(data().val, (metric,), 3)},
+                    best=[Best(lambda scores: scores[('often', metric)], mode='max'),
+                          Best(lambda scores: scores[('rare', metric)], mode='max')],
+                    stop=Plateau(metric, evals=3, split='often') if end == "plateau" else None)
+    run.checkpoints.wait()
+    assert int(state.step) == 4
+    assert run.checkpoints.resolve('best:aggregate:0') == run.checkpoints.resolve('best:aggregate:1') == 4
 
 
 def test_an_aggregate_reads_a_training_scalar_whose_name_has_parts(tmp_path):
@@ -293,6 +345,36 @@ def test_ranked_loss_and_periodic_retention(tmp_path):
         checkpoints.wait()
     assert checkpoints.best == 2
     assert {entry.step for entry in checkpoints.kept()} == {2, 4, 5}
+
+
+def test_ranked_ties_keep_the_older_steps(tmp_path):
+    """A ranking's best `top` steps are Orbax's `BestN` over the steps it scored: of tied scores the
+    older steps are kept, and a step the ranking never scored is not among them. The run's own first
+    step ranks by its higher training loss."""
+    run = trainer(tmp_path / 'run', keep=Keep(latest=1))
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
+    checkpoints = run.checkpoints
+    for step, loss in [(2, .5), (3, .5), (4, None), (5, .5), (6, .7), (7, .9)]:
+        ranking = None if loss is None else Ranking('train/loss', loss, 'min', top=2)
+        checkpoints.save(step, state.replace(step=jnp.int32(step)), None, ranking=ranking)
+        checkpoints.wait()
+    assert {entry.step for entry in checkpoints.kept()} == {2, 3, 7}
+
+
+def test_plateau_counts_an_improvement_as_flax_early_stopping_does(tmp_path):
+    """An evaluation improves on the best where Flax's `EarlyStopping` says it does, by more than
+    `min_delta` (`best - value > min_delta`): 1 - 2**-24 improves on 1 by 2**-24, more than a
+    `min_delta` of 2**-24 - 2**-60, though `1 - min_delta` rounds to it in float64. So a plateau of one
+    evaluation stops at the first evaluation that does not improve, the third, not the second."""
+    delta, value = 2.0 ** -24 - 2.0 ** -60, 1.0 - 2.0 ** -24
+    assert 1.0 - delta == value
+    metric = Scripted('value', itertools.chain([1.0], itertools.repeat(value)))
+    run = trainer(tmp_path / 'run')
+    state = run.fit(data(), steps=10, log_every=1, eval_every=1, checkpoint_every=1, metrics=[metric],
+                    stop=Plateau(metric, evals=1, min_delta=delta))
+    assert int(state.step) == 3
+    held = run.checkpoints.control(3)['plateau:val/value']
+    assert (held['best'], held['bad']) == (value, 1)
 
 
 def test_plateau_restores_patience_and_stops_after_eligible_evaluations(tmp_path):
@@ -595,7 +677,8 @@ def test_tile_head_invalidates_validation_trace_for_the_same_batch_shape():
     # finds its program again.
     from flax import linen as nn
 
-    from dew.nn.sharding import DEFAULT_RULES, pipeline_microbatches
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.sharding import pipeline_microbatches
     with nn.logical_axis_rules((("vocab", None), *DEFAULT_RULES)):
         Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
     with pipeline_microbatches(2):
@@ -617,3 +700,180 @@ def test_a_refused_save_leaves_the_step_the_retention_policy_reads(tmp_path):
     checkpoints.save(2, state)
     checkpoints.wait()
     assert [kept.step for kept in checkpoints.kept()] == [1, 2]
+
+
+def logged(tracker: RecordingTracker, name: str) -> dict[int, float]:
+    """Each step's logged value of `name`."""
+    return {step: row[name] for step, row in tracker.scalars if name in row}
+
+
+BOARD = f'{Summary.SPLIT}/board'
+"""The recorded name of the summary `board`, in the summaries' namespace."""
+
+
+def summarized(path, rare: list[float], steps: int, **fit):
+    """A run of `steps` whose `often` split scores every step, 10 then one less each evaluation, and whose
+    `rare` split scores every third, `rare`'s values in turn, weighed 1 to 3 into the summary `board`; with
+    checkpoints every third step, and each of `fit`'s policies built from the summary. Returns its state,
+    its checkpoints and the rows it logged."""
+    from dew.training import EvalSuite
+
+    often = Scripted('often', itertools.count(10.0, -1.0))
+    seldom = Scripted('rare', iter(rare))
+    board = Summary('board', {'often/often': 1.0, 'rare/rare': 3.0}, better='lower')
+    tracker = RecordingTracker()
+    run = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker,
+                  checkpoints=Checkpoints(str(path), keep=1))
+    suites = {'often': EvalSuite(data().val, (often,)), 'rare': EvalSuite(data().val, (seldom,), 3)}
+    state = run.fit(data(), steps=steps, log_every=1, eval_every=1, checkpoint_every=3, validation=suites,
+                    summaries=[board], **{name: policy(board) for name, policy in fit.items()})
+    run.checkpoints.wait()
+    return state, run.checkpoints, tracker
+
+
+def test_a_summary_is_formed_only_where_every_split_it_weighs_was_scored(tmp_path):
+    """A summary weighs a step's split scores into one, recorded in the summaries' namespace, formed once
+    where the step's scores join and only at a step that scored every split it weighs: with `rare` scored
+    every third step, at 3, 6 and the run's end, 7, never between, where a stale `rare` score would mix
+    in. Its value is the weighted mean of that step's own scores, it is logged, and best-K ranks by it."""
+    _, checkpoints, tracker = summarized(tmp_path / 'run', [4.0, 1.0, 2.0], 7,
+                                         best=lambda board: Best(BOARD))
+    often, rare, board = (logged(tracker, name) for name in ('often/often', 'rare/rare', BOARD))
+    assert sorted(often) == list(range(1, 8)) and sorted(rare) == sorted(board) == [3, 6, 7]
+    for step, value in board.items():
+        assert value == (often[step] + 3 * rare[step]) / 4
+    assert checkpoints.resolve('best') == min(board, key=board.get) == 6
+
+
+def test_a_plateau_counts_only_the_evaluations_that_form_its_summary(tmp_path):
+    """A plateau on a summary reads only the evaluations that form it, those that scored every split it
+    weighs: the steps between see no summary and count neither for nor against it. With one evaluation
+    of patience the run stops at step 9, the first summary no better than step 6's."""
+    state, _, tracker = summarized(tmp_path / 'run', [4.0, 1.0, 9.0, 0.0], 12,
+                                   stop=lambda board: Plateau(board, evals=1))
+    assert int(state.step) == 9 and sorted(logged(tracker, BOARD)) == [3, 6, 9]
+
+
+def test_an_aggregate_reads_a_summary_where_it_is_formed(tmp_path):
+    """An aggregate reads a summary by its recorded name as it reads a split's metric: at a step that
+    formed it, its value, and at one whose rarer suite did not run, NaN, which ranks nothing, the fit
+    declaring it to its rankings as to its selections (`declarations`)."""
+    _, checkpoints, _ = summarized(tmp_path / 'run', [4.0, 1.0, 2.0], 7,
+                                   best=lambda board: Best(lambda scores: scores[BOARD]))
+    assert checkpoints.resolve('best:aggregate:0') == 6
+
+
+def test_an_aggregate_over_every_score_reads_each_by_the_key_it_is_given(tmp_path):
+    """An aggregate's scores yield each score under a key that reads it back, by the rule a lookup
+    follows: a summary's and a split's loss by their recorded names, a metric and a training scalar by
+    their objects. So `values()` and `items()` read every score the step recorded, each once, and a
+    ranking by their sum ranks each kept step by the sum of the scores it kept, the summary's among them
+    at the steps that formed it."""
+    unread = []
+
+    def total(scores):
+        # A key that does not read its score back would raise in `values()`; it ranks nothing instead.
+        unread.extend(repr(key) for key in scores if key not in scores)
+        return math.nan if unread else math.fsum(scores.values())
+
+    _, checkpoints, _ = summarized(tmp_path / 'run', [4.0, 1.0, 2.0], 7, best=lambda board: Best(total))
+    assert unread == []
+    kept = {record.step: record for record in checkpoints.kept()}
+    assert BOARD in kept[7].metrics
+    for record in kept.values():
+        recorded = [value for name, value in record.metrics.items() if not name.startswith('checkpoint/')]
+        assert record.rankings['aggregate:0']['value'] == math.fsum(recorded)
+
+
+def test_each_key_the_scores_yield_reads_its_own_score_back():
+    """`MetricScores` yields each recorded score under the key that reads it back: a training scalar and
+    a validation metric by their objects, another split's metric with its split, and a split's loss and
+    a summary by their recorded names. Its keys, `values()` and `items()` agree, so the validation loss
+    reads as itself and not as the training loss, and a summary's object reads its score live as a
+    checkpoint's kept scores do."""
+    objective = Overfit()
+    metric = Value('value', Shown(better='lower'))
+    board = Summary('board', {'val/value': 1.0}, better='lower')
+    scores = {'val/value': 1.0, 'val/loss': 2.0, 'test/value': 3.0, 'train/loss': 4.0, BOARD: 5.0}
+    live = MetricScores({'val': [metric], 'test': [metric], Summary.SPLIT: [board]}, scores, objective)
+    assert all(key in live for key in live)
+    assert [live[key] for key in live] == list(live.values()) == list(scores.values())
+    assert [value for _, value in live.items()] == list(scores.values())
+    assert live[board] == Metrics(scores)[board] == 5.0
+
+
+def test_a_summary_is_formed_once_where_the_end_completes_the_step_a_plateau_stops_at(tmp_path):
+    """A plateau that stops off a rarer suite's cadence ends the run at a step that scored only some of
+    its splits: here `often`, worse at step 2 than at 1, before `rare`'s step 3. The end scores `rare`
+    there, joined to that step's `often` score, and each summary is formed once at the step, by the
+    evaluation that completes the splits it weighs: `board`, over both, at the end, logged and ranked by
+    `Best`; `solo`, over `often` alone, at the step's own evaluation, and not again at the end. The
+    display shows both as the step's one evaluation of the summaries, each with its history."""
+    from dew.training import EvalSuite
+
+    often, rare = Scripted('often', iter([1.0, 2.0])), Scripted('rare', iter([4.0]))
+    board = Summary('board', {'often/often': 1.0, 'rare/rare': 3.0}, better='lower')
+    solo = Summary('solo', {'often/often': 1.0}, better='lower')
+    tracker = RecordingTracker()
+    run = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker,
+                  checkpoints=Checkpoints(str(tmp_path / 'run'), keep=1))
+    suites = {'often': EvalSuite(data().val, (often,)), 'rare': EvalSuite(data().val, (rare,), 3)}
+    state = run.fit(data(), steps=9, log_every=1, eval_every=1, validation=suites, summaries=[board, solo],
+                    stop=Plateau(often, evals=1, split='often'), best=Best(board))
+    run.checkpoints.wait()
+
+    def rows(name):
+        return [(step, row[name]) for step, row in tracker.scalars if name in row]
+
+    assert int(state.step) == 2
+    assert rows(BOARD) == [(2, (2.0 + 3 * 4.0) / 4)] and rows(f'{Summary.SPLIT}/solo') == [(1, 1.0), (2, 2.0)]
+    assert run.checkpoints.resolve('best') == 2
+    shown = f'{run._display.label(Summary.SPLIT)} · step 2'
+    assert [(row.name, list(row.values)) for heading, row in run._display.evaluation_rows()
+            if heading == shown] == [('solo', [1.0, 2.0]), ('board', [(2.0 + 3 * 4.0) / 4])]
+
+
+@pytest.mark.parametrize('beside', [False, True], ids=['alone', 'beside-summaries'])
+def test_a_split_named_summary_is_selected_and_ranked_as_any_split_is(tmp_path, beside):
+    """A validation split may be named `summary`, a name the summaries' namespace does not take: alone
+    or beside the run's summaries, `Best` resolves a metric to it as to any split, and the run ranks by
+    that split's own scores, which a summary named as its metric is logged apart from."""
+    accuracy, other = Scripted('accuracy', iter([3.0, 1.0, 2.0])), Scripted('other', iter([1.0, 1.0, 4.0]))
+    assert Best(accuracy).resolved({'summary': (accuracy,)}).split == 'summary'
+    summaries = [Summary('accuracy', {'summary/accuracy': 1.0, 'summary/other': 1.0}, better='lower')]
+    tracker = RecordingTracker()
+    run = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker,
+                  checkpoints=Checkpoints(str(tmp_path / 'run'), keep=1))
+    run.fit(data(), steps=3, log_every=1, eval_every=1, validation={'summary': data().val},
+            metrics=[accuracy, other], best=accuracy, summaries=summaries if beside else ())
+    run.checkpoints.wait()
+    assert run.checkpoints.resolve('best') == 2
+    assert logged(tracker, 'summary/accuracy') == {1: 3.0, 2: 1.0, 3: 2.0}
+    assert logged(tracker, f'{Summary.SPLIT}/accuracy') == ({1: 2.0, 2: 1.0, 3: 3.0} if beside else {})
+
+
+def test_a_summary_named_as_a_metric_of_a_split_named_summary_is_recorded_apart(tmp_path):
+    """A summary and a metric of a split named `summary` that share a name each keep their own score:
+    the split's under `summary/<metric>`, the summary's in the summaries' namespace, so neither
+    replaces the other in the step's scores or its log."""
+    accuracy, other = Scripted('accuracy', iter([3.0, 1.0, 2.0])), Scripted('other', iter([1.0, 1.0, 4.0]))
+    board = Summary('accuracy', {'summary/accuracy': 1.0, 'summary/other': 1.0}, better='lower')
+    tracker = RecordingTracker()
+    Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker).fit(
+        data(), steps=3, log_every=1, eval_every=1, validation={'summary': data().val},
+        metrics=[accuracy, other], summaries=[board])
+    assert logged(tracker, 'summary/accuracy') == {1: 3.0, 2: 1.0, 3: 2.0}
+    assert logged(tracker, f'{Summary.SPLIT}/accuracy') == {1: 2.0, 2: 1.0, 3: 3.0}
+
+
+def test_no_split_metric_or_summary_name_takes_the_summaries_namespace():
+    """A summary's score is recorded in `Summary.SPLIT`, a namespace that holds a '/', which a split's
+    name, a metric's and a summary's are each refused: no split's score can be named in it."""
+    objective = Overfit()
+    variables = objective.init(jax.random.key(0))
+    for split, name in ((Summary.SPLIT, 'board'), ('evaluation', 'summary/board')):
+        with pytest.raises(ValueError):
+            Evaluation.run(objective, variables, data().val, key=jax.random.key(0),
+                           metrics=[Value(name, Shown(better='lower'))], split=split)
+    with pytest.raises(ValueError):
+        Summary('summary/board', {'val/value': 1.0}, better='lower')

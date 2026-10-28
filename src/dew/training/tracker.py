@@ -13,6 +13,7 @@ backend is imported when the first value is logged into it.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
 import io
@@ -28,6 +29,7 @@ from typing import TYPE_CHECKING, Protocol, TextIO
 import jax
 import numpy as np
 
+from dew._records import integer, record
 from dew.artifacts import (
     Artifact,
     Decisions,
@@ -38,7 +40,7 @@ from dew.artifacts import (
     VideoGrid,
     uint8_pixels,
 )
-from dew.records import integer, record
+from dew.cleanup import attempted
 from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, json_value, reported_number
 
 if TYPE_CHECKING:
@@ -68,14 +70,14 @@ def _home(array: jax.Array | np.ndarray) -> np.ndarray:
 
     A tracker draws on process zero alone, and completing a global array needs
     every process, so an artifact arrives here already brought home by
-    `dew.coordination.collective_host`. The refusal names the missing call
+    `dew._coordination.collective_host`. The refusal names the missing call
     instead of hanging in a collective one process entered by itself.
     """
     if isinstance(array, jax.Array) and not array.is_fully_addressable:
         raise ValueError(
             "a tracker was handed a shard of a global array, which it cannot "
             "complete from one process: bring the artifact home with "
-            "dew.coordination.collective_host on every process before drawing it")
+            "dew.distributed.collective_host on every process before drawing it")
     return np.asarray(array)
 
 def _uint8(images: jax.Array | np.ndarray) -> np.ndarray:
@@ -104,6 +106,13 @@ def _gif(clip: np.ndarray) -> bytes:
 
 DECISION_ROWS = 256
 """The most scored questions a tracker shows of one `Decisions` preview."""
+DECISION_COLUMNS = ("row", "question", "label", "predicted", "p_label")
+"""The columns of a decision preview's rows (`_decided`), as every sink shows them."""
+
+
+def _texts(value: TextSamples) -> tuple[str, ...]:
+    """A text preview's samples as text: its decoded texts, or each row's token ids where it has none."""
+    return value.texts or tuple(str(row.tolist()) for row in _home(value.tokens))
 
 
 def _decided(value: Decisions) -> list[list[float | int]]:
@@ -164,8 +173,7 @@ def _(value: VideoGrid) -> Payload:
 def _(value: TextSamples) -> Payload:
     import wandb
 
-    texts = value.texts or tuple(str(row.tolist()) for row in _home(value.tokens))
-    rows = [[index, value.prompt, text] for index, text in enumerate(texts)]
+    rows = [[index, value.prompt, text] for index, text in enumerate(_texts(value))]
     table = wandb.Table(columns=["sample", "prompt", "text"])
     for row in rows:
         table.add_data(*row)
@@ -191,7 +199,7 @@ def _(value: TokenScores) -> Payload:
 def _(value: Decisions) -> Payload:
     import wandb
 
-    table = wandb.Table(columns=["row", "question", "label", "predicted", "p_label"])
+    table = wandb.Table(columns=list(DECISION_COLUMNS))
     for row in _decided(value):
         table.add_data(*row)
     return {"val/decisions": table}
@@ -205,12 +213,7 @@ class _OwnedTracker:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        try:
-            self.close()
-        except BaseException as failure:
-            if exc is None:
-                raise
-            exc.add_note(f"Tracker close failed: {failure!r}")
+        attempted((("Tracker close", self.close),), primary=exc)
 
 
 class WandbTracker(_OwnedTracker):
@@ -325,7 +328,7 @@ class LocalTracker(_OwnedTracker):
         self.directory.mkdir(parents=True, exist_ok=True)
         self._sequence += 1
         prefix = self.directory / f'preview-{step}-{time.time_ns()}-{self._sequence}'
-        files = _write_preview(value, prefix)
+        files = write_artifact(value, prefix)
         self._write('records.jsonl', {'type': type(value).__name__, 'step': step,
                                     'time': time.time(), 'files': [path.name for path in files]})
 
@@ -383,24 +386,19 @@ class LocalTracker(_OwnedTracker):
     def close(self) -> None:
         if self._closed:
             return
-        error = None
+
+        def plotted() -> None:
+            self.plot_files()
+
+        def closed() -> None:
+            self._closed = True
+
         try:
-            if self.plots:
-                self.plot_files()
-        except BaseException as failure:
-            error = failure
-        self._closed = True
-        for handle in self._files.values():
-            try:
-                handle.close()
-            except BaseException as failure:
-                if error is None:
-                    error = failure
-                else:
-                    error.add_note(f'Journal close also failed: {failure!r}')
-        self._files.clear()
-        if error is not None:
-            raise error
+            plots = [("Journal plots", plotted)] if self.plots else []
+            attempted([*plots, ("Journal state", closed),
+                       *((f"Journal close of {name}", handle.close) for name, handle in self._files.items())])
+        finally:
+            self._files.clear()
 
 
 def _curves(history: Mapping[str, list[tuple[int, float]]], metrics: tuple[str, ...], *, smooth: int = 1,
@@ -419,7 +417,9 @@ def _curves(history: Mapping[str, list[tuple[int, float]]], metrics: tuple[str, 
 
 
 @functools.singledispatch
-def _write_preview(value: Reported, prefix: Path) -> list[Path]:
+def write_artifact(value: Reported, prefix: Path) -> list[Path]:
+    """`value` written as files under `prefix`, as a tracker keeps a preview (an image's PNG, an array
+    artifact's .npz), returning their paths; a type with no writer is refused."""
     raise TypeError(f'LocalTracker has no renderer for {type(value).__name__}')
 
 
@@ -435,17 +435,17 @@ def _write_frames(frames, encode, suffix: str, captions, prefix: Path) -> list[P
     return [*paths, written]
 
 
-@_write_preview.register
+@write_artifact.register
 def _(value: ImageGrid, prefix: Path) -> list[Path]:
     return _write_frames(_uint8(value.images), _png, '.png', value.captions, prefix)
 
 
-@_write_preview.register
+@write_artifact.register
 def _(value: VideoGrid, prefix: Path) -> list[Path]:
     return _write_frames(_uint8(value.videos), _gif, '.gif', value.captions, prefix)
 
 
-@_write_preview.register
+@write_artifact.register
 def _(value: TextSamples, prefix: Path) -> list[Path]:
     path = prefix.with_suffix('.json')
     path.write_text(json.dumps({'prompt': value.prompt, 'texts': list(value.texts),
@@ -453,27 +453,28 @@ def _(value: TextSamples, prefix: Path) -> list[Path]:
     return [path]
 
 
-@_write_preview.register
+@write_artifact.register
 def _(value: Representations, prefix: Path) -> list[Path]:
-    path = prefix.with_suffix('.npz')
-    np.savez(path, features=_home(value.features), labels=_home(value.labels))
-    return [path]
+    return _arrays(prefix, features=value.features, labels=value.labels)
 
 
-@_write_preview.register
+@write_artifact.register
 def _(value: TokenScores, prefix: Path) -> list[Path]:
+    return _arrays(prefix, losses=value.losses, weights=value.weights)
+
+
+def _arrays(prefix: Path, **arrays) -> list[Path]:
+    """`arrays`, brought home, saved together under `prefix` as one .npz preview."""
     path = prefix.with_suffix('.npz')
-    np.savez(path, losses=_home(value.losses), weights=_home(value.weights))
+    np.savez(path, allow_pickle=False, **{name: _home(array) for name, array in arrays.items()})
     return [path]
 
 
-@_write_preview.register
+@write_artifact.register
 def _(value: Decisions, prefix: Path) -> list[Path]:
-    path = prefix.with_suffix('.npz')
-    np.savez(path, probabilities=_home(value.probabilities), options=_home(value.options),
-             labels=_home(value.labels), targets=_home(value.targets), ordinal=_home(value.ordinal),
-             scored=_home(value.scored))
-    return [path]
+    classes = {} if value.classes is None else {"classes": value.classes}
+    return _arrays(prefix, probabilities=value.probabilities, options=value.options, labels=value.labels,
+                   targets=value.targets, ordinal=value.ordinal, scored=value.scored, **classes)
 
 
 MLFLOW_NAME = re.compile(r"[/\w.\- ]{0,250}")
@@ -561,7 +562,7 @@ class MLflowTracker(_OwnedTracker):
                 self._status = value.terminal_status
             return
         with tempfile.TemporaryDirectory() as directory:
-            for path in _write_preview(value, Path(directory) / f'preview-{step}'):
+            for path in write_artifact(value, Path(directory) / f'preview-{step}'):
                 client.log_artifact(run, str(path), f'previews/step-{step}')
 
     def close(self) -> None:
@@ -638,17 +639,14 @@ class TensorBoardTracker(_OwnedTracker):
 
 
 def _text(tag: str, payload: str) -> Summary.Value:
-    """A text-plugin summary value: the string tensor a text tab reads."""
-    from tensorboard.compat.proto import summary_pb2, tensor_pb2, tensor_shape_pb2, types_pb2
+    """A text-plugin summary value: the one-string tensor a text tab reads, its metadata and tensor
+    built as TensorBoard's own TensorFlow-free `text_pb` builds them."""
+    from tensorboard.compat.proto.summary_pb2 import Summary
+    from tensorboard.plugins.text.metadata import create_summary_metadata
+    from tensorboard.util.tensor_util import make_tensor_proto
 
-    return summary_pb2.Summary.Value(
-        tag=tag,
-        metadata=summary_pb2.SummaryMetadata(
-            plugin_data=summary_pb2.SummaryMetadata.PluginData(plugin_name='text')),
-        tensor=tensor_pb2.TensorProto(
-            dtype=types_pb2.DT_STRING, string_val=[payload.encode()],
-            tensor_shape=tensor_shape_pb2.TensorShapeProto(
-                dim=[tensor_shape_pb2.TensorShapeProto.Dim(size=1)])))
+    return Summary.Value(tag=tag, metadata=create_summary_metadata(display_name=None, description=None),
+                         tensor=make_tensor_proto([payload], dtype=np.object_))
 
 
 def _picture(tag: str, encoded: bytes, frame: np.ndarray) -> Summary.Value:
@@ -698,26 +696,21 @@ def _(value: VideoGrid):
 def _(value: TextSamples):
     from tensorboard.compat.proto.summary_pb2 import Summary
 
-    texts = value.texts or tuple(str(row.tolist()) for row in _home(value.tokens))
     return Summary(value=[_text('val/samples', json.dumps(
-        {'prompt': value.prompt, 'texts': list(texts)}))])
+        {'prompt': value.prompt, 'texts': list(_texts(value))}))])
 
 
-def _histogram(tag: str, values: np.ndarray):
-    """A histogram-plugin summary value of `values`, in 30 buckets."""
-    from tensorboard.compat.proto.summary_pb2 import HistogramProto, Summary
+def _histogram(tag: str, values: np.ndarray) -> Summary:
+    """A histogram-plugin summary of `values`, in 30 buckets, as TensorBoard's own TensorFlow-free
+    `histogram_pb` builds it: the plugin's tensor of bucket edges and counts."""
+    from tensorboard.plugins.histogram.summary_v2 import histogram_pb
 
-    counts, edges = np.histogram(values, bins=30)
-    return Summary.Value(tag=tag, histo=HistogramProto(
-        min=values.min(), max=values.max(), num=values.size, sum=values.sum(),
-        sum_squares=(values ** 2).sum(), bucket_limit=edges[1:].tolist(), bucket=counts.tolist()))
+    return histogram_pb(tag, values, buckets=30)
 
 
 @_summarize.register
 def _(value: Representations):
-    from tensorboard.compat.proto.summary_pb2 import Summary
-
-    return Summary(value=[_histogram('val/representation_std', _spread(value).astype(np.float64))])
+    return _histogram('val/representation_std', _spread(value).astype(np.float64))
 
 
 @_summarize.register
@@ -725,16 +718,15 @@ def _(value: TokenScores):
     from tensorboard.compat.proto.summary_pb2 import Summary
 
     losses = _counted_losses(value)
-    return Summary(value=[_histogram('val/token_losses', losses)] if losses.size else [])
+    return _histogram('val/token_losses', losses) if losses.size else Summary(value=[])
 
 
 @_summarize.register
 def _(value: Decisions):
     from tensorboard.compat.proto.summary_pb2 import Summary
 
-    rows = _decided(value)
     return Summary(value=[_text('val/decisions', json.dumps(
-        {'columns': ['row', 'question', 'label', 'predicted', 'p_label'], 'rows': rows}))])
+        {'columns': list(DECISION_COLUMNS), 'rows': _decided(value)}))])
 
 
 class Trackers(_OwnedTracker):
@@ -751,17 +743,8 @@ class Trackers(_OwnedTracker):
     def _each(self, operation) -> None:
         if self._closed:
             raise RuntimeError('Trackers is closed')
-        error = None
-        for tracker in self.trackers:
-            try:
-                operation(tracker)
-            except BaseException as failure:
-                if error is None:
-                    error = failure
-                else:
-                    error.add_note(f'{type(tracker).__name__} also failed: {failure!r}')
-        if error is not None:
-            raise error
+        attempted([(type(tracker).__name__, functools.partial(operation, tracker))
+                   for tracker in self.trackers])
 
     def log(self, scalars: Mapping[str, float], step: int) -> None:
         self._each(lambda tracker: tracker.log(scalars, step))
@@ -798,3 +781,17 @@ class Trackers(_OwnedTracker):
         if exc is None and error is not None:
             raise error
 
+
+@dataclasses.dataclass(frozen=True)
+class Wandb:
+    """Where a run reports to Weights & Biases.
+
+    Setting it turns tracking on; the entity and the offline switch have no effect
+    without a project. `name` is the run's display name there, apart from the name
+    its checkpoints are kept under; None shows it as the run is named.
+    """
+
+    project: str
+    entity: str | None = None
+    offline: bool = False
+    name: str | None = None

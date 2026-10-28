@@ -34,10 +34,12 @@ import optax
 import torch
 from torch.overrides import TorchFunctionMode
 
+from dew.batch import Variables
 from dew.interop.pretrained import Pretrained
-from dew.objectives.base import Variables
+from dew.interop.sources import load_shards
 from dew.objectives.lm import LMObjective
-from dew.training import TrainState
+from dew.objectives.routing import ExpertBalance
+from dew.state import TrainState
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 RATE = 5e-2
@@ -143,21 +145,14 @@ class RoundTrip(Trip):
     truth: np.ndarray
 
 
-def source_tensors(directory: Path) -> dict[str, np.ndarray]:
-    """The checkpoint's own tensor table, as the loader reads it."""
-    from dew.interop.sources import load_shards
-
-    return load_shards(directory)
-
-
 def logits(source: Pretrained, variables: Variables, ids: np.ndarray) -> np.ndarray:
     return np.asarray(source.model.apply(variables, jnp.asarray(ids, jnp.int32)), np.float32)
 
 
 def train(case: Case, source: Pretrained, ids: np.ndarray):
     """One real `Trainer` step of plain SGD over the loaded checkpoint (`stepped`)."""
-    objective = LMObjective(source, seq_len=int(ids.shape[1]) - 1, ema_decay=None,
-                            balance_rate=case.balance_rate,
+    balance = None if case.balance_rate is None else ExpertBalance(balance_rate=case.balance_rate)
+    objective = LMObjective(source, seq_len=int(ids.shape[1]) - 1, ema_decay=None, balance=balance,
                             mtp_weight=case.mtp_weight)
     return stepped(objective, ids, case.rate)
 
@@ -344,12 +339,12 @@ def reference_model(case: Case, directory: Path, dtype=None):
 def reference_logits(case: Case, directory: Path, ids: np.ndarray, *, wide: bool = False) -> np.ndarray:
     """transformers 5.16.1 over the exported directory on the eager path, in
     fp32, or `wide` in float64: the model built and run under
-    `diffusers_wan_reference.float64`, which widens its float32 pins too."""
+    `torch_precision.float64`, which widens its float32 pins too."""
     import contextlib
 
     import torch
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     with float64() if wide else contextlib.nullcontext():
         model, _ = reference_model(case, directory, torch.float64 if wide else torch.float32)
@@ -390,7 +385,7 @@ def glm5_prediction_logits(case: Case, directory: Path, ids: np.ndarray) -> np.n
         raise ValueError('glm5_next has no reference checkpoint conversion')
     rules = deepcopy(registered)
     prefix = f'model.layers.{model.config.num_hidden_layers}.'
-    tensors = source_tensors(directory)
+    tensors = load_shards(directory)
     prepared: dict[str, torch.Tensor] = {}
     pending: dict[str, WeightConverter] = {}
     for source_name in sorted((name for name in tensors if name.startswith(prefix)),
@@ -430,7 +425,7 @@ def round_trip(case: Case, workspace: Path) -> RoundTrip:
     return RoundTrip(source=source, trained=trained, export=export, ids=ids,
                      ours=logits(source, trained, ids), reloaded=reloaded,
                      theirs=reference_logits(case, export, ids),
-                     source_tensors=source_tensors(directory), exported_tensors=source_tensors(export),
+                     source_tensors=load_shards(directory), exported_tensors=load_shards(export),
                      case=case, truth=reference_logits(case, export, ids, wide=True))
 
 
@@ -521,7 +516,7 @@ def _reference_gradients(trip: RoundTrip, *, wide: bool = False):
 
     import torch
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     with float64() if wide else contextlib.nullcontext():
         model, _ = reference_model(trip.case, FIXTURES / trip.case.fixture,
@@ -676,7 +671,7 @@ def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, tuple[np.ndarray, 
 
     from dew.objectives.base import Step
     from tools.deepseek_v4_reference import deepseek_v4_source_name, load_mtp_reference
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     source, case = trip.source, trip.case
     weight = case.mtp_weight

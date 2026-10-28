@@ -21,13 +21,12 @@ from PIL import Image
 
 from dew import Checkpoints, Field, InputSpec, Trainer, sample
 from dew.artifacts import uint8_pixels
-from dew.config import OptimConfig
-from dew.config.data import Augment, ImageData, loader
-from dew.data import TFDS, Loading
+from dew.data import TFDS, Dataset, presets
 from dew.data.dataset import Loader
 from dew.diffusion.presets import EDM
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
+from dew.optim import OptimConfig
 from dew.sampling import Heun
 from dew.training import ProfileWindow
 
@@ -42,21 +41,17 @@ class Config:
     profile: int = 0  # steps to trace; above 0 the run only profiles and draws no samples
 
 
-def flowers(config: Config) -> ImageData:
-    """Every training record of the prepared split; none is held out."""
-    return ImageData(
-        source=TFDS("oxford_flowers102", split="train", path=str(config.data.expanduser())),
-        image_size=config.image_size,
-        caption_templates=("a photo of a {}",),
-        augment=Augment(flip=True, jitter=True),
-        validation=None,
-    )
+def flowers(config: Config) -> Dataset:
+    """Every training record of the prepared split, in a new order each epoch; none is held out."""
+    return (TFDS("oxford_flowers102", split="train", path=str(config.data.expanduser()))
+            .shuffle(seed=0).repeat()
+            .pipe(presets.images, config.image_size, batch=config.batch, augment=True)
+            .workers(2))
 
 
-def main(config: Config, data: Loader | None = None):
+def main(config: Config, data: Dataset | Loader | None = None):
     if data is None:
-        data = loader(flowers(config), batch=config.batch, read="memory",
-                      loading=Loading(workers=2, threads=2, read_buffer=16, worker_buffer=2))
+        data = flowers(config)
     model = SimpleDiT(
         patch_size=4,
         emb_features=128,

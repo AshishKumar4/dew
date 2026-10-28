@@ -53,11 +53,12 @@ import numpy as np
 import pytest
 from token_support import write_token_corpus
 
-from dew.data import HFTokenizer
+from dew.config.lm import LMRunConfig
+from dew.data import HFTokenizer, Loading, presets
+from dew.data.sources.tokens import TokenFiles
 from dew.inference import Completion, OllamaCompletion
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.nn.inputs import ModelInputs
-from dew.objectives.lm import LMRunConfig
 from dew.registry import models
 from dew.sampling.text import Sampling, generate
 
@@ -133,17 +134,17 @@ def train_and_export(root: Path) -> Path:
             model_args.append(f"--model.{'' if value else 'no-'}{key}")
         else:
             model_args.extend((f"--model.{key}", str(value)))
+    windows = TokenFiles(str(tokens / "train")).shuffle(seed=0).repeat().pipe(
+        presets.lm, None, seq_len=SEQ, batch=16, pack=None).loading(Loading(workers=0))
     config = LMRunConfig.cli([
-        "--data.source", str(tokens), "--data.seq-len", str(SEQ),
-        "--loading.workers", "0", "--tokenizer", str(TOKENIZER),
-        "--trainer.batch-size", "16", "--trainer.steps", str(STEPS),
+        "--tokenizer", str(TOKENIZER), "--trainer.steps", str(STEPS),
         "--trainer.log-every", str(STEPS), "--trainer.eval-every", "None",
         "--trainer.checkpoint-every", "None", "--trainer.name", "ollama-interop",
         "--trainer.checkpoint-dir", str(root / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--model.dtype", "float32", "--max-new-tokens", "0",
         "--optim.learning-rate", "3e-3",
-        *model_args])
+        *model_args], default=LMRunConfig(data=windows))
     state = config.run()
     assert int(state.step) == STEPS
 
@@ -269,7 +270,7 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
     from reference_error import FACTOR, distance
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     _, export, _ = imported
     tokenizer = AutoTokenizer.from_pretrained(str(export), local_files_only=True)

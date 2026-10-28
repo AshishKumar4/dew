@@ -33,8 +33,8 @@ from dew.nn.activations import gated_product
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.dense import Dense
-from dew.nn.flops import attention_flops, matching_lengths, patch_lengths, projection_flops
-from dew.nn.precision import at_least_fp32
+from dew.nn.flops import matching_lengths, patch_lengths, projection_flops, self_attention_flops
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
 
@@ -93,8 +93,7 @@ class Flux2SingleBlock(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """The fused QKV/gate/up map and joined output; modulation is shared."""
-        return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
-                + attention_flops(lengths, self.heads, self.head_dim, self.head_dim, causal=False))
+        return self_attention_flops(lengths, self.projections(), self.heads, self.head_dim)
 
     @nn.compact
     def __call__(self, x, mods, rotation):
@@ -103,7 +102,8 @@ class Flux2SingleBlock(nn.Module):
         normalized = modulate(layer_norm(self.dtype, self.epsilon)(x), shift, scale)
         maps = self.projections()
         projected = Dense(maps['to_qkv_mlp_proj'][1], use_bias=False, dtype=self.dtype,
-                          precision=self.precision, name="to_qkv_mlp_proj")(normalized)
+                          precision=self.precision, name="to_qkv_mlp_proj",
+                          dot_general=float32_dot_general)(normalized)
         heads = (x.shape[0], x.shape[1], self.heads, self.head_dim)
         query, key, value = (
             part.reshape(heads) for part in jnp.split(projected[..., : 3 * inner], 3, axis=-1)
@@ -120,7 +120,8 @@ class Flux2SingleBlock(nn.Module):
         # The source's `attn.to_out`, named as Flux's single block names its
         # fused output map.
         return x + gate[:, None] * Dense(maps['proj_fused'][1], use_bias=False, dtype=self.dtype,
-                                         precision=self.precision, name="proj_fused")(joined)
+                                         precision=self.precision, name="proj_fused",
+                                         dot_general=float32_dot_general)(joined)
 
 
 @logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),
@@ -160,6 +161,25 @@ class Flux2Transformer(TextStream, nn.Module):
                 'single_stream_modulation': 3, 'norm_out': 2}
 
     @nn.nowrap
+    def _double(self, **where) -> DoubleStreamBlock:
+        """A joint block as the model runs it, named by `where` (or unbound, `parent=None`, where a FLOP
+        count reads it): one factory, so the count and the execution build the same block."""
+        return DoubleStreamBlock(self.features, self.heads, self.head_dim, context_first=True, bias=False,
+                                 mlp_hidden=int(self.features * self.mlp_ratio), swiglu=True,
+                                 shared_modulation=True, **self._block_fields(), **where)
+
+    @nn.nowrap
+    def _single(self, **where) -> Flux2SingleBlock:
+        """A single-stream block as the model runs it (`_double`)."""
+        return Flux2SingleBlock(self.features, self.heads, self.head_dim, int(self.features * self.mlp_ratio),
+                                **self._block_fields(), **where)
+
+    @nn.nowrap
+    def _block_fields(self) -> dict:
+        return {"epsilon": self.eps, "dtype": self.dtype, "precision": self.precision,
+                "attention_impl": self.attention_impl}
+
+    @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
         return patch_lengths(sample_shape, (1, 1), rows)
 
@@ -175,12 +195,9 @@ class Flux2Transformer(TextStream, nn.Module):
         count += (1 + self.guidance_embeds) * time
         count += sum(Modulation(self.features, pieces, parent=None).model_flops(rows)
                      for pieces in self.modulation_pieces.values())
-        hidden = int(self.features * self.mlp_ratio)
-        block = DoubleStreamBlock(self.features, self.heads, self.head_dim, mlp_hidden=hidden,
-                                   swiglu=True, shared_modulation=True, parent=None)
-        count += self.num_layers * block.multisequence_flops(lengths, context_lengths)
-        single = Flux2SingleBlock(self.features, self.heads, self.head_dim, hidden, parent=None)
-        count += self.num_single_layers * single.model_flops((image + context).astype(np.int64))
+        count += self.num_layers * self._double(parent=None).multisequence_flops(lengths, context_lengths)
+        joined = (image + context).astype(np.int64)
+        count += self.num_single_layers * self._single(parent=None).model_flops(joined)
         return count + projection_flops(lengths, self.features, self.out_channels)
 
     @nn.compact
@@ -195,15 +212,17 @@ class Flux2Transformer(TextStream, nn.Module):
             raise ValueError(f"FLUX.2 takes NHWC latents, got shape {x.shape}")
         batch, rows, columns, _ = x.shape
         dense = {"use_bias": False, "dtype": self.dtype, "precision": self.precision}
-        image = Dense(self.features, name="x_embedder", **dense)(x.reshape(batch, rows * columns, -1))
-        context = Dense(self.features, name="context_embedder", **dense)(conditioning.context)
+        image = Dense(self.features, name="x_embedder", **dense,
+                      dot_general=float32_dot_general)(x.reshape(batch, rows * columns, -1))
+        context = Dense(self.features, name="context_embedder", **dense,
+                        dot_general=float32_dot_general)(conditioning.context)
 
         # `Flux2TimestepGuidanceEmbeddings`: the time's sinusoids through two
         # bias-free maps, plus the guidance's where the checkpoint embeds it.
         def embed(values, name: str):
             features = sinusoidal_time(values, self.timestep_guidance_channels,
                                        dtype=at_least_fp32(self.dtype)).astype(image.dtype)
-            return embedding(features, self.features, name, bias=False, dtype=self.dtype,
+            return embedding(self, features, self.features, name, bias=False, dtype=self.dtype,
                              precision=self.precision)
 
         embedded = guided_time(embed, time, conditioning.guidance, guidance_embeds=self.guidance_embeds)
@@ -218,23 +237,15 @@ class Flux2Transformer(TextStream, nn.Module):
         tables = axis_tables(flux2_positions(rows, columns, context.shape[1]), self.axes_dims_rope,
                              self.rope_theta, dtype=np.float64)
         rotation = tuple(jnp.asarray(table[None], at_least_fp32(image.dtype)) for table in tables)
-        hidden = int(self.features * self.mlp_ratio)
-        block = {"epsilon": self.eps, "dtype": self.dtype, "precision": self.precision,
-                 "attention_impl": self.attention_impl}
         for index in range(self.num_layers):
-            image, context = DoubleStreamBlock(
-                self.features, self.heads, self.head_dim, context_first=True, bias=False, mlp_hidden=hidden,
-                swiglu=True, shared_modulation=True, name=f"transformer_blocks_{index}", **block)(
-                image, context, mods, rotation)
+            image, context = self._double(name=f"transformer_blocks_{index}")(image, context, mods, rotation)
         joined = jnp.concatenate([context, image], axis=1)
         for index in range(self.num_single_layers):
-            joined = Flux2SingleBlock(self.features, self.heads, self.head_dim, hidden,
-                                      name=f"single_transformer_blocks_{index}", **block)(
-                joined, single_mods, rotation)
+            joined = self._single(name=f"single_transformer_blocks_{index}")(joined, single_mods, rotation)
         image = joined[:, context.shape[1]:]
         scale, shift = modulation("norm_out")
         image = modulate(layer_norm(self.dtype, self.eps)(image), shift, scale)
-        out = Dense(self.out_channels, name="proj_out", **dense)(image)
+        out = Dense(self.out_channels, name="proj_out", **dense, dot_general=float32_dot_general)(image)
         return out.reshape(batch, rows, columns, self.out_channels)
 
 

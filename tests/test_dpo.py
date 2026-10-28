@@ -16,18 +16,38 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
 from rl_support import TinyHead
 from steady_state import steady_state
+from tool_support import load
 
-from dew.config.data import PreferenceData, loader
-from dew.data import Loading
-from dew.data.compile import iterate
+from dew.data import Files, Loading, Memory, presets
+from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
 from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
-from dew.rl import preference_logsigmoid_terms
+
+
+def test_preference_rewards_and_gradients_ignore_nonfinite_completion_padding():
+    """Policy and reference likelihoods outside each completion carry no preference evidence,
+    even when those positions are nonfinite."""
+    from dew.rl.surrogate import preference_logsigmoid_terms
+
+    values = jnp.arange(24, dtype=jnp.float32).reshape(4, 2, 3) / -8
+    chosen = jnp.asarray([[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+    rejected = jnp.asarray([[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]])
+    masks = jnp.stack([chosen, rejected, chosen, rejected])
+
+    def loss(log_probs):
+        terms, rewards = preference_logsigmoid_terms(*log_probs, chosen, rejected, beta=0.1)
+        return jnp.sum(terms), rewards
+
+    evaluate = jax.value_and_grad(loss, has_aux=True)
+    clean = evaluate(values)
+    poisoned = evaluate(jnp.where(masks != 0, values, jnp.nan))
+    for observed, expected in zip(jax.tree.leaves(poisoned), jax.tree.leaves(clean), strict=True):
+        np.testing.assert_array_equal(observed, expected)
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "dpo.npz"
 VOCAB = 8
@@ -37,42 +57,26 @@ WIDTH = 6
 
 @pytest.fixture(scope="module")
 def reference():
-    return dict(np.load(FIXTURE, allow_pickle=True))
-
-
-def trl_layout_loss(policy_logits, fixture):
-    """Dew's DPO loss and mean chosen and rejected rewards over the fixture's
-    TRL-layout batch: token log-probabilities read off the shifted logits,
-    the shifted completion mask, and `preference_logsigmoid_terms` over the
-    [chosen; rejected] halves, averaged over pairs as `DPOObjective` does."""
-    ids = jnp.asarray(fixture["input_ids"], jnp.int32)[:, 1:, None]
-    mask = jnp.asarray(fixture["completion_mask"], jnp.float32)[:, 1:]
-
-    def token_log_probs(logits):
-        return jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids, axis=-1)[..., 0]
-
-    policy = token_log_probs(policy_logits)
-    ref = token_log_probs(jnp.asarray(fixture["ref_logits"], jnp.float32))
-    half = policy.shape[0] // 2
-    terms, (chosen, rejected) = preference_logsigmoid_terms(
-        policy[:half], policy[half:], ref[:half], ref[half:], mask[:half], mask[half:],
-        float(fixture["beta"]))
-    return jnp.mean(terms), (jnp.mean(chosen), jnp.mean(rejected))
+    return recording(FIXTURE)
 
 
 def test_dpo_loss_rewards_and_gradient_match_trl(reference):
     """Dew against TRL 1.12.0's own `DPOTrainer._compute_loss` with its
-    default settings (tools/parity_dpo.py), on fixed policy and reference
-    logits, held to the float64 rule over the loss, its gradient in the
-    policy logits and the chosen and rejected rewards: Dew's RMS error from
-    TRL's float64 values at most twice TRL's own fp32 error."""
-    (loss, rewards), gradient = jax.value_and_grad(trl_layout_loss, has_aux=True)(
-        jnp.asarray(reference["policy_logits"], jnp.float32), reference)
-    mine = np.concatenate([[loss], np.ravel(gradient), rewards])
-    theirs, truth = (np.concatenate([np.ravel(reference[f"trl_loss{tail}"]),
-                                     np.ravel(reference[f"trl_policy_logits_grad{tail}"]),
-                                     reference[f"trl_rewards{tail}"]]) for tail in ("", "_f64"))
-    assert_as_exact_as_the_reference(mine, theirs, truth, "DPO loss, gradient and rewards")
+    default settings (tools/parity_dpo.py), on par with TRL's fp32 over the
+    recorded policy and reference logits (check 1): the loss, its gradient in
+    the policy logits and the chosen and rejected rewards, TRL's float64 run
+    the truth."""
+    seeds = declared_seeds(FIXTURE)["dpo"]
+    draw, recorded, truth = indexed_recording(reference, "dpo", seeds)
+    # Dew's composition over the TRL-layout batch, the one the recorder planned its seeds by: token
+    # log-probabilities off the shifted logits and `preference_logsigmoid_terms` over the halves.
+    composed = load("parity_dpo").proxy
+
+    @jax.jit
+    def dew(index, arrays):
+        return composed(arrays)
+
+    assert_as_exact(dew, recorded, draw, "DPO loss, gradient and rewards", seeds=seeds, truth_fn=truth)
 
 
 # --- the objective -------------------------------------------------------------
@@ -219,9 +223,9 @@ def records(*rows):
 
 
 def preference_rows(rows, pad_id, width):
-    recipe = PreferenceData(source=tuple(json.loads(row) for row in rows), seq_len=width, pad_id=pad_id)
-    pipeline, _, _ = recipe.pipelines()
-    return list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
+    pairs = Memory([json.loads(row) for row in rows]).pipe(presets.preferences, seq_len=width, batch=None,
+                                                           pad_id=pad_id)
+    return list(iterate(pairs, read="memory", loading=Loading(workers=0)))
 
 
 PAIR = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],
@@ -231,11 +235,11 @@ PAIR = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],
 def test_a_preference_dataset_trains_as_the_preference_config_does():
     """`Trainer.fit` compiles a Dataset with the objective's own stages.
     DPO adds none, so one step over `preferences.PreferencePair` rows moves the policy
-    exactly as one step over the same pairs through `PreferenceData`."""
+    exactly as one step over the same pairs through the preferences preset."""
     import optax
     from bank_support import identical
 
-    from dew.data import Memory, preferences
+    from dew.data import preferences
     from dew.training import Layout, Trainer
 
     pairs = [PAIR] * 8
@@ -246,8 +250,8 @@ def test_a_preference_dataset_trains_as_the_preference_config_does():
         return trainer.fit(data, steps=1).variables
 
     identical(trained(Memory(pairs).map(preferences.PreferencePair(4)).batch(8)),
-              trained(loader(PreferenceData(source=tuple(pairs), seq_len=4), batch=8, read="memory",
-                             loading=Loading(workers=0))))
+              trained(compile(Memory(pairs).pipe(presets.preferences, seq_len=4, batch=8),
+                              read="memory", loading=Loading(workers=0))))
 
 
 def test_a_ragged_pair_is_refused():
@@ -268,7 +272,8 @@ def test_an_incomplete_row_is_refused():
     with pytest.raises(ValueError):
         preference_rows(records([1, 2]), 0, 4)[0]
     with pytest.raises(ValueError):
-        loader(PreferenceData(source=(), seq_len=4), batch=1, read="memory", loading=Loading(workers=0))
+        compile(Memory([]).pipe(presets.preferences, seq_len=4, batch=1), read="memory",
+                loading=Loading(workers=0))
 
 
 def test_unread_preference_fields_pass_through():
@@ -288,8 +293,8 @@ def test_parquet_pairs_batch_in_pairs(tmp_path):
         "chosen_mask": [[0, 0, 1, 1]], "rejected_mask": [[0, 0, 1]],
     }), path)
 
-    data = loader(PreferenceData(source=str(path), seq_len=4), batch=1, read="memory",
-        loading=Loading(workers=0), validation_records=4 * (1))
+    data = compile(Files(str(path), format="parquet").pipe(presets.preferences, seq_len=4, batch=1),
+                   read="memory", loading=Loading(workers=0))
 
     assert data.records == 1
     batch = next(data.train(DataPartition()))
@@ -311,8 +316,9 @@ def test_varied_rows_pad_to_one_window(mask_case):
     elif mask_case == "default":
         rows = records({"chosen": [1, 2], "rejected": [3]})
     batch_size = 2 if mask_case == "varied" else 1
-    data = loader(PreferenceData(source=tuple(json.loads(row) for row in rows), seq_len=4),
-        batch=batch_size, read="memory", loading=Loading(workers=0), validation_records=4 * batch_size)
+    data = compile(Memory([json.loads(row) for row in rows]).pipe(presets.preferences, seq_len=4,
+                                                                  batch=batch_size),
+                   read="memory", loading=Loading(workers=0))
 
     batch = next(data.train(DataPartition()))
 
@@ -345,9 +351,5 @@ def test_parquet_without_sides_is_refused(tmp_path):
     path = tmp_path / "nopairs.parquet"
     pq.write_table(pa.table({"chosen": [[1]]}), path)
     with pytest.raises(ValueError):
-        loader(PreferenceData(source=str(path)), batch=1, read="memory", validation_records=4 * (1))
-
-
-def test_unknown_recipe_fields_are_refused_before_reading_pairs():
-    with pytest.raises(ValueError):
-        loader("preferences", source=(PAIR,), batch=2, read="memory", records=(PAIR,))
+        next(compile(Files(str(path), format="parquet").pipe(presets.preferences, seq_len=4, batch=1),
+                     read="memory").train(DataPartition()))

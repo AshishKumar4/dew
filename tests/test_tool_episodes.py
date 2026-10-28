@@ -11,24 +11,28 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from episode_support import (
+    SAMPLING,
+    Harness,
+    SquareSession,
+    build,
+    collect,
+    episode_scheduler,
+    per_call,
+    trained_batch,
+    verify,
+)
+from tool_policy import (
     ANSWER_NINE,
     ANSWER_SIXTEEN,
     EOS,
     GROUPS,
     NINE,
     RESPONSE,
-    SAMPLING,
     SIXTEEN,
     TURNS,
     VOCAB,
-    Harness,
-    SquareSession,
     ToolPolicy,
-    build,
-    collect,
-    per_call,
     transition_logits,
-    verify,
 )
 
 from dew.data.dataset import Loader
@@ -40,11 +44,11 @@ from dew.training import Checkpoints
 
 def test_multiturn_actions_keep_cached_likelihoods_and_observations_out_of_targets():
     harness = Harness()
-    trainer, rollout = build(harness)
+    episodes = []
+    trainer, collector = build(harness, record=episodes.append)
     state = trainer.initial_state()
 
-    episodes = collect(rollout, state)
-    batch = rollout.project(episodes)
+    batch = trained_batch(collector, state)
 
     assert Counter(harness.opened) == Counter(harness.closed)
     assert len(harness.calls) == GROUPS
@@ -58,12 +62,12 @@ def test_multiturn_actions_keep_cached_likelihoods_and_observations_out_of_targe
         # two calls merge into one chain holding the second call's context.
         second = episode.transitions[1].action
         chain = batch["input_ids"][batch["session_index"] == index]
-        np.testing.assert_array_equal(chain, (*second.context, *second.tokens))
+        np.testing.assert_array_equal(chain, (*second.prompt, *second.tokens))
         for turn, transition in enumerate(episode.transitions):
             action = transition.action
             row = index * TURNS + turn
             assert action.terminated and len(action.tokens) == 2
-            context = list(action.context)
+            context = list(action.prompt)
             for position, token in enumerate(action.tokens):
                 logits = table[context[-1]]
                 raw = jax.nn.log_softmax(jnp.asarray(logits))[token]
@@ -95,10 +99,10 @@ def test_grpo_gradient_matches_action_only_categorical_reference():
     Observation and padded-turn targets would change its support and gradient.
     Largest observed difference from the categorical reference: 6.22e-09.
     """
-    trainer, rollout = build()
+    episodes = []
+    trainer, collector = build(record=episodes.append)
     state = trainer.initial_state()
-    episodes = collect(rollout, state)
-    batch = {name: jnp.asarray(value) for name, value in rollout.project(episodes).items()}
+    batch = {name: jnp.asarray(value) for name, value in trained_batch(collector, state).items()}
     info = Step(state.microstep, jax.random.key(1), state.ema)
 
     def loss(table):
@@ -113,7 +117,7 @@ def test_grpo_gradient_matches_action_only_categorical_reference():
     table = transition_logits().astype(np.float64)
     for episode, advantage in zip(episodes, advantages, strict=True):
         for turn in episode.transitions:
-            previous = turn.action.context[-1]
+            previous = turn.action.prompt[-1]
             for token in turn.action.tokens:
                 probabilities = np.exp(table[previous] - table[previous].max())
                 probabilities /= probabilities.sum()
@@ -134,11 +138,11 @@ def test_grpo_gradient_matches_action_only_categorical_reference():
 def test_environment_failures_abort_collection_and_release_sessions(failure, status):
     harness = Harness(failure)
     records = []
-    trainer, rollout = build(harness, record=records.append)
+    trainer, collector = build(harness, record=records.append)
     before = trainer.initial_state()
     expected = EpisodeCancelled if status == EpisodeStatus.CANCELLED else EpisodeFailure
     with pytest.raises(expected) as caught:
-        collect(rollout, before)
+        collect(collector, before)
     assert Counter(harness.opened) == Counter(harness.closed)
     assert len(harness.closed) == len(records) == (1 if failure == "reset" else GROUPS)
     assert all(episode.status == EpisodeStatus.CANCELLED and episode.reward is None
@@ -157,9 +161,9 @@ def test_verifier_failure_is_not_a_zero_reward(mode):
         if mode == "raise":
             raise OSError("verifier unavailable")
         return float("nan")
-    trainer, rollout = build(harness, verifier=verifier)
+    trainer, collector = build(harness, verifier=verifier)
     with pytest.raises(EpisodeFailure) as caught:
-        collect(rollout, trainer.initial_state())
+        collect(collector, trainer.initial_state())
     assert caught.value.episode.reward is None
     assert caught.value.episode.status == EpisodeStatus.ERROR
     assert len(caught.value.episode.transitions) == 2
@@ -173,8 +177,8 @@ def test_verifier_failure_is_not_a_zero_reward(mode):
 ])
 def test_truncation_preserves_actions_but_does_not_execute_partial_calls(limits, turns, tool_calls):
     harness = Harness()
-    trainer, rollout = build(harness, **limits)
-    episodes = collect(rollout, trainer.initial_state())
+    trainer, collector = build(harness, **limits)
+    episodes = collect(collector, trainer.initial_state())
     assert len(harness.calls) == tool_calls
     assert Counter(harness.opened) == Counter(harness.closed)
     assert all(episode.status == EpisodeStatus.TRUNCATED and episode.reward == -1. for episode in episodes)
@@ -203,8 +207,8 @@ class Tasks:
 
 
 def run(directory, steps, records, accumulation=1):
-    trainer, rollout = build(record=records.append, accumulation=accumulation)
-    trainer.rollout = rollout
+    trainer, collector = build(record=records.append, accumulation=accumulation)
+    trainer.rollout = episode_scheduler(collector)
     trainer.checkpoints = Checkpoints(str(directory))
     data = Loader(train=lambda partition: Tasks(), val=None, records=None, batch=jax.device_count())
     return trainer.fit(data, steps=steps, log_every=1)
@@ -235,7 +239,7 @@ def test_trainer_update_and_checkpoint_continue_without_replaying_committed_epis
 
 
 def test_collection_does_not_follow_live_mapping_replacements():
-    trainer, rollout = build()
+    trainer, collector = build()
     state = trainer.initial_state()
     live = {"params": dict(state.variables["params"])}
     state = replace(state, variables=live)
@@ -247,11 +251,11 @@ def test_collection_does_not_follow_live_mapping_replacements():
         live["params"]["table"] = jnp.zeros_like(live["params"]["table"])
         return verify(episode)
 
-    episodes = collect(replace(rollout, verifier=changing_verifier), state)
+    episodes = collect(replace(collector, verifier=changing_verifier), state)
 
     for episode in episodes:
         for turn in episode.transitions:
-            previous = turn.action.context[-1]
+            previous = turn.action.prompt[-1]
             for token, recorded in zip(turn.action.tokens, turn.action.raw_log_probs, strict=True):
                 np.testing.assert_allclose(recorded,
                     jax.nn.log_softmax(jnp.asarray(original[previous]))[token], atol=2e-6)
@@ -264,8 +268,8 @@ def test_aborted_episode_leaves_the_previous_trainer_checkpoint_intact(tmp_path,
     first = run(directory, 1, [])
     expected = np.asarray(first.variables["params"]["table"]).copy()
     records = []
-    trainer, rollout = build(Harness(failure), record=records.append)
-    trainer.rollout = rollout
+    trainer, collector = build(Harness(failure), record=records.append)
+    trainer.rollout = episode_scheduler(collector)
     trainer.checkpoints = Checkpoints(str(directory))
     data = Loader(train=lambda partition: Tasks(), val=None, records=None, batch=jax.device_count())
     exception = EpisodeFailure if failure == "tool" else EpisodeCancelled
@@ -288,8 +292,8 @@ def test_verifier_runs_before_environment_resources_are_released():
         assert episode.identity not in harness.closed, "verifier lost its environment resources"
         return verify(episode)
 
-    trainer, rollout = build(harness, verifier=live_verifier)
-    episodes = collect(rollout, trainer.initial_state())
+    trainer, collector = build(harness, verifier=live_verifier)
+    episodes = collect(collector, trainer.initial_state())
     assert {episode.reward for episode in episodes} == {0., 1.}
     assert Counter(harness.opened) == Counter(harness.closed)
 
@@ -327,9 +331,9 @@ def test_async_cancellation_keeps_its_cause_and_partial_episode(phase, retained_
             raise cancelled
         return verify(episode)
 
-    trainer, rollout = build(environment=environment, verifier=verifier, record=records.append)
+    trainer, collector = build(environment=environment, verifier=verifier, record=records.append)
     with pytest.raises(EpisodeCancelled) as caught:
-        collect(rollout, trainer.initial_state())
+        collect(collector, trainer.initial_state())
 
     assert caught.value.__cause__ is cancelled
     count = 1 if phase == "reset" else GROUPS

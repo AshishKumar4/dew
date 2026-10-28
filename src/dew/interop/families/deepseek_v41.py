@@ -13,7 +13,7 @@ from collections.abc import Mapping
 
 import numpy as np
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
@@ -35,9 +35,11 @@ from dew.interop.families.deepseek import (
     DSPARK_LEAVES,
     V4_LAYER_NAMES,
     V4_SCORES,
+    V4_TRUNK,
     deepseek_v4_prepare,
     dspark_fields,
     dspark_path,
+    v4_depth,
 )
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -76,8 +78,8 @@ def _v41_modes(text: Mapping[str, object], layers: int) -> tuple[tuple[int, ...]
     if not isinstance(ratios, (list, tuple)) or len(ratios) < layers or any(
             type(rate) is not int or rate < 0 for rate in ratios):
         refuse('compress_ratios', 'expected a non-negative compress ratio for every layer')
-    kv_sources = set(records.integers(text.get('kv_source_layer_ids', ()), 'kv_source_layer_ids'))
-    index_sources = set(records.integers(text.get('index_source_layer_ids', ()), 'index_source_layer_ids'))
+    kv_sources = set(_records.integers(text.get('kv_source_layer_ids', ()), 'kv_source_layer_ids'))
+    index_sources = set(_records.integers(text.get('index_source_layer_ids', ()), 'index_source_layer_ids'))
     modes, latest_kv, latest_index = [], None, None
     for layer, rate in enumerate(ratios[:layers]):
         if rate == 0:
@@ -127,7 +129,7 @@ def _deepseek_v41_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wr
         'projector': translate_deepseek_v41_projector_config(
             hf_config, record_int(text, 'emb_features')),
         'image_token_id': record_int(hf_config, 'image_token_id'),
-        'tokens_per_image': None, **NO_AUDIO}
+        'tokens_per_image': None, 'video_token_id': None, 'extra_placeholder_ids': (), **NO_AUDIO}
 
 
 def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias: bool) -> DecoderFields:
@@ -286,10 +288,10 @@ def _v41_engram(text: Mapping[str, object], seen: set[str]) -> EngramFields | No
               'engram_vocab_size', 'engram_n_heads', 'engram_head_dim',
               'engram_compressed_vocab_size', 'engram_pad_token_id')
     seen.update(fields)
-    layers = records.integers(text.get('engram_layer_ids', ()), 'engram_layer_ids')
+    layers = _records.integers(text.get('engram_layer_ids', ()), 'engram_layer_ids')
     if not layers:
         return None
-    embeddings = records.integers(text.get('engram_num_embeddings', ()), 'engram_num_embeddings')
+    embeddings = _records.integers(text.get('engram_num_embeddings', ()), 'engram_num_embeddings')
     return native_fields(Engram)(layer_ids=layers, num_embeddings=embeddings,
             max_ngram_size=record_int(text, 'engram_max_ngram_size'),
             vocab_size=record_int(text, 'engram_vocab_size'),
@@ -310,8 +312,6 @@ _DEEPSEEK_V41_NAMES = (
     ('.gate.bias_vl', '.gate.media_bias'),
     *V4_LAYER_NAMES,
 )
-_V41_TRUNK = {'embed.weight': 'model.embed_tokens.weight', 'norm.weight': 'model.norm.weight',
-              'head.weight': 'lm_head.weight'}
 # V4.1's Markov tables (v41:1077-1081), beside the leaves both releases name.
 _V41_DSPARK_LEAVES: dict[str, tuple[str, ...]] = {
     **DSPARK_LEAVES,
@@ -326,7 +326,7 @@ def _deepseek_v41_path(name: str, config: Mapping[str, object]) -> tuple[str, ..
     DSpark drafter's `mtp.*` included; the tied head's copy is None."""
     if name.startswith('mtp.'):
         return dspark_path(name, config, _V41_DSPARK_LEAVES, _deepseek_v41_path)
-    name = _V41_TRUNK.get(name, name)
+    name = V4_TRUNK.get(name, name)
     parts = name.split('.')
     if len(parts) >= 4 and parts[0] == 'layers' and parts[1].isdigit() and parts[2] == 'engram':
         leaf = '.'.join(parts[3:])
@@ -383,7 +383,7 @@ DEEPSEEK_V41 = DecoderFamily(
     lambda fields: any(isinstance(mixer, DeepseekV4Mixer) and mixer.compressor == 'csa2'
                        for mixer in kind_mixers(fields)),
     'deepseek_v41', 'DeepseekV41ForCausalLM', lambda model: {},
-    weight_path=_deepseek_v41_path, prepare=deepseek_v4_prepare,
+    weight_path=_deepseek_v41_path, prediction_depth=v4_depth, prepare=deepseek_v4_prepare,
     preserve_source_layout=True, tied_head_names=('head.weight', 'embed.weight'),
     constants=_deepseek_v41_constants, wrapper=_deepseek_v41_wrapper,
     # The image span's learned vectors sit at the top level, beside the

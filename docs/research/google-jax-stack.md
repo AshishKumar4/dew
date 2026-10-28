@@ -24,7 +24,7 @@ The Dew seams referred to throughout:
 | data source | `dew.data`, today `grain.python` via `dew/data/dataloaders.py` |
 | kernel path | `dew.nn.attention.scaled_dot_product_attention(implementation=...)` |
 | checkpointer | `dew.training.trainer`, an `ocp.CheckpointManager` |
-| optimizer | `dew.training.optim.build_optimizer` and `OPTIMIZER_MAP` |
+| optimizer | `dew.optim.build_optimizer` and `OPTIMIZER_MAP` |
 | sharding | `dew.training.distributed`, a `(data, fsdp)` mesh |
 | objective | `dew.objectives` |
 | post-training interop | `dew.interop`, safetensors |
@@ -36,7 +36,7 @@ The Dew side of this note describes the source on 2026-09-02, and several of the
 
 - Item 1 and item 8: a `Layout` maps the logical axes the modules declare onto mesh axes (`src/dew/training/distributed.py:299-302`), with a `tolerance` of 0.02 for unsharded parameters (`src/dew/training/distributed.py:338`). The mesh has six named axes, all `AxisType.Auto` (`src/dew/nn/sharding.py:43-48`; `src/dew/training/distributed.py:201`). The two-axis `(data, fsdp)` mesh and the shape-inferred `parameter_spec` this note describes are gone.
 - Item 2: token windows carry `<field>_segment_ids` for packed documents (`src/dew/data/tokens.py:254`).
-- Item 3: `OPTIMIZER_MAP` has `muon` and `muonclip` entries built on `optax.contrib.muon` (`src/dew/training/optim.py:13,306-312`). Schedule-free AdamW is not in the map.
+- Item 3: `OPTIMIZER_MAP` has `muon` and `muonclip` entries built on `optax.contrib.muon` (`src/dew/optim.py:13,306-312`). Schedule-free AdamW is not in the map.
 - Item 4: the LM head scores the vocabulary in chunks (`src/dew/objectives/lm/chunked.py`; see [lm-head.md](lm-head.md)).
 - Item 5: the decoder takes a named remat policy from MaxText's list, including host-offloading ones (`REMAT_POLICIES`, `src/dew/nn/backbones/causal_transformer.py:485-498`).
 - Item 7: Dew has an MoE whose grouped matmul runs `jax.lax.ragged_dot` or, optionally, `tokamax.ragged_dot` (`src/dew/nn/moe.py:49,311-312`). TPU attention runs JAX's Pallas Splash kernel, not tokamax's (`src/dew/nn/attention.py:35-38`).
@@ -436,7 +436,7 @@ The second change is to stop hand-rolling iterator checkpointing and register Gr
 
 The JAX optimizer library, <https://github.com/google-deepmind/optax>. Apache 2.0. PyPI 0.2.8, dated 2026-03-20; the clone declares `0.2.9.dev` (`optax/__init__.py:319`) and carries 2026 commits. Dew already depends on it.
 
-Dew's `build_optimizer` offers `adam`, `adamw` and `lamb`, a warmup-cosine schedule, weight decay folded into the optimizer kwargs, `clip_by_global_norm`, and `MultiSteps` for gradient accumulation (`src/dew/training/optim.py:14-41`). Everything in `optax.contrib` is a plain `GradientTransformation`, so anything below drops into `OPTIMIZER_MAP` without touching the surrounding wiring.
+Dew's `build_optimizer` offers `adam`, `adamw` and `lamb`, a warmup-cosine schedule, weight decay folded into the optimizer kwargs, `clip_by_global_norm`, and `MultiSteps` for gradient accumulation (`src/dew/optim.py:14-41`). Everything in `optax.contrib` is a plain `GradientTransformation`, so anything below drops into `OPTIMIZER_MAP` without touching the surrounding wiring.
 
 ### Muon
 
@@ -471,8 +471,8 @@ Optax provides no wrap-to-shard helper. What it provides is a tested guarantee: 
 
 Add two entries to `OPTIMIZER_MAP`: `optax.contrib.muon` and `optax.contrib.schedule_free_adamw`. Muon is the one that matters, because it is what several 2025 and 2026 frontier runs used, and because it costs one map entry. Two wiring details: pass the caller's schedule explicitly, since `muon` otherwise derives `adam_learning_rate` from `learning_rate`; and schedule-free needs the eval-params hook above, so it is the larger of the two changes.
 
-[adopt: depend on it] `optax.contrib.muon`. Seam: `dew.training.optim.OPTIMIZER_MAP`.
-[adopt: depend on it] `optax.contrib.schedule_free_adamw`, with a params-for-eval path. Seams: `dew.training.optim`, `dew.training.trainer`.
+[adopt: depend on it] `optax.contrib.muon`. Seam: `dew.optim.OPTIMIZER_MAP`.
+[adopt: depend on it] `optax.contrib.schedule_free_adamw`, with a params-for-eval path. Seams: `dew.optim`, `dew.training.trainer`.
 [borrow: reimplement the idea] QK-Clip, which is not in Optax and does not belong there. Seam: `dew.nn.attention`.
 [later] `galore` and `ademamix`, triggered by a memory or stability problem that adamw and muon do not solve.
 
@@ -692,7 +692,7 @@ Evidence: MaxText expresses twelve physical axes through a 109-line rules table 
 2. Sequence packing with segment ids. [adopt] Seam: data source in `dew.data`.
 Evidence: `grain.experimental.FirstFitPackIterDataset` emits `_segment_ids` and `_positions` per feature (`packing_packed_batch.py:116-117`), which is what a block-diagonal mask and per-document RoPE need. Dew's `TokenWindowSource` chops a concatenated stream at fixed stride (`dew/data/sources/text.py:24-63`), so today every training window that straddles a document boundary trains attention across unrelated text with no marker. Grain's own guidance is that packing is one of exactly three reasons to use the `Dataset` API (`docs/api_choice.md:10-16`).
 
-3. `optax.contrib.muon`. [adopt] Seam: `dew.training.optim.OPTIMIZER_MAP`.
+3. `optax.contrib.muon`. [adopt] Seam: `dew.optim.OPTIMIZER_MAP`.
 Evidence: one dictionary entry, because `muon()` already partitions by `ndim == 2` and routes non-matrices to adamw internally (`optax/contrib/_muon.py`), so Dew's parameter tree needs no restructuring. It is the cheapest item on this list per unit of frontier parity.
 
 4. Vocabulary tiling for the LM head. [borrow] Seam: the LM objective.

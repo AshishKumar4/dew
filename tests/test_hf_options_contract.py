@@ -231,22 +231,19 @@ def test_an_unprepared_pinned_csv_split_selects_the_read_arrow_provisions(tmp_pa
 
 
 def test_importing_hub_without_datasets_does_not_load_the_optional_package():
+    # An environment without the optional package: Python refuses an import of a module whose
+    # entry in sys.modules is None, as it refuses one that is not installed.
     code = """
-import builtins
-original = builtins.__import__
-def absent(name, *args, **kwargs):
-    if name == 'datasets':
-        raise ModuleNotFoundError('datasets is absent')
-    return original(name, *args, **kwargs)
-builtins.__import__ = absent
+import sys
+sys.modules['datasets'] = None
 from dew.data.sources.hub import Hub
 source = Hub('acme/records', name='named', revision='frozen')
-source.__dict__['commit'] = 'frozen'
 try:
     source.builder
 except ImportError as error:
-    assert "pip install 'dewml[streaming]'" in str(error)
-    assert isinstance(error.__cause__, ModuleNotFoundError)
+    # Refused for the optional package itself, which the extra installs.
+    assert isinstance(error.__cause__, ModuleNotFoundError) and error.__cause__.name == 'datasets'
+
 else:
     raise AssertionError('opening Arrow without datasets succeeded')
 """
@@ -268,8 +265,8 @@ def test_a_memory_read_of_a_hub_image_split_holds_its_encoded_images(tmp_path, m
     from huggingface_hub.hf_api import GitRefs
     from PIL import Image as PILImage
 
-    from dew.config.data import ImageData, loader
-    from dew.data import Loading
+    from dew.data import Loading, presets
+    from dew.data.compile import compile
     from dew.data.dataset import DataPartition
 
     pixels = [np.full((8, 8, 3), 30 * index, np.uint8) for index in range(4)]
@@ -288,8 +285,8 @@ def test_a_memory_read_of_a_hub_image_split_holds_its_encoded_images(tmp_path, m
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     held = Hub("acme/images").records("memory")
     assert [held[index]["image"]["bytes"] for index in range(4)] == [value["bytes"] for value in encoded]
-    data = loader(ImageData(Hub("acme/images"), image_size=8, augment=None, validation=None), batch=4,
-                  read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
+    chain = Hub("acme/images").shuffle(0).repeat().pipe(presets.images, 8, batch=4, rejects=False)
+    data = compile(chain, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
     reader = data.train(DataPartition())
     try:
         batch = next(reader)

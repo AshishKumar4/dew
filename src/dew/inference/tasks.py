@@ -17,7 +17,7 @@ import dataclasses
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, Self
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -27,28 +27,40 @@ from flax.core import freeze
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike, DTypeLike
 
+from dew._coordination import agreed
+from dew._records import integer, record as named_fields, strings, text as named
+from dew.batch import PARAMETER_ROOTS, Variables, thaw
 from dew.cache import persist_compilations
-from dew.coordination import agreed
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
+from dew.inference.projections import packed_owned
+from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key, token_id
-from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
-from dew.objectives.base import UNREAD, Variables, thaw
-from dew.records import integer, record as named_fields, text as named
+from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
+from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
+from dew.objectives.base import UNREAD, Objective
 from dew.sampling import decoding, vocabulary
-from dew.sampling.decoding import LogitsTransform, Stopping
+from dew.sampling.decoding import LogitsTransform, Stopping, id_row
 from dew.sampling.solvers import Solver
 from dew.sampling.strategies import Strategy
-from dew.sampling.text import Criteria, Generation, Sampling, Transforms, generate, with_ids_of
+from dew.sampling.text import (
+    Criteria,
+    Generation,
+    Sampling,
+    Transforms,
+    decoded_rows,
+    generate,
+    row_texts,
+    with_ids_of,
+)
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.config import ModelConfig
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.quantization import Quantization
-    from dew.training.distributed import Layout, MeshSpec
+    from dew.registry import ModelConfig
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows
@@ -69,17 +81,36 @@ media or multi-axis positions also keeps its own shapes.
 """
 
 
+SCORING_RUNGS = 4
+"""How many lengths a task that scores whole requests pads its passes to (`length_ladder`)."""
+
+
+def length_ladder(top: int, smallest: int, rungs: int = SCORING_RUNGS) -> tuple[int, ...]:
+    """The lengths a task that scores whole requests compiles its passes at, shortest first: `top`, the
+    layout's window, so a request at the training window reads training's shape, and its halvings, `rungs`
+    of them at most and none shorter than `smallest`, the shortest row the layout lays out. Each length is
+    one program, which the task compiles once, up front, rather than one per power of two of every
+    request's length, rows and options (`dew.decision.task.Decide.pass_shapes`)."""
+    return tuple(sorted({max(min(smallest, top), top >> step) for step in range(rungs)}))
+
+
 class Processor(Protocol):
     """Interface for a loaded source's host processor, which prepares requests and decodes tokens.
 
     Calling it turns text, with optional images, into `ModelInputs`.
-    `decode` turns token rows into one string per row, and `bos_id` is the
-    id a sequence starts with, or None.
+    `decode` turns token rows into one string per row, `encode` one text into its ids, with the
+    special tokens a sequence carries or without, `spelling` a row of ids into the text the
+    tokenizer's own decode gives it, its special tokens spelled out, and `bos_id` is the id a
+    sequence starts with, or None.
     """
 
     def __call__(self, text: str | Sequence[str], *, images: Media | None = None) -> ModelInputs: ...
 
     def decode(self, tokens: ArrayLike) -> list[str]: ...
+
+    def encode(self, text: str, *, specials: bool) -> list[int]: ...
+
+    def spelling(self, ids: Sequence[int]) -> str: ...
 
     @property
     def bos_id(self) -> int | None: ...
@@ -110,15 +141,11 @@ def prepared_inputs(processor: Processor | None, request: Request, *, images: Me
     if isinstance(request, ModelInputs):
         return ModelInputs.from_value(request)
     if isinstance(request, Sequence):
-        for row in request:
-            if isinstance(row, str):
-                raise ValueError("a request cannot mix text prompts and numeric token rows")
-            if isinstance(row, np.ndarray) and not np.issubdtype(row.dtype, np.integer):
-                raise ValueError("token rows must contain integers")
-            if isinstance(row, Sequence):
-                for token in row:
-                    token_id(token, where="a token row")
-        return ModelInputs.from_value(np.asarray(request))
+        rows = [row for row in request if not isinstance(row, str)]
+        if len(rows) != len(request):
+            raise ValueError("a request cannot mix text prompts and numeric token rows")
+        # ModelInputs reads the rows by `dew.batch.token_id`'s law.
+        return ModelInputs.from_value(rows)
     # A resident array stays where it is; a global one cannot be fetched.
     return ModelInputs.from_value(request)
 
@@ -134,18 +161,6 @@ def _task_inputs(processor: Processor | None, request: Request, *, images: Media
                                          inputs.tokens.shape[1]), random_key
 
     return agreed("inference task input preparation", prepared) if collective else prepared()
-
-
-def decoded_rows(
-    processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike, width: int
-) -> tuple[str, ...]:
-    """Each row's `lengths` tokens past `width`, as text: what a task's `decode` and a generation's
-    `text` both return. Without a processor there is no text to return, and it raises."""
-    if processor is None:
-        raise ValueError("this generation carries no processor to decode with")
-    rows, counts = np.asarray(tokens), np.asarray(lengths)
-    return tuple(processor.decode(rows[row:row + 1, width:width + int(counts[row])])[0]
-                 for row in range(rows.shape[0]))
 
 
 def generation_budget(requested: int | None, default: int | None, max_length: int | None,
@@ -260,41 +275,186 @@ def _requested(generated: Generation, budget: int, padding: int) -> Generation:
                    raw_log_probs=generated.raw_log_probs[:, :budget])
 
 
-class SavedRun(NamedTuple):
-    """One checkpoint of a run, pinned: its inference declaration, not the
-    training configuration, and the exact step it is, which a loader reads
-    the weights at too, so a step saved meanwhile cannot pair one step's
-    declaration with another's weights."""
+@dataclass(frozen=True)
+class SavedRun:
+    """One checkpoint of a run, pinned, as every loader of a run reads it (a task's `from_run`,
+    `Pretrained.from_run`, `Adapter.from_run`, `dew export`): its inference declaration, not the
+    training configuration, the objective that wrote it, and the exact step it is, which the
+    weights are read at too (`variables`), so a step saved meanwhile cannot pair one step's
+    declaration with another's weights. A loader reconstructs its own components from the record
+    (`saved_settings`, `saved_model`)."""
 
+    directory: str
     record: Mapping[str, object]
     step: int
 
+    @classmethod
+    def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
+        """The selected checkpoint of the run in `directory`, its latest or `step`. A task loaded
+        from it compiles into the persistent cache (`persist_compilations`). `trust` names the
+        packages outside Dew whose modules the record may import (`dew.registry.imported`)."""
+        from dew.checkpoints import Checkpoints
+        from dew.registry import import_trusted, objectives
+        persist_compilations()
+        with Checkpoints(directory) as checkpoints:
+            step = checkpoints.pinned(step)
+            record = checkpoints.artifact(step)
+        import_trusted(record, trust)
+        if record is None:
+            raise ValueError("this checkpoint's objective declares no inference record; declare "
+                             "Objective.inference_record, or call objective.pipeline(state)")
+        record = earlier_shapes(named_fields(record, 'checkpoint artifact'))
+        if 'unrecorded' in record:
+            raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
+        objective = objectives[named(record['objective'], 'objective')]
+        declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
+        stray = set(record) - {'objective', 'model', UNREAD, *declared}
+        if stray:
+            raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
+                             f"{sorted(stray)}")
+        return cls(str(directory), record, step)
 
-def run_record(directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
-    """The selected checkpoint of the run in `directory`, pinned (`SavedRun`).
-    A task loaded from it compiles into the persistent cache
-    (`persist_compilations`). `trust` names the packages outside Dew whose
-    modules the record may import (`dew.registry.imported`)."""
-    from dew.checkpoints import Checkpoints
-    from dew.registry import import_trusted, objectives
-    persist_compilations()
-    with Checkpoints(directory) as checkpoints:
-        step = checkpoints.pinned(step)
-        record = checkpoints.artifact(step)
-    import_trusted(record, trust)
-    if record is None:
-        raise ValueError("this checkpoint's objective declares no inference record; declare "
-                         "Objective.inference_record, or call objective.pipeline(state)")
-    record = named_fields(record, 'checkpoint artifact')
-    if 'unrecorded' in record:
-        raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
-    objective = objectives[named(record['objective'], 'objective')]
-    declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
-    stray = set(record) - {'objective', 'model', UNREAD, *declared}
-    if stray:
-        raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
-                         f"{sorted(stray)}")
-    return SavedRun(record, step)
+    @property
+    def objective(self) -> type[Objective]:
+        """The objective class the run trained, which its record names."""
+        from dew.registry import objectives
+
+        return objectives[named(self.record['objective'], 'objective')]
+
+    def variables(self, *, ema: bool | None, mesh: MeshSpec | Mesh | None = None,
+                  layout: Layout | None = None, param_dtype: DTypeLike | None = None,
+                  parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS) -> Variables:
+        """The model's variables at this step, as every run loader reads them: an objective whose
+        average is its frozen reference gives the trained weights whatever `ema` asks
+        (`Objective.ema_is_reference`), and one that nests the model beside other networks gives the
+        model's own part (`Objective.model_tree`), trained and frozen collections together; the parts
+        the record names unread (`UNREAD`) are neither placed nor read. The other arguments are
+        `Checkpoints.variables`'."""
+        from dew.checkpoints import Checkpoints
+
+        unread = self.record.get(UNREAD, [])
+        if not isinstance(unread, list):
+            raise ValueError(f"{UNREAD} must be a list of paths")
+        objective = self.objective
+        with Checkpoints(self.directory) as checkpoints:
+            variables = checkpoints.variables(
+                step=self.step, ema=False if objective.ema_is_reference else ema, mesh=mesh, layout=layout,
+                param_dtype=param_dtype, parameter_roots=parameter_roots,
+                unread=tuple(strings(path, UNREAD) for path in unread))
+        return objective.model_tree(variables)
+
+
+class SavedRunTask:
+    """A task a saved run loads as (`dew.objectives.base.SavedTask`): `from_run` pins the run's checkpoint
+    once (`SavedRun.pinned`) and builds the task from it with the class's `from_saved`, which
+    `dew.pipeline` and `dew export` call on the run they pinned themselves."""
+
+    if TYPE_CHECKING:
+        @classmethod
+        def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
+                       layout: Layout | None = None, dtype: DTypeLike | None = None,
+                       param_dtype: DTypeLike | None = None) -> Self: ...
+
+    @classmethod
+    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
+                 mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
+                 trust: Sequence[str] = ()) -> Self:
+        """Load the run in `directory` as this task (`from_saved`), at its latest checkpoint or at
+        `step`. `trust` names the packages outside Dew the run's record may import, as
+        `trust_remote_code` does in transformers."""
+        return cls.from_saved(SavedRun.pinned(directory, step, trust), ema=ema, mesh=mesh, layout=layout,
+                              dtype=dtype, param_dtype=param_dtype)
+
+
+_EARLIER_AUTOENCODERS = {
+    "sd_vae": ("dew.nn.autoencoders.sd_vae:StableDiffusionVAE", "dew.nn.autoencoders.kl:AutoencoderKL"),
+    "dc_ae": ("dew.nn.autoencoders.dc_ae:DCAutoencoder", "dew.nn.autoencoders.dc_ae:DCAE"),
+    "wan": ("dew.nn.autoencoders.wan:WanAutoencoder", "dew.nn.autoencoders.wan:WanVAE"),
+    "rae": ("dew.nn.autoencoders.rae:RAEAutoencoder", "dew.nn.autoencoders.rae:RAE"),
+    "flux2": ("dew.nn.autoencoders.flux2:Flux2Autoencoder", "dew.nn.autoencoders.kl:AutoencoderKL"),
+    "qwen_image": ("dew.nn.autoencoders.qwen_image:QwenImageAutoencoder",
+                   "dew.nn.autoencoders.qwen_image:QwenImageVAE"),
+}
+"""The built-in autoencoders an earlier run recorded by name, each the wrapper's and its module's
+import paths the record names now (`earlier_shapes`)."""
+
+def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A run's record with its components in the shapes Dew writes now, every earlier shape read here
+    and nowhere else (`SavedRun.pinned`), so no component keeps two readers: a decision head's
+    `{"name"}` record, its class by import path or by class name alone in `dew.decision.head`, a
+    built-in autoencoder's by its name with its module's bare fields (`_EARLIER_AUTOENCODERS`), a
+    decision layout's by class name in `dew.decision.layout`, each read as the registry's class record
+    and refused where it holds more than its name and fields (ledger 1239),
+    a processor's source as its encoded string (ledger 1641), a Qwen or MiMo projector's earlier
+    fields (`_earlier_projectors`, ledger 1622), and a row of segments' question budgets, which it
+    ignored and an earlier record wrote at their defaults (row 2006). A record in today's shapes passes
+    as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
+    current = dict(record)
+    for key in ("head", "layout"):
+        held = record.get(key)
+        if isinstance(held, Mapping) and "name" in held and not set(held) <= {"name", "fields"}:
+            raise ValueError(f"an earlier run's {key} names its class and its fields alone, not "
+                             f"{sorted(set(held) - {'name', 'fields'})}")
+    head = record.get("head")
+    if isinstance(head, Mapping) and "name" in head and "class" not in head:
+        name = named(head["name"], "head.name")
+        current["head"] = {"class": name if ":" in name else f"dew.decision.head:{name}",
+                           "fields": named_fields(head.get("fields", {}), "head.fields")}
+    autoencoder = record.get("autoencoder")
+    if isinstance(autoencoder, Mapping) and "name" in autoencoder and "class" not in autoencoder:
+        name = named(autoencoder["name"], "autoencoder.name")
+        if name not in _EARLIER_AUTOENCODERS:
+            raise ValueError(f"{name!r} names no built-in autoencoder an earlier run recorded")
+        wrapper, module = _EARLIER_AUTOENCODERS[name]
+        fields = dict(named_fields(autoencoder.get("fields", {}), "autoencoder.fields"))
+        current["autoencoder"] = {"class": wrapper,
+                                  "fields": {**fields, "model": {"class": module, "fields": fields["model"]}}}
+    layout = record.get("layout")
+    if isinstance(layout, Mapping) and "name" in layout and "class" not in layout:
+        current["layout"] = {"class": f"dew.decision.layout:{named(layout['name'], 'layout.name')}",
+                             "fields": named_fields(layout.get("fields", {}), "layout.fields")}
+    laid = current.get("layout")
+    fields = laid.get("fields") if isinstance(laid, Mapping) else None
+    if isinstance(laid, Mapping) and isinstance(fields, Mapping) and fields.get("segments") is not None and (
+            "order" not in fields) and (
+            fields.get("head_max_len") is not None or fields.get("option_tokens") is not None):
+        # A row of segments kept its question whole and ignored the question budgets an earlier record
+        # wrote at their defaults (192 and 48) (row 2006). A record that states the row's order (2007)
+        # was written since a row of segments takes its budgets, so it keeps them.
+        current["layout"] = {**laid, "fields": {**fields, "head_max_len": None, "option_tokens": None}}
+    processor = record.get("processor")
+    if isinstance(processor, str):
+        # A source's identity was an encoded string before typed component references (ledger 1641).
+        from dew.interop.sources import SourceReference
+        from dew.registry import to_record
+
+        current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
+    if "model" in current:
+        current = _earlier_projectors(current)
+    return current
+
+
+def _earlier_projectors(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A record's earlier Qwen or MiMo projector fields read as today's (`earlier_shapes`), wherever the
+    model nests the projector through another recorded wrapper. Carried until 1.0 (ledger 1622);
+    current constructors and source codecs accept only their current schema."""
+    def current(value):
+        if isinstance(value, Mapping):
+            component = {key: current(field) for key, field in value.items()}
+            name, fields = component.get("class"), component.get("fields")
+            if name in ("dew.nn.vision.qwen35:Qwen35Projector", "dew.nn.vision.mimo:MiMoProjector") \
+                    and isinstance(fields, dict) and "vision_width" in fields:
+                width, merge = fields.pop("vision_width"), fields.pop("merge_size")
+                component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
+                                     "width": width * merge ** 2,
+                                     "bias": name == "dew.nn.vision.qwen35:Qwen35Projector"}
+            return component
+        if isinstance(value, list | tuple):
+            return [current(field) for field in value]
+        return value
+
+    return {**record, "model": current(record["model"])}
 
 
 def settings_fields(settings: type) -> frozenset[str]:
@@ -312,77 +472,72 @@ def saved_settings[SettingsT](record: Mapping[str, object], settings: type[Setti
 
 
 @dataclass(frozen=True, kw_only=True)
-class TextSettings:
-    """What a causal decoder's run records beside its model, and its task is built with
-    (`TextGeneration.from_settings`).
-
-    `seq_len` is the decoder's training row length, `max_new_tokens` its
-    previews' budget (0 for none) and `sampling` their policy. `tokenizer`
-    names the run tokenizer (`recorded_tokenizer`) and `processor` a
-    checkpoint's own processor source (`recorded_processor`); either may be
-    None.
-    """
+class TaskSettings:
+    """What every generation run records beside its model: `seq_len`, its training row length,
+    `max_new_tokens`, its task's response budget (0 for none), and its host processor's source:
+    `tokenizer` names the run tokenizer (`recorded_tokenizer`) and `processor` a checkpoint's own
+    processor source (`recorded_processor`); either may be None. Each task's settings add what its
+    generation reads."""
 
     seq_len: int
     max_new_tokens: int
-    sampling: Sampling
     tokenizer: str | None
-    processor: str | None
+    processor: SourceReference | None
 
     def __post_init__(self) -> None:
-        _budget_checked(self.max_new_tokens)
+        if type(self.max_new_tokens) is not int or self.max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be a nonnegative integer")
 
 
 @dataclass(frozen=True, kw_only=True)
-class MaskedSettings:
-    """What a masked-diffusion run records beside its model, and its task is built with
-    (`MaskedGeneration.from_settings`): the row length, the response budget, the tokenizer or
-    source processor as `TextSettings` holds them, the masking process, the unmasking solver
-    and its step count."""
+class TextSettings(TaskSettings):
+    """A causal decoder's run's settings (`TextGeneration.from_settings`): its previews' sampling
+    policy beside the common ones."""
 
-    seq_len: int
-    max_new_tokens: int
+    sampling: Sampling
+    prefix: int | Literal["prompt"] | None = None
+    """The prefix run's blocks a served prompt takes (`TextGeneration.prefix`); None serves causally."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class MaskedSettings(TaskSettings):
+    """A masked-diffusion run's settings (`MaskedGeneration.from_settings`): the masking process,
+    the unmasking solver and its step count, and the end-of-sequence ids a response stops at,
+    beside the common ones."""
+
     process: DiscreteProcess
     solver: Solver
     sampling_steps: int
-    tokenizer: str | None
-    processor: str | None
+    eos_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        _budget_checked(self.max_new_tokens)
+        super().__post_init__()
         integer(self.sampling_steps, "sampling_steps")
+        if len(self.eos_token_ids):
+            object.__setattr__(self, "eos_token_ids", id_row("eos_token_ids", self.eos_token_ids))
         if not isinstance(self.solver, Unmask):
             raise ValueError("a masked run's task unmasks with an Unmask solver")
 
 
 @dataclass(frozen=True, kw_only=True)
-class BlockSettings:
-    """What a block-diffusion run records beside its model, and its task is built with
-    (`BlockGeneration.from_settings`): the sequence length, the canvas budget, the tokenizer or
-    source processor as `TextSettings` holds them, the block process and the pad id."""
+class BlockSettings(TaskSettings):
+    """A block-diffusion run's settings (`BlockGeneration.from_settings`): the block process, the
+    pad id and the end-of-sequence ids a response stops at beside the common ones."""
 
-    seq_len: int
-    max_new_tokens: int
     process: BlockProcess
     pad_token_id: int
-    tokenizer: str | None
-    processor: str | None
+    eos_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
-        _budget_checked(self.max_new_tokens)
+        super().__post_init__()
         integer(self.pad_token_id, "pad_token_id")
-
-
-def _budget_checked(budget: int) -> None:
-    """Refuse a recorded token budget that is not a nonnegative integer."""
-    if type(budget) is not int or budget < 0:
-        raise ValueError("max_new_tokens must be a nonnegative integer")
+        if len(self.eos_token_ids):
+            object.__setattr__(self, "eos_token_ids", id_row("eos_token_ids", self.eos_token_ids))
 
 
 def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
     """Read the run's model record, with `dtype` overriding the computation it saved."""
-    from dew.config import ModelConfig
-    from dew.registry import dtype_name, resolve_dtype
+    from dew.registry import ModelConfig, dtype_name, resolve_dtype
 
     config = ModelConfig.from_dict(named_fields(record["model"], "model"))
     return config.with_dtype(dtype_name(resolve_dtype(dtype)))
@@ -394,14 +549,14 @@ def recorded_tokenizer(processor: Processor | None) -> str | None:
     own name, byte or Hugging Face. Any other processor records none, and the
     run loads as weights that take ids."""
     from dew.data.text import ByteTokenizer, HFTokenizer
-    from dew.inference.pipeline import RunProcessor
+    from dew.inference.loading import RunProcessor
 
     if isinstance(processor, RunProcessor) and isinstance(processor.tokenizer, ByteTokenizer | HFTokenizer):
         return processor.tokenizer.name
     return None
 
 
-def recorded_processor(processor: Processor | None) -> str | None:
+def recorded_processor(processor: Processor | None) -> SourceReference | None:
     """The source a run's record keeps for a checkpoint's own processor
     (`dew.interop.processors.Processor.source`), which `_saved_processor`
     reloads from its files; any other processor records none here."""
@@ -410,12 +565,11 @@ def recorded_processor(processor: Processor | None) -> str | None:
     return processor.source if isinstance(processor, SourceProcessor) else None
 
 
-def _saved_processor(settings: TextSettings | MaskedSettings | BlockSettings,
-                     config: ModelConfig) -> Processor | None:
+def _saved_processor(settings: TaskSettings, config: ModelConfig) -> Processor | None:
     """Build the run's host processor: the checkpoint's own, reloaded from the
     source it recorded beside `config`'s model, or its run tokenizer."""
     from dew.data.text import tokenizer_for
-    from dew.inference.pipeline import RunProcessor
+    from dew.inference.loading import RunProcessor
     from dew.interop.pretrained import load_processor
 
     if settings.processor is not None:
@@ -425,32 +579,32 @@ def _saved_processor(settings: TextSettings | MaskedSettings | BlockSettings,
 
 def resident(model: nn.Module, variables: Variables) -> Variables:
     """`variables` as decoding reads them (`decoding_storage`), each leaf held in host memory, as
-    `Pretrained.load` returns them without a mesh, cast on the host and then placed on the device
+    `Pretrained.load(on_host=True)` returns them, cast on the host and then placed on the device
     once: replicated on the mesh the tree's arrays sit on, or committed to this process's default
     device as it is now (`jax.default_device`), so a later call made elsewhere runs where the
     weights are rather than moving them. A jax.Array stays where it is, a pinned-host bank's among
     them. A task's generations and a server's steps read their weights so, where a host leaf
     would be copied to the device again at each call."""
-    stored = decoding_storage(model, variables)
-    mesh = mesh_of(stored)
-    default = jax.config.jax_default_device
-    if mesh is not None:
-        target = NamedSharding(mesh, P())
-    elif default is None or isinstance(default, str):
-        target = jax.local_devices(backend=default)[0]
-    else:
-        target = default
-
-    def placed(leaf):
-        return jax.device_put(leaf, target) if isinstance(leaf, (np.ndarray, np.generic)) else leaf
-
-    return jax.tree.map(placed, stored)
+    return held(decoding_storage(model, variables))
 
 
-class _NativeTextTask:
+def held(variables: Variables) -> Variables:
+    """`variables` placed on the device once (`resident`'s placement, its storage as given): each host
+    leaf replicated on the mesh the tree's arrays sit on, or committed to this process's default
+    device, one leaf at a time (`placed_leaves`), into a tree of its own; a jax.Array stays where it
+    is."""
+    from dew.distributed.host import placed_leaves
+
+    mesh = mesh_of(variables)
+    target = default_placement() if mesh is None else NamedSharding(mesh, P())
+    return placed_leaves(variables, lambda _, leaf: jax.device_put(leaf, target)
+                         if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=False)
+
+
+class _NativeTextTask(SavedRunTask):
     """The lifecycle Dew's three text tasks share, over their own `model`,
-    `variables` and `processor`: frozen weights, rebinding, loading a run or
-    its Hub copy, and the row decoder their generations carry. Each task
+    `variables` and `processor`: frozen weights, rebinding, loading a run
+    (`SavedRunTask`), and the row decoder their generations carry. Each task
     keeps its own controls, loading checks and device call."""
 
     model: nn.Module
@@ -458,7 +612,7 @@ class _NativeTextTask:
     processor: Processor | None
 
     def __post_init__(self) -> None:
-        # A tree split for training, an adapter's or `dew.objectives.base.freeze`'s,
+        # A tree split for training, an adapter's or `dew.batch.freeze`'s,
         # is read whole; a frozen dataclass's field is written through `object.__setattr__`.
         object.__setattr__(self, "variables", freeze(dict(thaw(self.variables))))
 
@@ -477,49 +631,22 @@ class _NativeTextTask:
         # Each task is a dataclass, which `bind` replaces a field of.
         __dataclass_fields__: ClassVar[dict[str, dataclasses.Field[object]]]
 
-        # Each task loads its own kind of run; `from_pretrained` reads the Hub copy through it.
-        @classmethod
-        def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                     mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                     dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
-                     trust: Sequence[str] = ()) -> Self: ...
-
     @classmethod
     def _loaded[SettingsT: (TextSettings, MaskedSettings, BlockSettings)](
-            cls, directory: str, settings: type[SettingsT], checked: Callable[[nn.Module, SettingsT], None],
-            *, ema: bool | None, step: int | str | None, mesh: MeshSpec | Mesh | None,
-            layout: Layout | None, dtype: DTypeLike | None, param_dtype: DTypeLike | None,
-            trust: Sequence[str]) -> tuple[nn.Module, Variables, SettingsT, Processor | None]:
+            cls, run: SavedRun, settings: type[SettingsT], checked: Callable[[nn.Module, SettingsT], None],
+            *, ema: bool | None, mesh: MeshSpec | Mesh | None, layout: Layout | None,
+            dtype: DTypeLike | None, param_dtype: DTypeLike | None
+            ) -> tuple[nn.Module, Variables, SettingsT, Processor | None]:
         """A run's model at `dtype`, as `checked` accepts it before any weight loads, its weights
-        as its objective restores them, its task settings, and its host processor."""
-        from dew.registry import objectives
-
-        record, exact = run_record(directory, step, trust)
-        config = saved_model(record, dtype)
-        held = saved_settings(record, settings)
+        as its objective restores them, its task settings, and its host processor. The task owns
+        the weights it restored: their projections pack here, once, as a source's do at its load
+        (`dew.pipeline`), so every route reads the same packed weights."""
+        config = saved_model(run.record, dtype)
+        held = saved_settings(run.record, settings)
         model = config.build()
         checked(model, held)
-        variables = objectives[named(record["objective"], "objective")]._saved_variables(
-            directory, step=exact, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        return model, variables, held, _saved_processor(held, config)
-
-    @classmethod
-    def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
-                        ema: bool | None = None, step: int | str | None = None,
-                        mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                        dtype: DTypeLike | None = None,
-                        param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> Self:
-        """Load a run directory published to the Hugging Face Hub.
-
-        You publish one by uploading the run directory itself with
-        `HfApi().upload_folder`. `revision` pins a Hub revision, and the
-        other arguments work as in `from_run`.
-        """
-        from huggingface_hub import snapshot_download
-
-        return cls.from_run(snapshot_download(repo_id=repo_id, revision=revision),
-                            ema=ema, step=step, mesh=mesh, layout=layout,
-                            dtype=dtype, param_dtype=param_dtype, trust=trust)
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
+        return model, packed_owned(model, variables), held, _saved_processor(held, config)
 
     def _decoded[GenerationT: (Generation, CanvasGeneration)](self, generated: GenerationT) -> GenerationT:
         """`generated` carrying the processor's row decoder, or none without a processor."""
@@ -529,16 +656,9 @@ class _NativeTextTask:
 
 def _canvas_text(processor: Processor | None, generation: CanvasGeneration,
                  trace: str) -> tuple[str, ...]:
-    """Decode a canvas generation's rows past their prompt, traced under `trace`.
-
-    A generation with no prompt width names no boundary to decode from, so it
-    is refused rather than decoded from the start of the canvas.
-    """
+    """Decode a canvas generation's rows past their prompt (`row_texts`), traced under `trace`."""
     with region(trace):
-        if generation.prompt_width is None:
-            raise ValueError("this generation has no prompt width")
-        rows = generation.host()
-        return decoded_rows(processor, rows.tokens, rows.lengths, generation.prompt_width)
+        return row_texts(functools.partial(decoded_rows, processor), generation, generation.prompt_width)
 
 
 @dataclass(frozen=True)
@@ -577,6 +697,11 @@ class TextGeneration(_NativeTextTask):
 
     model: nn.Module
     variables: Variables
+    """The weights generations read. A task loaded from a source (`dew.pipeline`) or a saved run
+    (`from_run`) holds them in the serving layout, its projections packed
+    (`dew.inference.projections`); one over a live objective's arrays holds those as they are. An
+    objective built over them, and an export of them, read the model's own tree
+    (`projections.unpacked`)."""
     processor: Processor | None = None
     sampling: Sampling = dataclasses.field(default_factory=Sampling)
     max_new_tokens: int | None = None
@@ -585,10 +710,14 @@ class TextGeneration(_NativeTextTask):
     logits: tuple[LogitsTransform, ...] | None = None
     stopping: tuple[Stopping, ...] = ()
     strategy: Strategy | None = None
+    prefix: int | Literal["prompt"] | None = None
+    """The prefix run the model trained (`LMObjective(prefix=...)`): a prompt's first tokens, or all of it
+    under "prompt", form one block the model reads whole. A request's own blocks stand; None is causal."""
     _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        refuse_prefix(self.model, self.prefix, longest=cache_ceiling(self.model))
         object.__setattr__(self, "_stops", self._stop_criteria(self.sampling.stop))
 
     def _stop_criteria(self, strings: tuple[str, ...]) -> tuple[Stopping, ...]:
@@ -633,15 +762,15 @@ class TextGeneration(_NativeTextTask):
         return replace(self, model=model, variables=variables)
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
-                 trust: Sequence[str] = ()) -> TextGeneration:
-        """Load the causal language-model run in `directory` as a task.
+    def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
+                   layout: Layout | None = None, dtype: DTypeLike | None = None,
+                   param_dtype: DTypeLike | None = None) -> TextGeneration:
+        """Load the causal language-model run `run` (its checkpoint pinned, `SavedRun.pinned`) as a task;
+        `from_run` loads one from its directory.
 
-        The task rebuilds the model that the run's `run.json` records, the
-        way the recipe built it, over the weights of the latest checkpoint
-        (or of `step`), and decodes text through the run's own tokenizer.
+        The task rebuilds the model that the checkpoint's inference record
+        (`Checkpoints.artifact`) declares, the way the recipe built it, over
+        the checkpoint's weights, and decodes text through the run's own tokenizer.
         The run's preview budget and sampling policy become the task's
         defaults, and a PPO run loads only its policy weights.
 
@@ -651,12 +780,11 @@ class TextGeneration(_NativeTextTask):
         weights are restored directly onto that mesh under `layout`, the way
         the trainer places them. `dtype` overrides the computation dtype and
         `param_dtype` the parameter storage dtype; None keeps what the
-        checkpoint stored. `trust` names the packages outside Dew the run's
-        record may import, as `trust_remote_code` does in transformers.
+        checkpoint stored.
         """
         model, variables, settings, processor = cls._loaded(
-            directory, TextSettings, lambda model, settings: None, ema=ema, step=step, mesh=mesh,
-            layout=layout, dtype=dtype, param_dtype=param_dtype, trust=trust)
+            run, TextSettings, lambda model, settings: None, ema=ema, mesh=mesh, layout=layout, dtype=dtype,
+            param_dtype=param_dtype)
         return cls.from_settings(model, variables, settings, processor)
 
     @classmethod
@@ -664,11 +792,9 @@ class TextGeneration(_NativeTextTask):
                       processor: Processor | None) -> TextGeneration:
         """The task `settings` describe over `model` and `variables`, reading text through
         `processor`: the previews' policy and budget become its defaults. A live objective
-        (`LMObjective.build_task`) and a saved run (`from_run`) build it alike."""
+        (`LMObjective.build_task`) and a saved run (`from_saved`) build it alike."""
         return cls(model, variables, processor, sampling=settings.sampling,
-                   max_new_tokens=settings.max_new_tokens or None)
-
-
+                   max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: int | jax.Array | None = None, n: int | None = None,
@@ -685,15 +811,15 @@ class TextGeneration(_NativeTextTask):
             generated = generate(cache_sized(self.model, capacity), self.placed, shaped, budget,
                                  key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,
                                  stopping=criteria, strategy=self.strategy if strategy is None else strategy,
-                                 trips=trips)
+                                 trips=trips, prefix=self.prefix)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
             return self._decoded(_requested(generated, budget, padding))
 
     def decode(self, generation: Generation) -> tuple[str, ...]:
         """Return each row's valid continuation as text; raises ValueError without a processor."""
         with region("inference.text.decode"):
-            rows = generation.host()
-            return decoded_rows(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
+            return row_texts(functools.partial(decoded_rows, self.processor), generation,
+                             generation.prompt_width)
 
 
 @dataclass(frozen=True)
@@ -720,37 +846,37 @@ class BlockGeneration(_NativeTextTask):
     n: int = 1
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
-                 trust: Sequence[str] = ()) -> BlockGeneration:
-        """Load the block-diffusion run in `directory` as a task.
+    def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
+                   layout: Layout | None = None, dtype: DTypeLike | None = None,
+                   param_dtype: DTypeLike | None = None) -> BlockGeneration:
+        """Load the block-diffusion run `run` (its checkpoint pinned) as a task; `from_run` loads one
+        from its directory.
 
-        The task rebuilds the block denoiser that the run's `run.json`
-        records, over the weights of the latest checkpoint (or of `step`),
+        The task rebuilds the block denoiser that the checkpoint's inference
+        record declares, over the checkpoint's weights,
         and samples with the run's saved `BlockProcess` over the canvas the
         model declares. The run's preview budget becomes the task's
         `max_new_tokens`, and its pad id the task's `pad_token_id`. A run
         whose model is not a `BlockDenoiser` raises `TypeError` naming the
         operations it lacks.
 
-        The arguments work as in `TextGeneration.from_run`: `ema` selects
+        The arguments work as in `TextGeneration.from_saved`: `ema` selects
         the averaged weights, `mesh` and `layout` place them, and the two
         dtypes override computation and storage.
         """
         model, variables, settings, processor = cls._loaded(
-            directory, BlockSettings, lambda model, settings: refuse_non_denoiser(model), ema=ema,
-            step=step, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype, trust=trust)
+            run, BlockSettings, lambda model, settings: refuse_non_denoiser(model), ema=ema, mesh=mesh,
+            layout=layout, dtype=dtype, param_dtype=param_dtype)
         return cls.from_settings(model, variables, settings, processor)
 
     @classmethod
     def from_settings(cls, model: nn.Module, variables: Variables, settings: BlockSettings,
                       processor: Processor | None) -> BlockGeneration:
         """The task `settings` describe over `model` and `variables`, reading text through
-        `processor`: their process, pad id and canvas budget. A live objective
-        (`BlockDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike."""
-        return cls(model, variables, settings.process, processor, pad_token_id=settings.pad_token_id,
-                   max_new_tokens=settings.max_new_tokens or None)
+        `processor`: their process, pad id, end-of-sequence ids and canvas budget. A live objective
+        (`BlockDiffusionObjective.build_task`) and a saved run (`from_saved`) build it alike."""
+        return cls(model, variables, settings.process, processor, eos_token_ids=settings.eos_token_ids,
+                   pad_token_id=settings.pad_token_id, max_new_tokens=settings.max_new_tokens or None)
 
 
 
@@ -797,21 +923,21 @@ class MaskedGeneration(_NativeTextTask):
     n: int = 1
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
-                 trust: Sequence[str] = ()) -> MaskedGeneration:
-        """Load the masked-diffusion run in `directory` as a task.
+    def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
+                   layout: Layout | None = None, dtype: DTypeLike | None = None,
+                   param_dtype: DTypeLike | None = None) -> MaskedGeneration:
+        """Load the masked-diffusion run `run` (its checkpoint pinned) as a task; `from_run` loads one
+        from its directory.
 
-        The task rebuilds the bidirectional model that the run's `run.json`
-        records, over the weights of the latest checkpoint (or of `step`),
+        The task rebuilds the bidirectional model that the checkpoint's inference
+        record declares, over the checkpoint's weights,
         and refines responses with MDLM over the run's own mask token, using
         the solver and step count the run saved. The model must score the
         whole row with every position reading the others (`Logits`, and
         `TokenModel` with `causal` False) and name a mask token (`TokenModel.mask_token_id`)
         that matches the saved process, or loading raises `ValueError`.
 
-        The arguments work as in `TextGeneration.from_run`, and the run's
+        The arguments work as in `TextGeneration.from_saved`, and the run's
         preview budget becomes the response length a call omits.
         """
         def checked(model: nn.Module, settings: MaskedSettings) -> None:
@@ -824,19 +950,21 @@ class MaskedGeneration(_NativeTextTask):
                 raise ValueError("model and process mask token disagree")
 
         model, variables, settings, processor = cls._loaded(
-            directory, MaskedSettings, checked, ema=ema, step=step, mesh=mesh, layout=layout, dtype=dtype,
-            param_dtype=param_dtype, trust=trust)
+            run, MaskedSettings, checked, ema=ema, mesh=mesh, layout=layout, dtype=dtype,
+            param_dtype=param_dtype)
         return cls.from_settings(model, variables, settings, processor)
 
     @classmethod
     def from_settings(cls, model: nn.Module, variables: Variables, settings: MaskedSettings,
                       processor: Processor | None) -> MaskedGeneration:
         """The task `settings` describe over `model` and `variables`, reading text through
-        `processor`: their process, solver, step count and response budget. A live objective
-        (`MaskedDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike."""
+        `processor`: their process, solver, step count, end-of-sequence ids and response budget. A
+        live objective (`MaskedDiffusionObjective.build_task`) and a saved run (`from_saved`) build it
+        alike."""
         assert isinstance(settings.solver, Unmask)
         return cls(model, variables, settings.process, processor, solver=settings.solver,
-                   steps=settings.sampling_steps, max_new_tokens=settings.max_new_tokens or None)
+                   steps=settings.sampling_steps, eos_token_ids=settings.eos_token_ids,
+                   max_new_tokens=settings.max_new_tokens or None)
 
 
 

@@ -7,35 +7,39 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
-from flax.typing import Dtype, PrecisionLike
+from flax.typing import Dtype, Initializer, PrecisionLike
 
-from dew import records
-from dew.interop.weights import placed
+from dew import _records
+from dew._model_types import SANDWICH_NORMS
+from dew.batch import Variables, coordinates
+from dew.interop.unread import Stored
+from dew.interop.weights import native_layouts, placed
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
+from dew.nn.blocks import table_rows
 from dew.nn.dense import Dense
-from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
-from dew.objectives.base import Variables
+from dew.nn.precision import float32_dot_general
+from dew.nn.scan_orders import patchify
 from dew.registry import Record
 
 from .common import (
-    _PROJECTOR_PATHS,
     ProjectorBase,
+    ProjectorLayout,
     TowerBase,
     TowerGeometry,
+    TowerLayout,
     _vision_section,
     activation_name,
     head_width,
-    projector_weight_path,
     rope_base,
     trunk_geometry,
 )
@@ -71,9 +75,73 @@ class Gemma4ClippableLinear(Dense):
 
     use_clipped_linears: bool = False
 
+    @nn.nowrap
+    def _envelope(self, linear, inputs):
+        return clipped_linear(self, linear, inputs, self.use_clipped_linears)
+
+
+class AxialPatchEmbedding(nn.Module):
+    """Positioned HWC patches projected once, with a learned table for each spatial axis."""
+
+    features: int
+    patch_size: int
+    position_size: int
+    block_size: int = 1
+    use_bias: bool = False
+    table_axis: Literal[0, 1] = 0
+    position_validity: Literal["token", "axis"] = "token"
+    norm: Callable[..., nn.Module] | None = None
+    initializer: Initializer = nn.initializers.normal(0.02)
+    dtype: Dtype | None = None
+    precision: PrecisionLike = None
+
+    def __call__(self, pixels, pixel_position_ids=None):
+        return self.positioned(pixels, pixel_position_ids)[0]
+
     @nn.compact
-    def __call__(self, inputs):
-        return clipped_linear(self, super().__call__, inputs, self.use_clipped_linears)
+    def positioned(self, pixels, positions=None):
+        pixels = jnp.asarray(pixels, self.dtype)
+        if pixels.ndim == 4:
+            if positions is not None:
+                raise ValueError("position IDs accompany patch pixels, not NCHW images")
+            batch, channels, height, width = pixels.shape
+            stride = self.patch_size * self.block_size
+            if channels != 3 or height % stride or width % stride:
+                raise ValueError(f"images must have three channels and sides divisible by {stride}")
+            rows, columns = height // self.patch_size, width // self.patch_size
+            pixels = patchify(pixels.transpose(0, 2, 3, 1), self.patch_size)
+            x = jnp.tile(jnp.arange(columns), rows)
+            y = jnp.repeat(jnp.arange(rows), columns)
+            positions = jnp.broadcast_to(jnp.stack([x, y], axis=-1), (batch, rows * columns, 2))
+        if pixels.ndim != 3 or pixels.shape[-1] != 3 * self.patch_size ** 2:
+            raise ValueError("patch pixels must be [B, patches, 3 * patch_size**2]")
+        if positions is None or positions.shape != (*pixels.shape[:2], 2):
+            raise ValueError("patch pixels require aligned [B, patches, 2] position IDs")
+        if not jnp.issubdtype(positions.dtype, jnp.integer):
+            raise ValueError("pixel_position_ids must be integers")
+        if pixels.shape[1] % self.block_size ** 2:
+            raise ValueError("patch count must divide into whole pooling blocks")
+        if self.norm is not None:
+            pixels = self.norm(dtype=self.dtype, name="patch_norm1")(pixels)
+        hidden = Dense(self.features, use_bias=self.use_bias, dtype=self.dtype,
+                       precision=self.precision, name="patch_embed",
+                       dot_general=float32_dot_general)(pixels)
+        if self.norm is not None:
+            hidden = self.norm(dtype=self.dtype, name="patch_norm2")(hidden)
+        shape = ((2, self.position_size, self.features) if self.table_axis == 0
+                 else (self.position_size, 2, self.features))
+        table = jnp.moveaxis(self.param("position_table", self.initializer, shape), self.table_axis, 0)
+        valid = positions >= 0
+        mask = (valid if self.position_validity == "axis" else
+                jnp.broadcast_to(valid.all(axis=-1, keepdims=True), valid.shape))
+        safe = jnp.maximum(positions, 0)
+        embedded = [jnp.where(mask[..., axis, None],
+                              table_rows(table[axis], safe[..., axis], hidden.dtype), 0)
+                    for axis in range(2)]
+        hidden = hidden + (embedded[0] + embedded[1])
+        if self.norm is not None:
+            hidden = self.norm(dtype=self.dtype, name="position_norm")(hidden)
+        return hidden, positions
 
 
 class Gemma4VisionTransformer(nn.Module):
@@ -109,13 +177,12 @@ class Gemma4VisionTransformer(nn.Module):
             raise ValueError(
                 f"num_heads ({cfg.num_heads}) must repeat num_key_value_heads "
                 f"({cfg.num_key_value_heads})")
-        self.patch_embed = Dense(
-            cfg.hidden_size, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name="patch_embed")
-        self.position_table = self.param(
-            "position_table", nn.initializers.normal(0.02),
-            (2, cfg.position_embedding_size, cfg.hidden_size))
-        linear = functools.partial(Gemma4ClippableLinear, use_clipped_linears=cfg.use_clipped_linears)
+        self.embedding = AxialPatchEmbedding(cfg.hidden_size, cfg.patch_size, cfg.position_embedding_size,
+                                             block_size=cfg.pooling_kernel_size, dtype=self.dtype,
+                                             precision=self.precision)
+        nn.share_scope(self, self.embedding)
+        linear = functools.partial(Gemma4ClippableLinear, use_clipped_linears=cfg.use_clipped_linears,
+                                   dot_general=float32_dot_general)
         attention = functools.partial(
             CausalSelfAttention, ctx=MixerContext(
                 emb_features=cfg.hidden_size, num_heads=cfg.num_heads, num_kv_heads=cfg.num_key_value_heads,
@@ -144,38 +211,14 @@ class Gemma4VisionTransformer(nn.Module):
         cfg = self.config
         pixels = jnp.asarray(pixel_values)
         kernel = cfg.pooling_kernel_size
-        if pixels.ndim == 4:
-            if pixel_position_ids is not None:
-                raise ValueError("position IDs accompany patch pixels, not NCHW images")
-            batch, channels, height, width = pixels.shape
-            stride = cfg.patch_size * kernel
-            if channels != 3 or height % stride or width % stride:
-                raise ValueError(f"Gemma4 images must have three channels and sides divisible by {stride}")
-            rows, columns = height // cfg.patch_size, width // cfg.patch_size
-            patches = pixels.reshape(batch, channels, rows, cfg.patch_size, columns, cfg.patch_size)
-            pixels = patches.transpose(0, 2, 4, 3, 5, 1).reshape(batch, rows * columns, -1)
-            x = jnp.tile(jnp.arange(columns), rows)
-            y = jnp.repeat(jnp.arange(rows), columns)
-            pixel_position_ids = jnp.broadcast_to(jnp.stack([x, y], axis=-1), (batch, rows * columns, 2))
-        if pixels.ndim != 3 or pixels.shape[-1] != 3 * cfg.patch_size ** 2:
-            raise ValueError("Gemma4 patch pixels must be [B, patches, 3 * patch_size**2]")
-        if pixel_position_ids is None or pixel_position_ids.shape != (*pixels.shape[:2], 2):
-            raise ValueError("Gemma4 patch pixels require aligned [B, patches, 2] position IDs")
-        if not jnp.issubdtype(pixel_position_ids.dtype, jnp.integer):
-            raise ValueError("pixel_position_ids must be integers")
-        if pixels.shape[1] % kernel ** 2:
-            raise ValueError("patch count must divide into whole pooling blocks")
+        hidden_states, pixel_position_ids = self.embedding.positioned(2 * (pixels - 0.5), pixel_position_ids)
         valid = (pixel_position_ids >= 0).all(axis=-1)
         safe = jnp.maximum(pixel_position_ids, 0)
-        hidden_states = self.patch_embed(2 * (pixels - 0.5))
-        table = jnp.asarray(self.position_table, hidden_states.dtype)
-        positional = table[0, safe[..., 0]] + table[1, safe[..., 1]]
-        hidden_states = hidden_states + jnp.where(valid[..., None], positional, 0)
         metadata = AttentionMetadata(coordinates=coordinates(valid=valid),
                                      rotary_positions=pixel_position_ids)
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_metadata=metadata)
-        output_length = pixels.shape[1] // kernel ** 2
+        output_length = hidden_states.shape[1] // kernel ** 2
         width = safe[..., 0].max(axis=-1, keepdims=True) + 1
         indices = safe[..., 0] // kernel + (width // kernel) * (safe[..., 1] // kernel)
         values = jnp.where(valid[..., None], hidden_states, 0).astype(jnp.float32) / kernel ** 2
@@ -214,10 +257,11 @@ class Gemma4Vision(TowerBase):
         return Gemma4VisionTransformer(self)
 
     def geometry(self) -> TowerGeometry:
-        return TowerGeometry(patch_size=self.patch_size, block_size=self.pooling_kernel_size)
+        return TowerGeometry(patch_size=self.patch_size, block_size=self.pooling_kernel_size,
+                             position_size=self.position_embedding_size)
 
 
-class Gemma4ProjectorModule(nn.Module):
+class Gemma4Projector(ProjectorBase):
     """Soft tokens to text width: a scale-free RMS norm, then the map.
 
     The reference keeps this beside the tower (modeling_gemma4.py,
@@ -229,27 +273,25 @@ class Gemma4ProjectorModule(nn.Module):
     norm_eps: float = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    input_features: int | None = None
+
+    @property
+    def input_width(self) -> int | None:
+        return self.input_features
 
     def setup(self):
         self.pre_norm = RMSNorm(epsilon=self.norm_eps, with_scale=False,
                                 dtype=self.dtype, name="pre_norm")
         self.projection = Dense(
             self.text_width, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name="projection")
+            precision=self.precision, name="projection", dot_general=float32_dot_general)
 
     def __call__(self, image_features) -> jax.Array:
-        return self.projection(self.pre_norm(image_features))
-
-
-@dataclasses.dataclass(frozen=True)
-class Gemma4Projector(ProjectorBase):
-    """Gemma 4's projector fields: the decoder width and the norm epsilon."""
-
-    text_width: int
-    norm_eps: float = 1e-6
-
-    def build(self) -> nn.Module:
-        return Gemma4ProjectorModule(text_width=self.text_width, norm_eps=self.norm_eps)
+        features = jnp.asarray(image_features, self.dtype)
+        if self.input_features is not None and features.shape[-1] != self.input_features:
+            raise ValueError(f"media features have width {features.shape[-1]}, "
+                             f"expected {self.input_features}")
+        return self.projection(self.pre_norm(features))
 
 
 _GEMMA4_VISION_TENSORS = {
@@ -260,11 +302,6 @@ _GEMMA4_VISION_TENSORS = {
 }
 _GEMMA4_VISION_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj")
 _GEMMA4_VISION_MLP = ("gate_proj", "up_proj", "down_proj")
-# The sandwich's four norms as the decoder block names them.
-_GEMMA4_VISION_NORMS = {"input_layernorm": "input_layernorm",
-                        "post_attention_layernorm": "attention_output_norm",
-                        "pre_feedforward_layernorm": "post_attention_layernorm",
-                        "post_feedforward_layernorm": "mlp_output_norm"}
 
 
 def _gemma4_vision_layer_path(parts) -> tuple[str, ...] | None:
@@ -272,8 +309,8 @@ def _gemma4_vision_layer_path(parts) -> tuple[str, ...] | None:
     if len(parts) < 5 or parts[:2] != ["encoder", "layers"] or not parts[2].isdigit():
         return None
     layer = f"layers_{parts[2]}"
-    if len(parts) == 5 and parts[3] in _GEMMA4_VISION_NORMS and parts[4] == "weight":
-        return (layer, _GEMMA4_VISION_NORMS[parts[3]], "scale")
+    if len(parts) == 5 and parts[3] in SANDWICH_NORMS and parts[4] == "weight":
+        return (layer, SANDWICH_NORMS[parts[3]], "scale")
     if len(parts) == 7 and parts[5] == "linear" and parts[6] == "weight":
         if parts[3] == "self_attn" and parts[4] in _GEMMA4_VISION_PROJECTIONS:
             return (layer, "self_attn", parts[4], "kernel")
@@ -309,17 +346,56 @@ def gemma4_vision_path(hf_name: str) -> tuple[str, ...] | None:
     return (collection, *path)
 
 
+GEMMA4_PROJECTOR_TENSORS = {"embedding_projection.weight": ("projection", "kernel")}
+"""The Gemma 4 embedder's tensors past `embed_vision.` (or its audio's), each to its leaf."""
+
+
+def gemma4_vision_name(path: tuple[str, ...]) -> str:
+    """The Gemma 4 vision tensor name of the leaf at `path`, its collection then its trunk path:
+    `gemma4_vision_path`'s inverse, for a tower built natively rather than read."""
+    trunk = path[1:]
+    named = next((name for name, known in _GEMMA4_VISION_TENSORS.items() if known == trunk), None)
+    if named is not None:
+        return named
+    layer, *rest = trunk
+    if not layer.startswith("layers_"):
+        raise ValueError(f"unknown vision parameter {path!r}")
+    norms = {native: name for name, native in SANDWICH_NORMS.items()}
+    if len(rest) == 2 and rest[0] in norms:
+        rest = [norms[rest[0]], "weight"]
+    elif rest[-1] == "kernel":
+        rest = [*rest[:-1], "linear", "weight"]
+    elif rest[-1] == "scale":
+        rest = [*rest[:-1], "weight"]
+    return ".".join(("encoder.layers", layer.removeprefix("layers_"), *rest))
+
+
+def gemma4_tower_layouts(variables: Variables) -> tuple[WeightLayout, ...]:
+    """The layouts that write a natively built Gemma 4 tower's tensors back from its collections
+    (`gemma4_vision_name`); a read tower's come from its reading (`Gemma4Vision.checkpoint`)."""
+    return native_layouts(variables, gemma4_vision_name, gemma4_vision_path)
+
+
+def gemma4_projector_layouts(params: Variables) -> tuple[WeightLayout, ...]:
+    """The layouts that write a natively built Gemma 4 embedder's projection back from its
+    parameters, rooted at `params`."""
+    names: dict[tuple[str, ...], str] = {("params", *path): name
+                                         for name, path in GEMMA4_PROJECTOR_TENSORS.items()}
+    return native_layouts({"params": params}, names.__getitem__,
+                          lambda name: ("params", *GEMMA4_PROJECTOR_TENSORS[name]))
+
+
 def translate_gemma4_projector_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+    hf_tensors: Mapping[str, Stored], *, param_dtype: str = "float32"
 ) -> tuple[Variables, tuple[WeightLayout, ...]]:
     """A Gemma 4 embedder's map into its parameter tree, with the layouts that write it back.
 
     The pre-projection norm carries no scale, so the projection weight is
     the only tensor.
     """
-    if set(hf_tensors) != set(_PROJECTOR_PATHS["gemma4"]):
+    if set(hf_tensors) != set(GEMMA4_PROJECTOR_TENSORS):
         raise ValueError(f"unknown tensor names {sorted(hf_tensors)}")
-    return placed(hf_tensors, lambda name: projector_weight_path("gemma4", name), param_dtype)
+    return placed(hf_tensors, GEMMA4_PROJECTOR_TENSORS.__getitem__, param_dtype)
 
 
 def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
@@ -342,19 +418,19 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
     return {
         "class": "gemma4", "fields": {
         **geometry,
-        "num_key_value_heads": records.integer(
+        "num_key_value_heads": _records.integer(
             vision.get("num_key_value_heads", heads), "num_key_value_heads"
         ),
-        "head_dim": records.integer(vision.get("head_dim", geometry["hidden_size"] // heads), "head_dim"),
-        "patch_size": records.integer(vision.get("patch_size", 16), "patch_size"),
-        "pooling_kernel_size": records.integer(vision.get("pooling_kernel_size", 3), "pooling_kernel_size"),
-        "position_embedding_size": records.integer(
+        "head_dim": _records.integer(vision.get("head_dim", geometry["hidden_size"] // heads), "head_dim"),
+        "patch_size": _records.integer(vision.get("patch_size", 16), "patch_size"),
+        "pooling_kernel_size": _records.integer(vision.get("pooling_kernel_size", 3), "pooling_kernel_size"),
+        "position_embedding_size": _records.integer(
             vision.get("position_embedding_size", 10240), "position_embedding_size"
         ),
         "hidden_act": activation_name(vision, ("gelu_pytorch_tanh", "gelu"), "gelu_pytorch_tanh",
                                       ("hidden_activation", "hidden_act")),
-        "rms_norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
-        "rope_theta": rope_base(vision, 100.0),
+        "rms_norm_eps": _records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
+        "rope_theta": rope_base(vision, 100.0, axial=True),
         "standardize": bool(vision.get("standardize", False)),
         "use_clipped_linears": bool(vision.get("use_clipped_linears", False)),
     }}
@@ -383,11 +459,18 @@ def export_gemma4_vision_config(tower: Gemma4Vision) -> Mapping[str, object]:
     }
 
 
-def translate_gemma4_projector_config(vision: Mapping[str, object],
-                                      text_width: int) -> Record:
-    """A Gemma 4 wrapper's projector fields: decoder width, norm epsilon."""
-    return {
-        "class": "gemma4", "fields": {
+def translate_gemma4_projector_config(vision: Mapping[str, object], text_width: int,
+                                      input_width: int | None = None) -> Record:
+    """A Gemma 4 wrapper's projector fields: decoder width, norm epsilon, and the width of the raw media
+    it projects where no encoder precedes it (`input_width`, Gemma 4 Unified's)."""
+    fields: dict[str, object] = {
         "text_width": int(text_width),
-        "norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
-    }}
+        "norm_eps": _records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps")}
+    if input_width is not None:
+        fields["input_features"] = int(input_width)
+    return {"class": "gemma4", "fields": fields}
+
+
+Gemma4Vision.checkpoint = TowerLayout("vision_tower.", gemma4_vision_path)
+Gemma4Projector.checkpoint = ProjectorLayout("embed_vision.", GEMMA4_PROJECTOR_TENSORS,
+                                             read=translate_gemma4_projector_weights)

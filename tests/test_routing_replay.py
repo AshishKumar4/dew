@@ -7,13 +7,16 @@ decoder: the replayed choice equals the rollout's exactly even where the
 trainer's own top-k would differ, however the stack runs (plain, scanned,
 banked on the device or the host, pipelined over stages); the gate keeps its
 gradient; and an engine's `[tokens, layers, top_k]` record lands on the
-right layers.
+right layers. Where two ways of running the stack score the same replay,
+they are on par from the stack's float64 run over drawn models, tokens and
+records (check 1, tests/reference_error.py).
 """
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.inference.banks import HeldBanks
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -26,6 +29,9 @@ from dew.objectives.rl.sessions import ROUTED_EXPERTS_KEY, ROUTED_KEY, Call, Ses
 from dew.training import Layout, MeshSpec
 
 VOCAB, SEQ_LEN, LAYERS, EXPERTS, TOP_K = 64, 16, 4, 8, 2
+SEEDS = {'gate': 128, 'banked': 32, 'pipeline': 8, 'conflicting prefix': 128, 'packed': 64}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
+the most any of a site's cases took."""
 
 
 def objective(scan: bool = False, dtype=None, layers: tuple[int, ...] | None = None,
@@ -59,6 +65,26 @@ def tokens_of(batch: int, seed: int = 1):
 
 def replayed_log_probs(obj, params, tokens, routes):
     return -obj.token_scores(params, tokens, routes=routes).losses
+
+
+def replay_draw(obj, batch: int):
+    """Check 1's draw of a replay: a seed's parameters and tokens, and a record one expert off the
+    router's own choice on every layer, so the replay moves each token."""
+    init = jax.jit(obj.init)
+    sown = jax.jit(lambda params, tokens: obj.token_scores(params, tokens, routing=True).routing)
+
+    def draw(seed):
+        params = init(jax.random.fold_in(jax.random.key(0), seed))
+        tokens = tokens_of(batch, seed=1000 + seed)
+        chosen = {int(name.split('_')[1]): np.asarray(tree['mlp']['gate']['indices'][0])
+                  for name, tree in sown(params, tokens).items()}
+        return params, tokens, (engine_layout(chosen, batch) + 1) % EXPERTS
+    return draw
+
+
+def replayed(obj):
+    """`obj`'s replayed log-probabilities as a function of a draw (`replay_draw`)."""
+    return jax.jit(lambda params, tokens, routed: replayed_log_probs(obj, params, tokens, (routed, None)))
 
 
 @pytest.mark.parametrize("scan", [False, True])
@@ -137,26 +163,48 @@ def test_replaying_a_forwards_own_routing_changes_nothing():
 
 def test_the_gate_keeps_its_gradient_under_replay():
     """Only the selection is fixed: the replayed loss is smooth in the router
-    kernel, and its gradient matches a central difference along a direction."""
-    obj = objective(layers=(1, 3))
-    params = obj.init(jax.random.key(0))
-    tokens = tokens_of(2)
-    routed = jax.random.randint(jax.random.key(2), (2, SEQ_LEN + 1, LAYERS, 1), 0, EXPERTS)
-    routed = jnp.concatenate([routed, (routed + 1) % EXPERTS], axis=-1)
+    kernel, and its gradient, taken backward, is on par with the one taken
+    forward a kernel entry at a time, over drawn models, tokens and records
+    (check 1), the truth the stack's forward derivatives in float64. The loss
+    is scored from the whole logits, whose head forward mode passes; the tiled
+    head's custom backward is another test's."""
+    obj, wide = objective(layers=(1, 3)), objective(layers=(1, 3), dtype=jnp.float64)
+    init = jax.jit(obj.init)
 
-    def loss(kernel):
-        layer = params['params']['layers_1']
-        tree = {**params, 'params': {**params['params'], 'layers_1': {
-            **layer, 'mlp': {**layer['mlp'], 'gate': {'kernel': kernel}}}}}
-        return jnp.sum(replayed_log_probs(obj, tree, tokens, (routed, None)))
+    def draw(seed):
+        params = init(jax.random.fold_in(jax.random.key(0), seed))
+        routed = jax.random.randint(jax.random.fold_in(jax.random.key(2), seed), (2, SEQ_LEN + 1, LAYERS, 1),
+                                    0, EXPERTS)
+        pair = jnp.concatenate([routed, (routed + 1) % EXPERTS], axis=-1)
+        # The loss's cotangent, one, held in the draw as the gate takes it.
+        return params, tokens_of(2, seed=1000 + seed), pair, jnp.float32(1)
 
-    kernel = params['params']['layers_1']['mlp']['gate']['kernel']
-    gradient = jax.grad(loss)(kernel)
-    direction = jax.random.normal(jax.random.key(4), kernel.shape)
-    step = 1e-3
-    numeric = (loss(kernel + step * direction) - loss(kernel - step * direction)) / (2 * step)
-    assert float(jnp.abs(gradient).sum()) > 0
-    np.testing.assert_allclose(float(jnp.vdot(gradient, direction)), float(numeric), rtol=2e-2)
+    def backward_of(loss, one):
+        return lambda kernel: with_gradients(loss)(kernel, one)[1]
+
+    def forward(loss, one):
+        # A directional derivative a kernel entry at a time, looped: the experts' ragged product has
+        # no batching rule past its first dimension.
+        def run(kernel):
+            basis = jnp.eye(kernel.size, dtype=kernel.dtype).reshape(-1, *kernel.shape)
+            return jax.lax.map(lambda tangent: jax.jvp(loss, (kernel,), (tangent,))[1], basis).reshape(
+                kernel.shape)
+        return run
+
+    def gradient(obj, differentiate):
+        def run(params, tokens, routed, one):
+            def loss(kernel):
+                layer = params['params']['layers_1']
+                tree = {**params, 'params': {**params['params'], 'layers_1': {
+                    **layer, 'mlp': {**layer['mlp'], 'gate': {'kernel': kernel}}}}}
+                return -jnp.sum(obj.token_scores(tree, tokens, routes=(routed, None), logits=True).losses)
+            return differentiate(loss, one)(params['params']['layers_1']['mlp']['gate']['kernel'])
+        return jax.jit(run)
+
+    backward = gradient(obj, backward_of)
+    assert float(jnp.abs(backward(*draw(0))).sum()) > 0
+    assert_as_exact(backward, gradient(obj, forward), draw, "gate gradient", seeds=SEEDS['gate'],
+                    truth_fn=gradient(wide, forward))
 
 
 @pytest.mark.parametrize("parallel", [False, True], ids=["router", "gemma4"])
@@ -222,40 +270,49 @@ def test_tokens_without_a_record_keep_the_routers_own_choice():
     np.testing.assert_array_equal(replayed[0][:, 5:], native[0][:, 5:])
 
 
-@pytest.mark.parametrize("layout", [Layout(min_shard=1, tolerance=1.0),
-                                    Layout(min_shard=1, tolerance=1.0, host_parameters=("params/layers_*",))],
-                         ids=["device", "host"])
-def test_replay_on_banked_weights_scores_as_on_the_plain_tree(layout):
+@pytest.mark.parametrize("where", ["device", "host"])
+def test_replay_on_banked_weights_scores_as_on_the_plain_tree(where):
     """A store banked by run, resident or in pinned host memory, is read by
     the prefetch loop one layer at a time; the replay reaches each layer the
     same way and scores what the plain tree scores."""
+    layout = Layout(min_shard=1, tolerance=1.0,
+                    host_parameters=("params/layers_*",) if where == "host" else ())
     plain = objective()
     banked = objective(scan=True, bank_layers=2)
-    params = plain.init(jax.random.key(0))
-    tokens = tokens_of(2)
-    routed = (engine_layout(choices(plain, params, tokens), 2) + 1) % EXPERTS
-    store = HeldBanks(params).place(banked.model, layout=layout)
-    expected = replayed_log_probs(plain, params, tokens, (routed, None))
-    np.testing.assert_allclose(replayed_log_probs(banked, store, tokens, (routed, None)), expected, atol=1e-5)
-    assert float(jnp.max(jnp.abs(expected - plain.per_token_log_probs(params, tokens)))) > 1e-3
+    draw = replay_draw(plain, 2)
+    scored = jax.jit(lambda store, tokens, routed: replayed_log_probs(banked, store, tokens, (routed, None)))
+
+    @as_given
+    def from_banks(params, tokens, routed):
+        return np.asarray(scored(HeldBanks(params).place(banked.model, layout=layout), tokens, routed))
+
+    assert_as_exact(from_banks, replayed(plain), draw, f"{where} banked replay", seeds=SEEDS['banked'],
+                    truth_fn=replayed(objective(dtype=jnp.float64)))
+    params, tokens, routed = draw(0)
+    native = plain.per_token_log_probs(params, tokens)
+    assert not np.array_equal(replayed(plain)(params, tokens, routed), native)
 
 
 @pytest.mark.mesh(devices=4)
 def test_replay_under_a_pipeline_scores_as_on_one_stage():
     """Four layers over two stages fed four microbatches: every stage's
-    routers read their own microbatch's slice of the record."""
+    routers read their own microbatch's slice of the record, on par with the
+    stack on one stage (check 1)."""
     obj = objective()
-    params = obj.init(jax.random.key(0))
-    tokens = tokens_of(8)
-    routed = (engine_layout(choices(obj, params, tokens), 8) + 1) % EXPERTS
+    run = replayed(obj)
 
     def scored(spec, microbatches=None):
         mesh = spec.build()
-        with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
-            return np.asarray(jax.jit(lambda p: replayed_log_probs(obj, p, tokens, (routed, None)))(params))
 
-    flat = scored(MeshSpec(fsdp=4))
-    np.testing.assert_allclose(scored(MeshSpec(fsdp=2, stage=2), 2), flat, atol=1e-5)
+        @as_given
+        def score(params, tokens, routed):
+            with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
+                return np.asarray(run(params, tokens, routed))
+        return score
+
+    assert_as_exact(scored(MeshSpec(fsdp=2, stage=2), 2), scored(MeshSpec(fsdp=4)), replay_draw(obj, 8),
+                    "pipelined replay", seeds=SEEDS['pipeline'],
+                    truth_fn=replayed(objective(dtype=jnp.float64)))
 
 
 def test_pack_extends_recorded_routing_when_the_shared_prefix_agrees():
@@ -285,9 +342,9 @@ def test_pack_extends_recorded_routing_when_the_shared_prefix_agrees():
 def test_packed_grpo_preserves_each_calls_conflicting_prefix_routing(conflict):
     from dew.objectives.rl.grpo import GRPOObjective
 
-    obj = objective(scan=True)
+    obj, wide = objective(scan=True), objective(scan=True, dtype=jnp.float64)
     grpo = GRPOObjective(obj.model, SEQ_LEN)
-    params = obj.init(jax.random.key(0))
+    init = jax.jit(obj.init)
     first_routes = np.broadcast_to(np.arange(TOP_K, dtype=np.uint8), (4, LAYERS, TOP_K)).copy()
     later_routes = np.broadcast_to(first_routes[0], (7, LAYERS, TOP_K)).copy()
     later_routes[conflict] += TOP_K
@@ -296,17 +353,28 @@ def test_packed_grpo_preserves_each_calls_conflicting_prefix_routing(conflict):
     batch = pack([Session("t", "g", 0, 0, (first, second), Status.COMPLETED, 1.)], SEQ_LEN + 1)
     sampled = batch["response_mask"] != 0
     order = np.argsort(batch["call_index"][sampled], kind="stable")
-    scored = np.asarray(grpo.packed_log_probs(params, batch))[sampled][order]
-    expected = []
-    for call in (first, second):
-        assert call.routed_experts is not None
-        ids = np.zeros((1, SEQ_LEN + 1), np.int32)
-        size = len(call.prompt_ids) + len(call.sampled_ids)
-        ids[0, :size] = call.prompt_ids + call.sampled_ids
-        routes = np.pad(call.routed_experts, ((0, SEQ_LEN + 2 - size), (0, 0), (0, 0)))[None]
-        direct = np.asarray(replayed_log_probs(obj, params, ids, (routes, None)))
-        expected.extend(direct[0, len(call.prompt_ids) - 1:size - 1].tolist())
-    np.testing.assert_allclose(scored, expected, rtol=1e-5, atol=1e-6)
+    packed = jax.jit(lambda params: grpo.packed_log_probs(params, batch))
+
+    def calls(obj):
+        run = replayed(obj)
+
+        def direct(params):
+            found = []
+            for call in (first, second):
+                assert call.routed_experts is not None
+                ids = np.zeros((1, SEQ_LEN + 1), np.int32)
+                size = len(call.prompt) + len(call.tokens)
+                ids[0, :size] = call.prompt + call.tokens
+                routes = np.pad(call.routed_experts, ((0, SEQ_LEN + 2 - size), (0, 0), (0, 0)))[None]
+                found.append(run(params, jnp.asarray(ids), routes)[0, len(call.prompt) - 1:size - 1])
+            return jnp.concatenate(found)
+        return direct
+
+    def draw(seed):
+        return (init(jax.random.fold_in(jax.random.key(0), seed)),)
+
+    assert_as_exact(as_given(lambda params: np.asarray(packed(params))[sampled][order]), calls(obj), draw,
+                    f"{conflict} conflicting prefix", seeds=SEEDS['conflicting prefix'], truth_fn=calls(wide))
     np.testing.assert_array_equal(batch["behavior_log_probs"][sampled][order],
                                   np.array([-.1, -.2, -.3, -.4], np.float32))
     assert len(np.unique(batch["text_segment_ids"][sampled])) == 2
@@ -319,18 +387,26 @@ def test_packed_grpo_replays_the_routing_its_batch_carries():
 
     obj = objective(scan=True)
     grpo = GRPOObjective(obj.model, SEQ_LEN)
-    params = obj.init(jax.random.key(0))
-    tokens = tokens_of(1)
-    routed = (engine_layout(choices(obj, params, tokens), 1) + 1) % EXPERTS
-    ids = [int(token) for token in np.asarray(tokens[0])]
-    call = Call(tuple(ids[:5]), tuple(ids[5:]), (-1.0,) * (SEQ_LEN - 4), "length", 0,
-                routed_experts=routed[0, :SEQ_LEN])
-    batch = pack([Session("t", "g", 0, 0, (call,), Status.COMPLETED, 1.0)], SEQ_LEN + 1)
-    scored = np.asarray(grpo.packed_log_probs(params, batch))[0, 5:]
-    expected = np.asarray(replayed_log_probs(obj, params, tokens, (routed, None)))[0, 4:]
+    packed = jax.jit(grpo.packed_log_probs)
+
+    @as_given
+    def through_pack(params, tokens, routed):
+        ids = [int(token) for token in np.asarray(tokens[0])]
+        call = Call(tuple(ids[:5]), tuple(ids[5:]), (-1.0,) * (SEQ_LEN - 4), "length", 0,
+                    routed_experts=np.asarray(routed)[0, :SEQ_LEN])
+        batch = pack([Session("t", "g", 0, 0, (call,), Status.COMPLETED, 1.0)], SEQ_LEN + 1)
+        return np.asarray(packed(params, batch))[0, 5:]
+
+    def direct(obj):
+        run = replayed(obj)
+        return lambda params, tokens, routed: run(params, tokens, routed)[0, 4:]
+
+    draw = replay_draw(obj, 1)
+    assert_as_exact(through_pack, direct(obj), draw, "packed replay", seeds=SEEDS['packed'],
+                    truth_fn=direct(objective(scan=True, dtype=jnp.float64)))
+    params, tokens, routed = draw(0)
     native = np.asarray(obj.per_token_log_probs(params, tokens))[0, 4:]
-    np.testing.assert_allclose(scored, expected, atol=1e-6)
-    assert np.abs(scored - native).max() > 1e-3
+    assert not np.array_equal(through_pack(params, tokens, routed), native)
 
 
 def test_a_multimodal_mixture_replays_through_its_language_model():

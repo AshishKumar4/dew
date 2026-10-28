@@ -8,6 +8,7 @@ import pytest
 from flax import linen as nn
 from test_model_flops import decoder, forward_products
 
+from dew.batch import FROZEN, TEXT_KEY
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.lora import LoRA
@@ -21,9 +22,8 @@ from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers.mamba import Mamba
 from dew.nn.mixers.mamba2 import Mamba2, Mamba2Mixer
 from dew.nn.mixers.mlp import MLPMixer
-from dew.objectives.base import FROZEN
 from dew.objectives.diffusion import DiffusionObjective
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
 
 
 class DenseCount(nn.Module):

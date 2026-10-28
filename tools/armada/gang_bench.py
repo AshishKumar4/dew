@@ -102,6 +102,7 @@ def gradient_sync(mesh) -> dict:
     from jax.sharding import NamedSharding, PartitionSpec
 
     from dew.nn.backbones import CausalTransformer
+    from dew.telemetry.benchmark import samples
 
     model = CausalTransformer(emb_features=384, num_layers=6, num_heads=6, mlp_features=1536,
                               vocab_size=256, max_seq_len=257)
@@ -116,24 +117,18 @@ def gradient_sync(mesh) -> dict:
     timed = {}
     for name, summed in (("tuple", tupled), ("flat", flat)):
         timed[f"{name}_all_reduces"] = summed.lower(rows).compile().as_text().count(" all-reduce(")
-        jax.block_until_ready(summed(rows))
-        times = []
-        for _ in range(3):
-            start = time.monotonic()
-            jax.block_until_ready(summed(rows))
-            times.append(time.monotonic() - start)
-        timed[f"{name}_s"] = round(statistics.median(times), 3)
+        timed[f"{name}_s"] = round(statistics.median(samples(summed, rows, warmup=1, repeats=3)), 3)
     return {"buffers": len(rows), "bytes": sum(4 * leaf.size for leaf in jax.tree.leaves(shapes)), **timed}
 
 
 def agreements() -> dict:
-    """The median seconds of each way the pool shares a host value (`dew.coordination`): a
+    """The median seconds of each way the pool shares a host value (`dew._coordination`): a
     coordination-service barrier alone, a 4-byte device allgather (how agreements once went), a
     round of the service (`from_every_process`), an agreement on an outcome and on a value."""
     import numpy as np
     from jax.experimental import multihost_utils
 
-    from dew.coordination import _client, agree_process_phase, agreed_same, from_every_process
+    from dew._coordination import _client, agree_process_phase, agreed_same, from_every_process
 
     client = _client()
     rounds = iter(range(1_000_000))
@@ -177,6 +172,8 @@ def main() -> None:
     from jax.experimental import multihost_utils
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
+    from dew.telemetry.benchmark import samples
+
     mesh = Mesh(np.array(jax.devices()), ("hosts",))
     started = time.monotonic()
     multihost_utils.sync_global_devices("bench start")
@@ -190,12 +187,8 @@ def main() -> None:
         total = summed(rows).block_until_ready()
         expected = WORLD * (WORLD + 1) / 2
         assert float(np.asarray(total.addressable_data(0))[0]) == expected, "the sum is wrong"
-        times = []
-        for _ in range(REPEATS if size < (16 << 20) else 3):
-            start = time.monotonic()
-            summed(rows).block_until_ready()
-            times.append(time.monotonic() - start)
-        median = statistics.median(times)
+        repeats = REPEATS if size < (16 << 20) else 3
+        median = statistics.median(samples(summed, rows, warmup=0, repeats=repeats))
         moved = 2 * (WORLD - 1) / WORLD * size
         results.append({"bytes": size, "median_s": round(median, 4),
                         "bus_MBps": round(moved / median / 1e6, 2)})

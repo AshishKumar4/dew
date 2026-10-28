@@ -33,7 +33,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays
+from interop_support import (
+    assert_transformer_exports,
+    channels_last,
+    extract_fixture,
+    fixture_arrays,
+    source_transformer,
+)
 from reference_error import assert_as_exact_as_the_reference, assert_no_less_exact, float64_terms, widened
 
 from dew.diffusion.process import DenoisingCondition
@@ -56,23 +62,14 @@ def arrays(source):
     return fixture_arrays(source / "wan_transformer.npz")
 
 
-def channels_last(value):
-    """`[B, C, F, H, W]` to `[B, F, H, W, C]`."""
-    return np.moveaxis(np.asarray(value), 1, -1)
-
-
 def load(source, name):
-    config = json.loads((source / name / "transformer" / "config.json").read_text())
-    model = WanTransformer(**wan_fields(config, dtype="float32", attention_impl="xla"))
-    params, layouts = read_transformer(component_tensors(source / name, "transformer"), wan_path)
-    return model, params, layouts
+    return source_transformer(source, name, WanTransformer, wan_fields, wan_path)
 
 
 @pytest.mark.parametrize("name", CASES)
 def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
     _, params, layouts = load(source, name)
-    tensors = component_tensors(source / name, "transformer")
-    assert_layout_tensors(layouts, {"params": params}, tensors, "transformer/")
+    assert_transformer_exports(source, name, layouts, params)
 
 
 @pytest.mark.parametrize("name", CASES)
@@ -344,8 +341,8 @@ def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, 
     bitwise where they were."""
     import optax
 
+    from dew.batch import FROZEN
     from dew.lora import LoRA
-    from dew.objectives.base import FROZEN
     from dew.training import Trainer
 
     _, record, arrays = walk
@@ -370,8 +367,14 @@ def test_a_wan_lora_starts_as_the_source_and_trains_its_factors_alone(pipeline, 
     batch = clip_batch(objective, prompts)
     trainer = Trainer(objective, optax.sgd(1e-1), key=jax.random.key(3))
     initial = trainer.initial_state()
+    # The step donates the state it is given, so what it is compared with is read first; the
+    # source it started from still reads as loaded after it.
+    held, loaded = jax.device_get(initial), jax.device_get(tuned.variables)
     state, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
+    for leaf, before in zip(jax.tree.leaves(tuned.variables), jax.tree.leaves(loaded), strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), before)
+    initial = held
     factors = jax.tree_util.tree_leaves_with_path(state.variables["params"])
     assert factors and all(path[-1].key in ("lora_A", "lora_B") for path, _ in factors)
     assert all(bool(jnp.any(leaf)) for path, leaf in factors if path[-1].key == "lora_B")

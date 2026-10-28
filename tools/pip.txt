@@ -1,0 +1,5 @@
+# The pip every install of Dew's through pip takes first. pip 26.2.2 is the first whose own bundled roots leave out
+# those of eMudhra's compromised CAs (2026-10-20), and the wheel's hash holds its download whatever the older pip
+# fetching it trusts (Python packaging's advice). site/scripts/gen_install.py copies it into the standalone
+# installer and the install guide.
+pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70

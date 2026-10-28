@@ -19,14 +19,13 @@ You pass `Trainer` an instance of the objective. A configuration file or a saved
 
 ## Supervised
 
-A model trained on a loss over its outputs needs no objective of its own. `Supervised(model, loss, metrics=(), *, inputs)` applies any Flax module to the batch field `inputs.sample` names, and `loss(outputs, batch)` returns one loss per example (any trailing axes are averaged too):
+A model trained on a loss over its outputs needs no objective of its own. `Supervised(model, loss, metrics=(), *, inputs)` applies any Flax module to the batch field `inputs` names, and `loss(outputs, batch)` returns one loss per example (any trailing axes are averaged too):
 
 ```python
 import optax
 from flax import linen as nn
 
 from dew import Supervised
-from dew.inputs import Field, InputSpec
 from dew.objectives.supervised import Accuracy
 
 
@@ -34,8 +33,10 @@ def cross_entropy(outputs, batch):
     return optax.softmax_cross_entropy_with_integer_labels(outputs, batch["label"])
 
 
-objective = Supervised(nn.Dense(2), cross_entropy, (Accuracy(),), inputs=InputSpec(Field("x", (2,))))
+objective = Supervised(nn.Dense(2), cross_entropy, (Accuracy(),), inputs="x")
 ```
+
+Naming the field alone, `inputs="x"`, lets the run read the field's per-example shape off its first batch once, before the model initializes, and the objective then declares it as `objective.inputs`. An explicit spec, `inputs=InputSpec(Field("x", (2,)))`, states the shape instead, which a state placed before any data is read (`Trainer.place`) needs. `work=`, a module-level function of a batch, declares the analytical FLOPs of training on it for a model Dew holds no count for, which the run's MFU reads; without it such a run logs no MFU rather than an estimate.
 
 The loss is the mean over the batch's rows, `Objective.row_mean`, so a validation batch's repeated rows count for nothing. Each metric is called the same way and reported as its own mean, under its function's name or its class's (`accuracy`). A loss or metric is a module-level function or a configured callable object, such as `CrossEntropy(labels="label")`: a run's record names it by import path, and saving a run whose loss is a lambda raises. Reading the record back builds a callable object only of a class from Dew, Flax or a package the reader trusts (`RunConfig.load(directory, trust=("mypackage",))`). [Recipes](../recipes.md#python-experiments) trains this objective from a Python experiment file.
 
@@ -88,7 +89,8 @@ import jax
 import optax
 
 from dew import Objective
-from dew.objectives.base import EMASpec, under
+from dew.batch import under
+from dew.objectives.base import EMASpec
 
 
 class Players(Objective):
@@ -121,9 +123,11 @@ For a composite loss, return a pytree whose leaves are additive sufficient stati
 
 A loss whose update rule is not its own derivative (e-prop's eligibility traces, a forward-gradient or evolution-strategies estimate, a synthetic gradient) returns its statistics through `Objective.with_gradients(stats, gradients, variables["params"])`, where `gradients` mirrors `stats` with each scalar statistic's gradient tree, or None for one no parameter moves. The statistics keep their values, and the trainer steps with the stated rule through the same microbatching, accumulation and sharding as any other loss.
 
+Two such rules are built in. `dew.objectives.perturbation.NodePerturbation`, mixed into an objective (`class ForwardLM(NodePerturbation, LMObjective)`, built as `ForwardLM(model, seq_len, draws=256, sigma=0.1)`), trains its model without backpropagation, as Dust does: every `nn.Dense`, `nn.DenseGeneral` and `nn.Embed` output is jittered in antithetic pairs at every unit of the batch, and a vocabulary head the loss reads as a matrix, a tied embedding's, is jittered in that read, each unit credited by its own share of the loss (`Objective.scored_units`, the loss's own scoring with its configured terms), the weight gradient formed as an outer product with the layer's clean input, and the other parameters estimated by weight-space evolution strategies. The estimate is taken where the trainer asks for the loss's derivative, under the weight the trainer's reduction gives each statistic, so it pools over a split or accumulated update as the gradient does. `dew.objectives.residuals.Residuals` trains on the mean square of the residuals its subclass computes, a physics-informed network's or a least-squares fit's; with `damping` set it steps by damped Gauss-Newton, one solve of the whole update's system however the trainer splits or accumulates it, the normal equations or, where the update's residuals are fewer than its parameters, their dual, in the parameters' dtype, so `optax.sgd(1.0)` takes the step and a float64 run solves in float64. `examples/pinn_burgers.py` trains a self-similar blowup profile that way, through a Fourier feature pyramid (`dew.nn.fourier.FourierPyramid`).
+
 `Aux(metrics=...)` holds scalar arrays to report next to the loss. With a tracker configured, the trainer records them as `train/<name>` at the logging interval. They are measured on the training batch, not on the validation set.
 
-`Aux.variables` holds new values for non-parameter state, such as BatchNorm statistics, and the trainer applies them in order after each accepted microbatch. `Aux.effects` holds additive observations. Once per supported optimizer commit, the trainer passes them to `apply_effects(variables, effects)`, which returns the new non-parameter values. Router balancing uses these deferred counts so that its bias stays fixed within an accumulation window. `Aux.qk_stats` holds attention observations, and the trainer keeps the per-head maximum across accepted microbatches.
+`Aux.variables` holds new values for non-parameter state, such as BatchNorm statistics, and the trainer applies them in order after each accepted microbatch. `Aux.effects` holds additive observations. Once per supported optimizer commit, the trainer passes them to `apply_effects(variables, effects)`, which returns the new non-parameter values. Router balancing uses these deferred counts so that its bias stays fixed within an accumulation window. `Aux.qk_stats` holds the attention logit maxima a QK-Clip reads (`dew.optim.scale_by_qk_clip`, `muonclip`): a run whose optimizer holds one sets `Step.qk_stats`, the objective opens the `qk` collection in the model calls it trains through and returns what they sowed, and the trainer keeps the per-head maximum across accepted microbatches. A run refuses a step whose objective returns none, so an objective that cannot return them cannot train under it.
 
 ## Non-parameter state
 

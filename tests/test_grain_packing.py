@@ -10,13 +10,13 @@ import numpy as np
 import pytest
 from grain.experimental import FirstFitPackIterDataset
 
+from dew.batch import VALID_ROWS, Coordinates
 from dew.data import Loading, Memory
 from dew.data.compile import compile, validation
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
 from dew.data.plan import fingerprint
 from dew.data.text import Chunks
-from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 
@@ -24,10 +24,21 @@ READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 FIELDS = ("text", "text_roles")
 
 
-@pytest.mark.parametrize("window, bins, segments", [(8, 1, None), (8, 3, None), (16, 4, 3), (5, 2, 2)])
+def _drawn(count: int) -> list[tuple[int, int, int | None]]:
+    """`count` packings drawn at random: a window of 2 to 48 tokens, 1 to 12 bins, and no cap or a
+    cap of 1 to 6 documents a window."""
+    rng = np.random.default_rng(1064)
+    return [(int(rng.integers(2, 49)), int(rng.integers(1, 13)),
+             None if rng.random() < 0.3 else int(rng.integers(1, 7))) for _ in range(count)]
+
+
+@pytest.mark.parametrize("window, bins, segments",
+                         [(8, 1, None), (8, 3, None), (16, 4, 3), (5, 2, 2), *_drawn(16)])
 def test_planned_windows_are_grains_first_fit_windows(window, bins, segments):
-    """Documents from one token to well past the window, a few exactly the
-    window, with ids and roles, cut by a chunk step before a first-fit pack:
+    """Dew plans first-fit windows by documents' lengths alone (`dew.data.tokens.first_fit`), a
+    placement Grain's packer reaches only by packing every token, so Grain's packer is its oracle,
+    over packings drawn at random as over the edge cases. Documents from one token to well past the
+    window, a few exactly the window, with ids and roles, cut by a chunk step before a first-fit pack:
     grain's packer, given the chunks in file order and its bins emitted in
     order, writes window for window what a memory read and an indexed read of
     documents that state their lengths read by the plan (`plan_windows`), and
@@ -84,6 +95,38 @@ def test_planned_windows_are_grains_first_fit_windows(window, bins, segments):
     assert data.plan.derived["0/valid_targets"] == fingerprint(sum(targets))
 
 
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_packed_window_keeps_each_fields_trailing_shape_as_grain_packs_it(read):
+    """A pack of ids beside an aligned field that holds a row of three a token (a token's features):
+    every window an indexed plan or a memory read assembles holds each field with its trailing shape,
+    field for field what grain's first-fit packer writes of the same documents, where every packed
+    field was allocated one-dimensional and a row of three could not be assigned (row 1873)."""
+    lengths = (3, 7, 2, 5, 8, 4)
+    documents = [{"text": (np.arange(length) + 100 * index).astype(np.int32),
+                  "text_features": np.arange(3 * length, dtype=np.float32).reshape(length, 3) + index}
+                 for index, length in enumerate(lengths)]
+    fields = ("text", "text_features")
+    reference = list(FirstFitPackIterDataset(
+        grain.MapDataset.source(documents).to_iter_dataset(), length_struct=dict.fromkeys(fields, 8),
+        num_packing_bins=3, shuffle_bins=False, meta_features=fields[1:]))
+    source = (Memory(documents) if read == "memory" else
+              Memory({"text": [value["text"] for value in documents],
+                      "text_features": [value["text_features"] for value in documents],
+                      "length": list(lengths)}))
+    reader = validation(Pipeline(source).pack(8, fields=fields, bins=3), batch=1, read=read,
+                        loading=READ)(DataPartition())
+    try:
+        windows = list(reader)
+    finally:
+        reader.close()
+    assert len(windows) == len(reference)
+    for got, expected in zip(windows, reference, strict=True):
+        assert got["text_features"][0].shape == (8, 3)
+        for key in fields:
+            np.testing.assert_array_equal(got[key][0], expected[key], err_msg=key)
+        np.testing.assert_array_equal(got["text_coordinates"].segments[0], expected["text_segment_ids"])
+
+
 @pytest.mark.parametrize("policy, overlap", [("first-fit", 0), ("best-fit", 0), ("concat", 0), ("concat", 1)])
 def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy, overlap):
     """read='memory' packs the whole corpus before the order and an indexed
@@ -101,8 +144,11 @@ def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy, over
         try:
             # The windows' arrays: each read declares its own bound on the documents a window holds
             # (`Coordinates.max_segments`), the memory read the most it packed into one and the
-            # indexed read, packing as it streams, its window's length.
-            return [[np.asarray(value).tolist() for value in jax.tree.leaves(batch)] for batch in reader]
+            # indexed read, packing as it streams, its window's length, which its documents' firsts are
+            # as wide as: their token-aligned fields compared.
+            return [[np.asarray(value).tolist() for value in jax.tree.leaves(
+                {name: value.tokens() if isinstance(value, Coordinates) else value
+                 for name, value in batch.items()})] for batch in reader]
         finally:
             reader.close()
 
@@ -189,3 +235,35 @@ def test_a_window_with_no_target_is_left_out_whatever_the_read(read):
     memory = windows("memory")
     assert memory == [[[2, 3, 0, 0]]]
     assert windows(read) == memory
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+@pytest.mark.parametrize("policy", ["concat", "first-fit", "windows"])
+def test_a_record_whose_packed_fields_differ_in_length_is_refused(read, policy):
+    """A packed or windowed record's fields hold one entry a token. One whose fields differ in length
+    is refused by every read, packer and window reader: each field would be cut at other places
+    (where Grain's concatenating packer loses a token of the shorter field's remainder), its windows
+    holding one field's tokens beside another's from elsewhere. Records whose fields agree are read
+    alike."""
+    def records(others: tuple[int, int]) -> Memory:
+        return Memory([{"text": np.arange(start, start + length, dtype=np.int32),
+                        "other": np.arange(100 + start, 100 + start + other, dtype=np.int32)}
+                       for start, length, other in zip((10, 20), (3, 4), others, strict=True)])
+
+    def windows(source: Memory) -> list[tuple[list[int], list[int]]]:
+        pipeline = Pipeline(source)
+        laid = (pipeline.windows(3, fields=("text", "other")) if policy == "windows"
+                else pipeline.pack(4, fields=("text", "other"), policy=policy))
+        chain = laid.batch(1)
+        stream = compile(chain, read=read, loading=Loading(workers=0, threads=1)).train(DataPartition())
+        try:
+            return [(batch["text"][0].tolist(), batch["other"][0].tolist())
+                    for batch in itertools.islice(stream, 3)]
+        finally:
+            stream.close()
+
+    for text, other in windows(records((3, 4))):
+        assert [token + 100 if token else 0 for token in text] == other
+    with pytest.raises(ValueError):
+        windows(records((1, 4)))
+

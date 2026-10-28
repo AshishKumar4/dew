@@ -21,15 +21,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mixers import AttentionMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.moe import global_router_loss
-from dew.objectives.lm.objective import _router_scores, router_moments, router_z_terms
-from dew.training.optim import ParamGroup, Power, linear_schedule, param_labels, power_schedule
+from dew.objectives.routing import router_moments, router_scores, router_z_terms
+from dew.optim import OptimConfig, ParamGroup, Power, linear_schedule, param_labels, power_schedule
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "lm_engine"
 COEF = 0.01  # the fixture's router_aux_loss_coef
@@ -123,7 +122,7 @@ def objective(model, tokens):
         logp = jax.nn.log_softmax(logits[:, :-1], axis=-1)
         lm = -jnp.mean(jnp.take_along_axis(logp, tokens[:, 1:, None], axis=-1))
         routing = sown["router"]
-        switch = sum(global_router_loss(router_moments(s, i, {}), 1.0) for s, i in _router_scores(routing))
+        switch = sum(global_router_loss(router_moments(s, i, {}), 1.0) for s, i in router_scores(routing))
         z = sum(term.total / term.mass for term in router_z_terms(routing, 1.0, {}))
         aux = switch + 0.1 * z
         return lm + COEF * aux, (logits, lm, aux)
@@ -171,7 +170,7 @@ def test_mup_groups_and_adamw_steps_match_lm_engine(reference):
 
     config = OptimConfig(
         optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-10},
-        schedule=Power(peak=0.01, warmup_steps=2, a=0.05, b=-0.51, c=16.0),
+        learning_rate=Power(peak_value=0.01, warmup_steps=2, a=0.05, b=-0.51, c=16.0),
         weight_decay=0.1, param_groups=groups)
     with float64():
         solver = config.build(3)

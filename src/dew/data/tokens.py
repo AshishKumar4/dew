@@ -1,4 +1,4 @@
-"""Document chunk tables, packed windows and first-fit plans."""
+"""Document chunk tables, packed windows, first-fit plans and a row's shares of its room."""
 
 from __future__ import annotations
 
@@ -8,7 +8,39 @@ from typing import overload
 import grain.python as pygrain
 import numpy as np
 
-from .dataset import Batch
+from dew.batch import Batch
+
+
+def share_tokens(lengths: Sequence[int], room: int, *, caps: Sequence[int | None] | None = None,
+                 whole: Sequence[bool] | None = None) -> list[int]:
+    """How many of its own tokens each segment of a row keeps of the row's `room`: the one allocation
+    segments that share a row read, as a decision row's copies of its state do.
+
+    A segment kept whole (`whole`) takes all of its `lengths`, past the room too, which the row's own
+    check then judges. The others share what that leaves, never below zero, each wanting its length
+    up to its cap (`caps`, None for none). Where their wants exceed it, the share is max-min within one
+    token: in a stable ascending order of want, each takes the least of its want and an equal split of
+    what is left, floored, so a floor's remainder goes to the later segments in that order ([10, 10]
+    into 7 keeps [3, 4], [100, 10, 10] into 4 keeps [2, 1, 1]). No share is below zero, the cut ones
+    sum to at most what they share, and none of it is left while a segment wants more."""
+    count = len(lengths)
+    caps = [None] * count if caps is None else list(caps)
+    whole = [False] * count if whole is None else list(whole)
+    if len(caps) != count or len(whole) != count:
+        raise ValueError(f"a cap and a whole flag for each of {count} segments, got {len(caps)} and "
+                         f"{len(whole)}")
+    cut = [at for at in range(count) if not whole[at]]
+    wants = {at: lengths[at] if (cap := caps[at]) is None else min(cap, lengths[at]) for at in cut}
+    left = max(0, room - sum(length for length, kept in zip(lengths, whole, strict=True) if kept))
+    if sum(wants.values()) <= left:
+        return [lengths[at] if whole[at] else wants[at] for at in range(count)]
+    shares = [lengths[at] if whole[at] else 0 for at in range(count)]
+    remaining = len(cut)
+    for at in sorted(cut, key=lambda at: wants[at]):
+        shares[at] = min(wants[at], left // remaining)
+        left -= shares[at]
+        remaining -= 1
+    return shares
 
 
 def chunk_table(lengths, chunk_len: int, overlap: int) -> tuple[np.ndarray, np.ndarray]:
@@ -36,7 +68,8 @@ def chunk_lengths(lengths, chunk_len: int, overlap: int) -> np.ndarray:
 
 def packed_window(chunks: Sequence[Batch], window: int) -> Batch:
     """`chunks`, each holding the same per-token fields, laid end to end in a
-    zero-padded window of `window` tokens.
+    zero-padded window of `window` tokens, each field keeping its trailing shape
+    (a token's row of an aligned auxiliary field), as grain's packer keeps it.
 
     Named after the first field (the ids), `<field>_segment_ids` says which
     chunk of the window each token came from, counted from 1, and 0 for the
@@ -46,8 +79,14 @@ def packed_window(chunks: Sequence[Batch], window: int) -> Batch:
     (`grain/_src/python/dataset/transformations/packing_packed_batch.py:116-117`);
     chunks are cut the same way in every field here, so one pair describes
     them all and nothing transfers a second copy to the device.
+
+    It is grain's assembly, held to it field for field (tests/test_grain_packing.py), and not grain's
+    own: on armada's CPUs grain's `PackedBatch` assembles a twelve-chunk window in 112 us and its
+    public packer in 3.6 ms where this takes 28 us, and an indexed read assembles a window a read
+    (row 1873).
     """
-    fields = {key: np.zeros(window, value.dtype) for key, value in chunks[0].items()}
+    fields = {key: np.zeros((window, *np.shape(value)[1:]), np.asarray(value).dtype)
+              for key, value in chunks[0].items()}
     segment_ids = np.zeros(window, np.int32)
     positions = np.zeros(window, np.int32)
     filled = 0
@@ -74,6 +113,10 @@ def first_fit(sizes: np.ndarray, window: int, bins: int,
     every chunk belongs to, without reading a token. That plan is what lets
     the packing run ahead of the shard, so a window holds the same chunks at
     any process count.
+
+    It is grain's placement, held to it window for window (tests/test_grain_packing.py), and not
+    grain's packer run over the lengths: over 200,000 chunks on armada's CPUs this plans in 0.15 s
+    and grain's packer, fed zero-strided stand-ins of each length, in 88 s, the same plan (row 1873).
 
     Returns the chunk indices grouped by window, in the order the packer
     added them, and where each window starts in that grouping. A window the

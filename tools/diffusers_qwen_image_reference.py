@@ -40,7 +40,13 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import frequency_exponent, perturb, saved_pipeline, torch_exp_disagreements
+from diffusers_reference_helpers import (
+    frequency_exponent,
+    perturb,
+    recording,
+    saved_pipeline,
+    torch_exp_disagreements,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests" / "fixtures" / "hf" / "qwen-image-2.1-source"
@@ -293,12 +299,7 @@ def main(destination: str) -> None:
     import transformers
     from diffusers import QwenImage21Pipeline
 
-    from reference_releases import require
-
-    require("qwen-image")
-    torch.set_num_threads(2)
-    root = Path(destination)
-    root.mkdir(parents=True, exist_ok=True)
+    root = recording(destination, "qwen-image")
     arrays: dict[str, np.ndarray] = {}
     cases: dict[str, dict[str, object]] = {}
     for name, case in CASES.items():

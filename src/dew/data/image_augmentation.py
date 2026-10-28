@@ -11,6 +11,9 @@ used to make variable-size decoded records stackable before augmentation.
 
 from __future__ import annotations
 
+import dataclasses
+from collections.abc import Callable
+from types import ModuleType
 from typing import NamedTuple
 
 import jax
@@ -34,13 +37,49 @@ _GREY = (0.2989, 0.587, 0.114)
 saturation blend against."""
 
 
-def jitter_ranges(brightness: float = 0.2, contrast: float = 0.05,
-                  saturation: float = 0.2) -> tuple[tuple[float, float], ...]:
-    """Brightness, contrast and saturation factor bounds."""
-    return tuple((max(0.0, 1 - spread), 1 + spread) for spread in (brightness, contrast, saturation))
+@dataclasses.dataclass(frozen=True)
+class Spread:
+    """How far ColorJitter's brightness, contrast and saturation factors reach from 1: each drawn
+    from [1 - spread, 1 + spread], none below 0."""
+
+    brightness: float = 0.2
+    contrast: float = 0.05
+    saturation: float = 0.2
+
+    def ranges(self) -> tuple[tuple[float, float], ...]:
+        """Brightness, contrast and saturation factor bounds."""
+        return tuple((max(0.0, 1 - spread), 1 + spread)
+                     for spread in (self.brightness, self.contrast, self.saturation))
 
 
-_LOW, _HIGH = tuple(zip(*jitter_ranges(), strict=True))
+JITTER = Spread()
+"""The spread a jitter draws its factors from where none is given, on the host or the device."""
+
+_LOW, _HIGH = tuple(zip(*JITTER.ranges(), strict=True))
+
+
+def crop_extent[Pixels: (np.ndarray, jax.Array)](sides: Pixels, fraction: ArrayLike,
+                                                 xp: ModuleType) -> Pixels:
+    """A crop's (height, width) of an image of `sides`: `fraction` of each side, at least a pixel,
+    as `xp` (NumPy or `jax.numpy`) rounds it."""
+    return xp.maximum(1, xp.rint(sides * fraction).astype(xp.int32))
+
+
+def _toward[Pixels: (np.ndarray, jax.Array)](pixels: Pixels, operation: int, xp: ModuleType,
+                                             grey: Callable[[Pixels], Pixels]) -> Pixels | int:
+    """What ColorJitter's `operation` blends `pixels` toward: black (0, brightness), the mean of
+    their grey (1, contrast) or each pixel's grey (2, saturation), `grey` giving a pixel's grey as
+    `xp` lays it out."""
+    if operation == 0:
+        return 0
+    return xp.mean(grey(pixels)) if operation == 1 else grey(pixels)
+
+
+def _blend[Pixels: (np.ndarray, jax.Array)](pixels: Pixels, factor: ArrayLike, toward: Pixels | int,
+                                            xp: ModuleType) -> Pixels:
+    """torchvision's `_blend`: `pixels` by `factor`, the rest toward `toward`, clamped to the pixel
+    range."""
+    return xp.clip(pixels * factor + toward * (1 - factor), 0, 255)
 
 
 def draw_device(key: jax.Array, shape: tuple[int, ...], *, flip: bool, jitter: bool,
@@ -51,7 +90,7 @@ def draw_device(key: jax.Array, shape: tuple[int, ...], *, flip: bool, jitter: b
     fraction = jnp.sqrt(jax.random.uniform(area, (), dtype=jnp.float32,
                                          minval=crop_scale[0], maxval=crop_scale[1]))
     sides = jnp.asarray(shape[:2], jnp.int32)
-    extent = jnp.maximum(1, jnp.rint(sides * fraction).astype(jnp.int32))
+    extent = crop_extent(sides, fraction, jnp)
     start = jax.random.randint(origin, (2,), 0, sides - extent + 1, dtype=jnp.int32)
     factors = (
         jax.random.uniform(
@@ -74,7 +113,7 @@ def draw_host(rng: np.random.Generator, shape: tuple[int, ...], *, flip: bool, j
               crop_scale: tuple[float, float]) -> ImageParameters:
     """Draw the same parameter ranges with Grain's host record generator."""
     fraction = np.sqrt(rng.uniform(*crop_scale))
-    extent = np.maximum(1, np.rint(np.asarray(shape[:2]) * fraction).astype(np.int32))
+    extent = crop_extent(np.asarray(shape[:2]), fraction, np)
     start = rng.integers(0, np.asarray(shape[:2]) - extent + 1)
     return ImageParameters(np.concatenate([start, extent]),
                            np.asarray(flip and rng.random() < 0.5),
@@ -95,17 +134,18 @@ def apply_device(image: ArrayLike, parameters: ImageParameters, size: int) -> ja
         channel, [(top + row)[:, None], (left + col)[None, :]], order=1, mode="nearest"),
         in_axes=2, out_axes=2)(pixels)
     pixels = jnp.where(jnp.asarray(parameters.flip), pixels[:, ::-1], pixels)
-    brightness, contrast, saturation = jnp.asarray(parameters.factors, dtype=pixels.dtype)
-    grey = jnp.asarray(_GREY, dtype=pixels.dtype)
+    factors = jnp.asarray(parameters.factors, dtype=pixels.dtype)
+    weights = jnp.asarray(_GREY, dtype=pixels.dtype)
+
+    def grey(current):
+        return jnp.sum(current * weights, axis=-1, keepdims=True)
 
     def colour(current, operation):
         # Each place in the order selects its operation per image, as a batched switch does; a
         # selection also traces over rows an Explicit mesh axis types, which a switch does not.
-        brightened = current * brightness
-        contrasted = current * contrast + jnp.mean(jnp.sum(current * grey, axis=-1)) * (1 - contrast)
-        saturated = current * saturation + jnp.sum(current * grey, axis=-1, keepdims=True) * (1 - saturation)
-        return jnp.clip(jnp.where(operation == 0, brightened,
-                                  jnp.where(operation == 1, contrasted, saturated)), 0, 255)
+        brightened, contrasted, saturated = (
+            _blend(current, factors[each], _toward(current, each, jnp, grey), jnp) for each in range(3))
+        return jnp.where(operation == 0, brightened, jnp.where(operation == 1, contrasted, saturated))
 
     order = jnp.asarray(parameters.order)
     for place in range(3):
@@ -120,23 +160,15 @@ def jitter_host(pixels: np.ndarray, factors: ArrayLike, order: ArrayLike) -> np.
     pixel range."""
     import cv2
 
-    brightness, contrast, saturation = np.asarray(factors, dtype=pixels.dtype)
-    grey = np.asarray(_GREY, dtype=pixels.dtype)
-    pixels = np.array(pixels, copy=True)
-    for index in np.asarray(order):
-        if index == 0:
-            np.multiply(pixels, brightness, out=pixels)
-        elif index == 1:
-            # The mean grey of the image as it stands at its place in the order.
-            mean = cv2.transform(pixels, grey[None]).mean()
-            np.multiply(pixels, contrast, out=pixels)
-            np.add(pixels, mean * (1 - contrast), out=pixels)
-        else:
-            # Saturation as one matrix: out_c = s * x_c + (1 - s) * grey.
-            matrix = np.eye(3, dtype=pixels.dtype) * saturation + np.outer(
-                np.ones(3, pixels.dtype), (1 - saturation) * grey)
-            pixels = cv2.transform(pixels, matrix)
-        np.clip(pixels, 0, 255, out=pixels)
+    blended = np.asarray(factors, dtype=pixels.dtype)
+    weights = np.asarray(_GREY, dtype=pixels.dtype)[None]
+
+    def grey(current: np.ndarray) -> np.ndarray:
+        # OpenCV's one pass over the channels, a pixel's grey kept on its last axis.
+        return cv2.transform(current, weights)[..., None]
+
+    for operation in np.asarray(order).tolist():
+        pixels = _blend(pixels, blended[operation], _toward(pixels, operation, np, grey), np)
     return pixels
 
 

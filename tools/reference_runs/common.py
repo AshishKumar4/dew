@@ -2,8 +2,10 @@
 
 The torch generators run in a venv without Dew, the Dew generators in one
 without torch, so this module imports numpy and the standard library only,
-and `tools/trace_window.py`, which names and splits a profile's kernels the
-way `tools/benchmark_step.py` does. Every number the comparison reads is
+`tools/reference_source.py`, which loads Dew's host-only modules here (among
+them `dew.telemetry.trace`, which splits a profile's kernels as
+`tools/benchmark_step.py` does), and `tools/trace_window.py`, which names
+them. Every number the comparison reads is
 produced by one definition, so a difference between two records is a
 difference between the runs.
 """
@@ -13,7 +15,6 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
-import importlib.util
 import json
 import math
 import os
@@ -27,24 +28,18 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from trace_window import device_events, kernel_category, kernel_totals, window_totals
+from reference_source import loaded
+from trace_window import kernel_category, kernel_totals
 
+SOURCE = Path(__file__).resolve().parents[2] / "src" / "dew"
 EVIDENCE = Path(os.environ.get(
     "REFERENCE_RUNS_DIR", Path.home() / ".cache/dew/verification-evidence/reference-runs"))
 
 
-def _native(name: str, source: str):
-    """Read Dew's host-only records and target table without its backend import policy."""
-    path = Path(__file__).resolve().parents[2] / "src/dew" / source
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-gpu_target = _native("dew_gpu_targets", "nn/kernels/generation.py").gpu_target
-WorkloadWork = _native("dew_workload", "telemetry/workload.py").WorkloadWork
+# Dew's host-only records and target table, read without its backend import policy.
+gpu_target = loaded("dew_gpu_targets", SOURCE / "nn/kernels/generation.py").gpu_target
+WorkloadWork = loaded("dew_workload", SOURCE / "telemetry/workload.py").WorkloadWork
+trace = loaded("dew_trace", SOURCE / "telemetry/trace.py")
 
 
 def peak_flops(device_kind: str) -> float | None:
@@ -128,7 +123,7 @@ def kernel_summary(kernels: Sequence[tuple[str, int, int, int]], steps: int) -> 
     """Per-step device time from `(name, start_ns, end_ns, device)` kernel
     records of `steps` traced steps.
 
-    Each device's window is split by `trace_window.window_split`, the split
+    Each device's window is split by `trace.window_split`, the split
     `tools/benchmark_step.py` reports, and the figures are averaged over the
     devices: busy is the union of a device's kernels, the window runs from its
     first kernel's start to its last one's end, and the window is compute +
@@ -138,7 +133,7 @@ def kernel_summary(kernels: Sequence[tuple[str, int, int, int]], steps: int) -> 
     if not kernels:
         raise ValueError("the trace holds no device kernels")
     devices = sorted({device for *_, device in kernels})
-    figures = window_totals([[(name, start, end) for name, start, end, owner in kernels if owner == device]
+    figures = trace.window_totals([[(name, start, end) for name, start, end, owner in kernels if owner == device]
                              for device in devices])
     scale = 1e-6 / steps / len(devices)
     records = [(name, start, end) for name, start, end, _ in kernels]
@@ -204,13 +199,6 @@ def trim_trace(kernels: Sequence[tuple[str, int, int, int]], path: str | Path) -
     with gzip.open(path, "wt") as handle:
         json.dump(rows, handle)
     return path
-
-
-def git_head(path: str | Path) -> str:
-    """The commit a record was measured at; a record without one cannot be
-    traced, so a checkout git cannot read fails the run."""
-    return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True,
-                          text=True, check=True).stdout.strip()
 
 
 def source_version(path: str | Path) -> str:
@@ -382,7 +370,7 @@ def attach_xplane_profile(record: dict, trace_dir: str | Path, steps: int,
     recorded as such: the run's curves stand without it."""
     trace_dir = Path(trace_dir)
     try:
-        planes, lines = device_events(trace_dir)
+        planes, lines = trace.device_events(trace_dir)
         kernels = [(event.name, event.start_ns, event.end_ns, int(plane.rsplit(":", 1)[1]))
                    for plane, events in planes.items() for event in events]
         record["profile"] = kernel_summary(kernels, steps)

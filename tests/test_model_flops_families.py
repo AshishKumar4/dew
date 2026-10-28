@@ -9,8 +9,10 @@ import numpy as np
 import pytest
 from test_model_flops import forward_products
 
+from dew.batch import TEXT_KEY
 from dew.diffusion import presets
 from dew.diffusion.process import DenoisingCondition
+from dew.distributed.batches import shard_batch
 from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import DiffusionConditioner, T5Segment
 from dew.inputs.encoders import CharTable, ConditionWork, T5Text
@@ -41,9 +43,8 @@ from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.text_encoders import CLIPTextTransformer, CLIPVisionTransformer, T5EncoderTransformer
 from dew.objectives.diffusion import DiffusionObjective
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec
-from dew.training.distributed import shard_batch
 from dew.training.model_flops import TRAINING_FLOPS, prepare_counts, step_counts
 
 IMAGE = np.array([2, 5], np.int64)
@@ -163,6 +164,25 @@ def test_text_and_vision_towers_count_all_projection_maps():
                                    patch_size=2, num_channels=3)
     expected = 2 * 12 * 8 * IMAGE.sum() + 2 * ((8 * 8 * 8 + 4 * 8 * 16) * 9 + 4 * 8 * 45)
     assert vision.model_flops(IMAGE) == expected
+
+
+@pytest.mark.parametrize("fixture", ["gemma-3n-audio-tiny", "gemma-4-audio-tiny",
+                                     "gemma4-unified-native-tiny"])
+def test_a_media_wrapper_counts_its_decoder_and_refuses_an_audio_encoders_work(fixture):
+    """A media wrapper's model FLOPs are its language model's over the real tokens. An audio encoder's
+    work over its frames has no count, so a wrapper with one refuses, Gemma 3n's and Gemma 4's alike;
+    Gemma 4 Unified's audio is a projector of raw frames, left out of the count as a vision projector's
+    is, so it counts its language model's work."""
+    from dew.interop import Pretrained
+
+    model = Pretrained.load(Path(__file__).parent / "fixtures" / "hf" / fixture, weights=False,
+                            dtype="float32").model
+    lengths = np.array([5, 3], np.int64)
+    if fixture == "gemma4-unified-native-tiny":
+        assert model.model_flops(lengths) == model.language_model.model_flops(lengths) > 0
+    else:
+        with pytest.raises(MissingFlopsCount):
+            model.model_flops(lengths)
 
 
 def test_patch_lengths_retain_video_frames_and_reject_partial_patches():

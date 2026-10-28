@@ -31,10 +31,10 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from dew._records import record as section
 from dew.inference.clients import decode_routed_experts
 from dew.objectives.rl.records import messages
 from dew.objectives.rl.sessions import Call, Transcript
-from dew.records import record as section
 
 if TYPE_CHECKING:
     import httpx
@@ -106,9 +106,10 @@ class Gateway:
     def ready(self, timeout: float, *, poll: float = 2.0) -> None:
         """Wait until the gateway routes to a healthy worker that answers, or raise after `timeout` seconds.
 
-        Ready means `/health/workers` counts a healthy worker and `GET /v1/models`, proxied through
-        the gateway to an engine, answers 200. The check runs every `poll` seconds, and the error
-        after `timeout` is a RuntimeError.
+        Ready means `/health/workers` and `GET /v1/models`, proxied through the gateway to an engine,
+        answer 200. Only their status is read; the bodies are closed unread. The remaining deadline
+        bounds each network operation, and a status received after it is never accepted. The check
+        runs every `poll` seconds, and expiry raises RuntimeError.
 
         rllm-model-gateway marks a worker dead after three failed health checks, which happens to an
         engine that is still loading when the gateway starts. Until a later check revives the worker,
@@ -119,26 +120,31 @@ class Gateway:
 
         url = f"{self.url}/health/workers"
         deadline, seen = time.monotonic() + timeout, "no answer"
-        while True:
+        while (remaining := deadline - time.monotonic()) > 0:
             try:
-                response = self._client.get(url)
-                answer = response.json() if response.status_code == 200 else None
-                seen = f"{response.status_code} {response.text[:500]}"
-                healthy = answer.get("healthy") if isinstance(answer, dict) else None
-                if isinstance(healthy, int) and healthy > 0:
+                with self._client.stream("GET", url, timeout=remaining) as response:
+                    status = response.status_code
+                    seen = f"GET /health/workers: {status}"
+                if status == 200:
                     # The gateway calls a worker healthy until its first probe fails, so also see the
                     # engine answer through it; a request without a session leaves no trace.
-                    listing = self._client.get(f"{self.url}/v1/models")
-                    seen = f"GET /v1/models: {listing.status_code} {listing.text[:500]}"
-                    if listing.status_code == 200:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    with self._client.stream("GET", f"{self.url}/v1/models", timeout=remaining) as listing:
+                        status = listing.status_code
+                        seen = f"GET /v1/models: {status}"
+                    if status == 200 and time.monotonic() < deadline:
                         return
-            except (httpx.HTTPError, ValueError) as error:
+            except httpx.HTTPError as error:
                 seen = f"{type(error).__name__}: {error}"
-            if time.monotonic() >= deadline:
-                raise RuntimeError(
-                    f"the gateway reported no healthy worker within {timeout:g} s at {url} (last: {seen}); "
-                    "check that the engines are up and registered, or raise ready_timeout")
-            time.sleep(poll)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(poll, remaining))
+        raise RuntimeError(
+            f"the gateway reported no healthy worker within {timeout:g} s at {url} (last: {seen}); "
+            "check that the engines are up and registered, or raise ready_timeout")
 
     def stamp(self, version: int) -> None:
         """Make the gateway label the calls it records from now on with `version` (a `Publication` stamp)."""

@@ -20,15 +20,18 @@ import numpy as np
 import optax
 import pytest
 from affine_run import BATCH, TimingRegression as Regression, batches
-from process_support import assert_exits_cleanly
+from process_support import assert_exits_cleanly, running
+from recording import RecordingTracker
 
 from dew.artifacts import Representations
 from dew.data import Loading, Rejected, from_grain, mix
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, mapped
 from dew.data.readers import _Host
+from dew.distributed.batches import DevicePrefetchIterator, batch_signature, shard_batch
+from dew.telemetry.records import FitEnded
 from dew.training import Checkpoints, MeshSpec, Trainer
-from dew.training.distributed import DevicePrefetchIterator, batch_signature, shard_batch, step_reads
+from dew.training.distributed import step_reads
 
 
 class Source:
@@ -325,9 +328,10 @@ def test_a_field_no_compiled_step_reads_stays_on_the_host():
     mesh = MeshSpec().build()
     rows = jax.device_count()
     batch = {"x": np.ones((rows, 3), np.float32), "unused": np.arange(rows), "absent": None}
-    step = jax.jit(lambda state, batch, part: state + jnp.sum(batch["x"]) + part)
+    # A step's arguments as the trainer's: the moving state, the frozen tree, then the batch.
+    step = jax.jit(lambda state, frozen, batch, part: state + frozen + jnp.sum(batch["x"]) + part)
     first = shard_batch(mesh, batch)
-    compiled = step.lower(jnp.zeros(()), first, jnp.int32(0)).compile()
+    compiled = step.lower(jnp.zeros(()), jnp.zeros(()), first, jnp.int32(0)).compile()
     # The trainer publishes the mask under the placed batch's signature.
     signature = batch_signature(first)
     reads = {signature: step_reads(compiled, signature)}
@@ -335,7 +339,7 @@ def test_a_field_no_compiled_step_reads_stays_on_the_host():
     with DevicePrefetchIterator(iter([batch, wider]), mesh, reads=reads) as stream:
         placed, whole = next(stream), next(stream)
     assert isinstance(placed["x"], jax.Array) and isinstance(placed["unused"], np.ndarray)
-    assert float(compiled(jnp.zeros(()), placed, jnp.int32(0))) == 3 * rows
+    assert float(compiled(jnp.zeros(()), jnp.zeros(()), placed, jnp.int32(0))) == 3 * rows
     assert isinstance(whole["unused"], jax.Array)
 
 
@@ -548,15 +552,20 @@ def test_repeated_bounded_fit_releases_each_source_and_reuses_checkpointer(tmp_p
     assert len(opened) == 2
 
 
-def test_unexpected_training_eof_still_closes_and_does_not_save_success(tmp_path):
+def test_a_training_stream_that_runs_out_closes_and_ends_the_run_at_its_last_batch(tmp_path):
+    """A stream of one batch under a run of two steps ends the run at step 1, as a run of one step
+    would end: the stream closed, its final checkpoint written there with the position it stopped at,
+    and the run's outcome completed."""
     source = Source(end=1)
     checkpoints = Checkpoints(str(tmp_path))
+    tracker = RecordingTracker()
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
-                      checkpoints=checkpoints)
-    with pytest.raises(StopIteration):
-        trainer.fit(Loader(lambda partition: source, None, None, 8), steps=2)
+                      checkpoints=checkpoints, tracker=tracker)
+    state = trainer.fit(Loader(lambda partition: source, None, None, 8), steps=2)
     assert source.closed.is_set()
-    assert checkpoints.latest is None
+    assert int(state.step) == checkpoints.latest == 1
+    assert json.loads(checkpoints.restore(share=DataPartition())[1]) == {"position": 1}
+    assert [value.status for _, value in tracker.artifacts if isinstance(value, FitEnded)] == ["completed"]
 
 
 @pytest.mark.parametrize("steps", [0, 2])
@@ -743,7 +752,7 @@ def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
     program = (
         "import numpy as np\n"
         "from dew.training import MeshSpec\n"
-        "from dew.training.distributed import DevicePrefetchIterator\n"
+        "from dew.distributed.batches import DevicePrefetchIterator\n"
         "batch = {'x': np.ones((2048, 4096), np.float32)}\n"
         "def endless():\n"
         "    while True:\n"
@@ -752,16 +761,6 @@ def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
         "for _ in range(20):\n"
         "    next(prefetch)\n")
     assert_exits_cleanly(program)
-
-
-def _running(pid: int) -> bool:
-    """Whether process `pid` runs: it exists and has not ended (a zombie has). One that ends between
-    the open of its state and the read fails the read with ESRCH, and has ended too."""
-    try:
-        status = Path(f"/proc/{pid}/stat").read_text()
-    except (FileNotFoundError, ProcessLookupError):
-        return False
-    return status.rsplit(")", 1)[1].split()[0] != "Z"
 
 
 def test_a_process_that_ends_as_its_state_is_read_is_not_running(monkeypatch):
@@ -781,7 +780,7 @@ def test_a_process_that_ends_as_its_state_is_read_is_not_running(monkeypatch):
 
     monkeypatch.setattr(Path, "read_text", ended_while_read)
     try:
-        assert not _running(child.pid)
+        assert not running(child.pid)
     finally:
         child.kill()
         child.wait()
@@ -838,14 +837,14 @@ def test_a_killed_program_leaves_no_loading_worker_running():
         parent.send_signal(signal.SIGKILL)
         parent.wait(timeout=30)
         deadline = time.monotonic() + 60
-        while (any(map(_running, workers)) or _segments_marked(mark)) and time.monotonic() < deadline:
+        while (any(map(running, workers)) or _segments_marked(mark)) and time.monotonic() < deadline:
             time.sleep(0.5)
-        assert [pid for pid in workers if _running(pid)] == []
+        assert [pid for pid in workers if running(pid)] == []
         assert _segments_marked(mark) == set()
     finally:
         parent.kill()
         for pid in workers:
-            if _running(pid):
+            if running(pid):
                 os.kill(pid, signal.SIGKILL)
         for name in _segments_marked(mark):
             Path("/dev/shm", name).unlink(missing_ok=True)
@@ -869,3 +868,16 @@ def test_a_source_with_no_deadline_of_its_own_closes_when_its_finalization_ends(
     next(stream)
     stream.close()
     assert finished.is_set()
+
+
+def test_a_mix_repeated_whole_goes_on_counting_each_corpus_on_its_second_pass():
+    """Two finite corpora mixed, each rejecting a third of its records, the mix repeated whole: the
+    second pass rewinds each corpus to its start, where the mix had not yet opened it, and its counts
+    go on from the first pass's, so each corpus counts the rows and rejections of both passes, every
+    counter its stages keep (rows 2016 and 2045)."""
+    chain = mix([from_grain(grain.MapDataset.source([{"i": np.int32(index)} for index in range(6)]), name)
+                 .filter_map(reject_thirds) for name in ("a", "b")]).repeat(2)
+    metrics = chain.stats(records=16)
+    assert (metrics["data/rows/a"], metrics["data/rows/b"]) == (8, 8)
+    # Every counter its stages keep goes on, the filter's rejections as the rows it delivered.
+    assert (metrics["data/rejected/a/third"], metrics["data/rejected/b/third"]) == (4, 4)

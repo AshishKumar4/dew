@@ -10,14 +10,18 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import tempfile
-from collections.abc import Iterator
-from typing import TYPE_CHECKING
+from collections.abc import Iterator, Mapping, Sequence
+from typing import TYPE_CHECKING, ClassVar
 
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew.batch import Batch
+from dew.data.facts import shaped
+from dew.data.images import resized_to
 from dew.data.pipeline import Rejected
+from dew.data.sources.av_utils import FPS
+from dew.data.sources.files import Files
 
 if TYPE_CHECKING:
     from dew.data.sources.urls import Fetch
@@ -27,17 +31,16 @@ def fit_frames(frames: np.ndarray, size: int) -> np.ndarray:
     """`frames` `[T, H, W, 3]` resized to `size` squares by area interpolation."""
     if frames.shape[1] == size and frames.shape[2] == size:
         return frames
-    import cv2
-    return np.stack([cv2.resize(frame, (size, size), interpolation=cv2.INTER_AREA)
-                     for frame in frames])
+    return np.stack([resized_to(frame, size, size, "area") for frame in frames])
 
 
-def fetch(url: str = "url", to: str = "mp4", *, timeout: float = 30.0, max_bytes: int = 256 * 2**20) -> Fetch:
+def fetch(url: str = "url", to: str = "mp4", *, timeout: float = 30.0, max_bytes: int = 256 * 2**20,
+          threads: int | None = None) -> Fetch:
     """A record step that fetches the clip at the record's `url` field into
-    `to` as bytes, as `images.fetch` does an image."""
+    `to` as bytes, `threads` at once where given, as `images.fetch` does an image."""
     from dew.data.sources.urls import Fetch
 
-    return Fetch(url, to, timeout, max_bytes)
+    return Fetch(url, to, timeout, max_bytes, threads)
 
 
 @contextlib.contextmanager
@@ -82,6 +85,10 @@ class PickClip(grain.RandomMapTransform):
     rejects: bool = True
     """Whether media that does not read or is too short is dropped (`filter_map`) rather than an error."""
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Windows `seconds` long, as `[start, stop]` under `to`."""
+        return {**shaped(facts, self.to, [2]), "seconds": self.seconds}
+
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch | Rejected:
         from dew.data.sources.av_utils import media_info
 
@@ -108,17 +115,25 @@ class DecodeVideo(grain.MapTransform):
     """`frames` frames at `fps` from the start of the window under `clip`, read from the video in
     `field`, each fitted into a `size` square, under `to`. The frames must fit the window: one shorter
     than `frames / fps` raises, as no record could pass. A clip that does not decode is counted and
-    dropped."""
+    dropped, and so is one whose frames are under `min_size` on their shorter side as stored, before
+    they are fitted (`"too_small"`)."""
 
     frames: int = 16
     _: dataclasses.KW_ONLY
-    fps: float = 25.0
+    fps: float = FPS
     size: int = 256
+    min_size: int = 0
     field: str = "mp4"
     clip: str = "clip"
     to: str = "video"
     rejects: bool = True
     """Whether a clip that does not decode is dropped (`filter_map`) rather than an error."""
+    external: ClassVar[bool] = True
+    """A video a record names by path is read from storage (`dew.data.pipeline.External`)."""
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """`frames` RGB frames at `fps`, each a `size` square, under `to`."""
+        return {**shaped(facts, self.to, [self.frames, self.size, self.size, 3]), "fps": self.fps}
 
     def map(self, element: Batch) -> Batch | Rejected:
         from dew.data.sources.av_utils import read_frames
@@ -134,4 +149,33 @@ class DecodeVideo(grain.MapTransform):
             if not self.rejects:
                 raise
             return Rejected("undecodable")
+        if min(frames.shape[1:3]) < self.min_size:
+            if not self.rejects:
+                raise ValueError(f"a {frames.shape[2]}x{frames.shape[1]} clip is under {self.min_size} "
+                                 "pixels on its shorter side")
+            return Rejected("too_small")
         return {**element, self.to: fit_frames(frames, self.size)}
+
+
+@dataclasses.dataclass(frozen=True)
+class Row(grain.MapTransform):
+    """A listed media file's record with its path (`video_path`, else `path`) moved to `mp4`, where the
+    decoders read it, and its caption, `caption` where it states none: every other field the record
+    holds (a label, an id) reaches the batch as it is."""
+
+    caption: str = ""
+
+    def map(self, element: Batch) -> Batch:
+        from dew._records import text
+
+        named = "video_path" if "video_path" in element else "path"
+        path = text(element.get(named), named)
+        kept = {key: value for key, value in element.items() if key != named}
+        return {**kept, "mp4": path, "caption": element.get("caption", self.caption)}
+
+
+def media(listing: Files, extensions: Sequence[str] = (".mp4", ".avi", ".mov", ".webm")) -> Files:
+    """A listing of files (`Files(url, format="files")`) cut to those whose name ends in one of
+    `extensions`, any case: a directory's media, not the lists and notes beside it, listed when the
+    store is read (`Files.suffixes`), so a chain over media not fetched yet is made and recorded."""
+    return dataclasses.replace(listing, suffixes=tuple(extensions))

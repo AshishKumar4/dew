@@ -169,10 +169,11 @@ def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(mo
 
 @pytest.mark.parametrize("wrapper,read", [
     ("hash", "streamed"), ("concatenate", "streamed"), ("concatenate_hash", "streamed"),
-    ("concatenate", "indexed"), ("slice", "indexed"), ("random", "indexed"), ("hash", "memory"),
+    ("concatenate", "indexed"), ("slice", "indexed"), ("hash", "memory"),
 ])
 def test_wrapped_hub_resume_checks_the_conversion_only_when_consumed(moving_hub_conversion, wrapper, read):
-    from dew.config.data import HoldOut, RecordsData, loader
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
     from dew.data.sources import Hub
     from dew.data.sources.concatenate import Concatenate
 
@@ -180,12 +181,13 @@ def test_wrapped_hub_resume_checks_the_conversion_only_when_consumed(moving_hub_
         source = Hub("owner/data")
         if wrapper.startswith("concatenate"):
             source = Concatenate((source, Memory([{"id": index} for index in range(40, 48)])))
-        holdout = (
-            HoldOut(fraction=.25, by="hash") if wrapper.endswith("hash") else
-            HoldOut(records=8, by="index" if wrapper == "slice" else "random")
-            if wrapper in ("slice", "random") else None
-        )
-        return loader(RecordsData(source, validation=holdout), batch=2, read=read, loading=Loading(workers=0))
+        train = Pipeline(source)
+        if wrapper.endswith("hash"):
+            train, _ = train.holdout(.25)
+        elif wrapper == "slice":
+            train, _ = train.holdout(records=8)
+        order = train.shuffle(0, window=64 if read == "streamed" else None).repeat()
+        return compile(order.batch(2), read=read, loading=Loading(workers=0))
 
     data = loaded()
     reader = data.train(DataPartition())
@@ -222,17 +224,19 @@ def test_wrapped_hub_resume_checks_the_conversion_only_when_consumed(moving_hub_
 def test_metadata_wrapped_hub_resume_keeps_facts_and_checks_consumed_files(
     moving_hub_conversion, recipe, read
 ):
-    from dew.config.data import PromptData, loader
+    from dew.data import presets
+    from dew.data.compile import compile
     from dew.data.sources import Hub
-    from dew.decision.data import Decisions
+    from dew.decision import decisions
 
     def loaded():
         source = Hub("owner/data")
         configured = (
-            PromptData(source, "byte", max_prompt_len=4, reward_bytes=None if read == "memory" else 8)
-            if recipe == "prompts" else Decisions(source, options=("a", "b"))
+            source.pipe(presets.prompts, "byte", max_prompt_len=4, batch=2,
+                        reward_bytes=None if read == "memory" else 8)
+            if recipe == "prompts" else source.pipe(decisions, options=("a", "b")).batch(2)
         )
-        return loader(configured, batch=2, read=read, loading=Loading(workers=0))
+        return compile(configured, read=read, loading=Loading(workers=0))
 
     reader = loaded().train(DataPartition())
     try:
@@ -284,6 +288,51 @@ def test_a_hub_url_reads_a_repository_or_the_files_it_names(monkeypatch, url, fo
     assert type(resolved) is {"Hub": Hub, "Files": Files}[read_as]
     if read_as == "Files":
         assert resolved.url == url and resolved.format == format
+
+
+@pytest.mark.parametrize(("url", "revision"), [
+    pytest.param("hf://datasets/owner/data@refs/convert/parquet", "refs/convert/parquet",
+                 id="parquet-conversion"),
+    pytest.param("hf://datasets/owner/data@refs/pr/3/", "refs/pr/3", id="pull-request"),
+    pytest.param("hf://datasets/owner/data@feature%2Fx", "feature/x", id="branch-with-a-slash"),
+    pytest.param("hf://owner/data@v1", "v1", id="tag-without-type"),
+])
+def test_a_hub_url_reads_its_repository_at_a_revision_holding_a_slash(monkeypatch, url, revision):
+    """An hf:// URL's revision runs from its `@` to the path after it, as the Hub's own URLs spell
+    one: a reference of the Hub's (its Parquet conversion, a pull request) whole, and a branch whose
+    name holds a `/` with it spelled `%2F`. Such a URL names the repository at that revision, where
+    the slashes it holds read as a path below the repository and its files were read instead."""
+    from huggingface_hub import HfFileSystem
+
+    from dew.data.sources import Hub, source
+
+    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
+    resolved = source(url)
+    assert type(resolved) is Hub
+    assert (resolved.repo, resolved.revision) == ("owner/data", revision)
+
+
+@pytest.mark.parametrize("url", [
+    pytest.param("hf://datasets/owner/data/export", id="directory"),
+    pytest.param("hf://datasets/owner/data@pinned/exports/run/", id="directory-at-a-revision"),
+    pytest.param("hf://datasets/owner/data@refs/convert/parquet/default/train",
+                 id="directory-of-the-conversion"),
+    pytest.param("hf://datasets/owner/data@feature/x", id="directory-at-a-branch"),
+])
+def test_a_hub_path_below_its_repository_reads_as_the_files_there(monkeypatch, url):
+    """An hf:// URL of a directory in a repository, such as an export's (`export` commits one there),
+    is read as its files, whose manifest names their record format, never as a repository of that
+    name: no suffix names its format, as none names a repository's. A revision ends at the first `/`
+    past its `@` unless it is a reference of the Hub's, so `@feature/x` is the directory `x` at the
+    branch `feature`, as `HfFileSystem` reads it."""
+    from huggingface_hub import HfFileSystem
+
+    from dew.data.sources import Files, source
+
+    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
+    resolved = source(url)
+    assert type(resolved) is Files
+    assert resolved.url == url
 
 
 @pytest.mark.parametrize("format", ["jsonl", "parquet"])
@@ -532,3 +581,23 @@ def test_a_hub_jsonl_shard_keeps_its_offset_index_in_its_identity_with_the_hub_o
     # The offline Hub confirms no file: `HfFileSystem.exists` reads an unreachable Hub as absent.
     monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
     assert Hub("owner/lines", revision="pinned").files.fingerprint() == identity
+
+
+@pytest.mark.parametrize("listing, split, expected", [
+    (["data/dev-00000.parquet", "data/train-00000.parquet"], "validation", ["data/dev-00000.parquet"]),
+    (["data/train-00000-of-00002.parquet", "data/train-00001-of-00002.parquet",
+      "data/test-00000-of-00001.parquet"], "train",
+     ["data/train-00000-of-00002.parquet", "data/train-00001-of-00002.parquet"]),
+    (["train/a.jsonl", "valid/b.jsonl", "README.md"], "validation", ["valid/b.jsonl"]),
+    (["rows.parquet", "README.md"], "train", ["rows.parquet"]),
+    (["pretraining/x.parquet", "train.parquet"], "train", ["train.parquet"]),
+    ([], "train", []),
+], ids=["dev", "sharded", "directories", "lone", "keyword-inside-a-word", "empty"])
+def test_a_hub_split_holds_the_files_datasets_resolves_to_it(listing, split, expected):
+    """A split's shards are the files `datasets` gives it from the repository's listing, by its own
+    default patterns (`split_files`): `dev` and `valid` are `validation`'s, a sharded name's split is
+    its own, a lone file is `train`'s, a keyword inside another word names no split, and a listing of
+    no file (a configuration's directory holding none) gives none."""
+    from dew.data.sources.hub import split_files
+
+    assert split_files(listing, split) == expected

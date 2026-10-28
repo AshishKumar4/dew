@@ -1,4 +1,5 @@
-"""Configure test-lane environment before any numerical library is imported."""
+"""The test lane's settings, and the environment the suite runs under (`configured`), which
+tests/conftest.py sets before any numerical library is imported."""
 
 import os
 import subprocess
@@ -11,8 +12,11 @@ from collections.abc import Mapping, MutableMapping
 MESH_DEVICES = 8
 
 
-REPEATABLE_GPU_FLAGS = ("--xla_gpu_deterministic_ops=true", "--xla_gpu_autotune_level=0",
-                        "--xla_gpu_enable_triton_gemm=false")
+DETERMINISTIC_OPS = "--xla_gpu_deterministic_ops=true"
+"""Under it a process keeps no picks (`dew.cache.keeps_picks`) and XLA refuses cudnn attention
+(openxla/xla#46500)."""
+
+REPEATABLE_GPU_FLAGS = (DETERMINISTIC_OPS, "--xla_gpu_autotune_level=0", "--xla_gpu_enable_triton_gemm=false")
 """The cuda lane's flags for steps repeatable across processes. Deterministic
 ops order the reductions; autotuning off leaves every cuBLAS and cuDNN call
 the configuration it was emitted with, so no process chooses one; and such
@@ -31,6 +35,12 @@ configuration, which cuDNN refuses on an H100, so that test compiles in its
 own process without it (tests/test_quantization.py)."""
 
 
+def without_deterministic_ops(flags: str) -> str:
+    """XLA `flags` without `DETERMINISTIC_OPS`."""
+    name = DETERMINISTIC_OPS.split("=")[0]
+    return " ".join(flag for flag in flags.split() if not flag.startswith(name))
+
+
 def configure_lane(environ: MutableMapping[str, str]) -> None:
     """Set the environment a lane runs the suite under, before jax opens a backend.
 
@@ -41,7 +51,7 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     io_callback) place their operands on a CPU device, float64 references run
     there, since a TPU has no float64, and a host layout pairs every
     accelerator device with a CPU device of its process
-    (`dew.training.host.companion_mesh`), so that backend holds one device
+    (`dew.distributed.host.companion_mesh`), so that backend holds one device
     per local accelerator device. A cuda lane's steps are made repeatable
     across processes (`REPEATABLE_GPU_FLAGS`), since exact state and
     gradient checks require it.
@@ -52,7 +62,7 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     flags = [environ.get("XLA_FLAGS", "")]
     if "--xla_allow_excess_precision" not in flags[0]:
         # Every rounding the program states, as a run keeps them
-        # (`dew.telemetry.devices.keep_roundings`).
+        # (`dew.devices.keep_roundings`).
         flags.append("--xla_allow_excess_precision=false")
     local = {"cuda": _local_gpus, "tpu": _local_tpus}
     accelerator = next((name for name in platforms if name in local), None)
@@ -75,6 +85,27 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     # aborted the process (tests/test_discrete.py's toy run on CI, three
     # times). Two threads per device hold both launches.
     environ.setdefault("PJRT_NPROC", str(max(len(os.sched_getaffinity(0)), 2 * cpu_devices)))
+    # Parity tests assert fp32 against references computed in fp32. Ampere and
+    # later GPUs default fp32 matmuls to TF32, a 10-bit mantissa, which puts
+    # 1e-2 between two correct implementations.
+    environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "highest")
+    # The arithmetic the suite holds a CPU to (`dew.nn.precision.WIDE_CPU_ARITHMETIC`): float32
+    # products summed in float64, a loop's running sum of them compensated, and a row's reductions in
+    # float64 (`widened_reduction`).
+    # Dew's test setting, never the library's default.
+    environ.setdefault("DEW_WIDE_CPU_ARITHMETIC", "1")
+    # A frontier's first plan, untimed (`dew.training.planning.UNTIMED_FRONTIER`): two pools a run and
+    # its resume would otherwise each time their own. Dew's test setting, never the library's default.
+    environ.setdefault("DEW_UNTIMED_FRONTIER", "1")
+
+
+def configured(environ: Mapping[str, str]) -> dict[str, str]:
+    """`environ` as the suite runs under it (`configure_lane`), which tests/conftest.py sets before
+    anything imports JAX. Importing this module configures nothing, so a worker process that imports
+    the lane's settings keeps the topology its parent gave it."""
+    lane = dict(environ)
+    configure_lane(lane)
+    return lane
 
 
 def _local_gpus(environ: MutableMapping[str, str]) -> int:
@@ -123,10 +154,3 @@ def outside_any_cluster(environ: Mapping[str, str]) -> dict[str, str]:
                              "TPU_PROCESS_ADDRESSES_PATH", "KUBERNETES_SERVICE_HOST",
                              "DEW_PROCESS_COUNT", "DEW_PROCESS_ID", "JAX_COORDINATOR_ADDRESS")}
     return {**kept, "TPU_SKIP_MDS_QUERY": "1"}
-
-
-configure_lane(os.environ)
-# Parity tests assert fp32 against references computed in fp32. Ampere and
-# later GPUs default fp32 matmuls to TF32, a 10-bit mantissa, which puts
-# 1e-2 between two correct implementations.
-os.environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "highest")

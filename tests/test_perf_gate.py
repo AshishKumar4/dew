@@ -38,22 +38,29 @@ def after(command, flag):
     return command[command.index(flag) + 1]
 
 
-def standing_in(gate, monkeypatch, *, passed: bool) -> list:
-    """Stand every tool of the battery in with one writing its output format,
-    and return the commands run. The reference either passes its claim or
-    measures a head at 0.72 of it and exits 1."""
+def standing_in(gate, monkeypatch, *, passed: bool, peaks: bool = True) -> list:
+    """Stand every tool of the battery in with one writing its output format, a measured peak beside each
+    time (`peak_device_bytes`; none where `peaks` is False, as a tool that predates it writes), and return the
+    commands run. The reference either passes its claim or measures a head at 0.72 of it and exits 1."""
+    peak = 3 * 2 ** 30 if peaks else None
     outputs = {
-        "benchmark_step.py": lambda command: [{"ms_per_step": 5.0, "compile_seconds": 30.0}],
-        "benchmark_forward.py": lambda command: {after(command, "--cases"): 5.0},
+        "benchmark_step.py": lambda command: [{"ms_per_step": 5.0, "compile_seconds": 30.0,
+                                               "peak_device_bytes": peak}],
+        "benchmark_forward.py": lambda command: {after(command, "--cases"): {"ms": 5.0,
+                                                                             "peak_device_bytes": peak}},
+        "benchmark_serving_compile.py": lambda command: {
+            "construction_seconds": 8.0, "warm_seconds": 40.0,
+            "by_admission_width": {f"admission {rows}": 8.0 for rows in (1, 2, 4, 8)}},
         "benchmark_lm_serving.py": lambda command: {"sweep": [
-            {"slots": int(slots), "repeats": [{"output_tokens_per_second": rate} for rate in (5.0, 6.0)]}
+            {"slots": int(slots), "repeats": [{"output_tokens_per_second": rate} for rate in (5.0, 6.0)],
+             "peak_device_bytes": peak}
             for slots in after(command, "--slots").split(",")]},
         "benchmark_attention.py": lambda command: [
-            {"implementation": implementation, "forward_backward_ms": 5.0}
+            {"implementation": implementation, "forward_backward_ms": 5.0, "peak_device_bytes": peak}
             for implementation in command[command.index("--implementations") + 1:
                                           command.index("--sequence-lengths")]],
         "benchmark_image_pipeline.py": lambda command: {
-            "pipeline": {"device_crop_flip_jitter": {"images_per_second": 5.0}}},
+            "pipeline": {"device_crop_flip_jitter": {"images_per_second": 5.0, "peak_device_bytes": peak}}},
         "qwen35_pair.py": lambda command: {"comparison": {
             "dew_tokens_per_s": 720.0, "dew_over_torch": 1.0 if passed else 0.72, "tolerance": 0.01,
             "performance_claim_passed": passed}},
@@ -63,8 +70,10 @@ def standing_in(gate, monkeypatch, *, passed: bool) -> list:
     def child(command, **kwargs):
         commands.append(command)
         if command[1] == "-c":
-            printed = ("NVIDIA A100-SXM4-80GB" if "device_kind" in command[2]
-                       else json.dumps({"save_ms": 5.0, "restore_ms": 6.0}))
+            return subprocess.CompletedProcess(command, 0, "NVIDIA A100-SXM4-80GB\n", "")
+        # The checkpoint's script, written beside its probe's output.
+        if Path(command[1]).is_file() and Path(command[1]).read_text() == gate.CHECKPOINT:
+            printed = json.dumps({"save_ms": 5.0, "restore_ms": 6.0, "peak_device_bytes": peak})
             return subprocess.CompletedProcess(command, 0, printed + "\n", "")
         tool = Path(command[1]).name
         flag = "--json-out" if "--json-out" in command else "--out"
@@ -108,6 +117,32 @@ def test_a_head_reads_every_row_of_the_battery_from_the_tool_it_names(gate, tmp_
         value = sample[row.name]
         assert value["exit_code"] == 0 if row.head_only else gate.measured(value), (row.name, value)
 
+
+
+def test_a_faster_head_whose_measured_peak_grows_regresses_and_an_unmeasured_peak_is_never_zero(
+        gate, tmp_path, monkeypatch):
+    """Two measures decide (testing.md): a head faster on a step's time whose measured peak grew past its band
+    regresses on its peak row, whatever its time did; a base whose tool predates the peak (no
+    peak_device_bytes) is not compared on it, never read as zero."""
+    [row] = [row for row in gate.BATTERY if row.name == "peak step lm-dense 4x1024"]
+    assert row.unit == "GiB" and row.gated
+    assert gate.verdict(row, [3.0, 3.0, 3.0], [3.3, 3.3, 3.3])[0] == "regressed"
+    [time] = [row for row in gate.BATTERY if row.name == "step lm-dense 4x1024"]
+    assert gate.verdict(time, [5.0, 5.1, 5.0], [4.0, 4.1, 4.0])[0] == "faster"
+    assert gate.peak({"ms_per_step": 5.0}) is None
+    assert gate.verdict(row, [None, None, None], [3.0, 3.0, 3.0])[0] == "not compared"
+    # A tree whose tools measure no peak: its peak rows unmeasured, every time row still measured.
+    from types import SimpleNamespace
+
+    standing_in(gate, monkeypatch, passed=True, peaks=False)
+    args = SimpleNamespace(only=[], claim=False, model="unused", flowers="unused", torch_python="torch",
+                           out=tmp_path / "gate.json")
+    sample = gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=True)
+    for battery_row in gate.BATTERY:
+        if battery_row.unit == "GiB":
+            assert sample[battery_row.name] is None, battery_row.name
+        elif not battery_row.head_only:
+            assert gate.measured(sample[battery_row.name]), (battery_row.name, sample[battery_row.name])
 
 
 def standing_in_environments(gate, monkeypatch) -> tuple[list, list]:
@@ -358,3 +393,25 @@ def test_a_gate_keeps_each_trees_compiles_apart_and_judges_compile_rows_on_the_f
         assert compiles == [True, False, False], (tree, compiles)
     assert set(results["seconds"]) == {"first round", "later rounds"}
     assert gate.report(SimpleNamespace(results=out, table=None, claim=False)) == 0
+
+
+def test_a_probe_measuring_compiles_alone_runs_in_the_first_round_alone(gate, tmp_path, monkeypatch):
+    """A probe whose every row is a first round's compile, the Server's program by program, runs once
+    per tree: a later round would recompile it uncached and read nothing. Each of its programs is a
+    row of its own, and the whole warm is shown beside them, ungated."""
+    from types import SimpleNamespace
+
+    _, rows = standing_in_environments(gate, monkeypatch)
+    trees = {name: locked_tree(tmp_path / name) for name in ("main", "head")}
+    out = tmp_path / "gate.json"
+    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=3,
+                           only=["compile serve"], claim=False, model="unused", flowers="unused",
+                           torch_python="", out=str(out), environments=str(tmp_path / "environments"))
+    assert gate.run(args) == 0
+    served = [command for _, command, _ in rows if Path(command[1]).name == "benchmark_serving_compile.py"]
+    assert len(served) == len(trees)
+    gated = {row.name: row for probe in gate.PROBES for row in probe.rows if "compile serve" in row.name}
+    assert sorted(name for name, row in gated.items() if row.gated) == sorted(
+        f"compile serve dory-1.0-4b {program}"
+        for program in ("construction", "admission 1", "admission 2", "admission 4", "admission 8"))
+    assert not gated["compile serve dory-1.0-4b warm 16 slots"].gated

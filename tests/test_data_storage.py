@@ -13,6 +13,7 @@ from uuid import uuid4
 import fsspec
 import pytest
 from fsspec.implementations.local import LocalFileSystem
+from storage_support import moto_bucket
 
 from dew.data.sources import Files
 from dew.data.storage import BoundedFileCache, PreconditionFailed, Store, Versioned, _profile
@@ -21,20 +22,12 @@ from dew.data.storage import BoundedFileCache, PreconditionFailed, Store, Versio
 @pytest.fixture(params=["memory", "file", "s3"])
 def store(request, tmp_path):
     if request.param == "memory":
-        return Store(f"memory://storage-{uuid4().hex}/value")
-    if request.param == "file":
-        return Store(str(tmp_path / "value"))
-    from moto.server import ThreadedMotoServer
-
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
-    server.start()
-    _, port = server.get_host_and_port()
-    options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}"}
-    fs = fsspec.filesystem("s3", **options)
-    bucket = "storage-test-" + uuid4().hex
-    fs.mkdir(bucket)
-    request.addfinalizer(server.stop)
-    return Store(f"s3://{bucket}/value", options)
+        yield Store(f"memory://storage-{uuid4().hex}/value")
+    elif request.param == "file":
+        yield Store(str(tmp_path / "value"))
+    else:
+        with moto_bucket("storage-test") as (bucket, options):
+            yield Store(f"s3://{bucket}/value", options)
 
 
 def test_a_versioned_s3_read_is_the_filesystems_own_request():
@@ -45,20 +38,11 @@ def test_a_versioned_s3_read_is_the_filesystems_own_request():
     import hashlib
     import os
 
-    from moto.server import ThreadedMotoServer
-
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
-    server.start()
-    try:
-        _, port = server.get_host_and_port()
-        secret = os.urandom(32)
-        sealed = {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": base64.b64encode(secret).decode(),
-                  "SSECustomerKeyMD5": base64.b64encode(hashlib.md5(secret).digest()).decode()}
-        options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}",
-                   "s3_additional_kwargs": sealed}
-        bucket = "sealed-" + uuid4().hex
+    secret = os.urandom(32)
+    sealed = {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": base64.b64encode(secret).decode(),
+              "SSECustomerKeyMD5": base64.b64encode(hashlib.md5(secret).digest()).decode()}
+    with moto_bucket("sealed", s3_additional_kwargs=sealed) as (bucket, options):
         fs = fsspec.filesystem("s3", **options)
-        fs.mkdir(bucket)
         fs.pipe(f"{bucket}/value", b"payload")
         # The read's own parameters, as botocore builds the request from them.
         sent = []
@@ -68,8 +52,61 @@ def test_a_versioned_s3_read_is_the_filesystems_own_request():
         assert sent and all(sent[-1].get(name) == value for name, value in sealed.items())
         with pytest.raises(FileNotFoundError):
             Store(f"s3://{bucket}/absent", options).get_versioned()
+
+
+def test_a_conditional_s3_write_is_the_filesystems_own_request():
+    """An S3 store's conditional writes send what its filesystem's options add to every request, as its
+    reads do: a write under a customer-provided key (SSE-C) puts the object with that key, which a read
+    of it then needs; a write whose condition fails raises PreconditionFailed, the stored object as it
+    was."""
+    import base64
+    import hashlib
+
+    secret = os.urandom(32)
+    sealed = {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": base64.b64encode(secret).decode(),
+              "SSECustomerKeyMD5": base64.b64encode(hashlib.md5(secret).digest()).decode()}
+    with moto_bucket("sealed-put", s3_additional_kwargs=sealed) as (bucket, options):
+        fs = fsspec.filesystem("s3", **options)
+        sent = []
+        fs.s3.meta.events.register("before-parameter-build.s3.PutObject",
+                                   lambda params, **kwargs: sent.append(dict(params)))
+        store = Store(f"s3://{bucket}/value", options)
+        first = store.put_if_absent(b"first")
+        assert sent and all(sent[-1].get(name) == value for name, value in sealed.items())
+        with pytest.raises(PreconditionFailed):
+            store.put_if_absent(b"again")
+        second = store.put_if_match(b"second", first)
+        with pytest.raises(PreconditionFailed):
+            store.put_if_match(b"stale", first)
+        read = store.get_versioned()
+        assert (read.data, read.version) == (b"second", second)
+
+
+@pytest.mark.parametrize("publish", ["write", "put_if_absent"])
+def test_a_local_publication_has_a_plain_writes_mode_and_a_failed_one_leaves_nothing(tmp_path, monkeypatch,
+                                                                                       publish):
+    """A local write, plain or conditional, publishes by one rename (dew.files.write_atomically): the file
+    has the mode a plain write gives under the umask, not a temporary file's private one, and a write
+    that fails leaves no temporary beside its target."""
+    target = tmp_path / "value"
+    previous = os.umask(0o022)
+    try:
+        getattr(Store(str(target)), publish)(b"first")
     finally:
-        server.stop()
+        os.umask(previous)
+    assert oct(target.stat().st_mode & 0o777) == oct(0o644)
+
+    full = OSError("disk full")
+
+    def interrupted(fd):
+        raise full
+
+    monkeypatch.setattr(os, "fsync", interrupted)
+    before = {path.name for path in tmp_path.iterdir()}
+    with pytest.raises(OSError) as raised:
+        getattr(Store(str(tmp_path / "other")), publish)(b"second")
+    assert raised.value is full
+    assert {path.name for path in tmp_path.iterdir()} - before <= {"other.cas.lock"}, "only a CAS lock"
 
 
 def test_compare_and_swap_rejects_stale_and_duplicate_publication(store):
@@ -128,6 +165,57 @@ def test_a_filesystem_of_its_own_supplies_conditional_writes():
     assert store.put_immutable(b"second") == second
 
 
+def test_an_immutable_put_reads_again_only_an_upload_that_reads_back_otherwise():
+    """`put_immutable`'s retries are for an object it created that reads back with other bytes, which no
+    transport checks: it is read again, and returns once a read verifies, or raises an OSError after its
+    retries. A failed transfer raises at once, since the transport has retried it already."""
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    calls = {"writes": 0, "reads": 0}
+
+    class Flaky(MemoryFileSystem):
+        protocol = "flaky"
+        garbled = 1
+        refused = False
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(path.replace("flaky://", "memory://", 1))
+
+        def ukey(self, path):
+            return hashlib.sha256(super().cat_file(path)).hexdigest()
+
+        def cat_file(self, path, *args, **kwargs):
+            calls["reads"] += 1
+            payload = super().cat_file(path, *args, **kwargs)
+            # The first `garbled` reads return other bytes, as a store that has yet to settle would.
+            return payload[::-1] if calls["reads"] <= type(self).garbled else payload
+
+        def put_conditional(self, path, payload, version):
+            calls["writes"] += 1
+            if type(self).refused:
+                raise ConnectionError("the transfer failed after the transport's own retries")
+            if (self.ukey(path) if self.exists(path) else None) != version:
+                raise FileExistsError(path)
+            self.pipe_file(path, payload)
+            return self.ukey(path)
+
+    fsspec.register_implementation("flaky", Flaky, clobber=True)
+    store = Store(f"flaky://storage-{uuid4().hex}/value")
+    assert store.put_immutable(b"payload", retries=2) == store.get_versioned().version
+    assert (calls["writes"], calls["reads"]) == (1, 3)
+    calls.update(writes=0, reads=0)
+    Flaky.garbled = 9
+    with pytest.raises(OSError):
+        Store(f"flaky://storage-{uuid4().hex}/value").put_immutable(b"payload", retries=2)
+    assert (calls["writes"], calls["reads"]) == (1, 3)
+    calls.update(writes=0, reads=0)
+    Flaky.refused = True
+    with pytest.raises(ConnectionError):
+        Store(f"flaky://storage-{uuid4().hex}/value").put_immutable(b"payload", retries=5)
+    assert (calls["writes"], calls["reads"]) == (1, 0)
+
+
 def test_two_finalizers_publish_only_one_snapshot(store):
     start = threading.Barrier(2)
 
@@ -154,6 +242,35 @@ def test_named_profile_resolves_secrets_lazily(monkeypatch):
     fs, path = Store("credentialtest://bucket/key").resolve()
     fs.pipe_file(path, b"present")
     assert fs.cat_file(path) == b"present"
+
+
+def test_a_profile_over_this_hosts_disk_exports_provisions_and_reads_as_the_disk_does(tmp_path):
+    """A storage profile whose base is this host's disk, by either of its names, is that disk: an
+    export to it commits there, and its ArrayRecord shards, a line file's offset index and a Parquet
+    file read there by their own readers."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dew.data.sinks import export
+    from dew.data.sources import Memory
+
+    rows = [{"id": np.int64(index)} for index in range(5)]
+    for base in ("file", "local"):
+        name = f"disk{base}"
+        _profile(name, base, {})
+        root = tmp_path / base
+        root.mkdir()
+        export(Memory(rows), f"{name}://{root}/records", format="array_record", rows_per_shard=2)
+        records = Files(f"{name}://{root}/records").records("indexed")
+        assert [int(records[index]["id"]) for index in range(len(records))] == list(range(5))
+        (root / "rows.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(5)))
+        lines = Files(f"{name}://{root}/rows.jsonl")
+        lines.provision()
+        assert [lines.records("indexed")[index]["id"] for index in (4, 0)] == [4, 0]
+        pq.write_table(pa.table({"id": list(range(5))}), root / "rows.parquet")
+        table = Files(f"{name}://{root}/rows.parquet").records("memory")
+        assert [int(table[index]["id"]) for index in range(5)] == list(range(5))
 
 
 def test_local_content_versions_are_shared_and_refreshed_after_writes(tmp_path, monkeypatch):
@@ -308,6 +425,11 @@ def test_url_chain_reads_and_writes_memory(tmp_path):
 
 
 def test_gcs_generation_preconditions_are_sent_to_the_json_api():
+    """A Store over gcsfs's JSON API sends a write's generation precondition, and reads the generation
+    it names. The client is a process of its own whose gcsfs is imported with its zonal and
+    hierarchical-namespace transport off (GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT=false, which gcsfs reads
+    at its import): that transport discovers a bucket's layout over gRPC before it reads, which this
+    HTTP fake does not serve."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -369,22 +491,38 @@ def test_gcs_generation_preconditions_are_sent_to_the_json_api():
     with ThreadingHTTPServer(("127.0.0.1", 0), GCS) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
-        store = Store(
-            "gs://bucket/value", {"token": "anon", "endpoint_url": f"http://127.0.0.1:{server.server_port}"}
-        )
         try:
-            first = store.put_if_absent(b"first")
-            assert store.get_versioned().data == b"first"
-            with pytest.raises(PreconditionFailed):
-                store.put_if_absent(b"duplicate")
-            second = store.put_if_match(b"second", first)
-            with pytest.raises(PreconditionFailed):
-                store.put_if_match(b"stale", first)
-            assert store.get_versioned().version == second
-            assert store.read() == b"second"
+            client = subprocess.run([sys.executable, "-c", """
+import sys
+import gcsfs
+from dew.data.storage import PreconditionFailed, Store
+
+store = Store("gs://bucket/value", {"token": "anon", "endpoint_url": sys.argv[1]})
+assert type(store.resolve()[0]) is gcsfs.core.GCSFileSystem
+first = store.put_if_absent(b"first")
+assert store.get_versioned().data == b"first"
+try:
+    store.put_if_absent(b"duplicate")
+except PreconditionFailed:
+    pass
+else:
+    raise AssertionError("a second put_if_absent was not refused")
+second = store.put_if_match(b"second", first)
+try:
+    store.put_if_match(b"stale", first)
+except PreconditionFailed:
+    pass
+else:
+    raise AssertionError("a put_if_match on a stale generation was not refused")
+assert store.get_versioned().version == second
+assert store.read() == b"second"
+""", f"http://127.0.0.1:{server.server_port}"], capture_output=True, text=True,
+                env={**os.environ, "GCSFS_EXPERIMENTAL_ZB_HNS_SUPPORT": "false"})
         finally:
             server.shutdown()
             thread.join()
+    assert client.returncode == 0, client.stderr
+    assert [payload for _, payload in versions["value"]] == [b"first", b"second"]
 
 
 @pytest.mark.network

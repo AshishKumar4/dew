@@ -11,9 +11,12 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.config.data import RecordsData
+from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
+from dew.data import Files
+from dew.data.steps.generic import Formatting
 from dew.inputs import Field, InputSpec
+from dew.optim import OptimConfig
+from dew.registry import ModelConfig
 
 FEATURES = 8
 
@@ -62,8 +65,10 @@ def run() -> RunConfig:
              "validation": points(data / "validation.jsonl", 64, 2)}
     return RunConfig(
         model=ModelConfig.from_model(Autoencoder()),
-        data=RecordsData(source=files["train"], validation=files["validation"]),
+        # Formatting reads each JSON point as an array of numbers.
+        data=Files(files["train"]).map(Formatting()).shuffle(seed=0).repeat().batch(32),
+        validation=Files(files["validation"]).map(Formatting()).batch(32),
         objective=ObjectiveConfig("supervised", {"loss": evidence_bound, "metrics": (reconstruction_error,),
                                                  "inputs": InputSpec(Field("x", (FEATURES,)))}),
         optim=OptimConfig(learning_rate=1e-2),
-        trainer=TrainerConfig(steps=40, batch_size=32, log_every=1, eval_every=None, checkpoint_every=40))
+        trainer=TrainerConfig(steps=40, log_every=1, eval_every=None, checkpoint_every=40))

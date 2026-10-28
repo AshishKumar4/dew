@@ -8,7 +8,6 @@ import importlib.util
 import json
 import os
 import posixpath
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,8 +19,10 @@ from typing import TYPE_CHECKING
 from etils import epath
 from filelock import FileLock
 
+from dew.batch import Batch
 from dew.cache import dew_cache_dir
 from dew.data.pipeline import Dataset
+from dew.files import published
 
 from ..dataset import Records
 from .base import Read, ShardManifest, _indexed_manifest, preparing
@@ -30,12 +31,24 @@ if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import
     from tensorflow_datasets import DecoderTree
 
 
+@dataclasses.dataclass(frozen=True)
+class _Texts:
+    """A TFDS record with its text features decoded from the utf-8 bytes TFDS hands over."""
+
+    fields: tuple[str, ...]
+
+    def __call__(self, row: Batch | bytes | None) -> Batch | bytes | None:
+        if not isinstance(row, Mapping):
+            return row
+        return {**row, **{name: row[name].decode() for name in self.fields if isinstance(row[name], bytes)}}
+
+
 def _decoder_record(value: object) -> Mapping[str, object] | None:
     if value is None:
         return None
     if isinstance(value, Mapping):
         return {name: _decoder_record(decoder) for name, decoder in value.items()}
-    from dew.records import json_value
+    from dew._records import json_value
 
     try:
         settings = {
@@ -371,7 +384,7 @@ class TFDS(Dataset):
                 (staged / "READY").write_text(
                     json.dumps({"source": self.path, "split": self.split, "files": copied})
                 )
-                shutil.move(staged, destination)
+                published(staged, destination)
         return True
 
     def records(self, read: Read) -> Records:
@@ -388,20 +401,45 @@ class TFDS(Dataset):
         self.fingerprint()
         rows = self.builder.as_data_source(self.split, decoders=self.decoders)
         import grain.python as grain
+        import tensorflow_datasets as tfds
 
         from .memory import _record
 
         indexed = grain.MapDataset.source(rows).map(_record)
+        features = self.builder.info.features
+        texts = (tuple(name for name, feature in features.items() if isinstance(feature, tfds.features.Text))
+                 if isinstance(features, tfds.features.FeaturesDict) else ())
+        if texts:
+            # TFDS hands its text features over as utf-8 bytes; a record holds them as text.
+            indexed = indexed.map(_Texts(texts))
         return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
 
     def manifest(self) -> ShardManifest:
-        return _indexed_manifest(self, self.describe(), str(self.builder.data_path), self.shard_rows)
+        return _indexed_manifest(self, str(self.builder.data_path), self.shard_rows)
 
-    def metadata(self) -> Mapping[str, object]:
+    def stated(self) -> Mapping[str, object]:
+        """Its builder's info, no data source opened: the dataset's name and version, its class
+        names, and the split's rows the info counts. A split not prepared here, or a remote one not
+        mirrored yet, states nothing: a run's record and model are built where its data may not be."""
+        root = epath.Path(os.path.expanduser(self.directory))
+        # A prepared directory holds the split's metadata, or a data directory the dataset's own.
+        prepared = all((root / name).is_file() for name in METADATA)
+        here = root.is_dir() and (prepared or (root / self.name).is_dir())
+        if not here or (self.remote and not Path(self.directory, "READY").is_file()):
+            return {}
+        described = self.builder.info
+        splits = described.splits
+        counted = splits is not None and self.split in splits
+        rows = {"rows": splits[self.split].num_examples} if counted else {}
+        return {"name": described.name, "version": str(described.version), "class_names": self._class_names,
+                **rows}
+
+    @property
+    def _class_names(self) -> Mapping[str, tuple[str, ...]]:
         import tensorflow_datasets as tfds
 
         features = self.builder.info.features
-        class_names = (
+        return (
             {
                 name: tuple(feature.names)
                 for name, feature in features.items()
@@ -410,6 +448,9 @@ class TFDS(Dataset):
             if isinstance(features, tfds.features.FeaturesDict)
             else {}
         )
+
+    def metadata(self) -> Mapping[str, object]:
+        class_names = self._class_names
         return {
             "name": self.builder.info.name,
             "version": str(self.builder.info.version),

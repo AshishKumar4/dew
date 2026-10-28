@@ -1,8 +1,8 @@
 """Supervised fine-tuning data: conversations with a role on every token.
 
-The `Chat` recipe reads conversations from a parquet file, a JSONL file or
-an `hf://` Hub dataset, and renders each with the tokenizer's chat
-template. Every token gets the role of the message that wrote it, so
+The sft preset (`dew.data.presets.sft`) reads conversations from any store, a parquet file, a JSONL
+file or a Hub dataset among them, and renders each with the tokenizer's chat template
+(`template`). Every token gets the role of the message that wrote it, so
 `LMObjective` with `loss_role=Role.ASSISTANT` trains on assistant tokens
 only.
 
@@ -14,7 +14,7 @@ stream's position is a global window count, so a run can resume on any
 number of processes.
 
 Block diffusion reads a prompt and the canvases after it instead, so its
-`ChatCanvasData` recipe lays each assistant turn out as a row of its own,
+canvas preset (`dew.data.presets.canvas`) lays each assistant turn out as a row of its own,
 unpacked: the conversation before the turn, then the turn on whole canvases.
 
 A `Message` holds the fields the Hugging Face chat-template contract reads:
@@ -42,12 +42,14 @@ import grain.python as grain
 import numpy as np
 from jinja2 import TemplateError
 
-from dew.data.text import HFTokenizer, tokenizer_name
+from dew._records import JSON
+from dew.data.facts import unshaped
+from dew.data.text import HFTokenizer, SavedTokenizer, tokenizer_name
 
 if TYPE_CHECKING:
-    from transformers import PreTrainedTokenizerBase
+    from transformers import BatchEncoding, PreTrainedTokenizerBase
 
-    from dew.data.dataset import Batch
+    from dew.batch import Batch
     from dew.data.steps.text import LengthPolicy
 
 ROLES_KEY = "text_roles"
@@ -86,15 +88,14 @@ def _role(raw: object, where: str) -> Role:
     return role
 
 
-def _text(raw: object, name: str, where: str) -> str:
-    if not isinstance(raw, str):
-        raise ValueError(f"{where}: {name} is a string, got {raw!r}")
-    return raw
+_KINDS = {str: "a string", Mapping: "an object"}
+"""What a message's field is said to be where it is something else (`_typed`)."""
 
 
-def _mapping(raw: object, name: str, where: str) -> Mapping[str, object]:
-    if not isinstance(raw, Mapping):
-        raise ValueError(f"{where}: {name} is an object, got {raw!r}")
+def _typed[T](raw: object, kind: type[T], name: str, where: str) -> T:
+    """`raw`, a message's field `name`, as the `kind` it has to be, or refused at `where`."""
+    if not isinstance(raw, kind):
+        raise ValueError(f"{where}: {name} is {_KINDS[kind]}, got {raw!r}")
     return raw
 
 
@@ -113,7 +114,7 @@ def _records(raw: object, name: str, where: str) -> list[Mapping[str, object]]:
             raise ValueError(f"{where}: {name} is not JSON: {exc}") from None
     if not isinstance(raw, list):
         raise ValueError(f"{where}: {name} is a list, got {raw!r}")
-    return [_mapping(entry, f"an entry of {name}", where) for entry in raw]
+    return [_typed(entry, Mapping, f"an entry of {name}", where) for entry in raw]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -131,10 +132,10 @@ class ContentPart:
 
     @classmethod
     def parse(cls, part: Mapping[str, object], where: str) -> ContentPart:
-        kind = _text(part.get("type"), "a content part's type", where)
+        kind = _typed(part.get("type"), str, "a content part's type", where)
         fields = {key: value for key, value in part.items() if key != "type"}
         if kind == "text":
-            _text(fields.get("text"), "a text part's text", where)
+            _typed(fields.get("text"), str, "a text part's text", where)
         return cls(kind, fields)
 
     def as_template(self) -> Mapping[str, object]:
@@ -170,7 +171,7 @@ class ToolCall:
         outer = {key: value for key, value in call.items() if value is not None}
         function = outer.pop("function", None)
         if function is not None:
-            body = dict(_mapping(function, "a tool call's function", where))
+            body = dict(_typed(function, Mapping, "a tool call's function", where))
             body = {key: value for key, value in body.items() if value is not None}
         else:
             body = {key: outer.pop(key) for key in ("name", "arguments") if key in outer}
@@ -180,7 +181,7 @@ class ToolCall:
             raise ValueError(
                 f"{where}: a tool call carries id, type and function; "
                 f"unknown fields {sorted(outer)}")
-        name = _text(body.pop("name", None), "a tool call's name", where)
+        name = _typed(body.pop("name", None), str, "a tool call's name", where)
         arguments = body.pop("arguments", None)
         if body:
             raise ValueError(
@@ -201,8 +202,8 @@ class ToolCall:
                 f"object, got {arguments!r}")
         return cls(
             name, dict(arguments),
-            None if call_id is None else _text(call_id, "a tool call's id", where),
-            _text(kind, "a tool call's type", where))
+            None if call_id is None else _typed(call_id, str, "a tool call's id", where),
+            _typed(kind, str, "a tool call's type", where))
 
     def as_template(self) -> Mapping[str, object]:
         call: dict[str, object] = {
@@ -266,8 +267,8 @@ class Message:
                  if key not in RESERVED and value is not None}
         return cls(
             role, parts, tool_calls,
-            None if call_id is None else _text(call_id, "tool_call_id", where),
-            None if name is None else _text(name, "name", where),
+            None if call_id is None else _typed(call_id, str, "tool_call_id", where),
+            None if name is None else _typed(name, str, "name", where),
             extra)
 
     def as_template(self) -> Mapping[str, object]:
@@ -352,7 +353,7 @@ class Conversation:
                     raise ValueError(
                         f"{at}: content part {part.type!r} requires a processor; "
                         "text tokenizers accept only text parts")
-                texts.append(_text(part.fields.get("text"), "a text part's text", at))
+                texts.append(_typed(part.fields.get("text"), str, "a text part's text", at))
             rows.append({**row, "content": "".join(texts)})
         return rows
 
@@ -372,13 +373,8 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
     string-valued dicts while its contract reads lists under `tool_calls` and
     `content`, so the honest type has no spelling the checker accepts.
     """
-    try:
-        render = functools.partial(
-            tokenizer.apply_chat_template, rows, tools=[dict(tool) for tool in tools] or None,
-            tokenize=True, return_dict=False, add_generation_prompt=generation_prompt)
-        rendered = render() if thinking is None else render(enable_thinking=thinking)
-    except (TemplateError, TypeError) as exc:
-        raise ValueError(f"{where}: the chat template refused the conversation: {exc}") from exc
+    rendered = _rendered(tokenizer, rows, tools, generation_prompt=generation_prompt, where=where,
+                         thinking=thinking, tokenize=True)
     if not isinstance(rendered, list):
         raise ValueError(
             f"tokenizer {where!r} answered the chat template with "
@@ -391,6 +387,108 @@ def _token_ids(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping
                 f"non-id {token!r}")
         ids.append(token)
     return ids
+
+
+RENDERER_KEYS = frozenset({"conversation", "tools", "documents", "tokenize", "return_dict", "return_tensors",
+                           "add_generation_prompt", "continue_final_message", "chat_template",
+                           "enable_thinking", "padding", "truncation", "max_length", "tokenizer_kwargs",
+                           "return_assistant_tokens_mask"})
+"""The keywords the template call itself owns (`apply_chat_template`'s and this module's own
+controls), which a template's variables (`options`) never set: each has its own field."""
+
+
+def template_options(options: Mapping[str, JSON], *, where: str) -> Mapping[str, JSON]:
+    """`options` as a chat template's own variables, refused (ValueError) where one names a keyword
+    the template call owns (`RENDERER_KEYS`): thinking, the template and the rest have their own
+    fields, so an option never overrides one silently or collides with it."""
+    owned = sorted(set(options) & RENDERER_KEYS)
+    if owned:
+        raise ValueError(f"{where}: {owned} are the chat template call's own controls, not template "
+                         "variables; set them through their own fields")
+    return options
+
+
+def _rendered(tokenizer: PreTrainedTokenizerBase, rows, tools: Sequence[Mapping[str, object]], *,
+              generation_prompt: bool, where: str, thinking: bool | None, tokenize: bool,
+              chat_template: str | None = None, options: Mapping[str, JSON] | None = None
+              ) -> str | list[int] | list[str] | list[list[int]] | BatchEncoding:
+    """The chat template's rendering of `rows`, as token ids (`tokenize`) or as text: `chat_template`
+    in place of the tokenizer's own where given, and `options` the variables the template reads beside
+    the messages; `thinking` and a refusal as `_token_ids` says."""
+    try:
+        render = functools.partial(
+            tokenizer.apply_chat_template, rows, tools=[dict(tool) for tool in tools] or None,
+            tokenize=tokenize, return_dict=False, add_generation_prompt=generation_prompt,
+            **({} if chat_template is None else {"chat_template": chat_template}),
+            **template_options(options or {}, where=where))
+        return render() if thinking is None else render(enable_thinking=thinking)
+    except (TemplateError, TypeError) as exc:
+        raise ValueError(f"{where}: the chat template refused the conversation: {exc}") from exc
+
+
+CONTENT = "\x00content\x00"
+"""The stand-in for a turn's content that `framed` renders and splits the conversation at: no
+template's own markup holds it, and none trims or escapes it."""
+
+
+def framed(tokenizer: PreTrainedTokenizerBase, system: str, *, where: str, thinking: bool | None = None,
+           chat_template: str | None = None, options: Mapping[str, JSON] | None = None) -> tuple[str, str]:
+    """The text a chat template renders around one user turn's content: a system message and the
+    user's turn up to its content, then the rest of the turn and the assistant's opening (the
+    generation prompt), as `tokenizer`'s own template writes them, with `thinking` its
+    `_token_ids`' switch, `chat_template` in place of its own and `options` the template's other
+    variables (`_rendered`). A row that frames its own content between the two is the conversation the
+    template renders, its markup the template's own tokens, whatever the backbone's family; the
+    content is placed as written, never re-rendered, so its tokens and spans are the caller's."""
+    rows = [{"role": "system", "content": system}, {"role": "user", "content": CONTENT}]
+    text = _rendered(tokenizer, rows, (), generation_prompt=True, where=where, thinking=thinking,
+                     tokenize=False, chat_template=chat_template, options=options)
+    if not isinstance(text, str) or text.count(CONTENT) != 1:
+        raise ValueError(f"{where}: the chat template does not render a user turn's content once, as written")
+    before, after = text.split(CONTENT)
+    return before, after
+
+
+def framed_turn(tokenizer: PreTrainedTokenizerBase, system: str, content: str, *, where: str,
+                thinking: bool | None = None, chat_template: str | None = None,
+                options: Mapping[str, JSON] | None = None) -> tuple[str, int, int, int]:
+    """One user turn's `content` rendered by `tokenizer`'s chat template as `framed` renders the turn
+    around it, its own content in place, so the template's transformations of it are its own: the
+    rendered text, where in it the content stands, how many of its leading characters the template
+    left out, and how many it holds. The template holds the content as written or trimmed (`|trim`,
+    `str.strip`), once; a template that changes it otherwise has no character map to the content's
+    spans, and is refused (ValueError)."""
+    rows = [{"role": "system", "content": system}, {"role": "user", "content": content}]
+    text = _rendered(tokenizer, rows, (), generation_prompt=True, where=where, thinking=thinking,
+                     tokenize=False, chat_template=chat_template, options=options)
+    if not isinstance(text, str):
+        raise ValueError(f"{where}: the chat template renders no text")
+    kept = content.strip()
+    for held, dropped in ((content, 0), (kept, len(content) - len(content.lstrip()))):
+        if text.count(held) == 1:
+            return text, text.index(held), dropped, len(held)
+    raise ValueError(f"{where}: the chat template does not hold a user turn's content once, as written or "
+                     "trimmed")
+
+
+def image_text(processor, *, where: str) -> str:
+    """The text one image stands as in a user's turn, as `processor`'s own chat template writes an
+    image part: the turn rendered with an image before its text, less the same turn without it.
+    Qwen-VL's processors write `<|vision_start|><|image_pad|><|vision_end|>`, Llama 4's `<|image|>`;
+    the processor expands it to the image's tokens."""
+    def before(parts: list[dict[str, str]]) -> str:
+        rows = [{"role": "user", "content": [*parts, {"type": "text", "text": CONTENT}]}]
+        text = _rendered(processor, rows, (), generation_prompt=False, where=where, thinking=None,
+                         tokenize=False)
+        if not isinstance(text, str) or text.count(CONTENT) != 1:
+            raise ValueError(f"{where}: the chat template does not render a user turn's text once, "
+                             "as written")
+        return text.split(CONTENT)[0]
+
+    plain, seen = before([]), before([{"type": "image"}])
+    if not seen.startswith(plain) or seen == plain:
+        raise ValueError(f"{where}: the chat template writes no image part of its own before a turn's text")
+    return seen[len(plain):]
 
 
 def render_prompt(tokenizer: PreTrainedTokenizerBase, conversation: Conversation,
@@ -525,6 +623,12 @@ class RenderChat(grain.MapTransform):
     def dependencies(self) -> Mapping[str, object]:
         return {"tokenizer": self.vocabulary.dependencies()}
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Token ids under "text" and their speakers under "text_roles", each conversation's
+        length, from `tokenizer`'s template, in place of its turns."""
+        rendered = unshaped(facts, self.column, "prompt", "tools", "text", ROLES_KEY)
+        return {**rendered, "tokenizer": self.tokenizer}
+
     def map(self, element: Batch) -> Batch:
         messages = element.get(self.column, element.get("prompt"))
         conversation = Conversation.parse(messages, element.get("tools"), self.tokenizer)
@@ -533,7 +637,7 @@ class RenderChat(grain.MapTransform):
         return {**kept, "text": ids, "text_roles": roles}
 
 
-def template(tokenizer: str | PreTrainedTokenizerBase, *, messages: str = "messages") -> RenderChat:
+def template(tokenizer: str | SavedTokenizer, *, messages: str = "messages") -> RenderChat:
     """A record step that renders the conversation in `messages` through the
     tokenizer's chat template to token ids under "text" and each token's
     speaker under "text_roles", which an assistant-only loss reads.

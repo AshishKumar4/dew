@@ -5,32 +5,54 @@ or Dew's own step, reads exactly the samples the first did.
 `Tape` holds the record; `TorchDraws` and `JaxDraws` stand in for `torch`
 and `jax.random` in a reference's scope, every other name passing through.
 A draw is made only while recording, and a replayed one is checked against
-the shape asked for where the call names one.
+the shape asked for where the call names one. `fixed_draws` answers torch's
+density draws with one supplied draw instead.
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib
 
 
 class Tape:
     """Draws in the order a walk makes them: `drawn` while recording, or the
-    `replayed` record's next, popped."""
+    `replayed` record's next. `taken` counts the draws handed out."""
 
     def __init__(self, replayed=None):
         self.drawn: list = []
         self.replayed = None if replayed is None else list(replayed)
+        self.taken = 0
 
-    def next(self, draw, shape=None):
+    def next(self, draw=None, shape=None):
         """The record's next draw, or while recording `draw()`, kept."""
         if self.replayed is None:
             value = draw()
             self.drawn.append(value)
-            return value
-        value = self.replayed.pop(0)
-        if shape is not None:
-            assert tuple(value.shape) == tuple(shape), (tuple(value.shape), tuple(shape))
+        else:
+            value = self.replayed[self.taken]
+            if shape is not None:
+                assert tuple(value.shape) == tuple(shape), (tuple(value.shape), tuple(shape))
+        self.taken += 1
         return value
+
+    def spent(self) -> None:
+        """Refuse a replay that left a recorded draw untaken."""
+        assert self.replayed is None or self.taken == len(self.replayed), (
+            f"the walk took {self.taken} of the {len(self.replayed)} draws recorded")
+
+
+@contextlib.contextmanager
+def fixed_draws(base):
+    """`torch.normal(mean, std, size)` and `torch.rand(size)` read the tensor `base`, whatever size
+    they ask for (a normal as `mean + std * base`), so a reference's density runs on one supplied
+    draw."""
+    torch = importlib.import_module("torch")
+    from torch_precision import replaced
+
+    with replaced((torch, "normal", lambda mean, std, size, **_: mean + std * base),
+                  (torch, "rand", lambda size, **_: base)):
+        yield
 
 
 class TorchDraws:

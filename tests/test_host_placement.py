@@ -323,7 +323,7 @@ def test_synthetic_banks_keep_namespace_values_across_bank_sizes(kind):
     from tools.benchmark_host_offload import SyntheticBanks
 
     model, variables, tokens, indices, media = fixture(kind)
-    sites = model.bank_sites
+    sites = model.bank_sites(variables)
     source = SyntheticBanks(HeldBanks(variables).shapes(), seed=17)
     resident = source.place(model, layout=DEVICE)
     selected = SelectedReads(source, sites)
@@ -333,5 +333,5 @@ def test_synthetic_banks_keep_namespace_values_across_bank_sizes(kind):
     one = (model.clone(language_model=model.language_model.clone(bank_layers=1))
            if isinstance(model, MultimodalTransformer) else model.clone(bank_layers=1))
     separate = source.place(one, layout=DEVICE)
-    identical(unpack(separate, one.bank_sites, source.shapes()),
+    identical(unpack(separate, one.bank_sites(variables), source.shapes()),
               unpack(resident, sites, source.shapes()))

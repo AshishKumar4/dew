@@ -15,6 +15,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.rope import sincos_grid, sinusoid_frequencies
+
 from .sharding import rows_spec
 
 ScanOrder = Literal['raster', 'hilbert', 'zigzag']
@@ -23,29 +25,18 @@ curve, or in a zigzag."""
 
 
 def build_2d_sincos_pos_embed(emb_dim: int, H_P: int, W_P: int) -> np.ndarray:
-    """Fixed MAE-style 2D sin-cos positional embedding, row-major [H_P * W_P, emb_dim].
-    Half the channels encode the row, half the column. For another scan order,
-    index the result by that order's permutation.
+    """Fixed MAE-style 2D sin-cos positional embedding, row-major [H_P * W_P, emb_dim], in float32.
+    The first half of the channels encodes the row and the second the column (MAE's own 2D table puts
+    the column first). For another scan order, index the result by that order's permutation.
+
+    Each axis is MAE's `get_1d_sincos_pos_embed_from_grid`, which computes in float64: so is it here,
+    rounded once to float32 (`sincos_grid`).
     """
     assert emb_dim % 4 == 0, f"emb_dim must be divisible by 4 for 2D sincos, got {emb_dim}"
-    half = emb_dim // 2
-    quarter = half // 2
-
-    omega = np.arange(quarter, dtype=np.float32) / quarter
-    omega = 1.0 / (10000.0 ** omega)  # [quarter]
-
-    rows = np.arange(H_P, dtype=np.float32)
-    cols = np.arange(W_P, dtype=np.float32)
-
-    row_emb = np.einsum('h,d->hd', rows, omega)
-    col_emb = np.einsum('w,d->wd', cols, omega)
-
-    pos = np.zeros((H_P, W_P, emb_dim), dtype=np.float32)
-    pos[..., 0:quarter] = np.sin(row_emb)[:, None, :]
-    pos[..., quarter:half] = np.cos(row_emb)[:, None, :]
-    pos[..., half:half + quarter] = np.sin(col_emb)[None, :, :]
-    pos[..., half + quarter:] = np.cos(col_emb)[None, :, :]
-    return pos.reshape(H_P * W_P, emb_dim)
+    quarter = emb_dim // 4
+    rows, columns = np.meshgrid(np.arange(H_P), np.arange(W_P), indexing="ij")
+    return sincos_grid(sinusoid_frequencies(quarter, quarter, dtype=np.float64), rows, columns,
+                       dtype=np.float32)
 
 
 def _d2xy(n: int, d: int) -> tuple[int, int]:
@@ -136,25 +127,9 @@ def pixel_shuffle(x: jnp.ndarray) -> jnp.ndarray:
     return einops.rearrange(x, 'b h w (c p1 p2) -> b (h p1) (w p2) c', p1=2, p2=2)
 
 
-def _ordered_patchify(x: jnp.ndarray, patch_size: int, order: np.ndarray):
-    return patchify(x, patch_size)[:, order, :], inverse_permutation(order)
-
-
-def hilbert_patchify(x: jnp.ndarray, patch_size: int) -> tuple[jnp.ndarray, np.ndarray]:
-    """`(patches in hilbert order, inv_idx)`; `hilbert_unpatchify` takes the
-    pair back to the image."""
-    _, H, W, _ = x.shape
-    return _ordered_patchify(x, patch_size, hilbert_indices(H // patch_size, W // patch_size))
-
-
-def zigzag_patchify(x: jnp.ndarray, patch_size: int) -> tuple[jnp.ndarray, np.ndarray]:
-    """`(patches in zigzag order, inv_idx)`, the contract of `hilbert_patchify`."""
-    _, H, W, _ = x.shape
-    return _ordered_patchify(x, patch_size, zigzag_indices(H // patch_size, W // patch_size))
-
-
-def hilbert_unpatchify(x: jnp.ndarray, inv_idx: np.ndarray, patch_size: int,
-                       H: int, W: int, C: int) -> jnp.ndarray:
+def unscanned(x: jnp.ndarray, inverse: np.ndarray | None, patch_size: int,
+              H: int, W: int, C: int) -> jnp.ndarray:
     """Scan-ordered patches `[B, N, p * p * C]` back to the image `[B, H, W, C]`
-    through the `inv_idx` their patchify returned, whichever order it was."""
-    return unpatchify(x[:, inv_idx, :], patch_size, H, W, C)
+    through the `inverse` their gather returned (`dew.nn.dit.scan_ordered`),
+    whichever order it was; None for raster patches, which are in order."""
+    return unpatchify(x if inverse is None else x[:, inverse, :], patch_size, H, W, C)

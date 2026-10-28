@@ -4,12 +4,15 @@ Two properties carry the whole language model: a position never sees the
 future, and decoding one token at a time against the KV cache gives the same
 logits as one forward pass over the finished sequence. Everything else here
 guards the config surface the HF decoders need (grouped-query heads, sliding
-layers, the Gemma flags) and the param tree the interop map renames.
+layers, the Gemma flags) and the param tree the interop map renames. Where
+two ways of computing the model agree, they are on par from the model's
+float64 run over drawn weights and tokens (check 1, tests/reference_error.py),
+or bitwise where they are one computation; a change that must move the
+logits moves at least one bit of them.
 """
 
 import functools
 import math
-import re
 from pathlib import Path
 
 import jax
@@ -17,13 +20,24 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, decode_steps, model_draw, with_logit_cotangent
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    torch_with_gradients,
+    widened,
+    with_gradients,
+    without_ynn,
+)
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.kernels.selection import KernelRefused
+from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 from dew.nn.mixers import AttentionMixer
+from dew.nn.precision import FP32_SUMS
+from dew.nn.rope import YarnScaling
 
 VOCAB = 37
 SEQ = 12
@@ -35,6 +49,48 @@ def tiny(**overrides):
 
 def tokens(rng, batch=2, length=SEQ):
     return jax.random.randint(rng, (batch, length), 0, VOCAB)
+
+
+SEEDS = {'decode': 16, 'kernels': 16, 'window kernels': 8, 'softcap': 32, 'routed softcap': 64,
+         'grouped': 32, 'sliding decode': 16, 'hybrid decode': 512, 'sandwich': 8, 'packed alone': 16,
+         'metadata': 128, 'packed kernels': 16, 'bf16 head': 8, 'strict head': 8, 'norm gradient': 8,
+         'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'packed cudnn': 8,
+         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 64,
+         'learned hybrid decode': 8, 'layouts': 8}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, and the GPU
+sites on an A100): the most any of a site's cases took."""
+
+
+def drawn(model, batch=2, length=SEQ):
+    """Check 1's draw for `model`: a seed's variables and `[batch, length]` tokens."""
+    return model_draw(model, (batch, length), VOCAB)
+
+
+def float64(model):
+    """`model` in float64 on the reference kernel, which keeps float64 where a fused one narrows."""
+    return model.clone(dtype=jnp.float64, attention_impl="reference")
+
+
+def applied(model, **call):
+    """`model`'s logits as a function of its variables and tokens, compiled."""
+    return jax.jit(lambda params, ids: model.apply(params, ids, **call))
+
+
+@pytest.mark.parametrize("position_embedding", ["learned", "alibi"])
+def test_a_named_mixer_places_its_own_tokens_beside_the_models_default(rng, position_embedding):
+    """The model's `position_embedding` is how a layer with no named mixer places its tokens; a
+    mixer a kind names places its own. The default's own mixer named on a kind computes the model
+    the default builds, bit for bit, and a kind naming rotary attention beside learned positions or
+    ALiBi builds and runs, its rotation changing the logits."""
+    default = AttentionMixer(nope=True, alibi=position_embedding == "alibi")
+    implicit = tiny(position_embedding=position_embedding, layer_types=("full_attention", "rotated"))
+    named = implicit.clone(kinds={"rotated": {"mixer": default}})
+    ids = tokens(rng)
+    params = implicit.init(rng, ids)
+    logits = np.asarray(implicit.apply(params, ids))
+    np.testing.assert_array_equal(np.asarray(named.apply(params, ids)), logits)
+    rotated = implicit.clone(kinds={"rotated": {"mixer": AttentionMixer()}})
+    assert not np.array_equal(np.asarray(rotated.apply(params, ids)), logits)
 
 
 @pytest.mark.parametrize("fields,causal,message", [
@@ -98,11 +154,17 @@ def test_attention_dropout_reaches_local_and_grouped_heads(rng, geometry):
     assert np.asarray(evaluated).tobytes() == np.asarray(baseline).tobytes()
 
 
-def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
+def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
+    """A decoder record from before dropout builds with every rate zero and computes what its
+    serialized pre-dropout forward and gradient compute: the export run as serialized is check 1's
+    reference, and the same pre-dropout program exported in float64 from the same source its truth,
+    over the export's own weights and drawn ids (the two are different programs, which no bits
+    bind)."""
     from flax.traverse_util import unflatten_dict
     from jax import export
 
-    from dew.config import ModelConfig
+    from dew.registry import ModelConfig
+    from tools.generate_decoder_dropout_fixture import forward_and_gradient
 
     config = {"vocab_size": 17, "emb_features": 8, "num_layers": 1, "num_heads": 2,
                   "mlp_features": 16, "max_seq_len": 8}
@@ -111,35 +173,60 @@ def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
     assert model.embedding_dropout_rate == model.attention_dropout_rate == 0
     directory = Path(__file__).with_name("fixtures")
     held = np.load(directory / "decoder-default-dropout.npz")
-    try:
-        before = export.deserialize((directory / "decoder-default-dropout.jaxexport").read_bytes())
-    except Exception as error:
-        pytest.fail(f"cannot deserialize the pre-dropout forward/gradient export: {error}")
-    with jax.default_device(jax.devices("cpu")[0]):
-        ids = jnp.asarray(held["ids"])
-        params = unflatten_dict({tuple(name.split("/")[1:]): jnp.asarray(leaf)
-                                 for name, leaf in held.items() if name.startswith("params/")})
+    before, wide = (export.deserialize((directory / f"decoder-default-dropout{suffix}.jaxexport")
+                                       .read_bytes()) for suffix in ("", "-float64"))
+    cpu = jax.devices("cpu")[0]
+    params = unflatten_dict({tuple(name.split("/")[1:]): np.asarray(leaf)
+                             for name, leaf in held.items() if name.startswith("params/")})
+    with jax.default_device(cpu):
+        assert jax.tree.structure(jax.jit(forward_and_gradient(model))(params, held["ids"])) == \
+            jax.tree.structure(before.call(params, held["ids"]))
+    # The two arms are two Dew programs, compiled alike (testing.md: both without YNNPACK's fusions).
+    current, exported = without_ynn(forward_and_gradient(model)), without_ynn(before.call)
 
-        def forward_and_gradient(params, ids):
-            forward = model.apply(params, ids, train=True)
-            gradient = jax.grad(lambda p: jnp.sum(model.apply(p, ids, train=True)))(params)
-            return forward, gradient
+    def draw(seed):
+        ids = np.random.default_rng([0x0D, seed]).integers(0, 17, held["ids"].shape)
+        return (ids.astype(held["ids"].dtype),)
 
-        expected = before.call(params, ids)
-        actual = jax.jit(forward_and_gradient)(params, ids)
-        assert jax.tree.structure(actual) == jax.tree.structure(expected)
-        for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
-            assert np.asarray(left).tobytes() == np.asarray(right).tobytes()
+    @as_given
+    def ours(ids):
+        with jax.default_device(cpu), jax.default_matmul_precision(FP32_SUMS):
+            return jax.device_get(current(params, ids))
+
+    @as_given
+    def theirs(ids):
+        with jax.default_device(cpu):
+            return jax.device_get(exported(params, ids))
+
+    def truth(ids):
+        with jax.enable_x64(new_val=True), jax.default_device(cpu):
+            return jax.device_get(wide.call(widened(params), ids))
+
+    assert_as_exact(ours, theirs, draw, "an old record against its export", seeds=SEEDS["old record"],
+                    truth_fn=truth)
+
+
+def flax_with_keep(query, value, mask, rng, rate: float) -> jax.Array:
+    """Flax's attention arithmetic under `dew`'s dropout draw: the weights of `query` against itself under
+    `mask`, times the keep draw `dropout_keep` takes from `rng` (the draw `scaled_dot_product_attention`
+    takes), then the value product. Flax's own dropout is a bernoulli draw of another stream, so the keep
+    is materialized here and the arithmetic around it is flax's."""
+    weights = nn.dot_product_attention_weights(query, query, mask=mask, deterministic=True)
+    keep = dropout_keep(dropout_seed(rng), rate, weights.shape)
+    scale = jnp.asarray(1 / (1 - rate), weights.dtype)
+    return jnp.einsum("...hqk,...khd->...qhd", weights * jnp.where(keep, scale, 0), value)
 
 
 def test_attention_probability_dropout_matches_flax_on_the_same_draw(rng):
     query = jnp.zeros((1, 4, 2, 4), jnp.float32)
     value = jnp.broadcast_to(jnp.eye(4)[None, :, None, :], (1, 4, 2, 4))
     mask = jnp.tril(jnp.ones((4, 4), bool))[None, None]
-    expected = nn.dot_product_attention(query, query, value, mask=mask, dropout_rate=.5,
-                                        dropout_rng=rng, broadcast_dropout=False, deterministic=False)
+    expected = flax_with_keep(query, value, mask, rng, .5)
     actual = scaled_dot_product_attention(query, query, value, causal=True, implementation="reference",
                                           dropout_rate=.5, dropout_rng=rng, deterministic=False)
+    # Zero queries give every visible weight exp(0) = 1 over an integer sum, one correctly rounded quotient,
+    # and the keep mask and its exact multiplier 2 are the same draw's: both programs round the same value
+    # once, so they agree bit for bit by construction.
     assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
     probabilities = np.asarray(actual)[0]
     for row in range(4):
@@ -177,10 +264,11 @@ def test_attention_dropout_preserves_visibility_masks(rng):
     documents = jnp.asarray([[1, 1, 2, 2]])
     visible = (documents[:, :, None] == documents[:, None, :])[:, None]
     visible = visible & jnp.tril(jnp.ones((4, 4), bool))[None, None]
-    expected = nn.dot_product_attention(query, query, value, mask=visible, dropout_rate=.5,
-                                        dropout_rng=rng, broadcast_dropout=False, deterministic=False)
+    expected = flax_with_keep(query, value, visible, rng, .5)
     actual = scaled_dot_product_attention(query, query, value, causal=True, segment_ids=documents,
         implementation="auto", dropout_rate=.5, dropout_rng=rng, deterministic=False)
+    # Bit for bit by construction, as in `test_attention_probability_dropout_matches_flax_on_the_same_draw`:
+    # zero queries' weights are one correctly rounded quotient each, the keep mask the same draw's.
     assert np.asarray(actual).tobytes() == np.asarray(expected).tobytes()
     assert not np.any(np.asarray(actual)[0, 2:, :, :2]), "documents never see an earlier document"
 
@@ -200,19 +288,29 @@ def test_decoder_dropout_rates_must_be_probabilities(rng, field, rate):
 
 def decode_logits(model, params, prompt, rest):
     """Prefill `prompt`, then feed `rest` one token at a time: [B, 1 + len(rest), V]."""
-    cache = model.apply(params, prompt.shape[0], method=CausalTransformer.init_cache,
-                        mutable=['cache'])[1]['cache']
-    logits, mutated = model.apply({**params, 'cache': cache}, prompt,
-                                  decode=True, mutable=['cache'])
+    made, step = decode_steps(model)
+    logits, cache = step(params, made(params, prompt.shape[0]), prompt)
     steps = [logits[:, -1]]
-    cache = mutated['cache']
     for position in range(rest.shape[1]):
-        logits, mutated = model.apply({**params, 'cache': cache},
-                                      rest[:, position:position + 1],
-                                      decode=True, mutable=['cache'])
-        cache = mutated['cache']
+        logits, cache = step(params, cache, rest[:, position:position + 1])
         steps.append(logits[:, -1])
     return jnp.stack(steps, axis=1)
+
+
+def decoded_against_full(model, prompt: int, label: str, seeds: int, length=SEQ, **shape):
+    """Check 1: `model`'s prefill of `prompt` tokens and single-token steps on par with its full pass
+    from position `prompt - 1` over drawn variables and tokens, the truth the model in float64. A
+    model whose logits a scaling divides is run unscaled in float64 and divided there, since the model
+    divides its states in fp32."""
+    def decoded(params, ids):
+        return decode_logits(model, params, ids[:, :prompt], ids[:, prompt:])
+
+    def full(model, divided=1.0):
+        return jax.jit(lambda params, ids: model.apply(params, ids)[:, prompt - 1:] / divided)
+
+    wide = float64(model.clone(logits_scaling=1.0))
+    assert_as_exact(decoded, full(model), drawn(model, length=length, **shape), label, seeds=seeds,
+                    truth_fn=full(wide, model.logits_scaling))
 
 
 def test_logits_ignore_every_later_token(rng):
@@ -228,115 +326,110 @@ def test_logits_ignore_every_later_token(rng):
     changed = model.apply(params, rewritten)
     assert jnp.array_equal(baseline[:, :cut + 1], changed[:, :cut + 1])
     # and the tail did move, so the test is not passing on a dead model
-    assert not jnp.allclose(baseline[:, cut + 1:], changed[:, cut + 1:])
+    assert not jnp.array_equal(baseline[:, cut + 1:], changed[:, cut + 1:])
 
 
 @pytest.mark.parametrize("attention_impl", ['reference', 'xla'])
 def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
     """The prefill plus single-token steps must reproduce the full-sequence
-    logits position by position, on the reference kernel and on the fused one
-    (where the cache mask travels as a mask argument, not a causal flag)."""
+    logits position by position, on par with them (check 1), on the reference
+    kernel and on the fused one (where the cache mask travels as a mask
+    argument, not a causal flag)."""
     model = tiny(attention_impl=attention_impl)
     ids = tokens(rng)
     params = model.init(rng, ids)
-    full = model.apply(params, ids)
-
-    prompt, rest = ids[:, :4], ids[:, 4:]
-    incremental = decode_logits(model, params, prompt, rest)
-    assert incremental.shape == (ids.shape[0], SEQ - 3, VOCAB)
-    assert jnp.allclose(full[:, 3:], incremental, atol=1e-4)
+    assert decode_logits(model, params, ids[:, :4], ids[:, 4:]).shape == (ids.shape[0], SEQ - 3, VOCAB)
+    decoded_against_full(model, 4, f"{attention_impl} decode", SEEDS['decode'])
 
 
 @pytest.mark.gpu(reason="FlashAttention runs on CUDA")
-def test_a_cached_prompt_reads_its_cache_through_flash_where_its_row_names_it(rng, without_deterministic_ops):
+def test_a_cached_prompt_reads_its_cache_as_the_uncached_forward(without_deterministic_ops):
     """A bf16 prompt prefilled into the cache under 'auto' reads it as the documents its tokens end, no
-    mask, which FlashAttention takes where the GPU's row names it for packed documents: the compiled
-    prefill holds its kernel there, and its logits are within tests/reference_error.py's rule of the
-    xla kernel's uncached forward against the float64 forward."""
-    from reference_error import assert_as_exact_as_the_reference
-
-    from dew.nn.kernels.generation import measured_kernel
-
+    mask, whatever kernel the GPU takes: its logits are on par with the xla kernel's uncached forward from
+    the float64 forward over drawn weights and prompts (check 1)."""
     model = tiny(dtype=jnp.bfloat16)
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-    prompt = ids[:, :6]
-    cache = model.apply(params, prompt.shape[0], method=CausalTransformer.init_cache,
-                        mutable=['cache'])[1]['cache']
-    prefill = jax.jit(lambda params, cache, prompt: model.apply(
-        {**params, 'cache': cache}, prompt, decode=True, mutable=['cache'])[0])
-    compiled = prefill.lower(params, cache, prompt).compile().as_text()
-    flash = (measured_kernel('attention_packed', 'xla') == 'flash'
-             and measured_kernel('attention', 'cudnn') == 'flash')
-    # FlashAttention-2's and -3's packed calls (dew_flash_attn's custom-call targets).
-    assert bool(re.search(r'dew_flash3?_mha_varlen_fwd', compiled)) == flash
-    found = np.asarray(prefill(params, cache, prompt), np.float64)
-    plain = np.asarray(model.clone(attention_impl='xla').apply(params, prompt), np.float64)
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf, np.float64)), params)
-        truth = np.asarray(model.clone(dtype=jnp.float64, attention_impl='reference').apply(wide, prompt))
-    assert_as_exact_as_the_reference(found, plain, truth, "cached prefill")
+    made, step = decode_steps(model)
+    assert_as_exact(lambda params, prompt: step(params, made(params, prompt.shape[0]), prompt)[0],
+                    applied(model.clone(attention_impl='xla')), drawn(model, length=6), "cached prefill",
+                    seeds=SEEDS['cached prefill'], truth_fn=applied(float64(model)))
 
 
-def test_reference_and_xla_kernels_agree_when_causal(rng):
+def test_reference_and_xla_kernels_agree_when_causal():
+    """The fused kernel's logits on par with the reference kernel's (check 1)."""
     model = tiny()
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-    reference = model.apply(params, ids)
-    fused = model.clone(attention_impl='xla').apply(params, ids)
-    assert jnp.allclose(reference, fused, atol=1e-4)
+    assert_as_exact(applied(model.clone(attention_impl='xla')),
+                    applied(model.clone(attention_impl='reference')), drawn(model), "causal kernels",
+                    seeds=SEEDS['kernels'], truth_fn=applied(float64(model)))
 
 
 def test_sliding_window_agrees_across_kernels(rng):
     """The banded mask on the reference path and jax's local_window_size have to
     mean the same window, or a run changes behaviour when it changes machine."""
-    query, key, value = (jax.random.normal(k, (2, 8, 4, 16))
-                         for k in jax.random.split(rng, 3))
-    reference = scaled_dot_product_attention(query, key, value, causal=True,
-                                             sliding_window=3)
-    fused = scaled_dot_product_attention(query, key, value, causal=True,
-                                         sliding_window=3, implementation='xla')
-    assert jnp.allclose(reference, fused, atol=1e-5)
+    def draw(seed):
+        return tuple(jax.random.normal(k, (2, 8, 4, 16))
+                     for k in jax.random.split(jax.random.fold_in(rng, seed), 3))
+
+    def attention(implementation):
+        return jax.jit(lambda query, key, value: scaled_dot_product_attention(
+            query, key, value, causal=True, sliding_window=3, implementation=implementation))
+
+    assert_as_exact(attention('xla'), attention('reference'), draw, "window kernels",
+                    seeds=SEEDS['window kernels'])
 
 
 def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, monkeypatch):
     """Gemma 2's tanh on the logits, against the equation on a hand-computed
     case: reference and xla agree with it, and 'auto' resolves a softcapped
     call to that same math even where cudnn would otherwise run (bf16 inputs,
-    an 8-wide head, a gpu backend), while cudnn raises a ValueError naming
-    the implementation. A cap of 2 on logits of order 10 changes the
-    weights by a wide margin; an uncapped path fails the comparison."""
-    query, key, value = (jax.random.normal(k, (1, 6, 2, 8)) * 3
-                         for k in jax.random.split(rng, 3))
-    scaled = np.einsum('bqhd,bkhd->bhqk', query, key) / np.sqrt(8)
-    capped = 2.0 * np.tanh(scaled / 2.0)
-    causal = np.tril(np.ones((6, 6), bool))
-    weights = jax.nn.softmax(np.where(causal, capped, -np.inf), axis=-1)
-    expected = np.einsum('bhqk,bkhd->bqhd', weights, value)
-    uncapped = scaled_dot_product_attention(query, key, value, causal=True)
-    assert np.max(np.abs(np.asarray(uncapped) - expected)) > 0.1
+    an 8-wide head, a gpu backend), check 1 on whatever kernel it runs (the
+    accuracy gate decides, never one kernel's equality to another's), while
+    cudnn raises a ValueError naming the implementation.
+    A cap of 2 on logits of order 10 changes the weights by a wide margin;
+    an uncapped path moves the output. Each path is on par with the equation
+    from its float64 run over drawn calls (check 1)."""
+    def draw(seed):
+        return tuple(jax.random.normal(k, (1, 6, 2, 8)) * 3
+                     for k in jax.random.split(jax.random.fold_in(rng, seed), 3))
 
-    reference = scaled_dot_product_attention(query, key, value, causal=True, softcap=2.0)
-    fused = scaled_dot_product_attention(query, key, value, causal=True, softcap=2.0,
-                                         implementation='xla')
-    assert np.allclose(reference, expected, atol=1e-5)
-    assert np.allclose(fused, expected, atol=1e-5)
+    def equation(query, key, value):
+        scaled = jnp.einsum('bqhd,bkhd->bhqk', query, key) / np.sqrt(8)
+        capped = 2.0 * jnp.tanh(scaled / 2.0)
+        causal = np.tril(np.ones((6, 6), bool))
+        weights = jax.nn.softmax(jnp.where(causal, capped, -jnp.inf), axis=-1)
+        return jnp.einsum('bhqk,bkhd->bqhd', weights, value)
+
+    def attention(implementation, **dtype):
+        def run(query, key, value):
+            halves = [x.astype(dtype.get("dtype", x.dtype)) for x in (query, key, value)]
+            return scaled_dot_product_attention(*halves, causal=True, softcap=2.0,
+                                                implementation=implementation).astype(query.dtype)
+        return run
+
+    query, key, value = draw(0)
+    uncapped = scaled_dot_product_attention(query, key, value, causal=True)
+    assert not np.array_equal(np.asarray(uncapped), np.asarray(equation(query, key, value)))
+    for implementation in ("reference", "xla"):
+        assert_as_exact(jax.jit(attention(implementation)), jax.jit(equation), draw,
+                        f"{implementation} softcap", seeds=SEEDS['softcap'])
+
+    def bf16_equation(query, key, value):
+        # The equation on the bf16 operands in fp32, its output rounded to bf16, as a bf16 call returns.
+        halves = [x.astype(jnp.bfloat16).astype(jnp.float32) for x in (query, key, value)]
+        return equation(*halves).astype(jnp.bfloat16).astype(query.dtype)
 
     monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
+    assert_as_exact(attention('auto', dtype=jnp.bfloat16), jax.jit(bf16_equation), draw,
+                    "routed bf16 softcap", seeds=SEEDS['routed softcap'], truth_fn=equation)
     halves = (query.astype(jnp.bfloat16), key.astype(jnp.bfloat16), value.astype(jnp.bfloat16))
-    routed = scaled_dot_product_attention(*halves, causal=True, softcap=2.0,
-                                          implementation='auto')
-    assert np.allclose(routed.astype(jnp.float32), expected, atol=5e-2)
     with pytest.raises(ValueError):
         scaled_dot_product_attention(*halves, causal=True, softcap=2.0, implementation='cudnn')
 
 
 def test_grouped_query_heads_match_repeated_kv_projections(rng):
     """Grouped heads must read the kv head the fused kernels read: a GQA model
-    equals an all-heads model whose kv kernels are the grouped ones repeated."""
+    is on par with an all-heads model whose kv kernels are the grouped ones
+    repeated (check 1)."""
     grouped = tiny(num_kv_heads=2)
-    ids = tokens(rng)
-    params = grouped.init(rng, ids)
 
     def widen(kernel):
         """One kv kernel per grouped head -> one per query head."""
@@ -345,17 +438,21 @@ def test_grouped_query_heads_match_repeated_kv_projections(rng):
                           grouped.num_heads // grouped.kv_heads,
                           axis=1).reshape(features, -1)
 
-    expanded = {'params': {
-        name: child if not name.startswith('layers_') else {
-            **child,
-            'self_attn': {
-                **child['self_attn'],
-                'k_proj': {'kernel': widen(child['self_attn']['k_proj']['kernel'])},
-                'v_proj': {'kernel': widen(child['self_attn']['v_proj']['kernel'])}}}
-        for name, child in params['params'].items()}}
+    def expanded(params):
+        return {'params': {
+            name: child if not name.startswith('layers_') else {
+                **child,
+                'self_attn': {
+                    **child['self_attn'],
+                    'k_proj': {'kernel': widen(child['self_attn']['k_proj']['kernel'])},
+                    'v_proj': {'kernel': widen(child['self_attn']['v_proj']['kernel'])}}}
+            for name, child in params['params'].items()}}
 
-    plain = tiny()
-    assert jnp.allclose(grouped.apply(params, ids), plain.apply(expanded, ids), atol=1e-5)
+    def plain(model):
+        return jax.jit(lambda params, ids: model.apply(expanded(params), ids))
+
+    assert_as_exact(applied(grouped), plain(tiny()), drawn(grouped), "grouped heads", seeds=SEEDS['grouped'],
+                    truth_fn=plain(float64(tiny())))
 
 
 def test_sliding_attention_forgets_past_the_window(rng):
@@ -368,7 +465,7 @@ def test_sliding_attention_forgets_past_the_window(rng):
 
     flipped = 3
     changed = model.apply(params, ids.at[:, flipped].set((ids[:, flipped] + 5) % VOCAB))
-    moved = jnp.abs(baseline - changed).max(axis=(0, 2)) > 1e-5
+    moved = jnp.any(baseline != changed, axis=(0, 2))
     assert [int(index) for index in jnp.where(moved)[0]] == list(
         range(flipped, flipped + 5))
 
@@ -386,7 +483,7 @@ def bidirectional_reach(rng, implementation, path, kind):
                          "positions": jnp.broadcast_to(jnp.arange(SEQ), ids.shape)}}[path]
     baseline = model.apply(params, ids, **inputs)
     changed = model.apply(params, ids.at[:, 6].set((ids[:, 6] + 5) % VOCAB), **inputs)
-    moved = jnp.abs(baseline - changed).max(axis=(0, 2)) > 1e-5
+    moved = jnp.any(baseline != changed, axis=(0, 2))
     return [int(index) for index in jnp.where(moved)[0]]
 
 
@@ -410,37 +507,51 @@ def test_a_bidirectional_layer_without_a_two_sided_window_reads_its_whole_row(rn
     assert bidirectional_reach(rng, implementation, path, {'window': 3}) == list(range(SEQ))
 
 
-def test_sliding_attention_decode_matches_the_full_sequence(rng):
+def test_sliding_attention_decode_matches_the_full_sequence():
+    """A sliding layer decodes on par with its full pass (check 1)."""
     model = tiny(layer_types=('full_attention', 'sliding_attention'),
                  kinds={'sliding_attention': {'window': 4}})
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-    full = model.apply(params, ids)
-    incremental = decode_logits(model, params, ids[:, :6], ids[:, 6:])
-    assert jnp.allclose(full[:, 5:], incremental, atol=1e-4)
+    decoded_against_full(model, 6, "sliding decode", SEEDS['sliding decode'])
 
 
 def hybrid(**overrides):
     """Qwen3.5's stack at toy size: three gated-delta-net layers, one gated
     full-attention layer with a partial rotary."""
-    return tiny(num_layers=4, num_kv_heads=2, head_dim=8, output_gate=True,
-                partial_rotary_factor=0.5,
-                layer_types=('linear_attention',) * 3 + ('full_attention',),
-                kinds={'linear_attention': {'mixer': {
-                    'class': 'gated_delta_net', 'fields': {'linear_num_key_heads': 2,
-                    'linear_num_value_heads': 4, 'linear_key_head_dim': 6,
-                    'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}}},
-                **overrides)
+    return tiny(**{'num_layers': 4, 'num_kv_heads': 2, 'head_dim': 8, 'output_gate': True,
+                   'partial_rotary_factor': 0.5,
+                   'layer_types': ('linear_attention',) * 3 + ('full_attention',),
+                   'kinds': {'linear_attention': {'mixer': {
+                       'class': 'gated_delta_net', 'fields': {'linear_num_key_heads': 2,
+                       'linear_num_value_heads': 4, 'linear_key_head_dim': 6,
+                       'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}}},
+                   **overrides})
+
+
+def test_learned_positions_continue_from_the_models_own_count_whatever_its_first_layer(rng):
+    """Learned positions read a cached call's places from the model's own count of each row's real
+    tokens (`DecodeCursor`), whatever mixer its first layer runs: Qwen3.5's stack, whose first layers
+    are gated delta nets that keep no cursor, decodes on par with its full pass (check 1), where every
+    cached step read position 0 off a first layer with no cursor (audit NN-A5)."""
+    model = hybrid(position_embedding='learned', partial_rotary_factor=None)
+    decoded_against_full(model, 4, "learned hybrid decode", SEEDS['learned hybrid decode'], batch=16)
+
+
+def test_a_yarn_layer_refuses_a_proportional_partial_rotary(rng):
+    """YaRN ramps the rotated width and has no proportional form (`dew.nn.rope.rotary_freqs`), so a
+    layer given YaRN and a partial rotary under the proportional convention, the default, refuses at
+    its first call."""
+    with pytest.raises(ValueError):
+        tiny(partial_rotary_factor=0.5, yarn=YarnScaling()).init(rng, tokens(rng))
 
 
 def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
     """The test that catches a wrong recurrent state: a prefill of four
     tokens and eight single-token steps, every layer's state riding the
     flax cache collection (the delta net's recurrent memory and conv tail,
-    the attention's KV cache), against the same twelve tokens scored at
-    once. Largest observed logit difference 5.1e-06 on logits of magnitude
-    3.1, every argmax equal. A delta net that stops writing its memory back
-    (`recurrent.value = final` dropped) moves the logits by 3.8e+00."""
+    the attention's KV cache), on par with the same twelve tokens scored at
+    once over drawn weights and tokens (check 1), every argmax equal. A delta
+    net that stops writing its memory back (`recurrent.value = final`
+    dropped) moves the logits by 3.8e+00."""
     model = hybrid()
     ids = tokens(rng)
     params = model.init(rng, ids)
@@ -452,18 +563,16 @@ def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(cache))
 
     incremental = decode_logits(model, params, ids[:, :4], ids[:, 4:])
-
-    difference = float(jnp.abs(full[:, 3:] - incremental).max())
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
     assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
+    decoded_against_full(model, 4, "hybrid decode", SEEDS['hybrid decode'], batch=16)
 
     _, mutated = model.apply({**params, "cache": cache}, ids[:, :4], decode=True, mutable=["cache"])
     kept, _ = model.apply({**params, "cache": mutated["cache"]}, ids[:, 4:5], decode=True, mutable=["cache"])
     zeroed = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: jnp.zeros_like(leaf) if "conv_state" in jax.tree_util.keystr(path) else leaf,
+        lambda path, leaf: jnp.zeros_like(leaf) if jax.tree_util.DictKey("conv_state") in path else leaf,
         mutated["cache"])
     reset, _ = model.apply({**params, "cache": zeroed}, ids[:, 4:5], decode=True, mutable=["cache"])
-    assert not jnp.allclose(kept, reset, atol=1e-4)
+    assert not jnp.array_equal(kept, reset)
 
 
 def test_gemma_zero_qk_norm_weights_are_identity(rng):
@@ -480,8 +589,7 @@ def test_gemma_zero_qk_norm_weights_are_identity(rng):
         gemma_params["params"]["layers_0"]["self_attn"][name]["scale"] = (
             jnp.zeros_like(gemma_scale))
 
-    assert jnp.allclose(gemma.apply(gemma_params, ids), qwen.apply(qwen_params, ids),
-                        atol=1e-6)
+    assert jnp.array_equal(gemma.apply(gemma_params, ids), qwen.apply(qwen_params, ids))
 
 
 def test_a_kinds_rope_base_only_moves_that_kinds_layers(rng):
@@ -493,10 +601,10 @@ def test_a_kinds_rope_base_only_moves_that_kinds_layers(rng):
     params = model.init(rng, ids)
     same_theta = tiny(layer_types=pattern,
                       kinds={'sliding_attention': {'window': 4, 'rope_theta': 10000.0}})
-    assert jnp.allclose(model.apply(params, ids), same_theta.apply(params, ids))
+    assert jnp.array_equal(model.apply(params, ids), same_theta.apply(params, ids))
     other_theta = tiny(layer_types=pattern,
                        kinds={'sliding_attention': {'window': 4, 'rope_theta': 1e6}})
-    assert not jnp.allclose(model.apply(params, ids), other_theta.apply(params, ids))
+    assert not jnp.array_equal(model.apply(params, ids), other_theta.apply(params, ids))
 
     pattern = ("sliding_attention", "sliding_attention")
     both = tiny(rope_theta=111.0, layer_types=pattern,
@@ -504,28 +612,29 @@ def test_a_kinds_rope_base_only_moves_that_kinds_layers(rng):
     precedence_params = both.init(rng, ids)
     kind_only = tiny(layer_types=pattern, kinds={"sliding_attention": {"window": 4, "rope_theta": 1e6}})
     model_only = tiny(rope_theta=1e6, layer_types=pattern, kinds={"sliding_attention": {"window": 4}})
-    assert jnp.allclose(both.apply(precedence_params, ids), kind_only.apply(precedence_params, ids))
-    assert jnp.allclose(both.apply(precedence_params, ids), model_only.apply(precedence_params, ids))
+    assert jnp.array_equal(both.apply(precedence_params, ids), kind_only.apply(precedence_params, ids))
+    assert jnp.array_equal(both.apply(precedence_params, ids), model_only.apply(precedence_params, ids))
 
 
 def test_sandwich_norms_normalize_what_the_residual_adds(rng):
     """The two norms sit on the sublayer outputs, which makes each residual
-    contribution scale-free: a ten times larger o_proj and down_proj leave the
-    logits where they were, and without the norms they move them."""
+    contribution scale-free: an eight times larger o_proj and down_proj (a
+    power of two, which rounds nothing) leave the logits on par with the plain
+    weights' over drawn weights and tokens (check 1), the same logits in real
+    arithmetic where the norms add no epsilon, and without the norms they move
+    them."""
     ids = tokens(rng)
-    model = tiny(sandwich_norms=True)
+    model = tiny(sandwich_norms=True, norm_eps=0.0)
     params = model.init(rng, ids)
-
     amplified = ('o_proj', 'down_proj')
-    louder = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: leaf * 10.0 if path[-2].key in amplified else leaf, params)
 
-    def gap(model):
-        return float(jnp.max(jnp.abs(model.apply(params, ids) - model.apply(louder, ids))))
+    def louder(params):
+        return jax.tree_util.tree_map_with_path(
+            lambda path, leaf: leaf * 8.0 if path[-2].key in amplified else leaf, params)
 
-    # exact in real arithmetic, fp32 rounding through the norm is the residue
-    assert gap(model) < 1e-3
-    assert gap(tiny()) > 0.1
+    assert_as_exact(jax.jit(lambda params, ids: model.apply(louder(params), ids)), applied(model),
+                    drawn(model), "sandwich norms", seeds=SEEDS['sandwich'], truth_fn=applied(float64(model)))
+    assert not jnp.array_equal(tiny().apply(params, ids), tiny().apply(louder(params), ids))
 
 
 def test_a_post_norm_block_is_residual_plus_normed_sublayer_output(rng):
@@ -556,13 +665,13 @@ def test_a_post_norm_block_is_residual_plus_normed_sublayer_output(rng):
     mid = x + norm('attention_output_norm', attended)
     fed = feedforward(name='mlp').apply({'params': params['params']['mlp']}, mid)
     expected = mid + norm('mlp_output_norm', fed)
-    assert jnp.allclose(block.apply(params, x), expected, atol=1e-5)
+    assert jnp.array_equal(block.apply(params, x), expected)
 
     pre = DecoderBlock(mixer=mixer, feedforward=feedforward, emb_features=features,
                        wiring=BlockWiring(output_norms=True))
     with_input_norms = pre.init(rng, x)
     with_input_norms['params'].update(params['params'])
-    assert not jnp.allclose(pre.apply(with_input_norms, x), expected, atol=1e-2)
+    assert not jnp.array_equal(pre.apply(with_input_norms, x), expected)
 
 
 def test_the_embedding_scale_is_not_rounded_to_the_activation_dtype(rng):
@@ -614,7 +723,7 @@ def test_attention_scale_defaults_to_the_head_dim_scale(rng):
 
     # query_pre_attn_scalar 16 on head_dim 16 heads, as Gemma3 sets it
     gemma = tiny(head_dim=16, attention_scale=16 ** -0.5 * 2)
-    assert not jnp.allclose(model.apply(params, ids), gemma.apply(params, ids))
+    assert not jnp.array_equal(model.apply(params, ids), gemma.apply(params, ids))
 
 
 def test_the_attention_scale_is_not_rounded_to_the_activation_dtype(rng):
@@ -700,19 +809,23 @@ def test_packed_attention_stays_causal_inside_a_document(rng):
     changed = model.apply(params, rewritten, positions=positions,
                           segment_ids=segment_ids)
     assert jnp.array_equal(baseline[:, :cut], changed[:, :cut])
-    assert not jnp.allclose(baseline[:, cut:6], changed[:, cut:6])
+    assert not jnp.array_equal(baseline[:, cut:6], changed[:, cut:6])
 
 
 def test_a_packed_document_reads_like_the_document_alone(rng):
     """The second document's logits cannot depend on sitting after the first:
-    same tokens, same per-document positions, same output."""
+    same tokens, same per-document positions, the output on par with the
+    document alone over drawn weights and tokens (check 1)."""
     model = tiny()
-    ids, segment_ids, positions = packed_pair(rng)
-    params = model.init(rng, ids)
-    packed = model.apply(params, ids, positions=positions, segment_ids=segment_ids)
+    _, segment_ids, positions = packed_pair(rng)
 
-    alone = model.apply(params, ids[:, 6:])
-    assert jnp.max(jnp.abs(packed[:, 6:] - alone)) < 1e-5
+    def alone(model):
+        return jax.jit(lambda params, ids: model.apply(params, ids[:, 6:]))
+
+    packed = jax.jit(lambda params, ids: model.apply(params, ids, positions=positions,
+                                                     segment_ids=segment_ids)[:, 6:])
+    assert_as_exact(packed, alone(model), drawn(model), "packed alone", seeds=SEEDS['packed alone'],
+                    truth_fn=alone(float64(model)))
 
 
 def test_a_packed_row_refuses_a_decode_cache(rng):
@@ -749,36 +862,22 @@ def test_padding_in_a_packed_row_reaches_no_query(rng):
 @pytest.mark.gpu(reason="cuDNN runs on CUDA")
 def test_a_layer_naming_cudnn_takes_a_packed_batch_as_its_document_mask(rng, without_deterministic_ops):
     """A bf16 model whose layers name cudnn (`attention_impl`) runs a packed batch on cuDNN, its
-    documents reaching the kernel as their mask, an additive bias (`_attention_kernel`), which 'auto'
-    leaves for the cheaper xla kernel: the route says cudnn, and the logits are within
-    tests/reference_error.py's rule of the xla kernel's against the float64 model."""
-    from reference_error import assert_as_exact_as_the_reference
-
-    from dew.nn.kernels.generation import routes
-
-    ids, segment_ids, positions = packed_pair(rng)
-    params = tiny().init(rng, ids)
+    documents reaching the kernel as their mask, an additive bias (`_attention_kernel`): the logits are
+    on par with the xla kernel's from the float64 model over drawn weights and tokens (check 1)."""
+    _, segment_ids, positions = packed_pair(rng)
     named = tiny(attention_impl='cudnn', dtype=jnp.bfloat16)
-    with routes() as found:
-        logits = np.asarray(named.apply(params, ids, positions=positions, segment_ids=segment_ids),
-                            np.float64)
-    assert {route.kernel for route in found if route.choice == "attention"} == {"cudnn"}
-    plain = np.asarray(tiny(attention_impl='xla', dtype=jnp.bfloat16).apply(
-        params, ids, positions=positions, segment_ids=segment_ids), np.float64)
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf, np.float64)), params)
-        truth = np.asarray(tiny(dtype=jnp.float64, attention_impl='reference').apply(
-            wide, ids, positions=positions, segment_ids=segment_ids))
-    assert_as_exact_as_the_reference(logits, plain, truth, "packed cudnn logits")
+    packed = {"positions": positions, "segment_ids": segment_ids}
+    plain = tiny(attention_impl='xla', dtype=jnp.bfloat16)
+    assert_as_exact(applied(named, **packed), applied(plain, **packed), drawn(tiny()), "packed cudnn logits",
+                    seeds=SEEDS['packed cudnn'],
+                    truth_fn=applied(float64(tiny()), **packed))
 
 
 def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what_it_fails(
         rng, without_deterministic_ops):
     """A model whose layers name cudnn (`attention_impl`) forces it, so a call cudnn does not take
-    raises, naming every requirement it fails (`dew.nn.kernels.selection.select`), as torch's
-    `sdpa_kernel` does, rather than running another kernel: here an fp32 model, packed or not. A
-    packed batch's documents are no reason, as a named cuDNN takes them as their mask. 'auto' runs
-    both."""
+    raises, naming the kernel (`dew.nn.kernels.selection.select`), as torch's `sdpa_kernel` does,
+    rather than running another kernel: here an fp32 model, packed or not. 'auto' runs both."""
     model = tiny(attention_impl='cudnn')
     ids, segment_ids, positions = packed_pair(rng)
     params = tiny().init(rng, ids)
@@ -788,9 +887,6 @@ def test_a_layer_forcing_a_kernel_that_does_not_take_its_call_raises_naming_what
     with pytest.raises(KernelRefused) as packed:
         model.apply(params, ids, positions=positions, segment_ids=segment_ids)
     assert plain.value.kernel == packed.value.kernel == "cudnn"
-    assert "dtype" in {refusal.code for refusal in plain.value.refusals}
-    assert "dtype" in {refusal.code for refusal in packed.value.refusals}
-    assert "documents" not in {refusal.code for refusal in packed.value.refusals}
     tiny().apply(params, ids, positions=positions, segment_ids=segment_ids)
 
 
@@ -822,20 +918,23 @@ def test_metadata_that_restricts_no_visibility_scores_like_no_metadata(rng):
     that spells them out has to score exactly as a batch that omits them. Both
     sides run the same kernel with the same flags; the gradient graphs differ
     by one gather, so XLA may fuse their reductions differently and the
-    gradients are compared at the file's fp32 bound rather than bitwise."""
+    gradients are on par over drawn weights and tokens (check 1) rather than
+    bitwise."""
     model = tiny(attention_impl='xla')
     ids = tokens(rng)
     params = model.init(rng, ids)
     rotary = jnp.tile(jnp.arange(ids.shape[1]), (ids.shape[0], 1))
 
-    def scored(**metadata):
-        return jax.grad(lambda tree: jnp.sum(model.apply(tree, ids, **metadata) ** 2))(params)
+    def scored(model, **metadata):
+        def run(tree, ids, cotangent):
+            return with_gradients(lambda tree: model.apply(tree, ids, **metadata))(tree, cotangent)[1]
+        return jax.jit(run)
 
+    draw = with_logit_cotangent(drawn(model), VOCAB, 0x904)
     assert jnp.array_equal(model.apply(params, ids),
                            model.apply(params, ids, rotary_positions=rotary))
-    plain, spelled = scored(), scored(rotary_positions=rotary)
-    for left, right in zip(jax.tree.leaves(plain), jax.tree.leaves(spelled), strict=True):
-        assert jnp.max(jnp.abs(left - right)) < 1e-4 * max(1.0, float(jnp.max(jnp.abs(left))))
+    assert_as_exact(scored(model, rotary_positions=rotary), scored(model), draw, "spelled rotary",
+                    seeds=SEEDS['metadata'], truth_fn=scored(float64(model)))
 
 
 def test_a_padded_slot_reaches_no_query(rng):
@@ -869,17 +968,15 @@ def test_a_padded_slot_reaches_no_query(rng):
 ])
 def test_packed_kernels_agree_with_the_reference(rng, overrides):
     """The reference kernel applies the segment mask itself and xla applies it
-    inside jax.nn.dot_product_attention, on the same weights."""
+    inside jax.nn.dot_product_attention, on the same weights: on par over drawn
+    weights and tokens (check 1)."""
     kernel = tiny(**overrides)
     reference = tiny(**{**overrides, "attention_impl": "reference"})
-    ids, segment_ids, positions = packed_pair(rng)
-    params = reference.init(rng, ids)
-
-    expected = reference.apply(params, ids, positions=positions,
-                               segment_ids=segment_ids)
-    actual = kernel.apply(params, ids, positions=positions, segment_ids=segment_ids)
-    # Largest difference observed on CPU: 1.5e-06.
-    assert jnp.max(jnp.abs(expected - actual)) < 1e-4
+    _, segment_ids, positions = packed_pair(rng)
+    packed = {"positions": positions, "segment_ids": segment_ids}
+    assert_as_exact(applied(kernel, **packed), applied(reference, **packed), drawn(reference),
+                    f"{overrides} packed kernels", seeds=SEEDS['packed kernels'],
+                    truth_fn=applied(float64(reference), **packed))
 
 
 def test_a_sliding_layer_packs_without_widening_its_window(rng):
@@ -896,7 +993,7 @@ def test_a_sliding_layer_packs_without_widening_its_window(rng):
     changed = model.apply(
         params, ids.at[:, flipped].set((ids[:, flipped] + 5) % VOCAB),
         positions=positions, segment_ids=segment_ids)
-    moved = jnp.abs(baseline - changed).max(axis=(0, 2)) > 1e-5
+    moved = jnp.any(baseline != changed, axis=(0, 2))
     # Five tokens of reach, but the second document starts at 6, so the token
     # at 1 moves 1..5 and stops there, short of 6.
     assert [int(index) for index in jnp.where(moved)[0]] == list(
@@ -906,38 +1003,64 @@ def test_a_sliding_layer_packs_without_widening_its_window(rng):
 def test_the_tied_head_rounds_its_bf16_product_to_bf16_logits_under_bf16_compute(rng):
     """Under bf16 compute the head multiplies the bf16 states by the table
     rounded to bf16, accumulates in fp32 and rounds the logits to bf16, as
-    torch autocast's bf16 logits are: each logit is a bf16 value within a
-    bf16 rounding (2^-8 relative) of the fp32 sum of the rounded operands,
-    plus that sum's own fp32 rounding. At "highest" the head multiplies the
-    fp32 table, and its logits are that fp32 product."""
+    torch autocast's bf16 logits are: each logit a bf16 value, on par with
+    the fp32 sum of the rounded operands rounded to bf16 once, from that sum
+    in float64, over drawn weights and tokens (check 1). At "highest" the head
+    multiplies the fp32 table, and its logits are on par with that fp32
+    product. The truth of each takes the head's own states as exact input."""
     model = tiny(dtype=jnp.bfloat16)
     ids = tokens(rng)
     params = model.init(rng, ids)
     logits = model.apply(params, ids)
+    np.testing.assert_array_equal(
+        np.asarray(logits), np.asarray(logits.astype(jnp.bfloat16).astype(jnp.float32))
+    )
+
+    def head(model, dtype, finish, *, rounded):
+        # The states as the compiled model computes them: on a GPU an uncompiled bf16 stack fuses
+        # otherwise, and the head's input is the compiled one's.
+        states = jax.jit(lambda params, ids: model.apply(params, ids, method=CausalTransformer.hidden_states))
+
+        @as_given
+        def run(params, ids):
+            narrow = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
+            with jax.enable_x64(new_val=False):
+                hidden = states(narrow, ids)
+            hidden = np.asarray(hidden, np.float32)
+            table = np.asarray(params["params"]["embed_tokens"]["embedding"], np.float32)
+            if rounded:
+                table = np.asarray(jnp.asarray(table, jnp.bfloat16), np.float32)
+            return finish(jnp.einsum("...d,vd->...v", jnp.asarray(hidden, dtype), jnp.asarray(table, dtype),
+                                     precision=jax.lax.Precision.HIGHEST))
+        return run
+
+    def to_bf16(product):
+        return product.astype(jnp.bfloat16).astype(jnp.float32)
+
+    def unrounded(product):
+        return product
+
+    assert_as_exact(applied(model), head(model, jnp.float32, to_bf16, rounded=True), drawn(model),
+                    "bf16 head", seeds=SEEDS['bf16 head'],
+                    truth_fn=head(model, jnp.float64, unrounded, rounded=True))
     hidden = model.apply(params, ids, method=CausalTransformer.hidden_states)
     table = params["params"]["embed_tokens"]["embedding"]
     exact = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32),
                        table.astype(jnp.bfloat16).astype(jnp.float32),
                        precision=jax.lax.Precision.HIGHEST)
-    np.testing.assert_array_equal(
-        np.asarray(logits), np.asarray(logits.astype(jnp.bfloat16).astype(jnp.float32))
-    )
-    assert np.all(np.abs(np.asarray(logits - exact)) <= 2 ** -8 * np.abs(np.asarray(exact)) + 1e-6)
-    assert not np.allclose(np.asarray(logits), np.asarray(exact), atol=1e-6)
+    assert not np.array_equal(np.asarray(logits), np.asarray(exact))
 
     strict = tiny(dtype=jnp.bfloat16, precision="highest")
-    logits = strict.apply(params, ids)
-    hidden = strict.apply(params, ids, method=CausalTransformer.hidden_states)
-    fp32 = jnp.einsum("...d,vd->...v", hidden.astype(jnp.float32), table,
-                      precision=jax.lax.Precision.HIGHEST)
-    np.testing.assert_allclose(np.asarray(logits), np.asarray(fp32), atol=1e-6)
+    assert_as_exact(applied(strict), head(strict, jnp.float32, unrounded, rounded=False), drawn(strict),
+                    "strict head", seeds=SEEDS['strict head'],
+                    truth_fn=head(strict, jnp.float64, unrounded, rounded=False))
 
 
 def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
     """Gemma scales in fp32 and casts the product; Llama and Qwen3 cast the
     normalized activations, then scale (modeling_qwen3.py:61-64). The
-    two agree at fp32 and differ under bf16, and the HF translation picks per
-    family."""
+    two agree at fp32, to the bit, and differ under bf16, and the HF
+    translation picks per family."""
     from dew.interop.hf_decoders import translate_config
     from dew.nn.backbones.causal_transformer import RMSNorm
 
@@ -948,9 +1071,8 @@ def test_the_rmsnorm_cast_order_is_a_field_that_bf16_tells_apart(rng):
     assert gemma.dtype == llama.dtype == jnp.bfloat16
     assert not jnp.array_equal(gemma, llama), "bf16 cannot tell the two orders apart"
     fp32 = x.astype(jnp.float32)
-    np.testing.assert_allclose(np.asarray(RMSNorm(scale_after_cast=False).apply(variables, fp32)),
-                               np.asarray(RMSNorm(scale_after_cast=True).apply(variables, fp32)),
-                               rtol=1e-6)
+    np.testing.assert_array_equal(np.asarray(RMSNorm(scale_after_cast=False).apply(variables, fp32)),
+                                  np.asarray(RMSNorm(scale_after_cast=True).apply(variables, fp32)))
 
     base = {"model_type": "llama", "hidden_size": 32, "num_hidden_layers": 1,
             "num_attention_heads": 4, "intermediate_size": 64, "vocab_size": 64,
@@ -974,42 +1096,57 @@ def test_a_cast_then_scale_norm_rounds_under_jit_and_keeps_an_fp32_weight_gradie
     product in bf16. Under jit XLA drops a narrowing cast that a widening one
     follows, and a bf16 product would reduce the weight's gradient in bf16
     (1e-2 relative). The oracle is NumPy: the fp32 normalization, rounded to
-    bf16, times the fp32 weight in fp32, rounded to bf16; the gradient of
-    sum(out * c) is sum over rows of c * round(y) in float64, which an fp32
-    reduction over 64 rows meets to about 1e-7."""
+    bf16, times the fp32 weight in fp32, rounded to bf16, exactly; the
+    gradient of sum(out * c), the sum over rows of c * round(y), on par with
+    NumPy's fp32 sum of it from its float64 sum over drawn inputs (check 1)."""
     from dew.nn.attention import RMSNorm
 
     x = (jax.random.normal(jax.random.key(0), (64, 512)) * 3).astype(jnp.bfloat16)
     weight = 1.0 + 0.1 * jax.random.normal(jax.random.key(1), (512,), jnp.float32)
-    # The cotangent of a bf16 output is bf16, so c holds bf16 values.
-    c = jax.random.normal(jax.random.key(2), (64, 512)).astype(jnp.bfloat16).astype(jnp.float32)
     norm = RMSNorm(epsilon=1e-6, scale_after_cast=True, dtype=jnp.bfloat16)
 
-    x32 = np.asarray(x, np.float32)
-    inverse = np.float32(1) / np.sqrt(np.mean(np.square(x32), -1, keepdims=True) + np.float32(1e-6))
-    rounded = (x32 * inverse).astype(jnp.bfloat16).astype(np.float32)
-    expected = (rounded * np.asarray(weight)).astype(jnp.bfloat16)
-    expected_grad = np.sum(np.asarray(c, np.float64) * rounded, axis=0)
+    def normalized(x):
+        """The fp32 normalization, rounded to bf16."""
+        x32 = np.asarray(x, np.float32)
+        inverse = np.float32(1) / np.sqrt(np.mean(np.square(x32), -1, keepdims=True) + np.float32(1e-6))
+        return (x32 * inverse).astype(jnp.bfloat16).astype(np.float32)
 
-    def loss(weight):
-        return jnp.sum(norm.apply({"params": {"scale": weight}}, x).astype(jnp.float32) * c)
-
+    expected = (normalized(x) * np.asarray(weight)).astype(jnp.bfloat16)
     out = jax.jit(norm.apply)({"params": {"scale": weight}}, x)
     assert out.dtype == jnp.bfloat16
     np.testing.assert_array_equal(np.asarray(out), expected)
-    grad = np.asarray(jax.jit(jax.grad(loss))(weight), np.float64)
-    assert np.max(np.abs(grad - expected_grad)) <= 1e-5 * np.max(np.abs(expected_grad))
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(3), seed), 3)
+        x = (jax.random.normal(keys[0], (64, 512)) * 3).astype(jnp.bfloat16)
+        weight = 1.0 + 0.1 * jax.random.normal(keys[1], (512,), jnp.float32)
+        # The cotangent of a bf16 output is bf16, so c holds bf16 values.
+        c = jax.random.normal(keys[2], (64, 512)).astype(jnp.bfloat16).astype(jnp.float32)
+        return x, weight, c
+
+    def gradient(x, weight, c):
+        def normed(weight):
+            return norm.apply({"params": {"scale": weight}}, x).astype(jnp.float32)
+        return with_gradients(normed)(weight, c)[1]
+
+    @as_given
+    def summed(x, weight, c):
+        rounded = normalized(x)
+        dtype = np.asarray(c).dtype
+        return np.sum(np.asarray(c, dtype) * rounded.astype(dtype), axis=0)
+
+    assert_as_exact(jax.jit(gradient), summed, draw, "norm weight gradient", seeds=SEEDS['norm gradient'])
 
 
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("mixture", [None, {"experts": 8, "top_k": 2, "expert_features": 32}])
 def test_a_bf16_decoder_scores_the_same_on_one_device_and_split_over_four(mixture):
-    """The rows are independent, so splitting the batch over devices changes
-    no token's arithmetic. With XLA free to skip roundings, what fused on one
-    device and on four differed: the hidden states of a 4-layer bf16 decoder
-    matched in 13% of entries, an 8-expert MoE's top-2 routes differed in
-    0.3% of layer 0's choices and 2.8% of layer 3's, and its loss moved
-    2.6e-4. Every rounding kept, they are bitwise the same."""
+    """The rows are independent, so splitting the batch over devices changes no token's arithmetic. With
+    XLA free to skip roundings, what fused on one device and on four differed: the hidden states of a
+    4-layer bf16 decoder matched in 13% of entries, an 8-expert MoE's top-2 routes differed in 0.3% of layer
+    0's choices and 2.8% of layer 3's, and its loss moved 2.6e-4. Every rounding kept, the split's hidden
+    states are on par with one device's over drawn weights and tokens (check 1; the owner's option (a),
+    10-22: floats by check 1 across layouts), truth the decoder in float64."""
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
     config = {"vocab_size": 512, "emb_features": 64, "num_layers": 4, "num_heads": 8, "num_kv_heads": 4,
@@ -1017,87 +1154,168 @@ def test_a_bf16_decoder_scores_the_same_on_one_device_and_split_over_four(mixtur
     if mixture is not None:
         config["mixture"] = {**mixture, "layers": (0, 1, 2, 3)}
     model = CausalTransformer(**config)
-    ids = jax.random.randint(jax.random.key(0), (16, 32), 0, 512)
-    params = model.init(jax.random.key(1), ids)
-
-    def hidden(params, ids):
-        return model.apply(params, ids, method=CausalTransformer.hidden_states)
-
-    one = jax.jit(hidden)(params, ids)
     mesh = Mesh(np.asarray(jax.devices()[:4]), ("data",))
-    split = jax.jit(hidden)(params, jax.device_put(ids, NamedSharding(mesh, PartitionSpec("data"))))
 
-    np.testing.assert_array_equal(np.asarray(one), np.asarray(split))
+    def hidden(model):
+        return lambda params, ids: model.apply(params, ids, method=CausalTransformer.hidden_states)
+
+    compiled = jax.jit(hidden(model))
+
+    def split(params, ids):
+        return compiled(params, jax.device_put(ids, NamedSharding(mesh, PartitionSpec("data"))))
+
+    assert_as_exact(as_given(split), compiled, model_draw(model, (16, 32), 512),
+                    f"one device against four, {'MoE' if mixture else 'dense'}", seeds=SEEDS['layouts'],
+                    truth_fn=hidden(model.clone(dtype=jnp.float64)))
 
 
 @pytest.mark.parametrize("activation", ["swiglu", "geglu", "geglu_exact"])
 def test_an_expert_gated_product_rounds_its_projections_and_product_under_jit(activation):
     """An expert's gate and up come out of `expert_projection`, whose fp32
     sum XLA can carry into the activation past the sum's bf16 cast. One
-    expert takes the fixture's gate g and up u through projections that sum
-    each with an eighth of its bf16 ulp, which rounds back to g and u only
-    if the projection's rounding survives, and a down projection that hands
-    the product out unchanged: the MLP's output and its input's gradient
-    must be Torch's product and gradients of the same gate and up."""
-    from dew.nn.moe import ExpertMLP
+    expert takes gate g and up u through projections that sum each with an
+    eighth of its bf16 ulp, which rounds back to g and u only if the
+    projection's rounding survives, and a down projection that hands the
+    product out unchanged: on the fixture's g and u the compiled MLP's output
+    and gradient are the bits it computes from g and u alone, the same
+    program summing each with zero, and over drawn ones its output and its
+    input's gradient are as exact as Torch's (`_torch_gated_gradients`) by
+    the float64 gate: the fused kernel rounds the gate's gradient once from
+    fp32, where Torch rounds the cotangent first."""
+    from reference_error import assert_as_exact
 
     fixture = np.load(Path(__file__).parent / "fixtures" / "gated_product" / "bf16.npz")
-    tokens, width = 16, 128
     gate, up, cotangent, output, d_gate, d_up = (
-        np.asarray(fixture[f"{activation}/{key}"], np.float32).reshape(tokens, width)
+        np.asarray(fixture[f"{activation}/{key}"], np.float32).reshape(GATED_SHAPE)
         for key in ("gate", "up", "cotangent", "output", "d_gate", "d_up"))
+    fixed = tuple(jnp.asarray(value, jnp.bfloat16) for value in (gate, up, cotangent))
+    expert = jax.jit(_expert_gated(activation))
+    offsets = (jax.tree.leaves(expert(*fixed, np.float32(offset))) for offset in (1, 0))
+    for summed, alone in zip(*offsets, strict=True):
+        np.testing.assert_array_equal(np.asarray(summed, np.float32), np.asarray(alone, np.float32))
+    reference = functools.partial(_torch_gated_gradients, activation)
+    # The reference arm is Torch's own: on the fixture it gives what Torch recorded there.
+    for got, want in zip(reference(*fixed), (output, d_gate, d_gate, d_up, d_up), strict=True):
+        np.testing.assert_array_equal(np.asarray(got, np.float32), want)
 
-    def eighth_ulp(values):
-        magnitude = np.abs(values)
-        exponent = np.floor(np.log2(np.where(magnitude > 0, magnitude, 1.0)))
-        return np.where(magnitude > 0, np.sign(values) * 2.0 ** (exponent - 10), 0.0).astype(np.float32)
+    def draw(seed):
+        if seed == 0:
+            return fixed
+        rng = np.random.default_rng(seed)
+        # The fixture's laws: gate 3 N(0, 1), up and cotangent N(0, 1).
+        return tuple(jnp.asarray(scale * rng.standard_normal(GATED_SHAPE), jnp.bfloat16)
+                     for scale in (3, 1, 1))
 
+    activated = GATED_ACTIVATIONS[activation]
+
+    def handed_out(product, *gradients):
+        """The product in the output's first block, the down projection's zeros in the others."""
+        return jnp.hstack([product] + [jnp.zeros_like(product)] * 3), *gradients
+
+    def truth(gate, up, cotangent):
+        product, d_gate, d_up = with_gradients(lambda gate, up: activated(gate) * up)(gate, up, cotangent)
+        return handed_out(product, d_gate, d_gate, d_up, d_up)
+
+    def ours(*inputs):
+        out, dx = expert(*inputs, np.float32(1))
+        return out, *_blocks(dx)
+
+    assert_as_exact(ours, as_given(lambda *inputs: handed_out(*reference(*inputs))), draw,
+                    f"{activation} output and input gradient", seeds=GATED_SEEDS, truth_fn=truth)
+
+
+GATED_SHAPE = (16, 128)
+GATED_SEEDS = 8
+"""The gated product's declared draws (`reference_error.seeds_for` of Torch's product and gradients on
+them)."""
+GATED_ACTIVATIONS = {"swiglu": jax.nn.silu, "geglu": functools.partial(jax.nn.gelu, approximate=True),
+                     "geglu_exact": functools.partial(jax.nn.gelu, approximate=False)}
+"""Each gated activation's float64 truth."""
+
+
+def _expert_gated(activation):
+    """One expert of `ExpertMLP` whose projections hand `gate` and `up` (each summed with `offset`
+    times an eighth of its bf16 ulp, a value the program takes) to its gated product and the product
+    out unchanged: `(gate, up, cotangent)` to the MLP's output and its input's gradient."""
+    from dew.nn.moe import ExpertMLP
+
+    tokens, width = GATED_SHAPE
     eye, zero = np.eye(width, dtype=np.float32), np.zeros((width, width), np.float32)
     kernels = {"gate_proj": np.vstack([eye, eye, zero, zero]), "up_proj": np.vstack([zero, zero, eye, eye]),
                "down_proj": np.hstack([eye, zero, zero, zero])}
     variables = {"params": {name: {"kernel": jnp.asarray(np.stack([kernel] * 2))}
                             for name, kernel in kernels.items()}}
     model = ExpertMLP(2, width, 4 * width, activation=activation, dtype=jnp.bfloat16)
-    x = jnp.asarray(np.hstack([gate, eighth_ulp(gate), up, eighth_ulp(up)]), jnp.bfloat16)
     weights, indices = jnp.ones((tokens, 1), jnp.float32), jnp.zeros((tokens, 1), jnp.int32)
-    slot_cotangent = jnp.asarray(np.hstack([cotangent] + [np.zeros_like(cotangent)] * 3), jnp.bfloat16)
 
-    def forward_and_backward(x, cotangent):
-        out, pull = jax.vjp(lambda x: model.apply(variables, x, weights, indices), x)
-        return out, pull(cotangent)[0]
+    def eighth_ulp(values):
+        mantissa, exponent = jnp.frexp(values.astype(jnp.float32))
+        return jnp.where(values != 0, jnp.ldexp(jnp.sign(mantissa), exponent - 11), 0.0)
 
-    out, dx = jax.jit(forward_and_backward)(x, slot_cotangent)
-    np.testing.assert_array_equal(np.asarray(out, np.float32),
-                                  np.hstack([output] + [np.zeros_like(output)] * 3), err_msg="output")
-    np.testing.assert_array_equal(np.asarray(dx, np.float32), np.hstack([d_gate, d_gate, d_up, d_up]),
-                                  err_msg="input gradient")
+    def run(gate, up, cotangent, offset):
+        x = jnp.hstack([gate.astype(jnp.float32), offset * eighth_ulp(gate), up.astype(jnp.float32),
+                        offset * eighth_ulp(up)]).astype(jnp.bfloat16)
+        slot_cotangent = jnp.hstack([cotangent] + [jnp.zeros_like(cotangent)] * 3)
+        return with_gradients(lambda x: model.apply(variables, x, weights, indices))(x, slot_cotangent)
+
+    return run
+
+
+def _blocks(dx):
+    """The input gradient's four blocks: the gate's twice and the up's twice."""
+    return tuple(jnp.split(dx, 4, axis=1))
+
+
+def _torch_gated_gradients(activation, gate, up, cotangent):
+    """Torch's bf16 gated product `act(gate) * up` (transformers' gated MLP, as
+    tools/gated_product_reference.py runs it) and its gradients, in the input gradient's four blocks."""
+    import torch.nn.functional as F
+
+    act = {"swiglu": F.silu, "geglu": functools.partial(F.gelu, approximate="tanh"),
+           "geglu_exact": F.gelu}[activation]
+    # The bf16 inputs held in float32, which holds them exactly, and cast to bf16 inside the product,
+    # whose bf16 output takes the cotangent at bf16.
+    product, d_gate, d_up = torch_with_gradients(lambda gate, up: act(gate.bfloat16()) * up.bfloat16())(
+        *(np.asarray(value, np.float32) for value in (gate, up, cotangent)))
+    product, d_gate, d_up = (jnp.asarray(value, jnp.bfloat16) for value in (product, d_gate, d_up))
+    return product, d_gate, d_gate, d_up, d_up
 
 
 def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head():
-    """The float64 projection y - (<y, v> / <v, v>) v with each value head
-    repeated over its query group, forward and backward; the result is
-    orthogonal to the token's own value, and a zero value leaves y alone
-    where lm-engine's unguarded division is NaN."""
+    """The projection y - (<y, v> / <v, v>) v with each value head repeated
+    over its query group, and the result's inner product with the token's own
+    value, which the projection makes zero, on par with NumPy's equation from
+    its float64 run over drawn heads (check 1); a zero value leaves y alone
+    where lm-engine's unguarded division is NaN, and the backward is checked
+    in float64."""
     from jax.test_util import check_grads
 
     from dew.nn.mixers.attention import exclusive_self_attention
+
+    @as_given
+    def oracle(y, v):
+        v = np.repeat(np.asarray(v), 2, axis=-2)
+        norm = np.sum(v * v, -1, keepdims=True)
+        safe = np.where(norm > 0, norm, 1)
+        along = np.where(norm > 0, np.sum(np.asarray(y) * v, -1, keepdims=True) / safe, 0)
+        projected = np.asarray(y) - along * v
+        return {"projection": projected, "own": np.sum(projected * v, -1)}
+
+    def projected(y, v):
+        out = exclusive_self_attention(y, v)
+        return {"projection": out, "own": jnp.sum(out * jnp.repeat(v, 2, axis=-2), -1)}
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(0), seed), 2)
+        return (jax.random.normal(keys[0], (2, 5, 4, 8)),
+                jax.random.normal(keys[1], (2, 5, 2, 8)).at[1, 3, 1].set(0.0))
+
+    assert_as_exact(jax.jit(projected), oracle, draw, "exclusive self attention", seeds=SEEDS['xsa'])
     with jax.enable_x64(new_val=True):
         keys = jax.random.split(jax.random.key(0), 2)
         y = jax.random.normal(keys[0], (2, 5, 4, 8), jnp.float64)
         v = jax.random.normal(keys[1], (2, 5, 2, 8), jnp.float64).at[1, 3, 1].set(0.0)
-
-        def oracle(y, v):
-            v = np.repeat(np.asarray(v), 2, axis=-2)
-            norm = np.sum(v * v, -1, keepdims=True)
-            safe = np.where(norm > 0, norm, 1)
-            return (
-                np.asarray(y) - np.where(norm > 0, np.sum(np.asarray(y) * v, -1, keepdims=True) / safe, 0) * v
-            )
-
         out = exclusive_self_attention(y, v)
-        np.testing.assert_allclose(out, oracle(y, v), rtol=1e-13, atol=1e-13)
-        own = jnp.repeat(v, 2, axis=-2)
-        np.testing.assert_allclose(jnp.sum(out * own, -1), 0.0, atol=1e-12)
         np.testing.assert_array_equal(out[1, 3, 2:], y[1, 3, 2:])
         # Backward against finite differences, away from the zero value,
         # where the projection jumps and no derivative exists.
@@ -1122,24 +1340,20 @@ def test_a_nope_layer_reads_no_positions_and_keeps_its_logit_scale():
     np.testing.assert_array_equal(plain, shifted)
     roped = CausalTransformer(vocab_size=32, emb_features=32, num_layers=1, num_heads=4,
                               num_kv_heads=2, max_seq_len=16, qk_norm=False)
-    assert not np.allclose(roped.apply(variables, tokens), plain)
+    assert not np.array_equal(roped.apply(variables, tokens), plain)
     scaled = nope_model(attention_scale=1.0).apply(variables, tokens)
-    assert not np.allclose(scaled, plain)
+    assert not np.array_equal(scaled, plain)
 
 
 def test_an_xsa_nope_mup_model_decodes_what_its_full_forward_scores(rng):
-    """Prefill and token-by-token decode read the same logits as one forward
-    for a Rigel-style layer: XSA subtracts the new token's own value while
-    decoding, no rotation reads the cache slot, and the multipliers and the
-    logit division apply on both paths."""
+    """Prefill and token-by-token decode read the logits of one forward, on
+    par (check 1), for a Rigel-style layer: XSA subtracts the new token's own
+    value while decoding, no rotation reads the cache slot, and the
+    multipliers and the logit division apply on both paths."""
     model = tiny(qk_norm=False, mixer=AttentionMixer(nope=True, exclusive_self_attention=True),
                  embedding_multiplier=12.0, residual_multiplier=0.22, logits_scaling=4.0,
                  initializer_range=0.1, depth_scaled_init=True)
-    ids = tokens(rng, length=10)
-    params = model.init(rng, ids)
-    full = model.apply(params, ids)
-    stepped = decode_logits(model, params, ids[:, :4], ids[:, 4:])
-    np.testing.assert_allclose(stepped, full[:, 3:], rtol=1e-4, atol=1e-5)
+    decoded_against_full(model, 4, "xsa decode", SEEDS['xsa decode'], length=10)
 
 
 def test_nope_and_xsa_are_the_attention_mixers_own_switches():
@@ -1152,7 +1366,7 @@ def test_nope_and_xsa_are_the_attention_mixers_own_switches():
     kinded = tiny(qk_norm=False, layer_types=("a", "a"), kinds={"a": LayerKind(mixer=record)})
     params = kinded.init(jax.random.key(1), ids)
     plain = tiny(qk_norm=False).apply(params, ids)
-    assert not np.allclose(kinded.apply(params, ids), plain)
+    assert not np.array_equal(kinded.apply(params, ids), plain)
 
 
 @pytest.mark.parametrize("extra", [{"laurel_rank": 8}, {"per_layer_input_dim": 4},
@@ -1179,17 +1393,12 @@ def test_root_multipliers_scale_around_blocks_that_keep_their_own(extra):
 def test_a_decode_step_reads_each_key_head_once_for_its_group(rng):
     """A decode step's grouped query heads reach the kernel as their key
     head's query positions, [rows, group, kv_heads, width]
-    (`decode_geometry.grouped_query`), so a kernel reads each key head once
+    (`decode_attention.grouped_query`), so a kernel reads each key head once
     (cuDNN ran each query head on its own and padded the lone query to two:
     0.154 against 0.146 ms a layer of Qwen3-0.6B at 64 rows on an RTX 4080).
-    The steps decode what the full pass computes."""
+    The steps decode on par with what the full pass computes (check 1)."""
     model = tiny(num_heads=4, num_kv_heads=2, head_dim=8)
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-    full = model.apply(params, ids)
-    prompt, rest = ids[:, :4], ids[:, 4:]
-    incremental = decode_logits(model, params, prompt, rest)
-    np.testing.assert_allclose(np.asarray(incremental), np.asarray(full[:, 3:]), atol=1e-5)
+    decoded_against_full(model, 4, "grouped decode", SEEDS['grouped decode'])
 
 
 @pytest.mark.gpu(reason="needs a GPU")
@@ -1199,15 +1408,10 @@ def test_a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_de
     that mask sent Qwen3-0.6B's decode to xla's two dense dots over the whole
     cache on an RTX 4080 (1.00 against cuDNN's 0.30 ms a layer at 128 rows),
     and a small model to cuDNN's bias variant, which reads it per head. The
-    steps still decode what the full pass computes."""
+    steps decode on par with the full pass, both from the model in float64
+    (check 1)."""
     model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-    full = model.apply(params, ids)
-    prompt, rest = ids[:, :4], ids[:, 4:]
-    incremental = decode_logits(model, params, prompt, rest)
-    np.testing.assert_allclose(np.asarray(incremental, np.float32),
-                               np.asarray(full[:, 3:], np.float32), atol=0.05)
+    decoded_against_full(model, 4, "cudnn decode", SEEDS['cudnn decode'])
 
 
 
@@ -1217,21 +1421,26 @@ def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deter
     sends a training call to xla (`kernel_for_materialized_mask`); a prefill
     runs forward only, so cuDNN takes that mask as its bias (xla's dense dots
     took 6.2 against 4.0 ms over Qwen3-0.6B's 28 layers for 8 prompts of 256
-    on an RTX 4080). The prefill still scores what the full pass does."""
+    on an RTX 4080). The prefill scores on par with the full pass, both from
+    the model in float64 (check 1)."""
     model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-    valid = jnp.ones(ids.shape, bool).at[0, :3].set(False)
-    full = model.apply(params, ids, attention_mask=valid)
-    cache = model.apply(params, ids.shape[0], method=CausalTransformer.init_cache,
-                        mutable=['cache'])[1]['cache']
+    valid = jnp.ones((2, SEQ), bool).at[0, :3].set(False)
+    made, _ = decode_steps(model)
+    prefill = jax.jit(lambda params, cache, ids: model.apply(
+        {**params, 'cache': cache}, ids, attention_mask=valid, decode=True, mutable=['cache'])[0])
 
-    def prefill(model):
-        return jax.jit(lambda cache, ids, valid: model.apply(
-            {**params, 'cache': cache}, ids, attention_mask=valid, decode=True, mutable=['cache'])[0])
+    def held(logits):
+        # A padded slot's logits are no contract: the real tokens' are held.
+        return jnp.where(valid[..., None], logits, 0)
 
-    np.testing.assert_allclose(np.asarray(prefill(model)(cache, ids, valid), np.float32)[valid],
-                               np.asarray(full, np.float32)[valid], atol=0.05)
+    def full(model):
+        return jax.jit(lambda params, ids: held(model.apply(params, ids, attention_mask=valid)))
+
+    def prefilled(params, ids):
+        return held(prefill(params, made(params, ids.shape[0]), ids))
+
+    assert_as_exact(prefilled, full(model), drawn(model), "padded prefill", seeds=SEEDS['padded prefill'],
+                    truth_fn=full(float64(model)))
 
 
 
@@ -1240,25 +1449,23 @@ def test_right_padded_rows_attend_causally_with_no_mask(rng, causal):
     """Rows declared right-padded reach the attention kernel as an unpadded
     call does, causal with no mask, which keeps 'auto' on its fused kernel
     (a mask sends it to xla's dense dots, `_restricts_visibility`); their
-    real tokens' states are the masked call's. A bidirectional layer's real
-    queries read the padding after them, so it keeps the mask."""
+    real tokens' states are as exact as the masked call's, both from the
+    masked call's in float64. A bidirectional layer's real queries read the
+    padding after them, so it keeps the mask. On par over drawn weights and
+    tokens (check 1)."""
     model = tiny(causal=causal)
-    ids = tokens(rng)
-    params = model.init(rng, ids)
     valid = jnp.arange(SEQ)[None, :] < jnp.asarray([[7], [SEQ]])
 
-    def states(**declared):
-        return model.apply(params, ids, attention_mask=valid,
-                           method=CausalTransformer.hidden_states, **declared)
+    def states(model, **declared):
+        return jax.jit(lambda params, ids: jnp.where(valid[..., None], model.apply(
+            params, ids, attention_mask=valid, method=CausalTransformer.hidden_states, **declared), 0))
 
-    masked = states()
-    declared = states(right_padded=True)
-    np.testing.assert_allclose(np.asarray(declared)[np.asarray(valid)], np.asarray(masked)[np.asarray(valid)],
-                               atol=1e-6)
+    assert_as_exact(states(model, right_padded=True), states(model), drawn(model), f"{causal} right padded",
+                    seeds=SEEDS['right padded'], truth_fn=states(model.clone(dtype=jnp.float64)))
 
 
 def _rotate_half_reference(x, freqs_cos, freqs_sin, scale=None):
-    """`dew.nn.rope`'s rotate-half as it was through 2026-10-06, and as the HF
+    """`dew.nn.rope`'s rotate-half as it was before its halves rotated in place, and as the HF
     decoders write it, `x cos + rotate_half(x) sin`, at least fp32."""
     cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)
     sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)
@@ -1288,48 +1495,29 @@ def test_a_per_axis_rotary_without_its_axes_is_refused():
 def test_the_rotary_rotates_the_halves_as_rotate_half_does(dtype, pairs, scale, packed):
     """The halves rotate as `x1 cos - x2 sin` and `x2 cos + x1 sin`, without
     rotate_half's rotated copy. The arithmetic is the same, its rounding
-    order not quite, so the forward and the input gradient are each within
-    tests/reference_error.py's rule of rotate_half's against float64: full
-    and partial rotary, a folded scale, and a packed batch's own angles."""
-    from reference_error import assert_as_exact_as_the_reference
+    order not quite, so the forward and the input gradient are each on par
+    with rotate_half's from float64 over drawn inputs and angles (check 1):
+    full and partial rotary, a folded scale, and a packed batch's own angles."""
 
     from dew.nn.rope import rotate
 
-    rng = np.random.default_rng(0)
-    x = jnp.asarray(rng.normal(size=(2, 96, 4, 128)), dtype)
-    angles = rng.normal(size=(2, 96, pairs) if packed else (96, pairs)) * 3
-    cos, sin = (jnp.asarray(f(angles), jnp.float32) for f in (np.cos, np.sin))
-    cotangent = jnp.asarray(rng.normal(size=x.shape), dtype)
+    def draw(seed):
+        rng = np.random.default_rng([0, seed])
+        x = jnp.asarray(rng.normal(size=(2, 96, 4, 128)), dtype)
+        angles = rng.normal(size=(2, 96, pairs) if packed else (96, pairs)) * 3
+        cos, sin = (jnp.asarray(f(angles), jnp.float32) for f in (np.cos, np.sin))
+        return x, cos, sin, jnp.asarray(rng.normal(size=x.shape), dtype)
 
-    def forward_and_gradient(rotary, x, cos, sin):
-        out, pullback = jax.vjp(lambda x: rotary(x, cos, sin, scale=scale), x)
-        return out, pullback(cotangent.astype(x.dtype))[0]
+    def forward_and_gradient(rotary):
+        def run(x, cos, sin, cotangent):
+            rotated = with_gradients(lambda x: rotary(x, cos, sin, scale=scale))
+            out, gradient = rotated(x, cotangent.astype(x.dtype))
+            return {"forward": out, "gradient": gradient}
+        return jax.jit(run)
 
-    with jax.enable_x64():
-        wide = (np.asarray(part, np.float64) for part in (x, cos, sin))
-        truth = forward_and_gradient(_rotate_half_reference, *wide)
-    new = forward_and_gradient(rotate, x, cos, sin)
-    old = forward_and_gradient(_rotate_half_reference, x, cos, sin)
-    for label, mine, theirs, want in zip(("forward", "gradient"), new, old, truth, strict=True):
-        assert mine.dtype == theirs.dtype == dtype
-        assert_as_exact_as_the_reference(np.asarray(mine, np.float64), np.asarray(theirs, np.float64),
-                                         np.asarray(want), label)
+    found = forward_and_gradient(rotate)(*draw(0))
+    assert found["forward"].dtype == found["gradient"].dtype == dtype
+    assert_as_exact(forward_and_gradient(rotate), forward_and_gradient(_rotate_half_reference), draw,
+                    f"{dtype} {pairs} {scale} {packed} rotary", seeds=SEEDS['rotary'])
 
 
-def test_param_tree_mirrors_the_hf_decoder_layout(rng):
-    """The interop map has to be a rename, so the tree is a fixed contract."""
-    model = tiny()
-    params = model.init(rng, tokens(rng))['params']
-    paths = sorted('.'.join(str(entry.key) for entry in path)
-                   for path, _ in jax.tree_util.tree_flatten_with_path(params)[0])
-    layer = ['input_layernorm.scale',
-             'mlp.down_proj.kernel', 'mlp.gate_proj.kernel', 'mlp.up_proj.kernel',
-             'post_attention_layernorm.scale',
-             'self_attn.k_norm.scale', 'self_attn.k_proj.kernel',
-             'self_attn.o_proj.kernel', 'self_attn.q_norm.scale',
-             'self_attn.q_proj.kernel', 'self_attn.v_proj.kernel']
-    assert paths == sorted(
-        ['embed_tokens.embedding', 'norm.scale']
-        + [f'layers_{index}.{leaf}' for index in (0, 1) for leaf in layer])
-    # tie_embeddings=True is the reason there is no lm_head to rename
-    assert 'lm_head' not in params

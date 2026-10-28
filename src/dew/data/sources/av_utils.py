@@ -13,7 +13,7 @@ import subprocess
 import numpy as np
 
 FPS = 25.0
-"""The rate `VideoData` samples clips at."""
+"""The frame rate a clip is read at where none is asked for (`video.DecodeVideo`)."""
 
 
 def media_info(path: str) -> tuple[float, bool, bool]:

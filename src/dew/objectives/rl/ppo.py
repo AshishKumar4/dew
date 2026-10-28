@@ -1,18 +1,23 @@
 """PPO with a separate trainable critic, clipped value loss and episode GAE."""
 
+import contextlib
 import math
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 
-from dew.coordination import agreed, from_every_process
+from dew._coordination import agreed, from_every_process
+from dew.batch import Batch, Variables, part
+from dew.distributed.batches import shard_batch
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
+from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import HiddenStates
 from dew.objectives.base import (
     OMITTED,
@@ -24,20 +29,19 @@ from dew.objectives.base import (
     Ratio,
     Shown,
     Step,
-    Variables,
     joined,
-    part,
     projected_draw,
     projected_parts,
 )
+from dew.objectives.routing import ExpertBalance, RoutedStatistics
 from dew.rl.advantage import gae_advantages, masked_whiten
 from dew.rl.surrogate import clipped_value_loss_terms
 from dew.sampling.text import Generation, Sampling
-from dew.training.distributed import shard_batch
-from dew.training.state import TrainState
+from dew.state import TrainState
 
-from .episodes import EpisodeInference, EpisodeRollout
+from .episodes import EpisodeCollector, EpisodeInference
 from .grpo import GRPOObjective, onto_ids
+from .scheduler import RolloutScheduler, SchedulerRecord, Synchronous, task_ids
 from .sessions import (
     ADVANTAGES_KEY,
     CALL_INDEX_KEY,
@@ -46,14 +50,19 @@ from .sessions import (
     RESPONSE_MASK_KEY,
     SEGMENT_IDS_KEY,
     SESSION_INDEX_KEY,
+    TOKEN_REWARDS_KEY,
 )
+
+if TYPE_CHECKING:
+    from dew.objectives.base import SavedTask, Task
 
 OLD_VALUES_KEY = "old_values"
 RETURNS_KEY = "returns"
 
 
 class ValueHead(nn.Module):
-    """Projects a decoder's hidden states to one float32 value per position.
+    """Projects a decoder's hidden states to one value per position, at least float32: a bf16 or
+    float32 backbone's in float32, a float64 twin's in float64.
 
     Packed rows pass their chains' `segment_ids` and `positions`, so no
     hidden state sees another chain.
@@ -73,7 +82,7 @@ class ValueHead(nn.Module):
         hidden = self.backbone.hidden_states(
             tokens, train=False, segment_ids=segment_ids, positions=positions
         )
-        return Dense(1, dtype=jnp.float32, name="value")(hidden)[..., 0]
+        return Dense(1, dtype=at_least_fp32(hidden.dtype), name="value")(hidden)[..., 0]
 
 
 @dataclass(frozen=True)
@@ -90,9 +99,10 @@ class _Policy:
 
 @struct.dataclass
 class PPOStatistics:
-    """The actor's loss statistics and the critic's independently normalized value error."""
+    """The actor's loss statistics, with the router terms its policy adds where it balances, and the
+    critic's independently normalized value error."""
 
-    actor: Ratio
+    actor: Ratio | RoutedStatistics
     critic: Ratio
 
 
@@ -104,10 +114,11 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
     at unit decay, tracks only the policy leaves. Rollout targets are
     detached.
 
-    The policy is a `GRPOObjective` built from `model`, `seq_len` and the
-    remaining keyword arguments, so its aggregation, sequence masks, `beta`
-    and clip settings work as they do there. The critic always averages
-    over the response tokens, independently of the actor's weighting.
+    The policy is a `GRPOObjective` built from `model`, `seq_len`, `balance` and the remaining keyword
+    arguments, so its aggregation, sequence masks, `beta` and clip settings work as they do there.
+    `balance` (`ExpertBalance`, `dew.objectives.routing`) is named here rather than left to
+    `policy_options`, so a run's record and its flags read it as the `ExpertBalance` it is. The critic
+    always averages over the response tokens, independently of the actor's weighting.
     `value_coefficient` weights verl's half-squared, clipped value error, and
     `value_clip` is that error's clip range.
 
@@ -122,15 +133,16 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
 
     saved_task = TextGeneration
     settings = TextSettings
-    _ema_is_reference = True
+    ema_is_reference = True
     _model_part = "policy"
 
     def __init__(self, model, seq_len: int, *, critic: nn.Module,
-                 value_coefficient: float = .5, value_clip: float = .2, **policy_options):
+                 value_coefficient: float = .5, value_clip: float = .2,
+                 balance: ExpertBalance | None = None, **policy_options):
         for name, value in (("value_coefficient", value_coefficient), ("value_clip", value_clip)):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{name} must be finite and nonnegative")
-        self.actor = GRPOObjective(model, seq_len, **policy_options)
+        self.actor = GRPOObjective(model, seq_len, balance=balance, **policy_options)
         self.critic, self.seq_len = critic, seq_len
         self.value_coefficient, self.value_clip = value_coefficient, value_clip
         self.inputs = self.actor.inputs
@@ -145,6 +157,10 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         *actor, self.critic = modules
         self.actor.substitute(actor)
+
+    def row_tokens(self, batch: Batch) -> int | None:
+        """The actor's tokens a row, of the rows the actor and the critic both read."""
+        return self.actor.row_tokens(batch)
 
     def projected(self, params: Variables, *, updated: bool) -> Variables:
         """The actor's projection of the policy's tree, and the critic's of its own."""
@@ -185,12 +201,13 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         return self.actor.recorded_model()
 
     def build_task(self, variables: Variables, *,
-                   processor: Processor | None | Omitted = OMITTED) -> TextGeneration:
-        """Return the trained actor as a `TextGeneration`, without the critic or the frozen KL reference."""
+                   processor: Processor | None | Omitted = OMITTED) -> "Task | SavedTask":
+        """Return the trained actor's task, its `TextGeneration`, without the critic or the frozen KL
+        reference."""
         return self.actor.build_task(part(variables, "policy"), processor=processor)
 
     def values(self, variables: Variables, batch: Mapping[str, object]) -> jax.Array:
-        """Return the critic's float32 value of each packed id's prefix, placed by `onto_ids`.
+        """Return the critic's value of each packed id's prefix, at least float32, placed by `onto_ids`.
 
         A critic that does not return one value per input position raises
         `ValueError`.
@@ -208,10 +225,10 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         qk = None
         if qk_stats:
             values, gathered = values
-            qk = gathered.get("qk")
+            qk = gathered.get("qk", {})
         if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
-        return onto_ids(batch, values.astype(jnp.float32)), qk
+        return onto_ids(batch, values.astype(at_least_fp32(values.dtype))), qk
 
     def loss(self, variables: Variables, batch, step: Step) -> tuple[PPOStatistics, Aux[Variables]]:
         """Return independent statistics for the actor and the clipped value error.
@@ -219,13 +236,13 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         The batch must hold `old_values` and `returns` from the rollout,
         aligned with `response_mask`, or the loss raises `ValueError`.
         """
-        for field in (OLD_VALUES_KEY, RETURNS_KEY):
-            if field not in batch or jnp.shape(batch[field]) != jnp.shape(batch[RESPONSE_MASK_KEY]):
-                raise ValueError(f"PPO requires response-aligned {field} from the rollout")
+        for column in (OLD_VALUES_KEY, RETURNS_KEY):
+            if column not in batch or jnp.shape(batch[column]) != jnp.shape(batch[RESPONSE_MASK_KEY]):
+                raise ValueError(f"PPO requires response-aligned {column} from the rollout")
         policy_step = replace(step, ema=None if step.ema is None else part(step.ema, "policy"))
         pg, aux = self.actor.loss(part(variables, "policy"), batch, policy_step)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
-        values, critic_qk = self._critic_scores(variables, batch, qk_stats=self.actor.qk_stats)
+        values, critic_qk = self._critic_scores(variables, batch, qk_stats=step.qk_stats)
         terms = clipped_value_loss_terms(values, jnp.asarray(batch[RETURNS_KEY]),
                                          jnp.asarray(batch[OLD_VALUES_KEY]), self.value_clip)
         critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), jnp.sum(mask))
@@ -233,16 +250,22 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         qk = None if aux.qk_stats is None else {"policy": aux.qk_stats}
         if critic_qk is not None:
             qk = {**(qk or {}), "critic": critic_qk}
-        return PPOStatistics(pg, critic), Aux(metrics, qk_stats=qk)
+        return PPOStatistics(pg, critic), Aux(metrics, qk_stats=qk, effects=aux.effects)
 
     def reduce_loss(self, stats: PPOStatistics | Ratio) -> tuple[jax.Array, jax.Array]:
         """Combine the independently normalized actor and weighted critic losses, or the validation NLL."""
         if isinstance(stats, Ratio):
             return stats.mean()
-        actor, _ = stats.actor.mean()
+        actor, actor_active = self.actor.reduce_loss(stats.actor)
         critic, _ = stats.critic.mean()
-        support = stats.actor.mass + self.value_coefficient * stats.critic.mass
-        return actor + self.value_coefficient * critic, support > 0
+        critic_active = self.value_coefficient * stats.critic.mass > 0
+        return actor + self.value_coefficient * critic, actor_active | critic_active
+
+    def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
+        """The policy's router counts applied (`GRPOObjective.apply_effects`), in the policy's own
+        collections and the critic's left as they are."""
+        policy = self.actor.apply_effects(part(variables, "policy"), effects)
+        return {name: {**variables[name], "policy": tree} for name, tree in policy.items()}
 
     def validation_loss(self, variables: Variables, batch, step: Step):
         """Score source prompts under the live actor, without rollout targets or the critic."""
@@ -266,16 +289,21 @@ def _over_processes(moments: jax.Array) -> jax.Array:
 
 @dataclass(frozen=True)
 class PPORollout:
-    """Collects episodes, then adds critic baselines and targets from verl's masked GAE.
+    """Collects episodes through `rollout`, then adds critic baselines and targets from verl's masked GAE.
 
-    GAE runs across the action tokens of all turns in one episode, wherever
-    the packer placed them. Tool observations and padding are outside the
-    mask, so they get no targets. Each step reward the environment paid
-    (`Observation.reward`) goes on the last action id of the call it paid
-    for, and the verifier's terminal reward on the episode's last action,
-    with no bootstrap value after it, which matches the input convention of
-    the pinned verl GAE. The packer masks truncated episodes, so they take
-    no targets either.
+    `episodes` collects `groups` episodes of each task through the
+    rollout scheduler (`RolloutScheduler`, `Synchronous`), its policy
+    `objective.policy({})`, which binds each step's policy subtree; `log`
+    receives the scheduler's record of each call. GAE runs across the
+    action tokens of all turns in one episode, wherever the packer placed
+    them. Tool observations and padding are
+    outside the mask, so they get no targets. The rewards are the packed
+    `token_rewards`: each step reward the environment paid
+    (`Observation.reward`) on the last action id of the call it paid for,
+    and the verifier's terminal reward on the episode's last action, with no
+    bootstrap value after it, which matches the input convention of the
+    pinned verl GAE. The packer masks truncated episodes, so they take no
+    targets either.
 
     A cohort with no trainable token at all returns zero targets and zero
     mass. A cohort with a single trainable token raises `ValueError`,
@@ -287,22 +315,40 @@ class PPORollout:
     """
 
     objective: PPOObjective
-    episodes: EpisodeRollout
+    episodes: EpisodeCollector
+    groups: int = 2
     gamma: float = 1.
     lam: float = .95
+    log: Callable[[SchedulerRecord], None] | None = None
+    rollout: RolloutScheduler = field(init=False)
 
     def __post_init__(self) -> None:
         if any(not math.isfinite(value) or not 0 <= value <= 1 for value in (self.gamma, self.lam)):
             raise ValueError("PPO gamma and lam must be finite values in [0, 1]")
-        if self.objective.seq_len != self.episodes.max_prompt_tokens + self.episodes.max_new_tokens - 1:
+        if self.objective.seq_len != self.episodes.width - 1:
             raise ValueError("PPO objective and episode token budgets must agree")
+        object.__setattr__(self, "rollout", RolloutScheduler(Synchronous(self.episodes), groups=self.groups,
+                                                             log=self.log))
+
+    @property
+    def metrics(self) -> Mapping[str, float]:
+        return self.rollout.metrics
+
+    @property
+    def shown(self) -> Mapping[str, Shown]:
+        return self.rollout.shown
+
+    def branch(self, name: str) -> contextlib.AbstractContextManager[None]:
+        """The cooldown branch `name`'s calls (`dew.training.rollout`), as its scheduler draws them
+        (`RolloutScheduler.branch`)."""
+        return self.rollout.branch(name)
 
     def _order(self, batch: Mapping[str, np.ndarray], count: int) -> np.ndarray:
         """Per episode, the flat packed positions of its action ids in the order they were drawn.
 
-        `[episodes, max_turns * max_new_tokens]`, padded with -1. A call's
-        ids sit in one chain in order, so sorting by call then position
-        reads an episode's actions across its chains and rows.
+        `[episodes, max_turns * max_new_tokens]`, padded with -1. A call's ids
+        sit in one chain in order, so sorting by call then position reads an
+        episode's actions across its chains and rows.
         """
         mask = np.asarray(batch[RESPONSE_MASK_KEY]).reshape(-1) != 0
         owner = np.asarray(batch[SESSION_INDEX_KEY]).reshape(-1)
@@ -315,30 +361,21 @@ class PPORollout:
             order[episode, :mine.size] = mine
         return order
 
-    def _targets(self, values: np.ndarray, batch: Mapping[str, np.ndarray], rewards: np.ndarray,
-                 steps: Sequence[Sequence[float | None]]) -> dict[str, np.ndarray]:
+    def _targets(self, values: np.ndarray, batch: Mapping[str, np.ndarray],
+                 count: int) -> dict[str, np.ndarray]:
         """Run verl's masked GAE over each episode's actions, then whiten over every process.
 
-        Each episode's call `c` with a step reward `steps[episode][c]` has it on
-        its last action id, and the episode's reward lands on its last action
-        id; GAE runs across the actions of all its turns at once. Whitening
-        reads the global action count and moments, as it did over one device
-        batch.
+        GAE runs across the actions of all an episode's turns at once, on
+        the packed `token_rewards`. Whitening reads the global action count
+        and moments, as it did over one device batch.
         """
-        order = self._order(batch, rewards.shape[0])
+        order = self._order(batch, count)
         keep = order >= 0
         flat = values.reshape(-1)
-        baselines = np.where(keep, flat[np.maximum(order, 0)], 0).astype(np.float32)
-        last = np.where(keep.any(axis=1), keep.shape[1] - 1 - np.argmax(keep[:, ::-1], axis=1), -1)
-        token_rewards = np.zeros_like(baselines)
-        calls = np.where(keep, np.asarray(batch[CALL_INDEX_KEY]).reshape(-1)[np.maximum(order, 0)], -1)
-        for episode, paid in enumerate(steps):
-            for call, reward in enumerate(paid):
-                ids = np.flatnonzero(calls[episode] == call)
-                if reward is not None and ids.size:
-                    token_rewards[episode, ids[-1]] += reward
-        scored = last >= 0
-        token_rewards[scored, last[scored]] += rewards[scored]
+        placed = np.maximum(order, 0)
+        baselines = np.where(keep, flat[placed], 0).astype(np.float32)
+        token_rewards = np.where(keep, np.asarray(batch[TOKEN_REWARDS_KEY]).reshape(-1)[placed], 0
+                                 ).astype(np.float32)
         raw = np.asarray(gae_advantages(jnp.asarray(token_rewards), jnp.asarray(baselines),
                                         jnp.asarray(keep, jnp.float32), self.gamma, self.lam))
         returns = raw + baselines
@@ -355,8 +392,8 @@ class PPORollout:
         self, state: TrainState, batch: Mapping[str, object], key: jax.Array
     ) -> dict[str, np.ndarray]:
         """Collect one cohort of episodes and return its packed rows with critic targets."""
-        episodes = self.episodes.collect(state, batch, key)
-        projected = agreed("PPO episode projection", lambda: self.episodes.project(episodes))
+        projected = self.rollout(state, batch, key)
+        episodes = len(task_ids(batch)) * self.groups
         count = sum(from_every_process(min(2, int(np.count_nonzero(projected[RESPONSE_MASK_KEY])))))
         if int(count) == 0:
             # Every episode was masked (truncated): zero mass, so the step makes no update.
@@ -370,8 +407,4 @@ class PPORollout:
         )
         critic = self.objective.program("values", self.objective.values)
         values = agreed("PPO critic values", lambda: local_rows(critic(state.variables, device)))
-        rewards = np.asarray(
-            [0.0 if episode.reward is None else episode.reward for episode in episodes], np.float32
-        )
-        steps = [[turn.observation.reward for turn in episode.transitions] for episode in episodes]
-        return {**projected, **self._targets(np.asarray(values), projected, rewards, steps)}
+        return {**projected, **self._targets(np.asarray(values), projected, episodes)}

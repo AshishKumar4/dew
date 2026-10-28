@@ -16,18 +16,20 @@ from __future__ import annotations
 import enum
 import functools
 import math
+import zlib
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from collections.abc import Callable, Hashable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
-    Any,
     ClassVar,
     Generic,
     Literal,
     NamedTuple,
+    NotRequired,
     Protocol,
     Self,
+    TypedDict,
     runtime_checkable,
 )
 
@@ -39,11 +41,15 @@ from flax import struct
 from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
+from dew._distributions import counter_key
+from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
-from dew.nn.kernels.options import compiler_options
-from dew.nn.precision import compensated_sum
+from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
+from dew.nn import categorical
+from dew.nn.kernels.options import Held, Option, compiler_options
+from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.protocols import HiddenStates, ProjectsParameters
-from dew.records import JSON, strings
+from dew.nn.sharding import rows_taken
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -53,36 +59,18 @@ if TYPE_CHECKING:
 
     from dew.data.pipeline import DeviceStep, ObjectiveData
     from dew.data.text import Tokenizer
-    from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
+    from dew.distributed.placement import Layout, MeshSpec
+    from dew.inference.images import TextToImage
+    from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, SavedRun, TextGeneration
     from dew.inputs import InputSpec
     from dew.nn.autoencoders import AutoEncoder
     from dew.nn.backbones.decoder_stack import DecoderBank
     from dew.sampling.guidance import Guidance
-    from dew.sampling.pipelines import TextToImage
-    from dew.training.distributed import Layout, MeshSpec
-    from dew.training.state import TrainState
+    from dew.state import TrainState
 
     type Task = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
 
-type Variables = Mapping[str, Any]
-"""A Flax variables dict: the `params` collection plus any other collection
-the modules keep (`moe`, `batch_stats`, an objective's frozen encoders)."""
 
-type Batch = Mapping[str, Any]
-"""One batch of training examples, as the trainer and every objective read it.
-
-It is declared here and imported by `dew.data.dataset`, so a field added on
-one side has the same type on the other. The values are not all arrays.
-Besides the arrays a step consumes, a batch can hold the prepared text inputs
-of a language run, the file paths a video corpus loads lazily, the integer
-row counts a packer keeps and the record lists a mixture reads. A narrower
-value type would be wrong about what `dew.data` already builds."""
-type Path = tuple[str, ...]
-type PathFilter = Callable[[Path], bool]
-"""A function that selects leaves of a variables tree by the tuple of dict keys above them.
-
-One filter type is used for the EMA selection, for `optax.multi_transform`
-labels and for frozen subtrees."""
 type Initializer = Partial
 """An objective's `init` with its held variables bound as `Partial` children,
 which a JIT takes as arguments (`Objective.initializer` says why)."""
@@ -112,8 +100,149 @@ class Ratio:
         return jnp.where(active, value, 0), active
 
 
+@struct.dataclass
+class Weighted:
+    """A loss of several terms, each a `Ratio` normalized by its own mass, summed with `weights`:
+    `sum_i weight_i * term_i.mean()`, which has mass where any term of nonzero weight has.
+
+    Each term sums across microbatches and devices as a `Ratio` does, so every term is its mean over the
+    whole update before the weights combine them (`Objective.reduce_loss`).
+    """
+
+    terms: tuple[Ratio, ...]
+    weights: tuple[float, ...] = struct.field(pytree_node=False)
+
+    def mean(self) -> tuple[jax.Array, jax.Array]:
+        """Return the weighted sum of the terms' means, and whether any term of nonzero weight has mass."""
+        means = [(weight, *term.mean()) for weight, term in zip(self.weights, self.terms, strict=True)]
+        value = functools.reduce(jnp.add, [weight * mean for weight, mean, _ in means])
+        active = functools.reduce(jnp.logical_or, [active for weight, _, active in means if weight != 0],
+                                  jnp.asarray(a=False))
+        return value, active
+
+
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
+
+
+@dataclass(eq=False)
+class Recorder:
+    """What a loss's `Step.sample` and `Step.boundary` calls produced, by name, each with the examples
+    (`Step.example_index`) its rows are: what one run records for others to replay (`Step.tape`). It
+    records concrete values, a loss run outside `jax.jit`; a jitted step records through the trainer's
+    `record`."""
+    values: dict[str, list[tuple[np.ndarray, np.ndarray]]] = field(default_factory=dict)
+    kinds: dict[str, str] = field(default_factory=dict)
+
+    def record(self, kind: str, name: str, examples: jax.Array, value: jax.Array) -> None:
+        """Keep `value`, a `kind` ("sample" or "boundary") named `name`. A name is one kind and holds
+        each example once, as a tape replays it by name and example alone."""
+        if self.kinds.setdefault(name, kind) != kind:
+            raise ValueError(f"{name!r} is recorded as a {self.kinds[name]} and as a {kind}: a tape "
+                             "replays a name as one value")
+        places = np.asarray(examples)
+        held = [np.asarray(index) for index, _ in self.values.get(name, ())]
+        if held and np.intersect1d(np.concatenate(held), places).size:
+            raise ValueError(f"{name!r} is recorded twice for an example: a tape holds one value each")
+        self.values.setdefault(name, []).append((places, np.asarray(value)))
+
+    def tape(self, examples: int) -> dict[str, np.ndarray]:
+        """Every recorded name's values placed at their examples, of `examples` in all: a `Step.tape`.
+        Raises `ValueError` for a name not recorded for every example."""
+        def placed(name, records):
+            first = records[0][1]
+            tape = np.zeros((examples, *first.shape[1:]), first.dtype)
+            seen = np.zeros(examples, bool)
+            for index, value in records:
+                tape[index], seen[index] = value, True
+            if not seen.all():
+                raise ValueError(f"{name!r} is recorded for {int(seen.sum())} of the {examples} examples")
+            return tape
+
+        return {name: placed(name, records) for name, records in self.values.items()}
+
+
+RECORD = "record/"
+"""The prefix of the metrics under which a recording step (`Trainer(record=True)`) returns what its
+evaluations' `Step.sample` and `Step.boundary` calls produced, one array each (`recorded_metrics`),
+which `taken_record` reads back as a `Recorded`."""
+
+
+class Evaluated(TypedDict):
+    """One evaluation's record (`Witness.report`): each kept value by name, `[rows, ...]`, the places
+    of its rows (`Step.example_index`), and the trainer column the loss saw (`EXAMPLE_ROWS`), where
+    its batch carried one."""
+    values: dict[str, jax.Array]
+    example_index: jax.Array
+    column: NotRequired[jax.Array]
+
+
+class Recorded(TypedDict):
+    """A recording step's record (`transaction.recorded`): its evaluations' values by name and places
+    stacked on a first axis, whether each row's place is the one its slot and column give it
+    (`column_ok`), and which evaluations ran (`evaluated`)."""
+    values: dict[str, jax.Array]
+    example_index: jax.Array
+    column_ok: jax.Array
+    evaluated: jax.Array
+
+
+def recorded_metrics(record: Recorded) -> dict[str, jax.Array]:
+    """`record` as a step's metrics, one array each under `RECORD`, as a compiled step returns them."""
+    fields = {f"{RECORD}{name}": record[name] for name in ("example_index", "column_ok", "evaluated")}
+    return {**fields, **{f"{RECORD}values/{name}": value for name, value in record["values"].items()}}
+
+
+def taken_record(metrics: Mapping[str, jax.Array]) -> tuple[Recorded | None, dict[str, jax.Array]]:
+    """A step's record read back from its `metrics` (`recorded_metrics`), None for a step that
+    records nothing, and the metrics without it."""
+    rest = {name: value for name, value in metrics.items() if not name.startswith(RECORD)}
+    if f"{RECORD}evaluated" not in metrics:
+        return None, rest
+    values = {name.removeprefix(f"{RECORD}values/"): value for name, value in metrics.items()
+              if name.startswith(f"{RECORD}values/")}
+    return Recorded(values=values, example_index=metrics[f"{RECORD}example_index"],
+                    column_ok=metrics[f"{RECORD}column_ok"], evaluated=metrics[f"{RECORD}evaluated"]), rest
+
+
+@dataclass(eq=False)
+class Witness:
+    """What one traced evaluation of a loss's `Step.sample` and `Step.boundary` calls produced, by name:
+    the traced values themselves, which the evaluation returns as outputs (`RECORD`), so a compiled step
+    reports what it ran, each microbatch and each replay its own, where a `Recorder` keeps concrete
+    values of a loss run eagerly."""
+    values: dict[str, jax.Array] = field(default_factory=dict)
+    kinds: dict[str, str] = field(default_factory=dict)
+
+    def keep(self, kind: str, name: str, value: jax.Array) -> None:
+        """Keep `value`, a `kind` named `name`. Raises `ValueError` for a name an evaluation produces
+        twice, which a witness could not tell apart."""
+        if name in self.values:
+            raise ValueError(f"{name!r} is produced twice in one evaluation ({self.kinds[name]} and {kind}); "
+                             "a recording holds one value a name")
+        self.values[name], self.kinds[name] = value, kind
+
+    def report(self, batch: Batch, examples: jax.Array) -> Evaluated:
+        """The evaluation's record (`Evaluated`) of the batch the loss saw and its rows' places."""
+        evaluated = Evaluated(values=dict(self.values), example_index=examples)
+        if EXAMPLE_ROWS in batch:
+            evaluated["column"] = jnp.asarray(batch[EXAMPLE_ROWS], jnp.int32)
+        return evaluated
+
+
+EXAMPLE_STREAM = 0x6578616D
+"""What a run folds its key with for its examples' draws (`Step.example_key`), apart from its attempts'."""
+
+_STREAMS: dict[int, str] = {}
+
+
+def stream(name: str) -> int:
+    """The fold of a named draw (`Step.sample`): the same on every process and every run. Raises
+    `ValueError` for a name whose fold another name has, which would draw what it draws."""
+    fold = zlib.crc32(name.encode()) & 0x7FFFFFFF
+    if _STREAMS.setdefault(fold, name) != name:
+        raise ValueError(f"the draws {name!r} and {_STREAMS[fold]!r} fold alike; rename one")
+    return fold
 
 
 @struct.dataclass
@@ -124,7 +253,15 @@ class Step:
     step's batch is read in (`Trainer.compile`), which is what an objective's
     own schedules index by, however the trainer splits its batches. `key` is
     new for every attempt at a microbatch, and a replayed microbatch gets the
-    key of the attempt that first read it, so it draws the same randomness.
+    key of the attempt that first read it, so it draws the same randomness:
+    the key a model's own streams (dropout) take.
+
+    An example's draws are its own (`sample`): each row of the batch is an
+    example of the update (`example_index`), and its draws fold from the
+    update's key (`example_key`) and its place, so a step reads the same
+    noise, times and masks for an example however the batch is split, pooled,
+    sharded or resumed. A step built outside a run, with neither, reads its
+    rows as the examples 0, 1, ... under `key`.
     """
     step: jax.Array
     key: jax.Array
@@ -136,6 +273,106 @@ class Step:
     committed: jax.Array | None = None
     """The updates the run committed before this step's (`TrainState.updates`), or None for a
     step made outside a run (`updates`)."""
+    example_key: jax.Array | None = None
+    """The key every example of the update folds its draws from, the same for each microbatch the
+    update pools and each replay of one; None outside a run, where `key` is."""
+    example_index: jax.Array | None = None
+    """Each row's place among the update's examples, `[rows]` int32: its step's place in the window
+    times a step's rows, plus its row in the step's batch. None outside a run, where rows are 0, 1, ..."""
+    example_count: int | None = struct.field(pytree_node=False, default=None)
+    """How many examples the update pools, which a draw stratified over them reads (`places`); None
+    outside a run, where it is the batch's rows."""
+    tape: Mapping[str, jax.Array] | None = None
+    """Values recorded by name, each indexed by example on its first axis, which `sample` and `boundary`
+    read in place of drawing or computing them (`Recorder.tape`)."""
+    recorder: Recorder | None = struct.field(pytree_node=False, default=None)
+    """Where `sample` and `boundary` record what they produce, or None."""
+    record: bool = struct.field(pytree_node=False, default=False)
+    """Whether the loss returns what its `sample` and `boundary` calls produce as outputs (`RECORD`):
+    a static flag, so a compiled step's cache holds one program a mode."""
+    witness: Witness | None = struct.field(pytree_node=False, default=None)
+    """The evaluation's collector of what `sample` and `boundary` produce, which `Objective._loss` opens
+    inside the trace of a recording step (`record`); None otherwise."""
+    qk_stats: bool = struct.field(pytree_node=False, default=False)
+    """Whether the run's optimizer reads the step's attention logit maxima (`dew.optim.clips_qk`, its
+    QK-Clip): the objective opens the `qk` collection in the model calls it trains through and returns
+    what they sowed (`Aux.qk_stats`). Static, as opening a collection changes the program."""
+
+    def places(self, rows: int) -> tuple[jax.Array, int]:
+        """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
+        examples the update pools: what a draw stratified over the update's examples reads, or a role
+        the update gives a share of its examples, the same on every layout."""
+        return self.examples(rows), rows if self.example_count is None else self.example_count
+
+    def examples(self, rows: int) -> jax.Array:
+        """The places among the update's examples of a batch's `rows` rows."""
+        if self.example_index is None:
+            return jnp.arange(rows, dtype=jnp.int32)
+        if self.example_index.shape != (rows,):
+            raise ValueError(f"this step's batch holds {self.example_index.shape[0]} examples, and a draw "
+                             f"asked for {rows} rows")
+        return self.example_index
+
+    def _taped(self, tape: jax.Array, name: str, examples: jax.Array, row: tuple[int, ...]) -> jax.Array:
+        """`tape`, the step's tape of `name`, at `examples`, checked against the update's examples and
+        `row`."""
+        needed = examples.shape[0] if self.example_count is None else self.example_count
+        if tape.shape[0] < needed or tuple(tape.shape[1:]) != row:
+            raise ValueError(f"the tape's {name!r} holds {tuple(tape.shape)}, and the step reads "
+                             f"{needed} examples of {row}")
+        return rows_taken(jnp.asarray(tape), examples)
+
+    def sample(self, name: str, draw: Callable[..., jax.Array], shape: tuple[int, ...] | None = None, *,
+               dtype=None, rows: int) -> jax.Array:
+        """`draw(key, shape, dtype=dtype)` for each of `rows` examples, under the example's own key
+        folded with `name` (`stream`): `[rows, *shape]`, the same values an example draws on any layout,
+        as `jax.random`'s draws take them. `dtype` is the draw's own, never a model's, so a float64 twin
+        draws what the run drew; None leaves it out, and `shape` None calls `draw(key)`, a draw that fixes
+        both. The key is the example's place folded into `counter_key` of the update's key, or of the
+        attempt's outside a run. With a `tape` holding `name`, its rows for these examples instead,
+        at the draw's dtype."""
+        examples = self.examples(rows)
+        value = self._drawn(name, draw, shape, dtype, examples)
+        if self.recorder is not None:
+            self.recorder.record("sample", name, examples, value)
+        if self.witness is not None:
+            self.witness.keep("sample", name, value)
+        return value
+
+    def sample_update(self, name: str, draw: Callable[..., jax.Array], shape: tuple[int, ...] | None = None,
+                      *, dtype=None, rows: int) -> jax.Array:
+        """`sample`'s draws of `name` for every example of the update, in place order, where a batch of
+        `rows` rows is a part of it (`places`): what a role the update gives a count of its examples
+        by reads, the same on every layout. Not recorded: `sample` records the batch's own rows."""
+        _, count = self.places(rows)
+        return self._drawn(name, draw, shape, dtype, jnp.arange(count, dtype=jnp.int32))
+
+    def _drawn(self, name, draw, shape, dtype, examples) -> jax.Array:
+        given = () if shape is None else (shape,)
+        options = {} if dtype is None else {"dtype": dtype}
+
+        def drawn(key):
+            return draw(key, *given, **options)
+
+        if self.tape is not None and name in self.tape:
+            like = jax.eval_shape(drawn, jax.random.key(0))
+            return self._taped(self.tape[name], name, examples, like.shape).astype(like.dtype)
+        key = jax.random.fold_in(counter_key(self.key if self.example_key is None else self.example_key),
+                                 stream(name))
+        return jax.vmap(lambda example: drawn(jax.random.fold_in(key, example)))(examples)
+
+    def boundary(self, name: str, value: jax.Array) -> jax.Array:
+        """`value`, one row an example, where the model's computation starts from it (a noised input,
+        times, a mask, loss weights, a preprocessed target): a `tape` holding `name` replaces it with its
+        rows for these examples, at `value`'s dtype, and a `recorder` keeps it."""
+        examples = self.examples(value.shape[0])
+        if self.tape is not None and name in self.tape:
+            value = self._taped(self.tape[name], name, examples, value.shape[1:]).astype(value.dtype)
+        if self.recorder is not None:
+            self.recorder.record("boundary", name, examples, value)
+        if self.witness is not None:
+            self.witness.keep("boundary", name, value)
+        return value
 
     @property
     def updates(self) -> jax.Array:
@@ -187,10 +424,15 @@ class Aux(Generic[Effects]):
     one-tuple of an fp32 `[rows, heads]` array of per-head logit maxima, and
     an MLA layer also holds `qk_nope`, an int scalar giving its nope width.
     Rows are the batch's rows, with microbatches concatenated under a
-    pipeline. It is None when the loss never opened the collection, and then
-    the clip does nothing."""
+    pipeline. It is None where the step asked for none (`Step.qk_stats`),
+    and empty where it asked and no layer sowed any; a run whose optimizer
+    clips by it refuses a step that returns None."""
     effects: Effects | None = None
     """Additive observations that `Objective.apply_effects` applies once per optimizer commit."""
+    record: Evaluated | Recorded | None = None
+    """What a recording evaluation's `Step.sample` and `Step.boundary` calls produced (`Step.record`),
+    which `Objective._loss` fills (`Evaluated`) and a transaction stacks with its replays' (`Recorded`);
+    None otherwise."""
 
 
 def _has_aux(loss: Loss | tuple[Loss, Aux[Effects]]) -> TypeIs[tuple[Loss, Aux[Effects]]]:
@@ -204,12 +446,13 @@ class Shown:
     `better` says which way the metric improves, "higher" or "lower", and the
     display colours its change as progress or regress by it. `percent` shows a
     fraction as a percentage. `group` puts the metric under a heading other
-    than its name's prefix. A metric with no `Shown` is shown under its name,
-    without colour.
+    than its name's prefix, and `label` shows it under another name than its
+    own. A metric with no `Shown` is shown under its name, without colour.
     """
     better: Literal["higher", "lower"] | None = None
     percent: bool = False
     group: str | None = None
+    label: str | None = None
 
 
 @dataclass(frozen=True)
@@ -261,125 +504,13 @@ class Prediction:
     hidden: tuple[jax.Array, ...]
 
 
-def everything(path: Path) -> bool:
-    return True
-
-
-def under(*prefix: str) -> PathFilter:
-    """Return a filter that accepts the leaves below `prefix`.
-
-    For example, `under("params", "context_encoder")`.
-    """
-    return lambda path: path[:len(prefix)] == prefix
-
-
-def select(tree: Variables, keep: PathFilter) -> Variables:
-    """Return the subtree of `tree` whose leaves `keep` accepts, nested the same way.
-
-    A branch with no accepted leaf is dropped, so the result is what the EMA
-    stores and what `merge` puts back. Raises `ValueError` when `keep`
-    accepts no leaf at all.
-    """
-    def prune(node, path):
-        if isinstance(node, Mapping):
-            kept = {name: prune(child, (*path, name)) for name, child in node.items()}
-            return {name: child for name, child in kept.items() if child is not None} or None
-        return node if keep(path) else None
-
-    selected = prune(tree, ())
-    if not selected:
-        raise ValueError("the filter selected no leaf of the variables tree")
-    return selected
-
-
-def merge(tree: Variables, overlay: Variables) -> Variables:
-    """Return a copy of `tree` with every leaf in `overlay` written over it."""
-    merged = dict(tree)
-    for name, child in overlay.items():
-        held = tree.get(name)
-        merged[name] = (merge(held, child)
-                        if isinstance(held, Mapping) and isinstance(child, Mapping)
-                        else child)
-    return merged
-
-
 TEACHER = "teacher"
 """The collection of a distilling objective's frozen teacher variables."""
 
 UNREAD = "unread"
 """The field of an inference record naming the parts of the run's tree its model does not read
-(`without`), which a loader leaves unrestored (`Objective._saved_variables`): a distillation's
+(`without`), which a loader leaves unrestored (`dew.inference.tasks.SavedRun.variables`): a distillation's
 teacher and projections beside the student it saves."""
-
-
-def without(tree: Variables, paths: Sequence[Sequence[str]]) -> Variables:
-    """`tree` without the subtree at each of `paths`, a path the tree does not hold left as it is."""
-    kept = dict(tree)
-    for path in paths:
-        name, *rest = path
-        if name in kept:
-            if rest:
-                held = kept[name]
-                kept[name] = without(held, [rest]) if isinstance(held, Mapping) else held
-            else:
-                del kept[name]
-    return kept
-
-FROZEN = "frozen"
-"""The name of the collection where a partially trained run keeps its frozen weights.
-
-The optimizer updates the `params` collection and nothing else, so the
-leaves that `freeze` keeps in `params` are the ones that train. The frozen
-leaves stay in this collection as part of the state, and `thaw` merges the
-two before the model reads them."""
-
-
-VALID_ROWS = "valid_rows"
-"""The field every evaluation batch holds: one bool per row, True for a real record and False for a repeat.
-
-A split's last batch is padded to full size with repeats of its own rows, and
-a process whose share runs out before the others' scores a copy of its last
-batch in which every row is a repeat. That way a pass is whole batches on
-every process and counts each record once. A loss weights its rows by this
-field, and its batch-wide terms are taken over the real rows only. Training
-batches never have it.
-"""
-
-
-def freeze(variables: Variables, trainable: PathFilter) -> Variables:
-    """Move the `params` leaves that `trainable` rejects into the `FROZEN` collection.
-
-    `trainable` sees full leaf paths, `("params", ...)`. Raises `ValueError`
-    when it keeps every leaf or none, since then there is nothing to split.
-    """
-    leaves = jax.tree_util.tree_leaves_with_path(variables["params"])
-    kept = sum(trainable(("params", *(entry.key for entry in path))) for path, _ in leaves)
-    if kept in (0, len(leaves)):
-        raise ValueError(
-            f"trainable keeps {kept} of {len(leaves)} parameter leaves, which "
-            f"{'freezes' if kept else 'trains'} nothing")
-    moving = select(variables, lambda path: path[0] == "params" and trainable(path))
-    frozen = select(variables, lambda path: path[0] == "params" and not trainable(path))
-    return {**variables, "params": moving["params"], FROZEN: frozen["params"]}
-
-
-def thaw(variables: Variables) -> Variables:
-    """Undo `freeze`, merging the frozen leaves back into one `params` collection.
-
-    Variables without a `FROZEN` collection are returned unchanged.
-    """
-    if FROZEN not in variables:
-        return variables
-    rest = {name: value for name, value in variables.items() if name != FROZEN}
-    return {**rest, "params": merge(variables[FROZEN], variables["params"])}
-
-
-def part(variables: Variables, name: str) -> Variables:
-    """Cut the `name` subtree out of every collection that holds one: one
-    module's own tree out of an objective's that nests several under each
-    collection, `params/policy` and `frozen/policy`, so an adapted module's
-    base comes with its factors."""
-    return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
 
 
 def projected_parts(params: Variables, owners: Mapping[str, ProjectsParameters | nn.Module | HiddenStates], *,
@@ -440,14 +571,28 @@ class EMASpec:
 class SavedTask(Protocol):
     """The task class a saved run of an objective loads as (`Objective.saved_task`).
 
-    It is a class whose `from_run` builds the task from a run directory.
-    Dew's tasks (`TextToImage`, `TextGeneration`, `BlockGeneration`,
-    `MaskedGeneration`) are such classes, and a plugin can supply its own."""
+    It is a class whose `from_saved` builds the task from a run's pinned checkpoint
+    (`dew.inference.tasks.SavedRun`), which `dew.pipeline` and `dew export` pin once; deriving
+    from `dew.inference.tasks.SavedRunTask` adds `from_run`, which loads one from a run directory.
+    Dew's tasks (`TextToImage`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `Decide`)
+    are such classes, and a plugin can supply its own."""
 
     @classmethod
-    def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
-                 mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self: ...
+    def from_saved(cls, run: SavedRun, *, ema: bool | None = None, mesh: MeshSpec | Mesh | None = None,
+                   layout: Layout | None = None, dtype: DTypeLike | None = None,
+                   param_dtype: DTypeLike | None = None) -> Self: ...
+
+
+@runtime_checkable
+class SettingsTask(SavedTask, Protocol):
+    """A saved task that builds from the settings its run records (`Objective.task_settings`), over a
+    model, its variables and a processor: a live objective builds it as a saved run loads it
+    (`Objective.build_task`). Dew's token tasks (`TextGeneration`, `BlockGeneration`,
+    `MaskedGeneration`) are such classes."""
+
+    @classmethod
+    def from_settings(cls, model: nn.Module, variables: Variables, settings,
+                      processor: Processor | None) -> Self: ...
 
 
 @runtime_checkable
@@ -499,9 +644,8 @@ def _ruled(value: jax.Array, rule: Variables, params: Variables) -> jax.Array:
 def _ruled_jvp(primals, tangents):
     value, rule, _ = primals
     moved_value, _, moved = tangents
-    return value, moved_value + sum(jnp.vdot(leaf, change) for leaf, change in
+    return value, moved_value + sum(accumulated(jnp.vdot, leaf, change) for leaf, change in
                                     zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
-
 
 
 class Objective(ABC, Generic[Loss, Effects]):
@@ -536,23 +680,35 @@ class Objective(ABC, Generic[Loss, Effects]):
     def inputs(self, inputs: InputSpec | None) -> None:
         self._inputs = inputs
 
+    named_inputs: str | None = None
+    """The batch field an objective names as its sample alone, as `Supervised(inputs="x")` does, which a
+    run declares as `inputs` at the per-example shape its model reads of the run's first batch
+    (`Trainer.fit`); None where `inputs` declares the shapes in full, an explicit spec that overrides
+    any the data would give, or declares none."""
+
     ema: EMASpec | None = None
     saved_task: ClassVar[type[SavedTask] | None] = None
     settings: ClassVar[type[DataclassInstance] | None] = None
     """The dataclass of what a saved run records beside its objective and model
     (`task_settings`), the one list of those fields: the objective writes an
     instance, its `saved_task` reads it back, and a record holding any other
-    field is refused (`dew.inference.tasks.run_record`). None records nothing
+    field is refused (`dew.inference.tasks.SavedRun.pinned`). None records nothing
     more."""
     """The task class a saved run of this objective loads as, which `dew.pipeline` builds from the run.
 
     A subclass inherits its parent's. None means a saved run of this
     objective loads as no task."""
-    _ema_is_reference: ClassVar[bool] = False
+    ema_is_reference: ClassVar[bool] = False
+    """Whether the objective's average is the frozen reference its loss compares against (an RL
+    policy's), which validation, `pipeline` and a saved run's loader never read as the trained weights."""
     # The name an objective that trains other networks beside its model nests
     # the model under in every collection, as PPO nests its policy beside the
     # critic; None when the saved tree is the model's.
     _model_part: ClassVar[str | None] = None
+    # The name the model's tree nests its recorded model (`recorded_model`) under, beside parts its record
+    # leaves out, as a decision model nests its backbone beside its head; None when the model's tree is
+    # the recorded model's. A LoRA record's factors merge there (`dew.checkpoints.averaged`).
+    _recorded_part: ClassVar[str | None] = None
     shown: Mapping[str, Shown] = {}
     """How the display shows the metrics `loss` reports, keyed by the names it reports them under.
 
@@ -597,15 +753,21 @@ class Objective(ABC, Generic[Loss, Effects]):
         three, and `variables` and `processor` override its own, an explicit
         None included. A bare model supplies none, so what is omitted is None.
         The constructor keeps the model as `model`, the module the objective
-        trains, which `program_key` names by default.
+        trains, which `program_key` names by default. A loaded task's tree, its
+        projections packed for serving, is held as the model's own tree
+        (`dew.inference.projections.unpacked`), and a tree of Flax `FrozenDict`s
+        (a loaded task's) as dicts (`dew.batch.dicts`).
         """
+        from dew.inference.projections import unpacked
+
         if _loaded(source):
             variables = source.variables if variables is OMITTED else variables
             processor = source.text_processor if processor is OMITTED else processor
             model = source.model
         else:
             model = source
-        self.variables = None if variables is OMITTED else variables
+        self.variables = None if variables is OMITTED or variables is None else dicts(
+            unpacked(model, variables))
         self.processor = None if processor is OMITTED else processor
         return model
 
@@ -617,13 +779,49 @@ class Objective(ABC, Generic[Loss, Effects]):
         tower. The trainer calls this once and passes the result to `init`, so
         an objective never has to read its own held arrays inside a trace.
         The default is the starting tree, `variables`.
+
+        A leaf of the `FROZEN` collection that `init` returns as it is, by
+        reference, as the base `init` returns the whole collection (it projects
+        `params` alone), is shared: the trainer's state holds that very array,
+        which no step donates, so a run and its objective hold one frozen tree
+        (`dew.state.apart`). A frozen leaf `init` builds, another
+        array's copy or values of its own, is the state's own.
         """
         return self.variables
 
     counts_tokens: bool = False
-    """Whether the objective supplies real token lengths (`real_lengths`), for throughput telemetry
-    and a run whose length is its tokens (`Trainer.fit(tokens=)`); an objective over another's
-    batches, a distillation's, counts as that one does."""
+    """Whether the objective counts the targets its loss scores (`scored_tokens`), for a run whose
+    length is its tokens (`Trainer.fit(tokens=)`) and its tokens a second; an objective over
+    another's batches, a distillation's, counts as that one does."""
+
+    def scored_tokens(self, batch: Batch) -> np.ndarray:
+        """Each row's tokens the loss scores, read before device placement: what a token budget
+        commits. By default every real input, each row's `real_lengths` summed; an objective that
+        scores fewer, a language model its shifted targets, counts those. The FLOP count reads the
+        inputs (`real_lengths`)."""
+        from dew.data.dataset import rows_of
+
+        rows = rows_of(batch)
+        return np.asarray([np.sum(self.real_lengths(jax.tree.map(
+            lambda leaf, index=index: leaf[index:index + 1] if np.ndim(leaf) and np.shape(leaf)[0] == rows
+            else leaf, batch))) for index in range(rows)], np.int64)
+
+    def scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, jax.Array] | None:
+        """The statistics `loss` returns for `batch`, without its `Aux`, by the loss's own path (its
+        configured terms, its mode and its model's draws under `step`), with each unit's share of their
+        first leaf (a `Ratio`'s total, a routed decoder's prediction total): `[B]` for an example's,
+        `[B, T]` for a token's, the shares summing to that leaf. A method that credits each unit by its
+        own loss reads them (`dew.objectives.perturbation`). None, the default, where the objective states
+        no units, whose whole statistics credit every unit; the model's other collections are left as they
+        are."""
+        return None
+
+    def row_tokens(self, batch: Batch) -> int | None:
+        """The tokens each of `batch`'s rows holds, read from its shapes alone, so a placed batch
+        answers without a wait: the most a row's `scored_tokens` counts, and what a device steps of
+        it (`dew.training.memory.device_tokens`). None where rows hold no token geometry, an image's,
+        whose run reads its committed tokens off the devices at each step a count is due."""
+        return None
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Real row (or packed-segment) lengths, read before device placement.
@@ -673,6 +871,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         model = vars(self).get("model")
         return () if model is None else (ProgramModule(model, None, trained=True),)
 
+    def towers(self) -> tuple[Held, ...]:
+        """Every network this objective's programs run, whose quantization the options they compile
+        with read (`dew.nn.kernels.options.compiler_options`): the modules `program_key` names, and
+        an objective whose steps also call frozen towers (a condition's encoder, an autoencoder)
+        adds them."""
+        return tuple(entry.module for entry in self.program_key())
+
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         """Replace the modules `program_key` names, one per entry in its order."""
         if len(modules) != len(self.program_key()):
@@ -681,16 +886,16 @@ class Objective(ABC, Generic[Loss, Effects]):
         if modules:
             (self.model,) = modules
 
-    @property
-    def bank_sites(self) -> tuple[DecoderBank, ...]:
-        """The scanned layer stacks this objective runs, which a host layout streams as banks.
+    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
+        """The scanned layer stacks this objective runs, which a host layout streams as banks, as they
+        lie in `store`, the variables the banks are drawn from.
 
         Each site names a decoder's namespace below every variables
-        collection, and its `StackView`, as the model declares them. An
-        objective without a layer stack returns an empty tuple, and all its
-        variables are entry variables. Only the execution snapshot uses
-        these banks; the variables and optimizer trees the trainer keeps
-        never take them on.
+        collection, and its `StackView`, as the model declares them over the
+        store's rows. An objective without a layer stack returns an empty
+        tuple, and all its variables are entry variables. Only the execution
+        snapshot uses these banks; the variables and optimizer trees the
+        trainer keeps never take them on.
         """
         return ()
 
@@ -760,7 +965,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
                 holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (),
-                modules: tuple[nn.Module, ...] = ()):
+                modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
 
@@ -773,8 +978,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         step runs or a sample's guidance and autoencoder, whose numbers it bakes in: the program is
         reused only while they are the same objects, and one over others replaces it. `modules` are
         the networks it runs beside the objective's own, an autoguide's or an autoencoder's: they key
-        it as `holds` do, and its options cover them. Keep only the current specialization, not a
-        history of old models or steps.
+        it as `holds` do, and its options cover them. `step` are the XLA options of the training step
+        the program is part of (`dew.training.memory.step_compiler_options`), beside its modules' own,
+        so a host step's programs compile as the resident step does. Keep only the current
+        specialization, not a history of old models or steps. The cache is the objective's, so its
+        programs live as long as it does: the process-wide seam every other outer program shares
+        (`dew.nn.kernels.options.program`) would keep each objective alive with them.
         """
         programs = tuple((program.module, (program.head_tile, program.head_fused))
                          for program in self.program_key())
@@ -786,8 +995,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             self._program_cache = cached
         from dew.nn.sharding import trace_context
         # The options follow where the program runs (`compiler_options`), so they key it too.
-        options = compiler_options(*(module for module, _ in programs), *modules)
-        key = (name, trace_context(), tuple(options.items()))
+        options = {**compiler_options(*self.towers(), *modules), **(step or {})}
+        key = (name, trace_context(), tuple(sorted(options.items())))
         held = cached[1].get(key)
         kept = (*holds, *modules)
         if held is None or len(held[0]) != len(kept) or any(
@@ -859,7 +1068,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     @staticmethod
     def row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *,
-                 rows: int | tuple[int, ...] = 0) -> Ratio:
+                 rows: int | tuple[int, ...] = 0, weights: jax.Array | None = None) -> Ratio:
         """Return the mean of `values` over `axis`, as the `Ratio` of their sum and count.
 
         `rows` is the axis of `values`, or the consecutive axes, that index `batch`'s
@@ -868,19 +1077,41 @@ class Objective(ABC, Generic[Loss, Effects]):
         `VALID_ROWS`, a repeat row has zero weight in both, so a loss and every
         batch-wide term computed through this count each real record once. Without
         `VALID_ROWS`, as in training, this is the sum (`compensated_sum`) and the size.
+
+        With `weights`, each value counts for its weight, broadcast to `values`: the `Ratio`
+        is of their weighted sum and the weights' (`dew.nn.precision.weighted_total`), a value
+        of weight 0, a padded target's loss, selected away before its product, so a NaN or an
+        infinity there adds nothing.
         """
-        dtype = jnp.promote_types(values.dtype, jnp.float32)
+        dtype = at_least_fp32(values.dtype)
         axes = (tuple(range(values.ndim)) if axis is None
                 else (axis,) if isinstance(axis, int) else tuple(axis))
-        if VALID_ROWS not in batch:
+        real = None
+        if VALID_ROWS in batch:
+            held = (rows,) if isinstance(rows, int) else rows
+            shape = [values.shape[a] if a in held else 1 for a in range(values.ndim)]
+            real = Objective.row_weights(batch, math.prod(values.shape[a] for a in held)).reshape(shape) > 0
+        if weights is not None:
+            weights = jnp.broadcast_to(weights, values.shape)
+            counted = weights if real is None else jnp.where(real, weights, 0)
+            return Ratio(*weighted_total(values, counted, axes))
+        if real is None:
             count = math.prod(values.shape[a] for a in axes)
             return Ratio(compensated_sum(values, axes), jnp.asarray(count, dtype))
-        held = (rows,) if isinstance(rows, int) else rows
-        shape = [values.shape[a] if a in held else 1 for a in range(values.ndim)]
-        real = Objective.row_weights(batch, math.prod(values.shape[a] for a in held)).reshape(shape) > 0
         # Selected rather than multiplied, so a repeat holding a NaN still adds nothing.
         return Ratio(compensated_sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
                      jnp.sum(jnp.broadcast_to(real, values.shape).astype(dtype), axes))
+
+    @staticmethod
+    def row_moments(values: jax.Array, batch: Batch, axis: int | tuple[int, ...], *,
+                    rows: int | tuple[int, ...] = 0) -> tuple[jax.Array, jax.Array]:
+        """Return the mean and the biased variance of `values` over `axis`, over `batch`'s rows
+        (`row_mean`), in two passes as `jnp.mean` and `jnp.var` take them; both drop `axis`."""
+        axes = (axis,) if isinstance(axis, int) else tuple(axis)
+        mean, _ = Objective.row_mean(values, batch, axes, rows=rows).mean()
+        centered = values - jnp.expand_dims(mean, axes)
+        var, _ = Objective.row_mean(jnp.square(centered), batch, axes, rows=rows).mean()
+        return mean, var
 
     @staticmethod
     def row_weights(batch: Batch, rows: int) -> jax.Array:
@@ -911,23 +1142,36 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def _loss(self, variables: Variables, batch: Batch, step: Step, *,
               validation: bool = False) -> tuple[Loss, Aux[Effects]]:
+        marked = batch
+        if EXAMPLE_ROWS in batch:
+            # The trainer's column of the examples' places is the step's (`Step.example_index`).
+            batch = {name: value for name, value in batch.items() if name != EXAMPLE_ROWS}
+        witness = Witness() if step.record and not validation else None
+        step = step if witness is None else replace(step, witness=witness)
         loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
         if _has_aux(loss):
-            return loss
-        return loss, Aux(metrics={})
+            stats, aux = loss
+        else:
+            stats, aux = loss, Aux[Effects](metrics={})
+        if witness is not None:
+            # A batch with no rows has no examples (`example_fields`), and records none.
+            places = jnp.zeros((0,), jnp.int32) if step.example_index is None else step.example_index
+            aux = replace(aux, record=witness.report(marked, places))
+        return stats, aux
 
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """Return the objective value of summed statistics and whether they have any mass.
 
-        A `Ratio` reduces by `Ratio.mean`, and a scalar is its own value with
-        mass one. Composite statistics need an override, since the default
-        raises `TypeError` for them.
+        A `Ratio` reduces by `Ratio.mean`, terms `Weighted` together by
+        `Weighted.mean`, and a scalar is its own value with mass one. Other
+        composite statistics need an override, since the default raises
+        `TypeError` for them.
         """
-        if isinstance(stats, Ratio):
+        if isinstance(stats, (Ratio, Weighted)):
             return stats.mean()
         if isinstance(stats, (jax.Array, float, int)):
             value = jnp.asarray(stats)
-            value = value.astype(jnp.promote_types(value.dtype, jnp.float32))
+            value = value.astype(at_least_fp32(value.dtype))
             if value.ndim != 0:
                 raise ValueError("a unit-mass loss must be scalar")
             return value, jnp.asarray(a=True)
@@ -1070,12 +1314,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         if self._evaluation_scores is None:
             return None
-        return self._compiled_scores(self.evaluation_variables(params, step), batch, step.key)
+        return self._compiled_scores(self.evaluation_variables(params, step), batch, replace(step, ema=None))
 
     _evaluation_scores: Callable[..., TokenScores] | None = None
     """The per-token scores of one evaluation batch, a pure function of the
-    weights, the batch and the pass's key, or None when the objective scores
-    no tokens."""
+    weights, the batch and the pass's step, whose draws are its examples'
+    (`Step.sample`), or None when the objective scores no tokens."""
 
     _validation_scores: Callable[..., tuple[Loss, Artifacts]] | None = None
     """One validation batch's loss statistics and the artifacts `evaluate`
@@ -1113,44 +1357,18 @@ class Objective(ABC, Generic[Loss, Effects]):
     def evaluation_variables(self, variables: Variables, step: Step) -> Variables:
         """Return the weights a validation pass and a preview score: the
         step's average when the run keeps one, unless that average is the
-        objective's frozen reference (`_ema_is_reference`), else `variables`."""
-        return variables if step.ema is None or self._ema_is_reference else step.ema
+        objective's frozen reference (`ema_is_reference`), else `variables`."""
+        return variables if step.ema is None or self.ema_is_reference else step.ema
 
     def _pipeline_weights(self, state: TrainState, ema: bool | None) -> Variables:
-        if self._ema_is_reference or ema is False or (ema is None and state.ema is None):
+        if self.ema_is_reference or ema is False or (ema is None and state.ema is None):
             return state.variables
         return state.averaged
 
     @classmethod
-    def _saved_variables(cls, directory: str, *, step: int | str | None, ema: bool | None,
-                         mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                         param_dtype: DTypeLike | None = None,
-                         parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))
-                         ) -> Variables:
-        """Return the model's variables from a run of this objective, as every run loader reads them.
-
-        The arguments are `Checkpoints.variables`'. An objective whose average
-        is its frozen reference gives the trained weights whatever `ema` asks,
-        and one that nests the model beside other networks gives the model's
-        own part, its trained and frozen collections together.
-        """
-        from dew.checkpoints import Checkpoints
-
-        with Checkpoints(directory) as checkpoints:
-            step = checkpoints.pinned(step)
-            record = checkpoints.artifact(step)
-            unread = record.get(UNREAD, []) if isinstance(record, Mapping) else []
-            if not isinstance(unread, list):
-                raise ValueError(f"{UNREAD} must be a list of paths")
-            variables = checkpoints.variables(
-                step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
-                param_dtype=param_dtype, parameter_roots=parameter_roots,
-                unread=tuple(strings(path, UNREAD) for path in unread))
-        return cls._model_tree(variables)
-
-    @classmethod
-    def _model_tree(cls, variables: Variables) -> Variables:
-        """The `_model_part` subtree of `variables`, or the whole tree when the objective names none."""
+    def model_tree(cls, variables: Variables) -> Variables:
+        """The model's own subtree of a tree this objective's class trains (`_model_part`), or the whole
+        tree when the objective names none: what a saved run's loader reads (`SavedRun.variables`)."""
         return variables if cls._model_part is None else part(variables, cls._model_part)
 
     def model_variables(self, variables: Variables) -> Variables:
@@ -1161,7 +1379,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         part, trained and frozen collections together, of an objective that
         nests the model beside other networks or frozen ones.
         """
-        return self._model_tree(variables)
+        return self.model_tree(variables)
 
     def task_settings(self) -> DataclassInstance | None:
         """Return the task settings a saved step records beside its model, an
@@ -1186,8 +1404,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         settings returns None; a custom research method can still restore its
         raw state.
         """
-        from dew.config import ModelConfig
-        from dew.registry import import_path, record_fields, to_record
+        from dew.registry import ModelConfig, import_path, record_fields, to_record
 
         settings = self.task_settings()
         if settings is None:
@@ -1201,11 +1418,18 @@ class Objective(ABC, Generic[Loss, Effects]):
         """Return the task over `variables`, the trained tree as the run keeps it.
 
         `processor` encodes and decodes in place of the objective's own, an
-        explicit None included. Objectives without a generation task raise
-        `TypeError`. A plugin objective returns its own `saved_task` class, so
-        the return type also allows a `SavedTask` besides Dew's own tasks.
+        explicit None included. An objective whose `saved_task` builds from
+        the settings its run records (`SettingsTask`) builds it from its own
+        (`task_settings`) over its model, as a saved run of it loads; any other
+        overrides this, or has no inference task and raises `TypeError`. A
+        plugin objective's task is its own `saved_task` class, so the return
+        type also allows a `SavedTask` besides Dew's own tasks.
         """
-        raise TypeError(f"{type(self).__name__} has no inference task")
+        task, settings, model = self.saved_task, self.task_settings(), vars(self).get("model")
+        if task is None or settings is None or model is None or not isinstance(task, SettingsTask):
+            raise TypeError(f"{type(self).__name__} has no inference task")
+        return task.from_settings(model, variables, settings,
+                                  self.processor if processor is OMITTED else processor)
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:
@@ -1258,6 +1482,23 @@ class Source(Protocol[M]):
     def text_processor(self) -> Processor | None: ...
 
 
+@runtime_checkable
+class Ending(Protocol):
+    """A loaded source that names the end-of-sequence ids its generation stops at, as
+    `dew.interop.Pretrained` does (`eos_token_ids`)."""
+
+    @property
+    def eos_token_ids(self) -> tuple[int, ...]: ...
+
+
+def ended(source: nn.Module | Source, eos_token_ids: Sequence[int] | Omitted) -> tuple[int, ...]:
+    """The end-of-sequence ids a task over `source` stops at: `eos_token_ids` where given, else a
+    loaded source's own (`Ending`), else none, as a bare model names none."""
+    if eos_token_ids is not OMITTED:
+        return tuple(eos_token_ids)
+    return tuple(source.eos_token_ids) if isinstance(source, Ending) else ()
+
+
 S = TypeVar("S")
 
 
@@ -1301,28 +1542,6 @@ class Metric(Protocol[S]):
         ...
 
 
-def recorded_name[S, A](key, names: Collection[str], owner: Objective[S, A] | None = None) -> str:
-    """The recorded name a run's score object names, one rule for the scores `best=` and `stop=` read
-    live and the ones a checkpoint keeps: a `TrainingScalar` the training split's (of the objective
-    `owner` where it is given, by identity), a `Metric` the validation split's ('val'), and a
-    `(split, metric)` pair that split's. A metric its split did not record raises with the splits that
-    did."""
-    split = "val"
-    if isinstance(key, tuple) and len(key) == 2:
-        split, key = key
-    if isinstance(key, TrainingScalar):
-        if owner is not None and key.owner is not owner:
-            raise KeyError("training score belongs to another objective")
-        return f"train/{key.name}"
-    if isinstance(key, Metric):
-        if f"{split}/{key.name}" in names:
-            return f"{split}/{key.name}"
-        splits = sorted(name.rpartition("/")[0] for name in names if name.rpartition("/")[2] == key.name)
-        raise KeyError(f"metric {key.name!r} has no {split} score" + (
-            f"; it is recorded under {', '.join(splits)}: ask (split, metric)" if splits else ""))
-    raise KeyError(key)
-
-
 def merge_totals(accumulated: tuple[float, float],
                  contribution: tuple[float, float]) -> tuple[float, float]:
     """Add one batch's (total, count) pair into a metric's accumulator.
@@ -1338,31 +1557,20 @@ def mean_of_totals(accumulated: tuple[float, float]) -> float:
     return accumulated[0] / accumulated[1]
 
 
-
 def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
-    """`log_softmax(logits)[..., tokens]`, reduced in fp32 whatever `logits` holds.
+    """`log_softmax(logits)[..., tokens]`, reduced in at least fp32 (`dew.nn.categorical`).
 
-    `tokens` is `logits.shape[:-1]` of ids and the result has that shape. A
-    bf16 log partition over a vocabulary carries bf16's 8-bit mantissa into
-    every score, which is error in the second decimal of a log probability
-    near -10; fp32 carries the logits exactly and rounds only the reduction.
-    optax's cross entropy reads the target logit without building the
-    normalized row.
+    `tokens` is `logits.shape[:-1]` of ids and the result has that shape.
     """
-    return -optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tokens)
+    return -categorical.cross_entropy(logits, tokens)
 
 __all__ = [
-    "FROZEN",
     "OMITTED",
-    "VALID_ROWS",
     "Aux",
-    "Batch",
     "EMASpec",
     "Metric",
     "Objective",
     "Omitted",
-    "Path",
-    "PathFilter",
     "Prediction",
     "ProgramModule",
     "Ratio",
@@ -1372,15 +1580,7 @@ __all__ = [
     "Step",
     "TrainingScalar",
     "TrainingScalars",
-    "Variables",
-    "everything",
-    "freeze",
     "joined",
-    "merge",
     "model_rngs",
-    "part",
-    "select",
-    "thaw",
     "training_rngs",
-    "under",
 ]

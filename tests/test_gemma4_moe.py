@@ -10,6 +10,7 @@ from pathlib import Path
 
 import jax.numpy as jnp
 import numpy as np
+from interop_support import fixture_arrays
 
 from dew.nn.gemma4_moe import Gemma4Experts, Gemma4TextRouter
 
@@ -18,8 +19,7 @@ HIDDEN, EXPERTS, TOP_K, WIDTH = 32, 4, 2, 16
 
 
 def fixture() -> dict:
-    with np.load(FIXTURES / "moe.npz") as data:
-        return {key: np.asarray(value) for key, value in data.items()}
+    return fixture_arrays(FIXTURES / "moe.npz")
 
 
 def router_params(tensors: dict) -> dict:

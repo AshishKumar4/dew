@@ -68,3 +68,16 @@ def clipped_surrogate(log_ratio, advantages, mask, module=surrogate, **clip):
     """The token-mean reduction of the dual-clipped policy terms."""
     terms, aux = module.clipped_surrogate_terms(log_ratio, advantages, mask, **clip)
     return token_mean(terms, mask), aux
+
+
+def prompt_inputs(records):
+    """A batch's left-padded prompts (`prompt`, `prompt_length`) as model inputs, each row's real
+    tokens the last `prompt_length` and the rest masked out."""
+    from dew.nn.inputs import ModelInputs
+
+    tokens = jnp.asarray(records["prompt"])
+    padding = tokens.shape[1] - jnp.asarray(records["prompt_length"])[:, None]
+    return ModelInputs(tokens, {"attention_mask": jnp.arange(tokens.shape[1])[None, :] >= padding})
+
+
+

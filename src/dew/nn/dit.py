@@ -20,27 +20,25 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
+from dew._records import JSON
 from dew.nn.dense import Dense
-from dew.records import JSON
+from dew.nn.dropout import Dropout
 
 from .activations import gelu_exact_torch, gelu_tanh
-from .attention import LayerNorm, NormalAttention
+from .attention import LayerNorm, NormalAttention, QKNorm
 from .blocks import FourierEmbedding, TimeProjection, modulation
 from .conv import Conv
 from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from .mlp import GatedMLP
-from .precision import at_least_fp32, fp32_result_dot_general
+from .precision import at_least_fp32, float32_dot_general, fp32_result_dot_general, weighted_total
 from .rope import rotary_freqs
 from .scan_orders import (
     ScanOrder,
     build_2d_sincos_pos_embed,
     hilbert_indices,
-    hilbert_patchify,
-    hilbert_unpatchify,
     inverse_permutation,
-    unpatchify,
+    unscanned,
     zigzag_indices,
-    zigzag_patchify,
 )
 from .sharding import RESIDUAL, constrain, logical_axes
 from .ssm import BidirectionalS5Layer, S5Layer, SpatialFusionConv
@@ -63,8 +61,8 @@ def masked_mean(x, mask):
     `[B, L]` marks; a padded row moves nothing, and a row with no real
     tokens at all contributes zero."""
     weights = jnp.asarray(mask, x.dtype)[:, :, None]
-    counted = jnp.sum(weights, axis=1)
-    return jnp.sum(x * weights, axis=1) / jnp.maximum(counted, 1)
+    total, counted = weighted_total(x, weights, axis=1)
+    return total / jnp.maximum(counted, 1)
 
 
 def scan_indices(scan_order: str, H_P: int, W_P: int):
@@ -74,6 +72,19 @@ def scan_indices(scan_order: str, H_P: int, W_P: int):
     if scan_order == 'zigzag':
         return zigzag_indices(H_P, W_P)
     return None
+
+
+def scan_ordered(tokens: jax.Array, scan_order: str, H_P: int, W_P: int
+                 ) -> tuple[jax.Array, np.ndarray | None]:
+    """Row-major patch tokens `[B, H_P * W_P, D]` gathered into `scan_order`,
+    and the inverse permutation that restores row-major order (None for
+    raster): every order embeds its patches through the one projection."""
+    order = scan_indices(scan_order, H_P, W_P)
+    if order is None:
+        return tokens, None
+    # A permutation reads each row once, so the gradient's scatter needs
+    # no atomic adds.
+    return jnp.take(tokens, order, axis=1, unique_indices=True), inverse_permutation(order)
 
 
 def scan_ordered_pos_embed(emb_dim: int, H_P: int, W_P: int, scan_order: str):
@@ -129,6 +140,12 @@ class PatchEmbedding(nn.Module):
         return (projection_flops(lengths, self.patch_size**2 * input_channels, projected)
                 + (projection_flops(lengths, projected, self.embedding_dim) if self.bottleneck else 0))
 
+    def scanned(self, x, scan_order: str) -> tuple[jax.Array, np.ndarray | None]:
+        """`x`'s patch tokens gathered into `scan_order`, and the inverse that restores row-major
+        order (`scan_ordered`; `unscanned` undoes both)."""
+        _, height, width, _ = x.shape
+        return scan_ordered(self(x), scan_order, height // self.patch_size, width // self.patch_size)
+
     @nn.compact
     def __call__(self, x):
         batch, height, width, _ = x.shape
@@ -143,7 +160,8 @@ class PatchEmbedding(nn.Module):
                  dtype=self.dtype,
                  precision=self.precision)(x)
         if self.bottleneck is not None:
-            x = Dense(self.embedding_dim, dtype=self.dtype, precision=self.precision)(x)
+            x = Dense(self.embedding_dim, dtype=self.dtype, precision=self.precision,
+                      dot_general=float32_dot_general)(x)
         # The token count is named, not inferred: a reshape cannot infer it from a batch of no rows,
         # which a shortcut objective's bootstrap slice is below `bootstrap_every` rows.
         return jnp.reshape(x, (batch, x.shape[1] * x.shape[2], self.embedding_dim))
@@ -175,11 +193,11 @@ class AdaLNParams(nn.Module):
 
 @logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")})
 class PatchSequenceEmbed(nn.Module):
-    """Patchify in raster/hilbert/zigzag order and add the 2D sincos signal.
+    """Patchify through `PatchEmbedding`, gather the tokens into
+    raster/hilbert/zigzag order (`scan_ordered`) and add the 2D sincos signal.
 
     Returns `(tokens, inv_idx)`; `inv_idx` restores row-major order on the
-    way out and is None for raster. `bottleneck` is `PatchEmbedding`'s, in
-    raster order only.
+    way out and is None for raster. `bottleneck` is `PatchEmbedding`'s.
     """
     patch_size: int
     emb_features: int
@@ -195,43 +213,20 @@ class PatchSequenceEmbed(nn.Module):
 
     def setup(self):
         assert self.scan_order in get_args(ScanOrder), f"Unknown scan order {self.scan_order}"
-        if self.scan_order == 'raster':
-            self.patch_embed = PatchEmbedding(
-                patch_size=self.patch_size,
-                embedding_dim=self.emb_features,
-                dtype=self.dtype,
-                precision=self.precision,
-                bottleneck=self.bottleneck,
-                name="patch_embed",
-            )
-        elif self.bottleneck is not None:
-            raise ValueError(f"a patch bottleneck embeds raster patches, not {self.scan_order} ones")
-        else:
-            # The patches arrive already permuted, so a dense projection of
-            # the raw pixels replaces the strided convolution.
-            self.scan_proj = Dense(
-                features=self.emb_features,
-                dtype=self.dtype,
-                precision=self.precision,
-                name="hilbert_projection",
-            )
+        self.patch_embed = PatchEmbedding(
+            patch_size=self.patch_size,
+            embedding_dim=self.emb_features,
+            dtype=self.dtype,
+            precision=self.precision,
+            bottleneck=self.bottleneck,
+            name="patch_embed",
+        )
 
     def __call__(self, x):
         _, H, W, _ = x.shape
-        H_P, W_P = H // self.patch_size, W // self.patch_size
-
-        inv_idx = None
-        if self.scan_order == 'hilbert':
-            patches_raw, inv_idx = hilbert_patchify(x, self.patch_size)
-            tokens = self.scan_proj(patches_raw)
-        elif self.scan_order == 'zigzag':
-            patches_raw, inv_idx = zigzag_patchify(x, self.patch_size)
-            tokens = self.scan_proj(patches_raw)
-        else:
-            tokens = self.patch_embed(x)
-
+        tokens, inv_idx = self.patch_embed.scanned(x, self.scan_order)
         pos_embed = scan_ordered_pos_embed(
-            self.emb_features, H_P, W_P, self.scan_order)
+            self.emb_features, H // self.patch_size, W // self.patch_size, self.scan_order)
         tokens = tokens + jnp.asarray(pos_embed, dtype=tokens.dtype)[None, :, :]
         return tokens, inv_idx
 
@@ -272,7 +267,8 @@ class ConditioningEmbed(nn.Module):
                 FourierEmbedding(features=self.emb_features, scale=self.time_scale, dtype=self.dtype),
                 TimeProjection(features=self.emb_features * self.mlp_ratio,
                                dtype=self.dtype, precision=self.precision),
-                Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),
+                Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision,
+                      dot_general=float32_dot_general),
             ], name=name)
 
         if self.interval:
@@ -280,7 +276,7 @@ class ConditioningEmbed(nn.Module):
         self.time_embed = time_embedding("time_embed")
         self.text_proj = Dense(
             features=self.emb_features, dtype=self.dtype,
-            precision=self.precision, name="text_context_proj")
+            precision=self.precision, name="text_context_proj", dot_general=float32_dot_general)
 
     def __call__(self, temb, textcontext: TextContext | None = None, duration=None):
         cond_emb = self.time_embed(temb)
@@ -345,9 +341,7 @@ class PatchSequenceOutput(nn.Module):
             name="final_proj",
         )(x_out)
 
-        if inv_idx is not None:
-            return hilbert_unpatchify(x_out, inv_idx, self.patch_size, H, W, self.output_channels)
-        return unpatchify(x_out, self.patch_size, H, W, self.output_channels)
+        return unscanned(x_out, inv_idx, self.patch_size, H, W, self.output_channels)
 
 
 # A fused attention forward reaches a remat policy as one of these
@@ -642,7 +636,7 @@ class ModulatedBlock(nn.Module):
                 precision=self.precision,
                 use_bias=True,
                 qkv_bias=self.qkv_bias,
-                qk_norm=self.qk_norm,
+                qk_norm=QKNorm() if self.qk_norm else None,
                 attention_impl=self.attention_impl,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
             )
@@ -666,7 +660,7 @@ class ModulatedBlock(nn.Module):
         self.mlp = GatedMLP(hidden_features, self.features,
                             activation=gelu_tanh if self.gelu_approximate else _exact_gelu, use_bias=True,
                             dtype=self.dtype, precision=self.precision)
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
+        self.dropout = Dropout(rate=self.dropout_rate)
 
     def _apply_2d_fusion(self, ssm_output):
         """Un-permute scan-ordered SSM output to a 2D grid, fuse, re-permute back."""

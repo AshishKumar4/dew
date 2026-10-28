@@ -21,6 +21,13 @@ observed. Run it with an interpreter that has torch and jax:
 
   ~/Desktop/dew/.venv/bin/python tools/parity_rl.py
 
+`recording` records the advantage estimators over check 1's seeds instead
+(tools/recorded_references.py), each reference's float32 run's evidence from
+verl's float64 run, with that run's sketch, each
+seed's inputs drawn again by tests/test_rl_advantage.py (`advantage_inputs`):
+
+  PYTHONPATH=src:tools python tools/parity_rl.py recording
+
 Both references import their whole training stack at module scope (ray,
 tensordict and omegaconf for verl; metrax, jaxtyping and the SFT trainer for
 Tunix), so the reference files are compiled directly with those names stubbed.
@@ -30,7 +37,6 @@ arithmetic.
 """
 
 import argparse
-import importlib.util
 import sys
 import types
 from pathlib import Path
@@ -114,6 +120,133 @@ EXTREME_LOG_PROBS = np.full((1, 3), -1.0, dtype=np.float32)
 EXTREME_REF_LOG_PROBS = EXTREME_LOG_PROBS + EXTREME_KL_DIFF
 
 
+ESTIMATORS = ("masked_mean_rows", "masked_whiten", "group_advantage", "group_advantage_unnormalised",
+              "rloo_advantage", "gae_advantage", "gae_return")
+"""The advantage recording's leaves, one per estimator output."""
+
+
+DRAWN_MASK = np.tile(RESPONSE_MASK, (16, 1))
+"""The recorded draws' response mask: the fixed fixture's three rows (one row cut short, one whole,
+one a single token) sixteen times over."""
+DRAWN_GROUPS = 64
+"""The recorded draws' groups of GROUP rewards."""
+WHITENED = 32
+"""The recorded draws' tensors whitened apart: a whitening shares one mean and one deviation over its
+tensor, one rounding a draw would otherwise give."""
+
+
+def advantage_inputs(seed: int) -> dict[str, np.ndarray]:
+    """A seed's inputs to every estimator, the same on every run: DRAWN_GROUPS groups of GROUP rewards,
+    the second group's equal (the case only the eps under the deviation divides), and token rewards and
+    values under DRAWN_MASK, the values large behind it (which a recursion that reads them moves).
+    Check 1's draw for the recorded references, each draw many rows, so a few seeds resolve it."""
+    rng = np.random.default_rng([0xADB, seed])
+    rewards = rng.normal(size=DRAWN_GROUPS * GROUP).astype(np.float32)
+    rewards[GROUP:2 * GROUP] = rewards[GROUP]
+
+    def values(*shape):
+        drawn = rng.normal(size=(*shape, *DRAWN_MASK.shape))
+        return np.where(DRAWN_MASK > 0, drawn, 7 * drawn).astype(np.float32)
+
+    return {"rewards": rewards, "token_rewards": rng.normal(size=DRAWN_MASK.shape).astype(np.float32),
+            "values": values(), "whitened": values(WHITENED)}
+
+
+def verl_advantages(verl, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
+    """verl's estimators on `inputs` at the torch `dtype`."""
+    import torch
+
+    reductions = sys.modules["verl.utils.torch_functional"]
+
+    def tensor(x):
+        return torch.tensor(np.asarray(x), dtype=dtype)
+
+    rewards = inputs["rewards"]
+    uids = np.repeat(np.arange(rewards.shape[0] // GROUP), GROUP).astype(np.int64)
+    token_level, ones = tensor(rewards[:, None]), tensor(np.ones((rewards.shape[0], 1)))
+    values, mask = tensor(inputs["values"]), tensor(DRAWN_MASK)
+    found = {"masked_mean_rows": reductions.masked_mean(values, mask, axis=-1),
+             "masked_whiten": torch.stack([reductions.masked_whiten(tensor(one), mask)
+                                           for one in inputs["whitened"]])}
+    found["group_advantage"] = verl.compute_grpo_outcome_advantage(token_level.clone(), ones, uids)[0][:, 0]
+    found["group_advantage_unnormalised"] = verl.compute_grpo_outcome_advantage(
+        token_level.clone(), ones, uids, norm_adv_by_std_in_grpo=False)[0][:, 0]
+    found["rloo_advantage"] = verl.compute_rloo_outcome_advantage(token_level.clone(), ones, uids)[0][:, 0]
+    found["gae_advantage"], found["gae_return"] = verl.compute_gae_advantage_return(
+        tensor(inputs["token_rewards"]), values, mask, GAMMA, LAM)
+    return {name: found[name].detach().numpy() for name in ESTIMATORS}
+
+
+def tunix_advantages(tunix, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.ndarray]:
+    """Tunix's estimators on `inputs` at the JAX `dtype`."""
+    import jax.numpy as jnp
+
+    rewards, values, mask = (jnp.asarray(inputs.get(name, DRAWN_MASK), dtype)
+                             for name in ("rewards", "values", "response_mask"))
+    found = {"masked_mean_rows": tunix.masked_mean(values, mask, axis=-1),
+             "masked_whiten": jnp.stack([tunix.masked_whiten(jnp.asarray(one, dtype), mask)
+                                         for one in inputs["whitened"]]),
+             "group_advantage": tunix.compute_advantages(rewards, GROUP),
+             "group_advantage_unnormalised": tunix.compute_drgrpo_advantages(rewards, GROUP),
+             "rloo_advantage": tunix.compute_rloo_advantages(rewards, GROUP)}
+    found["gae_advantage"], found["gae_return"] = tunix.compute_gae_advantages(
+        jnp.asarray(inputs["token_rewards"], dtype), values, mask, GAMMA, LAM)
+    return {name: np.asarray(found[name]) for name in ESTIMATORS}
+
+
+def dew_estimators(inputs: dict) -> dict:
+    """Dew's estimators on a draw (`advantage_inputs`), by the recording's leaf names: the count the
+    recording plans on, and the test's arm and, in float64, its truth."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.rl.advantage import gae, group_advantage, masked_mean, masked_whiten, rloo_advantage
+
+    mask = jnp.asarray(DRAWN_MASK, inputs["values"].dtype)
+    advantages, returns = gae(inputs["token_rewards"], inputs["values"], mask, gamma=GAMMA, lam=LAM)
+    return {"masked_mean_rows": masked_mean(inputs["values"], mask, axis=-1),
+            "masked_whiten": jax.vmap(lambda one: masked_whiten(one, mask))(inputs["whitened"]),
+            "group_advantage": group_advantage(inputs["rewards"], GROUP),
+            "group_advantage_unnormalised": group_advantage(inputs["rewards"], GROUP, normalise_by_std=False),
+            "rloo_advantage": rloo_advantage(inputs["rewards"], GROUP),
+            "gae_advantage": advantages, "gae_return": returns}
+
+
+def write_advantage_recording(verl, tunix, command: str, out: Path) -> None:
+    """recorded_advantage_<reference>.npz: each reference's estimators recorded over check 1's seeds
+    (`record_case`'s summary), its float32 run's evidence from verl's float64 run, which keeps float64
+    through every estimator, and that run's sketch, the count planned on Dew's own estimators
+    (`dew_estimators`)."""
+    import jax
+    import jax.numpy as jnp
+    import torch
+    from fetched_fixtures import save
+    from recorded_references import provenance, record_case
+
+    def truth(inputs):
+        return verl_advantages(verl, inputs, torch.float64)
+
+    def tunix_float32(inputs):
+        # The recording runs where x64 is enabled, where a constant Tunix makes without a dtype (its
+        # scan's carry) would be float64; its float32 run is the one without x64.
+        with jax.enable_x64(new_val=False):
+            return tunix_advantages(tunix, inputs, jnp.float32)
+
+    evaluations = {"verl": lambda inputs: (verl_advantages(verl, inputs, torch.float32), truth(inputs)),
+                   "tunix": lambda inputs: (tunix_float32(inputs), truth(inputs))}
+    for name, evaluate in evaluations.items():
+        with jax.enable_x64(new_val=True):
+            recorded = record_case(name, advantage_inputs, evaluate, dew_estimators,
+                                   truth_proxy=dew_estimators,
+                                   store_inputs=False, summary=True)
+        commit = {"verl": "896a9bb", "tunix": "b9f5e65"}[name]
+        recorded[f"{name}.provenance"] = provenance(name, commit, "cpu", command, torch=torch.__version__,
+                                                    truth="verl float64")
+        written = save(out / f"recorded_advantage_{name}.npz", recorded, reference=f"{name} {commit}",
+                       license="Apache-2.0")
+        print(f"{written}: {written.stat().st_size} bytes", flush=True)
+
+
 def stub(name, **attributes):
     """Register a module that exists only to satisfy an import a reference
     performs at load time."""
@@ -164,22 +297,10 @@ def registering(*_):
     return lambda function: function
 
 
-def compile_reference(name, path):
-    """Compile a reference file under its own module name, imports stubbed."""
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"{path} is not a Python source file; is the clone checked out?")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    parent, _, leaf = name.rpartition(".")
-    if parent in sys.modules:
-        setattr(sys.modules[parent], leaf, module)
-    spec.loader.exec_module(module)
-    return module
+def load_verl(verl=VERL):
+    """verl's core_algos and the masked reductions it calls, from the clone at `verl`."""
+    from reference_source import loaded
 
-
-def load_verl():
-    """verl's core_algos and the masked reductions it calls."""
     stub("ray")
     stub("tensordict", TensorDict=dict)
     stub("omegaconf", DictConfig=dict, MISSING=None)
@@ -194,10 +315,8 @@ def load_verl():
     stub("verl.workers")
     stub("verl.workers.config", ActorConfig=ActorConfig)
 
-    compile_reference("verl.utils.torch_functional",
-                      VERL / "verl" / "utils" / "torch_functional.py")
-    return compile_reference("verl.trainer.ppo.core_algos",
-                             VERL / "verl" / "trainer" / "ppo" / "core_algos.py")
+    loaded("verl.utils.torch_functional", verl / "verl" / "utils" / "torch_functional.py")
+    return loaded("verl.trainer.ppo.core_algos", verl / "verl" / "trainer" / "ppo" / "core_algos.py")
 
 
 def load_tunix():
@@ -209,6 +328,8 @@ def load_tunix():
     because the decorators run at import and nothing here calls a function
     back through them.
     """
+    from reference_source import loaded
+
     stub("tunix")
     stub("tunix.rl")
     stub("tunix.sft")
@@ -216,11 +337,10 @@ def load_tunix():
     stub("tunix.rl.function_registry", default_registry=Registry(),
          register_policy_loss_fn=registering, register_value_loss_fn=registering,
          register_advantage_estimator=registering)
-    compile_reference("tunix.oss.utils", TUNIX / "tunix" / "oss" / "utils.py")
-    compile_reference("tunix.sft.utils", TUNIX / "tunix" / "sft" / "utils.py")
-    common = compile_reference("tunix.rl.common", TUNIX / "tunix" / "rl" / "common.py")
-    algo_core = compile_reference("tunix.rl.algo_core",
-                                  TUNIX / "tunix" / "rl" / "algo_core.py")
+    loaded("tunix.oss.utils", TUNIX / "tunix" / "oss" / "utils.py")
+    loaded("tunix.sft.utils", TUNIX / "tunix" / "sft" / "utils.py")
+    common = loaded("tunix.rl.common", TUNIX / "tunix" / "rl" / "common.py")
+    algo_core = loaded("tunix.rl.algo_core", TUNIX / "tunix" / "rl" / "algo_core.py")
     return algo_core, common
 
 
@@ -365,10 +485,16 @@ def write_surrogate(verl, tunix_common):
 def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("mode", nargs="?", choices=("recording",))
     parser.add_argument("--out", type=Path, default=FIXTURES)
-    out = parser.parse_args(argv).out
+    parsed = parser.parse_args(argv)
+    out = parsed.out
     verl = load_verl()
     tunix, tunix_common = load_tunix()
+    if parsed.mode == "recording":
+        write_advantage_recording(verl, tunix, "PYTHONPATH=src:tools python tools/parity_rl.py recording",
+                                  out)
+        return
 
     out.mkdir(parents=True, exist_ok=True)
     for name, written in (("advantage", write_advantage(verl, tunix)),

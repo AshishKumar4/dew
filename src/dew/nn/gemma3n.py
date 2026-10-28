@@ -27,7 +27,14 @@ from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
 from dew.nn.fake_quant import straight_through
 from dew.nn.flops import projection_flops
-from dew.nn.precision import at_least_fp32, sqrt_or_zero
+from dew.nn.precision import (
+    accumulated,
+    at_least_fp32,
+    float32_dot_general,
+    float32_einsum,
+    float32_products,
+    sqrt_or_zero,
+)
 from dew.nn.sharding import logical_axes
 
 # The reference floors the magnitude a projected copy is rescaled by
@@ -101,7 +108,7 @@ class LaurelBlock(nn.Module):
     @nn.compact
     def __call__(self, x):
         dense = functools.partial(Dense, use_bias=False, dtype=self.dtype,
-                                  precision=self.precision)
+                                  precision=self.precision, dot_general=float32_dot_general)
         maps = self.projections()
         low = dense(maps['linear_left'][1], name='linear_left')(x)
         projected = dense(maps['linear_right'][1], name='linear_right')(low)
@@ -136,7 +143,8 @@ class _Coefficients(nn.Module):
             clipped = jnp.clip(kernel, -self.clip, self.clip)
             kernel = straight_through(kernel, clipped) if self.stored else clipped
         dtype = x.dtype if self.dtype is None else self.dtype
-        return jnp.dot(x.astype(dtype), kernel.astype(dtype), precision=self.precision)
+        return accumulated(functools.partial(jnp.dot, precision=float32_products(dtype, self.precision)),
+                           x.astype(dtype), kernel.astype(dtype))
 
 
 def clamped_predictions(params, clip: float):
@@ -220,7 +228,8 @@ class AltUpLayer(nn.Module):
         self.prediction_coefs = coefficients(maps['prediction_coefs'][1], stored=True,
                                              name='prediction_coefs')
         self.modality_router = Dense(maps['modality_router'][1], use_bias=False, dtype=self.dtype,
-                                     precision=self.precision, name='modality_router')
+                                     precision=self.precision, name='modality_router',
+                                     dot_general=float32_dot_general)
         self.router_norm = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name='router_norm')
 
     def modalities(self, x):
@@ -235,7 +244,7 @@ class AltUpLayer(nn.Module):
         # the stream moved to the end (the reference's permute(0, 1, 3, 2)).
         coefs = self.prediction_coefs(modalities, train=train)
         coefs = jnp.swapaxes(coefs.reshape(*modalities.shape[:-1], n, n), -1, -2)
-        predictions = jnp.einsum('nbsd,bsnm->mbsd', stream, coefs,
+        predictions = float32_einsum('nbsd,bsnm->mbsd', stream, coefs,
                                  precision=self.precision)
         return (predictions + stream).astype(stream.dtype)
 

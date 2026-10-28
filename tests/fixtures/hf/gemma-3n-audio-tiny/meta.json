@@ -1,6 +1,6 @@
 {
-  "torch": "2.14.0+cpu",
-  "transformers": "5.16.1",
+  "torch": "2.14.1+cpu",
+  "transformers": "5.17.0",
   "seed": 2718,
   "prompts": [
     "listen <audio> ok",

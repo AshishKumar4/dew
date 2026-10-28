@@ -22,6 +22,7 @@ causal convolution that doubles the channels. The decoder clamps pixels to
 """
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Mapping
 from itertools import pairwise
@@ -34,17 +35,26 @@ import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype
 
-from dew import records
-from dew.interop.components import bind_component, component_source
-from dew.objectives.base import Variables
+from dew import _records
+from dew.batch import Variables
+from dew.interop.components import bind_component
+from dew.interop.weights import indexed_path
+from dew.nn.kernels.options import program
 
+from ..activations import silu
 from ..attention import l2_normalized, scaled_dot_product_attention
+from ..blocks import Upsample
 from ..conv import Conv
-from .api import AutoEncoder
+from ..precision import at_least_fp32
+from .api import AutoEncoder, LatentNormalization, published_source
 from .kl import posterior_latent
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
+
+
+PUBLISHED = ("AutoencoderKLWan",)
+"""The `_class_name` a published AutoencoderKLWan's config states."""
 
 
 class WanRMSNorm(nn.Module):
@@ -59,7 +69,7 @@ class WanRMSNorm(nn.Module):
     @nn.compact
     def __call__(self, x):
         gamma = self.param("gamma", nn.initializers.ones, (self.features, *(1,) * (self.rank - 1)))
-        wide = x.astype(jnp.promote_types(x.dtype, jnp.float32))
+        wide = x.astype(at_least_fp32(x.dtype))
         return (l2_normalized(wide) * math.sqrt(self.features) * gamma.reshape(-1)).astype(self.dtype)
 
 
@@ -120,9 +130,9 @@ class WanResidualBlock(nn.Module):
         shortcut = x
         if self.in_features != self.features:
             shortcut = causal_conv(self.features, 1, spatial, self.dtype, "conv_shortcut")(x)
-        x = nn.silu(WanRMSNorm(self.in_features, 4, self.dtype, name="norm1")(x))
+        x = silu(WanRMSNorm(self.in_features, 4, self.dtype, name="norm1")(x))
         x = _causal(self, self.features, 3, spatial, "conv1", x)
-        x = nn.silu(WanRMSNorm(self.features, 4, self.dtype, name="norm2")(x))
+        x = silu(WanRMSNorm(self.features, 4, self.dtype, name="norm2")(x))
         return _causal(self, self.features, 3, spatial, "conv2", x) + shortcut
 
 
@@ -216,9 +226,11 @@ class _Upsample(nn.Module):
                 later = later.reshape(batch, frames, height, width, 2, channels)
                 later = later.transpose(0, 1, 4, 2, 3, 5).reshape(batch, 2 * frames, height, width, channels)
                 x = jnp.concatenate([first, later], axis=1)
-        x = jnp.repeat(jnp.repeat(x, 2, axis=2), 2, axis=3)
-        conv = Conv(self.features // 2, (3, 3), padding=((1, 1), (1, 1)), dtype=self.dtype, name="resample_1")
-        return _frames(conv, x)
+        # Each frame doubled by nearest resize and convolved to half the channels (`blocks.Upsample`), its
+        # convolution this module's `resample_1`, as the published Wan VAE names it.
+        upsample = Upsample(self.features // 2, 2, dtype=self.dtype, conv="resample_1")
+        nn.share_scope(upsample, self)
+        return _frames(upsample, x)
 
 
 class _Encoder(nn.Module):
@@ -242,7 +254,7 @@ class _Encoder(nn.Module):
                 x = _Downsample(features, self.temporal[level], self.dtype, name=f"down_blocks_{index}")(x)
                 index += 1
         x = WanMidBlock(dims[-1], self.dtype, name="mid_block")(x)
-        x = nn.silu(WanRMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
+        x = silu(WanRMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
         return _causal(self, 2 * self.latent, 3, 3, "conv_out", x)
 
 
@@ -282,8 +294,18 @@ class _Decoder(nn.Module):
             upsample = level != len(self.multipliers) - 1
             x = _UpBlock(in_features // 2 if level > 0 else in_features, features, self.blocks, upsample,
                          upsample and upsampling[level], self.dtype, name=f"up_blocks_{level}")(x)
-        x = nn.silu(WanRMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
+        x = silu(WanRMSNorm(dims[-1], 4, self.dtype, name="norm_out")(x))
         return _causal(self, 3, 3, 3, "conv_out", x)
+
+
+def _posterior(model: WanVAE, params, video, key=None, noise=None):
+    """A video's posterior draw: the whole video's moments, its chunks assembled, and its noise whole."""
+    return posterior_latent(chunked_moments(model, {"params": params}, video), key, noise)
+
+
+def _chunk_decoded(model: WanVAE, params, latents):
+    """A video's latents decoded chunk by chunk (`chunked_decode`)."""
+    return chunked_decode(model, {"params": params}, latents)
 
 
 class WanVAEFields(TypedDict):
@@ -327,8 +349,8 @@ class WanVAE(nn.Module):
             raise ValueError(f"a Wan VAE encodes 1 + {self.temporal_factor}k frames, not {video.shape[1]}")
         return self.quant_conv(self.encoder(video))
 
-    def encode(self, video, key=None):
-        return posterior_latent(self.moments(video), key)
+    def encode(self, video, key=None, noise=None):
+        return posterior_latent(self.moments(video), key, noise)
 
     def decode(self, latents):
         return jnp.clip(self.decoder(self.post_quant_conv(latents)), -1.0, 1.0)
@@ -375,11 +397,11 @@ def chunked_decode(model: WanVAE, variables: Variables, latents):
 def wan_vae_fields(config: Mapping[str, object]) -> WanVAEFields:
     """Read an `AutoencoderKLWan` config into the fields `WanVAE` takes,
     refusing what the port does not compute."""
-    multipliers = records.integers(config["dim_mult"], "dim_mult")
+    multipliers = _records.integers(config["dim_mult"], "dim_mult")
     halvings = config["temperal_downsample"]
     if not isinstance(halvings, (list, tuple)):
         raise ValueError(f"temperal_downsample={halvings!r}: this field is one flag per downsampling")
-    temporal = tuple(records.boolean(halves, "temperal_downsample") for halves in halvings)
+    temporal = tuple(_records.boolean(halves, "temperal_downsample") for halves in halvings)
     if len(temporal) != len(multipliers) - 1:
         raise ValueError(f"temperal_downsample has {len(temporal)} entries for {len(multipliers)} levels")
     if config.get("attn_scales"):
@@ -389,9 +411,10 @@ def wan_vae_fields(config: Mapping[str, object]) -> WanVAEFields:
     for name in ("is_residual", "patch_size"):
         if config.get(name):
             raise ValueError(f"{name} belongs to Wan 2.2's VAE, which this port does not compute")
-    return WanVAEFields(base=records.integer(config["base_dim"], "base_dim"),
-                        latent=records.integer(config["z_dim"], "z_dim"), multipliers=multipliers,
-                        blocks=records.integer(config["num_res_blocks"], "num_res_blocks"), temporal=temporal)
+    return WanVAEFields(base=_records.integer(config["base_dim"], "base_dim"),
+                        latent=_records.integer(config["z_dim"], "z_dim"), multipliers=multipliers,
+                        blocks=_records.integer(config["num_res_blocks"], "num_res_blocks"),
+                        temporal=temporal)
 
 
 _LEAF_RANK = {"weight": (4, 5), "bias": (1,), "gamma": (3, 4)}
@@ -408,12 +431,7 @@ def wan_vae_path(name: str, ndim: int) -> tuple[str, ...]:
         raise ValueError(f"{name!r} is not an AutoencoderKLWan tensor")
     if ndim not in _LEAF_RANK[leaf]:
         raise ValueError(f"{name!r} has {ndim} axes, not {' or '.join(map(str, _LEAF_RANK[leaf]))}")
-    path: list[str] = []
-    for part in parts:
-        if part.isdigit() and path:
-            path[-1] = f"{path[-1]}_{part}"
-        else:
-            path.append("attention_out" if part == "proj" else part)
+    path = indexed_path("attention_out" if part == "proj" else part for part in parts)
     return (*path, "kernel" if leaf == "weight" else leaf)
 
 
@@ -428,27 +446,22 @@ class WanAutoencoder(AutoEncoder):
     `chunked_decode`), so a clip's length does not set the memory they hold.
     """
 
-    record_name = 'wan'
-    record_module = WanVAE
-
     def __init__(self, *, model: WanVAE, params: Variables, latents_mean, latents_std):
         self.model = model
         self.params = params
-        self.latents_std = np.asarray(latents_std, np.float32)
-        self.latent_shift = np.asarray(latents_mean, np.float32)
-        self.latent_scale = 1.0 / self.latents_std
+        mean, std = np.asarray(latents_mean, np.float32), np.asarray(latents_std, np.float32)
         expected = (model.latent,)
-        if self.latent_shift.shape != expected or self.latent_scale.shape != expected:
+        if mean.shape != expected or std.shape != expected:
             raise ValueError(
-                f"latents_mean {self.latent_shift.shape} and latents_std {self.latent_scale.shape} "
+                f"latents_mean {mean.shape} and latents_std {std.shape} "
                 f"must both hold one value per latent channel {expected}"
             )
-        self._encode = jax.jit(lambda params, video, key=None: posterior_latent(
-            chunked_moments(model, {"params": params}, video), key))
-        self._decode = jax.jit(lambda params, latents: chunked_decode(model, {"params": params}, latents))
+        self.normalization = LatentNormalization({'latents_mean': mean, 'latents_std': std}, mean, 1.0 / std)
+        self._encode = functools.partial(program(_posterior, model, static_argnums=0), model)
+        self._decode = functools.partial(program(_chunk_decoded, model, static_argnums=0), model)
 
     def record_arguments(self) -> dict:
-        return {'latents_mean': self.latent_shift, 'latents_std': self.latents_std}
+        return dict(self.normalization.record)
 
     @property
     def downscale_factor(self) -> int:
@@ -466,14 +479,14 @@ class WanAutoencoder(AutoEncoder):
             raise ValueError(f"a Wan VAE encodes 1 + {self.model.temporal_factor}k frames, not {frames}")
         return ((frames - 1) // self.model.temporal_factor + 1, *super().latent_shape(tuple(image)))
 
-    def encode_batch(self, params, x, key=None):
-        return self._encode(params, x[:, None], key)[:, 0]
+    def encode_batch(self, params, x, key=None, noise=None):
+        return self._encode(params, x[:, None], key, None if noise is None else noise[:, None])[:, 0]
 
     def decode_batch(self, params, z):
         return self._decode(params, z[:, None])[:, 0]
 
-    def encode_video(self, params, x, key=None):
-        return self._encode(params, x, key)
+    def encode_video(self, params, x, key=None, noise=None):
+        return self._encode(params, x, key, noise)
 
     def decode_video(self, params, z):
         return self._decode(params, z)
@@ -491,11 +504,7 @@ def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str 
     Supplied `params` are bound unchanged: only the config is read, and no
     source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
     placement to read (`dew.interop.weights.record_layouts`)."""
-    directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
-    if config.get("_class_name") != "AutoencoderKLWan":
-        raise ValueError(
-            f"{directory} holds a {config.get('_class_name')}, not an AutoencoderKLWan"
-        )
+    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=params is None)
     model = WanVAE(**wan_vae_fields(config), dtype=compute)
     video = jax.ShapeDtypeStruct(
         (1, 1 + model.temporal_factor, model.downscale_factor, model.downscale_factor, 3), jnp.float32

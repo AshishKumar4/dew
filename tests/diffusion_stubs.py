@@ -3,13 +3,13 @@ axis divides, and a table that reads a class off a prompt."""
 
 from dataclasses import dataclass
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import Variables
 from dew.inputs import CharTable, ConditionEncoder
+from dew.inputs.encoders import char_codes
 from dew.nn.dit import TextContext
-from dew.objectives.base import Variables
 
 RES = 8
 TOKENS = 5
@@ -39,13 +39,7 @@ class StubText(ConditionEncoder[str]):
         return cls(checkpoint=checkpoint, params=params, tokens=tokens, vocab=vocab)
 
     def tokenize(self, data):
-        ids = np.zeros((len(data), self.tokens), np.int32)
-        mask = np.zeros((len(data), self.tokens), np.int32)
-        for row, text in enumerate(data):
-            codes = [1] + [2 + (ord(char) % (self.vocab - 2)) for char in text[:self.tokens - 1]]
-            ids[row, :len(codes)] = codes
-            mask[row, :len(codes)] = 1
-        return {"input_ids": ids, "attention_mask": mask}
+        return char_codes(data, self.tokens, self.vocab)
 
     def encode(self, params, tokens):
         return TextContext(hidden=params["table"][jnp.asarray(tokens["input_ids"])],
@@ -55,7 +49,7 @@ class StubText(ConditionEncoder[str]):
         return tuple("".join(chr(97 + int(i)) for i in row[row > 1])
                      for row in np.asarray(tokens["input_ids"]))
 
-    def to_json(self):
+    def recorded_fields(self):
         return {"checkpoint": self.checkpoint, "tokens": self.tokens,
                 "features": int(self.params["table"].shape[1]), "vocab": self.vocab}
 
@@ -67,12 +61,10 @@ PROMPTS = ["a red bird", "two cats"]
 
 def batch_for(objective, size: int) -> dict:
     """One row per device, the prompts in turn: a batch the data axis divides,
-    in the channels the objective's sample field names."""
-    rows, channels = jax.device_count(), objective.inputs.sample.shape[-1]
-    pixels = np.tile(np.arange(size * size * channels, dtype=np.uint8).reshape(
-        1, size, size, channels), (rows, 1, 1, 1))
-    return {"image": pixels,
-            **objective.inputs.tokenize([PROMPTS[row % len(PROMPTS)] for row in range(rows)])}
+    in the channels the objective's sample field names (`diffusion_support.image_batch`)."""
+    from diffusion_support import image_batch
+
+    return image_batch(objective, PROMPTS, size)
 
 
 def label_table(labels, null: float = 0.0) -> CharTable:

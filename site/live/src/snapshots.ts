@@ -22,6 +22,11 @@ interface SnapshotEnv {
 }
 
 const LIFETIME_MS = 30 * 24 * 60 * 60_000;
+
+/** Whether `generation`'s snapshot has outlived its lifetime at `now`: a host restores none that has. */
+export function expired(generation: SnapshotGeneration, now = Date.now()): boolean {
+	return generation.created + LIFETIME_MS <= now;
+}
 const RENEW_MS = 7 * 24 * 60 * 60_000;
 // A preparation reports within PREPARATION_MS, or its preparer has abandoned it.
 const REBUILD_MS = PREPARATION_MS;
@@ -42,7 +47,7 @@ export interface Trial {
 export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 	async current(commit: string, now = Date.now()): Promise<SnapshotGeneration | null> {
 		const generation = await this.ctx.storage.get<SnapshotGeneration>('active');
-		return generation?.commit === commit && generation.created + LIFETIME_MS > now ? generation : null;
+		return generation?.commit === commit && !expired(generation, now) ? generation : null;
 	}
 
 	async previous(): Promise<SnapshotGeneration | null> {

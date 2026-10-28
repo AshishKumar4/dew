@@ -6,14 +6,14 @@ one request at a time, so turns of different sessions interleave in the
 engine's continuous batch instead of waiting on a lock-step cohort.
 
 `EnvironmentSource` runs the in-process `Environment` protocol that
-`EpisodeRollout` runs, one session per sample on a worker thread, through
+`EpisodeCollector` runs, one session per sample on a worker thread, through
 the same per-episode state, `EpisodeProgress`: its context limit, its
 record of each call with the observation that followed it, and its finite
 verifier reward. Each turn submits the observation's context and steps the
 environment with the drawn action; the episode becomes a `Session` through
-`session_of`, the converter `EpisodeRollout` packs with, so both paths feed
-one packer. Each call keeps the version its request was submitted under, so
-a session that spans a weight push carries both versions.
+`session_of`, as `EpisodeCollector`'s do, so both feed one packer. Each
+call keeps the version its request was submitted under, so a session that
+spans a weight push carries both versions.
 
 The statuses follow the scheduler's failure policy. An infrastructure
 failure is an INFRA_ERROR session, retried and never scored: a draw the
@@ -37,37 +37,21 @@ verification overlaps generation.
 
 from __future__ import annotations
 
-import hashlib
 import threading
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, InvalidStateError, ThreadPoolExecutor
-from contextlib import AbstractContextManager, suppress
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
 from uuid import uuid4
 
 import jax
-import numpy as np
 
-from dew.data.prompts import PromptRecord
-from dew.inference.rollouts import Draw, InfrastructureError, RolloutServer
-from dew.objectives.base import Batch
+from dew.inference.engine import settled
+from dew.inference.rollouts import INFRASTRUCTURE, Draw, RolloutServer
 
-from .episodes import (
-    Action,
-    Environment,
-    Episode,
-    EpisodeId,
-    EpisodeProgress,
-    EpisodeStatus,
-    finite_reward,
-    session_of,
-    step_action,
-)
-from .rollout import Reward, prompt_rows
+from .episodes import Environment, Episode, EpisodeId, EpisodeProgress, EpisodeStatus, session_of, step_action
+from .rollout import PromptTask, Reward, scored_draw
 from .sessions import Call, Session, Status, Task
-
-_INFRASTRUCTURE = (InfrastructureError, OSError)
-"""What a draw or a callback fails with when its external boundary, not its code, failed."""
 
 
 def _failure(error: BaseException) -> str:
@@ -85,7 +69,7 @@ def _draw_failure(drawn: Future[Draw]) -> str | None:
     failure = drawn.exception()
     if failure is None:
         return None
-    if isinstance(failure, _INFRASTRUCTURE):
+    if isinstance(failure, INFRASTRUCTURE):
         return f"draw: {_failure(failure)}"
     raise failure
 
@@ -104,7 +88,7 @@ class EnvironmentSource:
     read the task's own payload, and `identity.task` is the submission's
     serial number. `workers` is the most sessions that run at once, and the
     server batches their calls. The server's sampling policy must set an EOS
-    id. `cancel` stops a session at its next turn or during a draw, but
+    id or a stop string. `cancel` stops a session at its next turn or during a draw, but
     never inside `environment.step`. So an environment must bound its own
     step time, as `SubprocessEnvironment` does with its wall clock, or a hung
     step holds its worker until it returns. An action carries the draw's raw
@@ -119,8 +103,9 @@ class EnvironmentSource:
                             ("max_turns", max_turns), ("workers", workers)):
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        if server.sampling.eos_token_ids is None:
-            raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
+        if server.sampling.eos_token_ids is None and not server.sampling.stop:
+            raise ValueError("tool episodes need an EOS id or a stop string to tell a turn that ended "
+                             "from one cut at its token limit")
         self.server, self.environment, self.verifier = server, environment, verifier
         self.max_prompt_tokens, self.max_new_tokens, self.max_turns = (
             max_prompt_tokens,
@@ -182,15 +167,9 @@ class EnvironmentSource:
             return None
         return pending
 
-    def _action(self, draw: Draw, context: tuple[int, ...]) -> Action:
-        if draw.prompt != context:
-            raise ValueError("the server returned a draw for another context")
-        return Action(context, draw.tokens, draw.raw_log_probs, draw.behavior_log_probs, draw.terminated,
-                      draw.version, self.server.sampling)
-
-    def _play(self, episode: EpisodeProgress, environment: Environment, key: jax.Array, handle: _Handle,
-              draws: list[Draw]) -> None:
-        """Run the episode's turns, each a draw on the server and an environment step, appending each draw."""
+    def _play(self, episode: EpisodeProgress, environment: Environment, key: jax.Array,
+              handle: _Handle) -> None:
+        """Run the episode's turns, each a draw on the server and an environment step."""
         episode.begin(environment.reset())
         for turn in range(self.max_turns):
             context = episode.next_context(max_prompt_tokens=self.max_prompt_tokens)
@@ -204,80 +183,51 @@ class EnvironmentSource:
             if failed is not None:
                 episode.stop(EpisodeStatus.ERROR, failed)
                 return
-            draw = drawn.result()
-            action = self._action(draw, context)
-            draws.append(draw)
-            episode.pending = action
-            episode.commit(action, step_action(environment, action))
+            draw = drawn.result().checked(self.server.sampling)
+            if draw.prompt != context:
+                raise ValueError("the server returned a draw for another context")
+            episode.pending = draw
+            episode.commit(draw, step_action(environment, draw))
 
     def _run(self, task: Task, identity: EpisodeId, version: int, key: jax.Array, handle: _Handle) -> Session:
-        episode = EpisodeProgress(identity)
-        draws: list[Draw] = []
+        episode = EpisodeProgress(identity, self.server.sampling)
         binding = uuid4().hex
         broken = False
         try:
             with self.environment(task, identity) as environment:
                 try:
-                    self._play(episode, environment, key, handle, draws)
-                except _INFRASTRUCTURE:
+                    self._play(episode, environment, key, handle)
+                except INFRASTRUCTURE:
                     raise
                 except BaseException:
                     broken = True
                     raise
             if episode.status not in (EpisodeStatus.ERROR, EpisodeStatus.CANCELLED):
                 episode.score(lambda finished: self.verifier(task, finished), version, binding)
-        except _INFRASTRUCTURE as error:
+        except INFRASTRUCTURE as error:
             if broken:
                 # The environment's exit failed while broken code was raising: the failure carries
                 # that error as its context and is raised, not retried.
                 raise
             # The draw's, the environment's or the verifier's boundary failed: infrastructure, retried.
             episode.abort(EpisodeStatus.ERROR, _failure(error))
-        session = session_of(episode.episode(version, binding), group="")
-        # An episode records what the environment saw; the engine records of
-        # each call (routing, sampling support) come from its draw.
-        calls = tuple(replace(call, routed_experts=draw.routed_experts, support=draw.support)
-                      for call, draw in zip(session.calls, draws, strict=True))
-        return replace(session, task=task.id, calls=calls)
+        # Each call keeps its draw whole, the engine's routing and sampling support with it.
+        return replace(session_of(episode.episode(version, binding), group=""), task=task.id)
 
 
-def prompt_tasks(batch: Batch) -> list[Task]:
-    """Return one single-turn task per prompt row, with its prompt ids and its `PromptRecord`.
-
-    A task's id is a digest of its prompt ids, so repeated prompts share an
-    id; their groups keep them apart.
-    """
-    prompts, lengths, records = prompt_rows(batch)
-    rows, width = prompts.shape
-    tasks = []
-    for row in range(rows):
-        ids = tuple(int(token) for token in prompts[row, width - int(lengths[row]):])
-        name = hashlib.sha256(np.asarray(ids, np.int64).tobytes()).hexdigest()[:16]
-        tasks.append(Task(name, {"prompt": ids, "record": records[row]}))
-    return tasks
-
-
-@dataclass(frozen=True)
-class _Prompt:
-    """What `prompt_tasks` puts in a task: the prompt ids and the `PromptRecord` its reward reads."""
-
-    ids: tuple[int, ...]
-    record: PromptRecord
-
-    @classmethod
-    def of(cls, task: Task) -> _Prompt:
-        ids, record = task.data.get("prompt"), task.data.get("record")
-        if not (isinstance(ids, tuple) and isinstance(record, PromptRecord)):
-            raise TypeError(f"task {task.id!r} is not a prompt_tasks task: it needs prompt ids "
-                            "and a PromptRecord")
-        return cls(ids, record)
+def _cancelled_with(job: Future[None], rollout: Future[Session]) -> None:
+    """Cancel `rollout` where its reward `job` was cancelled (`PromptSource.close`), and notify its
+    waiters: `concurrent.futures.wait` counts a cancelled future done only once it is notified."""
+    if job.cancelled() and rollout.cancel():
+        rollout.set_running_or_notify_cancel()
 
 
 class PromptSource:
     """Draws one completion per sample of a `prompt_tasks` task and scores its decoded text.
 
     `decode` turns the sampled ids into text, and `reward` scores that text,
-    without the EOS, on `scorers` threads as soon as each draw finishes. A
+    without the EOS id a draw ended on but with a stop string it ended on
+    (`Draw.response`), on `scorers` threads as soon as each draw finishes. A
     draw that ends on its token budget is TRUNCATED and still scored. A
     draw the server cancelled, and an `InfrastructureError` or `OSError`
     the draw or the reward fails with, such as an unreachable engine or a
@@ -302,7 +252,7 @@ class PromptSource:
         self._scorers = ThreadPoolExecutor(max_workers=scorers, thread_name_prefix="dew-reward")
 
     def submit(self, task: Task, samples: int, *, version: int, key: jax.Array) -> list[Future[Session]]:
-        prompt = _Prompt.of(task)
+        prompt = PromptTask.of(task)
         return [self._scored(task, prompt, version, self.server.submit(prompt.ids, self.max_new_tokens,
                                                                        key=jax.random.fold_in(key, k)))
                 for k in range(samples)]
@@ -313,38 +263,22 @@ class PromptSource:
             future.cancel()
 
     def close(self) -> None:
-        """Stop the reward threads. The caller closes the server; this method does not."""
+        """Stop the reward threads: a reward running finishes, and a rollout whose reward has not
+        started is cancelled. The caller closes the server; this method does not."""
         self._scorers.shutdown(wait=True, cancel_futures=True)
 
-    def _rollout(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Session:
+    def _rollout(self, task: Task, prompt: PromptTask, version: int, drawn: Future[Draw]) -> Session:
         failed = _draw_failure(drawn)
         if failed is not None:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {}, failed)
-        draw = drawn.result()
+        draw = drawn.result().checked(self.server.sampling)
         if draw.version != version:
             return Session(task.id, "", 0, 0, (), Status.INFRA_ERROR, None, {},
                            f"draw: served by version {draw.version}, submitted under {version}")
-        call = Call(
-            draw.prompt,
-            draw.tokens,
-            draw.behavior_log_probs,
-            "stop" if draw.terminated else "length",
-            draw.version,
-            routed_experts=draw.routed_experts,
-            support=draw.support,
-        )
-        status = Status.COMPLETED if draw.terminated else Status.TRUNCATED
-        text = self.decode(draw.tokens[:len(draw.tokens) - int(draw.terminated)])
-        try:
-            score = self.reward(text, prompt.record)
-        except _INFRASTRUCTURE as error:
-            # The reward's boundary failed, a sandbox or a service: infrastructure, retried.
-            return Session(
-                task.id, "", 0, 0, (call,), Status.INFRA_ERROR, None, {}, f"reward: {_failure(error)}"
-            )
-        return Session(task.id, "", 0, 0, (call,), status, finite_reward(score))
+        return scored_draw(task.id, 0, Call.of(draw), self.decode(draw.response(self.server.sampling)),
+                           prompt.record, self.reward)
 
-    def _scored(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Future[Session]:
+    def _scored(self, task: Task, prompt: PromptTask, version: int, drawn: Future[Draw]) -> Future[Session]:
         """The draw's future, chained into its reward on a scorer thread."""
         scored: Future[Session] = Future()
 
@@ -355,18 +289,17 @@ class PromptSource:
                 rollout = self._rollout(task, prompt, version, drawn)
             except BaseException as failure:
                 # Broken code or a broken contract, not infrastructure: the scheduler raises it.
-                with suppress(InvalidStateError):  # cancelled while scoring
-                    scored.set_exception(failure)
+                settled(scored, failure)
                 return
-            with suppress(InvalidStateError):  # cancelled while scoring
-                scored.set_result(rollout)
+            settled(scored, rollout)
 
         def chained(_: Future[Draw]) -> None:
             try:
-                self._scorers.submit(score)
+                job = self._scorers.submit(score)
             except RuntimeError as closed:
-                with suppress(InvalidStateError):
-                    scored.set_exception(closed)
+                settled(scored, closed)
+                return
+            job.add_done_callback(lambda job: _cancelled_with(job, scored))
 
         drawn.add_done_callback(chained)
         return scored

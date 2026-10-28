@@ -19,17 +19,19 @@ in a run's metrics, never its identity.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import logging
-from collections.abc import Callable, Iterable, Mapping
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self, TypeGuard, runtime_checkable
 
-from dew.records import JSON, json_value
+from dew._records import JSON, json_value
 
 if TYPE_CHECKING:
     import grain.python as pygrain
     import numpy as np
 
     from dew.data.dataset import Records
+    from dew.data.pipeline import Stage
 
 type Read = Literal["memory", "indexed", "streamed"]
 """How a run reads every source it names: `memory` reads each whole into RAM
@@ -84,6 +86,14 @@ _COUNTS = ("rows", "accepted", "accepted_rows", "windows", "valid_targets", "zer
 """The `metadata` facts that count a source's rows and their target tokens."""
 
 
+def stated(source: Source) -> Mapping[str, object]:
+    """What `source` states of its records without reading them (`dew.data.pipeline.Stated`), none
+    where it states nothing so."""
+    from dew.data.pipeline import Stated
+
+    return source.stated() if isinstance(source, Stated) else {}
+
+
 def _uncounted(metadata: Mapping[str, object]) -> Mapping[str, object]:
     """`metadata` without its counts (`_COUNTS`): the facts a source that reads part of another's
     rows, or rows made from them, keeps of the other's. Its own counts, where it knows them, it
@@ -100,11 +110,16 @@ class ShardManifest:
     When physical shards cannot fill the readers and workers, `subdivide`
     receives the needed count and returns exactly that many `Shard`s, each
     a disjoint part of these records with an exact per-part position read
-    by the same `reader`. None keeps the physical-shard requirement."""
+    by the same `reader`. None keeps the physical-shard requirement.
+
+    `index_ordered` states that the shards, one after another, read the
+    records in their index order, as a store read by index streams them
+    (`_indexed_manifest`)."""
 
     shards: tuple[Shard, ...]
     reader: Callable[[Shard], pygrain.IterDataset]
     subdivide: Callable[[int], tuple[Shard, ...]] | None = None
+    index_ordered: bool = False
 
 
 @runtime_checkable
@@ -147,6 +162,18 @@ class Source(Protocol):
         ...
 
 
+_UNNAMED = itertools.count()
+"""The places the stores a program makes without a name take in the order it makes them, which tell
+apart two such stores read in one run (`unnamed`)."""
+
+
+def unnamed() -> int:
+    """The next place among the stores a program makes without a name: in its run, the key its
+    counters and phases keep apart, the same in every run of the program, and no content
+    version, which a store without a name has none of (`dew.data.plan.identified`)."""
+    return next(_UNNAMED)
+
+
 def url_label(url: str) -> str:
     """The name a store at `url` goes by: its last path part that is no pattern, without extensions
     (`s3://corpus/forum/*.jsonl` is `forum`, `data/train.jsonl.gz` is `train`)."""
@@ -170,17 +197,108 @@ def _consumed(source: Source, read: Read) -> Source:
     return source.consumed(read) if isinstance(source, Consumed) else source
 
 
-def _indexed_manifest(source: Source, prefix: str, uri: str, rows: int) -> ShardManifest:
+type Rows = Literal["read", "selected", "described", "materialized", "derived"]
+"""How a view's rows stand to its source's (`View.rows`): its source's rows as a read took them, its
+facts pinned (`read`); some of them, unchanged (`selected`); all of them with facts of its own
+added (`described`); rows a memory read made by running a pipeline's first stages over them
+(`materialized`); or rows another layout makes of them, windows or a cache's outputs
+(`derived`)."""
+
+SAME_ROWS: tuple[Rows, ...] = ("read", "selected", "described")
+"""The views whose rows are their source's, or some of them: a walk to the store a run's records
+come from (`dew.data.analysis._store`) passes through them."""
+
+
+class View[S: Source]:
+    """A source made of another's rows, `source`: a holdout's selection of them, a compile's read of
+    them pinned, a memory read's materialized rows, windows packed of them. Every view names the
+    source it reads `source`, so one walk reaches the sources beneath it (`beneath`), and says how
+    its rows stand to that source's (`rows`), which decides what it keeps of the source unless it
+    states its own: its name, how it is read (of its source's reads, those in `reads`, fewer where
+    a selection takes fewer, `refusal` saying why and what reads instead), its records, shards and
+    lengths; its facts (`metadata`, `stated`) whole
+    where its rows are the source's, without their counts (`_uncounted`) where they are not; and a
+    consumed read (`consumed`) taken through the source where its rows are the source's as read,
+    or held as they are where it already holds what it read. Its identity (`fingerprint`) is its
+    own. A store of several sources (a concatenation) or one that stands in for another when read
+    (a Hub dataset's files) is no view."""
+
+    source: S
+    rows: ClassVar[Rows]
+    reads: ClassVar[tuple[Read, ...]] = READS
+    refusal: ClassVar[str] = ""
+    __dataclass_fields__: ClassVar[dict[str, dataclasses.Field[object]]]
+    """Every view is a dataclass, which `consumed` rebuilds over its consumed source."""
+
+    def label(self) -> str:
+        return self.source.label()
+
+    def describe(self) -> str:
+        return self.source.describe()
+
+    def supports(self, read: Read) -> bool:
+        return read in self.reads and self.source.supports(read)
+
+    def records(self, read: Read) -> Records:
+        return self.source.records(read)
+
+    def manifest(self) -> ShardManifest:
+        return self.source.manifest()
+
+    def lengths(self) -> np.ndarray | None:
+        return self.source.lengths()
+
+    def metadata(self) -> Mapping[str, object]:
+        facts = self.source.metadata()
+        return facts if self.rows in ("read", "described") else _uncounted(facts)
+
+    def stated(self) -> Mapping[str, object]:
+        return _uncounted(stated(self.source)) if self.rows == "selected" else {}
+
+    def consumed(self, read: Read) -> Self:
+        if self.rows in ("selected", "described"):
+            return dataclasses.replace(self, source=_consumed(self.source, read))
+        return self
+
+
+def beneath(source: Source, through: Collection[Rows]) -> Iterator[Source]:
+    """`source`, then the source each view reads, down through every view whose rows are of a kind
+    in `through`, ending at the first source that is not one."""
+    yield source
+    while isinstance(source, View) and source.rows in through:
+        source = source.source
+        yield source
+
+
+class Materialized(Source, Protocol):
+    """A memory read's rows (`dew.data.materialize`): the source it read, the stages it ran over its
+    rows and the source position each row came from."""
+
+    source: Source
+    ran: tuple[Stage, ...]
+    identifiers: tuple[tuple[int, ...], ...]
+
+
+def materialized(source: Source) -> TypeGuard[Materialized]:
+    """Whether `source` holds rows a memory read made (`View.rows`)."""
+    return isinstance(source, View) and source.rows == "materialized"
+
+
+def _indexed_manifest(source: Source, uri: str, rows: int,
+                      reader: Callable[[Shard], pygrain.IterDataset] | None = None) -> ShardManifest:
     """The records `source` reads by index as a stream: consecutive ranges of
-    at most `rows` records, each `Shard` named `<prefix>:<start>` at `uri`,
-    read as that slice of its indexed records (`_IndexedSlice`)."""
+    at most `rows` records, each `Shard` named by the record it starts at,
+    which no copy of the source names otherwise, wherever it is, and read at
+    `uri` as that slice of its indexed records (`_IndexedSlice`), or by
+    `reader`, which reads the same slice with less than `source` to pickle."""
     count = len(source.records("indexed"))
     return ShardManifest(
         tuple(
-            Shard(f"{prefix}:{start}", uri, start, min(start + rows, count), min(rows, count - start))
+            Shard(f"records:{start}", uri, start, min(start + rows, count), min(rows, count - start))
             for start in range(0, count, rows)
         ),
-        _IndexedSlice(source),
+        _IndexedSlice(source) if reader is None else reader,
+        index_ordered=True,
     )
 
 

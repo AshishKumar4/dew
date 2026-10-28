@@ -29,13 +29,6 @@ def unet_body(model: "Unet", x, temb, text, temporal=None, operations=None):
 
     feature_depths = model.feature_depths
     attention_configs = model.attention_configs
-    if len(attention_configs) != len(feature_depths):
-        # The decoder walks the two reversed, so a disagreement does not drop
-        # the odd stage: it offsets the levels the decoder attends in from the
-        # ones the encoder does, and the halves stop mirroring silently.
-        raise ValueError(
-            "attention_configs names one stage per feature depth; got "
-            f"{len(attention_configs)} stages for {len(feature_depths)} depths")
 
     conv = model._convolution
     residual = partial(ResidualBlock, activation=model.activation,

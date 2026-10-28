@@ -1,5 +1,6 @@
 """Phi-3's fused GQA and LongRoPE against transformers 5.16.1."""
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -71,11 +72,40 @@ def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_
     np.testing.assert_array_equal(actual.argmax(-1), generated[:, 4:])
 
 
+def test_a_kinds_longrope_rebuilds_the_cache_at_its_crossing_as_the_models_does():
+    """LongRoPE given on the layers' kind rather than on the model switches its factors at the same
+    crossing, which the cache rebuilds at (`cache_rebuild_position`, over every layer's kind): the
+    cached walk across it computes, bit for bit, what the model-level ramp's does, where a rebuild read
+    from the model alone never came and the cache kept keys rotated by the short factors (audit
+    NN-04)."""
+    from dew.nn.backbones.layer_plan import LayerKind
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling.text import decode_ops, prefill_state
+
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
+    kinds = dict(loaded.model.kinds or {})
+    kinded = loaded.model.clone(rope_scaling=None, kinds={**kinds, **{
+        kind: dataclasses.replace(kinds.get(kind, LayerKind()), rope_scaling=loaded.model.rope_scaling)
+        for kind in set(loaded.model.per_layer_types)}})
+    generated = jnp.asarray(np.load(DIRECTORY / 'generated.npy'), jnp.int32)
+
+    def walk(model):
+        ops = decode_ops(model, loaded.variables, 0, 0)
+        state, _ = prefill_state(model, loaded.variables, ModelInputs(generated[:, :4]), ops)
+        outputs = []
+        for step in range(6):
+            outputs.append(np.asarray(state.logits))
+            state = ops.advance(state, generated[:, 4 + step], jnp.ones(2, bool))
+        return np.stack(outputs, axis=1)
+
+    np.testing.assert_array_equal(walk(kinded), walk(loaded.model))
+
+
 def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64_rule():
     import torch
     from transformers import AutoModelForCausalLM
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
     ids = np.load(DIRECTORY / 'input_ids.npy')[:, :4]

@@ -33,7 +33,7 @@ def bundle():
     # Match the fp32 reference arithmetic on GPU as well as CPU.
     precision = jax.lax.Precision.HIGHEST
     tower = towers.from_record(record["tower"]).build().clone(precision=precision)
-    projector = projectors.from_record(record["projector"]).build().clone(precision=precision)
+    projector = projectors.from_record(record["projector"]).clone(precision=precision)
     decoder = models.build("causal_transformer", record["text"], dtype="float32", attention_impl="reference")
     decoder = decoder.clone(precision=precision)
     return record, variables, tower, projector, decoder

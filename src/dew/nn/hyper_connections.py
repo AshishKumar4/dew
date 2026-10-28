@@ -44,7 +44,7 @@ from flax import linen as nn
 
 from .attention import unweighted_rmsnorm
 from .flops import projection_flops
-from .precision import at_least_fp32
+from .precision import at_least_fp32, float32_einsum, float32_matmul
 
 HEADS = ('mean', 'weighted', 'carried')
 
@@ -116,7 +116,7 @@ def mix_streams(post, comb, output, streams):
     (modeling_glm5_next.py:1316-1318).
     """
     dtype = streams.dtype
-    mixed = jnp.einsum('bsjk,bsjd->bskd', comb.astype(dtype), streams)
+    mixed = float32_einsum('bsjk,bsjd->bskd', comb.astype(dtype), streams)
     return post.astype(dtype)[..., None] * output[..., None, :] + mixed
 
 
@@ -163,11 +163,8 @@ class HyperConnection(nn.Module):
         fn = self.param('fn', nn.initializers.normal(0.02), (mix, inputs), jnp.float32)
         base = self.param('base', nn.initializers.zeros, (mix,), jnp.float32)
         scale = self.param('scale', nn.initializers.ones, (3,), jnp.float32)
-        flat = unweighted_rmsnorm(
-            streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(at_least_fp32(streams.dtype)),
-            self.norm_eps)
-        mixes = flat @ fn.T
-        pre = nn.sigmoid(mixes[..., :hc] * scale[0] + base[:hc]) + self.spec.hc_eps
+        mixes = stream_mixes(streams, fn, self.norm_eps)
+        pre = pre_weights(mixes[..., :hc], scale[0], base[:hc], self.spec.hc_eps)
         post = 2 * nn.sigmoid(mixes[..., hc:2 * hc] * scale[1] + base[hc:2 * hc])
         logits = mixes[..., 2 * hc :].reshape(*mixes.shape[:-1], hc, hc) * scale[2] + base[2 * hc :].reshape(
             hc, hc
@@ -175,6 +172,22 @@ class HyperConnection(nn.Module):
         comb = sinkhorn(jax.nn.softmax(logits, axis=-1) + self.spec.hc_eps,
                         self.spec.hc_sinkhorn_iters, self.spec.hc_eps)
         return pre, post, comb
+
+
+def stream_mixes(streams, fn, norm_eps: float):
+    """The learned map `fn` `[mixes, hc * width]` of the streams `[B, S, hc, width]`, flattened per
+    token in at least fp32 and normalized without a weight (`unweighted_rmsnorm`): the mixes a
+    hyper-connection site and its head read (modeling_glm5_next.py's `hc_fn` product)."""
+    hc = streams.shape[2]
+    flat = unweighted_rmsnorm(
+        streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(at_least_fp32(streams.dtype)),
+        norm_eps)
+    return float32_matmul(flat, fn.T)
+
+
+def pre_weights(mixes, scale, base, eps: float):
+    """Each stream's collapse weight from its mixes: `sigmoid(mixes * scale + base) + eps`."""
+    return nn.sigmoid(mixes * scale + base) + eps
 
 
 def collapse_by(pre, streams):
@@ -222,10 +235,7 @@ class HyperHead(nn.Module):
         fn = self.param('hc_fn', nn.initializers.normal(0.02), (outputs, inputs), jnp.float32)
         base = self.param('hc_base', nn.initializers.zeros, (hc,), jnp.float32)
         scale = self.param('hc_scale', nn.initializers.ones, (1,), jnp.float32)
-        flat = unweighted_rmsnorm(
-            streams.reshape(*streams.shape[:2], hc * streams.shape[-1]).astype(at_least_fp32(streams.dtype)),
-            self.norm_eps)
-        pre = nn.sigmoid(flat @ fn.T * scale + base) + self.spec.hc_eps
+        pre = pre_weights(stream_mixes(streams, fn, self.norm_eps), scale, base, self.spec.hc_eps)
         return collapse_by(pre, streams)
 
 

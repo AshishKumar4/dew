@@ -1,6 +1,7 @@
-"""Router parity readings and the two-process expert-exchange launch the MoE
-tests share. The routers stay with their tests: V2's softmax and best-expert
-group score and V3's sigmoid, two-best group score and bias differ."""
+"""Router parity readings, the fixtures the balance tests share (`balanced_decoder`,
+`favour_expert_zero` and `uniform_gates`), and the two-process expert-exchange launch the MoE tests
+share. The routers stay with their tests: V2's softmax and best-expert group score and V3's sigmoid,
+two-best group score and bias differ."""
 
 import sys
 from pathlib import Path
@@ -9,7 +10,22 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from flax.traverse_util import flatten_dict, unflatten_dict
 from process_support import start_process
+
+BALANCED_VOCAB, BALANCED_EXPERTS = 16, 4
+"""The token ids and experts of the decoder the balance tests train (`balanced_decoder`)."""
+
+
+def balanced_decoder(max_seq_len: int, *, layers: int = 2, causal: bool = True):
+    """The decoder the expert-balance tests train: `layers` layers of four softmax-routed experts, two a
+    token, whose balancing bias is in the routing weights."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    return CausalTransformer(vocab_size=BALANCED_VOCAB, emb_features=8, num_layers=layers, num_heads=2,
+                             mlp_features=16, max_seq_len=max_seq_len, causal=causal, qk_norm=False,
+                             mixture={"experts": BALANCED_EXPERTS, "top_k": 2, "bias": True,
+                                      "bias_in_weights": True, "score_function": "softmax"})
 
 
 def by_expert(indices, weights):
@@ -32,11 +48,40 @@ def router_variables(tensors, bias=False):
     return variables
 
 
+def favour_expert_zero(variables, amount):
+    """`variables` with expert 0's balancing bias raised in every router, so every token favours it."""
+    moe = flatten_dict(variables["moe"])
+    moe = {path: leaf.at[0].add(amount) if path[-1] == "e_score_correction_bias" else leaf
+           for path, leaf in moe.items()}
+    return {**variables, "moe": unflatten_dict(moe)}
+
+
+def uniform_gates(variables):
+    """`variables` with every router's gate at zero. Its scores are then the same for every token, so its
+    choice is its balancing bias alone, and no mask a microbatch draws can change what it counts."""
+    params = flatten_dict(variables["params"])
+    params = {path: jnp.zeros_like(leaf) if path[-2:] == ("gate", "kernel") else leaf
+              for path, leaf in params.items()}
+    return {**variables, "params": unflatten_dict(params)}
+
+
 def exchange_worker(script, out, processes, process_id, coordinator):
     """One rank of an expert-exchange script, as run_pool's `start`: one CPU
     device, its own session, and the rank, coordinator and report as argv."""
     return start_process(
         [sys.executable, str(script), str(process_id), coordinator, str(out)], devices=1)
+
+
+def assert_exchange_across_processes(worker: Path, tmp_path: Path, bound: float) -> None:
+    """`worker` (a script beside the tests) run in two real CPU processes (`exchange_worker`):
+    each reports two processes, and every error it measured against its one-process reference
+    within `bound`."""
+    from process_support import run_pool
+
+    for report in run_pool(worker, tmp_path, 2, timeout=120, start=exchange_worker):
+        assert report['processes'] == 2
+        for errors in report['errors'].values():
+            assert max(errors) < bound, errors
 
 
 def routing_case(tokens: int, experts: int, top_k: int, skewed: bool):

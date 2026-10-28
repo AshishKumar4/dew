@@ -1,9 +1,12 @@
 """Benchmark cases and presets shared without importing either framework."""
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from flax import linen as nn
 
 # The CLIP-L/14 context's shape, from the library's table encoder: a benchmark
 # of the model should not spend its first minute downloading a text tower, and
@@ -21,6 +24,9 @@ LM_MOE: dict[str, object] = {
     "vocab_size": 50304, "emb_features": 768, "num_layers": 12, "num_heads": 12, "mlp_features": 2048,
     "max_seq_len": 1024,
     "mixture": {"experts": 8, "top_k": 2, "layers": [1, 3, 5, 7, 9, 11], "dispatch": "global"}}
+DIT_B: dict[str, object] = {"patch_size": 4, "emb_features": 768, "num_layers": 12, "num_heads": 12,
+                            "mlp_ratio": 4}
+"""DiT-B/4: the large, compute-dominated SimpleDiT the parity study and the performance gate step."""
 
 @dataclass(frozen=True)
 class Case:
@@ -76,9 +82,8 @@ class Case:
     """For language models, canvases among them, the vocabulary slices the
     loss scores a batch in; None is the objective's own default."""
     objective: dict[str, object] = field(default_factory=dict)
-    """For language models, further keywords of the decoder's objective, such
-    as LMObjective's balance terms `aux_loss_alpha` and `balance_rate`, or of
-    a canvas's BlockDiffusionObjective, such as `encoder_loss_weight`."""
+    """For language models, further keywords of the decoder's objective, such as LMObjective's `balance`
+    (an `ExpertBalance` record), or of a canvas's BlockDiffusionObjective, such as `encoder_loss_weight`."""
     decoder_objective: Literal["lm", "sft", "dpo", "grpo", "mdlm"] = "lm"
     """For language models, what the decoder trains: next-token cross entropy
     ("lm"), the same over the assistant's turns only ("sft"), DPO over
@@ -358,10 +363,57 @@ def parity_case(model: str, size: str, *, batch_size: int | None = None,
                             "mlp_features": 3072, "max_seq_len": 1024},
                     batch_size=8, seq_len=1024, image_size=64)
     elif model == "simple_dit":
-        case = Case(model, {"patch_size": 4, "emb_features": 768, "num_layers": 12, "num_heads": 12,
-                            "mlp_ratio": 4},
-                    batch_size=32, image_size=64)
+        case = Case(model, dict(DIT_B), batch_size=32, image_size=64)
     else:
         raise ValueError("the unet has no large parity case")
     config = case.config if vocab_size is None else {**case.config, "vocab_size": vocab_size}
     return dataclasses.replace(case, config=config, batch_size=batch_size or case.batch_size)
+
+
+# Forward passes of inference modules at their published sizes, with random weights: the cost depends only
+# on the shapes. Each factory imports the framework when called, so this module still imports neither.
+def _siglip() -> "tuple[nn.Module, tuple[int, ...]]":
+    import jax.numpy as jnp
+
+    from dew.nn.vision import SiglipVision
+
+    # google/siglip-so400m-patch14-384, the tower Gemma 3 and PaliGemma 2 read.
+    tower = SiglipVision(hidden_size=1152, intermediate_size=4304, num_layers=27, num_heads=16,
+                         image_size=384, patch_size=14)
+    return tower.build().clone(dtype=jnp.bfloat16), (8, 3, 384, 384)
+
+
+def _qwen35() -> "tuple[nn.Module, tuple[int, ...]]":
+    import jax.numpy as jnp
+
+    from dew.nn.vision import Qwen35Vision
+
+    # Qwen3.5's tower at its released width and depth, a 448px image a row.
+    return Qwen35Vision().build().clone(dtype=jnp.bfloat16), (8, 3, 448, 448)
+
+
+def _gemma4() -> "tuple[nn.Module, tuple[int, ...]]":
+    import jax.numpy as jnp
+
+    from dew.nn.vision import Gemma4Vision
+
+    # Gemma 4's tower at its released width and depth, 42x42 patches a row.
+    return Gemma4Vision().build().clone(dtype=jnp.bfloat16), (4, 3, 672, 672)
+
+
+def _sd_decoder() -> "tuple[nn.Module, tuple[int, ...]]":
+    import jax.numpy as jnp
+
+    from dew.nn.autoencoders.vae import FlaxDecoder
+
+    # stabilityai/sd-vae-ft-mse's decoder: a 64x64x4 latent to a 512px image.
+    return FlaxDecoder(block_out_channels=(128, 256, 512, 512), dtype=jnp.bfloat16), (4, 64, 64, 4)
+
+
+FORWARD: "dict[str, Callable[[], tuple[nn.Module, tuple[int, ...]]]]" = {
+    "vision siglip-400m 384px b8": _siglip,
+    "vision qwen3.5 448px b8": _qwen35,
+    "vision gemma4 672px b4": _gemma4,
+    "vae decode sd 512px b4": _sd_decoder,
+}
+"""The forward cases tools/benchmark_forward.py times and the performance gate rows, by name."""

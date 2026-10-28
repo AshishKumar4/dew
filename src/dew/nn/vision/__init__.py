@@ -37,153 +37,65 @@ exact-GELU MLP and lays the image out as its decoder reads it.
 Each family lives in its own module of this package (`siglip`, `llama4`,
 `gemma4`, `qwen35`, `mimo`, `muse_glimmer`, `deepseek_v41`, `gemma3n`) over the
 bases in `common` and the shared trunk in `vit`,
-with its path map and its config and weight translators. The package exports
-the classes a caller constructs or subclasses, and keeps where each kind's
-tensors sit and which map reads them.
+with its path map and its config and weight translators, and each family's
+classes say where their tensors sit (`TowerLayout`, `ProjectorLayout`), so the
+kinds `dew.registry` names are the one list of them. The package exports the
+classes a caller constructs or subclasses, and reads a kind's tensors through
+its class's layout (`tower_variables`, `projector_variables`).
 """
 
 from __future__ import annotations
 
-import dataclasses
-import functools
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-import numpy as np
-
-from dew.interop.weights import placed
-from dew.objectives.base import Variables
+from dew.batch import Variables
+from dew.interop.unread import Stored
 
 from .common import (
     ProjectorBase as ProjectorBase,
+    ProjectorLayout as ProjectorLayout,
     TowerBase as TowerBase,
     TowerGeometry as TowerGeometry,
-    projector_weight_path,
+    TowerLayout as TowerLayout,
+    projector_layout as projector_layout,
+    tower_layout as tower_layout,
 )
-from .deepseek_v41 import (
-    DeepseekV41Projector as DeepseekV41Projector,
-    DeepseekV41ProjectorModule as DeepseekV41ProjectorModule,
-    DeepseekV41Vision as DeepseekV41Vision,
-    deepseek_v41_vision_path,
-)
-from .gemma3n import (
-    Gemma3nProjector as Gemma3nProjector,
-    Gemma3nProjectorModule as Gemma3nProjectorModule,
-    Gemma3nVision as Gemma3nVision,
-    gemma3n_vision_path,
-    translate_gemma3n_projector_weights,
-)
+from .deepseek_v41 import DeepseekV41Projector as DeepseekV41Projector, DeepseekV41Vision as DeepseekV41Vision
+from .gemma3n import Gemma3nProjector as Gemma3nProjector, Gemma3nVision as Gemma3nVision
 from .gemma4 import (
     Gemma4Projector as Gemma4Projector,
-    Gemma4ProjectorModule as Gemma4ProjectorModule,
     Gemma4Vision as Gemma4Vision,
     Gemma4VisionTransformer as Gemma4VisionTransformer,
-    gemma4_vision_path,
-    translate_gemma4_projector_weights,
 )
 from .llama4 import (
     Llama4Projector as Llama4Projector,
-    Llama4ProjectorModule as Llama4ProjectorModule,
     Llama4Vision as Llama4Vision,
     Llama4VisionTransformer as Llama4VisionTransformer,
-    llama4_vision_path,
 )
-from .mimo import MiMoProjector as MiMoProjector, MiMoVision as MiMoVision, mimo_vision_path
-from .muse_glimmer import (
-    MuseGlimmerProjector as MuseGlimmerProjector,
-    MuseGlimmerProjectorModule as MuseGlimmerProjectorModule,
-    MuseGlimmerVision as MuseGlimmerVision,
-    muse_glimmer_vision_path,
-)
-from .qwen35 import Qwen35Projector as Qwen35Projector, Qwen35Vision as Qwen35Vision, qwen35_vision_path
-from .siglip import (
-    GemmaProjector as GemmaProjector,
-    GemmaProjectorModule as GemmaProjectorModule,
-    SiglipVision as SiglipVision,
-    SiglipVisionTransformer as SiglipVisionTransformer,
-    siglip_vision_path,
-    translate_gemma_projector_weights,
-)
+from .mimo import MiMoProjector as MiMoProjector, MiMoVision as MiMoVision
+from .muse_glimmer import MuseGlimmerProjector as MuseGlimmerProjector, MuseGlimmerVision as MuseGlimmerVision
+from .qwen35 import Qwen35Projector as Qwen35Projector, Qwen35Vision as Qwen35Vision
+from .siglip import GemmaProjector as GemmaProjector, SiglipVision as SiglipVision
 from .vit import (
     MergeProjector as MergeProjector,
     VisionTransformer as VisionTransformer,
     ViTLayout as ViTLayout,
-    translate_vit_weights,
 )
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
 
 
-@dataclasses.dataclass(frozen=True)
-class TowerLayout:
-    """Where one tower kind's tensors sit in a media checkpoint and the leaves they fill: `prefix`
-    before every name, and `path` from a name past it to its leaf, rooted at its collection
-    (`params`, and Gemma 4's `constants` beside it). `patch_dense` where the tower runs its patch
-    convolution as one Dense map (`translate_vit_weights`). Loading (`variables`), routing a
-    checkpoint's names (`hf_decoders`) and binding an export (`interop.pretrained`) read it alike."""
-
-    prefix: str
-    path: Callable[[str], tuple[str, ...] | None]
-    patch_dense: bool = False
-
-    def variables(self, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
-                  ) -> tuple[Variables, tuple[WeightLayout, ...]]:
-        """The tower's variables from its tensors, in the requested storage, and the layouts that
-        write each tensor it placed back from them (`placed`); a tensor the tower does not compute
-        with, as SigLIP's pooling head, has none."""
-        translate = translate_vit_weights if self.patch_dense else placed
-        return translate(hf_tensors, self.path, param_dtype)
-
-
-def _in_params(path: Callable[[str], tuple[str, ...] | None]) -> Callable[[str], tuple[str, ...] | None]:
-    """`path`, whose leaves are parameters, rooted at `params`."""
-    def rooted(name: str) -> tuple[str, ...] | None:
-        leaf = path(name)
-        return None if leaf is None else ("params", *leaf)
-    return rooted
-
-
-TOWERS = {
-    "siglip": TowerLayout("vision_tower.", _in_params(siglip_vision_path)),
-    "llama4": TowerLayout("vision_model.", _in_params(llama4_vision_path)),
-    "gemma4": TowerLayout("vision_tower.", gemma4_vision_path),
-    "qwen3_5": TowerLayout("visual.", _in_params(qwen35_vision_path), patch_dense=True),
-    "gemma3n": TowerLayout("vision_tower.", _in_params(gemma3n_vision_path)),
-    "deepseek_v41": TowerLayout("vision.", _in_params(deepseek_v41_vision_path)),
-    "mimo": TowerLayout("visual.", _in_params(mimo_vision_path), patch_dense=True),
-    "muse_glimmer": TowerLayout("vision_tower.", _in_params(muse_glimmer_vision_path)),
-}
-"""Each tower kind's checkpoint layout."""
-PROJECTOR_PREFIX: dict[str, str | tuple[str, ...]] = {
-    "gemma": "multi_modal_projector.", "llama4": "multi_modal_projector.", "gemma4": "embed_vision.",
-    "qwen3_5": "visual.merger.", "gemma3n": "embed_vision.", "deepseek_v41": "aligner.",
-    "mimo": "visual.merger.", "muse_glimmer": ("vision_adapter.", "vision_projection.")}
-"""Where each projector kind's tensors sit: one prefix, or several whose tensors each keep the name
-past their own."""
-# Three projectors check their tensors; every other map reads one tensor to one leaf.
-_PROJECTOR_WEIGHTS: dict[str, Callable[..., tuple[Variables, tuple[WeightLayout, ...]]]] = {
-    "gemma": translate_gemma_projector_weights,
-    "gemma4": translate_gemma4_projector_weights,
-    "gemma3n": translate_gemma3n_projector_weights,
-}
-
-
-def tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+def tower_variables(kind: str, hf_tensors: Mapping[str, Stored], param_dtype: str
                     ) -> tuple[Variables, tuple[WeightLayout, ...]]:
-    """One vision tower's variables, in the requested storage (`TOWERS`), and the layouts that
-    write its tensors back from them."""
-    if kind not in TOWERS:
-        raise ValueError(f"tower kind {kind!r} has no weight map here")
-    return TOWERS[kind].variables(hf_tensors, param_dtype)
+    """One vision tower's variables, in the requested storage (`tower_layout`), and the layouts
+    that write its tensors back from them."""
+    return tower_layout(kind).variables(hf_tensors, param_dtype)
 
 
-def projector_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+def projector_variables(kind: str, hf_tensors: Mapping[str, Stored], param_dtype: str
                         ) -> tuple[Variables, tuple[WeightLayout, ...]]:
-    """One projector kind's parameters, in the requested storage, and the layouts that write
-    its tensors back from them."""
-    if kind in _PROJECTOR_WEIGHTS:
-        return _PROJECTOR_WEIGHTS[kind](hf_tensors, param_dtype=param_dtype)
-    if kind not in PROJECTOR_PREFIX:
-        raise ValueError(f"projector kind {kind!r} has no weight map here")
-    return placed(hf_tensors, functools.partial(projector_weight_path, kind), param_dtype)
+    """One projector kind's parameters, in the requested storage (`projector_layout`), and the
+    layouts that write its tensors back from them."""
+    return projector_layout(kind).variables(hf_tensors, param_dtype)

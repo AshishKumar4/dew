@@ -20,15 +20,18 @@ import optax
 import pytest
 from flax import linen as nn
 from model_support import flat_tree
+from reference_error import assert_as_exact, widened
 
+from dew.batch import coordinates
 from dew.checkpoints import Checkpoints
 from dew.data import ByteTokenizer
 from dew.data.dataset import Loader
 from dew.diffusion.discrete import MDLM, Unmask
 from dew.inference import RunProcessor, pipeline
+from dew.inference.projections import unpacked
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
-from dew.nn.inputs import ModelInputs, coordinates, request_axes
+from dew.nn.inputs import ModelInputs, request_axes
 from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
@@ -51,10 +54,12 @@ def test_biased_masked_objective_scores_the_same_affine_logits_as_its_forward():
     process = MDLM(mask_id=31)()
     objective = MaskedDiffusionObjective(model, process, seq_len=4, head_chunks=4,
                                          variables=variables, ema_decay=None)
-    key = jax.random.key(1)
-    _, losses, _, _, predicted, _ = objective._token_losses(variables, {'text': tokens}, key, train=False)
-    time_key, mask_key, _ = jax.random.split(key, 3)
-    corrupted, _ = process.corrupt(mask_key, tokens, process.sample_t(time_key, tokens.shape[0]))
+    time_key, mask_key, _ = jax.random.split(jax.random.key(1), 3)
+    times = process.sample_t(time_key, tokens.shape[0])
+    corrupted, is_masked = process.corrupt(mask_key, tokens, times)
+    # The objective reads this corruption (`Step.tape`).
+    step = Step(jnp.asarray(0), jax.random.key(1), None, tape={"times": times, "mask": is_masked})
+    _, losses, _, _, predicted, _, _ = objective._token_losses(variables, {'text': tokens}, step, train=False)
     logits = model.apply(variables, corrupted).at[..., 31].set(-jnp.inf)
     expected = optax.softmax_cross_entropy_with_integer_labels(logits, tokens)
     # The same 1e-5 relative loss contract as the bias-free chunked head.
@@ -87,8 +92,9 @@ def test_a_media_slot_reaches_the_model_and_is_never_masked_or_scored():
     params = objective.init(jax.random.key(0))
     params["params"]["media"] = jnp.ones(8)
     media = {"text": ModelInputs(tokens, {"image_indices": slots})}
-    _, losses, _, counted, _, real = objective._token_losses(params, media, jax.random.key(1), train=False)
-    plain = objective._token_losses(params, {"text": tokens}, jax.random.key(1), train=False)[1]
+    step = Step(jnp.asarray(0), jax.random.key(1), None)
+    _, losses, _, counted, _, real, _ = objective._token_losses(params, media, step, train=False)
+    plain = objective._token_losses(params, {"text": tokens}, step, train=False)[1]
 
     np.testing.assert_array_equal(real, slots < 0)
     assert not counted[:, :2].any() and counted[:, 2:].any()
@@ -115,7 +121,8 @@ def test_padding_that_holds_the_mask_token_scores_nothing(given):
         batch = ({"text": ModelInputs(tokens, {"attention_mask": mask})} if given == "attention_mask"
                  else {"text": tokens, "text_coordinates": coordinates(valid=mask)})
         loss, grads = jax.value_and_grad(lambda v: objective.scalar_loss(v, batch, step)[0])(variables)
-        return loss, grads, objective._evaluation_scores(variables, batch, jax.random.key(2))
+        scoring = Step(jnp.asarray(0), jax.random.key(2), None)
+        return loss, grads, objective._evaluation_scores(variables, batch, scoring)
 
     mask_padded, other_padded = scored(31), scored(7)
     assert np.isfinite(float(mask_padded[0]))
@@ -164,6 +171,66 @@ def test_compiled_samples_follow_the_substituted_masked_model():
     assert objective._sample is objective._sample
 
 
+@pytest.mark.parametrize("name", ["llada-tiny", "dream-tiny"])
+def test_a_masked_family_unmasks_each_position_from_the_logits_its_reference_reads(name):
+    """LLaDA predicts each position's token from its own logits; Dream-v0, continued from an
+    autoregressive model, from the position before (its reference shifts the logits right, the first
+    repeated). One unmasking step's distribution at every position is the softmax of those logits of
+    the released model, the mask's column left out, as exact as the release's own float32 forward
+    is to float64."""
+    from reference_error import assert_as_exact_as_the_reference
+
+    from dew.diffusion.discrete import DiscreteProcess, LogLinear
+
+    model, variables = loaded(name)
+    directory = FIXTURES / name
+    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+
+    def unmasking(logits):
+        logits = np.asarray(logits, np.float64)
+        if name == "dream-tiny":
+            logits = np.concatenate([logits[:, :1], logits[:, :-1]], axis=1)
+        logits[..., 120] = -np.inf
+        shifted = logits - logits.max(axis=-1, keepdims=True)
+        return np.exp(shifted) / np.exp(shifted).sum(axis=-1, keepdims=True)
+
+    _, log_probs = DiscreteProcess(LogLinear(), mask_id=120).denoiser(model, variables)(ids, jnp.ones((1,)))
+    assert_as_exact_as_the_reference(np.exp(np.asarray(log_probs, np.float64)),
+                                      unmasking(np.load(directory / "logits.npy")),
+                                      unmasking(np.load(directory / "logits_f64.npy")), f"{name} unmasking")
+
+
+def test_a_shifted_model_reads_each_document_and_padded_row_as_if_alone():
+    """Dream reads position i's prediction from position i-1, but a packed document's first token,
+    and a left-padded row's first real one, read their own, as the reference does a row's first: a
+    packed row's predictions are its documents' each aligned alone, and a padded row's real ones are
+    its text's aligned alone."""
+    from dew.diffusion.discrete import aligned
+
+    model, _ = loaded("dream-tiny")
+    scores = jnp.arange(6.0).reshape(1, 6, 1) + 10
+    alone = [aligned(model, scores[:, :3]), aligned(model, scores[:, 3:])]
+    packed = aligned(model, scores, {"segment_ids": jnp.array([[1, 1, 1, 2, 2, 2]])})
+    np.testing.assert_array_equal(packed, jnp.concatenate(alone, axis=1))
+    padded = aligned(model, scores, {"attention_mask": jnp.array([[False, False, True, True, True, True]])})
+    np.testing.assert_array_equal(padded[:, 2:], aligned(model, scores[:, 2:]))
+    one = aligned(model, scores[:, :1], {"segment_ids": jnp.array([[1]])})
+    np.testing.assert_array_equal(one, scores[:, :1])
+
+
+def test_a_dream_shaped_record_keeps_how_its_logits_line_up():
+    """The alignment is a fact of the checkpoint, so the model's record carries it: a Dream config
+    reads to a model that shifts, which its record rebuilds as one that shifts, and LLaDA's to one
+    that does not."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import from_record, to_record
+
+    for name, shifted in (("dream-tiny", True), ("llada-tiny", False)):
+        model, _ = loaded(name)
+        assert model.shifted_logits is shifted
+        assert from_record(CausalTransformer, to_record(model, CausalTransformer)).shifted_logits is shifted
+
+
 def test_unmask_sampler_runs_on_a_loaded_model_end_to_end():
     """Evaluation on llada-tiny unmasks the fully masked rows into vocabulary
     ids: [4, 12] int32 with no mask id left. A sampler returning its input
@@ -204,13 +271,40 @@ def test_the_trainer_builds_its_state_from_the_held_checkpoint():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]))
 
 
-@pytest.fixture(scope="module", params=["llada-tiny", "dream-tiny"])
+@pytest.fixture(scope="module", params=["llada-tiny", "dream-tiny", "llada-moe-tiny",
+                                      "llada-moe-v2-tiny", "llada2-tiny", "llada22-tiny"])
 def masked_source(request):
     source = Pretrained.load(FIXTURES / request.param, dtype="float32", attention_impl="xla")
     tokens = jnp.asarray([[0, 120, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
     fields = {"attention_mask": jnp.asarray([[0, 1, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1]], bool),
               "positions": jnp.asarray([[0, 3, 4, 5], [0, 1, 2, 3], [0, 0, 4, 5]])}
     return source, ModelInputs(tokens, fields)
+
+
+def test_a_masked_run_over_a_source_stops_at_its_end_of_sequence_ids(tmp_path):
+    """An objective over a loaded source takes the source's end-of-sequence ids into its task and its
+    saved run: each stops a response where the source's own task does."""
+    from dew.inference.tasks import MaskedGeneration
+
+    source = Pretrained.load(FIXTURES / "llada-tiny", dtype="float32", attention_impl="xla")
+    tokens = jnp.asarray([[0, 120, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
+    valid = jnp.asarray([[0, 1, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1]], bool)
+    inputs = ModelInputs(tokens, {"attention_mask": valid,
+                                  "positions": jnp.asarray([[0, 3, 4, 5], [0, 1, 2, 3], [0, 0, 4, 5]])})
+    eos = int(source.text_generation()(inputs, 8, key=7, steps=5).host().tokens[0, 5])
+    ending = replace(source, generation_config={**source.generation_config, "eos_token_id": [eos]})
+    expected = ending.text_generation()(inputs, 8, key=7, steps=5).host()
+    objective = MaskedDiffusionObjective(ending, ending.text_generation().process, 12, ema_decay=None,
+                                         processor=None)
+    state = Trainer(objective, optax.sgd(0.05), key=jax.random.PRNGKey(19)).initial_state()
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    for task in (objective.pipeline(state, ema=False), MaskedGeneration.from_run(str(tmp_path / "run"))):
+        stopped = task(inputs, 8, key=7, steps=5).host()
+        np.testing.assert_array_equal(stopped.lengths, expected.lengths)
+        np.testing.assert_array_equal(stopped.terminated, expected.terminated)
+    assert np.any(np.asarray(expected.terminated))
 
 
 def test_native_masked_task_matches_direct_mdlm_trajectory(masked_source):
@@ -322,11 +416,20 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(restored.variables))
     converted = pipeline(str(tmp_path / "run"), ema=False, dtype="float32", param_dtype="bfloat16")
     reference = replace(live, model=model.clone(dtype=jnp.float32),
-                        variables=jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), live.variables))
+                        variables={**live.variables, 'params': jax.tree.map(
+                            lambda leaf: leaf.astype(jnp.bfloat16), live.variables['params'])})
     np.testing.assert_array_equal(converted(prompt, key=7).host().tokens,
                                   reference(prompt, 8, key=7).host().tokens)
     assert converted.model.dtype == jnp.float32
-    assert all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(converted.variables))
+    held = unpacked(converted.model, converted.variables)
+    assert jax.tree.map(lambda leaf: leaf.dtype, held) == jax.tree.map(
+        lambda leaf: leaf.dtype, reference.variables)
+    expected_logits = jax.jit(lambda tokens: reference.model.apply(reference.variables, tokens))
+    actual_logits = jax.jit(lambda tokens: converted.model.apply(converted.variables, tokens))
+    assert_as_exact(actual_logits, expected_logits,
+                    lambda seed: (np.asarray([(np.arange(8) + seed) % model.vocab_size], np.int32),),
+                    'converted masked decoder logits', seeds=8,
+                    truth_fn=lambda tokens: np.asarray(expected_logits(tokens), np.float64))
 
     source.save(tmp_path / "published", variables=resumed.variables)
     reloaded = Pretrained.load(tmp_path / "published", dtype="bfloat16", attention_impl="xla")
@@ -336,6 +439,55 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
         prompt, 8, key=7).host().tokens, expected)
     raw = restored(["a", "bc"], 3, key=7, steps=3)
     assert raw.text == restored.decode(raw)
+
+
+PACKED_SEEDS = 32
+"""The declared seeds for check 1 of the packed masked logits (`assert_as_exact`), sized by
+`seeds_for` on armada over every masked fixture."""
+
+
+def masked_draw(model):
+    """One seeded masked canvas: a row of tokens with about half masked, at the fixtures' length."""
+    def draw(seed):
+        rng = np.random.default_rng([0x1615, seed])
+        tokens = rng.integers(0, model.vocab_size, (2, 8), dtype=np.int32)
+        return (np.where(rng.random((2, 8)) < 0.5, model.mask_token_id, tokens).astype(np.int32),)
+    return draw
+
+
+def test_a_masked_task_packs_its_projections_as_a_decoder_does(masked_source, tmp_path):
+    """A bidirectional masked model packs its projection groups at load, as a decoder does: the task
+    the pipeline loads holds them packed; its denoising logits are on par with the unpacked
+    model's (check 1); its canvases are those of a task over the unpacked tree, which packs the same
+    groups in its call; and unpacking gives back the source's tree, exporting as the source does."""
+    from dew.inference.projections import packed_layout
+
+    source, prompt = masked_source
+    source.save(tmp_path / "source")
+    task = pipeline(str(tmp_path / "source"), dtype="float32")
+    groups, _ = packed_layout(task.model, task.variables)
+    assert groups, "the masked task holds its projections packed"
+    for ours, theirs in zip(jax.tree.leaves(unpacked(task.model, task.variables)),
+                            jax.tree.leaves(source.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    exported, canonical = source.export(task.variables), source.export()
+    assert exported.keys() == canonical.keys()
+    for name, tensor in canonical.items():
+        np.testing.assert_array_equal(np.asarray(exported[name]), np.asarray(tensor), err_msg=name)
+
+    def apart(tokens):
+        return source.model.apply(source.variables, tokens)
+
+    def exact(tokens):
+        """The unpacked model in float64, its weights widened exactly."""
+        return source.model.clone(dtype=jnp.float64).apply(widened(source.variables), tokens)
+
+    assert_as_exact(jax.jit(lambda tokens: task.model.apply(task.variables, tokens)), jax.jit(apart),
+                    masked_draw(source.model), "packed masked logits", seeds=PACKED_SEEDS,
+                    truth_fn=exact)
+    held_apart = replace(task, variables=source.variables)
+    np.testing.assert_array_equal(task(prompt, 8, key=7, steps=4).host().tokens,
+                                  held_apart(prompt, 8, key=7, steps=4).host().tokens)
 
 
 def test_masked_source_accepts_neutral_controls_and_honors_task_metadata(masked_source):
@@ -352,3 +504,4 @@ def test_masked_source_accepts_neutral_controls_and_honors_task_metadata(masked_
     wanted = expected(inputs, key=7, steps=5).host()
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(wanted), strict=True):
         np.testing.assert_array_equal(left, right)
+

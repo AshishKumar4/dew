@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import itertools
 import math
+import time
 import types
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, runtime_checkable
@@ -12,21 +14,78 @@ from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, run
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew.batch import Batch
+from dew.data.dataset import WORKER_BUFFER, Records, phase_ends
 
 if TYPE_CHECKING:
     import jax
 
-    from dew.data.cache import Cache
     from dew.data.dataset import Loading
-    from dew.data.generation import Generation
+    from dew.data.generation import DependencyManifest
+    from dew.data.sinks import Writer
     from dew.data.sources.base import Read, Source
+    from dew.data.text import NearDuplicates
 
 
 @dataclasses.dataclass(frozen=True)
 class Rejected:
     reason: str
     permanent: bool = True
+
+
+type Cuts = Mapping[str, tuple[int, int]]
+"""A record's cut record (`_dew_cut`): by what each cut, the rows it shortened and the tokens it removed;
+characters where the kind names them (`<kind>_characters`), as a cut of text encoded whole is measured."""
+
+
+def cut(element: Batch, removed: Mapping[str, int]) -> Batch:
+    """`element` cut short by a step that removed `removed` of it (by what it cut, the tokens), its cut
+    record composed with what earlier steps recorded (`composed`)."""
+    if not any(removed.values()):
+        return element
+    made = {kind: (1, tokens) for kind, tokens in removed.items() if tokens}
+    return {**element, "_dew_truncated": True, "_dew_cut": composed(element.get("_dew_cut", {}), made)}
+
+
+def composed(earlier: Cuts, later: Cuts) -> dict[str, tuple[int, int]]:
+    """Two cut records of the same rows, one step after another: a kind both cut counts its rows once,
+    the most either shortened, and adds what each removed; a 100-token text cut to 80, then to 60,
+    removed 40 of one row."""
+    kinds = {**earlier, **later}
+    return {kind: (max(earlier.get(kind, (0, 0))[0], later.get(kind, (0, 0))[0]),
+                   earlier.get(kind, (0, 0))[1] + later.get(kind, (0, 0))[1]) for kind in kinds}
+
+
+def cut_unit(kind: str) -> str | None:
+    """The unit a cut of `kind` removes: characters for a kind that names them (`<kind>_characters`,
+    a text encoded whole), none for an event that removes nothing (`options_alike`, a row whose cut
+    left two options alike), else tokens."""
+    if kind == "options_alike":
+        return None
+    return "characters" if kind.endswith("_characters") else "tokens"
+
+
+def cut_counts(cuts: Iterable[Mapping[str, int]]) -> dict[str, tuple[int, int]]:
+    """Several rows' cuts (each the tokens a cut removed of the row, by what it cut) as one record's
+    `_dew_cut`, which `dew.data.mixing.CorpusCounts.delivered` counts: by what each cut, the rows it
+    shortened and the tokens it removed; distinct rows add, where `composed` adds one row's successive
+    cuts."""
+    found: dict[str, tuple[int, int]] = {}
+    for row in cuts:
+        for kind, tokens in row.items():
+            shortened, removed = found.get(kind, (0, 0))
+            found[kind] = (shortened + 1, removed + tokens)
+    return found
+
+
+class Refused(ValueError):
+    """A request a served task refuses, under the reason its training would reject the same record
+    under (`Rejected`), which a server counts as a run's data counters count rejections
+    (`dew.data.mixing.CorpusCounts`)."""
+
+    def __init__(self, reason: str, message: str):
+        super().__init__(message)
+        self.reason = reason
 
 
 type Record = Batch | bytes | Rejected | None
@@ -52,9 +111,44 @@ class Reasoned(Protocol):
     reason: str
 
 
+PACK_POLICY: Literal["first-fit", "best-fit", "concat"] = "first-fit"
+"""How a pack fills its rows where none is asked for."""
+DROP_REMAINDER = True
+"""Whether a batch a training pass fills only in part is dropped, where none is asked for."""
+TOKEN_FIELDS = ("text",)
+"""The per-token fields a pack or a window lays out where none are named."""
+PACK_BINS = 32
+"""The rows a pack holds open at once where none is asked for."""
+INTERLEAVE = 16
+"""The sources an interleave reads at once where none is asked for."""
+PREFETCH = 64
+"""The records a prefetch reads ahead where none is asked for."""
+
+
 @runtime_checkable
 class Volatile(Protocol):
     volatile: bool
+
+
+@runtime_checkable
+class External(Protocol):
+    """A step that reads the storage a record names by path, as a media decoder does when its field
+    holds a path rather than bytes: what it makes is keyed by the path, not by what the path holds, so
+    no automatic cache's prefix runs past it (`dew.data.compile._automatic`), a file replaced at the same
+    path reading anew; a chain's own `cache=` keeps what it made, as it is told to."""
+
+    external: bool
+
+
+@runtime_checkable
+class Costly(Protocol):
+    """A step that costs more to run on a record than reading what it made back from a cache costs,
+    as measured (`tools/benchmark_data.py automatic-cache`), and makes it from the record alone: so a
+    chain that runs it first caches what it makes with no `cache=` (`dew.data.compile._automatic`).
+    An image decode is not one: an image a record names by path is read from storage the record's
+    content does not key."""
+
+    costly: bool
 
 
 @runtime_checkable
@@ -64,8 +158,8 @@ class SingleReader(Protocol):
 
 @runtime_checkable
 class TokenGeometry(Protocol):
-    """A record step whose rows each hold `max_length` tokens, which a token
-    budget divides into rows (`TokenBudget`)."""
+    """A record step, or a stage that lays rows out (`Pack`, `Windows`), whose rows each hold
+    `max_length` tokens, which a token budget divides into rows (`TokenBudget`)."""
 
     @property
     def max_length(self) -> int: ...
@@ -77,8 +171,13 @@ class TokenBudget:
     length (`TokenGeometry`) divides it into, resolved when it compiles."""
 
     tokens: int
-    drop_remainder: bool = True
+    drop_remainder: bool = DROP_REMAINDER
     batch_fn: Callable[[Sequence[Batch]], Batch] | None = None
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Rows of the pipeline's row length, as many a batch as `tokens` holds."""
+        width = facts.get("seq_len")
+        return {**facts, "batch": self.tokens // (width + 1)} if isinstance(width, int) else dict(facts)
 
     def __post_init__(self) -> None:
         if self.tokens <= 0:
@@ -93,14 +192,55 @@ class Expansion(Protocol):
 type ExpandStep = Expansion | Callable[[Batch], Iterable[Batch | Rejected]]
 
 
+@runtime_checkable
+class Declares(Protocol):
+    """A step, or a stage, that says what it makes of the facts of the records it reads
+    (`Dataset.facts`): the fields it writes and their shapes, the tokenizer it encodes with."""
+
+    def declared(self, facts: Mapping[str, object], /) -> Mapping[str, object]: ...
+
+
+@runtime_checkable
+class Stated(Protocol):
+    """A store that states facts of its records without reading them (`Dataset.facts`): a token
+    store's tokenizer and vocabulary, say."""
+
+    def stated(self) -> Mapping[str, object]: ...
+
+
+@runtime_checkable
+class Measure(Protocol):
+    """A fact a configured step needs that a memory read measures over a store's records where the
+    store states none (`Configured.measures`): `fact` names it, and calling it on the records gives
+    its value."""
+
+    fact: str
+
+    def __call__(self, records: Records, /) -> int: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class Configured:
-    """Resolve one record step from source facts before any record reader opens."""
+    """Resolve one record step from source facts before any record reader opens. `one_to_one`
+    states that the step keeps one record for each input whatever the facts, which a cache after it
+    reads before it binds; binding it to a step that drops or expands records is refused.
+    `measures` measures a fact it needs over each store it reads, in a memory read: the whole store,
+    below any holdout, so the parts a run trains and scores on agree; a store's own statement of it
+    gives way to the measure, and a mixture's step binds the largest of its stores'. `random` and
+    `expands` state what the step it binds to is, before it binds: a random map's, and an expansion's
+    of a record into several (`Expansion`); binding to another is refused. An objective's step that
+    expands is marked as one that makes several rows of each source example (`examples`, set where the
+    objective places it): it runs after the chain's record order, a run's `examples=` bound stands
+    before it, and the expansion it binds to carries the mark (`FlatMap.examples`)."""
 
     factory: Callable[[Mapping[str, object]], RecordStep | pygrain.RandomMapTransform | Expansion]
     needs: tuple[str, ...]
     scope: Literal["source", "run"] = "source"
     random: bool = False
+    one_to_one: bool = False
+    measures: Measure | None = None
+    expands: bool = False
+    examples: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -174,6 +314,10 @@ class FlatMap:
     step: ExpandStep
     identity: str | None = None
     configured: Bound | None = None
+    examples: bool = False
+    """Whether this is an objective's step that makes several rows of each source example (a decision
+    layout's row a question): a corpus counts its source examples before it (`Accepted`), and a run's
+    `examples=` bound stands before it (`dew.data.compile._bounded`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -195,14 +339,18 @@ class Slice:
 
 @dataclasses.dataclass(frozen=True)
 class Interleave:
-    cycle_length: int = 16
+    cycle_length: int = INTERLEAVE
 
 
 @dataclasses.dataclass(frozen=True)
 class BatchStage:
     size: int
-    drop_remainder: bool = True
+    drop_remainder: bool = DROP_REMAINDER
     batch_fn: Callable[[Sequence[Batch]], Batch] | None = None
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """The same records, `size` of them a batch."""
+        return {**facts, "batch": self.size}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -222,9 +370,9 @@ class Pack:
     """
 
     seq_len: int
-    fields: tuple[str, ...] = ("text",)
-    bins: int = 32
-    policy: Literal["first-fit", "best-fit", "concat"] = "first-fit"
+    fields: tuple[str, ...] = TOKEN_FIELDS
+    bins: int = PACK_BINS
+    policy: Literal["first-fit", "best-fit", "concat"] = PACK_POLICY
     segments: int | None = None
     along: tuple[tuple[str, int], ...] = ()
     overlap: int = 0
@@ -233,6 +381,25 @@ class Pack:
     def packed(self) -> tuple[str, ...]:
         """Every field a window holds: `fields` and those `along` axes of their own."""
         return (*self.fields, *(name for name, _ in self.along))
+
+    def document(self, element: Batch) -> Batch:
+        """`element` as a document a window packs: its `packed` fields alone, its token `fields` of one
+        length (`dew.data.steps.generic.aligned`), its `along` fields beside them."""
+        from dew.data.steps.generic import aligned
+
+        return aligned(element, self.fields, tuple(name for name, _ in self.along))
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Rows of `seq_len` tokens along `fields`, the last of them a target: `seq_len - 1` inputs."""
+        from dew.data.facts import windowed
+
+        return windowed(facts, self.seq_len - 1, self.fields, packed=True, along=self.along)
+
+    @property
+    def max_length(self) -> int:
+        """The inputs each window holds, its last token their target, which a token budget divides
+        into rows (`TokenGeometry`)."""
+        return self.seq_len - 1
 
     def __post_init__(self) -> None:
         if self.policy == "concat" and (self.segments is not None or self.along):
@@ -252,7 +419,18 @@ class Pack:
 class Windows:
     seq_len: int
     stride: int | None = None
-    fields: tuple[str, ...] = ("text",)
+    fields: tuple[str, ...] = TOKEN_FIELDS
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Windows of `seq_len` inputs and their targets along `fields`."""
+        from dew.data.facts import windowed
+
+        return windowed(facts, self.seq_len, self.fields, packed=False)
+
+    @property
+    def max_length(self) -> int:
+        """The inputs each window holds, which a token budget divides into rows (`TokenGeometry`)."""
+        return self.seq_len
 
     def __post_init__(self) -> None:
         if self.seq_len < 1 or (self.stride is not None and self.stride < 1) or not self.fields:
@@ -263,7 +441,7 @@ class Windows:
 class TokenSplit:
     fraction: float
     held: bool
-    fields: tuple[str, ...] = ("text",)
+    fields: tuple[str, ...] = TOKEN_FIELDS
 
     def __post_init__(self) -> None:
         if not 0 <= self.fraction < 1:
@@ -272,13 +450,13 @@ class TokenSplit:
 
 @dataclasses.dataclass(frozen=True)
 class Prefetch:
-    buffer: int
+    buffer: int = PREFETCH
 
 
 @dataclasses.dataclass(frozen=True)
 class Workers:
     count: int
-    buffer: int = 2
+    buffer: int = WORKER_BUFFER
 
 
 @dataclasses.dataclass(frozen=True)
@@ -304,9 +482,25 @@ class MapBatch:
     identity: str | None = None
 
 
+@runtime_checkable
+class Cached(Protocol):
+    """What a cache stage fills and reads, a `dew.data.cache.Cache`, or the published generation
+    it stands in for, a `dew.data.generation.Generation`: each says where it lives and which rows
+    a plan reads from it."""
+
+    @property
+    def url(self) -> str: ...
+
+    def reference(self, manifest: DependencyManifest, /) -> str: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class Artifact:
-    cache: Cache | Generation
+    cache: Cached
+    automatic: bool = False
+    """Whether the compiler placed it (`dew.data.compile._automatic`) rather than the chain: it holds
+    the records its prefix makes, so a run reads the same records with or without it and its plan
+    names none (`dew.data.cache.automatic_root`)."""
 
 
 type Stage = (
@@ -352,6 +546,31 @@ factory."""
 
 
 @dataclasses.dataclass(frozen=True)
+class Runs:
+    """What a stage runs (`runs`): its callable, the identity written for it, and the configured step
+    it was bound from, the one description its plan identity, its cache keyability and `show` read."""
+
+    step: Step
+    identity: str | None = None
+    configured: Bound | None = None
+
+
+def runs(stage: Stage) -> Runs | None:
+    """What `stage` runs, None for a stage that runs no step of its own (an order, a batch, a cache)."""
+    if isinstance(stage, Configured):
+        return Runs(stage.factory)
+    if isinstance(stage, (Map, RandomMap, FlatMap)):
+        return Runs(stage.step, stage.identity, stage.configured)
+    if isinstance(stage, (MapWithIndex, MapBatch, Batched)):
+        return Runs(stage.step, stage.identity)
+    if isinstance(stage, Filter):
+        return Runs(stage.predicate, stage.identity)
+    if isinstance(stage, Native):
+        return Runs(stage.function, stage.identity)
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
 class Mixture:
     pipelines: tuple[Pipeline, ...]
     weights: tuple[float, ...]
@@ -369,20 +588,52 @@ class Mixture:
 @dataclasses.dataclass(frozen=True)
 class Phases:
     pipelines: tuple[Pipeline, ...]
-    until_steps: tuple[int | None, ...]
+    ends: tuple[int | None, ...]
+    """Where each phase ends, as `clock` counts them: at the training step it names (`phases`), or at
+    the run's committed tokens (`schedule`). The last runs on (None); on the token clock it may end
+    instead, where the data ends."""
+    clock: Literal["steps", "tokens"] = "steps"
 
     def __post_init__(self) -> None:
-        if (
-            not self.pipelines
-            or len(self.pipelines) != len(self.until_steps)
-            or self.until_steps[-1] is not None
-        ):
-            raise ValueError("phases need one boundary per pipeline; the last boundary is None")
-        previous = 0
-        for boundary in self.until_steps[:-1]:
-            if boundary is None or boundary <= previous:
-                raise ValueError("phase step boundaries must increase from above zero")
-            previous = boundary
+        if len(self.pipelines) != len(self.ends):
+            raise ValueError(f"phases need one end per pipeline: {len(self.pipelines)} pipelines and "
+                             f"{len(self.ends)} ends")
+        if self.clock == "steps":
+            phase_ends(self.ends, "step")
+        else:
+            phase_ends(self.ends if self.ends[-1] is None else (*self.ends, None), "token")
+
+
+def children(pipeline: Pipeline) -> tuple[Pipeline, ...]:
+    """The chains `pipeline`'s mixture or phases read, none where it reads a store."""
+    source = pipeline.source
+    return source.pipelines if isinstance(source, (Mixture, Phases)) else ()
+
+
+def chains(pipeline: Pipeline) -> Iterator[Pipeline]:
+    """Every chain of `pipeline`'s tree, children first: each corpus under its mixtures and phases,
+    then the chain that mixes or phases them, and `pipeline` last."""
+    for child in children(pipeline):
+        yield from chains(child)
+    yield pipeline
+
+
+def with_children(pipeline: Pipeline, rewrite: Callable[[Pipeline], Pipeline]) -> Pipeline:
+    """`pipeline` with each chain its mixture or phases read rewritten by `rewrite`; `pipeline` itself
+    where it reads a store."""
+    source = pipeline.source
+    if not isinstance(source, (Mixture, Phases)):
+        return pipeline
+    rewritten = tuple(rewrite(child) for child in source.pipelines)
+    return dataclasses.replace(pipeline, source=dataclasses.replace(source, pipelines=rewritten))
+
+
+def with_stores(pipeline: Pipeline, store: Callable[[Source], Source]) -> Pipeline:
+    """`pipeline` with each store under its mixtures and phases read through `store`, every step as it
+    was."""
+    if isinstance(pipeline.source, (Mixture, Phases)):
+        return with_children(pipeline, functools.partial(with_stores, store=store))
+    return dataclasses.replace(pipeline, source=store(pipeline.source))
 
 
 class Dataset:
@@ -412,7 +663,7 @@ class Dataset:
 
     def holdout(self, fraction: float | None = None, *, key: str | None = None, records: int | None = None,
                 split: str | tuple[str, ...] | None = None, tokens: float | None = None,
-                fields: tuple[str, ...] = ("text",), **named: float) -> tuple[Dataset, ...]:
+                fields: tuple[str, ...] = TOKEN_FIELDS, **named: float) -> tuple[Dataset, ...]:
         """This dataset split into the records a run trains on and the ones it
         scores, with the steps it has replayed on each, so hold out before
         preparing.
@@ -442,6 +693,16 @@ class Dataset:
 
         return holdout(self, fraction, key=key, records=records, split=split, **named)
 
+    def facts(self) -> Mapping[str, object]:
+        """What this dataset's records are, read without opening a reader: the facts its stores
+        state (a token store's tokenizer and vocabulary), then what each step makes of them in
+        order: `fields`, each field's shape a record holds; `seq_len` and `packed` for token rows;
+        `tokenizer`, `vocab_size`; `batch` once batched. A step that changes records and doesn't
+        say how leaves their fields unknown."""
+        from dew.data.facts import folded
+
+        return folded(self._chain())
+
     def named(self, name: str) -> Pipeline:
         """This dataset under `name`, which its counts log under in a mix."""
         chain = self._chain()
@@ -449,8 +710,22 @@ class Dataset:
 
     def pipe[**Options](self, stages: Callable[Concatenate[Dataset, Options], Dataset],
                         *args: Options.args, **kwargs: Options.kwargs) -> Dataset:
-        """`stages(self, *args, **kwargs)`: a dataset-level stage, such as `text.pack`."""
-        return stages(self, *args, **kwargs)
+        """`stages(self, *args, **kwargs)`: a dataset-level stage, such as `text.pack`. The chain
+        it returns keeps the call beside the stages it made (`Piped`), which a run's record writes
+        in their place (`dew.data.records`)."""
+        before = self._chain()
+        after = stages(self, *args, **kwargs)
+        if not isinstance(after, Pipeline):
+            return after
+        called = Piped(stages, args, tuple(kwargs.items()), len(before.stages), len(after.stages))
+        kept = tuple(entry for entry in after.piped if entry.end <= len(after.stages))
+        if after.source is before.source and len(after.stages) >= len(before.stages) and all(
+                made is had for made, had in zip(after.stages, before.stages, strict=False)):
+            # The call extends its input: what the input kept still stands, and the call covers the rest.
+            inherited = tuple(entry for entry in before.piped if all(entry is not other for other in kept))
+            return dataclasses.replace(after, piped=(*inherited, *kept, called))
+        # The call made another store of its input: it stands for its input and all it made.
+        return dataclasses.replace(after, piped=(*kept, dataclasses.replace(called, start=0, input=before)))
 
     def map(self, *steps: RecordStep | Configured | HostStep, batched: bool = False, batch_size: int = 1000,
             identity: str | None = None) -> Pipeline:
@@ -572,7 +847,7 @@ class Dataset:
     def repeat(self, epochs: int | None = None) -> Pipeline:
         return self._then(Repeat(epochs))
 
-    def interleave(self, cycle_length: int = 16) -> Pipeline:
+    def interleave(self, cycle_length: int = INTERLEAVE) -> Pipeline:
         return self._then(Interleave(cycle_length))
 
     def batch(
@@ -580,7 +855,7 @@ class Dataset:
         size: int | None = None,
         *,
         tokens: int | None = None,
-        drop_remainder: bool = True,
+        drop_remainder: bool = DROP_REMAINDER,
         batch_fn: Callable[[Sequence[Batch]], Batch] | None = None,
     ) -> Pipeline:
         if (size is None) == (tokens is None):
@@ -595,9 +870,9 @@ class Dataset:
         self,
         seq_len: int,
         *,
-        fields: tuple[str, ...] = ("text",),
-        bins: int = 32,
-        policy: Literal["first-fit", "best-fit", "concat"] = "first-fit",
+        fields: tuple[str, ...] = TOKEN_FIELDS,
+        bins: int = PACK_BINS,
+        policy: Literal["first-fit", "best-fit", "concat"] = PACK_POLICY,
         segments: int | None = None,
         along: tuple[tuple[str, int], ...] = (),
         overlap: int = 0,
@@ -611,20 +886,20 @@ class Dataset:
         return self._then(Pack(seq_len, fields, bins, policy, segments, along, overlap))
 
     def windows(
-        self, seq_len: int, *, stride: int | None = None, fields: tuple[str, ...] = ("text",)
+        self, seq_len: int, *, stride: int | None = None, fields: tuple[str, ...] = TOKEN_FIELDS
     ) -> Pipeline:
         return self._then(Windows(seq_len, stride, fields))
 
-    def prefetch(self, buffer: int = 64) -> Pipeline:
+    def prefetch(self, buffer: int = PREFETCH) -> Pipeline:
         return self._then(Prefetch(buffer))
 
-    def workers(self, count: int, *, buffer: int = 2) -> Pipeline:
+    def workers(self, count: int, *, buffer: int = WORKER_BUFFER) -> Pipeline:
         return self._then(Workers(count, buffer))
 
     def take(self, count: int) -> Pipeline:
         return self._then(Limit(count))
 
-    def cache(self, cache: str | Cache | Generation) -> Pipeline:
+    def cache(self, cache: str | Cached) -> Pipeline:
         """Fill `cache` with the deterministic record steps before it, or read a
         published `Generation` as the source in their place, with its published
         packing in place of a `pack` that follows."""
@@ -632,16 +907,40 @@ class Dataset:
 
         return self._then(Artifact(Cache(cache) if isinstance(cache, str) else cache))
 
-    def snapshot(self, url: str, *, format: Literal["array_record", "parquet"] = "array_record",
-                 rows_per_shard: int = 100_000) -> Mapping[str, object]:
+    def snapshot(self, url: str, *, format: Literal["array_record", "parquet"] | Writer = "array_record",
+                 rows_per_shard: int = 100_000,
+                 deduplicate: NearDuplicates | None = None) -> Mapping[str, object]:
         """Run this dataset once over every record and seal what it makes at
         `url`: immutable shards and their committed manifest, which
-        `Files(url)` reads back. A fetch's outcomes are sealed with it, so a
-        run that reads the snapshot resumes exactly. Returns the manifest."""
-        from dew.data.sinks import export
+        `Files(url)` reads back, written as ArrayRecord, as Parquet or by a
+        native writer (`dew.data.sinks.Writer`). A fetch's outcomes are sealed with it, so a
+        run that reads the snapshot resumes exactly. With `deduplicate`
+        (`dew.data.text.NearDuplicates`, the `curation` extra), each group of
+        near-duplicates in that one pass is sealed as one record, and the
+        manifest's metadata records the rule, DataTrove's release and the
+        records removed. Returns the manifest."""
+        from dew.data.sinks import export, passed
 
         chain = self._chain()
-        return export(chain, url, format=format, rows_per_shard=rows_per_shard)
+        if deduplicate is None:
+            return export(chain, url, format=format, rows_per_shard=rows_per_shard)
+        import tempfile
+        from importlib.metadata import version
+
+        from dew.data.sources import Files
+        from dew.data.text import near_duplicates_removed
+
+        # The one pass sealed first, so every later read of it reads the same records in one order,
+        # whatever a fetch makes of them the next time.
+        with tempfile.TemporaryDirectory(prefix="dew-deduplicate-") as sealed:
+            # A pass that kept no record seals none, and has none to deduplicate.
+            if export(chain, sealed, format="array_record", rows_per_shard=rows_per_shard)["rows"]:
+                kept, removed = near_duplicates_removed(lambda: passed(Files(sealed)), deduplicate)
+            else:
+                kept, removed = iter(()), 0
+            rule = {**dataclasses.asdict(deduplicate), "datatrove": version("datatrove"), "removed": removed}
+            return export(kept, url, format=format, rows_per_shard=rows_per_shard,
+                          metadata={"near_duplicates": rule})
 
     def rename_columns(self, names: Mapping[str, str]) -> Pipeline:
         """Each record with its fields renamed, as `rename_columns({"txt": "caption"})`."""
@@ -674,12 +973,15 @@ class Dataset:
         return self._then(Native(function, identity))
 
     def stats(self, records: int = 1000) -> dict[str, float]:
-        """The counts a run logs from a fresh, lazy pass over at most
-        `records` accepted records: the rows delivered and the drops by
-        reason (`dew.data.mixing.CorpusCounts`)."""
+        """The counts a run logs from a fresh, lazy pass over at most `records` accepted records:
+        the rows delivered and the drops by reason (`dew.data.mixing.CorpusCounts`), the rows the
+        pass read a second once its reader was open (`data/records_per_second`: the loading
+        settings default to none, while workers or prefetching the chain writes run as written),
+        and for token rows, under "text", the tokens they hold (`data/tokens`) and the share of
+        their places that pad a row (`data/padding`)."""
+        from dew._records import record
         from dew.data.compile import _diagnostic
         from dew.data.mixing import data_metrics, state_counts
-        from dew.records import record
 
         chain = self._chain()
         if any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
@@ -689,12 +991,22 @@ class Dataset:
         if records == 0:
             return {}
         reader = _diagnostic(chain, records=records)
+        rows = places = padding = 0
+        started = time.perf_counter()
         try:
-            for _ in reader:
-                pass
-            return data_metrics(state_counts(record(reader.get_state(), "diagnostic state")).values())
+            for batch in reader:
+                rows += 1
+                held, padded = _token_places(batch)
+                places, padding = places + held, padding + padded
+            seconds = time.perf_counter() - started
+            metrics = data_metrics(state_counts(record(reader.get_state(), "diagnostic state")).values())
         finally:
             reader.close()
+        metrics["data/records_per_second"] = rows / seconds if seconds > 0 else math.inf
+        if places:
+            metrics["data/tokens"] = places - padding
+            metrics["data/padding"] = padding / places
+        return metrics
 
     def read(self, mode: Read) -> Pipeline:
         """Read the stores this way, rather than as they prefer: "memory" holds
@@ -711,6 +1023,19 @@ class Dataset:
         return self.loading(dataclasses.replace(loading, threads=count,
                                                 read_buffer=max(loading.read_buffer, count)))
 
+    def elastic(self) -> Pipeline:
+        """Read it for training so a run resumes on any number of readers that splits its batch, as
+        a global order does, where its own order is read per share (a stream, or steps that drop,
+        expand, pack or draw). Every reader reads the order one reader reads, through its last step
+        that is not a map of each record alone, and keeps every count-th row of each batch, its
+        share; the maps written after that step run on its own rows alone, on its read threads. So
+        its rows are a one-reader run's, and its position, the same on every reader, resumes on any
+        count, as HF's `split_dataset_by_node` reads a stream on every node; each reader reads the
+        steps before those maps over every record. Read by index, its loading workers read its
+        inputs in their order (`dew.data.lowering._InputOrder`), so their count is no part of its
+        position either; streamed, it reads without them (ledger row 1896)."""
+        return dataclasses.replace(self._chain(), _elastic=True)
+
     def loading(self, loading: Loading) -> Pipeline:
         """Read with these workers, threads and buffers (`Loading`), rather than the measured
         defaults, recorded with the chain; `threads` sets its read threads alone."""
@@ -720,9 +1045,9 @@ class Dataset:
         """This dataset's records, or its batches where it batches: one pass,
         or the passes its `repeat` asks for, with training's random draws
         (`for record in dataset`)."""
+        from dew.batch import VALID_ROWS
         from dew.data.compile import _batch_steps, _diagnostic
         from dew.data.dataset import take_batch
-        from dew.objectives.base import VALID_ROWS
 
         chain = self._chain()
         batched = any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages)
@@ -742,12 +1067,25 @@ class Dataset:
             reader.close()
 
     def show(self, count: int = 8) -> None:
-        """Print the first `count` records."""
-        from rich.pretty import pprint
+        """Print the chain, each verb and step a preset or function expanded to in order, then
+        its first `count` records."""
+        from dew.data.show import shown
 
-        for record in itertools.islice(self, count):
-            pprint({name: _shown(value) for name, value in record.items()} if isinstance(record, Mapping)
-                   else record)
+        shown(self._chain(), itertools.islice(self, count))
+
+
+@dataclasses.dataclass(frozen=True)
+class Piped:
+    """A call of `Dataset.pipe` and what it made: `function(input, *args, **settings)` made the
+    stages `start` to `end` of the chain that keeps it, or, where it made another store of its
+    input (a token store's windows), the store and the stages to `end` from `input`."""
+
+    function: Callable[..., Dataset]
+    args: tuple[object, ...]
+    settings: tuple[tuple[str, object], ...]
+    start: int
+    end: int
+    input: Pipeline | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -759,6 +1097,10 @@ class Pipeline(Dataset):
     name: str | None = None
     mode: Read | None = None
     _loading: Loading | None = None
+    _elastic: bool = False
+    """Whether a training run reads it elastically (`Dataset.elastic`)."""
+    piped: tuple[Piped, ...] = dataclasses.field(default=(), compare=False, repr=False)
+    """The calls of `pipe` that made its stages (`Piped`), outermost last; no plan reads them."""
 
     def _then(self, *stages: Stage) -> Pipeline:
         return dataclasses.replace(self, stages=(*self.stages, *stages))
@@ -778,13 +1120,20 @@ def concat(datasets: Sequence[Dataset]) -> Pipeline:
     return Pipeline(Concatenate(stores))
 
 
-def _shown[Field](value: np.ndarray | bytes | Field) -> np.ndarray | bytes | Field | str:
-    """A field as `show` prints it: an array as its shape and dtype, bytes as their length."""
-    if isinstance(value, np.ndarray) and value.size > 16:
-        return f"{value.dtype}{list(value.shape)}"
-    if isinstance(value, bytes) and len(value) > 64:
-        return f"<{len(value)} bytes>"
-    return value
+def _token_places(batch: Batch) -> tuple[int, int]:
+    """The places a batch's token rows under "text" hold, and those of them that pad a row, as a
+    model reads them (`dew.batch.real_slots`): segment 0 of a packed row and the places its
+    validity marks invalid, in its `text_coordinates` or in stored `text_segment_ids` and
+    `text_attention_mask`; none where it holds no token ids."""
+    tokens = batch.get("text")
+    if not isinstance(tokens, np.ndarray) or tokens.dtype.kind not in "iu":
+        return 0, 0
+    from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, real_slots
+
+    fields = {name: batch[f"text_{name}"] for name in (COORDINATES_FIELD, VALIDITY_FIELD, "segment_ids")
+              if f"text_{name}" in batch}
+    real = real_slots(fields, tokens.shape, xp=np)
+    return int(tokens.size), int(tokens.size - np.count_nonzero(real))
 
 
 def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
@@ -805,6 +1154,36 @@ def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
     return Pipeline(Mixture(chains, shares, tokens))
 
 
+def phases(*entries: tuple[Dataset, int | None]) -> Pipeline:
+    """Datasets read one after another: each `(dataset, until_step)` until the training step it
+    names, the last until the run ends (`None`). Each phase is a whole chain, laid out and batched
+    as it reads, each of the same batch."""
+    if not entries:
+        raise ValueError("phases need at least one (dataset, until_step)")
+    return Pipeline(Phases(tuple(dataset._chain() for dataset, _ in entries),
+                           tuple(until for _, until in entries)))
+
+
+def schedule(stages: Sequence[tuple[Dataset, float | None]]) -> Pipeline:
+    """Datasets read one after another on the run's committed-token clock, the clock `fit(tokens=)`
+    counts: each `(dataset, tokens)` for the valid target tokens its steps commit, the last for the
+    rest of the run (`None`), or for its tokens, where the data ends (the run's last step). A stage
+    ends at the step whose commit reaches its tokens, on every process alike, so its last step may
+    commit past them; one that a single step's commit passes reads nothing. A corpus that an earlier
+    stage read continues from where it left it, and what the run had read ahead of the end is not
+    trained on. Each stage is a whole chain, laid out and batched as it reads."""
+    if not stages:
+        raise ValueError("a schedule needs at least one (dataset, tokens)")
+    budgets = [tokens for _, tokens in stages]
+    if any(tokens is None for tokens in budgets[:-1]) or any(
+            tokens is not None and not (math.isfinite(tokens) and tokens >= 1) for tokens in budgets):
+        raise ValueError(f"every stage but the last commits a count of tokens, of at least one; got "
+                         f"{budgets}")
+    ends = list(itertools.accumulate(int(tokens) for tokens in budgets if tokens is not None))
+    return Pipeline(Phases(tuple(dataset._chain() for dataset, _ in stages),
+                           (*ends[:len(stages) - 1], None if budgets[-1] is None else ends[-1]), "tokens"))
+
+
 @dataclasses.dataclass(frozen=True)
 class ObjectiveData:
     train: tuple[RecordStep | pygrain.RandomMapTransform | Expansion | Configured, ...] = ()
@@ -813,9 +1192,28 @@ class ObjectiveData:
     packed: tuple[RecordStep, ...] = ()
     train_batch: tuple[HostStep, ...] = ()
     evaluate_batch: tuple[HostStep, ...] = ()
+    geometry: RecordStep | None = None
+    """The rows the objective reads where a chain lays out none of its own, after its other record
+    steps; rows a chain packs or cuts into windows (`Pack`, `Windows`) keep the length it gives them, as
+    a schedule's stages each give theirs (`dew.data.compile.objective_steps`)."""
 
 
 type _Step = RecordStep | RandomStep | HostStep | Configured | ExpandStep | ColumnStep
+
+
+def record_stage(step: RecordStep | pygrain.RandomMapTransform | Expansion, *, identity: str | None = None,
+                 configured: Bound | None = None) -> Map | RandomMap | FlatMap:
+    """The stage a record step is applied by where no verb names it, from what the step says it is:
+    an expansion's records (`FlatMap`), a generator's draws (`RandomMap`), or one record's
+    replacement (`Map`), dropping records where it says it does (`rejects`). An objective's steps
+    and a configured step's binding are read through it; a verb (`map`, `random_map`, `filter_map`,
+    `random_filter_map`, `flat_map`) builds the stage its name states, which a step of another
+    kind is refused."""
+    if isinstance(step, Expansion):
+        return FlatMap(step, identity, configured)
+    if isinstance(step, pygrain.RandomMapTransform):
+        return RandomMap(step, identity, _declares_rejects(step), configured)
+    return Map(step, identity, _declares_rejects(step), configured)
 
 
 def _named_step(step: _Step) -> str:

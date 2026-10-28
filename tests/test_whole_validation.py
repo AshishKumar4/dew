@@ -13,23 +13,28 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from data_support import record_batches
 from diffusion_stubs import batch_for
-from objective_cases import cases, corpus_windows
+from diffusion_support import images_of
+from objective_cases import cases
+from objective_data import corpus_windows
 from reference_error import assert_computes_the_oracle, chain_roundings
 from test_guidance_distillation import FIXTURES, FLUX
 
 from dew import Evaluation
-from dew.config import ModelConfig, ObjectiveConfig
-from dew.config.data import ImageData, RecordsData, loader
+from dew.batch import VALID_ROWS, padded_rows
+from dew.config import ObjectiveConfig
+from dew.config.diffusion import DiffusionRunConfig
 from dew.data import Loading
 from dew.data.chat import Role
 from dew.data.dataset import DataPartition, rows_of
 from dew.diffusion.presets import Flow
+from dew.inputs import TextCondition
 from dew.nn.backbones import CausalTransformer
-from dew.objectives.base import TEACHER, VALID_ROWS, Step
-from dew.objectives.diffusion import DiffusionRunConfig, GuidanceDistillationObjective, TextCondition
+from dew.objectives.base import TEACHER, Step
+from dew.objectives.diffusion import GuidanceDistillationObjective
 from dew.objectives.lm import LMObjective, Perplexity
-from dew.registry import objectives
+from dew.registry import ModelConfig, objectives
 from dew.sampling import Euler
 
 ROWS = 8
@@ -53,8 +58,7 @@ def runnable(name: str, windows, tmp_path):
         archive.extractall(tmp_path / "flux", filter="data")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102", split="all", image_size=8), preset=Flow(),
-            val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", 8), preset=Flow(), val_metrics=(),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(tmp_path / "flux" / "pipeline")),
         objective=ObjectiveConfig("diffusion",
                                   {"solver": Euler(), "guidance": None, "steps": 2,
@@ -81,9 +85,9 @@ def stacked(records: list) -> dict:
 
 
 def wide(tree):
-    """`tree` with every floating leaf in float64."""
+    """`tree` with every floating leaf in float64; a host field, a record's captions, as it is."""
     return jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
-                        if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, tree)
+                        if jnp.issubdtype(np.asarray(leaf).dtype, jnp.floating) else leaf, tree)
 
 
 def moved(tree, seed: int):
@@ -104,8 +108,8 @@ def test_the_last_batch_is_filled_out_and_marked_on_every_process_count(held):
     one to validate. The pass reads each record once, on one process or two,
     and the repeats that fill the last batch out are marked; with one record,
     process 1's share is empty and reads one batch of repeats alone."""
-    data = loader(RecordsData(source={"id": np.arange(8)}, validation={"id": np.arange(held)}), batch=4,
-        loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
+    data = record_batches({"id": np.arange(8)}, 4, {"id": np.arange(held)},
+                          loading=Loading(workers=0, threads=1, read_buffer=1))
     for count in (1, 2):
         seen = []
         for index in range(count):
@@ -118,13 +122,23 @@ def test_the_last_batch_is_filled_out_and_marked_on_every_process_count(held):
         assert sorted(seen) == list(range(held)), count
 
 
+def test_a_batch_fills_out_with_its_own_rows_in_turn_and_never_from_none():
+    """A batch of three rows filled out to seven repeats them in turn and marks the four repeats; a
+    batch of no rows has nothing to repeat, so filling one out is refused rather than made up."""
+    indices, repeats = padded_rows(3, 7)
+    assert indices.tolist() == [0, 1, 2, 0, 1, 2, 0]
+    assert repeats.tolist() == [False] * 3 + [True] * 4
+    with pytest.raises(ValueError):
+        padded_rows(0, 4)
+
+
 EVALUATED = sorted(set(objectives) - ROLLOUT)
 """Every registered objective with an evaluation loss."""
 
 
 def evaluated(name: str, windows, tmp_path) -> dict:
     """`name`'s pass over a split of `RECORDS` in batches of `ROWS`, run on
-    every process of the pool: once through `loader(RecordsData(...))`, whose
+    every process of the pool: once through a run's compiled records (`record_batches`), whose
     repeats fill the last batch with its own rows, and once with the repeats
     another record's. Each pass's scores and counts, and for a loss that draws
     nothing (the same under two keys) the loss of every record in one batch
@@ -135,8 +149,7 @@ def evaluated(name: str, windows, tmp_path) -> dict:
         drawn = objective.init(jax.random.key(0))
         variables, averaged = moved(drawn, 1), moved(drawn, 2)
         records = wide(records)
-        data = loader(RecordsData(source=records, validation=records), batch=ROWS, loading=Loading(workers=0,
-            threads=1, read_buffer=1), read="memory")
+        data = record_batches(records, ROWS, records, loading=Loading(workers=0, threads=1, read_buffer=1))
         tail = len(records) - ROWS
         batches = [{**stacked(records[:ROWS]), VALID_ROWS: np.ones(ROWS, bool)},
                    {**stacked(records[ROWS:] + [records[0]] * (ROWS - tail)),
@@ -155,7 +168,7 @@ def evaluated(name: str, windows, tmp_path) -> dict:
                   "batches": [result.coordinated_batches for result in passes], "unbatched": None}
         # The pass scores the averaged weights, unless the average is the
         # objective's frozen reference.
-        scored = variables if objective._ema_is_reference else averaged
+        scored = variables if objective.ema_is_reference else averaged
 
         def statistics(rows, key: int):
             return objective._loss(scored, rows, Step(jnp.asarray(0), jax.random.key(key), averaged))[0]
@@ -257,8 +270,8 @@ def perplexity(windows, count: int = RECORDS) -> dict:
     records = records_of(batch, count)
     with jax.enable_x64(new_val=True):
         variables = moved(objective.init(jax.random.key(0)), 1)
-        data = loader(RecordsData(source=records_of(batch, ROWS), validation=records), batch=ROWS,
-            loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
+        data = record_batches(records_of(batch, ROWS), ROWS, records,
+                              loading=Loading(workers=0, threads=1, read_buffer=1))
         result = Evaluation.run(objective, variables, data.val, key=3, metrics=(Perplexity(),))
         whole = stacked(records)
         step = Step(jnp.asarray(0), jax.random.key(1), None)

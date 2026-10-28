@@ -9,6 +9,7 @@ trainer has just written.
 
 import dataclasses
 import json
+import types
 from pathlib import Path
 
 import jax
@@ -23,17 +24,20 @@ from steady_state import steady_state
 import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
-from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.config.data import ImageData as ImageRecipe, VideoData
-from dew.data import ByteTokenizer
+from dew.batch import merge
+from dew.config import MetricConfig, ObjectiveConfig, TrainerConfig
+from dew.config.diffusion import DiffusionRunConfig
+from dew.data import ByteTokenizer, presets
 from dew.data.dataset import Loader
+from dew.data.images import CAPTIONS
+from dew.data.sources import source
+from dew.data.sources.files import Files
 from dew.diffusion.presets import EDM, Flow
-from dew.inference import RunProcessor, TextGeneration
-from dew.inputs import Field, unit_range
-from dew.objectives.base import merge
-from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
-from dew.sampling import CFG, DPMSolverSDE, Euler, Heun, TextToImage
-from dew.sampling.pipelines import Images
+from dew.inference import Images, RunProcessor, TextGeneration, TextToImage
+from dew.inputs import Field, TextCondition, unit_range
+from dew.registry import ModelConfig
+from dew.sampling import CFG, DPMSolverSDE, Euler, Heun
+from dew.telemetry.instrumentation import Compiles
 from dew.training import Checkpoints, LocalTracker, Trainer
 
 RES = 8
@@ -48,8 +52,8 @@ def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder=STUB_TEXT, 
     text condition names the registered stub encoder by default."""
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {**MODEL, "dtype": "float32", "attention_impl": "reference"}),
-        data=ImageRecipe(source="tfds://oxford_flowers102", split="all", image_size=RES),
-        trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
+        data=source("tfds://oxford_flowers102").pipe(presets.images, RES, batch=8),
+        trainer=TrainerConfig(checkpoint_dir=str(directory), steps=2, keep=1),
         preset=preset, text=TextCondition(encoder=encoder, checkpoint=checkpoint),
         objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 3}))
 
@@ -214,7 +218,6 @@ def test_sampler_and_guidance_are_call_arguments(tmp_path):
 def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
     """A request's CFG scale, a Brownian solver's seed and an explicit grid's values are data to the
     image walk: another value changes the sample and runs the program the first value compiled."""
-    from dew.sampling import pipelines
 
     make_run(tmp_path)
     loaded = TextToImage.from_run(str(tmp_path))
@@ -229,26 +232,29 @@ def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
                     key=jax.random.PRNGKey(1)).host().images
 
     first = draw(times=grid)
-    compiled = pipelines._run(None, ())._cache_size()
-    for other in (draw(scale=2.0, times=grid), draw(seed=2, times=grid), draw(times=nudged)):
-        assert not np.allclose(other, first)
-    assert np.array_equal(draw(times=grid), first)
-    assert np.array_equal(draw(), first)
-    assert pipelines._run(None, ())._cache_size() == compiled
+    # The walk is `dew.inference.images._walk`.
+    with Compiles("_walk") as compiled:
+        for other in (draw(scale=2.0, times=grid), draw(seed=2, times=grid), draw(times=nudged)):
+            assert not np.allclose(other, first)
+        assert np.array_equal(draw(times=grid), first)
+        assert np.array_equal(draw(), first)
+    assert compiled.count == 0
 
 
-def test_build_eval_metrics_follows_the_sample_field(tmp_path):
+def test_validation_metrics_follow_the_sample_field(tmp_path):
     """A video run scores its `VideoGrid` against its `video` field: a PSNR stating no field reads
-    that grid there, and an image-only metric raises a ValueError naming it in
-    `build_eval_metrics`, before the trainer."""
+    that grid there, and an image-only metric raises a ValueError naming it as the run builds its
+    splits' metrics (`suites`), before the trainer."""
     video = dataclasses.replace(run_config(tmp_path),
-                                data=VideoData(source="clips", frame_size=8, frames=2),
+                                data=Files("clips", format="files").pipe(presets.video, 2 / 25, frames=2,
+                                                                          fps=25, size=8, batch=2),
                                 val_metrics=(MetricConfig("psnr"),))
-    (metric,) = video.build_eval_metrics()
+    held = types.SimpleNamespace(val=object())
+    (metric,) = video.suites(held, None)["val"].metrics
     images = np.zeros((2, 2, 8, 8, 3), np.uint8)
     assert np.isinf(metric.finalize(metric(VideoGrid(unit_range(images)), {"video": images})))
     with pytest.raises(ValueError):
-        dataclasses.replace(video, val_metrics=(MetricConfig("clip"),)).build_eval_metrics()
+        dataclasses.replace(video, val_metrics=(MetricConfig("clip"),)).suites(held, None)
 
 
 TINY_CLIP = str(Path(__file__).parent / "fixtures" / "clip" / "tiny")
@@ -264,7 +270,9 @@ def validated_run(directory, *, validates: bool, **fields):
     encoder = objective.inputs.conditions["textcontext"].encoder
     images = np.tile(np.linspace(0, 255, RES, dtype=np.float32)[None, :, None, None],
                      (8, 1, RES, 3)).astype(np.uint8)
-    batch = {"image": images, "text": encoder.tokenize(["a", "b", "c", "d", "e", "f", "g", "h"])}
+    # As a run's data holds it (`DiffusionObjective.data`): the captions' tokens and the captions as text.
+    captions = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    batch = {"image": images, "text": encoder.tokenize(captions), CAPTIONS: np.asarray(captions)}
     data = Loader(train=lambda partition: Replaying(lambda position: batch),
                   val=(lambda partition: iter([batch])) if validates else None, records=None, batch=8)
     checkpoints = Checkpoints(str(directory / "checkpoints"), keep=1)
@@ -272,8 +280,11 @@ def validated_run(directory, *, validates: bool, **fields):
         trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0),
                           checkpoints=checkpoints, tracker=tracker)
         try:
-            trainer.fit(data, steps=2, log_every=100, checkpoint_every=2,
-                        metrics=config.build_eval_metrics(data.val is not None))
+            # As `RunConfig.train` scores them: each split's named metrics, or the kind's own.
+            suites = config.suites(data, None)
+            trainer.fit(data, steps=2, log_every=100, checkpoint_every=2, validation=suites,
+                        metrics=config.validation_metrics(validates=data.val is not None) if suites is None
+                        else ())
         finally:
             checkpoints.wait()
     with LocalTracker(directory / "tracking") as journal:
@@ -294,29 +305,64 @@ def test_an_image_run_validates_on_clip_by_default_with_the_model_its_metric_nam
     scalars, _ = validated_run(tmp_path / "named", validates=True, val_metrics=named.val_metrics)
     final = {name: value for step, values in scalars if step == 2 for name, value in values.items()}
     assert 0.0 <= final["val/clip_similarity"] <= 2.0
-    assert run_config(tmp_path).build_eval_metrics(validates=True)[0].name == "clip_similarity"
+    assert run_config(tmp_path).validation_metrics(validates=True)[0].name == "clip_similarity"
     scalars, latest = validated_run(tmp_path / "unvalidated", validates=False)
     assert latest == 2 and not any(name.startswith("val/") for _, values in scalars for name in values)
 
 
 def test_a_metric_a_run_names_without_a_validation_split_refuses_before_an_update(tmp_path):
     """A run that names a metric asks for it whatever its data holds, so data with no validation
-    split refuses the run in `Trainer.fit`, before its first update writes a checkpoint."""
+    split refuses the run as it builds its splits' metrics (`RunConfig.suites`), before its first
+    update writes a checkpoint."""
     named = (MetricConfig("psnr"),)
-    # The metric builds for data that does not validate; the run is what refuses it.
-    run = dataclasses.replace(run_config(tmp_path), val_metrics=named)
-    assert len(run.build_eval_metrics(validates=False)) == 1
     with pytest.raises(ValueError):
         validated_run(tmp_path, validates=False, val_metrics=named)
     assert Checkpoints(str(tmp_path / "checkpoints"), keep=1).latest is None
 
 
-def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
+def test_an_lm_run_over_a_source_stops_at_its_end_of_sequence_ids(tmp_path):
+    """An LM objective over a loaded source takes the source's end-of-sequence ids into the policy it
+    trains, its task and its saved run, where its own sampling names none: each stops a greedy response
+    at the first id the source ends at, which the same objective over the bare model generates past."""
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective, Samples
+    from dew.sampling import Sampling
+
+    source = Pretrained.load(Path(__file__).resolve().parent / "fixtures/hf/qwen3-tiny", dtype="float32",
+                             attention_impl="xla")
+    greedy = Samples([1, 2, 3], 0, sampling=Sampling(temperature=0))
+    prompt = jnp.asarray([[1, 2, 3], [4, 5, 6]], jnp.int32)
+
+    def generated(objective):
+        state = Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(0)).initial_state()
+        return objective, state, objective.pipeline(state, ema=False)(prompt, 6, key=7).host()
+
+    _, _, free = generated(LMObjective(source.model, 8, variables=source.variables, ema_decay=None,
+                                       samples=greedy))
+    eos = int(free.tokens[0, 3 + 2])
+    ending = dataclasses.replace(source, generation_config={**source.generation_config, "eos_token_id": eos})
+    objective, state, stopped = generated(LMObjective(ending, 8, ema_decay=None, samples=greedy,
+                                                      processor=None))
+    responses = np.asarray(free.tokens[:, 3:])
+    hits = [np.flatnonzero(row == eos) for row in responses]
+    expected = [int(hit[0]) + 1 if hit.size else 6 for hit in hits]
+    np.testing.assert_array_equal(stopped.lengths, expected)
+    np.testing.assert_array_equal(stopped.terminated, [bool(hit.size) for hit in hits])
+    policy = objective.policy(state.variables, Sampling(temperature=0))(prompt, 6, key=7).host()
+    np.testing.assert_array_equal(policy.lengths, expected)
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    restored = TextGeneration.from_run(str(tmp_path / "run"))(prompt, 6, key=7).host()
+    np.testing.assert_array_equal(restored.lengths, expected)
+
+
+def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=None):
     """Two training steps of a tiny byte-level decoder, its checkpoints, whose
     record names the byte tokenizer it decodes through, and the `run.json` the
     LM recipe writes: the resolved model, tokenizer and budget.
     `max_seq_len` is the model's window, which training at 9 ids does not
-    reach."""
+    reach; `fields` override the decoder's shape."""
     import json
 
     from dew.objectives.lm import LMObjective, Samples
@@ -324,7 +370,7 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     from dew.training import MeshSpec
 
     fields = {"vocab_size": 256, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
-                  "mlp_features": 32, "max_seq_len": max_seq_len}
+              "mlp_features": 32, "max_seq_len": max_seq_len, **(fields or {})}
     model_config = ModelConfig("causal_transformer", {**fields,
                                                     "dtype": "float32", "attention_impl": "reference"})
     objective = LMObjective(model_config.build(), 8, ema_decay=ema_decay,
@@ -347,6 +393,169 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
         "max_new_tokens": 4, "sampling": dataclasses.asdict(objective.samples.sampling),
         "ema_decay": ema_decay, "data": {"seq_len": 8}}))
     return objective, state
+
+
+@pytest.mark.parametrize("family", ["qwen3_5", "mimo"])
+def test_an_earlier_projector_record_reloads_its_saved_image_model(tmp_path, family):
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import MiMoProjector, Qwen35Projector, SiglipVision
+    from dew.objectives.lm import LMObjective
+
+    projector = {"qwen3_5": Qwen35Projector, "mimo": MiMoProjector}[family](
+        hidden_size=4, spatial_merge_size=2, width=16, out_width=8, bias=family == "qwen3_5")
+    model = MultimodalTransformer(
+        CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=2,
+                          mlp_features=16, max_seq_len=16, attention_impl="reference"),
+        SiglipVision(hidden_size=4, intermediate_size=8, num_layers=1, num_heads=1,
+                      image_size=4, patch_size=2), projector, family, 30)
+    objective = LMObjective(model, 4, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.01), key=3).initial_state()
+    record = objective.inference_record()
+    projection = record["model"]["fields"]["projection"]
+    projection["fields"] = {"vision_width": 4, "merge_size": 2, "out_width": 8}
+    with Checkpoints(str(tmp_path), keep=2) as checkpoints:
+        checkpoints.save(0, state, artifact=record)
+        checkpoints.wait()
+        checkpoints.save(1, state, artifact=objective.inference_record())
+        checkpoints.wait()
+    restored = TextGeneration.from_run(str(tmp_path), step=0)
+    pixels = jnp.arange(48, dtype=jnp.float32).reshape(1, 1, 3, 4, 4) / 48
+    tokens = jnp.asarray([[1, 30, 4, 5]], jnp.int32)
+    conditioning = {"pixel_values": pixels, "image_lengths": jnp.asarray([[1]], jnp.int32)}
+    images = jnp.asarray([[-1, 0, -1, -1]], jnp.int32)
+    expected = model.apply(state.variables, tokens, conditioning=conditioning, image_indices=images)
+    actual = restored.model.apply(restored.variables, tokens, conditioning=conditioning,
+                                  image_indices=images)
+    np.testing.assert_array_equal(actual, expected)
+
+
+def test_every_route_generates_through_the_same_packed_projections(tmp_path):
+    """A run's task and a source's hold their query/key/value and gate/up packed, packed once at
+    their load from the weights they own; a live objective's task keeps the trainer's own arrays,
+    bound in place, and packs them inside each generation's compiled call. Every route draws, bit
+    for bit, what a task over weights packed beforehand draws, and the run's and the objective's
+    draws agree. The run task's tree is a serving layout: an objective built over it holds, and an
+    export of it writes, the run's own tree, bit for bit."""
+    from flax.core import unfreeze
+
+    from dew.inference.projections import inference_projections, projection_groups
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective
+    from dew.quantization import Quantization
+    from dew.sampling import Sampling
+
+    run = tmp_path / "run"
+    run.mkdir()
+    objective, state = make_lm_run(run, ema_decay=None)
+    Pretrained.from_run(str(run)).save(tmp_path / "source")
+    routes = {"run": dew.pipeline(str(run)), "source": dew.pipeline(str(tmp_path / "source")),
+              "objective": objective.pipeline(state)}
+    for name, task in routes.items():
+        attention = task.variables["params"]["layers_0"]["self_attn"]
+        owned = name != "objective"
+        assert ("qkv_proj" in attention) == owned, name
+        assert ({"q_proj", "k_proj", "v_proj"} & set(attention) == set()) == owned, name
+    for bound, live in zip(jax.tree.leaves(routes["objective"].variables), jax.tree.leaves(state.variables),
+                           strict=True):
+        assert bound is live
+    greedy = Sampling(temperature=0, eos_token_ids=255)
+    drawn = {}
+    for name, task in routes.items():
+        packed = inference_projections(task.model, task.variables)
+        prepacked = TextGeneration(task.model, packed, task.processor)
+        drawn[name] = task("the ", 4, key=2, sampling=greedy).host()
+        expected = prepacked("the ", 4, key=2, sampling=greedy).host()
+        np.testing.assert_array_equal(drawn[name].tokens, expected.tokens, err_msg=name)
+        np.testing.assert_array_equal(drawn[name].raw_log_probs, expected.raw_log_probs, err_msg=name)
+    np.testing.assert_array_equal(drawn["run"].raw_log_probs, drawn["objective"].raw_log_probs)
+    trained = Pretrained.from_run(str(run))
+    # A model quantized on the query alone would not pack the group anew; the tree still stores it packed.
+    queried = Quantization(patterns=(".*/q_proj",)).apply(routes["run"].model)
+    assert "qkv_proj" not in {group.packed for group in projection_groups(queried, trained.variables)}
+    for model in (routes["run"].model, queried):
+        held = LMObjective(model, 8, variables=routes["run"].variables).variables
+        assert jax.tree.structure(unfreeze(held)) == jax.tree.structure(unfreeze(trained.variables))
+        for ours, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(trained.variables), strict=True):
+            np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    exported, canonical = trained.export(routes["run"].variables), trained.export()
+    assert set(exported) == set(canonical)
+    for name, tensor in canonical.items():
+        np.testing.assert_array_equal(np.asarray(exported[name]), np.asarray(tensor), err_msg=name)
+
+
+def test_a_generation_reads_its_models_groups_once_for_every_call(tmp_path):
+    """A generate call finds the groups a borrowed tree packs in the call (`pending`) without
+    binding the model again: the groups a model declares are a function of the model and its
+    tree's shapes, which binding a deep decoder to read took tens of milliseconds of every call.
+    A decoder that counts its declarations is asked once over every call on one tree, draws what
+    a task over its tree packed beforehand draws, and is asked again for a tree of another shape."""
+    from dew.inference.projections import inference_projections, projection_groups
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.sampling import Sampling
+
+    asked = []
+
+    class Counting(CausalTransformer):
+        def inference_projection_groups(self, variables):
+            asked.append(1)
+            return super().inference_projection_groups(variables)
+
+    run = tmp_path / "run"
+    run.mkdir()
+    objective, state = make_lm_run(run, ema_decay=None)
+    model = objective.pipeline(state).model
+    counting = Counting(**{field.name: getattr(model, field.name) for field in dataclasses.fields(model)
+                           if field.init and field.name not in ("parent", "name")})
+    task = TextGeneration(counting, state.variables, RunProcessor(ByteTokenizer()))
+    greedy = Sampling(temperature=0, eos_token_ids=255)
+    drawn = [task("the ", 2, key=key, sampling=greedy).host() for key in range(3)]
+    assert len(asked) == 1
+    # The kept plan is the plan: the draws are a prepacked task's, bit for bit.
+    prepacked = TextGeneration(model, inference_projections(model, state.variables), task.processor)
+    for key, generation in enumerate(drawn):
+        expected = prepacked("the ", 2, key=key, sampling=greedy).host()
+        np.testing.assert_array_equal(generation.raw_log_probs, expected.raw_log_probs)
+    # A tree of another shape is asked again: the plan is kept per model and tree shape.
+    widened = jax.tree.map(lambda leaf: leaf, dict(state.variables))
+    widened["params"] = {**widened["params"], "spare": {"kernel": jnp.zeros((2, 2))}}
+    projection_groups(counting, widened)
+    assert len(asked) == 2
+
+
+@pytest.mark.mesh(devices=3)
+def test_a_run_on_a_mesh_packs_the_projections_its_layout_keeps_whole(tmp_path):
+    """A packed kernel's columns are its members' outputs side by side, so a run's task packs a
+    group only where the layout leaves each member's output axis whole, and the packed kernel
+    keeps the members' placement. FSDP over three devices splits the inputs and both groups pack;
+    a tensor axis of three splits three query heads' twelve output units, so the query, key and
+    value stay apart, but not the MLP's 32, so the gate and up projections pack. On each mesh the
+    task draws the tokens it draws on one device."""
+    from dew.sampling import Sampling
+    from dew.training import Layout, MeshSpec
+
+    run = tmp_path / "run"
+    run.mkdir()
+    make_lm_run(run, ema_decay=None, fields={"emb_features": 12, "num_heads": 3, "num_kv_heads": 1,
+                                             "head_dim": 4})
+    devices = jax.devices()[:3]
+    layout = Layout(min_shard=1, tolerance=1.0)
+    greedy = Sampling(temperature=0, eos_token_ids=255)
+    alone = dew.pipeline(str(run), mesh=MeshSpec().build(devices[:1]), layout=layout)
+    here = alone("the ", 4, key=2, sampling=greedy).host()
+    for spec, packed in ((MeshSpec(fsdp=3), {"qkv_proj", "gate_up_proj"}),
+                         (MeshSpec(tensor=3), {"gate_up_proj"})):
+        task = dew.pipeline(str(run), mesh=spec.build(devices), layout=layout)
+        layer = task.variables["params"]["layers_0"]
+        held = {*layer["self_attn"], *layer["mlp"]}
+        assert held & {"qkv_proj", "gate_up_proj"} == packed, spec
+        assert ({"q_proj", "k_proj", "v_proj"} <= held) == ("qkv_proj" not in packed), spec
+        for name in packed:
+            kernel = (layer["self_attn"] if name == "qkv_proj" else layer["mlp"])[name]["kernel"]
+            assert kernel.sharding.shard_shape(kernel.shape)[-1] == kernel.shape[-1], (spec, name)
+            assert kernel.sharding.shard_shape(kernel.shape)[0] == kernel.shape[0] // spec.fsdp, (spec, name)
+        there = task("the ", 4, key=2, sampling=greedy).host()
+        np.testing.assert_array_equal(there.tokens, here.tokens, err_msg=str(spec))
 
 
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
@@ -409,32 +618,31 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
         dataclasses.replace(task, max_new_tokens=None)("the ", key=2)
 
 
-def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path):
+@pytest.mark.parametrize("earlier", [False, True])
+def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path, earlier):
     """A decoder fine-tuned from a checkpoint encodes text with the processor the
     checkpoint ships; its run records that processor's source, so the reloaded task
     encodes as the trained one does rather than loading as weights that take ids."""
-    import shutil
-    from pathlib import Path
+    from model_support import tokenized_qwen3
 
     from dew.interop import Pretrained
     from dew.objectives.lm import LMObjective
 
-    fixtures = Path(__file__).parent / "fixtures" / "hf"
-    source = tmp_path / "source"
-    source.mkdir()
-    for name in ("config.json", "model.safetensors"):
-        shutil.copyfile(fixtures / "qwen3-tiny" / name, source / name)
-    for name in ("tokenizer.json", "tokenizer_config.json"):
-        shutil.copyfile(fixtures / "qwen38-dense-tiny" / name, source / name)
+    source = tokenized_qwen3(tmp_path / "source")
     loaded = Pretrained.load(source, dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = LMObjective(loaded, 8)
     batch = {"text": np.random.RandomState(0).randint(1, 100, (8, 9)).astype(np.int32)}
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0), checkpoints=checkpoints)
-    trainer.fit(Loader(train=lambda partition: Replaying(lambda position: batch), val=None, records=None,
-                       batch=8), steps=1, log_every=100, checkpoint_every=1)
+    state = trainer.fit(Loader(train=lambda partition: Replaying(lambda position: batch),
+                               val=None, records=None, batch=8),
+                        steps=1, log_every=100, checkpoint_every=1)
     checkpoints.wait()
+    if earlier:
+        record = {**objective.inference_record(), "processor": str(source)}
+        checkpoints.save(int(state.step) + 1, state, artifact=record)
+        checkpoints.wait()
 
     task = dew.pipeline(str(run))
     assert loaded.text_processor is not None and task.processor is not None
@@ -518,7 +726,8 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     which the fp32 rebuild does not. Observed on CPU: 3e-02 on logits of
     order 1."""
     pytest.importorskip("qwix")
-    from dew.objectives.lm import LMObjective, LMRunConfig
+    from dew.config.lm import LMRunConfig
+    from dew.objectives.lm import LMObjective
     from dew.quantization import Quantization
 
     batch, seq = 8, 8
@@ -529,7 +738,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     config = LMRunConfig(
         model=ModelConfig("causal_transformer", {**fields,
                                                "dtype": "float32", "attention_impl": "reference"}),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=batch, steps=1,
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1,
                               eval_every=None, checkpoint_every=1, compilation_cache_dir=None,
                               quantization=Quantization()))
     state = config.train(LMObjective(config.model.build(), seq, ema_decay=0.9),
@@ -729,8 +938,8 @@ def test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weig
 ):
     import jax.numpy as jnp
 
+    from dew.batch import FROZEN
     from dew.inference import TextGeneration
-    from dew.objectives.base import FROZEN
 
     objective, state = make_lm_run(tmp_path)
     baseline = dew.pipeline(str(tmp_path))
@@ -807,14 +1016,13 @@ def test_saved_bare_encoder_weights_follow_storage_without_changing_compute(tmp_
 
 
 
-def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
-    """Fit, save, restore, sample: the restored task's unconditional branch is the one the training
-    step encoded (`DiffusionObjective.blank_conditions` over the step's own towers), to the bit, with a
-    bf16 CLIP as the published hybrid DiT has, and the task samples as the objective's own does."""
+def saved_clip_run(directory):
+    """A text-to-image run with a bf16 CLIP, as the published hybrid DiT has, after one training step,
+    saved in `directory` with its inference record: its config, objective and state."""
     from pathlib import Path
 
     config = stating(dataclasses.replace(
-        run_config(tmp_path, preset=Flow()),
+        run_config(directory, preset=Flow()),
         text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
                            dtype="bfloat16")), guidance=CFG(5.0), ema_decay=None)
     objective = config.build()
@@ -823,9 +1031,17 @@ def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
     batch = {"image": np.full((jax.device_count(), RES, RES, 3), 180, np.uint8),
              **objective.inputs.tokenize(["a bird"] * jax.device_count())}
     state, *_ = trainer.compile(state, batch)(state, batch)
-    checkpoints = Checkpoints(str(tmp_path))
+    checkpoints = Checkpoints(str(directory))
     checkpoints.save(1, state, None, artifact=objective.inference_record())
     checkpoints.wait()
+    return config, objective, state
+
+
+def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
+    """Fit, save, restore, sample: the restored task's unconditional branch is the one the training
+    step encoded (`DiffusionObjective.blank_conditions` over the step's own towers), to the bit, with a
+    bf16 CLIP as the published hybrid DiT has, and the task samples as the objective's own does."""
+    _, objective, state = saved_clip_run(tmp_path)
     original = objective.pipeline(state, ema=False)
     restored = TextToImage.from_run(str(tmp_path), ema=False)
 
@@ -841,21 +1057,7 @@ def test_a_restored_task_reads_the_training_steps_blank_to_the_bit(tmp_path):
 def test_binding_new_encoder_weights_encodes_both_branches_with_them(tmp_path):
     """A restored task binds a new encoder tree: its conditional and unconditional features and
     samples match a fresh task over those weights, not the old ones."""
-    from pathlib import Path
-
-    config = stating(dataclasses.replace(
-        run_config(tmp_path, preset=Flow()),
-        text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
-                           dtype="bfloat16")), guidance=CFG(5.0), ema_decay=None)
-    objective = config.build()
-    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
-    state = trainer.initial_state()
-    batch = {"image": np.full((jax.device_count(), RES, RES, 3), 180, np.uint8),
-             **objective.inputs.tokenize(["a bird"] * jax.device_count())}
-    state, *_ = trainer.compile(state, batch)(state, batch)
-    checkpoints = Checkpoints(str(tmp_path))
-    checkpoints.save(1, state, None, artifact=objective.inference_record())
-    checkpoints.wait()
+    config, _, _ = saved_clip_run(tmp_path)
     restored = TextToImage.from_run(str(tmp_path), ema=False)
     prompts = ["a bird", "a cat"]
     old_blank = restored.prepare(prompts, key=0, steps=8).unconditional

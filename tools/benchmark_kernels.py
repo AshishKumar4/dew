@@ -6,8 +6,8 @@ mark, so a row is one process.
 - `projection`: `dew.nn.moe.expert_projection` forward and forward plus
   backward, at lm-moe's shape (8192 rows, 8 experts, bf16 compute, Dirichlet
   routing), against a float64 oracle of the rounded operands.
-- `adam`: one AdamW update over the lm-dense parameter tree, fp32 or bf16
-  moment storage (`OptimConfig.state_dtype`).
+- `adam`: one AdamW update over the lm-dense parameter tree, fp32, bf16 or
+  8-bit moment storage (`OptimConfig.state_dtype`).
 - `step`: a whole training step of `lm-dense` (359.8M) or `lm-moe` (321.8M,
   8 experts top-2), through `tools/benchmark_step.py`'s trainer, with the
   grouped matmul, the state dtype and the vocabulary head chosen.
@@ -23,8 +23,8 @@ with these commands, for example:
 
 import argparse
 import json
-import time
 
+import grouped_oracle
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -32,8 +32,8 @@ import optax
 from benchmark_cases import LM_DENSE, LM_MOE, Case
 from benchmark_models import build_trainer, compiled_step, timed_steps
 
-from dew.config import OptimConfig
 from dew.nn.moe import expert_projection
+from dew.optim import OptimConfig
 from dew.telemetry.benchmark import samples
 from dew.telemetry.profile import capture_options
 
@@ -72,17 +72,7 @@ def projection(args: argparse.Namespace) -> dict[str, object]:
     both = jax.jit(jax.value_and_grad(loss, argnums=(0, 1)))
     output = np.asarray(forward(x, kernel), np.float64)
     _, (dx, dk) = both(x, kernel)
-    xr = np.asarray(x, np.float64)
-    kr = np.asarray(kernel.astype(jnp.bfloat16), np.float64)
-    cr = np.asarray(cotangent, np.float64)
-    starts = np.cumsum(sizes) - sizes
-    oracle, dx_oracle = np.zeros((rows, features)), np.zeros((rows, width))
-    dk_oracle = np.zeros((experts, width, features))
-    for expert in range(experts):
-        block = slice(starts[expert], starts[expert] + sizes[expert])
-        oracle[block] = xr[block] @ kr[expert]
-        dx_oracle[block] = cr[block] @ kr[expert].T
-        dk_oracle[expert] = xr[block].T @ cr[block]
+    oracle, dx_oracle, dk_oracle = grouped_oracle.products(x, kernel.astype(jnp.bfloat16), cotangent, sizes)
 
     def relative(value, reference):
         return float(np.abs(np.asarray(value, np.float64) - reference).max() / np.abs(reference).max())
@@ -120,15 +110,14 @@ def adam(args: argparse.Namespace) -> dict[str, object]:
 
     run = jax.jit(update, donate_argnums=(0, 1))
     state = solver.init(params)
-    for _ in range(3):
+
+    def step():
+        # Each call donates the last call's parameters and state.
+        nonlocal params, state
         params, state = run(params, state, grads)
-    # The update threads its donated state through each call, which `samples` cannot.
-    updates = []
-    for _ in range(args.repeats):
-        start = time.perf_counter()
-        params, state = run(params, state, grads)
-        jax.block_until_ready((params, state))
-        updates.append((time.perf_counter() - start) * 1e3)
+        return params, state
+
+    updates = [seconds * 1e3 for seconds in samples(step, warmup=3, repeats=args.repeats)]
     return {"state_dtype": args.state_dtype, "params": sum(leaf.size for leaf in params.values()),
             "update_mean_ms": float(np.mean(updates)), "update_min_ms": float(np.min(updates)),
             "state_bytes": sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(state))}
@@ -187,7 +176,7 @@ def main(argv: list[str] | None = None) -> None:
     project.add_argument("--features", type=int, default=2048, help="the expert width it writes")
     project.add_argument("--repeats", type=int, default=50)
     update = modes.add_parser("adam")
-    update.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32")
+    update.add_argument("--state-dtype", choices=("float32", "bfloat16", "int8"), default="float32")
     update.add_argument("--repeats", type=int, default=30)
     run = modes.add_parser("step")
     run.add_argument("--path", choices=("lm-dense", "lm-moe", "dit"), required=True)
@@ -195,7 +184,7 @@ def main(argv: list[str] | None = None) -> None:
                      help="none, full, a REMAT_POLICIES name (decoders) or dots (DiT)")
     run.add_argument("--batch", type=int, required=True)
     run.add_argument("--implementation", default="auto")
-    run.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32")
+    run.add_argument("--state-dtype", choices=("float32", "bfloat16", "int8"), default="float32")
     run.add_argument("--steps", type=int, default=30)
     run.add_argument("--trace", default=None,
                      help="a directory for a jax.profiler trace of three steady-state steps")

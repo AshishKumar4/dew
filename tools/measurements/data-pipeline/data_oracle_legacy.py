@@ -20,7 +20,6 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
-import jax
 import numpy as np
 
 
@@ -42,22 +41,39 @@ def memory_images(pixels, loading):
 
 
 def digest(batch):
-    tree = jax.tree.structure(batch)
-    leaves = []
-    for value in jax.tree.leaves(batch):
-        array = np.asarray(value)
-        if array.dtype.hasobject:
-            encoded = json.dumps(array.tolist(), sort_keys=True).encode()
+    """The batch's public fields: each array's shape, dtype and content digest by its path, and each
+    record's static facts (`Coordinates`' `max_segments` and `right_padded`) by theirs, not the tree's
+    spelling. A field that is None holds nothing and adds no entry, where a renamed field or a changed
+    static fact still changes the digest (Main, 10-27: a field added to Coordinates once re-recorded
+    142 tree strings whose leaves had not moved). tests/test_pipeline_golden.py reads Dew's batches by
+    this digest, so a capture and the test's reading of it are one format."""
+    fields = {}
+
+    def walk(value, path):
+        if value is None:
+            return
+        if isinstance(value, dict):
+            for key in sorted(value):
+                walk(value[key], f"{path}[{key!r}]")
+        elif isinstance(value, (list, tuple)):
+            for index, item in enumerate(value):
+                walk(item, f"{path}[{index}]")
+        elif dataclasses.is_dataclass(value):
+            for field in dataclasses.fields(value):
+                item = getattr(value, field.name)
+                if field.metadata.get("pytree_node", True):
+                    walk(item, f"{path}.{field.name}")
+                else:
+                    fields[f"{path}.{field.name}"] = {"static": item}
         else:
-            encoded = array.tobytes()
-        leaves.append(
-            {
-                "shape": list(array.shape),
-                "dtype": array.dtype.str,
-                "sha256": hashlib.sha256(encoded).hexdigest(),
-            }
-        )
-    return {"tree": str(tree), "leaves": leaves}
+            array = np.asarray(value)
+            encoded = (json.dumps(array.tolist(), sort_keys=True).encode()
+                       if array.dtype.hasobject else array.tobytes())
+            fields[path] = {"shape": list(array.shape), "dtype": array.dtype.str,
+                            "sha256": hashlib.sha256(encoded).hexdigest()}
+
+    walk(batch, "")
+    return fields
 
 
 def _read(reader, count):
@@ -168,6 +184,30 @@ def token_store(root, name, shift):
     return str(directory)
 
 
+def image_records(root: Path, pixels, pack: Callable[[dict[str, bytes]], bytes]) -> Path:
+    """`pixels` written as one ArrayRecord shard of image records under `root`/images, each packed by
+    `pack`: the reference checkout's packer here, and the one the checkout under test has where its
+    golden test writes the same records (tests/test_pipeline_golden.py)."""
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    image_root = root / "images"
+    image_root.mkdir()
+    writer = ArrayRecordWriter(str(image_root / "00.array_record"), "group_size:1")
+    for row in pixels:
+        writer.write(
+            pack(
+                {
+                    "image": row["image"].tobytes(),
+                    "shape": np.asarray([16, 16], "<i4").tobytes(),
+                    "caption": row["caption"].encode(),
+                    "label": np.asarray(row["label"], np.int32).tobytes(),
+                }
+            )
+        )
+    writer.close()
+    return image_root
+
+
 def fixture_inputs(root: Path):
     from dew.data.images import pack_dict_of_byte_arrays
     from dew.data.text import ByteTokenizer
@@ -219,23 +259,7 @@ def fixture_inputs(root: Path):
         for index in range(40)
     )
 
-    image_root = root / "images"
-    image_root.mkdir()
-    from array_record.python.array_record_module import ArrayRecordWriter
-
-    writer = ArrayRecordWriter(str(image_root / "00.array_record"), "group_size:1")
-    for row in pixels:
-        writer.write(
-            pack_dict_of_byte_arrays(
-                {
-                    "image": row["image"].tobytes(),
-                    "shape": np.asarray([16, 16], "<i4").tobytes(),
-                    "caption": row["caption"].encode(),
-                    "label": np.asarray(row["label"], np.int32).tobytes(),
-                }
-            )
-        )
-    writer.close()
+    image_root = image_records(root, pixels, pack_dict_of_byte_arrays)
     import cv2
     import pyarrow as pa
     import pyarrow.parquet as pq

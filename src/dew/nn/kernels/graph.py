@@ -1,5 +1,5 @@
 """A kernel's description of the values it rounds and holds, which the float64 gate holds it by
-(bible §7's source-aware gate; tests/reference_error.py `assert_graph_as_exact`).
+(tests/reference_error.py `assert_graph_as_exact`).
 
 A kernel is checked where it rounds. Each `Node` is one value the kernel rounds and holds (an
 accumulator, a stored max, a cast), computed from its parents' values by the kernel's own arithmetic:

@@ -27,14 +27,19 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from dew.batch import Batch, Variables
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
 from dew.nn.attention import l2_normalized
 from dew.nn.blocks import sinusoidal_time
+from dew.nn.conv import convolution
 from dew.nn.dit import TextContext, masked_mean
-from dew.objectives.base import TEACHER, Aux, Batch, Objective, Step, Variables
+from dew.nn.precision import accumulated, divided
+from dew.nn.protocols import Lacks
+from dew.nn.sharding import rows_taken
+from dew.objectives.base import TEACHER, Aux, Objective, Step
 
 from .objective import DISCRIMINATOR, SPECTRAL, FlowDistillationObjective
 
@@ -62,18 +67,17 @@ class SpectralConv(nn.Module):
         # torch's [out, in, kh, kw] flattened per output channel.
         matrix = jnp.transpose(kernel, (3, 2, 0, 1)).reshape(self.features, -1)
         held = jax.lax.stop_gradient(matrix)
-        v = l2_normalized(held.T @ u.value)
-        following = l2_normalized(held @ v)
-        sigma = following @ (matrix @ v)
+        v = l2_normalized(accumulated(jnp.matmul, held.T, u.value))
+        following = l2_normalized(accumulated(jnp.matmul, held, v))
+        sigma = accumulated(jnp.matmul, following, accumulated(jnp.matmul, matrix, v))
         if update and not self.is_initializing():
             u.value = following
         pad = [(size // 2, size // 2) for size in self.kernel_size]
         if self.circular:
             x = jnp.pad(x, [(0, 0), *pad, (0, 0)], mode="wrap")
             pad = [(0, 0), (0, 0)]
-        y = jax.lax.conv_general_dilated(x, (kernel / sigma).astype(x.dtype), (1, 1), pad,
-                                         dimension_numbers=("NHWC", "HWIO", "NHWC"))
-        return y + bias
+        # The library's convolution of the normalized kernel, placed and at the precision its own layers run.
+        return convolution(x, (kernel / sigma).astype(x.dtype), pad) + bias
 
 
 class BatchNormLocal(nn.Module):
@@ -90,13 +94,8 @@ class BatchNormLocal(nn.Module):
         rows, height, width, channels = x.shape
         groups = math.ceil(rows / self.virtual_batch)
         grouped = x.reshape(groups, -1, height * width, channels)
-
-        def group_mean(values: jax.Array) -> jax.Array:
-            mean, _ = Objective.row_mean(values, batch, (1, 2), rows=(0, 1)).mean()
-            return jnp.expand_dims(mean, (1, 2))
-
-        mean = group_mean(grouped)
-        var = group_mean(jnp.square(grouped - mean))
+        mean, var = (jnp.expand_dims(moment, (1, 2))
+                     for moment in Objective.row_moments(grouped, batch, (1, 2), rows=(0, 1)))
         normalized = ((grouped - mean) / jnp.sqrt(var + self.eps)).reshape(x.shape)
         weight = self.param("weight", nn.initializers.ones, (channels,))
         bias = self.param("bias", nn.initializers.zeros, (channels,))
@@ -131,14 +130,15 @@ class Head(nn.Module):
     def __call__(self, x: jax.Array, condition: jax.Array, update: bool, batch: Batch) -> jax.Array:
         channels = x.shape[-1]
         h = Block(channels, (1, 1), name="block_0")(x, update, batch)
-        h = (Block(channels, self.kernel_size, name="block_1")(h, update, batch) + h) / math.sqrt(2)
+        # IEEE division: XLA takes a division by a constant as a product with its rounded reciprocal.
+        h = divided(Block(channels, self.kernel_size, name="block_1")(h, update, batch) + h, math.sqrt(2))
         out = SpectralConv(self.cmap_dim, (1, 1), circular=False, name="cls")(
             h, update)
         weight = self.param("cmapper_weight", nn.initializers.normal(1.0),
                             (condition.shape[-1], self.cmap_dim))
         cmap_bias = self.param("cmapper_bias", nn.initializers.zeros, (self.cmap_dim,))
-        cmap = condition @ (weight / math.sqrt(condition.shape[-1])) + cmap_bias
-        return jnp.sum(out * cmap[:, None, None, :], axis=-1) / math.sqrt(self.cmap_dim)
+        cmap = accumulated(jnp.matmul, condition, divided(weight, math.sqrt(condition.shape[-1]))) + cmap_bias
+        return divided(jnp.sum(out * cmap[:, None, None, :], axis=-1), math.sqrt(self.cmap_dim))
 
 
 class Heads(nn.Module):
@@ -256,7 +256,7 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         kept = dict(captured).get("intermediates", {})
         missing = [name for name in self.feature_layers if name not in kept]
         if missing:
-            raise ValueError(f"the teacher has no layers {missing} to read features after")
+            raise Lacks("features", f"the teacher has no layers {missing} to read features after")
         grids = []
         for name in self.feature_layers:
             tokens = jnp.asarray(kept[name]["__call__"][0])
@@ -267,27 +267,30 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         return grids
 
     def loss(self, variables, batch, step: Step):
-        encode_key, drop_key, time_key, noise_key, renoise_key = jax.random.split(step.key, 5)
-        samples = self.clean_samples(variables, batch, encode_key)
+        # Each example's times, noises and posterior draw are its own (`Step.sample`).
+        encode_key, drop_key, _, _, _ = jax.random.split(step.key, 5)
+        samples = self.clean_samples(variables, batch, encode_key, step)
         count = samples.shape[0]
         schedule = self.process.schedule
         assert self.process.prediction is not None
-        conditions = self._dropped(*self._conditions(variables, batch, drop_key), batch, drop_key)
-        indices = jax.random.randint(time_key, (count,), 0, len(self.student_times))
-        t = jnp.asarray(self.student_times)[indices]
+        conditions = self._dropped(*self._conditions(variables, batch, drop_key, step), batch, step)
+        steps = len(self.student_times)
+        indices = step.sample("student times", lambda key: jax.random.randint(key, (), 0, steps, jnp.int32),
+                              rows=count)
+        t = rows_taken(jnp.asarray(self.student_times), indices)
         # Float32 draws, as the step's others are, at any precision.
-        noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
+        noise = step.sample("noise", jax.random.normal, samples.shape[1:], dtype=jnp.float32, rows=count)
         noisy, _, _ = self.process.prediction.forward_diffusion(samples, noise,
                                                                  broadcast_rates(schedule, t, samples))
         student = self.process.denoiser(self.model, self.model_variables(variables), conditions,
                                         schedule=schedule)
         clean, _ = student(noisy, t)
 
-        level_key, renoise_noise = jax.random.split(renoise_key)
         mean, std = self.renoise_times
-        level = jax.nn.sigmoid(mean + std * jax.random.normal(level_key, (count,), dtype=jnp.float32))
+        level = jax.nn.sigmoid(mean + std * step.sample("renoise times", jax.random.normal, (),
+                                                        dtype=jnp.float32, rows=count))
         rates = broadcast_rates(schedule, level, samples)
-        renoise = jax.random.normal(renoise_noise, samples.shape, dtype=jnp.float32)
+        renoise = step.sample("renoise", jax.random.normal, samples.shape[1:], dtype=jnp.float32, rows=count)
         teacher = jax.lax.stop_gradient(variables[TEACHER])
 
         def renoised(x):

@@ -6,8 +6,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from episode_support import PROMPT, RESPONSE, build, collect
+from episode_support import build, trained_batch
 from rl_support import token_mean
+from tool_policy import PROMPT, RESPONSE
 
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective
@@ -40,10 +41,10 @@ def test_token_correction_matches_pinned_verl_loss_and_gradient():
 
 
 def test_correction_is_explicit_and_uses_actual_recorded_behavior():
-    trainer, rollout = build()
+    trainer, collector = build()
     assert isinstance(trainer.objective, GRPOObjective)
     state = trainer.initial_state()
-    batch = rollout.project(collect(rollout, state))
+    batch = trained_batch(collector, state)
     corrected = GRPOObjective(trainer.objective.model, PROMPT + RESPONSE - 1,
                               beta=.05, behavior_importance=2.)
     info = Step(state.microstep, jax.random.key(4), state.ema)
@@ -68,10 +69,10 @@ def test_corrected_objective_changes_a_real_trainer_update():
     from dew.data.dataset import Loader
     from dew.training import Trainer
 
-    original, rollout = build()
+    original, collector = build()
     assert isinstance(original.objective, GRPOObjective)
     state = original.initial_state()
-    batch = rollout.project(collect(rollout, state))
+    batch = trained_batch(collector, state)
     batch = {name: np.repeat(value, 2, axis=0) for name, value in batch.items()}
     copies = []
     for cap in (None, 2.):

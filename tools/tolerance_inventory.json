@@ -1,0 +1,769 @@
+{
+ "about": "SLOP020's inventory (tools/lint_slop.py): each file under tests/ and tools/ that still compares floats within a tolerance outside the gate (tests/reference_error.py), its count, its lane (the owner of the modules it imports, PLAN.md). It only shrinks: a file above its count fails; one below it fails until the count comes down; and no commit's inventory may be looser than its parents' (tests/test_tolerance_lint.py). Every accuracy comparison goes through the gate's assertion.",
+ "files": {
+  "tests/diffusion_support.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/interop_support.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/kimi_support.py": {
+   "comparisons": 3,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/moe_biased_exchange_worker.py": {
+   "comparisons": 2,
+   "lane": "Training"
+  },
+  "tests/moe_exchange_worker.py": {
+   "comparisons": 1,
+   "lane": "Training"
+  },
+  "tests/multiprocess_worker.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/qualification_worker.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_adversarial.py": {
+   "comparisons": 5,
+   "lane": "Training"
+  },
+  "tests/test_agentic_losses.py": {
+   "comparisons": 17,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_alignment.py": {
+   "comparisons": 4,
+   "lane": "Training"
+  },
+  "tests/test_attention_masked_rows.py": {
+   "comparisons": 1,
+   "lane": "Kernels"
+  },
+  "tests/test_attention_sinks.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_attention_splash.py": {
+   "comparisons": 3,
+   "lane": "Kernels"
+  },
+  "tests/test_audio.py": {
+   "comparisons": 8,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_audio_condition.py": {
+   "comparisons": 2,
+   "lane": "Training"
+  },
+  "tests/test_autoencoder.py": {
+   "comparisons": 4,
+   "lane": "Training"
+  },
+  "tests/test_beam_search.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_behavior_correction.py": {
+   "comparisons": 7,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_block_diffusion.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_block_sft.py": {
+   "comparisons": 18,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_capability_matrix.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_checkpoint_ranking.py": {
+   "comparisons": 4,
+   "lane": "Training"
+  },
+  "tests/test_clip_metrics.py": {
+   "comparisons": 8,
+   "lane": "Training"
+  },
+  "tests/test_codecs.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_config.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_data_mixtures.py": {
+   "comparisons": 3,
+   "lane": "Training"
+  },
+  "tests/test_dc_ae.py": {
+   "comparisons": 4,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_decision_joint_checkpoint.py": {
+   "comparisons": 2,
+   "lane": "Training"
+  },
+  "tests/test_decision_objective.py": {
+   "comparisons": 10,
+   "lane": "Training"
+  },
+  "tests/test_decision_option_slots.py": {
+   "comparisons": 1,
+   "lane": "Training"
+  },
+  "tests/test_decision_packing.py": {
+   "comparisons": 2,
+   "lane": "Training"
+  },
+  "tests/test_decision_questions.py": {
+   "comparisons": 2,
+   "lane": "Training"
+  },
+  "tests/test_decision_task.py": {
+   "comparisons": 6,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_decode_attention.py": {
+   "comparisons": 1,
+   "lane": "Kernels"
+  },
+  "tests/test_decode_cache.py": {
+   "comparisons": 4,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_decoder_export.py": {
+   "comparisons": 16,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_decoding_components.py": {
+   "comparisons": 5,
+   "lane": "Training"
+  },
+  "tests/test_decoding_strategies.py": {
+   "comparisons": 6,
+   "lane": "Training"
+  },
+  "tests/test_deepseek_v2.py": {
+   "comparisons": 5,
+   "lane": "Training"
+  },
+  "tests/test_deepseek_v41.py": {
+   "comparisons": 7,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_depthwise_conv.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_device_image_augmentation.py": {
+   "comparisons": 6,
+   "lane": "Training"
+  },
+  "tests/test_diffusion_objective.py": {
+   "comparisons": 7,
+   "lane": "Training"
+  },
+  "tests/test_disk_banks.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_distillation.py": {
+   "comparisons": 4,
+   "lane": "Training"
+  },
+  "tests/test_distribution.py": {
+   "comparisons": 9,
+   "lane": "Training"
+  },
+  "tests/test_dory.py": {
+   "comparisons": 2,
+   "lane": "Recurrence & Dory"
+  },
+  "tests/test_dpo.py": {
+   "comparisons": 7,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_edm2.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_end_to_end.py": {
+   "comparisons": 8,
+   "lane": "Training"
+  },
+  "tests/test_engine_replay.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_eval_harness.py": {
+   "comparisons": 6,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_evaluation_contract.py": {
+   "comparisons": 6,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_fid.py": {
+   "comparisons": 9,
+   "lane": "Training"
+  },
+  "tests/test_fla_gdn.py": {
+   "comparisons": 19,
+   "lane": "Recurrence & Dory"
+  },
+  "tests/test_flaxdiff.py": {
+   "comparisons": 6,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_flow_matching.py": {
+   "comparisons": 2,
+   "lane": "Training"
+  },
+  "tests/test_flux_source.py": {
+   "comparisons": 5,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_gemma3n.py": {
+   "comparisons": 9,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_gemma3n_vision.py": {
+   "comparisons": 10,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_gemma4_moe.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_generate.py": {
+   "comparisons": 1,
+   "lane": "Training"
+  },
+  "tests/test_generate_reference.py": {
+   "comparisons": 3,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_gpt_oss.py": {
+   "comparisons": 3,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_grpo.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_guidance_distillation.py": {
+   "comparisons": 1,
+   "lane": "Training"
+  },
+  "tests/test_guided_decoding.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_hf_classic_gpt.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_hf_decoder_hybrids.py": {
+   "comparisons": 13,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_hf_decoder_moe.py": {
+   "comparisons": 15,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_hf_decoders.py": {
+   "comparisons": 18,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_hf_opt.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_hf_qwen35_moe_wrapper.py": {
+   "comparisons": 3,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_host_placement.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_host_training.py": {
+   "comparisons": 4,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_image_metrics.py": {
+   "comparisons": 3,
+   "lane": "Training"
+  },
+  "tests/test_inference.py": {
+   "comparisons": 10,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_inference_media.py": {
+   "comparisons": 4,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_inference_sampling.py": {
+   "comparisons": 10,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_inference_tasks.py": {
+   "comparisons": 5,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_instrumentation.py": {
+   "comparisons": 8,
+   "lane": "Training"
+  },
+  "tests/test_jit.py": {
+   "comparisons": 2,
+   "lane": "Training"
+  },
+  "tests/test_k2_horizon.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_kda.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_kernels.py": {
+   "comparisons": 9,
+   "lane": "Kernels"
+  },
+  "tests/test_kimi_k3.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_kv_cache.py": {
+   "comparisons": 3,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_layer_stack.py": {
+   "comparisons": 20,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_linear_attention.py": {
+   "comparisons": 32,
+   "lane": "Kernels"
+  },
+  "tests/test_llama4.py": {
+   "comparisons": 7,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_lm_engine_parity.py": {
+   "comparisons": 5,
+   "lane": "Training"
+  },
+  "tests/test_lm_recipe.py": {
+   "comparisons": 6,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_lora.py": {
+   "comparisons": 26,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_lpips.py": {
+   "comparisons": 3,
+   "lane": "Training"
+  },
+  "tests/test_mamba.py": {
+   "comparisons": 5,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_mamba2.py": {
+   "comparisons": 1,
+   "lane": "Training"
+  },
+  "tests/test_mamba2_interop.py": {
+   "comparisons": 3,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_masked_diffusion.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_masked_diffusion_export.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_mdlm_reference.py": {
+   "comparisons": 2,
+   "lane": "Training"
+  },
+  "tests/test_mesh_axes.py": {
+   "comparisons": 12,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_metrics.py": {
+   "comparisons": 1,
+   "lane": "Training"
+  },
+  "tests/test_mimo_audio.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_mimo_v2.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_mixed_step.py": {
+   "comparisons": 4,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_mixers.py": {
+   "comparisons": 6,
+   "lane": "Kernels"
+  },
+  "tests/test_models.py": {
+   "comparisons": 10,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_moe.py": {
+   "comparisons": 10,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_moe_biased_exchange.py": {
+   "comparisons": 12,
+   "lane": "Training"
+  },
+  "tests/test_moe_decoder.py": {
+   "comparisons": 5,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_moe_exchange.py": {
+   "comparisons": 6,
+   "lane": "Training"
+  },
+  "tests/test_moe_precision.py": {
+   "comparisons": 13,
+   "lane": "Kernels"
+  },
+  "tests/test_mtp.py": {
+   "comparisons": 3,
+   "lane": "Training"
+  },
+  "tests/test_multimodal_model.py": {
+   "comparisons": 11,
+   "lane": "Kernels"
+  },
+  "tests/test_multiprocess.py": {
+   "comparisons": 18,
+   "lane": "Training"
+  },
+  "tests/test_muse_glimmer.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_native_rollout_server.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_norm_swiglu.py": {
+   "comparisons": 6,
+   "lane": "Kernels"
+  },
+  "tests/test_ollama_interop.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_optional_ema.py": {
+   "comparisons": 3,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_ouro.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_packed_grpo.py": {
+   "comparisons": 4,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_packed_rollouts.py": {
+   "comparisons": 9,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_parallelism.py": {
+   "comparisons": 6,
+   "lane": "Training"
+  },
+  "tests/test_pickle_sources.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_plan.py": {
+   "comparisons": 1,
+   "lane": "Training"
+  },
+  "tests/test_posthoc.py": {
+   "comparisons": 7,
+   "lane": "Training"
+  },
+  "tests/test_ppo.py": {
+   "comparisons": 13,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_precision_policy.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_predictors.py": {
+   "comparisons": 4,
+   "lane": "Training"
+  },
+  "tests/test_pretrained_sources.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_quantization_sites.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_quantized.py": {
+   "comparisons": 4,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_qwen_image_source.py": {
+   "comparisons": 11,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_qwen_image_vae.py": {
+   "comparisons": 6,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_qwen_qualification.py": {
+   "comparisons": 13,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_rae.py": {
+   "comparisons": 7,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_rcm.py": {
+   "comparisons": 8,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_reference_runs.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_reporting.py": {
+   "comparisons": 3,
+   "lane": "Training"
+  },
+  "tests/test_rl_surrogate.py": {
+   "comparisons": 8,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_rollout.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_router_statistics.py": {
+   "comparisons": 4,
+   "lane": "Training"
+  },
+  "tests/test_samplers.py": {
+   "comparisons": 9,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_sd3_source.py": {
+   "comparisons": 17,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_sequence_parallel.py": {
+   "comparisons": 6,
+   "lane": "Kernels"
+  },
+  "tests/test_serving.py": {
+   "comparisons": 3,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_source_schedulers.py": {
+   "comparisons": 5,
+   "lane": "Training"
+  },
+  "tests/test_speculative.py": {
+   "comparisons": 2,
+   "lane": "Training"
+  },
+  "tests/test_ssm.py": {
+   "comparisons": 4,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_standalone_evaluation.py": {
+   "comparisons": 2,
+   "lane": "Training"
+  },
+  "tests/test_supervised.py": {
+   "comparisons": 3,
+   "lane": "Training"
+  },
+  "tests/test_support_replay.py": {
+   "comparisons": 5,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_text_data.py": {
+   "comparisons": 1,
+   "lane": "Training"
+  },
+  "tests/test_token_accuracy.py": {
+   "comparisons": 3,
+   "lane": "Training"
+  },
+  "tests/test_token_log_probs.py": {
+   "comparisons": 2,
+   "lane": "Training"
+  },
+  "tests/test_tool_episodes.py": {
+   "comparisons": 9,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_tools.py": {
+   "comparisons": 25,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_torchax_fallback.py": {
+   "comparisons": 5,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_trainer.py": {
+   "comparisons": 2,
+   "lane": "Training"
+  },
+  "tests/test_training_dtypes.py": {
+   "comparisons": 6,
+   "lane": "Training"
+  },
+  "tests/test_training_qualification.py": {
+   "comparisons": 3,
+   "lane": "Training"
+  },
+  "tests/test_training_references.py": {
+   "comparisons": 3,
+   "lane": "Training"
+  },
+  "tests/test_training_telemetry.py": {
+   "comparisons": 5,
+   "lane": "Training"
+  },
+  "tests/test_training_transactions.py": {
+   "comparisons": 6,
+   "lane": "Training"
+  },
+  "tests/test_vae.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_vae_16ch.py": {
+   "comparisons": 5,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_vision.py": {
+   "comparisons": 19,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_wan_vae.py": {
+   "comparisons": 9,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_whole_validation.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tests/test_wrappers.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tools/benchmark_depthwise.py": {
+   "comparisons": 2,
+   "lane": "Training"
+  },
+  "tools/check_native_diffusion.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tools/classic_gpt_reference.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tools/decoder_export_reference.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tools/deepseek_v41_reference.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tools/deepseek_v4_dspark_reference.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tools/diffusers_flux_reference.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tools/diffusers_limits_reference.py": {
+   "comparisons": 2,
+   "lane": "Models, Serving & RL"
+  },
+  "tools/diffusers_qwen_image_reference.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tools/diffusers_sd3_reference.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tools/diffusers_source_reference.py": {
+   "comparisons": 3,
+   "lane": "Training"
+  },
+  "tools/flaxdiff_family_reference.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
+  "tools/gated_product_reference.py": {
+   "comparisons": 1,
+   "lane": "Kernels"
+  },
+  "tools/landing_visuals.py": {
+   "comparisons": 1,
+   "lane": "Training"
+  },
+  "tools/layout_parity.py": {
+   "comparisons": 1,
+   "lane": "Accuracy Gate"
+  },
+  "tools/lora_reference.py": {
+   "comparisons": 3,
+   "lane": "Models, Serving & RL"
+  },
+  "tools/moe_exchange_probe.py": {
+   "comparisons": 1,
+   "lane": "Training"
+  },
+  "tools/reference_runs/torch_qwen35_step.py": {
+   "comparisons": 3,
+   "lane": "Models, Serving & RL"
+  },
+  "tools/repa_reference.py": {
+   "comparisons": 1,
+   "lane": "Training"
+  },
+  "tools/stopping_reference.py": {
+   "comparisons": 1,
+   "lane": "Training"
+  }
+ }
+}

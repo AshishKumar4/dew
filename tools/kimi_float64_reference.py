@@ -43,9 +43,9 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+import reference_mxfp4
+import torch
 from safetensors.numpy import load_file
-
-from dew.nn.fake_quant import E2M1
 
 jax.config.update("jax_enable_x64", val=True)
 
@@ -56,8 +56,10 @@ LATENT_EPS = 1e-6
 
 def load(directory: Path) -> tuple[dict, dict[str, np.ndarray]]:
     """The text config and the decoder's weights in float64 by their names below
-    the vision wrapper, each compressed-tensors MXFP4 pair decoded (low nibble
-    first, E8M0 scales over 32 inputs) and each `A_log` as its heads."""
+    the vision wrapper, each compressed-tensors MXFP4 pair decoded by the library
+    (`reference_mxfp4`, in bfloat16: exact while each scale byte is at most 252, a power of
+    two up to 2^125, as the fixtures' are, since every E2M1 code times one is a bfloat16)
+    and each `A_log` as its heads."""
     config = json.loads((directory / "config.json").read_text())
     text = config.get("text_config", config)
     prefix = "language_model." if "text_config" in config else ""
@@ -70,9 +72,9 @@ def load(directory: Path) -> tuple[dict, dict[str, np.ndarray]]:
         name = name.removeprefix(prefix)
         if name.endswith(".weight_packed"):
             name = name.removesuffix("_packed")
-            codes = np.stack([value & 15, value >> 4], -1).reshape(value.shape[0], -1)
-            exponents = raw[prefix + name + "_scale"].astype(np.float64) - 127
-            value = E2M1[codes] * np.exp2(np.repeat(exponents, 32, axis=1))
+            scale = torch.from_numpy(raw[prefix + name + "_scale"])
+            assert int(scale.max()) <= 252, (name, int(scale.max()))
+            value = reference_mxfp4.decoded(torch.from_numpy(value), scale).numpy()
         elif name.endswith(".A_log"):
             # K3 stores the heads zero-padded to the head dim, Kimi Linear as [1, 1, heads, 1].
             value = value.reshape(-1)[:heads]

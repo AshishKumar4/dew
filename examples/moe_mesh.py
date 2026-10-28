@@ -40,17 +40,19 @@ import tyro
 from jax.sharding import NamedSharding
 
 from dew import Layout, MeshSpec, Trainer
-from dew.config import OptimConfig
-from dew.config.data import TextData, loader
-from dew.data import ByteTokenizer, Loading
+from dew.data import ByteTokenizer, Memory, presets
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition
+from dew.distributed.batches import DevicePrefetchIterator, batch_shardings
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server
+from dew.mesh import logical_spec
 from dew.nn.backbones import CausalTransformer, Mixture
-from dew.nn.sharding import RESIDUAL, logical_spec
+from dew.nn.sharding import RESIDUAL
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
+from dew.optim import OptimConfig
 from dew.sampling import Sampling
-from dew.training.distributed import DevicePrefetchIterator, batch_shardings
 
 
 @dataclass
@@ -95,18 +97,6 @@ def corpus(rng: np.random.Generator, lines: int) -> str:
         else:
             out.append(f"{rng.choice(names)} = {rng.choice(names)} * {rng.integers(2, 10)};")
     return "\n".join(out) + "\n"
-
-
-def write_tokens(directory: Path, seed: int) -> None:
-    """Byte token files in the layout a Text recipe reads."""
-    directory.mkdir(parents=True)
-    rng = np.random.default_rng(seed)
-    for split, lines in (("train", 20000), ("val", 400)):
-        np.asarray(ByteTokenizer().encode(corpus(rng, lines)), np.uint8).tofile(directory / f"{split}.bin")
-    sizes = {split: (directory / f"{split}.bin").stat().st_size for split in ("train", "val")}
-    (directory / "meta.json").write_text(json.dumps({
-        "tokenizer": "byte", "vocab_size": 256, "dtype": "uint8",
-        "train_tokens": sizes["train"], "val_tokens": sizes["val"], "eos_id": None}))
 
 
 def token_class(tokens: np.ndarray) -> np.ndarray:
@@ -217,15 +207,15 @@ def all_to_all_ops(hlo: str) -> tuple[int, str]:
 
 def main(config: Config) -> None:
     config.out.mkdir(parents=True)
-    write_tokens(config.out / "tokens", config.seed)
-    data = loader(TextData(source=str(config.out / "tokens"), seq_len=config.sequence_length),
-                batch=config.batch_size, read="memory", validation_records=config.batch_size,
-                loading=Loading(workers=0, threads=1, read_buffer=2))
+    # The corpus as one stream of bytes, cut into windows (pack=None), with no end-of-text token.
+    text = corpus(np.random.default_rng(config.seed), 20000)
+    data = compile(Memory([{"text": text}]).repeat().pipe(
+        presets.lm, "byte", seq_len=config.sequence_length, batch=config.batch_size, pack=None, eos=False))
     model = CausalTransformer(
         vocab_size=256, emb_features=64, num_layers=2, num_heads=4,
         mlp_features=128, max_seq_len=64, dtype=jnp.float32, attention_impl="xla",
         mixture=Mixture(experts=config.experts, top_k=config.top_k, dispatch=config.dispatch))
-    objective = LMObjective(model, config.sequence_length, aux_loss_alpha=0.01)
+    objective = LMObjective(model, config.sequence_length, balance=ExpertBalance(aux_loss_alpha=0.01))
     optimizer = OptimConfig(optimizer="adam", learning_rate=config.learning_rate).build(config.steps)
     trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed),
                       mesh=MeshSpec(fsdp=config.fsdp, expert=config.expert), layout=Layout(min_shard=1))

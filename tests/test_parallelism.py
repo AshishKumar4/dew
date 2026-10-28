@@ -6,27 +6,25 @@ single-device optax loop produces, otherwise the collectives GSPMD derived are
 not the ones we meant.
 """
 
-import json
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from diffusion_support import DeterministicObjective
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
 from sharded import assert_sharded
+from token_support import write_token_corpus
 
 from dew.artifacts import Representations
-from dew.config.data import loader
 from dew.data import Loading
 from dew.data.dataset import DataPartition, Loader, replayed
-from dew.inputs import unit_range
-from dew.nn.backbones.dit import SimpleDiT
-from dew.objectives.base import Aux, EMASpec, Objective
+from dew.distributed.batches import DevicePrefetchIterator, shard_batch
+from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.training.distributed import DevicePrefetchIterator, shard_batch
 from dew.training.evaluation import WARM_BATCHES
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
@@ -39,42 +37,6 @@ BATCH = 8
 # the threshold is lowered; at the production value "FSDP on" would replicate
 # everything.
 TINY = 256
-
-
-_DEFAULT_INIT_DECAY = optax.constant_schedule(0.999)
-
-
-class DeterministicObjective(Objective):
-    """Squared error against the input, straight through the real DiT.
-
-    No noise level, no dropout, no unconditional mask: the loss depends only
-    on the parameters and the batch. That is what makes two accumulation
-    regimes comparable, and two topologies: every micro-gradient in a window
-    is identical, which is exactly the "one big batch" an accumulated update
-    stands in for, so a k-accumulated run and a plain run must trace the same
-    parameters, and a partitioned run the same losses as a single-device one.
-    """
-
-    def __init__(self, decay=_DEFAULT_INIT_DECAY, emb_features=32):
-        self.model = SimpleDiT(patch_size=4, emb_features=emb_features, num_layers=1,
-                               num_heads=2, mlp_ratio=1)
-        self.ema = EMASpec(decay=decay)
-
-    def fresh_variables(self, key, held):
-        return self.model.init(key, jnp.ones((1, RES, RES, 3)), jnp.zeros((1,)))
-
-    def loss(self, variables, batch, step):
-        data = unit_range(batch["image"])
-        preds = self.model.apply(variables, data, jnp.zeros((data.shape[0],), jnp.float32))
-        return jnp.mean((preds - data) ** 2), Aux({})
-
-    def evaluate(self, params, batch, step):
-        """The EMA copy's reconstruction, pooled per example: reads the
-        sharded EMA parameters, which the training step alone never does."""
-        data = unit_range(batch["image"])
-        preds = self.model.apply(step.ema, data, jnp.zeros((data.shape[0],), jnp.float32))
-        return Representations(features=jnp.mean(preds, axis=(1, 2)),
-                               labels=jnp.zeros((data.shape[0],), jnp.int32))
 
 
 def images():
@@ -258,16 +220,15 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
     position as a dict where the DataLoader reports JSON bytes. A checkpoint
     holds bytes, so the position has to arrive as bytes and go back as a
     dict."""
-    from dew.config.data import TextData
+    from dew.data import presets
+    from dew.data.compile import compile
+    from dew.data.sources.tokens import TokenFiles
 
-    documents = np.concatenate([np.arange(1, 9), [0]] * 40).astype(np.uint16)
-    (tmp_path / "train.bin").write_bytes(documents.tobytes())
-    (tmp_path / "val.bin").write_bytes(documents.tobytes())
-    (tmp_path / "meta.json").write_text(json.dumps(
-        {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint16", "eos_id": 0}))
-    data = loader(TextData(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2),
-        batch=jax.device_count(), read="memory", seed=0, loading=Loading(workers=0),
-            validation_records=4 * (jax.device_count()))
+    corpus = write_token_corpus(tmp_path / "tokens", np.concatenate([np.arange(1, 9), [0]] * 40), eos_id=0)
+    # Packed in the store's order, then ordered: the pack is one plan over the store.
+    packed = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=8, batch=None, bins=2).shuffle(
+        0).repeat().batch(jax.device_count())
+    data = compile(packed, read="memory", seed=0, loading=Loading(workers=0))
 
     mesh = MeshSpec().build()
     with DevicePrefetchIterator(data.train(DataPartition()), mesh, depth=2) as it:

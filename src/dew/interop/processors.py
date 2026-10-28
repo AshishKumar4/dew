@@ -12,11 +12,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew import records
-from dew._model_types import QWEN35_TYPES
+from dew import _records
+from dew._model_types import GEMMA4_TYPES, QWEN35_TYPES
+from dew._records import JSON
+from dew.interop.sources import SourceReference
 from dew.nn import audio as audio_nn
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
-from dew.records import JSON
 from dew.registry import towers
 
 if TYPE_CHECKING:
@@ -35,6 +36,7 @@ class ProcessorCall(TypedDict, total=False):
     padding: bool
     truncation: bool
     return_tensors: str | None
+    add_special_tokens: bool
     audio: Media
     videos: Media
     video_metadata: Sequence[Mapping[str, object]]
@@ -60,14 +62,12 @@ def hosts(reference: PreTrainedTokenizerBase) -> TypeGuard[HostProcessor]:
                for name in ("__call__", "save_pretrained", "apply_chat_template", "batch_decode"))
 
 
-def _media_token_ids(record: Mapping[str, object], config: Mapping[str, object], *,
-                     qwen: bool, gemma: bool) -> tuple[int, int | None]:
-    """Read the source's image/video placeholder IDs before aligning features."""
-    image_id = record.get("image_token_id", config.get("image_token_id"))
+def _media_token_ids(record: Mapping[str, object]) -> tuple[int, int | None]:
+    """The source's image and video placeholder IDs, as its wrapper record reads them
+    (`hf_decoders.translate_wrapper_config`), before aligning features."""
+    image_id, video_id = record.get("image_token_id"), record.get("video_token_id")
     if type(image_id) is not int:
         raise ValueError("image_token_id must be an integer")
-    video_id = (config.get("video_token_id", 258884) if gemma else
-                config.get("video_token_id") if qwen else None)
     if video_id is not None and type(video_id) is not int:
         raise ValueError("video_token_id must be an integer")
     return image_id, video_id
@@ -102,7 +102,7 @@ def _in_text_order[T](streams: Mapping[int, Sequence[T]], tokens: np.ndarray,
     return ordered
 
 
-def _placed(runs: list[list[np.ndarray]], lengths: Sequence[int] | np.ndarray, capacity: int,
+def _placed(runs: list[list[np.ndarray]], selected: Sequence[np.ndarray], capacity: int,
             shape: tuple[int, ...], what: str) -> tuple[np.ndarray, list[tuple[int, int, np.ndarray]]]:
     """Check each run's length against its item's and return the slot each
     placeholder reads with every item's (row, index in its row, slots)."""
@@ -110,18 +110,21 @@ def _placed(runs: list[list[np.ndarray]], lengths: Sequence[int] | np.ndarray, c
     places = []
     for row, spans in enumerate(runs):
         for medium, slots in enumerate(spans):
-            if len(slots) != int(lengths[len(places)]):
+            members = selected[len(places)]
+            if len(slots) != len(members):
                 raise ValueError(f"media placeholder counts do not match the {what}")
-            indices[row, slots] = medium * capacity + np.arange(len(slots))
+            indices[row, slots] = medium * capacity + members
             places.append((row, medium, slots))
     return indices, places
 
 
 def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | None, *,
-                   kernel: int, table_size: int, patch_size: int
-                   ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """Return each modality's patch frames, their coordinates and their pooled
-    lengths, by the placeholder id that stands in the prompt for them.
+                   kernel: int, table_size: int, patch_size: int, retains_slots: bool = False
+                   ) -> dict[int, tuple[np.ndarray, np.ndarray, list[np.ndarray]]]:
+    """Return each modality's patch frames, their coordinates and each item's
+    projector slots its placeholders read, by the placeholder id that stands in
+    the prompt for them: a tower that keeps its patch slots reads its valid
+    patches' own, a pooling one its pooled blocks in order.
 
     The source flattens its video and frame axes, not its prompt rows
     (modeling_gemma4.py:2476-2488), so the two streams stay separate here and
@@ -129,7 +132,7 @@ def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | 
     arrives whole: its pixels with its positions, its coordinates inside the
     position table, and its patches in complete pooling blocks.
     """
-    streams: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    streams: dict[int, tuple[np.ndarray, np.ndarray, list[np.ndarray]]] = {}
     for pixel_name, position_name, token_id, ndim in (
         ("pixel_values", "image_position_ids", image_id, 3),
         ("pixel_values_videos", "video_position_ids", video_id, 4),
@@ -155,14 +158,16 @@ def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | 
         coordinates = coordinates.reshape(-1, *coordinates.shape[-2:])
         valid_patches = (coordinates >= 0).all(axis=-1)
         padding = (coordinates == -1).all(axis=-1)
-        if not np.all(valid_patches | padding):
+        if np.any(coordinates < -1) or (not retains_slots and not np.all(valid_patches | padding)):
             raise ValueError(f"{position_name} uses nonnegative coordinates or paired (-1, -1) padding")
         if np.any(coordinates >= table_size):
             raise ValueError(f"{position_name} exceeds position_embedding_size")
         counts = valid_patches.sum(axis=1)
-        if frames.shape[1] % kernel ** 2 or np.any(counts % kernel ** 2):
+        if not retains_slots and (frames.shape[1] % kernel ** 2 or np.any(counts % kernel ** 2)):
             raise ValueError("patch counts must divide into complete pooling blocks")
-        streams[token_id] = (frames, coordinates, counts // kernel ** 2)
+        streams[token_id] = (frames, coordinates,
+                             [np.flatnonzero(valid) for valid in valid_patches] if retains_slots
+                             else [np.arange(count // kernel ** 2) for count in counts])
     return streams
 
 
@@ -177,7 +182,7 @@ def _row_padding(reference: HostProcessor) -> tuple[int, Literal["left", "right"
     side = getattr(tokenizer, "padding_side", "right")
     if side not in ("left", "right"):
         raise ValueError("the tokenizer padding_side must be left or right")
-    return (0 if pad_id is None else records.integer(pad_id, "pad_token_id"),
+    return (0 if pad_id is None else _records.integer(pad_id, "pad_token_id"),
             "left" if side == "left" else "right")
 
 
@@ -187,7 +192,7 @@ def _row_start(reference: HostProcessor) -> int | None:
     processor wraps, or the tokenizer itself."""
     tokenizer = getattr(reference, "tokenizer", reference)
     bos = getattr(tokenizer, "bos_token_id", None)
-    return None if bos is None else records.integer(bos, "bos_token_id")
+    return None if bos is None else _records.integer(bos, "bos_token_id")
 
 
 @dataclass(frozen=True)
@@ -201,7 +206,7 @@ class Processor:
     algorithms. Calling it with text, and optionally `images`, `audio` or
     `videos`, returns `ModelInputs`.
 
-    `source` is the local directory or `repo@commit` its files came from.
+    `source` records the directory or repository, revision and subfolder its files came from.
     That identity reloads the processor (`load_processor`), and a media
     processor's geometry from the source config, independently of a task's
     text tokenizer. Only a media processor reads files from `directory`.
@@ -211,7 +216,7 @@ class Processor:
     config: Mapping[str, object]
     record: Mapping[str, object]
     vocab_size: int
-    source: str | None = None
+    source: SourceReference | None = None
     directory: Path | None = None
     """Where this process reads the files. Only `source` records their identity."""
 
@@ -224,6 +229,14 @@ class Processor:
         options = {"backend": "pil"} if self.config.get("model_type") == "gemma3" else {}
         return AutoProcessor.from_pretrained(str(self.directory), local_files_only=True, **options)
 
+    def host_media(self, text: str | Sequence[str], *, images: Media) -> dict[str, np.ndarray]:
+        """The source's fields for `text` and `images` as host arrays in their own dtypes, before Dew
+        aligns them to model rows: asked of the processor in the tensor type it computes in
+        (`_media_tensors`), and read as `_from_arrays` reads them, a bfloat16 field widened to
+        float32."""
+        return self._host_arrays(self.media(text=text if isinstance(text, str) else list(text), images=images,
+                                            return_tensors=self._media_tensors))
+
     def media(self, *, images: Media | None = None,
               **kwargs: Unpack[ProcessorCall]) -> Mapping[str, object]:
         """Return the source's media fields before Dew aligns them to model rows."""
@@ -231,6 +244,13 @@ class Processor:
         if images is None:
             return self._media_reference(**kwargs)
         return self._media_reference(images=images, **kwargs)
+
+    def image_text(self) -> str:
+        """The text one image stands as in a prompt, as this checkpoint's own chat template writes
+        an image part (`dew.data.chat.image_text`), which `media` expands to the image's tokens."""
+        from dew.data.chat import image_text
+
+        return image_text(self._media_reference, where=str(self.directory))
 
     def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
                  audio: Media | None = None, videos: Media | None = None,
@@ -253,7 +273,7 @@ class Processor:
             "text": text if isinstance(text, str) else list(text),
             "padding": not isinstance(text, str) and len(text) > 1,
             "truncation": False,
-            "return_tensors": "pt",
+            "return_tensors": self._media_tensors,
         }
         if audio is not None:
             arguments["audio"] = audio
@@ -261,7 +281,7 @@ class Processor:
             arguments["videos"] = videos
         if video_metadata is not None:
             arguments["video_metadata"] = video_metadata
-        return self._from_tensors(self.media(images=images, **arguments))
+        return self._from_arrays(self.media(images=images, **arguments))
 
     def chat(self, messages: Sequence[Mapping[str, object]], *, add_generation_prompt: bool = True,
              **template_options: JSON) -> ModelInputs:
@@ -280,22 +300,47 @@ class Processor:
                     for part in content)
         reference = self._media_reference if media else self.reference
         values = reference.apply_chat_template(
-            messages, tokenize=True, return_dict=True, return_tensors="pt" if media else "np",
+            messages, tokenize=True, return_dict=True, return_tensors=self._media_tensors if media else "np",
             add_generation_prompt=add_generation_prompt, **template_options)
         if not isinstance(values, Mapping):
             raise TypeError("the source chat processor must return named numeric inputs")
-        return self._from_tensors(values) if media else self.from_hf(values)
+        return self._from_arrays(values) if media else self.from_hf(values)
 
-    def _from_tensors(self, values: Mapping[str, object]) -> ModelInputs:
-        import torch
+    @property
+    def _media_tensors(self) -> Literal["np", "pt"]:
+        """The tensor type the media processor is asked for: NumPy, so a processor that computes on
+        the host needs no PyTorch, unless an image or video processor of it computes in PyTorch
+        (Transformers' torchvision backend, whose bfloat16 pixels NumPy cannot hold), which
+        installs PyTorch itself and whose tensors `_from_arrays` reads."""
+        from transformers.image_processing_backends import TorchvisionBackend
 
+        parts = vars(self._media_reference).values()
+        return "pt" if any(isinstance(part, TorchvisionBackend) for part in parts) else "np"
+
+    def _from_arrays(self, values: Mapping[str, object]) -> ModelInputs:
+        """A media processor's fields as model inputs, read on the host (`_host_arrays`)."""
+        return self.from_hf(self._host_arrays(values))
+
+    def _host_arrays(self, values: Mapping[str, object]) -> dict[str, np.ndarray]:
+        """A media processor's fields on the host, in their own dtypes: NumPy arrays as they are, and
+        the tensors of a processor that computes in PyTorch (`_media_tensors`) read by PyTorch, which
+        that processor installs, a bfloat16 one (Llama 4's pixels) widened to float32, which is exact.
+        A field neither is refused naming the processor."""
         arrays: dict[str, np.ndarray] = {}
         for name, value in values.items():
+            if isinstance(value, np.ndarray):
+                arrays[name] = value
+                continue
+            if self._media_tensors != "pt":
+                raise TypeError(f"{type(self._media_reference).__name__} returned {name!r} as "
+                                f"{type(value).__name__}, not the NumPy array Dew asks it for")
+            import torch
+
             if not isinstance(value, torch.Tensor):
-                raise TypeError(f"processor field {name!r} is not a tensor")
-            # Llama 4's processor emits bf16; float32 widening is exact.
+                raise TypeError(f"{type(self._media_reference).__name__} returned {name!r} as "
+                                f"{type(value).__name__}, which is no tensor")
             arrays[name] = (value.float() if value.dtype == torch.bfloat16 else value).numpy()
-        return self.from_hf(arrays)
+        return arrays
 
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
         """Check a processor's raw outputs and turn them into `ModelInputs` for the device.
@@ -322,28 +367,33 @@ class Processor:
         token_fields = {"positions": jnp.asarray(positions)}
         if not valid.all():
             token_fields["attention_mask"] = jnp.asarray(valid)
-        gemma = self.config.get("model_type") == "gemma4"
+        gemma = self.config.get("model_type") in GEMMA4_TYPES
         if gemma:
             for pixels, coordinates in (("pixel_values", "image_position_ids"),
                                          ("pixel_values_videos", "video_position_ids")):
                 if (pixels in values) != (coordinates in values):
                     raise ValueError(f"{pixels} and {coordinates} arrive together")
+            # A Gemma 4 call's vision blocks are its mm_token_type_ids' runs. A call without the field
+            # carries none, so its vision tokens read causally, as transformers computes them without it
+            # (5.17.0's modeling_gemma4.py:2395-2405, modeling_gemma4_unified.py:1097-1101).
             if "mm_token_type_ids" in values:
                 types = np.asarray(values["mm_token_type_ids"])
                 if types.shape != tokens.shape or not np.issubdtype(types.dtype, np.integer):
                     raise ValueError("mm_token_type_ids must be integer values aligned with input_ids")
                 # Image-to-video adjacency stays one vision run; hard text
-                # breaks it (modeling_gemma4.py:2148-2157).
+                # breaks it (5.17.0's modeling_gemma4.py:2143-2152).
                 vision = (types == 1) | (types == 2)
                 previous = np.concatenate([np.zeros((tokens.shape[0], 1), bool), vision[:, :-1]], axis=1)
                 groups = np.cumsum(vision & ~previous, axis=1, dtype=np.int32) - 1
-                token_fields["image_groups"] = jnp.asarray(np.where(vision, groups, -1))
+                field = ("block_groups" if self.config.get("model_type") == "gemma4_unified"
+                         else "image_groups")
+                token_fields[field] = jnp.asarray(np.where(vision, groups, -1))
         elif "video_position_ids" in values:
             raise ValueError("video_position_ids require the Gemma4 visual tower")
         conditioning: dict[str, jax.Array] = {}
         if "pixel_values" in values or "pixel_values_videos" in values:
             if ("pixel_values_videos" in values
-                    and self.config.get("model_type") not in (*QWEN35_TYPES, "gemma4")):
+                    and self.config.get("model_type") not in (*QWEN35_TYPES, *GEMMA4_TYPES)):
                 raise ValueError("video patch inputs require a Qwen3.5 or Gemma4 visual tower")
             image_fields, conditioning = self._images(values, tokens)
             token_fields.update(image_fields)
@@ -367,18 +417,20 @@ class Processor:
         """Row-align the processor's image and video features to their placeholders.
 
         It runs in two halves. The first reads the processor's output into
-        `chunks`, one feature block per image, with `lengths` its placeholder
-        count, `shape` the padded block shape and `capacity` the slots one
-        image occupies; `grid` and `patch_positions` carry the per-family
+        `chunks`, one feature block per image, with `selected` the projector
+        slots its placeholders read, `shape` the padded block shape and
+        `capacity` the slots one image occupies; `grid` and `patch_positions` carry the per-family
         extras. The second copies each chunk into `padded` at its row and image
         slot and writes `indices`, the slot each placeholder token reads.
 
-        The three branches are the three source layouts: Qwen's packed patch
-        runs, a per-patch position stream, and a fixed tokens-per-image grid.
+        The three branches are the three source layouts: Qwen's and Muse
+        Glimmer's packed patch runs, a per-patch position stream, and a fixed
+        tokens-per-image grid.
         """
         qwen = self.config.get("model_type") in QWEN35_TYPES
-        gemma = self.config.get("model_type") == "gemma4"
-        image_id, video_id = _media_token_ids(self.record, self.config, qwen=qwen, gemma=gemma)
+        packed = qwen or self.config.get("model_type") == "muse_glimmer"
+        gemma = self.config.get("model_type") in GEMMA4_TYPES
+        image_id, video_id = _media_token_ids(self.record)
         pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))
         if pixels.ndim not in (2, 3, 4) or not np.issubdtype(pixels.dtype, np.floating):
             raise ValueError("pixel_values must contain floating image tensors or patch vectors")
@@ -388,18 +440,19 @@ class Processor:
         patch_positions = None
         grid = None
         merge = 1
-        if qwen:
-            expected_types = np.where(tokens == image_id, 1, np.where(tokens == video_id, 2, 0))
-            supplied_types = np.asarray(values.get("mm_token_type_ids"))
-            if not np.array_equal(supplied_types, expected_types):
-                raise ValueError("mm_token_type_ids must identify each image and video placeholder")
+        if packed:
+            if qwen:
+                expected_types = np.where(tokens == image_id, 1, np.where(tokens == video_id, 2, 0))
+                supplied_types = np.asarray(values.get("mm_token_type_ids"))
+                if not np.array_equal(supplied_types, expected_types):
+                    raise ValueError("mm_token_type_ids must identify each image and video placeholder")
             chunks, grid, merge = self._qwen_frames(values, tokens, runs)
             shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
-            lengths = np.prod(grid, axis=1) // merge ** 2
+            selected = [np.arange(length) for length in np.prod(grid, axis=1) // merge ** 2]
             capacity = shape[0] // merge ** 2
         elif "image_position_ids" in values or "video_position_ids" in values:
-            chunks, patch_positions, lengths, kernel = self._positioned_chunks(values, tokens, runs,
-                                                                               image_id, video_id)
+            chunks, patch_positions, selected, kernel = self._positioned_chunks(values, tokens, runs,
+                                                                                image_id, video_id)
             shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
             pixel_dtype = np.result_type(*(chunk.dtype for chunk in chunks))
             capacity = shape[0] // kernel ** 2
@@ -407,7 +460,7 @@ class Processor:
             count = self.record.get("tokens_per_image")
             if type(count) is not int or count < 1 or pixels.ndim != 4:
                 raise ValueError("fixed-resolution pixel_values require a positive tokens_per_image")
-            lengths = np.full(pixels.shape[0], count, np.int32)
+            selected = [np.arange(count)] * pixels.shape[0]
             capacity = count
             chunks, shape = list(pixels), pixels.shape[1:]
         if len(chunks) != int(image_counts.sum()):
@@ -421,7 +474,7 @@ class Processor:
             padded_grid[..., 1:] = merge
         padded_positions = (None if patch_positions is None else np.full(
             (tokens.shape[0], width, shape[0], 2), -1, np.int32))
-        indices, places = _placed(runs, lengths, capacity, tokens.shape, "projector's feature count")
+        indices, places = _placed(runs, selected, capacity, tokens.shape, "projector's feature count")
         groups = None if gemma else np.full(tokens.shape, -1, np.int32)
         token_lengths = np.zeros((tokens.shape[0], width), np.int32)
         for offset, (row, image, slots) in enumerate(places):
@@ -453,23 +506,25 @@ class Processor:
         runs: list[list[np.ndarray]],
         image_id: int,
         video_id: int | None,
-    ) -> tuple[list[np.ndarray], list[np.ndarray], list[int], int]:
+    ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], int]:
         """The per-patch position layout's feature blocks, in placeholder order:
-        each image or video's patches, their positions and placeholder count,
-        and the vision pooling kernel that sets how many slots one fills."""
+        each image or video's patches, their positions and the projector slots
+        its placeholders read (`_patch_streams`), and the vision pooling kernel
+        that sets how many slots one fills."""
         # The tower's geometry as its translation reads it, the reference's defaults included.
-        tower = records.record(records.record(self.record["tower"], "tower")["fields"], "tower fields")
-        kernel = records.integer(tower["pooling_kernel_size"], "pooling_kernel_size")
+        tower = towers.from_record(_records.record(self.record["tower"], "tower")).geometry()
+        kernel, patch_size, table_size = tower.block_size, tower.patch_size, tower.position_size
+        if kernel is None or patch_size is None or table_size is None:
+            raise ValueError("positioned image patches require patch, pooling and position-table geometry")
         streams = _patch_streams(values, image_id, video_id, kernel=kernel,
-                                 table_size=records.integer(tower["position_embedding_size"],
-                                                            "position_embedding_size"),
-                                 patch_size=records.integer(tower["patch_size"], "patch_size"))
+                                 table_size=table_size, patch_size=patch_size,
+                                 retains_slots=tower.retains_patch_slots)
         patches = {token: list(zip(*stream, strict=True)) for token, stream in streams.items()}
         ordered = _in_text_order(patches, tokens, runs)
         if not ordered:
             raise ValueError("pixels require image or video placeholders")
-        chunks, patch_positions, lengths = (list(part) for part in zip(*ordered, strict=True))
-        return chunks, patch_positions, [int(length) for length in lengths], kernel
+        chunks, patch_positions, selected = (list(part) for part in zip(*ordered, strict=True))
+        return chunks, patch_positions, selected, kernel
 
     def _audio(self, values: Mapping[str, object], tokens: np.ndarray
                ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
@@ -482,26 +537,29 @@ class Processor:
         """
         audio_id = self.record.get("audio_token_id")
         audio = self.record.get("audio")
-        if type(audio_id) is not int or not isinstance(audio, Mapping):
-            raise ValueError("this source has no audio tower")
-        encoder = towers.from_record(audio)
-        if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
-            raise ValueError("audio conditioning requires a Gemma audio encoder")
+        if type(audio_id) is not int or self.record.get("audio_projector") is None:
+            raise ValueError("this source has no audio projector")
+        stride = 1
+        if audio is not None:
+            encoder = towers.from_record(_records.record(audio, "audio"))
+            if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
+                raise ValueError("audio conditioning requires a Gemma audio encoder")
+            stride = audio_nn.encoded_frame_stride(encoder)
         features = np.asarray(values["input_features"])
         mask = np.asarray(values["input_features_mask"])
         if features.ndim != 3 or not np.issubdtype(features.dtype, np.floating):
             raise ValueError("input_features must be floating [clips, frames, mel]")
         if mask.shape != features.shape[:2] or mask.dtype != np.bool_:
             raise ValueError("input_features_mask must be bool [clips, frames], True for valid frames")
-        encoded = mask[:, ::audio_nn.encoded_frame_stride(encoder)]
+        encoded = mask[:, ::stride]
         slots = self.record.get("audio_soft_tokens")
         if slots is None:
-            expected = encoded.sum(axis=1)
+            selected = [np.flatnonzero(row) for row in encoded]
             capacity = encoded.shape[1]
         else:
             if type(slots) is not int or encoded.shape[1] > slots:
                 raise ValueError(f"{encoded.shape[1]} encoded frames exceed the {slots} audio slots per clip")
-            expected = np.full(features.shape[0], slots)
+            selected = [np.arange(slots) for _ in range(features.shape[0])]
             capacity = slots
         runs = _placeholder_runs(tokens, audio_id, None)
         counts = np.array([len(row) for row in runs], np.int32)
@@ -510,7 +568,7 @@ class Processor:
         width = int(counts.max())
         padded = np.zeros((tokens.shape[0], width, *features.shape[1:]), features.dtype)
         padded_mask = np.zeros((tokens.shape[0], width, features.shape[1]), bool)
-        indices, places = _placed(runs, expected, capacity, tokens.shape, "encoded frame counts")
+        indices, places = _placed(runs, selected, capacity, tokens.shape, "encoded frame counts")
         for offset, (row, clip, _) in enumerate(places):
             padded[row, clip] = features[offset]
             padded_mask[row, clip] = mask[offset]
@@ -523,13 +581,16 @@ class Processor:
 
     def _merge_size(self) -> int:
         """The merger's spatial merge, as the projector's translation reads it, the reference's
-        default of 2 included."""
-        projector = records.record(records.record(self.record["projector"], "projector")["fields"],
+        default of 2 included: Qwen 3.5's merger names it `spatial_merge_size`, Muse Glimmer's
+        adapter `merge_size`."""
+        projector = _records.record(_records.record(self.record["projector"], "projector")["fields"],
                                    "projector fields")
-        return records.integer(projector["merge_size"], "merge_size")
+        name = "spatial_merge_size" if "spatial_merge_size" in projector else "merge_size"
+        return _records.integer(projector[name], name)
 
     def _qwen_frames(self, values: Mapping[str, object], tokens: np.ndarray, runs):
-        """Return views of packed image/video patches in text order, one item per frame.
+        """Return views of packed image/video patches in text order, one item per frame: Qwen 3.5's
+        and Muse Glimmer's, whose processors pack alike.
 
         Qwen3.5 get_rope_index repeats video grids by their temporal count and
         resets each frame's temporal coordinate to zero. The processor places
@@ -562,7 +623,7 @@ class Processor:
                     pieces.append((pixels[offset:offset + frames * count],
                                    (frames, int(height), int(width))))
                     offset += frames * count
-            token_id = self.config[token_name]
+            token_id = self.record.get(token_name)
             if type(token_id) is not int:
                 raise ValueError(f"{token_name} must be an integer")
             streams[token_id] = pieces
@@ -615,10 +676,26 @@ class Processor:
             raise ValueError("decode expects integer [B, S] token rows")
         return self.reference.batch_decode(array.tolist(), skip_special_tokens=True)
 
+    def spelling(self, ids: Sequence[int]) -> str:
+        """The text the source's tokenizer decodes `ids` to, its special tokens spelled out, as
+        transformers' `decode` gives it by default."""
+        return self.reference.batch_decode([list(ids)], skip_special_tokens=False)[0]
+
     @property
     def bos_id(self) -> int | None:
         """The id the source's tokenizer starts a sequence with, or None."""
         return _row_start(self.reference)
+
+    def encode(self, text: str, *, specials: bool) -> list[int]:
+        """`text`'s ids from the source's tokenizer: with the special tokens its encoding adds around
+        a sequence where `specials` (a BOS it opens with, an EOS it closes with, as T5's does), and
+        none otherwise."""
+        values = self.reference(text=[text], add_special_tokens=specials, padding=False, truncation=False,
+                                return_tensors=None)
+        rows = values["input_ids"]
+        if not isinstance(rows, Sequence) or len(rows) != 1 or not isinstance(rows[0], Sequence):
+            raise TypeError(f"{type(self.reference).__name__} returned no one row of input ids for one text")
+        return [int(token) for token in rows[0]]
 
     def save_pretrained(self, directory: str | Path) -> None:
         """Save the tokenizer and the source's unchanged media processor files."""

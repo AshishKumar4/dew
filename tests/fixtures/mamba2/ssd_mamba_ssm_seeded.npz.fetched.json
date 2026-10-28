@@ -1,0 +1,9 @@
+{
+ "bytes": 9144542,
+ "license": "Apache-2.0",
+ "path": "recordings/f21034fb395f98ea6d93bf874c28125d30a3a4680963fbb16c7390bf3c9722b0.npz",
+ "reference": "mamba_ssm 2.3.2.post1",
+ "repo": "dewml/fixtures",
+ "revision": "4db81c033bcccb0a3495b61bbbc1bbdaabc062c9",
+ "sha256": "f21034fb395f98ea6d93bf874c28125d30a3a4680963fbb16c7390bf3c9722b0"
+}

@@ -3,7 +3,14 @@
 import jax
 import jax.numpy as jnp
 
-from .common import GeneralizedNoiseScheduler
+from .common import GeneralizedNoiseScheduler, times
+
+
+def rho_ramp(low_inv, high_inv, ramp, rho):
+    """(high_inv + ramp (low_inv - high_inv))^rho: the rho spacing at `ramp` between sigma extremes
+    given as their 1/rho powers, on a number or an array of either library, the one interpolation
+    the scheduler and the published Karras grids take."""
+    return (high_inv + ramp * (low_inv - high_inv)) ** rho
 
 
 class KarrasVENoiseScheduler(GeneralizedNoiseScheduler):
@@ -22,11 +29,11 @@ class KarrasVENoiseScheduler(GeneralizedNoiseScheduler):
         self.max_inv_rho = sigma_max ** (1 / rho)
 
     def sigmas(self, t):
-        ramp = jnp.clip(1 - jnp.asarray(t, jnp.float32) / self.T, 0.0, 1.0)
-        return (self.max_inv_rho + ramp * (self.min_inv_rho - self.max_inv_rho)) ** self.rho
+        ramp = jnp.clip(1 - times(t) / self.T, 0.0, 1.0)
+        return rho_ramp(self.min_inv_rho, self.max_inv_rho, ramp, self.rho)
 
     def t_of_sigma(self, sigma):
-        inv_rho = jnp.asarray(sigma, jnp.float32) ** (1 / self.rho)
+        inv_rho = times(sigma) ** (1 / self.rho)
         ramp = jnp.clip((inv_rho - self.max_inv_rho) / (self.min_inv_rho - self.max_inv_rho),
                         0.0, 1.0)
         return (1 - ramp) * self.T
@@ -48,10 +55,10 @@ class EDMNoiseScheduler(GeneralizedNoiseScheduler):
         self.P_std = P_std
 
     def sigmas(self, t):
-        return jnp.exp(jnp.asarray(t, jnp.float32) / self.T * self.P_std + self.P_mean)
+        return jnp.exp(times(t) / self.T * self.P_std + self.P_mean)
 
     def t_of_sigma(self, sigma):
-        return (jnp.log(jnp.asarray(sigma, jnp.float32)) - self.P_mean) / self.P_std * self.T
+        return (jnp.log(times(sigma)) - self.P_mean) / self.P_std * self.T
 
     def sample_t(self, key, n):
         return jax.random.normal(key, (n,), dtype=jnp.float32)

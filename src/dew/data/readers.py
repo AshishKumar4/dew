@@ -11,8 +11,10 @@ from typing import Literal
 import grain.python as pygrain
 import numpy as np
 
+from dew import position
+from dew._records import record
+from dew.batch import Batch
 from dew.data.dataset import (
-    Batch,
     Closeable,
     DataPartition,
     FilledBatch,
@@ -27,7 +29,6 @@ from dew.data.dataset import (
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
 from dew.data.plan import Plan
-from dew.records import record
 
 
 @dataclasses.dataclass(frozen=True)
@@ -90,7 +91,7 @@ class _CanonicalPass:
         import jax
         from jax.experimental import multihost_utils
 
-        from dew.coordination import agreed, broadcast_from_process_zero
+        from dew._coordination import agreed, broadcast_from_process_zero
         from dew.data.sources.codec import decode, encode
 
         root = jax.process_index() == 0
@@ -142,11 +143,14 @@ class _PerShare(Forwarding):
         *,
         stop_seconds: float,
         endless: bool = True,
+        replicated: bool = False,
     ):
         self._open, self._plan = open_reader, plan
         self._resume: Literal["exact", "non-exact"] = resume
         self._stop_seconds = stop_seconds
         self._endless = endless
+        # An elastic read's position (`position.REPLICATED`), the same on every reader.
+        self._replicated = replicated
         self._read: pygrain.DatasetIterator[Batch] | None = None
         self._saved: Mapping[str, object] | None = None
         self._state: Mapping[str, object] | None = None
@@ -156,11 +160,18 @@ class _PerShare(Forwarding):
         return self._read
 
     def _reader(self) -> pygrain.DatasetIterator[Batch]:
-        """Open and restore the reader on its iteration thread."""
+        """Open and restore the reader on its iteration thread, every loading worker's process
+        started at once (`start_prefetch`). Grain's interleave of its workers makes their iterators
+        unstarted where it is asked its position before its first read, as a flat map over it asks
+        at its start (a pooled read's, `_Build.handed`), and where it is restored, and each then
+        starts at its first turn, after the one before it has read: a spawn and an import apart,
+        3.5 s each on a 4-CPU host, so 30 workers read their first two minutes at 73 rows/s on an
+        A100 host (ledger row 1846)."""
         if self._read is None:
             self._read = self._open()
             if self._saved is not None:
                 self._read.set_state(self._saved)
+            self._read.start_prefetch()
         return self._read
 
     def __iter__(self) -> Iterator[Batch]:
@@ -185,10 +196,18 @@ class _PerShare(Forwarding):
         if state is None:
             state = self._reader().get_state()
             self._publish(state)
-        return json.dumps({"dew_data_plan": self._plan.record(), "iterator": state}).encode()
+        saved = {"dew_data_plan": self._plan.record(), "iterator": state}
+        return json.dumps({position.REPLICATED: saved} if self._replicated else saved).encode()
 
     def set_state(self, state: bytes) -> None:
-        decoded = record(json.loads(state), "saved per-share position")
+        held = position.replicated(state)
+        if self._replicated != (held is not None):
+            raise ValueError(
+                "this read is elastic, and the saved position is one share's own offset; resume it with the "
+                "chain that saved it (without .elastic())" if self._replicated else
+                "the saved position is an elastic read's, and this read is per share; resume it with "
+                ".elastic() on the chain")
+        decoded = record(json.loads(state), "saved per-share position") if held is None else held
         self._plan.check(record(decoded.get("dew_data_plan"), "saved data plan"), resume=self._resume)
         saved = record(decoded.get("iterator"), "saved Grain iterator")
         self.close()
@@ -236,8 +255,5 @@ class _FillShare:
     batch: int
 
     def __call__(self, batch: Batch) -> Batch:
-        mine = take_batch(batch, slice(self.partition.index, None, self.partition.count))
-        empty = rows_of(mine) == 0
-        if empty:
-            mine = take_batch(batch, slice(1))
-        return FilledBatch(self.partition.rows(self.batch), real=not empty).map(mine)
+        held, real = self.partition.held(rows_of(batch))
+        return FilledBatch(self.partition.rows(self.batch), real=real).map(take_batch(batch, held))

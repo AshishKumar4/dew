@@ -39,6 +39,8 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 
+from dew.nn.precision import at_least_fp32, weighted_total
+
 MEAN_EPS = 1e-8
 """Added to a masked mean's denominator, as both references add it. Without
 it a fully masked row is a nan that spreads through the batch."""
@@ -61,9 +63,8 @@ def masked_mean(x: jax.Array, mask: jax.Array, axis=None) -> jax.Array:
     positions are where uninitialised values sit. The denominator adds
     `MEAN_EPS`, so a fully masked input gives zero.
     """
-    weights = mask.astype(x.dtype)
-    kept = jnp.where(weights != 0, x, 0)
-    return jnp.sum(kept * weights, axis=axis) / (jnp.sum(weights, axis=axis) + MEAN_EPS)
+    total, mass = weighted_total(x, mask, axis=axis)
+    return total / (mass + MEAN_EPS)
 
 
 def masked_whiten(x: jax.Array, mask: jax.Array,
@@ -82,15 +83,16 @@ def masked_whiten(x: jax.Array, mask: jax.Array,
     from it, so a shift of every value moves no whitened one.
     """
     weights = mask.astype(x.dtype)
-    count, kept = total(jnp.stack([jnp.sum(weights), jnp.sum(jnp.where(weights != 0, x, 0) * weights)]))
+    kept, count = weighted_total(x, weights)
+    count, kept = total(jnp.stack([count, kept]))
     mean = kept / (count + MEAN_EPS)
     deviations = jnp.where(weights != 0, x - mean, 0)
-    variance = total(jnp.sum(jnp.square(deviations) * weights)) / (count + MEAN_EPS)
+    variance = total(weighted_total(jnp.square(deviations), weights)[0]) / (count + MEAN_EPS)
     return (x - mean) * jax.lax.rsqrt(variance * (count / (count - 1)) + WHITEN_EPS)
 
 
 def _grouped(rewards: jax.Array, group: int) -> jax.Array:
-    """`[prompts, group]` float32 rewards.
+    """`[prompts, group]` rewards, at least float32 (a float64 caller's stay float64).
 
     A group of one has no baseline, and the three references answer it three
     ways (verl with the raw reward, Tunix with a nan from ddof 1 or with zeros,
@@ -101,7 +103,7 @@ def _grouped(rewards: jax.Array, group: int) -> jax.Array:
     if rewards.ndim != 1:
         raise ValueError(
             f"rewards are one scalar per completion, [B], got {rewards.shape}")
-    return jnp.asarray(rewards, jnp.float32).reshape(-1, group)
+    return jnp.asarray(rewards, at_least_fp32(jnp.asarray(rewards).dtype)).reshape(-1, group)
 
 
 def group_advantage(rewards: jax.Array, group: int, normalise_by_std: bool = True,
@@ -120,12 +122,19 @@ def group_advantage(rewards: jax.Array, group: int, normalise_by_std: bool = Tru
     `norm_adv_by_std_in_grpo`.
     """
     grouped = _grouped(rewards, group)
-    centred = grouped - jnp.mean(grouped, axis=-1, keepdims=True)
     if not normalise_by_std:
-        return centred.reshape(-1)
+        return (grouped - jnp.mean(grouped, axis=-1, keepdims=True)).reshape(-1)
     # ddof 1 is both references' choice, and jnp.std defaults to 0.
-    deviation = jnp.std(grouped, axis=-1, ddof=1, keepdims=True)
-    return (centred / (deviation + eps)).reshape(-1)
+    return group_normalised(grouped, ddof=1, eps=eps).reshape(-1)
+
+
+def group_normalised(grouped, *, ddof: int, eps: float, xp=jnp):
+    """Each row of `grouped` `[groups, members]` less its mean, over its standard deviation
+    (`ddof`) plus `eps`, in `grouped`'s dtype and array library (`xp`, NumPy for a host reference's
+    float64): the arithmetic every group-relative advantage shares, each reference its own
+    `ddof`, `eps` and dtype."""
+    centred = grouped - xp.mean(grouped, axis=-1, keepdims=True)
+    return centred / (xp.std(grouped, axis=-1, ddof=ddof, keepdims=True) + eps)
 
 
 def rloo_advantage(rewards: jax.Array, group: int) -> jax.Array:
@@ -153,15 +162,16 @@ def gae_advantages(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
     reaches no real step. Positions outside the mask hold the neighbouring
     step's carry, as in both references, and the loss masks them again.
 
-    The recursion runs in float32 whatever the caller's dtype, the way Tunix's
-    GRPO loss casts its log-probabilities. A caller whitens the advantages
+    The recursion runs in at least float32, the way Tunix's GRPO loss casts
+    its log-probabilities (a float64 caller's, a float64 truth's, in float64). A caller whitens the advantages
     itself (`gae` over its batch, `PPORollout` over every process's), from
     these rather than from returns less values: at values far above the
     advantages, float32 rounds those differences away.
     """
     keep = jnp.asarray(mask) != 0
-    rewards = jnp.where(keep, jnp.asarray(token_rewards, jnp.float32), 0)
-    values = jnp.where(keep, jnp.asarray(values, jnp.float32), 0)
+    wide = at_least_fp32(jnp.result_type(token_rewards, values))
+    rewards = jnp.where(keep, jnp.asarray(token_rewards, wide), 0)
+    values = jnp.where(keep, jnp.asarray(values, wide), 0)
 
     def step(carry, inputs):
         advantage, next_value = carry
@@ -172,7 +182,7 @@ def gae_advantages(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
         next_value = jnp.where(keep_t, value_t, next_value)
         return (advantage, next_value), advantage
 
-    zeros = jnp.zeros(values.shape[0], jnp.float32)
+    zeros = jnp.zeros(values.shape[0], wide)
     _, transposed = jax.lax.scan(
         step, init=(zeros, zeros),
         xs=(rewards.T, values.T, keep.T), reverse=True)
@@ -187,8 +197,8 @@ def gae(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
     Returns the whitened advantages and the unwhitened returns, in that order.
     Both references compute `returns = A + V` before whitening. The whitening
     subtracts two nearby numbers, and bf16 rounds the difference away, so it
-    runs in float32 as the recursion does.
+    runs in at least float32 as the recursion does.
     """
     advantages = gae_advantages(token_rewards, values, mask, gamma, lam)
-    returns = advantages + jnp.asarray(values, jnp.float32)
-    return masked_whiten(advantages, jnp.asarray(mask, jnp.float32)), returns
+    returns = advantages + jnp.asarray(values, advantages.dtype)
+    return masked_whiten(advantages, jnp.asarray(mask, advantages.dtype)), returns

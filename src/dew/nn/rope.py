@@ -1,7 +1,10 @@
 """Rotary position embeddings: the angles of one axis or several, Qwen's
 interleaved M-RoPE, the one rotation every model applies (half-split or
 adjacent pairs, leading or trailing), Llama 3.1's frequency ramp, and
-YaRN's frequency ramp and attention factor.
+YaRN's frequency ramp and attention factor. Beside them the absolute
+sinusoidal tables share their frequencies (`sinusoid_frequencies`) and their
+sines and cosines (`sinusoids`, `sincos_grid`): a timestep's, a patch grid's
+and audio's relative positions.
 
 YaRN's ramp is transformers 5.16.1's `_compute_yarn_parameters` and its
 scale `yarn_apply_mscale` (models/deepseek_v3), with `dim` at the rope
@@ -25,6 +28,44 @@ from jax.typing import DTypeLike
 from dew.registry import from_record
 
 from .precision import at_least_fp32
+
+
+def sinusoid_frequencies(count: int, divisor: float, *, dtype: DTypeLike, exponential: bool = False
+                         ) -> np.ndarray:
+    """`10000 ** (-i / divisor)` for i below `count`, an absolute sinusoidal table's frequencies, on the
+    host in `dtype`: rounded once from float64 (`_base_powers`), or, `exponential`, as the published
+    timestep embeddings form them, the whole exponent `i * -ln(10000)` in `dtype` before it is divided
+    (the other order moves a sine by 1e-5 near timestep 1000) and its exp taken in float64 and rounded
+    once."""
+    if not exponential:
+        return (1.0 / _base_powers(10000.0, np.arange(count, dtype=np.float64) / divisor)).astype(dtype)
+    width = np.dtype(dtype).type
+    exponent = np.arange(count, dtype=width) * width(-math.log(10000.0)) / width(divisor)
+    return np.exp(exponent.astype(np.float64)).astype(width)
+
+
+def sinusoids(angles, *, cosine_first: bool = False, xp=jnp):
+    """Each angle's sine and cosine side by side, `[..., n]` to `[..., 2n]`, the sines first or, where
+    `cosine_first`, the cosines. `xp` is the array module: `numpy` for a host table built while a model
+    traces, which JAX would otherwise stage into the trace."""
+    first, second = (xp.cos(angles), xp.sin(angles)) if cosine_first else (xp.sin(angles), xp.cos(angles))
+    return xp.concatenate([first, second], axis=-1)
+
+
+def sincos_grid(frequencies: np.ndarray, first: np.ndarray, second: np.ndarray, *, dtype: DTypeLike
+                ) -> np.ndarray:
+    """A 2D sinusoidal table on the host, `[positions, 4 * len(frequencies)]`: the `first` axis's
+    coordinate of each position, then the `second`'s, each as its sines then cosines at `frequencies`,
+    computed in the frequencies' dtype and rounded once to `dtype` (the caller's axis order: a patch
+    grid's rows first, SD3's columns). Each axis's distinct coordinates are computed once and gathered
+    into the one output, so a wide grid holds no full-width table in the wider dtype."""
+    width = 2 * len(frequencies)
+    table = np.empty((first.size, 2 * width), dtype)
+    for half, coordinates in enumerate((first, second)):
+        values, where = np.unique(coordinates.reshape(-1), return_inverse=True)
+        angles = values.astype(frequencies.dtype)[:, None] * frequencies[None, :]
+        table[:, half * width:(half + 1) * width] = sinusoids(angles, xp=np).astype(dtype)[where]
+    return table
 
 
 def inverse_frequencies(theta: float, dim: int, pairs: int | None = None, *,
@@ -135,15 +176,52 @@ def rope_scaling_from_record(record: Mapping[str, object]) -> RopeScaling | Long
             else from_record(RopeScaling, record))
 
 
+@dataclasses.dataclass(frozen=True)
+class YarnScaling:
+    """YaRN rope scaling, the reference's `rope_parameters` fields.
+
+    Both released DeepSeek configs carry this spelling (rope_type yarn,
+    factor 40 off 4096 base positions), so the record keeps the reference's
+    names and a translation renames nothing. The ramp transforms the base of
+    the layer it rides on (`MixerContext.rope_theta`), which it does not
+    repeat; the mscale is applied in the attention as a query pre-scale.
+    """
+
+    rope_type: str = 'yarn'
+    factor: float = 40.0
+    original_max_position_embeddings: int = 4096
+    beta_fast: float = 32.0
+    beta_slow: float = 1.0
+    mscale: float | None = None
+    mscale_all_dim: float | None = None
+    truncate: bool = True
+    # An explicit cos/sin amplitude, which the reference applies instead of
+    # deriving one; None derives it from factor and the mscales above.
+    attention_factor: float | None = None
+
+
+type Scaling = RopeScaling | LongRopeScaling | YarnScaling
+"""A rotary's one frequency scaling: Llama 3.1's ramp, LongRoPE's factors or YaRN's (`rotary_freqs`)."""
+
+
 def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None,
                  partial_rotary_type: str = 'proportional',
-                 rope_scaling: RopeScaling | LongRopeScaling | None = None, *, dtype: DTypeLike,
-                 reach=None):
+                 rope_scaling: Scaling | None = None, *,
+                 dtype: DTypeLike, reach=None, section: Sequence[int] | None = None):
     """Return cos and sin of the rotary angles at absolute `positions`: [P, pairs].
 
     `positions` is [P], or [B, P] for a packed batch whose documents restart at
     0. The angles are computed in `dtype` (at least fp32), so a token rotates
     the same in prefill and decode.
+
+    With `section`, Qwen's interleaved M-RoPE, `positions` is [B, S, 3]: each
+    token's temporal, height and width ids. Pair i turns by the height id
+    when `i % 3 == 1` and `i < 3 * section[1]`, by the width id when
+    `i % 3 == 2` and `i < 3 * section[2]`, and by the temporal id otherwise
+    (Qwen3-VL's `apply_interleaved_mrope`), each at the frequency and
+    amplitude the rope and its ramp give that pair (Llama 3.1's or YaRN's,
+    the same at every position), as Qwen3_5TextRotaryEmbedding builds them
+    through `ROPE_INIT_FUNCTIONS` (modeling_qwen3_5.py:143-213).
 
     LongRoPE picks its short or long factors by how far a sequence reaches: a
     row's furthest position, or `reach` `[B, P]`, each token's document's
@@ -162,7 +240,13 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
 
     `rope_scaling` (Llama 3.1's ramp) applies before a proportional rope pads
     its zero-frequency tail, as the reference's `dim = head_dim *
-    partial_rotary_factor` does.
+    partial_rotary_factor` does. YaRN (`YarnScaling`) replaces the inverse
+    frequencies of the rotated width with its ramp (`yarn_inv_freq`) and
+    scales cos and sin by its attention factor, as the reference's rotary
+    embedding does: over the whole head, or over `rot_dim` under 'default',
+    the reference's `dim = head_dim * partial_rotary_factor`
+    (`_compute_yarn_parameters`). A proportional rope has no YaRN form, so
+    YaRN beside a proportional `rot_dim` is refused.
     """
     if partial_rotary_type not in ('proportional', 'default'):
         raise ValueError(
@@ -181,6 +265,11 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
         furthest = jnp.max(rows, axis=-1, keepdims=rows.ndim > 1) if reach is None else jnp.asarray(reach)
         expanded = furthest + 1 > rope_scaling.original_max_position_embeddings
         inv_freq = jnp.where(expanded[..., None], long, short)
+    elif isinstance(rope_scaling, YarnScaling):
+        if rot_dim is not None and partial_rotary_type == 'proportional':
+            raise ValueError(f"YaRN ramps the rotated width at its own frequencies and has no "
+                             f"proportional form, so it takes no proportional rot_dim, got {rot_dim}")
+        inv_freq = yarn_inv_freq(divisor, theta, rope_scaling, dtype=dtype)
     elif rope_scaling is not None:
         inv_freq = rope_scaling.apply(inv_freq)
     if rot_dim is not None and partial_rotary_type == 'proportional':
@@ -189,10 +278,23 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
             inv_freq = jnp.pad(inv_freq, (*((0, 0),) * (inv_freq.ndim - 1), (0, padding)))
         else:
             inv_freq = np.concatenate([inv_freq, np.zeros((padding,), inv_freq.dtype)])
-    angles = jnp.asarray(positions, inv_freq.dtype)[..., None] * inv_freq
+    if section is None:
+        angles = jnp.asarray(positions, inv_freq.dtype)[..., None] * inv_freq
+    else:
+        if positions.shape[-1] != 3:
+            raise ValueError(f"M-RoPE reads three coordinates per position, got {positions.shape[-1]}")
+        indices = jnp.arange(inv_freq.shape[-1])
+        axes = jnp.zeros(indices.shape, jnp.int32)
+        for axis in (1, 2):
+            axes = jnp.where((indices % 3 == axis) & (indices < section[axis] * 3), axis, axes)
+        selected = jnp.take_along_axis(positions, axes[None, None, :], axis=-1)
+        angles = selected.astype(inv_freq.dtype) * inv_freq
     cos, sin = jnp.cos(angles), jnp.sin(angles)
     if isinstance(rope_scaling, LongRopeScaling):
         cos, sin = cos * rope_scaling.amplitude, sin * rope_scaling.amplitude
+    elif isinstance(rope_scaling, YarnScaling):
+        factor = yarn_attention_factor(rope_scaling)
+        cos, sin = cos * factor, sin * factor
     return cos, sin
 
 
@@ -223,28 +325,6 @@ def axis_tables[P: (np.ndarray, jax.Array)](positions: P, axes: Sequence[int], t
         return np.cos(joined).astype(table), np.sin(joined).astype(table)
     joined = jnp.concatenate(angles, axis=-1)
     return jnp.cos(joined).astype(table), jnp.sin(joined).astype(table)
-
-
-def mrope_tables(positions: jax.Array, section: Sequence[int], width: int, theta: float, *,
-                 dtype: DTypeLike) -> tuple[jax.Array, jax.Array]:
-    """cos and sin of Qwen's interleaved M-RoPE over a `width`-wide rope:
-    `[B, S, width // 2]` from temporal, height and width ids `[B, S, 3]`.
-
-    Pair i turns at `inverse_frequencies(theta, width)[i]` by the height id
-    when `i % 3 == 1` and `i < 3 * section[1]`, by the width id when
-    `i % 3 == 2` and `i < 3 * section[2]`, and by the temporal id otherwise
-    (Qwen3-VL's `apply_interleaved_mrope`). The angles are computed in
-    `dtype`.
-    """
-    if positions.shape[-1] != 3:
-        raise ValueError(f"M-RoPE reads three coordinates per position, got {positions.shape[-1]}")
-    indices = jnp.arange(width // 2)
-    axes = jnp.zeros((width // 2,), jnp.int32)
-    for axis in (1, 2):
-        axes = jnp.where((indices % 3 == axis) & (indices < section[axis] * 3), axis, axes)
-    selected = jnp.take_along_axis(positions, axes[None, None, :], axis=-1)
-    angles = selected.astype(dtype) * inverse_frequencies(theta, width, dtype=dtype)
-    return jnp.cos(angles), jnp.sin(angles)
 
 
 def rotate(x, cos, sin, *, pairs: Literal['half', 'adjacent'] = 'half',
@@ -288,37 +368,14 @@ def rotate(x, cos, sin, *, pairs: Literal['half', 'adjacent'] = 'half',
     return (out if scale is None else out * scale).astype(x.dtype)
 
 
-@dataclasses.dataclass(frozen=True)
-class YarnScaling:
-    """YaRN rope scaling, the reference's `rope_parameters` fields.
-
-    Both released DeepSeek configs carry this spelling (rope_type yarn,
-    factor 40 off 4096 base positions), so the record keeps the reference's
-    names and a translation renames nothing. The ramp transforms the base of
-    the layer it rides on (`MixerContext.rope_theta`), which it does not
-    repeat; the mscale is applied in the attention as a query pre-scale.
-    """
-
-    rope_type: str = 'yarn'
-    factor: float = 40.0
-    original_max_position_embeddings: int = 4096
-    beta_fast: float = 32.0
-    beta_slow: float = 1.0
-    mscale: float | None = None
-    mscale_all_dim: float | None = None
-    truncate: bool = True
-    # An explicit cos/sin amplitude, which the reference applies instead of
-    # deriving one; None derives it from factor and the mscales above.
-    attention_factor: float | None = None
-
-
 def yarn_inv_freq(head_dim: int, theta: float, yarn: YarnScaling, *,
                   dtype: DTypeLike) -> np.ndarray:
     """YaRN inverse frequencies over the rope width, `[head_dim // 2]`, in `dtype`.
 
-    Mirrors `modeling_rope_utils._compute_yarn_parameters` with `dim` at the
-    head dim, as DeepSeek's configs do by pointing `head_dim` at the rope
-    slice. Low dims interpolate towards `1 / (factor * pos_freqs)`,
+    Mirrors `modeling_rope_utils._compute_yarn_parameters` with `dim` at
+    `head_dim`, the rotated width: a whole head's, as DeepSeek's configs point
+    `head_dim` at the rope slice, or a partial rotary's `head_dim *
+    partial_rotary_factor`. Low dims interpolate towards `1 / (factor * pos_freqs)`,
     high dims keep extrapolating, and the linear ramp between the correction
     bounds blends them.
     """
@@ -376,24 +433,6 @@ def yarn_query_scale(yarn: YarnScaling) -> float:
         return 1.0
     mscale = 0.1 * yarn.mscale_all_dim * math.log(yarn.factor) + 1.0
     return mscale * mscale
-
-
-def yarn_rope_freqs(positions, head_dim: int, theta: float,
-                    yarn: YarnScaling | None, *, dtype: DTypeLike):
-    """cos/sin over the rope width, plain or YaRN-scaled: `[P, head_dim // 2]`,
-    computed in `dtype` as `rotary_freqs`'s are.
-
-    Plain rope is `rotary_freqs`, the one layout every mixer shares. YaRN
-    replaces the inverse frequencies with the ramp and scales the resulting
-    cos/sin by its attention factor, as the reference's rotary embedding
-    does.
-    """
-    if yarn is None:
-        return rotary_freqs(positions, head_dim, theta, dtype=dtype)
-    inv_freq = yarn_inv_freq(head_dim, theta, yarn, dtype=dtype)
-    angles = jnp.asarray(positions, inv_freq.dtype)[..., None] * inv_freq
-    factor = yarn_attention_factor(yarn)
-    return jnp.cos(angles) * factor, jnp.sin(angles) * factor
 
 
 def axis_halves(x, axes: Sequence[int]):

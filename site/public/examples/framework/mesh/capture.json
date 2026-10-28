@@ -1,19 +1,19 @@
 {
 	"about": "The screen mesh.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "033e391a3c6162735da891a95c0a9595063ed5af1e9f8e125cb644234a4ab7df",
+	"script_sha256": "76483d4bbf212d806ff8f6004713f013836789fe62356b9520f4798daf1ff8a6",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",
-		"jax": "0.11.2.post4",
+		"jax": "0.11.2.post11",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "10d1092cf7e2855be1b80162809534006f19f928",
-		"date": "2026-10-14"
+		"dew": "d2adda0186300fcbbe16c47b462a589c4b9dbf96",
+		"date": "2026-10-21"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 26.4,
+		"seconds": 34.5,
 		"columns": 96,
 		"screen": [
 			[
@@ -121,7 +121,631 @@
 					"dim": true
 				},
 				{
-					"text": "  100%  0:00:02 "
+					"text": "  100%  0:00:03 "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "data ",
+					"dim": true
+				},
+				{
+					"text": "48",
+					"bold": true,
+					"dim": true
+				},
+				{
+					"text": " rows  \u00b7  ",
+					"dim": true
+				},
+				{
+					"text": "0",
+					"bold": true,
+					"dim": true
+				},
+				{
+					"text": " rejected",
+					"dim": true
+				},
+				{
+					"text": "                                                                  "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                                                              "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "train                                                                                       ",
+					"fg": "875fd7",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  loss           ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     5.874",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  ce             ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     5.874",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  perplexity     ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     355.7",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  token_accuracy ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "      0.4%",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  data_wait_ms   ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "   0.03056",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  grad_norm      ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     1.819",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  compiles       ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     1.000",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  cache_hits     ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "         0",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  cache_misses   ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     5.000",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "throughput                                                                                  ",
+					"fg": "875fd7",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  step_time_ms   ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     117.4",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  samples_per_sec",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     68.15",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  tokens         ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     512.0",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  tokens_per_s   ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     4,362",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "optimizer                                                                                   ",
+					"fg": "875fd7",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  accepted       ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    100.0%",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  learning_rate  ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "  0.001000",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
 				},
 				{
 					"text": "\u2502",
@@ -179,7 +803,7 @@
 					"dim": true
 				},
 				{
-					"text": "3 steps in 0:00:03             "
+					"text": "3 steps in 0:00:04             "
 				},
 				{
 					"text": "\u2502",
@@ -199,7 +823,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 3.36 s                   "
+					"text": "after 4.16 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -219,7 +843,7 @@
 					"dim": true
 				},
 				{
-					"text": "145.1 step/s                   "
+					"text": "15.0 step/s                    "
 				},
 				{
 					"text": "\u2502",
@@ -239,7 +863,7 @@
 					"dim": true
 				},
 				{
-					"text": "0.4% of the wall time in steps "
+					"text": "3.1% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
@@ -259,7 +883,7 @@
 					"dim": true
 				},
 				{
-					"text": "5.929                         ",
+					"text": "5.874                         ",
 					"bold": true
 				},
 				{

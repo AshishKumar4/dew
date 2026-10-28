@@ -13,15 +13,13 @@ import tyro
 from PIL import Image
 
 from dew.artifacts import uint8_pixels
-from dew.config import OptimConfig
-from dew.config.data import Augment, HoldOut, ImageData, loader
-from dew.data import TFDS
-from dew.data.images import EncodeCaptions
-from dew.diffusion import presets
+from dew.data import TFDS, Dataset, images, presets
+from dew.diffusion.presets import EDM
 from dew.inputs import CLIPText, Condition, Field, InputSpec
 from dew.interop import save_hf_layout
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
+from dew.optim import OptimConfig
 from dew.sampling import CFG, Heun
 from dew.training import Checkpoints, MeshSpec, Trainer
 
@@ -49,25 +47,30 @@ def text_conditioned_inputs(image_size: int) -> InputSpec:
         conditions={"textcontext": Condition(CLIPText.from_pretrained("openai/clip-vit-large-patch14"))})
 
 
+def flowers(config: Config) -> tuple[Dataset, Dataset]:
+    """Every Flowers image, captioned with its class, less four batches held out for validation."""
+    source = TFDS("oxford_flowers102", split="all",
+                  path=None if config.data_path is None else str(config.data_path.expanduser()))
+    train, validation = source.holdout(records=4 * config.batch_size)
+    # rejects=False: every record decodes or the run stops, so an epoch's length is known up front.
+    sized = {"batch": config.batch_size, "caption": images.caption("a photo of a {label}"), "rejects": False}
+    return (train.shuffle(seed=0).repeat().pipe(presets.images, config.image_size, augment=True, **sized),
+            validation.pipe(presets.images, config.image_size, **sized))
+
+
 def main(config: Config, data=None, inputs=None):
     inputs = inputs or text_conditioned_inputs(config.image_size)
-    data = data or loader(ImageData(
-        source=TFDS("oxford_flowers102", split="all",
-                    path=None if config.data_path is None else str(config.data_path.expanduser())),
-        image_size=config.image_size,
-        caption_templates=("a photo of a {}",),
-        augment=Augment(flip=True, jitter=True), validation=HoldOut(records=4 * config.batch_size),
-    ), batch=config.batch_size, provision=config.data_path is None, read="memory",
-        host=(EncodeCaptions(inputs.tokenize),))
-    steps = config.steps or data.epoch_steps(config.epochs)
+    train, validation = (data, None) if data is not None else flowers(config)
     model = SimpleDiT(**config.model, output_channels=3, dtype=jnp.bfloat16)
-    objective = DiffusionObjective(model, presets.EDM(regime="pixel"), inputs,
+    # The objective encodes each batch's captions with its text condition as the trainer reads them.
+    objective = DiffusionObjective(model, EDM(regime="pixel"), inputs,
                                    solver=Heun(), guidance=CFG(3.0), steps=40)
 
     trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=config.fsdp),
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
-    state = trainer.fit(data, steps=steps, log_every=50)
+    state = trainer.fit(train, validation=validation, steps=config.steps,
+                        epochs=None if config.steps else config.epochs, log_every=50)
 
     # The averaged weights stay on
     # the trainer's mesh, prompts split over it, and host() reads the rows back.

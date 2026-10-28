@@ -170,7 +170,9 @@ trainer.fit(data, steps=100_000, metrics=[fid, clip], eval_every=1_000,
 
 The metrics you pass are evaluated together, on the same weights. If a callable needs a score that evaluation did not produce, its tracker leaves the step unranked and never fills the gap from a previous evaluation. To rank by training reports, `best=objective.loss` selects the objective's training loss, and `objective.scalars.ce` selects a value the objective declares in `shown`. Aggregates can index those objects too. In code, select a declared evaluation metric by its object. Strings are for recorded configurations, reader selectors and log keys.
 
-`Plateau` stops the run after `evals` eligible evaluations without an improvement, and it counts evaluations, not training steps. An improvement must exceed `min_delta`, an absolute amount in the selected direction. Missing scores do not advance the patience count, and a non-finite objective validation loss is an error. The patience count and its policy are stored in the checkpoint metadata, so resuming with the same policy continues the same count. Resuming with a changed policy is refused. Stopping writes a final full checkpoint and reports "Stopped: validation plateau", and the checkpoint's control metadata records the reason. Nothing is added to `TrainState`.
+`Plateau` stops the run after `evals` eligible evaluations without an improvement, and it counts evaluations, not training steps. An improvement must exceed `min_delta`, an absolute amount in the selected direction, as Flax's `EarlyStopping` counts it (`best - value > min_delta`), which runs the count. Missing scores do not advance the patience count, and a non-finite objective validation loss is an error. The patience count and its policy are stored in the checkpoint metadata, so resuming with the same policy continues the same count. Resuming with a changed policy is refused. Stopping writes a final full checkpoint and reports "Stopped: validation plateau", and the checkpoint's control metadata records the reason. Nothing is added to `TrainState`.
+
+`Pause(fraction)` stops the run at that fraction of its budget instead, at the whole update nearest it (or the first update whose tokens reach it), which falls between the first update and the budget's end. It writes the whole state and the data position, even where the step also ranks a best kept as weights alone, and the budget still sizes the learning-rate schedule, so the run fitted again without the pause (`stop=None`) trains on as one that never paused. Fitted again with the same pause, the run is already there and trains nothing.
 
 The readers that take a step, such as `restore` and `from_run`, also accept best selectors. `"best"` chooses the first tracker's best step, and `"best:val/clip_score"` chooses the best step of the tracker for that metric. An aggregate is named by its position, such as `"best:aggregate:0"`.
 
@@ -248,7 +250,7 @@ The planes are computed on the devices that hold the EMA. So a save holds one mo
 
 ## Post-hoc EMA
 
-You usually pick an EMA's length before training and judge it afterwards. Post-hoc EMA (Karras et al. 2024, [arXiv:2312.02696](https://arxiv.org/abs/2312.02696)) lets you pick it after training. Setting `OptimConfig.ema_profiles`, for example to `(0.05, 0.10)`, wraps the optimizer in `dew.training.optim.power_profiles`. That keeps one power-function EMA of the weights per relative standard deviation (the paper's σ_rel) in the optimizer state, so the profiles are sharded, placed and saved with that state.
+You usually pick an EMA's length before training and judge it afterwards. Post-hoc EMA (Karras et al. 2024, [arXiv:2312.02696](https://arxiv.org/abs/2312.02696)) lets you pick it after training. Setting `OptimConfig.ema_profiles`, for example to `(0.05, 0.10)`, wraps the optimizer in `dew.optim.power_profiles`. That keeps one power-function EMA of the weights per relative standard deviation (the paper's σ_rel) in the optimizer state, so the profiles are sharded, placed and saved with that state.
 
 A snapshot is the ordinary checkpoint itself, which Orbax's public preservation policy keeps even after `keep` would prune it. The state and the averages go into one atomic save, so an interrupted save cannot publish a state without its profiles.
 
@@ -261,7 +263,7 @@ averaged = checkpoints.posthoc_ema(0.07)               # at the latest snapshot
 averaged = checkpoints.posthoc_ema(0.07, step=40000)
 ```
 
-`posthoc_ema` returns the `params` collection as host arrays, in the weights' structure and dtypes. It reads one snapshot at a time and weights every snapshot up to the step by the least-squares solve of the paper's Algorithm 3 (`dew.training.posthoc.coefficients`). On the paper's setting, those weights match NVlabs' `phema.py` to the last bit.
+`posthoc_ema` returns the `params` collection as host arrays, in the weights' structure and dtypes. It reads one snapshot at a time and weights every snapshot up to the step by the least-squares solve of the paper's Algorithm 3 (`dew.averaging.coefficients`). On the paper's setting, those weights match NVlabs' `phema.py` to the last bit.
 
 The accuracy depends on how many snapshots there are. In a 96-step CPU run tracking 0.05 and 0.10, I rebuilt an average of 0.07 and compared it with one tracked directly, on weights of scale 2. From snapshots every 4 steps the two differed by at most 1.2e-7, from every 8 steps by 4.8e-7, and from every 16 steps by 5.7e-6. For comparison, the tracked 0.05 average was 1.3e-4 from the directly tracked 0.07.
 
@@ -304,6 +306,34 @@ A persistent checkpoint can restore into a different, compatible placement throu
 
 Local checkpoints hold only the shards each process had, so they restore onto the placement they were written with. See [Training data](../concepts/data.md) for how datasets save their position.
 
+## Evaluating a run as it trains
+
+A process beside the one that trains, such as an evaluation worker on another GPU, reads the run's checkpoints as they commit. `Checkpoints.committed()` lists the committed steps at each call, reading the store without opening it or writing to it, so a save still in flight is listed only once it commits. `kept()` is the training process's own view, its retained steps and their metadata. The worker opens the run's directory, evaluates each step it has not seen, and waits for the next:
+
+<!-- not run: a worker's loop over a run another process trains; its directory, template and evaluation are the run's -->
+```python
+import time
+
+from dew.checkpoints import Checkpoints
+
+checkpoints = Checkpoints(run_directory)
+seen = set()
+while True:
+    # Read before listing, so the last listing holds the final checkpoint the run committed.
+    done = finished(run_directory)
+    for step in checkpoints.committed():
+        if step in seen:
+            continue
+        state, _ = checkpoints.restore(template, step=step)
+        report(step, evaluate(state))
+        seen.add(step)
+    if done:
+        break
+    time.sleep(60)
+```
+
+A committed step can still be removed by the run's retention (`keep`) before the worker reads it. A worker that must read every step gives the run a retention that keeps them, such as `Keep(every=...)` at the evaluation cadence.
+
 ## Reading a checkpoint with Orbax alone
 
 A step directory is an ordinary Orbax checkpoint of one PyTree item, so Orbax opens it without Dew:
@@ -318,7 +348,7 @@ tree = manager.restore(step, args=ocp.args.PyTreeRestore())
 custom = manager.metadata(step).custom_metadata
 ```
 
-`tree` holds, by name, the train-state fields a checkpoint persists (`dew.training.state.CHECKPOINTED`) and, when the data iterator reported one, `position`; Orbax returns `key` as a typed PRNG key. Two things in it are Dew's encodings, each named in `custom`:
+`tree` holds, by name, the train-state fields a checkpoint persists (`dew.state.CHECKPOINTED`) and, when the data iterator reported one, `position`; Orbax returns `key` as a typed PRNG key. Two things in it are Dew's encodings, each named in `custom`:
 
 - An EMA leaf whose path `custom["ema_deltas"]` lists holds byte planes (above): the average's bits are its weight's bits XOR the planes' bytes, plane `k` shifted left by `8 * k`, read as unsigned integers of the weight's width.
 - A collection of the variables or the EMA other than `params` lives in the run's `frozen/` store, one Orbax PyTree checkpoint per content digest; `custom["frozen"]` maps each tree's collection names to their digests, and `ocp.PyTreeCheckpointer().restore(directory / "frozen" / digest)` reads one.
@@ -335,7 +365,7 @@ The first time a pool uses `Checkpoints`, process 0 writes a file into the direc
 
 ## What a checkpoint does not save
 
-`Checkpoints` does not write `run.json`. `RunConfig.train` and `RunConfig.save` write the run configuration separately, as the run's class and its fields. `RunConfig.load` builds the run as the class its record names. A field the record lacks takes its default, which matches how runs behaved before the field existed. The model and the objective also record the defaults their classes gave them, so a default changed since the run was written does not change what the record builds. `load` refuses a field it does not know, such as one a newer Dew wrote. A checkpoint also does not save source code, package versions, tokenizer files, the dataset revision, or the state of any external service, so record those in the experiment metadata.
+`RunConfig.train` and `RunConfig.save` write the run configuration, `run.json`, as the run's class and its fields. A run that `Trainer.fit` trains directly gets one from its first checkpoint instead, saying no record rebuilds it and why (docs/recipes.md, Python experiments). `RunConfig.load` builds the run as the class its record names. A field the record lacks takes its default, which matches how runs behaved before the field existed. The model and the objective also record the defaults their classes gave them, so a default changed since the run was written does not change what the record builds. `load` refuses a field it does not know, such as one a newer Dew wrote. A checkpoint also does not save source code, package versions, tokenizer files, the dataset revision, or the state of any external service, so record those in the experiment metadata.
 
 ## Limits
 

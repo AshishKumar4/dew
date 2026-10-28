@@ -9,13 +9,15 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import FlaxFeedForward, GroupNorm, LayerNorm, NormalAttention
+from dew.nn.attention import BasicTransformerBlock, GroupNorm
 from dew.nn.blocks import ResidualBlock, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, projection_flops
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general
 
+from .decoder_stack import pipelined_blocks, pipelines
+from .joint import embedding, embedding_flops
 from .spatial import SpatialCount, SpatialForward, SpatialShape
 
 if TYPE_CHECKING:
@@ -39,70 +41,18 @@ class UNetStage:
     cross_only: bool = False
 
 
-class _TimeMLP(nn.Module):
-    """Project a time embedding through two dense layers with a silu between."""
-
-    features: int
-    dtype: Dtype
-    precision: PrecisionLike = None
-
-    @nn.nowrap
-    def model_flops(self, lengths, input_features: int) -> float:
-        return projection_flops(lengths, input_features + self.features, self.features)
-
-    @nn.compact
-    def __call__(self, x):
-        x = Dense(self.features, dtype=self.dtype, precision=self.precision, name="in_proj")(x)
-        return Dense(self.features, dtype=self.dtype, precision=self.precision, name="out_proj")(
-            nn.silu(x)
-        )
-
-
-class _Transformer(nn.Module):
-    """Run one transformer block: self-attention, cross-attention, feed-forward.
-
-    Each sublayer is pre-normed and added back as a residual. Under
-    `stage.cross_only` the first attention reads `context` too, which is
-    what the SD checkpoints with no self-attention hold.
-    """
-
-    stage: UNetStage
-    dropout: float
-    dtype: Dtype
-    precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
-    approximate_gelu: bool = True
-
-    @nn.compact
-    def __call__(self, x, context, *, train=False):
-        def norm(name):
-            return LayerNorm(epsilon=1e-5, dtype=self.dtype, name=name)
-        def attention(name, x, context):
-            # The SD checkpoints hold no query, key or value bias.
-            attended = NormalAttention(
-                self.stage.features, self.stage.heads, self.stage.features // self.stage.heads, self.dtype,
-                self.precision, qkv_bias=False, attention_impl=self.attention_impl, name=name)(x, context)
-            return nn.Dropout(self.dropout)(attended, deterministic=not train) if self.dropout else attended
-
-        x = x + attention("self_attention", norm("self_norm")(x), context if self.stage.cross_only else None)
-        x = x + attention("cross_attention", norm("cross_norm")(x), context)
-        x = x + FlaxFeedForward(self.stage.features, dtype=self.dtype, precision=self.precision,
-                               dropout=self.dropout, approximate_gelu=self.approximate_gelu,
-                               name="feed_forward")(norm("ff_norm")(x), train=train)
-        return nn.Dropout(self.dropout)(x, deterministic=not train) if self.dropout else x
-
-
 class _SpatialAttention(nn.Module):
     """Flatten an image to tokens, run `stage.depth` transformers, fold it back.
 
     A group norm and a residual wrap the whole block. `linear_projection`
     picks the projection into and out of the token width, a dense layer or a
     1x1 convolution; SD1/2 store the convolution and SDXL the dense layer.
+    Nothing in it drops: diffusers' conditional UNet builds its transformers
+    without the model's dropout, which only its residual blocks take.
     """
 
     stage: UNetStage
     linear_projection: bool
-    dropout: float
     dtype: Dtype
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
@@ -114,36 +64,53 @@ class _SpatialAttention(nn.Module):
     def cross_flops(self, lengths, context_lengths, text_features: int) -> float:
         """Spatial input/output maps and every configured transformer sublayer."""
         width = self.stage.features
-        attention = NormalAttention(width, self.stage.heads, width // self.stage.heads, parent=None)
-        crossed = attention.cross_flops(lengths, context_lengths, text_features)
-        first = crossed if self.stage.cross_only else attention.model_flops(lengths)
-        feedforward = FlaxFeedForward(width, parent=None).model_flops(lengths)
+        first = "context" if self.stage.cross_only else "self"
+        heads = self.stage.heads
+        block = BasicTransformerBlock(width, heads, width // heads, first_attention=first, parent=None)
         return (2 * projection_flops(lengths, width, width)
-                + self.stage.depth * (first + crossed + feedforward))
+                + self.stage.depth * block.cross_flops(lengths, context_lengths, text_features))
 
     @nn.compact
-    def __call__(self, x, context, *, train=False):
+    def __call__(self, x, context):
         residual = x
         x = GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype, name="norm")(x)
         batch, height, width, channels = x.shape
         if self.linear_projection:
             x = x.reshape(batch, height * width, channels)
-            x = Dense(channels, dtype=self.dtype, precision=self.precision, name="input")(x)
+            x = Dense(channels, dtype=self.dtype, precision=self.precision, name="input",
+                      dot_general=float32_dot_general)(x)
         else:
             x = Conv(channels, (1, 1), padding="VALID", dtype=self.dtype,
                      precision=self.precision, name="input")(x).reshape(batch, height * width, channels)
-        for index in range(self.stage.depth):
-            x = _Transformer(self.stage, self.dropout, self.dtype, self.precision,
-                             self.attention_impl, approximate_gelu=self.approximate_gelu,
-                             name=f"layer_{index}")(x, context, train=train)
+        def layer(index: int) -> BasicTransformerBlock:
+            # Affine layer norms at 1e-5, no query, key or value bias, and under `stage.cross_only`
+            # a first attention that reads the text too: what the SD checkpoints hold.
+            return BasicTransformerBlock(
+                self.stage.features, self.stage.heads, self.stage.features // self.stage.heads, self.dtype,
+                self.precision, qkv_bias=False,
+                first_attention="context" if self.stage.cross_only else "self", norm="layer",
+                norm_epsilon=1e-5, approximate_gelu=self.approximate_gelu,
+                attention_impl=self.attention_impl, name=f"layer_{index}")
+
+        def run(blocks, x, context):
+            for block in blocks:
+                x = block(x, context)
+            return x
+
+        # The level's transformers are like blocks, which a stage axis that
+        # splits them runs as a pipeline; SDXL's levels of two and ten do.
+        if pipelines(self, ["transformer"] * self.stage.depth):
+            x = pipelined_blocks(self, ("layer_",), self.stage.depth, x, layer, run, rows=context)
+        else:
+            x = run([layer(index) for index in range(self.stage.depth)], x, context)
         if self.linear_projection:
-            x = Dense(channels, dtype=self.dtype, precision=self.precision, name="output")(x)
+            x = Dense(channels, dtype=self.dtype, precision=self.precision, name="output",
+                      dot_general=float32_dot_general)(x)
             x = x.reshape(batch, height, width, channels)
         else:
             x = Conv(channels, (1, 1), padding="VALID", dtype=self.dtype, precision=self.precision,
                      name="output")(x.reshape(batch, height, width, channels))
-        x = residual + x
-        return nn.Dropout(self.dropout)(x, deterministic=not train) if self.dropout else x
+        return residual + x
 
 
 class _Level(nn.Module):
@@ -201,7 +168,6 @@ class _Level(nn.Module):
                 x = operations.attention(_SpatialAttention(
                     self.stage,
                     self.linear_projection,
-                    self.dropout,
                     self.dtype,
                     self.precision,
                     self.attention_impl,
@@ -209,7 +175,7 @@ class _Level(nn.Module):
                     norm_epsilon=self.attention_norm_epsilon,
                     approximate_gelu=self.approximate_gelu,
                     name=f"attention_{index}",
-                ), x, context, train=train)
+                ), x, context)
             outputs.append(x)
         if self.resize:
             if self.direction == "up":
@@ -285,12 +251,11 @@ class UNet2DCondition(nn.Module):
         height, width, _ = sample_shape
         first = self.stages[0].features
         row = np.ones((rows,), np.int64)
-        time = _TimeMLP(self.time_features, self.dtype, parent=None)
-        count = time.model_flops(row, first)
+        count = embedding_flops(row, first, self.time_features)
         if self.additional_time_features:
             if additional_features is None:
                 raise MissingFlopsCount("UNet2DCondition needs pooled width plus sinusoidal time-id width")
-            count += time.model_flops(row, additional_features)
+            count += embedding_flops(row, additional_features, self.time_features)
         operations = SpatialCount(context_lengths, text_features)
         operations.flops = count
         self.spatial_walk(SpatialShape((rows, height, width, self.in_channels)),
@@ -315,7 +280,7 @@ class UNet2DCondition(nn.Module):
         first = self.stages[0].features
         time = sinusoidal_time(time, first, dtype=at_least_fp32(self.dtype), shift=self.frequency_shift,
                                cosine_first=self.cosine_first)
-        time = _TimeMLP(self.time_features, self.dtype, self.precision, name="time")(time)
+        time = embedding(self, time, self.time_features, "time", dtype=self.dtype, precision=self.precision)
         if self.additional_time_features:
             if conditioning.pooled is None or conditioning.time_ids is None:
                 raise ValueError("This UNet needs pooled text and size/aesthetic conditioning")
@@ -323,8 +288,8 @@ class UNet2DCondition(nn.Module):
                                   dtype=at_least_fp32(self.dtype), shift=self.frequency_shift,
                                   cosine_first=self.cosine_first)
             extra = jnp.concatenate([conditioning.pooled, ids.reshape(x.shape[0], -1)], axis=-1)
-            time = time + _TimeMLP(self.time_features, self.dtype, self.precision,
-                                   name="additional_time")(extra)
+            time = time + embedding(self, extra, self.time_features, "additional_time", dtype=self.dtype,
+                                    precision=self.precision)
         return self.spatial_walk(x, time, conditioning.context, train=train, operations=SpatialForward())
 
     @nn.nowrap
@@ -355,7 +320,6 @@ class UNet2DCondition(nn.Module):
             x = operations.attention(_SpatialAttention(
                 stage,
                 self.linear_projection,
-                self.dropout,
                 self.dtype,
                 self.precision,
                 self.attention_impl,
@@ -363,7 +327,7 @@ class UNet2DCondition(nn.Module):
                 norm_epsilon=self.attention_norm_epsilon,
                 approximate_gelu=self.approximate_gelu,
                 name="middle_attention",
-            ), x, context, train=train)
+            ), x, context)
             x = operations.residual(ResidualBlock(
                 stage.features,
                 norm_groups=self.norm_groups,

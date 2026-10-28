@@ -27,7 +27,7 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
 )
 from dew.nn.blocks import Modulation
-from dew.nn.dense import Dense
+from dew.nn.dropout import Dropout
 from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, projection_flops
 from dew.nn.mlp import GatedMLP
 from dew.nn.rope import rotate
@@ -49,7 +49,7 @@ def layer_norm(dtype, epsilon: float = 1e-6):
     return LayerNorm(epsilon=epsilon, use_scale=False, use_bias=False, dtype=dtype)
 
 
-def embedding(x, features: int, name: str, *, bias: bool = True, dtype: Dtype | None = None,
+def embedding(owner: nn.Module, x, features: int, name: str, *, bias: bool = True, dtype: Dtype | None = None,
               precision: PrecisionLike = None, activation: Callable[[jax.Array], jax.Array] = nn.silu):
     """Apply `TimestepEmbedding` or `PixArtAlphaTextProjection` to `x`.
 
@@ -57,9 +57,11 @@ def embedding(x, features: int, name: str, *, bias: bool = True, dtype: Dtype | 
     activation is SiLU, or Wan's tanh GELU. The two layers are stored flat
     as `{name}_linear_1` and `{name}_linear_2` in the calling module.
     """
-    hidden = Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=f"{name}_linear_1")(x)
-    return Dense(features, use_bias=bias, dtype=dtype, precision=precision,
-                 name=f"{name}_linear_2")(activation(hidden))
+    mlp = GatedMLP(features, features, in_features=x.shape[-1], activation=activation, use_bias=bias,
+                    names=(f"{name}_linear_1", f"{name}_linear_2"), dtype=dtype, precision=precision,
+                    name=name)
+    nn.share_scope(owner, mlp)
+    return mlp(x)
 
 
 def embedding_axes(*names: str) -> dict[tuple[str, ...], tuple[str | None, ...]]:
@@ -100,7 +102,8 @@ class TextStream:
 
 def embedding_flops(lengths, input_features: int, features: int) -> float:
     """The two maps that `embedding` builds around its activation."""
-    return projection_flops(lengths, input_features, features) + projection_flops(lengths, features, features)
+    return GatedMLP(features, features, in_features=input_features, activation=nn.silu,
+                    parent=None).model_flops(lengths)
 
 
 def guided_time(embed: Callable[[jax.Array, str], jax.Array], time, guidance, *, guidance_embeds: bool):
@@ -350,7 +353,7 @@ class DoubleStreamBlock(nn.Module):
         # zero-initialized one emits shift, scale and then the gates.
         context_scale, context_shift = context_mods[:2] if self.context_pre_only else context_mods[1::-1]
         norm = layer_norm(self.dtype, self.epsilon)
-        dropout = nn.Dropout(self.dropout_rate, deterministic=not train)
+        dropout = Dropout(self.dropout_rate, deterministic=not train)
         normalized = norm(image)
         attention = self._attention("attn", context_out=not self.context_pre_only)
         context_input = modulate(norm(context), context_shift, context_scale)

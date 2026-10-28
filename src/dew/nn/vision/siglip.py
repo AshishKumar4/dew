@@ -9,87 +9,36 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
-from dew.interop.weights import checkpoint_array
-from dew.nn.attention import LayerNorm, RMSNorm
-from dew.nn.conv import Conv
+from dew import _records
+from dew.batch import Variables
+from dew.interop.unread import Stored, held
+from dew.interop.weights import checkpoint_array, in_params
+from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
-from dew.nn.text_encoders import (
-    TOWER_ACTIVATIONS,
-    _encoder_layer_path,
-    checked_image,
-    clip_layer,
-    tower_activation,
-)
-from dew.objectives.base import Variables
+from dew.nn.precision import float32_dot_general
+from dew.nn.text_encoders import TOWER_ACTIVATIONS, _encoder_layer_path, tower_activation
 from dew.registry import Record
 
 from .common import (
-    _PROJECTOR_PATHS,
     ProjectorBase,
+    ProjectorLayout,
     TowerBase,
     TowerGeometry,
+    TowerLayout,
     _side,
     _vision_section,
     activation_name,
     head_width,
     trunk_geometry,
 )
+from .vit import LearnedPositions, VisionTransformer, ViTLayout
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
-
-
-class SiglipVisionTransformer(nn.Module):
-    """The SigLIP vision trunk, param layout of `SiglipVisionConfig`.
-
-    `pixel_values` are what the checkpoint's image processor emits: [B, C, H,
-    W] at `image_size`, normalized. The sequence returned is the encoder
-    output through the post norm. The attention pooling head some SigLIP
-    checkpoints carry is not built; the Gemma path reads the sequence alone.
-    """
-
-    config: SiglipVision
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        cfg = self.config
-        head_width(cfg.hidden_size, cfg.num_heads)
-        patches = (cfg.image_size // cfg.patch_size) ** 2
-        # torch Conv2d carries a bias unless told otherwise; the CLIP tower's
-        # convolution is the bias-free exception, not the rule.
-        self.patch_embedding = Conv(
-            cfg.hidden_size, (cfg.patch_size, cfg.patch_size),
-            strides=(cfg.patch_size, cfg.patch_size), padding="VALID",
-            use_bias=True, dtype=self.dtype, precision=self.precision,
-            name="patch_embedding")
-        self.position_embedding = nn.Embed(patches, cfg.hidden_size,
-                                           dtype=self.dtype, name="position_embedding")
-        self.layers = [
-            clip_layer(cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, patches,
-                       activation=tower_activation(cfg.hidden_act), eps=cfg.layer_norm_eps, dtype=self.dtype,
-                       precision=self.precision, name=f"layers_{index}")
-            for index in range(cfg.num_layers)]
-        self.post_layernorm = LayerNorm(
-            epsilon=cfg.layer_norm_eps, dtype=self.dtype, name="post_layernorm")
-
-    def __call__(self, pixel_values) -> jax.Array:
-        cfg = self.config
-        pixel_values = checked_image(pixel_values, cfg.num_channels, cfg.image_size)
-        batch = pixel_values.shape[0]
-        patches = self.patch_embedding(jnp.transpose(pixel_values, (0, 2, 3, 1)))
-        hidden_states = patches.reshape(batch, -1, cfg.hidden_size)
-        hidden_states = hidden_states + self.position_embedding(
-            jnp.arange(hidden_states.shape[1]))
-        for layer in self.layers:
-            hidden_states = layer(hidden_states)
-        return self.post_layernorm(hidden_states)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -106,15 +55,28 @@ class SiglipVision(TowerBase):
     hidden_act: str = "gelu_pytorch_tanh"
     layer_norm_eps: float = 1e-6
 
+    def layout(self) -> ViTLayout:
+        return ViTLayout(
+            depth=self.num_layers, hidden_size=self.hidden_size, num_heads=self.num_heads,
+            num_kv_heads=self.num_heads, head_dim=head_width(self.hidden_size, self.num_heads),
+            intermediate_size=self.intermediate_size, activation=tower_activation(self.hidden_act),
+            in_channels=self.num_channels, patch_size=self.patch_size, temporal_patch_size=1,
+            spatial_merge_size=1, norm_type="fast_layer", norm_eps=self.layer_norm_eps, norm_bias=True,
+            mlp_bias=True, packed=False, patch_bias=True, attention=("full",) * self.num_layers,
+            order=("patches",) * self.num_layers, sinks=(False,) * self.num_layers,
+            positions=LearnedPositions(self.image_size // self.patch_size, "fixed"),
+            patch_projection="conv", image_size=self.image_size, rotary=None, post_norm="layer",
+            outer_norm_eps=self.layer_norm_eps, merge_blocks=False)
+
     def build(self) -> nn.Module:
-        return SiglipVisionTransformer(self)
+        return VisionTransformer(self.layout())
 
     def geometry(self) -> TowerGeometry:
         return TowerGeometry(image_size=self.image_size, patch_size=self.patch_size,
                              channels=self.num_channels)
 
 
-class GemmaProjectorModule(nn.Module):
+class GemmaProjector(ProjectorBase):
     """Patch features into soft tokens: block average, norm, map to text width.
 
     The reference reshapes the trunk sequence into its patch grid, averages
@@ -139,7 +101,7 @@ class GemmaProjectorModule(nn.Module):
             name="mm_soft_emb_norm")
         self.mm_input_projection = Dense(
             self.text_width, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name="mm_input_projection")
+            precision=self.precision, name="mm_input_projection", dot_general=float32_dot_general)
 
     def __call__(self, vision_outputs) -> jax.Array:
         batch, length, width = vision_outputs.shape
@@ -155,28 +117,12 @@ class GemmaProjectorModule(nn.Module):
             self.mm_soft_emb_norm(pooled.reshape(batch, tokens * tokens, width)))
 
 
-@dataclasses.dataclass(frozen=True)
-class GemmaProjector(ProjectorBase):
-    """Gemma's projector fields: the decoder width and the patch grid pooled
-    into the soft-token grid."""
-
-    text_width: int
-    patches_per_side: int
-    tokens_per_side: int
-    norm_eps: float = 1e-6
-
-    def build(self) -> nn.Module:
-        return GemmaProjectorModule(
-            text_width=self.text_width, patches_per_side=self.patches_per_side,
-            tokens_per_side=self.tokens_per_side, norm_eps=self.norm_eps)
-
-
 _SIGLIP_TENSORS = {
-    "embeddings.patch_embedding.weight": ("patch_embedding", "kernel"),
-    "embeddings.patch_embedding.bias": ("patch_embedding", "bias"),
-    "embeddings.position_embedding.weight": ("position_embedding", "embedding"),
-    "post_layernorm.weight": ("post_layernorm", "scale"),
-    "post_layernorm.bias": ("post_layernorm", "bias"),
+    "embeddings.patch_embedding.weight": ("patch_embed", "kernel"),
+    "embeddings.patch_embedding.bias": ("patch_embed", "bias"),
+    "embeddings.position_embedding.weight": ("position_table", "embedding"),
+    "post_layernorm.weight": ("post_norm", "scale"),
+    "post_layernorm.bias": ("post_norm", "bias"),
 }
 
 
@@ -189,14 +135,21 @@ def siglip_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """
     if hf_name == "embeddings.position_ids" or hf_name.split(".")[0] == "head":
         return None
-    path = _SIGLIP_TENSORS.get(hf_name) or _encoder_layer_path(hf_name.split("."), "encoder")
+    path = _SIGLIP_TENSORS.get(hf_name) or _encoder_layer_path(hf_name.split("."), "encoder", block="blocks")
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path
 
 
+GEMMA_PROJECTOR_TENSORS = {
+    "mm_soft_emb_norm.weight": ("mm_soft_emb_norm", "scale"),
+    "mm_input_projection_weight": ("mm_input_projection", "kernel"),
+}
+"""The Gemma 3 projector's tensors past `multi_modal_projector.`, each to its leaf."""
+
+
 def translate_gemma_projector_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+    hf_tensors: Mapping[str, Stored], *, param_dtype: str = "float32"
 ) -> tuple[Variables, tuple[WeightLayout, ...]]:
     """A Gemma projector's two tensors into its parameter tree, with the layouts that write them
     back.
@@ -207,12 +160,12 @@ def translate_gemma_projector_weights(
     """
     from dew.interop.streaming import WeightLayout
 
-    known = set(_PROJECTOR_PATHS["gemma"])
+    known = set(GEMMA_PROJECTOR_TENSORS)
     unknown = sorted(set(hf_tensors) - known)
     if unknown:
         raise ValueError(f"unknown tensor names {unknown}")
-    paths = _PROJECTOR_PATHS["gemma"]
-    return ({module: {leaf: np.ascontiguousarray(checkpoint_array(hf_tensors[name], param_dtype))}
+    paths = GEMMA_PROJECTOR_TENSORS
+    return ({module: {leaf: held(checkpoint_array(hf_tensors[name], param_dtype), contiguous=True)}
              for name, (module, leaf) in paths.items()},
             tuple(WeightLayout(name, (path,), tuple(np.shape(hf_tensors[name])))
                   for name, path in paths.items()))
@@ -232,10 +185,10 @@ def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Record:
         **trunk_geometry(vision),
         "image_size": _side(vision.get("image_size", 224), "image_size"),
         "patch_size": _side(vision.get("patch_size", 16), "patch_size"),
-        "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
+        "num_channels": _records.integer(vision.get("num_channels", 3), "num_channels"),
         "hidden_act": activation_name(vision, TOWER_ACTIVATIONS, "gelu_pytorch_tanh",
                                       ("hidden_act", "hidden_activation")),
-        "layer_norm_eps": records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
+        "layer_norm_eps": _records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
     }}
 
 
@@ -251,7 +204,7 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
         raise ValueError(
             f"mm_tokens_per_image ({mm_tokens_per_image}) is not a square, this "
             "projector pools a grid into a grid")
-    patches = records.integer(vision["image_size"], "image_size") // records.integer(
+    patches = _records.integer(vision["image_size"], "image_size") // _records.integer(
         vision["patch_size"], "patch_size"
     )
     if patches % side:
@@ -262,5 +215,10 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
         "text_width": int(text_width),
         "patches_per_side": patches,
         "tokens_per_side": side,
-        "norm_eps": records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
+        "norm_eps": _records.number(vision.get("layer_norm_eps", 1e-6), "layer_norm_eps"),
     }}
+
+
+SiglipVision.checkpoint = TowerLayout("vision_tower.", in_params(siglip_vision_path))
+GemmaProjector.checkpoint = ProjectorLayout("multi_modal_projector.", GEMMA_PROJECTOR_TENSORS,
+                                            read=translate_gemma_projector_weights)

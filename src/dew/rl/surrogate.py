@@ -39,7 +39,7 @@ import math
 import jax
 import jax.numpy as jnp
 
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, weighted_total
 from dew.rl.advantage import MEAN_EPS, masked_mean
 
 LOG_RATIO_CLAMP = 20.0
@@ -237,7 +237,14 @@ def k3_kl(log_probs: jax.Array, ref_log_probs: jax.Array) -> jax.Array:
     work = at_least_fp32(log_probs.dtype)
     diff = jnp.asarray(ref_log_probs, work) - log_probs.astype(work)
     diff = jnp.clip(diff, -KL_DIFF_CLAMP, KL_DIFF_CLAMP)
-    return jnp.clip(jnp.exp(diff) - diff - 1, -KL_CLAMP, KL_CLAMP)
+    return jnp.clip(sampled_kl(diff), -KL_CLAMP, KL_CLAMP)
+
+
+def sampled_kl(log_ratio: jax.Array) -> jax.Array:
+    """Schulman's k3 estimate of a KL divergence from each sample's log ratio `r`, `exp(r) - r - 1`,
+    computed as `expm1(r) - r`: where `r` is small, `exp(r) - 1` rounds away the terms the estimate
+    is made of (its `r**2 / 2`), and `expm1` keeps them."""
+    return jnp.expm1(log_ratio) - log_ratio
 
 
 def preference_logsigmoid_terms(policy_chosen: jax.Array, policy_rejected: jax.Array,
@@ -253,10 +260,10 @@ def preference_logsigmoid_terms(policy_chosen: jax.Array, policy_rejected: jax.A
     `beta` times its log-ratio. The masks come already shifted, with one
     value per scored token.
     """
-    chosen = (jnp.sum(policy_chosen * mask_chosen, axis=-1)
-              - jnp.sum(ref_chosen * mask_chosen, axis=-1))
-    rejected = (jnp.sum(policy_rejected * mask_rejected, axis=-1)
-                - jnp.sum(ref_rejected * mask_rejected, axis=-1))
+    chosen = (weighted_total(policy_chosen, mask_chosen, axis=-1)[0]
+              - weighted_total(ref_chosen, mask_chosen, axis=-1)[0])
+    rejected = (weighted_total(policy_rejected, mask_rejected, axis=-1)[0]
+                - weighted_total(ref_rejected, mask_rejected, axis=-1)[0])
     terms = -jax.nn.log_sigmoid(beta * (chosen - rejected))
     return terms, (beta * chosen, beta * rejected)
 
@@ -340,7 +347,7 @@ def mismatch_metrics(proximal_log_probs: jax.Array, behavior_log_probs: jax.Arra
     normalized = weights / (masked_mean(weights, keep) + MEAN_EPS)
     spread = masked_mean(jnp.square(normalized), keep)
     return {"kl": masked_mean(behavior - proximal, keep),
-            "k3_kl": masked_mean(jnp.exp(log_ratio) - log_ratio - 1, keep),
+            "k3_kl": masked_mean(sampled_kl(log_ratio), keep),
             "ess": jnp.where(spread > 0, 1.0 / jnp.where(spread > 0, spread, 1.0), 0.0)}
 
 

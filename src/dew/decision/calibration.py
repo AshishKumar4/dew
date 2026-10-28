@@ -10,6 +10,9 @@ bucket: a question type and its option count, as `bucket` names it.
   held-out answers in its histogram bin.
 - `Abstention` sets each bucket's lowest confidence an answer needs, where
   the held-out answers at or above it err at most a target rate.
+
+Each fits by the general math of a forecast's calibration (`dew.eval.calibration`); this module holds
+decision's policy of which answers calibrate together.
 """
 
 from collections.abc import Mapping, Sequence
@@ -18,6 +21,13 @@ from dataclasses import dataclass, field, replace
 import numpy as np
 
 from dew.decision.questions import Question
+from dew.eval.calibration import (
+    abstention_threshold,
+    fit_temperature,
+    histogram_map,
+    histogram_mapped,
+    softmax,
+)
 
 
 def bucket(question: Question) -> str:
@@ -56,10 +66,9 @@ class Scored:
         return _bucket(self.kind, len(self.logits))
 
 
-def softmax(logits: np.ndarray, temperature: float) -> np.ndarray:
-    scaled = np.asarray(logits, np.float64) / temperature
-    shifted = np.exp(scaled - scaled.max())
-    return shifted / shifted.sum()
+TYPE_MINIMUM, BUCKET_MINIMUM = 10, 2000
+"""The answers a question type's and a bucket's temperatures need to be fitted: Laya's minimums
+(laya/calibrate.py MIN_TYPE_N and MIN_BUCKET_N)."""
 
 
 @dataclass(frozen=True)
@@ -95,14 +104,17 @@ class Temperatures:
         return min(self.highest, max(self.lowest, value))
 
     @classmethod
-    def fit(cls, scored: Sequence[Scored], *, type_minimum: int = 10, bucket_minimum: int = 2000,
-            lowest: float = 0.5, highest: float = 5.0) -> "Temperatures":
+    def fit(cls, scored: Sequence[Scored], *, type_minimum: int = TYPE_MINIMUM,
+            bucket_minimum: int = BUCKET_MINIMUM, lowest: float | None = None,
+            highest: float | None = None) -> "Temperatures":
         """Return the temperatures that minimize held-out log loss.
 
         There is one per question type with at least `type_minimum` answers, and one
-        per bucket with at least `bucket_minimum`; these are Laya's minimums
-        (laya/calibrate.py MIN_TYPE_N and MIN_BUCKET_N).
+        per bucket with at least `bucket_minimum` (`TYPE_MINIMUM`, `BUCKET_MINIMUM`), each held
+        within [`lowest`, `highest`], the class's own bounds where not given.
         """
+        lowest = cls.lowest if lowest is None else lowest
+        highest = cls.highest if highest is None else highest
         def fitted(group: list[Scored], minimum: int) -> float | None:
             return None if len(group) < minimum else _temperature(group)
 
@@ -115,37 +127,18 @@ class Temperatures:
 
 
 def _temperature(group: Sequence[Scored]) -> float:
-    """The temperature minimizing mean log loss against the gold distributions
-    over `group`, by Newton's method on its inverse, in which the loss is
-    convex: its first derivative is the mean over answers of
-    E_p[z] - E_gold[z] and its second the mean of Var_p[z]. Each gold is
-    read as a distribution, to unit mass, as `Example.distribution` reads a
-    target: a batch packs it in float32, a little short of unit mass, and the
-    shortfall would scale with the logits' common offset. Rows of fewer
-    options pad with logits that take no mass."""
+    """The temperature minimizing mean log loss against the gold distributions over `group`
+    (`fit_temperature`), each gold read as a distribution, as `Example.distribution` reads a target.
+    Rows of fewer options pad with logits that take no mass."""
     width = max(len(held.logits) for held in group)
     z = np.zeros((len(group), width))
     gold = np.zeros((len(group), width))
     real = np.zeros((len(group), width), bool)
     for row, held in enumerate(group):
         z[row, :len(held.logits)] = held.logits
-        target = np.asarray(held.target, np.float64)
-        gold[row, :len(target)] = target / np.sum(target)
+        gold[row, :len(held.target)] = held.target
         real[row, :len(held.logits)] = True
-    labelled = np.sum(gold * z, axis=1)
-    inverse = 1.0
-    for _ in range(100):
-        scaled = np.where(real, z * inverse, -np.inf)
-        p = np.exp(scaled - scaled.max(axis=1, keepdims=True))
-        p /= p.sum(axis=1, keepdims=True)
-        mean = np.sum(p * z, axis=1)
-        slope = float(np.mean(mean - labelled))
-        curvature = float(np.mean(np.sum(p * (z - mean[:, None]) ** 2, axis=1)))
-        step = slope / max(curvature, 1e-12)
-        inverse = max(inverse - step, 1e-3)
-        if abs(step) < 1e-10 * inverse:
-            break
-    return 1.0 / inverse
+    return fit_temperature(z, gold, real)
 
 
 @dataclass(frozen=True)
@@ -161,9 +154,7 @@ class Binning:
 
     def apply(self, kind: str, count: int, top: float) -> float:
         values = self.maps.get(_bucket(kind, count))
-        if values is None:
-            return top
-        return values[min(len(values) - 1, max(0, int(top * len(values))))]
+        return top if values is None else histogram_mapped(values, top)
 
     @classmethod
     def fit(cls, scored: Sequence[Scored], temperatures: Temperatures, *, bins: int = 15,
@@ -177,10 +168,7 @@ class Binning:
             group = [held for held in scored if held.bucket == name]
             if len(group) < bucket_minimum:
                 continue
-            tops, correct = _tops(group, temperatures)
-            index = np.clip((tops * bins).astype(int), 0, bins - 1)
-            maps[name] = tuple(float(correct[index == b].mean()) if np.any(index == b) else (b + 0.5) / bins
-                               for b in range(bins))
+            maps[name] = histogram_map(*_tops(group, temperatures), bins)
         return cls(maps)
 
 
@@ -213,24 +201,9 @@ class Abstention:
             group = [held for held in scored if held.bucket == name]
             if len(group) < bucket_minimum:
                 continue
-            tops, correct = _tops(group, temperatures, binning)
-            levels, accepted, right = tied_prefixes(np.round(tops, 4), correct)
-            errors = accepted - right
-            rate = (errors + 1) / (accepted + 1) if conservative else errors / accepted
-            met = rate <= target_error
-            thresholds[name] = float(levels[met].min()) if met.any() else 1.0
+            thresholds[name] = abstention_threshold(*_tops(group, temperatures, binning),
+                                                    target_error=target_error, conservative=conservative)
         return cls(thresholds)
-
-
-def tied_prefixes(confidence: np.ndarray, correct: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Each distinct `confidence`, highest first, with how many answers are at or
-    above it and how many of those are `correct`: a group of tied answers
-    counts as a whole, in any order. Abstention's thresholds and AURC's curve
-    read their accepted answers off these."""
-    order = np.argsort(-confidence, kind="mergesort")
-    confidence, correct = confidence[order], correct[order]
-    last = np.flatnonzero(np.concatenate((confidence[1:] != confidence[:-1], [True])))
-    return confidence[last], last + 1, np.cumsum(correct)[last]
 
 
 def _tops(group: Sequence[Scored], temperatures: Temperatures,

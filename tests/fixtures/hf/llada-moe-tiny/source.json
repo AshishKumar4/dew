@@ -1,0 +1,31 @@
+{
+ "released": {
+  "repo": "inclusionAI/LLaDA-MoE-7B-A1B-Base",
+  "revision": "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf",
+  "files": [
+   "config.json",
+   "configuration_lladamoe.py",
+   "modeling_lladamoe.py",
+   "tokenizer.json"
+  ]
+ },
+ "instruct": {
+  "repo": "inclusionAI/LLaDA-MoE-7B-A1B-Instruct",
+  "revision": "783d3467f108d28ac0a78d3e41af16ab05cabd8d",
+  "same_config_and_modeling": true
+ },
+ "transformers": {
+  "version": "4.57.1"
+ },
+ "torch": {
+  "version": "2.9.0+cpu"
+ },
+ "generator": "tools/llada_moe_reference.py llada-moe-tiny --draw",
+ "seed": 0,
+ "changes": "Small geometry, a dense middle layer and nonzero expert_bias exercise the supported routing branches. The release fixes norm_topk_prob=False and does not apply routed_scaling_factor.",
+ "recording": {
+  "file": "released.npz",
+  "by": "tools/recorded_references.py record_case, summary",
+  "torch": "2.14.1+cpu"
+ }
+}

@@ -2,3 +2,6 @@ checkpoint filter=lfs diff=lfs merge=lfs -text
 
 # The notebooks are tutorials, not the codebase; keep them out of the language statistics.
 *.ipynb linguist-documentation
+
+# Each lane adds its own entries to the changelog and edits no other's: a merge keeps both sides' lines.
+CHANGELOG.md merge=union

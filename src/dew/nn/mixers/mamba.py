@@ -39,27 +39,21 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.mesh import LayoutRefused
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
-from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import LayoutRefused, logical_axes, rows_like, sequence_shards
+from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum, float32_products
+from dew.nn.sharding import logical_axes, rows_like, sequence_shards
+from dew.nn.ssm import affine_spans
 
 CHUNK_SIZE = 64
 """Tokens per associative scan. Each chunk materialises its `[B, C, D, N]`
 decays and writes, so the chunk bounds the scan's memory; the output does
 not depend on it."""
-
-
-def _combine(left, right):
-    """Two consecutive spans of the recurrence as one, the reference's
-    `combine_fn` (modeling_mamba.py:231-234)."""
-    decay_left, write_left = left
-    decay_right, write_right = right
-    return decay_left * decay_right, decay_right * write_left + write_right
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int = CHUNK_SIZE):
@@ -80,8 +74,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     pad = (chunk_size - length % chunk_size) % chunk_size
 
     def chunks(t):  # [B, S, ...] -> [NC, B, C, ...], chunks leading for the scan
-        t = jnp.pad(t, ((0, 0), (0, pad), *[(0, 0)] * (t.ndim - 2)))
-        return jnp.moveaxis(t.reshape(batch, (length + pad) // chunk_size, chunk_size, *t.shape[2:]), 1, 0)
+        return sequence_blocks(t, chunk_size, leading=True)
 
     # A padded step is dt 0, which neither decays nor writes, and no reset.
     resets = jnp.zeros((batch, length), jnp.bool_) if starts is None else jnp.asarray(starts, jnp.bool_)
@@ -91,9 +84,11 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         decay = jnp.exp(dt_c[..., None] * A)                # [B, C, D, N]
         decay = jnp.where(reset_c[..., None, None], 0.0, decay)
         write = (dt_c * x_c)[..., None] * B_c[:, :, None, :]
-        decays, writes = jax.lax.associative_scan(_combine, (decay, write), axis=1)
+        # The reference's `combine_fn` (modeling_mamba.py:231-234).
+        decays, writes = jax.lax.associative_scan(affine_spans, (decay, write), axis=1)
         states = decays * h[:, None] + writes
-        return states[:, -1], jnp.einsum('bcdn,bcn->bcd', states, C_c)
+        read = float32_einsum('bcdn,bcn->bcd', states, C_c)
+        return states[:, -1], read
 
     final, out = jax.lax.scan(one_chunk, carried, tuple(chunks(t) for t in (x, dt, B, C, resets)))
     out = jnp.moveaxis(out, 0, 1).reshape(batch, length + pad, channels)[:, :length] + x * D
@@ -158,7 +153,8 @@ class Mamba(nn.Module):
     def setup(self):
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
-        dense = functools.partial(Dense, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(Dense, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         self.in_proj = dense(2 * self.intermediate_size, use_bias=self.use_bias, name='in_proj',
                              **normal_kernel(self.init_std))
         self.conv1d = DepthwiseConv1d(features=self.intermediate_size, kernel=self.conv_kernel,
@@ -243,7 +239,8 @@ class _StepProjection(nn.Module):
             (self.rank, self.features))
         bias = self.param('bias', inverse_softplus_step, (self.features,))
         dtype = self.dtype if self.dtype is not None else raw.dtype
-        widened = jnp.matmul(raw.astype(dtype), kernel.astype(dtype), precision=self.precision)
+        product = functools.partial(jnp.matmul, precision=float32_products(dtype, self.precision))
+        widened = accumulated(product, raw.astype(dtype), kernel.astype(dtype))
         wide = at_least_fp32(widened.dtype)
         return nn.softplus(widened.astype(wide) + bias.astype(wide))
 
@@ -273,7 +270,7 @@ class MambaMixer(MixerBase):
     SSM has no keys to cache or positions to rotate.
     """
 
-    residuals = ('context', 'conv')
+    residuals = ('context', 'scan', 'conv')
 
     intermediate_size: int = 1536
     state_size: int = 16

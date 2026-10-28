@@ -1,22 +1,20 @@
 import functools
 from collections.abc import Sequence
-from typing import Literal
+from typing import ClassVar, Literal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.mesh import LayoutRefused
+
 from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
 from ..flops import MissingFlopsCount, counted_flops, patch_lengths
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
-
-
-def gather_tokens(tokens: jax.Array, kept: jax.Array) -> jax.Array:
-    """The `[B, K, F]` tokens at the `[B, K]` indices `kept`: TREAD's
-    `Router.start_route`."""
-    return jnp.take_along_axis(tokens, kept[..., None], axis=1)
+from ..scatter import gather_positions
+from .decoder_stack import pipelined_blocks, pipelines
 
 
 def scatter_tokens(held: jax.Array, kept: jax.Array, tokens: jax.Array) -> jax.Array:
@@ -49,6 +47,9 @@ class SimpleDiT(_DiTStackOptions):
     patch_bottleneck: int | None = None
     interval: bool = False
     time_scale: float = 16
+
+    block_prefixes: ClassVar[tuple[str, ...]] = ("dit_block_",)
+    """The names the stack's blocks are stored under, `{prefix}N`, one prefix a mixer."""
 
     @nn.nowrap
     def counted_blocks(self) -> list[ModulatedBlock]:
@@ -93,11 +94,22 @@ class SimpleDiT(_DiTStackOptions):
     def stack(self, *, counted: bool = False) -> list[ModulatedBlock]:
         """The layers between the patch embedding and the output, all attention; `counted`,
         unbound and without remat (`counted_blocks`)."""
+        return [self.layer(index, kind, counted=counted) for index, kind in enumerate(self.kinds())]
+
+    @nn.nowrap
+    def kinds(self) -> list[str]:
+        """Each layer's mixer, in order."""
+        return ['attn'] * self.num_layers
+
+    @nn.nowrap
+    def layer(self, index: int, kind: str, *, counted: bool = False) -> ModulatedBlock:
+        """Layer `index`'s block, of mixer `kind`, stored as `dit_block_{index}`; `counted`, unbound
+        and without remat."""
         block = functools.partial(ModulatedBlock if counted else remat_block(ModulatedBlock, self.remat),
                                   features=self.emb_features, num_heads=self.num_heads, mixer='attention',
-                                  adaln_silu=self.adaln_silu, **self._block_options())
-        return [block(name=f"dit_block_{i}", parent=None) if counted else block(name=f"dit_block_{i}")
-                for i in range(self.num_layers)]
+                                  adaln_silu=self.adaln_silu, **self._block_options(),
+                                  name=f"dit_block_{index}")
+        return block(parent=None) if counted else block()
 
     def __call__(self, x, temb, textcontext=None, train: bool = False, duration=None):
         _, H, W, _ = x.shape
@@ -108,12 +120,20 @@ class SimpleDiT(_DiTStackOptions):
         starts = (
             {int(start): (ratio, int(end)) for ratio, start, end in self.checked_routes()} if train else {}
         )
+        if pipelines(self, self.kinds()):
+            if starts:
+                raise LayoutRefused(
+                    "TREAD's routes take part of the tokens through a span of the blocks, and a pipeline's "
+                    "stages over the stage axis run one program over every token; train the routed model "
+                    "on a mesh without a stage axis")
+            return self.output(self.pipelined(x_seq, cond_emb, freqs_cis, train), inv_idx, H, W)
         rotation, held, kept, end = freqs_cis, None, None, None
         for index, block in enumerate(self.blocks):
             if index in starts:
                 ratio, end = starts[index]
                 held, kept = x_seq, self.kept_tokens(x_seq, ratio, index)
-                x_seq = gather_tokens(x_seq, kept)
+                # TREAD's `Router.start_route`: the tokens the router keeps.
+                x_seq = gather_positions(x_seq, kept)
                 if freqs_cis is not None:
                     rotation = rotary_freqs(kept, self.emb_features // self.num_heads, ROPE_THETA,
                                             dtype=at_least_fp32(x_seq.dtype))
@@ -123,6 +143,19 @@ class SimpleDiT(_DiTStackOptions):
                 rotation, held, kept, end = freqs_cis, None, None, None
 
         return self.output(x_seq, inv_idx, H, W)
+
+    def pipelined(self, tokens, conditioning, freqs_cis, train: bool):
+        """The blocks over `tokens` as a pipeline over the stage axis (`pipelined_blocks`), each row
+        modulated by its own `conditioning`, every one rotated alike."""
+        kinds = self.kinds()
+
+        def run(blocks, x, rows):
+            for block in blocks:
+                x = block(x, rows, freqs_cis, train)
+            return x
+
+        return pipelined_blocks(self, self.block_prefixes, len(kinds), tokens,
+                                lambda index: self.layer(index, kinds[index]), run, rows=conditioning)
 
     def checked_routes(self) -> list[tuple[float, int, int]]:
         """Return `routes` as `(ratio, start, end)` tuples, after checking them.

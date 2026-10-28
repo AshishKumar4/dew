@@ -12,10 +12,10 @@ from pathlib import Path
 import pytest
 
 from dew.config import ObjectiveConfig, RunConfig
+from dew.config.diffusion import DiffusionRunConfig
+from dew.config.jepa import JepaRunConfig
+from dew.config.lm import LMRunConfig
 from dew.decision.config import DecisionRunConfig
-from dew.objectives.diffusion import DiffusionRunConfig
-from dew.objectives.jepa import JepaRunConfig
-from dew.objectives.lm.config import LMRunConfig
 from dew.quantization import Quantization
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -93,10 +93,13 @@ def published_layout() -> tuple[dict, dict]:
     import jax
     from flax.traverse_util import unflatten_dict
 
+    from dew.inference.tasks import earlier_shapes
+
     fixture = json.loads(LAYOUT.read_text())
     variables = unflatten_dict({path: jax.ShapeDtypeStruct(tuple(shape), dtype)
                                 for path, (shape, dtype) in fixture["variables"].items()}, sep="/")
-    return fixture["artifact"], variables
+    # The published run's record, as a run loader reads it (`SavedRun.pinned`).
+    return earlier_shapes(fixture["artifact"]), variables
 
 
 def test_the_published_runs_weights_are_the_ones_its_models_read():
@@ -115,7 +118,7 @@ def test_the_published_runs_weights_are_the_ones_its_models_read():
 
     artifact, variables = published_layout()
     model = saved_model(artifact, None).build()
-    autoencoder = AutoEncoder.from_json(artifact["autoencoder"], params=variables["autoencoder"])
+    autoencoder = AutoEncoder.bound(artifact["autoencoder"], params=variables["autoencoder"])
     sample = tuple(artifact["inputs"]["sample"]["shape"])
     latents = jax.ShapeDtypeStruct((1, *autoencoder.latent_shape(sample)), jnp.float32)
     # CLIP ViT-L/14's 77 tokens of 768 features, the published run's text condition.
@@ -139,11 +142,13 @@ def test_the_live_run_holds_the_committed_layout_and_samples_an_image():
     import numpy as np
     from flax.core import unfreeze
 
-    from dew.sampling import TextToImage
+    import dew
+    from dew.inference import TextToImage
     from dew.training import MeshSpec
 
     repo, revision = LIVE_PIN.read_text().strip().split("@")
-    pipe = TextToImage.from_pretrained(repo, revision=revision, mesh=MeshSpec().build(jax.devices()[:1]))
+    pipe = dew.pipeline(repo, revision=revision, mesh=MeshSpec().build(jax.devices()[:1]))
+    assert isinstance(pipe, TextToImage)
     artifact, expected = published_layout()
     held = unfreeze(pipe.variables)
     assert jax.tree.structure(held) == jax.tree.structure(expected)

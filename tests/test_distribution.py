@@ -25,8 +25,8 @@ import numpy as np
 import pytest
 from lane_environment import outside_any_cluster
 
+from dew.distributed.placement import parameter_axes
 from dew.training import MeshSpec
-from dew.training.distributed import parameter_axes
 
 # Needs the eight simulated CPU devices conftest configures, except the tests
 # that name fewer: those of stand-in devices need none, and a four-GPU run
@@ -404,14 +404,14 @@ def test_a_failure_no_agreement_hears_ends_the_peer_after_the_grace():
     to rank 0, whose watch ends it once the grace has passed unheard."""
     program = ("import orbax.checkpoint.multihost\n"
                "import os, threading\n"
-               "import dew.coordination as coordination\n"
-               "coordination.FAILURE_GRACE_SECONDS = 3.0\n"
-               "coordination.FAILURE_POLL_SECONDS = 0.5\n"
+               "import dew._coordination as engine\n"
+               "engine.FAILURE_GRACE_SECONDS = 3.0\n"
+               "engine.FAILURE_POLL_SECONDS = 0.5\n"
                "from dew.training.runtime import prepare_process\n"
                "prepare_process()\n"
                "import jax\n"
                "if jax.process_index() == 1:\n"
-               "    coordination.publish_failure(RuntimeError('injected failure'), 'a step')\n"
+               "    engine.publish_failure(RuntimeError('injected failure'), 'a step')\n"
                "else:\n"
                "    threading.Event().wait()\n")
     started = time.monotonic()
@@ -421,6 +421,13 @@ def test_a_failure_no_agreement_hears_ends_the_peer_after_the_grace():
     heard = [line for line in output.splitlines() if line.startswith("[0]") and "injected failure" in line]
     assert heard, output
     assert time.monotonic() - started < 120, output
+
+
+def four_rank_pool(program: str) -> tuple[int, str]:
+    """`program` run by every rank of a pool of four processes of one device each: the launch's exit
+    code and everything it printed."""
+    done = launch("--processes-per-host", "4", "--", sys.executable, "-c", program, devices=1, timeout=300)
+    return done.returncode, done.stdout + done.stderr
 
 
 @pytest.mark.mesh(devices=4)
@@ -438,9 +445,8 @@ def test_a_stopped_pool_ends_its_ranks_without_aborts():
                "if os.environ['DEW_PROCESS_ID'] == '3':\n"
                "    raise RuntimeError('rank 3 fails')\n"
                "time.sleep(600)\n")
-    done = launch("--processes-per-host", "4", "--", sys.executable, "-c", program, devices=1, timeout=300)
-    output = done.stdout + done.stderr
-    assert done.returncode == 1, output
+    code, output = four_rank_pool(program)
+    assert code == 1, output
 
 
 def stopped_by_sigterm(process: subprocess.Popen, after: str, timeout: float = 300) -> tuple[int, str]:
@@ -563,13 +569,12 @@ def test_a_pool_whose_program_ends_while_its_failure_watches_read_exits_cleanly(
     whose programs had run to their end: SIGABRT and "terminate called ..."
     in the pool tests of two CI runs (ci/train-2, ci/commit-select). Every
     watch here reads without a pause, so each rank ends mid-read."""
-    program = ("import dew.coordination as coordination\n"
-               "coordination.FAILURE_POLL_SECONDS = 0\n"
+    program = ("import dew._coordination as engine\n"
+               "engine.FAILURE_POLL_SECONDS = 0\n"
                "from dew.training.runtime import prepare_process\n"
                "prepare_process()\n")
-    done = launch("--processes-per-host", "4", "--", sys.executable, "-c", program, devices=1, timeout=300)
-    output = done.stdout + done.stderr
-    assert done.returncode == 0, output
+    code, output = four_rank_pool(program)
+    assert code == 0, output
 
 
 @pytest.mark.gpu(reason="the execution bound is XLA's GPU watchdog; CPU pools have none")
@@ -598,7 +603,7 @@ def test_a_rank_busy_on_its_host_before_an_agreement_leaves_the_pool_running():
                "runtime.EXECUTION_TIMEOUT = '20s'\n"
                "runtime.prepare_process()\n"
                "import time, jax\n"
-               "from dew.coordination import agreed\n"
+               "from dew._coordination import agreed\n"
                "if jax.process_index() == 1:\n"
                "    time.sleep(45)\n"
                "print('agreed', agreed('upload', lambda: jax.process_index()))\n")
@@ -646,10 +651,11 @@ def test_a_link_figure_is_kept_for_its_placement_and_carried_by_a_checkpoint(tmp
     import optax
     from jax.sharding import Mesh
 
+    from dew.distributed.placement import link_topology
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
-    from dew.training.distributed import link_bandwidth, link_topology
+    from dew.training.distributed import link_bandwidth
 
     devices = np.asarray(jax.devices()[:4])
     paired = Mesh(devices.reshape(2, 2), ("data", "tensor"))
@@ -695,7 +701,7 @@ def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
                "runtime.prepare_process()\n"
                "import jax, numpy as np\n"
                "from jax.sharding import NamedSharding, PartitionSpec\n"
-               "from dew import coordination\n"
+               "from dew import distributed as coordination\n"
                "from dew.training import MeshSpec\n"
                "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
                "value = np.arange(4 * jax.device_count(), dtype=np.float32)\n"
@@ -724,7 +730,7 @@ def test_a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
         "runtime.prepare_process()\n"
         "import jax, jax.numpy as jnp, numpy as np\n"
         "from jax.sharding import NamedSharding, PartitionSpec\n"
-        "from dew import coordination\n"
+        "from dew import distributed as coordination\n"
         "from dew.training import MeshSpec\n"
         "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
         "def placed(value, spec):\n"
@@ -898,29 +904,19 @@ def test_the_readers_of_one_share_train_on_the_rows_its_first_reader_sampled(tmp
 
 @pytest.mark.mesh(devices=2)
 def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
-    """A pool runs twice over one persistent compilation cache, and the second
-    run loads its step on every process. jax 0.11.2 keyed an executable by the
-    compiling process's topology fingerprint, which on a GPU describes the
-    device down to its NVLink links, and only process 0 writes entries. On the
-    box, whose GPUs 0 and 1 share NVLink and 2 and 3 do not, a pool of GPUs 1
-    and 2 loaded the step on one process and compiled it on the other, whose
-    sharded autotuning then waited for ever for its peer's share. Each process
-    here reports a fingerprint of its own, as those two did, whatever devices
-    the run has; Dew's JAX build (constraints.txt) hashes the fingerprints of
-    every process a computation spans."""
+    """A pool runs twice over one persistent compilation cache: process 0 writes
+    the entries, and its second run loads its step. Another process loads it
+    where its key is process 0's. JAX keys an executable by its process's
+    topology fingerprint: on a GPU, whose pool shares one topology (jaxlib 0.12
+    starts none whose fingerprints differ, openxla/xla#49677;
+    docs/guides/multi-node.md), every process does; on the CPU, where a
+    process's topology is its own devices, the others compile the step again,
+    as upstream JAX does (Main, 2026-10-26: no fork code for the CPU alone)."""
     cache, records = tmp_path / "cache", tmp_path / "records"
     program = (
         "import json, sys\n"
         "from pathlib import Path\n"
         "import jax\n"
-        "from jax._src.lib import xla_client\n"
-        "topology_of = xla_client.get_topology_for_devices\n"
-        "class Apart:\n"
-        "    def __init__(self, topology):\n"
-        "        self.topology = topology\n"
-        "    def fingerprint(self):\n"
-        "        return self.topology.fingerprint() ^ (jax.process_index() + 1)\n"
-        "xla_client.get_topology_for_devices = lambda devices: Apart(topology_of(devices))\n"
         "events = []\n"
         "jax.monitoring.register_event_listener(lambda event, **_: events.append(event))\n"
         "jax.config.update('jax_explain_cache_misses', True)\n"
@@ -946,7 +942,7 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
         "step = events[before:]\n"
         "Path(sys.argv[2], f'{jax.process_index()}.json').write_text(json.dumps(\n"
         "    [step.count('/jax/compilation_cache/compile_requests_use_cache'),\n"
-        "     step.count('/jax/compilation_cache/cache_hits')]))\n"
+        "     step.count('/jax/compilation_cache/cache_hits'), jax.default_backend()]))\n"
     )
     runs, logged = [], []
     for run in range(2):
@@ -960,7 +956,11 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
         # it wrote or could not, which says why a second run loads nothing.
         logged += [f"run {run}: {line}" for line in (done.stdout + done.stderr).splitlines()
                    if "cache" in line.lower()]
-    # [lookups, hits] a process: the first run compiles every lookup, the second loads it.
-    compiled = runs[0][0][0]
-    assert compiled > 0 and runs == [[[compiled, 0]] * 2, [[compiled, compiled]] * 2], (
+    # [lookups, hits, backend] a process: the first run compiles every lookup; the
+    # second loads them on process 0, and on process 1 where it keys as process 0.
+    compiled, backend = runs[0][0][0], runs[0][0][2]
+    keyed_alike = backend != "cpu"
+    assert compiled > 0 and runs == [
+        [[compiled, 0, backend]] * 2,
+        [[compiled, compiled, backend], [compiled, compiled if keyed_alike else 0, backend]]], (
         runs, "\n".join(logged))

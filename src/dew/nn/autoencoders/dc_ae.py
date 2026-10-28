@@ -24,24 +24,29 @@ import jax
 import jax.numpy as jnp
 from flax.typing import Dtype
 
-from dew import records
-from dew.interop.components import bind_component, component_source
+from dew import _records
+from dew.batch import Variables
+from dew.interop.components import bind_component
+from dew.interop.weights import indexed_path
 from dew.nn.dense import Dense
-from dew.objectives.base import Variables
 
-from ..activations import gated_product
+from ..activations import gated_product, silu
 from ..attention import rms_normalized
 from ..conv import Conv
-from ..precision import at_least_fp32
+from ..precision import at_least_fp32, float32_dot_general, float32_einsum
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
-from .api import ModuleAutoEncoder
+from .api import LatentNormalization, ModuleAutoEncoder, published_source
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
 
 _EPS = 1e-5
 _ATTENTION_EPS = 1e-15
-_ACTIVATIONS = {"relu": nn.relu, "relu6": nn.relu6, "silu": nn.silu}
+_ACTIVATIONS = {"relu": nn.relu, "relu6": nn.relu6, "silu": silu}
+
+
+PUBLISHED = ("AutoencoderDC",)
+"""The `_class_name` a published AutoencoderDC's config states."""
 
 
 class _RMSNorm(nn.Module):
@@ -133,7 +138,8 @@ class _LinearAttention(nn.Module):
         batch, height, width, _ = x.shape
         heads = self.features // self.head_dim
         inner = heads * self.head_dim
-        qkv = jnp.concatenate([Dense(inner, use_bias=False, dtype=self.dtype, name=name)(x)
+        qkv = jnp.concatenate([Dense(inner, use_bias=False, dtype=self.dtype, name=name,
+                                     dot_general=float32_dot_general)(x)
                                for name in ("to_q", "to_k", "to_v")], axis=-1)
         qkv = jnp.concatenate(
             [
@@ -154,16 +160,17 @@ class _LinearAttention(nn.Module):
         qkv = qkv.reshape(batch, positions, -1, 3, self.head_dim)
         query, key, value = nn.relu(qkv[..., 0, :]), nn.relu(qkv[..., 1, :]), qkv[..., 2, :]
         if quadratic:
-            scores = jnp.einsum("bmgd,bngd->bgmn", key, query).astype(jnp.float32)
+            scores = float32_einsum("bmgd,bngd->bgmn", key, query).astype(jnp.float32)
             scores = scores / (jnp.sum(scores, axis=2, keepdims=True) + _ATTENTION_EPS)
-            attended = jnp.einsum("bmgd,bgmn->bngd", value, scores.astype(value.dtype))
+            attended = float32_einsum("bmgd,bgmn->bngd", value, scores.astype(value.dtype))
         else:
             value = jnp.concatenate([value, jnp.ones_like(value[..., :1])], axis=-1)
-            scores = jnp.einsum("bngd,bnge->bgde", value, key)
-            attended = jnp.einsum("bgde,bnge->bngd", scores, query)
+            scores = float32_einsum("bngd,bnge->bgde", value, key)
+            attended = float32_einsum("bgde,bnge->bngd", scores, query)
             attended = (attended[..., :-1] / (attended[..., -1:] + _ATTENTION_EPS)).astype(x.dtype)
         attended = attended.reshape(batch, height, width, -1)
-        out = Dense(self.features, use_bias=False, dtype=self.dtype, name="to_out")(attended)
+        out = Dense(self.features, use_bias=False, dtype=self.dtype, name="to_out",
+                    dot_general=float32_dot_general)(attended)
         return _norm(self.norm, self.features, self.dtype, "norm_out")(out) + x
 
 
@@ -176,7 +183,7 @@ class _GLUMBConv(nn.Module):
     @nn.compact
     def __call__(self, x):
         hidden = 4 * self.features
-        y = nn.silu(_conv(2 * hidden, 1, self.dtype, "conv_inverted")(x))
+        y = silu(_conv(2 * hidden, 1, self.dtype, "conv_inverted")(x))
         y = _conv(2 * hidden, 3, self.dtype, "conv_depth", groups=2 * hidden)(y)
         y, gate = jnp.split(y, 2, axis=-1)
         y = _conv(self.features, 1, self.dtype, "conv_point", bias=False)(gated_product('swiglu')(gate, y))
@@ -390,8 +397,11 @@ class DCAE(nn.Module):
                                 self.decoder_channels, self.decoder_layers, self.decoder_scales,
                                 self.decoder_norms, self.decoder_activations, self.interpolate, self.dtype)
 
-    def encode(self, image, key=None):
-        """The latent of `image`; the encoder is deterministic, so `key` is unused."""
+    def encode(self, image, key=None, noise=None):
+        """The latent of `image`. The encoder is deterministic: `key` is unused, and a posterior's
+        `noise` raises TypeError, since it has none to draw."""
+        if noise is not None:
+            raise TypeError(f"{type(self).__name__} encodes deterministically and draws no posterior noise")
         return self.encoder(image)
 
     def decode(self, latents):
@@ -418,15 +428,15 @@ def _per_level(config: Mapping[str, object], name: str, levels: int) -> tuple:
 def dc_ae_fields(config: Mapping[str, object]) -> DCAEFields:
     """Read an `AutoencoderDC` config into the fields `DCAE` takes, refusing
     what the port does not compute."""
-    encoder_channels = records.integers(config["encoder_block_out_channels"], "encoder_block_out_channels")
-    decoder_channels = records.integers(config["decoder_block_out_channels"], "decoder_block_out_channels")
+    encoder_channels = _records.integers(config["encoder_block_out_channels"], "encoder_block_out_channels")
+    decoder_channels = _records.integers(config["decoder_block_out_channels"], "decoder_block_out_channels")
     levels = len(encoder_channels)
     if len(decoder_channels) != levels:
         raise ValueError("the encoder and decoder have different numbers of levels")
     fields = DCAEFields(
-        image_channels=records.integer(config["in_channels"], "in_channels"),
-        latent_channels=records.integer(config["latent_channels"], "latent_channels"),
-        head_dim=records.integer(config["attention_head_dim"], "attention_head_dim"),
+        image_channels=_records.integer(config["in_channels"], "in_channels"),
+        latent_channels=_records.integer(config["latent_channels"], "latent_channels"),
+        head_dim=_records.integer(config["attention_head_dim"], "attention_head_dim"),
         encoder_blocks=_per_level(config, "encoder_block_types", levels),
         decoder_blocks=_per_level(config, "decoder_block_types", levels),
         encoder_channels=encoder_channels, decoder_channels=decoder_channels,
@@ -477,12 +487,7 @@ def dc_ae_path(name: str, ndim: int) -> tuple[str, ...] | None:
     ranks = (2, 4) if leaf == "weight" and not norm else (1,)
     if ndim not in ranks:
         raise ValueError(f"{name!r} has {ndim} axes, not {' or '.join(map(str, ranks))}")
-    path: list[str] = []
-    for part in parts:
-        if part.isdigit():
-            path[-1] = f"{path[-1]}_{part}"
-        else:
-            path.append("per_head" if part == "proj_out" else part)
+    path = indexed_path("per_head" if part == "proj_out" else part for part in parts)
     if leaf == "weight":
         leaf = "scale" if norm else "kernel"
     return (*path, leaf)
@@ -492,16 +497,17 @@ class DCAutoencoder(ModuleAutoEncoder[DCAE]):
     """Native DC-AE weights and the pipeline's latent scaling,
     `z * scaling_factor` on the way out and `z / scaling_factor` on the way in."""
 
-    record_name = 'dc_ae'
-    record_module = DCAE
-
     def __init__(self, *, model: DCAE, params: Variables, latent_scale: float, latent_shift: float = 0.0):
         super().__init__(model, params)
-        self.latent_scale = latent_scale
-        self.latent_shift = latent_shift
+        self.normalization = LatentNormalization({'latent_scale': latent_scale, 'latent_shift': latent_shift},
+                                                 latent_shift, latent_scale)
+
+    @property
+    def stochastic(self) -> bool:
+        return False
 
     def record_arguments(self) -> dict:
-        return {'latent_scale': self.latent_scale, 'latent_shift': self.latent_shift}
+        return dict(self.normalization.record)
 
 
 def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
@@ -517,9 +523,7 @@ def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | 
     Supplied `params` are bound unchanged: only the config is read, and no
     source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
     placement to read (`dew.interop.weights.record_layouts`)."""
-    directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
-    if config.get("_class_name") != "AutoencoderDC":
-        raise ValueError(f"{directory} holds a {config.get('_class_name')}, not an AutoencoderDC")
+    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=params is None)
     model = DCAE(**dc_ae_fields(config), dtype=compute)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)

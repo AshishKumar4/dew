@@ -22,9 +22,9 @@ import pytest
 from hub_support import native_builder
 from transformers import AutoTokenizer
 
-from dew.config.data import ChatData, loader
-from dew.data import Loading
+from dew.data import Files, Loading, presets
 from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
+from dew.data.compile import held
 from dew.data.dataset import Checkpointable, DataPartition
 
 TOKENIZERS = Path(__file__).resolve().parent / "fixtures" / "tokenizers"
@@ -67,6 +67,13 @@ TOOLS_TEXT = (
 """What the tiny-tools template renders for CONVERSATION, written by hand
 from its source: every id, name and argument in place, the text part's
 text, no content for the tool-call turn."""
+
+
+def validated(source, seq_len: int):
+    """`source`'s conversations rendered and packed one to a row of `seq_len + 1` tokens by the sft
+    preset, each one longer cut into pieces, read once in memory to validate on, a row a batch."""
+    rows = source.pipe(presets.sft, str(TOOLS_TOKENIZER), seq_len=seq_len, batch=1, bins=1, long="chunk")
+    return held(rows.read("memory").loading(Loading(workers=0)))
 
 
 @pytest.fixture(scope="module")
@@ -114,19 +121,13 @@ def test_structured_packing_resumes_exact_tokens_and_masks(tmp_path, tools_token
                          hf["assistant_masks"]))
     path = tmp_path / "sft.parquet"
     pq.write_table(pa.Table.from_pylist(rows), path)
-    spec = ChatData(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=511, packing_bins=1,
-        validation=str(path), long="chunk")
-    data = loader(spec, batch=1, read="memory", loading=Loading(workers=0))
-    assert data.val is not None
-    stream = data.val(DataPartition())
+    stream = validated(Files(str(path)), 511)(DataPartition())
     assert isinstance(stream, Checkpointable)
 
     first = next(stream)
     position = stream.get_state()
     remaining = list(stream)
-    fresh = loader(spec, batch=1, read="memory", loading=Loading(workers=0))
-    assert fresh.val is not None
-    restored = fresh.val(DataPartition())
+    restored = validated(Files(str(path)), 511)(DataPartition())
     assert isinstance(restored, Checkpointable)
     restored.set_state(position)
     resumed = list(restored)
@@ -212,11 +213,7 @@ def test_rows_without_a_tools_column_render_plain(tmp_path, tools_tokenizer):
     pq.write_table(pa.table({"prompt": [messages]}), path)
     ids, roles = render(tools_tokenizer, messages)
 
-    data = loader(ChatData(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=511, packing_bins=1,
-        validation=str(path), long="chunk"), batch=1, read="memory", loading=Loading(workers=0),
-            validation_records=4 * (1))
-    assert data.val is not None
-    batch = next(iter(data.val(DataPartition())))
+    batch = next(iter(validated(Files(str(path)), 511)(DataPartition())))
 
     np.testing.assert_array_equal(batch["text"][0][:len(ids)], ids)
     np.testing.assert_array_equal(batch[ROLES_KEY][0][:len(ids)], roles)
@@ -232,12 +229,7 @@ def test_jsonl_rows_pack_the_way_the_same_rows_do_in_parquet(tmp_path, tools_tok
         json.dumps({"messages": messages, "tools": [WEATHER]}) + "\n" for _ in range(2)))
     ids, roles = render(tools_tokenizer, messages, [WEATHER])
 
-    data = loader(ChatData(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=1023, packing_bins=1,
-        validation=str(path), long="chunk"), batch=1, read="memory", loading=Loading(workers=0),
-            validation_records=4 * (1))
-
-    assert data.val is not None
-    batch = next(iter(data.val(DataPartition())))
+    batch = next(iter(validated(Files(str(path)), 1023)(DataPartition())))
     np.testing.assert_array_equal(batch["text"][0][:len(ids)], ids)
     np.testing.assert_array_equal(batch[ROLES_KEY][0][:len(ids)], roles)
     # Two conversations, one window: the second starts where the first ends.
@@ -261,11 +253,7 @@ def test_a_prepared_hub_split_packs_the_same_conversations(tmp_path, monkeypatch
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="abc123"))
     monkeypatch.setattr(hf_datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     source = Hub("acme/chat", revision="abc123", cache_dir=str(tmp_path / "arrow"))
-    data = loader(ChatData(source=source, validation=dataclasses.replace(source, split="test"),
-                     tokenizer=str(TOOLS_TOKENIZER), seq_len=1023, packing_bins=1, long="chunk"),
-                batch=1, read="memory", loading=Loading(workers=0))
-    assert data.val is not None
-    reader = data.val(DataPartition())
+    reader = validated(dataclasses.replace(source, split="test"), 1023)(DataPartition())
     try:
         batch = next(reader)
     finally:

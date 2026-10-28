@@ -27,7 +27,9 @@ import uuid
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import NamedTuple
 
+from guests import GUEST_UIDS, MAX_CONTEXTS
 from kernel_outputs import outputs_of
 from websockets.asyncio.client import connect
 from websockets.asyncio.server import serve
@@ -36,10 +38,8 @@ from websockets.http11 import Response
 
 MAX_CODE = 100_000
 MAX_OUTPUT = 2_000_000
-# Python contexts one page may hold, and one host, besides its one training context;
-# start-gateway.sh starts at most MAX_CONTEXTS + 1 kernels.
+# Python contexts one page may hold; a host's are guests.MAX_CONTEXTS.
 MAX_CELLS = 6
-MAX_CONTEXTS = 24
 DEADLINE_HEADER = "X-Dew-Deadline"
 """The session's end, in milliseconds since the epoch, which the Worker sets on every connection. The
 bridge reads it against its own wall clock: the host's and the Worker's clocks, both NTP-synced, may
@@ -47,7 +47,18 @@ differ by the end's accuracy, a few seconds at most, which moves the end by as m
 # Memory the model process and the bridge keep free. Below it a new context is refused and the
 # largest guest is killed at once: waiting for the kernel's OOM killer lets the host thrash first.
 RESERVE = 1536 << 20
-GUEST_UIDS = range(6100, 6200)
+# A guest cannot lower its OOM score below the 1000 it starts at; its /proc is read-only besides. The
+# smoke checks (smoke-shared.py, benchmark_gateway.py) run this in a guest's context.
+OOM_PROBE = """for score in ("-1000", "-999", "0"):
+    try:
+        with open("/proc/self/oom_score_adj", "w") as file:
+            file.write(score)
+    except OSError:
+        pass
+    else:
+        raise AssertionError(f"a guest lowered its OOM score to {score}")
+assert open("/proc/self/oom_score_adj").read().strip() == "1000"
+"""
 PRELOAD = {"python3": "import model_client; model_client.install()",
            "dew-train": "import live_training; live_training.install()"}
 
@@ -79,7 +90,9 @@ class Context:
                 "content": {"code": code, "silent": False, "store_history": False,
                             "user_expressions": {}, "allow_stdin": False, "stop_on_error": True},
             }))
-            reply, idle, size = None, False, 0
+            # What the page shows of the cell, as it shows it (site/src/scripts/live.ts): every output since
+            # the last clear, a display under an id at its latest frame each place it shows (kernel_outputs).
+            reply, idle, size, displays, clearing = None, False, 0, {}, False
             while reply is None or not idle:
                 try:
                     message = json.loads(await asyncio.wait_for(self.channels.recv(), timeout=95))
@@ -99,8 +112,21 @@ class Context:
                     idle = True
                 else:
                     for output in outputs_of(kind, content):
-                        size += len(json.dumps(output))
-                        if size > MAX_OUTPUT:
+                        cost = len(json.dumps(output))
+                        if output["type"] == "clear" and output.get("wait"):
+                            clearing = True
+                        elif output["type"] == "clear":
+                            size, displays, clearing = 0, {}, False
+                        elif output.get("update"):
+                            displays[output["display"]] = [cost] * len(displays.get(output["display"], []))
+                        else:
+                            if clearing:
+                                size, displays, clearing = 0, {}, False
+                            if "display" in output:
+                                displays.setdefault(output["display"], []).append(cost)
+                            else:
+                                size += cost
+                        if size + sum(map(sum, displays.values())) > MAX_OUTPUT:
                             raise ValueError("this cell printed more than the live output allowance")
                         await send(output)
             self.last_used = time.monotonic()
@@ -168,14 +194,21 @@ def largest_guest(proc=Path("/proc")):
     return pids[max(held, key=held.__getitem__)] if held else []
 
 
+class Running(NamedTuple):
+    """What runs in a cell: its task, and the request it answers."""
+    task: asyncio.Task
+    request: str
+
+
 class Page:
-    """One page's connection: its socket and contexts, each cell's running task and request, every
+    """One page's connection: its socket and contexts, what runs in each cell, every
     task it started and has not ended (a restart's predecessor included), the contexts of its
     running training cells, the cells its Stop ended and the cells restarting."""
 
     def __init__(self, socket, session, cells):
         self.socket, self.session, self.cells = socket, session, cells
-        self.running, self.requests, self.training, self.stops = {}, {}, {}, set()
+        self.running: dict[str, Running] = {}
+        self.training, self.stops = {}, set()
         self.tasks, self.restarting = set(), set()
 
     def admit(self, message, cell):
@@ -188,7 +221,7 @@ class Page:
         return None
 
     def busy(self):
-        return any(not task.done() for task in self.running.values())
+        return any(not running.task.done() for running in self.running.values())
 
     async def fail(self, identifier, error):
         await self.socket.send(json.dumps({"id": identifier, "type": "error",
@@ -204,6 +237,8 @@ class Gateway:
         self.token, self.secret, self.commit, self.kernels = token, secret, commit, kernels
         # session -> cell -> context; None holds the context made ready before the page names a cell.
         self.contexts: dict[str, dict[str | None, Context]] = {}
+        # session -> the one task creating its first context, which create and close await or cancel.
+        self.creating: dict[str, asyncio.Task] = {}
         self.connected = set()
         self.allocating = asyncio.Lock()
         # The training slot: whether a training cell runs, and the tickets of those waiting, in order.
@@ -288,13 +323,34 @@ class Gateway:
         # Waits for its end without raising its failure, and leaves it running if the caller is cancelled.
         await asyncio.wait({task})
 
+    async def first(self, session):
+        """`session`'s first context, made ready before the page names a cell: the one creation the gateway
+        owns for the session (`creating`), which a close cancels, `start` then deleting the kernel it made."""
+        mine = asyncio.current_task()
+        try:
+            self.contexts[session][None] = await self.start(session)
+        except BaseException:
+            # A close took the session already, and a later create may have begun it again, which is
+            # not this one's to end.
+            if self.creating.get(session) is mine:
+                self.contexts.pop(session, None)
+            raise
+        finally:
+            if self.creating.get(session) is mine:
+                del self.creating[session]
+
     async def create(self, session):
+        """`session`'s contexts, its first made ready if it has none (`first`), which every create of the
+        session waits for, and a close of it ends."""
         if session not in self.contexts:
             self.contexts[session] = {}
+            self.creating[session] = asyncio.ensure_future(self.first(session))
+        if task := self.creating.get(session):
             try:
-                self.contexts[session][None] = await self.start(session)
-            except BaseException:
-                del self.contexts[session]
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.cancelled():
+                    raise RuntimeError("this session was closed while its context started") from None
                 raise
         return self.contexts[session]
 
@@ -310,6 +366,11 @@ class Gateway:
         await self.settle(self.discard(context.channels, context.identifier))
 
     async def close(self, session):
+        """End `session`: its first context's creation, if one runs, cancelled, and every context it holds
+        closed. The creation is not awaited: `start` deletes the kernel it made once the gateway has made it
+        (`settle`), which this close need not wait for."""
+        if task := self.creating.pop(session, None):
+            task.cancel()
         for context in self.contexts.pop(session, {}).values():
             await self.stop(context)
 
@@ -350,6 +411,9 @@ class Gateway:
             context = await self.start(session, "dew-train")
             started(context)
             try:
+                # A Stop while the context started ends the run before its code reaches the kernel.
+                if stopped():
+                    return {"status": "aborted", "count": None}
                 return await context.execute(code, send)
             finally:
                 await self.stop(context)
@@ -428,14 +492,15 @@ class Gateway:
                 if message.get("op") == "interrupt":
                     await self.interrupt(page, cell)
                 elif message.get("op") in ("execute", "restart"):
-                    if message["op"] == "execute" and cell in page.running and not page.running[cell].done():
+                    running = page.running.get(cell)
+                    if message["op"] == "execute" and running is not None and not running.task.done():
                         raise ValueError("a cell is already running in this context")
                     if (not isinstance(message.get("id"), str) or len(message["id"]) > 128 or
                             (message["op"] == "execute" and
                              (not isinstance(message.get("code"), str) or len(message["code"]) > MAX_CODE))):
                         raise ValueError("invalid or oversized cell")
-                    for ended in [name for name, task in page.running.items() if task.done()]:
-                        del page.running[ended], page.requests[ended]
+                    for ended in [name for name, running in page.running.items() if running.task.done()]:
+                        del page.running[ended]
                     if refusal := page.admit(message, cell):
                         await page.fail(message["id"], ValueError(refusal))
                         continue
@@ -443,11 +508,10 @@ class Gateway:
                     if step == self.restart:
                         # Before the next message is read: a restart of this cell admitted now is refused.
                         page.restarting.add(cell)
-                    before = page.running.get(cell), page.requests.get(cell)
-                    task = asyncio.create_task(step(page, message, cell, before))
+                    task = asyncio.create_task(step(page, message, cell, page.running.get(cell)))
                     page.tasks.add(task)
                     task.add_done_callback(page.tasks.discard)
-                    page.running[cell], page.requests[cell] = task, message["id"]
+                    page.running[cell] = Running(task, message["id"])
                 else:
                     raise ValueError("unsupported kernel operation")
         finally:
@@ -467,7 +531,7 @@ class Gateway:
             await self.api(f"/api/kernels/{page.training[cell].identifier}/interrupt", {}, "POST")
         elif cell in page.cells:
             await self.api(f"/api/kernels/{page.cells[cell].identifier}/interrupt", {}, "POST")
-        if cell in page.running and not page.running[cell].done():
+        if cell in page.running and not page.running[cell].task.done():
             page.stops.add(cell)
             async with self.slot:
                 self.slot.notify_all()
@@ -486,7 +550,9 @@ class Gateway:
                                           lambda started: page.training.__setitem__(cell, started))
             else:
                 context = await self.context(page.session, cell)
-                result = await context.execute(message["code"], send)
+                # A Stop while the context started ends the run before its code reaches the kernel.
+                result = ({"status": "aborted", "count": None} if cell in page.stops
+                          else await context.execute(message["code"], send))
             await socket.send(json.dumps({"id": message["id"], "type": "done", **result}))
         except Exception as error:
             if isinstance(error, Stopped) and context is not None and page.cells.get(cell) is context:
@@ -503,14 +569,13 @@ class Gateway:
 
     async def restart(self, page, message, cell, before):
         """End what runs in `cell`, give it a fresh context, and answer done: the notebook's Restart."""
-        previous, ended = before
         try:
-            if previous is not None and not previous.done():
+            if before is not None and not before.task.done():
                 page.stops.add(cell)
-                previous.cancel()
+                before.task.cancel()
                 with suppress(asyncio.CancelledError):
-                    await previous
-                await page.socket.send(json.dumps({"id": ended, "type": "done", "status": "aborted",
+                    await before.task
+                await page.socket.send(json.dumps({"id": before.request, "type": "done", "status": "aborted",
                                                    "count": None}))
             # A cell that never ran has no context of its own yet; its first run starts a fresh one.
             if cell in page.cells:

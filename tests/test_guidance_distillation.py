@@ -9,23 +9,22 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import pytest
 from diffusion_stubs import batch_for
-from diffusion_support import saved_after_one_step
+from diffusion_support import images_of, saved_after_one_step
 
-from dew.checkpoints import Checkpoints
-from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.config.data import ImageData
+from dew.config import ObjectiveConfig, TrainerConfig
+from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion import broadcast_rates
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.process import aligned_conditions
-from dew.inputs import unit_range
+from dew.inference import TextToImage
+from dew.inputs import TextCondition, unit_range
 from dew.objectives.base import TEACHER, Step
-from dew.objectives.diffusion import DiffusionRunConfig, GuidanceDistillationObjective, TextCondition
+from dew.objectives.diffusion import GuidanceDistillationObjective
 from dew.objectives.diffusion.guidance_distillation import with_guidance
-from dew.sampling import Euler, TextToImage
-from dew.training import Trainer
+from dew.registry import ModelConfig
+from dew.sampling import Euler
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 FLUX = {
@@ -53,23 +52,15 @@ def runs(tmp_path_factory, request):
         archive.extractall(root / "flux", filter="data")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=8), preset=request.param, val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", 8), preset=request.param, val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(root / "flux" / "pipeline")),
         objective=ObjectiveConfig("diffusion",
                                   {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
-    objective = teacher.build()
-    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
-    state = trainer.initial_state()
-    batch = batch_for(objective, 8)
-    state, *_ = trainer.compile(state, batch)(state, batch)
-    checkpoints = Checkpoints(str(root / "teacher"))
-    checkpoints.save(1, state, None)
-    checkpoints.wait()
-    teacher.save(str(root / "teacher"))
-    student = dataclasses.replace(teacher, objective=ObjectiveConfig("guidance_distillation", {
-        "teacher_run": str(root / "teacher"), "scales": [1.0, 6.0], "solver": Euler(), "steps": 2,
-        "ema_decay": None}))
+    _, _, batch = saved_after_one_step(teacher, lambda task: batch_for(task, 8), root / "teacher", 1e-2,
+                                       key=0)
+    student = dataclasses.replace(teacher, teacher_run=str(root / "teacher"), objective=ObjectiveConfig(
+        "guidance_distillation", {"scales": [1.0, 6.0], "solver": Euler(), "steps": 2, "ema_decay": None}))
     return root, student, batch
 
 
@@ -96,10 +87,7 @@ def test_the_loss_is_the_papers_equation(runs):
     task = config.build()
     assert isinstance(task, GuidanceDistillationObjective)
     params = task.init(jax.random.PRNGKey(1))
-    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
-    loss, _ = task.loss(params, batch, step)
-
-    _, drop_key, time_key, noise_key, scale_key = jax.random.split(step.key, 5)
+    _, drop_key, time_key, noise_key, scale_key = jax.random.split(jax.random.PRNGKey(2), 5)
     assert task.autoencoder is None
     samples = unit_range(batch["image"])
     count = samples.shape[0]
@@ -107,6 +95,10 @@ def test_the_loss_is_the_papers_equation(runs):
     schedule = task.process.schedule
     t = schedule.sample_t(time_key, count)
     noise = jax.random.normal(noise_key, samples.shape)
+    # The step reads these scales, times and noise (`Step.tape`); its conditions' key is its own.
+    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None,
+                tape={"guidance scale": scale, "times": t, "noise": noise})
+    loss, _ = task.loss(params, batch, step)
     alpha, sigma = broadcast_rates(schedule, t, samples)
     x = (alpha * samples + sigma * noise) * task.process.prediction.get_input_scale((alpha, sigma))
     time = schedule.model_time(t)
@@ -130,7 +122,7 @@ def test_the_loss_is_the_papers_equation(runs):
 
 def test_a_saved_student_samples_one_branch_at_its_conditioners_guidance(runs, tmp_path):
     _, config, batch = runs
-    task, state = saved_after_one_step(config, batch, tmp_path / "student", 1e-2)
+    task, state, _ = saved_after_one_step(config, batch, tmp_path / "student", 1e-2)
     restored = TextToImage.from_run(str(tmp_path / "student"))
     assert restored.guidance is None and TEACHER not in restored.variables
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images

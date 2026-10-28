@@ -10,12 +10,12 @@ import functools
 import importlib.metadata
 import os
 import sys
-import uuid
 from collections.abc import Callable
+from pathlib import Path
 
 import jax
 
-from dew.telemetry.devices import deterministic_ops_requested, xla_flag
+from dew.devices import deterministic_ops_requested, xla_flag
 
 
 def dew_cache_dir() -> str:
@@ -23,6 +23,16 @@ def dew_cache_dir() -> str:
     return os.path.expanduser(
         os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache"), "dew")
     )
+
+
+def dew_config_dir() -> Path:
+    """Dew's configuration directory, which every configuration file of Dew's is read from:
+    `$DEW_CONFIG_DIR`, else `$XDG_CONFIG_HOME/dew`, else ~/.config/dew."""
+    override = os.environ.get("DEW_CONFIG_DIR")
+    if override:
+        return Path(override)
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".config") / "dew"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -92,8 +102,10 @@ def default_compilation_cache_dir() -> str:
     the codec "zlib" in the key, which says "zstandard" only for the
     zstandard package (`jax._src.compilation_cache.get_cache_key`), so an
     older interpreter sharing the directory would read those bytes with the
-    wrong codec. Explicit paths passed to enable_compilation_cache remain
-    unchanged.
+    wrong codec. Hosts of every CPU class share it: Dew's JAX build keys a
+    CPU program by the host's CPU (0.12.0.1.post13), which XLA:CPU compiles
+    for, so no host reads a program that does not link there. Explicit paths
+    passed to enable_compilation_cache remain unchanged.
     """
     if jax.config.jax_compilation_cache_dir:
         return jax.config.jax_compilation_cache_dir
@@ -184,6 +196,11 @@ KERNEL_PINS = jax.make_user_context(())
 """The `(kernel, config)` pairs `dew.nn.kernels.tuning.pinned` holds in this
 thread, keyed on as `KERNEL_TUNES` is."""
 
+KERNEL_ASSUMED = jax.make_user_context(default_value=None)
+"""The device `dew.nn.kernels.generation.assumed` stands in for in this thread, its generation and its
+facts where given them, keyed on as `KERNEL_TUNES` is, so a program traced for one device's launches
+traces again for another's."""
+
 KERNEL_CHOICES = jax.make_user_context(())
 """The `(choice, kernel)` pairs `dew.nn.kernels.generation.chosen` holds in
 this thread, keyed on as `KERNEL_TUNES` is, so a program traced before a
@@ -197,6 +214,11 @@ QUANTIZED_TRACE = jax.make_user_context(default_value=None)
 so a trace of one taken under the swap holds its quantized product, which JAX's
 cache would hand a later plain call of the same shapes, and a plain trace a
 quantized call. In this context their traces are kept apart."""
+
+
+INTERCEPTED = jax.make_user_context(default_value=False)
+"""Whether Dew installed a layer interceptor in this trace: adapters, input QDQ and Qwix retain
+their individual projection calls. This is independent of Qwix's arithmetic trace key above."""
 
 
 def keeps_picks() -> bool:
@@ -227,12 +249,13 @@ def persist_compilations() -> None:
     seen (a minute for a text-to-image sample on an A100), and every restart compiles them again
     without it. A process Dew readies for training turns it on (`dew.training.runtime.
     ready_process`, from `prepare_process` or the first `fit`), and a task where it is loaded,
-    `dew.pipeline` or a saved run's record (`dew.inference.tasks.run_record`). JAX's own switch,
-    JAX_ENABLE_COMPILATION_CACHE=false (`jax_enable_compilation_cache`), turns it off, and a
-    process pool whose processes key a step apart turns it off the same way. JAX writes entries
-    from process 0 alone, so a pool takes the directory only where every process reads it as one
-    (`_shared_by_pool`): caches apart would find a step on one process and compile it on another,
-    which waits for ever for its peers. Reading the settings is what makes it idempotent and what
+    `dew.pipeline` or a saved run's record (`dew.inference.tasks.SavedRun.pinned`). JAX's own switch,
+    JAX_ENABLE_COMPILATION_CACHE=false (`jax_enable_compilation_cache`), turns it off. JAX writes
+    entries from process 0 alone, so a pool takes the directory only where every process reads it
+    as one (`_shared_by_pool`): caches apart would find a step on one process and compile it on
+    another, which waits for ever for its peers. Each process keys a step by its own topology, so a
+    CPU pool's other processes, whose topologies are their own devices, compile what process 0
+    loads (docs/guides/multi-node.md). Reading the settings is what makes it idempotent and what
     leaves a trainer's own directory, or a caller's, alone.
 
     JAX settles whether a process uses the cache at its first compile: one that compiled with the
@@ -242,7 +265,7 @@ def persist_compilations() -> None:
     """
     if jax.config.jax_compilation_cache_dir or not jax.config.jax_enable_compilation_cache:
         return
-    from dew.coordination import pool_size
+    from dew._coordination import pool_size
 
     directory = default_compilation_cache_dir()
     if pool_size() > 1 and not _shared_by_pool(directory):
@@ -252,17 +275,7 @@ def persist_compilations() -> None:
 
 @functools.cache
 def _shared_by_pool(directory: str) -> bool:
-    """Whether every process of the pool reads `directory` as one: a mark process 0 writes there
-    is one each of them finds, over the coordination service (`from_every_process`)."""
-    from dew.coordination import broadcast_from_process_zero, from_every_process
+    """Whether every process of the pool reads `directory` as one (`seen_by_every_process`)."""
+    from dew._coordination import seen_by_every_process
 
-    mark = os.path.join(directory, f".dew-pool-{broadcast_from_process_zero(uuid.uuid4().hex)}")
-    if jax.process_index() == 0:
-        os.makedirs(directory, exist_ok=True)
-        with open(mark, "w"):
-            pass
-    from_every_process(None)  # every process looks once the mark is written
-    found = from_every_process(os.path.exists(mark))
-    if jax.process_index() == 0:
-        os.remove(mark)
-    return all(found)
+    return all(seen_by_every_process(directory))

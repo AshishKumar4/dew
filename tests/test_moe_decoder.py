@@ -18,12 +18,14 @@ import optax
 import pytest
 from recording import RecordingTracker
 from sharded import assert_sharded
+from token_support import repeated_token_batch
 
 from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mlp import GatedMLP
 from dew.nn.moe import SparseMLP
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
 
@@ -105,10 +107,7 @@ def moe_config() -> dict:
 
 
 def token_batches():
-    rng = np.random.default_rng(0)
-    batch = {"text": rng.integers(0, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)}
-    while True:
-        yield batch
+    return repeated_token_batch(VOCAB, BATCH, SEQ_LEN + 1)
 
 
 def moe_trainer(expert_size, fsdp_size, tracker=None, bias=False, learning_rate=1e-3):
@@ -116,7 +115,7 @@ def moe_trainer(expert_size, fsdp_size, tracker=None, bias=False, learning_rate=
     model = models.build("causal_transformer",
                          **{**config, "mixture": {**config["mixture"], "bias": bias}})
     return Trainer(
-        LMObjective(model, SEQ_LEN, balance_rate=0.01 if bias else None),
+        LMObjective(model, SEQ_LEN, balance=ExpertBalance(balance_rate=0.01) if bias else None),
         optax.adam(learning_rate), key=jax.random.key(0),
         mesh=MeshSpec(fsdp=fsdp_size, expert=expert_size),
         layout=Layout(min_shard=TINY_SHARD), tracker=tracker)
@@ -238,13 +237,14 @@ from dew.data.dataset import Loader
 from dew.registry import models
 import dew.nn.backbones
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.training import Trainer, MeshSpec, Layout
 import test_moe_decoder as suite
 
 model = models.build("causal_transformer", **{{
     **suite.moe_config(),
     "mixture": {{**suite.moe_config()["mixture"], "bias": True}}}})
-trainer = Trainer(LMObjective(model, suite.SEQ_LEN, balance_rate=0.01),
+trainer = Trainer(LMObjective(model, suite.SEQ_LEN, balance=ExpertBalance(balance_rate=0.01)),
                   optax.adam(1e-3), key=jax.random.key(0),
                   mesh=MeshSpec(), layout=Layout(min_shard=suite.TINY_SHARD))
 state = trainer.fit(

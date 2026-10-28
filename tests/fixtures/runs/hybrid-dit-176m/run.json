@@ -1,5 +1,5 @@
 {
-  "class": "dew.objectives.diffusion.config:DiffusionRunConfig",
+  "class": "diffusion",
   "fields": {
     "model": {
       "name": "dew.nn.backbones.ssm_dit:HybridSSMAttentionDiT",
@@ -35,76 +35,11 @@
       },
       "wrappers": []
     },
-    "data": {
-      "class": "dew.config.data:ImageData",
-      "fields": {
-        "source": {
-          "class": "dew.data.sources.files:Files",
-          "fields": {
-            "url": [
-              "arrayrecord2/laion12m_coco"
-            ],
-            "format": "arrayrecord",
-            "index": null,
-            "columns": null,
-            "where": null,
-            "partitioning": "hive",
-            "shard_bytes": 67108864,
-            "storage_options": null,
-            "spark": false,
-            "file_info": null
-          }
-        },
-        "image_size": 256,
-        "staging_size": null,
-        "field": "image",
-        "caption": null,
-        "caption_templates": [],
-        "caption_columns": [
-          "caption",
-          "text"
-        ],
-        "classes": [],
-        "labels": null,
-        "augment": {
-          "flip": true,
-          "jitter": true,
-          "crop_scale": [
-            1.0,
-            1.0
-          ],
-          "backend": "host"
-        },
-        "validation": {
-          "class": "dew.data.holdout:HoldOut",
-          "fields": {
-            "records": 512,
-            "fraction": null,
-            "by": "index",
-            "most": null,
-            "seed": 0
-          }
-        },
-        "split": "train"
-      }
-    },
-    "data_read": null,
-    "provision": false,
     "data_seed": 0,
-    "loading": {
-      "workers": 32,
-      "threads": 64,
-      "read_buffer": 128,
-      "worker_buffer": 2,
-      "ram_budget_mb": null,
-      "max_workers": null
-    },
-    "validation_records": null,
     "optim": {
       "optimizer": "adamw",
       "optimizer_opts": {},
       "learning_rate": 0.0001,
-      "schedule": null,
       "weight_decay": null,
       "b1": null,
       "b2": null,
@@ -119,8 +54,6 @@
       "checkpoint_dir": "run",
       "keep": 1,
       "best": null,
-      "batch_size": 128,
-      "batch_tokens": null,
       "update_tokens": null,
       "key": 0,
       "steps": 1350000,
@@ -143,6 +76,7 @@
         "replicas": 1,
         "explicit": []
       },
+      "microbatches": null,
       "layout": {
         "rules": [
           [
@@ -288,7 +222,9 @@
         "min_shard": 65536,
         "tolerance": 0.02,
         "host": [],
-        "host_parameters": []
+        "host_parameters": [],
+        "frozen_whole": false,
+        "data_axes": []
       },
       "profile": null,
       "compilation_cache_dir": null,
@@ -297,7 +233,8 @@
       "multi_host": null,
       "xla_flags": null,
       "quantization": null,
-      "lower_for": null
+      "lower_for": null,
+      "tune_kernels": false
     },
     "objective": {
       "name": "dew.objectives.diffusion.objective:DiffusionObjective",
@@ -369,6 +306,152 @@
     },
     "pretrained": null,
     "pretrained_param_dtype": "float32",
-    "val_metrics": []
+    "teacher_run": null,
+    "rollout": null,
+    "val_metrics": [],
+    "data": {
+      "version": 1,
+      "source": {
+        "class": "dew.data.holdout:RecordSlice",
+        "fields": {
+          "source": {
+            "class": "dew.data.sources.files:Files",
+            "fields": {
+              "url": [
+                "arrayrecord2/laion12m_coco"
+              ],
+              "format": "array_record",
+              "index": null,
+              "columns": null,
+              "where": null,
+              "partitioning": "hive",
+              "shard_bytes": 67108864,
+              "storage_options": null,
+              "spark": false,
+              "file_info": null,
+              "suffixes": null
+            }
+          },
+          "start": 512,
+          "stop": null
+        }
+      },
+      "name": null,
+      "read": null,
+      "loading": {
+        "workers": 32,
+        "threads": 64,
+        "read_buffer": 128,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "stages": [
+        {
+          "class": "dew.data.pipeline:Shuffle",
+          "fields": {
+            "seed": 0,
+            "window": null,
+            "block_shards": null
+          }
+        },
+        {
+          "class": "dew.data.pipeline:Repeat",
+          "fields": {
+            "epochs": null
+          }
+        },
+        {
+          "pipe": "dew.data.presets:images",
+          "settings": {
+            "size": 256,
+            "batch": 128,
+            "augment": [
+              {
+                "class": "dew.data.images:Flip",
+                "fields": {
+                  "p": 0.5,
+                  "field": "image"
+                }
+              },
+              {
+                "class": "dew.data.images:ColorJitter",
+                "fields": {
+                  "brightness": 0.2,
+                  "contrast": 0.05,
+                  "saturation": 0.2,
+                  "field": "image"
+                }
+              }
+            ],
+            "rejects": false,
+            "caption": {
+              "template": null,
+              "classes": [],
+              "columns": [
+                "caption",
+                "text"
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "validation": {
+      "version": 1,
+      "source": {
+        "class": "dew.data.holdout:RecordSlice",
+        "fields": {
+          "source": {
+            "class": "dew.data.sources.files:Files",
+            "fields": {
+              "url": [
+                "arrayrecord2/laion12m_coco"
+              ],
+              "format": "array_record",
+              "index": null,
+              "columns": null,
+              "where": null,
+              "partitioning": "hive",
+              "shard_bytes": 67108864,
+              "storage_options": null,
+              "spark": false,
+              "file_info": null,
+              "suffixes": null
+            }
+          },
+          "start": 0,
+          "stop": 512
+        }
+      },
+      "name": null,
+      "read": null,
+      "loading": {
+        "workers": 32,
+        "threads": 64,
+        "read_buffer": 128,
+        "worker_buffer": 2,
+        "ram_budget_mb": null,
+        "max_workers": null
+      },
+      "stages": [
+        {
+          "pipe": "dew.data.presets:images",
+          "settings": {
+            "size": 256,
+            "batch": 128,
+            "rejects": false,
+            "caption": {
+              "template": null,
+              "classes": [],
+              "columns": [
+                "caption",
+                "text"
+              ]
+            }
+          }
+        }
+      ]
+    }
   }
 }

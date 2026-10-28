@@ -20,20 +20,22 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from model_support import TINY_DECODER
 from recording import RecordingTracker
 from sharded import assert_sharded
+from token_support import repeated_token_batch, write_token_corpus
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
+from dew.distributed.batches import shard_batch
+from dew.mesh import TENSOR_AXIS, mesh_axes
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
-from dew.nn.sharding import declarations, declared_axes, mesh_axes
+from dew.nn.sharding import Link, declarations, declared_axes
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.telemetry.instrumentation import COLLECTIVES
+from dew.telemetry.trace import COLLECTIVES
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.distributed import shard_batch
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -66,22 +68,27 @@ def test_fsdp_beside_tensor_computes_each_matmul_of_the_step_once():
     residual width left whole, GSPMD gathered a block's activations over
     fsdp and repeated those products on both devices of each pair: 1.21
     times one device's matmul FLOPs on layout_parity's dense decoder."""
-    from dew.telemetry.instrumentation import compiled_flops
-
     def flops(mesh: MeshSpec, devices) -> float:
-        trainer = Trainer(LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                          mesh=mesh, layout=Layout(min_shard=TINY_SHARD), checkpoints=None,
-                          tracker=None)
-        trainer.device_mesh = mesh.build(devices)
-        state, _, _ = trainer.place()
-        trainer.compile(state, shard_batch(trainer.device_mesh, next(token_batches())))
-        assert trainer.executable is not None
-        counted = compiled_flops(trainer.executable)
-        assert counted is not None
-        return counted * len(devices)
+        return step_flops(tiny(), mesh, devices, layout=Layout(min_shard=TINY_SHARD))
 
     one = flops(MeshSpec(), jax.devices()[:1])
     assert flops(MeshSpec(fsdp=2, tensor=2), jax.devices()[:4]) == pytest.approx(one, rel=1e-6)
+
+
+def step_flops(model, mesh: MeshSpec, devices, *, layout: Layout, links=None) -> float:
+    """The compiled training step's matmul FLOPs over all `devices` of `mesh`, `model` trained as a
+    language model under `layout` (and `links`, where given)."""
+    from dew.telemetry.instrumentation import compiled_flops
+
+    trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0), mesh=mesh,
+                      layout=layout, checkpoints=None, tracker=None, links=links)
+    trainer.device_mesh = mesh.build(devices)
+    state, _, _ = trainer.place()
+    trainer.compile(state, shard_batch(trainer.device_mesh, next(token_batches())))
+    assert trainer.executable is not None
+    counted = compiled_flops(trainer.executable)
+    assert counted is not None
+    return counted * len(devices)
 
 
 def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
@@ -94,8 +101,6 @@ def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
     tensor shards compute one device's matmul FLOPs. (The latents' kernels
     ride fsdp, so with no fsdp axis they stay whole on every device: a sixth
     of this toy's weights, a thousandth of V3's.)"""
-    from dew.telemetry.instrumentation import compiled_flops
-
     model = models.build(
         "causal_transformer", vocab_size=VOCAB, emb_features=64, num_layers=1, num_heads=4,
         mlp_features=64, max_seq_len=SEQ_LEN,
@@ -103,16 +108,9 @@ def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
                "qk_rope_head_dim": 8, "v_head_dim": 16}})
 
     def flops(mesh: MeshSpec, devices) -> float:
-        trainer = Trainer(LMObjective(model, SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
-                          mesh=mesh, layout=Layout(min_shard=TINY_SHARD, tolerance=1.0),
-                          checkpoints=None, tracker=None)
-        trainer.device_mesh = mesh.build(devices)
-        state, _, _ = trainer.place()
-        trainer.compile(state, shard_batch(trainer.device_mesh, next(token_batches())))
-        assert trainer.executable is not None
-        counted = compiled_flops(trainer.executable)
-        assert counted is not None
-        return counted * len(devices)
+        # A CPU's peak is not in the table, so the run states a link fast enough to spread over.
+        return step_flops(model, mesh, devices, layout=Layout(min_shard=TINY_SHARD, tolerance=1.0),
+                          links={TENSOR_AXIS: Link(1e15, 1e12)})
 
     one = flops(MeshSpec(), jax.devices()[:1])
     assert flops(MeshSpec(tensor=4), jax.devices()[:4]) == pytest.approx(one, rel=1e-6)
@@ -256,15 +254,17 @@ def native_trainer(mesh, layout, directory, **hybrid) -> Trainer:
 def token_windows(directory):
     """Eight-row batches of windows over a token file, a stream fit
     checkpoints and resumes."""
-    from dew.config.data import TextData, loader
-    from dew.data import Loading
+    from dew.data import Loading, presets
+    from dew.data.compile import compile
+    from dew.data.sources.tokens import TokenFiles
 
-    directory.mkdir(exist_ok=True)
-    tokens = (np.arange(400) * 7 % VOCAB).astype(np.uint16)
-    for split in ("train", "val"):
-        tokens.tofile(directory / f"{split}.bin")
-    return loader(TextData(source=str(directory), seq_len=LENGTH, stride=1), batch=8, read="memory", seed=7,
-                  loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=32)
+    tokens = np.arange(400) * 7 % VOCAB
+    corpus = write_token_corpus(directory, tokens, tokens, vocab_size=VOCAB)
+    train = TokenFiles(corpus.train).shuffle(7).repeat().pipe(presets.token_windows, seq_len=LENGTH,
+                                                               stride=1, batch=8)
+    held = TokenFiles(corpus.val).pipe(presets.token_windows, seq_len=LENGTH, stride=1, batch=8, records=32)
+    return compile(train, validation=held, read="memory", seed=7,
+                   loading=Loading(workers=0, threads=1, read_buffer=1))
 
 
 @pytest.mark.mesh(devices=8)
@@ -328,7 +328,7 @@ def test_a_meshs_explicit_axes_split_rows_and_hold_no_parameter(tmp_path):
 
 
 @pytest.mark.parametrize(("length", "tensor_shards", "heads", "slow", "fast"), [
-    (1, 1, 4, 60e9, None),
+    (1, 1, 4, 60e9, 1e15),
     (13, 1, 4, 60e9, 80e9),
     (13, 2, 4, 75e9, 90e9),
     (13, 2, 1, 90e9, 100e9),
@@ -342,10 +342,11 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
     not twelve, because three padded positions add work. The links straddle
     that crossover. Splitting four heads over tensor2 raises it to 78.7 GB/s;
     one head cannot split, and its smaller projection needs 92.6 GB/s.
-    A one-position context saves no work even on a CPU link.
+    A one-position context saves no work even on a link fast enough for any split.
     """
+    from dew.mesh import SEQUENCE_AXIS
     from dew.nn.attention import NormalAttention
-    from dew.nn.sharding import SEQUENCE_AXIS, Link, measured_links
+    from dew.nn.sharding import measured_links
     from dew.telemetry.instrumentation import compiled_flops
 
     model = NormalAttention(64, heads=heads, dim_head=16, attention_impl="reference")
@@ -371,10 +372,9 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
         moved = sharded.collective_bytes(executable.as_text(), COLLECTIVES)
         return result, flops * sequence * tensor, moved
 
-    expected, _, _ = compiled(1, 1, Link(None, None, "cpu"))
-    kept, kept_flops, kept_bytes = compiled(4, tensor_shards, Link(slow, 1e12, "gpu"))
-    link = Link(fast, 1e12, "gpu") if fast is not None else Link(None, None, "cpu")
-    split, split_flops, split_bytes = compiled(4, tensor_shards, link)
+    expected, _, _ = compiled(1, 1, Link(None, None))
+    kept, kept_flops, kept_bytes = compiled(4, tensor_shards, Link(slow, 1e12))
+    split, split_flops, split_bytes = compiled(4, tensor_shards, Link(fast, 1e12))
     for actual in (kept, split):
         for got, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
             np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
@@ -396,10 +396,10 @@ def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, device
     fsdp and sequence, and split as the rules split it over the rest
     (tensor): the step gathers none of what they split, the optimizer state
     and the trained parameters lie as the split layout lays them, and one
-    step trains what it trains."""
+    step trains what it trains, bit for bit."""
+    from dew.batch import FROZEN
+    from dew.distributed.placement import placed_bytes
     from dew.lora import LoRA
-    from dew.objectives.base import FROZEN
-    from dew.training.distributed import placed_bytes
 
     model = tiny()
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj", "gate_proj", "down_proj")).apply(
@@ -434,8 +434,10 @@ def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, device
     assert placed_bytes(whole_state.opt_state) == placed_bytes(split_state.opt_state)
     kept = placed_bytes(whole_state.variables[FROZEN]) - placed_bytes(split_state.variables[FROZEN])
     assert kept > 0 and split_gathered - whole_gathered >= kept
+    # Holding the base whole only skips its gather, an exact copy: the step's arithmetic is the split
+    # layout's, so it trains the same bits.
     for got, want in zip(jax.tree.leaves(whole_trained), jax.tree.leaves(split_trained), strict=True):
-        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
+        np.testing.assert_array_equal(got, want)
 
 
 class Named(nn.Module):
@@ -443,8 +445,8 @@ class Named(nn.Module):
 
     @nn.compact
     def __call__(self, x):
+        from dew.batch import FROZEN
         from dew.nn.dense import Dense
-        from dew.objectives.base import FROZEN
 
         return Dense(16, name=FROZEN)(jax.nn.relu(Dense(64, name="hidden")(x)))
 
@@ -456,8 +458,8 @@ def test_a_module_or_optimizer_group_named_frozen_keeps_its_split_under_frozen_w
     module or an optimizer group that is only named `frozen` keeps its fsdp split, in its
     parameters and its Adam moments: with no frozen collection the layout places every train-state
     leaf and trains one step exactly as the split layout does."""
+    from dew.batch import FROZEN
     from dew.inputs import Field, InputSpec
-    from dew.objectives.base import FROZEN
     from dew.objectives.supervised import Supervised
 
     rng = np.random.default_rng(0)
@@ -492,10 +494,7 @@ def test_a_module_or_optimizer_group_named_frozen_keeps_its_split_under_frozen_w
 
 
 def token_batches():
-    rng = np.random.default_rng(0)
-    batch = {"text": rng.integers(0, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)}
-    while True:
-        yield batch
+    return repeated_token_batch(VOCAB, BATCH, SEQ_LEN + 1)
 
 
 def run_losses(mesh, layout, steps, microbatches=None):

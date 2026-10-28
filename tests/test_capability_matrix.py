@@ -19,7 +19,8 @@ declarations, never by trying an operation and skipping what raises:
   the trained leaves, the run checkpoints, evaluation runs, and the saved
   run reloads to the same numbers;
 - a refused cell, a family the method reads but whose math it cannot run,
-  fails with an error that names the missing fact.
+  is refused for the missing fact (`dew.nn.protocols.Lacks`, whose
+  `capability` is one the family lacks), not by any other error.
 
 A family Dew registers without a fixture here fails
 `test_every_registered_family_has_a_fixture`, and an objective without a row
@@ -34,7 +35,7 @@ import dataclasses
 import functools
 import gc
 import itertools
-import re
+import pickle
 import shutil
 import tempfile
 from collections.abc import Callable, Mapping
@@ -47,19 +48,19 @@ import numpy as np
 import optax
 import pytest
 from capability_modules import Denoiser, FamilyText, NNXDenoiser, NNXLanguageModel, NNXTokens, TokenModel
+from decision_support import decision_rows
 from flax.nnx import bridge
 from recording import RecordingTracker
 from steady_state import steady_state
-from tiny_models import PER_ARCH, TINY
+from test_text_rollout_contract import assert_generation_scores_as_full_forwards
+from tiny_configs import PER_ARCH, TINY
 
 from dew.checkpoints import Checkpoints
-from dew.config.data import loader
-from dew.data.dataset import DataPartition, Loader
+from dew.data.dataset import DataPartition, Loader, replayed
 from dew.data.preferences import IDS_KEY as PAIR_IDS_KEY, MASK_KEY as PAIR_MASK_KEY
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, MarkerLayout, Specials, StateFirstLayout
-from dew.decision.data import Decisions
 from dew.diffusion import presets
 from dew.diffusion.discrete import MDLM
 from dew.inference.tasks import TextGeneration
@@ -67,6 +68,7 @@ from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.encoders import CharTable
 from dew.interop import Pretrained
 from dew.lora import Adapter, LoRA
+from dew.nn.protocols import Lacks
 from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import (
     AdversarialDistillationObjective,
@@ -97,7 +99,7 @@ from dew.objectives.rl.sessions import (
     SEGMENT_IDS_KEY,
 )
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
-from dew.registry import models
+from dew.registry import models, objectives
 from dew.sampling import Euler, Sampling
 from dew.training import Trainer
 
@@ -148,20 +150,6 @@ ENCODES = "encodes"
 """Encodes a sample's patches into token states a JEPA predictor reads (`HiddenStates`-like)."""
 CANVAS = "canvas"
 """Refines a canvas of tokens against a cache of committed clean ones (`BlockDenoiser`)."""
-
-REASONS: Mapping[str, str] = {
-    LOGITS: r"logits|sample alone",
-    CAUSAL: r"causal",
-    BIDIRECTIONAL: r"bidirectional|reads the whole|future",
-    PACKING: r"pack|segment",
-    CACHE: r"cache",
-    INTERVAL: r"interval",
-    GUIDED: r"guidance",
-    FEATURES: r"feature",
-    CANVAS: r"canvas|BlockDenoiser|encode",
-}
-"""What the error of a refused cell names, by the fact the family lacks."""
-
 
 # --- families --------------------------------------------------------------
 
@@ -232,9 +220,10 @@ def user(module, **fields) -> Callable[[], Loaded]:
 
 def torch_fallback() -> Loaded:
     """A random tiny GPT-NeoX, which no Dew family reads, through the torchax fallback."""
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("torchax")
-    transformers = pytest.importorskip("transformers")
+    # The fallback and its reference are the suite's own dependencies (the ci extra): a missing one
+    # fails here, or at the load that imports torchax, rather than skipping the cell.
+    import torch
+    import transformers
     torch.manual_seed(0)
     config = transformers.GPTNeoXConfig(num_hidden_layers=1, hidden_size=16, num_attention_heads=2,
                                         intermediate_size=32, vocab_size=256, max_position_embeddings=64)
@@ -306,7 +295,18 @@ JEPA_ENCODER = {"patch_size": 4, "emb_features": 32, "num_layers": 1, "num_heads
 JEPA_PREDICTOR = {"grid": JEPA_GRID, "emb_features": 32, "predictor_features": 16, "num_layers": 1,
                   "num_heads": 2, "mlp_ratio": 2}
 
-FAMILIES: Mapping[str, tuple[Family, ...]] = {
+def registered[V](registry: Mapping[str, object], rows: Mapping[str, V], kind: str) -> Mapping[str, V]:
+    """`rows` keyed by every name `registry` holds and no other: a registered member without a row, or a
+    row naming nothing registered, stops this file's collection by name, so the matrix covers every
+    member Dew registers before it lands."""
+    missing, unknown = sorted(set(registry) - set(rows)), sorted(set(rows) - set(registry))
+    if missing or unknown:
+        raise ValueError(f"the matrix's {kind} rows lack the registered {missing} and name the "
+                         f"unregistered {unknown}")
+    return rows
+
+
+FAMILIES: Mapping[str, tuple[Family, ...]] = registered(models, {
     "causal_transformer": (
         Family("causal_transformer", "causal_transformer", DECODER_LM | {TEXT}, 256,
                built("causal_transformer", **DECODER)),
@@ -341,6 +341,14 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = {
                released("modernbert-tiny")),
         Family("causal_transformer+llada", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
                released("llada-tiny")),
+        Family("causal_transformer+llada_moe", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
+               released("llada-moe-tiny")),
+        Family("causal_transformer+llada_moe_v2", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
+               released("llada-moe-v2-tiny")),
+        Family("causal_transformer+llada2_moe", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
+               released("llada2-tiny")),
+        Family("causal_transformer+llada22_moe", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
+               released("llada22-tiny")),
         Family("causal_transformer+dream", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
                released("dream-tiny")),
     ),
@@ -376,7 +384,7 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = {
                                   described((FRAMES, PIXELS, PIXELS, 3))),),
     "jepa_predictor": (Family("jepa_predictor", "jepa_predictor", frozenset({ENCODES}), 0,
                               built("jepa_predictor", **JEPA_PREDICTOR), described((PIXELS, PIXELS, 3))),),
-}
+}, "family")
 """Every registered family's fixtures, keyed by its registry name."""
 
 UNREGISTERED: tuple[Family, ...] = (
@@ -407,6 +415,11 @@ def loaded(family: Family) -> Loaded:
     """Each fixture once per process, its tree on the host: the trainer
     donates the device buffers it is given, and a host tree hands it copies."""
     held = family.load()
+    if family.registered is not None:
+        # The cells count a family by the fixtures that build it: the nearest registered class its model
+        # is, an adapter's the family it adapts, a family's its own over one it extends.
+        nearest = next(name for kind in type(held.model).__mro__ for name in models if models[name] is kind)
+        assert nearest == family.registered, (family, nearest)
     if held.variables is None:
         return held
     variables = jax.device_get(held.variables)
@@ -451,9 +464,11 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     its step, and evaluation scores `evaluated` (the batch by default) to
     finite artifacts, or, for an objective that scores no tokens (`scores`
     False), to none; a second evaluation runs the programs the first
-    compiled, tracing nothing. `data` replaces the batch stream with the method's own;
-    a method that trains on what its `rollout` samples from the batch, not
-    on the batch (`sampled` False), has no sample field to check.
+    compiled, tracing nothing. The run resumes from its checkpoint onto the
+    run that never stopped (`assert_resumes`). `data` replaces the batch stream
+    with the method's own; a method that trains on what its `rollout` samples
+    from the batch, not on the batch (`sampled` False), has no sample field to
+    check.
     """
     if objective.inputs is not None and sampled:
         objective.inputs.check(batch)
@@ -467,10 +482,11 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     checkpoints = Checkpoints(str(directory))
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints, tracker=tracker,
                       rollout=rollout)
-    initial = trainer.initial_state()
+    # The state fit places, which a run that never stopped starts from too.
+    initial, _, _ = trainer.place()
     started = jax.device_get(initial.variables["params"])
     if data is None:
-        data = Loader(lambda partition: itertools.repeat(batch), None, batch=ROWS, records=None)
+        data = Loader(replayed(lambda partition: itertools.repeat(batch)), None, batch=ROWS, records=None)
     state = trainer.fit(data, steps=1, log_every=1, state=initial)
     checkpoints.wait()
     losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
@@ -487,7 +503,38 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     assert (artifact is not None and finite(artifact)) if scores else artifact is None, artifact
     with steady_state(allow=("host_to_device", "device_to_host")):
         objective.evaluate(variables, batch if evaluated is None else evaluated, trained.step)
+    assert_resumes(objective, data, directory, rollout)
     return trained
+
+
+def assert_resumes(objective, data, directory: Path, rollout) -> None:
+    """A new trainer resumed from the run's first checkpoint ends its second step on every leaf of
+    a run of two steps that never stopped, bit for bit, keys as their raw bits, and its step reads
+    the restored state as that run's read its fresh one: the same avals, shardings and formats, so
+    it runs the program the persistent cache holds for the step. It resumes from a copy of the
+    checkpoint's directory, so the checkpoint the cell reloads stays the first step's."""
+    copied = directory.with_name(f"{directory.name}-resumed")
+    shutil.copytree(directory, copied)
+    resumed = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(str(copied)),
+                      rollout=rollout)
+    after = resumed.fit(data, steps=2, log_every=1, checkpoint_final=False)
+    whole = Trainer(objective, optax.adam(1e-3), key=0, rollout=rollout)
+    uninterrupted = whole.fit(data, steps=2, log_every=1)
+    assert int(after.step) == int(uninterrupted.step) == 2
+
+    def bits(tree):
+        return [(jax.tree_util.keystr(path), np.asarray(jax.random.key_data(leaf)
+                 if jnp.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf))
+                for path, leaf in jax.tree_util.tree_leaves_with_path(tree)]
+
+    assert jax.tree.structure(after) == jax.tree.structure(uninterrupted)
+    read, fresh = resumed.executable, whole.executable
+    programs = [name for name in ("in_avals", "input_shardings", "input_formats")
+                if getattr(read, name) != getattr(fresh, name)]
+    leaves = [path for (path, got), (_, want) in zip(bits(after), bits(uninterrupted), strict=True)
+              if got.dtype != want.dtype or not np.array_equal(got, want)]
+    assert not programs and not leaves, {"the step reads the restored state otherwise": programs,
+                                         "leaves off the run that never stopped": leaves}
 
 
 def token_batch(width: int, seed: int = 0) -> np.ndarray:
@@ -632,8 +679,7 @@ def decision(family: Family, directory: Path) -> None:
     layout = (StateFirstLayout if CAUSAL in family.facts else MarkerLayout)(
         max_len=48, head_max_len=32, option_tokens=4)
     objective = DecisionObjective(held.given, tokenizer=tokenizer, specials=specials, layout=layout)
-    data = loader(Decisions(source=EXAMPLES, validation=EXAMPLES), batch=ROWS, read="memory",
-        objective=objective.data())
+    data = decision_rows(EXAMPLES, ROWS, EXAMPLES, objective=objective.data())
     batch = next(iter(data.train(DataPartition())))
     trained = assert_trains(objective, batch, directory, data=data)
     live = objective.pipeline(trained.state)
@@ -690,18 +736,28 @@ def mask_id(family: Family) -> int:
     return model.mask_token_id if MASK_TOKEN in family.facts else TOKENS[1]
 
 
+GENERATION_SEEDS: Mapping[str, int] = {f"{family} generation {leaf}": 8 for family in ALL
+                                       for leaf in ("raw", "policy")} | {
+    "causal_transformer+gated_delta_hybrid generation raw": 32,
+    "causal_transformer+gated_delta_hybrid generation policy": 64,
+    "multimodal_transformer+gemma3 generation policy": 32}
+"""Check 1's declared seeds for each family's cached generation, raw and under its policy, sized by
+`seeds_for` paired with the cached arm on armada: 8, but where named."""
+
+
 def generation(family: Family, directory: Path) -> None:
-    """Cached greedy decoding continues a prompt with the tokens the full
-    forward pass ranks first at every position it decoded."""
+    """The task continues each prompt after its own tokens, and cached decoding of left-padded prompts
+    scores each drawn token on par with a fresh full forward over the row's unpadded tokens, raw and
+    under the top-k policy that drew it, from the family's float64 twin (check 1,
+    test_text_rollout_contract.py's `assert_generation_scores_as_full_forwards`)."""
     held = loaded(family)
     variables = held.variables or held.model.init(jax.random.key(0), jnp.zeros((1, SEQ), jnp.int32))
     task = TextGeneration(held.model, variables, sampling=Sampling(temperature=0.0))
     prompt = token_batch(SEQ // 2, seed=8)[:2]
-    generated = task(prompt.tolist(), SEQ // 2, key=0)
-    tokens = np.asarray(generated.tokens)
+    tokens = np.asarray(task(prompt.tolist(), SEQ // 2, key=0).tokens)
     assert tokens.shape == (2, SEQ) and (tokens[:, :SEQ // 2] == prompt).all()
-    logits = np.asarray(held.model.apply(variables, jnp.asarray(tokens)))
-    np.testing.assert_array_equal(logits[:, SEQ // 2 - 1:-1].argmax(-1), tokens[:, SEQ // 2:])
+    assert_generation_scores_as_full_forwards(held.model, f"{family} generation", params=variables,
+                                              seeds=GENERATION_SEEDS)
 
 
 # --- denoising methods -------------------------------------------------------
@@ -1011,6 +1067,11 @@ METHODS: tuple[Method, ...] = (
 )
 
 
+TRAINED: Mapping[str, Method] = registered(
+    objectives, {name: method for method in METHODS for name in method.trains}, "objective")
+"""The row that trains each registered objective."""
+
+
 def cells(supported: bool) -> list:
     return [pytest.param(method, family, id=f"{method}-{family}")
             for method in METHODS for family in ALL
@@ -1036,13 +1097,13 @@ def test_a_supported_cell_trains_evaluates_and_reloads(method, family, tmp_path)
     method.run(family, tmp_path / "run")
 
 
-CRASHES = re.compile(r"unexpected keyword argument|missing \d+ required|has no attribute")
-"""Python's own signature and attribute errors: a crash on the way, not a refusal."""
-
-
 @pytest.mark.parametrize("method, family", cells(supported=False))
 def test_a_refused_cell_names_what_the_family_lacks(method, family):
-
-    with pytest.raises((TypeError, ValueError)) as refused:
+    """The method refuses the family for a fact its math needs and the family lacks
+    (`dew.nn.protocols.Lacks`), not for any other error on the way, and the refusal crosses a
+    process boundary whole, its capability with it."""
+    with pytest.raises(Lacks) as refused:
         method.refuse(family)
-    assert not CRASHES.search(str(refused.value)), refused.value
+    assert refused.value.capability in method.needs - family.facts
+    carried = pickle.loads(pickle.dumps(refused.value))
+    assert (carried.capability, carried.args) == (refused.value.capability, refused.value.args)

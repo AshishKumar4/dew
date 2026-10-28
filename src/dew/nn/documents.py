@@ -9,14 +9,16 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
+from .visibility import visible
+
 
 class CrossDocuments(NamedTuple):
     """The packed documents of a call whose keys are not its queries
     (cross-attention): `query` `[B, Q]` and `key` `[B, K]` ids, each query
     reading the keys of its own document, 0 as padding, which reads nothing
-    and is read by nothing. FlashAttention runs each row's documents as its
-    packed sequences, which needs the keys in ascending id order, padding
-    after them; the queries it orders itself.
+    and is read by nothing; ids are nonnegative. FlashAttention runs each
+    row's documents as its packed sequences, which needs the keys in
+    ascending id order, padding after them; the queries it orders itself.
 
     Under causality or a window, a document's queries are its last keys, in
     order: the last query reads up to the document's last key, the one before
@@ -30,9 +32,13 @@ class CrossDocuments(NamedTuple):
 
 def document_ids(segment_ids) -> tuple[jax.Array, jax.Array]:
     """The query's and the key's ids of `segment_ids`, one `[B, S]` array of a
-    call's own documents or a `CrossDocuments`."""
+    call's own documents or a `CrossDocuments`, the two in one dtype (their
+    promotion), so an id names one document on both sides however it is
+    ordered."""
     if isinstance(segment_ids, CrossDocuments):
-        return jnp.asarray(segment_ids.query), jnp.asarray(segment_ids.key)
+        queries, keys = jnp.asarray(segment_ids.query), jnp.asarray(segment_ids.key)
+        common = jnp.promote_types(queries.dtype, keys.dtype)
+        return queries.astype(common), keys.astype(common)
     return jnp.asarray(segment_ids), jnp.asarray(segment_ids)
 
 
@@ -44,8 +50,7 @@ def document_mask(segment_ids) -> jax.Array:
     the mask every kernel but splash and the pallas flash kernel reads for
     `segment_ids`; those two compare the ids per block.
     """
-    queries, keys = document_ids(segment_ids)
-    return (queries[:, :, None] == keys[:, None, :]) & (queries[:, :, None] != 0)
+    return _spanned(segment_ids)
 
 
 def with_documents(mask, segment_ids):
@@ -67,9 +72,11 @@ def document_offsets(segment_ids, max_segments: int) -> jax.Array:
 
 
 def _padding_last(ids: jax.Array) -> jax.Array:
-    """`ids` ordered with padding (0) after every document: each id less one as an unsigned word, so
-    padding wraps to the largest and no document's id meets it."""
-    return jnp.asarray(ids).astype(jnp.uint32) - jnp.uint32(1)
+    """`ids` ordered with padding (0) after every document: each id less one as an unsigned word of its
+    own width, so padding wraps to the largest and no two documents' ids meet."""
+    ids = jnp.asarray(ids)
+    word = jnp.dtype(f"uint{8 * ids.dtype.itemsize}")
+    return ids.astype(word) - jnp.asarray(1, word)
 
 
 def _searched(ordered: jax.Array, wanted: jax.Array, side: str) -> jax.Array:
@@ -92,6 +99,15 @@ def held_keys(segment_ids: CrossDocuments) -> jax.Array:
     return _searched(ordered, wanted, "right") - _searched(ordered, wanted, "left")
 
 
+def holds_keys(segment_ids: CrossDocuments) -> jax.Array:
+    """Whether each query's document holds any key in its row, `[B, Q]`, whatever order the keys stand
+    in: the keys sorted first (`held_keys` reads them in ascending order), a padding query (0) holding
+    none."""
+    queries, keys = document_ids(segment_ids)
+    ordered, wanted = jnp.sort(_padding_last(keys), axis=-1), _padding_last(queries)
+    return (queries != 0) & (_searched(ordered, wanted, "right") > _searched(ordered, wanted, "left"))
+
+
 def aligned_places(segment_ids: CrossDocuments) -> jax.Array:
     """Each query's place among its document's keys under causality or a window, `[B, Q]`: a document's
     query of rank r among its Q queries sits at rank K - Q + r among its K keys (`CrossDocuments`)."""
@@ -111,15 +127,23 @@ def cross_document_mask(segment_ids: CrossDocuments, *, causal: bool,
     """`[B, 1, Q, K]`: each query's document's keys (`document_mask`), under causality and a window
     aligned to the document's last key (`aligned_places`); causality keeps the keys at or before a
     query's place, a window of w the w - 1 before it, or without causality those within w - 1 of it
-    (`dew.nn.attention.window_sides`). A key's rank in its document is its distance from the
+    (`dew.nn.visibility.window_sides`). A key's rank in its document is its distance from the
     document's first key, the keys running in ascending id order."""
+    # Elementwise over the keys' ranks, not the spans' sorted search, which takes no batch-sharded ids
+    # under explicit sharding (test_parallelism_matrix's data4_explicit).
     _, keys = document_ids(segment_ids)
     ordered = _padding_last(keys)
     key_rank = jnp.arange(keys.shape[-1])[None, :] - _searched(ordered, ordered, "left")
-    distance = aligned_places(segment_ids)[:, :, None] - key_rank[:, None, :]
-    keep = document_mask(segment_ids)
-    if causal:
-        keep &= distance >= 0
-    if sliding_window is not None:
-        keep &= (distance < sliding_window) if causal else (jnp.abs(distance) < sliding_window)
+    keep = document_mask(segment_ids) & visible(aligned_places(segment_ids)[:, :, None], key_rank[:, None, :],
+                                                 causal=causal, window=sliding_window)
     return keep[:, None]
+
+
+def _spanned(segment_ids) -> jax.Array:
+    """The keys each query of a call of documents `segment_ids` sees by its documents alone, `[B, Q, K]`:
+    every key in reach, the ids keeping each query to its own, padding none, as spans (`template.dense`)."""
+    from dew.nn.kernels.templates import attention as template
+
+    queries, keys = document_ids(segment_ids)
+    end = jnp.where(queries == 0, 0, keys.shape[1]).astype(jnp.int32)
+    return template.dense(template.KeySpans(jnp.zeros_like(end), end, queries, keys, keys.shape[1], "spans"))

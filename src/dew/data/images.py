@@ -6,7 +6,6 @@ from __future__ import annotations
 import copy
 import dataclasses
 import importlib
-import inspect
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol
@@ -15,9 +14,13 @@ import grain.python as grain
 import numpy as np
 from numpy.typing import ArrayLike
 
-from dew.data.dataset import Batch
+from dew._records import record
+from dew.batch import Batch
+from dew.data.facts import resized, shaped, unshaped
+from dew.data.image_augmentation import JITTER
 from dew.data.image_codec import as_rgb, decode_image
 from dew.data.pipeline import DeviceStep, Rejected
+from dew.data.plan import callable_name
 
 if TYPE_CHECKING:
     import jax
@@ -43,26 +46,23 @@ def import_opencv() -> None:
 def resize_image(image: np.ndarray, size: int | tuple[int, int]) -> np.ndarray:
     """`image` at `size`, a square side or (height, width); area interpolation
     where it shrinks along either side, cubic where it only grows."""
-    import cv2
-
     height, width = (size, size) if isinstance(size, int) else size
-    if image.shape[:2] == (height, width):
-        return image
-    shrinks = image.shape[0] > height or image.shape[1] > width
-    return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA if shrinks else cv2.INTER_CUBIC)
+    return resized_to(image, height, width, None)
 
 
-def fetch(url: str = "url", to: str = "jpg", *, timeout: float = 10.0, max_bytes: int = 64 * 2**20) -> Fetch:
+def fetch(url: str = "url", to: str = "jpg", *, timeout: float = 10.0, max_bytes: int = 64 * 2**20,
+          threads: int | None = None) -> Fetch:
     """A record step (`filter_map`) that fetches the image at the record's
     `url` field into `to` as bytes, in one attempt of at most `timeout` once
     its host is resolved (`Fetch`); a
     failed fetch is counted and dropped, a transient one fetched again on a
-    later pass. An indexed read runs `Loading.threads` fetches at once in each
-    worker. The bytes are volatile: a published cache after the fetch keeps
-    them for exact resume."""
+    later pass. `threads` fetches that many at once on the stage's own pool, in
+    each loading worker, delivered in the order read; without it an indexed
+    read runs `Loading.threads` fetches at once in each worker. The bytes are
+    volatile: a published cache after the fetch keeps them for exact resume."""
     from dew.data.sources.urls import Fetch
 
-    return Fetch(url, to, timeout, max_bytes)
+    return Fetch(url, to, timeout, max_bytes, threads)
 
 
 def _payload(image: bytes | Mapping[str, object] | ArrayLike) -> bytes | ArrayLike:
@@ -73,8 +73,8 @@ def _payload(image: bytes | Mapping[str, object] | ArrayLike) -> bytes | ArrayLi
     body = image.get("bytes")
     if isinstance(body, bytes):
         return body
+    from dew._records import text
     from dew.data.storage import Store
-    from dew.records import text
 
     return Store(text(image.get("path"), "image.path")).read()
 
@@ -90,6 +90,12 @@ class DecodeImage(grain.MapTransform):
     _: dataclasses.KW_ONLY
     at_least: int | None = None
     rejects: bool = True
+    external: ClassVar[bool] = True
+    """An image a record names by path is read from storage (`dew.data.pipeline.External`)."""
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """RGB pixels under `to`, each image its own height and width, in place of the bytes in `field`."""
+        return shaped(unshaped(facts, self.field), self.to, [None, None, 3])
 
     def __post_init__(self) -> None:
         import_opencv()
@@ -171,12 +177,30 @@ _INTERPOLATIONS = {"area": "INTER_AREA", "bilinear": "INTER_LINEAR", "bicubic": 
 type Interpolation = Literal["area", "bilinear", "bicubic", "nearest", "lanczos"]
 
 
-def _resized(image: np.ndarray, height: int, width: int, method: Interpolation) -> np.ndarray:
+def resized_to(image: np.ndarray, height: int, width: int, method: Interpolation | None) -> np.ndarray:
+    """`image` at `height` x `width` by OpenCV's `method` interpolation; where None, area where it
+    shrinks along either side and bicubic where it only grows. The one resize every image and video
+    step reads."""
     import cv2
 
     if image.shape[:2] == (height, width):
         return image
+    if method is None:
+        method = "area" if image.shape[0] > height or image.shape[1] > width else "bicubic"
     return cv2.resize(image, (width, height), interpolation=getattr(cv2, _INTERPOLATIONS[method]))
+
+
+def _cropped(image: np.ndarray, rows: int, columns: int, method: Interpolation,
+             resize: Literal["cover", "grow"]) -> np.ndarray:
+    """`image` cut to `rows` x `columns` at its centre, first resized by `method`, in proportion, to
+    cover them: always (`cover`), or only where it is smaller (`grow`)."""
+    height, width = image.shape[:2]
+    if resize == "cover" or height < rows or width < columns:
+        scale = max(rows / height, columns / width)
+        height, width = max(rows, round(height * scale)), max(columns, round(width * scale))
+        image = resized_to(image, height, width, method)
+    top, left = (height - rows) // 2, (width - columns) // 2
+    return image[top : top + rows, left : left + columns]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -189,12 +213,41 @@ class Resize(grain.MapTransform):
     _: dataclasses.KW_ONLY
     field: str = "image"
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        height, width = (self.size, self.size) if isinstance(self.size, int) else self.size
+        return resized(facts, self.field, height, width)
+
+    def map(self, element: Batch) -> Batch:
+        height, width = (self.size, self.size) if isinstance(self.size, int) else self.size
+        image = np.asarray(element[self.field])
+        return {**element, self.field: resized_to(image, height, width, self.method)}
+
+
+@dataclasses.dataclass(frozen=True)
+class Fit(grain.MapTransform):
+    """The pixels in `field` fitted into a `size` square whole: the longer side resized to `size`
+    (area down, bicubic up), the shorter in proportion, rounded, and the rest padded on both sides
+    with `fill`, the odd pixel at the bottom or right. A web image keeps all it shows, as the
+    retired online loader fitted it; `Resize` stretches it and `CenterCrop` cuts it instead."""
+
+    size: int
+    fill: int = 255
+    _: dataclasses.KW_ONLY
+    field: str = "image"
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        return resized(facts, self.field, self.size, self.size)
+
     def map(self, element: Batch) -> Batch:
         image = np.asarray(element[self.field])
-        if self.method is None:
-            return {**element, self.field: resize_image(image, self.size)}
-        height, width = (self.size, self.size) if isinstance(self.size, int) else self.size
-        return {**element, self.field: _resized(image, height, width, self.method)}
+        height, width = image.shape[:2]
+        scale = self.size / max(height, width)
+        fitted = (max(1, round(height * scale)), max(1, round(width * scale)))
+        resized = resized_to(image, *fitted, None).reshape(*fitted, *image.shape[2:])
+        tall, wide = self.size - fitted[0], self.size - fitted[1]
+        padding = ((tall // 2, tall - tall // 2), (wide // 2, wide - wide // 2),
+                   *((0, 0) for _ in image.shape[2:]))
+        return {**element, self.field: np.pad(resized, padding, constant_values=self.fill)}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -207,15 +260,13 @@ class CenterCrop(grain.MapTransform):
     _: dataclasses.KW_ONLY
     field: str = "image"
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """The images `size` squares, as many channels as they held."""
+        return resized(facts, self.field, self.size, self.size)
+
     def map(self, element: Batch) -> Batch:
         image = np.asarray(element[self.field])
-        height, width = image.shape[:2]
-        if min(height, width) < self.size:
-            scale = self.size / min(height, width)
-            height, width = max(self.size, round(height * scale)), max(self.size, round(width * scale))
-            image = _resized(image, height, width, self.method)
-        top, left = (height - self.size) // 2, (width - self.size) // 2
-        return {**element, self.field: image[top : top + self.size, left : left + self.size]}
+        return {**element, self.field: _cropped(image, self.size, self.size, self.method, "grow")}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -227,6 +278,9 @@ class RandomCrop(grain.RandomMapTransform):
     scale: tuple[float, float] = (0.8, 1.0)
     flip: bool = False
     jitter: bool = False
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        return resized(facts, "image", self.size, self.size)
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         from dew.data.image_augmentation import apply_host, draw_host
@@ -258,12 +312,8 @@ class Bucket(grain.MapTransform):
         aspect = np.log(width / height)
         index = int(np.argmin([abs(np.log(columns / rows) - aspect) for rows, columns in self.sizes]))
         rows, columns = self.sizes[index]
-        scale = max(rows / height, columns / width)
-        height, width = max(rows, round(height * scale)), max(columns, round(width * scale))
-        image = _resized(image, height, width, self.method)
-        top, left = (height - rows) // 2, (width - columns) // 2
-        cut = image[top : top + rows, left : left + columns]
-        return {**element, self.field: cut, self.to: np.int32(index)}
+        return {**element, self.field: _cropped(image, rows, columns, self.method, "cover"),
+                self.to: np.int32(index)}
 
 
 def bucket(sizes: Sequence[tuple[int, int]], method: Interpolation = "area", *, field: str = "image",
@@ -288,6 +338,9 @@ class RandomResizedCrop(grain.RandomMapTransform):
     method: Interpolation = "bilinear"
     field: str = "image"
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        return resized(facts, self.field, self.size, self.size)
+
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         image = np.asarray(element[self.field])
         height, width = image.shape[:2]
@@ -310,7 +363,7 @@ class RandomResizedCrop(grain.RandomMapTransform):
                 crop_width, crop_height = width, height
             top, left = (height - crop_height) // 2, (width - crop_width) // 2
         crop = image[top : top + crop_height, left : left + crop_width]
-        return {**element, self.field: _resized(crop, self.size, self.size, self.method)}
+        return {**element, self.field: resized_to(crop, self.size, self.size, self.method)}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -320,6 +373,10 @@ class Flip(grain.RandomMapTransform):
     p: float = 0.5
     _: dataclasses.KW_ONLY
     field: str = "image"
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """The images as their shape was: a mirror moves pixels, not the frame."""
+        return facts
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         image = np.asarray(element[self.field])
@@ -333,16 +390,20 @@ class ColorJitter(grain.RandomMapTransform):
     contrast and saturation factors drawn from [1 - x, 1 + x], applied in a
     random order, rounded once."""
 
-    brightness: float = 0.2
-    contrast: float = 0.05
-    saturation: float = 0.2
+    brightness: float = JITTER.brightness
+    contrast: float = JITTER.contrast
+    saturation: float = JITTER.saturation
     _: dataclasses.KW_ONLY
     field: str = "image"
 
-    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        from dew.data.image_augmentation import jitter_host, jitter_ranges
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """The images as their shape was, uint8 still: the jitter changes their values alone."""
+        return facts
 
-        ranges = jitter_ranges(self.brightness, self.contrast, self.saturation)
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
+        from dew.data.image_augmentation import Spread, jitter_host
+
+        ranges = Spread(self.brightness, self.contrast, self.saturation).ranges()
         factors = np.asarray([rng.uniform(low, high) for low, high in ranges])
         pixels = jitter_host(np.asarray(element[self.field]).astype(np.float32), factors, rng.permutation(3))
         return {**element, self.field: np.rint(pixels).astype(np.uint8)}
@@ -443,13 +504,22 @@ class Torchvision(grain.RandomMapTransform):
         return {**element, self.field: np.ascontiguousarray(np.asarray(transformed).transpose(1, 2, 0))}
 
 
+CAPTION_COLUMNS = ("caption", "text")
+"""The fields a record's own caption is read from, the first it holds (`Caption`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Caption(grain.MapTransform):
     """A record's caption and int32 numeric labels, from columns or a class template."""
 
     template: str | None = None
     classes: tuple[str, ...] = ()
-    columns: tuple[str, ...] = ("caption", "text")
+    columns: tuple[str, ...] = CAPTION_COLUMNS
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """A caption, a string of no fixed shape, in place of any the record held, beside the fields
+        as they were."""
+        return unshaped(facts, "caption")
 
     def map(self, element: Batch) -> Batch:
         label = element.get("label")
@@ -480,7 +550,7 @@ class RandomCaption(Caption, grain.RandomMapTransform):
 
 def caption(template: str | None = None, *, templates: tuple[str, ...] = (),
             classes: tuple[str, ...] = (),
-            columns: tuple[str, ...] = ("caption", "text")) -> Caption | RandomCaption:
+            columns: tuple[str, ...] = CAPTION_COLUMNS) -> Caption | RandomCaption:
     """A record step that writes "caption": `template` formatted with the
     record's fields ("{label}" is the class name `classes` gives its label),
     or with none, the first of `columns`. With `templates`, a random step
@@ -494,8 +564,12 @@ def caption(template: str | None = None, *, templates: tuple[str, ...] = (),
 class ConfigureCaption:
     caption: Caption
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """A caption, a string of no fixed shape, in place of any the record held, beside the rest."""
+        return unshaped(facts, "caption")
+
     def __call__(self, metadata: Mapping[str, object]) -> Caption:
-        from dew.records import record, strings
+        from dew._records import strings
 
         labels = record(metadata.get("class_names", {}), "class names").get("label")
         return (
@@ -509,29 +583,47 @@ class ConfigureCaption:
 class AugmentationKey(grain.RandomMapTransform):
     """The key `DeviceAugment` augments the record with, drawn from the record's generator."""
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        return shaped(facts, "image_augmentation_key", [2])
+
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         return {**element, "image_augmentation_key": rng.integers(0, 2**32, size=2, dtype=np.uint32)}
 
 
+CAPTIONS = "captions"
+"""The field a diffusion objective keeps each batch's captions under as host text (`EncodeCaptions`),
+which a metric or a reward reads with its own tokenizer (`dew.eval.images.CLIPScore`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class EncodeCaptions:
+    """Each batch's captions encoded by `reader` for the conditions that read them, or dropped without
+    one; `keep` names a field to hold them beside as host text, which a metric reads against its own
+    tokenizer (`dew.eval.images.CLIPScore`) and no compiled step takes (`split_fields`). A reader that
+    encodes a field of that name too is refused (ValueError), rather than one overwriting the other."""
+
     reader: Callable[[Sequence[str]], Batch] | None = dataclasses.field(default=None, repr=False)
-    binding = "captions"
+    keep: str | None = None
 
     @property
     def identity(self) -> str:
-        reader = self.reader
-        if reader is None:
-            return "dew.drop-captions@1"
-        kind = reader if inspect.ismethod(reader) or inspect.isfunction(reader) else type(reader)
-        return f"dew.encode-captions:{kind.__module__}.{kind.__qualname__}"
+        kept = "" if self.keep is None else f"+keep={self.keep}"
+        if self.reader is None:
+            return "dew.drop-captions@1" if self.keep is None else f"dew.keep-captions@1:{self.keep}"
+        return f"dew.encode-captions{kept}:{callable_name(self.reader)}"
 
     def __call__(self, batch: Batch) -> Batch:
         held = dict(batch)
         if "caption" not in held:
             return held
         captions = [str(value) for value in held.pop("caption")]
-        return held if self.reader is None else {**held, **self.reader(captions)}
+        encoded = held if self.reader is None else {**held, **self.reader(captions)}
+        if self.keep is None:
+            return encoded
+        if self.keep in encoded:
+            raise ValueError(f"the captions kept as {self.keep!r} would overwrite the field of that name the "
+                             "conditions read; keep them under another")
+        return {**encoded, self.keep: np.asarray(captions)}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -543,9 +635,7 @@ class EncodeFields:
 
     @property
     def identity(self) -> str:
-        reader = self.reader
-        kind = reader if inspect.ismethod(reader) or inspect.isfunction(reader) else type(reader)
-        return f"dew.encode-fields:{kind.__module__}.{kind.__qualname__}"
+        return f"dew.encode-fields:{callable_name(self.reader)}"
 
     def __call__(self, batch: Batch) -> Batch:
         return {**batch, **self.reader(batch)}
@@ -561,6 +651,10 @@ class DeviceAugment(DeviceStep):
     crop_scale: tuple[float, float] = (1.0, 1.0)
     flip: bool = True
     jitter: bool = False
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Each image cropped to a `size` square, its key spent."""
+        return unshaped(resized(facts, "image", self.size, self.size), "image_augmentation_key")
 
     def __call__(self, batch: Mapping[str, jax.Array]) -> dict[str, jax.Array]:
         from dew.data.image_augmentation import augment_batch

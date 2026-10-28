@@ -14,22 +14,26 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import torch
+from diffusion_support import images_of
+from learning_gate import assert_learns
 
-from dew.config import ModelConfig, ObjectiveConfig
-from dew.config.data import ImageData, VideoData, loader
-from dew.data import Loading
+from dew.config import ObjectiveConfig
+from dew.config.diffusion import DiffusionRunConfig
+from dew.data import Loading, presets
+from dew.data.compile import fitted
 from dew.data.dataset import DataPartition
-from dew.inputs import Condition, HFAudio
+from dew.data.images import CAPTIONS
+from dew.data.sources.files import Files
+from dew.inputs import AudioCondition, Condition, HFAudio
 from dew.objectives.base import Step
-from dew.objectives.diffusion import AudioCondition, DiffusionRunConfig
+from dew.registry import ModelConfig, to_record
 from dew.sampling import CFG
 from dew.training import Trainer
 
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
 
-torch = pytest.importorskip("torch")
-pytest.importorskip("torchax")
 
 RATE = 16000
 
@@ -97,7 +101,7 @@ def test_an_audio_condition_rebuilt_from_its_record_encodes_the_same(towers):
     condition = Condition(HFAudio.from_pretrained(str(towers / "wav2vec2"), seconds=0.25),
                           field="audio", unconditional=0.0)
     saved = jax.tree.map(lambda leaf: np.asarray(leaf) * 2, condition.encoder.params)
-    rebuilt = Condition.from_json(condition.to_json(), params=saved)
+    rebuilt = Condition.bound(to_record(condition, Condition), params=saved)
     tokens = condition.encoder.tokenize([_tone(330, 0.25)])
 
     assert rebuilt.unconditional == 0.0 and rebuilt.encoder.seconds == 0.25
@@ -130,27 +134,30 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     The loss is the denoising loss over drawn noise levels and noise, so it
     is scored before and after training on the same 64 draws, and the drop
     is held to a test rather than a share: training lowered the expected
-    loss when the paired drops' t statistic clears Student's t with 63
-    degrees of freedom at one in a billion, 7.0
-    (scipy.stats.t.isf(1e-9, 63)). A run that learns nothing scores near 0;
-    this one scored 15.9, on the pixel regime's sigmas a pixel run draws."""
-    pytest.importorskip("moviepy.config", reason="needs the av extra")
+    loss when the paired drops over the 64 draws, a unit each, clear the
+    learning gate's threshold (Student's t with 63 degrees of freedom at one
+    in a billion, 7.0). A run that learns nothing scores near 0; this one
+    scored 15.9, on the pixel regime's sigmas a pixel run draws."""
     for hertz in range(220, 1100, 110):
         _clip(tmp_path / f"{hertz}.avi", hertz)
-    data = VideoData(source=str(tmp_path), extensions=(".avi",), frame_size=8, frames=2,
-                 audio_padding=1, audio_model=str(towers / "wav2vec2"))
+    # Two frames at 25 fps, their sound a frame wider on each side, at the rate wav2vec2 reads.
+    data = Files(str(tmp_path), format="files").pipe(
+        presets.video, 2 / 25, frames=2, fps=25, size=8, batch=8, extensions=(".avi",), sample_rate=16_000,
+        context=1 / 25).read("memory").loading(Loading(workers=0))
+    seconds = data.facts()["audio_seconds"]
     config = DiffusionRunConfig(
         model=ModelConfig("video_dit", {"patch_size": 4, "emb_features": 32, "num_layers": 1,
                                         "num_heads": 2, "dtype": "float32", "attention_impl": "reference"}),
-        data=data, text=None, audio=AudioCondition(), val_metrics=(),
+        data=data, text=None, audio=AudioCondition(checkpoint=str(towers / "wav2vec2")), val_metrics=(),
         objective=ObjectiveConfig("diffusion", {"steps": 4, "guidance": CFG(2.0), "ema_decay": None}))
     objective = config.build()
-    assert objective.inputs.conditions["textcontext"].encoder.seconds == data.audio_seconds
-    assert DiffusionRunConfig.from_dict(config.to_dict()) == config
-    dataset = loader(data, batch=8, read="memory", loading=Loading(workers=0),
-                   host=objective.data().train_batch)
+    assert objective.inputs.conditions["textcontext"].encoder.seconds == seconds
+    assert DiffusionRunConfig.from_dict(config.to_dict()).to_dict() == config.to_dict()
+    dataset, _ = fitted(data, None, objective=objective.data())
     batch = next(dataset.train(DataPartition()))
-    assert set(batch) == {"video", "audio", "audio_valid"} and set(batch["audio"]) == {"input_values"}
+    # The clips' captions ride beside as host text, which no compiled step takes (`EncodeCaptions(keep=...)`).
+    assert set(batch) == {"video", "audio", "audio_valid", CAPTIONS}
+    assert set(batch["audio"]) == {"input_values"}
 
     keys = jax.random.split(jax.random.PRNGKey(7), 64)
     scored = jax.jit(lambda variables, key: objective.loss(
@@ -163,11 +170,11 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     state = Trainer(objective, optax.adam(3e-3), key=jax.random.PRNGKey(0)).fit(
         dataset, steps=40, log_every=100)
     drop = before - losses(state.variables)
-    statistic = drop.mean() / (drop.std(ddof=1) / np.sqrt(drop.size))
-    assert statistic > 7.0, (statistic, drop.mean())
+    assert_learns(lambda draws: {"training lowers the loss": drop[draws]}, "audio-conditioned loss",
+                  units=drop.size)
 
     pipe = objective.pipeline(state, ema=False)
-    low, high = (pipe([{"audio": _tone(hertz, data.audio_seconds)}], key=0).host().images
+    low, high = (pipe([{"audio": _tone(hertz, seconds)}], key=0).host().images
                  for hertz in (220, 880))
     assert low.shape == (1, 2, 8, 8, 3)
     assert np.abs(low - high).max() > 1e-3
@@ -176,8 +183,8 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
 def test_audio_conditioning_is_refused_beside_text_or_without_clip_audio():
     """The audio takes the models' one context keyword, so a run naming text
     too is refused, and so is a dataset whose samples carry no audio."""
+    silent = Files("clips", format="files").pipe(presets.video, 2 / 25, frames=2, fps=25, size=8, batch=8)
     with pytest.raises(ValueError):
-        DiffusionRunConfig(data=VideoData(source="clips"), audio=AudioCondition())
+        DiffusionRunConfig(data=silent, audio=AudioCondition())
     with pytest.raises(ValueError):
-        DiffusionRunConfig(data=ImageData(source="tfds://oxford_flowers102"), text=None,
-                           audio=AudioCondition())
+        DiffusionRunConfig(data=images_of("tfds://oxford_flowers102", 32), text=None, audio=AudioCondition())

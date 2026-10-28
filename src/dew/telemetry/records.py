@@ -1,6 +1,6 @@
 """Host-only run records carried by Tracker.artifact, not training pytrees.
 
-`json_value` here runs the opposite direction from `dew.records`: that module
+`json_value` here runs the opposite direction from `dew._records`: that module
 narrows a config field a published file handed over, this one encodes a
 finished record on its way out to a tracker.
 """
@@ -16,11 +16,11 @@ import subprocess
 import traceback
 import typing
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 from typing import Literal
 
+from dew import _checkout
+from dew._records import JSON
 from dew.pool import PREEMPTED_EXIT
-from dew.records import JSON
 
 _log = logging.getLogger(__name__)
 
@@ -82,16 +82,11 @@ def checkout_revision() -> str | None:
     so both files and directories are accepted. Git unavailable or unable
     to read this checkout leaves the revision unknown and reports why.
     """
-    root = Path(__file__).resolve().parents[3]
-    if not (root / '.git').exists():
-        return None
     try:
-        revision = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'],
-                                  capture_output=True, text=True, check=True)
+        return _checkout.revision()
     except (OSError, subprocess.CalledProcessError) as error:
         _log.warning("Cannot read Dew's checkout revision: %s", error)
         return None
-    return revision.stdout.strip()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,6 +125,10 @@ class FitStarted:
     seed: int | None = None
     """None: no integer seed recorded (a JAX key was supplied, or the record predates the field)."""
     tokens: int | None = None
+    cadences: Mapping[str, JSON] = dataclasses.field(default_factory=dict)
+    """The run's cadences and schedule warmups as it resolved them, a share of the run among them
+    (`dew.training.budget.every_step`, `dew.optim.OptimConfig.warmups`): steps, committed tokens or a
+    duration by name."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -149,8 +148,9 @@ class StepCompiled:
     because the step did not fit, the links of the tensor and sequence axes
     the mesh splits, by axis name, the arithmetic of the check that it
     fits this process's devices (`dew.training.memory.memory_record`), and
-    its plan: the microbatches it reads each batch in, their rows, and every
-    compile the search made (`dew.training.memory.Probe`)."""
+    its plan: the microbatches it reads each batch in, their rows, every
+    compile the search made (`dew.training.memory.Probe`), and its kernels
+    (`dew.training._lowering.KernelReport.record`)."""
     seconds: float
     remat: JSON
     links: Mapping[str, AxisLink]

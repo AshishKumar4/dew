@@ -1,37 +1,36 @@
-"""CPU worker sessions, pool reports and process-group cleanup."""
+"""CPU worker sessions, pool reports, process-group cleanup and the local HTTP server a pool reads."""
 
 import argparse
 import contextlib
+import http.server
 import json
 import os
 import signal
 import socket
 import subprocess
 import sys
-import time
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
 
 import pytest
+from lane_environment import MESH_DEVICES, without_deterministic_ops
+from tool_support import load
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("multiprocess_worker.py")
-DEVICES = 8
+groups = load("child_groups", "tools/armada")
+"""The children's group ownership Dew's CI uses too."""
 
 
 READ_ONLY = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ"
 """The flag `gpu-run -n 0.5` adds beside other work on a GPU, under which no process measures."""
 
-REPEATABLE = "--xla_gpu_deterministic_ops=true"
-"""The flag under which a process keeps no picks, so its kernels repeat from run to run."""
-
-
 def keeping_picks() -> str:
-    """This process's XLA flags without `REPEATABLE`, which the cuda lane sets: a process
-    keeps and measures picks only without it (`dew.cache.keeps_picks`)."""
-    return " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
-                    if not flag.startswith(REPEATABLE.split("=")[0]))
+    """This process's XLA flags without the cuda lane's deterministic-ops flag: a process keeps and
+    measures picks only without it (`dew.cache.keeps_picks`)."""
+    return without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
 
 
 def fresh(script: str, *arguments: str, cache_dir, flags: str, source: Path = REPO_ROOT / "src"):
@@ -80,6 +79,26 @@ def serve_mode(modes: Mapping[str, Callable], args) -> None:
     args.out.write_text(json.dumps(modes[args.mode](args)))
 
 
+@contextlib.contextmanager
+def serving(handle):
+    """A local HTTP server answering each GET with `handle(request)`, and its address."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            handle(self)
+
+        def log_message(self, *arguments):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def free_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
@@ -95,14 +114,14 @@ def worker_env(devices: int) -> dict[str, str]:
 
 def start_process(command: Sequence[str], devices: int, *,
                   environment: Mapping[str, str] | None = None) -> subprocess.Popen[str]:
-    return subprocess.Popen(
-        command, cwd=REPO_ROOT, env={**worker_env(devices), **(environment or {})},
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
+    return groups.start(command, cwd=REPO_ROOT, env={**worker_env(devices), **(environment or {})},
+                       stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 
 def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,
           coordinator: str | None = None, devices: int | None = None, *,
-          script: Path = WORKER, **flags) -> subprocess.Popen[str]:
+          script: Path = WORKER, environment: Mapping[str, str] | None = None,
+          **flags) -> subprocess.Popen[str]:
     command = [sys.executable, str(script), mode, "--out", str(out),
                "--processes", str(processes), "--process-id", str(process_id)]
     if coordinator is not None:
@@ -113,33 +132,15 @@ def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,
             command.append(flag)
         elif value is not None:
             command += [flag, str(value)]
-    return start_process(command, DEVICES // processes if devices is None else devices)
+    return start_process(command, MESH_DEVICES // processes if devices is None else devices,
+                         environment=environment)
 
 
 def terminate(process: subprocess.Popen[str]) -> None:
     """Kill the session even if its leader already exited and left descendants,
-    and return once none of them still runs: SIGKILL lands asynchronously, so a
-    descendant can still be running when the leader has been reaped."""
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    process.wait(timeout=60)
-    deadline = time.monotonic() + 60
-    while running := session_members(process.pid):
-        assert time.monotonic() < deadline, f"session {process.pid} still runs {running} after SIGKILL"
-        time.sleep(0.01)
-
-
-def session_members(group: int) -> list[int]:
-    """The live (not zombie) processes of process group `group`."""
-    members = []
-    for stat in Path("/proc").glob("[0-9]*/stat"):
-        try:
-            fields = stat.read_text().rsplit(")", 1)[1].split()
-        except (FileNotFoundError, ProcessLookupError):
-            continue
-        if fields[0] != "Z" and int(fields[2]) == group:
-            members.append(int(stat.parent.name))
-    return members
+    and return once none of them still runs (tools/armada/child_groups.py's `stop`)."""
+    running = groups.stop(process, settle=120.0)
+    assert not running, f"session {process.pid} still runs {running} after SIGKILL"
 
 
 class ProcessGroup:
@@ -223,3 +224,29 @@ def assert_exits_cleanly(program: str) -> None:
                           timeout=300, env={**os.environ, "JAX_PLATFORMS": "cpu",
                                             "PYTHONPATH": str(REPO_ROOT / "src")})
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+def dew_train(directory, environment: Mapping[str, str], *arguments: str) -> None:
+    """`dew train *arguments` run from `directory` in `environment`, as a user types it; it must succeed."""
+    finished = subprocess.run([sys.executable, "-m", "dew.cli.main", "train", *arguments],
+                              cwd=directory, env=environment, capture_output=True, text=True, timeout=900)
+    assert finished.returncode == 0, f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}"
+
+
+def logged_losses(run_directory) -> list[float]:
+    """The training losses a run in `run_directory` logged, in step order (its tracking's scalars)."""
+    rows = (Path(run_directory) / "tracking" / "scalars.jsonl").read_text().splitlines()
+    scalars = [json.loads(row)["scalars"] for row in rows]
+    return [row["train/loss"] for row in scalars if "train/loss" in row]
+
+
+def running(pid: int) -> bool:
+    """Whether process `pid` runs: it exists and has not ended. A zombie has ended: it waits only for its
+    reaper, which for an orphan may be a child subreaper that reaps when its own job ends, as a GPU node's
+    job runner does. One that ends between the open of its state and the read fails the read with ESRCH,
+    and has ended too."""
+    try:
+        status = Path(f"/proc/{pid}/stat").read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        return False
+    return status.rsplit(")", 1)[1].split()[0] != "Z"

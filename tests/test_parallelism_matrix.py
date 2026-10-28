@@ -4,9 +4,11 @@ that split it differently, against one device on the eight-device CPU mesh.
 tools/layout_parity.py judges a layout's step-one loss and gradient against
 one device's, each leaf within FLOOR_FACTOR of the reference's own deviation
 under reassociating its sums (its rows reordered and pooled, and the step's
-distance from fp64), and holds the layout's FLOPs to an even split. A cell
-works, or is refused by design with its reason, as a stage axis over a model
-that runs no pipeline is; any other status is a defect. The models are the
+distance from fp64), and holds the layout's FLOPs to an even split. Each cell
+states what it does: it works, or it is refused by design for the reason
+REFUSED gives. A supported cell that refuses fails, and so does a refused
+cell that runs, so a refusal is never read as a pass and a lifted one is
+never left unclaimed. The models are the
 tool's zoo, sized so every layout divides them. Each row lists the layouts that
 split its model in a way no other row covers: a pair's second axis, a packed or
 masked column under a sequence split, a bidirectional exchange, a vision tower
@@ -41,9 +43,14 @@ CELLS: dict[str, tuple[str, ...]] = {
     "grouped": ("fsdp2_tensor2",),
     "gated": ("tensor4",),
     "moe_grpo": ("expert4", "expert2_fsdp2", "tensor4", "sequence4"),
+    "moe_exchange": ("expert4", "expert2_fsdp2"),
     "mla_dpo": ("fsdp4", "sequence4"),
     "hybrid_sft": ("sequence4", "stage4", "data4_explicit"),
+    "routed_tail": ("stage4",),
+    "shared_tail": ("stage2_fsdp2",),
     "mamba1_packed": ("fsdp2_explicit",),
+    "dense_packed": ("sequence4",),
+    "rigel_packed": ("sequence4",),
     "mmdit": ("tensor4", "fsdp2_tensor2"),
     "dit": ("sequence4", "tensor4", "fsdp2_explicit"),
     "unet": ("tensor4", "fsdp2_tensor2", "sequence4"),
@@ -53,6 +60,10 @@ CELLS: dict[str, tuple[str, ...]] = {
 CELLS_ON_FOUR: dict[str, tuple[str, ...]] = {
     "dense": ("stage4", "stage2_sequence2"),
 }
+REFUSED: dict[tuple[str, str], str] = {
+    ("hybrid_sft", "stage4"): "its four layers alternate two kinds, so no run of four repeats one layer",
+}
+"""The cells refused by design, each with its reason."""
 
 
 @pytest.fixture(scope="session")
@@ -62,8 +73,10 @@ def references(tmp_path_factory):
     cell is a test of its own, so CI spreads a model's layouts over tasks
     rather than running them all in one. Its tool module is the one each
     test runs: the one-device state the references hold (`_initial`) lives
-    in that module, so a layout's state is checked against it bit for bit
-    rather than drawn again by a module of its own."""
+    in that module, so each layout starts from that state itself rather than
+    a draw of its own, and its stepped state is judged against the reference
+    inside the tool's run, which gives the cell its status, never bit for bit
+    across layouts."""
     tool = load("layout_parity")
     return tool, tool.References(directory=tmp_path_factory.mktemp("layout-references"), prepare=True)
 
@@ -74,13 +87,15 @@ def references(tmp_path_factory):
       for model, layouts in sorted(CELLS.items()) for layout in layouts),
     *(pytest.param(model, layout, 4, id=f"{model}-{layout}-on-four")
       for model, layouts in sorted(CELLS_ON_FOUR.items()) for layout in layouts)])
-def test_each_layout_of_a_model_matches_one_device_or_is_refused(model, layout, devices, references):
+def test_each_layout_of_a_model_matches_one_device_or_is_refused_as_stated(model, layout, devices,
+                                                                           references):
     tool, held = references
     with jax.enable_x64(new_val=True):
         rows = tool.run([model], (layout,), dtype="float32", steps=1, anchor=True, mixture={},
                         objective={}, references=held, speak=lambda line: None,
                         keep=lambda rows: None, devices=devices)
-    assert tool.verdict(rows) == 0, [
+    stated = "refused" if (model, layout) in REFUSED else "works"
+    assert [row["status"] for row in rows] == [stated], [
         {key: row.get(key) for key in ("layout", "status", "worst_leaf", "worst_ratio", "loss_error",
                                        "loss_bound", "flops_ratio", "reason", "error")}
         for row in rows]

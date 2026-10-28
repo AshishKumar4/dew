@@ -16,12 +16,12 @@ import optax
 import pytest
 from affine_run import dataset
 
+from dew.batch import FROZEN
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.protocols import OutputTable
-from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
-from dew.objectives.lm.chunked import chunked_cross_entropy, model_logits
+from dew.objectives.lm.chunked import chunked_cross_entropy, logits_support_log_probs, model_logits
 from dew.objectives.rl.grpo import GRPOObjective
 from dew.objectives.rl.sessions import (
     SUPPORT_COLUMNS_KEY,
@@ -128,6 +128,20 @@ def test_an_adapted_head_rescores_its_support_and_trains_its_factors_alone():
     for before, after in zip(*leaves[FROZEN], strict=True):
         np.testing.assert_array_equal(before, after)
     assert all(np.any(before != after) for before, after in zip(*leaves["params"], strict=True))
+
+
+def test_a_heads_supported_likelihoods_are_at_least_float32_and_keep_float64():
+    """Over a head no matrix gives (`logits_support_log_probs`), each support renormalizes a bfloat16
+    head's logits in float32 and a float64 head's in float64 (`at_least_fp32`), as its whole-vocabulary
+    likelihoods are."""
+    targets = jnp.asarray([[1, 2, 3], [4, 5, 6]])
+    ids = jnp.asarray([[1, 9, 2, 3, -1], [4, 5, 7, 6, -1]])
+    columns = jnp.asarray([[0, 0, 1, 2, -1], [0, 1, 2, 2, -1]])
+    with jax.enable_x64(new_val=True):
+        logits = jax.random.normal(jax.random.key(0), (2, 3, VOCAB), jnp.float64)
+        for dtype, wide in ((jnp.bfloat16, jnp.float32), (jnp.float64, jnp.float64)):
+            log_probs, present = logits_support_log_probs(logits.astype(dtype), targets, ids, columns)
+            assert log_probs.dtype == wide and bool(present.all()), dtype
 
 
 def test_a_tempered_softcapped_cross_entropy_divides_after_the_cap():

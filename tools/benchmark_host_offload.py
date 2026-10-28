@@ -37,13 +37,16 @@ import numpy as np
 import tyro
 
 import dew.nn.backbones  # noqa: F401  (registers the kind)
-from dew.hashing import fmix32
+from dew._hashing import fmix32
+from dew.batch import Variables
+from dew.distributed.placement import Placement
 from dew.inference.banks import LayerBanks, at_namespace, in_namespace, narrowed, one_layer
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import Variables
+from dew.nn.inputs import ModelInputs
 from dew.registry import models
+from dew.sampling.text import decode_ops, prefill_state
+from dew.telemetry.benchmark import resident_memory
 from dew.training import Layout, MeshSpec
-from dew.training.distributed import Placement
 
 WIDTHS = {
     "tiny": {"vocab_size": 256, "emb_features": 64, "num_heads": 4, "head_dim": 16,
@@ -113,7 +116,7 @@ class SyntheticBanks(LayerBanks):
         def rows(path, leaf):
             if len(layers) == 1:
                 return self._values(path, layers[0], leaf.shape, leaf.dtype)
-            bank = np.empty((len(layers),) + leaf.shape, np.dtype(leaf.dtype))
+            bank = np.empty((len(layers), *leaf.shape), np.dtype(leaf.dtype))
             for offset, index in enumerate(layers):
                 bank[offset] = self._values(path, index, leaf.shape, leaf.dtype)
             return bank
@@ -139,14 +142,8 @@ class SyntheticBanks(LayerBanks):
 
 def status() -> dict[str, int]:
     """This process's resident memory, in bytes, as the kernel reports it."""
-    wanted = {"VmRSS": "rss", "RssAnon": "rss_anon", "VmHWM": "rss_peak"}
-    values = {}
-    with open("/proc/self/status") as handle:
-        for line in handle:
-            name, _, rest = line.partition(":")
-            if name in wanted:
-                values[wanted[name]] = int(rest.split()[0]) * 1024
-    return values
+    memory = resident_memory()
+    return {"rss": memory["VmRSS"], "rss_anon": memory["RssAnon"], "rss_peak": memory["VmHWM"]}
 
 
 def plan(compiled) -> dict[str, int]:
@@ -159,14 +156,11 @@ def plan(compiled) -> dict[str, int]:
 
 
 def entry_spaces(compiled) -> dict[str, int]:
-    """How many of the entry computation's parameters XLA put in each memory
-    space, read off the compiled module's own layout: `S(5)` is its name for
-    pinned host memory."""
-    head = compiled.as_text().splitlines()[0]
-    body = head.partition("entry_computation_layout={(")[2].partition(")->")[0]
+    """How many of the compiled program's parameters XLA put in each memory
+    space, as its input shardings name it (`memory_kind`)."""
     counts = {"pinned_host": 0, "device": 0}
-    for entry in body.split(", ") if body else []:
-        counts["pinned_host" if "S(5)" in entry else "device"] += 1
+    for sharding in jax.tree.leaves(compiled.input_shardings):
+        counts["pinned_host" if sharding.memory_kind == "pinned_host" else "device"] += 1
     return counts
 
 
@@ -198,9 +192,9 @@ def shapes_of(model: CausalTransformer, tokens, dtype: str) -> dict:
     """The store a source fills, as shapes.
 
     `init` writes fp32 masters, which a training run keeps and a published
-    checkpoint does not: `dew.sampling.pipelines.cast_floating` casts every
-    floating leaf on the way out of a run, so a bf16 case holds bf16 weights
-    and no fp32 copy of them exists anywhere here.
+    checkpoint does not: a published checkpoint holds every floating leaf in
+    the dtype it ships, so a bf16 case holds bf16 weights and no fp32 copy of
+    them exists anywhere here.
     """
     shapes = jax.eval_shape(lambda key: model.init(key, tokens), jax.random.key(0))
     target = jnp.dtype(dtype)
@@ -211,20 +205,18 @@ def shapes_of(model: CausalTransformer, tokens, dtype: str) -> dict:
 
 
 def decode_step(model: CausalTransformer):
-    def step(store, cache, token, position):
-        logits, changed = model.apply(
-            {**store, "cache": cache}, token, decode=True, mutable=["cache"],
-            positions=position)
-        return logits[:, -1], changed["cache"]
+    """The decoder's one-token advance (`dew.sampling.text.decode_ops`), bound to the placed store inside
+    the compiled call: the state the next token is drawn from."""
+    def step(store, state, token):
+        return decode_ops(model, store, 0, None).advance(state, token, jnp.ones(token.shape, bool))
 
     return jax.jit(step)
 
 
 def prefill_call(model: CausalTransformer):
+    """The decoder's prefill over the prompt (`dew.sampling.text.prefill_state`), from the cache given."""
     def prefill(store, cache, tokens):
-        logits, changed = model.apply(
-            {**store, "cache": cache}, tokens, decode=True, mutable=["cache"])
-        return logits[:, -1], changed["cache"]
+        return prefill_state(model, store, ModelInputs(tokens), decode_ops(model, store, 0, None), cache)[0]
 
     return jax.jit(prefill)
 
@@ -293,26 +285,24 @@ def measure(config: OffloadConfig, depth: int, offload: bool) -> dict:
     record["prefill_spaces"] = entry_spaces(compiled)
 
     started = time.perf_counter()
-    logits, cache = jax.block_until_ready(compiled(store, cache, tokens))
+    state = jax.block_until_ready(compiled(store, cache, tokens))
     record["prefill_seconds"] = time.perf_counter() - started
 
     step = decode_step(model)
-    token = jnp.argmax(logits, axis=-1)[:, None].astype(jnp.int32)
-    position = jnp.full((config.batch, 1), config.prompt, jnp.int32)
+    token = jnp.argmax(state.logits, axis=-1).astype(jnp.int32)
     started = time.perf_counter()
-    stepped = step.lower(store, cache, token, position).compile()
+    stepped = step.lower(store, state, token).compile()
     record["decode_compile_seconds"] = time.perf_counter() - started
     record["decode_plan"] = plan(stepped)
     record["decode_spaces"] = entry_spaces(stepped)
 
     produced, latencies = [], []
-    for index in range(config.new_tokens):
+    for _ in range(config.new_tokens):
         at = time.perf_counter()
-        logits, cache = jax.block_until_ready(stepped(store, cache, token, position))
+        state = jax.block_until_ready(stepped(store, state, token))
         latencies.append(time.perf_counter() - at)
-        token = jnp.argmax(logits, axis=-1)[:, None].astype(jnp.int32)
-        produced.append(int(token[0, 0]))
-        position = position + 1
+        token = jnp.argmax(state.logits, axis=-1).astype(jnp.int32)
+        produced.append(int(token[0]))
     record["tokens"] = produced
     record["decode_latencies"] = latencies
     record["decode_median_seconds"] = float(np.median(latencies))
@@ -328,7 +318,7 @@ def measure(config: OffloadConfig, depth: int, offload: bool) -> dict:
         name: int(value) for name, value in (jax.devices()[0].memory_stats() or {}).items()
         if name in ("bytes_in_use", "peak_bytes_in_use", "bytes_limit",
                     "largest_alloc_size")}
-    del store, cache
+    del store, cache, state
     gc.collect()
     return record
 

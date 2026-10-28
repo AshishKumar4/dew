@@ -23,30 +23,30 @@ float64.
 
 import argparse
 import importlib
-import sys
-import tempfile
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
+from beta_schedule_reference import SOURCES
+from reference_source import package, published_files
 
 ROOT = Path(__file__).resolve().parents[1]
-REPO, COMMIT = "XiangLi1999/Diffusion-LM", "759889d58ef38e2eed41a8c34db8032e072826f4"
+REPO, COMMIT, PATH = SOURCES["diffusion_lm"]
+FILES = {
+    "gaussian_diffusion.py": "4d344b0e0feca36f8c22c44cf1ddc2c74c8de3eee5c2b3dc6accb486b38730c1",
+    "nn.py": "d9547fb22b421a16dc079cb82a9d98630100b5e1b2a710d343f4d3f90b8661f3",
+    "losses.py": "fc9db890fe8f33667c76b1d556f51578bffe1ce41ad70a90024ae93f469e5278",
+}
+"""The published package's files beside its gaussian_diffusion.py, to their SHA-256."""
 STEPS = 2000
 SHAPE = (6, 3, 4, 4)
 
 
 def published():
     """Diffusion-LM's gaussian_diffusion module, from its own files at the pinned commit."""
-    package = Path(tempfile.mkdtemp()) / "improved_diffusion"
-    package.mkdir()
-    (package / "__init__.py").write_text("")
-    for name in ("gaussian_diffusion.py", "nn.py", "losses.py"):
-        url = f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/improved-diffusion/improved_diffusion/{name}"
-        with urllib.request.urlopen(url, timeout=60) as response:
-            (package / name).write_bytes(response.read())
-    sys.path.insert(0, str(package.parent))
+    directory = PATH.removesuffix("gaussian_diffusion.py")
+    files = {directory + name: digest for name, digest in FILES.items()}
+    package("improved_diffusion", published_files(REPO, COMMIT, files) / directory)
     return importlib.import_module("improved_diffusion.gaussian_diffusion")
 
 

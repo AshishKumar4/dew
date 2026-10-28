@@ -12,13 +12,20 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from affine_run import Affine, dataset
+import pytest
+from affine_run import BATCH, Affine, Counting, Replaying, dataset
 from flax import linen as nn
+from learning_gate import assert_learns
+from recording import RecordingTracker
 
-from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
+from dew.batch import VALID_ROWS
+from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
+from dew.data.dataset import Loader
+from dew.data.pipeline import DeviceStep
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import VALID_ROWS, Step
+from dew.objectives.base import Step
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
+from dew.registry import ModelConfig
 from dew.training import Trainer
 
 INPUTS = InputSpec(Field("x", (3,)))
@@ -30,19 +37,104 @@ def squared(outputs, batch):
     return (outputs - batch["y"]) ** 2
 
 
-def batch(rows=8):
-    x = np.random.default_rng(0).normal(size=(rows, 3)).astype(np.float32)
+def batch(rows=8, seed=0):
+    x = np.random.default_rng(seed).normal(size=(rows, 3)).astype(np.float32)
     return {"x": x, "y": 2 * x[:, :2], "label": (x[:, 0] > 0).astype(np.int32)}
 
 
+RUNS = 32
+"""The independent training runs a learning claim here is judged over (`assert_learns`): at eight the
+gate's t threshold is 38.7, past what these runs' spread of initial losses reaches."""
+
+
+def learned(objective, optimizer, loader_of, held_out_of, steps: int, margin: float) -> np.ndarray:
+    """Each of RUNS independent runs' contrast for "training lowers the held-out loss by `margin` times":
+    the log of the loss before over the loss after, less the log of `margin`, on the run's own held-out
+    batch, each run from its own initialization key and data. A ratio's claim in logs, so a run's
+    initial loss scales none of it."""
+    contrasts = []
+    for run in range(RUNS):
+        trainer = Trainer(objective, optimizer, key=jax.random.key(run))
+        start = trainer.initial_state()
+        state = trainer.fit(loader_of(run), steps=steps, log_every=steps)
+        held_out = held_out_of(run)
+        before, _ = objective.scalar_loss(start.variables, held_out, STEP)
+        after, _ = objective.scalar_loss(state.variables, held_out, STEP)
+        contrasts.append(float(np.log(float(before) / float(after)) - np.log(margin)))
+    return np.asarray(contrasts)
+
+
 def test_a_plain_flax_model_trains_on_a_loss_function():
+    """Over independent runs, each from its own key on its own data, sixty steps of Adam cut the affine
+    model's held-out squared error to under a quarter (`assert_learns`)."""
     objective = Supervised(Affine(), squared, inputs=INPUTS)
-    trainer = Trainer(objective, optax.adam(0.1), key=jax.random.key(0))
-    start = trainer.initial_state()
-    state = trainer.fit(dataset(), steps=60, log_every=60)
-    before, _ = objective.scalar_loss(start.variables, batch(), STEP)
-    after, _ = objective.scalar_loss(state.variables, batch(), STEP)
-    assert after < before / 4
+    drop = learned(objective, optax.adam(0.1),
+                   lambda run: dataset(train=lambda run=run: Replaying(lambda step: batch(seed=[run, step])),
+                                       batch=8),
+                   lambda run: batch(rows=256, seed=[run, 10_000]), steps=60, margin=4)
+    assert_learns(lambda runs: {"training cuts the held-out loss to a quarter": drop[runs]},
+                  "a plain flax model", units=RUNS)
+
+
+def test_a_model_named_by_its_input_field_alone_takes_the_shape_its_data_gives():
+    """`Supervised(model, loss, inputs="x")` names the field alone: the run reads its first batch once,
+    before the model initializes, and the objective declares the shape that batch holds, as an explicit
+    spec would, and trains as the run given that spec does. A state placed before any run has read the
+    data is refused."""
+    declared = Trainer(Supervised(Affine(), squared, inputs=INPUTS), optax.sgd(0.1), key=0).fit(
+        dataset(), steps=3)
+    named = Supervised(Affine(), squared, inputs="x")
+    with pytest.raises(ValueError):
+        Trainer(named, optax.sgd(0.1), key=0).place()
+    state = Trainer(named, optax.sgd(0.1), key=0).fit(dataset(), steps=3)
+    assert named.inputs == INPUTS
+    for leaf, expected in zip(jax.tree.leaves(state.variables), jax.tree.leaves(declared.variables),
+                              strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(expected))
+
+
+class Cropped(DeviceStep):
+    """A device step that keeps the first two of each row's three features."""
+
+    def __call__(self, batch):
+        return {**batch, "x": batch["x"][:, :2]}
+
+
+def test_a_named_input_takes_the_shape_the_loaders_device_steps_give_the_model():
+    """A loader whose device steps crop each row's three features to two gives the model rows of two: an
+    input named alone is declared at those, as the model reads them after the steps, not as the reader
+    delivers them, and the run trains as the run given an explicit spec of two does."""
+    def data() -> Loader:
+        return Loader(lambda partition: Counting(), None, None, BATCH, device=(Cropped(),))
+
+    two = InputSpec(Field("x", (2,)))
+    declared = Trainer(Supervised(Affine(), squared, inputs=two), optax.sgd(0.1), key=0).fit(data(), steps=3)
+    named = Supervised(Affine(), squared, inputs="x")
+    state = Trainer(named, optax.sgd(0.1), key=0).fit(data(), steps=3)
+    assert named.inputs == two
+    for leaf, expected in zip(jax.tree.leaves(state.variables), jax.tree.leaves(declared.variables),
+                              strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(expected))
+
+
+def affine_work(batch):
+    """Training `Affine` on a batch: a row's forward is 3 x 2 multiply-adds, two FLOPs each, and its
+    backward twice that."""
+    return 3 * 2 * 3 * 2 * len(batch["x"])
+
+
+def test_a_model_dew_holds_no_count_for_reports_the_work_its_objective_declares():
+    """`Supervised(work=)` declares a batch's analytical training FLOPs for a model Dew holds no count
+    for: the run logs it as each step's train/flops, the numerator train/mfu reads where the device's
+    peak is known; without it the run logs no count, never the compiled program's."""
+    def logged(work) -> list[float | None]:
+        tracker = RecordingTracker()
+        Trainer(Supervised(Affine(), squared, inputs=INPUTS, work=work), optax.sgd(0.1), key=0,
+                tracker=tracker).fit(dataset(), steps=2, log_every=1)
+        return [scalars.get("train/flops") for _, scalars in tracker.scalars if "train/loss" in scalars]
+
+    assert logged(affine_work) == [affine_work(batch(BATCH))] * 2
+    assert logged(None) == [None, None]
 
 
 def finite_inputs(call):
@@ -115,6 +207,7 @@ def test_an_autoencoder_with_two_outputs_trains_and_its_record_trains_it_again_i
     """A model returning its reconstruction and its latent trains through
     `dew train` on a loss reading both; a new process given only the run's
     `run.json` rebuilds the same run and trains the same loss, step for step."""
+    from process_support import dew_train, logged_losses
     from test_examples import REPO_ROOT, single_device
 
     (tmp_path / "tmp").mkdir()
@@ -122,15 +215,10 @@ def test_an_autoencoder_with_two_outputs_trains_and_its_record_trains_it_again_i
                    "PYTHONPATH": os.pathsep.join([str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")])}
 
     def train(*arguments):
-        finished = subprocess.run([sys.executable, "-m", "dew.cli.main", "train", *arguments],
-                                  cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=900)
-        assert finished.returncode == 0, (
-            f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}")
+        dew_train(tmp_path, environment, *arguments)
 
     def losses(directory):
-        rows = (directory / "autoencoder_experiment" / "tracking" / "scalars.jsonl").read_text().splitlines()
-        scalars = [json.loads(row)["scalars"] for row in rows]
-        return [row["train/loss"] for row in scalars if "train/loss" in row]
+        return logged_losses(directory / "autoencoder_experiment")
 
     train(str(REPO_ROOT / "tests" / "autoencoder_experiment.py"),
           "--set", f"trainer.checkpoint_dir={tmp_path / 'first'}")
@@ -138,11 +226,38 @@ def test_an_autoencoder_with_two_outputs_trains_and_its_record_trains_it_again_i
     loss = json.loads(record.read_text())["fields"]["objective"]["fields"]["loss"]
     assert loss == {"function": "autoencoder_experiment:evidence_bound"}
     trained = losses(tmp_path / "first")
-    assert len(trained) == 40 and np.mean(trained[-5:]) < 0.5 * np.mean(trained[:5])
+    # That the run learns is held over independent runs in process
+    # (`test_the_autoencoders_evidence_bound_falls_over_independent_runs`).
+    assert len(trained) == 40
 
     train(str(record), "--trust", "autoencoder_experiment",
           "--set", f"trainer.checkpoint_dir={tmp_path / 'again'}")
     assert losses(tmp_path / "again") == trained
+
+
+def test_the_autoencoders_evidence_bound_falls_over_independent_runs():
+    """The two-output experiment (tests/autoencoder_experiment.py), its objective and optimizer built
+    from its own run configuration, trained its forty steps halves its held-out evidence bound over
+    independent runs (`assert_learns`), each from its own key on its own points of the experiment's
+    plane."""
+    import autoencoder_experiment
+    from autoencoder_experiment import FEATURES
+
+    plane = np.random.default_rng(0).normal(size=(2, FEATURES)) / np.sqrt(2)
+
+    def points(seed, rows=32):
+        rng = np.random.default_rng(seed)
+        x = rng.normal(size=(rows, 2)) @ plane + rng.normal(0, 0.05, (rows, FEATURES))
+        return {"x": x.astype(np.float32)}
+
+    config = autoencoder_experiment.run()
+    objective = config.objective.build(model=config.model.build())
+    drop = learned(objective, config.optim.build(config.trainer.steps),
+                   lambda run: dataset(train=lambda run=run: Replaying(lambda step: points([run, step])),
+                                       batch=32),
+                   lambda run: points([run, 10_000], rows=256), steps=config.trainer.steps, margin=2)
+    assert_learns(lambda runs: {"training halves the held-out evidence bound": drop[runs]},
+                  "the autoencoder experiment", units=RUNS)
 
 
 class Normed(nn.Module):

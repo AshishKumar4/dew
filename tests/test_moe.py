@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import fixture_arrays
 from moe_support import by_expert, router_variables
 
 from dew.nn.mlp import GatedMLP
@@ -41,8 +42,7 @@ difference is 7.63e-06 on outputs that reach 34.9, the summation order's spread.
 
 
 def fixture(name: str) -> dict:
-    with np.load(FIXTURES / f"{name}.npz") as data:
-        return {key: np.asarray(value) for key, value in data.items()}
+    return fixture_arrays(FIXTURES / f"{name}.npz")
 
 
 def sparse_variables(tensors, num_experts):
@@ -95,30 +95,17 @@ def test_router_reproduces_the_mixtral_choice_and_gate_values():
     hidden = jnp.asarray(tensors["hidden"]).reshape(-1, CONFIG["mixtral"]["hidden_size"])
     weights, indices = mixtral_router().apply(router_variables(tensors), hidden)
 
-    theirs_indices, theirs_weights = by_expert(
-        tensors["router_indices"], tensors["router_weights"])
-    ours_indices, ours_weights = by_expert(indices, weights)
-    assert np.array_equal(ours_indices, theirs_indices)
     # Largest observed difference 1.79e-07 at fp32 on CPU, from the gate
     # matmul reading a transposed kernel.
-    assert np.max(np.abs(ours_weights - theirs_weights)) < ROUTER_TOLERANCE
+    assert_routes_as_recorded(tensors, weights, indices)
 
 
-def test_router_reproduces_the_deepseek_group_limited_choice():
-    """DeepseekV3MoE's router: sigmoid scores, a per-expert selection bias, the
-    node limit over expert groups, renormalise, scale."""
-    tensors = fixture("deepseek")
-    hidden = jnp.asarray(tensors["hidden"])
-    weights, indices = deepseek_router().apply(
-        router_variables(tensors, bias=True), hidden)
-
-    theirs_indices, theirs_weights = by_expert(
-        tensors["router_indices"], tensors["router_weights"])
+def assert_routes_as_recorded(tensors, weights, indices) -> None:
+    """The router chose each token's recorded experts and gated them as recorded, expert by expert."""
+    theirs_indices, theirs_weights = by_expert(tensors["router_indices"], tensors["router_weights"])
     ours_indices, ours_weights = by_expert(
         indices.reshape(-1, indices.shape[-1]), weights.reshape(-1, weights.shape[-1]))
     assert np.array_equal(ours_indices, theirs_indices)
-    # Largest observed difference 2.38e-07 at fp32 on CPU, on weights the
-    # routed_scaling_factor of 2.5 has already multiplied.
     assert np.max(np.abs(ours_weights - theirs_weights)) < ROUTER_TOLERANCE
 
 
@@ -218,22 +205,18 @@ def v4_router(**overrides) -> Router:
                   top_k=config["num_experts_per_tok"], **settings)
 
 
-def test_router_reproduces_the_deepseek_v4_sqrt_softplus_choice():
-    """`DeepseekV4TopKRouter`: sqrt(softplus) scores, the selection bias,
-    renormalise, scale.
-
-    Tolerance 1e-6; largest observed difference 1.19e-07 at fp32 on CPU.
-    """
-    tensors = fixture("deepseek_v4")
-    hidden = jnp.asarray(tensors["hidden"])
-    weights, indices = v4_router().apply(router_variables(tensors, bias=True), hidden)
-
-    theirs_indices, theirs_weights = by_expert(
-        tensors["router_indices"], tensors["router_weights"])
-    ours_indices, ours_weights = by_expert(
-        indices.reshape(-1, indices.shape[-1]), weights.reshape(-1, weights.shape[-1]))
-    assert np.array_equal(ours_indices, theirs_indices)
-    assert np.max(np.abs(ours_weights - theirs_weights)) < ROUTER_TOLERANCE
+@pytest.mark.parametrize(("name", "router"), [
+    pytest.param("deepseek", deepseek_router, id="v3-group-limited"),
+    pytest.param("deepseek_v4", v4_router, id="v4-sqrt-softplus")])
+def test_router_reproduces_the_deepseek_choice(name, router):
+    """DeepseekV3MoE's router (sigmoid scores, a per-expert selection bias, the
+    node limit over expert groups) and `DeepseekV4TopKRouter`'s (sqrt(softplus)
+    scores, the selection bias), each renormalising and scaling: largest
+    observed weight differences 2.38e-07 and 1.19e-07 at fp32 on CPU, on
+    weights the routed scaling factor has already multiplied."""
+    tensors = fixture(name)
+    weights, indices = router().apply(router_variables(tensors, bias=True), jnp.asarray(tensors["hidden"]))
+    assert_routes_as_recorded(tensors, weights, indices)
 
 
 def v4_experts(swiglu_limit) -> ExpertMLP:

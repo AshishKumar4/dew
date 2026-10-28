@@ -69,19 +69,25 @@ def test_the_nelbo_and_its_gradient_are_mdlms():
     variables = {"params": {"hidden": jnp.asarray(REFERENCE["hidden"]),
                             "head": jnp.asarray(REFERENCE["head"])}}
     batch = {"text": jnp.asarray(REFERENCE["tokens"], jnp.int32)}
-    step = Step(jnp.asarray(0), jax.random.key(0), None)
+    # The objective reads the reference's own corruption, its times and masks (`Step.tape`).
+    process = MDLM(mask_id=MASK)()
+    time_key, mask_key, _ = jax.random.split(jax.random.key(0), 3)
+    t = process.sample_t(time_key, REFERENCE["tokens"].shape[0])
+    _, is_masked = process.corrupt(mask_key, jnp.asarray(REFERENCE["tokens"]), t)
+    step = Step(jnp.asarray(0), jax.random.key(0), None, tape={"times": t, "mask": is_masked})
 
     def mean(variables):
         return model.scalar_loss(variables, batch, step)
 
     (value, aux), gradient = jax.value_and_grad(mean, has_aux=True)(variables)
+    # The per-token terms of the same corruption, which the taped step's evaluation reads.
     terms = model.evaluate(variables, batch, step).losses
     assert_as_exact_as_the_reference(terms, REFERENCE["nlls"], REFERENCE["nlls_f64"], "per-token NELBO")
     assert_as_exact_as_the_reference(gradient["params"]["hidden"], REFERENCE["grad/hidden"],
                                      REFERENCE["grad/hidden_f64"], "gradient in the hidden states")
     assert_as_exact_as_the_reference(gradient["params"]["head"], REFERENCE["grad/head"],
                                      REFERENCE["grad/head_f64"], "gradient in the head")
-    np.testing.assert_allclose(value, REFERENCE["loss_f64"], rtol=1e-6)
+    assert_as_exact_as_the_reference(value, REFERENCE["loss"], REFERENCE["loss_f64"], "NELBO")
 
     tokens, corrupted = REFERENCE["tokens"], REFERENCE["corrupted"]
     logits = REFERENCE["hidden"].astype(np.float64) @ REFERENCE["head"].astype(np.float64)
@@ -89,8 +95,11 @@ def test_the_nelbo_and_its_gradient_are_mdlms():
     masked = corrupted == MASK
     assert 0 < masked.sum() < masked.size
     right = logits.argmax(-1)[masked] == tokens[masked]
-    np.testing.assert_allclose(aux.metrics["masked_accuracy"], right.mean())
-    np.testing.assert_allclose(aux.metrics["masked_fraction"], masked.mean())
+    # Each report is a count over a count, one float32 division, so it is that division's own value.
+    np.testing.assert_array_equal(aux.metrics["masked_accuracy"],
+                                  np.float32(right.sum()) / np.float32(right.size))
+    np.testing.assert_array_equal(aux.metrics["masked_fraction"],
+                                  np.float32(masked.sum()) / np.float32(masked.size))
 
 
 def test_the_reverse_step_draws_from_mdlms_categorical():

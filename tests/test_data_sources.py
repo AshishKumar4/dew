@@ -5,23 +5,24 @@ import hashlib
 import io
 import itertools
 import json
-import os
 import pickle
 import shutil
 import tarfile
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
+import grain.python as grain
 import numpy as np
-import psutil
 import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 import pytest
-from reader_support import assert_a_rewrite_moves_the_identity
+from reader_support import assert_a_rewrite_moves_the_identity, assert_resumes_where_it_stopped
+from storage_support import moto_bucket
+from token_support import export_byte_tokens
 
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
 from dew.data.shards import streamed
 from dew.data.sinks import export
@@ -38,6 +39,48 @@ def test_memory_columns_snapshot_changes_with_content():
     assert [row["x"] for row in rows] == list(range(5))
     assert Memory([{"x": np.int16(4)}]).fingerprint() != Memory([{"x": np.int32(4)}]).fingerprint()
     assert Memory([{"x": 1}], shard_rows=1).fingerprint() != Memory([{"x": 1}], shard_rows=2).fingerprint()
+
+
+@dataclasses.dataclass(frozen=True)
+class Numbered:
+    """Adds one to each record's id."""
+
+    def __call__(self, row):
+        return {**row, "id": int(row["id"]) + 1}
+
+
+@pytest.mark.parametrize("table", ["pandas", "arrow"])
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_memory_reads_a_dataframe_or_arrow_table_as_its_rows(read, table):
+    """A DataFrame with an index of its own, or an Arrow table, read by `Memory`: each row a record
+    of its columns and nothing of the index, as the same rows given as records read; a changed
+    cell changes the store."""
+    import pandas as pd
+    import pyarrow as pa
+
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    columns = {"id": list(range(6)), "text": [f"row {index}" for index in range(6)]}
+    frame = pd.DataFrame(columns, index=[10 * index for index in range(6)])
+    given = frame if table == "pandas" else pa.table(columns)
+    records = [{"id": index, "text": f"row {index}"} for index in range(6)]
+
+    def read_back(memory):
+        chain = Pipeline(memory).map(Numbered(), identity="numbered@1").batch(2)
+        reader = compile(chain, read=read, loading=Loading(workers=0, threads=1, read_buffer=1)).train(
+            DataPartition())
+        try:
+            return [(np.asarray(batch["id"]).tolist(), list(batch["text"]))
+                    for batch in (next(reader) for _ in range(3))]
+        finally:
+            reader.close()
+
+    assert read_back(Memory(given)) == read_back(Memory(records))
+    assert Memory(given).fingerprint()["sha256"] == Memory(records).fingerprint()["sha256"]
+    changed = frame.assign(text=[*columns["text"][:5], "changed"])
+    assert Memory(changed).fingerprint()["sha256"] != Memory(frame).fingerprint()["sha256"]
 
 
 def test_memory_columns_of_different_row_counts_are_refused():
@@ -420,6 +463,195 @@ def test_spark_directory_requires_success_marker(tmp_path):
     assert len(Files(str(tmp_path), format="parquet", spark=True).records("indexed")) == 2
 
 
+@dataclasses.dataclass(frozen=True)
+class ArrowFiles:
+    """A native writer of the caller's: an Arrow IPC file for each batch it is handed, each beside a
+    hidden checksum as Hadoop's writers leave one, stopping before its file `stop` where given."""
+
+    stop: int | None = None
+    format = "arrow"
+
+    def write(self, rows, directory, filesystem):
+        for number, batch in enumerate(rows):
+            if number == self.stop:
+                raise RuntimeError(f"the writer stopped before file {number}")
+            path = f"{directory}/part-{number:06d}.arrow"
+            with filesystem.open_output_stream(path) as stream, pa.ipc.new_file(stream, batch.schema) as file:
+                file.write_batch(batch)
+            with filesystem.open_output_stream(f"{directory}/.part-{number:06d}.arrow.crc") as stream:
+                stream.write(b"checksum")
+
+
+def test_a_native_writers_export_is_committed_by_the_one_publisher_and_read_back(tmp_path):
+    """An export hands its rows to a native writer of the caller's as one Arrow stream; the files it
+    writes, not the ones it hides, are committed by the manifest and `_SUCCESS` every export
+    commits, in their format, and read back in their order, a Spark reader's committed directory
+    among them."""
+    rows = [{"id": index, "text": str(index)} for index in range(10)]
+    manifest = export(Memory(rows), str(tmp_path), format=ArrowFiles(), rows_per_shard=4)
+    assert manifest["format"] == "arrow" and manifest["rows"] == 10
+    assert [Path(entry["path"]).name for entry in manifest["files"]] == [
+        f"part-{number:06d}.arrow" for number in range(3)]
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    assert (tmp_path / "_SUCCESS").read_bytes() == hashlib.sha256(encoded).hexdigest().encode()
+    for read in (Files(str(tmp_path)), Files(str(tmp_path), format="arrow", spark=True)):
+        stored = read.records("indexed")
+        assert [stored[index] for index in range(len(stored))] == rows
+
+
+def test_an_export_whose_writer_stops_commits_nothing_and_the_next_commits_only_its_own(tmp_path):
+    """A writer that stops partway leaves its files uncommitted: no manifest and no `_SUCCESS`, so a
+    reader of committed directories refuses them. The next export to the same place commits its
+    own files alone, and its rows are what a read finds."""
+    rows = [{"id": index} for index in range(10)]
+    with pytest.raises(RuntimeError):
+        export(Memory(rows), str(tmp_path), format=ArrowFiles(stop=2), rows_per_shard=4)
+    assert not (tmp_path / "_dew_manifest.json").exists() and not (tmp_path / "_SUCCESS").exists()
+    assert len(list(tmp_path.rglob("part-*.arrow"))) == 2
+    with pytest.raises(ValueError):
+        Files(str(tmp_path), format="arrow", spark=True).records("indexed")
+    export(Memory(rows[:6]), str(tmp_path), format=ArrowFiles(), rows_per_shard=4)
+    stored = Files(str(tmp_path)).records("indexed")
+    assert [stored[index] for index in range(len(stored))] == rows[:6]
+
+
+@pytest.mark.parametrize("kind", ["jsonl", "text"])
+def test_one_small_file_streams_to_every_reader_each_reading_its_own_lines(tmp_path, kind):
+    """One file smaller than a shard is one physical shard. A streamed read by more readers than that
+    cuts it into as many parts, each the lines that start in an even cut of the file, as Hadoop
+    splits a text file: every share reads lines of its own, and together they read each once, where
+    a read by more readers and workers than shards was refused. Fewer lines than parts are refused."""
+    lines = [json.dumps({"id": index, "pad": "x" * (index % 9)}) for index in range(40)]
+    path = tmp_path / f"rows.{'jsonl' if kind == 'jsonl' else 'txt'}"
+    path.write_text("".join(line + "\n" for line in lines))
+    files = Files(str(path), format=kind)
+    assert len(files.manifest().shards) == 1
+    shares = []
+    for share in range(4):
+        rows = streamed(files.manifest(), partition=DataPartition(share, 4), loading=Loading(workers=0))
+        shares.append([row["id"] if kind == "jsonl" else json.loads(row["text"])["id"] for row in rows])
+    assert all(shares)
+    assert sorted(itertools.chain(*shares)) == list(range(40))
+    (tmp_path / "two.jsonl").write_text(lines[0] + "\n" + lines[1] + "\n")
+    with pytest.raises(ValueError):
+        streamed(Files(str(tmp_path / "two.jsonl")).manifest(), partition=DataPartition(0, 4),
+                 loading=Loading(workers=0))
+
+
+@dataclasses.dataclass(frozen=True)
+class LineOrTarFiles:
+    """A native writer of a record format no suffix of its name spells as `Files` infers one: the
+    rows' `text` as lines of a `.txt` file ("text"), or as each key's `txt` member of a `.tar`
+    ("webdataset"), a file for each batch it is handed."""
+
+    format: str
+
+    def write(self, rows, directory, filesystem):
+        for number, batch in enumerate(rows):
+            texts = batch.column("text").to_pylist()
+            if self.format == "text":
+                payload = "".join(text + "\n" for text in texts).encode()
+            else:
+                archive = io.BytesIO()
+                with tarfile.open(fileobj=archive, mode="w") as tar:
+                    for index, text in enumerate(texts):
+                        member = tarfile.TarInfo(f"{number:06d}-{index:06d}.txt")
+                        member.size = len(text.encode())
+                        tar.addfile(member, io.BytesIO(text.encode()))
+                payload = archive.getvalue()
+            suffix = "txt" if self.format == "text" else "tar"
+            with filesystem.open_output_stream(f"{directory}/part-{number:06d}.{suffix}") as stream:
+                stream.write(payload)
+
+
+@pytest.mark.parametrize("kind", ["text", "webdataset"])
+def test_a_native_writers_export_reads_back_by_the_format_its_manifest_commits(tmp_path, kind):
+    """An export commits the record format its writer states, and `Files` reads the export by that
+    value, whatever a suffix would spell: text lines and WebDataset members, which a reader that
+    looked the format up by a suffix (`data.text`, `data.webdataset`) refused."""
+    texts = [f"record {index}" for index in range(10)]
+    manifest = export(Memory([{"text": text} for text in texts]), str(tmp_path), format=LineOrTarFiles(kind),
+                      rows_per_shard=4)
+    assert manifest["format"] == kind
+    stored = Files(str(tmp_path))
+    rows = list(stored.records("memory"))
+    read = [row["text"].removesuffix("\n") if kind == "text" else row["txt"].decode() for row in rows]
+    assert read == texts
+
+
+def test_a_writer_of_a_format_no_reader_opens_is_refused_before_it_commits(tmp_path):
+    """A writer stating a record format `Files` has no reader for is refused before anything is
+    written: an export's manifest is committed once, so one committed under such a format could
+    never be read, nor written again, there."""
+    with pytest.raises(ValueError):
+        export(Memory([{"text": "one"}]), str(tmp_path), format=LineOrTarFiles("tfrecord"))
+    assert not (tmp_path / "_dew_manifest.json").exists() and not list(tmp_path.rglob("part-*"))
+
+
+def ids_per_reader(path: Path, readers: int, kind: str = "jsonl") -> list[list[int]]:
+    """The ids each of `readers` readers of a streamed read of the store at `path` reads."""
+    stored = Files(str(path), format=kind)
+    shares = []
+    for share in range(readers):
+        partition = DataPartition(share, readers)
+        rows = streamed(stored.manifest(), partition=partition, loading=Loading(workers=0))
+        shares.append([row["id"] if kind == "jsonl" else json.loads(row["text"])["id"] for row in rows])
+    return shares
+
+
+@pytest.mark.parametrize("kind", ["jsonl", "text"])
+@pytest.mark.parametrize("long", [pytest.param(0, id="first"), pytest.param(1, id="second"),
+                                  pytest.param(2, id="third"), pytest.param(3, id="last")])
+def test_a_long_record_leaves_each_of_four_readers_a_record(tmp_path, kind, long):
+    """Four records, one of them 10,000 characters long, read by four readers: the even cuts that fall
+    inside the long record move on to the records after it, and where none is left after them (a
+    long last record) the parts before them split at the records they hold, so each reader reads
+    one record of its own. Cuts that collapsed into one another left two parts; cuts past the last
+    record start left the file fewer parts than records, and the read was refused."""
+    lines = [json.dumps({"id": index, "pad": "x" * (10_000 if index == long else index)})
+             for index in range(4)]
+    (tmp_path / "rows.jsonl").write_text("".join(line + "\n" for line in lines))
+    shares = ids_per_reader(tmp_path / "rows.jsonl", 4, kind)
+    assert sorted(len(ids) for ids in shares) == [1, 1, 1, 1]
+    assert sorted(itertools.chain(*shares)) == [0, 1, 2, 3]
+
+
+def test_a_file_of_fewer_records_than_its_byte_share_hands_its_other_parts_to_another(tmp_path):
+    """A store of two files is cut by their bytes: a file of one long record holds one part, and the
+    parts its bytes would have given it go to the file of many short records, so every reader of
+    four reads, where the read was refused."""
+    (tmp_path / "long.jsonl").write_text(json.dumps({"id": 0, "pad": "x" * 10_000}) + "\n")
+    (tmp_path / "short.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(1, 9)))
+    shares = ids_per_reader(tmp_path, 4)
+    assert all(shares)
+    assert sorted(itertools.chain(*shares)) == list(range(9))
+
+
+def test_no_part_of_a_json_lines_file_starts_on_blank_lines_alone(tmp_path):
+    """Blank lines hold no JSON record: a cut that falls among them moves on to the next record, so
+    no reader is handed a part of blank lines alone and reads nothing."""
+    blank = "\n" * 3000
+    records = [json.dumps({"id": index}) for index in range(4)]
+    lines = [records[0], blank, *records[1:]]
+    (tmp_path / "rows.jsonl").write_text("".join(line + "\n" for line in lines))
+    shares = ids_per_reader(tmp_path / "rows.jsonl", 4)
+    assert sorted(len(ids) for ids in shares) == [1, 1, 1, 1]
+    assert sorted(itertools.chain(*shares)) == [0, 1, 2, 3]
+
+
+@pytest.mark.parametrize("blank", [pytest.param("", id="empty"), pytest.param("\n", id="blank-line"),
+                                   pytest.param(" \n\t\n" * 1000, id="blank-lines")])
+def test_a_json_lines_file_of_no_records_takes_no_part_beside_one_that_holds_them(tmp_path, blank):
+    """An empty or blank JSON-lines file holds no record, so a streamed read cut into more parts than
+    the store's files gives it none: three readers each read one record of the file beside it,
+    whatever share of the bytes the blank one holds, where its empty plan broke the read."""
+    (tmp_path / "blank.jsonl").write_text(blank)
+    (tmp_path / "rows.jsonl").write_text("".join(json.dumps({"id": index}) + "\n" for index in range(3)))
+    shares = ids_per_reader(tmp_path, 3)
+    assert sorted(len(ids) for ids in shares) == [1, 1, 1]
+    assert sorted(itertools.chain(*shares)) == [0, 1, 2]
+
+
 def test_a_corrupt_export_manifest_is_refused_and_never_falls_back_to_raw_shards():
     root = Store(f"memory://corrupt-export-{uuid4().hex}")
     export(Memory([{"id": 1}]), root.url)
@@ -467,7 +699,8 @@ def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
     from dew.data.text import Tokenize
 
     root = Store(f"memory://text-{uuid4().hex}/source.txt")
-    original = b"first\r\nsecond\n\nlast without newline"
+    # Two 9-byte ranges cut inside "second", the last line ending the file without a terminator.
+    original = b"first\r\nsecond\n\nlast"
     root.write(original)
     files = Files(root.url, shard_bytes=9)
     if read == "indexed":
@@ -479,6 +712,89 @@ def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
         records = [indexed[index] for index in range(len(indexed))]
     tokens = np.concatenate([Tokenize().map(row)["text"] for row in records])
     assert tokens.tolist() == list(original)
+
+
+def test_a_listing_keeps_the_files_whose_names_end_in_its_suffixes_in_any_case(tmp_path):
+    """A directory's media beside its notes: suffixes keep the media, whatever case either is
+    written in, as the store is read, here and under a glob."""
+    for name in ("a.MP4", "b.webm", "notes.txt", "list.csv"):
+        (tmp_path / name).write_bytes(b"")
+    for url in (str(tmp_path), str(tmp_path / "*")):
+        listing = Files(url, format="files", suffixes=("mp4", ".WEBM"))
+        names = sorted(row["path"].rsplit("/", 1)[-1] for row in listing.records("memory"))
+        assert names == ["a.MP4", "b.webm"]
+
+
+def test_a_token_export_reads_as_its_one_split_and_refuses_another(tmp_path):
+    """An export holds one split: named "train", the default, it reads as itself; named another,
+    it is refused rather than read as that split."""
+    from dew.data.sources import TokenFiles, source
+
+    export([{"text": np.arange(3, dtype=np.int32)}], str(tmp_path), format="array_record",
+           length_field="text", metadata={"token_store": True, "dtype": "int32", "tokenizer": "byte",
+                                          "vocab_size": 256, "eos_id": None})
+    assert isinstance(source(str(tmp_path), split="train"), TokenFiles)
+    with pytest.raises(ValueError):
+        source(str(tmp_path), split="validation")
+
+
+@pytest.mark.parametrize("transport", ["local", "memory"])
+def test_two_exports_of_the_same_rows_are_the_same_store_and_of_other_rows_another(tmp_path, transport):
+    """Each host of a run exports its corpus itself, and the run checks that every host reads the same
+    data: two exports of the same rows, each writer naming its shards its own way, are one store,
+    as tokens and as files. On a host's disk, wherever each mounted it; remote, where a store is
+    named by its URL, the same rows written again in its place. An export of other rows is another."""
+    import fsspec
+
+    from dew.data.sources import Files, TokenFiles
+
+    metadata = {"token_store": True, "dtype": "int32", "tokenizer": "byte", "vocab_size": 256, "eos_id": 0}
+    base = str(tmp_path) if transport == "local" else f"memory://exports-{uuid4().hex}"
+
+    def exported(name, last):
+        url = f"{base}/{name}"
+        rows = [{"text": np.asarray([1, 2, 0], np.int32)}, {"text": np.asarray([3, last, 0], np.int32)}]
+        export(rows, url, format="array_record", length_field="text", metadata=metadata)
+        return url, TokenFiles(url).fingerprint(), Files(url).fingerprint()
+
+    url, *one = exported("one", 4)
+    if transport == "memory":
+        fsspec.filesystem("memory").rm(url, recursive=True)
+    _, *again = exported("one" if transport == "memory" else "again", 4)
+    _, *other = exported("other", 5)
+    assert one == again
+    assert one[0] != other[0] and one[1] != other[1]
+
+
+def test_partitioned_exports_of_the_same_values_under_other_partitions_are_other_stores(tmp_path):
+    """Rows exported partitioned by a field keep that field in the partition's directory alone, so
+    two exports whose files hold the same bytes under other partitions read other rows: other
+    stores; the same rows under the same partitions are one."""
+    from dew.data.sources import Files
+
+    def exported(name, language):
+        export([{"text": "hello", "language": language}], str(tmp_path / name), partitioning=("language",))
+        return Files(str(tmp_path / name)).fingerprint()
+
+    english, again, french = exported("en", "en"), exported("en-again", "en"), exported("fr", "fr")
+    assert english == again != french
+
+
+def test_a_token_export_of_no_documents_reads_as_an_empty_corpus(tmp_path):
+    """An export whose input yields no rows commits no shards, and reads back as no tokens and no
+    documents rather than failing to open."""
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.tokens import TokenFiles
+
+    manifest = export([], str(tmp_path), format="array_record", length_field="text",
+                      metadata={"token_store": True, "dtype": "int32", "tokenizer": "byte",
+                                "vocab_size": 256, "eos_id": None})
+    assert manifest["rows"] == 0 and manifest["files"] == []
+    stored = TokenFiles(str(tmp_path))
+    assert len(stored.tokens) == 0 and stored.metadata()["tokens"] == 0
+    assert stored.fingerprint()["shards"] == []
+    assert list(iterate(Pipeline(stored), read="memory")) == []
 
 
 def test_exported_token_lengths_support_indexed_spans_without_record_scan():
@@ -506,31 +822,20 @@ def test_exported_token_lengths_support_indexed_spans_without_record_scan():
     from dew.data.sources import source as resolve
 
     assert isinstance(resolve(root), TokenFiles)
+    # An export holds one split: validation tokens are an export of their own.
     with pytest.raises(ValueError):
-        source.with_split("val")
+        source.holdout(split="val")
 
 
-@pytest.fixture(params=["raw", "packed", "export"])
-def token_span_store(tmp_path, request):
-    from array_record.python.array_record_module import ArrayRecordWriter
-
-    from dew.data.sources.codec import pack_dict_of_byte_arrays
-
+@pytest.fixture
+def token_span_store(tmp_path):
+    """A token export of six documents, three of them empty, two to a shard, each ended by EOS (0)."""
     documents = [[], [], [1, 2, 0], [], [3, 0], [4, 5, 6, 0]]
     metadata = {"token_store": True, "dtype": "int32", "tokenizer": "byte",
                 "vocab_size": 256, "eos_id": 0}
-    if request.param == "export":
-        export([{"text": np.asarray(document, np.int32)} for document in documents], str(tmp_path),
-               format="array_record", rows_per_shard=2, length_field="text", metadata=metadata)
-    else:
-        (tmp_path / "meta.json").write_text(json.dumps(metadata))
-        for shard, start in enumerate(range(0, len(documents), 2)):
-            writer = ArrayRecordWriter(str(tmp_path / f"train-{shard}.array_record"), "group_size:1")
-            for document in documents[start:start + 2]:
-                raw = np.asarray(document, np.int32).tobytes()
-                writer.write(pack_dict_of_byte_arrays({"ids": raw}) if request.param == "packed" else raw)
-            writer.close()
-    return tmp_path, "ids" if request.param == "packed" else None
+    export([{"text": np.asarray(document, np.int32)} for document in documents], str(tmp_path),
+           format="array_record", rows_per_shard=2, length_field="text", metadata=metadata)
+    return tmp_path
 
 
 def test_flat_and_sharded_token_indexes_read_the_same_spans_and_documents(token_span_store):
@@ -538,8 +843,7 @@ def test_flat_and_sharded_token_indexes_read_the_same_spans_and_documents(token_
     from dew.data.pipeline import Pipeline
     from dew.data.sources.tokens import TokenFiles
 
-    root, field = token_span_store
-    stored = TokenFiles(str(root), field=field).provision()
+    stored = TokenFiles(str(token_span_store)).provision()
     tokens = stored.tokens
     expected = np.asarray([1, 2, 0, 3, 0, 4, 5, 6, 0], np.int32)
     assert len(tokens) == len(expected)
@@ -563,41 +867,32 @@ def test_flat_and_sharded_token_indexes_read_the_same_spans_and_documents(token_
 def test_each_token_document_is_checked_against_its_producer_length(token_span_store):
     from dew.data.sources.tokens import TokenFiles
 
-    root, field = token_span_store
-    TokenFiles(str(root), field=field).provision()
+    root = token_span_store
+    TokenFiles(str(root)).provision()
     manifest_path = root / "_dew_manifest.json"
-    manifest = json.loads(manifest_path.read_bytes()) if manifest_path.exists() else None
-    path = (root / manifest["files"][1]["lengths"]["path"] if manifest is not None
-            else root / "train.lengths.npy")
+    manifest = json.loads(manifest_path.read_bytes())
+    path = root / manifest["files"][1]["lengths"]["path"]
     columns = np.load(path, allow_pickle=False)
-    row = 0 if manifest is not None else 2
-    columns[row, 0] += 1
-    columns[row:, 1] += 1
+    columns[0, 0] += 1
+    columns[:, 1] += 1
     encoded = io.BytesIO()
     np.save(encoded, columns, allow_pickle=False)
     path.write_bytes(encoded.getvalue())
-    if manifest is not None:
-        manifest["files"][1]["lengths"].update(
-            bytes=len(encoded.getvalue()), sha256=hashlib.sha256(encoded.getvalue()).hexdigest())
-        manifest_path.write_text(json.dumps(manifest))
-    stored = TokenFiles(str(root), field=field)
+    manifest["files"][1]["lengths"].update(
+        bytes=len(encoded.getvalue()), sha256=hashlib.sha256(encoded.getvalue()).hexdigest())
+    manifest_path.write_text(json.dumps(manifest))
+    stored = TokenFiles(str(root))
     with pytest.raises(ValueError):
         stored.tokens[:3]
 
 
 @pytest.mark.parametrize("format_args", [[], ["--format", "array_record"]])
 def test_cli_token_exports_are_readable_by_the_dispatched_token_source(tmp_path, format_args):
-    from dew.cli.main import main
     from dew.data.sources import TokenFiles, source
     from dew.data.text import ByteTokenizer
 
     documents = ["first café", "next document", "last"]
-    input = tmp_path / "documents.jsonl"
-    input.write_text("".join(json.dumps({"text": text}) + "\n" for text in documents))
-    destination = tmp_path / "tokens"
-    assert main(["data", "export", "records", str(destination),
-                 "--fields", json.dumps({"source": str(input)}), "--tokenizer", "byte", "--eos",
-                 "--rows-per-shard", "2", *format_args]) == 0
+    destination = export_byte_tokens(tmp_path, documents, "--rows-per-shard", "2", *format_args)
     stored = source(str(destination))
     assert isinstance(stored, TokenFiles)
     vocabulary = ByteTokenizer()
@@ -605,7 +900,7 @@ def test_cli_token_exports_are_readable_by_the_dispatched_token_source(tmp_path,
     assert stored.tokens[:].tolist() == expected.tolist()
     assert stored.supports("indexed")
     assert stored.metadata()["eos_id"] == vocabulary.eos_id
-    assert stored.metadata()["train_tokens"] == len(expected)
+    assert stored.metadata()["tokens"] == len(expected)
     records = stored.records("indexed")
     actual = np.concatenate([records[index]["text"] for index in range(len(records))])
     assert actual.tolist() == expected.tolist()
@@ -700,34 +995,19 @@ def test_a_token_export_reads_through_the_storage_options_it_is_given(tmp_path):
     """A committed token export that only its storage options reach, an S3 endpoint of its own,
     reads its manifest, metadata and tokens through them, as its shards and index do."""
     import fsspec
-    from moto.server import ThreadedMotoServer
 
-    from dew.cli.main import main
     from dew.data.sources import TokenFiles
     from dew.data.text import ByteTokenizer
 
-    input = tmp_path / "documents.jsonl"
-    input.write_text("".join(json.dumps({"text": text}) + "\n" for text in ("first", "next")))
-    destination = tmp_path / "tokens"
-    fields = json.dumps({"source": str(input)})
-    assert main(["data", "export", "records", str(destination), "--fields", fields, "--tokenizer", "byte",
-                 "--eos", "--format", "array_record"]) == 0
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
-    server.start()
-    try:
-        _, port = server.get_host_and_port()
-        options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}"}
-        bucket = "tokens-" + uuid4().hex
+    destination = export_byte_tokens(tmp_path, ("first", "next"), "--format", "array_record")
+    with moto_bucket("tokens") as (bucket, options):
         remote = fsspec.filesystem("s3", **options)
-        remote.mkdir(bucket)
         remote.put(str(destination), f"{bucket}/export", recursive=True)
         stored = TokenFiles(f"s3://{bucket}/export", storage_options=options)
         vocabulary = ByteTokenizer()
         assert stored.meta["eos_id"] == vocabulary.eos_id
         assert stored.tokens[:].tolist() == [*vocabulary.encode("first"), vocabulary.eos_id,
                                              *vocabulary.encode("next"), vocabulary.eos_id]
-    finally:
-        server.stop()
 
 
 def test_cli_refuses_an_unsupported_token_export_format_before_writing(tmp_path):
@@ -737,8 +1017,7 @@ def test_cli_refuses_an_unsupported_token_export_format_before_writing(tmp_path)
     input.write_text('{"text":"a document"}\n')
     destination = tmp_path / "tokens"
     with pytest.raises(ValueError):
-        main(["data", "export", "records", str(destination),
-              "--fields", json.dumps({"source": str(input)}), "--tokenizer", "byte", "--format", "parquet"])
+        main(["data", "export", str(input), str(destination), "--tokenizer", "byte", "--format", "parquet"])
     assert not destination.exists()
 
 
@@ -749,12 +1028,31 @@ def test_cli_record_exports_still_default_to_parquet(tmp_path):
     input = tmp_path / "documents.jsonl"
     input.write_text('{"text":"a document"}\n')
     destination = tmp_path / "records"
-    assert main(["data", "export", "records", str(destination),
-                 "--fields", json.dumps({"source": str(input)})]) == 0
+    assert main(["data", "export", str(input), str(destination)]) == 0
     stored = source(str(destination))
     assert isinstance(stored, Files)
     assert stored.kind == "parquet"
     assert stored.records("indexed")[0] == {"text": "a document"}
+
+
+def test_cli_exports_the_chain_of_the_file_it_names_and_no_other(tmp_path):
+    """Two files of one name in two directories each export their own chain, and a file named as a
+    module the process holds elsewhere (the standard library's `json`), or as a package's module
+    (`email.utils`), is refused, not read as it."""
+    from dew.cli.main import main
+    from dew.data.sources import source
+
+    for corpus in ("first", "second"):
+        (tmp_path / corpus).mkdir()
+        (tmp_path / corpus / "corpus.py").write_text(
+            f"from dew.data import Memory\ndata = Memory([{{'text': '{corpus}'}}])\n")
+        exported = tmp_path / f"{corpus}-out"
+        assert main(["data", "export", str(tmp_path / corpus / "corpus.py"), str(exported)]) == 0
+        assert source(str(exported)).records("indexed")[0] == {"text": corpus}
+    for named in ("json.py", "email.utils.py"):
+        (tmp_path / named).write_text("from dew.data import Memory\ndata = Memory([{'text': 'mine'}])\n")
+        with pytest.raises(ValueError):
+            main(["data", "export", str(tmp_path / named), str(tmp_path / f"{named}-out")])
 
 
 @pytest.mark.parametrize("read", [None, "memory", "indexed"])
@@ -827,270 +1125,6 @@ def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monke
     assert rows[9] == {"id": 9}
     assert len(downloaded) == 1
     assert downloaded[0].endswith(manifest["files"][2]["path"])
-
-
-@pytest.fixture
-def arrayrecord_paths(tmp_path):
-    from array_record.python.array_record_module import ArrayRecordWriter
-
-    paths = tuple(str(tmp_path / f"{shard}.array_record") for shard in range(Loading().threads + 1))
-    for shard, path in enumerate(paths):
-        writer = ArrayRecordWriter(path, "group_size:1")
-        for index in range(8):
-            writer.write(f"{shard}:{index}".encode())
-        writer.close()
-    return paths
-
-
-def test_arrayrecords_threaded_reads_overlap(arrayrecord_paths, monkeypatch):
-    import grain.python as grain
-
-    from dew.data.sources import records
-
-    source = records.ArrayRecords(arrayrecord_paths[:1], counts=(8,))
-    active = maximum = 0
-    lock = threading.Lock()
-    entered = threading.Barrier(3)
-    released = threading.Event()
-    underlying_read = grain.ArrayRecordDataSource.__getitem__
-
-    def blocked_read(reader, index):
-        nonlocal active, maximum
-        with lock:
-            active += 1
-            maximum = max(maximum, active)
-        try:
-            if index < 2:
-                entered.wait(timeout=5)
-                assert released.wait(timeout=5)
-            return underlying_read(reader, index)
-        finally:
-            with lock:
-                active -= 1
-
-    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", blocked_read)
-    try:
-        with ThreadPoolExecutor(2) as pool:
-            pending = [pool.submit(source.__getitem__, index) for index in range(8)]
-            try:
-                entered.wait(timeout=5)
-                assert maximum == 2
-            finally:
-                released.set()
-            assert [future.result(timeout=5) for future in pending] == [
-                f"0:{index}".encode() for index in range(8)
-            ]
-    finally:
-        source.close()
-
-
-@pytest.mark.parametrize("fail", [False, True])
-@pytest.mark.parametrize("retire", ["eviction", "close"])
-def test_arrayrecords_keep_busy_readers_alive_during_eviction_or_close(
-    arrayrecord_paths, monkeypatch, fail, retire
-):
-    import grain.python as grain
-
-    from dew.data.sources import records
-
-    source = records.ArrayRecords(arrayrecord_paths, counts=(8,) * len(arrayrecord_paths))
-    entered = threading.Barrier(3)
-    released = [threading.Event(), threading.Event()]
-    first_reader = []
-    underlying_read = grain.ArrayRecordDataSource.__getitem__
-    failed_read = ValueError("failed child read")
-
-    def descriptors(path):
-        real = os.path.realpath(path)
-        return {opened.fd for opened in psutil.Process().open_files() if opened.path == real}
-
-    def blocked_read(reader, index):
-        if not first_reader:
-            first_reader.append(id(reader))
-        held = id(reader) == first_reader[0]
-        payload = underlying_read(reader, index)
-        # A failed read's traceback must not keep the external reader alive after Dew closes it.
-        del reader
-        if held and index < 2:
-            entered.wait(timeout=5)
-            assert released[index].wait(timeout=5)
-            if fail:
-                raise failed_read
-        return payload
-
-    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", blocked_read)
-    try:
-        assert source[2] == b"0:2"
-        held = descriptors(arrayrecord_paths[0])
-        assert held
-        with ThreadPoolExecutor(2) as pool:
-            pending = [pool.submit(source.__getitem__, index) for index in range(2)]
-            try:
-                entered.wait(timeout=5)
-                if retire == "eviction":
-                    for shard in range(1, len(arrayrecord_paths)):
-                        assert source[8 * shard] == f"{shard}:0".encode()
-                else:
-                    source.close()
-                assert descriptors(arrayrecord_paths[0]) == held
-                # Close retires the busy reader; eviction keeps it and retires an idle one.
-                assert source[2] == b"0:2"
-                path = arrayrecord_paths[-1] if retire == "eviction" else arrayrecord_paths[0]
-                replacement = descriptors(path) - held
-                assert replacement
-                for index, future in enumerate(pending):
-                    released[index].set()
-                    if fail:
-                        with pytest.raises(ValueError) as raised:
-                            future.result(timeout=5)
-                        assert raised.value is failed_read
-                    else:
-                        assert future.result(timeout=5) == f"0:{index}".encode()
-                    still_open = descriptors(arrayrecord_paths[0])
-                    assert held & still_open == (set() if retire == "close" and index == 1 else held)
-                    assert replacement <= descriptors(path)
-            finally:
-                for release in released:
-                    release.set()
-    finally:
-        source.close()
-    assert all(not descriptors(path) for path in arrayrecord_paths)
-
-
-def test_pickled_arrayrecords_open_independent_readers(arrayrecord_paths):
-    from dew.data.sources.records import ArrayRecords
-
-    source = ArrayRecords(arrayrecord_paths, counts=(8,) * len(arrayrecord_paths))
-    assert source[0] == b"0:0"
-    restored = pickle.loads(pickle.dumps(source))
-    try:
-        source.close()
-        assert restored[1] == b"0:1"
-        restored.close()
-        assert source[2] == b"0:2"
-    finally:
-        source.close()
-        restored.close()
-
-
-@pytest.mark.parametrize("max_bytes", [1, 1 << 30])
-def test_arrayrecords_refuse_a_mirror_without_room_for_the_read_width(arrayrecord_paths, tmp_path, max_bytes):
-    """A local mirror with room for the shards a read holds open serves them;
-    one of a byte is refused."""
-    from dew.data.sources.records import ArrayRecords
-
-    shard = Store(f"memory://small-record-mirror-{uuid4().hex}/0.array_record")
-    shard.write(Path(arrayrecord_paths[0]).read_bytes())
-    source = ArrayRecords(
-        (shard.url,),
-        {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": max_bytes}},
-        counts=(8,),
-    )
-    try:
-        if max_bytes > 1:
-            assert source[0] == b"0:0"
-            return
-        with pytest.raises(ValueError):
-            source[0]
-    finally:
-        source.close()
-
-
-@pytest.mark.parametrize("busy_oldest,retire", [(False, "eviction"), (True, "eviction"), (True, "close")])
-def test_arrayrecords_release_an_idle_mirror_before_opening_its_replacement(
-    arrayrecord_paths, tmp_path, monkeypatch, busy_oldest, retire
-):
-    import grain.python as grain
-
-    from dew.data.sources.records import ArrayRecords
-
-    root = Store(f"memory://bounded-record-mirror-{uuid4().hex}")
-    shards = [root.child(f"{index}.array_record") for index in range(len(arrayrecord_paths))]
-    for shard, path in zip(shards, arrayrecord_paths, strict=True):
-        shard.write(Path(path).read_bytes())
-    capacity = sum(Path(path).stat().st_size for path in arrayrecord_paths[:-1])
-    source = ArrayRecords(
-        [shard.url for shard in shards],
-        {"dewcache": {"cache_storage": str(tmp_path / "mirror"), "max_bytes": capacity}},
-        counts=(8,) * len(shards),
-    )
-    entered, released = threading.Event(), threading.Event()
-    underlying_read = grain.ArrayRecordDataSource.__getitem__
-
-    def held(reader, index):
-        if busy_oldest and not entered.is_set():
-            entered.set()
-            assert released.wait(timeout=5)
-        return underlying_read(reader, index)
-
-    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", held)
-    try:
-        if busy_oldest:
-            with ThreadPoolExecutor(1) as pool:
-                pending = pool.submit(source.__getitem__, 0)
-                try:
-                    assert entered.wait(timeout=5)
-                    if retire == "close":
-                        source.close()
-                    for shard in range(1, len(shards)):
-                        assert source[8 * shard] == f"{shard}:0".encode()
-                finally:
-                    released.set()
-                assert pending.result(timeout=5) == b"0:0"
-        for _ in range(2):
-            for shard in range(len(shards)):
-                assert source[8 * shard] == f"{shard}:0".encode()
-    finally:
-        source.close()
-
-
-def test_arrayrecords_wait_for_a_busy_reader_before_opening_a_missing_shard(arrayrecord_paths, monkeypatch):
-    import grain.python as grain
-
-    from dew.data.sources.records import ArrayRecords
-
-    source = ArrayRecords(arrayrecord_paths, counts=(8,) * len(arrayrecord_paths))
-    width = Loading().threads
-    entered = threading.Barrier(width + 1)
-    released, queued = threading.Event(), threading.Event()
-    lock = threading.Lock()
-    admitted = 0
-    underlying_read = grain.ArrayRecordDataSource.__getitem__
-    condition_wait = threading.Condition.wait
-
-    def held(reader, index):
-        nonlocal admitted
-        with lock:
-            ordinal = admitted
-            admitted += 1
-        if ordinal < width:
-            entered.wait(timeout=5)
-            assert released.wait(timeout=5)
-        return underlying_read(reader, index)
-
-    def waiting(condition, timeout=None):
-        if condition is source._lock:
-            queued.set()
-        return condition_wait(condition, timeout)
-
-    monkeypatch.setattr(grain.ArrayRecordDataSource, "__getitem__", held)
-    monkeypatch.setattr(threading.Condition, "wait", waiting)
-    try:
-        with ThreadPoolExecutor(width + 1) as pool:
-            pending = [pool.submit(source.__getitem__, 8 * shard) for shard in range(width)]
-            try:
-                entered.wait(timeout=5)
-                overflow = pool.submit(source.__getitem__, 8 * width)
-                assert queued.wait(timeout=5)
-                assert not overflow.done()
-            finally:
-                released.set()
-            assert [future.result(timeout=5) for future in pending] == [
-                f"{shard}:0".encode() for shard in range(width)
-            ]
-            assert overflow.result(timeout=5) == f"{width}:0".encode()
-    finally:
-        source.close()
 
 
 def test_jsonl_offset_index_is_mapped_and_reopened_instead_of_pickled_as_rows():
@@ -1197,6 +1231,89 @@ def test_a_pool_is_shown_which_part_of_its_plan_differs():
     assert "manifest source" in differing(changed) and "manifest steps" not in differing(changed)
 
 
+class _Drawn(grain.RandomMapTransform):
+    """A record as it is, drawn by the record generator, so a streamed repeat after it stays where it
+    is written, restoring its reader at each pass's start."""
+
+    def random_map(self, element, rng):
+        return element
+
+
+@pytest.mark.parametrize(("kind", "name"), [("jsonl", "rows.jsonl"), ("csv", "rows.csv"),
+                                            ("text", "rows.txt"), ("jsonl", "rows.jsonl.zst")])
+def test_a_streamed_line_file_repeated_reads_every_record_each_pass(tmp_path, kind, name):
+    """A line file streamed and repeated reads its records again in each pass, as the first: Grain
+    restores the reader at its start after a pass, which starts its records over."""
+    import zstandard
+
+    from dew.data.compile import compile
+
+    lines = {"jsonl": [json.dumps({"id": index}) for index in range(3)],
+             "csv": ["id", *(str(index) for index in range(3))],
+             "text": [str(index) for index in range(3)]}[kind]
+    payload = ("\n".join(lines) + "\n").encode()
+    (tmp_path / name).write_bytes(zstandard.ZstdCompressor().compress(payload) if name.endswith(".zst")
+                                  else payload)
+    field = "text" if kind == "text" else "id"
+    reader = compile(Files(str(tmp_path / name), format=kind).random_map(_Drawn()).repeat().batch(1),
+                     read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
+                     ).train(DataPartition())
+    try:
+        read = [str(batch[field][0]).strip() for batch in itertools.islice(reader, 9)]
+    finally:
+        reader.close()
+    assert read == ["0", "1", "2"] * 3
+
+
+def test_a_text_file_is_provisioned_by_its_lines_bytes_and_a_line_is_decoded_when_read(tmp_path):
+    """Provisioning a text file finds its lines without decoding them, so a line that is not UTF-8
+    is refused when it is read, not when the file is indexed, and the lines before it read."""
+    (tmp_path / "rows.txt").write_bytes(b"ok\n\xff\nlast\n")
+    files = Files(str(tmp_path / "rows.txt"))
+    files.provision()
+    records = files.records("indexed")
+    assert len(records) == 3
+    assert (records[0], records[2]) == ({"text": "ok\n"}, {"text": "last\n"})
+    with pytest.raises(UnicodeDecodeError):
+        records[1]
+
+
+def test_a_hugging_face_stream_saved_again_before_it_reads_resumes_where_it_was_restored():
+    """A Hugging Face stream restored to a position and saved again before it reads saves that
+    position, not its dataset's start: a resume from it reads on where the first read stopped."""
+    import datasets
+
+    from dew.data.compile import compile
+    from dew.data.sources.hf import from_hf
+
+    native = datasets.Dataset.from_dict({"id": list(range(8))}).to_iterable_dataset()
+    data = compile(from_hf(native, "rows@1").batch(1), read="streamed",
+                   loading=Loading(workers=0, threads=1, read_buffer=0))
+
+    def ids(reader, count):
+        return [int(batch["id"][0]) for batch in itertools.islice(reader, count)]
+
+    first = data.train(DataPartition())
+    try:
+        assert ids(first, 3) == [0, 1, 2]
+        saved = first.get_state()
+        rest = ids(first, 3)
+    finally:
+        first.close()
+    restored = data.train(DataPartition())
+    try:
+        restored.set_state(saved)
+        again = restored.get_state()
+    finally:
+        restored.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(again)
+        assert ids(resumed, 3) == rest == [3, 4, 5]
+    finally:
+        resumed.close()
+
+
 def test_a_same_size_middle_write_changes_a_multifile_readers_identity(tmp_path):
     """An exact multifile reader identifies bytes between every shard's endpoints."""
     from dew.data.compile import compile
@@ -1215,6 +1332,40 @@ def test_a_same_size_middle_write_changes_a_multifile_readers_identity(tmp_path)
         assert batch["text"].tolist() == ["a" * (192 * 1024)]
 
     assert_a_rewrite_moves_the_identity(reader, tmp_path / "part-16.jsonl", b"b", read)
+
+
+@pytest.mark.parametrize("dtype", ["<u4", "<u8"])
+def test_a_producer_index_in_either_unsigned_type_places_its_records_in_their_files(tmp_path, dtype):
+    """A producer's offset index over several JSON lines files, its shard column in whichever unsigned
+    integer type it wrote, reads each record by index and block-shuffles them by file: an empty file
+    and files of uneven sizes among them, every record read once a pass."""
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+
+    files = [[0, 1, 2], [], [3, 4, 5, 6, 7], [8]]
+    entries = []
+    for shard, ids in enumerate(files):
+        payload = b""
+        for value in ids:
+            line = (json.dumps({"id": value}) + "\n").encode()
+            entries.append((shard, len(payload), len(line)))
+            payload += line
+        (tmp_path / f"part-{shard}.jsonl").write_bytes(payload)
+    encoded = io.BytesIO()
+    np.save(encoded, np.array(entries, dtype=[("shard", dtype), ("offset", "<u8"), ("bytes", "<u8")]),
+            allow_pickle=False)
+    (tmp_path / "rows.index.npy").write_bytes(encoded.getvalue())
+    paths = tuple(str(tmp_path / f"part-{shard}.jsonl") for shard in range(len(files)))
+    stored = Files(paths, format="jsonl", index=str(tmp_path / "rows.index.npy"))
+    records = stored.records("indexed")
+    assert [records[index]["id"] for index in range(len(records))] == list(range(9))
+    reader = compile(Pipeline(stored).shuffle(3, block_shards=2).repeat().batch(1), read="indexed",
+                     loading=Loading(workers=0, threads=1, read_buffer=0)).train(DataPartition())
+    try:
+        read = [int(batch["id"][0]) for batch in itertools.islice(reader, 9)]
+    finally:
+        reader.close()
+    assert sorted(read) == list(range(9))
 
 
 def test_published_file_facts_avoid_metadata_probes_and_verify_the_index(monkeypatch):
@@ -1245,9 +1396,9 @@ def test_torch_source_reads_every_way_and_refuses_a_cache_without_content_identi
 
     from dew.data.cache import Cache
     from dew.data.plan import Manifest
-    from dew.data.sources import Torch
+    from dew.data.sources import from_torch
 
-    rows = Torch(TensorDataset(torch.arange(4)), fields=("id",))
+    rows = from_torch(TensorDataset(torch.arange(4)), ("id",))
     assert rows.supports("streamed")
     assert int(rows.records("indexed")[2]["id"]) == 2
     import grain.python as grain
@@ -1258,21 +1409,51 @@ def test_torch_source_reads_every_way_and_refuses_a_cache_without_content_identi
         )
 
 
-@pytest.mark.parametrize("read", ["memory", "indexed"])
-@pytest.mark.parametrize("resume", ["exact", "non-exact"])
-def test_torch_compilation_requires_identity_even_for_equal_shapes(read, resume):
-    """Same-class, same-length datasets cannot name an exact position by their shape."""
+@pytest.mark.parametrize("kind,read", [("torch", "memory"), ("torch", "indexed"),
+                                       ("grain", "indexed"), ("grain", "streamed"), ("iterator", "streamed")])
+def test_an_unnamed_foreign_source_trains_and_resumes_only_where_told_its_content_is_unknown(
+        tmp_path, kind, read):
+    """A torch, Grain or iterator source given no name reads and trains; nothing says a later run
+    reads the same records, so an exact resume of its position is refused, one with
+    `resume="non-exact"` reads on from it, and no cache keys it."""
+    import grain.python as grain
     import torch
     from torch.utils.data import TensorDataset
 
-    from dew.data import from_torch
+    from dew.data import from_grain, from_iter, from_torch
     from dew.data.compile import compile
 
-    for offset in (0, 100):
-        source = from_torch(TensorDataset(torch.arange(32) + offset), fields=("id",))
+    rows = [{"id": index} for index in range(32)]
+
+    def source():
+        if kind == "torch":
+            return from_torch(TensorDataset(torch.arange(32)), fields=("id",))
+        if kind == "grain":
+            return from_grain(grain.MapDataset.source(rows))
+        return from_iter(lambda: iter(rows), replay=True)
+
+    def reader(resume):
+        return compile(source().repeat().batch(4), read=read, resume=resume,
+                       loading=Loading(workers=0)).train(DataPartition())
+
+    original = reader("exact")
+    try:
+        assert [next(original)["id"].tolist() for _ in range(2)] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+        saved = original.get_state()
+        remaining = [next(original)["id"].tolist() for _ in range(2)]
+    finally:
+        original.close()
+    exact, loose = reader("exact"), reader("non-exact")
+    try:
         with pytest.raises(ValueError):
-            compile(source.shuffle(4).repeat().batch(4), read=read, resume=resume,
-                    loading=Loading(workers=0))
+            exact.set_state(saved)
+        loose.set_state(saved)
+        assert [next(loose)["id"].tolist() for _ in range(2)] == remaining
+    finally:
+        exact.close()
+        loose.close()
+    with pytest.raises(ValueError):
+        compile(source().cache(str(tmp_path / "cache")).batch(4), read=read, loading=Loading(workers=0))
 
 
 @pytest.mark.parametrize("kind,read", [("torch", "memory"), ("torch", "indexed"),
@@ -1440,21 +1621,64 @@ def test_from_iter_forwards_a_native_stop_request():
         reader.close()
 
 
+def test_two_unnamed_grain_stores_keep_their_own_rows_and_counts_in_phases_and_a_mix():
+    """Two Grain stores given no name, read one in each phase, each from its own first row; mixed,
+    each counted apart. A store read again in a later phase goes on where it stopped."""
+    import grain.python as grain
+
+    from dew.data import from_grain
+    from dew.data.compile import compile
+    from dew.data.pipeline import Phases, Pipeline, mix
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    first = from_grain(grain.MapDataset.source([{"id": index} for index in range(100)]))
+    second = from_grain(grain.MapDataset.source([{"id": 1000 + index} for index in range(100)]))
+    phased = Pipeline(Phases((Pipeline(first).repeat(), Pipeline(second).repeat()), (4, None))).batch(1)
+    stream = compile(phased, read="indexed", loading=loading).train(DataPartition())
+    try:
+        assert [int(next(stream)["id"][0]) for _ in range(6)] == [0, 1, 2, 3, 1000, 1001]
+    finally:
+        stream.close()
+    again = Pipeline(Phases((Pipeline(first).repeat(), Pipeline(first).repeat()), (4, None))).batch(1)
+    stream = compile(again, read="indexed", loading=loading).train(DataPartition())
+    try:
+        assert [int(next(stream)["id"][0]) for _ in range(6)] == [0, 1, 2, 3, 4, 5]
+    finally:
+        stream.close()
+    counts = mix([Pipeline(first), Pipeline(second)]).stats(records=10)
+    assert sorted(value for name, value in counts.items() if name.startswith("data/rows/")) == [5, 5]
+
+
+@pytest.mark.parametrize("table", ["pandas", "arrow"])
+def test_memory_reads_a_table_of_lists_bytes_and_nulls_as_records_hold_them(table):
+    """A table whose columns hold token lists, encoded bytes and a missing value reads as the same
+    records given as records do."""
+    import pandas as pd
+    import pyarrow as pa
+
+    columns = {"tokens": [[1, 2], [3, 4, 5]], "image": [b"ab", b"cde"], "caption": ["a cat", None]}
+    given = pd.DataFrame(columns) if table == "pandas" else pa.table(columns)
+    records = [{"tokens": [1, 2], "image": b"ab", "caption": "a cat"},
+               {"tokens": [3, 4, 5], "image": b"cde", "caption": None}]
+    held = Memory(given).records("indexed")
+    assert [held[index] for index in range(len(held))] == records
+    assert Memory(given).fingerprint()["sha256"] == Memory(records).fingerprint()["sha256"]
+
+
 @pytest.mark.parametrize("kind", ["grain", "iterator"])
-@pytest.mark.parametrize("resume", ["exact", "non-exact"])
-def test_foreign_sources_cannot_use_an_empty_content_identity(kind, resume):
-    """Grain and iterator adapters require a real source name, just as Torch requires identity."""
+def test_foreign_sources_cannot_use_an_empty_content_identity(kind):
+    """A Grain or iterator source given an empty name declares no content version, which is no
+    name at all said otherwise: it is refused as it is made."""
     import grain.python as grain
 
     from dew.data import from_grain, from_iter
-    from dew.data.compile import compile
 
     rows = [{"id": index} for index in range(8)]
-    source = (from_grain(grain.MapDataset.source(rows), "") if kind == "grain"
-              else from_iter(lambda: iter(rows), name=""))
     with pytest.raises(ValueError):
-        compile(source.repeat().batch(2), read="indexed" if kind == "grain" else "streamed",
-                resume=resume, loading=Loading(workers=0))
+        if kind == "grain":
+            from_grain(grain.MapDataset.source(rows), "")
+        else:
+            from_iter(lambda: iter(rows), name="")
 
 
 def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):
@@ -1550,6 +1774,46 @@ def test_artifact_codec_preserves_extended_numpy_dtypes():
     assert restored["scalar"] == values["scalar"]
 
 
+@pytest.mark.parametrize("value", [
+    np.arange(24, dtype=np.uint8).reshape(2, 3, 4),
+    np.asfortranarray(np.arange(12, dtype=np.float32).reshape(3, 4)),
+    np.arange(6, dtype=">i4"),
+    np.asarray(3.5, dtype=np.float64),
+    np.zeros((0, 5), dtype=np.int16),
+    np.asarray([True, False]),
+    np.asarray(["ab", "cde"]),
+    np.asarray([b"ab", b"c"]),
+    np.asarray([1, 2], dtype="datetime64[ns]"),
+    np.zeros(2, dtype=[("x", "<f4"), ("y", "<i8")]),
+    np.arange(2 ** 17, dtype=np.int64).reshape(256, 512),
+    np.ndarray((2,), dtype="V0"),
+    np.zeros(3, dtype="S0"),
+], ids=["uint8-3d", "fortran", "big-endian", "0d", "empty", "bool", "unicode", "bytes", "datetime",
+        "structured", "long-header-free", "void-0", "bytes-0"])
+def test_artifact_codec_reads_back_every_array_as_saved(value):
+    """Every array a record holds reads back as it was saved, its dtype, shape, memory order and
+    values, whether its header is read straight or by `np.load`, and owns its writable memory."""
+    from dew.data.sources.codec import decode, encode
+
+    restored = decode(encode({"value": value}))["value"]
+    assert restored.dtype == value.dtype and restored.shape == value.shape
+    assert restored.flags.f_contiguous == value.flags.f_contiguous or value.ndim < 2
+    assert restored.flags.writeable
+    np.testing.assert_array_equal(restored, value)
+
+
+def test_artifact_codec_reads_back_a_complex_field_exactly():
+    """A record's Python complex field reads back as written, both parts exactly, as a record holds it
+    beside its other fields."""
+    from dew.data.sources.codec import decode, encode
+
+    values = {"z": complex(0.1, -2.5e-300), "zs": [complex(1, 0), complex(float("inf"), float("nan"))]}
+    restored = decode(encode(values))
+    assert restored["z"] == values["z"] and isinstance(restored["z"], complex)
+    assert restored["zs"][0] == values["zs"][0]
+    assert restored["zs"][1].real == float("inf") and np.isnan(restored["zs"][1].imag)
+
+
 def test_content_fingerprint_preserves_array_identity_and_sequence_order():
     from dew.data.sources.codec import content_fingerprint, decode, encode
 
@@ -1590,47 +1854,6 @@ def test_an_endless_read_of_a_store_that_states_it_holds_no_row_is_refused():
     assert list(streamed(manifest, partition=DataPartition(), epochs=1, loading=loading)) == []
     with pytest.raises(ValueError):
         streamed(manifest, partition=DataPartition(), epochs=None, loading=loading)
-
-
-@pytest.mark.parametrize("field", [None, "ids"])
-def test_raw_token_arrayrecords_require_explicit_lengths_for_indexed_reads(tmp_path, field):
-    from array_record.python.array_record_module import ArrayRecordWriter
-
-    from dew.data.sources import source as resolve
-    from dew.data.sources.codec import pack_dict_of_byte_arrays
-    from dew.data.sources.tokens import TokenFiles
-
-    root = Store(str(tmp_path))
-    root.child("meta.json").write(
-        json.dumps(
-            {
-                "tokenizer": "byte",
-                "dtype": "uint16",
-                "vocab_size": 256,
-                "train_tokens": 15,
-                "val_tokens": 4,
-                "eos_id": None,
-            }
-        ).encode()
-    )
-    for split, count in (("train", 15), ("val", 4)):
-        writer = ArrayRecordWriter(str(tmp_path / f"{split}-0.array_record"), "group_size:1")
-        for start, stop in zip((0, 2, 4), (2, 4, count), strict=True):
-            raw = np.arange(start, stop, dtype=np.uint16).tobytes()
-            writer.write(raw if field is None else pack_dict_of_byte_arrays({field: raw}))
-        writer.close()
-    source = TokenFiles(str(tmp_path), field=field)
-    assert isinstance(resolve(str(tmp_path)), TokenFiles)
-    assert source.metadata()["train_tokens"] == 15
-    assert not source.supports("indexed")
-    with pytest.raises(FileNotFoundError):
-        source.records("indexed")
-    source.records("memory")
-    assert source.tokens[1:14].tolist() == list(range(1, 14))
-    source.provision()
-    reopened = TokenFiles(str(tmp_path), field=field)
-    assert reopened.supports("indexed")
-    assert reopened.tokens[2:15].tolist() == list(range(2, 15))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1677,114 +1900,43 @@ def test_a_source_read_only_as_a_stream_packs_its_rows_as_they_arrive():
     assert sorted({int(token) for window in windows for token in window["text"] if token}) == [1, 2, 3, 4]
 
 
-def test_a_run_that_states_no_read_reads_as_its_sources_choose(tmp_path):
+def test_a_chain_that_states_no_read_reads_as_its_sources_choose(tmp_path):
     """Records held in memory read from memory, a store that reads by index
-    reads by index and a stream streams, when the run states no read; a read
+    reads by index and a stream streams, when the chain states no read; a read
     it states wins over each."""
     import pyarrow.parquet as pq
-
-    from dew.config import RunConfig
-    from dew.config.data import RecordsData, loader
 
     rows = [{"value": index} for index in range(8)]
     pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
     (tmp_path / "rows.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
 
-    def read(source, stated=RunConfig.data_read):
-        loaded = loader(RecordsData(source=source), batch=2, read=stated, loading=Loading(workers=0))
+    def read(source, stated=None):
+        loaded = compile(source.repeat().batch(2), read=stated, loading=Loading(workers=0))
         assert loaded.plan is not None
         return loaded.plan.order["read"]
 
-    listed, indexed, streamed = rows, str(tmp_path / "rows.parquet"), str(tmp_path / "rows.jsonl")
+    listed, indexed = Memory(rows), Files(str(tmp_path / "rows.parquet"))
+    streamed = Files(str(tmp_path / "rows.jsonl"))
     assert [read(listed), read(indexed), read(streamed)] == ["memory", "indexed", "streamed"]
     assert [read(listed, "streamed"), read(indexed, "memory"), read(streamed, "memory")] == [
         "streamed", "memory", "memory"]
 
 
-def test_a_run_that_states_no_read_takes_the_first_read_its_sources_can_all_take(tmp_path):
-    """A CSV with no index prefers a stream, but its random holdout cannot be
-    streamed and the CSV cannot be read by index, so the run reads it into
-    memory and trains on the half the holdout leaves."""
-    from dew.config.data import HoldOut, RecordsData, loader
-
-    (tmp_path / "rows.csv").write_text("text\n" + "".join(f"row {index}\n" for index in range(8)))
-    split = HoldOut(fraction=0.5, by="random")
-    loaded = loader(RecordsData(source=str(tmp_path / "rows.csv"), validation=split), batch=2, read=None,
-                  loading=Loading(workers=0))
-    assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
-    assert loaded.records == 4
-
-
 def test_a_token_holdout_with_no_stated_read_reads_unindexed_text_into_memory(tmp_path):
     """A token split needs a finite indexed order, which JSON lines without an
-    index can neither stream nor read by index, so the run reads them into
+    index can neither stream nor read by index, so the chain reads them into
     memory and holds out the first quarter of their tokens."""
-    from dew.config.data import HoldOut, TextData, loader
+    from dew.data import presets, text
+    from dew.data.compile import held
 
     documents = [{"text": f"document {index} " * 6} for index in range(8)]
     (tmp_path / "text.jsonl").write_text("".join(json.dumps(document) + "\n" for document in documents))
-    recipe = TextData(source=str(tmp_path / "text.jsonl"), seq_len=8, token_holdout=HoldOut(fraction=0.25))
-    loaded = loader(recipe, batch=2, read=None, loading=Loading(workers=0))
+    train, val = Files(str(tmp_path / "text.jsonl")).map(text.tokenize("byte")).holdout(tokens=0.25)
+    windows = train.pipe(presets.lm, None, seq_len=8, batch=None, pack=None)
+    loaded = compile(windows.shuffle(0).repeat().batch(2), loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
-    assert loaded.val is not None and loaded.records
-
-
-def test_a_token_holdout_over_an_indexed_store_reads_into_memory_when_no_read_is_stated(tmp_path):
-    """Parquet reads by index, but a recipe's default order repeats an indexed
-    read before its token split, which needs a finite order. Judged on the
-    pipelines each read would run, the run reads into memory, where the order
-    follows the split."""
-    import pyarrow.parquet as pq
-
-    from dew.config.data import HoldOut, TextData, loader
-
-    rows = [{"text": f"document {index} " * 6} for index in range(8)]
-    pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
-    recipe = TextData(source=str(tmp_path / "rows.parquet"), seq_len=8, token_holdout=HoldOut(fraction=0.25))
-    loaded = loader(recipe, batch=2, read=None, loading=Loading(workers=0))
-    assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
-
-
-def test_a_default_read_is_judged_on_the_order_the_recipe_adds_at_that_read(tmp_path):
-    """A token split straight after an indexed source is a global, finite
-    order by itself, but the default order a recipe adds at an indexed read
-    repeats before it. The run reads into memory, where the order follows
-    the split, rather than choosing indexed for the recipe as written."""
-    import pyarrow.parquet as pq
-
-    from dew.config.data import loader
-    from dew.data.pipeline import Pipeline
-
-    class Split:
-        def pipelines(self):
-            return Pipeline(Files(str(tmp_path / "rows.parquet"))).holdout(tokens=0.5)[0]._chain(), None, ()
-
-    rows = [{"text": [index] * 4} for index in range(8)]
-    pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
-    loaded = loader(Split(), batch=1, read=None, loading=Loading(workers=0))
-    assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
-
-
-def test_a_token_store_without_its_length_index_is_refused_until_provisioned(tmp_path):
-    """A token store that cannot be read by span until its length index is
-    built is not read whole into memory when the run states no read: it is
-    refused, and provision=True builds the index."""
-    from array_record.python.array_record_module import ArrayRecordWriter
-
-    from dew.config.data import TextData, loader
-
-    Store(str(tmp_path)).child("meta.json").write(json.dumps({
-        "tokenizer": "byte", "dtype": "uint16", "vocab_size": 256, "train_tokens": 40, "eos_id": None,
-    }).encode())
-    writer = ArrayRecordWriter(str(tmp_path / "train-0.array_record"), "group_size:1")
-    for start in range(0, 40, 10):
-        writer.write(np.arange(start, start + 10, dtype=np.uint16).tobytes())
-    writer.close()
-    with pytest.raises(ValueError):
-        loader(TextData(source=str(tmp_path), seq_len=4), batch=1, read=None, loading=Loading(workers=0))
-    loaded = loader(TextData(source=str(tmp_path), seq_len=4), batch=1, read=None, provision=True,
-                  loading=Loading(workers=0))
-    assert loaded.plan is not None and loaded.plan.order["read"] == "streamed"
+    assert loaded.records
+    assert next(iter(held(val.pipe(presets.lm, None, seq_len=8, batch=2, pack=None))(DataPartition())))
 
 
 def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
@@ -1803,31 +1955,34 @@ def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
             Files(url, file_info={url: stale}).fingerprint()
 
 
-def test_provisioning_a_store_again_replaces_the_index_a_reader_has_mapped(tmp_path):
-    """Provisioning a token store again replaces its document index rather than rewriting it in
-    place. A rewrite truncated the file first, so a reader that had mapped it, in this process or
-    another sharing the disk, faulted (SIGBUS) on any page past the cut while it was written;
-    replaced, the old file stays whole under the reader's mapping."""
-    import os
+def test_an_exports_files_of_one_place_shard_apart(tmp_path):
+    """Two files of a provisioned (committed) ArrayRecord directory whose writers' directories are left
+    out of their places, so they share one, are still two shards: a read of the files, and of a
+    concatenation of them, holds every record of both."""
+    import array_record.python.array_record_module as array_record
 
-    from token_support import write_token_corpus
+    from dew.data.sources import Concatenate
 
-    from dew.data.sources import TokenFiles
-
-    stream = np.tile(np.array([5, 6, 7, 255], np.uint16), 64)
-    write_token_corpus(tmp_path, stream, eos_id=255)
-    store = TokenFiles(str(tmp_path)).provision()
-    index = Path(store.document_index.url)
-    mapped = np.load(index, mmap_mode="r")
-    original = os.stat(index).st_ino
-    TokenFiles(str(tmp_path)).provision()
-    assert os.stat(index).st_ino != original
-    assert mapped.tolist() == np.load(index).tolist() == list(range(4, 257, 4))
+    root = tmp_path / "export"
+    for writer, values in (("a", (0, 1)), ("b", (2, 3))):
+        (root / "shards" / writer).mkdir(parents=True)
+        writing = array_record.ArrayRecordWriter(str(root / "shards" / writer / "part-000000.array_record"),
+                                                 "group_size:1")
+        for value in values:
+            writing.write(str(value).encode())
+        writing.close()
+    files = Files(str(root), format="array_record").provision()
+    assert len({shard.id for shard in files.manifest().shards}) == 2
+    for source in (files, Concatenate((files,))):
+        manifest = source.manifest()
+        read = sorted(bytes(row) for shard in manifest.shards for row in manifest.reader(shard))
+        assert read == [b"0", b"1", b"2", b"3"]
 
 
 def _indexed_source(kind: str, root: Path):
     """A source of `kind` that streams its indexed records, and the shards (id, location, start,
-    stop, rows) its manifest names: the ids a cache keys rows by and a saved position counts into."""
+    stop, rows) its manifest names: the ids a cache keys rows by and a saved position counts into,
+    which name no directory a local store's fingerprint leaves out."""
     from token_support import write_token_corpus
 
     from dew.data.pipeline import Pack, Pipeline
@@ -1835,15 +1990,15 @@ def _indexed_source(kind: str, root: Path):
 
     if kind == "memory":
         return Memory([{"id": index} for index in range(7)], shard_rows=3), [
-            ("memory:0", "memory", 0, 3, 3), ("memory:3", "memory", 3, 6, 3), ("memory:6", "memory", 6, 7, 1)]
+            ("records:0", "memory", 0, 3, 3), ("records:3", "memory", 3, 6, 3),
+            ("records:6", "memory", 6, 7, 1)]
     if kind == "tfds":
         import tensorflow_datasets as tfds
 
         path = str(Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0")
-        named = f"tfds:dew_images/None:None:all:{path}"
         return TFDS("dew_images", path=path, split="all", shard_rows=8,
                     decoders={"image": tfds.decode.SkipDecoding()}), [
-            (f"{named}:0", path, 0, 8, 8), (f"{named}:8", path, 8, 16, 8), (f"{named}:16", path, 16, 20, 4)]
+            ("records:0", path, 0, 8, 8), ("records:8", path, 8, 16, 8), ("records:16", path, 16, 20, 4)]
     if kind == "generation":
         from dew.data.cache import Cache
         from dew.data.compile import publish
@@ -1852,33 +2007,33 @@ def _indexed_source(kind: str, root: Path):
                              Cache(str(root / "cache")), read="indexed",
                              loading=Loading(workers=0, threads=1, read_buffer=0))
         url = generation.url
-        return generation.source(), [(f"{url}:0", url, 0, 4096, 4096), (f"{url}:4096", url, 4096, 4100, 4)]
+        return generation.source(), [("records:0", url, 0, 4096, 4096), ("records:4096", url, 4096, 4100, 4)]
     if kind == "planned":
         from dew.data.packing import PackedSource
 
         documents = [np.arange(3, dtype=np.int32) + index for index in range(1030)]
         held = Memory({"text": documents, "length": [3] * 1030}, identity="documents")
         return PackedSource.planned(held, Pack(4, bins=1)), [
-            ("memory:documents:0", "memory:documents", 0, 1024, 1024),
-            ("memory:documents:1024", "memory:documents", 1024, 1030, 6)]
-    write_token_corpus(root, np.tile(np.array([5, 255], np.uint16), 1030), eos_id=255)
-    tokens = TokenFiles(str(root)).provision()
+            ("records:0", "memory:documents", 0, 1024, 1024),
+            ("records:1024", "memory:documents", 1024, 1030, 6)]
+    corpus = write_token_corpus(root, np.tile(np.array([5, 255], np.uint16), 1030), eos_id=255)
+    tokens = TokenFiles(corpus.train).provision()
     if kind == "tokens":
-        return tokens, [(f"{root}:train:0", str(root), 0, 1024, 1024),
-                        (f"{root}:train:1024", str(root), 1024, 1030, 6)]
+        return tokens, [("records:0", corpus.train, 0, 1024, 1024),
+                        ("records:1024", corpus.train, 1024, 1030, 6)]
     from dew.data.steps.windows import WindowSource
 
     windows = WindowSource(tokens, tokens.tokens, 4, 1)
-    named = f"{tokens.describe()} causal windows=4,stride=1"
-    return windows, [(f"{named}:0", named, 0, 1024, 1024), (f"{named}:1024", named, 1024, 2048, 1024),
-                     (f"{named}:2048", named, 2048, 2056, 8)]
+    described = f"{tokens.describe()} causal windows=4,stride=1"
+    return windows, [("records:0", described, 0, 1024, 1024), ("records:1024", described, 1024, 2048, 1024),
+                     ("records:2048", described, 2048, 2056, 8)]
 
 
 @pytest.mark.parametrize("kind", ["memory", "tfds", "tokens", "windows", "generation", "planned"])
 def test_an_indexed_source_streams_as_bounded_shards_of_its_records(tmp_path, kind):
-    """A source read by index streams as consecutive shards of its records, each named by its
-    store and first row; a shard reads that slice of the indexed records, and the manifest
-    pickles, reader and all, for Grain's worker processes."""
+    """A source read by index streams as consecutive shards of its records, each named by its first
+    record, wherever the source is; a shard reads that slice of the indexed records, and the
+    manifest pickles, reader and all, for Grain's worker processes."""
     source, expected = _indexed_source(kind, tmp_path)
     manifest = source.manifest()
     named = [(shard.id, shard.uri, shard.start, shard.stop, shard.rows) for shard in manifest.shards]
@@ -1922,23 +2077,7 @@ def test_native_map_datasets_read_as_streams_and_mix_with_a_stream_only_member()
         finally:
             alone.close()
         data = compile(mix([native.repeat(), streamed.repeat()]).batch(2), read="streamed", loading=loading)
-        whole = data.train(DataPartition())
-        try:
-            expected = ids(whole, 6)
-        finally:
-            whole.close()
-        stopped = data.train(DataPartition())
-        try:
-            head = ids(stopped, 3)
-            state = stopped.get_state()
-        finally:
-            stopped.close()
-        resumed = data.train(DataPartition())
-        try:
-            resumed.set_state(state)
-            assert head + ids(resumed, 3) == expected
-        finally:
-            resumed.close()
+        assert_resumes_where_it_stopped(lambda data=data: data.train(DataPartition()), ids, 3, 3)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1963,8 +2102,9 @@ def test_a_concatenation_states_what_its_stores_state_of_their_records():
                    facts=(*contract, ("valid_targets", 30), ("split", "train")))
     second = Stated([{"id": np.int32(index)} for index in range(2)],
                     facts=(*contract, ("valid_targets", 20), ("split", "validation"), ("shuffled", True)))
+    # Both are held in memory, whose rows carry no count of Dew's (`count_rules`).
     assert Concatenate((first, second)).metadata() == {
-        **dict(contract), "rows": 5, "valid_targets": 50}
+        **dict(contract), "rows": 5, "valid_targets": 50, "count_rules": []}
     other = Stated([{"id": np.int32(0)}], facts=(("tokenizer", "llama"),))
     with pytest.raises(ValueError):
         Concatenate((first, other)).metadata()
@@ -1972,11 +2112,9 @@ def test_a_concatenation_states_what_its_stores_state_of_their_records():
 
 @pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
 def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(read):
-    """Two stores read in turn (`dew.data.Concatenate`) are one store to a recipe and to the verbs:
-    a pass over it holds every record of both once, in their order, steps chain on it as on any
-    store, and a training run resumed after two batches reads the batches the uninterrupted run
-    reads."""
-    from dew.config.data import RecordsData, loader
+    """Two stores read in turn (`dew.data.Concatenate`) are one store to the verbs: a pass over it
+    holds every record of both once, in their order, steps chain on it as on any store, and a
+    training run resumed after two batches reads the batches the uninterrupted run reads."""
     from dew.data import Concatenate
     from dew.data.compile import validation
     from dew.data.pipeline import Pipeline
@@ -1992,26 +2130,16 @@ def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(re
     finally:
         passed.close()
 
-    def opened():
-        return loader(RecordsData(joined), batch=2, read=read, loading=loading, seed=3).train(DataPartition())
+    trained = compile(Pipeline(joined).shuffle(3, window=4).repeat().batch(2), read=read, loading=loading,
+                      seed=3)
 
-    whole = opened()
-    try:
-        expected = [np.asarray(next(whole)["id"]).tolist() for _ in range(8)]
-    finally:
-        whole.close()
-    stopped = opened()
-    try:
-        head = [np.asarray(next(stopped)["id"]).tolist() for _ in range(2)]
-        saved = stopped.get_state()
-    finally:
-        stopped.close()
-    resumed = opened()
-    try:
-        resumed.set_state(saved)
-        assert head + [np.asarray(next(resumed)["id"]).tolist() for _ in range(6)] == expected
-    finally:
-        resumed.close()
+    def opened():
+        return trained.train(DataPartition())
+
+    def ids(reader, count):
+        return [np.asarray(next(reader)["id"]).tolist() for _ in range(count)]
+
+    assert_resumes_where_it_stopped(opened, ids, 2, 6)
 
 
 def test_a_directory_of_arrow_files_reads_its_feather_files_too(tmp_path):

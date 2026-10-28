@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
@@ -52,24 +53,43 @@ def test_the_objective_trains_the_duration_and_one_step_samples_the_interval():
 
     given, _ = task._conditions(params, batch, jax.random.PRNGKey(0))
     denoise = task.denoiser(params, given, None)
-    x_T = jax.random.normal(jax.random.PRNGKey(3), (4, 4, 4, 3))
-    walked = sample(denoise, x_T, 2, solver=Euler(), key=jax.random.PRNGKey(0), final_denoise=False)
     schedule = task.process.schedule
-    u = task.model.apply(task.model_variables(params), x_T, schedule.model_time(jnp.ones((4,))), **given,
-                         duration=schedule.model_time(jnp.ones((4,))) - schedule.model_time(jnp.zeros((4,))))
-    np.testing.assert_allclose(np.asarray(walked), np.asarray(x_T - u), rtol=1e-5, atol=1e-6)
+    variables = task.model_variables(params)
+
+    def draw(seed):
+        return (jax.random.normal(jax.random.PRNGKey(seed), (4, 4, 4, 3)),)
+
+    def walked(x_T):
+        return sample(denoise, x_T, 2, solver=Euler(), key=jax.random.PRNGKey(0), final_denoise=False)
+
+    def interval(model, held, x_T, conditions):
+        start, end = (schedule.model_time(jnp.full((4,), time, x_T.dtype)) for time in (1, 0))
+        return x_T - model.apply(held, x_T, start, **conditions, duration=start - end)
+
+    @as_given
+    def truth(x_T):
+        with jax.enable_x64(new_val=True):
+            return interval(task.model.clone(dtype=jnp.float64), *widened((variables, x_T, given)))
+
+    # The walk is one Euler step from t=1 to t=0 at the average velocity u over the interval, x_T - u:
+    # on par with u taken by the model itself (check 1), the model in float64 the truth.
+    assert_as_exact(jax.jit(walked), jax.jit(lambda x_T: interval(task.model, variables, x_T, given)), draw,
+                    "one-step walk", seeds=WALK_SEEDS, truth_fn=truth)
+
+
+WALK_SEEDS = 8
+"""Check 1's declared seeds for the one-step walk, sized by `seeds_for`."""
 
 
 def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp_path):
-    import optax
     from diffusion_stubs import batch_for
+    from diffusion_support import images_of, saved_after_one_step
 
-    from dew.checkpoints import Checkpoints
-    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.config.data import ImageData
-    from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
-    from dew.sampling import TextToImage
-    from dew.training import Trainer
+    from dew.config import ObjectiveConfig, TrainerConfig
+    from dew.config.diffusion import DiffusionRunConfig
+    from dew.inference import TextToImage
+    from dew.inputs import TextCondition
+    from dew.registry import ModelConfig
 
     config = DiffusionRunConfig(
         model=ModelConfig(
@@ -77,7 +97,7 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
             {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
              "dtype": "float32", "attention_impl": "xla"},
         ),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=4),
+        data=images_of("tfds://oxford_flowers102", 4),
         preset=presets.MeanFlow(),
         val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
@@ -86,47 +106,64 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
                                   {"omega": 2.0, "kappa": 0.5, "solver": Euler(), "steps": 2,
                                    "ema_decay": None}),
     )
-    task = config.build()
-    assert isinstance(task, MeanFlowObjective) and task.model.interval
-    trainer = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3))
-    state = trainer.initial_state()
-    batch = batch_for(task, 4)
-    state, *_ = trainer.compile(state, batch)(state, batch)
     run = tmp_path / "run"
-    checkpoints = Checkpoints(str(run))
-    checkpoints.save(1, state, None, artifact=task.inference_record())
-    checkpoints.wait()
-    config.save(str(run))
+    task, state, _ = saved_after_one_step(config, lambda task: batch_for(task, 4), run, 1e-2)
+    assert isinstance(task, MeanFlowObjective) and task.model.interval
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(
         TextToImage.from_run(str(run))(["a red bird"], key=9).host().images, expected
     )
 
 
+MEANFLOW_SEEDS = 128
+"""Check 1's declared seeds for a MeanFlow step through a fused attention kernel: the most paired sizing
+(`seeds_for` with the fused step as `dew_fn`, its confirming block) gave on the GPUs the site runs on, 128
+for Triton's kernel on an A100 and an H100 and 8 for cuDNN's (node receipts TL-a100-sizing-1851-679,
+TL-h100-sizing-1851-679), the largest declared as docs/design/testing.md's check 1 rules (d28b1c318)."""
+
+
 def agrees_with_xla(kernel: str) -> None:
-    """A MeanFlow step through the fused attention `kernel` runs, and its loss and gradient agree
-    with the xla kernel's within bf16's rounding of the step's scale."""
-    def run(implementation):
+    """A MeanFlow step through the fused attention `kernel` runs, and its loss and every parameter's
+    gradient are on par with the xla kernel's (check 1), both in bf16, the truth the step of the
+    model in float64 on xla. Each draw holds its own weights, images and the step's key, which draws
+    the step's times and noise: adaLN-Zero's gates and output start at zero, where attention reaches
+    neither the output nor any gradient (ledger 789), and drawn weights let every parameter take part."""
+    def over(implementation: str, dtype: str) -> MeanFlowObjective:
         model = SimpleDiT(patch_size=2, emb_features=64, num_layers=1, num_heads=2, mlp_ratio=1,
-                          interval=True, attention_impl=implementation, dtype="bfloat16")
+                          interval=True, attention_impl=implementation, dtype=dtype)
         inputs = InputSpec(Field("image", (16, 16, 3)),
                            {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
-        task = MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
-        params = task.init(jax.random.PRNGKey(0))
-        pixels = jax.random.randint(jax.random.PRNGKey(1), (8, 16, 16, 3), 0, 256)
-        batch = {"image": np.asarray(pixels, np.uint8), **task.inputs.tokenize(["a", "b", "c", "d"] * 2)}
-        step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
-        def loss_of(tree):
-            return task.scalar_loss({**params, "params": tree}, batch, step)[0]
+        return MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
 
-        loss, grads = jax.jit(jax.value_and_grad(loss_of))(params["params"])
-        return float(loss), jax.tree.leaves(grads)
+    fused, xla, wide = over(kernel, "bfloat16"), over("xla", "bfloat16"), over("xla", "float64")
+    template = xla.init(jax.random.PRNGKey(0))
+    with jax.enable_x64(new_val=True):
+        held = jax.tree.map(jnp.asarray, widened(template))
+    tokens = xla.inputs.tokenize(["a", "b", "c", "d"] * 4)
 
-    (fused, fused_grads), (xla, xla_grads) = run(kernel), run("xla")
-    assert fused == pytest.approx(xla, rel=2 ** -7)
-    for left, right in zip(fused_grads, xla_grads, strict=True):
-        scale = float(jnp.max(jnp.abs(right))) + 1e-12
-        assert float(jnp.max(jnp.abs(left - right))) <= 2 * 2 ** -7 * scale
+    def draw(seed):
+        leaves, tree = jax.tree.flatten(template["params"])
+        keys = jax.random.split(jax.random.PRNGKey(seed), len(leaves) + 2)
+        params = jax.tree.unflatten(tree, [0.3 * jax.random.normal(key, leaf.shape, leaf.dtype)
+                                           for key, leaf in zip(keys[2:], leaves, strict=True)])
+        pixels = np.asarray(jax.random.randint(keys[0], (16, 16, 16, 3), 0, 256), np.uint8)
+        return params, pixels, np.asarray(keys[1])
+
+    def stepped(task, rest):
+        """The step's loss and the gradient of every parameter, a function of the parameters, the
+        images and the step's raw key."""
+        def run(params, pixels, key):
+            batch = {"image": pixels, **tokens}
+            step = Step(step=jnp.asarray(0), key=jnp.asarray(key), ema=None)
+
+            def loss_of(tree):
+                return task.scalar_loss({**rest, "params": tree}, batch, step)[0]
+
+            return jax.value_and_grad(loss_of)(params)
+        return run
+
+    assert_as_exact(stepped(fused, template), stepped(xla, template), draw, f"MeanFlow step on {kernel}",
+                    seeds=MEANFLOW_SEEDS, truth_fn=stepped(wide, held))
 
 
 @pytest.mark.gpu(reason="a fused attention kernel runs on a cuda device")

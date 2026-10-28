@@ -44,7 +44,6 @@ import jax.numpy as jnp
 import numpy as np
 import tyro
 
-from dew.config import OptimConfig
 from dew.data import HFTokenizer
 from dew.data.dataset import Loader
 from dew.inference import NativeRolloutServer, Publication, SafetensorsReload, Server, TextGeneration
@@ -52,9 +51,10 @@ from dew.interop import PretrainedDecoder
 from dew.interop.gateway import Gateway
 from dew.interop.harbor import HARBOR_KEY, Harbor
 from dew.interop.harness import HarnessSource
-from dew.objectives.rl import GRPOObjective, RolloutScheduler, SchedulerRecord
+from dew.objectives.rl import Asynchronous, GRPOObjective, RolloutScheduler, SchedulerRecord
 from dew.objectives.rl.scheduler import task_ids
 from dew.objectives.rl.sessions import Task
+from dew.optim import OptimConfig
 from dew.sampling import Sampling
 from dew.training import Trainer
 
@@ -103,6 +103,7 @@ def main(config: Config) -> dict:
         dtype=jnp.float32 if config.smoke else jnp.bfloat16,
         param_dtype=jnp.float32,
         max_seq_len=config.width,
+        on_host=True,  # the trainer places the weights over its mesh
     )
     objective = GRPOObjective(source.model, config.width - 1, variables=source.variables,
                               behavior_importance=2.0, epsilon_high=0.28)
@@ -116,7 +117,8 @@ def main(config: Config) -> dict:
         gateway = Gateway(config.gateway, sandbox_url=config.sandbox_gateway)
         push = SafetensorsReload(source, config.served, config.engines, config.engine)
         push.write(source.variables)
-        # The engines launch on --served now; the Publication below stamps the gateway at once.
+        # The engines launch on --served now; the Publication below stamps the gateway when the
+        # scheduler first reads its version, before its first draw.
         gateway.ready(config.ready_timeout)
     trials = HarnessSource(Harbor(harbor=harbor, model=config.harness_model, trials=config.out / "trials",
                                   agent=config.agent,
@@ -130,10 +132,10 @@ def main(config: Config) -> dict:
     def harbor_tasks(batch) -> list[Task]:
         return [Task(task.id, {HARBOR_KEY: str(tasks[int(task.id)])}) for task in task_ids(batch)]
 
-    rollout = RolloutScheduler(objective, trials, Publication(push, stamp=gateway.stamp), width=config.width,
-                               rows=config.prompts * config.groups, tasks=harbor_tasks, groups=config.groups,
-                               max_lag=config.max_lag, ahead=config.max_lag, truncation=config.truncation,
-                               log=history.append)
+    rollout = RolloutScheduler(
+        Asynchronous(trials, Publication(push, stamp=gateway.stamp), objective, width=config.width,
+                     rows=config.prompts * config.groups, max_lag=config.max_lag, ahead=config.max_lag),
+        tasks=harbor_tasks, groups=config.groups, truncation=config.truncation, log=history.append)
     draw = np.random.default_rng(config.seed)
     data = Loader(train=lambda partition: iter(
                        lambda: {"task_id": draw.integers(0, len(tasks), config.prompts, np.int32)}, None),

@@ -1,9 +1,9 @@
 """The Dew calls a live cell makes, sent to the host's shared model process.
 
 A live cell runs in a small sandboxed process that holds no model weights.
-`install` puts stand-ins for `dew.interop.PretrainedDecoder`,
-`dew.sampling.TextToImage` and the sampling settings the page's cells use in
-place of Dew's own modules. Each call goes to the process on the same host that
+`install` puts stand-ins for `dew.interop.PretrainedDecoder`, `dew.pipeline`
+and the sampling settings the page's cells use in place of Dew's own modules.
+Each call goes to the process on the same host that
 loaded the pinned models with those same calls at startup (model_service.py),
 so a cell reads and prints as it would with Dew installed. Any other Dew module
 refuses to import here.
@@ -147,12 +147,10 @@ class Pipeline:
         return ImageResult(result)
 
 
-class TextToImage:
-    @staticmethod
-    @cache
-    def from_pretrained(repo, *, revision=None):
-        metadata = request({"op": "describe", "repo": repo, "revision": revision})
-        return Pipeline(metadata["repo"], metadata["revision"])
+@cache
+def pipeline(repo, *, revision=None):
+    metadata = request({"op": "describe", "repo": repo, "revision": revision})
+    return Pipeline(metadata["repo"], metadata["revision"])
 
 
 @dataclass(frozen=True)
@@ -209,8 +207,8 @@ def install():
     interop = types.ModuleType("dew.interop", __doc__)
     interop.PretrainedDecoder = PretrainedDecoder
     sampling = types.ModuleType("dew.sampling", __doc__)
-    for value in (CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling, TextToImage):
+    for value in (CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling):
         setattr(sampling, value.__name__, value)
-    dew.interop, dew.sampling = interop, sampling
+    dew.pipeline, dew.interop, dew.sampling = pipeline, interop, sampling
     sys.modules.update({"dew": dew, "dew.interop": interop, "dew.sampling": sampling})
     sys.meta_path.insert(0, Elsewhere())

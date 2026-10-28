@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import importlib.metadata
 import inspect
@@ -10,21 +11,26 @@ import json
 import logging
 import platform
 import re
-import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
 import jax
 import numpy as np
 
+from dew import _checkout
+from dew._hashing import array_header
+from dew._records import JSON, json_value, record
+from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
-from dew.records import JSON, json_value, record
+from dew.position import PER_SHARE
 
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
+
+    from dew.batch import Batch
 
 
 def _canonical(value: JSON | Mapping[str, object]) -> bytes:
@@ -33,10 +39,26 @@ def _canonical(value: JSON | Mapping[str, object]) -> bytes:
     ).encode()
 
 
+class Digest(Protocol):
+    """A running hash, as `hashlib`'s are."""
+
+    def update(self, chunk: bytes, /) -> None: ...
+
+    def hexdigest(self) -> str: ...
+
+
+def array_digest(dtype: np.dtype, shape: Sequence[int]) -> Digest:
+    """The digest an array of `dtype` and `shape` is fingerprinted by, its header taken
+    (`dew._hashing.array_header`, which tells apart dtypes of one byte layout): its elements' bytes
+    follow in C order, whole (`fingerprint`) or page by page as a published plan writes them
+    (`generation._write_plan`), to the same hash."""
+    return hashlib.sha256(array_header(dtype, shape))
+
+
 def fingerprint(value: JSON | Mapping[str, object] | np.ndarray) -> str:
     """Hash order metadata, including an array's shape and dtype."""
     if isinstance(value, np.ndarray):
-        digest = hashlib.sha256(_canonical([value.dtype.str, list(value.shape)]))
+        digest = array_digest(value.dtype, value.shape)
         if value.dtype.hasobject:
             digest.update(_canonical(value.tolist()))
         else:
@@ -45,19 +67,27 @@ def fingerprint(value: JSON | Mapping[str, object] | np.ndarray) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
-def _identified_sources(value: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> None:
-    """Require declared content identities throughout a source snapshot."""
+def identified(value: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> bool:
+    """Whether a source snapshot states the content of every store in it: a store that holds no
+    version of its own (a Grain dataset, an iterator, a torch dataset) states it by the name it was
+    given, and one given none can't say a later run reads the same records."""
     if isinstance(value, dict):
         identity = value.get("identity")
-        if value.get("identity_required") is True and (not isinstance(identity, str) or not identity):
-            raise ValueError(
-                f"source {value.get('store', 'adapter')} needs an explicit content identity"
-            )
-        for child in value.values():
-            _identified_sources(child)
-    elif isinstance(value, list):
-        for child in value:
-            _identified_sources(child)
+        if value.get("identity_required") is True and not (isinstance(identity, str) and identity):
+            return False
+        return all(identified(child) for child in value.values())
+    if isinstance(value, list):
+        return all(identified(child) for child in value)
+    return True
+
+
+def callable_name(step: Callable[..., Batch]) -> str:
+    """`step`'s qualified name, `module.qualname`: a function's or a bound method's own, else its
+    type's, as a batch encoder names the reader it runs. A step's identity (`StepIdentity.of`) names
+    a bound method by its type, as plans have always written it; only a function is named by its
+    own name there."""
+    kind = step if inspect.isfunction(step) or inspect.ismethod(step) else type(step)
+    return f"{kind.__module__}.{kind.__qualname__}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -232,6 +262,26 @@ def _environment(recorded: Mapping[str, object]) -> dict[str, JSON]:
             "modules": [step["modules"] for step in steps]}
 
 
+@functools.cache
+def _locked() -> str:
+    """The fingerprint of the checkout's lock files and installed distributions, read once a process:
+    it parses every installed distribution's metadata, most of a second, which no compilation
+    changes."""
+    locked = [_checkout.ROOT / name for name in ("pyproject.toml", "uv.lock", "constraints.txt")]
+    dependencies = {
+        distribution.metadata["Name"]: distribution.version
+        for distribution in importlib.metadata.distributions()
+        if distribution.metadata["Name"]
+    }
+    return fingerprint(
+        {
+            "files": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in locked
+                      if path.is_file()},
+            "installed": dependencies,
+        }
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class Manifest:
     """The dependency manifest shared by an execution plan and its cache.
@@ -255,9 +305,6 @@ class Manifest:
     schema: int = 1
     clean: bool = True
 
-    def __post_init__(self) -> None:
-        _identified_sources(json_value(self.source, "source"))
-
     @classmethod
     def of(
         cls,
@@ -267,44 +314,7 @@ class Manifest:
         ran: Sequence[StepIdentity] = (),
         fill: Mapping[str, object] | None = None,
     ) -> Manifest:
-        root = Path(__file__).resolve().parents[3]
-        versioned = (root / ".git").exists()
-        revision, clean = "unversioned", True
-        if versioned:
-            revision = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
-            ).stdout.strip()
-            dirty = subprocess.run(
-                ["git", "status", "--porcelain", "--untracked-files=no"],
-                cwd=root,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            added_code = subprocess.run(
-                ["git", "ls-files", "--others", "--exclude-standard", "src/dew"],
-                cwd=root,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            clean = not dirty and not added_code
-        locked = [root / name for name in ("pyproject.toml", "uv.lock", "constraints.txt")]
-        dependencies = {
-            distribution.metadata["Name"]: distribution.version
-            for distribution in importlib.metadata.distributions()
-            if distribution.metadata["Name"]
-        }
-        lock = fingerprint(
-            {
-                "files": {
-                    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-                    for path in locked
-                    if path.is_file()
-                },
-                "installed": dependencies,
-            }
-        )
+        (revision, clean), lock = checkout_now(), _locked()
         return cls(
             source,
             tuple(steps),
@@ -346,7 +356,10 @@ class Manifest:
 
     @property
     def exact(self) -> bool:
-        return all(step.exact for step in (*self.ran, *self.steps))
+        """Whether a later run can tell it makes these rows again: every step has a stable identity
+        and every store states its content (`identified`)."""
+        return all(step.exact for step in (*self.ran, *self.steps)) and identified(
+            json_value(self.source, "source"))
 
 
 def _digests(value: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
@@ -396,7 +409,7 @@ class Plan:
     """A mixture's members, each what it reads and runs as one digest under its key, and its own
     stages under the empty key (`dew.data.analysis._member_manifests`): what a streamed mix's
     resume reads of a member that joined or left (`check`)."""
-    version: ClassVar[int] = 4
+    version: ClassVar[int] = 7
 
     def record(self) -> dict[str, JSON]:
         return {
@@ -455,7 +468,8 @@ class Plan:
             )
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(
-                "data plan contains a step without stable identity; resume='non-exact' is required"
+                "data plan contains a step without stable identity or a store given no name "
+                "(from_grain(..., name=), from_iter(..., name=)); resume='non-exact' is required"
             )
         edited = self._edited_members(saved)
         # A mix whose members changed is compared member by member (`_edited_members`): each kept
@@ -473,8 +487,18 @@ class Plan:
         for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
             if previous.get(name) != self.derived.get(name):
                 raise ValueError(f"saved data plan derived order {name} changed")
-        if self.lowering == "per-share" and current["topology"] != saved.get("topology"):
-            raise ValueError("saved per-share data plan topology changed (shares, workers or cycle length)")
+        if self.lowering == "per-share":
+            topology = record(current["topology"], "data plan topology")
+            saved_topology = record(saved.get("topology", {}), "saved data plan topology")
+            # The workers each corpus read in (`pools`): a corpus an edited mix keeps reads in as many.
+            pools = record(topology.get("pools", {}), "data plan pools")
+            saved_pools = record(saved_topology.get("pools", {}), "saved data plan pools")
+            compared = set(pools) & set(saved_pools) if edited is not None else set(pools) | set(saved_pools)
+            if ({name: value for name, value in topology.items() if name != "pools"}
+                    != {name: value for name, value in saved_topology.items() if name != "pools"}
+                    or any(pools.get(name) != saved_pools.get(name) for name in compared)):
+                raise ValueError(f"saved per-share data plan topology changed (shares, workers or cycle "
+                                 f"length): {PER_SHARE}")
         changed = _changed(record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic())
         if edited is not None:
             changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))

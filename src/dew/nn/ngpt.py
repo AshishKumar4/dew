@@ -14,9 +14,8 @@ import math
 import jax
 import jax.numpy as jnp
 
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, l2norm
 
-EPSILON = 1e-6
 """The floor under a unit norm's squared length (dory.py's EPS)."""
 
 
@@ -37,8 +36,9 @@ class NGPT:
     that starts and stays at zero.
 
     A model under it keeps every hidden state on the unit sphere: no norm has a weight, the
-    keys and the attention's and feed-forward's outputs are unit-normed (`unit`), each sublayer
-    joins the residual by `stepped`, and no norm precedes the head.
+    keys and the attention's and feed-forward's outputs are unit-normed
+    (`dew.nn.precision.l2norm`), each sublayer joins the residual by `stepped`, and no norm
+    precedes the head.
     """
 
     std: float
@@ -69,25 +69,19 @@ class NGPT:
         return 1 / self.std
 
 
-def unit(x: jax.Array) -> jax.Array:
-    """`x` over its L2 length along the last axis, reduced in fp32 and returned in `x`'s dtype:
-    `x * rsqrt(sum(x**2) + 1e-6)`, Dory's `justnorm`."""
-    wide = x.astype(at_least_fp32(x.dtype))
-    return (wide * jax.lax.rsqrt(jnp.sum(jnp.square(wide), axis=-1, keepdims=True) + EPSILON)).astype(x.dtype)
-
-
 def stepped(residual: jax.Array, branch: jax.Array, alpha: jax.Array, scale: float) -> jax.Array:
-    """The residual after a sublayer's `branch` joins it: both ends unit-normed in the residual's
-    dtype, a step of `|alpha * scale|` from the residual toward the branch in fp32, and the result
-    unit-normed back to the residual's dtype (Dory's `slerp_alpha`)."""
-    wide = at_least_fp32(residual.dtype)
-    start = unit(residual).astype(wide)
-    end = unit(branch).astype(wide)
+    """The residual after a sublayer's `branch` joins it: both ends unit-normed in their own dtypes,
+    a step of `|alpha * scale|` from the residual toward the branch in at least fp32 of the residual,
+    the branch and the rate, and the result unit-normed back to the residual's dtype (Dory's
+    `slerp_alpha`)."""
+    wide = at_least_fp32(jnp.result_type(residual, branch, alpha))
+    start = l2norm(residual).astype(wide)
+    end = l2norm(branch).astype(wide)
     rate = jnp.abs(alpha.astype(wide) * scale)
-    return unit(start + rate * (end - start)).astype(residual.dtype)
+    return l2norm(start + rate * (end - start)).astype(residual.dtype)
 
 
 def gain(scale: jax.Array, factor: float) -> jax.Array:
-    """A learned per-feature gain stored at the initializer's scale, as the fp32 multiplier it
-    stands for: `scale * factor` (nGPT's s_qk, s_u, s_v and s_z, and Dory's output-gate scale)."""
+    """A learned per-feature gain stored at the initializer's scale, as the multiplier it stands for in
+    at least fp32: `scale * factor` (nGPT's s_qk, s_u, s_v and s_z, and Dory's output-gate scale)."""
     return scale.astype(at_least_fp32(scale.dtype)) * factor

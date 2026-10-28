@@ -31,9 +31,11 @@ import numpy as np
 import tyro
 from PIL import Image, ImageDraw, ImageFont
 
+import dew
 from dew.artifacts import uint8_pixels
-from dew.interop import split_revision
-from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, TextToImage
+from dew.inference import TextToImage
+from dew.interop import SourceReference
+from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun
 
 # Each sampler's solver, step count and classifier-free guidance.
 SAMPLERS = {
@@ -45,7 +47,7 @@ SAMPLERS = {
 
 @dataclass
 class Config:
-    model: str = "dewml/hybrid-dit-176m@4b322022189373fd9086313241269aa5cea92b86"
+    model: str = "dewml/hybrid-dit-176m@8d891d967319e51cd0e73d3e5b7c29d68a238b52"
     """A Hugging Face Hub repository, `repo@revision` to pin a commit or tag, or a local Dew run
     directory."""
     out: Path = Path("runs/sample-text-to-image")
@@ -68,8 +70,11 @@ class Config:
 def load(model: str) -> TextToImage:
     if Path(model).is_dir():
         return TextToImage.from_run(model)
-    repo, revision = split_revision(model)
-    return TextToImage.from_pretrained(repo, revision=revision)
+    source = SourceReference.parse(model)
+    pipe = dew.pipeline(source.name, revision=source.revision)
+    if not isinstance(pipe, TextToImage):
+        raise TypeError(f"{model} holds a {type(pipe).__name__} run, which draws no images")
+    return pipe
 
 
 def grid(title: str, prompts, seeds, images: np.ndarray) -> Image.Image:

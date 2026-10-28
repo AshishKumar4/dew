@@ -16,6 +16,8 @@ transformers `Dinov2Model` (no registers; REPA's encoder), `dinov2_plain`:
 - `mae`: ViT-MAE, 16-pixel patches at 128 pixels, whose 14x14 table is
   resized to the grid, and no latent statistics. SigLIP's and MAE's decoders
   paint 8-pixel patches, so a 64x64 image is enlarged to the encoder's input.
+  It is 96 wide: the source derives its head count as width // 64, so its one
+  head is 96 wide, not 64.
 
 Each is saved with `save_pretrained` - its real config and safetensors - and
 recorded in float32, channel-first:
@@ -72,7 +74,7 @@ CONFIGS = {
     "siglip2": {**DECODER, "encoder_type": "siglip2", "encoder_hidden_size": 64, "encoder_num_hidden_layers": 1,
                 "encoder_patch_size": 16, "encoder_input_size": 128, "patch_size": 8,
                 "encoder_norm_mean": [0.5, 0.5, 0.5], "encoder_norm_std": [0.5, 0.5, 0.5]},
-    "mae": {**DECODER, "encoder_type": "mae", "encoder_hidden_size": 64, "encoder_num_hidden_layers": 1,
+    "mae": {**DECODER, "encoder_type": "mae", "encoder_hidden_size": 96, "encoder_num_hidden_layers": 1,
             "encoder_patch_size": 16, "encoder_input_size": 128, "patch_size": 8},
 }
 STATISTICS = {"dinov2": ("std",), "siglip2": ("mean", "std"), "mae": ()}
@@ -169,6 +171,7 @@ def from_published(cls, repo: str, revision: str):
 
 def published(destination: str) -> None:
     from diffusers import AutoencoderRAE
+    from torch_precision import float64, float64_twin
 
     def walk(model, dtype):
         grid = model.config.encoder_input_size // model.config.encoder_patch_size
@@ -185,7 +188,9 @@ def published(destination: str) -> None:
     for name, (repo, revision) in PUBLISHED.items():
         model = from_published(AutoencoderRAE, repo, revision)
         single = walk(model, torch.float32)
-        exact = walk(model.double(), torch.float64)
+        # Built and run inside `float64`, so the decoder table its constructor recomputes is float64's.
+        with float64():
+            exact = walk(from_published(AutoencoderRAE, repo, revision), torch.float64)
         for key, value, rounded in zip(("latent", "pixels"), exact, single, strict=True):
             arrays[f"{name}.{key}"] = value
             arrays[f"{name}.{key}.float32_gap"] = np.float64(gap(rounded, value))
@@ -196,9 +201,11 @@ def published(destination: str) -> None:
     model = Dinov2Model.from_pretrained(DINOV2[0], revision=DINOV2[1]).eval()
     mean, std = (np.asarray(value, np.float32).reshape(1, 3, 1, 1) for value in IMAGENET)
     pixels = torch.from_numpy((smooth_image(224) - mean) / std)
+    wide = float64_twin(model)
     with torch.no_grad():
         single = model(pixels).last_hidden_state[:, 1:, :LATENT_CHANNELS].numpy()
-        exact = model.double()(pixels.double()).last_hidden_state[:, 1:, :LATENT_CHANNELS].numpy()
+        with float64():
+            exact = wide(pixels.double()).last_hidden_state[:, 1:, :LATENT_CHANNELS].numpy()
     arrays["dinov2_plain.tokens"] = exact
     arrays["dinov2_plain.tokens.float32_gap"] = np.float64(gap(single, exact))
     print("dinov2_plain", float(arrays["dinov2_plain.tokens.float32_gap"]))
@@ -234,8 +241,6 @@ def build_plain(root: Path) -> dict[str, np.ndarray]:
 
 
 def main(destination: str) -> None:
-    import diffusers
-    import transformers
 
     require("rae")
     torch.set_num_threads(2)

@@ -14,14 +14,14 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.batch import merge
 from dew.nn.dense import Dense
-from dew.objectives.base import merge
 
 from ..attention import NormalAttention, RMSNorm
 from ..blocks import TimeProjection
 from ..dit import ROPE_THETA
 from ..flops import MissingFlopsCount, patch_lengths, projection_flops
-from ..precision import at_least_fp32
+from ..precision import at_least_fp32, float32_dot_general
 from ..rope import rotary_freqs
 from .spatial import SpatialCount, SpatialShape
 from .unet import Unet, unet_body
@@ -67,7 +67,7 @@ class TemporalBlock(nn.Module):
         # zero-init gate: identity at init, so inflation preserves the 2D model
         h = Dense(
             features=C, dtype=self.dtype, precision=self.precision,
-            kernel_init=nn.initializers.zeros, name="temporal_out")(h)
+            kernel_init=nn.initializers.zeros, name="temporal_out", dot_general=float32_dot_general)(h)
 
         h = h.reshape(B, H * W, frames, C).transpose(0, 2, 1, 3).reshape(BT, H, W, C)
         return x + h

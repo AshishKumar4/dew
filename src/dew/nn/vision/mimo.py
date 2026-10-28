@@ -7,18 +7,22 @@ from collections.abc import Mapping
 
 from flax import linen as nn
 
-from dew import records
+from dew import _records
+from dew.interop.weights import in_params
 from dew.registry import Record
 
 from .common import (
     ProjectorBase,
+    ProjectorLayout,
     TowerBase,
     TowerGeometry,
+    TowerLayout,
     _vision_section,
     activation_name,
     block_tensor_path,
+    merger_projector,
 )
-from .vit import MergeProjector, VisionTransformer, ViTLayout
+from .vit import MergeProjector, VisionTransformer, ViTLayout, translate_vit_weights
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,20 +84,11 @@ class MiMoVision(TowerBase):
                              channels=self.in_channels)
 
 
-@dataclasses.dataclass(frozen=True)
-class MiMoProjector(ProjectorBase):
+class MiMoProjector(MergeProjector, ProjectorBase):
     """MiMo's merger (MiMoVisionPatchMerger): a layer norm, each merge block grouped, and two maps
     around an exact GELU to the decoder width. The release stores none of its biases."""
 
-    vision_width: int
-    merge_size: int
-    out_width: int
-
-    def build(self) -> nn.Module:
-        grown = self.vision_width * self.merge_size ** 2
-        return MergeProjector(hidden_size=self.vision_width, spatial_merge_size=self.merge_size,
-                              width=grown, out_width=self.out_width, bias=False)
-
+    bias: bool = False
 
 _BLOCK_MAPS = {("attn", "qkv"): ("self_attn", "qkv_proj"), ("attn", "proj"): ("self_attn", "o_proj"),
                ("mlp", "gate_proj"): ("mlp", "gate_proj"), ("mlp", "up_proj"): ("mlp", "up_proj"),
@@ -119,39 +114,37 @@ def translate_mimo_vision_config(hf_config: Mapping[str, object]) -> Record:
     release's silu names it, and no other activation."""
     vision = _vision_section(hf_config)
     activation_name(vision, ("silu",), "silu")
-    depth = records.integer(vision["depth"], "depth")
-    types = records.integers(vision.get("vit_window_attn_types") or [-1] * depth, "vit_window_attn_types")
+    depth = _records.integer(vision["depth"], "depth")
+    types = _records.integers(vision.get("vit_window_attn_types") or [-1] * depth, "vit_window_attn_types")
     return {"class": "mimo", "fields": {
         "depth": depth,
-        "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
-        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
-        "num_heads": records.integer(vision["num_heads"], "num_heads"),
-        "num_key_value_heads": records.integer(vision.get("num_key_value_heads", vision["num_heads"]),
+        "hidden_size": _records.integer(vision["hidden_size"], "hidden_size"),
+        "intermediate_size": _records.integer(vision["intermediate_size"], "intermediate_size"),
+        "num_heads": _records.integer(vision["num_heads"], "num_heads"),
+        "num_key_value_heads": _records.integer(vision.get("num_key_value_heads", vision["num_heads"]),
                                                "num_key_value_heads"),
-        "qk_channels": records.integer(vision.get("qk_channels", 64), "qk_channels"),
-        "in_channels": records.integer(vision.get("in_channels") or vision.get("in_chans", 3), "in_chans"),
-        "patch_size": records.integer(vision["patch_size"], "patch_size"),
-        "spatial_merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
-        "temporal_patch_size": records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
-        "rms_norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
-        "fullatt_block_indexes": records.integers(vision.get("fullatt_block_indexes", []),
+        "qk_channels": _records.integer(vision.get("qk_channels", 64), "qk_channels"),
+        "in_channels": _records.integer(vision.get("in_channels") or vision.get("in_chans", 3), "in_chans"),
+        "patch_size": _records.integer(vision["patch_size"], "patch_size"),
+        "spatial_merge_size": _records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
+        "temporal_patch_size": _records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
+        "rms_norm_eps": _records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
+        "fullatt_block_indexes": _records.integers(vision.get("fullatt_block_indexes", []),
                                                   "fullatt_block_indexes"),
         "vit_window_attn_types": types,
         "use_sink": bool(vision.get("use_sink", False)),
-        "visual_token_window_size": records.integer(vision.get("visual_token_window_size", -1),
+        "visual_token_window_size": _records.integer(vision.get("visual_token_window_size", -1),
                                                     "visual_token_window_size"),
     }}
 
 
 def translate_mimo_projector_config(hf_config: Mapping[str, object], text_width: int) -> Record:
-    """A MiMo-V2 wrapper's merger fields; a merger width beside the decoder width refuses, as the
-    merged features enter the text embeddings as they are."""
-    vision = _vision_section(hf_config)
-    merged = records.integer(vision["out_hidden_size"], "out_hidden_size")
-    if merged != int(text_width):
-        raise ValueError(f"out_hidden_size ({merged}) is not the decoder width ({text_width})")
-    return {"class": "mimo", "fields": {
-        "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
-        "merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
-        "out_width": merged,
-    }}
+    """A MiMo-V2 wrapper's merger fields (`merger_projector`)."""
+    return merger_projector(hf_config, text_width, "mimo", bias=False)
+
+
+MiMoVision.checkpoint = TowerLayout("visual.", in_params(mimo_vision_path), read=translate_vit_weights)
+# MiMo's merger stores no biases (MiMoVisionPatchMerger's released tensors).
+MiMoProjector.checkpoint = ProjectorLayout("visual.merger.", {
+    "ln_q.weight": ("norm", "scale"), "mlp.0.weight": ("fc1", "kernel"), "mlp.2.weight": ("fc2", "kernel"),
+}, strip="merger.")

@@ -340,6 +340,12 @@ document's start in every row."""
 RAGGED = (3, 7)
 """The lengths of two prompts decoded side by side."""
 
+GRADIENTS = ('backbone.embeddings.weight', 'backbone.layers.0.mixer.g_proj.weight',
+             'backbone.layers.3.mixer.up_proj.weight', 'backbone.layers.4.mixer.sqk',
+             'backbone.layers.7.mlp_alpha', 'lm_head.logit_scale')
+"""Tensors whose gradients tests/test_dory.py draws live against this reference: the embeddings,
+an input layer's output-gate projection, a looped feed-forward and attention gain, an output
+layer's step and the logit gain; the fixture `write_tiny` writes keeps every tensor's."""
 
 SPECIALS = ('<unk>', '<s>', '</s>', '[INST]', '[/INST]', '[AVAILABLE_TOOLS]', '[/AVAILABLE_TOOLS]',
             '[TOOL_RESULTS]', '[/TOOL_RESULTS]', '[TOOL_CALLS]', '<|im_start|>', '<|im_end|>')

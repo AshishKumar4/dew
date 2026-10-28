@@ -1,20 +1,17 @@
-"""Recipe encodings against the frozen pre-migration loader behavior."""
+"""Preset encodings against the frozen pre-migration loader behavior."""
 
-import dataclasses
 import itertools
+import json
 import re
 
 import numpy as np
 
-from dew.config.data import ChatData, PromptData, TextData, loader
-from dew.data import ByteTokenizer, Loading, Memory
+from dew.batch import VALID_ROWS
+from dew.data import ByteTokenizer, Loading, Memory, presets
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition
-from dew.data.pipeline import Pipeline
-from dew.data.steps.text import FixedTokens
-from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
-from dew.decision.data import Decisions
+from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout, decisions
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 
@@ -39,8 +36,11 @@ def _rows(batch):
 def test_decision_branches_keep_labels_aligned_with_option_order_in_packed_windows():
     examples = [Example(f"state {index}", {"class": Choice("Pick", ["yes", "no"])}, {"class": index % 2})
                 for index in range(40)]
-    recipe = Decisions(examples, validation=examples[:5])
-    ours = loader(recipe, batch=4, read="memory", objective=_objective().data(), seed=7, loading=READ)
+    def rows(chosen):
+        return Memory([{"example": example} for example in chosen]).pipe(decisions)
+
+    ours = compile(rows(examples).shuffle(7).repeat().batch(4), validation=rows(examples[:5]).batch(4),
+                   read="memory", objective=_objective().data(), seed=7, loading=READ)
 
     def aligned(text: str, label: int) -> int:
         matched = re.search(r"state (\d+)", text)
@@ -67,8 +67,9 @@ def test_decision_branches_keep_labels_aligned_with_option_order_in_packed_windo
 
 
 def test_text_windows_keep_document_continuations_and_global_resume():
-    documents = ({"text": "abcdefgh"}, {"text": "ijklmnopqrstuvwx"})
-    loaded = loader(TextData(documents, seq_len=3), batch=2, read="memory", loading=READ)
+    documents = Memory([{"text": "abcdefgh"}, {"text": "ijklmnopqrstuvwx"}])
+    chain = documents.pipe(presets.lm, "byte", seq_len=3, batch=None, pack=None).shuffle(0).repeat().batch(2)
+    loaded = compile(chain, read="memory", loading=READ)
     assert loaded.records == 8
     reader = loaded.train(DataPartition())
     first = next(reader)["text"]
@@ -84,12 +85,15 @@ def test_text_windows_keep_document_continuations_and_global_resume():
 
 def test_prompt_default_keeps_a_long_tasks_tail_and_explicit_dropping_filters_it():
     """An overlong prompt keeps its tail by default (post-training P62); `long="drop"` filters it."""
-    rows = ({"prompt": [1, 2]}, {"prompt": [3, 4, 5, 6, 7]}, {"prompt": [8, 9]})
-    filtered = loader(PromptData(rows, "byte", max_prompt_len=3, long="drop"), batch=1, read="memory",
-                      loading=READ)
-    assert filtered.records == 2
-    truncated = loader(PromptData(rows, "byte", max_prompt_len=3), batch=3, read="memory", loading=READ)
-    reader = truncated.train(DataPartition())
+    rows = Memory([{"prompt": [1, 2]}, {"prompt": [3, 4, 5, 6, 7]}, {"prompt": [8, 9]}])
+
+    def loaded(batch, **options):
+        # Rendered, then ordered: the prompts a drop keeps are the records an epoch reads.
+        chain = rows.pipe(presets.prompts, "byte", max_prompt_len=3, batch=None, **options)
+        return compile(chain.shuffle(0).repeat().batch(batch), read="memory", loading=READ)
+
+    assert loaded(1, long="drop").records == 2
+    reader = loaded(3).train(DataPartition())
     assert sorted(next(reader)["prompt"].tolist()) == [[0, 1, 2], [0, 8, 9], [5, 6, 7]]
     reader.close()
 
@@ -97,76 +101,41 @@ def test_prompt_default_keeps_a_long_tasks_tail_and_explicit_dropping_filters_it
 def test_chat_default_chunks_and_preserves_later_assistant_tokens_that_truncation_cuts():
     """A long conversation is chunked by default (post-training P37), keeping every turn, where an
     explicit `long="truncate"` cuts the later assistant tokens away."""
-    rows = ({"messages": [{"role": "user", "content": "hi"},
-                           {"role": "assistant", "content": "hello " * 20}]},) * 8
-    tokenizer = "tests/fixtures/tokenizers/tiny-chat"
-    truncated = loader(ChatData(rows, tokenizer, seq_len=15, long="truncate"), batch=1, read="memory",
-                       loading=READ)
-    chunked = loader(ChatData(rows, tokenizer, seq_len=15), batch=1, read="memory", loading=READ)
+    rows = Memory([{"messages": [{"role": "user", "content": "hi"},
+                                 {"role": "assistant", "content": "hello " * 20}]}] * 8)
+
+    def loaded(**options):
+        chain = rows.pipe(presets.sft, "tests/fixtures/tokenizers/tiny-chat", seq_len=15, batch=None, bins=8,
+                          **options)
+        return compile(chain.shuffle(0).repeat().batch(1), read="memory", loading=READ)
+
+    truncated, chunked = loaded(long="truncate"), loaded()
     assert chunked.records > truncated.records
     reader = chunked.train(DataPartition())
     assert any(np.any(batch["text_roles"] == 3) for batch in itertools.islice(reader, chunked.records))
     reader.close()
 
 
-def test_a_cached_token_holdout_caches_the_documents_before_the_split(tmp_path):
-    """A recipe's cache holds the deterministic steps before its token split,
-    so a cached memory read of a token holdout holds out what the uncached
-    read holds out."""
-    import json
+def test_a_cached_token_holdout_holds_out_what_the_uncached_one_does(tmp_path):
+    """A cache of the tokenized documents before a token split, read into memory, holds out what the
+    uncached read holds out."""
     from uuid import uuid4
 
-    from dew.config.data import HoldOut
+    from dew.data import Files, text
     from dew.data.cache import Cache
+    from dew.data.compile import held
 
     (tmp_path / "text.jsonl").write_text(
         "".join(json.dumps({"text": f"document {index} " * 6}) + "\n" for index in range(8)))
-    recipe = TextData(source=str(tmp_path / "text.jsonl"), seq_len=8, token_holdout=HoldOut(fraction=0.25))
+    documents = Files(str(tmp_path / "text.jsonl")).map(text.tokenize("byte", eos=True))
 
-    def held(cache):
-        loaded = loader(recipe, batch=2, read="memory", cache=cache, loading=READ)
-        assert loaded.val is not None
+    def scored(cache):
+        tokens = documents if cache is None else documents.cache(cache)
+        _, part = tokens.holdout(tokens=0.25)
+        windows = part.pipe(presets.lm, None, seq_len=8, batch=2, pack=None).read("memory").loading(READ)
         return [{name: np.asarray(value).tolist() for name, value in batch.items()}
-                for batch in loaded.val(DataPartition())]
+                for batch in held(windows)(DataPartition())]
 
-    assert held(Cache(f"memory://{uuid4().hex}")) == held(None)
-
-
-@dataclasses.dataclass(frozen=True)
-class _SelfBatched:
-    """A recipe whose training pipeline makes its own batch: `rows` rows, or `tokens` tokens of
-    fixed 8-target windows."""
-
-    rows: int | None = None
-    tokens: int | None = None
-
-    def pipelines(self):
-        documents = Memory(tuple({"text": np.arange(index, index + 9, dtype=np.int32)} for index in range(8)),
-                           identity="self-batched")
-        records = Pipeline(documents).map(FixedTokens(8, extra=1))
-        return records.batch(self.rows, tokens=self.tokens), None, ()
+    assert scored(Cache(f"memory://{uuid4().hex}")) == scored(None)
 
 
-def _epoch(data, batches: int) -> list[int]:
-    reader = data.train(DataPartition())
-    try:
-        return sorted(int(row[0]) for batch in itertools.islice(reader, batches) for row in batch["text"])
-    finally:
-        reader.close()
-
-
-def test_a_recipe_batched_by_rows_orders_its_records_before_the_batch_in_every_read():
-    """A memory read orders a recipe's records before its batch, as an indexed read does, so a
-    recipe that batches its own rows reads every record once an epoch in both, where the memory
-    read once ordered after the batch and refused its own global shuffle."""
-    for read in ("memory", "indexed"):
-        data = loader(_SelfBatched(rows=2), batch=2, read=read, seed=3, loading=READ)
-        assert _epoch(data, 4) == list(range(8))
-
-
-def test_a_recipe_batched_by_tokens_keeps_the_token_batch_the_load_asks_for():
-    """A recipe's own token batch, the budget a load asks for, is kept, as a row batch is, where a
-    second budget was once appended after it and refused."""
-    data = loader(_SelfBatched(tokens=16), batch=None, tokens=16, read="indexed", seed=3, loading=READ)
-    assert data.batch_tokens == 16
-    assert _epoch(data, 4) == list(range(8))

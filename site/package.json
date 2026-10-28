@@ -7,7 +7,7 @@
 		"node": ">=22.12.0"
 	},
 	"scripts": {
-		"content": "node scripts/sync-docs.mjs && node scripts/render-notebooks.mjs && pnpm content:python",
+		"content": "python3 snippets/cells.py --check && node scripts/sync-docs.mjs && node scripts/render-notebooks.mjs && pnpm content:python",
 		"content:python": "uv run --no-project --python 3.12 --with-requirements scripts/requirements.txt python scripts/gen_api.py && JAX_PLATFORMS=cpu uv run --no-project --python 3.12 --with-editable .. --extra-index-url https://pypi.dewml.dev/simple python scripts/gen_models.py && python3 scripts/gen_examples.py",
 		"dev": "pnpm content && astro dev",
 		"build": "pnpm content && astro build",

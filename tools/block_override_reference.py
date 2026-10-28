@@ -1,0 +1,230 @@
+"""Record tiny Qwen 3.5 block-attention draws from the release's mask adapter and transformers.
+
+Run in the reference environment (`TRANSFORMERS`'s pin), on armada. The
+release's pinned serve.patch supplies install_noncausal/blocks; no attention
+mask is transcribed here. The generator writes a native checkpoint, paired
+fp32/float64 logits and source.json with exact package/source provenance.
+`--seeds` and `--redraw` come from the accuracy gate's recording plan.
+"""
+
+import argparse
+import contextlib
+import copy
+import importlib
+import importlib.metadata
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import numpy as np
+import torch
+from fetched_fixtures import save
+from reference_source import CACHE, git_head, package, published_files, verified
+from torch_precision import default_dtype, dtype_widened, float_as, replaced, widened_to
+
+ROOT = Path(__file__).resolve().parents[1]
+REPO = "baselabs/elephant-1"
+REVISION = "b3f8a93462fb1051a9de031e94a7ff380e254072"
+PATCH_SHA256 = "f234c125f1d38d82104b9e1f24e75bde51e4401928acfba2fbf5c59ef2fb46b8"
+REFERENCE = f"https://huggingface.co/{REPO}/blob/{REVISION}/serve.patch; transformers"
+LICENSE = "MIT AND Apache-2.0"
+PROMPT_REPO = "OmniJev/OneJev"
+PROMPT_REVISION = "81ce62f1597c91e46767d4d02d6ac2e18534fe94"
+PROMPT_FILES = {
+    "qev/prompt.py": "17dfae09e4dff47cb8ce80e172eba116f188b82b70c2777bd14fd9b8a71680de",
+    "qev/schema.py": "bce4b7d353ac115a9e50aef284975ddeed9a3bb452e3fd928a556668705bc2f3",
+    "qev/engine.py": "f9665c68714818dbea8edc1e80d0b0d86737537dd606ff53cff37aafb84d6bf4",
+    "qev/answers.py": "09b06dba258c80a6a9afdaa5aacfd0f7523f9d2a087a7b6402ca03553ea6fba6",
+    "qev/calibrate.py": "3fa6013a81c7e79a702afcdcc0ebd089bee7047590c18cc44708850f5aeda1ee",
+}
+TRANSFORMERS = ROOT / "locks/reference/transformers519-v1.override.txt"
+"""The transformers the release's patch is recorded against: its one pin, which the reference
+environments install as an override."""
+
+
+def require_reference_transformers() -> None:
+    """Refuse a process whose transformers is not the reference's (`TRANSFORMERS`)."""
+    from packaging.requirements import Requirement
+
+    pin = Requirement(TRANSFORMERS.read_text().strip())
+    installed = importlib.metadata.version(pin.name)
+    if not pin.specifier.contains(installed):
+        raise RuntimeError(f"this reference is {pin}, got {pin.name} {installed}")
+
+
+def release_source() -> Path:
+    """The verified patch."""
+    return verified(f"https://huggingface.co/{REPO}/raw/{REVISION}/serve.patch",
+                    CACHE / REPO / REVISION / "serve.patch", PATCH_SHA256)
+
+
+@contextlib.contextmanager
+def release_package():
+    """The authors' pinned prompt, schema and engine with the release patch applied, beside the readout
+    module the patch adds, imported as the package `slot_reference`: its `prompt`, `schema` and
+    `readout` modules, for as long as the context lasts."""
+    held = published_files(PROMPT_REPO, PROMPT_REVISION, PROMPT_FILES)
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        for name in PROMPT_FILES:
+            target = root / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(held / name, target)
+        subprocess.run(["git", "apply", "--include=qev/prompt.py", "--include=qev/engine.py",
+                        "--include=qev/readout.py", str(release_source())], cwd=root, check=True)
+        package("slot_reference", root / "qev")
+        yield tuple(importlib.import_module(f"slot_reference.{name}")
+                    for name in ("prompt", "schema", "readout"))
+
+
+def release_blocks():
+    """The release's readout module (`release_package`), whose module-level block context and
+    transformers mask adapter (`install_noncausal`, `blocks`) the recorded draws run under."""
+    with release_package() as (_, _, readout):
+        return readout
+
+
+@contextlib.contextmanager
+def oracle_precision():
+    """Build and run the same reference with its explicit fp32 casts widened to float64.
+    All replacements compose the shared reference precision primitives."""
+    patches = [(torch.Tensor, "to", widened_to(torch.Tensor.to)), float_as(torch.float64)]
+    constructors = ("arange", "tensor", "zeros", "zeros_like", "ones", "ones_like", "full", "full_like")
+    patches.extend((torch, name, dtype_widened(getattr(torch, name))) for name in constructors)
+    patches.append((torch.nn.functional, "softmax", dtype_widened(torch.nn.functional.softmax)))
+    with default_dtype(torch.float64), replaced(*patches):
+        yield
+
+
+def tiny_config():
+    """The existing native Qwen fixture's geometry, with a small vocabulary and explicit blocks."""
+    from transformers import Qwen3_5Config
+
+    raw = json.loads((ROOT / "tests/fixtures/hf/qwen38-dense-tiny/config.json").read_text())
+    raw["text_config"].update(vocab_size=64, bos_token_id=1, eos_token_id=2, pad_token_id=0,
+                               dtype="float32")
+    raw.update(image_token_id=3, video_token_id=4, vision_start_token_id=5, vision_end_token_id=6,
+               modeling_overrides={"attention": {
+                   "full_attention": "block_bidirectional", "linear_attention": "causal"}})
+    return Qwen3_5Config.from_dict(raw)
+
+
+def inputs(seed: int, vocabulary: int) -> dict[str, np.ndarray]:
+    """Two independently drawn rows: a shared-state block, a question block and causal trailing tokens."""
+    rng = np.random.default_rng(seed)
+    batch, length = 2, 12
+    ids = rng.integers(7, vocabulary, (batch, length), dtype=np.int64)
+    groups = np.full((batch, length), -1, np.int64)
+    for row in range(batch):
+        split = int(rng.integers(2, length - 4))
+        stop = int(rng.integers(split + 2, length))
+        groups[row, :split] = 0
+        groups[row, split:stop] = 1
+    if seed % 4 == 0:
+        groups[:] = -1
+    return {"input_ids": ids, "block_groups": groups}
+
+
+def main():
+    from transformers import AutoModelForImageTextToText
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--seeds", type=int)
+    parser.add_argument("--redraw", type=int)
+    parser.add_argument("--calibrate", action="store_true",
+                        help="size the recorded draws in the checkout's gate environment")
+    args = parser.parse_args()
+    if args.calibrate:
+        calibrate(args.output)
+        return
+    if args.seeds is None or args.redraw is None or args.seeds <= 0 or args.redraw < 0:
+        parser.error("seeds must be positive and redraw nonnegative")
+    require_reference_transformers()
+    torch.set_num_threads(1)
+    torch.set_float32_matmul_precision("highest")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.manual_seed(43)
+    config = tiny_config()
+    model = AutoModelForImageTextToText.from_config(config, dtype=torch.float32,
+                                                   attn_implementation="eager").cpu().eval()
+    release = release_blocks()
+    release.install_noncausal(model)
+    probe = inputs(1, config.text_config.vocab_size)
+    ids = torch.from_numpy(probe["input_ids"])
+    altered = ids.clone()
+    altered[0, 1] = (altered[0, 1] - 6) % (config.text_config.vocab_size - 7) + 7
+    with torch.no_grad(), release.blocks(None):
+        causal = model(input_ids=ids, use_cache=False).logits[0, 0]
+        causal_changed = model(input_ids=altered, use_cache=False).logits[0, 0]
+    with torch.no_grad(), release.blocks(torch.from_numpy(probe["block_groups"])):
+        blocked = model(input_ids=ids, use_cache=False).logits[0, 0]
+        blocked_changed = model(input_ids=altered, use_cache=False).logits[0, 0]
+    if not torch.equal(causal, causal_changed) or torch.equal(blocked, blocked_changed):
+        raise RuntimeError("the reference did not isolate causal rows and admit their future block mate")
+    weights = copy.deepcopy(model.state_dict())
+    with oracle_precision():
+        exact = AutoModelForImageTextToText.from_config(copy.deepcopy(config), dtype=torch.float64,
+                                                       attn_implementation="eager").cpu().double().eval()
+        exact.load_state_dict(weights)
+    args.output.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(args.output)
+    arrays = {"blocks.redraw": np.asarray(args.redraw), "precision": np.asarray("ieee")}
+    draws, references, truths = [], [], []
+    for seed in range(args.seeds * (1 + args.redraw)):
+        draw = inputs(seed, config.text_config.vocab_size)
+        ids = torch.from_numpy(draw["input_ids"])
+        blocks = torch.from_numpy(draw["block_groups"])
+        with torch.no_grad(), release.blocks(blocks):
+            reference = model(input_ids=ids, use_cache=False).logits
+        with torch.no_grad(), oracle_precision(), release.blocks(blocks):
+            truth = exact(input_ids=ids, use_cache=False).logits
+        if reference.dtype != torch.float32 or truth.dtype != torch.float64:
+            raise RuntimeError(f"reference/oracle returned {reference.dtype}/{truth.dtype}")
+        draws.append(draw)
+        references.append(reference.numpy())
+        truths.append(truth.numpy())
+    for name in draws[0]:
+        arrays[f"blocks.input.{name}"] = np.stack([draw[name] for draw in draws])
+    arrays["blocks.reference.logits"] = np.stack(references)
+    arrays["blocks.truth.logits"] = np.stack(truths)
+    save(args.output / "reference.npz", arrays, reference=REFERENCE, license=LICENSE)
+    provenance = {"generator": "tools/block_override_reference.py", "generator_revision": git_head(ROOT),
+                  "repo": REPO, "revision": REVISION, "patch_sha256": PATCH_SHA256,
+                  "packages": {name: importlib.metadata.version(name)
+                               for name in ("transformers", "torch", "numpy", "safetensors")},
+                  "seeds": args.seeds, "redraw": args.redraw, "parameter_seed": 43,
+                  "attention_impl": "eager", "device": "cpu", "precision": "ieee"}
+    (args.output / "source.json").write_text(json.dumps(provenance, indent=2) + "\n")
+
+
+def calibrate(directory: Path, sites: tuple[str, ...] = ("blocks",)):
+    """Declare the recorded site's seeds with the gate's reference-vs-reference sizing, retaining
+    enough recorded draws for its redraw policy. No candidate implementation is measured."""
+    sys.path.insert(0, str(ROOT / "tests"))
+    from reference_error import REDRAW, indexed_recording, recording, seeds_for
+
+    path = directory / "reference.npz"
+    arrays = recording(path)
+    counts, capacities = {}, {}
+    for site in sites:
+        values = next(value for name, value in arrays.items() if name.startswith(f"{site}.reference."))
+        capacity = len(values) // (1 + REDRAW)
+        draw, reference, truth = indexed_recording(arrays, site, capacity)
+        count = seeds_for(reference, draw, site, most=capacity, truth_fn=truth)
+        arrays[f"{site}.seeds"] = np.asarray(count, np.int64)
+        counts[site], capacities[site] = count, capacity
+        print(f"{site}: {count} declared seeds, {capacity} recorded with redraw")
+    save(path, arrays, reference=REFERENCE, license=LICENSE)
+    provenance = json.loads((directory / "source.json").read_text())
+    provenance.update(declared_seeds=counts, recorded_seed_capacity=capacities,
+                      sizing_revision=git_head(ROOT))
+    (directory / "source.json").write_text(json.dumps(provenance, indent=2) + "\n")
+
+
+if __name__ == "__main__":
+    main()

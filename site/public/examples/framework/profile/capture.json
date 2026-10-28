@@ -1,19 +1,19 @@
 {
 	"about": "The screen profile.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "b3545bf1749091aad178297b5916ada2bb6fab75fd46b9814e58dc3e36765f33",
+	"script_sha256": "706a264d3b4dd786631fa340c087fae1d70e9e46a0e59fe8399caa2740037d27",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",
-		"jax": "0.11.2.post4",
+		"jax": "0.11.2.post11",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "10d1092cf7e2855be1b80162809534006f19f928",
-		"date": "2026-10-14"
+		"dew": "d2adda0186300fcbbe16c47b462a589c4b9dbf96",
+		"date": "2026-10-21"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 27.7,
+		"seconds": 34.7,
 		"columns": 96,
 		"screen": [
 			[
@@ -102,23 +102,23 @@
 					"text": " "
 				},
 				{
-					"text": "\u2501\u2501\u2501\u2501\u2501",
+					"text": "\u2501\u2501\u2501\u2501",
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
 					"fg": "5fafd7"
 				},
 				{
-					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
 					"fg": "5f87d7"
 				},
 				{
-					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
 					"fg": "8787d7"
 				},
 				{
-					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
 					"fg": "875fd7"
 				},
 				{
@@ -133,7 +133,638 @@
 					"dim": true
 				},
 				{
-					"text": "  100%  0:00:02 "
+					"text": "  100%  10.5"
+				},
+				{
+					"text": " step/s",
+					"dim": true
+				},
+				{
+					"text": "  0:00:03 "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "data ",
+					"dim": true
+				},
+				{
+					"text": "64",
+					"bold": true,
+					"dim": true
+				},
+				{
+					"text": " rows  \u00b7  ",
+					"dim": true
+				},
+				{
+					"text": "0",
+					"bold": true,
+					"dim": true
+				},
+				{
+					"text": " rejected",
+					"dim": true
+				},
+				{
+					"text": "                                                                  "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                                                              "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "train                                                                                       ",
+					"fg": "875fd7",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  loss           ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     5.883",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  ce             ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     5.883",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  perplexity     ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     358.9",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  token_accuracy ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "      0.7%",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  data_wait_ms   ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "   0.04664",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  grad_norm      ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     1.758",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  compiles       ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     1.000",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  cache_hits     ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "         0",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  cache_misses   ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     5.000",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "throughput                                                                                  ",
+					"fg": "875fd7",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  step_time_ms   ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     113.2",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  samples_per_sec",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     70.68",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  tokens         ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     500.2",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  tokens_per_s   ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "     4,419",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "optimizer                                                                                   ",
+					"fg": "875fd7",
+					"bold": true
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  accepted       ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "    100.0%",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
+				},
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				}
+			],
+			[
+				{
+					"text": "\u2502",
+					"fg": "00afd7"
+				},
+				{
+					"text": " "
+				},
+				{
+					"text": "  learning_rate  ",
+					"dim": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "  0.001000",
+					"bold": true
+				},
+				{
+					"text": "  "
+				},
+				{
+					"text": "\u2581",
+					"fg": "00afd7"
+				},
+				{
+					"text": "                                                             "
 				},
 				{
 					"text": "\u2502",
@@ -191,7 +822,7 @@
 					"dim": true
 				},
 				{
-					"text": "5 steps in 0:00:03             "
+					"text": "5 steps in 0:00:05             "
 				},
 				{
 					"text": "\u2502",
@@ -211,7 +842,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 2.89 s                   "
+					"text": "after 4.56 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -231,7 +862,7 @@
 					"dim": true
 				},
 				{
-					"text": "21.6 step/s                    "
+					"text": "11.3 step/s                    "
 				},
 				{
 					"text": "\u2502",
@@ -251,7 +882,7 @@
 					"dim": true
 				},
 				{
-					"text": "6.0% of the wall time in steps "
+					"text": "7.2% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
@@ -271,7 +902,7 @@
 					"dim": true
 				},
 				{
-					"text": "5.767                         ",
+					"text": "5.883                         ",
 					"bold": true
 				},
 				{

@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import functools
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch, Records
+from dew._records import record
+from dew.batch import Batch
+from dew.data.dataset import Closeable, Records
 from dew.data.pipeline import Dataset
 
 from .base import Read, Shard, ShardManifest
+from .codec import Value
+from .iterator import _StreamIterator
 from .memory import _record
 
 if TYPE_CHECKING:
@@ -91,14 +96,16 @@ class HF(Dataset):
 
         if not isinstance(self.dataset, Arrow):
             raise ValueError(f"{self.describe()} is an IterableDataset, read only as a stream")
-        return grain.MapDataset.source(_undecoded(self.dataset)).map(_record)
+        return arrow_rows(self.dataset)
 
     def manifest(self) -> ShardManifest:
         from datasets import Dataset as Arrow
 
         if isinstance(self.dataset, Arrow):
             rows = len(self.dataset)
-            return ShardManifest((Shard(self.describe(), self.describe(), 0, rows, rows),), self._read_shard)
+            # One shard, the Arrow dataset's records in their index order.
+            return ShardManifest((Shard(self.describe(), self.describe(), 0, rows, rows),), self._read_shard,
+                                 index_ordered=True)
         return ShardManifest(self._shards(self.dataset.n_shards), self._read_shard, self._shards)
 
     def _shards(self, count: int) -> tuple[Shard, ...]:
@@ -110,7 +117,7 @@ class HF(Dataset):
         from datasets import Dataset as Arrow
 
         if isinstance(self.dataset, Arrow):
-            return grain.MapDataset.source(_undecoded(self.dataset)).map(_record).to_iter_dataset()
+            return arrow_rows(self.dataset).to_iter_dataset()
         if not isinstance(shard, _HFShard):
             raise ValueError("a Hugging Face stream needs its own shard descriptor")
         return _Streamed(_undecoded(self.dataset), shard)
@@ -125,6 +132,13 @@ class HF(Dataset):
 
     def lengths(self) -> np.ndarray | None:
         return None
+
+
+def arrow_rows(dataset: datasets.Dataset) -> grain.MapDataset:
+    """An Arrow dataset's rows by index, as Dew reads them: its image columns undecoded, which Dew's
+    own steps decode, and each row a record (`_record`). A Hugging Face dataset and a prepared Hub
+    split read their rows through it."""
+    return grain.MapDataset.source(_undecoded(dataset)).map(_record)
 
 
 def _undecoded[D: (datasets.Dataset, datasets.IterableDataset)](dataset: D) -> D:
@@ -166,27 +180,40 @@ class _Streamed(grain.IterDataset):
 
             dataset = self._dataset.shard(num_shards=1, index=0, contiguous=True)
             dataset = split_dataset_by_node(dataset, rank=shard.index, world_size=shard.count)
-        return _StreamedIterator(dataset)
+        # The iterator bridge reads it (`iterator._StreamIterator`), its position the dataset's own.
+        return _StreamIterator(functools.partial(_Rows, dataset), shard.id, state=_Rows.state,
+                               load_state=_Rows.resume)
 
 
-class _StreamedIterator(grain.DatasetIterator):
+class _Rows(Iterator[Batch]):
+    """An `IterableDataset`'s rows, read from its iterator, made on the first read so that a position
+    `resume` loads first is where it starts."""
+
     def __init__(self, dataset: datasets.IterableDataset):
-        super().__init__()
         self._dataset = dataset
-        self._rows = iter(dataset)
+        self._rows: Iterator[Batch] | None = None
+        # The position resumed from, which the dataset reports as its own only once it reads.
+        self._resumed: Value | None = None
 
-    def __next__(self) -> Batch | bytes:
-        row = None
-        while row is None:
-            row = _record(next(self._rows))
-        return row
+    def __next__(self) -> Batch:
+        if self._rows is None:
+            self._rows = iter(self._dataset)
+        return next(self._rows)
 
-    def get_state(self) -> Mapping[str, object]:
+    def state(self) -> Value:
+        """Where the rows are: the position they resumed from until they read, which an
+        `IterableDataset` reports as its own only once its iterator starts."""
+        if self._rows is None and self._resumed is not None:
+            return self._resumed
         return self._dataset.state_dict()
 
-    def set_state(self, state: Mapping[str, object]) -> None:
-        self._dataset.load_state_dict(dict(state))
-        self._rows = iter(self._dataset)
+    def resume(self, position: Value) -> None:
+        self._dataset.load_state_dict(dict(record(position, "a Hugging Face stream's state_dict")))
+        self._resumed = position
+
+    def close(self) -> None:
+        if isinstance(self._rows, Closeable):
+            self._rows.close()
 
 
 def from_hf(dataset: datasets.Dataset | datasets.IterableDataset, name: str | None = None) -> HF:

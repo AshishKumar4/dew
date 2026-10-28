@@ -11,8 +11,9 @@ import jax
 import jax.numpy as jnp
 
 from dew.artifacts import ImageGrid
+from dew.nn.precision import at_least_fp32
 
-from .common import ImageMetric, paired
+from .common import PairedImageMetric
 from .psnr import frame_batch
 
 # Standard SSIM constants for the 11x11/sigma-1.5 gaussian window
@@ -22,8 +23,8 @@ _WINDOW_SIZE = 11
 _SIGMA = 1.5
 
 
-def _gaussian_window_1d(size: int, sigma: float) -> jnp.ndarray:
-    coords = jnp.arange(size, dtype=jnp.float32) - (size - 1) / 2.0
+def _gaussian_window_1d(size: int, sigma: float, dtype) -> jnp.ndarray:
+    coords = jnp.arange(size, dtype=dtype) - (size - 1) / 2.0
     kernel = jnp.exp(-(coords**2) / (2.0 * sigma**2))
     return kernel / jnp.sum(kernel)
 
@@ -31,13 +32,13 @@ def _gaussian_window_1d(size: int, sigma: float) -> jnp.ndarray:
 def _ssim_single_channel(
     x: jnp.ndarray, y: jnp.ndarray, data_range: float
 ) -> jnp.ndarray:
-    """SSIM map between two single-channel images of shape (H, W).
+    """SSIM map between two single-channel images of shape (H, W), both in one dtype.
 
     The window is applied as a 2D separable convolution with VALID padding,
     exactly the reference implementation's filtering; the score is the mean
     of the SSIM map.
     """
-    window_1d = _gaussian_window_1d(_WINDOW_SIZE, _SIGMA)
+    window_1d = _gaussian_window_1d(_WINDOW_SIZE, _SIGMA, x.dtype)
     window_2d = jnp.outer(window_1d, window_1d)
     window_2d = window_2d[None, None]  # (1, 1, K, K) for conv_general_dilated
 
@@ -102,7 +103,10 @@ def structural_similarity(
     The function returns the mean over frames, or the (N,) per-frame scores
     when `per_example` is set. Identical inputs give 1.0.
     """
-    pred, targ = frame_batch(predictions), frame_batch(targets)
+    # Both planes in one dtype, at least float32 (the window's too), so a bfloat16 or a float64 batch
+    # scores as its float32 or float64 twin does.
+    dtype = at_least_fp32(jnp.result_type(predictions, targets))
+    pred, targ = frame_batch(predictions).astype(dtype), frame_batch(targets).astype(dtype)
     # vmap over frames then channels. Each (H, W) plane is scored independently,
     # giving (N, C), which collapses to one score per frame.
     per_channel = jax.vmap(
@@ -113,7 +117,7 @@ def structural_similarity(
     return scores if per_example else jnp.mean(scores)
 
 
-class SSIM(ImageMetric):
+class SSIM(PairedImageMetric):
     """Measures the mean SSIM between the sampled frames and the batch's; higher is better.
 
     It uses the same [-1, 1] scale as `PSNR`. `reads` names the artifact type
@@ -121,8 +125,4 @@ class SSIM(ImageMetric):
     """
 
     def __init__(self, data_range: float = 2.0, field: str = "image", reads: type = ImageGrid):
-        def measure(artifact, batch):
-            samples, targets = paired(artifact, batch, field)
-            return structural_similarity(samples, targets, data_range, per_example=True)
-
-        super().__init__(name="ssim", measure=measure, reads=reads)
+        super().__init__("ssim", structural_similarity, data_range, field, reads)

@@ -1,6 +1,8 @@
 """Write a tiny GPT-NeoX reference with head-interleaved fused qkv tensors."""
 
-from hf_reference import write_device_tiny
+import sys
+
+from hf_reference import FIXTURES, write_device_tiny, write_logits_recording
 from transformers import GPTNeoXConfig, GPTNeoXForCausalLM
 
 
@@ -12,6 +14,12 @@ def main():
                                            'partial_rotary_factor': .5},
                           use_parallel_residual=True, bos_token_id=1, eos_token_id=None, pad_token_id=0)
     config._attn_implementation = 'eager'
+    if sys.argv[1:] == ['recording']:
+        # The committed fixture's own weights, recorded over check 1's seeds on the CPU.
+        model = GPTNeoXForCausalLM.from_pretrained(FIXTURES / 'gpt-neox-tiny')
+        write_logits_recording('gpt-neox-tiny', model,
+                               'PYTHONPATH=src:tools python tools/gpt_neox_reference.py recording')
+        return
     write_device_tiny('gpt-neox-tiny', GPTNeoXForCausalLM(config), 'cuda',
                       'PYTHONPATH=src python tools/gpt_neox_reference.py')
 

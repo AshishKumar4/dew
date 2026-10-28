@@ -3,17 +3,17 @@
     python -m pytest -p split --ci-group=G/N tests/test_heavy.py
 
 with tools/armada on the path, as `ci.py task --split=G/N` runs it. Every
-container collects the same tests and cuts them alike (`ci.groups`): in
+container collects the same tests and cuts them alike (`session.groups`): in
 node-id order, each weighing its time in tests/test_durations.json and a test
 that file lacks the mean of the others, into N runs of consecutive tests whose
 heaviest is as light as N runs can be. This keeps the Gth run and deselects
-the rest, after CI's own selection (`-m "not network"`).
+the rest, after CI's own selection (`session.SELECTION`).
 """
 
 import json
 
 import pytest
-from ci import DURATIONS, groups
+from session import DURATIONS, groups
 
 
 def pytest_addoption(parser):

@@ -23,7 +23,6 @@ import logging
 import math
 import os
 import threading
-import typing
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -31,15 +30,12 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 import grain.python as pygrain
 import jax
 import numpy as np
-import tyro
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
-from dew.nn.sharding import LayoutRefused, batch_axes
-
-# `Batch` lives in dew.objectives.base. The data layer imports it from here
-# so a dataset module needs one import for the value and its shape.
-from dew.objectives.base import VALID_ROWS, Batch
+from dew._records import record
+from dew.batch import VALID_ROWS, Batch, padded_rows
+from dew.mesh import LayoutRefused, batch_axes
 
 _log = logging.getLogger(__name__)
 
@@ -47,8 +43,6 @@ if TYPE_CHECKING:
     from dew.data.mixing import CorpusCounts
     from dew.data.pipeline import DeviceStep
     from dew.data.plan import Plan
-
-
 
 
 @dataclasses.dataclass(frozen=True)
@@ -73,14 +67,21 @@ class DataPartition:
     Each reads the same records. A source whose rows can differ between reads
     of one share, such as a network fetch that drops failed records, must
     either refuse more than one reader or read on the first reader alone and
-    send its batch to the others (`dew.training.distributed.first_reader_batch`).
+    send its batch to the others (`dew.distributed.batches.first_reader_batch`).
     """
     reader: int = 0
     """This process's place among the share's readers, in process order (0 for the first)."""
     row_multiple: int = 1
     """Number of distinct row shards this reader feeds within its host."""
+    window: int = 1
+    """The steps an update pools (`Trainer`'s accumulation): a batch ramp changes stage only where an
+    update begins (`Ramp.stages`). It cuts the stream into steps and names no data, so it is no part
+    of what a share reads."""
 
     def __post_init__(self):
+        if self.window < 1:
+            raise ValueError(f"a data partition's window is the steps an update pools, at least 1; got "
+                             f"{self.window}")
         if not 0 <= self.index < self.count or not 0 <= self.reader < self.readers:
             raise ValueError(
                 f"a data partition is share index of count, 0 <= index < count, read "
@@ -90,7 +91,7 @@ class DataPartition:
             )
 
     @classmethod
-    def of(cls, mesh: Mesh) -> DataPartition:
+    def of(cls, mesh: Mesh, window: int = 1) -> DataPartition:
         """Return the share of every global batch this process reads on `mesh`.
 
         A batch's rows split over the row axes and no others: those the rules
@@ -107,7 +108,27 @@ class DataPartition:
         being the same rows. No share can then be read whole by each group, so
         such a mesh is refused.
         """
-        return _partition(mesh, batch_axes(mesh))
+        return dataclasses.replace(_partition(mesh, batch_axes(mesh)), window=window)
+
+    def held(self, rows: int, offset: int = 0) -> tuple[slice, bool]:
+        """Which of `rows` rows a validation read of this share holds, and whether they are real:
+        every count-th from its index, `offset` places on as a resume's count inside a batch leaves
+        it (`GlobalStream`); where that holds none of rows that hold some, the first in their place,
+        not real (`FilledBatch` marks them so), so every share reads a batch where any does and
+        none scores another's row."""
+        mine = self.cut(offset)
+        if rows and not range(rows)[mine]:
+            return slice(1), False
+        return mine, True
+
+    def cut(self, offset: int = 0) -> slice:
+        """This share's rows of an order or a batch: every count-th from its first (`first`)."""
+        return slice(self.first(offset), None, self.count)
+
+    def first(self, offset: int = 0) -> int:
+        """This share's first row of an order or a batch: its index, `offset` places on as a resume's
+        count inside a batch leaves it (`GlobalStream`)."""
+        return (self.index + offset) % self.count
 
     def rows(self, batch: int) -> int:
         """Return how many rows of a `batch`-row global batch one share holds.
@@ -184,47 +205,6 @@ type Indexed = Records | Sequence[Batch]
 """Records read by index: a source that answers grain's two methods, or a
 plain sequence of them. A spec that lists its records in memory hands over
 the sequence, the way the video specs list their clips."""
-
-
-def record_argument[Value](annotation: type[Value]) -> tyro.constructors.PrimitiveConstructorSpec[Value]:
-    """A field typed `annotation` written as one JSON value on the command
-    line, the record a run holds: a tuple of records as a list,
-    `[{"field": ...}, ...]`, and a mapping of class records as an
-    object, `{"sigma": {"class": "linear", "fields": {...}}}`, since a flag per
-    field cannot spell a collection whose length or keys the command line
-    decides.
-
-    The value is read with `from_record` and written with `to_record`, so a
-    flag, a default and `run.json` hold the same record. Use it as the
-    field's metadata: `Annotated[Mapping[str, ScheduleSpec],
-    record_argument(Mapping[str, ScheduleSpec])]`."""
-    from dew.registry import from_record, to_record
-
-    container = typing.get_origin(annotation) or annotation
-    if container is Mapping:
-        container = dict
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="JSON",
-        instance_from_str=lambda given: from_record(annotation, json.loads(given[0]), dtypes=False),
-        is_instance=lambda given: isinstance(given, container),
-        str_from_instance=lambda given: [json.dumps(to_record(given, annotation))],
-    )
-
-
-@dataclasses.dataclass(frozen=True)
-class DataPhase:
-    """One phase of a run's data: what it reads and the step it ends at.
-
-    `path` names one corpus or a weighted mixture, the same way the spec's own
-    `path` does. `until_step` is the step the phase ends before, counted from
-    the run's start in steps of the full batch, or None for the last phase,
-    which runs to the end. `PhasedStream` describes how a resume treats a
-    changed phase list.
-    """
-
-    path: str | Mapping[str, float]
-    until_step: int | None = None
 
 
 @runtime_checkable
@@ -306,6 +286,75 @@ GRAIN_KILL_SECONDS = 25
 no setting or reading of: 25 s in grain 0.2.18 (process_prefetch.py), the release tested."""
 
 
+WORKER_BUFFER = 2
+"""The batches each worker process reads ahead where none is asked for (`Loading`, `Pipeline.workers`)."""
+
+
+WORKER_PROCESS_BYTES = 219 * 2**20
+"""The memory a loading worker's process takes before it holds a batch: each imports the program
+again. 32 workers of a 100-record pipeline held 7.07 GiB resident against 0.23 GiB with none, on
+two cores of a shared workstation (`Loading`), 219 MiB each."""
+
+
+SAMPLED_BATCHES = 5
+"""The batches automatic loading measures to size its buffers (`Loading.resolved`), as many as
+Grain's own pick samples."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Host:
+    """What automatic loading sizes its workers and buffers by (`Loading.resolved`): the CPUs this
+    process may run on, its CPU affinity bounded by its cgroup's quota, and the bytes of memory it
+    may still take, the host's available memory bounded by what its cgroup's limit leaves, so a
+    container's limits size it, not the machine's."""
+
+    cpus: int
+    memory: int
+
+    @classmethod
+    def current(cls, cgroup: Path | None = None, root: Path = Path("/sys/fs/cgroup")) -> Host:
+        """This process's host, read through `cgroup`, its own cgroup (v2) directory, which
+        /proc/self/cgroup names under `root` by default, and every ancestor of it up to `root`:
+        a container's limit on a parent binds an unlimited child, so each level's CPU quota and
+        the memory its limit leaves bound the host's. Under a memory limit the page cache the
+        kernel reclaims first (`inactive_file`) is room, as the kubelet counts a container's
+        working set: a run that has read its corpus once holds it in cache, charged to its
+        cgroup, and counting that as taken left room for no worker beside it."""
+        import psutil
+
+        group = _own_cgroup() if cgroup is None else cgroup
+        cpus, memory = len(os.sched_getaffinity(0)), psutil.virtual_memory().available
+        for level in (group, *group.parents):
+            quota = level / "cpu.max"
+            if quota.is_file():
+                limit, period = quota.read_text().split()
+                if limit != "max":
+                    cpus = min(cpus, math.ceil(int(limit) / int(period)))
+            maximum, current, stat = level / "memory.max", level / "memory.current", level / "memory.stat"
+            if maximum.is_file() and current.is_file() and (limit := maximum.read_text().strip()) != "max":
+                stated = [line.split() for line in stat.read_text().splitlines()] if stat.is_file() else []
+                reclaimed = next((int(value) for name, value in stated if name == "inactive_file"), 0)
+                memory = min(memory, max(0, int(limit) - (int(current.read_text()) - reclaimed)))
+            if level == root:
+                break
+        return cls(cpus, memory)
+
+
+def _own_cgroup() -> Path:
+    """This process's cgroup (v2) directory: the path /proc/self/cgroup names (`0::/path`) under
+    /sys/fs/cgroup, which is the root itself inside a container's own cgroup namespace."""
+    root, membership = Path("/sys/fs/cgroup"), Path("/proc/self/cgroup")
+    lines = membership.read_text().splitlines() if membership.is_file() else []
+    named = next((line[3:] for line in lines if line.startswith("0::")), None)
+    own = root / named.strip().lstrip("/") if named else root
+    return own if own.is_dir() else root
+
+
+def batch_bytes(batch: Batch) -> int:
+    """The bytes of a batch's leaves, as arrays hold them."""
+    return sum(np.asarray(leaf).nbytes for leaf in jax.tree_util.tree_leaves(batch))
+
+
 @dataclasses.dataclass(frozen=True)
 class Loading:
     """Read throughput settings, as Grain's four knobs.
@@ -348,39 +397,48 @@ class Loading:
     workers: int | Literal["auto"] = 0
     threads: int = 16
     read_buffer: int = 16
-    worker_buffer: int = 2
+    worker_buffer: int = WORKER_BUFFER
     ram_budget_mb: int | None = None
     max_workers: int | None = None
+    cache: bool = True
+    """Whether a run reads its chains' leading deterministic steps from the records an earlier run
+    made of the same records (`dew.data.cache.automatic_root`), which changes none of them."""
 
-    def resolved(self, records: pygrain.IterDataset) -> Loading:
-        """Ask Grain to size workers and buffers within the host's RAM limit."""
+    def resolved(self, records: pygrain.IterDataset, *, reads: int, host: Host | None = None) -> Loading:
+        """These settings with automatic workers and read buffer sized for `host` (this process's
+        by default) from its CPUs and its memory together, as tf.data's autotuning budgets both.
+        Grain's own pick (`pick_performance_config`) reads memory alone, takes the machine's CPU
+        count where a container may run on a few of them, and counts one batch for each worker.
+
+        A worker for each CPU, as tf.data's parallelism takes each schedulable one, where there is
+        more than one: on one CPU a worker adds a process and no parallelism, so the reading process
+        reads. On four CPUs of an eight-core host an image read in four workers read as many images
+        a second as in eight, within 2%, and in three 11% fewer (armada, 2026-10-26). At most
+        `max_workers` of them, and no more than half the memory the process may still take holds
+        (`ram_budget_mb` where given), each a process of its own (`WORKER_PROCESS_BYTES`) holding
+        its `worker_buffer` batches and `read_buffer` reads, the read buffer itself no more reads
+        than that half holds. `records` are the batches the read makes without workers,
+        `SAMPLED_BATCHES` of which are measured; `reads` is how many reads make one: one where the
+        order is read by batch, its rows where it streams records. A read that makes no batch reads
+        without workers."""
         if self.workers != "auto":
             return self
-        import grain.experimental as gx
-        import psutil
-
-        available = psutil.virtual_memory().available
-        maximum, current = Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")
-        if maximum.is_file() and current.is_file():
-            limit = maximum.read_text().strip()
-            if limit != "max":
-                available = min(available, max(0, int(limit) - int(current.read_text())))
-        budget = self.ram_budget_mb if self.ram_budget_mb is not None else max(1, available // (2 * 1024**2))
-        try:
-            picked = gx.pick_performance_config(
-                records,
-                ram_budget_mb=budget,
-                max_workers=self.max_workers or os.cpu_count() or 1,
-                max_buffer_size=self.read_buffer,
-            )
-        except StopIteration:
-            _log.warning("Grain autotune found no element; using explicit Loading fallback (0 workers)")
+        sampled = list(itertools.islice(records, SAMPLED_BATCHES))
+        if not sampled:
             return dataclasses.replace(self, workers=0)
-        workers = 0 if picked.multiprocessing_options is None else picked.multiprocessing_options.num_workers
-        buffers = (
-            self.read_buffer if picked.read_options is None else picked.read_options.prefetch_buffer_size
-        )
-        return dataclasses.replace(self, workers=workers, read_buffer=buffers)
+        host = Host.current() if host is None else host
+        batch = max(1, sum(batch_bytes(value) for value in sampled) // len(sampled))
+        read = max(1, batch // reads)
+        budget = host.memory // 2 if self.ram_budget_mb is None else self.ram_budget_mb * 2**20
+        cpus = host.cpus if host.cpus > 1 else 0
+        if self.max_workers is not None:
+            cpus = min(cpus, self.max_workers)
+        read_buffer = min(self.read_buffer, budget // read)
+        held = WORKER_PROCESS_BYTES + self.worker_buffer * batch + read_buffer * read
+        workers = max(0, min(cpus, budget // held))
+        _log.info("automatic loading reads in %d workers holding %d reads ahead, sized for %d CPUs and "
+                  "%.2f GiB", workers, read_buffer, host.cpus, budget / 2**30)
+        return dataclasses.replace(self, workers=workers, read_buffer=read_buffer)
 
     @property
     def worker_count(self) -> int:
@@ -401,7 +459,7 @@ class Loading:
         # The 5.1 to 7.4 s stop was examples/sft_gemma4.py's four workers.
         return float(
             GRAIN_KILL_SECONDS
-            * (1 + (self.max_workers or os.cpu_count() or 1) if self.workers == "auto" else 1 + self.workers)
+            * (1 + (self.max_workers or Host.current().cpus) if self.workers == "auto" else 1 + self.workers)
         )
 
     @contextlib.contextmanager
@@ -452,6 +510,32 @@ class Stage:
     records: int
 
 
+def _update_aligned(stages: tuple[Stage, ...], window: int) -> tuple[Stage, ...]:
+    """`stages` each beginning at the first multiple of `window` steps at or after the step it begins
+    at, counted from the run's first: every start is taken from the given schedule, not from the
+    stage before it moved, so no stage drifts past its own end, and a stage left with no step is
+    dropped. Each start's record is what the stages before it read up to it. A window is at least one
+    step."""
+    if window < 1:
+        raise ValueError(f"a ramp aligns its stages to updates of at least one step; got a window of "
+                         f"{window}")
+    starts, step = [], 0
+    for stage, after in itertools.pairwise(stages):
+        starts.append(step)
+        step += (after.records - stage.records) // stage.batch
+    starts.append(step)
+    moved = [-(-start // window) * window for start in starts]
+    aligned, records = [], 0
+    for index, (stage, start) in enumerate(zip(stages, moved, strict=True)):
+        end = moved[index + 1] if index + 1 < len(stages) else None
+        if end == start:
+            continue
+        if aligned:
+            records += (start - aligned[-1][1]) * aligned[-1][0].batch
+        aligned.append((Stage(batch=stage.batch, records=records), start))
+    return tuple(stage for stage, _ in aligned)
+
+
 @dataclasses.dataclass(frozen=True)
 class Ramp:
     """Grows the global batch over the run's first records.
@@ -471,9 +555,15 @@ class Ramp:
     the ramp with nothing else saved. A stage lasts
     `ceil(samples / increments / batch)` steps, computed as one integer ratio
     instead of MaxText's two floating-point divisions, so the boundaries are
-    exact. Where the ramp ends, MaxText's loader drops what is left of its
-    buffered batch while Dew keeps reading, so from then on MaxText reads
-    later records than Dew in each step, although the batch sizes match.
+    exact. A run whose updates pool several steps (`DataPartition.window`)
+    begins each stage where an update does, at the first update boundary at or
+    after the step it would begin at, as MaxText and torchtitan apply a batch
+    schedule per optimizer step: no update pools two stages' batches, and a
+    boundary moves by less than one update. The records stay the position, so a
+    run resumed under another window cuts its stages again. Where the ramp
+    ends, MaxText's loader drops what is left of its buffered batch while Dew
+    keeps reading, so from then on MaxText reads later records than Dew in each
+    step, although the batch sizes match.
     """
 
     # MaxText reference: configs/base.yml:755-765 and
@@ -483,8 +573,9 @@ class Ramp:
     increment: int
     samples: int
 
-    def stages(self, final: int) -> tuple[Stage, ...]:
-        """Return every stage of the ramp up to `final`, the run's own global batch.
+    def stages(self, final: int, window: int = 1) -> tuple[Stage, ...]:
+        """Return every stage of the ramp up to `final`, the run's own global batch, each beginning
+        where an update of `window` steps does.
 
         Each stage's batch has to split evenly into the mesh's rows, and so
         into the shares its readers read; the trainer checks every stage
@@ -514,21 +605,45 @@ class Ramp:
             records += -(-self.samples // (increments * batch)) * batch
             batch += self.increment
         stages.append(Stage(batch=final, records=records))
-        return tuple(stages)
+        return _update_aligned(tuple(stages), window)
 
-    def steps_for(self, records: int, final: int) -> int:
-        """Return the number of steps a run takes to read `records` records under this ramp.
+    def steps_for(self, records: int, final: int, window: int = 1, tail: Tail = "dropped") -> int:
+        """Return the number of steps a run of updates of `window` steps takes to read `records`
+        records under this ramp, a last step that holds fewer than a batch counted where it is read
+        (`tail`).
 
         Early steps read fewer records, so a pass over a corpus takes more
         steps than it would with the final batch from the start.
         """
-        stages = self.stages(final)
+        def whole(count: int, batch: int) -> int:
+            return -(-count // batch) if tail == "read" else count // batch
+
+        stages = self.stages(final, window)
         steps = 0
         for stage, next_stage in itertools.pairwise(stages):
             if records < next_stage.records:
-                return steps + (records - stage.records) // stage.batch
+                return steps + whole(records - stage.records, stage.batch)
             steps += (next_stage.records - stage.records) // stage.batch
-        return steps + max(records - stages[-1].records, 0) // final
+        return steps + whole(max(records - stages[-1].records, 0), final)
+
+
+LONG_RUN = 1024
+"""The run of rejected records or empty shards in a row a read first logs (`logged_run`): longer
+than an ordinary filter's runs or a sharded store's empty files, so a filter that keeps nothing or a
+store of empty files is named from the first line. An endless read reads on through any run; none
+proves the store holds nothing to keep."""
+
+
+def logged_run(run: int, first: int = 1) -> bool:
+    """Whether a read logs a run of `run` empty reads in a row: at `first`, then at each doubling, so a
+    run that goes on is named again ever more rarely."""
+    return run >= first and not run & (run - 1)
+
+
+type Tail = Literal["dropped", "read"]
+"""What becomes of the records an epoch leaves short of a whole batch (`Loader.tail`): `read`, where
+an order that reads on carries them into the next epoch's first batch or one that keeps its last
+short batch fills it; `dropped`, where a training order that ends drops them."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -586,18 +701,36 @@ class Loader:
     device: tuple[DeviceStep, ...] = ()
     """The training batch's steps the compiled training step runs, on the
     accelerator, after the reader delivers it (`DeviceStep`)."""
+    tail: Tail = "dropped"
+    """What becomes of the records an epoch leaves short of a whole batch: read, carried into the
+    next epoch by an order that reads on or kept and filled by one that keeps them, so an epoch's
+    steps count their batch; or dropped, so they count none (`Tail`)."""
+    order_records: int | None = None
+    """The records a training read of a global order that ends hands out over all its passes, the
+    same on every share, by which a batch ramp ends its last step (`RampedStream`); None where the
+    order never ends or its read counts none ahead."""
+    examples: int | None = None
+    """The records the training read is bounded to before they are packed (`compile`'s
+    `examples`), whose steps a run's `examples=` budget takes (`example_steps`); None where it is
+    not bounded."""
+    token_ends: tuple[int | None, ...] | None = None
+    """The committed tokens each phase of a schedule ends at (`dew.data.pipeline.schedule`), the last
+    where the data ends or None where it runs on, which the trainer reads its commits against and ends
+    the phase at (`PhasedStream.ending`); None for a read on no token clock."""
 
     @property
     def steps_per_epoch(self) -> int | None:
-        if self.records is None:
-            return None
-        if self.ramp is None:
-            return self.records // self.batch
-        return self.ramp.steps_for(self.records, self.batch)
+        return None if self.records is None else self._steps(self.records)
 
-    def epoch_steps(self, epochs: int = 1) -> int:
-        """Return the number of steps that `epochs` passes over the records take, refusing passes
-        too short to fill a batch.
+    def _steps(self, records: int, window: int = 1) -> int:
+        """The steps that read `records` records, a last short batch counted where it is read."""
+        if self.ramp is None:
+            return -(-records // self.batch) if self.tail == "read" else records // self.batch
+        return self.ramp.steps_for(records, self.batch, window, self.tail)
+
+    def epoch_steps(self, epochs: int = 1, window: int = 1) -> int:
+        """Return the number of steps that `epochs` passes over the records take, in updates of
+        `window` steps (`Ramp.stages`), refusing passes too short to fill a batch.
 
         A batch ramp grows the batch over the run's first records once, so its
         smaller early steps count once across all the passes, not once a pass.
@@ -606,15 +739,50 @@ class Loader:
         """
         if self.records is None:
             raise ValueError(
-                "epochs need a dataset with a record count; this one streams "
-                "without one, so give the run length in steps"
+                "epochs need a dataset with a record count, and this one streams without one: online "
+                "packing or a filter over an indexed or streamed read cuts its order per share. Read it "
+                "whole first (.read('memory')), read a published packing generation by index, or give "
+                "the run length in steps or tokens"
             )
         records = epochs * self.records
-        steps = records // self.batch if self.ramp is None else self.ramp.steps_for(records, self.batch)
+        steps = self._steps(records, window)
         if steps == 0:
             raise ValueError(f"{records} records do not fill one batch of {self.batch}, so {epochs} epochs "
                              "are no steps at all: read more data, lower the batch, or count the run in "
                              "steps")
+        return steps
+
+    def example_steps(self, examples: int, window: int = 1) -> int:
+        """The steps that read the `examples` source examples this loader's training read is bounded to
+        (`examples`), with every row the objective makes of each, its last batch short where they end
+        inside one, in whole updates of `window` steps. A global order's plan counts them ahead
+        (`order_records`); one read in its own order, as a pack that runs as rows arrive makes, or one
+        an objective expands after the bound, is counted by reading it once to its end, on the host.
+        Refused where the read is bounded to another count, in a pool, whose processes split the short
+        batch the examples end in unevenly, so each would end at a step of its own, and where the last
+        steps would make no whole update, so some examples would train nothing."""
+        if self.examples != examples:
+            held = "not bounded" if self.examples is None else f"bounded to {self.examples}"
+            raise ValueError(f"examples={examples} reads a training chain bounded to that many records "
+                             f"before packing, and this loader's is {held}; give fit the Dataset chain, "
+                             "which it bounds and compiles")
+        if jax.process_count() > 1:
+            raise ValueError("examples end in a short batch, which a pool's processes would split unevenly "
+                             "and end at steps of their own; train them on one process or count the run "
+                             "in steps")
+        if self.order_records is not None:
+            steps = self._steps(self.order_records, window)
+        else:
+            stream = self.train(DataPartition())
+            try:
+                steps = sum(1 for _ in stream)
+            finally:
+                if isinstance(stream, Closeable):
+                    stream.close()
+        if steps % window:
+            raise ValueError(f"{examples} examples fill {steps} batches, which are not whole updates of "
+                             f"{window} steps: the last {steps % window} would update nothing; change the "
+                             "examples, the batch or the accumulation")
         return steps
 
 
@@ -627,7 +795,7 @@ type Position = bytes | Mapping[str, object]
 """Where a stream stopped, as the stream reports it.
 
 Dew's own envelope is bytes, and Grain reports a JSON object, which
-`dew.training.distributed` encodes before a checkpoint stores it.
+`dew.distributed.batches` encodes before a checkpoint stores it.
 `dew.position` tells which of the two kinds a saved position is."""
 
 
@@ -644,6 +812,13 @@ class Checkpointable(Protocol):
     def get_state(self) -> Position: ...
 
     def set_state(self, state: Position) -> None: ...
+
+
+def restore_parent(parent: pygrain.DatasetIterator, state: Mapping[str, object], key: str,
+                   what: str) -> None:
+    """Set `parent`, the stream a wrapper reads, to the position the wrapper's own `state` saved for it
+    under `key`, `what` naming it where the record is no position."""
+    parent.set_state(record(state[key], what))
 
 
 @runtime_checkable
@@ -862,35 +1037,24 @@ def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
     return repr(source) if described else type(source).__name__
 
 
-def weight_counts(shares: Sequence[float], records: int) -> tuple[int, ...]:
-    """Grain's proportional selection counts over a prefix of an indexed mixture."""
-    scale = 100 / min(shares)
-    proportions = [int(share * scale) for share in shares]
-    counts, remaining, left = [], sum(proportions), records
-    for proportion in proportions:
-        rest = left * (remaining - proportion) // remaining
-        counts.append(left - rest)
-        left, remaining = rest, remaining - proportion
-    return tuple(counts)
-
-
 class FilledBatch(pygrain.MapTransform):
     """A batch of fewer than `rows` records filled out with repeats of its
-    own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones. Without
-    `real` every row is a repeat."""
+    own rows (`dew.batch.padded_rows`), and `VALID_ROWS` marking the real ones: those of
+    its own a batch that marks them already marks real. Without `real` every
+    row is a repeat."""
 
     def __init__(self, rows: int, *, real: bool = True):
         self._rows, self._real = rows, real
 
     def map(self, element: Batch) -> Batch:
-        from dew.nn.inputs import RowPlan
-
         held = rows_of(element)
         if held == self._rows and self._real:
             return element
-        plan = RowPlan(None, held, self._rows, 0, 1)
-        indices = plan.pad(np.arange(held))
-        return {**take_batch(element, indices), VALID_ROWS: ~plan.padding & self._real}
+        indices, repeats = padded_rows(held, self._rows)
+        valid = ~repeats & self._real
+        if VALID_ROWS in element:
+            valid = valid & np.asarray(element[VALID_ROWS], bool)[indices]
+        return {**take_batch(element, indices), VALID_ROWS: valid}
 
 
 def rows_of(batch: Mapping[str, object]) -> int:
@@ -906,12 +1070,18 @@ def rows_of(batch: Mapping[str, object]) -> int:
                  for leaf in leaves if isinstance(leaf, list) or np.shape(leaf)), 0)
 
 
+def take_rows(column, indices: np.ndarray):
+    """`column`'s rows at `indices`: a list or tuple of per-row records as its own type, an array
+    along its leading axis."""
+    if isinstance(column, list | tuple):
+        return type(column)(column[int(index)] for index in indices)
+    return column[indices]
+
+
 def take_batch(batch: Batch, indices: int | slice | np.ndarray) -> Batch:
-    """Rows selected along array axes and opaque lists of object records."""
+    """Rows selected along array axes and opaque lists of object records (`take_rows`)."""
     return jax.tree.map(
-        lambda column: ([column[int(index)] for index in indices]
-                        if isinstance(column, list) and isinstance(indices, np.ndarray)
-                        else column[indices]),
+        lambda column: take_rows(column, indices) if isinstance(indices, np.ndarray) else column[indices],
         batch, is_leaf=lambda column: isinstance(column, list),
     )
 
@@ -1131,6 +1301,59 @@ class GlobalReader(Protocol):
     def identity(self) -> str: ...
 
 
+@dataclasses.dataclass(frozen=True)
+class Ranges:
+    """Consecutive ranges of `counts` items each, as an indexed store's shards hold their records,
+    a run's phases its records and a ramp's stages its batches: which range holds an item
+    (`locate`, or `holding` where a range that runs on follows them), where a range starts
+    (`start`) and the items of them all. A range of no items holds none, so an item is never
+    located in one."""
+
+    counts: tuple[int, ...]
+
+    @classmethod
+    def ending(cls, ends: Sequence[int]) -> Ranges:
+        """The ranges that end at each of `ends`, the first starting at 0."""
+        return cls(tuple(end - start for start, end in itertools.pairwise((0, *ends))))
+
+    @functools.cached_property
+    def ends(self) -> tuple[int, ...]:
+        return tuple(itertools.accumulate(self.counts))
+
+    def __len__(self) -> int:
+        return self.ends[-1] if self.ends else 0
+
+    def start(self, index: int) -> int:
+        """Where range `index` starts: past the last, where the range that runs on after them does."""
+        return self.ends[index - 1] if index else 0
+
+    def locate(self, position: int) -> tuple[int, int]:
+        """The range that holds the item at `position` of them all, and its place in that range."""
+        if not 0 <= position < len(self):
+            raise IndexError(position)
+        index = self.holding(position)
+        return index, position - self.start(index)
+
+    def holding(self, position: int) -> int:
+        """The range that holds the item at `position`, one past the last for an item past them all:
+        the range that runs on after them, as a run's last phase or a ramp's final batch does."""
+        return bisect.bisect_right(self.ends, position)
+
+
+def phase_ends(ends: Sequence[int | None], unit: Literal["step", "token", "record"]) -> tuple[int, ...]:
+    """The ends of every phase but the last, which runs on (`None`), each past the one before it and
+    above zero, counted in `unit`s: steps or committed tokens where a run writes its phases (`Phases`),
+    records where it reads them (`PhasedStream`)."""
+    if not ends or ends[-1] is not None:
+        raise ValueError(f"phases need one end per phase, in {unit}s, the last None, which runs on")
+    bounded = tuple(end for end in ends[:-1] if end is not None)
+    rising = all(later > earlier for earlier, later in itertools.pairwise((0, *bounded)))
+    if len(bounded) != len(ends) - 1 or not rising:
+        raise ValueError(f"every phase but the last ends at a {unit}, past the one before it and above "
+                         f"zero, not {list(ends)}")
+    return bounded
+
+
 class PhasedStream:
     """Reads one global order per phase, switching at step boundaries.
 
@@ -1149,19 +1372,35 @@ class PhasedStream:
     trained on one mixture resumes into a phase list that starts with it.
     Changing a phase the run has already read, or ending the current phase
     before the records the run already read in it, is refused.
+
+    A run on the committed-token clock (`tokens`, the committed tokens each
+    phase ends at, the last's where the data ends or None, `dew.data.pipeline.schedule`) knows no phase's
+    end in records ahead: the trainer ends the phase it stands in at the step
+    whose commit reaches the phase's tokens (`ending`), and the saved position
+    carries that end, as the end of a phase the run completed. Each phase opens
+    with the record ends of the phases before it (a corpus they read continues
+    in it from where they left it), so one after an end the run has yet to
+    reach opens once the run reaches it. A phase the run's commits passed
+    within one step ends where it starts, holding no record.
     """
 
     endless = True
 
-    def __init__(self, phases: Sequence[tuple[Callable[[], GlobalReader], int | None]], stop_seconds: float):
+    def __init__(self, phases: Sequence[tuple[Callable[[tuple[int, ...]], GlobalReader], int | None]],
+                 stop_seconds: float, *, tokens: Sequence[int | None] | None = None):
         ends = [end for _, end in phases]
-        bounded = [end for end in ends[:-1] if end is not None]
-        if not phases or ends[-1] is not None or len(bounded) != len(ends) - 1:
-            raise ValueError("every phase but the last ends at a record count; the last runs on")
-        if any(later <= earlier for earlier, later in itertools.pairwise([0, *bounded])):
-            raise ValueError(f"phase ends must increase from above zero, got {bounded}")
-        self._streams = [open_stream() for open_stream, _ in phases]
-        self._ends: tuple[int, ...] = tuple(bounded)
+        if tokens is None:
+            phase_ends(ends, "record")
+        elif any(end is not None for end in ends) or len(tokens) != len(ends):
+            raise ValueError("a phase on the token clock ends where the run's commits reach its tokens, "
+                             "so it has no end in records until the run reaches it")
+        self._tokens = None if tokens is None else tuple(tokens)
+        # Each ending phase's end in records, None for one on the token clock the run has yet to reach.
+        self._ends: list[int | None] = ends[:-1]
+        self._open = [open_phase for open_phase, _ in phases]
+        self._streams: dict[int, GlobalReader] = {}
+        for index in range(len(phases) if tokens is None else 1):
+            self._stream(index)
         self._records = 0
         self._current: int | None = None
         self.stop_seconds = stop_seconds
@@ -1169,18 +1408,46 @@ class PhasedStream:
     def __iter__(self) -> Iterator[Batch]:
         return self
 
+    def _stream(self, phase: int) -> GlobalReader:
+        """Phase `phase`'s reader, opened with the ends of the phases before it."""
+        if phase not in self._streams:
+            before = self._ends[:phase]
+            if any(end is None for end in before):
+                raise ValueError(f"phase {phase} opens where the phases before it end, which the run has "
+                                 "not reached")
+            self._streams[phase] = self._open[phase](tuple(end for end in before if end is not None))
+        return self._streams[phase]
+
     def _phase(self, records: int) -> int:
-        return bisect.bisect_right(self._ends, records)
+        """The phase that reads the record at `records`: the first whose end, known, is past it."""
+        return next((index for index, end in enumerate(self._ends) if end is None or records < end),
+                    len(self._ends))
 
     def _start(self, phase: int) -> int:
-        return 0 if phase == 0 else self._ends[phase - 1]
+        start = self._ends[phase - 1] if phase else 0
+        if start is None:
+            raise ValueError(f"phase {phase} starts where the run has not reached")
+        return start
+
+    def _resolve(self, phase: int, end: int | None) -> None:
+        """Phase `phase` of the token clock ends at `end` records, or at none the run has reached; the
+        phases after it, opened at its old end, open again where they now start."""
+        if self._ends[phase] == end:
+            return
+        if end is not None and end < self._start(phase):
+            raise ValueError(f"phase {phase} cannot end at record {end}, before it starts")
+        self._ends[phase] = end
+        for later in [index for index in self._streams if index > phase]:
+            if later == self._current:
+                self._current = None
+            self._streams.pop(later).close()
 
     def __next__(self) -> Batch:
         phase = self._phase(self._records)
         if phase != self._current:
             if self._current is not None:
                 self._streams[self._current].close()
-            stream = self._streams[phase]
+            stream = self._stream(phase)
             stream.set_state(
                 position.encode(
                     position.Global(records=self._records - self._start(phase), order=stream.order)
@@ -1194,51 +1461,66 @@ class PhasedStream:
         batch = next(stream)
         read = stream.records - before
         self._records += read
-        if phase < len(self._ends) and self._records > self._ends[phase]:
+        end = self._ends[phase] if phase < len(self._ends) else None
+        if end is not None and self._records > end:
             raise ValueError(
                 f"a step of {read} records crossed the phase boundary at record "
-                f"{self._ends[phase]}; phases end on step boundaries"
+                f"{end}; phases end on step boundaries"
             )
         return batch
 
     def get_state(self) -> bytes:
         # The phase of the last record read: at a boundary nothing of the next
         # phase is read yet, so the finished one is still current and a
-        # resume may change what follows it or extend it.
-        phase = bisect.bisect_left(self._ends, self._records)
+        # resume may change what follows it or extend it. A phase the token
+        # clock ended is completed where it ended, as no list of phases
+        # says where that is.
+        if self._tokens is not None:
+            phase = self._phase(self._records)
+        else:
+            phase = self._phase(self._records - 1) if self._records else 0
         plans = [
-            position.read(_global_position(stream.get_state())).plan for stream in self._streams[: phase + 1]
+            position.read(_global_position(self._stream(index).get_state())).plan
+            for index in range(phase + 1)
         ]
+        completed = tuple((self._stream(index).order, self._start(index + 1)) for index in range(phase))
         return position.encode(
             position.Global(
                 records=self._records,
-                order=self._streams[phase].order,
-                completed=tuple((self._streams[index].order, self._ends[index]) for index in range(phase)),
+                order=self._stream(phase).order,
+                completed=completed,
                 plan={"phases": plans} if any(plan is not None for plan in plans) else None,
             )
         )
 
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
+        from dew.data.plan import same_order
+
+        if self._tokens is not None:
+            if len(saved.completed) > len(self._ends):
+                raise ValueError(f"the saved run finished {len(saved.completed)} phases, and this run has "
+                                 f"{len(self._ends) + 1}")
+            # The ends the saved run reached, and none past them, which this run reaches as it reads.
+            for index in range(len(self._ends)):
+                self._resolve(index, saved.completed[index][1] if index < len(saved.completed) else None)
         if saved.plan is not None:
             plans = saved.plan.get("phases") if "phases" in saved.plan else [saved.plan]
             if not isinstance(plans, list) or len(plans) != len(saved.completed) + 1:
                 raise ValueError("saved phase plans do not cover the completed and current phases")
             for index, plan in enumerate(plans):
-                if index >= len(self._streams) or (plan is not None and not isinstance(plan, Mapping)):
+                if index >= len(self._open) or (plan is not None and not isinstance(plan, Mapping)):
                     raise ValueError("saved phase plan is not part of this run")
                 end = saved.completed[index][1] if index < len(saved.completed) else saved.records
-                self._streams[index].set_state(
+                stream = self._stream(index)
+                stream.set_state(
                     position.encode(
-                        position.Global(
-                            records=end - self._start(index), order=self._streams[index].order, plan=plan
-                        )
+                        position.Global(records=end - self._start(index), order=stream.order, plan=plan)
                     )
                 )
-        from dew.data.plan import same_order
 
         for index, (order, end) in enumerate(saved.completed):
-            if (index >= len(self._ends) or not same_order(order, self._streams[index].order)
+            if (index >= len(self._ends) or not same_order(order, self._stream(index).order)
                     or self._ends[index] != end):
                 raise ValueError(
                     f"the saved run finished phase {index} reading {order} to record "
@@ -1246,24 +1528,41 @@ class PhasedStream:
                     f"run has read cannot change under it"
                 )
         phase = len(saved.completed)
-        if phase >= len(self._streams) or not same_order(saved.order, self._streams[phase].order):
+        if phase >= len(self._open) or not same_order(saved.order, self._stream(phase).order):
             raise ValueError(
                 f"the saved position is {saved.records} records into phase {phase}, "
                 f"reading {saved.order}, and this run's phase {phase} reads something "
                 f"else; resume with the order the checkpoint was written in"
             )
-        if phase < len(self._ends) and saved.records > self._ends[phase]:
+        end = self._ends[phase] if phase < len(self._ends) else None
+        if end is not None and saved.records > end:
             raise ValueError(
                 f"the saved run has read {saved.records} records, past this run's end "
-                f"of phase {phase} at {self._ends[phase]}"
+                f"of phase {phase} at {end}"
             )
         self.close()
         self._records = saved.records
 
+    def ending(self, state: bytes) -> bytes:
+        """`state`, a position of this run on the committed-token clock, with the phase it stands in
+        ended where it stands and the next opened there: where the run's commits reached the phase's
+        tokens, which the trainer reads (`dew.training.Trainer.fit`)."""
+        if self._tokens is None:
+            raise ValueError("phases on the step clock end at the steps they were written with")
+        self.set_state(state)
+        phase = self._phase(self._records)
+        if phase >= len(self._ends):
+            raise ValueError("the last phase runs on; it has no end to reach")
+        self._resolve(phase, self._records)
+        return self.get_state()
+
     def identity(self) -> str:
-        return "; ".join(
-            [*(stream.identity() for stream in self._streams), f"phases ending at records {list(self._ends)}"]
-        )
+        # A phase on the token clock opens where the run reaches it: the pool agrees on those open (the
+        # trainer agrees again as it opens a later one) and on where every phase ends.
+        ends = (f"records {list(self._ends)}" if self._tokens is None
+                else f"committed tokens {list(self._tokens)}")
+        return "; ".join([*(self._streams[index].identity() for index in sorted(self._streams)),
+                          f"phases ending at {ends}"])
 
     def close(self) -> None:
         if self._current is not None:
@@ -1293,6 +1592,19 @@ def _global_position(state: Position) -> bytes:
     return state
 
 
+def _joined(kept: Batch, new: Batch) -> Batch:
+    """The rows of `kept` then `new`, a ramp's buffer as a read adds to it: a batch that marks its
+    real rows (`VALID_ROWS`), a kept short one, beside one that does not, all of whose rows are."""
+    if (VALID_ROWS in kept) != (VALID_ROWS in new):
+        kept, new = (batch if VALID_ROWS in batch else {**batch, VALID_ROWS: np.ones(rows_of(batch), bool)}
+                     for batch in (kept, new))
+
+    def join(held: list | np.ndarray, read: list | np.ndarray) -> list | np.ndarray:
+        return held + read if isinstance(held, list) else np.concatenate([held, read])
+
+    return jax.tree.map(join, kept, new, is_leaf=lambda column: isinstance(column, list))
+
+
 class RampedStream(Forwarding):
     """Grows a training stream's step over the run's first records.
 
@@ -1311,10 +1623,16 @@ class RampedStream(Forwarding):
 
     # MaxText reference: common/data_loader.py:122-176.
 
-    def __init__(self, source: Resumable, stages: Sequence[Stage], partition: DataPartition):
+    def __init__(self, source: Resumable, stages: Sequence[Stage], partition: DataPartition, *,
+                 tail: Tail = "dropped", order_records: int | None = None):
         self._source = source
         self._stages = tuple(stages)
-        self._starts = tuple(stage.records for stage in stages)
+        # Where a global order ends, every share ends its last step at the same record: whole where
+        # its short last step is dropped, holding the order's last records, the rest filled, where
+        # it is read (`Loader.tail`).
+        self._tail, self._order_records = tail, order_records
+        # The stages that end, the final batch running on after them.
+        self._ramp = Ranges.ending(tuple(stage.records for stage in stages[1:]))
         self._partition = partition
         self._records = 0
         self._held: Batch | None = None
@@ -1334,20 +1652,31 @@ class RampedStream(Forwarding):
 
     def _stage(self) -> Stage:
         """The stage the records read so far leave the run in."""
-        return self._stages[bisect.bisect_right(self._starts, self._records) - 1]
+        return self._stages[self._ramp.holding(self._records)]
 
     def __next__(self) -> Batch:
         stage = self._stage()
         rows = self._partition.rows(stage.batch)
+        left = None if self._order_records is None else self._order_records - self._records
+        if left is not None and (left <= 0 or (left < stage.batch and self._tail == "dropped")):
+            raise StopIteration
         while self._held is None or rows_of(self._held) < rows:
-            read = next(self._source)
-            self._held = (
-                read
-                if self._held is None
-                else jax.tree.map(lambda kept, new: kept + new if isinstance(kept, list)
-                                  else np.concatenate([kept, new]), self._held, read,
-                                  is_leaf=lambda column: isinstance(column, list))
-            )
+            read = next(self._source, None)
+            if read is None:
+                break
+            self._held = read if self._held is None else _joined(self._held, read)
+        if self._held is None or not rows_of(self._held):
+            raise StopIteration
+        if left is not None and left < stage.batch:
+            # The order's last step: its records the first `left` of the step, which this share's
+            # rows hold every count-th of from its own place on, the rest repeats.
+            step = FilledBatch(rows).map(take_batch(self._held, slice(min(rows, rows_of(self._held)))))
+            real = np.arange(rows) * self._partition.count + self._partition.index < left
+            self._held, self._records = None, self._records + stage.batch
+            return {**step, VALID_ROWS: np.asarray(step.get(VALID_ROWS, real), bool) & real}
+        if rows_of(self._held) < rows:
+            # The source ended short of a whole step, in an order whose end no read counted ahead.
+            raise StopIteration
         step = take_batch(self._held, slice(rows))
         self._held = take_batch(self._held, slice(rows, None))
         self._records += stage.batch
@@ -1384,9 +1713,12 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
     Only a stream whose position is a global record count can ramp. The ramp
     cuts that order into other steps, and the count it saves has to be the
     records it handed over. A stream that batches its own records reports a
-    shard offset and is refused, by name.
+    shard offset and is refused, by name, as is an elastic read, whose
+    position is its order's, not a record count the ramp's steps cut.
     """
-    stages = ramp.stages(dataset.batch)  # An impossible schedule fails here, not mid-run.
+    # An impossible schedule fails here, not mid-run. Moving its stages to update boundaries
+    # (`Ramp.stages`' window) cannot make one impossible, so this checks the schedule as given.
+    ramp.stages(dataset.batch)
 
     def train(partition: DataPartition) -> Iterator[Batch]:
         stream = dataset.train(partition)
@@ -1398,8 +1730,11 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
             )
         if isinstance(stream, Resumable):
             state = stream.get_state()
-            if isinstance(state, bytes) and position.translates(state):
-                return RampedStream(stream, stages, partition)
+            # A global record count alone: an elastic read's position is the order's, which the
+            # ramp's steps, cut from a global order, do not save or restore (`RampedStream`).
+            if isinstance(state, bytes) and position.decode(state) is not None:
+                return RampedStream(stream, ramp.stages(dataset.batch, partition.window), partition,
+                                    tail=dataset.tail, order_records=dataset.order_records)
         if isinstance(stream, Closeable):
             stream.close()
         raise TypeError(
@@ -1416,7 +1751,6 @@ __all__ = [
     "Checkpointable",
     "Closeable",
     "DataPartition",
-    "DataPhase",
     "Forwarding",
     "GlobalStream",
     "Identified",
@@ -1432,5 +1766,4 @@ __all__ = [
     "Stage",
     "Stoppable",
     "mapped",
-    "record_argument",
 ]

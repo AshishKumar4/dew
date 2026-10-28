@@ -9,6 +9,7 @@ import importlib
 import io
 import json
 import math
+import re
 import struct
 from collections.abc import Iterable, Mapping
 from decimal import Decimal
@@ -17,7 +18,7 @@ from typing import TYPE_CHECKING
 import jax
 import numpy as np
 
-from dew.records import JSON
+from dew._records import JSON
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 type Value = (
     JSON
     | bytes
+    | complex
     | np.ndarray
     | jax.Array
     | np.generic
@@ -40,14 +42,44 @@ type Value = (
 )
 
 
+class Unencodable(TypeError):
+    """A value the artifact codec has no encoding for, as a record a cache keeps meets it."""
+
+
 def _dtype(value: np.ndarray) -> dict[str, str]:
     if value.dtype.fields is None and np.dtype(value.dtype.str) != value.dtype:
         return {"dtype": value.dtype.name}
     return {}
 
 
+_NPY_HEADER = re.compile(rb"\{'descr': '([<>|=][a-zA-Z][0-9]*)', 'fortran_order': (True|False), "
+                         rb"'shape': \(([0-9, ]*)\), \}")
+"""The header `np.save` writes for an array of one plain dtype, which `_saved` reads without
+evaluating it: a record's arrays are read back one by one, and `np.load` evaluates each header as
+Python (`ast.literal_eval`), a tenth of a millisecond each."""
+
+
+def _saved(encoded: bytes) -> np.ndarray:
+    """The array `np.save` wrote as `encoded`: one of a plain dtype read straight from its bytes, any
+    other (a structured dtype's header names its fields) by `np.load`."""
+    if encoded[:6] == b"\x93NUMPY" and encoded[6] in (1, 2, 3):
+        width = 2 if encoded[6] == 1 else 4
+        size = int.from_bytes(encoded[8:8 + width], "little")
+        start = 8 + width + size
+        header = _NPY_HEADER.fullmatch(encoded[8 + width:start].rstrip())
+        # A dtype of no width (`|V0`, `|S0`) has no bytes to read, which `np.load` allocates for.
+        if header is not None and np.dtype(header.group(1).decode()).itemsize:
+            descr, order, dims = header.groups()
+            shape = tuple(int(dim) for dim in dims.split(b",") if dim.strip())
+            dtype = np.dtype(descr.decode())
+            count = math.prod(shape)
+            values = np.frombuffer(encoded, dtype, count=count, offset=start)
+            return values.reshape(shape, order="F" if order == b"True" else "C").copy(order="K")
+    return np.load(io.BytesIO(encoded), allow_pickle=False)
+
+
 def _array(node: dict, leaves: Mapping[str, bytes], kind: str) -> np.ndarray:
-    value = np.load(io.BytesIO(leaves[str(node[kind])]), allow_pickle=False)
+    value = _saved(leaves[str(node[kind])])
     if "dtype" in node:
         value = value.view(np.dtype(node["dtype"]))
     return value
@@ -147,6 +179,9 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
         return {"scalar": leaves.add(array.view(np.dtype(array.dtype.str)) if dtype else array), **dtype}
     if isinstance(value, float) and not math.isfinite(value):
         return {"float": value.hex()}
+    if isinstance(value, complex):
+        # Its two parts exactly, as a record holds a Python complex beside its other fields.
+        return {"complex": [float(value.real).hex(), float(value.imag).hex()]}
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     for kind in (datetime.datetime, datetime.date, datetime.time):
@@ -171,7 +206,7 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
             return {"entries": [[_tree(key, leaves, canonical), _tree(entry, leaves, canonical)]
                                 for key, entry in entries]}
         if not all(isinstance(key, str) for key in value):
-            raise TypeError("artifact mappings need string keys")
+            raise Unencodable("artifact mappings need string keys")
         keys = sorted(value) if canonical else value
         return {"mapping": {key: _tree(value[key], leaves, canonical) for key in keys}}
     if isinstance(value, (list, tuple)):
@@ -180,7 +215,7 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         cls = type(value)
         if not cls.__module__.startswith("dew.") and not leaves.opaque:
-            raise TypeError(f"artifact codec has no schema for {cls.__module__}.{cls.__qualname__}")
+            raise Unencodable(f"artifact codec has no schema for {cls.__module__}.{cls.__qualname__}")
         return {
             "dataclass": [cls.__module__, cls.__qualname__],
             "fields": {
@@ -196,7 +231,7 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
         if array.ndim or not array.dtype.hasobject:
             return _tree(array, leaves, canonical)
         return {"opaque": f"{type(value).__module__}.{type(value).__qualname__}"}
-    raise TypeError(f"artifact codec cannot encode {type(value).__name__}")
+    raise Unencodable(f"artifact codec cannot encode {type(value).__name__}")
 
 
 def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:
@@ -213,6 +248,9 @@ def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:
         return Decimal(node["decimal"])
     if "float" in node:
         return float.fromhex(node["float"])
+    if "complex" in node:
+        real, imag = node["complex"]
+        return complex(float.fromhex(real), float.fromhex(imag))
     if "scalar" in node:
         return _array(node, leaves, "scalar")[()]
     if "bytes" in node:
@@ -276,9 +314,14 @@ def content_fingerprint(value: Value, *, opaque: bool = False) -> bytes:
 
 
 def fingerprint(values: Iterable[Value]) -> str:
+    return encoded_fingerprint(encode(value) for value in values)
+
+
+def encoded_fingerprint(encoded: Iterable[bytes]) -> str:
+    """`fingerprint` of the values `encoded` holds, each as `encode` wrote it, for a caller that holds
+    their encodings already."""
     digest = hashlib.sha256()
-    for value in values:
-        encoded = encode(value)
-        digest.update(struct.pack("<Q", len(encoded)))
-        digest.update(encoded)
+    for each in encoded:
+        digest.update(struct.pack("<Q", len(each)))
+        digest.update(each)
     return digest.hexdigest()

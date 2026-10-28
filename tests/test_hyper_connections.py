@@ -1,18 +1,23 @@
-"""Manifold-constrained hyper-connections against a float64 NumPy oracle.
+"""Manifold-constrained hyper-connections on par with transformers 5.16.1, run live.
 
-The oracle below is `Glm5NextTextHyperConnection.forward` and the decoder
-layer's mixing (modeling_glm5_next.py:267-295, 1316-1318) transcribed
-line for line into NumPy at float64, with `DeepseekV4HyperHead.forward`
-(modeling_deepseek_v4.py:958-962) for the weighted head; the two references
-share the mapping token for token (modeling_deepseek_v4.py:915-943).
-Nothing here imports torch, so the oracle holds the module to the math and
-not to another implementation's rounding.
+The reference is `Glm5NextTextHyperConnection` and the decoder layer's mixing
+(modeling_glm5_next.py:267-295, 1316-1318), and `DeepseekV4HyperHead` for the
+weighted head (modeling_deepseek_v4.py:958-962); the two references share the
+mapping token for token (modeling_deepseek_v4.py:915-943). Each runs in
+float32 and, as the truth, in float64 with its float32 pins widened, over drawn
+streams, block outputs and parameters, and Dew's module is on par with the
+float32 reference from that truth (check 1, tests/reference_error.py): the
+mapping's outputs, the mix, and the gradient into the streams and every
+parameter.
 """
+
+import contextlib
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import pytest
+import torch
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.nn.hyper_connections import (
     HyperConnection,
@@ -23,123 +28,105 @@ from dew.nn.hyper_connections import (
     mix_streams,
 )
 
-BOUND = 1e-4
 H, D, B, S = 3, 8, 2, 5
+SPEC = HyperConnections(hc_mult=H, hc_eps=1e-6, hc_sinkhorn_iters=5)
+SEEDS = {"site": 256, "head": 8, "mean": 16}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada."""
 
 
-def oracle_mapping(streams, fn, base, scale, eps, iters, norm_eps):
-    """(post, comb, collapsed) of one site, modeling_glm5_next.py:277-295."""
-    hc = streams.shape[2]
-    flat = streams.reshape(*streams.shape[:2], hc * streams.shape[-1])
-    flat = flat / np.sqrt(np.mean(np.square(flat), axis=-1, keepdims=True) + norm_eps)
-    mixes = flat @ fn.T
-    pre_w, post_w, comb_w = np.split(mixes, [hc, 2 * hc], axis=-1)
-    pre_b, post_b, comb_b = np.split(base, [hc, 2 * hc])
-    def sigmoid(z):
-        return 1 / (1 + np.exp(-z))
-    pre = sigmoid(pre_w * scale[0] + pre_b) + eps
-    post = 2 * sigmoid(post_w * scale[1] + post_b)
-    logits = comb_w.reshape(*comb_w.shape[:-1], hc, hc) * scale[2] + comb_b.reshape(hc, hc)
-    exp = np.exp(logits - logits.max(-1, keepdims=True))
-    comb = exp / exp.sum(-1, keepdims=True) + eps
-    comb = comb / (comb.sum(-2, keepdims=True) + eps)
-    for _ in range(iters - 1):
-        comb = comb / (comb.sum(-1, keepdims=True) + eps)
-        comb = comb / (comb.sum(-2, keepdims=True) + eps)
-    collapsed = (pre[..., None] * streams).sum(2)
-    return post, comb, collapsed
+def site_draw(seed):
+    """Streams, a block output, the site's parameters and a cotangent for each of the site's outputs
+    (the collapsed input and the mix), drawn from `seed` in float32."""
+    rng = np.random.default_rng(seed)
+    params = {"fn": rng.standard_normal(((2 + H) * H, H * D)) * 0.3,
+              "base": rng.standard_normal((2 + H) * H) * 0.5, "scale": 1 + rng.random(3)}
+    drawn = (rng.standard_normal((B, S, H, D)), rng.standard_normal((B, S, D)), params,
+             (rng.standard_normal((B, S, D)), rng.standard_normal((B, S, H, D))))
+    return jax.tree.map(lambda leaf: np.asarray(leaf, np.float32), drawn)
 
 
-def oracle_mix(post, comb, output, streams):
-    """`post * output + comb^T @ residual`, modeling_glm5_next.py:1316-1318."""
-    return post[..., None] * output[..., None, :] + np.swapaxes(comb, -1, -2) @ streams
+def reference_site(wide: bool):
+    """The reference site and mix as a function of a draw, in float32, or in float64 where `wide`: the
+    collapsed input and the mix, and the gradients into the streams, the block output and each
+    parameter under the drawn cotangents (`torch_with_gradients`)."""
+    from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
+    from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextHyperConnection
+
+    from tools.torch_precision import float64
+
+    def forward(streams, output, params):
+        with float64() if wide else contextlib.nullcontext():
+            config = Glm5NextTextConfig(hidden_size=D, hc_mult=H, hc_sinkhorn_iters=SPEC.hc_sinkhorn_iters,
+                                        hc_eps=SPEC.hc_eps, rms_norm_eps=1e-5)
+            module = Glm5NextTextHyperConnection(config).to(streams.dtype)
+            post, comb, collapsed = torch.func.functional_call(module, params, (streams,))
+            mixed = post.unsqueeze(-1) * output.unsqueeze(-2) + torch.matmul(comb.transpose(-1, -2), streams)
+        return collapsed, mixed
+    return torch_with_gradients(forward)
 
 
-def oracle_weighted_head(streams, fn, base, scale, eps, norm_eps):
-    """modeling_deepseek_v4.py:958-962."""
-    hc = streams.shape[2]
-    flat = streams.reshape(*streams.shape[:2], hc * streams.shape[-1])
-    flat = flat / np.sqrt(np.mean(np.square(flat), axis=-1, keepdims=True) + norm_eps)
-    pre = 1 / (1 + np.exp(-(flat @ fn.T * scale + base))) + eps
-    return (pre[..., None] * streams).sum(2)
+def site(streams, output, params):
+    """Dew's site and mix: the collapsed input and the mix."""
+    post, comb, collapsed = HyperConnection(spec=SPEC, emb_features=D, norm_eps=1e-5).apply(
+        {"params": params}, streams)
+    return collapsed, mix_streams(post, comb, output, streams)
 
 
-def scaled(actual, wanted) -> float:
-    return float(np.max(np.abs(np.asarray(actual, np.float64) - wanted)) / np.max(np.abs(wanted)))
+def test_the_site_mixes_and_differentiates_as_the_reference():
+    """Through the mapping, the Sinkhorn loop and the mix, the outputs and the gradients into the
+    streams, the block output and every parameter on par with the reference's float32 (check 1)."""
+    assert_as_exact(jax.jit(with_gradients(site)), reference_site(wide=False), site_draw,
+                    "hyper-connection site", seeds=SEEDS["site"], truth_fn=reference_site(wide=True))
 
 
-@pytest.fixture
-def case():
-    rng = np.random.RandomState(0)
-    spec = HyperConnections(hc_mult=H, hc_eps=1e-6, hc_sinkhorn_iters=5)
-    streams = rng.randn(B, S, H, D)
-    output = rng.randn(B, S, D)
-    params = {"fn": rng.randn((2 + H) * H, H * D) * 0.3, "base": rng.randn((2 + H) * H) * 0.5,
-              "scale": 1 + rng.rand(3)}
-    return spec, streams, output, params
+def head_draw(seed):
+    rng = np.random.default_rng(seed)
+    params = {"hc_fn": rng.standard_normal((H, H * D)) * 0.3, "hc_base": rng.standard_normal(H),
+              "hc_scale": 1 + rng.random(1)}
+    return rng.standard_normal((B, S, H, D)), params
 
 
-def site(spec, params, streams, output):
-    """The module's site over `streams` mixed with `output`, in fp32."""
-    module = HyperConnection(spec=spec, emb_features=D, norm_eps=1e-5)
-    variables = {"params": jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)}
-    outputs = module.apply(variables, jnp.asarray(streams, jnp.float32))
-    if not isinstance(outputs, tuple) or len(outputs) != 3:
-        raise TypeError("a hyper-connection site returns (post, comb, collapsed)")
-    post, comb, collapsed = outputs
-    return collapsed, mix_streams(
-        post, comb, jnp.asarray(output, jnp.float32), jnp.asarray(streams, jnp.float32)
-    )
+def reference_head(wide: bool):
+    from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+    from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4HyperHead
+
+    from tools.torch_precision import float64
+
+    dtype = torch.float64 if wide else torch.float32
+
+    @as_given
+    def run(streams, params):
+        with float64() if wide else contextlib.nullcontext(), torch.no_grad():
+            config = DeepseekV4Config(hidden_size=D, hc_mult=H, hc_eps=SPEC.hc_eps, rms_norm_eps=1e-5)
+            head = DeepseekV4HyperHead(config).to(dtype)
+            head.load_state_dict({name: torch.tensor(value, dtype=dtype) for name, value in params.items()})
+            return head(torch.tensor(streams, dtype=dtype)).numpy()
+    return run
 
 
-def test_the_gradients_match_central_differences_of_the_oracle(case):
-    """Through the mapping, the Sinkhorn loop and the mix, into the streams
-    and every parameter."""
-    spec, streams, output, params = case
-    cotangent = np.random.RandomState(1).randn(B, S, H, D)
+def test_the_weighted_head_collapses_as_the_reference():
+    """The weighted head on par with `DeepseekV4HyperHead`'s float32 (check 1)."""
+    head = HyperHead(spec=SPEC, emb_features=D, norm_eps=1e-5)
 
-    def loss_oracle(streams, fn, base, scale):
-        post, comb, _ = oracle_mapping(streams, fn, base, scale, spec.hc_eps, spec.hc_sinkhorn_iters, 1e-5)
-        return float(np.sum(oracle_mix(post, comb, output, streams) * cotangent))
+    @jax.jit
+    def dew(streams, params):
+        return head.apply({"params": params}, streams)
 
-    def loss_module(streams, params):
-        collapsed, mixed = site(spec, params, streams, output)
-        return jnp.sum(mixed * jnp.asarray(cotangent, jnp.float32)), (collapsed, mixed)
-
-    (_, (ours_collapsed, mixed)), grads = jax.value_and_grad(loss_module, argnums=(0, 1), has_aux=True)(
-        jnp.asarray(streams, jnp.float32), jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
-    )
-    post, comb, collapsed = oracle_mapping(streams, params["fn"], params["base"], params["scale"],
-                                           spec.hc_eps, spec.hc_sinkhorn_iters, 1e-5)
-    assert scaled(ours_collapsed, collapsed) < BOUND
-    assert scaled(mixed, oracle_mix(post, comb, output, streams)) < BOUND
-    ours = {"streams": grads[0], **grads[1]}
-    arguments = {"streams": streams, **params}
-    for name, value in arguments.items():
-        wanted = np.zeros_like(value)
-        step = 1e-6
-        for index in np.ndindex(value.shape):
-            bumped = {**arguments, name: value.copy()}
-            bumped[name][index] += step
-            up = loss_oracle(bumped["streams"], bumped["fn"], bumped["base"], bumped["scale"])
-            bumped[name][index] -= 2 * step
-            down = loss_oracle(bumped["streams"], bumped["fn"], bumped["base"], bumped["scale"])
-            wanted[index] = (up - down) / (2 * step)
-        assert scaled(ours[name], wanted) < BOUND, name
+    assert_as_exact(lambda streams, params: dew(*jax.tree.map(lambda x: jnp.asarray(x, jnp.float32),
+                                                              (streams, params))),
+                    reference_head(wide=False), head_draw, "weighted hyper head", seeds=SEEDS["head"],
+                    truth_fn=reference_head(wide=True))
 
 
-def test_the_weighted_head_matches_the_oracle_and_the_mean_head_is_the_mean(case):
-    spec, streams, _, _ = case
-    rng = np.random.RandomState(2)
-    params = {"hc_fn": rng.randn(H, H * D) * 0.3, "hc_base": rng.randn(H), "hc_scale": 1 + rng.rand(1)}
-    head = HyperHead(spec=spec, emb_features=D, norm_eps=1e-5)
-    variables = {"params": jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)}
+def test_the_mean_head_is_the_mean_and_expansion_repeats_a_stream():
+    """Without a weighted head the streams collapse to their mean, on par with NumPy's float32 mean
+    from the float64 one (check 1); expanding a stream repeats it, bit for bit."""
+    def draw(seed):
+        return (np.random.default_rng(seed).standard_normal((B, S, H, D)),)
 
-    weighted = head.apply(variables, jnp.asarray(streams, jnp.float32))
-    wanted = oracle_weighted_head(streams, params["hc_fn"], params["hc_base"], params["hc_scale"],
-                                  spec.hc_eps, 1e-5)
-
-    assert scaled(weighted, wanted) < BOUND
-    assert scaled(collapse_streams(jnp.asarray(streams, jnp.float32), None), streams.mean(2)) < BOUND
-    first = jnp.asarray(streams[:, :, 0], jnp.float32)
+    assert_as_exact(lambda streams: collapse_streams(jnp.asarray(streams, jnp.float32), None),
+                    as_given(lambda streams: np.asarray(streams, np.float32).mean(2)), draw,
+                    "mean hyper head",
+                    seeds=SEEDS["mean"], truth_fn=lambda streams: np.asarray(streams, np.float64).mean(2))
+    first = jnp.asarray(draw(0)[0][:, :, 0], jnp.float32)
     assert np.array_equal(expand_streams(first, H), np.repeat(np.asarray(first)[:, :, None], H, axis=2))

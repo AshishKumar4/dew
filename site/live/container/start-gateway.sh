@@ -6,9 +6,13 @@ umask 077
 mkdir -p /run/dew/gateway /sessions/connections /sessions/ipc /sessions/overlay /work
 chmod 0711 /sessions /sessions/connections /sessions/ipc /sessions/overlay
 : > /kernel.json
-for index in $(seq 0 99); do
-  id -u "ctx$index" >/dev/null 2>&1 || useradd --uid "$((6100+index))" --no-create-home --home-dir /work --shell /usr/sbin/nologin "ctx$index"
-done
+# The guests' users, each a name and id, and the kernels the gateway may start, all from guests.py.
+PYTHONPATH=/opt/live /opt/venv/bin/python -c \
+  'import guests; [print(guests.user(uid), uid) for uid in guests.GUEST_UIDS]' |
+  while read -r name uid; do
+    id -u "$name" >/dev/null 2>&1 || useradd --uid "$uid" --no-create-home --home-dir /work --shell /usr/sbin/nologin "$name"
+  done
+kernels=$(PYTHONPATH=/opt/live /opt/venv/bin/python -c 'import guests; print(guests.MAX_CONTEXTS + 1)')
 /opt/venv/bin/python - <<'PY'
 import os,secrets
 path='/run/dew/gateway-token'
@@ -32,7 +36,7 @@ export KG_AUTH_TOKEN
 nohup env JUPYTER_RUNTIME_DIR=/run/dew/gateway PYTHONPATH=/opt/live /opt/venv/bin/jupyter-kernelgateway \
   --KernelGatewayApp.kernel_manager_class=gateway_manager.LimitedMappingKernelManager \
   --KernelGatewayApp.ip=127.0.0.1 --KernelGatewayApp.port=8890 \
-  --KernelGatewayApp.max_kernels=25 \
+  --KernelGatewayApp.max_kernels="$kernels" \
   > /run/dew/gateway.log 2>&1 </dev/null &
 /opt/venv/bin/python - <<'PY'
 import time

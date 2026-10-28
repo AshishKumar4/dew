@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 import torch
 from reference_error import assert_as_exact_as_the_reference
+from token_support import byte_level_tokenizer
 from transformers.generation.logits_process import (
     EncoderNoRepeatNGramLogitsProcessor,
     EncoderRepetitionPenaltyLogitsProcessor,
@@ -194,7 +195,9 @@ def test_prompt_repetition_penalty_reads_only_the_prompt(penalty):
                 torch.tensor([prompt], dtype=torch.long),
                 torch.tensor(np.asarray(logits)[row:row + 1].copy())).numpy()[0]
         for row, prompt in enumerate(PROMPTS)])
-    np.testing.assert_allclose(got, want, atol=1e-6, rtol=0)
+    # Each score one float32 product or quotient by the inverted penalty, the reference's own operation
+    # on the same values, or left as it is: the same numbers bit for bit.
+    np.testing.assert_array_equal(got, want)
 
 
 @pytest.mark.parametrize("size", [2, 3])
@@ -217,8 +220,9 @@ def test_prompt_no_repeat_ngram_matches_the_reference_encoder_processor(size):
             torch.tensor(np.asarray(logits)[row:row + 1].copy())).numpy()[0]
         for row, (prompt, history) in enumerate(zip(prompts, histories(prompts, drawn), strict=True))])
     np.testing.assert_array_equal(np.isfinite(got), np.isfinite(want))
-    np.testing.assert_allclose(np.where(np.isfinite(want), got, 0.0),
-                               np.where(np.isfinite(want), want, 0.0), atol=1e-6, rtol=0)
+    # Every score not banned is the logit itself, in both.
+    kept = np.isfinite(want)
+    np.testing.assert_array_equal(np.where(kept, got, 0.0), np.where(kept, want, 0.0))
 
 
 def test_sequence_bias_matches_the_reference_over_mixed_lengths():
@@ -230,11 +234,14 @@ def test_sequence_bias_matches_the_reference_over_mixed_lengths():
            prompts, drawn, tolerance=1e-6)
 
 
-def test_bad_words_ban_sequences_and_keep_the_eos_reachable():
+@pytest.mark.parametrize("eos", [(4,), [4], range(4, 5), np.array([4]), np.int64(4)],
+                         ids=["tuple", "list", "range", "array", "numpy-int"])
+def test_bad_words_ban_sequences_and_keep_the_eos_reachable(eos):
+    """The EOS ids are any sequence of ids or one id, a tokenizer's arrays among them."""
     words = [[9], [1, 3], [4]]
     prompts = [[3, 3, 9, 1], [7, 2, 5, 2, 7]]
     drawn = [[1], [5]]
-    agrees(decoding.bad_words(words, eos_token_ids=(4,)),
+    agrees(decoding.bad_words(words, eos_token_ids=eos),
            NoBadWordsLogitsProcessor(words, eos_token_id=torch.tensor([4])), prompts, drawn)
 
 
@@ -328,7 +335,7 @@ def test_exponential_decay_grows_the_eos_score_after_its_start():
     np.testing.assert_allclose(got, want, atol=1e-5, rtol=0)
     # The first row is three tokens past the start and the second one is at it,
     # so a penalty that ignored the count would not separate them.
-    assert got[0, 6] > logits[0, 6] and got[1, 6] == pytest.approx(float(logits[1, 6]), abs=1e-6)
+    assert got[0, 6] > logits[0, 6] and got[1, 6] == logits[1, 6]
 
 
 PENALTIES = np.load(Path(__file__).resolve().parent / "fixtures" / "decoding" / "penalties.npz")
@@ -458,21 +465,6 @@ def test_stop_strings_refuse_a_vocabulary_that_cannot_spell_them(tmp_path):
         decoding.stop_strings(tokenizer, "zzzz", len(tokenizer))
 
 
-def byte_level_tokenizer(tmp_path):
-    """A byte-level BPE over all 256 bytes, so a code point splits in two."""
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
-    from transformers import AutoTokenizer, PreTrainedTokenizerFast
-    from transformers.convert_slow_tokenizer import bytes_to_unicode
-
-    alphabet = bytes_to_unicode()
-    backend = Tokenizer(models.BPE({alphabet[byte]: byte for byte in range(256)}, [],
-                                   unk_token=None))
-    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    backend.decoder = decoders.ByteLevel()
-    PreTrainedTokenizerFast(tokenizer_object=backend).save_pretrained(tmp_path / "bytes")
-    return AutoTokenizer.from_pretrained(tmp_path / "bytes", local_files_only=True)
-
-
 def test_a_stop_string_split_across_byte_tokens_still_ends_the_row(tmp_path):
     """A byte-level vocabulary spells 'é' as two tokens, neither of which is
     valid text on its own. Reading the vocabulary as text loses them, so the
@@ -482,7 +474,7 @@ def test_a_stop_string_split_across_byte_tokens_still_ends_the_row(tmp_path):
 
     from dew.sampling.vocabulary import matching_mode
 
-    tokenizer = byte_level_tokenizer(tmp_path)
+    tokenizer = byte_level_tokenizer(tmp_path / "bytes")
     assert matching_mode(tokenizer) == "byte_level"
     pair = tokenizer.encode("é")
 

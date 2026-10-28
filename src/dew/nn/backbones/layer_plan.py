@@ -70,6 +70,10 @@ class LayerKind:
     """Whether this kind's attention adds a learned sink logit per head
     (`dew.nn.attention_sinks`); None takes the model's `attention_sinks`.
     MiMo-V2-Flash sinks its windowed layers alone."""
+    qk_norm: bool | None = None
+    """Whether this kind's attention norms its queries and keys; None takes
+    the model's `qk_norm`. Llama 4 norms its rotated layers alone
+    (`use_qk_norm`, Llama4TextAttention)."""
     mixer: MixerBase | None = None
     """This kind's mixer value, or its record. None uses the model's mixer."""
 
@@ -111,6 +115,7 @@ class ResolvedKind:
     head_dim: int
     partial_rotary_factor: float | None
     sinks: bool
+    qk_norm: bool
     mixer: MixerBase | None
 
 
@@ -158,6 +163,8 @@ class LayerSpec:
     unrolled, as a `provider` does; None for the rest."""
     attention_norm: bool = True
     """Whether the block norms its attention input; ModernBERT's first block does not."""
+    cross: bool = False
+    """Whether the layer reads the call's context through a gated cross-attention block first."""
 
 
 def scan_groups(specs: Sequence[Hashable],
@@ -204,6 +211,14 @@ def group_layers(name: str) -> range | None:
         return None
     first, last = int(parts[0]), int(parts[-1])
     return range(first, last + 1)
+
+
+
+def layer_index(name: str) -> int | None:
+    """Return the layer index a single layer's `layers_N` module name holds (`group_layers`), or
+    None, a run's `layers_3_7` (or one-layer run's `layers_3_3`) among the rest."""
+    layers = group_layers(name)
+    return layers.start if layers is not None and name == f"layers_{layers.start}" else None
 
 
 __all__ = ["LayerKind", "LayerSpec", "ResolvedKind"]

@@ -19,9 +19,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import Variables
 from dew.interop import decoder_parts, hf_decoders as decoders
 from dew.interop.streaming import SourceLeaf, WeightLayout
-from dew.objectives.base import Variables
+from dew.interop.unread import Stored, Unread
 
 type Place = Callable[[tuple[str, ...]], tuple[str, ...]]
 """Where a leaf of the decoder's own tree sits in the bundle that holds it."""
@@ -57,19 +58,20 @@ def _leading_axes(variables: Mapping[str, object], path: tuple[str, ...],
         if not isinstance(node, Mapping) or part not in node:
             raise ValueError(f"the loaded tree holds no {path}, which {part!r} names")
         node = node[part]
-    if not isinstance(node, np.ndarray | jax.Array | SourceLeaf):
+    if not isinstance(node, np.ndarray | Unread | jax.Array | SourceLeaf):
         return 0
     rank = node.ndim - (0 if expert_index is None else 1)
     return max(rank - 2, 0)
 
 
-def reading_layout(name: str, reading: decoder_parts.Reading, config, model_type: str,
-                   variables: Mapping[str, object], place: Place = _held) -> WeightLayout | None:
+def reading_layout(name: str, reading: decoder_parts.Reading, config,
+                   model_type: str | decoder_parts.DecoderFamily, variables: Mapping[str, object],
+                   place: Place = _held) -> WeightLayout | None:
     """The binding of the stored tensor `name` that the text family reads as `reading`
     (`DecoderFamily.readings`): the leaves its parts fill, placed in the bundle by `place`, and
     the storage operations that rebuild it from them, a `packed` tensor's from the layouts of its
     parts; None where no leaf takes it. `variables` is the decoder's own tree."""
-    family = decoders.families()[model_type]
+    family = decoders.family_entry(model_type)
     if reading.packing is None:
         # The tensor as stored, which `prepare` may have reshaped for the tree.
         stored = reading.parts[0]._replace(tensor=reading.stored)
@@ -100,9 +102,9 @@ def _leaf_layout(name: str, part: decoder_parts.Part, family: decoder_parts.Deco
 
 
 def decoder_layouts(readings: Sequence[decoder_parts.Reading], record: decoder_parts.DecoderFields,
-                    family: str, variables: Variables, *, place: Place = _held,
+                    family: str | decoder_parts.DecoderFamily, variables: Variables, *, place: Place = _held,
                     export_name: Callable[[str], str] = str
-                    ) -> tuple[tuple[WeightLayout, ...], dict[str, np.ndarray]]:
+                    ) -> tuple[tuple[WeightLayout, ...], dict[str, Stored]]:
     """Each source tensor's binding into the bundle, from the readings `read_decoder` placed in the
     decoder's tree `variables`, under `export_name` of its name, and the tensors none binds, under
     the same names. `place` puts a leaf of the decoder's tree where the bundle holds it."""

@@ -1,0 +1,15 @@
+name: Site toolchain
+description: pnpm at site/package.json's version, Node 22 with pnpm's cache, and the site's locked dependencies.
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@v4
+      with:
+        package_json_file: site/package.json
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: pnpm
+        cache-dependency-path: site/pnpm-lock.yaml
+    - shell: bash
+      run: pnpm --dir site install --frozen-lockfile

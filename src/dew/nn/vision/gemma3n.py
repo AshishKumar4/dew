@@ -10,18 +10,21 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
-from dew.interop.weights import placed
+from dew import _records
+from dew.interop.config_records import NativeFields
+from dew.interop.unread import Stored
+from dew.interop.weights import in_params, placed
 from dew.nn.attention import RMSNorm
+from dew.nn.blocks import TokenEmbedding
 from dew.nn.dense import Dense
+from dew.nn.precision import float32_dot_general
 from dew.registry import Record, from_record
 
 from ..mobilenet import _ARCHITECTURE, MobileNetV5, MobileNetV5Encoder
-from .common import _PROJECTOR_PATHS, ProjectorBase, TowerBase, TowerGeometry, _vision_section
+from .common import ProjectorBase, ProjectorLayout, TowerBase, TowerGeometry, TowerLayout, _vision_section
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -39,7 +42,7 @@ class Gemma3nVision(MobileNetV5, TowerBase):
         return TowerGeometry(channels=self.in_chans)
 
 
-class Gemma3nProjectorModule(nn.Module):
+class Gemma3nProjector(ProjectorBase):
     """Gemma3nMultimodalEmbedder's vision hard and soft token paths."""
 
     vision_width: int
@@ -57,14 +60,14 @@ class Gemma3nProjectorModule(nn.Module):
             )
         if self.norm_eps <= 0:
             raise ValueError("norm_eps must be positive")
-        self.embedding = nn.Embed(self.vocab_size, self.vision_width, dtype=self.dtype,
+        self.embedding = TokenEmbedding(self.vocab_size, self.vision_width, dtype=self.dtype,
                                   name="embedding")
         norm = functools.partial(RMSNorm, epsilon=self.norm_eps, dtype=self.dtype)
         self.hard_embedding_norm = norm(name="hard_embedding_norm")
         self.soft_embedding_norm = norm(name="soft_embedding_norm")
         self.embedding_projection = Dense(self.text_width, use_bias=False,
                                               dtype=self.dtype, precision=self.precision,
-                                              name="embedding_projection")
+                                              name="embedding_projection", dot_general=float32_dot_general)
         self.embedding_post_projection_norm = norm(with_scale=False,
                                                    name="embedding_post_projection_norm")
 
@@ -104,18 +107,6 @@ class Gemma3nProjectorModule(nn.Module):
         chosen = jnp.where(mask, ids, self.vocab_offset + self.vocab_size - 1)
         hard = self.embed_hard(chosen).astype(token_embeddings.dtype)
         return jnp.where(mask[..., None], hard, token_embeddings)
-
-
-@dataclasses.dataclass(frozen=True)
-class Gemma3nProjector(ProjectorBase):
-    vision_width: int
-    text_width: int
-    vocab_size: int = 128
-    vocab_offset: int = 262144
-    norm_eps: float = 1e-6
-
-    def build(self) -> nn.Module:
-        return Gemma3nProjectorModule(**dataclasses.asdict(self))
 
 
 def gemma3n_vision_path(hf_name: str) -> tuple[str, ...]:
@@ -165,11 +156,20 @@ def gemma3n_vision_path(hf_name: str) -> tuple[str, ...]:
     return prefix + parts[:-1] + ("scale" if norm else "kernel",)
 
 
+GEMMA3N_PROJECTOR_TENSORS = {
+    "embedding.weight": ("embedding", "embedding"),
+    "hard_embedding_norm.weight": ("hard_embedding_norm", "scale"),
+    "soft_embedding_norm.weight": ("soft_embedding_norm", "scale"),
+    "embedding_projection.weight": ("embedding_projection", "kernel"),
+}
+"""The Gemma 3n embedder's tensors past `embed_vision.` (or its audio's), each to its leaf."""
+
+
 def translate_gemma3n_projector_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
+    hf_tensors: Mapping[str, Stored], *, param_dtype: str = "float32"
 ) -> tuple[Mapping[str, object], tuple[WeightLayout, ...]]:
     """A Gemma 3n vision embedder's parameter tree, with the layouts that write it back."""
-    paths = _PROJECTOR_PATHS["gemma3n"]
+    paths = GEMMA3N_PROJECTOR_TENSORS
     if set(hf_tensors) != set(paths):
         raise ValueError(f"vision embedder tensors differ: missing {sorted(set(paths) - set(hf_tensors))}, "
                          f"unknown {sorted(set(hf_tensors) - set(paths))}")
@@ -187,10 +187,7 @@ def _gemma3n_vision_record(
             "vocab_size", "vocab_offset", "rms_norm_eps"}
     # These are serialized HF metadata. Vocabulary and RMS fields above feed
     # the vision embedder; construction fields feed the MobileNet encoder.
-    metadata = {"architectures", "transformers_version", "torch_dtype", "dtype",
-                "initializer_range", "label_names", "num_classes", "id2label",
-                "label2id", "output_hidden_states", "output_attentions", "return_dict",
-                "is_encoder_decoder", "problem_type", "chunk_size_feed_forward"}
+    metadata = _records.HF_METADATA | {"initializer_range", "label_names", "num_classes"}
     unknown = (set(vision) - used - metadata
                - {key for key in vision if str(key).startswith("_")})
     if unknown:
@@ -198,17 +195,17 @@ def _gemma3n_vision_record(
     if vision.get("architecture", "mobilenetv5_300m_enc") != "mobilenetv5_300m_enc":
         raise ValueError(f"architecture {vision.get('architecture')!r} is not the MobileNet-v5 encoder")
     embedder = {
-        "vision_width": records.integer(vision.get("hidden_size", 2048), "hidden_size"),
-        "vocab_size": records.integer(vision.get("vocab_size", 128), "vocab_size"),
-        "vocab_offset": records.integer(vision.get("vocab_offset", 262144), "vocab_offset"),
-        "norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
+        "vision_width": _records.integer(vision.get("hidden_size", 2048), "hidden_size"),
+        "vocab_size": _records.integer(vision.get("vocab_size", 128), "vocab_size"),
+        "vocab_offset": _records.integer(vision.get("vocab_offset", 262144), "vocab_offset"),
+        "norm_eps": _records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
     }
     if embedder["vision_width"] != 2048:
         raise ValueError("hidden_size must be 2048; timm's MobileNet-v5 encoder fixes its adapter width")
     if vision.get("do_pooling", False):
         raise ValueError("do_pooling=True requests a classifier head the encoder does not have")
     options = vision.get("model_args")
-    options = records.record({} if options is None else options, "model_args")
+    options = _records.record({} if options is None else options, "model_args")
     allowed = {field.name for field in dataclasses.fields(Gemma3nVision)}
     unknown = set(options) - allowed
     if unknown:
@@ -225,5 +222,10 @@ def translate_gemma3n_vision_config(hf_config: Mapping[str, object]) -> Record:
 def translate_gemma3n_projector_config(hf_config: Mapping[str, object],
                                        text_width: int) -> Record:
     embedder, _ = _gemma3n_vision_record(hf_config)
-    value: Gemma3nProjector = from_record(Gemma3nProjector, {**embedder, "text_width": text_width})
-    return {"class": "gemma3n", "fields": {**dataclasses.asdict(value)}}
+    return {"class": "gemma3n", "fields": NativeFields(Gemma3nProjector,
+                                                       {**embedder, "text_width": text_width})}
+
+
+Gemma3nVision.checkpoint = TowerLayout("vision_tower.", in_params(gemma3n_vision_path))
+Gemma3nProjector.checkpoint = ProjectorLayout("embed_vision.", GEMMA3N_PROJECTOR_TENSORS,
+                                              read=translate_gemma3n_projector_weights)

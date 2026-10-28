@@ -22,11 +22,10 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-import json
 import math
 import threading
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
@@ -39,14 +38,14 @@ from jax.experimental.layout import Format, Layout as DeviceLayout
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 from jax.typing import DTypeLike
 
-from dew import records
+from dew.batch import Variables, merge, without
 from dew.nn.backbones.decoder_stack import DecoderBank, stack_layers
-from dew.nn.backbones.layer_plan import group_layers
+from dew.nn.backbones.layer_plan import group_layers, layer_index
 from dew.nn.hyper_connections import Carried
-from dew.objectives.base import Variables, merge
+from dew.nn.kernels.options import program
 
 if TYPE_CHECKING:
-    from dew.training.distributed import Layout, MeshSpec, Placement
+    from dew.distributed.placement import Layout, MeshSpec, Placement
 
 
 class LayerBanks(Protocol):
@@ -97,28 +96,11 @@ class LayerBanks(Protocol):
         sites, shapes, _device_mesh, placement, entries = _bank_plan(model, self, mesh, layout)
 
         entry_values = jax.block_until_ready(self.entry(entries)) if entries else {}
-        bank_store: dict[str, dict] = {}
-        for site in sites:
-            for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
-                bank = jax.block_until_ready(self.bank(
-                    range(first, first + count),
-                    _bank_placement(one_layer(placement, first, namespace=site.namespace),
-                                    one_layer(shapes, first, namespace=site.namespace), stacked=count > 1),
-                    namespace=site.namespace))
-                for collection, tree in bank.items():
-                    branch = bank_store.setdefault(collection, {})
-                    for component in site.namespace:
-                        branch = branch.setdefault(component, {})
-                    branch[name] = tree
-        return merge(entry_values, bank_store)
-
-
-def layer_index(name: str) -> int | None:
-    """Return the layer index a `layers_N` module name holds, or None."""
-    if not name.startswith("layers_"):
-        return None
-    rest = name[len("layers_"):]
-    return int(rest) if rest.isdigit() else None
+        return merge(entry_values, assembled(sites, lambda site, first, count, _: self.bank(
+            range(first, first + count),
+            _bank_placement(one_layer(placement, first, namespace=site.namespace),
+                            one_layer(shapes, first, namespace=site.namespace), stacked=count > 1),
+            namespace=site.namespace)))
 
 
 def one_layer(variables: Variables, index: int, *, namespace: tuple[str, ...] = ()) -> Variables:
@@ -240,21 +222,22 @@ class CheckpointBanks(LayerBanks):
                              layers[0], namespace=namespace)
         rows = [one_layer(self._restored(at_layer(_row_placement(placement), index, namespace=namespace)),
                           index, namespace=namespace) for index in layers]
-        return jax.jit(stack_layers, out_shardings=placement)(*rows)
+        return program(stack_layers, out_shardings=placement)(*rows)
 
     def _restored(self, placement: Placement) -> Variables:
-        """Restore the variables `placement` names onto its shardings."""
+        """Restore the variables `placement` names onto its shardings, as every load of a run's
+        variables restores them (`Checkpoints.materialized`)."""
         from dew.checkpoints import Checkpoints
 
         shapes = narrowed(self.shapes(), placement)
-        template = {"variables": _typed(shapes, narrowed(placement, shapes))}
+        template, placements = {"variables": shapes}, {"variables": narrowed(placement, shapes)}
         if self.ema:
             averaged = narrowed(self.stored["ema"], placement)
             if averaged:
-                template["ema"] = _typed(averaged, narrowed(placement, averaged))
+                template["ema"], placements["ema"] = averaged, narrowed(placement, averaged)
+        assert self.step is not None
         with Checkpoints(self.directory) as checkpoints:
-            values, _ = checkpoints.restore(template, step=self.step)
-        return merge(values["variables"], values["ema"]) if "ema" in template else values["variables"]
+            return checkpoints.materialized(template, placements, step=self.step)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -279,12 +262,14 @@ class DiskBankStats:
 class SafetensorsBanks(LayerBanks):
     """Reads a local HF decoder checkpoint without materializing its layer stack.
 
-    It translates the weights with the ordinary decoder's `SourceLeaf`
-    recipes over read-only memory maps, including expert stacking,
-    transposition and the cast to `param_dtype` (by default the
-    checkpoint's dtype). Quantized checkpoints are refused, because their
-    codec may dequantize the entire checkpoint before translation, which
-    would break the memory bound below.
+    The checkpoint is a decoder, a media wrapper around one, or the native
+    backbone a release with a separately stored readout describes (a slot
+    decision release). It translates the weights as `Pretrained.load` does
+    (`dew.interop.pretrained.native_backbone`), with its `SourceLeaf` recipes
+    over read-only memory maps, including expert stacking, transposition and
+    the cast to `param_dtype` (by default the checkpoint's dtype). Quantized
+    checkpoints are refused, because their codec may dequantize the entire
+    checkpoint before translation, which would break the memory bound below.
 
     The cache keeps complete layers in read order until `cache_bytes` is
     full, and holds them until `close`. A sequential decoder visits every
@@ -293,8 +278,9 @@ class SafetensorsBanks(LayerBanks):
     partial cache useful. One read-ahead slot holds the next layer, even
     with a zero cache, unless `read_ahead` is False. Host memory for weights
     is bounded by `cache_bytes`, two rows and one leaf's conversion scratch.
-    Embeddings, heads and the KV cache stay resident outside that bound, and
-    the bound does not count the kernel's page cache.
+    Embeddings, heads, a media wrapper's towers and projectors (read whole,
+    as the wrapper's reader reads them) and the KV cache stay resident
+    outside that bound, and the bound does not count the kernel's page cache.
 
     Keep the source open and its files unchanged until all executions
     finish, because a compiled callback cannot read a closed source.
@@ -302,32 +288,17 @@ class SafetensorsBanks(LayerBanks):
 
     def __init__(self, directory: str | Path, *, cache_bytes: int = 0,
                  param_dtype: DTypeLike | Literal["auto"] = "auto", read_ahead: bool = True):
-        from dew.interop.decoder_parts import DecoderFamily, check_decoder_tree
-        from dew.interop.hf_decoders import families, translate_config, translate_weights
-        from dew.interop.safetensors_io import read_weights
-        from dew.registry import dtype_name, models
+        from dew.interop.pretrained import native_backbone
+        from dew.registry import dtype_name
 
         if cache_bytes < 0:
             raise ValueError("cache_bytes must be nonnegative")
-        folder = Path(directory)
-        config = records.record(json.loads((folder / "config.json").read_text()), "config.json")
+        config, self._variables = native_backbone(
+            directory, param_dtype="auto" if param_dtype == "auto" else dtype_name(param_dtype))
         self.config: Mapping[str, object] = MappingProxyType(config)
-        if self.config.get("quantization_config") or self.config.get("expert_dtype"):
-            raise ValueError("disk banks require unquantized safetensors; a whole-model codec is not bounded")
-        record = translate_config(self.config)
-        family = records.text(self.config.get("model_type"), "model_type")
-        if families()[family].prepare is not DecoderFamily.prepare or families()[family].packed:
-            raise ValueError("disk banks require a family with lazy tensor translation; "
-                             "this family's preparation can materialize checkpoint weights")
-        tensors = read_weights(folder)
-        self._variables: Variables = translate_weights(
-            tensors, record, family, param_dtype="auto" if param_dtype == "auto" else dtype_name(param_dtype),
-            lazy=True)
         self._shapes = jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables
         )
-        check_decoder_tree(self._shapes, models.build(
-            "causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"}))
         self.cache_limit = cache_bytes
         self.read_ahead = read_ahead
         self._cache: dict[tuple[tuple[str, ...], int], Variables] = {}
@@ -376,17 +347,9 @@ class SafetensorsBanks(LayerBanks):
 
     @staticmethod
     def _placed(variables: Variables, placement: Placement) -> Variables:
-        from dew.training.host import place_leaf
+        from dew.distributed.host import place_leaf
 
-        def place(leaf, target):
-            if not isinstance(target, Format):
-                return place_leaf(leaf, target)
-            try:
-                return jax.block_until_ready(jax.device_put(leaf.read(), target))
-            finally:
-                leaf.release()
-
-        return jax.tree.map(place, variables, placement)
+        return jax.tree.map(place_leaf, variables, placement)
 
     def bank(self, layers: Sequence[int], placement: Placement, *,
              namespace: tuple[str, ...] = ()) -> Variables:
@@ -479,8 +442,8 @@ class SafetensorsBanks(LayerBanks):
             raise RuntimeError("the safetensors bank source is closed")
 
     def _read(self, key: tuple[tuple[str, ...], int]) -> Variables:
+        from dew.distributed.host import evict
         from dew.interop.streaming import SourceLeaf
-        from dew.training.host import evict
 
         with self._lock:
             if key in self._cache:
@@ -563,9 +526,11 @@ def bank_sharding(row: NamedSharding, *, memory_kind: str | None) -> NamedShardi
     return NamedSharding(row.mesh, P(None, *row.spec), memory_kind=memory_kind)
 
 
-def row_sharding(bank: NamedSharding) -> NamedSharding:
-    """One row's sharding out of a bank's (`bank_sharding`), in the bank's memory."""
-    return NamedSharding(bank.mesh, P(*bank.spec[1:]), memory_kind=bank.memory_kind)
+def row_sharding(bank: NamedSharding, *, memory_kind: str | None = None) -> NamedSharding:
+    """One row's sharding out of a bank's (`bank_sharding`): the layer axis dropped, in
+    `memory_kind`, the bank's own memory when None."""
+    return NamedSharding(bank.mesh, P(*bank.spec[1:]),
+                         memory_kind=bank.memory_kind if memory_kind is None else memory_kind)
 
 
 def spread(tree: Mapping, rows=lambda leaf, count: [leaf[offset] for offset in range(count)]) -> dict:
@@ -577,7 +542,7 @@ def spread(tree: Mapping, rows=lambda leaf, count: [leaf[offset] for offset in r
     goes and the base is held twice for one leaf at most.
 
     A CPU-owned training run stores its frozen collection banked
-    (`dew.training.execution.banked`); this is the layer view every reader
+    (`banked`, its inverse); this is the layer view every reader
     keyed by `layers_N`, a placement or a model, takes of it.
     """
     spread_tree = {}
@@ -596,6 +561,121 @@ def spread(tree: Mapping, rows=lambda leaf, count: [leaf[offset] for offset in r
     return spread_tree
 
 
+def banked(tree, sites, stack, release=None):
+    """Replace a scanned run's per-layer rows with one stacked bank: `spread`'s inverse, over the view's
+    own runs and bank names (`StackView.bank_names`), as `assembled` reads them.
+
+    `tree` is a frozen collection keyed per layer. Every leaf that all rows
+    of a run hold moves under the run's bank name, stacked by
+    `stack(rows, path)`. Arrays stack into one bank, shapes into one shape,
+    shardings into the bank's. A leaf only some rows hold stays per layer, as
+    does every run of one, and `run_stack` stacks those with the moving rows
+    at each snapshot.
+
+    `stack` is called with the rows and `path`, the bank leaf's keys from the
+    root, so a caller can place each bank as it makes it. A frozen bank then
+    exists once, from the moment it is placed, rather than as its rows in
+    pinned memory and a stacked copy beside them, which for a stack that
+    fills the host is the second copy that does not fit.
+
+    `release(namespace, index, keys, bank)` is told each row leaf the bank
+    replaced, and the bank itself. The tree the rows came from can then hold
+    the bank where the row was and let the row go.
+    """
+    tree = dict(tree)
+    for site in sites:
+        local = tree
+        for component in site.namespace:
+            if not isinstance(local.get(component), Mapping):
+                local = None
+                break
+            local[component] = dict(local[component])
+            local = local[component]
+        if local is None:
+            continue
+        for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
+            if count == 1:
+                continue
+            held = [local.get(f"layers_{first + offset}") for offset in range(count)]
+            if not all(isinstance(row, Mapping) for row in held):
+                continue
+            rows = [dict(row) for row in held if isinstance(row, Mapping)]
+            leaves = [{tuple(entry.key for entry in path): leaf
+                       for path, leaf in jax.tree_util.tree_leaves_with_path(row)} for row in rows]
+            shared = set(leaves[0]).intersection(*leaves[1:])
+            if not shared:
+                continue
+            bank = local.setdefault(name, {})
+            for keys in sorted(shared):
+                node = bank
+                for key in keys[:-1]:
+                    node = node.setdefault(key, {})
+                node[keys[-1]] = stack([held[keys] for held in leaves], (*site.namespace, name, *keys))
+                for offset, row in enumerate(rows):
+                    _dropped(row, keys)
+                    if release is not None:
+                        release(site.namespace, first + offset, keys, node[keys[-1]])
+            for offset, row in enumerate(rows):
+                layer = f"layers_{first + offset}"
+                if row:
+                    local[layer] = row
+                else:
+                    del local[layer]
+    return tree
+
+
+def without_banks(variables, sites):
+    """Return `variables` without the banks a scanned run stores under its name."""
+    banks = [(*site.namespace, name) for site in sites
+             for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True)
+             if count > 1]
+    return {collection: without(tree, banks) for collection, tree in variables.items()}
+
+
+def _dropped(tree, keys):
+    """Delete the leaf at `keys` from `tree`, and any node that emptied with it."""
+    node, parents = tree, []
+    for key in keys[:-1]:
+        parents.append((node, key))
+        # The copy is written into the parent before the walk moves on; a
+        # chained assignment would bind `node` first and write into the copy.
+        child = dict(node[key])
+        node[key] = child
+        node = child
+    del node[keys[-1]]
+    for parent, key in reversed(parents):
+        if parent[key]:
+            break
+        del parent[key]
+
+
+def _replaced(tree, namespace, subtrees):
+    """`tree` with each collection's namespace subtree replaced, spines copied."""
+    replaced = dict(tree)
+    for collection, subtree in subtrees.items():
+        if not namespace:
+            replaced[collection] = subtree
+            continue
+        spine = dict(replaced[collection])
+        replaced[collection] = spine
+        node = spine
+        for name in namespace[:-1]:
+            node[name] = dict(node[name])
+            node = node[name]
+        node[namespace[-1]] = subtree
+    return replaced
+
+
+def logical(tree, sites):
+    """Put every declared stack's banks back under their stored `layers_N` paths (`StackView.unstack`):
+    a host step's gradient read in the store's own layout."""
+    for site in sites:
+        local = in_namespace(tree, site.namespace)
+        if local:
+            tree = _replaced(tree, site.namespace, site.view.unstack(local))
+    return tree
+
+
 def shape_rows(leaf: jax.ShapeDtypeStruct, count: int) -> list[jax.ShapeDtypeStruct]:
     """A bank's shape cut into its rows' (`spread`): the layer axis dropped."""
     return [jax.ShapeDtypeStruct(leaf.shape[1:], leaf.dtype)] * count
@@ -606,7 +686,7 @@ def placed_rows(bank: jax.Array, count: int) -> tuple[jax.Array, ...]:
     sharding places it, in the bank's memory, and the bank deleted after."""
     sharding = bank.sharding
     assert isinstance(sharding, NamedSharding), "a restored bank is placed by a layout's NamedSharding"
-    cut = jax.jit(_cut, static_argnames="count",
+    cut = program(_cut, static_argnames="count",
                   out_shardings=(row_sharding(sharding),) * count)(bank, count=count)
     bank.delete()
     return cut
@@ -658,19 +738,13 @@ def narrowed(tree: Mapping, selection: Mapping) -> dict:
     return collected
 
 
-def _typed(shapes: Variables, placement: Placement) -> Variables:
-    return jax.tree.map(
-        lambda leaf, sharding: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=sharding),
-        shapes, placement)
-
-
 def _row_placement(placement: Placement) -> Placement:
     """Return one layer's shardings out of a bank's: the layer axis dropped, in device
     memory, which is where the rows a bank is stacked out of are read."""
     def row(target):
         sharding = target.sharding if isinstance(target, Format) else target
         assert isinstance(sharding, NamedSharding)
-        return NamedSharding(sharding.mesh, P(*sharding.spec[1:]), memory_kind="device")
+        return row_sharding(sharding, memory_kind="device")
 
     return jax.tree.map(row, placement)
 
@@ -692,12 +766,12 @@ def _bank_placement(placement: Placement, shapes: Variables, stacked: bool) -> P
 
 
 class BankedModel(Protocol):
-    @property
-    def bank_sites(self) -> tuple[DecoderBank, ...]: ...
+    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]: ...
 
 
-def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
-    """Return the model's declared stacks, deduplicated by canonical namespace.
+def bank_sites(model: BankedModel, store: Variables) -> tuple[DecoderBank, ...]:
+    """Return the model's declared stacks over `store`, the variables (or their shapes) the banks are
+    drawn from, deduplicated by canonical namespace.
 
     Two readers of one physical scope declare the same site, so a shared
     decoder is packed once. Conflicting views of a namespace, overlapping
@@ -705,7 +779,7 @@ def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
     before any value is read.
     """
     owners: dict[tuple[str, ...], DecoderBank] = {}
-    for site in model.bank_sites:
+    for site in model.bank_sites(store):
         if any(not isinstance(name, str) or not name or "/" in name for name in site.namespace):
             raise ValueError("decoder namespaces must contain nonempty module names")
         previous = owners.get(site.namespace)
@@ -726,6 +800,29 @@ def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
     if any(right[:len(left)] == left for left, right in itertools.pairwise(ordered)):
         raise ValueError("declared decoder banks overlap in their canonical layer ownership")
     return tuple(owners.values())
+
+
+def assembled(sites: Sequence[DecoderBank],
+              bank: Callable[[DecoderBank, int, int, str], Variables | None]) -> dict[str, dict]:
+    """The banked store `sites` declare, one bank at a time: each site's groups in its stack's
+    order, `bank(site, first, count, name)` the bank named `name` of a group's `count` layers from
+    `first` (None for a group with nothing to hold), its copies landed (`block_until_ready`) before
+    the next is read, so a load has one bank's transfers in flight, and its collections set under
+    the site's namespace by that name. A source's whole banks (`LayerBanks.place`) and training's
+    snapshot of its state (`HostExecution.snapshot`) both assemble through it, each with its own
+    source and stacking."""
+    store: dict[str, dict] = {}
+    for site in sites:
+        for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
+            held = bank(site, first, count, name)
+            if held is None:
+                continue
+            for collection, tree in jax.block_until_ready(held).items():
+                branch = store.setdefault(collection, {})
+                for component in site.namespace:
+                    branch = branch.setdefault(component, {})
+                branch[name] = tree
+    return store
 
 
 def entry_tree(variables: Variables, sites: Sequence[DecoderBank]) -> Variables:
@@ -775,14 +872,14 @@ def _check_shapes(shapes: Variables, site: DecoderBank) -> None:
 def _bank_plan(model: BankedModel, source: LayerBanks, mesh: MeshSpec | Mesh | None,
                layout: Layout | None):
     """Validate canonical ownership and placement before either loader reads a value."""
-    from dew.training.distributed import (
+    from dew.distributed.placement import (
         Layout as DefaultLayout,
         MeshSpec as DefaultMesh,
         device_mesh as resolve_mesh,
     )
 
-    sites = bank_sites(model)
     shapes = source.shapes()
+    sites = bank_sites(model, shapes)
     for site in sites:
         _check_shapes(shapes, site)
     device_mesh = resolve_mesh(DefaultMesh() if mesh is None else mesh)

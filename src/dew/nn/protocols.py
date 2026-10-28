@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, Self, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -51,16 +51,17 @@ from dew.nn.inputs import ModelKwarg
 from dew.nn.precision import capped_logits, head_product, scaled_logits
 
 if TYPE_CHECKING:
+    from dew._records import JSON
     from dew.diffusion.process import DenoisingCondition
     from dew.inputs.encoders import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
+    from dew.nn.cross_attention import CrossAttention
     from dew.nn.dit import TextContext
     from dew.nn.dspark import DSpark
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.kv_cache import KVCache
     from dew.nn.mla import MLAMixer
     from dew.quantization import InputQuantizer
-    from dew.records import JSON
 
 __all__ = [
     "AffineHead",
@@ -68,6 +69,7 @@ __all__ = [
     "BlockDrafting",
     "Bounded",
     "CacheCapacity",
+    "Capability",
     "Counted",
     "CountedCondition",
     "CountedConditionLayout",
@@ -93,6 +95,7 @@ __all__ = [
     "Generating",
     "HiddenStates",
     "IntervalModel",
+    "Lacks",
     "LayerScalars",
     "LayerStates",
     "Layered",
@@ -105,6 +108,7 @@ __all__ = [
     "ProjectionGroup",
     "ProjectsParameters",
     "QuantizesInputs",
+    "ReadsTrain",
     "Recomputing",
     "RematChoosing",
     "RequiresText",
@@ -114,7 +118,32 @@ __all__ = [
     "TokenModel",
     "TritonGemm",
     "VocabularyRows",
+    "label_logits",
 ]
+
+
+type Capability = Literal["logits", "causal", "bidirectional", "packing", "cache", "interval", "guided",
+                          "features", "canvas"]
+"""What a consumer can need of a model past its protocols' presence: its logits (`Logits`, or states
+through a head), causal or bidirectional attention (`TokenModel.causal`), packed rows apart, a token
+by token decode cache (`Decoding`), an interval's duration (`IntervalModel`), a guidance input, block
+outputs a discriminator reads, or a canvas against a committed cache (`BlockDenoiser`)."""
+
+
+class Lacks(TypeError, ValueError):
+    """A consumer's refusal of a model for a capability it lacks, raised where the consumer first
+    reads it: as it admits the model, or in the step that reads it. `capability` names what it
+    lacks, so a caller tells the refusal from any other error by that and not by the message. A
+    TypeError, as a model of the wrong kind, and a ValueError, as one configured otherwise, as numpy's
+    `AxisError` is both of its errors."""
+
+    def __init__(self, capability: Capability, message: str):
+        super().__init__(message)
+        self.capability = capability
+
+    def __reduce__(self):
+        # Rebuilt from its own fields, as a pickle or a process boundary carries it.
+        return type(self), (self.capability, self.args[0])
 
 
 @struct.dataclass
@@ -157,6 +186,38 @@ class OutputTable:
                               self.states(hidden), self.matrix, self.precision, compute=self.compute)
         return capped_logits(scaled_logits(logits, self.scale, self.bias), self.softcap, temperature)
 
+    def columns(self, hidden: jax.Array, ids: Sequence[int] | jax.Array, *, temperature: float = 1.0,
+                exact: bool = False) -> jax.Array:
+        """`hidden`'s logits at the vocabulary columns `ids` alone, `[..., len(ids)]`: `logits`
+        restricted to them by construction, the same states (the input quantizer's QDQ), product
+        (`head_product`) at the table's precision and compute, scale and bias at `ids`
+        (`scaled_logits`) and softcap, so a fixed set of a few columns costs no full-vocabulary
+        product. `exact` computes the product in fp32 or wider at fp32 precision, whatever the
+        table's compute, as a readout that reads a label's logit exactly does. (`dew.objectives.lm
+        .chunked`'s support log probabilities restrict each position to its own ids, another
+        contraction.) Static `ids` outside the vocabulary are refused (IndexError); traced ids are
+        the caller's to bound."""
+        if isinstance(ids, jax.Array):
+            index: jax.Array | np.ndarray = ids
+        else:
+            index = np.asarray(ids, np.int64)
+            vocab = self.matrix.shape[0 if self.vocab_major else 1]
+            if index.size and (index.min() < 0 or index.max() >= vocab):
+                raise IndexError(f"columns {index.tolist()} reach past a vocabulary of {vocab}")
+        matrix = jnp.take(self.matrix, index, axis=0 if self.vocab_major else 1)
+        states = self.states(hidden)
+        subscripts = '...d,vd->...v' if self.vocab_major else '...d,dv->...v'
+        if exact:
+            wide = jnp.promote_types(states.dtype, jnp.float32)
+            logits = head_product(subscripts, states.astype(wide),
+                                  matrix.astype(jnp.promote_types(matrix.dtype, jnp.float32)),
+                                  jax.lax.Precision.HIGHEST, compute=wide)
+        else:
+            logits = head_product(subscripts, states, matrix, self.precision, compute=self.compute)
+        scale = None if self.scale is None else jnp.take(self.scale, index)
+        bias = None if self.bias is None else jnp.take(self.bias, index)
+        return capped_logits(scaled_logits(logits, scale, bias), self.softcap, temperature)
+
     def rows(self) -> jax.Array:
         """Each vocabulary token's `[vocab, features]` row: the matrix's, times
         the token's scale, whose dot product with a state is the token's logit
@@ -164,6 +225,41 @@ class OutputTable:
         of tokens' vectors (a decision head's lexical prior) takes these."""
         rows = self.matrix if self.vocab_major else self.matrix.T
         return rows if self.scale is None else rows * self.scale[:, None]
+
+
+@runtime_checkable
+class ReadsTrain(Protocol):
+    """A module whose call takes `train`, for a stochastic layer of its own (a token mixer's or a
+    feed-forward's dropout, a vision tower's drop path): its owner passes `train` where `reads_train`
+    says the call reads it, whatever the module's family."""
+
+    @property
+    def reads_train(self) -> bool: ...
+
+
+@runtime_checkable
+class SteppedInContext(Protocol):
+    """A model whose head reads parameters an objective steps in context, a window at a time
+    (`dew.nn.continuum`, `LMObjective(adaptation=...)`): the level's parameters within a tree of its
+    variables, None without a level; the tree with others in their place; and the two halves of the
+    head the steps run between, the level on final states (`continuum_states`) and the head past it
+    (`head_logits`). Its owner keeps the level's place in its tree, so an objective never reads it.
+    `in_context` says whether the model holds a level, and `affine_head`, read from the bound model,
+    whether `head_logits` is affine in its states, which a damped step's curvature bound needs
+    (`ChunkAdaptation.damped`)."""
+
+    @property
+    def in_context(self) -> bool: ...
+
+    def affine_head(self) -> bool: ...
+
+    def in_context_level(self, variables: VariableDict) -> VariableDict | None: ...
+
+    def with_in_context_level(self, variables: VariableDict, level: VariableDict) -> VariableDict: ...
+
+    def continuum_states(self, hidden: jax.Array) -> jax.Array: ...
+
+    def head_logits(self, states: jax.Array) -> jax.Array: ...
 
 
 @runtime_checkable
@@ -351,7 +447,11 @@ class CountedVideo(Protocol):
 class CountedDecisions(Protocol):
     """A decision head counts the layout's real questions and options with its rows."""
 
-    def decision_flops(self, lengths: np.ndarray, questions: np.ndarray, options: np.ndarray) -> float: ...
+    def decision_flops(self, lengths: np.ndarray, questions: np.ndarray, options: np.ndarray, *,
+                       pooled: np.ndarray | None = None) -> float:
+        """The head's work over rows of `lengths` tokens, their real questions and options, its spans
+        pooled over `pooled` tokens a row where they are not the row's (a context's)."""
+        ...
 
 
 @runtime_checkable
@@ -393,6 +493,38 @@ class AffineHead(Protocol):
     """
 
     def output_table(self) -> OutputTable | None: ...
+
+
+def head_table(model: nn.Module, variables) -> OutputTable | None:
+    """`model`'s head over `variables` as one matrix (`AffineHead.output_table`),
+    or None for a model whose head no matrix alone is, or that names none: the
+    one checked read of a model's output table, which a loss and a readout share."""
+    table = model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
+    if table is not None and not isinstance(table, OutputTable):
+        raise TypeError(f"{type(model).__name__}.output_table gives a {type(table).__name__}, "
+                        f"not an OutputTable")
+    return table
+
+
+def label_logits(model: nn.Module, variables, answers: jax.Array, ids: Sequence[Sequence[int]]) -> jax.Array:
+    """`model`'s own logits `[B, N, K, V]` at each of the `[K, V]` label `ids` of each answer state of
+    `answers` `[B, N, features]`, a class read as its label's tokens' logits (a verbalizer): its output
+    table at the labels' columns alone, computed in fp32 (`OutputTable.columns`), where one matrix is
+    its head (`head_table`); else its exact head over the answer states, a few rows
+    (`LogitsFromHidden`), the labels' columns taken. No product is rebuilt from the vocabulary's rows,
+    which carry no bias and no softcap."""
+    held = np.asarray(ids, np.int64)
+    table = head_table(model, variables)
+    if table is not None:
+        return table.columns(answers, held.reshape(-1).tolist(), exact=True).reshape(
+            *answers.shape[:2], *held.shape)
+    if not isinstance(model, LogitsFromHidden):
+        raise TypeError(f"a readout of labels reads its backbone's exact head, which a "
+                        f"{type(model).__name__} does not give (AffineHead, LogitsFromHidden)")
+    full = jnp.asarray(model.apply(variables, answers, method="logits_from_hidden"))
+    picked = jnp.take(full, jnp.asarray(held.reshape(-1)), axis=-1)
+    return picked.astype(jnp.promote_types(picked.dtype, jnp.float32)).reshape(
+        *answers.shape[:2], *held.shape)
 
 
 @runtime_checkable
@@ -458,6 +590,36 @@ class RematChoosing(Protocol):
 
 
 @runtime_checkable
+class CrossAttending(Protocol):
+    """A decoder whose layers can read a conditioning sequence through gated
+    cross-attention (`dew.nn.cross_attention`): CausalTransformer answers this."""
+
+    cross_attention: CrossAttention | None
+
+    @property
+    def context_width(self) -> int:
+        """The width of the tokens of a context its cross-attention layers read."""
+        ...
+
+    @property
+    def context_dtype(self) -> jnp.dtype:
+        """The dtype a context's tokens enter its cross-attention layers in."""
+        ...
+
+    def cross_flops(self, lengths, context_lengths) -> float:
+        """The cross-attention layers' forward work over rows of `lengths` tokens reading contexts
+        of `context_lengths` tokens."""
+        ...
+
+    def token_embeddings(self, tokens: jax.Array) -> jax.Array:
+        """Each token's row of the model's own table, unscaled and without positions: a context's
+        tokens as a cross-attention reads them by the table (`dew.nn.cross_attention.encode_context`)."""
+        ...
+
+    def with_cross_attention(self, cross: CrossAttention | None) -> Self: ...
+
+
+@runtime_checkable
 class ProjectsParameters(Protocol):
     """A model whose training keeps a constraint on the parameters it stores.
 
@@ -485,7 +647,7 @@ class Recomputing(Protocol):
     own: a resumed run never compiles a lighter rung than it trained on.
     `recompute_half` is the model one rung up where that rung recomputes only
     the few values it names, a half rung the planner tries at each split
-    (`dew.training.planning.plan_step`), else None."""
+    (`dew.training.planning.FitSearch`), else None."""
 
     def recompute_record(self) -> JSON: ...
 
@@ -541,6 +703,16 @@ top_k]` record (`CausalTransformer.hidden_states`)."""
 
 
 @runtime_checkable
+class RoutesBlocks(Protocol):
+    """A routed feed-forward that chooses experts block by block (LLaDA2.2's), each block of
+    `routing_block` places sharing a shortlist when that is set: its caller hands it each token's
+    block (`dew.nn.inputs.routing_blocks`)."""
+
+    @property
+    def routing_block(self) -> int | None: ...
+
+
+@runtime_checkable
 class RoutesExperts(Protocol):
     """A module whose call takes `routes`, a layer's replayed experts, because
     it routes over experts: a routed feed-forward, or a token mixer holding one
@@ -559,6 +731,16 @@ class ProjectionSites(Protocol):
     def projection_groups(self) -> tuple[ProjectionGroup, ...]: ...
 
 
+def held_groups(inner: Serving, name: str, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
+    """The groups `inner`, held under `name` in a wrapper's variables, declares
+    (`Serving.inference_projection_groups`), at their paths in the wrapper's tree: what a module
+    around a decoder answers as its own groups, a multimodal model's around its language model or
+    a user's around Dew's decoder."""
+    held = {collection: tree[name] for collection, tree in variables.items() if name in tree}
+    return tuple(dataclasses.replace(group, path=(name, *group.path))
+                 for group in inner.inference_projection_groups(held))
+
+
 def declared_groups(*modules: nn.Module) -> tuple[ProjectionGroup, ...]:
     """The groups the bound `modules` declare, in order; a module declaring none adds none."""
     return tuple(group for module in modules if isinstance(module, ProjectionSites)
@@ -570,7 +752,11 @@ class Serving(Protocol):
     """What a server reads off a decoder. `inference_projection_groups` names
     the packed groups `variables` hold, packed or as every member (the packer
     checks the members concatenate; a model that does not decode
-    autoregressively names none). `cache_rebuild_position` is where cached
+    autoregressively names none). It reads which parameters the tree holds and
+    their shapes, never their values or placement, and the model is an unbound,
+    hashable module, so its answer is kept per model and tree shape
+    (`dew.inference.projections`) and is called over `jax.ShapeDtypeStruct`
+    leaves. `cache_rebuild_position` is where cached
     keys go stale and the prefix is recomputed (LongRoPE's long factors,
     Phi-3), or None. `mixed_admission_refusal` says why its layers would not
     run a mixed call (`dew.nn.inputs.Admitted`) as separate decode and
@@ -588,6 +774,80 @@ class Serving(Protocol):
     def mixed_admission_refusal(self) -> str | None: ...
 
     def split_prefill_refusal(self) -> str | None: ...
+
+
+@runtime_checkable
+class BlockReading(Protocol):
+    """A decoder whose trunk layers may read a block whole (`AttentionMixer.bidirectional_blocks`: a block's
+    tokens see each other both ways). `block_chunks` lists each trunk layer that reads blocks by its attention
+    chunk, None where it has none. A prefix run needs one: its blocks reach a model call as `block_groups`,
+    and a layer that reads none computes them causally."""
+
+    def block_chunks(self) -> tuple[int | None, ...]: ...
+
+
+def block_chunks_of(model: nn.Module) -> tuple[int | None, ...]:
+    """The attention chunk of each trunk layer that reads blocks whole, None where a layer has none; empty for
+    a model that says nothing, or whose layers read none (`BlockReading`)."""
+    return model.block_chunks() if isinstance(model, BlockReading) else ()
+
+
+def whole_block(chunks: tuple[int | None, ...]) -> bool:
+    """Whether a layer that reads blocks reads every block whole: one with no attention chunk. A chunk is
+    a run of places counted from 0 (`chunk_mask`), and a block's places start wherever its tokens sit in
+    their document, a window that continues a document or a prompt after cached tokens included, so a
+    chunk of any length cuts a block that crosses one of its multiples. The loss drops every target inside
+    a block, so a layer must read the block's every token for its targets to be ones its source saw."""
+    return any(chunk is None for chunk in chunks)
+
+
+def refuse_block_reading(model: nn.Module, reading: str) -> None:
+    """Refuse `reading` blocks (a prefix run's, a batch's) where `model` cannot read them whole: it needs a
+    trunk layer that reads blocks (`block_chunks_of`) with no attention chunk (`whole_block`). The loss drops
+    the targets inside a block, which the trunk sees only where a layer reads the whole block. A prefix run
+    and a batch that carries its own blocks are both admitted by this one rule."""
+    chunks = block_chunks_of(model)
+    if not chunks:
+        raise ValueError(f"{reading} needs a trunk layer that reads blocks "
+                         f"(AttentionMixer.bidirectional_blocks), and {type(model).__name__} has none")
+    if not whole_block(chunks):
+        raise ValueError(f"{reading} is read whole only by a layer with no attention chunk, and every layer "
+                         f"of {type(model).__name__} that reads blocks has one ({list(chunks)}), which cuts "
+                         "a block that crosses its multiples")
+
+
+def refuse_prefix(model: nn.Module, prefix: int | Literal["prompt"] | None, *, longest: int | None) -> None:
+    """Refuse a prefix run the model or its values cannot take. A prefix is "prompt" or a positive number of
+    tokens, at most `longest` where a longest row is declared, and its blocks are read as a batch's are
+    (`refuse_block_reading`)."""
+    if prefix is None:
+        return
+    if prefix != "prompt" and (type(prefix) is not int or prefix < 1):
+        raise ValueError(f"prefix is 'prompt' or a positive number of tokens, got {prefix!r}")
+    if isinstance(prefix, int) and longest is not None and prefix > longest:
+        raise ValueError(f"prefix {prefix} is more tokens than the longest row, {longest}")
+    refuse_block_reading(model, "a prefix's blocks")
+
+
+@runtime_checkable
+class ShiftsLogits(Protocol):
+    """A masked-diffusion model that declares how its logits line up with its inputs: with
+    `shifted_logits`, position i's prediction is position i-1's logits (Dream-v0's). A model that
+    declares nothing predicts each position's own."""
+
+    @property
+    def shifted_logits(self) -> bool: ...
+
+
+@runtime_checkable
+class PositionCapacity(Protocol):
+    """A model that declares the most places a row may hold that its positions cover, which a row longer
+    than that would read past (a learned table's rows), None where its positions cover any (rotary,
+    ALiBi): what a training row's length is checked against, apart from its decode cache's capacity
+    (`Bounded.max_seq_len`). A model that declares none is checked for none."""
+
+    @property
+    def position_capacity(self) -> int | None: ...
 
 
 @runtime_checkable

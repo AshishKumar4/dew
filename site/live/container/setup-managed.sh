@@ -10,6 +10,8 @@ done
 apt-get update
 apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl libcap2-bin libseccomp2 bubblewrap
 python3 -m venv /opt/venv
+# tools/pip.txt's pip first: older pips trust the roots of eMudhra's compromised CAs (2026-10-20).
+/opt/venv/bin/pip install --no-cache-dir --quiet -r "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/tools/pip.txt"
 # One pass under the suite's lock (tools/lock_environment.sh), which pins every package the live,
 # streaming and profile extras reach, so the container runs the versions CI tests and no package it
 # runs resolves on its own (pip's build tools for Dew's own tarball are outside the lock).
@@ -30,7 +32,8 @@ for file in text-to-image text-models; do
     curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/site/live/container/$file" -o "/opt/live/$file"
 done
 for file in guest_limits.py guest_entry.py gateway_manager.py start-gateway.sh benchmark_gateway.py warm-managed.py progress.py model_client.py model_service.py live_training.py \
-            shared_bridge.py kernel_outputs.py start-shared.sh smoke-shared.py prepare-cells.py; do
+            shared_bridge.py guests.py kernel_outputs.py start-shared.sh smoke-shared.py prepare-cells.py training-probe.py \
+            isolation-probe.py foreign-probe.py warm-image.py measure-text.py page-text.py page-image.py fill-memory.py; do
     curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$source/site/live/container/$file" -o "/opt/live/$file"
 done
 printf '%s\n' "$commit" > /opt/live/dew-commit

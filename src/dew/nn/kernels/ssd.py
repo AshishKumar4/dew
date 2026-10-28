@@ -27,18 +27,14 @@ holds the kernel to `chunk_ssd` and its `jax.grad`.
 
 from __future__ import annotations
 
-import functools
-import logging
-
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.typing import DTypeLike
 
+from ..precision import float32_products, products_dtype
 from . import generation
-
-_log = logging.getLogger(__name__)
 
 MIN_WIDTH = 8
 """The narrowest chunk, head width or state width the kernel is chosen for.
@@ -59,7 +55,7 @@ EXACT = jax.lax.Precision.HIGHEST
 Their operands are the chunk's `A dt` against a 0/1 matrix, so a pass in
 bf16 or tf32 would round the exponent itself, and `exp` would carry that
 rounding into every decay the chunk applies. The matmuls over the operands
-are left at the default the XLA path's einsums use."""
+take their dtype's precision (`_mm`)."""
 
 
 def _program_words(chunk_size: int, head_dim: int, state_size: int) -> int:
@@ -89,29 +85,14 @@ def ssd_kernel_runs(chunk_size: int, head_dim: int, state_size: int, backend: st
     return chunk_size >= MIN_CHUNK and _program_words(*widths) <= TPU_PROGRAM_WORDS
 
 
-@functools.cache
-def _announce(backend: str, chunk_size: int, head_dim: int, state_size: int,
-              platform: str | None) -> None:
-    """One line per geometry a process traces, from the trace that chose."""
-    geometry = f"chunk {chunk_size}, head width {head_dim}, state {state_size}"
-    if platform is None:
-        _log.info("mamba2 ssd scan on %s: the xla path (%s, %d fp32 words a program)",
-                  backend, geometry, _program_words(chunk_size, head_dim, state_size))
-    else:
-        _log.info("mamba2 ssd scan on %s: the pallas kernel (%s)", platform, geometry)
-
-
 def ssd_kernel_platform(chunk_size: int, head_dim: int, state_size: int, *,
                         dtype: DTypeLike) -> str | None:
     """Return the backend to build this `dtype` scan's kernel for, or None for the XLA path.
 
-    The choice is logged once per geometry.
-    """
+    The scan's route is the selector's to report (`recurrence_chunk.SCAN`, `generation`'s Route
+    collection), where the kernel report reads it (row 971)."""
     backend = generation.backend()
-    platform = backend if ssd_kernel_runs(chunk_size, head_dim, state_size, backend,
-                                          dtype=dtype) else None
-    _announce(backend, chunk_size, head_dim, state_size, platform)
-    return platform
+    return backend if ssd_kernel_runs(chunk_size, head_dim, state_size, backend, dtype=dtype) else None
 
 
 def _triangles(size: int):
@@ -150,6 +131,13 @@ def _last_row(matrix):
     return jnp.sum(jnp.where(_bottom(matrix.shape[0]), matrix, 0.0), axis=0)
 
 
+def _mm(lhs, rhs):
+    """`lhs @ rhs` at the precision its operands' dtype states (`precision.float32_products`): the chunk's
+    fp32 operands multiplied in fp32, where a TPU's Pallas matmul at its default precision takes one bf16
+    pass (template numerics review 2026-10-26 follow-up, P1-1: every Mamba-2 layer's scan on a TPU)."""
+    return jnp.matmul(lhs, rhs, precision=float32_products(products_dtype(lhs, rhs)))
+
+
 def _chunk_forward(x, b, c, a, state):
     """One chunk in fp32: `x` `[C, P]` already scaled by `dt`, `b` and `c`
     `[C, N]`, `a` `[C]` the per-step `A dt`, `state` `[P, N]` entering it.
@@ -159,8 +147,8 @@ def _chunk_forward(x, b, c, a, state):
     decay = jnp.where(below, jnp.exp(segments), 0.0)
     entered = jnp.exp(jnp.sum(spread, axis=-1))
     leaving, alpha = jnp.exp(_last_row(segments)), jnp.exp(jnp.sum(a))
-    y = (c @ b.T * decay) @ x + entered[:, None] * (c @ state.T)
-    return y, alpha * state + x.T @ (b * leaving[:, None])
+    y = _mm(_mm(c, b.T) * decay, x) + entered[:, None] * _mm(c, state.T)
+    return y, alpha * state + _mm(x.T, b * leaving[:, None])
 
 
 def _chunk_backward(x, b, c, a, state, dy, dnext):
@@ -173,12 +161,12 @@ def _chunk_backward(x, b, c, a, state, dy, dnext):
     entered = jnp.exp(jnp.sum(spread, axis=-1))
     leaving, alpha = jnp.exp(_last_row(segments)), jnp.exp(jnp.sum(a))
 
-    gram, outer = c @ b.T, dy @ x.T
-    dgram, written = outer * decay, x @ dnext
-    dx = (gram * decay).T @ dy + (b * leaving[:, None]) @ dnext.T
-    db = dgram.T @ c + written * leaving[:, None]
-    dc = dgram @ b + entered[:, None] * (dy @ state)
-    dstate = (dy * entered[:, None]).T @ c + alpha * dnext
+    gram, outer = _mm(c, b.T), _mm(dy, x.T)
+    dgram, written = outer * decay, _mm(x, dnext)
+    dx = _mm((gram * decay).T, dy) + _mm(b * leaving[:, None], dnext.T)
+    db = _mm(dgram.T, c) + written * leaving[:, None]
+    dc = _mm(dgram, b) + entered[:, None] * _mm(dy, state)
+    dstate = _mm((dy * entered[:, None]).T, c) + alpha * dnext
 
     dleaving = jnp.sum(written * b, axis=1) * leaving
     dsegments = (jnp.where(below, outer * gram * decay, 0.0)
@@ -187,7 +175,7 @@ def _chunk_backward(x, b, c, a, state, dy, dnext):
                                   precision=EXACT)
     # Every step of the chunk feeds `acs` and the chunk's total alike, so what
     # reaches those two spreads back over the whole of `a` rather than a step.
-    dspread = dspread + (jnp.sum(dy * (c @ state.T), axis=1) * entered)[:, None]
+    dspread = dspread + (jnp.sum(dy * _mm(c, state.T), axis=1) * entered)[:, None]
     da = jnp.sum(jnp.where(below, dspread, 0.0), axis=0) + jnp.sum(dnext * state) * alpha
     return dx, db, dc, da, dstate
 

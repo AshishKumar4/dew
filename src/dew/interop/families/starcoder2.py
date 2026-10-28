@@ -5,11 +5,12 @@ an ungated feed-forward, every map biased under `use_bias`."""
 from collections.abc import Mapping
 from functools import partial
 
-from dew import records
+from dew import _records
 from dew.interop.decoder_parts import (
+    GPT_MLP,
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
-    Renames,
     base_config,
     hf_ungated,
     renamed_name,
@@ -20,14 +21,14 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
 def _starcoder2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    activation = records.text(hf.get('hidden_act', 'gelu_pytorch_tanh'), 'hidden_act')
+    activation = _records.text(hf.get('hidden_act', 'gelu_pytorch_tanh'), 'hidden_act')
     mlp = ungated_mlp(activation, ('gelu_pytorch_tanh', 'gelu_new', 'gelu', 'relu'), 'hidden_act',
                       'Starcoder2')
-    layers = records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
+    layers = _records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
     # Starcoder2Model masks every layer by the window when one is set.
     window = hf.get('sliding_window')
     # base_config reads the gated activations; the ungated one is set below.
-    config = base_config({**hf, 'hidden_act': 'gelu_pytorch_tanh'}, used,
+    config = base_config({**hf, 'hidden_act': 'gelu_pytorch_tanh'}, used, rope=PLAIN_SPELLING,
                          layer_types=('full_attention' if window is None else 'sliding_attention',) * layers,
                          tie_embeddings=True, reads=frozenset({'sliding_window'}))
     biased = bool(hf.get('use_bias', True))
@@ -38,15 +39,12 @@ def _starcoder2_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     config.update({
         'mlp': mlp, 'mlp_bias': biased, 'attention_bias': biased,
         'norm_type': 'layer', 'norm_bias': True,
-        'norm_eps': records.number(hf.get('norm_epsilon', 1e-5), 'norm_epsilon'),
-        'dropout_rate': records.number(hf.get('residual_dropout', 0.), 'residual_dropout'),
-        'embedding_dropout_rate': records.number(hf.get('embedding_dropout', 0.), 'embedding_dropout'),
-        'attention_dropout_rate': records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
+        'norm_eps': _records.number(hf.get('norm_epsilon', 1e-5), 'norm_epsilon'),
+        'dropout_rate': _records.number(hf.get('residual_dropout', 0.), 'residual_dropout'),
+        'embedding_dropout_rate': _records.number(hf.get('embedding_dropout', 0.), 'embedding_dropout'),
+        'attention_dropout_rate': _records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
     })
     return config
-
-
-_STARCODER2_NAMES: Renames = (('mlp.c_fc', 'mlp.up_proj'), ('mlp.c_proj', 'mlp.down_proj'))
 
 
 def _starcoder2_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -79,7 +77,9 @@ def _matches(fields: CausalTransformer) -> bool:
 
 STARCODER2 = DecoderFamily(
     ('starcoder2',), _starcoder2_config, _matches, 'starcoder2', 'Starcoder2ForCausalLM', _starcoder2_export,
-    weight_path=partial(renamed_path, _STARCODER2_NAMES),
-    export_path=partial(renamed_name, _STARCODER2_NAMES),
+    weight_path=partial(renamed_path, GPT_MLP),
+    export_path=partial(renamed_name, GPT_MLP),
     preserve_source_layout=False,
+    padding_idx=True,
+    defaults={'max_position_embeddings': 4096},
 )

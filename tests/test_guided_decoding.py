@@ -11,11 +11,13 @@ likelihood stays the model's own.
 """
 
 import json
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from token_support import byte_level_tokenizer
 
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server
@@ -30,17 +32,7 @@ EOS = 256
 @pytest.fixture(scope="module")
 def tokenizer(tmp_path_factory):
     """A byte-level BPE over all 256 bytes, so any text has a spelling."""
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
-    from transformers import AutoTokenizer, PreTrainedTokenizerFast
-    from transformers.convert_slow_tokenizer import bytes_to_unicode
-
-    alphabet = bytes_to_unicode()
-    backend = Tokenizer(models.BPE({alphabet[byte]: byte for byte in range(256)}, [], unk_token=None))
-    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    backend.decoder = decoders.ByteLevel()
-    path = tmp_path_factory.mktemp("bytes")
-    PreTrainedTokenizerFast(tokenizer_object=backend).save_pretrained(path)
-    return AutoTokenizer.from_pretrained(path, local_files_only=True)
+    return byte_level_tokenizer(tmp_path_factory.mktemp("bytes"))
 
 
 _DEFAULT_TASK_SAMPLING = Sampling(temperature=0, eos_token_ids=EOS)
@@ -190,5 +182,31 @@ def test_the_raw_likelihood_is_the_models_own_and_the_behaviour_one_the_masked(t
     grammar = guided.regex(tokenizer, "7", EOS, vocab_size=EOS + 1)
     rows = task(tokenizer, grammar, Sampling(temperature=1.0, eos_token_ids=EOS))("q", 4, key=0).host()
     assert continuation(tokenizer, rows) == "7" and bool(rows.terminated[0])
-    np.testing.assert_allclose(rows.behavior_log_probs[0, :2], 0.0, atol=1e-6)
+    np.testing.assert_array_equal(rows.behavior_log_probs[0, :2], 0.0)
     assert np.all(rows.raw_log_probs[0, :2] < 0)
+
+
+@pytest.mark.parametrize("name", ["gpt2", "t5", "llama", "wordpiece"])
+def test_a_grammar_compiles_only_over_a_tokenizer_that_spells_every_piece_alike_at_the_start(tmp_path, name):
+    """The automaton holds each piece to the pattern as the decoder spells it mid-text. GPT-2's
+    byte-level BPE spells a piece alike at the start of a text, so its grammar compiles; T5's
+    SentencePiece and a byte-fallback Llama drop a piece's leading space there, and WordPiece the
+    space before a word, so a guided row could decode outside the pattern, and they are refused."""
+    from token_support import wordpiece_tokenizer
+    from transformers import AutoTokenizer
+
+
+    fixtures = Path(__file__).resolve().parent / "fixtures"
+    if name == "wordpiece":
+        tokenizer = wordpiece_tokenizer(tmp_path / name)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(str({"gpt2": fixtures / "tokenizers" / "gpt2",
+                                                       "t5": fixtures / "t5" / "tiny",
+                                                       "llama": fixtures / "llama_cpp" / "tokenizer"}[name]),
+                                                  local_files_only=True)
+    eos = tokenizer.eos_token_id if tokenizer.eos_token_id is not None else tokenizer.sep_token_id
+    if name == "gpt2":
+        guided.regex(tokenizer, "[a-z ]+", eos)
+    else:
+        with pytest.raises(ValueError):
+            guided.regex(tokenizer, "[a-z ]+", eos)

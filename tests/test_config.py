@@ -9,30 +9,33 @@ from typing import TYPE_CHECKING, Any
 import jax.numpy as jnp
 import pytest
 from affine_run import TimingRegression as Regression, batches
+from diffusion_support import images_of
 from flax import linen as nn
 
 import dew.config
 import dew.nn.backbones
-from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.data.dataset import Loader
+from dew.checkpoints import RUN_FILE
+from dew.config import RunConfig, TrainerConfig
+from dew.config.diffusion import DiffusionRunConfig
+from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
-from dew.objectives.diffusion import DiffusionRunConfig
-from dew.registry import Aliases, datasets, projectors, towers
-from dew.training import Checkpoints, Layout, MeshSpec
+from dew.optim import OptimConfig
+from dew.registry import Aliases, ModelConfig, projectors, towers
+from dew.training import Checkpoints, Layout, MeshSpec, Wandb
 
 
-@pytest.mark.parametrize("dataset", ["tfds", "arrayrecord_shards", "arrayrecord_path"])
+@pytest.mark.parametrize("dataset", ["tfds", "arrayrecord_shards"])
 def test_to_dict_and_from_dict_round_trip_a_run(dataset, tmp_path):
-    from dew.config.data import ImageData
-    from dew.data import Files
+    """A run's record holds its data as its chain's record (`dew.data.records`), the preset it calls
+    with its settings, which reads back the chain it was."""
+    from dew.data import Files, presets
+    from dew.data.sources import source
 
     data = {
-        "tfds": ImageData(source="tfds://oxford_flowers102", image_size=64),
-        "arrayrecord_shards": ImageData(
-            source=Files((str(tmp_path / "cc12m" / "*.array_record"),), format="array_record"),
-            image_size=64),
-        "arrayrecord_path": ImageData(source=str(tmp_path), image_size=8),
+        "tfds": source("tfds://oxford_flowers102").pipe(presets.images, 64, batch=32),
+        "arrayrecord_shards": Files((str(tmp_path / "cc12m" / "*.array_record"),),
+                                    format="array_record").pipe(presets.images, 64, batch=32),
     }[dataset]
     config = RunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 64}),
@@ -43,8 +46,37 @@ def test_to_dict_and_from_dict_round_trip_a_run(dataset, tmp_path):
     )
     record = config.to_dict()
     assert record["trainer"]["layout"]["rules"] == [["mlp", "fsdp"]]
-    assert RunConfig.from_dict(json.loads(json.dumps(record))) == config
-    assert record["data"]["class"] == datasets.paths["images"]
+    assert RunConfig.from_dict(json.loads(json.dumps(record))).to_dict() == record
+    assert record["data"]["stages"][-1]["pipe"] == "dew.data.presets:images"
+
+
+def test_a_chain_the_record_cannot_describe_trains_from_python_and_refuses_to_rebuild():
+    """A chain with a step only Python holds (a lambda) is recorded as unrecorded, with the reason,
+    and rebuilding the run from that record is refused by name."""
+    from dew.data import Memory
+
+    data = Memory([{"x": 1.0, "y": 2.0}] * 8).map(lambda record: record).batch(8)
+    record = RunConfig(data=data, trainer=TrainerConfig(steps=1)).to_dict()
+    assert set(record["data"]) == {"unrecorded"}
+    with pytest.raises(ValueError):
+        RunConfig.from_dict(json.loads(json.dumps(record)))
+
+
+def test_named_validation_splits_read_back_in_their_order(tmp_path):
+    """A run's named validation splits are recorded in their order, which a saved run.json keeps: the
+    first is the split a run ranks its checkpoints and calibrates on, so a save must not move another
+    ahead of it."""
+    from dew.data import presets
+    from dew.data.sources.tokens import TokenFiles
+
+    def windows(url):
+        return TokenFiles(url).pipe(presets.token_windows, seq_len=8, batch=2)
+
+    config = RunConfig(data=windows("tokens/train"), trainer=TrainerConfig(steps=1),
+                       validation={"val": windows("tokens/val"), "test": windows("tokens/test")})
+    loaded = RunConfig.load(config.save(str(tmp_path / "run")))
+    assert isinstance(loaded.validation, Mapping) and list(loaded.validation) == ["val", "test"]
+    assert [split.source.url for split in loaded.validation.values()] == ["tokens/val", "tokens/test"]
 
 
 def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
@@ -57,57 +89,28 @@ def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
         RunConfig.from_dict({**record, "data": {"class": "flowers", "fields": {}}})
 
 
-@pytest.mark.parametrize("fields", [
-    {"batch_tokens": 24},
-    {"update_tokens": 96},
-    {"batch_tokens": 24, "update_tokens": 96},
-    {"batch_size": None, "batch_tokens": 0, "update_tokens": 96},
-    {"batch_size": None, "batch_tokens": 24, "update_tokens": 95},
-    {"batch_size": None},
-])
-def test_token_budget_flags_refuse_an_ambiguous_or_fractional_batch(fields):
+def test_a_token_budget_refuses_a_ramp_or_a_budget_under_one_token():
     with pytest.raises(ValueError):
-        TrainerConfig(**fields)
-
-
-def test_token_budgets_determine_the_accumulation_every_reader_sees():
-    """The budgets set the accumulation in the config itself, so RunConfig.train's
-    Trainer commits once a window as a prepared run does; one at odds refuses."""
-    config = RunConfig(trainer=TrainerConfig(batch_size=None, batch_tokens=24576, update_tokens=98304,
-                                             steps=1))
-    assert config.trainer.accumulation == 4
-    loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
-    assert loaded.trainer.batch_size is None
-    assert loaded.trainer.batch_tokens == 24576 and loaded.trainer.update_tokens == 98304
-    assert loaded.trainer == config.trainer
+        TrainerConfig(update_tokens=0)
     with pytest.raises(ValueError):
-        dataclasses.replace(config.trainer, accumulation=3)
+        TrainerConfig(update_tokens=96, batch_ramp=Ramp(start=8, increment=8, samples=8))
 
 
-def test_coupled_fields_are_set_together():
-    """A row-batched run switches to token budgets by one set of assignments,
-    in any order, though no one of them is valid alone."""
-    rows = RunConfig(trainer=TrainerConfig(steps=1))
-    for order in (["trainer.batch_size=None", "trainer.batch_tokens=24", "trainer.update_tokens=96"],
-                  ["trainer.update_tokens=96", "trainer.batch_tokens=24", "trainer.batch_size=None"]):
-        budgeted = rows.assigned(order).trainer
-        assert (budgeted.batch_size, budgeted.batch_tokens, budgeted.accumulation) == (None, 24, 4)
-
-
-def test_an_unregistered_member_fails_at_write_not_at_reload(tmp_path):
-    """A spec the registry does not know cannot be written: to_dict raises
-    now, instead of saving a record from_dict can never load back."""
-    from dew.config.data import ImageData
-
-    @dataclasses.dataclass(frozen=True)
-    class Unregistered(ImageData):
-        pass
-
-    config = RunConfig(
-        data=Unregistered(source=str(tmp_path), image_size=8),
-        trainer=TrainerConfig(steps=1))
+def test_a_token_budget_sets_the_accumulation_over_its_datas_token_batches():
+    """The data's batch stage is the run's one batch: a budget of tokens an update sets the
+    accumulation to that many of the data's token batches (`TrainerConfig.accumulating`), and refuses
+    data batched in rows, a budget no whole number of its batches, or an accumulation set otherwise."""
+    trainer = TrainerConfig(update_tokens=98304, steps=1)
+    tokens = Loader(train=lambda partition: iter(()), val=None, records=None, batch=8, batch_tokens=24576)
+    assert trainer.accumulating(tokens).accumulation == 4
+    recorded = json.loads(json.dumps(RunConfig(trainer=trainer).to_dict()))
+    assert RunConfig.from_dict(recorded).trainer == trainer
+    for refused in (dataclasses.replace(tokens, batch_tokens=None),
+                    dataclasses.replace(tokens, batch_tokens=24575)):
+        with pytest.raises(ValueError):
+            trainer.accumulating(refused)
     with pytest.raises(ValueError):
-        config.to_dict()
+        dataclasses.replace(trainer, accumulation=3).accumulating(tokens)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -141,6 +144,27 @@ def test_the_model_config_builds_with_its_own_dtype_and_attention():
         params, ids)
     assert logits.dtype == jnp.float32
     assert jnp.array_equal(logits, expected)
+
+
+@pytest.mark.parametrize("scaling", ["llama3", "longrope"])
+def test_dtype_changes_preserve_union_held_rotary_policies(scaling):
+    """Model metadata may hold either rotary policy. It survives a compute-dtype override while
+    the model can still run on the same parameter tree."""
+    import jax
+
+    from dew.nn.rope import LongRopeScaling, RopeScaling
+
+    policy = (RopeScaling(8.0, 1.0, 4.0, 16) if scaling == "llama3" else
+              LongRopeScaling((1.0,) * 4, (2.0,) * 4, 16, factor=2.0))
+    model = CausalTransformer(vocab_size=16, emb_features=16, num_layers=1, num_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=32, rope_scaling=policy,
+                              dtype="float32", attention_impl="reference")
+    configured = ModelConfig.from_model(model).with_dtype("bfloat16").build()
+    ids = jnp.asarray([[1, 2, 3]], jnp.int32)
+    variables = model.init(jax.random.key(0), ids)
+    expected = model.clone(dtype=jnp.bfloat16).apply(variables, ids)
+    actual = configured.apply(variables, ids)
+    assert jnp.array_equal(actual, expected)
 
 
 class Unprecise(nn.Module):
@@ -181,17 +205,16 @@ def test_the_run_length_is_steps_or_epochs():
         TrainerConfig().total_steps(sized)
 
 
-def test_the_cli_parses_the_mesh_the_layout_and_a_dataset_subcommand():
-    config = RunConfig.cli( [
+def test_the_cli_parses_the_mesh_the_layout_and_a_setting_of_the_chain():
+    config = RunConfig.cli([
         "--trainer.mesh.fsdp", "2", "--trainer.layout.min-shard", "8",
         "--trainer.steps", "5", "--model", "uvit", "--model.emb_features", "32",
-        "data:text", "--data.source", "tokens", "--data.seq-len", "8"])
+        "--set", "data.images.size=64"], default=RunConfig(data=images_of("tfds://oxford_flowers102", 32)))
     assert config.trainer.mesh == MeshSpec(fsdp=2)
     assert config.trainer.layout.min_shard == 8
     assert config.model.fields == {"emb_features": 32}
-    assert type(config.data) is datasets["text"]
-    assert config.data.seq_len == 8
-    assert RunConfig.from_dict(config.to_dict()) == config
+    assert config.data is not None and config.data.facts()["fields"]["image"] == [64, 64, 3]
+    assert RunConfig.from_dict(config.to_dict()).to_dict() == config.to_dict()
 
 
 
@@ -290,7 +313,7 @@ def _data(records=48, batch=8):
 
 
 def test_a_run_records_its_token_budget_and_final_checkpoint_policy(tmp_path):
-    config = TrainerConfig(tokens=30, checkpoint_final=False, batch_size=8,
+    config = TrainerConfig(tokens=30, checkpoint_final=False,
                            checkpoint_dir=str(tmp_path), eval_every=None, checkpoint_every=None)
     run = RunConfig(trainer=config)
     assert RunConfig.from_dict(run.to_dict()).trainer == config
@@ -298,38 +321,41 @@ def test_a_run_records_its_token_budget_and_final_checkpoint_policy(tmp_path):
 
 
 def test_a_run_can_disable_final_checkpoint_saving(tmp_path):
-    run = RunConfig(trainer=TrainerConfig(steps=1, checkpoint_final=False, batch_size=8,
+    run = RunConfig(trainer=TrainerConfig(steps=1, checkpoint_final=False,
                     checkpoint_dir=str(tmp_path), eval_every=None, checkpoint_every=None))
     data = Loader(lambda partition: batches(), None, None, 8)
     assert int(run.train(Regression(), data, name="no-final").step) == 1
     assert Checkpoints(str(tmp_path / "no-final")).latest is None
 
 
+def test_a_run_that_must_start_afresh_refuses_a_directory_that_holds_one_before_writing_its_record(tmp_path):
+    """`trainer.resume="never"` trains a fresh run directory and refuses one that holds a checkpoint, on
+    every rank, before the run's record is written over that run's; `resume="require"` refuses a
+    directory that holds none to continue, so a job that must continue never trains from scratch."""
+    def run(resume, steps: int = 1) -> RunConfig:
+        return RunConfig(trainer=TrainerConfig(steps=steps, resume=resume, checkpoint_dir=str(tmp_path),
+                                               eval_every=None, checkpoint_every=None))
+
+    data = Loader(lambda partition: batches(), None, None, 8)
+    with pytest.raises(ValueError):
+        run("require").train(Regression(), data, name="kept")
+    assert int(run("never").train(Regression(), data, name="kept").step) == 1
+    record = (tmp_path / "kept" / RUN_FILE).read_bytes()
+    with pytest.raises(ValueError):
+        run("never", steps=2).train(Regression(), data, name="kept")
+    assert (tmp_path / "kept" / RUN_FILE).read_bytes() == record
+
+
 def test_publishing_requires_a_final_checkpoint_policy():
     with pytest.raises(ValueError):
-        TrainerConfig(publish=True, wandb=dew.config.Wandb(project="test"), checkpoint_final=False)
-
-
-def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path):
-    """The batch is one number: the recipes load the data at
-    `trainer.batch_size` and `train` refuses a dataset that reads another,
-    naming both, instead of training at one batch and reporting the other."""
-    run = RunConfig(trainer=TrainerConfig(
-        name="batch", checkpoint_dir=str(tmp_path / "runs"), steps=1, batch_size=8,
-        eval_every=None, checkpoint_every=None))
-
-    with pytest.raises(ValueError):
-        run.train(Regression(), Loader(lambda partition: batches(), None, None, 16), name="batch")
-
-    state = run.train(Regression(), Loader(lambda partition: batches(), None, None, 8), name="batch")
-    assert int(state.step) == 1
+        TrainerConfig(publish=True, wandb=Wandb(project="test"), checkpoint_final=False)
 
 
 def test_train_scores_every_named_validation_split(tmp_path):
     """#36 item 5: a held-out split and a test set, scored together at each
     evaluation and logged under their own names."""
     run = RunConfig(trainer=TrainerConfig(
-        name="splits", checkpoint_dir=str(tmp_path / "runs"), steps=2, batch_size=8,
+        name="splits", checkpoint_dir=str(tmp_path / "runs"), steps=2,
         eval_every=1, checkpoint_every=None))
     held = next(batches())
     splits = {"val": lambda partition: iter([held]),
@@ -355,7 +381,7 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
 
     trace = tmp_path / "trace"
     config = TrainerConfig(
-        name="built", checkpoint_dir=str(tmp_path / "runs"), steps=3, batch_size=8, accumulation=2,
+        name="built", checkpoint_dir=str(tmp_path / "runs"), steps=3, accumulation=2,
         dynamic_scale=True, mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
         profile=ProfileWindow(str(trace), steps=1, warmup=1), eval_every=None, checkpoint_every=None)
 
@@ -408,7 +434,7 @@ def test_the_run_record_is_written_to_a_bucket(tmp_path, monkeypatch):
     monkeypatch.setattr(dew.config.epath, "Path",
                         lambda uri: _Bucket(uri, tmp_path, seen))
     monkeypatch.setattr(os, "makedirs", refuse)
-    config = RunConfig(trainer=TrainerConfig(batch_size=8, steps=6))
+    config = RunConfig(trainer=TrainerConfig(steps=6))
 
     path = config.save("gs://dew-runs/flowers")
 
@@ -459,7 +485,7 @@ def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
     import jax
 
     run = VisionRun()
-    tower, projector = run.vision["tower"].build(), run.vision["projector"].build()
+    tower, projector = run.vision["tower"].build(), run.vision["projector"]
     pixels = jnp.arange(12, dtype=jnp.float32).reshape(1, 3, 2, 2)
     tower_params = tower.init(jax.random.key(2), pixels)
     encoded = tower.apply(tower_params, pixels)
@@ -467,7 +493,7 @@ def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
     expected = projector.apply(projector_params, encoded)
     run.save(str(tmp_path))
     restored = VisionRun.load(str(tmp_path))
-    actual = projectors.from_record(restored.vision["projector"]).build().apply(
+    actual = projectors.from_record(restored.vision["projector"]).apply(
         projector_params, towers.from_record(restored.vision["tower"]).build().apply(
             tower_params, pixels))
     assert jnp.array_equal(actual, expected)
@@ -518,11 +544,10 @@ class Spec(Base):
 def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
     """A run's record reads back the schedule it names, its tail and the muP
     groups included."""
-    from dew.training.optim import ParamGroup, Power, PowerTail
+    from dew.optim import ParamGroup, Power, PowerTail
     config = RunConfig(
-        data=datasets["images"](source="data/cc12m", image_size=64),
         trainer=TrainerConfig(steps=1),
-        optim=OptimConfig(schedule=Power(peak=0.01, warmup_steps=5, a=4.0, c=16.0,
+        optim=OptimConfig(learning_rate=Power(peak_value=0.01, warmup_steps=5, a=4.0, c=16.0,
                                          tail=PowerTail(start=8)),
                           param_groups=ParamGroup.mup(4.0)))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
@@ -532,20 +557,150 @@ def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
 def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     """A run's record reads back each group's schedules, `every` included,
     its bounds, and the config's own one-cycle schedule."""
-    from dew.training.optim import Cosine, Exponential, OneCycle, ParamGroup
-    momentum = OneCycle(peak=0.85, init=0.95, end=0.95, every=40)
+    from dew.optim import Cosine, Exponential, OneCycle, ParamGroup
+    momentum = OneCycle(peak_value=0.85, init_value=0.95, end_value=0.95, every=40)
     config = RunConfig(
-        data=datasets["images"](source="data/cc12m", image_size=64),
         trainer=TrainerConfig(steps=1),
         optim=OptimConfig(
-            optimizer="adam", schedule=Exponential(init=1e-3, end=1e-5, decay_steps=8, offset=1e-6),
+            optimizer="adam",
+            learning_rate=Exponential(init_value=1e-3, end_value=1e-5, decay_steps=8, offset=1e-6),
             param_groups=(
-                ParamGroup("delays", ("*/delay",), schedule=Cosine(peak=0.1, warmup_steps=0, every=40),
+                ParamGroup("delays", ("*/delay",), schedule=Cosine(peak_value=0.1, warmup_steps=0, every=40),
                            bounds=(0.0, 24.0)),
                 ParamGroup("weights", ("*/kernel",), weight_decay=1e-5,
-                           schedule=OneCycle(peak=5e-3, every=40), b1=momentum),
-                ParamGroup("rest", ("*",), schedule=OneCycle(peak=5e-3, warmup_fraction=0.25), b1=momentum),
+                           schedule=OneCycle(peak_value=5e-3, every=40), b1=momentum),
+                ParamGroup("rest", ("*",), schedule=OneCycle(peak_value=5e-3, warmup_fraction=0.25),
+                           b1=momentum),
             )))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
     assert loaded == config
     assert loaded.optim.param_groups[0].bounds == (0.0, 24.0)
+
+
+def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits():
+    """`val_metrics` is every run's (`RunConfig`). Where it names none, each split scores the kind's own
+    (`default_metrics`): a language model its perplexity, a decision run its held-out suite, a JEPA run
+    its probes. Where it names them, each split scores those that name it or no split
+    (`MetricConfig.split`), a split none names scores none, and a metric of a split the run does not
+    validate is refused; the record round trips through the command line and run.json alike."""
+    import types
+
+    from dew.config import MetricConfig
+    from dew.config.jepa import JepaRunConfig
+    from dew.config.lm import LMRunConfig
+    from dew.decision.config import DecisionRunConfig
+    from dew.decision.metrics import AURC, ECE, Accuracy, MacroF1, ScoredQuestions
+    from dew.decision.scoring import Brier, LogLoss
+    from dew.objectives.jepa.probes import KnnProbe, LinearProbe
+    from dew.objectives.lm.objective import Perplexity
+
+    def kinds(metrics):
+        return [type(metric) for metric in metrics]
+
+    assert kinds(LMRunConfig().validation_metrics(validates=True)) == [Perplexity]
+    assert LMRunConfig().validation_metrics(validates=False) == ()
+    assert kinds(DecisionRunConfig().validation_metrics(validates=True)) == [
+        Accuracy, MacroF1, ECE, AURC, LogLoss, Brier, ScoredQuestions]
+    assert kinds(JepaRunConfig(probe_classes=7).validation_metrics(validates=True)) == [LinearProbe, KnnProbe]
+    linear, knn = JepaRunConfig(probe_classes=7, knn_k=5).validation_metrics(validates=False)
+    assert (linear.num_classes, knn.num_classes, knn.k) == (7, 7, 5)
+    splits = {"val": object(), "test": object()}
+    stream = types.SimpleNamespace(val=None)
+    assert LMRunConfig().suites(stream, splits) is None
+    flag = '[{"name": "accuracy"}, {"name": "brier", "split": "test"}]'
+    named = DecisionRunConfig.cli(["--val-metrics", flag])
+    assert named.val_metrics == (MetricConfig("accuracy"), MetricConfig("brier", split="test"))
+    suites = named.suites(stream, splits)
+    assert {split: (suite.data, kinds(suite.metrics)) for split, suite in suites.items()} == {
+        "val": (splits["val"], [Accuracy]), "test": (splits["test"], [Accuracy, Brier])}
+    assert DecisionRunConfig.from_dict(named.to_dict()) == named
+    only = LMRunConfig(val_metrics=[MetricConfig("perplexity", split="test")]).suites(stream, splits)
+    assert {split: kinds(suite.metrics) for split, suite in only.items()} == {"val": [], "test": [Perplexity]}
+    assert LMRunConfig(val_metrics=[]).suites(types.SimpleNamespace(val=None), None) == {}
+    for stray in ([MetricConfig("brier", split="holdout")], [MetricConfig("brier")]):
+        with pytest.raises(ValueError):
+            LMRunConfig(val_metrics=stray).suites(stream, splits if stray[0].split else None)
+
+
+@pytest.mark.parametrize("kind", ["lm", "decision", "diffusion"])
+def test_every_run_kind_reads_its_source_options_from_the_command_line(kind):
+    """`--source.text-only`, `--source.prediction-depths` and `--source.attention` are every run kind's,
+    and its source's load reads them beside where it reads the source (`RunConfig.source_keywords`):
+    the attention as the load's `modeling_overrides`."""
+    from dew.config import SourceOptions
+    from dew.config.diffusion import DiffusionRunConfig
+    from dew.config.lm import LMRunConfig
+    from dew.decision.config import DecisionRunConfig
+
+    kinds = {"lm": LMRunConfig, "decision": DecisionRunConfig, "diffusion": DiffusionRunConfig}
+    run = kinds[kind].cli(["--source.text-only", "--source.prediction-depths", "0",
+                           "--source.attention", "full_attention", "block_bidirectional",
+                           "--trainer.multi-host", "False"])
+    assert run.source == SourceOptions(text_only=True, prediction_depths=0,
+                                       attention={"full_attention": "block_bidirectional"})
+    keywords = run.source_keywords(frozen=False)
+    assert keywords["text_only"] is True and keywords["prediction_depths"] == 0 and keywords["on_host"]
+    assert keywords["modeling_overrides"] == {"attention": {"full_attention": "block_bidirectional"}}
+    assert type(run).from_dict(run.to_dict()).source == run.source
+
+
+@pytest.mark.parametrize("options", [{"text_only": True},
+                                     {"modeling_overrides": {"attention": {"full_attention": "causal"}}}],
+                         ids=["text-only", "overrides"])
+def test_a_diffusion_source_has_no_language_model_for_text_only_to_take(options):
+    """A diffusion pipeline has no wrapper's language model for `text_only` to take, and no component
+    an override reaches: each is refused before anything is read."""
+    from dew.interop.pretrained import load_diffusion_source
+
+    with pytest.raises(ValueError):
+        load_diffusion_source("unused/pipeline", **options)
+
+
+def test_a_trainers_cadences_may_be_shares_of_the_run_on_the_command_line():
+    """`--trainer.log-every`, `--trainer.eval-every` and `--trainer.checkpoint-every` each take a share
+    of the run such as 5%, which reaches fit as written for it to resolve against the run's length;
+    a value that is neither steps, a share, epoch nor a duration is refused."""
+    from dew.config.lm import LMRunConfig
+
+    run = LMRunConfig.cli(["--trainer.log-every", "1%", "--trainer.eval-every", "5%",
+                           "--trainer.checkpoint-every", "10%", "--trainer.multi-host", "False"])
+    trainer = run.trainer
+    assert (trainer.log_every, trainer.eval_every, trainer.checkpoint_every) == ("1%", "5%", "10%")
+    for flags in (["--trainer.eval-every", "5x"], ["--trainer.log-every", "epoch"]):
+        with pytest.raises((ValueError, SystemExit)):
+            LMRunConfig.cli([*flags, "--trainer.multi-host", "False"])
+
+
+def test_a_decision_run_chooses_its_head_by_its_subcommand():
+    """`head:letters` and `head:joint-shape` choose a decision run's head on its command line, each with
+    its own flags, and none keeps Laya's."""
+    from dew.decision.config import DecisionRunConfig, JointShape, Letters
+
+    run = DecisionRunConfig.cli(["--trainer.multi-host", "False", "head:letters", "--head.count", "4"])
+    assert run.head == Letters(count=4)
+    joint = DecisionRunConfig.cli(["--trainer.multi-host", "False", "head:joint-shape", "--head.layers", "2"])
+    assert joint.head == JointShape(layers=2)
+    assert DecisionRunConfig.cli(["--trainer.multi-host", "False"]).head is None
+
+
+def test_a_decision_run_trains_its_backbone_beside_its_context_layers_on_the_command_line():
+    """`--no-context-frozen` with `--context-layers` trains the backbone whole beside the blocks; by
+    default it holds frozen."""
+    from dew.decision.config import DecisionRunConfig
+
+    flags = ["--trainer.multi-host", "False", "--context-layers", "0", "1"]
+    assert DecisionRunConfig.cli(flags).context_frozen
+    assert not DecisionRunConfig.cli([*flags, "--no-context-frozen"]).context_frozen
+
+
+def test_a_run_branches_into_the_cooldowns_its_command_line_names():
+    """`--trainer.cooldowns.at` and its length and shape choose a run's cooldown branches, which its
+    record holds and reads back."""
+    from dew.config.lm import LMRunConfig
+    from dew.training.cooldown import Cooldowns
+
+    run = LMRunConfig.cli(["--trainer.cooldowns.at", "20%", "40%", "--trainer.cooldowns.length", "10%",
+                           "--trainer.cooldowns.shape", "linear", "--trainer.multi-host", "False"])
+    assert run.trainer.cooldowns == Cooldowns(at=("20%", "40%"), length="10%", shape="linear")
+    assert LMRunConfig.from_dict(run.to_dict()).trainer.cooldowns == run.trainer.cooldowns
+    assert LMRunConfig.cli(["--trainer.multi-host", "False"]).trainer.cooldowns is None

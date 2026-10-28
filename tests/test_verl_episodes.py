@@ -23,11 +23,11 @@ def rollouts_of(episodes):
 def test_collected_episodes_survive_verl_rows_and_context_compaction():
     """A later call that saw a compacted context breaks the strict chain, so
     that rollout takes two verl rows; both come back to the same calls."""
-    trainer, rollout = build()
-    episodes = collect(rollout, trainer.initial_state())
+    trainer, collector = build()
+    episodes = collect(collector, trainer.initial_state())
     first = episodes[0]
     turn = first.transitions[1]
-    compact = replace(turn, action=replace(turn.action, context=turn.action.context[-1:]))
+    compact = replace(turn, action=replace(turn.action, prompt=turn.action.prompt[-1:]))
     episodes = (replace(first, transitions=(first.transitions[0], compact)), *episodes[1:])
     rollouts = rollouts_of(episodes)
     rows = json.loads(json.dumps(to_verl(rollouts)))
@@ -41,19 +41,41 @@ def test_collected_episodes_survive_verl_rows_and_context_compaction():
 
 
 def test_an_episode_record_reads_back_every_sampling_control():
-    """A recorded action's policy comes back whole, its penalties and stop
-    strings included, and an unset pad id stays the task's to fill."""
+    """A recorded episode's sampling policy comes back whole, its penalties and stop strings
+    included, and an unset pad id stays the task's to fill."""
     from dew.objectives.rl.records import episode_from_record
     from dew.sampling import Sampling
 
-    trainer, rollout = build()
-    episode = collect(rollout, trainer.initial_state())[0]
-    policy = Sampling(temperature=0.7, eos_token_ids=episode.transitions[0].action.sampling.eos_token_ids,
+    trainer, collector = build()
+    episode = collect(collector, trainer.initial_state())[0]
+    policy = Sampling(temperature=0.7, eos_token_ids=episode.sampling.eos_token_ids,
                       repetition_penalty=1.1, no_repeat_ngram_size=2, stop=("\n\n",))
-    turns = tuple(replace(turn, action=replace(turn.action, sampling=policy)) for turn in episode.transitions)
-    episode = replace(episode, transitions=turns)
+    episode = replace(episode, sampling=policy)
 
     restored = episode_from_record(json.loads(json.dumps(asdict(episode))))
 
     assert restored == episode
-    assert restored.transitions[0].action.sampling.pad_token_id is None
+    assert restored.sampling.pad_token_id is None
+
+
+def test_an_episode_record_reads_back_the_engine_records_its_draws_carry():
+    """A draw an engine served with its routing and its sampler's kept ids, as an environment
+    source's episodes keep them, writes to JSON and reads back whole."""
+    import numpy as np
+
+    from dew.objectives.rl.records import episode_from_record, record_json
+
+    trainer, collector = build()
+    episode = collect(collector, trainer.initial_state())[0]
+    turn = episode.transitions[0]
+    draw = turn.action
+    forwarded = len(draw.prompt) + len(draw.tokens) - 1
+    routed = np.arange(forwarded * 2 * 2, dtype=np.int32).reshape(forwarded, 2, 2) % 4
+    support = tuple((token, token + 1) for token in draw.tokens)
+    served = replace(draw, routed_experts=routed, support=support)
+    episode = replace(episode, transitions=(replace(turn, action=served), *episode.transitions[1:]))
+
+    restored = episode_from_record(json.loads(record_json(episode)))
+
+    assert restored == episode
+    np.testing.assert_array_equal(restored.transitions[0].action.routed_experts, routed)

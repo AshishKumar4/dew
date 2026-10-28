@@ -18,6 +18,7 @@ embed, mlp]` and `mlp/experts/down_proj/kernel` `[exp, mlp, embed]`, the
 layout `jax.lax.ragged_dot` takes and the `expert` mesh axis shards.
 """
 
+import contextlib
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
@@ -25,32 +26,23 @@ from collections.abc import Callable, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
-from flax.linen.dtypes import canonicalize_dtype, promote_dtype
+from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
 
+from dew.mesh import EXPERT_AXIS, STAGE_AXIS, LayoutRefused, LogicalAxes, batch_axes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 
-from .activations import GatedActivation, gated_product, relu2
+from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
-from .kernels.generation import backend, measured_kernel, ran_kernel, triton_runs
-from .kernels.grouped_matmul import grouped_projection, ragged_dot_refusal, xla_ragged_dot
-from .precision import at_least_fp32, rounded_operand
+from .kernels import generation
+from .kernels.templates.gemm import template
+from .precision import at_least_fp32, float32_dot_general, float32_einsum, float32_products, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
-from .sharding import (
-    EXPERT_AXIS,
-    STAGE_AXIS,
-    LayoutRefused,
-    LogicalAxes,
-    batch_axes,
-    logical_axes,
-    logical_spec,
-    mesh_axes,
-    seen_whole,
-)
+from .sharding import logical_axes
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
 # Qwen3.5); 'sigmoid' scores each expert on its own (DeepSeek V3, GLM, Kimi,
@@ -59,9 +51,22 @@ from .sharding import (
 # where a sigmoid saturates.
 SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 
-# 'auto' resolves per hardware generation through `gpu_target().kernels['grouped_matmul']`.
+# 'pallas' is the kernels, each launch running the first implementation that takes it
+# (`grouped_matmul.GROUPED`) or the one `generation.chosen(grouped_matmul=...)` names ('triton',
+# 'mosaic_gpu', 'cutlass'); 'auto' is the kernels where they run the call, else XLA
+# (`expert_projection`, through the GEMM template).
 GROUPED_MATMULS = ('auto', 'xla', 'pallas')
 EXPERT_DISPATCHES = ('global', 'exchange')
+
+# What a router writes and reads, by name. Its choices, scores and log partitions are sown under
+# `ROUTER_COLLECTION` where a caller opens it, and its balancing bias is a variable of
+# `EXPERT_BIAS_COLLECTION`, which the step that balances the load rewrites (`dew.objectives.routing`).
+ROUTER_COLLECTION = 'router'
+ROUTER_INDICES = 'indices'
+ROUTER_SCORES = 'scores'
+ROUTER_LOG_Z = 'log_z'
+EXPERT_BIAS_COLLECTION = 'moe'
+EXPERT_BIAS = 'e_score_correction_bias'
 
 # DeepSeek divides the selected weights by their sum plus this, so a token
 # whose sigmoid scores are all zero stays finite
@@ -115,7 +120,7 @@ class RouterMoments:
 
 def global_router_loss(stats: RouterMoments, alpha: float) -> jax.Array:
     """DeepSeek V2 auxiliary loss for each pool of routed positions."""
-    scores = stats.scores.astype(jnp.promote_types(stats.scores.dtype, jnp.float32))
+    scores = stats.scores.astype(at_least_fp32(stats.scores.dtype))
     positions = jax.lax.stop_gradient(stats.positions.astype(scores.dtype))
     counts = jax.lax.stop_gradient(stats.counts.astype(scores.dtype))
     denominator = jnp.where(positions > 0, positions, 1) ** 2 * stats.top_k
@@ -127,7 +132,7 @@ def sequence_router_moments(scores: jax.Array, indices: jax.Array, valid: jax.Ar
                             max_segments: int | None = None) -> RouterMoments:
     """Each document's router moments over its real queries."""
     rows, length, experts = scores.shape
-    scores = scores.astype(jnp.promote_types(scores.dtype, jnp.float32))
+    scores = scores.astype(at_least_fp32(scores.dtype))
     segments = (1 if documents is None else length) if max_segments is None else max_segments
     documents = jnp.ones((rows, length), jnp.int32) if documents is None else documents
     owners = jnp.where(valid & (documents != 0), documents - 1, segments)
@@ -192,6 +197,8 @@ class Router(nn.Module):
     token uses and not what they contribute, and no gradient reaches it.
     `load_balance_update` computes its update and the step that applies it owns
     the write (MaxText `layers/moe.py:965-972` hands it back the same way).
+    `bias_in_weights` is LLaDA-MoE's reading of the same buffer: the biased
+    scores are also the weights (modeling_lladamoe.py, LLaDAMoESparseMoeBlock).
 
     `expert_groups` above one is DeepSeek's node limit: a token chooses inside
     the best `groups_per_token` groups, scored by `group_score`, 'top2' (V3's
@@ -204,6 +211,19 @@ class Router(nn.Module):
     token id the caller passes, weighted by the learned gate. `media_bias` is
     DeepSeek-V4.1's second bias, selecting for image-span tokens in place of
     `expert_bias` (`bias_vl`, model.py:807-820), given the `media` mask.
+
+    `routing_block` with `block_experts` is LLaDA2.2's block routing
+    (modeling_llada2_moe.py, LLaDA2MoeGate.block_routing): a block's score for
+    an expert is its best token's, and each token chooses among the block's
+    `block_experts` best. The caller numbers the blocks (`blocks`,
+    `dew.nn.inputs.numbered_blocks`): each row's and each packed document's
+    own, of `routing_block` places counted over its real tokens, a partial
+    last block routing by its own tokens and padding voting for none. The
+    release flattens the batch's rows into one stream before cutting blocks
+    and asserts whole ones, so a row's experts there depend on the rows beside
+    it; Dew keeps each request's routing its own, which is the release's
+    computation wherever a row is whole blocks of real tokens (one row, or
+    rows a whole number of blocks long).
     """
     num_experts: int
     in_features: int
@@ -215,7 +235,10 @@ class Router(nn.Module):
     groups_per_token: int = 1
     group_score: str = 'top2'
     expert_bias: bool = False
+    bias_in_weights: bool = False
     media_bias: bool = False
+    routing_block: int | None = None
+    block_experts: int | None = None
     hash_vocab: int | None = None
     init_std: float | None = None  # normal std of the kernel; None: lecun normal
     precision: PrecisionLike = None
@@ -254,6 +277,21 @@ class Router(nn.Module):
                     f"{self.groups_per_token} of {self.expert_groups} groups hold "
                     f"{self.groups_per_token * per_group} experts, fewer than the "
                     f"top_k of {self.top_k}")
+        if self.bias_in_weights and not self.expert_bias:
+            raise ValueError("bias_in_weights gates on the balancing bias, which expert_bias holds")
+        if (self.routing_block is None) != (self.block_experts is None):
+            raise ValueError("block routing names its block of tokens and the experts a block may use, "
+                             f"got routing_block={self.routing_block} and block_experts={self.block_experts}")
+        if self.routing_block is not None:
+            if self.routing_block < 1:
+                raise ValueError(f"routing_block counts a block's tokens, got {self.routing_block}")
+            if self.block_experts is None or not self.top_k <= self.block_experts <= self.num_experts:
+                raise ValueError(
+                    f"block_experts must hold the top_k of {self.top_k} and at most the "
+                    f"{self.num_experts} experts, got {self.block_experts}")
+            if self.expert_groups > 1 or self.hash_vocab is not None:
+                raise ValueError("block routing limits a token to its block's experts, so it has no "
+                                 "expert groups and no hash table")
         # The kernel is the router's own parameter, not a nested Dense, so
         # the leaf is `gate/kernel` where a Hugging Face sparse layer keeps
         # `gate.weight`.
@@ -262,60 +300,74 @@ class Router(nn.Module):
             (self.in_features, self.num_experts), jnp.float32)
         if self.expert_bias:
             self.bias = self.variable(
-                'moe', 'e_score_correction_bias', jnp.zeros,
+                EXPERT_BIAS_COLLECTION, EXPERT_BIAS, jnp.zeros,
                 (self.num_experts,), jnp.float32)
         if self.media_bias:
-            self.bias_vl = self.variable('moe', 'media_bias', jnp.zeros, (self.num_experts,), jnp.float32)
+            self.bias_vl = self.variable(
+                EXPERT_BIAS_COLLECTION, 'media_bias', jnp.zeros, (self.num_experts,), jnp.float32)
         if self.hash_vocab is not None:
-            if self.expert_bias or self.expert_groups > 1:
+            if self.expert_bias or self.expert_groups > 1 or self.routing_block is not None:
                 raise ValueError(
                     "hash routing selects by the token table alone, so it has no "
-                    "balancing bias and no expert groups")
+                    "balancing bias, no expert groups and no routing blocks")
             self.tid2eid = self.variable(
-                'moe', 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
+                EXPERT_BIAS_COLLECTION, 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
 
-    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None):
+    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None, blocks=None):
         logits = self.logits(x)
         scores = self._activated(logits)
-        indices = chosen_experts(lambda: self._selected(scores, tokens, media),
+        indices = chosen_experts(lambda: self._selected(scores, tokens, media, blocks),
                                  (*scores.shape[:-1], self.top_k), routes)
         # The load each expert took, for the step that balances the bias:
         # written only when a caller opens the 'router' collection, and never
         # into the tree init returns, where it is not a variable.
         if not self.is_initializing():
-            self.sow('router', 'indices', indices)
+            self.sow(ROUTER_COLLECTION, ROUTER_INDICES, indices)
             # The V2 balance loss reads the scores beside the choices.
-            self.sow('router', 'scores', scores)
+            self.sow(ROUTER_COLLECTION, ROUTER_SCORES, scores)
             # The router z-loss squares each position's log partition.
-            self.sow('router', 'log_z', jax.nn.logsumexp(logits, axis=-1))
-        if self.normalize_weights and self.score_function == 'softmax':
+            self.sow(ROUTER_COLLECTION, ROUTER_LOG_Z, jax.nn.logsumexp(logits, axis=-1))
+        if self.normalize_weights and self.score_function == 'softmax' and not self.bias_in_weights:
             weights = renormalized_softmax(logits, indices)
         else:
-            weights = jnp.take_along_axis(scores, indices, axis=-1)
+            gating = scores + self.bias.value if self.bias_in_weights else scores
+            weights = jnp.take_along_axis(gating, indices, axis=-1)
             if self.normalize_weights:
                 weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + WEIGHT_SUM_EPSILON)
         return weights * self.routed_scaling_factor, indices
 
-    def _selected(self, scores, tokens, media):
+    def _selected(self, scores, tokens, media, blocks):
         """The experts this router chooses on its own: `[..., top_k]`."""
+        if (blocks is None) != (self.routing_block is None):
+            raise ValueError("a block router chooses each block's experts together, from the blocks its "
+                             "caller numbers (dew.nn.inputs.numbered_blocks), and only a block router "
+                             "reads them")
         if self.hash_vocab is not None:
             if tokens is None:
                 raise ValueError("hash routing selects by the token ids, which the caller passes")
             return self.tid2eid.value[jnp.asarray(tokens)]
         if tokens is not None:
             raise ValueError("only a hash router reads the token ids")
-        selection = scores if not self.expert_bias else scores + self.bias.value
-        if media is not None:
-            selection = jnp.where(media[..., None], scores + self.bias_vl.value, selection)
+        selection = self.selection(scores, media, blocks)
         if self.expert_groups > 1:
             selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
         _, indices = jax.lax.top_k(selection, self.top_k)
         return indices
 
+    def selection(self, scores, media=None, blocks=None):
+        """What a token's experts are chosen by before its groups are: its scores with the balancing
+        bias (a media token's own bias), and outside each block's shortlist -inf."""
+        selection = scores if not self.expert_bias else scores + self.bias.value
+        if media is not None:
+            selection = jnp.where(media[..., None], scores + self.bias_vl.value, selection)
+        if blocks is not None and self.block_experts is not None:
+            selection = jnp.where(self.block_mask(selection, blocks, self.block_experts), selection, -jnp.inf)
+        return selection
+
     def logits(self, x):
         """Each token's gate logit for every expert, in fp32 (`at_least_fp32`):
         `[..., num_experts]`."""
-        return jnp.einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
+        return float32_einsum('...d,de->...e', x.astype(at_least_fp32(x.dtype)), self.kernel,
                           precision=self.precision)
 
     def _activated(self, logits):
@@ -334,39 +386,41 @@ class Router(nn.Module):
         `n_group` means.
         """
         per_group = self.num_experts // self.expert_groups
-        grouped = selection.reshape(*selection.shape[:-1], self.expert_groups, per_group)
-        if self.group_score == 'max':
-            group_scores = jnp.max(grouped, axis=-1)
-        else:
-            best_two, _ = jax.lax.top_k(grouped, 2)
-            group_scores = jnp.sum(best_two, axis=-1)
-        _, groups = jax.lax.top_k(group_scores, self.groups_per_token)
+        _, groups = jax.lax.top_k(self.group_scores(selection), self.groups_per_token)
         kept = jnp.sum(
             jax.nn.one_hot(groups, self.expert_groups, dtype=jnp.int32), axis=-2)
         return jnp.repeat(kept > 0, per_group, axis=-1)
 
+    def group_scores(self, selection):
+        """Each expert group's score, by which a token's best groups are chosen (`group_mask`): its
+        best expert's selection score, or its two best's sum. `[..., expert_groups]`."""
+        grouped = selection.reshape(*selection.shape[:-1], self.expert_groups,
+                                    self.num_experts // self.expert_groups)
+        if self.group_score == 'max':
+            return jnp.max(grouped, axis=-1)
+        best_two, _ = jax.lax.top_k(grouped, 2)
+        return jnp.sum(best_two, axis=-1)
 
-def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[Dtype, ...],
-                          precision: PrecisionLike) -> str:
-    """The one choice of grouped matmul: 'xla' or 'pallas'.
+    @staticmethod
+    def block_mask(selection, blocks, experts: int):
+        """True where an expert is one of the `experts` best of its token's block: each block's score
+        for an expert is its best token's selection score (the release's `block_routing`). `blocks`
+        `[..., S]` numbers each row's blocks from 0 (`numbered_blocks`); a padding token, numbered -1,
+        is a block of its own beside them, so it moves no real block's score. A row holds at most as
+        many blocks as tokens, so its blocks' scores take the selection's own size, and each block's
+        shortlist is written by index, never as a one-hot of its experts."""
+        *rows, length, count = selection.shape
 
-    'auto' takes the generation's measured one (`gpu_target().kernels['grouped_matmul']`).
-    'pallas' needs a GPU the kernels compile for and a product they compute
-    exactly (`ragged_dot_refusal`), else 'xla', which `ran_kernel` logs where
-    'pallas' was measured fastest. `operands` are the input and kernel dtypes
-    as stored.
-    """
-    if implementation not in GROUPED_MATMULS:
-        raise ValueError(
-            f"implementation must be one of {list(GROUPED_MATMULS)}, got "
-            f"{implementation!r}")
-    chosen = measured_kernel('grouped_matmul', 'xla') if implementation == 'auto' else implementation
-    if chosen != 'pallas':
-        return chosen
-    placed = triton_runs() or (implementation == 'pallas' and backend() == 'cpu')
-    refusal = ragged_dot_refusal(compute, operands, precision) or (
-        None if placed else "the Pallas kernels need a GPU of sm80 or later")
-    return 'pallas' if refusal is None else ran_kernel('grouped_matmul', 'xla', refusal)
+        def row(scores, ids):
+            ids = jnp.where(ids < 0, length, ids)
+            best = jax.ops.segment_max(scores, ids, num_segments=length + 1)
+            _, allowed = jax.lax.top_k(best, experts)
+            kept = jnp.zeros((length + 1, count), bool).at[jnp.arange(length + 1)[:, None], allowed].set(True)
+            return kept[ids]
+
+        flat = jax.vmap(row)(selection.reshape(-1, length, count),
+                             jnp.broadcast_to(blocks, (*rows, length)).reshape(-1, length))
+        return flat.reshape(selection.shape)
 
 
 def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> jax.Array:
@@ -396,65 +450,32 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     dtype, an input gradient its input's, both accumulating over the widest of
     the compute, input and kernel dtypes, whatever the placement.
 
-    'xla' holds it in every differentiation mode (tangents on
-    `jax.lax.ragged_dot`); 'pallas' in first-order reverse mode
-    (`dew.nn.kernels.grouped_matmul`), and a trace the kernels cannot take
-    (`seen_whole`) runs 'xla'. tests/test_moe_precision.py measures it against
-    float64 sums and three Adam steps on every expert/fsdp layout.
+    Every implementation runs the GEMM template
+    (`dew.nn.kernels.templates.gemm.template.gemm`), which selects each of its
+    launches where it runs (`grouped_matmul.GROUPED`: the template's kernels on
+    a GPU, an old route on a declared cell, XLA's program off a GPU and on a
+    call no launch takes, each route reported with its reason) and holds the
+    law in every differentiation mode; 'xla' names XLA's ragged dot for every
+    launch (`generation.chosen`), and 'auto' and 'pallas' alike leave the
+    choice to the template. `generation.chosen(grouped_matmul=...)` names a
+    kernel, a launch's name raising where it cannot run the call
+    (`selection.KernelRefused`). A CPU process runs XLA's program: a test
+    interprets the kernels by calling the template's interpreter itself. XLA's
+    ragged dot runs a product over every expert, 70 to 200 times the kernels'
+    time on an H100 at Qwen3-30B-A3B's and Kimi Linear's experts (GMM-h100-2),
+    so where the kernels run they are the choice. tests/test_moe_precision.py
+    measures it against float64 sums and three Adam steps on every expert/fsdp
+    layout.
     """
+    if implementation not in GROUPED_MATMULS:
+        raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
-    chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), precision)
-    if chosen == 'pallas' and seen_whole(x) and seen_whole(kernel):
-        return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas')
-    return _projection(x, kernel, group_sizes, dtype, precision)
+    resolved = float32_products(compute, precision)
+    xla = implementation == 'xla'
+    with generation.chosen(grouped_matmul='xla') if xla else contextlib.nullcontext():
+        return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute, precision=resolved)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4))
-def _projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
-                dtype: Dtype | None, precision: PrecisionLike) -> jax.Array:
-    """`expert_projection` in every differentiation mode, on `jax.lax.ragged_dot`."""
-    x, kernel = promote_dtype(x, kernel, dtype=dtype)
-    accumulated = xla_ragged_dot(x, kernel, group_sizes, precision=precision,
-                                 preferred_element_type=jnp.promote_types(x.dtype, jnp.float32))
-    return accumulated.astype(x.dtype)
-
-
-def _projection_jvp(dtype: Dtype | None, precision: PrecisionLike,
-                    primals: tuple[jax.Array, jax.Array, jax.Array],
-                    tangents: tuple[jax.Array, jax.Array, jax.Array]
-                    ) -> tuple[jax.Array, jax.Array | SymbolicZero]:
-    x, kernel, group_sizes = primals
-    dx, dkernel, _ = tangents
-    output = jnp.asarray(_projection(x, kernel, group_sizes, dtype, precision))
-    work = jnp.result_type(output.dtype, x.dtype, kernel.dtype, jnp.float32)
-    # A symbolic zero tangent contributes no term. Only the others pass the
-    # barrier: jax 0.11.2 cannot transpose one that holds a constant zero.
-    live = [(name, tangent) for name, tangent in (('x', dx), ('kernel', dkernel))
-            if not isinstance(tangent, SymbolicZero)]
-    if not live:
-        return output, SymbolicZero(jax.typeof(output))
-    # The tangents keep their dtypes to this point whatever produced them, so
-    # an activation's bf16 cotangent is not fused into a wider expression.
-    held = dict(zip((name for name, _ in live),
-                    jax.lax.optimization_barrier(tuple(tangent for _, tangent in live)),
-                    strict=True))
-    terms = []
-    if 'x' in held:
-        matrix = jnp.asarray(rounded_operand(kernel, output.dtype))
-        terms.append(xla_ragged_dot(
-            held['x'].astype(work), matrix.astype(work), group_sizes, precision=precision,
-            preferred_element_type=work))
-    if 'kernel' in held:
-        inputs = jnp.asarray(rounded_operand(x, output.dtype))
-        terms.append(xla_ragged_dot(
-            inputs.astype(work), held['kernel'].astype(work), group_sizes, precision=precision,
-            preferred_element_type=work))
-    total = terms[0] if len(terms) == 1 else terms[0] + terms[1]
-    tangent = jax.lax.optimization_barrier(total.astype(output.dtype))
-    return output, tangent
-
-
-_projection.defjvp(_projection_jvp, symbolic_zeros=True)
 
 
 class ExpertLinear(nn.Module):
@@ -606,7 +627,7 @@ def _stored_primal_jvp(run, primals, tangents):
     dx, _, dparameters, dweights = tangents
     # Only the live tangents are differentiated; a symbolic zero stays a
     # closed-over primal, since jax 0.11.2 cannot transpose a zero tangent
-    # through `_projection`'s barrier.
+    # through `portable_projection`'s barrier.
     leaves, tree = jax.tree.flatten((x, parameters, input_weights))
     directions = jax.tree.leaves((dx, dparameters, dweights),
                                  is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
@@ -739,7 +760,10 @@ def _exchange_shard[Parameters](
     expert axis's maximum needs. Under a capacity the first bucket holds what
     the device's sequences can keep for one peer and nothing is left over. The
     later rounds run in a checkpointed scan, which recomputes rather than keeps
-    their intermediates, so they are as few as the bucket size allows.
+    their intermediates, so they are as few as the bucket size allows. They are
+    in the compiled program whether or not a routing needs them, so a static
+    count of a dropless step's FLOPs reads them (moe_grpo on four expert shards
+    1.10 of one device's global dispatch, 1.00 under a capacity of 2).
     """
     top_k = indices.shape[-1]
     tokens = x.reshape(-1, x.shape[-1])
@@ -811,7 +835,7 @@ def _widened[Tree](parameters: Tree) -> Tree:
     rounds it."""
     def widen(leaf):
         if jnp.issubdtype(leaf.dtype, jnp.floating):
-            return leaf.astype(jnp.promote_types(leaf.dtype, jnp.float32))
+            return leaf.astype(at_least_fp32(leaf.dtype))
         return leaf
     return jax.tree.map(widen, parameters)
 
@@ -896,23 +920,21 @@ class ExpertMLP(nn.Module):
                 x, kernel, sizes, dtype, self.implementation, self.precision))
 
         # The same residual names as the dense MLP's, so one remat policy
-        # covers both (decoder_block.RESIDUALS).
+        # covers both (mixer_base.RESIDUALS).
         if self.activation == 'relu2':
             up = checkpoint_name(linear(tokens, kernels[0]), 'up_proj')
             hidden = relu2(up)
             return checkpoint_name(linear(hidden, kernels[1]), 'down_proj')
         gate = checkpoint_name(linear(tokens, kernels[0]), 'gate_proj')
         up = checkpoint_name(linear(tokens, kernels[1]), 'up_proj')
-        if self.swiglu_limit is not None:
-            gate = jnp.minimum(gate, self.swiglu_limit)
-            up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
+        gate, up = swiglu_clamped(gate, up, self.swiglu_limit)
         return checkpoint_name(linear(gated_product(self.activation)(gate, up), kernels[2]), 'down_proj')
 
     def _combine(self, slots: jax.Array, weights: jax.Array) -> jax.Array:
         wide = at_least_fp32(slots.dtype)
         if self.scale_inputs:
             return jnp.sum(slots.astype(wide), axis=-2).astype(slots.dtype)
-        return jnp.einsum('...ke,...k->...e', slots.astype(wide),
+        return float32_einsum('...ke,...k->...e', slots.astype(wide),
                           weights.astype(wide), precision=self.precision).astype(slots.dtype)
 
     def __call__(self, x: jax.Array, weights: jax.Array, indices: jax.Array) -> jax.Array:
@@ -980,7 +1002,10 @@ class SparseMLP(nn.Module):
     groups_per_token: int = 1
     group_score: str = 'top2'
     expert_bias: bool = False
+    bias_in_weights: bool = False
     media_bias: bool = False
+    routing_block: int | None = None
+    block_experts: int | None = None
     hash_vocab: int | None = None
     swiglu_limit: float | None = None
     scale_inputs: bool = False
@@ -1026,7 +1051,10 @@ class SparseMLP(nn.Module):
                            groups_per_token=self.groups_per_token,
                            group_score=self.group_score,
                            expert_bias=self.expert_bias,
+                           bias_in_weights=self.bias_in_weights,
                            media_bias=self.media_bias,
+                           routing_block=self.routing_block,
+                           block_experts=self.block_experts,
                            hash_vocab=self.hash_vocab, init_std=self.init_std,
                            precision=self.precision, name='gate')
         width = self.out_features if self.latent_features is None else self.latent_features
@@ -1040,7 +1068,8 @@ class SparseMLP(nn.Module):
             init_std=self.init_std, output_init_std=self.output_init_std,
             dtype=self.dtype, precision=self.precision, name='experts')
         if self.latent_features is not None:
-            dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                      dot_general=float32_dot_general)
             self.routed_expert_down_proj = dense(self.latent_features, name='routed_expert_down_proj')
             self.routed_expert_up_proj = dense(self.out_features, name='routed_expert_up_proj')
             if self.latent_norm is not None:
@@ -1052,7 +1081,8 @@ class SparseMLP(nn.Module):
             if self.shared_gate:
                 self.shared_expert_gate = Dense(
                     1, use_bias=False, dtype=self.dtype, precision=self.precision,
-                    name='shared_expert_gate', **normal_kernel(self.init_std))
+                    name='shared_expert_gate', **normal_kernel(self.init_std),
+                    dot_general=float32_dot_general)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """The packed groups its shared branch declares (`ProjectionSites`);
@@ -1064,8 +1094,8 @@ class SparseMLP(nn.Module):
         """It takes a layer's replayed experts (`RoutesExperts`)."""
         return True
 
-    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None):
-        weights, indices = self.gate(x, tokens, media, routes)
+    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None, blocks=None):
+        weights, indices = self.gate(x, tokens, media, routes, blocks)
         if self.latent_features is None:
             routed = self.experts(x, weights, indices)
         else:

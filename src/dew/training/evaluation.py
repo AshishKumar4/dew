@@ -2,23 +2,22 @@
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import dataclasses
-import pickle
+import os
 import sys
 import time
 import types
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any
+from pathlib import Path
+from typing import Any, ClassVar, Literal
 
 import jax
 import numpy as np
 from jax.sharding import Mesh
 
-from dew.artifacts import Artifact, Artifacts
-from dew.coordination import (
+from dew._coordination import (
     agree_process_phase,
     agreed,
     agreed_same,
@@ -26,21 +25,15 @@ from dew.coordination import (
     collective_host,
     from_every_process,
 )
-from dew.data.dataset import Closeable, DataPartition, Reader, rows_of
-from dew.objectives.base import (
-    VALID_ROWS,
-    Batch,
-    Effects,
-    Loss,
-    Metric,
-    Objective,
-    Step,
-    TrainingScalar,
-    Variables,
-    recorded_name,
-)
-
-from .distributed import MeshSpec, shard_batch, split_fields, with_host
+from dew.artifacts import Artifact, Artifacts, FixedRows
+from dew.batch import VALID_ROWS, Batch, Variables
+from dew.data.dataset import Closeable, DataPartition, Reader, rows_of, take_rows
+from dew.data.pipeline import Dataset
+from dew.distributed.batches import row_origins, shard_batch, shared_host_fields, split_fields, with_host
+from dew.distributed.placement import MeshSpec
+from dew.objectives.base import Effects, Loss, Metric, Objective, Shown, Step, TrainingScalar
+from dew.training.cadence import Tokens
+from dew.training.tracker import write_artifact
 
 
 @dataclass(frozen=True)
@@ -54,7 +47,68 @@ class EvalSuite:
 
     data: Reader
     metrics: Sequence[Metric] = ()
-    every: int | None = None
+    every: int | str | Tokens | None = None
+
+
+@dataclass(frozen=True)
+class Summary:
+    """One scalar a run forms from each evaluation's split scores by a declared weighting, a board's
+    weighted index: `sum(weight * score) / sum(weight)` over `weights`, each score named as an evaluation
+    records it (`val/accuracy`, `test/loss`) and each weight positive. It is formed once a step, where the
+    step's scores are joined (`Trainer.fit`), and only at a step that scored every split it weighs, so a
+    step a rarer suite skips forms none rather than mix in its stale scores. It is logged as
+    `evaluation/summary/<name>`, which `Best` and `Plateau` rank by, `better` the way it improves."""
+
+    name: str
+    weights: Mapping[str, float]
+    better: Literal["higher", "lower"]
+
+    SPLIT: ClassVar[str] = "evaluation/summary"
+    """The namespace a summary's score is recorded under, in a score's split's place:
+    `evaluation/summary/<name>`. It holds a '/', which no split's name or metric's name can
+    (`Evaluation.run`), so no split's score is named in it."""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "weights", dict(self.weights))
+        if not self.name or "/" in self.name:
+            raise ValueError(f"a summary is named without '/', and {self.name!r} is not")
+        if not self.weights:
+            raise ValueError(f"summary {self.name!r} weighs no score")
+        for score, weight in self.weights.items():
+            split, _, metric = score.rpartition("/")
+            if not split or not metric:
+                raise ValueError(f"summary {self.name!r} weighs {score!r}, which names no split/metric")
+            if not (weight > 0 and np.isfinite(weight)):
+                raise ValueError(f"summary {self.name!r} weighs {score!r} by {weight}, which is not positive")
+        if self.better not in ("higher", "lower"):
+            raise ValueError(f"summary {self.name!r} improves 'higher' or 'lower', not {self.better!r}")
+
+    @property
+    def shown(self) -> Shown:
+        """Its direction, as a metric declares its own (`Best` reads it)."""
+        return Shown(better=self.better)
+
+    def formed(self, scores: Mapping[str, float]) -> dict[str, float]:
+        """`{evaluation/summary/<name>: value}` from one step's `scores`, where they hold every score it
+        weighs, as a step that scored every split it weighs does (`check`), and nothing where not."""
+        if not all(score in scores for score in self.weights):
+            return {}
+        total = sum(self.weights.values())
+        value = sum(weight * float(scores[score]) for score, weight in self.weights.items()) / total
+        return {f"{self.SPLIT}/{self.name}": value}
+
+    def check(self, suites: Mapping[str, EvalSuite], loss: bool) -> None:
+        """Refuse a score no evaluation records: one of a split `suites` does not hold, or a metric its
+        suite does not score, its loss where the objective defines none (`loss`)."""
+        for score in self.weights:
+            split, _, metric = score.rpartition("/")
+            if split not in suites:
+                raise ValueError(f"summary {self.name!r} weighs {score!r}, and the run validates no split "
+                                 f"{split!r} ({sorted(suites)})")
+            declared = {scored.name for scored in suites[split].metrics}
+            if metric not in declared and not (metric == "loss" and loss):
+                raise ValueError(f"summary {self.name!r} weighs {score!r}, which split {split!r} does not "
+                                 f"score ({sorted(declared | ({'loss'} if loss else set()))})")
 
 
 @dataclass(frozen=True)
@@ -90,19 +144,22 @@ class Evaluation:
 
     @classmethod
     def run(cls, objective: Objective[Loss, Effects], variables: Variables,
-            batches: Reader | None, *,
+            batches: Reader | Dataset | None, *,
             key: int | jax.Array, metrics: Sequence[Metric] = (),
             step: int | jax.Array = 0, averaged: Variables | None = None,
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
             schedule_step: int | jax.Array | None = None, loss: bool = False,
             training: Mapping[str, jax.Array] | None = None, warm: bool = False,
-            updates: int | jax.Array | None = None) -> Evaluation:
+            updates: int | jax.Array | None = None, scored_to: str | os.PathLike[str] | None = None
+            ) -> Evaluation:
         """Evaluate `variables` on the batches every process can read, without an optimizer or a tracker.
 
         Every process calls this with the same objective, metrics and numerical
         settings. `batches` is called with this process's share of the split
         (`DataPartition.of(mesh)`) and returns a fresh iterator, which this call
-        opens and closes; you can pass `Loader.val` directly. Every batch holds
+        opens and closes; you can pass `Loader.val` directly, or a chain
+        (`Dataset`), which compiles here with the objective's own evaluation
+        stages and reads in its own batches (`dew.data.compile.held`). Every batch holds
         `VALID_ROWS` (all True when the reader marked none), and the objective's loss
         and the metrics count only the real rows. A process whose share runs out
         before the others' scores a copy of its last batch in which every row is a
@@ -128,6 +185,11 @@ class Evaluation:
         before its first step (`Trainer.fit`), and no score of a part of the
         split is checked or read.
 
+        `scored_to`, a directory, takes every batch's scoring artifacts, process 0 writing each batch's
+        real rows (a decision run's `Decisions`) as `<scored_to>/<split>-<batch>.npz`
+        (`dew.training.tracker.write_artifact`), so a pass's metrics pool exactly offline, across
+        batches and splits; a warming pass writes none.
+
         The scores are broadcast to every process. Previews stay on process 0, and
         there is at most one objective preview, however long the validation split
         is. Reporting the result is up to the caller. In a process pool, the callers
@@ -135,8 +197,11 @@ class Evaluation:
         collective, and a device failure in flight still requires ending the
         distributed runtime.
         """
+        from dew.data.compile import held
         from dew.nn.inputs import request_key
         key = request_key(key)
+        if isinstance(batches, Dataset):
+            batches = held(batches, objective=objective.data())
         started = time.perf_counter()
         root = jax.process_index() == 0
         _agree_configuration(metrics, batches, split, loss=loss, training=training is not None, warm=warm)
@@ -148,11 +213,12 @@ class Evaluation:
         scores: dict[str, float] = {}
         previews: tuple[Artifact, ...] = ()
         scored = records = 0
-        if batches is not None and (metrics or preview_enabled or loss):
+        written = None if scored_to is None or warm else Path(scored_to) / split
+        if batches is not None and (metrics or preview_enabled or loss or written is not None):
             scores, previews, scored, records = _score_split(
                 objective, variables, batches, context, mesh, metrics=metrics, split=split,
                 root=root, preview_enabled=preview_enabled, score_key=score_key,
-                preview_key=preview_key, loss=loss, warm=warm)
+                preview_key=preview_key, loss=loss, warm=warm, written=written)
         scores.update(training_scores)
         elapsed = time.perf_counter() - started
         scores, elapsed = broadcast_from_process_zero((scores, elapsed))
@@ -238,6 +304,9 @@ def _agree_configuration(
             raise ValueError("evaluation metric names must be unique")
         if not split or "/" in split:
             raise ValueError("evaluation split must be a nonempty name without '/'")
+        if any("/" in name for name in names):
+            raise ValueError(f"evaluation metric names hold no '/', which a score's name puts after its "
+                             f"split's: {names}")
         # Each metric's name and the module and qualified name of the artifact it reads.
         return [batches is not None, split,
                 [[metric.name, metric.reads.__module__, metric.reads.__qualname__] for metric in metrics]]
@@ -295,7 +364,8 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                  context: Step, mesh: Mesh | None, *, metrics: Sequence[Metric],
                  split: str, root: bool, preview_enabled: bool,
                  score_key: jax.Array, preview_key: jax.Array, loss: bool = False,
-                 warm: bool = False) -> tuple[dict[str, float], tuple[Artifact, ...], int, int]:
+                 warm: bool = False, written: Path | None = None
+                 ) -> tuple[dict[str, float], tuple[Artifact, ...], int, int]:
     """Score every record of a validation split, or its first `WARM_BATCHES`
     batches unfinalized where `warm`.
 
@@ -325,6 +395,8 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
 
         agreed("iterator construction", open_source)
         assert iterator is not None and mesh is not None
+        # A pass that writes its scoring artifacts evaluates its batches, whatever metrics it scores.
+        evaluating = bool(metrics) or written is not None
         while True:
             held, available = _next_batch(iterator, scored)
             if not available:
@@ -334,7 +406,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
             # is summed once after the split.
             records += int(np.sum(held[VALID_ROWS]))
             produced = None
-            if metrics or loss:
+            if evaluating or loss:
                 # The objective scores under the mesh, as the step trains
                 # under it: the model's placements and its sequence and stage
                 # splits read it. A preview decodes, which neither split does.
@@ -343,17 +415,18 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                         f"scoring batch {scored}",
                         lambda batch=batch, scored=scored: _dispatched(
                             objective, variables, batch, context, scored,
-                            loss=loss, evaluate=bool(metrics), score_key=score_key))
+                            loss=loss, evaluate=evaluating, score_key=score_key))
                     loss_sums.add(statistics)
-                    if metrics:
+                    if evaluating:
                         produced = _merged(produced, batch, held, scored, mesh=mesh, metrics=metrics,
+                                           written=written,
                                            summaries=summaries, root=root)
             if scored == 0 and preview_enabled:
                 previews = _previewed(objective, variables, batch, context,
                                       preview_key=preview_key, scored=produced, root=root)
             produced = batch = None
             scored += 1
-            if (not metrics and not loss) or (warm and scored == WARM_BATCHES):
+            if (not metrics and not loss and written is None) or (warm and scored == WARM_BATCHES):
                 break
         # Processes on one data share (a replicated stage or sequence axis)
         # read the same rows, so the pool counts each share once.
@@ -425,15 +498,22 @@ def _covered(mesh: Mesh, batch: Batch | None, last: Batch | None, index: int
 def _cut(leaf, keep: np.ndarray):
     """`leaf` without the rows `keep` marks as repeats, when its leading axis
     is the batch's rows: an array, a per-row tuple of captions or texts, or a
-    per-row list of opaque records (`dew.data.dataset.take_batch`)."""
-    if isinstance(leaf, list | tuple) and len(leaf) == keep.size:
-        return type(leaf)(row for row, kept in zip(leaf, keep, strict=True) if kept)
+    per-row list of opaque records (`dew.data.dataset.take_rows`)."""
+    if isinstance(leaf, list | tuple):
+        return take_rows(leaf, np.flatnonzero(keep)) if len(leaf) == keep.size else leaf
     array = np.asarray(leaf) if isinstance(leaf, np.ndarray | jax.Array) else None
-    return array[keep] if array is not None and array.ndim and array.shape[0] == keep.size else leaf
+    if array is None or not array.ndim or array.shape[0] != keep.size:
+        return leaf
+    return take_rows(array, np.flatnonzero(keep))
 
 
 def _real_artifact[A: Artifact](artifact: A, keep: np.ndarray) -> A:
-    """`artifact` with every per-row field cut to the real rows."""
+    """`artifact` with every per-row field cut to the real rows; one whose metrics read their rows through
+    a mask of its own (`FixedRows`) keeps its batch's fixed shape with that mask cleared on its padding
+    rows, so a metric reads every batch of a split, a short tail among
+    them, in one shape."""
+    if isinstance(artifact, FixedRows):
+        return artifact.unscored(~keep)
     return dataclasses.replace(artifact, **{field.name: _cut(getattr(artifact, field.name), keep)
                                             for field in dataclasses.fields(artifact)})
 
@@ -464,7 +544,7 @@ def _as_placed(leaf) -> np.ndarray:
 
 
 def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metrics: Sequence[Metric],
-            summaries: _Accumulators, root: bool):
+            summaries: _Accumulators, root: bool, written: Path | None = None):
     """Merge one batch into every metric's accumulator on root, returning what
     the objective produced, hosted.
 
@@ -473,7 +553,8 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metr
     it, so nothing copies back; a batch spread over processes comes home
     with the artifacts, its host fields from every share (`_shares_host`).
     One agreement covers every metric, so a failure on root stops its peers
-    there.
+    there. Where `written` names a place, root writes each of the batch's scoring artifacts there,
+    `<written>-<batch>`, its real rows alone (`write_artifact`).
     """
     if all(leaf.is_fully_addressable for leaf in jax.tree.leaves(batch) if isinstance(leaf, jax.Array)):
         produced = collective_host(produced, phase=f"scoring batch {index}")
@@ -484,8 +565,8 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metr
         if host:
             rows = rows_of(held)
             produced, home, origins = collective_host(
-                (produced, device, _origins(mesh, rows)), phase=f"scoring batch {index}")
-            home = with_host(home, _shares_host(mesh, host, np.asarray(origins), rows))
+                (produced, device, row_origins(mesh, rows)), phase=f"scoring batch {index}")
+            home = with_host(home, shared_host_fields(mesh, host, np.asarray(origins), rows))
         else:
             produced, home = collective_host((produced, device), phase=f"scoring batch {index}")
 
@@ -499,45 +580,15 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metr
         real = _real_batch(home, keep)
         for metric in metrics:
             summaries.add(metric, metric(_pick(artifacts, metric.reads), real))
+        if written is not None:
+            # Every batch's scoring artifacts, its real rows alone, for pooling a pass offline.
+            written.parent.mkdir(parents=True, exist_ok=True)
+            for at, artifact in enumerate(artifacts):
+                suffix = f"-{at}" if len(artifacts) > 1 else ""
+                write_artifact(artifact, written.with_name(f"{written.name}-{index:05d}{suffix}"))
 
     agreed(f"metrics batch {index}", merge)
     return produced
-
-
-def _origins(mesh: Mesh, rows: int) -> jax.Array:
-    """Each row of the batch placed on `mesh`, numbered by where it came from, `share * rows + row`:
-    this process's `rows` rows of its share (`DataPartition.of`), placed as the batch's are
-    (`shard_batch`), so the gathered numbers say which share's row each row of the batch is."""
-    share = DataPartition.of(mesh).index
-    return shard_batch(mesh, {"origin": share * rows + np.arange(rows, dtype=np.int32)})["origin"]
-
-
-def _shares_host(mesh: Mesh, host: Batch, origins: np.ndarray, rows: int) -> Batch:
-    """The host fields of a batch spread over processes, each row where `origins` places it: every
-    share's own rows, from its first reader, which no device carries, so they meet on the host
-    (`from_every_process`). Every process takes part; the fields are whole on each."""
-    partition = DataPartition.of(mesh)
-    # Agreed, so a record no reader can serialize fails every process rather than leaving its peers
-    # waiting for its fields.
-    told = agreed("host fields serialization", lambda: base64.b64encode(pickle.dumps(host)).decode()
-                  if partition.reader == 0 else "")
-    shares = {index: pickle.loads(base64.b64decode(word))
-              for index, word in from_every_process([partition.index, told]) if word}
-    ordered = [shares[index] for index in range(len(shares))]
-    share, row = np.divmod(origins, rows)
-
-    def gathered(*columns):
-        first = columns[0]
-        # A field of one value for the whole batch, not one a row (`rows_of`), is every share's alike.
-        rowed = len(first) == rows if isinstance(first, list | tuple) else np.shape(first)[:1] == (rows,)
-        if not rowed:
-            return first
-        values = [columns[position][place] for position, place in zip(share, row, strict=True)]
-        if not isinstance(first, np.ndarray):
-            return values
-        return np.asarray(values, dtype=object) if first.dtype == object else np.asarray(values)
-
-    return jax.tree.map(gathered, *ordered, is_leaf=lambda column: not isinstance(column, Mapping))
 
 
 def _previewed(objective: Objective[Loss, Effects], variables: Variables, batch: Batch,
@@ -592,6 +643,28 @@ def _close_source(held) -> None:
         agree_process_phase(error, phase="iterator cleanup")
 
 
+def recorded_name[S, A](key, names: Collection[str], owner: Objective[S, A] | None = None) -> str:
+    """The recorded name a run's score object names, one rule for the scores `best=` and `stop=` read
+    live and the ones a checkpoint keeps: a `TrainingScalar` the training split's (of the objective
+    `owner` where it is given, by identity), a `Metric` the validation split's ('val'), a `Summary` its
+    namespace's (`Summary.SPLIT`), and a `(split, metric)` pair that split's. A metric its split did not
+    record raises with the splits that did."""
+    split = Summary.SPLIT if isinstance(key, Summary) else "val"
+    if isinstance(key, tuple) and len(key) == 2:
+        split, key = key
+    if isinstance(key, TrainingScalar):
+        if owner is not None and key.owner is not owner:
+            raise KeyError("training score belongs to another objective")
+        return f"train/{key.name}"
+    if isinstance(key, (Metric, Summary)):
+        if f"{split}/{key.name}" in names:
+            return f"{split}/{key.name}"
+        splits = sorted(name.rpartition("/")[0] for name in names if name.rpartition("/")[2] == key.name)
+        raise KeyError(f"metric {key.name!r} has no {split} score" + (
+            f"; it is recorded under {', '.join(splits)}: ask (split, metric)" if splits else ""))
+    raise KeyError(key)
+
+
 class MetricScores[Statistics, Additions](Mapping):
     """A fit's scores keyed by the metric objects, objective scalars and
     `(split, metric)` pairs that `best=` and `stop=` name, or by recorded name.
@@ -603,17 +676,20 @@ class MetricScores[Statistics, Additions](Mapping):
 
     def __init__(
         self,
-        declared: Mapping[str, Sequence[Metric]],
+        declared: Mapping[str, Sequence[Metric | Summary]],
         scores: Mapping[str, float],
         objective: Objective[Statistics, Additions],
     ):
         self.objective = objective
-        training = ('loss', *objective.shown)
+        self.declared = declared
+        self.training = {f"train/{name}": objective.scalars[name] for name in ('loss', *objective.shown)}
         every = {id(metric): metric for metrics in declared.values() for metric in metrics}
-        self.metrics = (*every.values(), *(objective.scalars[name] for name in training))
-        self.names = {*scores, *(f"train/{name}" for name in training),
-                      *(f"{split}/{name}" for split, metrics in declared.items()
-                        for name in ('loss', *(metric.name for metric in metrics)))}
+        self.metrics = (*every.values(), *self.training.values())
+        # Each split records its loss beside its metrics; the summaries' namespace records none.
+        self.names = {*scores, *self.training,
+                      *(f"{split}/loss" for split in declared if split != Summary.SPLIT),
+                      *(f"{split}/{metric.name}" for split, metrics in declared.items()
+                        for metric in metrics)}
         self.scores = scores
 
     def __getitem__(self, metric):
@@ -635,16 +711,15 @@ class MetricScores[Statistics, Additions](Mapping):
         return self.scores.get(name, float("nan"))
 
     def __iter__(self):
+        # Each score by the key that reads it back (`recorded_name`): a training scalar, its split's own
+        # metric (the validation split's alone, another's with its split), else its recorded name, as a
+        # split's loss and a summary are.
         for name in self.scores:
-            split, _, label = name.partition('/')
-            metric = next((metric for metric in self.metrics if metric.name == label), None)
-            yield (
-                name
-                if metric is None
-                else metric
-                if split == "val" or isinstance(metric, TrainingScalar)
-                else (split, metric)
-            )
+            split, _, label = name.rpartition('/')
+            metric = next((metric for metric in self.declared.get(split, ())
+                           if isinstance(metric, Metric) and metric.name == label), None)
+            owned = name if metric is None else metric if split == "val" else (split, metric)
+            yield self.training.get(name, owned)
 
     def __len__(self):
         return len(self.scores)

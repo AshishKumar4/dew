@@ -1,0 +1,6 @@
+{
+  "min_bytes": 1,
+  "max_bytes": 100000000,
+  "max_key_length": 512,
+  "key": "^[A-Za-z0-9._=-]+(/[A-Za-z0-9._=-]+)*$"
+}

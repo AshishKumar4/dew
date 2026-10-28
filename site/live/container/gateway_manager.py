@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from guests import GUEST_UIDS, user
 from kernel_gateway.services.kernels.manager import (
     KernelGatewayIOLoopKernelManager,
     SeedingMappingKernelManager,
@@ -20,7 +21,7 @@ from kernel_gateway.services.kernels.manager import (
 from traitlets import default
 
 _uids = queue.SimpleQueue()
-for _uid in range(6100, 6200):
+for _uid in GUEST_UIDS:
     _uids.put(_uid)
 
 
@@ -123,7 +124,7 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             "--chdir", "/work", "--cap-drop", "ALL",
             "/opt/venv/bin/python", "/opt/live/guest_entry.py", *arguments,
         ]
-        limited = ["/usr/sbin/capsh", "--drop=all", "--no-new-privs", f"--user=ctx{uid - 6100}",
+        limited = ["/usr/sbin/capsh", "--drop=all", "--no-new-privs", f"--user={user(uid)}",
                    "--", "-c", "exec " + shlex.join(command)]
         env = {
             "PATH": "/opt/venv/bin:/usr/bin:/bin", "HOME": "/work", "TMPDIR": "/tmp",

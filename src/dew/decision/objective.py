@@ -2,179 +2,66 @@
 
 import dataclasses
 import functools
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-import grain.python as pygrain
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
 from dew.artifacts import Decisions
-from dew.data.pipeline import Configured, ObjectiveData, Pack, Rejected
+from dew.batch import FROZEN, Batch, Variables, dicts, part
+from dew.data.pipeline import Configured, ObjectiveData
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
-from dew.decision.data import Example
 from dew.decision.head import DecisionHead, Head
 from dew.decision.layout import (
     OPTION_TILE,
     Bounds,
     DecisionInputs,
+    JointLayout,
     Layout,
     QuestionLayout,
     Specials,
-    compacted,
     default_layout,
-    question_fields,
 )
 from dew.decision.model import DecisionModel
-from dew.decision.questions import KINDS, Choice, Question, Score
+from dew.decision.questions import KINDS, Score
+from dew.decision.rows import ConfigureLayout, Fit, PackedRows, QuestionRows, _rows, packing
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.task import Decide, DecideSettings, Weights, laid_out
-from dew.inference.pipeline import RunProcessor
+from dew.inference.loading import RunProcessor
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
-from dew.nn.flops import MissingFlopsCount, counted_flops
+from dew.nn import categorical
+from dew.nn.cross_attention import ContextEncoder, crosses_alone
+from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import CountedDecisions, CountedTraining, TokenModel
+from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, TokenModel
 from dew.objectives.base import (
     OMITTED,
     Aux,
-    Batch,
     Objective,
     Omitted,
     ProgramModule,
     Ratio,
     Source,
     Step,
-    Variables,
+    Weighted,
     joined,
     model_rngs,
-    part,
 )
-from dew.records import integer, record
 
 if TYPE_CHECKING:
-    from dew.training.state import TrainState
-
-NONE_OF_THE_ABOVE = "none of the above"
+    from dew.state import TrainState
 
 _SCORE = KINDS.index(Score)
 
 
-@dataclass(frozen=True)
-class Encoding:
-    """How a labelled example becomes the row a step packs and trains on.
-
-    A row is its own tokens, at most `max_len`, one slot per question it lays
-    out and `width` option slots each. A layout of one row per question lays
-    out one answered question; a joint layout lays out every question of the
-    example, scoring the answered ones. With `shuffle`, a choice's options are
-    laid out in a fresh random order every time the row is read (Laya's
-    `--shuffle-options`), while a score's levels and a noul's two answers keep
-    their order, and a joint row asks its questions in a fresh order too.
-    With `none_of_the_above` p, a choice with a single right answer gains a
-    "none of the above" option with probability p, and half of those also
-    lose their right option, which makes "none of the above" the right
-    answer. That teaches the model to say
-    that no option fits instead of picking the nearest wrong one. Each scored
-    slot's target is its gold distribution (`Example.distribution`) in the
-    order the row shows the options. A reader passes the state's `tokens` it
-    fitted the example with (`Fit`), which the row lays out again.
-    """
-
-    layout: Layout
-    tokenizer: Tokenizer
-    specials: Specials
-    width: int
-    shuffle: bool = True
-    none_of_the_above: float = 0.0
-
-    def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None,
-                 tokens: np.ndarray | None = None) -> Batch:
-        labels = example.labels()
-        if rng is not None and self.shuffle and self.layout.joint:
-            names = [names[int(index)] for index in rng.permutation(len(names))]
-        asked: dict[str, Question] = {}
-        golds: dict[str, np.ndarray] = {}
-        for name in names:
-            question = example.questions[name]
-            gold = example.distribution(name) if name in labels else None
-            if (
-                name in example.answers
-                and isinstance(question, Choice)
-                and rng is not None
-                and rng.random() < self.none_of_the_above
-            ):
-                question, label = _none_of_the_above(question, labels[name], drop=rng.random() < 0.5)
-                gold = np.eye(len(question.options))[label]
-            asked[name] = question
-            if gold is not None:
-                golds[name] = gold
-        orders = (
-            {
-                name: [int(slot) for slot in rng.permutation(len(question.options))]
-                for name, question in asked.items()
-                if isinstance(question, Choice)
-            }
-            if rng is not None and self.shuffle
-            else None
-        )
-        rows = self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders,
-                                tokens=None if tokens is None else tokens.tolist())
-        if len(rows) != 1:
-            raise ValueError(f"an encoding lays out one row, and the layout gave {len(rows)}")
-        encoded = rows[0]
-        length = self.layout.max_len
-        if not self.layout.fits(encoded):
-            raise ValueError(f"the row needs {len(encoded.tokens)} tokens, more than max_len={length}")
-        for laid in encoded.questions:
-            count = len(asked[laid.name].options)
-            if len(laid.options) != count:
-                raise ValueError(
-                    f"{count - len(laid.options)} of question {laid.name!r}'s {count} options "
-                    f"fall past max_len={length}; raise it or shorten the question"
-                )
-            if count > self.width:
-                raise ValueError(f"a question of {count} options outgrows the encoding's {self.width} slots")
-        questions = len(encoded.questions)
-        row: Batch = {
-            "tokens": np.asarray(encoded.tokens, np.int32),
-            **question_fields(encoded, questions, self.width),
-            "labels": np.zeros(questions, np.int32),
-            "scored": np.zeros(questions, bool),
-            "targets": np.zeros((questions, self.width), np.float32),
-        }
-        for slot, laid in enumerate(encoded.questions):
-            count = len(laid.options)
-            if laid.name in golds:
-                shown = golds[laid.name][list(laid.order)]
-                row["targets"][slot, :count] = shown
-                row["labels"][slot] = int(np.argmax(shown))
-                row["scored"][slot] = True
-        if encoded.positions is not None and encoded.slots is not None:
-            row["positions"] = np.asarray(encoded.positions, np.int32)
-            row["slots"] = np.asarray(encoded.slots, np.int32)
-        return row
-
-
-def _none_of_the_above(question: Choice, label: int, *, drop: bool) -> tuple[Choice, int]:
-    """`question` with a "none of the above" option last, and without its
-    right option when `drop`; the new label."""
-    described = dict(zip(question.options, question.descriptions, strict=True))
-    right = question.options[label]
-    if drop:
-        described.pop(right)
-    described[NONE_OF_THE_ABOVE] = "none of the other options fits"
-    options = list(described)
-    return Choice(question.instructions, described), options.index(NONE_OF_THE_ABOVE if drop else right)
-
-
-def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
+def tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
     """The tokenizer a loaded model's text processor encodes with: a run's
     own, or a checkpoint's Hugging Face tokenizer, alone or inside a
     multimodal processor, read from the directory it was loaded from, at the
@@ -194,185 +81,7 @@ def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
             return None
 
 
-@dataclass(frozen=True)
-class FittedRow:
-    example: Example
-    names: tuple[str, ...]
-    length: int
-    truncated: bool
-    tokens: np.ndarray
-    """The state's tokens, which the encoding lays out again, as int32: a read
-    held in memory keeps them for every example."""
-
-
-@dataclass(frozen=True)
-class Fit(pygrain.MapTransform):
-    layout: Layout
-    tokenizer: Tokenizer
-    specials: Specials
-    head: Head
-    rejects = True
-
-    def map(self, element: Batch) -> Batch | Rejected:
-        example = Example.of(element.get("example", element))
-        labels = example.labels()
-        if not labels:
-            return Rejected("unlabelled")
-        asked = example.questions if self.layout.joint else {name: example.questions[name] for name in labels}
-        state = self.layout.state(self.tokenizer, self.specials, example.state)
-        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state)
-        if not all(map(self.layout.fits, laid)):
-            return Rejected("unfit")
-        self.head.validate_rows(laid)
-        tokens = np.asarray(state, np.int32)
-        fitted = tuple(
-            FittedRow(
-                example,
-                tuple(question.name for question in row.questions),
-                len(row.tokens),
-                row.state_kept < row.state_tokens,
-                tokens,
-            )
-            for row in laid
-        )
-        return (
-            {
-                "decision": fitted[0],
-                "_dew_length": fitted[0].length,
-                "_dew_truncated": fitted[0].truncated,
-                "_dew_bounds": {
-                    "slots": {
-                        "questions": len(asked),
-                        "options": max(len(question.options) for question in asked.values()),
-                    }
-                },
-            }
-            if self.layout.joint
-            else {"decision_rows": fitted}
-        )
-
-
-@dataclass(frozen=True)
-class QuestionRows:
-    def flat_map(self, element: Batch) -> Sequence[Batch]:
-        return tuple(
-            {"decision": row, "_dew_length": row.length, "_dew_truncated": row.truncated}
-            | {
-                "_dew_bounds": {
-                    "slots": {
-                        "questions": 1,
-                        "options": max(len(row.example.questions[name].options) for name in row.names),
-                    }
-                }
-            }
-            for row in element["decision_rows"]
-        )
-
-
-def _fitted(element: Batch) -> FittedRow:
-    fitted = element["decision"]
-    if not isinstance(fitted, FittedRow):
-        raise ValueError("decision encoding needs the fitted decision row")
-    return fitted
-
-
-@dataclass(frozen=True)
-class LayoutRows(pygrain.RandomMapTransform):
-    encoding: Encoding
-
-    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        fitted = _fitted(element)
-        return self.encoding(fitted.example, fitted.names, rng, fitted.tokens)
-
-
-@dataclass(frozen=True)
-class EvaluateRows(pygrain.MapTransform):
-    encoding: Encoding
-
-    def map(self, element: Batch) -> Batch:
-        fitted = _fitted(element)
-        return self.encoding(fitted.example, fitted.names, None, fitted.tokens)
-
-
-@dataclass(frozen=True)
-class ConfigureLayout:
-    layout: Layout
-    tokenizer: Tokenizer
-    specials: Specials
-    shuffle: bool
-    none_of_the_above: float
-    train: bool
-
-    def __call__(self, metadata: Mapping[str, object]) -> LayoutRows | EvaluateRows:
-        slots = record(metadata["slots"], "decision slots")
-        width = integer(slots.get("options"), "slots.options") + int(self.none_of_the_above > 0)
-        if width < 1:
-            raise ValueError("decision source slot maxima must be positive")
-        encoding = Encoding(self.layout, self.tokenizer, self.specials, width, self.shuffle,
-                            self.none_of_the_above)
-        return LayoutRows(encoding) if self.train else EvaluateRows(encoding)
-
-
-_ALONG_THE_QUESTIONS = ("kinds", "questions", "spans", "option_spans", "options", "labels", "scored",
-                        "targets")
-"""The fields of an encoded row that run along its questions."""
-
-
-def packing(layout: Layout, bounds: Bounds) -> Pack:
-    """Rows of `layout` packed first-fit into windows of its `max_len`, each
-    window's rows, questions and options within `bounds` (`Layout.bounds`)."""
-    parallel = isinstance(layout, QuestionLayout) and layout.parallel
-    along = tuple((name, bounds.questions) for name in _ALONG_THE_QUESTIONS)
-    return Pack(layout.max_len, ("tokens", "positions", "slots") if parallel else ("tokens",),
-                segments=bounds.segments, along=along)
-
-
-def _rows(batch: Batch) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Each packed row's tokens, questions and options, window by window."""
-    segments = np.asarray(batch["segments"])
-    owners = np.where(batch["questions"],
-                      np.take_along_axis(segments, np.asarray(batch["spans"])[..., 0], axis=1), 0)
-    options = np.sum(np.asarray(batch["options"], bool), axis=-1)
-    counted = []
-    for window, owner, option in zip(segments, owners, options, strict=True):
-        rows = int(window.max()) + 1
-        counted.append(np.stack([np.bincount(window, minlength=rows), np.bincount(owner, minlength=rows),
-                                 np.bincount(owner, weights=option, minlength=rows).astype(np.int64)])[:, 1:])
-    lengths, questions, real = np.concatenate(counted, axis=1)
-    return lengths, questions, real
-
-
-@dataclass(frozen=True)
-class PackedRows(pygrain.MapTransform):
-    """A window of packed rows (`packing`) as `DecisionInputs` reads it: each
-    row's spans moved to where it starts in the window, and with
-    `option_slots` the window's real options compacted to that many slots
-    (`compacted`). Every window is `max_length` tokens, which a token budget
-    divides into rows."""
-
-    max_length: int
-    option_slots: int | None = None
-
-    def map(self, element: Batch) -> Batch:
-        segments = np.asarray(element["tokens_segment_ids"])
-        owners = np.asarray(element["kinds_segment_ids"])
-        starts = np.concatenate([[0], np.cumsum(np.bincount(segments)[1:])]).astype(np.int32)
-        moved = np.where(owners > 0, starts[np.maximum(owners - 1, 0)], 0)
-        options = np.asarray(element["options"])
-        laid = {name: element[name] for name in ("tokens", *_ALONG_THE_QUESTIONS)} | {
-            "segments": segments,
-            "positions": element["positions"] if "slots" in element else element["tokens_positions"],
-            "spans": element["spans"] + moved[:, None],
-            "option_spans": element["option_spans"] + (moved[:, None] * options)[..., None],
-        }
-        if "slots" in element:
-            laid["slots"] = element["slots"]
-        if self.option_slots is not None:
-            laid["option_slots"], laid["slotted"] = compacted(options, self.option_slots)
-        return laid
-
-
-class DecisionObjective(Objective[Ratio]):
+class DecisionObjective(Objective[Ratio | Weighted]):
     """Trains a decision model on questions with known answers.
 
     The model is any backbone with final states (`dew.nn.protocols.HiddenStates`),
@@ -402,7 +111,13 @@ class DecisionObjective(Objective[Ratio]):
     mix of rows shorter than `max_len / segments` tokens fills its windows
     less under it and takes a larger one; None lets a window hold as many as
     the layout's shortest row fits. The loss is the mean over the batch's
-    scored questions.
+    scored questions. With `consistency` w > 0 it adds w times the mean over
+    the batch's consistency groups (`Example.groups`) of the generalized
+    Jensen-Shannon divergence of their members' answers over the group's
+    canonical options (`categorical.group_divergence`), reported as the
+    `consistency` metric; a group's members stand in one row, so a layout of a
+    question a row refuses an example with groups under it. At 0 the groups
+    are not read, and the loss is the label loss alone.
 
     Evaluation returns the model's `Decisions` on the validation rows, which
     `Accuracy`, `ECE`, `AURC` and the scoring rules read, its probabilities
@@ -414,18 +129,56 @@ class DecisionObjective(Objective[Ratio]):
     saved_task = Decide
     settings = DecideSettings
     _held_parts = True
+    # The record is the backbone's; the head beside it is a task setting.
+    _recorded_part = "backbone"
 
     counts_tokens = True
 
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """Each packed row's own length, not its window's."""
-        return _rows(batch)[0]
+        return _rows(batch, self.schema_in_context)[0]
 
     def model_flops(self, model, batch: Batch) -> float:
-        """One backbone pass plus the head's real question/option geometry. Forming the vocabulary
-        rows a head reads (an adapter's update merged into them) is execution, as recompute is."""
+        """One backbone pass, its cross-attention over each row's context where rows carry one
+        (`CrossAttending.cross_flops`), plus the head's real question/option geometry. Forming the
+        vocabulary rows a head reads (an adapter's update merged into them) is execution, as
+        recompute is."""
         model = self.model if model is None else model
-        return counted_flops(model.backbone, self.real_lengths(batch)) + self._head_flops(model, batch)
+        return (counted_flops(model.backbone, self.real_lengths(batch)) + self._context_flops(model, batch)
+                + self._cross_flops(model, batch) + self._head_flops(model, batch))
+
+    def _context_lengths(self, batch: Batch) -> np.ndarray | None:
+        """Each window row's context length where the backbone reads the context in a pass of its own,
+        as it reads a schema in context (`schema_in_context`) or encodes every context
+        (`DecisionModel.context_encoder`); None where it reads none."""
+        passes = self.schema_in_context or self.model.context_encoder == "backbone"
+        if not passes or "context_lengths" not in batch:
+            return None
+        return self._row_contexts(batch)
+
+    def _row_contexts(self, batch: Batch) -> np.ndarray:
+        """Each packed row's own context length, in the order `real_lengths` counts the rows: its tokens
+        of the window's context (`context_segments`), or a window of one row's whole context."""
+        if "context_segments" not in batch:
+            return np.asarray(batch["context_lengths"])
+        segments = np.asarray(batch["segments"])
+        contexts = np.asarray(batch["context_segments"])
+        return np.concatenate([np.bincount(owned, minlength=int(window.max()) + 1)[1:]
+                               for window, owned in zip(segments, contexts, strict=True)])
+
+    def _context_flops(self, model, batch: Batch) -> float:
+        """The backbone's forward over each row's context, where it reads one in a pass of its own."""
+        lengths = self._context_lengths(batch)
+        return 0.0 if lengths is None else counted_flops(model.backbone, lengths)
+
+    def _cross_flops(self, model, batch: Batch) -> float:
+        """The backbone's cross-attention work over each packed row's own context (`_row_contexts`):
+        none where rows carry none."""
+        if "context_lengths" not in batch:
+            return 0.0
+        backbone = model.backbone
+        assert isinstance(backbone, CrossAttending)
+        return backbone.cross_flops(self.real_lengths(batch), self._row_contexts(batch))
 
     def _head_flops(self, model, batch: Batch) -> float:
         """Forward and training work read the same layout geometry and head capability."""
@@ -434,15 +187,39 @@ class DecisionObjective(Objective[Ratio]):
             raise MissingFlopsCount("DecisionObjective needs its image tower's multi-sequence geometry")
         if not isinstance(model.head, CountedDecisions):
             raise MissingFlopsCount(f"{type(model.head).__name__} has no declared decision_flops")
-        return model.head.decision_flops(*_rows(batch))
+        # Spans in the context pool over its tokens, not the row's.
+        pooled = self._context_lengths(batch) if self.schema_in_context else None
+        return model.head.decision_flops(*_rows(batch, self.schema_in_context),
+                                         **({} if pooled is None else {"pooled": pooled}))
 
     def training_flops(self, model, batch: Batch) -> float:
-        """The adapted frozen/trainable backbone plus the trained decision head."""
+        """The backbone's frozen and trainable work, then three passes of the trained cross-attention
+        blocks and decision head: an adapted backbone's own count (`CountedTraining`); a backbone whose
+        held parameters train nothing but its cross-attention blocks, as `with_cross_attention` holds a
+        source, its forward, input-gradient and no weight-gradient work (`frozen_training_flops`);
+        else, trained whole, three passes of everything."""
         model = self.model if model is None else model
-        if not isinstance(model.backbone, CountedTraining):
-            return super().training_flops(model, batch)
-        return (model.backbone.training_flops(self.real_lengths(batch))
-                + 3 * self._head_flops(model, batch))
+        lengths = self.real_lengths(batch)
+        context = self._context_lengths(batch)
+        trained = 3 * (self._cross_flops(model, batch) + self._head_flops(model, batch))
+        if isinstance(model.backbone, CountedTraining):
+            # An adapter trains through the context's pass too.
+            own = 0.0 if context is None else model.backbone.training_flops(context)
+            return model.backbone.training_flops(lengths) + own + trained
+        if self._backbone_frozen():
+            # A context's pass trains nothing, so it runs forward alone (`encode_context`).
+            forward = counted_flops(model.backbone, lengths)
+            return (frozen_training_flops(forward, parameter_flops(model.backbone, lengths))
+                    + self._context_flops(model, batch) + trained)
+        return super().training_flops(model, batch)
+
+    def _backbone_frozen(self) -> bool:
+        """Whether the held tree trains none of the backbone's own parameters: every backbone
+        parameter it trains is a cross-attention block's (`crossing`), the rest held frozen."""
+        held = self.variables
+        if held is None or FROZEN not in held or "backbone" not in held[FROZEN]:
+            return False
+        return crosses_alone(held.get("params", {}).get("backbone", {}))
 
     def __init__(self, backbone: nn.Module | Source | Adapter | Decide, *,
                  loss: ScoringRule | None = None, tokenizer: Tokenizer | None = None,
@@ -450,7 +227,8 @@ class DecisionObjective(Objective[Ratio]):
                  head: Head | None = None, variables: Variables | None | Omitted = OMITTED,
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
-                 segments: int | None = 16):
+                 segments: int | None = 16, context_encoder: ContextEncoder | None = None,
+                 consistency: float = 0.0, context_window: int | None = None):
         held: Variables | None = None
         self.image_processor = None
         match backbone:
@@ -458,6 +236,7 @@ class DecisionObjective(Objective[Ratio]):
                 model, held = backbone.model, backbone.variables
                 self.image_processor = backbone.processor
                 head = head or model.head
+                context_encoder = context_encoder or model.context_encoder
                 layout = layout or backbone.layout
                 tokenizer = tokenizer or backbone.tokenizer
                 specials = specials or backbone.specials
@@ -465,7 +244,7 @@ class DecisionObjective(Objective[Ratio]):
             case Adapter() | Source():
                 module, held = backbone.model, joined({"backbone": backbone.variables})
                 if isinstance(backbone, Source):
-                    tokenizer = tokenizer or _tokenizer_of(backbone.text_processor)
+                    tokenizer = tokenizer or tokenizer_of(backbone.text_processor)
             case _:
                 module = backbone
         if variables is not OMITTED:
@@ -481,7 +260,12 @@ class DecisionObjective(Objective[Ratio]):
         if head is None:
             width, dtype = DecisionModel.head_size(module)
             head = DecisionHead(width, dtype=dtype)
-        self.model = DecisionModel(module, head)
+        if isinstance(layout, QuestionLayout) and layout.labels is not None:
+            # A head that reads labels and was drawn with none reads the layout's, by this tokenizer, the
+            # one its rows are laid out by, which names them where the layout names none.
+            head, labels = head.labelled(layout.labels, tokenizer)
+            layout = dataclasses.replace(layout, labels=labels)
+        self.model = DecisionModel(module, head, context_encoder or "table")
         if layout is None:
             if not isinstance(module, TokenModel):
                 raise ValueError(
@@ -493,12 +277,24 @@ class DecisionObjective(Objective[Ratio]):
         self.tokenizer = tokenizer
         self.specials = specials or Specials.of(tokenizer)
         self.loss_rule = LogLoss() if loss is None else loss
-        self.variables = held
+        self.variables = dicts(held)
         self.label_smoothing = label_smoothing
+        if not consistency >= 0.0:
+            raise ValueError(f"consistency weighs a divergence, so it is nonnegative, got {consistency}")
+        self.consistency = consistency
         self.shuffle_options = shuffle_options
         self.none_of_the_above = none_of_the_above
         self.temperatures = temperatures
         self.segments = segments
+        held_context = self.context_length
+        if context_window is not None and (held_context is None or context_window < held_context):
+            raise ValueError(f"context_window={context_window} holds a window's contexts, at least one row's "
+                             f"context_length ({held_context}), which rows that read a context carry")
+        # The most context tokens a packed window holds, its rows' contexts end to end (`packing`): as
+        # given, or as many as its own tokens, `max_len`, or one row's `context_length` where that is
+        # longer; none where its rows carry no context.
+        self.context_window = (None if held_context is None
+                               else context_window or max(self.layout.max_len, held_context))
         self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,)))
 
     def program_key(self) -> tuple[ProgramModule, ...]:
@@ -528,66 +324,66 @@ class DecisionObjective(Objective[Ratio]):
         if "backbone" not in parts:
             parts["backbone"] = self.model.backbone.init(backbone_key, tokens)
         if "head" not in parts:
-            # The width the head was built for (its parameters read the states' width, not their dtype),
-            # not a trace of the backbone inside every trace of the state.
-            head = self.model.head
-            states = jnp.zeros((1, self.layout.max_len, getattr(head, head.width_field)), jnp.float32)
-            one = jnp.ones((1, 1), bool)
-            inputs = DecisionInputs(
-                tokens=tokens,
-                segments=jnp.ones_like(tokens),
-                kinds=jnp.zeros((1, 1), jnp.int32),
-                questions=one,
-                spans=jnp.asarray([[[0, 1]]]),
-                option_spans=jnp.asarray([[[[0, 1]]]]),
-                options=one[..., None],
-            )
-            table = (
-                self.model.table(joined({"backbone": parts["backbone"]}))
-                if self.model.head.reads_table
-                else None
-            )
-            parts["head"] = self.model.head.init(head_key, states, inputs, table)
+            parts["head"] = self.model.initialize_head(head_key, parts["backbone"], tokens)
         return joined(parts)
+
+    @property
+    def context_length(self) -> int | None:
+        """The most context tokens a row carries (`DecisionModel.context_length`)."""
+        return self.model.context_length
+
+    @property
+    def schema_in_context(self) -> bool:
+        """Whether a row's schema is its context (`JointLayout.schema_in_context`)."""
+        return isinstance(self.layout, JointLayout) and self.layout.schema_in_context
 
     @functools.cached_property
     def bounds(self) -> Bounds:
         """The most rows, questions and options a window packs (`Layout.bounds`),
-        at most `segments` rows."""
-        bounds = self.layout.bounds(self.tokenizer, self.specials)
-        if self.segments is None:
-            return bounds
-        return dataclasses.replace(bounds, segments=min(self.segments, bounds.segments))
+        at most `segments` rows; rows that carry a context, an example's or their schema, pack as any
+        do, each reading its own (`DecisionInputs.context_segments`)."""
+        return self.layout.bounds(self.tokenizer, self.specials, self.context_length, self.segments,
+                                  self.context_window)
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        inputs = laid_out(batch, self.bounds.segments)
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         logits = self.model.logits(
             variables, inputs, train=step.training, rngs=model_rngs(step.key, training=step.training)
         )
         return self._charged(logits, inputs, batch)
 
-    def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch) -> tuple[Ratio, Aux]:
-        """The loss and its accuracy report over the questions' option logits."""
+    def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch
+                 ) -> tuple[Ratio | Weighted, Aux]:
+        """The loss and its accuracy report over the questions' option logits: where it adds a consistency
+        term, the label loss and the groups' divergence, each its own `Ratio`, `consistency` weighing the
+        divergence (`Weighted`)."""
         options, scored = inputs.options, jnp.asarray(batch["scored"]).astype(jnp.float32)
         # A padding question has no options; it is scored nothing over a
         # finite, even distribution, so no NaN reaches its gradient.
         empty = ~jnp.any(options, axis=-1, keepdims=True)
         logits, options = jnp.where(empty, 0.0, logits), options | empty
-        count = jnp.sum(options, axis=-1, keepdims=True)
-        gold = jnp.asarray(batch["targets"])
-        target = jnp.where(options, (1.0 - self.label_smoothing) * gold + self.label_smoothing / count, 0.0)
+        target = categorical.smoothed(jnp.asarray(batch["targets"]), options, self.label_smoothing)
         charge = self.loss_rule.charge(logits, target, options, inputs.kinds == _SCORE)
         correct = (jnp.argmax(logits, axis=-1) == batch["labels"]).astype(jnp.float32)
         accuracy, _ = self.accuracy(correct, batch, scored).mean()
         loss = Ratio(self.row_mean(charge * scored, batch).total, self.row_mean(scored, batch).total)
-        return loss, Aux(metrics={"accuracy": accuracy})
+        if not self.consistency:
+            return loss, Aux(metrics={"accuracy": accuracy})
+        # Each question's group in its window, and each option slot's canonical option: the group's
+        # members' answers over the canonical options (`categorical.group_divergence`).
+        divergence, members = categorical.group_divergence(logits, jnp.asarray(batch["groups"]),
+                                                           jnp.asarray(batch["canonical"]), options)
+        term = Ratio(self.row_mean(divergence, batch).total, self.row_mean(members, batch).total)
+        return (Weighted((loss, term), (1.0, self.consistency)),
+                Aux(metrics={"accuracy": accuracy, "consistency": term.mean()[0]}))
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
-        inputs = laid_out(batch, self.bounds.segments)
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         return self._decisions(self._logits(self.evaluation_variables(params, step), inputs), inputs, batch)
 
-    def _validation_scores(self, params: Variables, batch: Batch, step: Step) -> tuple[Ratio, Decisions]:
-        inputs = laid_out(batch, self.bounds.segments)
+    def _validation_scores(self, params: Variables, batch: Batch, step: Step
+                           ) -> tuple[Ratio | Weighted, Decisions]:
+        inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         logits = self.model.logits(params, inputs)
         return self._charged(logits, inputs, batch)[0], self._decisions(logits, inputs, batch)
 
@@ -617,6 +413,7 @@ class DecisionObjective(Objective[Ratio]):
             targets=batch["targets"],
             ordinal=inputs.kinds == _SCORE,
             scored=batch["scored"],
+            classes=batch.get("classes"),
         )
 
     @property
@@ -630,18 +427,23 @@ class DecisionObjective(Objective[Ratio]):
         if tokenizer not in (None, self.tokenizer):
             raise ValueError("a decision objective lays its rows out with its own tokenizer; "
                              "pass tokenizer= when building it")
+        grouped = bool(self.consistency)
         training = ConfigureLayout(self.layout, self.tokenizer, self.specials, self.shuffle_options,
-                                   self.none_of_the_above, train=True)
+                                   self.none_of_the_above, train=True, context_length=self.context_length,
+                                   grouped=grouped)
         evaluating = dataclasses.replace(training, train=False)
-        fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head)
-        expand = () if self.layout.joint else (QuestionRows(),)
+        fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head, self.context_length, grouped,
+                  self.bounds, self.none_of_the_above, self.context_window)
+        held = dataclasses.replace(fit, none_of_the_above=0.0, scored=True)
+        # Rows a record spreads into: a layout of a question a row's, or grouped examples' apart.
+        expand = (QuestionRows(),)
         options = self.bounds.options if self.layout.joint else None
         compact = None if options is None else -(-options // OPTION_TILE) * OPTION_TILE
         return ObjectiveData(
             train=(fit, *expand, Configured(training, needs=("slots",), scope="run", random=True)),
-            evaluate=(fit, *expand, Configured(evaluating, needs=("slots",), scope="run")),
-            pack=packing(self.layout, self.bounds),
-            packed=(PackedRows(self.layout.max_len, compact),),
+            evaluate=(held, *expand, Configured(evaluating, needs=("slots",), scope="run")),
+            pack=packing(self.layout, self.bounds, self.context_window, grouped),
+            packed=(PackedRows(self.layout.max_len, compact, self.schema_in_context),),
         )
 
     def task_settings(self) -> DecideSettings:
@@ -653,15 +455,15 @@ class DecisionObjective(Objective[Ratio]):
         from the source config; the decision record owns neither format.
         """
         from dew.inference.tasks import recorded_tokenizer
-        from dew.registry import to_record
 
         return DecideSettings(
             self.model.head.record(),
-            {"name": type(self.layout).__name__, "fields": to_record(self.layout, type(self.layout))},
+            self.layout,
             self.specials, recorded_tokenizer(RunProcessor(self.tokenizer)),
             # A decision task reads text through its own tokenizer, so only a media processor is kept.
             None if self.image_processor is None or self.image_processor.directory is None
-            else self.image_processor.source)
+            else self.image_processor.source,
+            self.model.context_encoder)
 
     def recorded_model(self) -> nn.Module:
         """The backbone; the head is a task setting of its own."""

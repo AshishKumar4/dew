@@ -25,18 +25,18 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from common import git_head, host, peak_flops, throughput, write_record
+from common import host, peak_flops, throughput, write_record
 from qwen35 import MODEL, REVISION, WHOLE_PEAK_SCOPE, inputs, workload
+from reference_source import git_head
 from work import measure
 
-from dew.config import OptimConfig
 from dew.inputs import Field, InputSpec
 from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Objective
+from dew.optim import Cosine, OptimConfig
 from dew.training import Trainer
-from dew.training.optim import Cosine
 from dew.training.runtime import prepare_process
 
 
@@ -130,7 +130,8 @@ def compile_step(args, model, variables):
     work.write(args.work)
     solver = OptimConfig(optimizer="adamw", b1=0.9, b2=0.999, optimizer_opts={"eps": 1e-8},
                           weight_decay=1e-4, clip_grads=0.0, state_dtype="float32",
-                          schedule=Cosine(init=0.0, peak=2.5e-5, warmup_steps=10, end=0.0)).build(220)
+                          learning_rate=Cosine(init_value=0.0, peak_value=2.5e-5, warmup_steps=10,
+                                               end_value=0.0)).build(220)
     trainer = Trainer(objective, solver, key=jax.random.key(args.seed), checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
     placed = jax.device_put({"tokens": rows})

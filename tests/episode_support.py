@@ -1,31 +1,40 @@
-"""Trainable tool policy, square environments and sampled episode scaffolding."""
+"""Square environments and sampled episode scaffolding over the tool policy of tests/tool_policy.py."""
 
 import json
 import sys
-from collections.abc import Callable
 from concurrent.futures import CancelledError
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import optax
-from flax import linen as nn
+from tool_policy import (
+    ANSWER_NINE,
+    ANSWER_SIXTEEN,
+    CALL_FOUR,
+    CALL_THREE,
+    EOS,
+    GROUPS,
+    NINE,
+    PAD,
+    PROMPT,
+    RESPONSE,
+    SIXTEEN,
+    START,
+    TURNS,
+    WRONG,
+    ToolPolicy,
+)
 
-from dew.inference import TextGeneration
-from dew.nn.protocols import OutputTable
-from dew.objectives.rl import GRPOObjective
-from dew.objectives.rl.episodes import Action, EpisodeId, EpisodeRollout, EpisodeStatus, Observation
+from dew.inference import Draw, TextGeneration
+from dew.objectives.rl import GRPOObjective, RolloutScheduler, Snapshot, Synchronous, Task
+from dew.objectives.rl.episodes import EpisodeCollector, EpisodeId, EpisodeStatus, Observation
 from dew.rl.sandbox import SandboxLimits, SubprocessEnvironment
 from dew.sampling import Sampling
 from dew.training import Trainer
 
-# Compact tool vocabulary: a call, a tool result, a final answer, and EOS.
-PAD, START, CALL_THREE, EOS, NINE, ANSWER_NINE, WRONG, CALL_FOUR, SIXTEEN, ANSWER_SIXTEEN = range(10)
-VOCAB = 12
-PROMPT, RESPONSE, TURNS, GROUPS = 8, 3, 3, 4
 SAMPLING = Sampling(temperature=.7, top_k=2, eos_token_ids=EOS, pad_token_id=PAD)
 
 
@@ -37,57 +46,9 @@ def environment(mode: str = "ok", *arguments: str, **limits) -> SubprocessEnviro
     return SubprocessEnvironment((sys.executable, str(worker), mode, *arguments), SandboxLimits(**limits))
 
 
-def action(context, *tokens: int) -> Action:
-    return Action(tuple(context), tokens, (-.1,) * len(tokens), (0.,) * len(tokens),
-                  terminated=True, policy_step=0, sampling=SAMPLING)
-
-
-def transition_logits():
-    logits = np.full((VOCAB, VOCAB), -1000., np.float32)
-    logits[:, EOS] = 1000.
-    logits[START, :] = -1000.
-    logits[START, CALL_THREE] = .2
-    logits[START, CALL_FOUR] = 0.
-    for observation, answer in ((NINE, ANSWER_NINE), (SIXTEEN, ANSWER_SIXTEEN)):
-        logits[observation, :] = -1000.
-        logits[observation, answer] = .25
-        logits[observation, WRONG] = 0.
-    return logits
-
-
-class ToolPolicy(nn.Module):
-    """A trainable bigram policy, by default over a finite tool-call vocabulary.
-
-    The shared sampler draws calls and final answers from logits; the test
-    environment executes square(3) or square(4). No generated code executes.
-    `logits` builds the starting `[vocab_size, vocab_size]` table.
-    """
-
-    vocab_size: int = VOCAB
-    max_seq_len: int = PROMPT + RESPONSE
-    logits: Callable[[], np.ndarray] = transition_logits
-
-    def setup(self):
-        self.table = self.param("table", lambda key: jnp.asarray(self.logits()))
-
-    def hidden_states(self, tokens, train=False, attention_mask=None, positions=None, segment_ids=None):
-        return jax.nn.one_hot(tokens, self.vocab_size)
-
-    def output_table(self):
-        return OutputTable(self.table, vocab_major=False)
-
-    @nn.compact
-    def init_cache(self, batch_size):
-        self.variable("cache", "seen", lambda: jnp.zeros(batch_size, jnp.int32))
-
-    def __call__(
-        self, tokens, train=False, decode=False, attention_mask=None, positions=None, segment_ids=None
-    ):
-        if decode:
-            seen = self.get_variable("cache", "seen")
-            valid = jnp.ones_like(tokens, bool) if attention_mask is None else attention_mask
-            self.put_variable("cache", "seen", seen + valid.sum(-1))
-        return self.hidden_states(tokens) @ self.table
+def action(context, *tokens: int) -> Draw:
+    draw = Draw(tuple(context), tokens, (-.1,) * len(tokens), "stop", 0, (0.,) * len(tokens))
+    return draw.checked(SAMPLING)
 
 
 class SquareSession:
@@ -117,7 +78,7 @@ class SquareSession:
             self.answer = value * value
             self.harness.calls.append((self.identity, value, self.answer))
             observation = {9: NINE, 16: SIXTEEN}[self.answer]
-            return Observation((*action.context, *action.tokens, observation),
+            return Observation((*action.prompt, *action.tokens, observation),
                                detail=f"square({value}) = {self.answer}",
                                reward=None if paid is None else paid[0])
         answer = {ANSWER_NINE: 9, ANSWER_SIXTEEN: 16, WRONG: 8}[command[0]]
@@ -152,25 +113,40 @@ def verify(episode):
 
 
 def build(harness=None, *, record=None, accumulation=1, **changes):
+    """A trainer and the episode collector its scheduler (`episode_scheduler`) draws through."""
     model = ToolPolicy()
     objective = GRPOObjective(model, PROMPT + RESPONSE - 1, beta=.05)
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19), accumulation=accumulation)
-    rollout = EpisodeRollout(
+    collector = EpisodeCollector(
         TextGeneration(model, objective.init(jax.random.key(0))),
         harness or Harness(),
         verify,
         PROMPT,
         RESPONSE,
         TURNS,
-        groups=GROUPS,
         sampling=SAMPLING,
         record=record,
     )
-    return trainer, replace(rollout, **changes)
+    return trainer, replace(collector, **changes)
 
 
-def collect(rollout, state, key=23):
-    return rollout.collect(state, {"task_id": np.array([31], np.int32)}, jax.random.key(key))
+def episode_scheduler(collector, **changes) -> RolloutScheduler:
+    """The trainer's rollout over `collector`: `GROUPS` episodes of each task, collected at each call."""
+    return RolloutScheduler(Synchronous(collector), groups=GROUPS, **changes)
+
+
+def cohort_snapshot(state, key=23) -> Snapshot:
+    return Snapshot(state.variables, int(state.step), int(state.updates), jax.random.key(key))
+
+
+def trained_batch(collector, state, key=23, tasks=(31,)):
+    """The batch the trainer's scheduler (`episode_scheduler`) packs from one cohort of `tasks`' episodes."""
+    return episode_scheduler(collector)(state, {"task_id": np.asarray(tasks, np.int32)}, jax.random.key(key))
+
+
+def collect(collector, state, key=23, tasks=(31,)):
+    """One cohort of `GROUPS` episodes of each of `tasks` under `state`, as the scheduler collects it."""
+    return collector.episodes(cohort_snapshot(state, key), [Task(str(task)) for task in tasks], GROUPS)
 
 
 def per_call(batch, name, episodes):
@@ -181,4 +157,3 @@ def per_call(batch, name, episodes):
             where = (batch["session_index"] == index) & (batch["call_index"] == turn)
             out[index * TURNS + turn, :len(transition.action.tokens)] = np.asarray(batch[name])[where]
     return out
-

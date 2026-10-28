@@ -15,12 +15,13 @@ PROGRAM = """
 import json, sys
 import jax, jax.numpy as jnp
 from dew.cache import enable_compilation_cache
-from dew.nn.kernels.norm_swiglu import rms_norm
+from dew.nn.attention import rms_normalized
 from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
 enable_compilation_cache(sys.argv[1])
 count_compilation_cache()
 x, scale = jnp.ones((4, 128, 1024), jnp.bfloat16), jnp.ones((1024,), jnp.float32)
-jax.jit(lambda x, scale: rms_norm(x, scale, 1e-6, jnp.bfloat16, False, False)).lower(x, scale).compile()
+jax.jit(lambda x, scale: rms_normalized(x, scale, 1e-6, jnp.bfloat16, False, False, True,
+                                        implementation="pallas")).lower(x, scale).compile()
 print(json.dumps(compilation_cache_counts()))
 """
 

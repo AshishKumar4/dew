@@ -10,17 +10,12 @@ from collections.abc import Callable, Mapping
 import grain.experimental as experimental
 import grain.python as grain
 
-from dew.records import boolean, record
+from dew._records import boolean
 
-from .dataset import DataPartition, Loading
+from .dataset import LONG_RUN, DataPartition, Loading, logged_run, restore_parent
 from .sources.base import Shard, ShardManifest
 
 _log = logging.getLogger(__name__)
-
-_FIRST_LOGGED_EMPTY = 1024
-"""The run of empty shards in a row a read first logs, then again at each doubling: more than a
-sharded store holds by accident, so a store of empty files is named from the first line."""
-
 
 def streamed(
     manifest: ShardManifest,
@@ -35,7 +30,7 @@ def streamed(
     """The shards of `manifest` read `epochs` times over (endlessly where None), this share's part
     of them interleaved `cycle_length` at a time. An endless read of a store whose shards all state
     they hold no row is refused, as it would read nothing forever; any other run of empty shards is
-    read through, logged at each doubling (`_FIRST_LOGGED_EMPTY`)."""
+    read through, logged at each doubling from `LONG_RUN` (`logged_run`)."""
     if cycle_length < 1:
         raise ValueError("interleave cycle_length must be positive")
     described = name or (manifest.shards[0].uri if manifest.shards else "a stream")
@@ -58,7 +53,7 @@ def streamed(
         root = root.shuffle(seed=seed)
     if epochs != 1:
         root = root.repeat(epochs)
-    root = root[partition.index :: partition.count]
+    root = root[partition.cut()]
     return _ShardPass(root, manifest.reader, cycle_length, loading, described)
 
 
@@ -94,7 +89,7 @@ class _EmptyRun:
         with self.lock:
             self.count = 0 if yielded else self.count + 1
             count = self.count
-        if count >= _FIRST_LOGGED_EMPTY and not count & (count - 1):
+        if logged_run(count, LONG_RUN):
             _log.warning("%s: its last %d shards held no row; the read goes on to the next", self.name, count)
 
 
@@ -139,7 +134,7 @@ class _WatchedIterator(grain.DatasetIterator):
         return {"parent": self.input_parent.get_state(), "yielded": self.yielded}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self.input_parent.set_state(record(state["parent"], "shard position"))
+        restore_parent(self.input_parent, state, "parent", "shard position")
         self.yielded = boolean(state["yielded"], "shard yielded")
 
     def close(self) -> None:

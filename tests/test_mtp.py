@@ -18,12 +18,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from lm_support import token_batch_of
 from model_support import TINY_DECODER
+from reference_error import assert_as_exact
+from test_lm_objective import assert_as_exact_over_instances, written_cross_entropy
 
+from dew.batch import TEXT_KEY, coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import ModelInputs, coordinates
+from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 
 VOCAB = 37
 SEQ = 8
@@ -31,6 +36,10 @@ SEQ = 8
 
 def tiny(**overrides):
     return CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, **overrides})
+
+
+DECODE_SEEDS = 8
+"""Check 1's declared seeds for the decode step's depth logits (`seeds_for`, paired)."""
 
 
 def test_mean_stream_trunk_exposes_normalized_states_to_plain_prediction():
@@ -47,15 +56,37 @@ def test_mean_stream_trunk_exposes_normalized_states_to_plain_prediction():
     doubled = {**variables, 'params': {**variables['params'], 'norm': {
         **variables['params']['norm'], 'scale': variables['params']['norm']['scale'] * 2}}}
     louder, _ = model.apply(doubled, ids, method=CausalTransformer.states_and_logits)
-    np.testing.assert_allclose(jnp.asarray(louder), 2 * state, atol=1e-4, rtol=0)
-    expected = model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0]
-    cache = model.apply(variables, ids.shape[0], method=CausalTransformer.init_mtp_cache,
-                        mutable=['cache'])[1]['cache']
-    (logits, carried), _ = model.apply(
-        {**variables, 'cache': cache}, state[:, :1], ids[:, 1:2],
-        method=CausalTransformer.mtp_step, decode=True, mutable=['cache'])
-    np.testing.assert_allclose(jnp.asarray(logits), jnp.asarray(expected)[:, :1], atol=1e-4, rtol=0)
-    assert jnp.asarray(carried).shape == (ids.shape[0], 1, model.emb_features)
+    # A power of two scales every product and sum it reaches exactly: the state is twice as large bit
+    # for bit.
+    np.testing.assert_array_equal(jnp.asarray(louder), 2 * state)
+
+    def decoded(variables, ids):
+        state, _ = model.apply(variables, ids, method=CausalTransformer.states_and_logits)
+        cache = model.apply(variables, ids.shape[0], method=CausalTransformer.init_mtp_cache,
+                            mutable=['cache'])[1]['cache']
+        (logits, carried), _ = model.apply(
+            {**variables, 'cache': cache}, state[:, :1], ids[:, 1:2],
+            method=CausalTransformer.mtp_step, decode=True, mutable=['cache'])
+        return logits, carried
+
+    def first_depth(model):
+        def logits(variables, ids):
+            hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
+            return model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0][:, :1]
+        return logits
+
+    assert jnp.asarray(decoded(variables, ids)[1]).shape == (ids.shape[0], 1, model.emb_features)
+    # The decode step's first-depth logits on par with the full depth's at its first position, the
+    # whole sequence's forward at its own shape (check 1 over drawn models and tokens).
+    init = jax.jit(model.init)
+
+    def draw(seed):
+        ids = token_batch(batch=2, seed=seed)[TEXT_KEY]
+        return init(jax.random.key(seed), ids), ids
+
+    assert_as_exact(lambda variables, ids: decoded(variables, ids)[0], first_depth(model), draw,
+                    "the decode step's depth logits", seeds=DECODE_SEEDS,
+                    truth_fn=first_depth(model.clone(dtype=jnp.float64)))
 
 
 def test_a_depth_reads_the_token_after_its_position():
@@ -94,7 +125,8 @@ def test_the_depths_score_through_the_main_head():
 
     for plain, louder in zip(scored(params), scored(doubled), strict=True):
         assert float(jnp.max(jnp.abs(plain))) > 1e-3
-        assert jnp.allclose(2.0 * plain, louder, rtol=1e-6)
+        # Twice the head's kernel doubles each product and sum of the logits exactly.
+        np.testing.assert_array_equal(2.0 * plain, louder)
 
 
 # --------------------------------------------------------------------------
@@ -106,8 +138,7 @@ def step_at(key=1):
 
 
 def token_batch(batch=4, seed=0):
-    ids = np.random.RandomState(seed).randint(0, VOCAB, (batch, SEQ + 1))
-    return {TEXT_KEY: jnp.asarray(ids, jnp.int32)}
+    return token_batch_of(VOCAB, SEQ, batch, seed)
 
 
 def cross_entropy(logits, targets):
@@ -118,15 +149,24 @@ def cross_entropy(logits, targets):
     return -np.take_along_axis(log_probs, np.asarray(targets)[..., None], axis=-1)[..., 0]
 
 
-def depth_cross_entropies(model, params, tokens):
-    """Each depth's cross entropy by hand: depth d's logits at p against the
-    token at p + d + 1, summed and divided by the main term's count."""
-    inputs = jnp.asarray(tokens[:, :-1], jnp.int32)
-    hidden = model.apply(params, inputs, method=CausalTransformer.hidden_states)
-    depths = model.apply(params, hidden, inputs, method=CausalTransformer.mtp_logits)
-    count = tokens.shape[0] * (tokens.shape[1] - 1)
-    return [cross_entropy(logits, tokens[:, depth + 1:]).sum() / count
-            for depth, logits in enumerate(depths, start=1)]
+def written_depth_cross_entropy(model):
+    """The mean over the depths of each depth's cross entropy written from its own logits, against the
+    tokens d + 1 positions on, summed and divided by the main term's count: the reference arm of the
+    term's check 1, and on the model in float64 its truth."""
+    def term(params, tokens):
+        inputs = tokens[:, :-1]
+        hidden = model.apply(params, inputs, method=CausalTransformer.hidden_states)
+        depths = model.apply(params, hidden, inputs, method=CausalTransformer.mtp_logits)
+        count = tokens.shape[0] * (tokens.shape[1] - 1)
+        return jnp.mean(jnp.stack([
+            -jnp.sum(jnp.take_along_axis(jax.nn.log_softmax(logits, axis=-1),
+                                         tokens[:, depth + 1:][..., None], axis=-1)) / count
+            for depth, logits in enumerate(depths, start=1)]))
+    return term
+
+
+TERM_SEEDS = 8
+"""Check 1's declared seeds for the term and the loss it joins (`seeds_for`, paired)."""
 
 
 def test_the_term_is_off_by_default():
@@ -146,7 +186,8 @@ def test_the_term_is_off_by_default():
     plain = {"params": {key: value for key, value in params["params"].items()
                         if key != "mtp_0"}}
     plain_loss, _ = LMObjective(tiny(), SEQ).scalar_loss(plain, batch, step_at())
-    assert float(loss) == pytest.approx(float(plain_loss), rel=1e-6)
+    # The same trunk and head compute the same loss: the unused depths change no operation it takes.
+    assert float(loss) == float(plain_loss)
     assert all(not jnp.any(leaf) for leaf in jax.tree.leaves(grads["params"]["mtp_0"]))
 
 
@@ -168,17 +209,33 @@ def test_the_term_adds_the_weighted_mean_depth_cross_entropy(hyper_connections):
         lambda p: objective.scalar_loss(p, batch, step_at()), has_aux=True)(params)
 
     ce = float(aux.metrics["ce"])
-    expected = depth_cross_entropies(model, params, tokens)
-    assert float(aux.metrics["mtp_ce"]) == pytest.approx(float(np.mean(expected)), rel=1e-5)
-    assert float(loss) == pytest.approx(ce + 0.3 * float(np.mean(expected)), rel=1e-5)
     assert abs(float(loss) - ce) > 1e-2
+
+    # Over drawn models and tokens, the term and the loss it joins on par with the written ones (check 1).
+    init = jax.jit(objective.init)
+
+    def draw(seed):
+        return init(jax.random.key(seed)), token_batch(seed=seed)[TEXT_KEY]
+
+    def dew(params, tokens):
+        loss, aux = objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
+        return aux.metrics["mtp_ce"], loss
+
+    def written(model):
+        main, depths = written_cross_entropy(model), written_depth_cross_entropy(model)
+        return lambda params, tokens: (depths(params, tokens),
+                                       main(params, tokens) + 0.3 * depths(params, tokens))
+
+    assert_as_exact_over_instances(dew, written(model), draw, "the depths' term and the loss",
+                                   seeds=TERM_SEEDS, truth_fn=written(model.clone(dtype=jnp.float64)))
     # Scored against the wrong tokens (the main targets, unshifted) the term
     # is a different number, which is the mistake this guards.
     inputs = jnp.asarray(tokens[:, :-1], jnp.int32)
     hidden = model.apply(params, inputs, method=CausalTransformer.hidden_states)
     first = model.apply(params, hidden, inputs, method=CausalTransformer.mtp_logits)[0]
     unshifted = cross_entropy(first, tokens[:, 1:-1]).sum() / (tokens.shape[0] * SEQ)
-    assert abs(unshifted - expected[0]) > 1e-3
+    shifted = cross_entropy(first, tokens[:, 2:]).sum() / (tokens.shape[0] * SEQ)
+    assert abs(unshifted - shifted) > 1e-3
     for depth in ("mtp_0", "mtp_1"):
         assert any(jnp.any(leaf) for leaf in jax.tree.leaves(grads["params"][depth]))
 
@@ -214,7 +271,7 @@ def test_packing_carried_by_the_model_inputs_scores_the_depths_the_same(depths):
     for ours, reference in zip((supplied.losses, supplied.weights, *supplied.depths),
                               (explicit.losses, explicit.weights, *explicit.depths), strict=True):
         for left, right in zip(jax.tree.leaves(ours), jax.tree.leaves(reference), strict=True):
-            np.testing.assert_allclose(left, right, rtol=1e-6, atol=1e-6)
+            np.testing.assert_array_equal(left, right)
 
 
 def test_a_routed_depth_balances_only_when_the_depths_run():
@@ -224,7 +281,7 @@ def test_a_routed_depth_balances_only_when_the_depths_run():
     model = tiny(num_nextn_predict_layers=1, num_kv_heads=4,
                  mixture={"experts": 4, "top_k": 2, "score_function": "sigmoid", "bias": True})
     batch = token_batch()
-    still = LMObjective(model, SEQ, balance_rate=0.1)
+    still = LMObjective(model, SEQ, balance=ExpertBalance(balance_rate=0.1))
     params = still.init(jax.random.key(0))
     _, aux = still.scalar_loss(params, batch, step_at())
     assert aux.effects is not None
@@ -234,7 +291,7 @@ def test_a_routed_depth_balances_only_when_the_depths_run():
     assert not jnp.array_equal(moved["layers_1"]["mlp"]["gate"]["e_score_correction_bias"],
                                params["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"])
 
-    running = LMObjective(model, SEQ, balance_rate=0.1, mtp_weight=0.3)
+    running = LMObjective(model, SEQ, balance=ExpertBalance(balance_rate=0.1), mtp_weight=0.3)
     _, aux = running.scalar_loss(params, batch, step_at())
     assert aux.effects is not None
     moved = running.apply_effects(params, aux.effects)["moe"]

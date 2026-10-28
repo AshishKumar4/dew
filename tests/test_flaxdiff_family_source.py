@@ -20,7 +20,6 @@ must ignore. The MM-DiTs and the VideoDiT, which pool the real tokens, get
 no padding.
 """
 
-import json
 from pathlib import Path
 
 import jax
@@ -28,6 +27,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from interop_support import fixture_with_meta, recorded_gradients
 from reference_error import (
     assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
@@ -36,6 +36,7 @@ from reference_error import (
     widened,
 )
 
+from dew.interop.flaxdiff import SCAN_PROJECTION, scan_projection
 from dew.nn.attention import Stage
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.mmdit import HierarchicalMMDiT, SimpleMMDiT
@@ -60,6 +61,10 @@ UDIT_MOVED = {"time_embed": ("conditioning", "time_embed"),
               "final_norm": ("output", "final_norm"), "final_proj": ("output", "final_proj")}
 DIT_POOLING = {"text_pooling": "all"}
 PROJECTIONS = {"project_in_conv": "project_in", "project_out_conv": "project_out"}
+FEED_FORWARD = {("net_0", "proj"): ("gate_up_proj",), ("net_2",): ("down_proj",)}
+"""FlaxDiff's GEGLU feed-forward, diffusers', under `GatedMLP`'s names (`geglu_feed_forward`)."""
+# A scan order's patch projection lands on Dew's patch convolution (`scan_projection`).
+SCAN_PROJECTED = ("patch_embed", "Conv_0")
 MMDITS = ("SimpleMMDiT", "HierarchicalMMDiT")
 # FlaxDiff's MM-DiT block module by module, as Dew's `DoubleStreamBlock`
 # names it: one joint attention holds both streams' projections and norms.
@@ -78,9 +83,7 @@ MODULATION_ORDER = (4, 3, 5, 1, 0, 2)
 
 @pytest.fixture(scope="module")
 def reference():
-    with np.load(FIXTURE) as loaded:
-        arrays = dict(loaded)
-    return arrays, json.loads(arrays.pop("meta").tobytes())
+    return fixture_with_meta(FIXTURE)
 
 
 def dew_model(cls: str, config: dict):
@@ -108,6 +111,9 @@ def mmdit_block(cls: str, name: str) -> bool:
 def dew_path(cls: str, name: str) -> tuple[str, ...]:
     """The Dew parameter a FlaxDiff parameter path lands on."""
     path = tuple(name.split("/"))
+    if SCAN_PROJECTION in path:
+        at = path.index(SCAN_PROJECTION)
+        path = (*path[:at], *SCAN_PROJECTED, *path[at + 1:])
     if cls == "SimpleUDiT" and path[0] in UDIT_MOVED:
         return (*UDIT_MOVED[path[0]], *path[1:])
     if mmdit_block(cls, name):
@@ -118,6 +124,10 @@ def dew_path(cls: str, name: str) -> tuple[str, ...]:
         at = path.index("mlp") + 1
         path = (*path[:at], MMDIT_LAYERS.get(path[at], path[at]), *path[at + 1:])
     if cls in UNETS:
+        if "ff" in path:
+            at = path.index("ff") + 1
+            moved = next(names for names in FEED_FORWARD if path[at:at + len(names)] == names)
+            path = (*path[:at], *FEED_FORWARD[moved], *path[at + len(moved):])
         # FlaxDiff's ConvLayer wraps the convolution Dew's Conv is, and its
         # middle stage projects with a 1x1 convolution where Dew's is dense.
         return tuple(PROJECTIONS.get(part, part.replace("ConvLayer_", "Conv_")) for part in path
@@ -125,12 +135,16 @@ def dew_path(cls: str, name: str) -> tuple[str, ...]:
     return path
 
 
-def to_dew(cls: str, name: str, value: np.ndarray) -> np.ndarray:
+def to_dew(cls: str, name: str, value: np.ndarray, patch_size: int | None = None) -> np.ndarray:
     """A FlaxDiff parameter in Dew's layout: a 1x1 convolution's kernel as
-    the dense kernel it is, an MM-DiT's per-head projections flat, and its
+    the dense kernel it is, a scan order's patch projection as the patch
+    convolution's kernel, an MM-DiT's per-head projections flat, and its
     modulation pieces in SD3's order."""
     if PROJECTIONS.keys() & set(name.split("/")):
         return value[0, 0]
+    if name.endswith(f"{SCAN_PROJECTION}/kernel"):
+        assert patch_size is not None
+        return scan_projection(value, patch_size)
     if not mmdit_block(cls, name):
         return value
     module, leaf = name.split("/")[1], name.split("/")[-1]
@@ -199,7 +213,7 @@ def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(reference, case
     prefix = f"{case}/param."
     names = sorted(name.removeprefix(prefix) for name in arrays if name.startswith(prefix))
     params = nest({dew_path(cls, name): to_dew(cls, name, part(f"param.{name}").view(ml_dtypes.bfloat16)
-                                                    .astype(np.float32))
+                                                    .astype(np.float32), config.get("patch_size"))
                    for name in names})
     constants = nest({(*fourier_path(cls), "frequencies"): part("fourier_table")})
     model = dew_model(cls, config)
@@ -222,9 +236,7 @@ def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(reference, case
         return np.asarray(tree)
 
     def source_order(precision: str) -> np.ndarray:
-        leaves = [part(f"{precision}.grad_image"), part(f"{precision}.grad_text")]
-        leaves += [part(f"{precision}.grad_param.{name}") for name in names]
-        return np.concatenate([np.ravel(value) for value in leaves])
+        return recorded_gradients(part, precision, ("image", "text"), names)
 
     def gradient_order(gradients, back=None):
         grad_params, grad_image, grad_text = gradients

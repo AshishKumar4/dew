@@ -2,16 +2,17 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Container, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
+from flax.traverse_util import flatten_dict
 
-from dew import records
-from dew.registry import dtype_name, resolve_dtype
+from dew import _records
+from dew.interop.unread import Stored, equal, held, valued
+from dew.registry import dtype_name, resolve_dtype, storage_name
 
 if TYPE_CHECKING:
     from flax import linen as nn
@@ -23,11 +24,48 @@ type ParamTree = Tree[np.ndarray]
 type TensorPath = Callable[[str], tuple[str, ...] | None]
 
 
+def in_params(path: TensorPath) -> TensorPath:
+    """`path`, whose leaves are parameters, rooted at `params`."""
+    def rooted(name: str) -> tuple[str, ...] | None:
+        leaf = path(name)
+        return None if leaf is None else ("params", *leaf)
+    return rooted
+
+
+def check_shapes[PathT](loaded: Iterable[tuple[PathT, tuple[int, ...]]],
+                        expected: Mapping[PathT, tuple[int, ...]]) -> None:
+    """Check every supplied shape against its native slot, including multiple source aliases.
+    Missing, unexpected and mismatched entries are reported together before parameters are read."""
+    seen: set[PathT] = set()
+    mismatched = []
+    for path, shape in loaded:
+        seen.add(path)
+        if path in expected and shape != expected[path]:
+            mismatched.append(f"{path} is {shape}, the module takes {expected[path]}")
+    missing = sorted(set(expected) - seen, key=str)
+    unexpected = sorted(seen - set(expected), key=str)
+    if missing or unexpected or mismatched:
+        raise ValueError(
+            f"the checkpoint does not fit the model: missing {missing}, "
+            f"unexpected {unexpected}, mismatched {sorted(mismatched)}")
+
+
+def check_tree(variables: Mapping[str, object], module: nn.Module, *inputs) -> None:
+    """Check every collection against the module's abstract initialization, without another
+    copy of its parameters. Inputs may be arrays or jax.ShapeDtypeStruct values."""
+    def shapes(tree) -> dict[str, tuple[int, ...]]:
+        return {jax.tree_util.keystr(path, simple=True, separator="."): np.shape(leaf)
+                for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
+
+    expected = shapes(jax.eval_shape(module.init, jax.random.key(0), *inputs))
+    check_shapes(shapes(dict(variables)).items(), expected)
+
+
 AUTO = "auto"
 """The param_dtype that stores a checkpoint's parameters in its own dtype."""
 
 
-def declared_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarray]) -> str:
+def declared_dtype(config: Mapping[str, object], tensors: Mapping[str, Stored]) -> str:
     """The compute dtype a checkpoint declares, which its packed FP8 or FP4
     payloads decode to under param_dtype 'auto': config.json's `dtype`
     (`torch_dtype` before transformers 5.0), else the dtype of the first
@@ -35,17 +73,16 @@ def declared_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarra
     """
     stated = config.get("dtype", config.get("torch_dtype"))
     if stated is not None:
-        storage = dtype_name(resolve_dtype(records.text(stated, "dtype")))
+        storage = dtype_name(resolve_dtype(_records.text(stated, "dtype")))
         if storage is None:
             raise ValueError(f"dtype={stated!r} names no floating parameter storage")
         return storage
-    storable = {np.dtype(np.float32): "float32", np.dtype(np.float16): "float16",
-                np.dtype(ml_dtypes.bfloat16): "bfloat16"}
     for tensor in tensors.values():
-        if tensor.dtype in storable:
-            return storable[tensor.dtype]
-    raise ValueError("param_dtype 'auto' found neither a stated dtype nor a float32, bfloat16 or "
-                     "float16 tensor in the checkpoint")
+        name = storage_name(tensor.dtype)
+        if name is not None:
+            return name
+    raise ValueError("param_dtype 'auto' found neither a stated dtype nor a floating tensor a config "
+                     "names (`dew.registry.DtypeName`) in the checkpoint")
 
 
 def checkpoint_dtype(stored: np.dtype, param_dtype: str = "float32", *,
@@ -88,10 +125,25 @@ def decoding_storage(model: nn.Module, variables: Mapping) -> Mapping:
     return jax.tree_util.tree_map_with_path(stored, variables)
 
 
-def checkpoint_array(tensor, param_dtype: str = "float32") -> np.ndarray:
+def checkpoint_array(tensor: Stored, param_dtype: str = "float32") -> Stored:
     """Cast a stored floating array directly, without an FP32 intermediate."""
-    leaf = np.asarray(tensor)
+    leaf = held(tensor)
     return leaf.astype(checkpoint_dtype(leaf.dtype, param_dtype), copy=False)
+
+
+def indexed_path(tokens: Iterable[str], *, indexed: Container[str] | None = None) -> tuple[str, ...]:
+    """A source tensor name's dotted tokens as Linen's path: each numeric token joins the token before it
+    (`down_blocks.0` → `down_blocks_0`) where that token, as folded so far, is one of `indexed` (any token,
+    where None; none, where empty). Unrestricted, consecutive digits all join it (`a.0.1` → `a_0_1`);
+    with `indexed`, the second joins only where the folded token (`a_0`) is itself in it. A leading
+    numeric token, or one after a token `indexed` leaves out, stays its own."""
+    path: list[str] = []
+    for token in tokens:
+        if token.isdigit() and path and (indexed is None or path[-1] in indexed):
+            path[-1] = f"{path[-1]}_{token}"
+        else:
+            path.append(token)
+    return tuple(path)
 
 
 def insert[LeafT](tree: Tree[LeafT], path: tuple[str, ...], leaf: LeafT, name: str) -> None:
@@ -112,11 +164,11 @@ def insert[LeafT](tree: Tree[LeafT], path: tuple[str, ...], leaf: LeafT, name: s
         raise ValueError(f"{name} lands on {'/'.join(path)}, which another tensor already fills")
 
 
-def source_alias(tensors: Mapping[str, np.ndarray], owners: dict[tuple[str, ...], str],
+def source_alias(tensors: Mapping[str, Stored], owners: dict[tuple[str, ...], str],
                  path: tuple[str, ...], name: str) -> None:
     """Compare source aliases before casting, since unequal values can round alike."""
     previous = owners.setdefault(path, name)
-    if previous != name and not np.array_equal(tensors[previous], tensors[name]):
+    if previous != name and not equal(tensors[previous], tensors[name]):
         raise ValueError(f"Two different source tensors {previous!r} and {name!r} map to {path}")
 
 
@@ -144,19 +196,21 @@ def swapped(values: np.ndarray) -> np.ndarray:
     return out.reshape(*lead, columns, rows)
 
 
-def _copy(stored: np.ndarray, dtype: np.dtype, order: tuple[int, ...] | None) -> np.ndarray:
+def _copy(stored: Stored, dtype: np.dtype, order: tuple[int, ...] | None) -> Stored:
     """Cast in contiguous source order before copying the native layout, a
     swap of the last two axes (every linear kernel) in tiles (`swapped`)."""
     leaf = stored.astype(dtype, copy=False)
     if order is None:
         return leaf
+    if not valued(leaf):
+        return leaf.transpose(order)
     if order == (*range(leaf.ndim - 2), leaf.ndim - 1, leaf.ndim - 2):
         return swapped(leaf)
     return np.ascontiguousarray(leaf.transpose(order))
 
 
-def _leaves[LeafT](tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype: str,
-                   read: Callable[[np.ndarray, np.dtype, tuple[int, ...] | None], LeafT]
+def _leaves[LeafT](tensors: Mapping[str, Stored], path_of: TensorPath, param_dtype: str,
+                   read: Callable[[Stored, np.dtype, tuple[int, ...] | None], LeafT]
                    ) -> Iterator[tuple[str, tuple[str, ...], LeafT, tuple[int, ...] | None]]:
     """Choose native paths, layout and precision for an eager or mapped reader.
 
@@ -166,7 +220,7 @@ def _leaves[LeafT](tensors: Mapping[str, np.ndarray], path_of: TensorPath, param
         path = path_of(name)
         if path is None:
             continue
-        stored = np.asarray(tensor)
+        stored = held(tensor)
         order, transpose = _orders(path, stored.ndim)
         dtype = checkpoint_dtype(stored.dtype, param_dtype, path=path)
         yield name, path, read(stored, dtype, order), transpose
@@ -180,6 +234,35 @@ def _orders(path: tuple[str, ...], rank: int) -> tuple[tuple[int, ...] | None, t
         return None, None
     order = (*range(2, rank), 1, 0)
     return order, tuple(int(axis) for axis in np.argsort(order))
+
+
+def native_shape(path: tuple[str, ...], shape: tuple[int, ...]) -> tuple[int, ...]:
+    """The native shape at `path` under the same source-axis permutation the parameter reader uses."""
+    order, _ = _orders(path, len(shape))
+    return shape if order is None else tuple(shape[axis] for axis in order)
+
+
+def stored_shape(path: tuple[str, ...], shape: tuple[int, ...]) -> tuple[int, ...]:
+    """The shape of the source tensor a leaf of `shape` at `path` is read from (`_orders`' inverse):
+    a kernel's axes as the source stores them, any other leaf's as they are."""
+    order, _ = _orders(path, len(shape))
+    return tuple(shape) if order is None else tuple(shape[order.index(axis)] for axis in range(len(shape)))
+
+
+def native_layouts(variables: Mapping[str, Mapping[str, object]], name_of: Callable[[tuple[str, ...]], str],
+                   path_of: TensorPath) -> tuple[WeightLayout, ...]:
+    """The layouts that write every leaf of `variables` (its collections) back as the source tensor
+    `name_of` names it from its path, for a tree built natively rather than read; `path_of`, the
+    reader's own map, places each name, and a name it does not place back at its leaf is refused."""
+    shapes = {}
+    for collection, tree in variables.items():
+        for path, leaf in flatten_dict(dict(tree)).items():
+            name = name_of((collection, *path))
+            if path_of(name) != (collection, *path) or not isinstance(leaf, (np.ndarray, jax.Array)):
+                raise ValueError(f"{name} reads into {path_of(name)}, not an array at ({collection}, "
+                                 f"{', '.join(path)})")
+            shapes[name] = stored_shape(path, leaf.shape)
+    return source_layouts("", shapes, path_of, ())
 
 
 def source_layouts(component: str, shapes: Mapping[str, tuple[int, ...]], path_of: TensorPath,
@@ -201,8 +284,8 @@ def _layout(component: str, name: str, shape: tuple[int, ...], path: tuple[str, 
                         _orders(path, len(shape))[1])
 
 
-def translate_parameters(tensors: Mapping[str, np.ndarray], path_of: TensorPath,
-                         param_dtype: str = "float32") -> ParamTree:
+def translate_parameters[A: (np.ndarray, Stored)](tensors: Mapping[str, A], path_of: TensorPath,
+                                                  param_dtype: str = "float32") -> Tree[A]:
     """Read host-built parameters without creating deferred placement recipes.
 
     Repeated paths compare at their storage precision.
@@ -210,8 +293,8 @@ def translate_parameters(tensors: Mapping[str, np.ndarray], path_of: TensorPath,
     return placed(tensors, path_of, param_dtype)[0]
 
 
-def placed(tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype: str = "float32"
-           ) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
+def placed[A: (np.ndarray, Stored)](tensors: Mapping[str, A], path_of: TensorPath,
+                                    param_dtype: str = "float32") -> tuple[Tree[A], tuple[WeightLayout, ...]]:
     """`translate_parameters`' tree, with the layout that writes each tensor it placed back
     under its own name from its path in that tree; a tensor `path_of` leaves out has none.
     It is `record_layouts`' binding pass (`_bound`) with each tensor read whole, under no
@@ -219,9 +302,9 @@ def placed(tensors: Mapping[str, np.ndarray], path_of: TensorPath, param_dtype: 
     return _bound("", tensors, path_of, (), param_dtype, _copy)
 
 
-def _bound[LeafT](component: str, tensors: Mapping[str, np.ndarray], path_of: TensorPath,
+def _bound[LeafT](component: str, tensors: Mapping[str, Stored], path_of: TensorPath,
                   prefix: tuple[str, ...], param_dtype: str,
-                  read: Callable[[np.ndarray, np.dtype, tuple[int, ...] | None], LeafT]
+                  read: Callable[[Stored, np.dtype, tuple[int, ...] | None], LeafT]
                   ) -> tuple[dict, tuple[WeightLayout, ...]]:
     """The one binding pass, eager (`placed`) or mapped (`record_layouts`): each tensor
     `path_of` places, read by `read` into its leaf, source aliases sharing the leaf of the
@@ -237,7 +320,7 @@ def _bound[LeafT](component: str, tensors: Mapping[str, np.ndarray], path_of: Te
     return parameters, tuple(layouts)
 
 
-def _aliased(tensors: Mapping[str, np.ndarray], path_of: TensorPath
+def _aliased(tensors: Mapping[str, Stored], path_of: TensorPath
              ) -> tuple[dict[tuple[str, ...], str], TensorPath]:
     """The first tensor each path holds, filled as the returned `path_of` is asked, which
     compares each later alias with it before any cast (`source_alias`)."""
@@ -261,7 +344,7 @@ def nested(layouts: tuple[WeightLayout, ...], depth: int, *keys: str) -> tuple[W
                  for layout in layouts)
 
 
-def record_layouts(component: str, tensors: Mapping[str, np.ndarray], path_of: TensorPath,
+def record_layouts(component: str, tensors: Mapping[str, Stored], path_of: TensorPath,
                    prefix: tuple[str, ...], *, param_dtype: str = "float32", lazy: bool = False
                    ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
     """Bind native leaves and the layouts that rebuild every source tensor.
@@ -273,7 +356,7 @@ def record_layouts(component: str, tensors: Mapping[str, np.ndarray], path_of: T
     """
     from dew.interop.streaming import SourceLeaf, materialize
 
-    def mapped(stored: np.ndarray, dtype: np.dtype, order: tuple[int, ...] | None) -> np.ndarray | SourceLeaf:
+    def mapped(stored: Stored, dtype: np.dtype, order: tuple[int, ...] | None) -> Stored | SourceLeaf:
         return (_copy(stored, dtype, order) if order is not None and stored.ndim != 2
                 else SourceLeaf((stored,), dtype, transposed=order is not None))
 

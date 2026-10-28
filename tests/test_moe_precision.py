@@ -7,23 +7,28 @@ tangent that dropped a representable 2^-30 residue. The Adam checks compare
 the exchange dispatch with the global one, whose gradients the oracle checks.
 """
 
+import contextlib
+import types
+
 import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import optax
 import pytest
+from generation_support import interpreted_projection
 from jax.sharding import NamedSharding, PartitionSpec as P
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, with_gradients
 from scipy.special import erfc
-from tuned import each_config
+from tuned import each_config, taken
 
 from dew.nn.activations import exact_gelu
 from dew.nn.gpt_oss import GptOssExperts
-from dew.nn.kernels import grouped_matmul, tuning
-from dew.nn.kernels.generation import triton_runs
+from dew.nn.kernels import generation, grouped_matmul, tuning
+from dew.nn.kernels.generation import chosen as kernel_choices, gpu_target, triton_runs
 from dew.nn.moe import ExpertMLP, expert_dispatch, expert_projection
 from dew.training import MeshSpec
+from tools import grouped_oracle as oracle
 
 pytestmark = pytest.mark.kernel
 
@@ -42,16 +47,8 @@ def rounded(value, dtype=ml_dtypes.bfloat16) -> np.ndarray:
     return np.asarray(value).astype(dtype).astype(np.float64)
 
 
-def grouped(a, b) -> np.ndarray:
-    """`a @ b` per expert for `a` of three rows per expert."""
-    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
-    return (a.reshape(8, 3, a.shape[-1]) @ b).reshape(24, -1)
-
-
-def gathered(a, b) -> np.ndarray:
-    """`a.T @ b` per expert, the kernel cotangent."""
-    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
-    return a.reshape(8, 3, a.shape[-1]).swapaxes(1, 2) @ b.reshape(8, 3, b.shape[-1])
+THREE_EACH = np.full(8, 3)
+"""Three rows for each of eight experts, the projections' equal routing."""
 
 
 def shardings(mesh, rows: bool):
@@ -116,9 +113,9 @@ def test_a_projection_rounds_whole_contractions_once(case, master, input_dtype, 
     the gradient returned placed or replicated."""
     x, kernel, dy = next(values for name, *values in cases() if name == case)
     sizes = np.full(8, 3, np.int32)
-    forward = rounded(grouped(rounded(x), rounded(kernel)))
-    kernel_oracle = gathered(rounded(x), rounded(dy))
-    input_oracle = rounded(grouped(rounded(dy), rounded(kernel).swapaxes(1, 2)), input_dtype)
+    forward = rounded(oracle.forward(rounded(x), rounded(kernel), THREE_EACH))
+    kernel_oracle = oracle.kernel_gradient(rounded(x), rounded(dy), THREE_EACH)
+    input_oracle = rounded(oracle.input_gradient(rounded(dy), rounded(kernel), THREE_EACH), input_dtype)
 
     def loss(kernel, x, dy, sizes):
         projected = jnp.asarray(expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None))
@@ -146,8 +143,8 @@ def test_a_projection_rounds_whole_contractions_once(case, master, input_dtype, 
     ids=['even', 'ragged', 'one-expert', 'fewer-rows', 'all-empty'])
 @pytest.mark.parametrize('input_dtype', [jnp.bfloat16, jnp.float32])
 def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
-    """Forward, input and kernel cotangents of 'pallas' against float64
-    sums of the bf16 operands, on the kernels (interpreted on a CPU): rows
+    """Forward, input and kernel cotangents of the projection's kernels against
+    float64 sums of the bf16 operands (interpreted on a CPU, `interpreted_projection`): rows
     past the routed ones, and every row when no expert is routed, come back
     zero in the output and the input gradient."""
     rng = np.random.default_rng(88)
@@ -155,26 +152,18 @@ def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
     kernel = rng.normal(size=(8, 16, 16)).astype(np.float32)
     dy = rng.normal(size=(24, 16))
     sizes = sizes.astype(np.int32)
-    ends = np.cumsum(sizes)
-    rows = np.searchsorted(ends, np.arange(24), side='right')
-    routed = np.arange(24) < ends[-1]
     qx, qk = rounded(x), rounded(kernel)
     qy = rounded(dy)
-    forward = np.zeros((24, 16))
-    input_oracle = np.zeros((24, 16))
-    kernel_oracle = np.zeros((8, 16, 16))
-    for row in np.flatnonzero(routed):
-        forward[row] = qx[row] @ qk[rows[row]]
-        input_oracle[row] = qy[row] @ qk[rows[row]].T
-        kernel_oracle[rows[row]] += np.outer(qx[row], qy[row])
+    forward, input_oracle, kernel_oracle = oracle.products(qx, qk, qy, sizes)
 
     def loss(x, kernel):
-        projected = jnp.asarray(expert_projection(x, kernel, jnp.asarray(sizes), jnp.bfloat16,
-                                                  'pallas', None))
+        projected = jnp.asarray(interpreted_projection(x, kernel, jnp.asarray(sizes), jnp.bfloat16))
         return jnp.sum(projected.astype(jnp.float32) * jnp.asarray(qy, jnp.float32)), projected
 
-    (_, y), (dx, dk) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(
-        jnp.asarray(x, input_dtype), jnp.asarray(kernel))
+    # A CPU interprets the kernels as the A100 it states; a GPU runs its own.
+    with generation.assumed("sm80") if jax.default_backend() == "cpu" else contextlib.nullcontext():
+        (_, y), (dx, dk) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(
+            jnp.asarray(x, input_dtype), jnp.asarray(kernel))
     assert dx.dtype == input_dtype and dk.dtype == jnp.float32
     np.testing.assert_allclose(np.asarray(y, np.float64), rounded(forward), atol=TOLERANCE,
                                rtol=TOLERANCE)
@@ -184,46 +173,98 @@ def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
                                rtol=TOLERANCE)
 
 
+HOPPER = pytest.mark.skipif(not (triton_runs() and gpu_target().wgmma),
+                            reason="Mosaic GPU's grouped launches need Hopper's warpgroup MMA")
+
+
 @pytest.mark.gpu(reason="the tuner's space is a GPU's")
 @pytest.mark.skipif(not triton_runs(), reason="needs a GPU the Pallas kernels compile for")
-@pytest.mark.parametrize("kernel", [grouped_matmul.Gmm, grouped_matmul.GmmTransposed, grouped_matmul.Tgmm])
-def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel):
-    """Each tile the tuner may pick for a launch, over groups ragged against
-    every tile size, one empty and one of a single row: the output and both
-    gradients of a bf16 projection lie within tests/reference_error.py's rule
-    of XLA's ragged dot, both measured from float64 sums of the same bf16
-    operands. The space declares only tiles proven here."""
-    rng = np.random.default_rng(91)
-    sizes = np.array([0, 70, 1, 129, 100, 0], np.int32)
-    rows, width, features = int(sizes.sum()), 192, 320
-    x = rounded(rng.normal(size=(rows, width)))
-    kernel_matrix = rounded(rng.normal(size=(len(sizes), width, features)) / np.sqrt(width))
-    dy = rounded(rng.normal(size=(rows, features)))
-    group = np.repeat(np.arange(len(sizes)), sizes)
-    truth = (np.einsum('ri,rio->ro', x, kernel_matrix[group]),
-             np.einsum('ro,rio->ri', dy, kernel_matrix[group]),
-             np.stack([x[group == expert].T @ dy[group == expert] for expert in range(len(sizes))]))
-
-    def projected(implementation):
-        def run(x, kernel_matrix):
-            y, pull = jax.vjp(lambda x, k: expert_projection(x, k, jnp.asarray(sizes), jnp.bfloat16,
-                                                             implementation, None), x, kernel_matrix)
-            return (y, *pull(jnp.asarray(dy, jnp.bfloat16)))
-        return run
-
-    operands = (jnp.asarray(x, jnp.bfloat16), jnp.asarray(kernel_matrix, jnp.bfloat16))
-    reference = [np.asarray(value, np.float64) for value in jax.jit(projected('xla'))(*operands)]
-    configs = each_config(kernel, projected('pallas'), *operands)
-    assert len(configs) > 1
+@pytest.mark.parametrize("kernel,width,features", [
+    (grouped_matmul.Gmm, 192, 320), (grouped_matmul.Tgmm, 192, 320),
+    pytest.param(grouped_matmul.MosaicGmm, 768, 768, marks=HOPPER),
+    pytest.param(grouped_matmul.MosaicTgmm, 768, 768, marks=HOPPER)])
+def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width, features):
+    """Each config a launch may take (`each_config`: the tile it derives and
+    the variants an opt-in tuning run times), of the implementation the
+    launch is forced to, over groups ragged against every tile size, one
+    empty and one of a single row: the output and both gradients of a bf16
+    projection over an fp32 master hold check 1 against XLA's ragged dot,
+    from float64 sums of the same bf16 operands, over the site's draws.
+    Triton's widths are ragged against its tiles, which mask them; Mosaic's
+    divide by every tile width it derives (64 to 256, and a pair's 256
+    rows), which it needs."""
+    gate = _tile_gate(kernel, width, features)
+    with kernel_choices(grouped_matmul=kernel.name):
+        configs = each_config(kernel, _tile_gate_arm('pallas'), *gate.draw(0))
+    assert configs
     for config in configs:
-        with tuning.pinned({kernel: config}):
-            actual = [np.asarray(value, np.float64) for value in jax.jit(projected('pallas'))(*operands)]
-        for name, got, theirs, exact in zip(("y", "dx", "dk"), actual, reference, truth, strict=True):
-            try:
-                assert_as_exact_as_the_reference(got, theirs, exact, name)
-            except AssertionError as error:
-                error.add_note(f"{kernel.__name__} at {config}")
-                raise
+        gate.check(config)
+
+
+def test_the_tile_gate_fails_a_launch_off_by_a_rounding():
+    """The tile gate on the Triton launch, interpreted on the CPU as an A100's, passes it and fails it
+    with its forward off by one part in 2^7, an error no rounding of its sums makes: the reference arm is
+    XLA's, not the launch under test."""
+    with generation.assumed("sm80"):
+        gate = _tile_gate(grouped_matmul.Gmm, 64, 128)
+        with kernel_choices(grouped_matmul='triton'):
+            config, *_ = taken(grouped_matmul.Gmm, _tile_gate_arm('pallas'), *gate.draw(0))
+        gate.check(config)
+        with pytest.raises(AssertionError):
+            gate.check(config, fault=1 + 2.0 ** -7)
+
+
+TILE_SIZES = np.array([0, 70, 1, 129, 100, 0], np.int32)
+"""The tile gate's groups: ragged against every tile, one empty, one of a single row."""
+
+
+def _tile_gate_arm(implementation, fault=1.0):
+    """A bf16 projection's output and both gradients through `implementation` ('pallas': the kernels,
+    interpreted on a CPU, `interpreted_projection`), its output times `fault`."""
+    def project(x, k):
+        if implementation == 'pallas':
+            return interpreted_projection(x, k, jnp.asarray(TILE_SIZES), jnp.bfloat16)
+        return expert_projection(x, k, jnp.asarray(TILE_SIZES), jnp.bfloat16, implementation, None)
+
+    def run(x, kernel_matrix, dy):
+        y, *gradients = with_gradients(project)(x, kernel_matrix, dy)
+        return ((y.astype(jnp.float32) * fault).astype(y.dtype), *gradients)
+    return run
+
+
+def _tile_gate(kernel, width, features):
+    """The tile gate of `kernel`'s launch at one shape: its draws, and `check(config, fault)`, check 1 of
+    the launch at `config` against XLA's ragged dot, which runs under its own choice so the forced kernel
+    never reaches it."""
+    rows = int(TILE_SIZES.sum())
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(len(TILE_SIZES), width, features)) / np.sqrt(width),
+                            jnp.float32),
+                jnp.asarray(rng.normal(size=(rows, features)), jnp.bfloat16))
+
+    def truth(x, kernel_matrix, dy):
+        # The products of the operands as the projection rounds them, in float64.
+        return oracle.products(x, rounded(kernel_matrix), dy, TILE_SIZES)
+
+    xla = jax.jit(_tile_gate_arm('xla'))
+
+    def reference(*inputs):
+        with kernel_choices(grouped_matmul='xla'):
+            return xla(*inputs)
+
+    def check(config, fault=1.0):
+        with kernel_choices(grouped_matmul=kernel.name), tuning.pinned({kernel: config}):
+            assert_as_exact(jax.jit(_tile_gate_arm('pallas', fault)), reference, draw,
+                            f"{kernel.__name__} at {config}", seeds=TILE_SEEDS, truth_fn=truth)
+
+    return types.SimpleNamespace(draw=draw, check=check)
+
+
+TILE_SEEDS = 8
+"""The tile gate's declared draws (`reference_error.seeds_for` of XLA's ragged dot on them)."""
 
 
 @pytest.mark.gpu(reason="needs a GPU the Pallas kernels compile for")
@@ -232,8 +273,8 @@ def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel):
 def test_a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels(implementation):
     """The kernels are chosen where the call lowers, not by the process's
     default backend. On a GPU host, a projection placed on the CPU runs
-    `jax.lax.ragged_dot` ('auto') or the interpreted kernels ('pallas'), and
-    its forward is the float64 sum of the bf16 operands either way."""
+    XLA's program ('auto' and 'pallas' alike), and its forward is the float64
+    sum of the bf16 operands either way."""
     rng = np.random.default_rng(88)
     x = rng.normal(size=(24, 16)).astype(np.float32)
     kernel = rng.normal(size=(8, 16, 16)).astype(np.float32)
@@ -244,7 +285,8 @@ def test_a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels(i
     y = project(*jax.device_put((x, kernel, np.full(8, 3, np.int32)), cpu))
 
     assert y.devices() == {cpu}
-    np.testing.assert_allclose(np.asarray(y, np.float64), rounded(grouped(rounded(x), rounded(kernel))),
+    np.testing.assert_allclose(np.asarray(y, np.float64),
+                               rounded(oracle.forward(rounded(x), rounded(kernel), THREE_EACH)),
                                atol=TOLERANCE, rtol=TOLERANCE)
 
 
@@ -263,13 +305,7 @@ def test_a_bf16_projection_at_the_highest_precision_holds_the_contract(sizes):
     dy = rounded(rng.normal(size=(24, 16)))
     sizes = sizes.astype(np.int32)
     # Rows past the routed ones belong to no expert and come back zero.
-    rows = np.searchsorted(np.cumsum(sizes), np.arange(24), side='right')
-    forward, input_oracle = np.zeros((24, 16)), np.zeros((24, 16))
-    kernel_oracle = np.zeros((8, 16, 16))
-    for row in np.flatnonzero(np.arange(24) < sizes.sum()):
-        forward[row] = x[row] @ kernel[rows[row]]
-        input_oracle[row] = dy[row] @ kernel[rows[row]].T
-        kernel_oracle[rows[row]] += np.outer(x[row], dy[row])
+    forward, input_oracle, kernel_oracle = oracle.products(x, kernel, dy, sizes)
 
     def loss(x, kernel):
         projected = expert_projection(x, kernel, jnp.asarray(sizes), jnp.bfloat16, 'xla', 'highest')
@@ -303,11 +339,12 @@ def test_a_projection_differentiates_the_same_law_in_every_direction(
     sizes = jnp.full(8, 3, jnp.int32)
     qx, qk, qc = (rounded(value, compute) for value in (x, kernel, cotangent))
     expected = (
-        rounded(grouped(qx, qk), compute),
-        rounded(grouped(dx, qk) + grouped(qx, dkernel), compute),
-        (rounded(grouped(qc, qk.swapaxes(1, 2)), input_dtype), rounded(gathered(qx, qc), master)),
-        (rounded(grouped(qc, np.asarray(dkernel).swapaxes(1, 2)), input_dtype),
-         rounded(gathered(dx, qc), master)))
+        rounded(oracle.forward(qx, qk, THREE_EACH), compute),
+        rounded(oracle.forward(dx, qk, THREE_EACH) + oracle.forward(qx, dkernel, THREE_EACH), compute),
+        (rounded(oracle.input_gradient(qc, qk, THREE_EACH), input_dtype),
+         rounded(oracle.kernel_gradient(qx, qc, THREE_EACH), master)),
+        (rounded(oracle.input_gradient(qc, dkernel, THREE_EACH), input_dtype),
+         rounded(oracle.kernel_gradient(dx, qc, THREE_EACH), master)))
 
     def evaluate(x, kernel, dx, dkernel, cotangent, sizes):
         def fn(x, kernel):
@@ -492,9 +529,9 @@ def test_both_dispatches_take_the_same_adam_steps_in_bf16(activation, skewed, sc
                                                           expert, fsdp, implementation):
     """Three Adam steps of a bf16 routed layer: outputs, gradients, parameters
     and moments agree between global and exchange dispatch. Observed maxima
-    1.5e-8 random and 6e-8 skewed. 'pallas' runs its kernels (interpreted on
-    a CPU) on every device's own rows, the exchange included on a mesh whose
-    only split axis is the expert one."""
+    1.5e-8 random and 6e-8 skewed. On a GPU 'pallas' runs its kernels on
+    every device's own rows, the exchange included on a mesh whose only split
+    axis is the expert one; a CPU runs XLA's program."""
     mesh = MeshSpec(expert=expert, fsdp=fsdp).build()
     model, parameters, specs, tokens, x, weights, choices = placed_experts(
         mesh, activation, skewed, scale_inputs, limit, implementation)

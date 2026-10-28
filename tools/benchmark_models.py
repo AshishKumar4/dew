@@ -23,12 +23,14 @@ from jax.sharding import Mesh
 
 import dew.nn.backbones
 import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
+from dew.batch import Variables, coordinates
 from dew.data import preferences
 from dew.data.chat import ROLES_KEY, Role
 from dew.data.dataset import DataPartition
 from dew.diffusion import presets
 from dew.diffusion.discrete import MDLM
 from dew.diffusion.process import DenoisingCondition
+from dew.distributed.batches import DevicePrefetchIterator
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.inputs.encoders import ConditionEncoder
 from dew.nn.attention import AttentionImpl
@@ -40,45 +42,44 @@ from dew.nn.backbones.unet_condition import UNet2DCondition
 from dew.nn.backbones.wan import WanTransformer
 from dew.nn.backbones.z_image import ZImageTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs, coordinates
+from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
 from dew.nn.vision import ProjectorBase, TowerBase
-from dew.objectives.base import Objective, Variables
+from dew.objectives.base import Objective
 from dew.objectives.diffusion import BlockDiffusionObjective, DiffusionObjective
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
-from dew.registry import models, projectors, resolve_dtype, towers
+from dew.registry import models, projectors, read_arguments, resolve_dtype, towers
+from dew.state import TrainState
+from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.distributed import DevicePrefetchIterator
-from dew.training.state import TrainState
+from dew.training.planning import Trials
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
 class _DenoisingTextTable(ConditionEncoder[str]):
     """Synthetic token and pooled features for native diffusion models."""
 
-    def __init__(self, table: CharTable, features: int, pooled_features: int | None,
-                 guidance: float | None, masked: bool = False):
-        self.table = table
-        self.params = table.params
-        self.features = features
-        self.pooled_features = pooled_features
-        self.guidance = guidance
-        self.masked = masked
-        """Whether the condition marks the real tokens, as Z-Image reads them."""
+    table: CharTable
+    params: Variables
+    features: int
+    pooled_features: int | None
+    guidance: float | None
+    masked: bool = False
+    """Whether the condition marks the real tokens, as Z-Image reads them."""
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = "char_table", *, tokens: int = TEXT_TOKENS,
                         features: int = TEXT_FEATURES, pooled_features: int | None = None,
                         guidance: float | None = None, masked: bool = False, vocab: int = 130, seed: int = 0,
                         dtype=None):
-        return cls(CharTable.from_pretrained(checkpoint, tokens=tokens,
-                                            features=max(features, pooled_features or 0),
-                                            vocab=vocab, seed=seed, dtype=dtype),
-                   features, pooled_features, guidance, masked)
+        table = CharTable.from_pretrained(checkpoint, tokens=tokens, vocab=vocab, seed=seed, dtype=dtype,
+                                          features=max(features, pooled_features or 0))
+        return cls(table, table.params, features, pooled_features, guidance, masked)
 
     def tokenize(self, data: Sequence[str]) -> Mapping[str, np.ndarray]:
         return self.table.tokenize(data)
@@ -91,9 +92,9 @@ class _DenoisingTextTable(ConditionEncoder[str]):
         return DenoisingCondition(hidden[..., :self.features], pooled, guidance=guidance,
                                   mask=jnp.asarray(text.mask, bool) if self.masked else None)
 
-    def to_json(self) -> dict:
-        return {**self.table.to_json(), "features": self.features, "pooled_features": self.pooled_features,
-                "guidance": self.guidance, "masked": self.masked}
+    def recorded_fields(self) -> dict:
+        return {**self.table.recorded_fields(), "features": self.features,
+                "pooled_features": self.pooled_features, "guidance": self.guidance, "masked": self.masked}
 
 
 def trainer_mesh(mesh: Mapping[str, int]) -> dict[str, object]:
@@ -142,11 +143,12 @@ def image_tokens(case: Case) -> int:
     return features.shape[1]
 
 
-def objective_keywords(case: Case) -> dict[str, Any]:
+def objective_keywords(case: Case, constructor: Callable[..., Objective]) -> Mapping[str, Any]:
     """The case's own objective keywords (`Case.objective`), with its head chunking where it names one:
-    what every language-model objective it builds, a decoder's or a canvas's, is given."""
+    what every language-model objective it builds, a decoder's or a canvas's, is given, each read against
+    `constructor`'s arguments as a run's record is (`dew.registry.read_arguments`)."""
     chunks: dict[str, Any] = {} if case.head_chunks is None else {"head_chunks": case.head_chunks}
-    return {**chunks, **case.objective}
+    return read_arguments(constructor, {**chunks, **case.objective})
 
 
 def decoder_objective(
@@ -156,19 +158,20 @@ def decoder_objective(
     with its own head chunking where it names one and its further objective
     keywords. Masked diffusion corrupts to the vocabulary's last id, which
     `global_batch` never draws."""
-    keywords = objective_keywords(case)
     match case.decoder_objective:
         case "lm":
-            return LMObjective(model, case.seq_len, **keywords)
+            return LMObjective(model, case.seq_len, **objective_keywords(case, LMObjective))
         case "sft":
-            return LMObjective(model, case.seq_len, loss_role=Role.ASSISTANT, **keywords)
+            return LMObjective(model, case.seq_len, loss_role=Role.ASSISTANT,
+                               **objective_keywords(case, LMObjective))
         case "dpo":
-            return DPOObjective(model, case.seq_len, **keywords)
+            return DPOObjective(model, case.seq_len, **objective_keywords(case, DPOObjective))
         case "grpo":
-            return GRPOObjective(model, case.seq_len, **keywords)
+            return GRPOObjective(model, case.seq_len, **objective_keywords(case, GRPOObjective))
         case "mdlm":
             vocab = _count(case.config, "vocab_size", case.architecture)
-            return MaskedDiffusionObjective(model, MDLM(mask_id=vocab - 1)(), case.seq_len, **keywords)
+            return MaskedDiffusionObjective(model, MDLM(mask_id=vocab - 1)(), case.seq_len,
+                                            **objective_keywords(case, MaskedDiffusionObjective))
 
 
 def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
@@ -209,7 +212,8 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
             raise ValueError(f"{case.label} trains canvases, which BlockDiffusionObjective scores; "
                              f"it names decoder_objective={case.decoder_objective!r}")
         objective = BlockDiffusionObjective(
-            model, prompt_length=prompt, canvas_size=width, num_canvases=count, **objective_keywords(case))
+            model, prompt_length=prompt, canvas_size=width, num_canvases=count,
+            **objective_keywords(case, BlockDiffusionObjective))
     elif case.media is not None:
         family, tower, projector, token = media_values(case)
         # The decoder carries the attention kernel; the wrapper reads none.
@@ -420,8 +424,9 @@ class CompiledStep:
 
 @contextlib.contextmanager
 def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) -> Iterator[CompiledStep]:
-    """Place the case's state as a run does (`Trainer.place`), compile its step on the first placed batch,
-    and yield it.
+    """Place the case's state as a run does (`Trainer.place`), compile its step on the first placed batch
+    with the trials a run's compile takes (`Trials`), which time a frontier's plans and profile the
+    step where JAX's AutoPGLE asks, on a copy of the state, and yield it.
 
     Each step reads the next placed batch, or with `fixed_batch` the first
     one again. The batches stay placed until the block ends.
@@ -431,8 +436,10 @@ def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) ->
         first = next(source)
         jax.block_until_ready((state, first))
         start = time.perf_counter()
-        compiled = trainer.compile(state, first)
+        trials = Trials(state, first)
+        compiled = trainer.compile(state, first, trials)
         compile_seconds = time.perf_counter() - start
+        state = trials.state
 
         def step(state: TrainState) -> tuple[TrainState, jax.Array, jax.Array]:
             state, loss, _, finite, _, _ = compiled(state, first if fixed_batch else next(source))
@@ -443,12 +450,10 @@ def compiled_step(case: Case, trainer: Trainer, *, fixed_batch: bool = False) ->
 
 def timed_steps(step: Step, state: TrainState, steps: int
                 ) -> tuple[TrainState, jax.Array, jax.Array, float]:
-    """Run `steps` steps, at least one, dispatched as a run dispatches them, waiting once at the end.
+    """Run `steps` steps, at least one, dispatched as a run dispatches them, waiting once at the end
+    (`dew.telemetry.benchmark.carried`).
 
     Returns the last state, loss and finiteness, and the seconds the window took.
     """
-    start = time.perf_counter()
-    for _ in range(steps):
-        state, loss, finite = step(state)
-    loss.block_until_ready()
-    return state, loss, finite, time.perf_counter() - start
+    (state, loss, finite), (seconds,) = carried(lambda carry: step(carry[0]), (state, None, None), steps)
+    return state, loss, finite, seconds

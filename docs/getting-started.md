@@ -7,8 +7,6 @@ The blocks below form one script, `train.py`.
 ## Data
 
 ```python
-from dew.data import Loading
-from dew.config.data import RecordsData, loader
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -16,17 +14,17 @@ import optax
 from flax import linen as nn
 
 from dew import Trainer
-from dew.data import Dataset
+from dew.data import Memory
 from dew.objectives.base import Aux, Objective
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
 y = 2 * x + 1
-data = loader(RecordsData(source={"x": x, "y": y}), batch=32, read="memory", loading=Loading(workers=0))
+data = Memory({"x": x, "y": y}).shuffle(seed=0).repeat().batch(32)
 ```
 
-`Records` accepts columns: here, float32 arrays `x` and `y` of shape `(32, 1)`, one record per row. `load(..., read="memory")` compiles that recipe. A batch has the same fields with the batch as its first dimension, so `batch=32` reads all 32 points every step.
+`Memory` accepts columns: here, float32 arrays `x` and `y` of shape `(32, 1)`, one record per row. It is already a dataset, and each verb returns a new one: `shuffle` draws a new order every epoch of the `repeat`, and `batch(32)` reads all 32 points every step. A batch has the same fields with the batch as its first dimension.
 
-The training stream reshuffles the records every epoch using `seed` (0 unless you pass one). A checkpoint saves the stream's position, so a resumed run continues where it stopped. With several processes, each one reads its own share of every batch. `validation=` takes held-out records in the same form; this example has none. [Training data](concepts/data.md) covers the readers for files, Hugging Face and TFDS datasets, and the `Dataset` value they all return.
+A checkpoint saves the stream's position, so a resumed run continues where it stopped. With several processes, each one reads its own share of every batch. `fit(..., validation=)` takes held-out records as a second dataset; this example has none. [Training data](concepts/data.md) covers the readers for files, Hugging Face and TFDS datasets, and the `Dataset` value they all return.
 
 ## Objective
 

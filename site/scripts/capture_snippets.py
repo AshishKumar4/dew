@@ -1,8 +1,10 @@
 """Run a landing page cell on a terminal and record what it showed.
 
 The page shows each cell beside the terminal it ran on, so a recording must come
-from running exactly that code. Run this after changing a cell, in an
-environment with Dew and pyte installed, and commit what it writes:
+from running exactly that code. Run this after changing what a cell does, in an
+environment with Dew and pyte installed, and commit what it writes (a change that
+cannot alter what it shows keeps its recording and takes its new digest:
+site/scripts/digest.py):
 
     python site/scripts/capture_snippets.py --where "a 4-vCPU Cloudflare container" --cell lm
 
@@ -193,7 +195,7 @@ def main() -> None:
     arguments = options.arguments[1:] if options.arguments[:1] == ["--"] else options.arguments
     if options.cell:
         code = cells.cell(options.cell)
-        target = SITE / "public/examples/framework" / options.cell
+        target = (SITE / cells.recordings()[options.cell][0]).parent
         work = Path(tempfile.mkdtemp(prefix=f"cell-{options.cell}-"))
         script = work / f"{options.cell}.py"
         script.write_text(code + "\n")

@@ -34,6 +34,7 @@ kernels.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import json
 import math
 import numbers
@@ -47,16 +48,27 @@ from typing import ClassVar, NotRequired, Protocol, TypedDict, runtime_checkable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn, traverse_util
+from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
+from dew._records import finite
+from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, part, select, thaw
+from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
-from dew.nn.dense import Dense, DenseGeneral
-from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
+from dew.nn.dense import _contractions, _linear_site
+from dew.nn.dropout import Dropout
+from dew.nn.flops import (
+    MissingFlopsCount,
+    counted_flops,
+    frozen_training_flops,
+    parameter_flops,
+    projection_flops,
+)
+from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general
 from dew.nn.protocols import (
     Counted,
     CountedConditionedSpatial,
@@ -74,15 +86,15 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
-from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
+from dew.nn.sharding import LOW_RANK_FACTORS
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
     InputQuantization,
-    frozen_fp8_kernel,
+    decoded_frozen_fp8,
     measured_fp8_sites,
 )
-from dew.registry import wrapper_layers
+from dew.registry import Wrapper, rebuilt, wrapper_layers
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -90,7 +102,7 @@ PEFT_PREFIX = "base_model.model."
 DIFFUSERS_WEIGHTS = "pytorch_lora_weights.safetensors"
 DIFFUSERS_METADATA = "lora_adapter_metadata"
 
-FACTORS = ("lora_A", "lora_B")
+FACTORS = LOW_RANK_FACTORS
 # PEFT's init: A as torch's Linear default, kaiming-uniform with a=sqrt(5),
 # which is uniform on +-1/sqrt(fan_in); B zero, so a fresh adapter is the
 # identity.
@@ -116,13 +128,6 @@ def _rank(owner: str, rank: object) -> int:
     if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
         raise ValueError(f"{owner}: rank must be a positive integer, not {rank!r}")
     return rank
-
-
-def _alpha(owner: str, alpha: object) -> float:
-    """`alpha` as a float, refused unless a finite number."""
-    if isinstance(alpha, bool) or not isinstance(alpha, numbers.Real) or not math.isfinite(alpha):
-        raise ValueError(f"{owner}: alpha must be a finite number, not {alpha!r}")
-    return float(alpha)
 
 
 def _dropout(owner: str, dropout: object) -> float:
@@ -160,7 +165,7 @@ class LoRA:
         object.__setattr__(self, "modules", tuple(self.modules))
         _rank("LoRA", self.rank)
         if self.alpha is not None:
-            _alpha("LoRA", self.alpha)
+            finite(self.alpha, "LoRA: alpha")
         _dropout("LoRA", self.dropout)
         if not self.modules or any(not isinstance(module, str) or not module for module in self.modules):
             raise ValueError("modules names at least one projection")
@@ -182,14 +187,17 @@ class LoRA:
         `fp8_base` (`fp8_base`'s measurement) runs its frozen sites' products in
         FP8: their kernels are packed from the base this adapter freezes, and the
         model computes them under the record, inside the adapter's branch. FP8
-        changes the function, by about E4M3's rounding of each operand.
+        changes the function, by about E4M3's rounding of each operand. Until an
+        FP8 product keeps fp32's sums (ledger 1625) it saves neither memory nor
+        time: its codes take two bytes a parameter, as bf16's do, and multiply as
+        bf16 values (`dew.quantization.frozen_fp8_product`).
         """
         from dew.nn.inputs import request_key
 
         _refuse_unadaptable(model)
         if fp8_base is not None:
             model = fp8_base.joined(model)
-        variables = thaw(variables)
+        source, variables = variables, thaw(variables)
         bound = _named(bound_layouts(model, variables, layouts or {}), self.modules)
         scaling = 2.0 * self.rank if self.alpha is None else float(self.alpha)
         targets: dict[Path, Target] = {}
@@ -202,7 +210,7 @@ class LoRA:
             _insert_factors(leaves, factors.module, INIT_A(factor_key, shape_a, FACTOR_DTYPE),
                             INIT_B(factor_key, shape_b, FACTOR_DTYPE))
         bases = {} if base is None else dict.fromkeys(_components(bound) or {""}, base)
-        return Adapter.bound(model, overlay(variables, leaves), targets, self.rslora, self.dropout, bound,
+        return Adapter.bound(model, overlay(source, leaves), targets, self.rslora, self.dropout, bound,
                              bases)
 
     def fp8_base(self, model: nn.Module, variables: Variables, *, tokens: int,
@@ -211,7 +219,8 @@ class LoRA:
         """Measure which projections of the base this adapter freezes run
         faster in FP8 at `tokens` rows a step, on process 0's GPU for the
         whole pool, and return the record `apply` takes as its `fp8_base`
-        (`measured_fp8_sites`).
+        (`measured_fp8_sites`): none until an FP8 product keeps fp32's sums
+        (ledger 1625), which saves neither memory nor time before then.
 
         `modules` names the projections as `modules` does (this adapter's own
         when None) and `layouts` resolves them as `apply` does. The
@@ -235,8 +244,7 @@ class LoRA:
         and PEFT features this loader does not support are refused by name.
         """
         _refuse_unadaptable(model)
-        variables = thaw(variables)
-        bound = bound_layouts(model, variables, layouts or {})
+        bound = bound_layouts(model, thaw(variables), layouts or {})
         path = FilePath(path)
         if (path / PEFT_WEIGHTS).is_file():
             where = str(path / PEFT_CONFIG)
@@ -283,14 +291,35 @@ class Adapter:
 
     model: nn.Module
     variables: Variables
-    targets: Mapping[Path, Target]
-    rslora: bool = False
-    dropout: float = 0.0
-    layouts: Mapping[str, WeightLayout] = dataclasses.field(default_factory=dict)
-    bases: Mapping[str, AdapterBase] = dataclasses.field(default_factory=dict)
-    """The published model each component was bound to, by component (`""` for a decoder's or a
-    registry-built model's one unnamed component), which `save` names in that component's PEFT
-    config; a component bound to a local directory or a model built from its class has none."""
+
+    @property
+    def _binding(self) -> _Bound:
+        """The settings `model` was adapted with (`_Bound`), the one record its branch computes from and
+        `merge` and `save` read."""
+        adapted = type(self.model)
+        if not isinstance(adapted, AdaptedClass):
+            raise TypeError(f"{adapted.__name__} is not adapted, so it carries no adapter")
+        return adapted._dew_lora_bound
+
+    @property
+    def targets(self) -> Mapping[Path, Target]:
+        return self._binding.targets
+
+    @property
+    def rslora(self) -> bool:
+        return self._binding.rslora
+
+    @property
+    def dropout(self) -> float:
+        return self._binding.dropout
+
+    @property
+    def layouts(self) -> Mapping[str, WeightLayout]:
+        return self._binding.layouts
+
+    @property
+    def bases(self) -> Mapping[str, AdapterBase]:
+        return self._binding.bases
 
     @classmethod
     def bound(cls, model: nn.Module, variables: Variables, targets: Mapping[Path, Target], rslora: bool,
@@ -298,14 +327,19 @@ class Adapter:
               bases: Mapping[str, AdapterBase] | None = None) -> Adapter:
         """Adapt `model` to `targets` and split `variables` into factors and frozen weights.
 
-        The factors go under `params` and everything else under `FROZEN`. `bases` are the published
-        models its components were bound to (`Adapter.bases`).
+        The factors go under `params` and everything else under `FROZEN`,
+        but what a split tree already trains keeps training (`freeze`), as do
+        a cross-attention block's leaves (`crossing`), which a source attached
+        unsplit holds beside its weights (`Pretrained.with_cross_attention`).
+        `bases` are the published models its components were bound to
+        (`Adapter.bases`).
         """
-        bases = dict(bases or {})
-        adapted = _adapted(model, _Branch(targets, rslora, dropout), layouts, bases)
+        from dew.nn.cross_attention import crossing
+
+        adapted = _adapted(model, _Bound(targets, rslora, dropout, layouts, dict(bases or {})))
         factors = {(*path, factor) for path in targets for factor in FACTORS}
-        return cls(adapted, _fp8_packed(model, freeze(thaw(variables), lambda path: path in factors)),
-                   targets, rslora, dropout, layouts, bases)
+        split = freeze(variables, lambda path: path in factors or crossing(path))
+        return cls(adapted, _fp8_packed(model, split))
 
     @classmethod
     def from_run(cls, directory: str | FilePath, *, step: int | str | None = None,
@@ -314,30 +348,37 @@ class Adapter:
 
         It holds the adapted model, the checkpoint's variables and the bindings the
         run recorded, so `save` writes the factors under the source's names without
-        the source at hand. A recorded binding whose shapes do not fit the restored
-        factors is refused by name. `trust` is as `TextGeneration.from_run` takes it.
+        the source at hand: the recorded model's own part of a tree that nests it
+        beside others (`Objective._recorded_part`, a decision's backbone). A recorded
+        binding whose shapes do not fit the restored factors is refused by name.
+        `trust` is as `TextGeneration.from_run` takes it.
         """
-        from dew.config import ModelConfig
-        from dew.inference.tasks import run_record
-        from dew.records import record, text
-        from dew.registry import objectives
+        from dew.inference.tasks import SavedRun, saved_model
 
-        declaration, step = run_record(str(directory), step, trust)
-        config = ModelConfig.from_dict(record(declaration['model'], 'model'))
-        if config.adapter is None:
+        run = SavedRun.pinned(str(directory), step, trust)
+        config = saved_model(run.record, None)
+        adapter = recorded_adapter(config.wrappers)
+        if adapter is None:
             raise ValueError(f"{directory} trained no adapter")
-        variables = objectives[text(declaration['objective'], 'objective')]._saved_variables(
-            str(directory), step=step, ema=ema)
-        return cls.recorded(config.build(), variables, config.adapter)
+        variables = run.variables(ema=ema)
+        # The recorded model's own tree, where the objective's nests it beside parts the record leaves out.
+        if run.objective._recorded_part is not None:
+            variables = part(variables, run.objective._recorded_part)
+        return cls.recorded(config.build(), variables, adapter)
 
     @classmethod
     def recorded(cls, model: nn.Module, variables: Variables, adapter: AdapterRecord) -> Adapter:
         """Return the adapter a model record's `adapter` describes.
 
-        It goes over the adapted `model` and a checkpoint's `variables`.
+        It goes over the adapted `model` and a checkpoint's `variables`. The model holds the adapter's
+        settings (`_Bound`), so a record that describes other settings than the ones it was adapted
+        with is refused rather than read past.
         """
-        if not isinstance(type(model), AdaptedClass):
-            raise ValueError(f"{type(model).__name__} is not adapted, so it carries no adapter")
+        adapted = type(model)
+        if not isinstance(adapted, AdaptedClass):
+            raise ValueError(f"{adapted.__name__} is not adapted, so it carries no adapter")
+        if _record(adapted._dew_lora_bound) != adapter:
+            raise ValueError(f"the record's adapter is not the one {adapted.__name__} was adapted with")
         targets, layouts = adapter.bound()
         whole = thaw(variables)
         for name, layout in layouts.items():
@@ -353,7 +394,7 @@ class Adapter:
             if found != expected:
                 raise ValueError(f"the recorded binding {name} expects factors {expected}, and the "
                                  f"checkpoint holds {found}")
-        return cls(model, variables, targets, adapter.rslora, adapter.dropout, layouts, dict(adapter.bases))
+        return cls(model, variables)
 
     def scale(self, target: Target) -> float:
         return _scale(target, self.rslora)
@@ -364,23 +405,17 @@ class Adapter:
         `variables` is the adapted tree, whole or split as a trainer keeps it. The sum
         runs in at least fp32 at full precision and is stored in the kernel's dtype,
         as PEFT's `merge_and_unload` does. A frozen FP8 site's kernel is the one its
-        codes decode to (`frozen_fp8_kernel`), targeted or not, and the codes go,
-        since a model under the record would multiply them in the merged kernel's
-        place. The result is one `params` collection.
+        codes decode to (`dew.quantization.decoded_frozen_fp8`), targeted or not, and
+        the codes go, since a model under the record would multiply them in the merged
+        kernel's place. The result is one `params` collection.
         """
-        variables = thaw(variables)
-        coded = {path[:-1] for path in traverse_util.flatten_dict(variables.get(QUANTIZATION, {}))
-                 if path[-1] == FROZEN_FP8[0]}
+        variables = decoded_frozen_fp8(thaw(variables))
         merged: dict = {}
-        for site in coded:
-            _insert(merged, ("params", *site, "kernel"), _base_kernel(variables, ("params", *site)))
         for path, target in self.targets.items():
             node = _node(variables, path)
-            kernel = _updated(_base_kernel(variables, path), node["lora_A"], node["lora_B"],
-                              self.scale(target))
+            kernel = _updated(node["kernel"], node["lora_A"], node["lora_B"], self.scale(target))
             _insert(merged, (*path, "kernel"), kernel)
-        dropped = ({(*path, factor) for path in self.targets for factor in FACTORS}
-                   | {(QUANTIZATION, *site, leaf) for site in coded for leaf in FROZEN_FP8})
+        dropped = {(*path, factor) for path in self.targets for factor in FACTORS}
         return select(overlay(variables, merged), lambda path: path not in dropped)
 
     def save(self, variables: Variables, path: str | FilePath) -> None:
@@ -442,9 +477,22 @@ def _scale(target: Target, rslora: bool) -> float:
 def _updated(kernel: jax.Array, a: jax.Array, b: jax.Array, scale: float) -> jax.Array:
     """`kernel` plus `scale` times the factors' product, summed in at least fp32 at full precision
     and stored in the kernel's dtype, as PEFT's `merge_and_unload` does."""
-    dtype = jnp.promote_types(kernel.dtype, jnp.float32)
-    delta = jnp.tensordot(a.astype(dtype), b.astype(dtype), axes=1, precision=jax.lax.Precision.HIGHEST)
+    dtype = at_least_fp32(kernel.dtype)
+    delta = accumulated(functools.partial(jnp.tensordot, axes=1, precision=jax.lax.Precision.HIGHEST),
+                        a.astype(dtype), b.astype(dtype))
     return (kernel.astype(dtype) + scale * delta).astype(kernel.dtype)
+
+
+def _targets_under(targets: Mapping[Path, Target], path: Path) -> bool:
+    """Whether a target lies at or under the module `path`, a scanned run standing for each layer it
+    runs (`_target_at`)."""
+    paths = [path]
+    for depth, name in enumerate(path):
+        layers = group_layers(name)
+        if layers is not None and len(layers) > 1:
+            paths = [(*held[:depth], f"layers_{index}", *held[depth + 1:])
+                     for held in paths for index in layers]
+    return any(target[:len(held)] == held for target in targets for held in paths)
 
 
 def _target_at(targets: Mapping[Path, Target], path: Path) -> Target | None:
@@ -469,14 +517,40 @@ def _target_at(targets: Mapping[Path, Target], path: Path) -> Target | None:
 
 
 @dataclass(frozen=True)
-class _Branch:
-    """The interceptor an adapted model runs under: the adapter branch on
-    every target module's `__call__`."""
+class _Bound:
+    """An adapter's settings, held once by the model it adapts (its branch, `_Branch`) and read by its
+    `Adapter`, `merge`, `save` and the model's record: `targets` the adapted modules' paths with their
+    rank and alpha, `rslora`, `dropout`, `layouts` the bindings by the name a file stores each module
+    under, and `bases` the published model each component was bound to (`""` for a decoder's or a
+    registry-built model's one unnamed component), which `save` names in that component's PEFT config;
+    a component bound to a local directory or a model built from its class has none."""
 
     targets: Mapping[Path, Target]
-    rslora: bool
-    dropout: float
+    rslora: bool = False
+    dropout: float = 0.0
+    layouts: Mapping[str, WeightLayout] = dataclasses.field(default_factory=dict)
+    bases: Mapping[str, AdapterBase] = dataclasses.field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _Branch:
+    """The interceptor an adapted model runs under: the adapter branch `bound` describes on every
+    target module's `__call__`."""
+
+    bound: _Bound
     root: Path = ("params",)
+
+    @property
+    def targets(self) -> Mapping[Path, Target]:
+        return self.bound.targets
+
+    @property
+    def rslora(self) -> bool:
+        return self.bound.rslora
+
+    @property
+    def dropout(self) -> float:
+        return self.bound.dropout
 
     def __call__(self, next_fun, args, kwargs, context):
         module = context.module
@@ -484,11 +558,12 @@ class _Branch:
         if context.method_name == "nonlinear_input":
             # A layer asks whether its submodule is linear in its input on
             # this call (`MultiHeadLatentAttention.nonlinear_input`): the
-            # branch's dropout draws on it, on a target under a dropout stream.
+            # branch's dropout draws on it, on a target at or under it under
+            # a dropout stream.
             name = args[0] if args else kwargs["name"]
             return next_fun(*args, **kwargs) or bool(
                 self.dropout and module.has_rng("dropout")
-                and _target_at(self.targets, root + module.path + (name,)) is not None)
+                and _targets_under(self.targets, root + module.path + (name,)))
         if context.method_name == "applied_kernel":
             # A model asks for the kernel its submodule multiplies by
             # (`CausalTransformer.applied_kernel`): a target's carries the
@@ -501,23 +576,17 @@ class _Branch:
             child = getattr(module, name)
             a, b = child.get_variable("params", "lora_A"), child.get_variable("params", "lora_B")
             return _updated(kernel, a, b, _scale(target, self.rslora))
-        target = _target_at(self.targets, root + module.path) if context.method_name == "__call__" else None
+        target = (_target_at(self.targets, root + module.path)
+                  if context.method_name in ("__call__", "_linear") else None)
         if target is None:
             return next_fun(*args, **kwargs)
-        # Dew's layers are flax's with the bias summed at fp32; a model built on flax's own adapts alike.
-        if type(module) not in (Dense, DenseGeneral, nn.Dense, nn.DenseGeneral):
-            raise TypeError(
-                f"{'/'.join(root + module.path)} is a {type(module).__name__}; an adapter "
-                "targets Dense and DenseGeneral kernels")
+        if not _linear_site(context, "/".join(root + module.path)):
+            return next_fun(*args, **kwargs)
         x = args[0] if args else kwargs["inputs"]
         output = next_fun(*args, **kwargs)
-        if isinstance(module, nn.DenseGeneral):
-            if module.batch_dims:
-                raise TypeError(f"{'/'.join(root + module.path)} contracts with batch dims")
-            axes = (module.axis,) if isinstance(module.axis, int) else tuple(module.axis)
-        else:
-            axes = (-1,)
-        axes = tuple(sorted(axis % x.ndim for axis in axes))
+        axes, batch_dims = _contractions(module, x.ndim)
+        if batch_dims:
+            raise TypeError(f"{'/'.join(root + module.path)} contracts with batch dims")
         if module.has_variable("params", "lora_A"):
             # A frozen FP8 site holds no kernel past init (`_fp8_packed`); its factors hold their shapes.
             a, b = module.get_variable("params", "lora_A"), module.get_variable("params", "lora_B")
@@ -529,11 +598,11 @@ class _Branch:
         # dropout stream, which is how a training forward is marked; an
         # evaluation forward carries none.
         if self.dropout and module.has_rng("dropout"):
-            x = nn.Dropout(self.dropout, deterministic=False)(x)
+            x = Dropout(self.dropout, deterministic=False)(x)
         x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
-        hidden = jax.lax.dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
+        hidden = float32_dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
                                      precision=module.precision)
-        delta = jax.lax.dot_general(hidden, b, (((hidden.ndim - 1,), (0,)), ((), ())),
+        delta = float32_dot_general(hidden, b, (((hidden.ndim - 1,), (0,)), ((), ())),
                                     precision=module.precision)
         return output + jnp.asarray(_scale(target, self.rslora), delta.dtype) * delta
 
@@ -549,12 +618,12 @@ def _refusing_counts(model: nn.Module, base: type[nn.Module], *protocols) -> typ
     return type('UncountedAdapter', (base,), methods)
 
 
-def _counted_adapter(model: nn.Module, branch: _Branch,
-                     layouts: Mapping[str, WeightLayout]) -> type[nn.Module]:
+def _counted_adapter(model: nn.Module, branch: _Branch) -> type[nn.Module]:
     """An adapter adds analytical work only to capabilities its wrapped model declares."""
     base = _refusing_counts(model, type(model), CountedImages, CountedMultimodal, CountedSequences,
                             CountedSpatial, CountedConditionedSpatial, CountedVideo)
-    bindings = {layout.paths[0][:-1]: layout for layout in layouts.values() if len(layout.paths) == 1}
+    bindings = {layout.paths[0][:-1]: layout for layout in branch.bound.layouts.values()
+                if len(layout.paths) == 1}
 
     class CountedAdapter(base):
         @nn.nowrap
@@ -598,36 +667,34 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
             original = unadapted(self)
             forward = counted_flops(original, lengths)
             learned = parameter_flops(original, lengths)
-            return 3 * forward - learned + 3 * self._adapter_forward(lengths)
+            return frozen_training_flops(forward, learned, self._adapter_forward(lengths))
 
     class LogitsAdapter(CountedAdapter):
         @nn.nowrap
-        def prediction_flops(self, lengths, *, prediction_lengths=None) -> float:
+        def _prediction(self, lengths, prediction_lengths):
+            """The unadapted model's prediction counts, `(forward, parameter)`, and the adapter's forward
+            over the prediction matrices' usage, which each prediction count adds."""
             original = unadapted(self)
             if not isinstance(original, CountedPredictionParameters):
                 raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
-            forward = original.prediction_flops(lengths, prediction_lengths=prediction_lengths)
             usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
-            return forward + self._adapter_forward(lengths, usage=usage)
+            return (original.prediction_flops(lengths, prediction_lengths=prediction_lengths),
+                    original.prediction_parameter_flops(lengths, prediction_lengths=prediction_lengths),
+                    self._adapter_forward(lengths, usage=usage))
+
+        @nn.nowrap
+        def prediction_flops(self, lengths, *, prediction_lengths=None) -> float:
+            forward, _, adapter = self._prediction(lengths, prediction_lengths)
+            return forward + adapter
 
         @nn.nowrap
         def prediction_parameter_flops(self, lengths, *, prediction_lengths=None) -> float:
-            original = unadapted(self)
-            if not isinstance(original, CountedPredictionParameters):
-                raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
-            learned = original.prediction_parameter_flops(lengths, prediction_lengths=prediction_lengths)
-            usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
-            return learned + self._adapter_forward(lengths, usage=usage)
+            _, learned, adapter = self._prediction(lengths, prediction_lengths)
+            return learned + adapter
 
         @nn.nowrap
         def prediction_training_flops(self, lengths, *, prediction_lengths=None) -> float:
-            original = unadapted(self)
-            if not isinstance(original, CountedPredictionParameters):
-                raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
-            forward = original.prediction_flops(lengths, prediction_lengths=prediction_lengths)
-            learned = original.prediction_parameter_flops(lengths, prediction_lengths=prediction_lengths)
-            usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
-            return 3 * forward - learned + 3 * self._adapter_forward(lengths, usage=usage)
+            return frozen_training_flops(*self._prediction(lengths, prediction_lengths))
 
         @nn.nowrap
         def logits_flops(self, lengths) -> float:
@@ -641,7 +708,9 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
             original = unadapted(self)
             if not isinstance(original, CountedLogits):
                 raise MissingFlopsCount(f"{type(original).__name__} has no declared vocabulary-head work")
-            return 2 * original.logits_flops(lengths) + 3 * self._adapter_forward(lengths, logits=True)
+            # The vocabulary head is frozen whole: all its forward work takes no weight gradient.
+            head = original.logits_flops(lengths)
+            return frozen_training_flops(head, head, self._adapter_forward(lengths, logits=True))
 
     if isinstance(model, CountedLogits):
         return LogitsAdapter
@@ -667,9 +736,8 @@ def _fp8_packed(model: nn.Module, variables: Variables) -> dict:
     return {**variables, FROZEN: frozen, QUANTIZATION: overlay(variables.get(QUANTIZATION, {}), packed)}
 
 
-def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayout],
-             bound_to: Mapping[str, AdapterBase]) -> nn.Module:
-    """Return `model` computing `branch` in every target module.
+def _adapted(model: nn.Module, bound: _Bound) -> nn.Module:
+    """Return `model` computing the adapter branch `bound` describes in every target module.
 
     The result is an instance of a subclass of `model`'s class with the
     same fields and methods, so it builds, checks and generates as the model
@@ -677,38 +745,36 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
     `apply` folds `FROZEN` back into `params` and runs under the interceptor;
     `init` (Flax's dispatches through `init_with_output`) runs under it and
     splits what it draws, the factors under `params` and the rest under
-    `FROZEN`. `layouts` are the bindings the class's record (`AdapterRecord`)
-    writes beside the targets, with the models its components were bound to
-    (`bound_to`); the record is written when a run asks for it.
+    `FROZEN`. The class's record (`AdapterRecord`) is `bound`'s, written when a run asks for it.
     """
     base = type(model)
     if isinstance(base, AdaptedClass):
         raise ValueError("The model is already adapted")
-    factors = {(*path, factor) for path in branch.targets for factor in FACTORS}
-    adapted_base = _counted_adapter(model, branch, layouts)
+    branch = _Branch(bound)
+    factors = {(*path, factor) for path in bound.targets for factor in FACTORS}
+    adapted_base = _counted_adapter(model, branch)
 
     class Adapted(adapted_base):
         # Staticmethods, or Flax would wrap the callables as module methods.
         _dew_lora_interceptor: ClassVar[Interceptor] = staticmethod(branch)
+        _dew_lora_bound: ClassVar[_Bound] = bound
         _dew_wrapped: ClassVar[type[nn.Module]] = base
 
         @staticmethod
         def _dew_wrapper() -> AdapterRecord:
-            return _record(branch.targets, branch.rslora, branch.dropout, layouts, bound_to)
+            return _record(bound)
 
         def apply(self, variables, *args, **kwargs):
-            with nn.intercept_methods(branch):
+            with INTERCEPTED(new_value=True), nn.intercept_methods(branch):
                 return super().apply(thaw(variables), *args, **kwargs)
 
         def init_with_output(self, *args, **kwargs):
-            with nn.intercept_methods(branch):
+            with INTERCEPTED(new_value=True), nn.intercept_methods(branch):
                 output, variables = super().init_with_output(*args, **kwargs)
             return output, _fp8_packed(model, dict(freeze(variables, lambda path: path in factors)))
 
     Adapted.__name__ = Adapted.__qualname__ = base.__name__
-    return Adapted(**{field.name: getattr(model, field.name)
-                      for field in dataclasses.fields(model)
-                      if field.init and field.name not in ("parent", "name")})
+    return rebuilt(Adapted, model)
 
 
 @dataclass(frozen=True)
@@ -738,7 +804,7 @@ class AdapterRecord:
     def __post_init__(self) -> None:
         for module, target in self.targets.items():
             _rank(f"the adapter record's {module}", target.rank)
-            _alpha(f"the adapter record's {module}", target.alpha)
+            finite(target.alpha, f"the adapter record's {module}: alpha")
         _dropout("the adapter record", self.dropout)
         if not self.targets or any(not name or name in ('.', '..')
                                    for module in self.targets for name in module.split('/')):
@@ -750,7 +816,7 @@ class AdapterRecord:
         """`model` adapted as this record says, which is how a recorded run's
         model is rebuilt (`ModelConfig.build`); the checkpoint supplies the factors."""
         targets, layouts = self.bound()
-        return _adapted(model, _Branch(targets, self.rslora, self.dropout), layouts, dict(self.bases))
+        return _adapted(model, _Bound(targets, self.rslora, self.dropout, layouts, dict(self.bases)))
 
     def bound(self) -> tuple[dict[Path, Target], dict[str, WeightLayout]]:
         """The targets by native path and the bindings by the name a file writes them under."""
@@ -761,14 +827,20 @@ class AdapterRecord:
         return targets, layouts
 
 
-def _record(targets: Mapping[Path, Target], rslora: bool, dropout: float,
-            layouts: Mapping[str, WeightLayout], bases: Mapping[str, AdapterBase]) -> AdapterRecord:
+def recorded_adapter(wrappers: Sequence[Wrapper]) -> AdapterRecord | None:
+    """The LoRA bound among a model record's `wrappers` (`ModelConfig.wrappers`), or None."""
+    return next((wrapper for wrapper in wrappers if isinstance(wrapper, AdapterRecord)), None)
+
+
+def _record(bound: _Bound) -> AdapterRecord:
     """The bound adapter as a model record holds it."""
-    bindings = {layout.paths[0][:-1]: layout for layout in layouts.values()}
-    return AdapterRecord({'/'.join(path): targets[path] for path in sorted(targets)}, rslora, dropout,
+    targets = bound.targets
+    bindings = {layout.paths[0][:-1]: layout for layout in bound.layouts.values()}
+    return AdapterRecord({'/'.join(path): targets[path] for path in sorted(targets)}, bound.rslora,
+                         bound.dropout,
                          {'/'.join(path): AdapterBinding(bindings[path].name, bindings[path].shape,
                                                          bindings[path].transpose)
-                          for path in sorted(targets) if path in bindings}, dict(bases))
+                          for path in sorted(targets) if path in bindings}, dict(bound.bases))
 
 
 def _site_codes(variables: Variables, path: Path) -> Mapping | None:
@@ -780,15 +852,9 @@ def _site_codes(variables: Variables, path: Path) -> Mapping | None:
     return leaves if FROZEN_FP8[0] in leaves else None
 
 
-def _base_kernel(variables: Variables, path: Path) -> jax.Array:
-    """The kernel of the module at `path`: its own, or a frozen FP8 site's
-    decoded from its packed codes (`frozen_fp8_kernel`)."""
-    codes = _site_codes(variables, path)
-    return _node(variables, path)["kernel"] if codes is None else jnp.asarray(frozen_fp8_kernel(codes))
-
-
 def _kernel_shape(variables: Variables, path: Path) -> tuple[int, ...]:
-    """The shape of `_base_kernel`, read without decoding a frozen FP8 site."""
+    """The shape of the kernel of the module at `path`, its own or a frozen FP8 site's as its codes
+    decode (`decoded_frozen_fp8`), read without decoding them."""
     codes = _site_codes(variables, path)
     return tuple(np.shape(_node(variables, path)["kernel"] if codes is None else codes[FROZEN_FP8[0]].T))
 
@@ -973,10 +1039,10 @@ class _Config:
         name, revision = config.get("base_model_name_or_path"), config.get("revision")
         if not isinstance(name, str | None) or not isinstance(revision, str | None):
             raise ValueError(f"{where} names its base model and revision as strings or not at all")
-        return cls(_rank(where, rank), _alpha(where, alpha),
+        return cls(_rank(where, rank), finite(alpha, f"{where}: alpha"),
                    {module: _rank(f"{where} rank_pattern {module}", value)
                     for module, value in rank_pattern.items()},
-                   {module: _alpha(f"{where} alpha_pattern {module}", value)
+                   {module: finite(value, f"{where} alpha_pattern {module}: alpha")
                     for module, value in alpha_pattern.items()},
                    rslora, _dropout(where, dropout), None if name is None else AdapterBase(name, revision))
 
@@ -1090,7 +1156,9 @@ def _entries(components: frozenset[str], tensors: Mapping[str, np.ndarray],
 
 def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Variables,
            entries: Sequence[_Entry]) -> Adapter:
-    """Build the adapter the entries describe, its factors restored into the model's tree."""
+    """Build the adapter the entries describe, its factors restored into the model's tree, which
+    keeps training what it trained where it came split (`freeze`)."""
+    source, variables = variables, thaw(variables)
     components = _components(layouts)
     settings = {(entry.config.rslora, entry.config.dropout) for entry in entries}
     if len(settings) != 1:
@@ -1128,7 +1196,7 @@ def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Var
         bound[entry.module] = layout
         _insert_factors(leaves, factors.module, factors.a.restore(entry.a, shape_a),
                         factors.b.restore(entry.b, shape_b))
-    return Adapter.bound(model, overlay(thaw(variables), leaves), targets, rslora, dropout, bound, bases)
+    return Adapter.bound(model, overlay(source, leaves), targets, rslora, dropout, bound, bases)
 
 
 def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,
@@ -1181,12 +1249,11 @@ def unadapted(model: nn.Module) -> nn.Module:
     base, layers = wrapper_layers(type(model))
     if not any("_dew_lora_interceptor" in vars(layer) for layer in layers):
         return model
-    rebuilt = base(**{field.name: getattr(model, field.name) for field in dataclasses.fields(model)
-                      if field.init and field.name not in ("parent", "name")})
+    model = rebuilt(base, model)
     for layer in reversed(layers):
         if "_dew_lora_interceptor" not in vars(layer):
-            rebuilt = layer._dew_wrapper().apply(rebuilt)
-    return rebuilt
+            model = layer._dew_wrapper().apply(model)
+    return model
 
 
 @runtime_checkable
@@ -1199,6 +1266,7 @@ class AdaptedClass(Protocol):
     """
 
     _dew_lora_interceptor: ClassVar[Interceptor]
+    _dew_lora_bound: ClassVar[_Bound]
 
 
 __all__ = ["Adapter", "AdapterRecord", "LoRA", "PeftConfig", "Target", "unadapted"]

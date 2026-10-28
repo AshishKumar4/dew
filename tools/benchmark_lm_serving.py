@@ -22,7 +22,9 @@ prompts and the full measured output length.
 `--mesh` places Dew's weights on a mesh of those MeshSpec fields before the
 server is built, as `dew.pipeline(mesh=...)` does, to time sharded decode;
 the record names the mesh, the devices the weights span and the mesh axes
-that split them (a weight below the layout's `min_shard` stays whole).
+that split them (a weight below the layout's `min_shard` stays whole). For
+vllm-engine it sets the engine's parallelism over as many GPUs
+(`vllm_parallelism`), so the two run at one shape.
 """
 
 from __future__ import annotations
@@ -34,13 +36,18 @@ import dataclasses
 import hashlib
 import io
 import json
+import os
 import platform
 import pstats
+import sys
 import time
 import uuid
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import peak_memory
 
 
 def prompts_for(slots: int, count: int, length: int, high: int, *, warm: bool = False) -> np.ndarray:
@@ -137,9 +144,10 @@ def dew_run(server, prompts: np.ndarray, output: int):
 def profile_decode(server, prompts: np.ndarray, output: int, steps: int, directory: Path):
     """Untraced Python costs and a warmed decode-only Dew/XProf capture."""
     import jax
-    from trace_window import DECODE_CATEGORIES, decode_category, device_events, kernel_totals, window_split
+    from trace_window import DECODE_CATEGORIES, decode_category, kernel_totals
 
     import dew
+    from dew.telemetry.trace import device_events, window_split
 
     if -(-len(prompts) // server.admission) + 2 + 2 * steps * server.decode_steps >= output:
         raise ValueError("--output must cover admission, warmup and both decode profiles")
@@ -196,6 +204,7 @@ def dew_points(args):
     from dew.inference.serving import Server
     from dew.nn.kv_cache import KVCache
     from dew.sampling import Sampling
+    from dew.telemetry.instrumentation import Compiles
     from dew.training import MeshSpec
 
     began = time.perf_counter()
@@ -232,7 +241,8 @@ def dew_points(args):
         for rows in sorted({min(server.admission, 1 << bit) for bit in range(server.admission.bit_length())}):
             dew_run(server, warm[:rows], args.output)
         print(f"slots {slots}: warm in {time.perf_counter() - began:.2f}s", flush=True)
-        compiled = server._step._cache_size()
+        # The server's step programs, whichever it runs (`dew.inference.serving_kernel._stepped`).
+        compiles = Compiles("_stepped").__enter__()
         repeats = []
         for repeat in range(args.repeats):
             measured, generations = dew_run(server, prompts, args.output)
@@ -244,7 +254,8 @@ def dew_points(args):
                          behavior=np.concatenate([row.behavior_log_probs for row in generations]))
         point = {"slots": slots, "admission": server.admission, "repeats": repeats,
                  "prompt_sha256": hashlib.sha256(prompts.tobytes()).hexdigest(),
-                 "measured_recompiles": server._step._cache_size() - compiled}
+                 "measured_recompiles": compiles.count}
+        compiles.__exit__()
         if args.rate:
             opened = prompts_for(slots, args.requests or 6 * slots, args.prompt, args.vocab_limit)
             point["open_loop"] = [dew_open(server, opened, args.output, rate) for rate in args.rate]
@@ -342,9 +353,26 @@ def closed_loop(streamed):
     return request
 
 
+def vllm_parallelism(mesh: dict[str, int] | None) -> dict[str, object]:
+    """vLLM's engine flags for a `--mesh` of 'tensor' and 'expert' sizes: tensor parallelism over
+    their product, its experts split over those ranks where 'expert' is above 1
+    (`enable_expert_parallel`), vLLM's one engine's way to spread an MoE's experts over GPUs."""
+    if not mesh:
+        return {}
+    if set(mesh) - {"tensor", "expert"}:
+        raise ValueError(f"vllm-engine runs a mesh of 'tensor' and 'expert' sizes, not {sorted(mesh)}")
+    expert = mesh.get("expert", 1)
+    return {"tensor_parallel_size": mesh.get("tensor", 1) * expert, "enable_expert_parallel": expert > 1}
+
+
 async def engine_points(args):
     """The same scheduler/stream clocks, without HTTP serialization. Output stays token ids, not text, as
-    Dew's and SGLang's do (`detokenize=False`)."""
+    Dew's and SGLang's do (`detokenize=False`). An engine over several GPUs starts its workers by
+    spawning them, as vLLM advises once the parent has touched CUDA, which forked workers cannot
+    initialize again."""
+    parallelism = vllm_parallelism(args.mesh)
+    if parallelism.get("tensor_parallel_size", 1) > 1:
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.inputs import TokensPrompt
@@ -353,7 +381,7 @@ async def engine_points(args):
     engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
         model=args.model, dtype="bfloat16", max_model_len=args.prompt + args.output,
         max_num_seqs=max(args.slots), gpu_memory_utilization=0.90,
-        generation_config="vllm", enable_prefix_caching=False, disable_log_stats=True))
+        generation_config="vllm", enable_prefix_caching=False, disable_log_stats=True, **parallelism))
 
     async def streamed(prompt, output):
         """The time each of a request's tokens reached the client."""
@@ -421,19 +449,39 @@ def main():
     parser.add_argument("--generations", action="store_true")
     parser.add_argument("--rate", default="", help="open-loop Poisson arrival rates, requests a second")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--peak-run", type=int,
+                        help="Dew: run slot count N of --slots alone, for its measured peak "
+                             "(tools/peak_memory.py), writing nothing")
     args = parser.parse_args()
     args.slots = [int(value) for value in args.slots.split(",")]
     args.rate = [float(value) for value in args.rate.split(",") if value]
     if args.rate and args.backend == "vllm":
         parser.error("--rate runs Dew and the in-process engines")
-    if args.mesh is not None and args.backend != "dew":
-        parser.error("--mesh places Dew's weights; vLLM takes its own parallelism flags")
+    if args.mesh is not None and args.backend not in ("dew", "vllm-engine"):
+        parser.error("--mesh places Dew's weights, or sets vllm-engine's parallelism; a vLLM server "
+                     "takes its own flags")
+    if args.backend == "vllm-engine":
+        try:
+            vllm_parallelism(args.mesh)
+        except ValueError as error:
+            parser.error(str(error))
     if (min(args.slots) < 1 or min(args.prompt, args.output, args.repeats, args.profile_steps) < 1
             or args.requests < 0 or args.vocab_limit <= 100):
         parser.error("counts must be positive; --requests=0 chooses the default")
+    if args.peak_run is not None:
+        # The timed repeats' work alone: no generations written, no open-loop rates, no profile.
+        dew_points(argparse.Namespace(**{**vars(args), "slots": [args.slots[args.peak_run]],
+                                         "generations": False, "rate": [], "profile": False}))
+        return
     args.out.parent.mkdir(parents=True, exist_ok=True)
+    # Dew's: each slot count's measured peak, in a process of its own, before this one opens a backend.
+    peaks = ([peak_memory.measured([os.path.abspath(__file__), *sys.argv[1:], "--peak-run", str(index)])
+              for index in range(len(args.slots))] if args.backend == "dew" else None)
     engines = {"vllm": vllm_points, "vllm-engine": engine_points, "sglang-engine": sglang_points}
     hardware, points = dew_points(args) if args.backend == "dew" else asyncio.run(engines[args.backend](args))
+    if peaks is not None:
+        for point, peak in zip(points, peaks, strict=True):
+            point["peak_device_bytes"] = None if None in peak else max(peak)
     record = {"backend": args.backend, "model": args.model, "hardware": hardware,
               "prompt": args.prompt, "output": args.output, "vocab_limit": args.vocab_limit,
               "sampling": {"temperature": 0, "ignore_eos": True}, "warm_output": args.output,

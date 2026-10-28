@@ -1,4 +1,4 @@
-"""EDM's own sampler (Karras et al. 2022, Algorithm 2), for tests/fixtures/edm.
+"""EDM's own sampler (Karras et al. 2022, Algorithm 2), for tests/fixtures/edm/heun.npz.
 
 The reference is `edm_sampler` in NVlabs/edm's `generate.py`, read at a
 pinned commit and run as published: its code is not vendored here (the
@@ -9,30 +9,31 @@ the draw Dew's `sample` makes at that step, `jax.random.normal` under the
 walk's key folded with the step index, fed to the reference as its
 `randn_like`, so both integrate one path.
 
-What lands per case: the sampler's arguments, the initial latent, and the
-result computed in float64 and in float32.
+What lands per case, over the seeds check 1 draws (`record_case`,
+tools/recorded_references.py): the sampler's arguments and its result, as
+published in float64 (the truth) and by its float32 twin (the reference). A
+seed's inputs, the walk's key and the initial latent, are a seeded draw
+(`draw`) the test makes again.
 
     PYTHONPATH=src python tools/edm_reference.py
 """
 
 from __future__ import annotations
 
+import functools
 import json
-import os
 from pathlib import Path
-
-os.environ["JAX_PLATFORMS"] = "cpu"
 
 import jax
 import numpy as np
 import torch
+from recorded_draws import Tape
 from reference_source import defined_in, fetched
 
 COMMIT = "008a4e5316c8e3bfe61a62f874bddba254295afb"
 SOURCE = f"https://raw.githubusercontent.com/NVlabs/edm/{COMMIT}/generate.py"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "edm" / "heun.npz"
 SHAPE = (2, 3, 4)
-KEY = 7
 CASES = {
     "deterministic": {"num_steps": 8},
     # The ImageNet-64 settings of the paper's Table 5.
@@ -61,23 +62,42 @@ def edm_sampler(dtype: str):
     return defined_in(text, {"edm_sampler"}, {"torch": torch, "np": np}, filename=SOURCE)["edm_sampler"]
 
 
+def draw(seed: int) -> dict[str, np.ndarray]:
+    """A seed's inputs: the walk's key, `jax.random.PRNGKey(seed)`, and the initial latent at unit
+    sigma, a seeded NumPy draw the walk scales by its top sigma."""
+    return {"key": np.asarray(jax.random.PRNGKey(seed)),
+            "latents": np.random.default_rng([0xED, seed]).standard_normal(SHAPE).astype(np.float32)}
+
+
 def main() -> None:
-    key = jax.random.PRNGKey(KEY)
-    latents = np.asarray(jax.random.normal(jax.random.fold_in(key, 10_000), SHAPE), np.float32)
-    arrays: dict[str, np.ndarray] = {"latents": latents}
-    for dtype, suffix in (("float64", "result"), ("float32", "result32")):
-        sampler = edm_sampler(dtype)
-        for name, arguments in CASES.items():
-            noises = iter([np.asarray(jax.random.normal(jax.random.fold_in(key, index), SHAPE))
-                           for index in range(arguments["num_steps"])])
-            result = sampler(Net(), torch.from_numpy(latents),
-                             randn_like=lambda x: torch.from_numpy(next(noises)).to(x.dtype),
-                             **arguments)
-            arrays[f"{name}.{suffix}"] = result.numpy()
-            arrays[f"{name}.arguments"] = np.asarray(json.dumps(arguments))
-    FIXTURE.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(FIXTURE, **arrays)
-    print(f"{FIXTURE}: {len(CASES)} cases")
+    jax.config.update("jax_platforms", "cpu")
+    from recorded_references import provenance, record_case, save
+
+    samplers = {dtype: edm_sampler(dtype) for dtype in ("float32", "float64")}
+
+    def evaluated(inputs, arguments):
+        """The float32 twin's result and the published float64 one, both walking the noise Dew's
+        `sample` draws at each step under the seed's key."""
+        noises = [np.asarray(jax.random.normal(jax.random.fold_in(inputs["key"], index), SHAPE))
+                  for index in range(arguments["num_steps"])]
+        results = []
+        for dtype in ("float32", "float64"):
+            tape = Tape(noises)
+            result = samplers[dtype](Net(), torch.from_numpy(inputs["latents"]),
+                                     randn_like=lambda x, tape=tape: torch.from_numpy(
+                                         tape.next(shape=x.shape)).to(x.dtype), **arguments)
+            results.append({"result": result.numpy()})
+        return tuple(results)
+
+    arrays: dict[str, np.ndarray] = {}
+    for name, arguments in CASES.items():
+        arrays.update(record_case(name, draw, functools.partial(evaluated, arguments=arguments),
+                                  store_inputs=False))
+        arrays[f"{name}.arguments"] = np.asarray(json.dumps(arguments))
+    written = save(FIXTURE, {**arrays, "provenance": provenance(
+        "NVlabs/edm", COMMIT, "cpu", "PYTHONPATH=src python tools/edm_reference.py",
+        torch=torch.__version__)}, reference="NVlabs/edm", license="CC BY-NC-SA 4.0 (results only)")
+    print(f"{written}: {sorted(arrays)}")
 
 
 if __name__ == "__main__":

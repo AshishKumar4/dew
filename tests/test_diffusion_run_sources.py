@@ -19,21 +19,23 @@ import numpy as np
 import optax
 import pytest
 from diffusion_stubs import PROMPTS, batch_for
-from reference_error import assert_as_exact_as_the_reference
+from diffusion_support import images_of
+from interop_support import allocated_bytes
+from reference_error import as_given, assert_as_exact
 
-from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.config.data import ImageData
+from dew.config import ObjectiveConfig, TrainerConfig
+from dew.config.diffusion import DiffusionRunConfig, FlowRolloutConfig
 from dew.diffusion.presets import Flow, ResolutionShift
 from dew.diffusion.process import Process
-from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.diffusion.schedules.source import SourceSchedule
+from dew.inference import TextToImage
+from dew.inputs import TextCondition
 from dew.objectives import Step
-from dew.objectives.diffusion import Alignment, DiffusionObjective, DiffusionRunConfig, TextCondition
+from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED_WEIGHTS, EndToEnd
-from dew.objectives.rl.flow import FlowGRPOObjective
-from dew.registry import to_record
-from dew.sampling import Euler, TextToImage
-from dew.sampling.pipelines import ImageSettings
+from dew.objectives.rl.flow import OLD_LOG_PROBS_KEY, REWARDS_KEY, FlowGRPOObjective
+from dew.registry import ModelConfig, to_record
+from dew.sampling import Euler
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -41,10 +43,17 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 @pytest.fixture(scope="module")
 def pipelines(tmp_path_factory):
+    """Each family's pipeline at `<family>/pipeline`: the flow transformers, and the tiny SD UNet
+    pipeline, whose DDIM grid ends short of a clean sample."""
     root = tmp_path_factory.mktemp("pipelines")
     for family in ("sd3", "flux", "qwen_image"):
         with tarfile.open(FIXTURES / f"{family}_source.tar.xz") as archive:
             archive.extractall(root / family, filter="data")
+    with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
+        archive.extractall(root / "unet", members=[member for member in archive.getmembers()
+                                                   if member.name.split("/")[0] == "sd"], filter="data")
+    (root / "sd").mkdir()
+    (root / "unet" / "sd").rename(root / "sd" / "pipeline")
     return root
 
 
@@ -52,6 +61,30 @@ def precision() -> ModelConfig:
     """The default model record at float32 on the XLA kernel."""
     model = DiffusionRunConfig().model
     return dataclasses.replace(model, fields={**model.fields, "dtype": "float32", "attention_impl": "xla"})
+
+
+def test_a_shape_only_pipeline_load_retains_geometry_without_eager_native_copies(pipelines, tmp_path,
+                                                                               monkeypatch):
+    """A shape-only load preserves every component's parameter geometry and storage dtype.
+    Checkpoint validation still requires valid safetensors files. A delegating NumPy allocation
+    recorder measures host buffers, not implementation calls: deferred linear leaves allocate fewer
+    native-layout bytes than an eager load of the same already-warmed pipeline."""
+    from dew.interop import Pretrained
+
+    original = pipelines / "sd3" / "pipeline"
+    expected = Pretrained.load(original, dtype="float32", attention_impl="xla", on_host=True)
+    selected = tmp_path / "source"
+    shutil.copytree(original, selected)
+    _, eager_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
+        selected, dtype="float32", attention_impl="xla", on_host=True))
+    loaded, deferred_bytes = allocated_bytes(monkeypatch, lambda: Pretrained.load(
+        selected, dtype="float32", attention_impl="xla", weights=False))
+    assert eager_bytes > 0 and deferred_bytes < eager_bytes
+    shapes = jax.tree.leaves(loaded.variables)
+    assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in shapes)
+    assert jax.tree.structure(loaded.variables) == jax.tree.structure(expected.variables)
+    for actual, wanted in zip(shapes, jax.tree.leaves(expected.variables), strict=True):
+        assert actual.shape == wanted.shape and actual.dtype == wanted.dtype
 
 
 def value(objective, params, batch) -> float:
@@ -73,7 +106,7 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     directory = pipelines / family / "pipeline"
     size = 16 if family != "qwen_image" else 32
     config = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
-                                data=ImageData(source="tfds://oxford_flowers102", image_size=size),
+                                data=images_of("tfds://oxford_flowers102", size),
                                     val_metrics=(),
                                 objective=ObjectiveConfig("diffusion",
                                                           {"solver": Euler(), "guidance": None, "steps": 2,
@@ -238,6 +271,22 @@ print(json.dumps({"saved": True}))
 """
 
 
+def test_a_pipeline_is_one_whatever_its_root_config_unless_that_names_a_model(pipelines, tmp_path):
+    """A pipeline directory loads as its components whatever else its root holds, a config.json too,
+    for a run as for a load (`_pipeline_source`); one whose config.json names a model is that model,
+    a decoder shipping an index for its sampler, and a run training a pipeline refuses it."""
+    from dew.interop.pretrained import load_diffusion_source
+
+    copy = tmp_path / "pipeline"
+    shutil.copytree(pipelines / "flux" / "pipeline", copy)
+    (copy / "config.json").write_text("{}")
+    loaded = load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16))
+    assert jax.tree.leaves(loaded.variables)
+    (copy / "config.json").write_text(json.dumps({"model_type": "diffusion_gemma"}))
+    with pytest.raises(ValueError):
+        load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16))
+
+
 @pytest.mark.network
 def test_a_hub_pipeline_rebound_online_exports_offline_from_its_recorded_headers(tmp_path):
     """A saved tree rebound over a Hub pipeline whose weights it never downloads reads the
@@ -283,7 +332,7 @@ def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_
                           resolution=56, width=8)
     config = DiffusionRunConfig(
         pretrained=str(pipelines / "sd3" / "pipeline"), preset=None, model=precision(), val_metrics=(),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=16),
+        data=images_of("tfds://oxford_flowers102", 16),
         objective=ObjectiveConfig("diffusion", {
             "solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None,
             "alignment": alignment, "end_to_end": EndToEnd(perceptual_weight=0., discriminator_weight=0.)}))
@@ -310,7 +359,7 @@ def test_a_pretrained_pipeline_trains_its_autoencoder_end_to_end(pipelines, tmp_
     assert value(rebuilt, trained.variables, batch) == value(objective, trained.variables, batch)
 
 
-@pytest.mark.parametrize("family", ["sd3", "flux", "qwen_image"])
+@pytest.mark.parametrize("family", ["sd3", "flux", "qwen_image", "sd"])
 def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelines):
     """The wiring half of a configured run: `DiffusionRunConfig` over a
     published pipeline builds what `DiffusionObjective(Pretrained.load(...))`
@@ -321,14 +370,18 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     and the text towers. The loss the two share is held to Diffusers'
     train_dreambooth_flux.py statements on matched draws in
     tests/test_flow_matching.py (ad63cc6a). Both sample by the same policy, the
-    pipeline's own grid and finish too."""
+    pipeline's own grid and finish: their evaluations draw alike from one key,
+    unlike an evaluation on the process's own times, and the run's published
+    task draws the walk the pipeline's own task draws from the same noise. A
+    flow grid ends at a clean sample, where a closing denoise moves nothing;
+    the SD pipeline's DDIM grid ends short of one, where it would."""
     from dew.interop.pretrained import load_diffusion_source
 
     directory = pipelines / family / "pipeline"
-    size = 16 if family != "qwen_image" else 32
+    size = 16 if family in ("sd3", "flux") else 32
     settings = {"guidance": None, "unconditional_prob": 0.25, "ema_decay": None}
     configured = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
-                                    data=ImageData(source="tfds://oxford_flowers102", image_size=size),
+                                    data=images_of("tfds://oxford_flowers102", size),
                                         val_metrics=(),
                                     objective=ObjectiveConfig("diffusion", {
                                         "solver": Euler(), "steps": 2, **settings})).build()
@@ -336,9 +389,6 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     written = DiffusionObjective(source, solver=Euler(), steps=2, **settings)
     assert configured.model == written.model
     assert to_record(configured.process, Process) == to_record(written.process, Process)
-    # The sampling policy a saved run records: the pipeline's grid and finish among it.
-    assert (to_record(configured.task_settings(), ImageSettings)
-            == to_record(written.task_settings(), ImageSettings))
     assert type(configured.autoencoder) is type(written.autoencoder)
     assert configured.inputs.sample == written.inputs.sample
     assert configured.inputs.conditions.keys() == written.inputs.conditions.keys()
@@ -355,13 +405,31 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
         np.testing.assert_array_equal(ours, theirs)
     batch = batch_for(configured, size)
     assert value(configured, states[0].variables, batch) == value(written, states[1].variables, batch)
+    # Both sample by the pipeline's own grid and its solver's finish: from one key an evaluation of
+    # either draws what the other's does, and not what the process's own times draw ...
+    step = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
+    drawn = [np.asarray(objective.evaluate(state.variables, batch, step).images)
+             for objective, state in zip((configured, written), states, strict=True)]
+    assert np.all(np.isfinite(drawn[0]))
+    np.testing.assert_array_equal(drawn[0], drawn[1])
+    on_times = DiffusionObjective(source, solver=Euler(), steps=2, grid=None, **settings)
+    elsewhere = np.asarray(on_times.evaluate(states[1].variables, batch, step).images)
+    assert not np.array_equal(drawn[0], elsewhere)
+    # ... and the run's published task draws the walk the pipeline's own task draws from the same noise,
+    # which the family's source tests hold to the source pipeline's own walk.
+    prompts = list(PROMPTS)
+    published = configured.build_task(states[0].variables)(prompts, key=7).host()
+    pipeline = source.text_to_image()(prompts, steps=2, guidance=None, solver=Euler(), key=7).host()
+    for name in ("latents", "images"):
+        assert np.all(np.isfinite(getattr(published, name))), name
+        np.testing.assert_array_equal(getattr(published, name), getattr(pipeline, name), err_msg=name)
 
 
 def test_a_pretrained_run_refuses_a_preset_of_another_kind(pipelines):
     """Flux was trained as a velocity flow; the default EDM preset is not
     that convention, and a flow preset is."""
     common = {"pretrained": str(pipelines / "flux" / "pipeline"), "model": precision(),
-              "data": ImageData(source="tfds://oxford_flowers102", image_size=16), "val_metrics": (),
+              "data": images_of("tfds://oxford_flowers102", 16), "val_metrics": (),
               "objective": ObjectiveConfig("diffusion", {"solver": Euler(), "guidance": None, "steps": 2})}
     with pytest.raises(ValueError):
         DiffusionRunConfig(**common).build()
@@ -420,6 +488,15 @@ def flux_shift(tokens: int, constants: str = "flux") -> float:
     return math.exp(SHIFTS[f"{constants}/mu"][list(SHIFTS["tokens"]).index(tokens)])
 
 
+SHIFT_SEEDS = 16
+"""Check 1's declared seeds for the shifted noise levels, sized by `seeds_for` (2026-10-21, on armada)."""
+
+
+def shift_times(seed: int) -> tuple[np.ndarray]:
+    """99 times in (0, 1), float32, as a schedule's grid holds them."""
+    return (np.random.default_rng(seed).uniform(0.005, 0.995, size=99).astype(np.float32),)
+
+
 @pytest.mark.parametrize("constants,fields", [
     ("flux", {}),
     ("long", {"max_tokens": 8192, "max_shift": 0.9}),
@@ -428,20 +505,39 @@ def test_the_resolution_shift_and_the_noise_levels_it_maps_to_are_diffusers(cons
     """At every token count, `ResolutionShift` and a loaded dynamic-shift
     scheduler file are exp(calculate_shift) to the bit, and the flow schedule
     at that shift maps each time to the noise level Diffusers'
-    `_time_shift_exponential` gives it at mu, held to the float64 rule, for
-    Flux's constants and a pipeline with another slope and span."""
+    `FlowMatchEulerDiscreteScheduler.time_shift` gives it at mu, run here, on
+    par with it over drawn times (check 1), for Flux's constants and a
+    pipeline with another slope and span."""
+    from diffusers import FlowMatchEulerDiscreteScheduler
+
     top_shift, top = fields.get("max_shift", 1.15), fields.get("max_tokens", 4096)
     loaded = SourceSchedule.from_config({
         "_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000,
         "use_dynamic_shifting": True, "base_shift": 0.5, "max_shift": top_shift,
         "base_image_seq_len": 256, "max_image_seq_len": top})
+    schedules, mus = {}, {}
     for index, tokens in enumerate(SHIFTS["tokens"]):
-        shift = ResolutionShift(tokens=int(tokens), **fields).shift()
+        resolution = ResolutionShift(tokens=int(tokens), **fields)
+        shift = resolution.shift()
         assert shift == flux_shift(int(tokens), constants)
-        assert loaded.training_process(int(tokens)).schedule.shift == shift
-        sigma = FlowMatchingScheduler(shift=shift).rates(SHIFTS["times"])[1]
-        assert_as_exact_as_the_reference(sigma, SHIFTS[f"{constants}/sigmas"][index],
-                                         SHIFTS[f"{constants}/sigmas_f64"][index], f"{constants} at {tokens}")
+        schedule = loaded.training_process(int(tokens)).schedule
+        assert schedule.shift == shift
+        # A preset's resolution shift maps as the loaded file's does, to the bit.
+        drawn, = shift_times(index)
+        np.testing.assert_array_equal(Flow(resolution_shift=resolution)().schedule.rates(drawn)[1],
+                                      schedule.rates(drawn)[1])
+        schedules[f"{tokens} tokens"] = schedule
+        mus[f"{tokens} tokens"] = float(SHIFTS[f"{constants}/mu"][index])
+    scheduler = FlowMatchEulerDiscreteScheduler(use_dynamic_shifting=True)
+
+    def dew(times):
+        return {name: schedule.rates(times)[1] for name, schedule in schedules.items()}
+
+    @as_given
+    def diffusers(times):
+        return {name: scheduler.time_shift(mu, 1.0, times) for name, mu in mus.items()}
+
+    assert_as_exact(dew, diffusers, shift_times, f"{constants} noise levels", seeds=SHIFT_SEEDS)
 
 
 def test_a_pretrained_run_stores_its_pipelines_weights_in_the_dtype_it_names(pipelines):
@@ -450,7 +546,7 @@ def test_a_pretrained_run_stores_its_pipelines_weights_in_the_dtype_it_names(pip
     objective = ObjectiveConfig("diffusion", {"guidance": None, "ema_decay": None})
     configured = DiffusionRunConfig(pretrained=str(pipelines / "flux" / "pipeline"), preset=None,
                                     model=precision(), pretrained_param_dtype="bfloat16",
-                                    data=ImageData(source="tfds://oxford_flowers102", image_size=16),
+                                    data=images_of("tfds://oxford_flowers102", 16),
                                         val_metrics=(),
                                     objective=objective).build()
     state = Trainer(configured, optax.sgd(1e-2), key=jax.random.PRNGKey(3)).initial_state()
@@ -480,7 +576,7 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
             "heads": 2, "head_dim": 12, "joint_attention_dim": 16, "pooled_projection_dim": 10,
             "guidance_embeds": True, "axes_dims_rope": [4, 4, 4],
             "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=8), preset=Flow(), val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", 8), preset=Flow(), val_metrics=(),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(directory)),
         objective=ObjectiveConfig("diffusion",
                                   {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
@@ -501,12 +597,12 @@ def grpo_run(beta: float = 0.0, directory: str = "./checkpoints") -> DiffusionRu
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
                                          "num_heads": 2, "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=4), preset=Flow(), val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=directory),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        objective=ObjectiveConfig("flow_grpo",
-                                  {"reward": "psnr", "groups": 2, "rollout_steps": 3, "clip_range": 0.2,
-                                   "beta": beta, "solver": Euler(), "guidance": None, "steps": 2}))
+        objective=ObjectiveConfig("flow_grpo", {"clip_range": 0.2, "beta": beta, "solver": Euler(),
+                                                "guidance": None, "steps": 2}),
+        rollout=FlowRolloutConfig(reward="psnr", groups=2, steps=3))
 
 
 def grpo_step(objective, rollout, **trainer):
@@ -527,12 +623,31 @@ def test_flow_grpo_trains_from_the_run_config_on_a_registered_reward():
     one policy step on the transitions the rollout cut."""
     config = grpo_run()
     objective = config.build()
-    assert isinstance(objective, FlowGRPOObjective)
-    prepared, started, state = grpo_step(objective, objective.rollout())
+    assert isinstance(objective, FlowGRPOObjective) and config.rollout is not None
+    prepared, started, state = grpo_step(objective, config.rollout.build(objective))
     assert prepared["latents"].shape[:2] == (jax.device_count() * 2, 2)
     assert np.all(np.isfinite(prepared["rewards"]))
     assert any(not np.array_equal(after, before) for after, before in zip(
         jax.tree.leaves(state.variables["params"]), started, strict=True))
+
+
+def test_a_flow_grpo_runs_rollout_is_its_own_record_beside_the_objective():
+    """A Flow-GRPO run's rollout is the run's `rollout` record, which the objective's record does
+    not hold: a run naming none states the default, a rollout setting on the objective is no
+    argument of it, and a rollout on a run whose objective trains on its data is refused."""
+    stated = dataclasses.replace(grpo_run(), rollout=None)
+    assert stated.rollout == FlowRolloutConfig()
+    assert DiffusionRunConfig.from_dict(stated.to_dict()).rollout == FlowRolloutConfig()
+    with pytest.raises(ValueError):
+        dataclasses.replace(grpo_run(), objective=ObjectiveConfig("flow_grpo", {"reward": "psnr"}))
+    with pytest.raises(ValueError):
+        dataclasses.replace(grpo_run(), objective=ObjectiveConfig("diffusion", {}))
+    with pytest.raises(ValueError):
+        FlowRolloutConfig(reward="no_such_metric")
+    parsed = DiffusionRunConfig.cli(["preset:flow", "--objective", "flow_grpo", "--rollout.reward", "psnr",
+                                     "--rollout.groups", "2", "--rollout.train-steps", "3"])
+    assert parsed.rollout == FlowRolloutConfig(reward="psnr", groups=2, train_steps=3)
+    assert DiffusionRunConfig.from_dict(parsed.to_dict()).rollout == parsed.rollout
 
 
 def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_path):
@@ -540,12 +655,13 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
     task restores the trained policy under `from_run`'s default `ema=None`,
     the weights the objective's own pipeline publishes."""
     from dew.checkpoints import Checkpoints
-    from dew.sampling.pipelines import TextToImage
+    from dew.inference import TextToImage
 
     config = grpo_run(beta=0.1, directory=str(tmp_path))
     objective = config.build()
+    assert isinstance(objective, FlowGRPOObjective) and config.rollout is not None
     checkpoints = Checkpoints(str(tmp_path / "run"))
-    _, started, state = grpo_step(objective, objective.rollout(), checkpoints=checkpoints)
+    _, started, state = grpo_step(objective, config.rollout.build(objective), checkpoints=checkpoints)
     checkpoints.save(1, state, None, {}, artifact=objective.inference_record())
     checkpoints.wait()
     config.save(str(tmp_path / "run"))
@@ -558,22 +674,92 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
                for got, before in zip(restored, started, strict=True))
 
 
-def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipelines):
-    """Flow-GRPO built over a loaded flow pipeline directly, its solver, steps and guidance given and
-    its grid left out, samples its evaluation and published task on the pipeline's own grid, as the
-    denoising objective over it does; `grid=None` asks for the training process's times."""
+def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipelines, tmp_path):
+    """Flow-GRPO built over a published pipeline, its grid left out, evaluates on the pipeline's own
+    grid as the denoising objective over it does, and its published task and the task a saved run
+    restores draw what the pipeline's own task draws from the same noise. `grid=None` evaluates on
+    the training process's times instead, as the denoising objective with that grid does, which
+    the pipeline's grid does not draw. The SDE rollout walks the process's own times either way."""
+    from dew.checkpoints import Checkpoints
     from dew.interop.pretrained import load_diffusion_source
 
-    source = load_diffusion_source(str(pipelines / "sd3" / "pipeline"), dtype="float32",
-                                   attention_impl="xla", size=(16, 16))
-    settings = {"reward": "psnr", "groups": 2, "rollout_steps": 3, "solver": Euler(), "guidance": None,
-                "steps": 2}
-    grpo = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
-                             variables=source.variables, **settings)
-    plain = DiffusionObjective(source, solver=Euler(), guidance=None, steps=2)
-    assert grpo.grid is not None and plain.grid is not None
-    assert to_record(grpo.grid, type(grpo.grid)) == to_record(plain.grid, type(plain.grid))
-    assert grpo.final_denoise is False
-    unset = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
-                              variables=source.variables, grid=None, **settings)
-    assert unset.grid is None and unset.final_denoise is True
+    directory = pipelines / "sd3" / "pipeline"
+    settings = {"solver": Euler(), "guidance": None, "steps": 2}
+    rollout = FlowRolloutConfig(reward="psnr", groups=2, steps=3)
+    source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(16, 16))
+    step = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
+
+    def built(**grid):
+        grpo = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
+                                 variables=source.variables, **settings, **grid)
+        plain = DiffusionObjective(source, solver=Euler(), guidance=None, steps=2, **grid)
+        return grpo, plain
+
+    def started(objective):
+        return Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3)).initial_state()
+
+    def evaluated(objective):
+        state = started(objective)
+        images = np.asarray(objective.evaluate(state.variables, batch_for(objective, 16), step).images)
+        assert np.all(np.isfinite(images))
+        return images
+
+    def rolled(objective):
+        state = started(objective)
+        drawn = rollout.build(objective)(state, batch_for(objective, 16), jax.random.PRNGKey(2))
+        fields = {name: np.asarray(drawn[name]) for name in (
+            "latents", "next_latents", "timesteps", "next_timesteps", OLD_LOG_PROBS_KEY, REWARDS_KEY)}
+        assert all(np.all(np.isfinite(field)) for field in fields.values())
+        return fields
+
+    (inherited, plain), (unset, plain_unset) = built(), built(grid=None)
+    on_grid, on_times = evaluated(inherited), evaluated(unset)
+    np.testing.assert_array_equal(on_grid, evaluated(plain))
+    np.testing.assert_array_equal(on_times, evaluated(plain_unset))
+    assert not np.array_equal(on_grid, on_times)
+    # The rollout walks the process's own times, whatever grid evaluation samples on.
+    on_grid_rollout, on_times_rollout = rolled(inherited), rolled(unset)
+    for name, field in on_grid_rollout.items():
+        np.testing.assert_array_equal(field, on_times_rollout[name], err_msg=name)
+    times = np.asarray(source.process.times(rollout.steps))
+    np.testing.assert_array_equal(on_grid_rollout["timesteps"][0], times[:-1])
+    np.testing.assert_array_equal(on_grid_rollout["next_timesteps"][0], times[1:])
+
+    prompts = list(PROMPTS[:2])
+    pipeline = source.text_to_image()
+    reference = np.asarray(pipeline(prompts, steps=2, guidance=None, solver=Euler(), key=7).images)
+    published = np.asarray(inherited.build_task(started(inherited).variables)(prompts, key=7).images)
+    assert np.all(np.isfinite(reference)) and np.all(np.isfinite(published))
+    np.testing.assert_array_equal(published, reference)
+
+    config = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
+                                data=images_of("tfds://oxford_flowers102", 16),
+                                val_metrics=(),
+                                trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
+                                objective=ObjectiveConfig("flow_grpo", settings), rollout=rollout)
+    saved = config.build()
+    initial = started(saved)
+    # The run's step-0 state is the pipeline's weights, leaf for leaf.
+    for (path, held), weight in zip(jax.tree_util.tree_leaves_with_path(initial.variables),
+                                    jax.tree.leaves(source.variables), strict=True):
+        assert np.all(np.isfinite(np.asarray(held))), jax.tree_util.keystr(path)
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(weight),
+                                      err_msg=jax.tree_util.keystr(path))
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, initial, None, {}, artifact=saved.inference_record())
+    checkpoints.wait()
+    config.save(str(tmp_path / "run"))
+    # The restored task runs where its weights were restored, over every device: the pipeline's task
+    # over those weights, run there too, draws what it does.
+    restored = TextToImage.from_run(str(tmp_path / "run"))
+    published_variables = saved.pipeline(initial).variables
+    for got, want in zip(jax.tree.leaves(restored.variables), jax.tree.leaves(published_variables),
+                         strict=True):
+        assert np.all(np.isfinite(np.asarray(got)))
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    drawn = np.asarray(restored(prompts, key=7).host().images)
+    assert np.all(np.isfinite(drawn))
+    np.testing.assert_array_equal(
+        drawn,
+        pipeline.bind(restored.variables)(prompts, steps=2, guidance=None, solver=Euler(),
+                                          key=7).host().images)

@@ -12,7 +12,6 @@ held to tests/reference_error.py's rule: no further from float64 than twice
 the float32 reference.
 """
 
-import json
 from pathlib import Path
 
 import jax
@@ -20,6 +19,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from interop_support import fixture_with_meta
 from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
 from torch_layout import QKV, case_arrays, dew_leaf, join_qkv, leaf, split_qkv, torch_leaf
 
@@ -35,9 +35,7 @@ DENSE = {"weight": "kernel", "bias": "bias"}
 
 @pytest.fixture(scope="module")
 def reference():
-    with np.load(FIXTURE) as loaded:
-        arrays = dict(loaded)
-    return arrays, json.loads(arrays.pop("meta").tobytes())
+    return fixture_with_meta(FIXTURE)
 
 
 def dew_path(name: str) -> tuple[str, ...]:

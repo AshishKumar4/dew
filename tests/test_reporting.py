@@ -1,9 +1,17 @@
 """Reporting persists real results and releases owned sinks on failures."""
 
+import errno
 import io
 import json
 import math
+import os
+import pty
+import re
+import selectors
+import subprocess
+import sys
 from contextlib import nullcontext
+from pathlib import Path
 
 import jax
 import numpy as np
@@ -90,6 +98,9 @@ def test_fit_records_requests_not_durability_and_leaves_tracker_borrowed(tmp_pat
     memory = entries[1]['value']['memory']
     assert memory['analysis']['temp'] >= 0 and memory['analysis']['argument'] > 0
     assert [device['id'] for device in memory['devices']] == [device.id for device in jax.local_devices()]
+    # The step's kernel report (row 1895) is in its plan: a CPU's regression step launches no kernel.
+    kernels = entries[1]['value']['plan']['kernels']
+    assert (kernels['launches'], kernels['unsized']) == ([], 0)
     assert entries[-1]['value']['status'] == 'completed'
 
 
@@ -253,6 +264,103 @@ def test_mlflow_takes_a_metric_named_in_free_text_under_a_name_it_accepts(tmp_pa
             tracker.log({mlflow_name(""): 2.0}, 2)
 
 
+WARNED = '''
+import logging
+import sys
+
+import jax
+import optax
+
+sys.path.insert(0, "tests")
+from affine_run import Regression, batches
+
+from dew.data.dataset import Loader
+from dew.training import Trainer
+
+
+def warned(when):
+    try:
+        raise ValueError(f"{when} raised")
+    except ValueError as error:
+        logging.getLogger("dew.training").warning("%s warned", when, exc_info=error)
+
+
+class Tracker:
+    """A tracker whose first report a Dew warning with its traceback follows, mid-run."""
+
+    def __init__(self):
+        self.logged = 0
+
+    def log(self, scalars, step):
+        self.logged += 1
+        if self.logged == 1:
+            warned("mid-run")
+
+    def artifact(self, value, step):
+        pass
+
+    def close(self):
+        pass
+
+
+Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0), tracker=Tracker()).fit(
+    Loader(lambda partition: batches(), None, None, 8), steps=2, log_every=1)
+warned("after-the-run")
+'''
+
+
+def drained(*descriptors: int) -> list[str]:
+    """What was written to the other end of each of `descriptors`, read until every writer closed it,
+    without a terminal's control sequences."""
+    held = {descriptor: bytearray() for descriptor in descriptors}
+    selector = selectors.DefaultSelector()
+    for descriptor in descriptors:
+        selector.register(descriptor, selectors.EVENT_READ)
+    while selector.get_map():
+        events = selector.select(timeout=300)
+        assert events, 'the run wrote nothing for 300 s'
+        for key, _ in events:
+            try:
+                chunk = os.read(key.fd, 1 << 16)
+            except OSError as error:
+                # A terminal's reader gets EIO once the last writer closed it.
+                if error.errno != errno.EIO:
+                    raise
+                chunk = b''
+            if chunk:
+                held[key.fd] += chunk
+            else:
+                selector.unregister(key.fd)
+    # CSI sequences, OSC sequences (a link) and carriage returns: what styles and redraws a line.
+    control = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\r')
+    return [control.sub('', held[descriptor].decode()) for descriptor in descriptors]
+
+
+@pytest.mark.parametrize('stderr', ['terminal', 'pipe'])
+def test_a_warning_mid_run_prints_above_the_live_panel_once_with_its_traceback(stderr):
+    """A run on a terminal draws its live panel there, and a Dew warning mid-run, with its traceback,
+    prints once above the panel: through Dew's styled handler, whose traceback is drawn once and not
+    formatted into the line too, where stderr is a terminal, and through the plain one where it is
+    not. Once the run ends the warning goes to stderr again, and the panel's terminal has none."""
+    tests = Path(__file__).resolve().parent
+    shown, writer = pty.openpty()
+    errors, error_writer = pty.openpty() if stderr == 'terminal' else os.pipe()
+    environment = {**os.environ, 'JAX_PLATFORMS': 'cpu', 'TERM': 'xterm-256color',
+                   'PYTHONPATH': os.pathsep.join(filter(None, (str(tests.parent / 'src'),
+                                                               os.environ.get('PYTHONPATH'))))}
+    with subprocess.Popen([sys.executable, '-c', WARNED], stdin=subprocess.DEVNULL, stdout=writer,
+                          stderr=error_writer, cwd=tests.parent, env=environment) as run:
+        os.close(writer)
+        os.close(error_writer)
+        terminal, written = drained(shown, errors)
+        assert run.wait(timeout=300) == 0, written[-3000:]
+    os.close(shown)
+    os.close(errors)
+    for text, when, elsewhere in ((terminal, 'mid-run', written), (written, 'after-the-run', terminal)):
+        assert (text.count(f'{when} warned'), text.count(f'ValueError: {when} raised')) == (1, 1), text
+        assert f'{when} warned' not in elsewhere
+
+
 def test_the_panel_shows_the_metrics_its_last_interval_reported():
     """A metric an interval no longer reports, a rollout source absent from its batch, leaves the
     panel rather than keep showing its last value, and shows its trend again when it returns."""
@@ -265,6 +373,40 @@ def test_the_panel_shows_the_metrics_its_last_interval_reported():
     display.interval(3, {"train/loss": 1.0, "rollout/source/a/reward": 0.5})
     assert [(row.name, list(row.values)) for _, row in display.rows()] == [
         ("loss", [2.0, 1.5, 1.0]), ("source/a/reward", [1.0, 0.5])]
+
+
+def test_the_panel_names_a_lower_bound_utilization_and_its_uncounted_kernels_within_its_name_column():
+    """A step some of whose launches' work XLA's cost analysis cannot count reports its utilizations
+    as lower bounds beside how many launches went uncounted: the panel shows them as `hfu ≥` and
+    `hlo_flops_util ≥` and the count as `uncounted kernels`, each whole within the name column, where
+    the metrics' own names would be cut."""
+    from dew.training.display import TRAINER_SHOWN, TrainingDisplay
+
+    display = TrainingDisplay(total=10, shown=TRAINER_SHOWN)
+    display.interval(1, {"train/loss": 2.0, "train/hfu_lower_bound": 0.41,
+                         "train/hlo_flops_util_lower_bound": 0.38, "train/unsized_kernels": 50.0})
+    names = {row.name: group for group, row in display.rows()}
+    assert names == {"loss": "train", "hfu ≥": "throughput", "hlo_flops_util ≥": "throughput",
+                     "uncounted kernels": "throughput"}
+    assert all(len(name) + 2 <= 24 for name in names)
+
+
+def test_a_metrics_label_names_it_in_evaluations_and_the_summary_too():
+    """A label (`Shown.label`) is the name everywhere the display shows the metric: an evaluation's
+    scores, its rows and the run's summary, whose trackers keep the metric's own name."""
+    from dew.objectives.base import Shown
+    from dew.training.display import TrainingDisplay
+    from dew.training.evaluation import Evaluation
+
+    display = TrainingDisplay(total=2, first=0, shown={"loss": Shown(better="lower", label="nll"),
+                                                       "accuracy": Shown(percent=True, label="top-1")})
+    evaluation = Evaluation(step=2, split="val", scores={"val/accuracy": 0.5}, coordinated_batches=1,
+                            records=4, event_key=(0,), elapsed_seconds=0.1, previews=())
+    display.evaluation(evaluation)
+    assert display.scores(evaluation).plain.startswith("top-1 ")
+    assert [row.name for _, row in display.evaluation_rows()] == ["top-1"]
+    # The summary's final loss is named as the display names it.
+    assert display.named("loss") == "nll" and display.named("tokens") == "tokens"
 
 
 def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counters():
@@ -281,8 +423,22 @@ def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counte
                          "data/chunks_per_record/tiny-shakespeare": 1.0})
     assert [row.name for _, row in display.rows()] == ["loss"]
     data_line = shown.data_line
+
+    def words(line):
+        # The line's words, its spacing and separators aside: what it says, not how it is laid out.
+        return [word for word in line.plain.split() if word != "·"]
+
     line = data_line(display.corpus_counts)
-    assert line is not None and line.plain == "data 4,824 rows  ·  0 rejected"
+    assert line is not None
+    # One label: its count, unnamed, and the rejected total, with no reason and no truncation.
+    said = words(line)
+
+    def follows(said, value, label):
+        return any(said[at:at + 2] == [value, label] for at in range(len(said) - 1))
+
+    assert "tiny-shakespeare" not in line.plain
+    assert follows(said, "4,824", "rows") and follows(said, "0", "rejected")
+    assert "(" not in line.plain and "%" not in line.plain
     # mix(web, code).filter(f): the corpora count the rows they fed the mix, the mixture the rows
     # f kept, and f's drops are the mixture's.
     mixture = data_line({"data/rows/web": 3000.0, "data/rows/code": 1824.0, "data/rows/mixture": 4700.0,
@@ -290,8 +446,17 @@ def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counte
                          "data/rejected/code/empty": 0.0, "data/rejected/mixture/filtered": 124.0,
                          "data/truncated/web": 0.25, "data/truncated/code": 0.0})
     assert mixture is not None
-    assert mixture.plain == ("data web 3,000  code 1,824  mixture 4,700 rows  ·  127 rejected (too_long 3, "
-                             "filtered 124)  ·  15.5% truncated")
+    said = words(mixture)
+    # Each label named before its count, in the order the counters came; the rejected total over every
+    # label (2 + 1 + 124) with each reason's count; the truncated share over the truncating labels' rows.
+    named = [said[said.index(label) + 1] for label in ("web", "code", "mixture")]
+    assert named == ["3,000", "1,824", "4,700"]
+    assert said.index("web") < said.index("code") < said.index("mixture")
+    assert follows(said, "4,700", "rows") and follows(said, "127", "rejected")
+    assert follows(said, "15.5%", "truncated")
+    reasons = mixture.plain[mixture.plain.index("(") + 1:mixture.plain.index(")")]
+    assert {tuple(reason.split()) for reason in reasons.split(",")} == {("too_long", "3"),
+                                                                        ("filtered", "124")}
     assert data_line({"train/loss": 1.0}) is None
 
 
@@ -303,6 +468,7 @@ def test_tensorboard_events_hold_the_fit_read_back_with_the_accumulator(tmp_path
         TENSORS,
         EventAccumulator,
     )
+    from tensorboard.util import tensor_util
 
     from dew.training import TensorBoardTracker
 
@@ -325,7 +491,9 @@ def test_tensorboard_events_hold_the_fit_read_back_with_the_accumulator(tmp_path
             for image in drawn] == [(2, (8, 8))]
     assert json.loads(reader.Tensors('val/samples/captions')[0]
                       .tensor_proto.string_val[0]) == ['a caption']
-    assert reader.Histograms('val/representation_std')[0].histogram_value.num == 3
+    # The histogram plugin's tensor (`histogram_pb`): each bucket's left edge, right edge and count.
+    buckets = tensor_util.make_ndarray(reader.Tensors('val/representation_std')[0].tensor_proto)
+    assert buckets.shape == (30, 3) and buckets[:, 2].sum() == 3
 
 
 def test_tensorboard_renders_clips_texts_token_losses_and_decisions(tmp_path):
@@ -336,6 +504,7 @@ def test_tensorboard_renders_clips_texts_token_losses_and_decisions(tmp_path):
         TENSORS,
         EventAccumulator,
     )
+    from tensorboard.util import tensor_util
 
     from dew.training import TensorBoardTracker
 
@@ -354,8 +523,9 @@ def test_tensorboard_renders_clips_texts_token_losses_and_decisions(tmp_path):
     assert (clip.format, clip.n_frames) == ('GIF', 2)
     assert json.loads(reader.Tensors('val/samples')[0]
                       .tensor_proto.string_val[0]) == {'prompt': '', 'texts': ['text']}
-    losses = reader.Histograms('val/token_losses')[0].histogram_value
-    assert (losses.num, losses.sum) == (1, 0.5)
+    # The histogram plugin's tensor (`histogram_pb`): each bucket's left edge, right edge and count.
+    losses = tensor_util.make_ndarray(reader.Tensors('val/token_losses')[0].tensor_proto)
+    assert losses[:, 2].sum() == 1 and losses[:, 0].min() <= 0.5 <= losses[:, 1].max()
     shown = json.loads(reader.Tensors('val/decisions')[0].tensor_proto.string_val[0])
     assert [row[:4] for row in shown['rows']] == [[0, 0, 2, 2], [0, 1, 0, 0]]
 
@@ -410,6 +580,23 @@ def paths_of(figure) -> list[list[tuple[float, ...]]]:
 
 def texts_of(figure) -> list[str]:
     return [shape.text for shape in figure.shapes if shape.tag == "text"]
+
+
+def test_a_figures_label_and_text_read_back_as_written():
+    """Markup characters in a figure's label and text are escaped: an SVG reader reads back what was
+    written, quotes of either kind included."""
+    from xml.etree import ElementTree
+
+    from dew import figures
+
+    written = "a < b & \"c\" 'd' > e"
+    figure = figures.Figure(120, 40, label=written)
+    figure.text(10, 20, written)
+    read = ElementTree.fromstring(figure.svg())
+    svg = "{http://www.w3.org/2000/svg}"
+    assert read.get("aria-label") == written
+    assert read.find(f"{svg}title").text == written
+    assert read.find(f"{svg}text").text == written
 
 
 def test_a_curve_draws_each_series_at_its_own_steps_from_its_finite_values():

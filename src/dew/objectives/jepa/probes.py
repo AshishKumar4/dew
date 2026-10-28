@@ -20,8 +20,12 @@ import jax.numpy as jnp
 import optax
 
 from dew.artifacts import Artifact, Representations
+from dew.batch import Batch
 from dew.eval.common import metric_device
-from dew.objectives.base import Batch, Objective, Shown, mean_of_totals, merge_totals
+from dew.nn import categorical
+from dew.nn.precision import accumulated
+from dew.objectives.base import Objective, Shown, mean_of_totals, merge_totals
+from dew.optim import OPTIMIZER_MAP
 
 
 class ProbeParams(NamedTuple):
@@ -52,15 +56,13 @@ def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100
     mean, std = jnp.mean(fit_x, axis=0), jnp.std(fit_x, axis=0) + 1e-6
     fit_x, test_x = (fit_x - mean) / std, (test_x - mean) / std
 
-    from dew.training.optim import OPTIMIZER_MAP
-
     params = ProbeParams(jnp.zeros((embeddings.shape[-1], num_classes)), jnp.zeros((num_classes,)))
     # Dew's AdamW, the one a run's config builds (`OPTIMIZER_MAP`), its bias corrections formed in double.
     optimizer = OPTIMIZER_MAP["adamw"](learning_rate, weight_decay=weight_decay)
 
     def objective(p: ProbeParams):
-        logits = fit_x @ p.w + p.b
-        return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, fit_y))
+        logits = accumulated(jnp.matmul, fit_x, p.w) + p.b
+        return jnp.mean(categorical.cross_entropy(logits, fit_y))
 
     def step(carry: tuple[ProbeParams, optax.OptState], _: None):
         p, opt_state = carry
@@ -69,7 +71,7 @@ def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100
         return (jax.tree.map(optax.apply_updates, p, updates), opt_state), None
 
     (params, _), _ = jax.lax.scan(step, (params, optimizer.init(params)), None, length=steps)
-    predicted = jnp.argmax(test_x @ params.w + params.b, axis=-1)
+    predicted = jnp.argmax(accumulated(jnp.matmul, test_x, params.w) + params.b, axis=-1)
     accuracy, _ = Objective.accuracy((predicted == test_y).astype(jnp.float32), {}).mean()
     return accuracy
 
@@ -84,7 +86,7 @@ def knn_probe_accuracy(embeddings, labels, num_classes: int, k: int = 20):
     fit_x = fit_x / (jnp.linalg.norm(fit_x, axis=-1, keepdims=True) + 1e-8)
     test_x = test_x / (jnp.linalg.norm(test_x, axis=-1, keepdims=True) + 1e-8)
 
-    similarity = test_x @ fit_x.T
+    similarity = accumulated(jnp.matmul, test_x, fit_x.T)
     neighbours = jnp.argsort(-similarity, axis=-1)[:, :min(k, fit_x.shape[0])]
     votes = jnp.sum(jax.nn.one_hot(fit_y[neighbours], num_classes), axis=1)
     accuracy, _ = Objective.accuracy((jnp.argmax(votes, axis=-1) == test_y).astype(jnp.float32), {}).mean()

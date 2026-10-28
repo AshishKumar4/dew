@@ -59,6 +59,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from dew.cleanup import end_group, exit_code, signal_group
+from dew.inference.rollouts import INFRASTRUCTURE
 from dew.objectives.rl.sessions import Call, Session, Status, Task
 
 from .gateway import SESSION, Gateway, Recorded, calls, engine_failure, refused_prompt
@@ -198,7 +200,9 @@ class HarnessSource:
     you are done. A trainer that exits without either, for example on an
     uncaught KeyboardInterrupt, still stops its trials. Trials run on daemon
     threads, and an atexit hook cancels the queued trials and interrupts the
-    running ones, then kills their process groups after `grace` seconds.
+    running ones, then kills their process groups after `grace` seconds. The
+    threads start, and the hook registers, at the first `submit`:
+    constructing the source starts nothing.
     """
 
     def __init__(
@@ -230,15 +234,13 @@ class HarnessSource:
         self._queue: queue.SimpleQueue[Callable[[], None] | None] = queue.SimpleQueue()
         self._workers = [threading.Thread(target=self._work, name=f"dew-harness-trial-{index}", daemon=True)
                          for index in range(workers)]
-        for worker in self._workers:
-            worker.start()
+        self._started = False
         self._lock = threading.Lock()
         # One record per submitted, unresolved future, queued or running; a done-callback drops it.
         self._records: dict[Future[Session], _Running] = {}
         # Trials run in their own process groups, so a Ctrl-C of the trainer does not reach them: at
         # interpreter exit this hook cancels every record and stops every live trial.
         self._exit_hook = functools.partial(_stop_all, self._records, self._lock, grace)
-        atexit.register(self._exit_hook)
 
     def submit(self, task: Task, samples: int, *, version: int, key: jax.Array) -> list[Future[Session]]:
         del key  # the agent's own requests draw through the gateway, which takes no key
@@ -256,6 +258,11 @@ class HarnessSource:
             with self._lock:
                 if self._closed:
                     raise RuntimeError("the harness source is closed")
+                if not self._started:
+                    for worker in self._workers:
+                        worker.start()
+                    atexit.register(self._exit_hook)
+                    self._started = True
                 self._records[future] = _Running()
                 self._queue.put(functools.partial(self._trial, future, task, group, sample, version))
             future.add_done_callback(self._forget_record)
@@ -287,7 +294,7 @@ class HarnessSource:
         """Send a trial's process group SIGINT, once, and arm its escalation. The caller holds the lock."""
         process = record.process
         if record.timer is None and process is not None:
-            _signal(process, signal.SIGINT)
+            signal_group(process, signal.SIGINT)
             record.timer = _timer(self._grace, self._escalate, record, signal.SIGTERM)
 
     def _escalate(self, record: _Running, sent: signal.Signals) -> None:
@@ -298,7 +305,7 @@ class HarnessSource:
             if process is None:
                 return
             _logger.warning("harness trial %d outlived its grace; sending %s", process.pid, sent.name)
-            _signal(process, sent)
+            signal_group(process, sent)
             record.timer = (_timer(self._grace, self._escalate, record, signal.SIGKILL)
                             if sent is signal.SIGTERM else _timer(self._grace, self._release, record))
 
@@ -313,8 +320,11 @@ class HarnessSource:
         with self._lock:
             # A submission checks this under the same lock, so none queues a trial behind the stop marks.
             self._closed = True
+            started = self._started
             pending = list(self._records)
         self.cancel(pending)
+        if not started:
+            return
         for _ in self._workers:
             self._queue.put(None)
         for worker in self._workers:
@@ -369,7 +379,7 @@ class HarnessSource:
                     with self._lock:
                         # A read that failed takes the trial's group with it, while the group is the trial's.
                         if record.process is not None:
-                            _signal(record.process, signal.SIGKILL)
+                            signal_group(record.process, signal.SIGKILL)
                     raise
                 finally:
                     with self._lock:
@@ -381,7 +391,8 @@ class HarnessSource:
                             record.timer.cancel()
                     assert process.stdout is not None
                     process.stdout.close()
-                    process.wait()
+                    # What the command left running in its group ends with the trial, a success's too.
+                    end_group(process)
                     record.closed.set()
             import httpx
 
@@ -396,6 +407,11 @@ class HarnessSource:
                 except httpx.HTTPError as error:
                     _logger.warning("could not delete gateway session %s: %s", session, error)
             future.set_result(verdict)
+        except INFRASTRUCTURE as error:
+            # The trial's own boundary failed (a missing executable or working directory, a pipe the
+            # host could not make): the session is an infrastructure failure the scheduler retries.
+            if not future.done():
+                future.set_result(ended(Status.INFRA_ERROR, detail=f"trial: {type(error).__name__}: {error}"))
         except BaseException as error:
             if not future.done():
                 future.set_exception(error)
@@ -423,7 +439,8 @@ class HarnessSource:
                 reading = len(ready.get_map()) > 1
                 if not reading:
                     with self._lock:
-                        if process.poll() is not None:
+                        # Read unreaped, so the trial's group keeps its id until `end_group` ends it.
+                        if exit_code(process) is not None:
                             record.process = None
                             break
                 if deadline is not None and time.monotonic() >= deadline:
@@ -492,11 +509,6 @@ def _timer[*Arguments](seconds: float, action: Callable[[*Arguments], None],
     return timer
 
 
-def _signal(process: subprocess.Popen[bytes], sent: signal.Signals) -> None:
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, sent)
-
-
 def _stop_all(records: dict[Future[Session], _Running], lock: threading.Lock, grace: float) -> None:
     """At interpreter exit: cancel every trial, interrupt the live ones, and
     kill the process group of each whose output is still open `grace`
@@ -506,7 +518,7 @@ def _stop_all(records: dict[Future[Session], _Running], lock: threading.Lock, gr
         for record in records.values():
             record.cancelled = True
             if record.process is not None:
-                _signal(record.process, signal.SIGINT)
+                signal_group(record.process, signal.SIGINT)
                 live.append(record)
     deadline = time.monotonic() + grace
     for record in live:
@@ -514,7 +526,7 @@ def _stop_all(records: dict[Future[Session], _Running], lock: threading.Lock, gr
         if not record.closed.wait(max(0.0, deadline - time.monotonic())):
             with lock:
                 if record.process is not None:
-                    _signal(record.process, signal.SIGKILL)
+                    signal_group(record.process, signal.SIGKILL)
 
 
 __all__ = ["Command", "Harness", "HarnessSource", "Judged", "Trial"]

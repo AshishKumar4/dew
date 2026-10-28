@@ -1,0 +1,9 @@
+{
+ "bytes": 5306824,
+ "license": "Apache-2.0",
+ "path": "recordings/80ba5881758f39f056eda8d422fa4d20c07dbd5a6d87d83a3cd24ae98d0d3dce.npz",
+ "reference": "huggingface/trl 1.12.0",
+ "repo": "dewml/fixtures",
+ "revision": "7cfac8cf5c8df6e364856188cc5c1be1987411ba",
+ "sha256": "80ba5881758f39f056eda8d422fa4d20c07dbd5a6d87d83a3cd24ae98d0d3dce"
+}

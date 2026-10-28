@@ -14,9 +14,13 @@ import threading
 import time
 from pathlib import Path
 
+from guests import GUEST_UIDS
+
 MAX_REQUEST = 32_768
 REQUEST_SECONDS = 90
-KERNEL_UIDS = range(6100, 6200)
+CAPACITY = 8
+"""Requests the service holds at once, queued or running, one per guest: a text model's serving slots,
+the request queue, the guests admitted and a text batch's rows."""
 
 
 def integer(value, low, high):
@@ -93,23 +97,24 @@ class NativeModels:
         import numpy as np
         import progress
 
+        import dew
         from dew.inference import Server
         from dew.interop import PretrainedDecoder
-        from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling, TextToImage
+        from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling
 
         print("MODEL_PHASE", time.time(), "pipeline load", flush=True)
         self.np, self.progress = np, progress
         self.cfg = CFG
         self.solvers = {solver.__name__: solver for solver in (DPMSolverMultistep, EulerAncestral, Heun)}
         self.repo, self.revision = (root / "text-to-image").read_text().strip().split("@")
-        self.pipe = progress.Reporting(TextToImage.from_pretrained(self.repo, revision=self.revision))
+        self.pipe = progress.Reporting(dew.pipeline(self.repo, revision=self.revision))
         self.text_servers = {}
         for line in (root / "text-models").read_text().split():
             name, _ = line.split("@")
             print("MODEL_PHASE", time.time(), "text load", name, flush=True)
             bundle = PretrainedDecoder.load(f"/opt/models/{name}", dtype=jnp.float32, max_seq_len=256)
             task = bundle.text_generation(sampling=Sampling(temperature=0))
-            self.text_servers[name] = Server.from_task(task, slots=8, capacity=256)
+            self.text_servers[name] = Server.from_task(task, slots=CAPACITY, capacity=256)
         print("MODEL_PHASE", time.time(), "warm sample", flush=True)
         self.sample({"repo": self.repo, "revision": self.revision,
                      "prompt": "the northern lights over a frozen lake at night", "negative": "",
@@ -185,9 +190,9 @@ class NativeModels:
 class ModelService(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
 
-    def __init__(self, path, models, uids=KERNEL_UIDS):
+    def __init__(self, path, models, uids=GUEST_UIDS):
         self.path, self.models, self.uids = Path(path), models, frozenset(uids)
-        self.jobs = queue.Queue(maxsize=8)
+        self.jobs = queue.Queue(maxsize=CAPACITY)
         self.pending = {}
         self.lock = threading.Lock()
         self.path.unlink(missing_ok=True)
@@ -205,7 +210,7 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
             if uid not in self.uids:
                 error = {"name": "PermissionError",
                          "message": "model requests require an isolated kernel uid"}
-            elif uid in self.pending or len(self.pending) >= 8:
+            elif uid in self.pending or len(self.pending) >= CAPACITY:
                 error = {"name": "ValueError", "message": "the shared model request queue is full; try again"}
             else:
                 self.pending[uid] = token
@@ -251,7 +256,7 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
             request, emit = job
             try:
                 if request["op"] == "text":
-                    while len(group) < 8:
+                    while len(group) < CAPACITY:
                         try:
                             following = self.jobs.get_nowait()
                         except queue.Empty:

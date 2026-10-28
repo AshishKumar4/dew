@@ -15,12 +15,13 @@ from collections.abc import Mapping
 
 from flax.traverse_util import flatten_dict
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     FUSED_EXPERTS,
     GEMMA3_MODEL_TYPE,
     MOE_SHARED,
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     MixtureFields,
@@ -41,7 +42,7 @@ from dew.interop.decoder_parts import (
 )
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS, Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.gemma3n import AltUp
 from dew.nn.mixers import AttentionMixer
@@ -51,28 +52,36 @@ def _trailing_sharers(hf_config: Mapping[str, object], layers: int, default: int
     """`num_kv_shared_layers` as the indices of the trailing layers that share
     their providers' keys and values (`first_kv_shared_layer_idx`,
     modeling_gemma3n.py:1178, modeling_gemma4.py:1068), None for none."""
-    count = records.integer(hf_config.get("num_kv_shared_layers", default), "num_kv_shared_layers")
+    count = _records.integer(hf_config.get("num_kv_shared_layers", default), "num_kv_shared_layers")
     if not 0 <= count < layers:
         refuse(f"num_kv_shared_layers {count}", f"it has to leave a provider among {layers} layers")
     return tuple(range(layers - count, layers)) or None
 
 
+_SHARED_UNUSED = ('k_proj', 'v_proj', 'k_norm')
+"""A kv-shared layer's own key and value projections and key norm, which transformers builds and a
+release may store (google/gemma-4-E4B-it @ee0ef60 does, layers 24-41) but never computes with: the
+layer reads its provider's keys and values (modeling_gemma4.py, Gemma4TextAttention.forward)."""
+
+
+def _shared_unused(name: str, config: Mapping[str, object]) -> bool:
+    """Whether `name` is one of a kv-shared layer's unused tensors (`_SHARED_UNUSED`), which a load
+    leaves unplaced and a save writes back as stored."""
+    parts = name.split('.')
+    sharing = config.get('kv_shared_layers') or ()
+    return (len(parts) == 6 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
+            and parts[3] == 'self_attn' and parts[4] in _SHARED_UNUSED and parts[5] == 'weight'
+            and isinstance(sharing, (tuple, list)) and int(parts[2]) in sharing)
+
+
 def _gemma_layer_types(hf_config: Mapping[str, object], used: set[str], *,
                        last_full: bool = False) -> tuple[str, ...]:
-    if hf_config.get('layer_types') is not None:
-        types = specified_layer_types(hf_config, used)
-    else:
-        pattern = (
-            6
-            if last_full
-            else records.integer(hf_config.get("sliding_window_pattern", 6), "sliding_window_pattern")
-        )
-        if not last_full:
-            used.add('sliding_window_pattern')
-        types = tuple(
-            "sliding_attention" if (index + 1) % pattern else "full_attention"
-            for index in range(records.integer(hf_config["num_hidden_layers"], "num_hidden_layers"))
-        )
+    period = 6
+    if not last_full and hf_config.get('layer_types') is None:
+        used.add('sliding_window_pattern')
+        period = _records.integer(hf_config.get("sliding_window_pattern", 6), "sliding_window_pattern")
+    types = specified_layer_types(hf_config, used,
+                                  ('sliding_attention',) * (period - 1) + ('full_attention',))
     # Gemma4TextConfig rewrites the final layer before building the model.
     return (*types[:-1], 'full_attention') if last_full and types else types
 
@@ -84,7 +93,7 @@ GEMMA4_ROPE = {'sliding_attention': {'rope_type': 'default', 'rope_theta': 10000
 rope_parameters is absent or null (configuration_gemma4.py:203-208)."""
 
 GEMMA4_DEFAULTS = {'hidden_activation': 'gelu_pytorch_tanh', 'head_dim': 256, 'num_key_value_heads': 4,
-                   'sliding_window': 512}
+                   'sliding_window': 512, 'pad_token_id': 0}
 """The class defaults Gemma 4's text configs share where Dew's readers would
 otherwise fall back to another value (configuration_gemma4.py:152-183)."""
 
@@ -96,8 +105,8 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
     partial rotary); the sliding layers rotate all of theirs. Anything but
     those two shapes refuses with the entry named.
     """
-    full = records.record(entries.get('full_attention') or {}, 'rope_parameters.full_attention')
-    sliding = records.record(entries.get('sliding_attention') or {}, 'rope_parameters.sliding_attention')
+    full = _records.record(entries.get('full_attention') or {}, 'rope_parameters.full_attention')
+    sliding = _records.record(entries.get('sliding_attention') or {}, 'rope_parameters.sliding_attention')
     factor = sliding.get('partial_rotary_factor')
     if factor not in (None, 1, 1.0):
         refuse(f"rope_parameters.sliding_attention partial_rotary_factor {factor}",
@@ -116,8 +125,8 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
         if extra or full.get('factor', 1.0) not in (1, 1.0):
             refuse("rope_parameters.full_attention scaling",
                     "the backbone applies plain rotary positions at rope_theta")
-        partial = records.number(factor, 'rope_parameters.full_attention partial_rotary_factor')
-        theta = records.number(
+        partial = _records.number(factor, 'rope_parameters.full_attention partial_rotary_factor')
+        theta = _records.number(
             full.get("rope_theta", 1000000.0), "rope_parameters.full_attention rope_theta"
         )
     elif rope_type in ('default', 'none'):
@@ -129,7 +138,7 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
     else:
         refuse(f"rope_parameters.full_attention (rope_type {rope_type!r})",
                 "the backbone applies plain rotary positions at rope_theta")
-    local = records.number(local, 'rope_parameters.sliding_attention rope_theta')
+    local = _records.number(local, 'rope_parameters.sliding_attention rope_theta')
 
     return theta, (None if local == theta else local), partial
 
@@ -142,7 +151,7 @@ def _gemma_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     :374). Its released config names hidden_act 'gelu', which the reference
     computes as the erf gelu (modeling_gemma.py:93, ACT2FN['gelu']).
     """
-    config = base_config(hf_config, used, scale_after_cast=False, tie_embeddings=True,
+    config = base_config(hf_config, used, rope=PLAIN_SPELLING, scale_after_cast=False, tie_embeddings=True,
                           reads=frozenset({'attention_bias'}))
     config.update(scale_offset=True, embedding_scale=True)
     return config
@@ -161,10 +170,10 @@ def _gemma_softcaps(hf_config: Mapping[str, object], used: set[str],
                  'attn_logit_softcapping'))
     scalar = hf_config.get('query_pre_attn_scalar')
     if scalar is not None:
-        config['attention_scale'] = records.number(scalar, 'query_pre_attn_scalar') ** -0.5
+        config['attention_scale'] = _records.number(scalar, 'query_pre_attn_scalar') ** -0.5
     softcap = hf_config.get('final_logit_softcapping')
     if softcap is not None:
-        config['final_logit_softcap'] = records.number(softcap, 'final_logit_softcapping')
+        config['final_logit_softcap'] = _records.number(softcap, 'final_logit_softcapping')
 
 
 def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -174,11 +183,8 @@ def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     full layers at one rope base and softcaps the attention logits with tanh
     (configuration_gemma2.py:95-98, modeling_gemma2.py:203-206).
     """
-    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    layer_types = specified_layer_types(hf_config, used, tuple(
-        'sliding_attention' if (index + 1) % 2 else 'full_attention'
-        for index in range(layers)))
-    config = base_config(hf_config, used, scale_after_cast=False,
+    layer_types = specified_layer_types(hf_config, used, ('sliding_attention', 'full_attention'))
+    config = base_config(hf_config, used, rope=PLAIN_SPELLING, scale_after_cast=False,
                           tie_embeddings=True, layer_types=layer_types,
                           reads=frozenset({'layer_types', 'sliding_window', 'attention_bias'}))
     sliding = kinds_of(config).get('sliding_attention', native_fields(LayerKind)())
@@ -188,7 +194,7 @@ def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     _gemma_softcaps(hf_config, used, config)
     softcap = hf_config.get('attn_logit_softcapping')
     if softcap is not None:
-        config['attn_logit_softcap'] = records.number(softcap, 'attn_logit_softcapping')
+        config['attn_logit_softcap'] = _records.number(softcap, 'attn_logit_softcapping')
     return config
 
 
@@ -200,7 +206,7 @@ the full layers at 1e6 and the sliding ones at rope_local_base_freq or 1e4
 
 
 def _gemma3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
-    rope = read_rope(hf_config, used, spelling=_GEMMA3_ROPE)
+    rope = read_rope(hf_config, used, _GEMMA3_ROPE)
     config = base_config(hf_config, used, qk_norm=True, scale_after_cast=False, rope=rope,
                           tie_embeddings=True, layer_types=_gemma_layer_types(hf_config, used))
     _gemma_softcaps(hf_config, used, config)
@@ -214,18 +220,12 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     block, gaussian top-k sparsity on the first layers, one feed-forward width
     per layer, per-layer inputs and KV sharing over the last layers.
     """
-    if hf_config.get('layer_types') is not None:
-        layer_types = specified_layer_types(hf_config, used)
-    else:
-        # Gemma3nTextConfig fills every fifth layer full.
-        layer_types = tuple(
-            "full_attention" if (index + 1) % 5 == 0 else "sliding_attention"
-            for index in range(records.integer(hf_config["num_hidden_layers"], "num_hidden_layers"))
-        )
-    ropes = read_rope(hf_config, used, spelling=_GEMMA3_ROPE)
+    # Gemma3nTextConfig fills every fifth layer full.
+    layer_types = specified_layer_types(hf_config, used, ('sliding_attention',) * 4 + ('full_attention',))
+    ropes = read_rope(hf_config, used, _GEMMA3_ROPE)
     config = base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
                           tie_embeddings=True, layer_types=layer_types, rope=ropes)
-    layers = records.integer(config.get('num_layers'), 'num_layers')
+    layers = _records.integer(config.get('num_layers'), 'num_layers')
     sparsity = hf_config.get('activation_sparsity_pattern')
     if sparsity is None:
         # The reference default is the first ten layers at 0.95 when there
@@ -245,9 +245,9 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     # AltUp's own checks name the reference's fields, so a config out of
     # their range is refused here; that is why the value is built before its
     # record, which states all four of AltUp's fields.
-    altup = AltUp(num_inputs=records.integer(hf_config.get('altup_num_inputs', 4), 'altup_num_inputs'),
-                  active_idx=records.integer(hf_config.get('altup_active_idx', 0), 'altup_active_idx'),
-                  coef_clip=None if clip is None else records.number(clip, 'altup_coef_clip'),
+    altup = AltUp(num_inputs=_records.integer(hf_config.get('altup_num_inputs', 4), 'altup_num_inputs'),
+                  active_idx=_records.integer(hf_config.get('altup_active_idx', 0), 'altup_active_idx'),
+                  coef_clip=None if clip is None else _records.number(clip, 'altup_coef_clip'),
                   correct_scale=bool(hf_config.get('altup_correct_scale', True)))
     config.update(
         sandwich_norms=True,
@@ -255,16 +255,16 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
         attention_scale=1.0,
         v_norm=True,
         activation_sparsity_pattern=tuple(float(fraction) for fraction in sparsity),
-        laurel_rank=records.integer(hf_config.get("laurel_rank", 64), "laurel_rank"),
+        laurel_rank=_records.integer(hf_config.get("laurel_rank", 64), "laurel_rank"),
         altup=NativeFields(AltUp, dataclasses.asdict(altup)),
-        per_layer_input_dim=records.integer(
+        per_layer_input_dim=_records.integer(
             hf_config.get("hidden_size_per_layer_input", 256), "hidden_size_per_layer_input"
         ),
-        per_layer_input_vocab=records.integer(
+        per_layer_input_vocab=_records.integer(
             hf_config.get("vocab_size_per_layer_input", 262144), "vocab_size_per_layer_input"
         ),
         kv_shared_layers=_trailing_sharers(hf_config, layers, 15),
-        final_logit_softcap=records.number(
+        final_logit_softcap=_records.number(
             hf_config.get("final_logit_softcapping", 30.0), "final_logit_softcapping"
         ),
     )
@@ -277,8 +277,11 @@ def _gemma3n_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
     Gemma 3n adds the AltUp and LAuReL leaves beside a Gemma 4 style layer.
     The copies' projections are indexed modules (altup_projections.{i}), which
     land as altup_projections_{i} the way the layers do; the coefficient maps
-    are Linears, so they transpose like any kernel.
+    are Linears, so they transpose like any kernel. A kv-shared layer's unused
+    keys, values and key norm land nowhere (`_shared_unused`).
     """
+    if _shared_unused(name, config):
+        return None
     parts = name.split('.')
     if len(parts) == 4 and parts[0] == 'model' and parts[2].isdigit() and parts[3] == 'weight' \
             and parts[1] in ('altup_projections', 'altup_unembed_projections'):
@@ -306,8 +309,8 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
                           tie_embeddings=True, layer_types=layer_types, rope=Ropes(10000.0))
     # The reference's final-layer rewrite takes precedence over an explicit pattern.
     config['layer_types'] = layer_types
-    sliding_dim = records.integer(config.get('head_dim'), 'head_dim')
-    kv_heads = records.integer(config.get('num_kv_heads'), 'num_key_value_heads')
+    sliding_dim = _records.integer(config.get('head_dim'), 'head_dim')
+    kv_heads = _records.integer(config.get('num_kv_heads'), 'num_key_value_heads')
     k_eq_v = k_eq_v or bool(hf_config.get('attention_k_eq_v', False))
     used.update(('attention_k_eq_v', 'enable_moe_block', 'per_layer_config',
                  'global_head_dim', 'num_global_key_value_heads'))
@@ -331,29 +334,39 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
             if not isinstance(entry, Mapping):
                 continue
             if entry.get('head_dim') is not None:
-                full_dim = records.integer(entry['head_dim'], 'per_layer_config head_dim')
+                full_dim = _records.integer(entry['head_dim'], 'per_layer_config head_dim')
             if entry.get('num_key_value_heads') is not None:
-                stated = records.integer(entry['num_key_value_heads'],
+                stated = _records.integer(entry['num_key_value_heads'],
                               'per_layer_config num_key_value_heads')
                 if full_kv != kv_heads and stated != full_kv:
                     refuse("per_layer_config num_key_value_heads",
                             f"the full layers name both {full_kv} and {stated}")
                 full_kv = stated
     else:
-        full_dim = records.integer(hf_config.get('global_head_dim', 512), 'global_head_dim')
+        full_dim = _records.integer(hf_config.get('global_head_dim', 512), 'global_head_dim')
         global_kv = hf_config.get('num_global_key_value_heads')
         if global_kv is not None and k_eq_v:
-            full_kv = records.integer(global_kv, 'num_global_key_value_heads')
+            full_kv = _records.integer(global_kv, 'num_global_key_value_heads')
     # Proportional rope rotates a fraction of the full layers' head dims
     # and passes the rest through; sliding layers rotate all of theirs.
     stated = hf_config.get('rope_parameters')
-    entries = GEMMA4_ROPE if stated is None else records.record(stated, 'rope_parameters')
+    entries = GEMMA4_ROPE if stated is None else _records.record(stated, 'rope_parameters')
     rope_theta, rope_local_theta, partial = _gemma4_rope(entries)
     used.update(('rope_parameters', 'rope_theta'))
-    per_layer = records.integer(
+    per_layer = _records.integer(
         hf_config.get("hidden_size_per_layer_input", 0), "hidden_size_per_layer_input"
     )
     sharing = _trailing_sharers(hf_config, len(layer_types), 0)
+    kinds = decoder_kinds(
+        layer_types,
+        kinds_of(config).get("sliding_attention", native_fields(LayerKind)()).value.window,
+        rope_local_theta,
+        None,
+        None if full_dim == sliding_dim else full_dim,
+    )
+    if partial is not None and "sliding_attention" in kinds:
+        # Gemma 4's sliding layers turn whole heads; its partial factor is the full layers' alone.
+        kinds["sliding_attention"]["partial_rotary_factor"] = 1.0
     config.update(
         sandwich_norms=True,
         embedding_scale=True,
@@ -361,22 +374,16 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
         v_norm=True,
         head_dim=sliding_dim,
         rope_theta=rope_theta,
-        kinds=decoder_kinds(
-            layer_types,
-            kinds_of(config).get("sliding_attention", native_fields(LayerKind)()).value.window,
-            rope_local_theta,
-            None,
-            None if full_dim == sliding_dim else full_dim,
-        ),
+        kinds=kinds,
         partial_rotary_factor=partial,
         # The reference widens only sharing layers. With none, this flag
         # changes neither the weights nor the forward operation.
         use_double_wide_mlp=bool(hf_config.get("use_double_wide_mlp", False)) and sharing is not None,
         kv_shared_layers=sharing,
         per_layer_input_dim=per_layer or None,
-        per_layer_input_vocab=records.integer(
+        per_layer_input_vocab=_records.integer(
             hf_config.get(
-                "vocab_size_per_layer_input", records.integer(hf_config["vocab_size"], "vocab_size")
+                "vocab_size_per_layer_input", _records.integer(hf_config["vocab_size"], "vocab_size")
             ),
             "vocab_size_per_layer_input",
         ),
@@ -391,7 +398,7 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
     used.add('attention_logit_cap')
     softcap = hf_config.get('final_logit_softcapping')
     if softcap is not None:
-        config['final_logit_softcap'] = records.number(softcap, 'final_logit_softcapping')
+        config['final_logit_softcap'] = _records.number(softcap, 'final_logit_softcapping')
     if full_kv != kv_heads:
         kinds_of(config).setdefault('full_attention', native_fields(LayerKind)())['num_kv_heads'] = full_kv
     # Every released Gemma 4 checkpoint carries the layer_scalar buffer the
@@ -411,9 +418,9 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
 
 def parallel_experts(hf_config: Mapping[str, object]) -> MixtureFields:
     """The routed branch a Gemma 4 layer runs beside its dense MLP."""
-    return native_fields(Mixture)(experts=records.integer(hf_config['num_experts'], 'num_experts'),
-            top_k=records.integer(hf_config['top_k_experts'], 'top_k_experts'),
-            expert_features=records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
+    return native_fields(Mixture)(experts=_records.integer(hf_config['num_experts'], 'num_experts'),
+            top_k=_records.integer(hf_config['top_k_experts'], 'top_k_experts'),
+            expert_features=_records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
             parallel=True)
 
 
@@ -441,8 +448,6 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
                  'laurel_rank', 'activation_sparsity_pattern', 'num_nextn_predict_layers', 'dropout_rate'):
         if getattr(model, name):
             refuse(name, 'the standalone Gemma4 reference has no such computation')
-    if model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias:
-        refuse('o_proj_bias', 'Gemma4 uses one attention_bias setting for every projection')
     if model.partial_rotary_factor is not None and model.partial_rotary_type != 'proportional':
         refuse('partial_rotary_type', 'Gemma4 full layers use proportional rotary')
     if model.layer_scalar not in ('frozen', 'trainable'):
@@ -458,7 +463,7 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
         if mixer is not None and not isinstance(mixer, AttentionMixer):
             refuse(f'kinds.{name}.mixer', 'Gemma4 uses ordinary attention')
         if isinstance(mixer, AttentionMixer) and (
-            mixer.bidirectional_images or mixer.mrope_section is not None
+            mixer.bidirectional_images or mixer.bidirectional_blocks or mixer.mrope_section is not None
         ):
             refuse(f'kinds.{name}.mixer', 'multimodal attention metadata needs its source wrapper')
         if kind.rope_scaling is not None or kind.yarn is not None:
@@ -512,21 +517,23 @@ def gemma4_export_weights(family: DecoderFamily, model: CausalTransformer, varia
     and nothing else in `constants`, before the shared writer reads them.
     """
     mode = model.layer_scalar
-    if mode not in ('frozen', 'trainable'):
+    if mode not in LAYER_SCALAR_COLLECTIONS:
         raise ValueError('Gemma4 tensor export requires an explicit layer_scalar mode')
-    params = variables.get('params', variables)
-    constants = variables.get('constants', {})
-    if not isinstance(params, Mapping) or not isinstance(constants, Mapping):
-        raise ValueError('params and constants must contain native variable trees')
-    fixed = set(flatten_dict(dict(constants), sep='.'))
+    found: dict[str, set[str]] = {}
+    for each, collection in LAYER_SCALAR_COLLECTIONS.items():
+        # A bare parameter tree is its own `params`.
+        tree = variables.get(collection, variables if collection == 'params' else {})
+        if not isinstance(tree, Mapping):
+            raise ValueError('params and constants must contain native variable trees')
+        found[each] = set(flatten_dict(dict(tree), sep='.'))
     scalars = {f'layers_{index}.layer_scalar' for index in range(model.num_layers)}
-    if fixed - scalars:
-        raise ValueError(f'unrepresented Gemma4 constants: {sorted(fixed - scalars)}')
-    trained = set(flatten_dict(dict(params), sep='.')) & scalars
-    held, stray = (fixed, trained) if mode == 'frozen' else (trained, fixed)
+    if found['frozen'] - scalars:
+        raise ValueError(f'unrepresented Gemma4 constants: {sorted(found["frozen"] - scalars)}')
+    held = found[mode] & scalars
+    stray = set().union(*(names & scalars for each, names in found.items() if each != mode))
     if held != scalars or stray:
         raise ValueError(f"layer_scalar={mode} keeps every layer scalar in "
-                         f"{'constants' if mode == 'frozen' else 'params'} alone")
+                         f"{LAYER_SCALAR_COLLECTIONS[mode]} alone")
     return decoder_tensors(family, model, variables, config)
 
 
@@ -548,15 +555,19 @@ _GEMMA4_MOE: dict[tuple[str, ...], tuple[str, ...]] = {
 
 
 def gemma4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """The variables-tree path of one Gemma 4 tensor: its routed branch's (`_GEMMA4_MOE`), its layer
+    scalar's collection, the shared names' otherwise; a kv-shared layer's unused keys, values and key
+    norm land nowhere (`_shared_unused`)."""
+    if _shared_unused(name, config):
+        return None
     parts = name.split('.')
     if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
         tail = tuple(parts[3:])
         if tail == ('layer_scalar',):
             mode = config.get("layer_scalar")
-            if mode not in ("frozen", "trainable"):
-                refuse("layer_scalar", "the source scalar requires a frozen or trainable model mode")
-            collection = "constants" if mode == "frozen" else "params"
-            return (collection, f'layers_{parts[2]}', 'layer_scalar')
+            if not isinstance(mode, str) or mode not in LAYER_SCALAR_COLLECTIONS:
+                return refuse("layer_scalar", "the source scalar requires a frozen or trainable model mode")
+            return (LAYER_SCALAR_COLLECTIONS[mode], f'layers_{parts[2]}', 'layer_scalar')
         layer = ('params', f'layers_{parts[2]}')
         if tail in _GEMMA4_MOE:
             return (*layer, *_GEMMA4_MOE[tail])
@@ -592,7 +603,11 @@ GEMMA3N_TEXT = DecoderFamily(
     sandwich_norms=True,
     weight_path=_gemma3n_path,
     preserve_source_layout=True,
-    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'final_logit_softcapping': 30.0},
+    # Gemma3nTextConfig's window, which an omitted sliding_window means.
+    defaults={'max_position_embeddings': 32768, 'hidden_activation': 'gelu_pytorch_tanh',
+              'final_logit_softcapping': 30.0, 'pad_token_id': 0,
+              'sliding_window': 512},
+    padding_idx=True,
 )
 
 GEMMA4_TEXT = DecoderFamily(
@@ -612,7 +627,26 @@ GEMMA4_TEXT = DecoderFamily(
     preserve_source_layout=True,
     defaults={**GEMMA4_DEFAULTS, 'hidden_size_per_layer_input': 256,
               'vocab_size_per_layer_input': 262144},
+    padding_idx=True,
 )
+
+def gemma4_unified_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+    used.add('is_causal')
+    if hf_config.get('is_causal', True) is not True:
+        refuse('Gemma4Unified text configuration',
+               'only its causal text path with optional vision blocks is mapped')
+    if hf_config.get('enable_moe_block') or hf_config.get('hidden_size_per_layer_input'):
+        refuse('Gemma4Unified text configuration', 'the unified decoder has no MoE or per-layer input branch')
+    return gemma4_config(hf_config, used)
+
+
+GEMMA4_UNIFIED_TEXT = dataclasses.replace(
+    GEMMA4_TEXT, model_types=('gemma4_unified_text',), export_model_type='gemma4_unified_text',
+    translate_config=gemma4_unified_config,
+    architecture='Gemma4UnifiedForCausalLM',
+    defaults={**GEMMA4_DEFAULTS, 'sliding_window': 1024, 'max_position_embeddings': 262144,
+              'use_bidirectional_attention': 'vision'})
+
 
 GEMMA3_TEXT = DecoderFamily(
     (GEMMA3_MODEL_TYPE,),
@@ -623,7 +657,10 @@ GEMMA3_TEXT = DecoderFamily(
     _gemma3_export,
     sandwich_norms=True,
     preserve_source_layout=False,
-    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256},
+    # Gemma3TextConfig's defaults for the fields its decoder reads.
+    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256, 'pad_token_id': 0,
+              'sliding_window': 4096, 'head_dim': 256, 'max_position_embeddings': 131072},
+    padding_idx=True,
 )
 
 GEMMA2 = DecoderFamily(
@@ -635,8 +672,11 @@ GEMMA2 = DecoderFamily(
     _gemma2_export,
     sandwich_norms=True,
     preserve_source_layout=False,
-    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256,
-              'final_logit_softcapping': 30.0, 'attn_logit_softcapping': 50.0},
+    # Gemma2Config's defaults for the fields its decoder reads.
+    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256, 'pad_token_id': 0,
+              'final_logit_softcapping': 30.0, 'attn_logit_softcapping': 50.0, 'sliding_window': 4096,
+              'head_dim': 256, 'max_position_embeddings': 8192},
+    padding_idx=True,
 )
 
 GEMMA = DecoderFamily(
@@ -647,5 +687,6 @@ GEMMA = DecoderFamily(
     'GemmaForCausalLM',
     lambda model: {},
     preserve_source_layout=False,
-    defaults={'hidden_act': 'gelu_pytorch_tanh'},
+    defaults={'max_position_embeddings': 8192, 'hidden_act': 'gelu_pytorch_tanh', 'pad_token_id': 0},
+    padding_idx=True,
 )

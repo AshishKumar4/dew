@@ -27,6 +27,14 @@ Import `Objective`, `Aux`, `Step` and `Ratio` from `dew.objectives`. `Ratio.mean
 
 `Aux` holds training measurements, sequential mutable replacements, QK maxima and additive deferred effects. The trainer applies the effects once per supported optimizer commit. `objective.scalar_loss(variables, batch, step)` returns a scalar and the same Aux for direct JAX differentiation.
 
+### Categorical log-likelihoods
+
+`dew.nn.categorical` is the one owner of a categorical distribution's log-likelihood over the last axis: a model's logits over its vocabulary, a classifier's over its classes, a decision's over a question's options.
+
+<!-- api: dew.nn.categorical.log_probs dew.nn.categorical.probabilities dew.nn.categorical.cross_entropy dew.nn.categorical.soft_cross_entropy dew.nn.categorical.kl_divergence dew.nn.categorical.entropy dew.nn.categorical.rescaled dew.nn.categorical.target_loss dew.nn.categorical.segment_log_partition -->
+
+Each computes in at least float32 and keeps float64 in float64. `where` excludes the classes a row does not hold; they take no probability and add no term, in value or gradient. `rescaled`, `target_loss` and `segment_log_partition` are the pieces of a partition read in blocks or over ragged supports, as `dew.objectives.lm.chunked` reads its vocabulary.
+
 ### Collections and EMA selection
 
 A variables tree is a nested mapping. Its outer keys name collections such as `params` and `batch_stats`; leaves are arrays such as a dense kernel or a running mean. The optimizer updates the `params` collection. A mutable Linen call returns replacement state collections, which the objective supplies through `Aux.variables`. See the [BatchNorm example](../concepts/objectives.md#non-parameter-state).
@@ -60,7 +68,7 @@ Import these from `dew.training`:
 - `host` names train-state fields out of `params`, `opt_state` and `ema`. A named `opt_state` or `ema` stays in pinned host memory between steps, and the step fetches it to the device. Naming `params` instead puts the whole `TrainState` on the CPU, including optimizer state, EMA and accumulation. The optimizer transaction then runs on a CPU companion of the mesh, and on every process the runtime CPU device count must match the accelerator count before JAX initializes.
 - `host_parameters` holds glob patterns over logical parameter paths (`params/layers_*`) that an inference placement keeps in pinned host memory. Only the `offloaded` placement reads them, and `check` refuses a layout that names them for any other placement.
 
-`shardings(mesh, tree)` returns a matching tree of placements, and `check(params, shardings, mesh)` checks for excessive replication. See [distributed training](../concepts/distributed.md).
+`shardings(mesh, tree)` returns a matching tree of placements, and `check(params, shardings, mesh)` checks for excessive replication. `validate(mesh, state, capacity=None)` reads a state as it will be placed, its leaves arrays or `jax.ShapeDtypeStruct`s that carry their shardings, and returns a `Validation`: each leaf's spec, shard shape and memory kind, the bytes each device holds between steps by device id, the axes a batch's rows split over, the collectives a step runs over each mesh axis by the role the placement gives it, and the logical axes no rule names. Rules naming an axis the mesh lacks are refused there as in `shardings`, and it raises `LayoutRefused` when a device would hold more than its capacity, the device's allocator `bytes_limit` unless `capacity` states it. See [distributed training](../concepts/distributed.md).
 
 ## Trainer
 
@@ -68,11 +76,13 @@ Import `Trainer` from `dew` or `dew.training`.
 
 <!-- api: dew.training.Trainer -->
 
-`objective` is an initialized objective object, and `optimizer` is an Optax gradient transformation or a `dew.config.OptimConfig`. `fit` builds a config over the optimizer updates its `steps` make, `steps // accumulation`, so the config's schedule spans that run; `OptimConfig.weight_decay` says which parameters its decay spares. The required JAX `key` seeds initialization and the run. `mesh`, a `MeshSpec` or a native `jax.sharding.Mesh`, and `layout` describe placement; `microbatches` is how many a pipelined step feeds through the mesh's stage axis, one a stage when unset. The optional objects turn on checkpoints, tracking, host-side rollouts and profiling.
+`objective` is an initialized objective object, and `optimizer` is an Optax gradient transformation or a `dew.optim.OptimConfig`. `fit` builds a config over the optimizer updates its `steps` make, `steps // accumulation`, so the config's schedule spans that run; `OptimConfig.weight_decay` says which parameters its decay spares. The required JAX `key` seeds initialization and the run. `mesh`, a `MeshSpec` or a native `jax.sharding.Mesh`, and `layout` describe placement; `microbatches` is how many a pipelined step feeds through the mesh's stage axis, one a stage when unset. The optional objects turn on checkpoints, tracking, host-side rollouts and profiling.
 
 `accumulation` counts accepted microbatches per effective window. Shared means use a weighted gradient accumulator with at least fp32 precision, and keep float64 when it is enabled in JAX. A TPU has no float64 (XLA rewrites it into pairs of float32, which are not IEEE doubles), so a trainer whose parameters are stored in float64 on a TPU mesh is refused when it places the state. Each finalized gradient enters Optax in its parameter's dtype, and partially accumulated gradients keep the wider working dtype.
 
-Composite statistics keep independent normalizers, and the inputs for scalar-VJP replay. Parameters and the EMA stay fixed within the window, and sequential mutable replacements keep the snapshots they originally read. `dynamic_scale=True` persists the scale and its history, and rejects nonfinite working or optimizer-input gradients without discarding the accepted prefix.
+Composite statistics keep independent normalizers, and the inputs for scalar-VJP replay. Parameters and the EMA stay fixed within the window, and sequential mutable replacements keep the snapshots they originally read. `dynamic_scale=True` persists the scale and its history, and rejects nonfinite working or optimizer-input gradients. A rejection drops its whole accumulation window, as torch's AMP skips the whole update: the window's accepted microbatches go with it, the next microbatch begins a window, and the mutable collections they wrote keep what they wrote. A batch ramp's new stage drops a window a rejection left part filled, so every update pools one stage's batches.
+
+`validate(batch=None, steps=None, capacity=None)` runs the checks `fit` runs before it places the state, on the state a fresh run would place, without placing it. Given one global batch, the state includes the gradient accumulator `accumulation` pools. An `OptimConfig` is built over `steps`, as `fit` builds it. `capacity` states each device's bytes for a mesh whose devices report none, such as CPU devices standing in for GPUs.
 
 A custom `step(objective, optimizer)` factory is responsible for the accepted and update clocks, the scaler, the EMA and mutable writes. Its body returns `(state, loss, aux)`, and the common compiled wrapper advances the attempt counter `state.step`. A host `rollout` produces the actual training arrays once per consumed attempt, before differentiation or replay.
 
@@ -85,7 +95,9 @@ A custom `step(objective, optimizer)` factory is responsible for the accepted an
 - `log_every` is the interval between training log lines.
 - `eval_every=None` disables evaluation. With an interval, evaluation also runs at the end.
 - `checkpoint_every` controls periodic saves when a checkpointer exists. The normal completion path can still save a final checkpoint when a checkpointer is present.
+- Each of the three, an `EvalSuite`'s own `every` and `Checkpoints(local_every=)` may be a share of the run such as `"5%"`, resolved once against its planned length: the whole updates nearest that share of its steps, epochs or examples, at least one, or for a token budget alone each time the committed tokens pass a multiple of that share. A schedule's warmup (`Cosine`, `Power` and `Linear`'s `warmup_steps`, `OneCycle`'s `warmup_fraction`) takes a share too, of the run's updates. The run's start records what each resolved to, and the warmups of the schedules its optimizer runs (`FitStarted.cadences`).
 - `metrics` reduce evaluation artifacts and require evaluation to be enabled.
+- `cooldowns=Cooldowns(at=("20%", "40%"), length="20%")` branches the run into cooldowns at those points (`dew.training.cooldown`): each branch trains on from the run's state and data at its rate times a decay to zero, is scored by every validation suite as `cooldown_<split>/<metric>` at the step it branched from, and is discarded; the run trains on as one with none. `--trainer.cooldowns.at` sets it on a run's command line.
 - `preview=True` explicitly requests generated/display artifacts during evaluation; adding a scalar tracker alone does not request them.
 
 Checkpointable data must supply the consumed iterator position. A failed scaled transaction advances attempted work and scaler history while preserving the earlier accepted prefix. Completely inactive windows close accepted slots without an optimizer call, weight decay, EMA, or deferred effects. Auxiliary-only windows can still be active.
@@ -104,9 +116,9 @@ An `OptimConfig` is built by `fit` over the run's optimizer updates. If you need
 
 ## TrainState
 
-Import `TrainState` from `dew.training`.
+Import `TrainState` from `dew.state`.
 
-<!-- api: dew.training.TrainState -->
+<!-- api: dew.state.TrainState -->
 
 `step` counts completed attempted batches, including rejected work. `microstep` counts accepted microbatches, including finite zero-support slots. `updates` counts committed supported optimizer updates.
 
@@ -118,25 +130,23 @@ Import `TrainState` from `dew.training`.
 
 ## Dataset, Loader and Loading
 
-Import stores, chains, `load` and `Loading` from `dew.data`, `compile` from `dew.data.compile`, and run specs and `loader` from `dew.config.data`. `Loader` and `DataPartition` are in `dew.data.dataset`.
+Import sources, `Dataset`, the step modules, `presets` and `Loading` from `dew.data`, and `compile` from `dew.data.compile`. `Loader` and `DataPartition` are in `dew.data.dataset`.
 
-<!-- api: dew.data.load.load dew.config.data.loader dew.data.compile.compile dew.data.dataset.Loader dew.data.dataset.DataPartition dew.data.Loading -->
+<!-- api: dew.data.Dataset dew.data.presets.lm dew.data.presets.images dew.data.compile.compile dew.data.dataset.Loader dew.data.dataset.DataPartition dew.data.Loading -->
 
-`load("hf/<repo>")` and `load("tfds/<builder>")` read a dataset by name: packed language-model rows where `tokenizer=` or `seq_len=` asks for them, batched records otherwise. Text holds out 1% of document identities before tokenization; records hold out the first 256. `hf/<repo>@<revision>` pins a Hub revision and `tfds/<builder>:<version>` a TFDS version. A `Dataset` is also accepted. Other source locations use `Hub()`, `TFDS()` or `Files()`.
+A source is already a `Dataset`, and every verb returns a new one. A preset of `dew.data.presets` (`images`, `lm`, `sft`, `prompts`, `preferences`, `canvas` or `clips`) is a function from a dataset and its settings to a dataset, applied with `pipe`. It ends in `batch`, so its result goes to `Trainer.fit`, which compiles it into a `Loader`. Validation is a second dataset, `fit(..., validation=)`, usually a part of `holdout` through the same preset; nothing is held out unless the chain says so.
 
-A run spec is a frozen value implementing `RunData.pipelines()`: it returns the training Pipeline, an optional finite validation Pipeline and common host steps. Every data spec has `.load(**options)`, which calls `loader` with that spec. Each spec has an alias in `dew.registry.datasets`, such as `records`, `text`, `chat`, `images` or `video`. Source URLs belong in `source`; `loader` refuses a bare URI. `TextData` defaults to EOS and a 1% token-axis holdout when no validation is named, keeping a token store's own validation split. `ImageData` defaults to a 256-record holdout.
+`batch(tokens=N)` selects token-budget batching: rows of the fixed length a record step declares (`TokenGeometry`), as many as `N` tokens hold. The compiled Loader exposes `batch_tokens`. Row and token budgets are mutually exclusive. A run configuration takes the micro-batch from its chain and `update_tokens` from `TrainerConfig`, and records the derived update/micro accumulation.
 
-`spec.load(batch=None, tokens=N)` selects token-budget batching: rows of the fixed length a record step declares (`TokenGeometry`), as many as `N` tokens hold. The compiled Loader exposes `batch_tokens`. Row and token budgets are mutually exclusive. Run configurations set TrainerConfig.batch_size=None, batch_tokens and update_tokens, and record the derived update/micro accumulation.
+A `Dataset` is immutable. Its methods add ordered stages: `map`, `random_map`, `map_with_index`, `filter`, `filter_map`, `random_filter_map`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `interleave`, `windows`, `pack`, `batch`, `workers`, `prefetch`, `take` and `cache`; a `map` after `batch` is a host step on the training batch. `batch` takes the global row batch. Host batch steps run after workers in the training process. `compile(..., host=(step,))` applies common steps to both branches.
 
-`Pipeline(source)` is immutable. Its methods add ordered stages: `map`, `random_map`, `map_with_index`, `filter`, `filter_map`, `random_filter_map`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `interleave`, `windows`, `pack`, `batch`, `workers`, `prefetch`, `take` and `cache`; a `map` after `batch` is a host step on the training batch. `batch` takes the global row batch. Host batch steps run after workers in the training process. `compile(..., host=(step,))` applies common steps to both branches.
+Sources implement `Source`: `Memory` holds records or columns, `Files` opens a format over URLs, `Hub` opens prepared Arrow or physical Hub Parquet shards, `TFDS` opens prepared ArrayRecords, and `from_torch` adapts map-style PyTorch samples with explicit tuple field names, as `from_grain`, `from_hf` and `from_iter` adapt Grain datasets, Hugging Face datasets and resumable iterators. A `DataLoader` keeps its own sampler and collator and is refused.
 
-Sources implement `Source`: `Memory` holds records or columns, `Files` opens a format over URLs, `Hub` opens prepared Arrow or physical Hub Parquet shards, `TFDS` opens prepared ArrayRecords, and `Torch` adapts map-style PyTorch samples with explicit tuple field names. A `DataLoader` keeps its own sampler and collator and is refused.
-
-`read="memory"` materializes deterministic transforms and packing. `read="indexed"` requires a producer index or provisioning. `read="streamed"` reads physical shards. The mode applies to every leaf, including validation; with no `read`, the sources choose it. `dew.data.load` provisions what the read needs, logging each artifact it prepares; with `provision=False`, a missing artifact is a named error.
+`read="memory"` materializes deterministic transforms and packing. `read="indexed"` requires a producer index or provisioning. `read="streamed"` reads physical shards. The mode applies to every leaf, including validation; with no `read`, the sources choose it. `Trainer.fit` provisions what the read needs, logging each artifact it prepares; under `compile`'s default, `provision=False`, a missing artifact is a named error.
 
 `Objective.data()` returns `ObjectiveData`, holding train and evaluation record steps and host batch steps for each branch. `ObjectiveData.pack` optionally packs those records into fixed windows, and `ObjectiveData.packed` runs record steps on each window before batching. It does not change `Objective.inputs`. Metadata-dependent steps use `Configured`; the compiler binds their declared facts from the source.
 
-`HoldOut(records=N)` reserves the source's head, `HoldOut(fraction=f, by="hash")` splits immutable record identities, and `Split(name)` opens a named split. An explicit source or Pipeline is also valid. `validation_records` caps accepted records before the share cut.
+`holdout(records=N)` reserves the source's head, `holdout(f)` splits immutable record identities, and `holdout(split=name)` opens a named split. A second dataset of your own is also valid validation. A preset's `records=` caps accepted records before the share cut.
 
 `train(partition)` opens a new training iterator. `val(partition)` opens one finite pass, or is `None` without validation. Its final partial batch is filled with repeats marked by `valid_rows=False`. `DataPartition.of(mesh)` selects the process's share; `DataPartition()` reads all rows.
 
@@ -144,11 +154,11 @@ Sources implement `Source`: `Memory` holds records or columns, `Files` opens a f
 
 A global count-preserving or memory-materialized plan resumes across process counts dividing its batch. A streamed, rejecting, expanding or online-packed plan saves exact Grain iterator state per share and refuses topology changes. Volatile fetches cannot claim exact resume before their bytes are persisted.
 
-`Loading` changes concurrency without changing record order or draws. `dew.data.load` defaults to `Loading(workers=0)`, which reads in the training process; spec `.load()` defaults to Grain's memory-budgeted auto tuning. A multiprocessing program needs a main guard.
+`workers(n)`, `threads(n)`, `prefetch(n)` and `loading(Loading(...))` change concurrency without changing record order or draws. A chain that names none reads in the training process (`workers=0`); `Loading(workers="auto")` sizes the workers and read buffer from the CPUs the process may run on and the memory it may take. A multiprocessing program needs a main guard.
 
 Each factory returns an exclusively owned iterator. Final `close()` must not race iteration or checkpoint operations. `request_stop()`, where supplied, is a nonblocking signal safe alongside both. The compiler's host stages forward ownership and position.
 
-`DevicePrefetchIterator(iterator, mesh, depth=2, source_state=None)` in `dew.training.distributed` takes ownership after successful construction. It starts reading and restoring on the first `next()`; closing an unused iterator only finalizes it. Use it in a context manager or call `close(timeout=5.0)`.
+`DevicePrefetchIterator(iterator, mesh, depth=2, source_state=None)` in `dew.distributed.batches` takes ownership after successful construction. It starts reading and restoring on the first `next()`; closing an unused iterator only finalizes it. Use it in a context manager or call `close(timeout=5.0)`.
 
 Depth is positive. The queue contains at most that many device batches plus one in flight. Saved source state names the last delivered batch, not speculative read-ahead. EOF or failure follows already queued batches; early close discards unread work and reports finalization errors.
 
@@ -168,6 +178,10 @@ Import `Checkpoints` from `dew`.
 
 This object does not write `run.json`; run configuration saving is separate. Use the [complete resume example](../guides/checkpoints.md) before adapting these lower-level calls.
 
+<!-- api: dew.checkpoints.averaged dew.checkpoints.averaged_pinned dew.checkpoints.Averaged -->
+
+`dew.checkpoints.averaged(runs, step=None, ema=None, mesh=None, layout=None)` averages runs trained apart from one model, of any objective, in fp32, each read onto `mesh` as `layout` places it; a pool's processes each take the mean of the shards they hold. A LoRA run's factors are merged into its kernels first. It returns an `Averaged`: the mean `variables`, the `model` record they apply to (its adapter merged away), and each run's directory, step and whether its EMA was read. Runs of another model are refused. `averaged_pinned(runs, ema=None, mesh=None, layout=None)` averages runs pinned already (`SavedRun.pinned`), as `Decide.averaged` does with the runs whose records it compared.
+
 ## Language modeling and generation
 
 Import `LMObjective` from `dew.objectives.lm`.
@@ -176,9 +190,15 @@ Import `LMObjective` from `dew.objectives.lm`.
 
 `model` may be a decoder bundle that `Pretrained.load` returned. The objective then reads the bundle's model, initial variables and processor, and `pipeline` decodes with that processor; passing `variables=` or `processor=` as well overrides that part. An adapted bundle (`bundle.adapt(LoRA(...), key=)`) trains only the adapter's factors, and its `save` and `export` merge them into the kernels. The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `output_table()`, returning the `OutputTable` (the stored vocabulary matrix and its orientation, bias, softcap and precision) that its logits contract (`dew.nn.protocols`). A decision head that reads the vocabulary's rows (the `JointSchemaHead`'s lexical prior) needs `vocabulary_rows()` (`VocabularyRows`): the head's `[vocab, features]` rows, `OutputTable.rows` where one matrix is the head, and past a nonlinear prediction head or an adapter on the head the rows its states meet. Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
 
-`variables` is the tree training starts from, either whole or split by `dew.objectives.base.freeze` or an adapter into the part that trains and the part that stays frozen. `loss_role` requires aligned `text_roles`. `pad_id` masks matching targets. `head_chunks` controls vocabulary tiling, and `head_tile` the head's backward tile (`'whole'`, `'tiled'` or a tile shape; `None` picks one for the objective); `samples` configures text previews. `ema_decay` defaults to `None`, which trains without an averaged copy; a decay such as `0.999` keeps one that evaluation and previews read, and `1.0` retains a frozen one. Routing balance, auxiliary loss, prediction-depth weight, and QK statistics require matching model computation. These interfaces make `LMObjective` specific to compatible decoders. `z_loss` adds PaLM's auxiliary term, the coefficient times the squared log partition of every counted prediction; zero adds nothing. `router_z_loss` is the routers' own z-loss (ST-MoE), and zero adds nothing. `token_accuracy=False` drops the `token_accuracy` metric and the pass over every logit it costs.
+`variables` is the tree training starts from, either whole or split by `dew.batch.freeze` or an adapter into the part that trains and the part that stays frozen. `loss_role` requires aligned `text_roles`. `pad_id` masks matching targets. `head_chunks` controls vocabulary tiling, and `head_tile` the head's backward tile (`'whole'`, `'tiled'` or a tile shape; `None` picks one for the objective); `samples` configures text previews. `ema_decay` defaults to `None`, which trains without an averaged copy; a decay such as `0.999` keeps one that evaluation and previews read, and `1.0` retains a frozen one. Routing balance, auxiliary loss, prediction-depth weight, and QK statistics require matching model computation. These interfaces make `LMObjective` specific to compatible decoders. `z_loss` adds PaLM's auxiliary term, the coefficient times the squared log partition of every counted prediction; zero adds nothing. `router_z_loss` is the routers' own z-loss (ST-MoE), and zero adds nothing. `token_accuracy=False` drops the `token_accuracy` metric and the pass over every logit it costs.
 
 `indexer` trains DeepSeek-V3.2's lightning indexer on a model whose `mla` mixer names `index_n_heads` and `index_head_dim`. `IndexerTraining("warmup")` needs a mixer without `index_topk`. The model then runs dense attention, `init` puts only the indexer in `params` and the rest of the tree under `frozen` (a `variables` tree may omit the indexer, as a dense checkpoint does), and the loss is the KL of the indexer's softmax from the attention distribution, reported as `indexer_kl`. `IndexerTraining("sparse")` needs a mixer with `index_topk`. The whole tree trains: the cross entropy trains the main weights, and the KL over the selected keys trains the indexer, whose inputs are detached. A warm-up checkpoint's split tree is accepted as `variables`. `weight` scales the KL term.
+
+Import `ExpertBalance` from `dew.objectives.routing`.
+
+<!-- api: dew.objectives.routing.ExpertBalance -->
+
+`ExpertBalance` holds how a run trains its routers. `LMObjective(balance=...)`, `MaskedDiffusionObjective(balance=...)`, `GRPOObjective(balance=...)`, `DPOObjective(balance=...)` and `PPOObjective(balance=...)` compose it: `balance_rate` moves each balancing bias against its load at every committed update (it needs a mixture with `bias=True`), `aux_loss_alpha` and `seq_aux` add DeepSeek V2's balance loss, and `router_z_loss` adds ST-MoE's z-loss. Each term is optional.
 
 Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 
@@ -212,7 +232,7 @@ A prompt's key is its global row key. Continuation zero draws with that key, so 
 
 `rows` counts this process's real prompts times `n`. `host()` returns the record over host arrays of those rows, and `text` decodes them through the task's processor, one string per row.
 
-`LMObjective.per_token_log_probs(params, tokens, left_padding=...)` scores the raw policy. It left-aligns real tokens for the forward and restores the original next-token alignment. Unscored padding slots are zero. `SampledRollout` records the raw sampling-time values as `old_log_probs` and preserves actual draws as `behavior_log_probs`, in the packed layout `GRPOObjective.packed_log_probs` rescores. Reward text excludes EOS and padding. When a batch carries no `old_log_probs`, GRPO uses the behavior probabilities as the old policy and its behavior corrections follow verl's bypass mode. The next-token objective refuses models declaring `causal=False`.
+`LMObjective.per_token_log_probs(params, tokens, left_padding=...)` scores the raw policy. It left-aligns real tokens for the forward and restores the original next-token alignment. Unscored padding slots are zero. `RolloutScheduler.sampled` records the raw sampling-time values as `old_log_probs` and preserves actual draws as `behavior_log_probs`, in the packed layout `GRPOObjective.packed_log_probs` rescores. Reward text excludes EOS and padding. When a batch carries no `old_log_probs`, GRPO uses the behavior probabilities as the old policy and its behavior corrections follow verl's bypass mode. The next-token objective refuses models declaring `causal=False`.
 
 ### Decoding components
 
@@ -417,13 +437,13 @@ Each source control has one rule for its consumer, neutral value, mode and refus
 
 Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `TextToImage`, `Images`, `DenoisingInputs` and `RunProcessor` from `dew.inference`. `dew.pipeline` is the same function. [Inference](../concepts/inference.md) describes placement and the three workflows.
 
-<!-- api: dew.inference.pipeline.pipeline dew.objectives.Objective.pipeline dew.objectives.Objective.build_task -->
+<!-- api: dew.inference.loading.pipeline dew.objectives.Objective.pipeline dew.objectives.Objective.build_task -->
 
-`Objective.pipeline` builds the objective's task over `state.averaged` or `state.variables`. An omitted processor keeps the objective's own; `None` clears it. `build_task` returns `TextGeneration` for LM, GRPO and PPO's actor, `MaskedGeneration` for MDLM, `BlockGeneration` for block SFT and `TextToImage` for diffusion, which takes no processor.
+`Objective.pipeline` builds the objective's task over `state.averaged` or `state.variables`. An omitted processor keeps the objective's own; `None` clears it. `build_task` returns `TextGeneration` for LM, GRPO and PPO's actor, `MaskedGeneration` for MDLM, `BlockGeneration` for block SFT and `TextToImage` for diffusion, which takes no processor. An objective whose `saved_task` builds from the settings its run records (`from_settings`, as Dew's token tasks do) needs no `build_task` of its own: the default builds that task from its `task_settings()` over its model, as a saved run of it loads.
 
-<!-- api: dew.inference.TextGeneration dew.inference.TextGeneration.__call__ dew.inference.TextGeneration.bind dew.inference.TextGeneration.decode dew.inference.TextGeneration.quantized dew.inference.TextGeneration.from_run dew.inference.TextGeneration.from_pretrained -->
+<!-- api: dew.inference.TextGeneration dew.inference.TextGeneration.__call__ dew.inference.TextGeneration.bind dew.inference.TextGeneration.decode dew.inference.TextGeneration.quantized dew.inference.TextGeneration.from_run dew.inference.TextGeneration.from_saved -->
 
-<!-- api: dew.inference.BlockGeneration dew.inference.BlockGeneration.__call__ dew.inference.BlockGeneration.from_run dew.inference.BlockGeneration.from_pretrained dew.inference.MaskedGeneration.from_run dew.inference.MaskedGeneration.from_pretrained -->
+<!-- api: dew.inference.BlockGeneration dew.inference.BlockGeneration.__call__ dew.inference.BlockGeneration.from_run dew.inference.BlockGeneration.from_saved dew.inference.MaskedGeneration.from_run dew.inference.MaskedGeneration.from_saved -->
 
 <!-- api: dew.interop.Pretrained.load dew.interop.PretrainedDecoder.text_generation dew.interop.PretrainedMaskedDecoder.text_generation dew.interop.PretrainedBlockDecoder.block_generation dew.interop.PretrainedPipeline.text_to_image dew.interop.Pretrained.adapt dew.interop.Pretrained.save dew.interop.Pretrained.push_to_hub -->
 
@@ -431,7 +451,7 @@ Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `Tex
 
 <!-- api: dew.lora.LoRA dew.lora.LoRA.apply dew.lora.LoRA.load dew.lora.Adapter.from_run dew.lora.Adapter.merge dew.lora.Adapter.save -->
 
-<!-- api: dew.inference.TextToImage dew.inference.TextToImage.from_objective dew.inference.TextToImage.from_run dew.inference.TextToImage.from_pretrained dew.objectives.lm.LMObjective.policy dew.inference.TextToImage.bind dew.inference.TextToImage.quantized dew.inference.TextToImage.prepare dew.inference.TextToImage.__call__ dew.inference.RunProcessor dew.inference.Server.from_task -->
+<!-- api: dew.inference.TextToImage dew.inference.TextToImage.from_objective dew.inference.TextToImage.from_run dew.inference.TextToImage.from_saved dew.objectives.lm.LMObjective.policy dew.inference.TextToImage.bind dew.inference.TextToImage.quantized dew.inference.TextToImage.prepare dew.inference.TextToImage.__call__ dew.inference.RunProcessor dew.inference.Server.from_task -->
 
 `RunProcessor` adapts a run's `ByteTokenizer` or `HFTokenizer` as a task processor.
 
@@ -439,9 +459,9 @@ A task captures the variables mapping at construction and on `bind`. Replacing t
 
 `max_new_tokens` takes precedence over a source default. If only `max_length` is declared, the budget is that total minus the padded prompt width. Otherwise an LM run records its `max_new_tokens` and `sampling` value; an objective uses its `Samples`. With no limit the call must provide one. A call's `n` takes precedence over the task's bound count the same way, including `n=1` over a source that asks for more; omitting it uses the bound count. Equal shapes and controls reuse the compiled executable across calls and `bind`.
 
-`LMObjective.policy(params)` uses those parameters directly. DPO, GRPO and PPO pipelines publish the trained policy and leave out the frozen reference their loss uses; PPO also removes the critic. For other generative objectives, `ema=True` requires the moving-average state and raises if it is absent; use `ema=False` for live weights. `objective.pipeline`, `dew.pipeline`, `Pretrained.from_run` and every task's `from_run` and `from_pretrained` default to `ema=None`, which uses the EMA copy merged over the live parameters when the state or run has one, and the live parameters otherwise. `ema=True` refuses a run without an EMA copy, and `ema=False` takes the live parameters.
+`LMObjective.policy(params)` uses those parameters directly. DPO, GRPO and PPO pipelines publish the trained policy and leave out the frozen reference their loss uses; PPO also removes the critic. For other generative objectives, `ema=True` requires the moving-average state and raises if it is absent; use `ema=False` for live weights. `objective.pipeline`, `dew.pipeline`, `Pretrained.from_run` and every task's `from_run` and `from_saved` default to `ema=None`, which uses the EMA copy merged over the live parameters when the state or run has one, and the live parameters otherwise. `ema=True` refuses a run without an EMA copy, and `ema=False` takes the live parameters.
 
-`TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory, and `from_pretrained` first pulls a published run directory from the Hub. The three text tasks are constructed the same way for the model kinds they generate for, and `dew.pipeline` picks the task class from the objective name in `run.json`. In `pipeline`, `dtype` selects the computation dtype and `param_dtype` the parameter storage. `None` keeps a run's stored dtypes and uses FP32 masters for a source, and `"auto"` keeps the stored dtypes of either.
+`TextToImage.from_run` reads `run.json` and the latest checkpoint under one directory, pinning it once (`SavedRun.pinned`), and `from_saved` builds the task from a run pinned already. `dew.pipeline` is the one loader of a published run on the Hub: it pulls the run directory at the revision asked for, pins it, and picks the task class from the objective name in `run.json`. The three text tasks are constructed the same way for the model kinds they generate for. In `pipeline`, `dtype` selects the computation dtype and `param_dtype` the parameter storage. `None` keeps a run's stored dtypes and uses FP32 masters for a source, and `"auto"` keeps the stored dtypes of either.
 
 A source-default text task keeps the temperature, top-k, top-p, min-p, EOS and padding settings as its `Sampling` value. It holds the source's complete chain as `logits`, its criteria as `stopping` and the strategy its config names, and takes its return count from `num_return_sequences`.
 
@@ -489,7 +509,7 @@ Ollama requests go through the SDK's public `generate` and `chat` methods, which
 
 Provider extensions cannot override the task's model, prompt, token budget, requested choice count or an explicit `Sampling` policy. The SDK writes `extra_body` over the named parameters, so a policy field in it must equal the policy, or the request is refused before any network call.
 
-`Pretrained.from_run(run_dir, *, ema=None, step=None).save(destination)` writes a saved run in that same layout. `from_run` rebuilds the run's model from its record as the right kind of bundle (`PretrainedDecoder` for a decoder), and `save` passes it to its family's writer, which refuses by name a model with no published layout. `dew export <run> <dest>` does the same from the command line. `bundle.push_to_hub(repo_id, private=, commit_message=)` publishes what `save` writes. To publish in the form `from_pretrained` pulls back, upload the run directory itself with `huggingface_hub.HfApi().upload_folder`.
+`Pretrained.from_run(run_dir, *, ema=None, step=None).save(destination)` writes a saved run in that same layout. `from_run` rebuilds the run's model from its record as the right kind of bundle (`PretrainedDecoder` for a decoder), and `save` passes it to its family's writer, which refuses by name a model with no published layout. `dew export <run> <dest>` does the same from the command line. `bundle.push_to_hub(repo_id, private=, commit_message=)` publishes what `save` writes. To publish in the form `dew.pipeline` pulls back, upload the run directory itself with `huggingface_hub.HfApi().upload_folder`.
 
 A decoder trained through the LM recipe, exported with `PretrainedDecoder.from_model(...).save` and converted by `ollama create` answers a greedy request with Dew's own greedy continuation, token for token, over the live daemon. A loaded source's `save` and a `from_model` bundle's leave the same files, so either export converts.
 
@@ -599,6 +619,6 @@ Splash's mask is a block-sparse descriptor built along with the executable, so a
 
 An additive bias, a mask that is a value of the trace (a KV-cache decode mask, or the striped mask sequence parallelism builds), a mask past the published cell budget, or a length that is not a multiple of 128 sends an explicit `'tpu'` call to the older Pallas flash kernel and keeps `'auto'` on `'xla'`. Splash applies a logit softcap (Gemma 2) and attention sinks (GPT-OSS) itself, and a packed batch reaches it as segment IDs instead of a mask. The flash kernel has neither a softcap nor sinks, so an explicit `'tpu'` call that splash cannot describe refuses them. On a GPU, `'auto'` runs both on `'xla'`, and `'cudnn'` refuses them by name.
 
-Below 512 keys `'auto'` stays on `'xla'`, where XLA's attention measured faster on a v6e (`SPLASH_MIN_LENGTH` in `dew/nn/attention.py`). The parameter tree does not change with the implementation, so checkpoints are interchangeable across hardware.
+Below 512 keys `'auto'` stays on `'xla'`, where XLA's attention measured faster on a v6e (`SPLASH_MIN_LENGTH` in `dew/nn/attention_kernels.py`). The parameter tree does not change with the implementation, so checkpoints are interchangeable across hardware.
 
 The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names which model configurations run the whole workflow; each task guide covers its own data and objective.

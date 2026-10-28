@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import parameter_loss
 
 from dew.interop import Pretrained
 from dew.objectives.base import Step
@@ -22,6 +23,22 @@ from dew.sampling import Sampling, generate
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
 
+
+
+def stepped_and_reloaded(loaded, inputs, expected_loss, learning_rate: float, directory, **options):
+    """One SGD step of the LM objective (`options`, its MTP weight) over `inputs`, the source's pad
+    id masking its padding: its loss within 1e-5 of `expected_loss`, then the stepped weights saved
+    to `directory` and loaded back. Returns the stepped variables and the reloaded source."""
+    objective = LMObjective(loaded, inputs.tokens.shape[1] - 1, ema_decay=None,
+                            pad_id=int(loaded.generation_config["pad_token_id"]), **options)
+    step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
+    loss = parameter_loss(objective, loaded.variables, {"text": inputs}, step)
+    value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])
+    np.testing.assert_allclose(value, expected_loss, atol=1e-5, rtol=0)
+    variables = {**loaded.variables, "params": jax.tree.map(
+        lambda weight, grad: weight - learning_rate * grad, loaded.variables["params"], gradient)}
+    loaded.save(directory, variables=variables)
+    return variables, Pretrained.load(directory, dtype="float32", attention_impl="reference")
 
 def test_a_media_source_trains_and_saves_text_without_loading_media(monkeypatch, tmp_path):
     import optax
@@ -40,7 +57,9 @@ def test_a_media_source_trains_and_saves_text_without_loading_media(monkeypatch,
     monkeypatch.setattr(AutoProcessor, "from_pretrained", load_media)
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla")
     processor = loaded.processor
-    assert processor is not None and processor.source == str(directory)
+    from dew.interop.sources import SourceReference
+
+    assert processor is not None and processor.source == SourceReference(str(directory))
     texts = ["token4 token5", "token4 token5 token6"]
     expected = tokenizer(text=texts, padding=True, truncation=False, return_tensors="np")
     inputs = processor(texts)
@@ -149,22 +168,8 @@ def test_source_update_exports_and_decodes_as_reference(source, tmp_path):
     gradients and source layouts that drop trained parameters on export.
     """
     loaded, inputs, reference = source
-    objective = LMObjective(loaded, inputs.tokens.shape[1] - 1,
-                            ema_decay=None,
-                            pad_id=int(loaded.generation_config["pad_token_id"]))
-    step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
-
-    def loss(variables):
-        statistics, _ = objective.loss({**loaded.variables, "params": variables}, {"text": inputs}, step)
-        return objective.reduce_loss(statistics)[0]
-
-    value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])
-    np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
-    variables = {**loaded.variables, "params": jax.tree.map(
-        lambda weight, grad: weight - reference["learning_rate"] * grad,
-        loaded.variables["params"], gradient)}
-    loaded.save(tmp_path, variables=variables)
-    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    variables, restored = stepped_and_reloaded(loaded, inputs, reference["loss"], reference["learning_rate"],
+                                               tmp_path)
     for before, after in zip(jax.tree.leaves(variables), jax.tree.leaves(restored.variables), strict=True):
         np.testing.assert_array_equal(before, after)
     output = restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
@@ -238,21 +243,7 @@ def test_prediction_loss_respects_padding_and_exports_trained_depth(source, tmp_
     """
     loaded, inputs, _ = source
     reference = np.load(loaded.source / "mtp_reference.npz")
-    objective = LMObjective(loaded, inputs.tokens.shape[1] - 1,
-                            ema_decay=None, mtp_weight=0.2,
-                            pad_id=int(loaded.generation_config["pad_token_id"]))
-    step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
-
-    def loss(variables):
-        statistics, _ = objective.loss({**loaded.variables, "params": variables}, {"text": inputs}, step)
-        return objective.reduce_loss(statistics)[0]
-
-    value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])
-    np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
-    variables = {**loaded.variables, "params": jax.tree.map(
-        lambda weight, grad: weight - 1e-4 * grad, loaded.variables["params"], gradient)}
-    loaded.save(tmp_path, variables=variables)
-    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    _, restored = stepped_and_reloaded(loaded, inputs, reference["loss"], 1e-4, tmp_path, mtp_weight=0.2)
     hidden = restored.model.apply(restored.variables, inputs.tokens,
                                    method=restored.model.hidden_states, **inputs.kwargs())
     logits = restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
@@ -316,21 +307,7 @@ def test_video_prediction_training_exports_the_reference_update(video_source, tm
     gave finite forward values but non-finite gradients and exported weights.
     """
     loaded, inputs, reference = video_source
-    objective = LMObjective(loaded, inputs.tokens.shape[1] - 1,
-                            ema_decay=None, mtp_weight=.2,
-                            pad_id=int(loaded.generation_config["pad_token_id"]))
-    step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
-
-    def loss(variables):
-        statistics, _ = objective.loss({**loaded.variables, "params": variables}, {"text": inputs}, step)
-        return objective.reduce_loss(statistics)[0]
-
-    value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])
-    np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
-    variables = {**loaded.variables, "params": jax.tree.map(
-        lambda weight, grad: weight - 1e-4 * grad, loaded.variables["params"], gradient)}
-    loaded.save(tmp_path, variables=variables)
-    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    _, restored = stepped_and_reloaded(loaded, inputs, reference["loss"], 1e-4, tmp_path, mtp_weight=0.2)
     logits = restored.model.apply(restored.variables, inputs.tokens, **inputs.kwargs())
     valid = np.asarray(inputs.token_fields["attention_mask"])
     np.testing.assert_allclose(

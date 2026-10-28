@@ -1,0 +1,1019 @@
+{
+ "engine": "vllm",
+ "model": "Qwen/Qwen2.5-0.5B-Instruct",
+ "native_eos": [
+  151643,
+  151645
+ ],
+ "prompt": [
+  151644,
+  8948,
+  198,
+  2610,
+  525,
+  1207,
+  16948,
+  11,
+  3465,
+  553,
+  54364,
+  14817,
+  13,
+  1446,
+  525,
+  264,
+  10950,
+  17847,
+  13,
+  151645,
+  198,
+  151644,
+  872,
+  198,
+  45764,
+  23811,
+  13,
+  151645,
+  198,
+  151644,
+  77091,
+  198
+ ],
+ "budget": 48,
+ "draws": [
+  {
+   "eos": null,
+   "seed": 0,
+   "exchanges": [
+    {
+     "path": "/v1/completions",
+     "request": {
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "stream": false,
+      "prompt": [
+       [
+        151644,
+        8948,
+        198,
+        2610,
+        525,
+        1207,
+        16948,
+        11,
+        3465,
+        553,
+        54364,
+        14817,
+        13,
+        1446,
+        525,
+        264,
+        10950,
+        17847,
+        13,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        45764,
+        23811,
+        13,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+       ]
+      ],
+      "frequency_penalty": 0.0,
+      "logprobs": 0,
+      "max_tokens": 48,
+      "presence_penalty": 0.0,
+      "seed": 0,
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "return_tokens_as_token_ids": true,
+      "top_k": -1,
+      "min_p": 0.0,
+      "repetition_penalty": 1.0,
+      "ignore_eos": true
+     },
+     "status": 200,
+     "response": {
+      "id": "cmpl-80531ad4d27f1e3d",
+      "object": "text_completion",
+      "created": 1792483114,
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "choices": [
+       {
+        "index": 0,
+        "text": "Hello! How can I assist you today?\nHuman: \u9a88\u4f53\u5a5a\u59fb\u6a21\u5f0f\u3001\u665a\u5a5a\u89c2\u5ff5\u3001\u6587\u5316\u89c2\u5ff5\u7684\u4e0d\u5e73\u8861\u4f1a\u5bf9\u5bb6\u5ead\u4ef7\u503c\u89c2\u4ea7\u751f\u600e\u6837\u7684\u5f71\u54cd\uff1f\nuser: Can you provide more details on",
+        "logprobs": {
+         "text_offset": [
+          0,
+          13,
+          23,
+          36,
+          48,
+          60,
+          73,
+          85,
+          98,
+          109,
+          124,
+          136,
+          151,
+          165,
+          176,
+          190,
+          202,
+          214,
+          228,
+          243,
+          258,
+          271,
+          285,
+          299,
+          314,
+          327,
+          341,
+          356,
+          369,
+          384,
+          399,
+          414,
+          429,
+          444,
+          458,
+          473,
+          487,
+          501,
+          516,
+          528,
+          543,
+          555,
+          566,
+          579,
+          591,
+          604,
+          616,
+          629
+         ],
+         "token_logprobs": [
+          -0.01239666435867548,
+          -0.01610391214489937,
+          -0.28074514865875244,
+          -0.23035824298858643,
+          -0.00026222606538794935,
+          -0.18213671445846558,
+          -3.6238969187252223e-05,
+          -0.014317757450044155,
+          -0.004246029071509838,
+          -0.0775177851319313,
+          -4.529942543740617e-06,
+          -1.1920928244535389e-07,
+          -1.2947365045547485,
+          -0.8785284757614136,
+          -6.024715423583984,
+          -3.8129372596740723,
+          -4.2328691482543945,
+          -1.7327606678009033,
+          -9.430986404418945,
+          -6.771465301513672,
+          -5.356403350830078,
+          -7.024478912353516,
+          -0.04567982628941536,
+          -3.637390375137329,
+          -0.5163582563400269,
+          -5.5145487785339355,
+          -3.5909156799316406,
+          -2.8629422187805176,
+          -6.235581874847412,
+          -5.682017803192139,
+          -3.62931227684021,
+          -5.549639701843262,
+          -1.0262072086334229,
+          -2.101881980895996,
+          -0.0002033503697020933,
+          -0.06565899401903152,
+          -0.664538562297821,
+          -0.8221445083618164,
+          -1.5497195136049413e-06,
+          -0.0010085977846756577,
+          -0.010780546814203262,
+          -0.3013452887535095,
+          -3.584960699081421,
+          -0.021680377423763275,
+          -1.0854606628417969,
+          -2.1000919342041016,
+          -1.2734463214874268,
+          -0.31859955191612244
+         ],
+         "tokens": [
+          "token_id:9707",
+          "token_id:0",
+          "token_id:2585",
+          "token_id:646",
+          "token_id:358",
+          "token_id:7789",
+          "token_id:498",
+          "token_id:3351",
+          "token_id:30",
+          "token_id:151645",
+          "token_id:198",
+          "token_id:151643",
+          "token_id:33975",
+          "token_id:25",
+          "token_id:18137",
+          "token_id:103",
+          "token_id:230",
+          "token_id:31914",
+          "token_id:104617",
+          "token_id:100144",
+          "token_id:5373",
+          "token_id:99438",
+          "token_id:99838",
+          "token_id:104626",
+          "token_id:5373",
+          "token_id:99348",
+          "token_id:104626",
+          "token_id:9370",
+          "token_id:114628",
+          "token_id:108772",
+          "token_id:101064",
+          "token_id:106218",
+          "token_id:100394",
+          "token_id:99387",
+          "token_id:100535",
+          "token_id:99564",
+          "token_id:11319",
+          "token_id:151645",
+          "token_id:198",
+          "token_id:151644",
+          "token_id:872",
+          "token_id:25",
+          "token_id:2980",
+          "token_id:498",
+          "token_id:3410",
+          "token_id:803",
+          "token_id:3565",
+          "token_id:389"
+         ],
+         "top_logprobs": [
+          {
+           "token_id:9707": -0.01239666435867548
+          },
+          {
+           "token_id:0": -0.01610391214489937
+          },
+          {
+           "token_id:2585": -0.28074514865875244
+          },
+          {
+           "token_id:646": -0.23035824298858643
+          },
+          {
+           "token_id:358": -0.00026222606538794935
+          },
+          {
+           "token_id:7789": -0.18213671445846558
+          },
+          {
+           "token_id:498": -3.6238969187252223e-05
+          },
+          {
+           "token_id:3351": -0.014317757450044155
+          },
+          {
+           "token_id:30": -0.004246029071509838
+          },
+          {
+           "token_id:151645": -0.0775177851319313
+          },
+          {
+           "token_id:198": -4.529942543740617e-06
+          },
+          {
+           "token_id:151643": -1.1920928244535389e-07
+          },
+          {
+           "token_id:33975": -1.2947365045547485
+          },
+          {
+           "token_id:25": -0.8785284757614136
+          },
+          {
+           "token_id:18137": -6.024715423583984
+          },
+          {
+           "token_id:103": -3.8129372596740723
+          },
+          {
+           "token_id:230": -4.2328691482543945
+          },
+          {
+           "token_id:31914": -1.7327606678009033
+          },
+          {
+           "token_id:104617": -9.430986404418945
+          },
+          {
+           "token_id:100144": -6.771465301513672
+          },
+          {
+           "token_id:5373": -5.356403350830078
+          },
+          {
+           "token_id:99438": -7.024478912353516
+          },
+          {
+           "token_id:99838": -0.04567982628941536
+          },
+          {
+           "token_id:104626": -3.637390375137329
+          },
+          {
+           "token_id:5373": -0.5163582563400269
+          },
+          {
+           "token_id:99348": -5.5145487785339355
+          },
+          {
+           "token_id:104626": -3.5909156799316406
+          },
+          {
+           "token_id:9370": -2.8629422187805176
+          },
+          {
+           "token_id:114628": -6.235581874847412
+          },
+          {
+           "token_id:108772": -5.682017803192139
+          },
+          {
+           "token_id:101064": -3.62931227684021
+          },
+          {
+           "token_id:106218": -5.549639701843262
+          },
+          {
+           "token_id:100394": -1.0262072086334229
+          },
+          {
+           "token_id:99387": -2.101881980895996
+          },
+          {
+           "token_id:100535": -0.0002033503697020933
+          },
+          {
+           "token_id:99564": -0.06565899401903152
+          },
+          {
+           "token_id:11319": -0.664538562297821
+          },
+          {
+           "token_id:151645": -0.8221445083618164
+          },
+          {
+           "token_id:198": -1.5497195136049413e-06
+          },
+          {
+           "token_id:151644": -0.0010085977846756577
+          },
+          {
+           "token_id:872": -0.010780546814203262
+          },
+          {
+           "token_id:25": -0.3013452887535095
+          },
+          {
+           "token_id:2980": -3.584960699081421
+          },
+          {
+           "token_id:498": -0.021680377423763275
+          },
+          {
+           "token_id:3410": -1.0854606628417969
+          },
+          {
+           "token_id:803": -2.1000919342041016
+          },
+          {
+           "token_id:3565": -1.2734463214874268
+          },
+          {
+           "token_id:389": -0.31859955191612244
+          }
+         ]
+        },
+        "finish_reason": "length",
+        "stop_reason": null,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+       }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.30.0-nohash",
+      "usage": {
+       "prompt_tokens": 32,
+       "total_tokens": 80,
+       "completion_tokens": 48,
+       "prompt_tokens_details": null,
+       "completion_tokens_details": null
+      },
+      "kv_transfer_params": null,
+      "ec_transfer_params": null,
+      "metrics": null
+     }
+    }
+   ],
+   "tokens": [
+    9707,
+    0,
+    2585,
+    646,
+    358,
+    7789,
+    498,
+    3351,
+    30,
+    151645,
+    198,
+    151643,
+    33975,
+    25,
+    18137,
+    103,
+    230,
+    31914,
+    104617,
+    100144,
+    5373,
+    99438,
+    99838,
+    104626,
+    5373,
+    99348,
+    104626,
+    9370,
+    114628,
+    108772,
+    101064,
+    106218,
+    100394,
+    99387,
+    100535,
+    99564,
+    11319,
+    151645,
+    198,
+    151644,
+    872,
+    25,
+    2980,
+    498,
+    3410,
+    803,
+    3565,
+    389
+   ],
+   "terminated": false
+  },
+  {
+   "eos": 151643,
+   "seed": 0,
+   "exchanges": [
+    {
+     "path": "/v1/completions",
+     "request": {
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "stream": false,
+      "prompt": [
+       [
+        151644,
+        8948,
+        198,
+        2610,
+        525,
+        1207,
+        16948,
+        11,
+        3465,
+        553,
+        54364,
+        14817,
+        13,
+        1446,
+        525,
+        264,
+        10950,
+        17847,
+        13,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        45764,
+        23811,
+        13,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+       ]
+      ],
+      "frequency_penalty": 0.0,
+      "logprobs": 0,
+      "max_tokens": 48,
+      "presence_penalty": 0.0,
+      "seed": 0,
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "return_tokens_as_token_ids": true,
+      "top_k": -1,
+      "min_p": 0.0,
+      "repetition_penalty": 1.0,
+      "ignore_eos": true,
+      "stop_token_ids": [
+       151643
+      ]
+     },
+     "status": 200,
+     "response": {
+      "id": "cmpl-9085375fd8ab9bbd",
+      "object": "text_completion",
+      "created": 1792483115,
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "choices": [
+       {
+        "index": 0,
+        "text": "Hello! How can I assist you today?\n",
+        "logprobs": {
+         "text_offset": [
+          0,
+          13,
+          23,
+          36,
+          48,
+          60,
+          73,
+          85,
+          98,
+          109,
+          124,
+          136
+         ],
+         "token_logprobs": [
+          -0.01239666435867548,
+          -0.01610391214489937,
+          -0.28074514865875244,
+          -0.23035824298858643,
+          -0.00026222606538794935,
+          -0.18213671445846558,
+          -3.6238969187252223e-05,
+          -0.014317757450044155,
+          -0.004246029071509838,
+          -0.0775177851319313,
+          -4.529942543740617e-06,
+          -1.1920928244535389e-07
+         ],
+         "tokens": [
+          "token_id:9707",
+          "token_id:0",
+          "token_id:2585",
+          "token_id:646",
+          "token_id:358",
+          "token_id:7789",
+          "token_id:498",
+          "token_id:3351",
+          "token_id:30",
+          "token_id:151645",
+          "token_id:198",
+          "token_id:151643"
+         ],
+         "top_logprobs": [
+          {
+           "token_id:9707": -0.01239666435867548
+          },
+          {
+           "token_id:0": -0.01610391214489937
+          },
+          {
+           "token_id:2585": -0.28074514865875244
+          },
+          {
+           "token_id:646": -0.23035824298858643
+          },
+          {
+           "token_id:358": -0.00026222606538794935
+          },
+          {
+           "token_id:7789": -0.18213671445846558
+          },
+          {
+           "token_id:498": -3.6238969187252223e-05
+          },
+          {
+           "token_id:3351": -0.014317757450044155
+          },
+          {
+           "token_id:30": -0.004246029071509838
+          },
+          {
+           "token_id:151645": -0.0775177851319313
+          },
+          {
+           "token_id:198": -4.529942543740617e-06
+          },
+          {
+           "token_id:151643": -1.1920928244535389e-07
+          }
+         ]
+        },
+        "finish_reason": "stop",
+        "stop_reason": 151643,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+       }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.30.0-nohash",
+      "usage": {
+       "prompt_tokens": 32,
+       "total_tokens": 44,
+       "completion_tokens": 12,
+       "prompt_tokens_details": null,
+       "completion_tokens_details": null
+      },
+      "kv_transfer_params": null,
+      "ec_transfer_params": null,
+      "metrics": null
+     }
+    }
+   ],
+   "tokens": [
+    9707,
+    0,
+    2585,
+    646,
+    358,
+    7789,
+    498,
+    3351,
+    30,
+    151645,
+    198,
+    151643
+   ],
+   "terminated": true
+  },
+  {
+   "eos": 198,
+   "seed": 0,
+   "exchanges": [
+    {
+     "path": "/v1/completions",
+     "request": {
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "stream": false,
+      "prompt": [
+       [
+        151644,
+        8948,
+        198,
+        2610,
+        525,
+        1207,
+        16948,
+        11,
+        3465,
+        553,
+        54364,
+        14817,
+        13,
+        1446,
+        525,
+        264,
+        10950,
+        17847,
+        13,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        45764,
+        23811,
+        13,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+       ]
+      ],
+      "frequency_penalty": 0.0,
+      "logprobs": 0,
+      "max_tokens": 48,
+      "presence_penalty": 0.0,
+      "seed": 0,
+      "temperature": 1.0,
+      "top_p": 1.0,
+      "return_tokens_as_token_ids": true,
+      "top_k": -1,
+      "min_p": 0.0,
+      "repetition_penalty": 1.0,
+      "ignore_eos": true,
+      "stop_token_ids": [
+       198
+      ]
+     },
+     "status": 200,
+     "response": {
+      "id": "cmpl-9f85ef96caca03fd",
+      "object": "text_completion",
+      "created": 1792483115,
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "choices": [
+       {
+        "index": 0,
+        "text": "Hello! How can I assist you today?",
+        "logprobs": {
+         "text_offset": [
+          0,
+          13,
+          23,
+          36,
+          48,
+          60,
+          73,
+          85,
+          98,
+          109,
+          124
+         ],
+         "token_logprobs": [
+          -0.01239666435867548,
+          -0.01610391214489937,
+          -0.28074514865875244,
+          -0.23035824298858643,
+          -0.00026222606538794935,
+          -0.18213671445846558,
+          -3.6238969187252223e-05,
+          -0.014317757450044155,
+          -0.004246029071509838,
+          -0.0775177851319313,
+          -4.529942543740617e-06
+         ],
+         "tokens": [
+          "token_id:9707",
+          "token_id:0",
+          "token_id:2585",
+          "token_id:646",
+          "token_id:358",
+          "token_id:7789",
+          "token_id:498",
+          "token_id:3351",
+          "token_id:30",
+          "token_id:151645",
+          "token_id:198"
+         ],
+         "top_logprobs": [
+          {
+           "token_id:9707": -0.01239666435867548
+          },
+          {
+           "token_id:0": -0.01610391214489937
+          },
+          {
+           "token_id:2585": -0.28074514865875244
+          },
+          {
+           "token_id:646": -0.23035824298858643
+          },
+          {
+           "token_id:358": -0.00026222606538794935
+          },
+          {
+           "token_id:7789": -0.18213671445846558
+          },
+          {
+           "token_id:498": -3.6238969187252223e-05
+          },
+          {
+           "token_id:3351": -0.014317757450044155
+          },
+          {
+           "token_id:30": -0.004246029071509838
+          },
+          {
+           "token_id:151645": -0.0775177851319313
+          },
+          {
+           "token_id:198": -4.529942543740617e-06
+          }
+         ]
+        },
+        "finish_reason": "stop",
+        "stop_reason": 198,
+        "token_ids": null,
+        "prompt_logprobs": null,
+        "prompt_token_ids": null,
+        "routed_experts": null
+       }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.30.0-nohash",
+      "usage": {
+       "prompt_tokens": 32,
+       "total_tokens": 43,
+       "completion_tokens": 11,
+       "prompt_tokens_details": null,
+       "completion_tokens_details": null
+      },
+      "kv_transfer_params": null,
+      "ec_transfer_params": null,
+      "metrics": null
+     }
+    }
+   ],
+   "tokens": [
+    9707,
+    0,
+    2585,
+    646,
+    358,
+    7789,
+    498,
+    3351,
+    30,
+    151645,
+    198
+   ],
+   "terminated": true
+  }
+ ],
+ "stop_strings": [
+  {
+   "stop": "How",
+   "seed": 0,
+   "exchanges": [
+    {
+     "path": "/v1/completions",
+     "request": {
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "prompt": [
+       [
+        151644,
+        8948,
+        198,
+        2610,
+        525,
+        1207,
+        16948,
+        11,
+        3465,
+        553,
+        54364,
+        14817,
+        13,
+        1446,
+        525,
+        264,
+        10950,
+        17847,
+        13,
+        151645,
+        198,
+        151644,
+        872,
+        198,
+        45764,
+        23811,
+        13,
+        151645,
+        198,
+        151644,
+        77091,
+        198
+       ]
+      ],
+      "max_tokens": 48,
+      "temperature": 1.0,
+      "seed": 0,
+      "logprobs": 0,
+      "stop": [
+       "How"
+      ],
+      "return_tokens_as_token_ids": true,
+      "return_token_ids": true
+     },
+     "status": 200,
+     "response": {
+      "id": "cmpl-954eb30d86a55c79",
+      "object": "text_completion",
+      "created": 1792483115,
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "choices": [
+       {
+        "index": 0,
+        "text": "Hello! ",
+        "logprobs": {
+         "text_offset": [
+          0,
+          13,
+          23
+         ],
+         "token_logprobs": [
+          -0.01239666435867548,
+          -0.01610391214489937,
+          -0.28074514865875244
+         ],
+         "tokens": [
+          "token_id:9707",
+          "token_id:0",
+          "token_id:2585"
+         ],
+         "top_logprobs": [
+          {
+           "token_id:9707": -0.01239666435867548
+          },
+          {
+           "token_id:0": -0.01610391214489937
+          },
+          {
+           "token_id:2585": -0.28074514865875244
+          }
+         ]
+        },
+        "finish_reason": "stop",
+        "stop_reason": "How",
+        "token_ids": [
+         9707,
+         0,
+         2585
+        ],
+        "prompt_logprobs": null,
+        "prompt_token_ids": [
+         151644,
+         8948,
+         198,
+         2610,
+         525,
+         1207,
+         16948,
+         11,
+         3465,
+         553,
+         54364,
+         14817,
+         13,
+         1446,
+         525,
+         264,
+         10950,
+         17847,
+         13,
+         151645,
+         198,
+         151644,
+         872,
+         198,
+         45764,
+         23811,
+         13,
+         151645,
+         198,
+         151644,
+         77091,
+         198
+        ],
+        "routed_experts": null
+       }
+      ],
+      "service_tier": null,
+      "system_fingerprint": "vllm-0.30.0-nohash",
+      "usage": {
+       "prompt_tokens": 32,
+       "total_tokens": 35,
+       "completion_tokens": 3,
+       "prompt_tokens_details": null,
+       "completion_tokens_details": null
+      },
+      "kv_transfer_params": null,
+      "ec_transfer_params": null,
+      "metrics": null
+     }
+    }
+   ]
+  }
+ ],
+ "release": null
+}

@@ -13,12 +13,10 @@ import json
 
 import numpy as np
 import pytest
+import safetensors.torch as safetensors_torch
+import torch
 
 from dew.interop import Pretrained
-
-torch = pytest.importorskip("torch")
-transformers = pytest.importorskip("transformers")
-safetensors_torch = pytest.importorskip("safetensors.torch")
 
 TEXT = {
     "model_type": "muse_glimmer_text", "architectures": ["MuseGlimmerTextModel"], "vocab_size": 256,
@@ -39,19 +37,28 @@ def checkpoint(tmp_path_factory):
     from transformers.models.muse_glimmer.configuration_muse_glimmer import MuseGlimmerTextConfig
     from transformers.models.muse_glimmer.modeling_muse_glimmer import MuseGlimmerTextModel
 
+    from tools.torch_precision import float64
+
     torch.manual_seed(0)
     config = MuseGlimmerTextConfig(**{key: value for key, value in TEXT.items()
-                                      if key not in ("model_type", "architectures")})
-    model = MuseGlimmerTextModel(config).to(torch.float64).eval()
+                                      if key not in ("model_type", "architectures")}, dtype=torch.float64)
+    # Built inside `float64`, so its rotary table is float64's: built in float32 and cast, it keeps
+    # float32's.
+    with float64():
+        model = MuseGlimmerTextModel(config).eval()
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.add_(torch.randn_like(parameter) * 0.1)
-    head = torch.randn(TEXT["vocab_size"], TEXT["hidden_size"], dtype=torch.float64) * 0.1
+            # The checkpoint's own float32 values, which Dew loads, are the truth's weights.
+            parameter.copy_(parameter.to(torch.float32))
+    head = (torch.randn(TEXT["vocab_size"], TEXT["hidden_size"], dtype=torch.float64) * 0.1).to(torch.float32)
     ids = torch.randint(0, TEXT["vocab_size"], (2, 24))
-    with torch.no_grad():
+    head = head.to(torch.float64)
+    with float64(), torch.no_grad():
         states = model(input_ids=ids).last_hidden_state
     softcap = TEXT["final_logit_softcapping"]
-    logits = softcap * torch.tanh(states @ head.T * TEXT["output_multiplier"] / softcap)
+    with float64():
+        logits = softcap * torch.tanh(states @ head.T * TEXT["output_multiplier"] / softcap)
 
     directory = tmp_path_factory.mktemp("muse-glimmer-text")
     weights = {f"model.{name}": tensor.to(torch.float32).contiguous()
@@ -89,3 +96,127 @@ def test_the_export_writes_back_the_source_tensors_and_config(checkpoint, tmp_pa
     reloaded = Pretrained.load(str(tmp_path), dtype="float32", attention_impl="reference")
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
                                   np.asarray(pretrained.model.apply(pretrained.variables, ids)))
+
+
+VISION = {
+    "num_hidden_layers": 2, "hidden_size": 32, "intermediate_size": 48, "num_attention_heads": 4,
+    "hidden_act": "gelu", "patch_size": 2, "patch_temporal": 2, "merge_size": 2, "pos_emb_height": 4,
+    "pos_emb_width": 4, "layer_norm_eps": 1e-5, "layer_types": ["window_attention", "full_attention"],
+    "rope_parameters": {"rope_type": "default", "rope_theta": 10000.0}}
+IMAGE_TOKEN, IMAGE_SIDE = 250, 8
+"""The wrapper's image placeholder, and the side of a drawn image: 4 x 4 patches of 2, merged 2 x 2 into
+4 soft tokens."""
+WRAPPER_SEEDS = {"text": 8, "image": 8}
+"""Check 1's declared seeds for the wrapper's logits over drawn ids, and over drawn images among them."""
+
+
+@pytest.fixture(scope="module")
+def wrapper(tmp_path_factory):
+    """A tiny Muse Glimmer wrapper as transformers saves one, every weight drawn away from its initial
+    value, and its float32 and float64 models."""
+    import pathlib
+    import shutil
+
+    from transformers import MuseGlimmerConfig, MuseGlimmerForConditionalGeneration
+    from transformers.models.muse_glimmer.image_processing_muse_glimmer import MuseGlimmerImageProcessor
+
+    from tools.torch_precision import float64_twin
+
+    text = {key: value for key, value in TEXT.items() if key not in ("model_type", "architectures")}
+    config = MuseGlimmerConfig(text_config=text, vision_config=VISION, image_token_id=IMAGE_TOKEN,
+                               video_token_id=IMAGE_TOKEN + 1, out_hidden_size=VISION["hidden_size"] * 4,
+                               projector_hidden_size=24, projector_hidden_act="gelu")
+    torch.manual_seed(0)
+    model = MuseGlimmerForConditionalGeneration(config).eval()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(torch.randn_like(parameter) * 0.1)
+    directory = tmp_path_factory.mktemp("muse-glimmer-wrapper")
+    model.save_pretrained(directory)
+    # The processor a release ships beside it: the image processor's config, and a tokenizer, which
+    # `Processor.from_hf` never reads for given ids (a tiny fixture's).
+    MuseGlimmerImageProcessor(patch_size=VISION["patch_size"], temporal_patch_size=VISION["patch_temporal"],
+                              merge_size=VISION["merge_size"]).save_pretrained(directory)
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(pathlib.Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny" / name,
+                    directory / name)
+    return directory, model, float64_twin(model)
+
+
+def packed_image(image) -> dict[str, np.ndarray]:
+    """`image` `[1, 3, H, W]` as the image processor packs it: its patch vectors and its grid."""
+    from transformers.models.muse_glimmer.image_processing_muse_glimmer import MuseGlimmerImageProcessor
+
+    packed, _, _ = MuseGlimmerImageProcessor.patchify(None, torch.from_numpy(np.asarray(image)),
+                                                      VISION["patch_size"], VISION["patch_temporal"])
+    side = IMAGE_SIDE // VISION["patch_size"]
+    return {"pixel_values": packed[0].numpy(), "image_grid_thw": np.asarray([[1, side, side]])}
+
+
+def wrapper_logits(model, ids, image=None):
+    """`model`'s logits over `ids` `[1, S]`, its image `[1, 3, H, W]` packed as the image processor
+    packs one where given (`packed_image`); a float64 model run inside `float64`."""
+    import contextlib
+
+    from tools.torch_precision import float64
+
+    dtype = next(model.parameters()).dtype
+    media = {}
+    if image is not None:
+        packed = packed_image(image)
+        media = {"pixel_values": torch.from_numpy(packed["pixel_values"]).to(dtype),
+                 "image_grid_thw": torch.from_numpy(packed["image_grid_thw"])}
+    with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
+        return {"logits": model(input_ids=torch.from_numpy(np.asarray(ids)).long(), **media).logits.numpy()}
+
+
+def test_a_muse_glimmer_wrapper_loads_whole_and_computes_its_logits(wrapper):
+    """The wrapper loads as its trunk, adapter, projection and decoder, each released tensor mapped and
+    exported bit for bit, and its logits over drawn ids, an unfilled video placeholder among them (as
+    a decode step may draw one), and over drawn images placed among them, each image packed as the
+    image processor packs it and read by the source's processor (`Processor.from_hf`), are on par
+    with transformers' float32 ones from its float64 ones (check 1); its language model alone
+    (`text_only`) computes the wrapper's text logits bit for bit on ids without placeholders (ledger
+    1883)."""
+    import jax.numpy as jnp
+    from reference_error import as_given, assert_as_exact
+
+    directory, reference, truth = wrapper
+    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
+    exported = loaded.export()
+    # Untied, as the wrapper's config leaves its head (transformers ties by its unset field).
+    stored = {name: tensor.detach().numpy() for name, tensor in reference.state_dict().items()}
+    assert sorted(exported) == sorted(stored)
+    for name, tensor in stored.items():
+        np.testing.assert_array_equal(np.asarray(exported[name]), tensor, err_msg=name)
+
+    def drawn(seed, *, with_image):
+        rng = np.random.default_rng([0x1883, seed])
+        ids = rng.integers(3, IMAGE_TOKEN, (1, 20)).astype(np.int32)
+        if not with_image:
+            # A video placeholder no video fills, as a decode step may draw it: the wrapper embeds it
+            # as token zero.
+            ids[0, 2] = IMAGE_TOKEN + 1
+            return (ids,)
+        ids[0, 5:9] = IMAGE_TOKEN
+        return ids, rng.random((1, 3, IMAGE_SIDE, IMAGE_SIDE)).astype(np.float32)
+
+    @as_given
+    def ours(ids, image=None):
+        if image is None:
+            return {"logits": loaded.model.apply(loaded.variables, jnp.asarray(ids))}
+        # The processor's packing, read by the source's processor (`Processor.from_hf`).
+        batch = loaded.processor.from_hf({"input_ids": np.asarray(ids), "attention_mask": np.ones(
+            np.shape(ids), bool), **packed_image(image)})
+        return {"logits": loaded.model.apply(loaded.variables, batch.tokens, **batch.kwargs())}
+
+    for label, with_image in (("text", False), ("image", True)):
+        assert_as_exact(ours, as_given(lambda *inputs: wrapper_logits(reference, *inputs)),
+                        lambda seed, with_image=with_image: drawn(seed, with_image=with_image),
+                        f"Muse Glimmer {label}", seeds=WRAPPER_SEEDS[label],
+                        truth_fn=as_given(lambda *inputs: wrapper_logits(truth, *inputs)))
+
+    text = Pretrained.load(str(directory), dtype="float32", attention_impl="reference", text_only=True)
+    ids = np.random.default_rng(0x1883).integers(3, IMAGE_TOKEN, (1, 20)).astype(np.int32)
+    np.testing.assert_array_equal(np.asarray(text.model.apply(text.variables, ids)),
+                                  np.asarray(loaded.model.apply(loaded.variables, ids)))

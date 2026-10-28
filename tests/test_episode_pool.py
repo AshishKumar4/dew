@@ -24,8 +24,8 @@ def test_two_process_variable_turns_match_single_process_actions_and_update(tmp_
     pool = run(tmp_path / "pool", 2)
     pooled = [episode for report in pool for episode in report["episodes"]]
     assert pooled == single["episodes"]
-    # Rank 0 names the cohort once for the pool: every episode and action on
-    # both ranks carries the one binding.
+    # Rank 0 names the cohort once for the pool: every episode on both ranks
+    # carries the one binding.
     assert pool[0]["bindings"] == pool[1]["bindings"] and len(pool[0]["bindings"]) == 1
     assert {len(episode["transitions"]) for episode in pooled} == {1, 2}
     assert all(report["opened"] == report["closed"] == 4 for report in pool)
@@ -51,4 +51,5 @@ def test_rank_local_environment_error_aborts_peers_and_releases_all_slots(tmp_pa
 def test_inconsistent_cohort_settings_fail_before_creating_environments(tmp_path):
     reports = run(tmp_path / "pool", 2, "mismatch")
     assert all(report["opened"] == report["closed"] == 0 for report in reports)
-    assert all(report["updates"] is None and "must agree" in report["error"] for report in reports)
+    # Every rank refuses the cohort (agreed_same's ValueError) before an environment opens.
+    assert all(report["updates"] is None and report["failure"] == "ValueError" for report in reports)

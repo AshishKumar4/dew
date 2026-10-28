@@ -18,11 +18,10 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
-import math
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Generic
+from typing import Generic, Literal, get_args
 
 import jax
 import jax.numpy as jnp
@@ -33,21 +32,19 @@ from jax.experimental import checkify
 from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
+from dew._hashing import array_fingerprint
+from dew._records import finite
+from dew.batch import Variables, real_slots, token_positions, valid_order, with_validity
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import (
-    ModelInputs,
-    PredictionPhase,
-    Request,
-    local_rows,
-    mesh_of,
-    next_position,
-    real_slots,
-    token_positions,
-    valid_order,
-    with_validity,
+from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
+from dew.nn.kernels.options import program
+from dew.nn.kv_cache import (
+    gather_cache_rows,
+    refuse_unassigned,
+    with_rounding_keys,
+    with_rounding_keys_of,
+    write_cache,
 )
-from dew.nn.kernels.options import compiler_options
-from dew.nn.kv_cache import gather_cache_rows, refuse_unassigned, write_cache
 from dew.nn.protocols import (
     BlockDenoiser,
     BlockDrafting,
@@ -55,12 +52,16 @@ from dew.nn.protocols import (
     Decoding,
     Exposing,
     Generating,
+    Lacks,
     Layered,
     Predicting,
+    ProjectionGroup,
     Selective,
     Serving,
+    refuse_prefix,
 )
-from dew.objectives.base import Variables
+from dew.nn.visibility import with_served_blocks
+from dew.objectives.base import ROUNDING_STREAM
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,
@@ -96,7 +97,7 @@ type Identity = str | int | tuple[Identity, ...]
 # function, a bound method, a library builtin. Anything else is named by its
 # class, which is one of these.
 type SelfNaming = type | types.FunctionType | types.MethodType | types.BuiltinFunctionType
-SELF_NAMING = (type, types.FunctionType, types.MethodType, types.BuiltinFunctionType)
+SELF_NAMING: tuple[type[SelfNaming], ...] = get_args(SelfNaming.__value__)
 
 
 # Transformers' `_get_logits_processor` order, by its own control names: the
@@ -154,20 +155,20 @@ class Sampling:
     stop: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not math.isfinite(self.temperature) or self.temperature < 0:
+        # A rate is any real number, Python's or NumPy's (a config's or a sweep's), held as a float; zero
+        # is greedy decoding, so the temperature is the one rate the controls' own checks do not cover.
+        rates = {name: decoding.unit_interval(name, getattr(self, name))
+                 for name in ("top_p", "min_p", "typical_p")}
+        rates["temperature"] = finite(self.temperature, "temperature")
+        if rates["temperature"] < 0:
             raise ValueError("temperature must be finite and non-negative")
-        if self.top_k is not None and (type(self.top_k) is not int or self.top_k < 1):
-            raise ValueError("top_k must be a positive integer or None")
-        for name, value in (("top_p", self.top_p), ("min_p", self.min_p), ("typical_p", self.typical_p)):
-            if isinstance(value, (bool, np.bool_)) or not math.isfinite(value) or not 0 <= value <= 1:
-                raise ValueError(f"{name} must be finite and between zero and one")
-        if isinstance(self.repetition_penalty, bool) or not (
-                math.isfinite(self.repetition_penalty) and self.repetition_penalty > 0):
-            raise ValueError("repetition_penalty must be finite and positive")
-        for name, value in (("presence_penalty", self.presence_penalty),
-                            ("frequency_penalty", self.frequency_penalty)):
-            if isinstance(value, bool) or not math.isfinite(value):
-                raise ValueError(f"{name} must be finite")
+        rates["repetition_penalty"] = decoding.positive("repetition_penalty", self.repetition_penalty)
+        for name in ("presence_penalty", "frequency_penalty"):
+            rates[name] = finite(getattr(self, name), name)
+        if self.top_k is not None:
+            object.__setattr__(self, "top_k", decoding.positive_size("top_k", self.top_k))
+        for name, rate in rates.items():
+            object.__setattr__(self, name, rate)
         for name, value in (("no_repeat_ngram_size", self.no_repeat_ngram_size),
                             ("min_new_tokens", self.min_new_tokens)):
             if type(value) is not int or value < 0:
@@ -175,11 +176,7 @@ class Sampling:
         if self.pad_token_id is not None and (type(self.pad_token_id) is not int or self.pad_token_id < 0):
             raise ValueError("pad_token_id must be a non-negative token id")
         if self.eos_token_ids is not None:
-            eos = self.eos_token_ids
-            stops = (eos,) if isinstance(eos, int) else tuple(eos)
-            if not stops or any(type(token) is not int or token < 0 for token in stops):
-                raise ValueError("eos_token_ids must contain non-negative token ids")
-            object.__setattr__(self, "eos_token_ids", stops)
+            object.__setattr__(self, "eos_token_ids", decoding.id_row("eos_token_ids", self.eos_token_ids))
         if isinstance(self.stop, str):
             raise ValueError(f"stop is a tuple of strings; write stop=({self.stop!r},)")
         if any(not isinstance(string, str) or not string for string in self.stop):
@@ -318,22 +315,55 @@ class Generation(Generic[ArrayT]):
 
     def host(self) -> Generation[np.ndarray]:
         """Return this process's real rows as host arrays, without the padding rows that fill the devices."""
-        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+        return jax.tree.map(lambda leaf: host_rows(leaf, self.rows), self)
 
     @functools.cached_property
     def text(self) -> tuple[str, ...]:
-        """Each real row's valid continuation, decoded on first access.
+        """Each real row's valid continuation, decoded on first access (`row_texts`)."""
+        return row_texts(self.decoder, self, self.prompt_width)
 
-        Raises `ValueError` when the generation has no processor to decode with.
-        """
-        if self.decoder is None:
-            raise ValueError("this generation carries no processor to decode with")
-        rows = self.host()
-        return self.decoder(rows.tokens, rows.lengths, self.prompt_width)
+
+def decoded_rows(processor, tokens: ArrayLike, lengths: ArrayLike, width: int) -> tuple[str, ...]:
+    """Each row's `lengths` tokens past `width`, as text, by `processor`: what a task's `decode` and a
+    generation's `text` both return (`row_texts`). Without a processor there is no text to return, and
+    it raises."""
+    if processor is None:
+        raise ValueError("this generation carries no processor to decode with")
+    rows, counts = np.asarray(tokens), np.asarray(lengths)
+    return tuple(processor.decode(rows[row:row + 1, width:width + int(counts[row])])[0]
+                 for row in range(rows.shape[0]))
+
+
+def row_texts(decoder, generation, prompt_width: int | None) -> tuple[str, ...]:
+    """A text or canvas generation's real rows decoded past their prompt by `decoder`, `decoded_rows`
+    over a processor: its rows on the host (`generation.host()`), each row's tokens past
+    `prompt_width`. A generation with no decoder, or with no prompt width to decode from, is refused
+    (ValueError) rather than decoded from the start of its tokens."""
+    if decoder is None:
+        raise ValueError("this generation carries no processor to decode with")
+    if prompt_width is None:
+        raise ValueError("this generation has no prompt width")
+    rows = generation.host()
+    return decoder(rows.tokens, rows.lengths, prompt_width)
+
+
+def rounding_keys(keys: jax.Array) -> jax.Array:
+    """Each row's key data of its stochastic-rounding stream (`dew.nn.kv_cache.ROUNDING_KEYS`) from its
+    request's `keys`: a default-impl key, `ROUNDING_STREAM`'s, folded with each word of the row's key
+    in turn, so it is apart from the sampling stream whatever that key's implementation, as a training
+    step's rounding stream is apart from its dropout (`dew.objectives.base.training_rngs`)."""
+    def derived(words: jax.Array) -> jax.Array:
+        key = jax.random.key(ROUNDING_STREAM)
+        for index in range(words.shape[0]):
+            key = jax.random.fold_in(key, words[index])
+        return jax.random.key_data(key)
+
+    return jax.vmap(derived)(jax.random.key_data(keys))
 
 
 def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps,
-             cache: Variables | None = None) -> tuple[DecoderState, jax.Array]:
+                  cache: Variables | None = None, rounding: jax.Array | None = None
+                  ) -> tuple[DecoderState, jax.Array]:
     """The state after the prompt, and which rows hold a real token.
 
     A `Selective` decoder skips the prompt-wide head, the largest array a
@@ -341,10 +371,14 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
     cache seeded over the prompt (`_seeded_depths`), so the first block does
     not draft from nothing, and a block drafter's windows take every real
     prompt position's context. `cache` continues a cache the caller holds,
-    whose cursors say where each prompt resumes; None allocates an empty one.
+    whose cursors say where each prompt resumes; None allocates an empty one. `rounding` is each
+    row's stochastic-rounding key data (`rounding_keys`), which the cache then holds for every later
+    call (`dew.nn.kv_cache.with_rounding_keys`); None leaves the cache's.
     """
     batch, width = inputs.tokens.shape
     held = _empty_cache(model, params, batch, ops) if cache is None else cache
+    if rounding is not None:
+        held = with_rounding_keys(held, rounding)
     exposed = isinstance(model, Exposing)
     selective = isinstance(model, Selective)
     real = real_slots(inputs.token_fields, (batch, width))
@@ -373,6 +407,9 @@ def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops:
         if cache is not None or logical is not None or inputs.conditioning:
             raise ValueError('LongRoPE cache rebuilding requires a fresh text prompt '
                              'without custom coordinates')
+        if ops.depths or ops.record is not None:
+            raise ValueError("LongRoPE cache rebuilding recomputes the trunk's prefix alone, not a "
+                             "prediction depth's or a block drafter's cache, so it decodes without drafting")
         lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
         slots = jnp.where(real, jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1, -1)
         history = write_cache(jnp.zeros((batch, model.max_seq_len), inputs.tokens.dtype),
@@ -510,15 +547,17 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                 32. Rebuilding the prefix retains the prompt's information.
                 https://github.com/huggingface/transformers/issues/49334
                 """
-                empty = model.apply(params, tokens.shape[0],
-                                     method='init_cache', mutable=['cache'])[1]['cache']
+                empty = with_rounding_keys_of(
+                    model.apply(params, tokens.shape[0], method='init_cache', mutable=['cache'])[1]['cache'],
+                    state.cache)
                 answer, updated = model.apply(
                     {**params, 'cache': empty}, history,
                     attention_mask=jnp.arange(history.shape[1])[None, :] < following[:, None],
-                    decode=True, mutable=['cache'], method='states_and_logits')
-                states, logits = answer
+                    decode=True, mutable=['cache'], method='states_and_logits' if exposed else None)
                 rows = jnp.arange(tokens.shape[0])[:, None]
-                rebuilt = (states[rows, slots], logits[rows, slots]), updated
+                # The same answer `append` gives: states beside the logits where the model exposes them.
+                picked = jax.tree.map(lambda leaf: leaf[rows, slots], answer)
+                rebuilt = picked, updated
 
                 def replaced(fresh, held):
                     selected = crossing.reshape(-1, *(1,) * (fresh.ndim - 1))
@@ -620,7 +659,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
                           jnp.zeros(batch * n, bool), empty, empty)
     drafting = isinstance(strategy, Speculative)
     ops = decode_ops(model, params, pad_id, prediction_depths(model) if drafting else None)
-    state, real = prefill_state(model, params, inputs, ops)
+    state, real = prefill_state(model, params, inputs, ops, rounding=rounding_keys(keys))
     start = StepState(
         tokens=jnp.concatenate([inputs.tokens, jnp.zeros((batch, trips), jnp.int32)], axis=1),
         valid=jnp.concatenate([real_slots(inputs.token_fields, (batch, width)),
@@ -644,11 +683,11 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
     `max_seq_len` where None.
     """
     if isinstance(model, BlockDenoiser):
-        raise TypeError(f"{type(model).__name__}'s cache commits whole canvases (BlockDenoiser), not a "
-                        "token at a time; generate with BlockGeneration")
+        raise Lacks("cache", f"{type(model).__name__}'s cache commits whole canvases (BlockDenoiser), not "
+                             "a token at a time; generate with BlockGeneration")
     if not isinstance(model, Decoding):
-        raise TypeError(f"{type(model).__name__} opens no decode cache (Decoding.init_cache), so it cannot "
-                        "continue a prompt token by token")
+        raise Lacks("cache", f"{type(model).__name__} opens no decode cache (Decoding.init_cache), so it "
+                             "cannot continue a prompt token by token")
     if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("inputs must contain non-empty [B, P] integer token ids")
     if type(max_new_tokens) is not int or max_new_tokens < 0:
@@ -742,7 +781,7 @@ def _stable(value: object, seen: frozenset[int] = frozenset()) -> Identity:
         return ("mapping", tuple(sorted((repr(name), _stable(entry, seen))
                                         for name, entry in value.items())))
     if isinstance(value, (np.ndarray, np.generic, jax.Array)):
-        return ("array", *_hashed(value))
+        return ("array", _hashed(value))
     if isinstance(value, functools.partial):
         return ("partial", _stable(value.func, seen), _stable(value.args, seen),
                 _stable(dict(value.keywords), seen))
@@ -771,10 +810,11 @@ def _stable(value: object, seen: frozenset[int] = frozenset()) -> Identity:
     return (_named(kind), text)
 
 
-def _hashed(value: np.ndarray | np.generic | jax.Array) -> tuple[tuple[int, ...], str, str]:
-    """An array's shape, dtype and contents, as a comparable triple."""
-    array = np.ascontiguousarray(np.asarray(value))
-    return (array.shape, str(array.dtype), hashlib.sha256(array.tobytes()).hexdigest())
+def _hashed(value: np.ndarray | np.generic | jax.Array) -> str:
+    """An array's dtype, shape and contents, fingerprinted (`dew._hashing.array_fingerprint`)."""
+    digest = hashlib.sha256()
+    array_fingerprint(digest, np.asarray(value))
+    return digest.hexdigest()
 
 
 def _digest(components: Components) -> tuple[Identity, str]:
@@ -795,17 +835,22 @@ def _digest(components: Components) -> tuple[Identity, str]:
 
 def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tokens: int, trips: int,
            sampling: Sampling, n: int, logits: Transforms | None, stopping: Criteria | None,
-           strategy: Strategy | None, pooled: bool) -> tuple[ModelInputs, tuple, Components]:
+           strategy: Strategy | None, prefix: int | Literal["prompt"] | None,
+           pooled: bool) -> tuple[ModelInputs, tuple, Components]:
     """This process's validated request, the controls a pool compares, and
     the decoding components.
 
     The component digest is raised from here with the rest, so a pool agrees
     on the failure before any rank enters a collective. A single process
     never digests: refusing a component only a pool could disagree about
-    would cost it nothing.
+    would cost it nothing. A prefix run's blocks are made here of this
+    process's own rows, and a prompt too short for them refused, so a pool
+    refuses it together.
     """
     ids = local_rows(inputs.tokens)
     fields = {name: jax.tree.map(local_rows, value) for name, value in inputs.token_fields.items()}
+    refuse_prefix(model, prefix, longest=None)
+    fields = with_served_blocks(fields, real_slots(fields, ids.shape, xp=np), prefix)
     conditioning = {name: local_rows(value, host=False) for name, value in inputs.conditioning.items()}
     if "params" not in params:
         raise ValueError("generate takes the full variables dict ({'params': ...})")
@@ -821,7 +866,8 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
              budget: jax.Array, trips: int, pad_id: int, n: int,
              transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
-             strategy: Strategy) -> tuple[checkify.Error, Generation]:
+             strategy: Strategy,
+             packing: tuple[ProjectionGroup, ...] = ()) -> tuple[checkify.Error, Generation]:
     """`_generate` with its device checks discharged into a returned error.
 
     An undefined draw has to reach the caller as an exception rather than a
@@ -830,21 +876,18 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
     and throwing it costs nothing.
     """
 
+    # dew.inference imports this module, so its packing is imported here.
+    from dew.inference.projections import packed_in_call
+
     def run(params, inputs, keys, budget, transforms, stopping, strategy):
-        return _generate(model, params, inputs, keys, trips, budget, pad_id, n,
+        # The groups a borrowed tree holds unpacked pack here, once a call (`packed_in_call`).
+        return _generate(model, packed_in_call(params, packing), inputs, keys, trips, budget, pad_id, n,
                          transforms, stopping, strategy)
 
     return checkify.checkify(run, errors=checkify.user_checks)(
         params, inputs, keys, budget, transforms, stopping, strategy)
 
 
-@functools.cache
-def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
-    """The generation program over `rows`, compiled with the model's own XLA `options`
-    (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
-    return jax.jit(_checked, static_argnames=("model", "trips", "pad_id", "n"),
-                   in_shardings=(None, rows, rows, None, None, None, None),
-                   out_shardings=(None, rows), compiler_options=dict(options))
 
 
 _DEFAULT_SAMPLING = Sampling()
@@ -855,7 +898,7 @@ def generate(model: nn.Module, params: Variables,
              *, key: int | jax.Array,
              sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
              stopping: Criteria | None = None, strategy: Strategy | None = None,
-             trips: int | None = None) -> Generation:
+             trips: int | None = None, prefix: int | Literal["prompt"] | None = None) -> Generation:
     """Generate continuations from model inputs, or from token ids for a text-only prompt.
 
     ``params`` is the full variables dict, ``{'params': ...}``.
@@ -895,6 +938,13 @@ def generate(model: nn.Module, params: Variables,
     them); the budget still bounds what the request draws as far as a
     transform or a search reads it (``ForcedEOS``, ``Beam``), and the
     columns past it come back for the caller to cut.
+
+    ``prefix`` serves a prefix run (``LMObjective``'s): each prompt that
+    carries no blocks of its own reads its first ``prefix`` real tokens, or
+    with ``"prompt"`` all of them, as one block (``served_blocks``). They are
+    made of each process's own rows inside the request's agreed check, and a
+    prompt with fewer real tokens than an int ``prefix`` is refused there, by
+    every process of a pool together.
     """
     if sampling.stop:
         raise ValueError("stop strings compile against a tokenizer's vocabulary, which generate does not "
@@ -904,16 +954,21 @@ def generate(model: nn.Module, params: Variables,
     request, components = Request.prepare(
         inputs, key, mesh_of(params),
         lambda canonical, pooled: _check(model, params, canonical, max_new_tokens, scanned, sampling, n,
-                                         logits, stopping, strategy, pooled),
+                                         logits, stopping, strategy, prefix, pooled),
         phase="generation")
     plan = request.plan
     capacity = model.max_seq_len if isinstance(model, Bounded) else None
     if isinstance(model, Layered) and capacity is not None:
         refuse_unassigned(model.kv_cache, plan.count, capacity)
-    program = _compiled(plan.sharding, tuple(compiler_options(model).items()))
-    failure, output = program(model, decoding_storage(model, params), plan.place(request.padded()),
-                              plan.keys(request.key), jnp.int32(max_new_tokens), scanned, sampling.pad, n,
-                              *components)
+    from dew.inference.projections import pending
+
+    compiled = program(_checked, model, static_argnames=("model", "trips", "pad_id", "n", "packing"),
+                       in_shardings=(None, plan.sharding, plan.sharding, None, None, None, None),
+                       out_shardings=(None, plan.sharding))
+    # A tree a loader owns arrives packed; one borrowed from a live objective packs in the call.
+    failure, output = compiled(model, decoding_storage(model, params), plan.place(request.padded()),
+                               plan.keys(request.key), jnp.int32(max_new_tokens), scanned, sampling.pad, n,
+                               *components, pending(model, params))
     # The error's flags are the one read a request waits on.
     jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)

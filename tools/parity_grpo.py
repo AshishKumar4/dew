@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
-"""Write verl's GRPO loss and its gradient to tests/fixtures/rl/grpo.npz.
+"""Record verl's GRPO loss and its gradient over seeds, to tests/fixtures/rl/grpo.npz.
 
 verl's own functions compute it (`verl/trainer/ppo/core_algos.py`, verl
 0.9.0): `compute_policy_loss_vanilla` under an `ActorConfig` with its GRPO
 defaults (clip_ratio 0.2 both sides, clip_ratio_c 3.0, `token-mean`), plus
 `beta` times `agg_loss` (`token-mean`) of `kl_penalty(..., "k3")` over the
-same mask. The tensors are one fixed rollout (two prompts, two completions
-each): old, current and reference log-probabilities, advantages with both
-signs, and a mask with short tails. A few entries are set past the clip
-points so each term binds. The same calls run once in fp32, the values
-Dew's composition is compared with, and once in float64, the exact values
-both are measured from (tests/reference_error.py).
+same mask. Each seed draws a rollout (two prompts, two completions each):
+old, current and reference log-probabilities, advantages with both signs,
+and a mask with short tails, a few entries set past the clip points so each
+term binds. The same calls run once in fp32, the values Dew's composition is
+compared with, and once in float64, the exact values both are measured from,
+over the seeds check 1 draws (`tools/recorded_references.py`,
+tests/reference_error.py).
 
-Run with verl 0.9.0 and Torch 2.14.0 CPU:
-  uv venv /tmp/rlref --python 3.12
-  uv pip install --python /tmp/rlref/bin/python torch==2.14.0 \\
+Run with verl 0.9.0, Torch 2.14.0 CPU and JAX (the recorder plans its seeds
+on a JAX transcription):
+  uv venv venvs/rlref --python 3.12
+  uv pip install --python venvs/rlref/bin/python torch==2.14.0 \\
       --index-url https://download.pytorch.org/whl/cpu
-  uv pip install --python /tmp/rlref/bin/python verl==0.9.0 trl==1.12.0 numpy
-  /tmp/rlref/bin/python tools/parity_grpo.py
+  uv pip install --python venvs/rlref/bin/python verl==0.9.0 trl==1.12.0 numpy jax==0.11.2
+  venvs/rlref/bin/python tools/parity_grpo.py
 """
 
 from __future__ import annotations
 
-import argparse
 from pathlib import Path
 
 import numpy as np
@@ -35,9 +36,9 @@ RESPONSE = 4
 BETA = 0.01
 
 
-def rollout() -> dict[str, np.ndarray]:
-    """The fixed rollout: log-probabilities, advantages and a ragged mask."""
-    rng = np.random.default_rng(11)
+def rollout(seed: int = 0) -> dict[str, np.ndarray]:
+    """Seed `seed`'s rollout: log-probabilities, advantages and a ragged mask."""
+    rng = np.random.default_rng(11 + seed)
     old = rng.normal(-0.5, 0.5, (ROWS, RESPONSE)).astype(np.float32)
     current = (old + rng.normal(0, 0.1, (ROWS, RESPONSE))).astype(np.float32)
     ref = (old + rng.normal(0, 0.2, (ROWS, RESPONSE))).astype(np.float32)
@@ -76,28 +77,40 @@ def verl_loss(arrays: dict[str, np.ndarray], dtype) -> tuple[float, np.ndarray]:
     return loss.item(), current.grad.numpy()
 
 
-def main(argv: list[str] | None = None) -> None:
+def evaluated(arrays: dict[str, np.ndarray]) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """verl's loss and gradient on a rollout in fp32, and in float64 on it widened."""
     import torch
-    import verl
 
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--out", type=Path, default=FIXTURES / "rl" / "grpo.npz")
-    out = parser.parse_args(argv).out
-    from reference_releases import require
-
-    require("verl")
-    torch.set_num_threads(1)
-    arrays = rollout()
     loss, gradient = verl_loss(arrays, torch.float32)
-    exact = {name: value.astype(np.float64) for name, value in arrays.items()}
-    exact_loss, exact_gradient = verl_loss(exact, torch.float64)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out, **arrays, beta=np.asarray(BETA),
-             verl_loss=np.asarray(loss, np.float32), verl_current_grad=gradient,
-             verl_loss_f64=np.asarray(exact_loss), verl_current_grad_f64=exact_gradient,
-             verl_version=np.array(verl.__version__), torch_version=np.array(torch.__version__))
-    print(f"{out}: loss {loss:.6f}, verl {verl.__version__}, torch {torch.__version__}")
+    exact_loss, exact_gradient = verl_loss({name: value.astype(np.float64) for name, value in arrays.items()},
+                                           torch.float64)
+    return ({"loss": np.asarray(loss, np.float32), "grad": gradient},
+            {"loss": np.asarray(exact_loss, np.float64), "grad": exact_gradient})
+
+
+def proxy(arrays):
+    """The same composition in JAX, which plans the seeds the recorder confirms on verl."""
+    import jax
+    import jax.numpy as jnp
+
+    mask = arrays["response_mask"]
+
+    def loss(current):
+        ratio = jnp.exp(current - arrays["old_log_probs"])
+        advantages = arrays["advantages"]
+        clipped = jnp.maximum(-advantages * ratio, -advantages * jnp.clip(ratio, 0.8, 1.2))
+        policy = jnp.where(advantages < 0, jnp.minimum(clipped, -advantages * 3.0), clipped)
+        delta = arrays["ref_log_probs"] - current
+        kl = jnp.exp(delta) - delta - 1
+        return (jnp.sum(policy * mask) + BETA * jnp.sum(kl * mask)) / jnp.sum(mask)
+
+    value, gradient = jax.value_and_grad(loss)(arrays["current_log_probs"])
+    return {"loss": value, "grad": gradient}
 
 
 if __name__ == "__main__":
-    main()
+    from recorded_references import record_reference
+
+    record_reference("grpo", rollout, evaluated, proxy, package="verl", repo="volcengine/verl",
+                     tool="tools/parity_grpo.py", out=FIXTURES / "rl" / "grpo.npz", description=__doc__,
+                     beta=BETA)

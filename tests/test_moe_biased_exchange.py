@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from moe_support import exchange_worker, reference_case, training_shardings, training_step
+from moe_support import assert_exchange_across_processes, reference_case, training_shardings, training_step
 
 from dew.nn.gpt_oss import GptOssExperts, GptOssMLP
 from dew.training import MeshSpec
@@ -232,14 +232,8 @@ def test_full_biased_router_and_experts_take_identical_pooled_adam_steps(dtype, 
 
 @pytest.mark.mesh
 def test_biased_router_updates_pool_across_two_real_cpu_processes(tmp_path):
-    from process_support import run_pool
-
-    reports = run_pool(Path(__file__).with_name('moe_biased_exchange_worker.py'), tmp_path, 2,
-                       timeout=120, start=exchange_worker)
-    for report in reports:
-        assert report['processes'] == 2
-        for errors in report['errors'].values():
-            assert max(errors) < 3e-5, errors
+    worker = Path(__file__).with_name('moe_biased_exchange_worker.py')
+    assert_exchange_across_processes(worker, tmp_path, 3e-5)
 
 
 @pytest.mark.mesh

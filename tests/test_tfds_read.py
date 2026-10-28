@@ -16,8 +16,7 @@ import pytest
 import tensorflow_datasets as tfds
 from fsspec.implementations.local import LocalFileSystem
 
-from dew.config.data import HoldOut, ImageData, loader
-from dew.data import TFDS, Loading, Memory, images
+from dew.data import TFDS, Loading, Memory, images, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.image_codec import decode_image
@@ -29,9 +28,9 @@ FIXTURE = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
 def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
     """The source hands out the bytes on disk; `record` decodes them, so a
     worker pays one decode at the resolution it needs and no more."""
-    spec = ImageData(source=TFDS("dew_images", path=str(FIXTURE), split="all",
-        decoders={"image": tfds.decode.SkipDecoding()}), caption_templates=("a photo of a {}",))
-    source = spec.source.records("indexed")
+    templates = ("a photo of a {}",)
+    source = TFDS("dew_images", path=str(FIXTURE), split="all",
+                  decoders={"image": tfds.decode.SkipDecoding()}).records("indexed")
     assert len(source) == 20
     for index in range(len(source)):
         record = source[index]
@@ -39,7 +38,7 @@ def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
         np.testing.assert_array_equal(decode_image(record["image"]), np.full((8, 8, 3), index + 10, np.uint8))
         assert record["label"] == index % 2
         result = next(iter(Memory([record]).map(images.DecodeImage("image", rejects=False))
-                           .random_map(images.caption(templates=spec.caption_templates,
+                           .random_map(images.caption(templates=templates,
                                                       classes=("red", "blue"))).batch(1)))
         caption, label = result["caption"][0], result["label"][0]
         assert ("red" if label == 0 else "blue") in caption.split()
@@ -111,11 +110,15 @@ def test_streamed_tfds_pins_one_fingerprint_for_all_virtual_shards(tmp_path, mon
 
 @pytest.mark.parametrize("workers", [0, 2])
 def test_prepared_records_reach_grain_batches_without_split_overlap(workers):
-    data = loader(ImageData(source=TFDS("dew_images", path=str(FIXTURE), split="all",
-        decoders={"image": tfds.decode.SkipDecoding()}),
-                       image_size=8, augment=None, validation=HoldOut(records=4),
-                       caption_templates=("a photo of a {}",)), batch=4, read="memory",
-                loading=Loading(workers=workers, threads=1, read_buffer=8, worker_buffer=2))
+    train, held = TFDS("dew_images", path=str(FIXTURE), split="all",
+                       decoders={"image": tfds.decode.SkipDecoding()}).holdout(records=4)
+
+    def pictures(dataset):
+        return dataset.pipe(presets.images, 8, batch=4, rejects=False,
+                            caption=images.caption(templates=("a photo of a {}",)))
+
+    data = compile(pictures(train.shuffle(0).repeat()), validation=pictures(held), read="memory",
+                   loading=Loading(workers=workers, threads=1, read_buffer=8, worker_buffer=2))
     source = data.train(DataPartition())
     train = list(itertools.islice(source, 4))
     validation = list(data.val(DataPartition()))
@@ -129,3 +132,21 @@ def test_prepared_records_reach_grain_batches_without_split_overlap(workers):
         np.testing.assert_array_equal(row["label"], (row["image"][:, 0, 0, 0] - 10) % 2)
         np.testing.assert_array_equal(
             row["image"], np.broadcast_to(row["image"][:, :1, :1, :1], (4, 8, 8, 3)))
+
+
+def test_the_images_preset_over_a_split_a_run_mirrors_provisions_it_before_reading(tmp_path, monkeypatch):
+    """The images preset with a fixed caption over a prepared split a run must mirror first: the run
+    mirrors it (provision=True), choosing the caption's order without reading the split, and trains."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    remote = Store(f"memory://tfds-snapshot-{uuid4().hex}/1.0.0")
+    for path in FIXTURE.iterdir():
+        remote.child(path.name).write(path.read_bytes())
+    chain = TFDS("dew_images", path=remote.url, split="all").shuffle(0).repeat().pipe(
+        presets.images, 4, batch=4, rejects=False, caption=images.caption("a photo"))
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    data = compile(chain, read="indexed", provision=True, loading=loading)
+    reader = data.train(DataPartition())
+    try:
+        assert np.asarray(next(reader)["image"]).shape[0] == 4
+    finally:
+        reader.close()

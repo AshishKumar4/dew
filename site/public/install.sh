@@ -9,25 +9,45 @@
 #
 #   -y              take every default without asking (or DEW_YES=1); so does a run
 #                   with no terminal
-#   --cuda 12|13    the CUDA build, whatever the driver says
+#   --cuda N        the CUDA build N (one of cuda_builds below), whatever the driver says
 #   --tpu, --cpu    the TPU or the CPU build
 #   --venv PATH     install into the virtual environment at PATH, created if missing
 #   --conda NAME    install into the conda environment NAME, created if missing
 #   --version X     install dewml X instead of the newest release
 #   --pip           use pip instead of uv
 #
-# The CUDA build follows the driver and every GPU's SM, using the generated minima below
-# (JAX's installation guide; NVIDIA's CUDA release notes, table 3). Dew needs Python python_min or newer.
+# The CUDA build is the newest of cuda_builds below, each build:least driver:least SM, generated from
+# dew.builds.CUDA_BUILDS, that the driver and every GPU's SM run. Dew needs Python python_min or
+# newer.
 set -eu
 
 # BEGIN install facts (site/scripts/gen_install.py)
 python_min=3.12
 package_index=https://pypi.dewml.dev/simple
-cuda13_driver=580
-cuda13_sm=7.5
-cuda12_driver=525
-cuda12_sm=5.2
+pip_least='pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
+cuda_builds='cuda13:580:7.5 cuda12:525:5.2'
 # END install facts
+# BEGIN uv bootstrap (site/scripts/gen_install.py)
+uv_least=0.13.4
+# uv at uv_least or newer (pyproject.toml's [tool.uv] required-version). bootstrap_uv [NAME=VALUE...]
+# installs that release from astral's installer, NAME=VALUE in the installer's environment, where uv is
+# missing or older; uv_version is the release of the uv on PATH (none where there is none), and
+# uv_older VERSION says whether VERSION is older: a pre-release of uv_least is, a build of it is not.
+uv_version() { (uv --version 2>/dev/null || true) | awk '{print $2}'; }
+uv_older() {
+	awk -v have="${1%%+*}" -v least="$uv_least" 'BEGIN {
+		split(have, h, "."); split(least, l, ".")
+		for (i = 1; i <= 3; i++) if (h[i] + 0 != l[i] + 0) exit !(h[i] + 0 < l[i] + 0)
+		exit have !~ /[^0-9.]/
+	}'
+}
+bootstrap_uv() {
+	have=$(uv_version)
+	if [ -z "$have" ] || uv_older "$have"; then
+		curl -LsSf "https://astral.sh/uv/$uv_least/install.sh" | env "$@" sh
+	fi
+}
+# END uv bootstrap
 
 if [ -t 1 ]; then
 	bold=$(printf '\033[1m') dim=$(printf '\033[2m') green=$(printf '\033[32m')
@@ -39,6 +59,8 @@ die() {
 	printf '%serror:%s %s\n' "$red" "$plain" "$1" >&2
 	exit 1
 }
+# The CUDA majors of cuda_builds, each after a space.
+majors() { for entry in $cuda_builds; do printf ' %s' "${entry%%:*}"; done | sed 's/cuda//g'; }
 # A word as a shell would read it back: as it is when it is plain, else in single quotes.
 quote() {
 	case $1 in
@@ -51,7 +73,8 @@ yes=${DEW_YES:-} build='' target='' conda_name='' version='' use_pip=''
 while [ $# -gt 0 ]; do
 	case $1 in
 		-y | --yes) yes=1 ;;
-		--cuda) [ "${2:-}" = 12 ] || [ "${2:-}" = 13 ] || die "--cuda takes 12 or 13"; build=cuda$2; shift ;;
+		--cuda) case " $cuda_builds " in *" cuda${2:-}:"*) ;; *) die "--cuda takes one of$(majors)" ;; esac
+			build=cuda$2; shift ;;
 		--tpu) build=tpu ;;
 		--cpu) build=cpu ;;
 		--venv) [ -n "${2:-}" ] || die "--venv needs a path"; target=$2; shift ;;
@@ -90,11 +113,16 @@ if [ -n "$gpus" ]; then
 	sm=$(printf '%s\n' "$gpus" | cut -s -d, -f3 | tr -d ' ' | sort -n | head -n 1)
 	at_least() { awk -v sm="$sm" -v need="$1" 'BEGIN { exit !(sm + 0 >= need) }'; }
 	major=${driver%%.*}
-	if [ "$major" -lt "$cuda12_driver" ]; then runs=cpu why="CUDA 12 needs driver $cuda12_driver or newer; update the driver to use the GPU"
-	elif [ -z "$sm" ]; then runs=cpu why="nvidia-smi did not report its compute capability; choose with --cuda 12 or 13"
-	elif [ "$major" -ge "$cuda13_driver" ] && at_least "$cuda13_sm"; then runs=cuda13
-	elif at_least "$cuda12_sm"; then runs=cuda12
-	else runs=cpu why="SM $sm is older than JAX's CUDA builds support"
+	# The oldest build, the last entry, and its least driver.
+	oldest=${cuda_builds##* } least=${cuda_builds##* } least=${least#*:} least=${least%%:*}
+	runs=cpu why="SM $sm is older than JAX's CUDA builds support" name=${oldest%%:*}
+	if [ "$major" -lt "$least" ]; then why="CUDA ${name#cuda} needs driver $least or newer; update the driver to use the GPU"
+	elif [ -z "$sm" ]; then why="nvidia-smi did not report its compute capability; choose with --cuda, one of$(majors)"
+	else
+		for entry in $cuda_builds; do
+			least=${entry#*:} least=${least%%:*}
+			if [ "$major" -ge "$least" ] && at_least "${entry##*:}"; then runs=${entry%%:*}; break; fi
+		done
 	fi
 	if [ "$runs" = cpu ]; then hardware="$gpu, driver $driver: no GPU build, as $why"
 	else hardware="$gpu, driver $driver, runs CUDA ${runs#cuda}"
@@ -121,8 +149,11 @@ fi
 printf '%sDew installer%s\n' "$bold" "$plain"
 printf '  hardware  %s\n' "$hardware"
 printf '  python    %s\n' "${found:-no environment active}"
-if [ -z "$use_pip" ] && ! command -v uv >/dev/null 2>&1; then
-	printf '  uv        not installed; it will be, from astral.sh, unless you run this with --pip\n'
+if [ -z "$use_pip" ]; then
+	have=$(uv_version)
+	if [ -z "$have" ]; then printf '  uv        not installed; uv %s will be, from astral.sh, unless you run this with --pip\n' "$uv_least"
+	elif uv_older "$have"; then printf '  uv        %s, older than %s, which will be installed from astral.sh, unless you run this with --pip\n' "$have" "$uv_least"
+	fi
 fi
 printf '\n'
 
@@ -145,14 +176,18 @@ if [ -z "$target" ] && [ -z "$conda_name" ]; then
 	esac
 fi
 
-# uv, from its own installer.
-if [ -z "$use_pip" ] && ! command -v uv >/dev/null 2>&1; then
-	curl -LsSf https://astral.sh/uv/install.sh | sh ||
-		die "uv's installer failed; install uv from https://docs.astral.sh/uv, or rerun with --pip"
-	# Where uv's installer puts it (https://docs.astral.sh/uv/reference/storage/#executable-directory).
-	bin=${UV_INSTALL_DIR:-${UV_UNMANAGED_INSTALL:-${XDG_BIN_HOME:-${XDG_DATA_HOME:+$XDG_DATA_HOME/../bin}}}}
-	PATH="${bin:-$HOME/.local/bin}:${bin:+$bin/bin:}$PATH"
-	command -v uv >/dev/null 2>&1 || die "uv is installed but not on PATH; open a new shell and rerun"
+# uv, from its own installer, where it is missing or older than uv_least.
+if [ -z "$use_pip" ]; then
+	bootstrap_uv || die "uv's installer failed; install uv $uv_least or newer from https://docs.astral.sh/uv, or rerun with --pip"
+	have=$(uv_version)
+	if [ -z "$have" ] || uv_older "$have"; then
+		# Where uv's installer put it (https://docs.astral.sh/uv/reference/storage/#executable-directory).
+		bin=${UV_INSTALL_DIR:-${UV_UNMANAGED_INSTALL:-${XDG_BIN_HOME:-${XDG_DATA_HOME:+$XDG_DATA_HOME/../bin}}}}
+		PATH="${bin:-$HOME/.local/bin}:${bin:+$bin/bin:}$PATH"
+		have=$(uv_version)
+	fi
+	[ -n "$have" ] || die "uv is installed but not on PATH; open a new shell and rerun"
+	! uv_older "$have" || die "uv $have, older than $uv_least, comes first on PATH; remove it or update it with uv self update"
 fi
 
 # The environment's Python, made if it does not exist yet.
@@ -180,9 +215,13 @@ fi
 "$python" -c "import sys; sys.exit(sys.version_info < tuple(map(int, '$python_min'.split('.'))))" || die "$python is Python \
 $("$python" -c 'import sys; print("%d.%d" % sys.version_info[:2])'); Dew needs $python_min or newer, so choose a new .venv or upgrade it"
 
-# pip, for --pip, in an environment uv made without it.
-if [ -n "$use_pip" ] && ! "$python" -m pip --version >/dev/null 2>&1; then
-	"$python" -m ensurepip -q || die "$python has no pip and ensurepip could not add it; rerun without --pip to use uv"
+# pip, for --pip, in an environment uv made without it, then pip 26.2.2 by its wheel's hash (tools/pip.txt):
+# older pips trust the roots of eMudhra's compromised CAs in their own bundle (2026-10-20).
+if [ -n "$use_pip" ]; then
+	if ! "$python" -m pip --version >/dev/null 2>&1; then
+		"$python" -m ensurepip -q || die "$python has no pip and ensurepip could not add it; rerun without --pip to use uv"
+	fi
+	"$python" -m pip install -q "$pip_least" || die "pip could not update itself to 26.2.2; rerun without --pip to use uv"
 fi
 
 # The install, shown and then run.

@@ -8,16 +8,19 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from diffusion_support import TanhLayer
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
 
 from dew.diffusion import presets
+from dew.inference import TextToImage
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones import SimpleDiT
+from dew.nn.scan_orders import patchify
 from dew.objectives.base import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, spatial_zscore
-from dew.sampling import Euler, TextToImage
+from dew.sampling import Euler
 
 CASES = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "losses.npz")
 SETTINGS = json.loads(str(CASES["settings"]))
@@ -103,19 +106,6 @@ COMPOSED = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "comp
 PREPROCESSED = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "preprocessed.npz")
 
 
-def patches(images, patch: int):
-    """`[B, H, W, C]` as `[B, N, p * p * C]` tokens in raster order."""
-    b, h, w, c = images.shape
-    grid = images.reshape(b, h // patch, patch, w // patch, patch, c).transpose(0, 1, 3, 2, 4, 5)
-    return grid.reshape(b, (h // patch) * (w // patch), patch * patch * c)
-
-
-class Block(nn.Module):
-    @nn.compact
-    def __call__(self, hidden):
-        return jnp.tanh(hidden @ self.param("kernel", nn.initializers.zeros, (hidden.shape[-1],) * 2))
-
-
 class Network(nn.Module):
     """`tools/repa_reference.py`'s stand-in model at Dew's model time (t times
     1000): patch tokens plus the time, the aligned `block`, a head."""
@@ -126,11 +116,11 @@ class Network(nn.Module):
     @nn.compact
     def __call__(self, x, time, train=False):
         b, side, _, c = x.shape
-        tokens = patches(x, self.patch)
+        tokens = patchify(x, self.patch)
         hidden = (tokens @ self.param("embed", nn.initializers.zeros, (tokens.shape[-1], self.width))
                   + (time / 1000).reshape(-1, 1, 1)
                   * self.param("time", nn.initializers.zeros, (self.width,)))
-        block = Block(name="block")(hidden)
+        block = TanhLayer(name="block")(hidden)
         out = block @ self.param("head", nn.initializers.zeros, (self.width, tokens.shape[-1]))
         grid = out.reshape(b, side // self.patch, side // self.patch, self.patch, self.patch, c)
         return grid.transpose(0, 1, 3, 2, 4, 5).reshape(b, side, side, c)
@@ -143,7 +133,7 @@ class Projected(nn.Module):
 
     @nn.compact
     def __call__(self, pixels):
-        tokens = patches(pixels, self.patch)
+        tokens = patchify(pixels, self.patch)
         return tokens @ self.param("encoder", nn.initializers.zeros, (tokens.shape[-1], 6))
 
 
@@ -183,7 +173,9 @@ def test_repa_trains_on_repas_composed_loss_and_its_gradient():
               "head": COMPOSED["weights/head"], "block": {"kernel": COMPOSED["weights/block"]},
               ALIGNMENT: projector}
     params = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
-    step = Step(step=jnp.asarray(0), key=jax.random.key(settings["key"]), ema=None)
+    # The step reads REPA's own times and noise (`Step.tape`).
+    step = Step(step=jnp.asarray(0), key=jax.random.key(settings["key"]), ema=None,
+                tape={"times": COMPOSED["times"], "noise": COMPOSED["noise"]})
 
     def loss(params):
         return objective.scalar_loss({**variables, "params": params}, {"image": pixels}, step)[0]
@@ -282,11 +274,11 @@ def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
     import tarfile
 
     import optax
+    from diffusion_support import images_of
     from test_diffusion_run_sources import batch_for, precision
 
     from dew.config import ObjectiveConfig
-    from dew.config.data import ImageData
-    from dew.objectives.diffusion import DiffusionRunConfig
+    from dew.config.diffusion import DiffusionRunConfig
     from dew.training import Trainer
 
     for name in ("flux_source", "rae"):
@@ -294,8 +286,8 @@ def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
             archive.extractall(tmp_path / name, filter="data")
     alignment = Alignment("x_embedder", source=str(tmp_path / "rae" / "dinov2_plain"), width=8, resolution=56)
     config = DiffusionRunConfig(pretrained=str(tmp_path / "flux_source" / "pipeline"), preset=None,
-                                model=precision(), data=ImageData(source="tfds://oxford_flowers102",
-                                    image_size=16), val_metrics=(),
+                                model=precision(), data=images_of("tfds://oxford_flowers102", 16),
+                                val_metrics=(),
                                 objective=ObjectiveConfig("diffusion", {
                                     "alignment": alignment, "solver": Euler(), "guidance": None, "steps": 2,
                                     "ema_decay": None}))

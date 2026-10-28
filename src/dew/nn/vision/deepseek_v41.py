@@ -3,7 +3,6 @@
 """
 
 import dataclasses
-import functools
 from collections.abc import Mapping
 
 import jax
@@ -11,12 +10,22 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
+from dew import _records
+from dew.interop.weights import in_params
 from dew.nn.activations import gelu_exact
-from dew.nn.dense import Dense
+from dew.nn.mlp import GatedMLP
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section, block_tensor_path, rope_base
+from .common import (
+    ProjectorBase,
+    ProjectorLayout,
+    TowerBase,
+    TowerGeometry,
+    TowerLayout,
+    _vision_section,
+    block_tensor_path,
+    rope_base,
+)
 from .vit import VisionTransformer, ViTLayout
 
 
@@ -47,7 +56,7 @@ class DeepseekV41Vision(TowerBase):
             in_channels=3, patch_size=self.patch_size, temporal_patch_size=1, spatial_merge_size=1,
             norm_type="rms", norm_eps=1e-6, norm_bias=False, mlp_bias=False, packed=True, mlp_packed=True,
             patch_bias=True, attention=("full",) * depth, order=("patches",) * depth, sinks=(False,) * depth,
-            post_norm="rms", outer_norm_eps=1e-6, rope_theta=self.rope_theta, grid_output=True)
+            post_norm="rms", outer_norm_eps=1e-6, rope_theta=self.rope_theta, output="patch_grid")
 
     def build(self) -> nn.Module:
         return VisionTransformer(self.layout())
@@ -56,7 +65,7 @@ class DeepseekV41Vision(TowerBase):
         return TowerGeometry(patch_size=self.patch_size, channels=3)
 
 
-class DeepseekV41ProjectorModule(nn.Module):
+class DeepseekV41Projector(ProjectorBase):
     """DeepSeek-V4.1's aligner and image span (vision.py:106-119,
     model.py:1228-1239).
 
@@ -83,8 +92,12 @@ class DeepseekV41ProjectorModule(nn.Module):
         squares = padded.reshape(images, high, ratio, wide, ratio, self.vision_width).transpose(
             0, 1, 3, 5, 2, 4
         )
-        dense = functools.partial(Dense, self.out_width, dtype=self.dtype, precision=self.precision)
-        aligned = dense(name="w2")(gelu_exact(dense(name="w1")(squares.reshape(images, high, wide, -1))))
+        grouped = squares.reshape(images, high, wide, -1)
+        mlp = GatedMLP(self.out_width, self.out_width, in_features=grouped.shape[-1],
+                        activation=gelu_exact, use_bias=True, names=("w1", "w2"), dtype=self.dtype,
+                        precision=self.precision)
+        nn.share_scope(self, mlp)
+        aligned = mlp(grouped)
         start, newline, end = (
             self.param(name, nn.initializers.normal(1.0), (self.out_width,), jnp.float32).astype(
                 aligned.dtype
@@ -97,21 +110,6 @@ class DeepseekV41ProjectorModule(nn.Module):
         return jnp.concatenate([jnp.broadcast_to(start, (images, 1, self.out_width)),
                                 lines.reshape(images, high * (wide + 1), self.out_width),
                                 jnp.broadcast_to(end, (images, 1, self.out_width))], axis=1)
-
-
-@dataclasses.dataclass(frozen=True)
-class DeepseekV41Projector(ProjectorBase):
-    """DeepSeek-V4.1's aligner fields: the ViT width, the side of the squares
-    it groups, and the decoder width."""
-
-    vision_width: int
-    downsample_ratio: int
-    out_width: int
-
-    def build(self) -> nn.Module:
-        return DeepseekV41ProjectorModule(vision_width=self.vision_width,
-                                          downsample_ratio=self.downsample_ratio,
-                                          out_width=self.out_width)
 
 
 # A block's maps as the decoder block names them (`block_tensor_path`).
@@ -144,18 +142,18 @@ def translate_deepseek_v41_vision_config(hf_config: Mapping[str, object]) -> Rec
     vision = _vision_section(hf_config)
     if vision.get("model_type", "deepseek_v41_vision") != "deepseek_v41_vision":
         raise ValueError(f"vision model_type {vision.get('model_type')!r} is not DeepSeek-V4.1's ViT")
-    width = records.integer(vision["hidden_size"], "hidden_size")
-    heads = records.integer(vision["num_attention_heads"], "num_attention_heads")
+    width = _records.integer(vision["hidden_size"], "hidden_size")
+    heads = _records.integer(vision["num_attention_heads"], "num_attention_heads")
     if width % heads or (width // heads) % 4:
         raise ValueError(f"hidden_size {width} over {heads} heads leaves no head width the 2D rotary "
                          "splits into height and width pairs")
     return {
         "class": "deepseek_v41", "fields": {
-        "num_hidden_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
+        "num_hidden_layers": _records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
         "hidden_size": width,
         "num_attention_heads": heads,
-        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
-        "patch_size": records.integer(vision["patch_size"], "patch_size"),
+        "intermediate_size": _records.integer(vision["intermediate_size"], "intermediate_size"),
+        "patch_size": _records.integer(vision["patch_size"], "patch_size"),
         "rope_theta": rope_base(vision, 10000.0),
     }}
 
@@ -167,7 +165,17 @@ def translate_deepseek_v41_projector_config(hf_config: Mapping[str, object],
     vision = _vision_section(hf_config)
     return {
         "class": "deepseek_v41", "fields": {
-        "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
-        "downsample_ratio": records.integer(vision.get("downsample_ratio", 3), "downsample_ratio"),
+        "vision_width": _records.integer(vision["hidden_size"], "hidden_size"),
+        "downsample_ratio": _records.integer(vision.get("downsample_ratio", 3), "downsample_ratio"),
         "out_width": int(text_width),
     }}
+
+
+DeepseekV41Vision.checkpoint = TowerLayout("vision.", in_params(deepseek_v41_vision_path))
+# The aligner's maps under its `aligner.` prefix, and the span's learned vectors, which the release
+# keeps at its top level (model.py:1215-1222).
+DeepseekV41Projector.checkpoint = ProjectorLayout("aligner.", {
+    "w1.weight": ("w1", "kernel"), "w1.bias": ("w1", "bias"),
+    "w2.weight": ("w2", "kernel"), "w2.bias": ("w2", "bias"),
+    "image_start": ("image_start",), "image_newline": ("image_newline",), "image_end": ("image_end",),
+})

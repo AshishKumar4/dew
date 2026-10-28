@@ -174,6 +174,36 @@ test('a pool cell waits its turn on the host, then its live run replaces the rec
 	await page.close();
 });
 
+test('a training cell\'s panel is one output its updates replace, as Jupyter shows a display handle', { timeout: 10_000 }, async () => {
+	const page = await browser.newPage();
+	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({
+		contentType: 'text/javascript',
+		body: 'window.turnstile = { render: (el, o) => { o.callback("token"); return "w"; }, remove() {} };',
+	}));
+	await page.route(`${live.endpoint}/v1/sessions`, (route) => route.fulfill({ json: { socket: SOCKET } }));
+	await page.routeWebSocket(SOCKET, (socket) => {
+		socket.send(JSON.stringify({ type: 'ready', uptime: 1, setup: 1 }));
+		socket.onMessage((raw) => {
+			const message = JSON.parse(String(raw));
+			if (message.op !== 'execute') return;
+			const reply = (body) => socket.send(JSON.stringify({ id: message.id, ...body }));
+			reply({ type: 'display', display: 'panel', text: 'frame 0' });
+			for (let frame = 1; frame <= 3; frame++) reply({ type: 'display', display: 'panel', update: true, text: `frame ${frame}` });
+			// An update to an id nothing shows shows nothing.
+			reply({ type: 'display', display: 'gone', update: true, text: 'never shown' });
+			reply({ type: 'stream', name: 'stdout', text: 'Trained 20 steps\n' });
+			reply({ type: 'done', status: 'ok', count: 1 });
+		});
+	});
+	await page.goto(site.url);
+	const panel = page.locator('[data-landing-cell="finetune"]');
+	await panel.locator('[data-cell-run]').click();
+	await page.waitForFunction(() => document.querySelector('[data-landing-cell="finetune"] [data-cell-status]').textContent.startsWith('Ran in'));
+	const shown = await panel.locator('[data-cell-output] > *').evaluateAll((children) => children.map((child) => child.textContent));
+	assert.deepEqual(shown, ['frame 3', 'Trained 20 steps']);
+	await page.close();
+});
+
 test('a live stream shows nothing while it is blank, then its text without blank edges', { timeout: 10_000 }, async () => {
 	const page = await browser.newPage();
 	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({

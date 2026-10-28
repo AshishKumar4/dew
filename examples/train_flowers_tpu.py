@@ -32,19 +32,19 @@ from PIL import Image
 
 import dew
 from dew.artifacts import uint8_pixels
-from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.config.data import Augment, HoldOut, ImageData, loader
-from dew.coordination import collective_host
-from dew.data import TFDS, Files, Loading
-from dew.data.images import EncodeCaptions
+from dew.config import MetricConfig, ObjectiveConfig, TrainerConfig
+from dew.config.diffusion import DiffusionRunConfig
+from dew.data import TFDS, Files, Loading, images, presets
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
+from dew.distributed import collective_host
+from dew.inputs import TextCondition
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
+from dew.optim import Cosine, OptimConfig
+from dew.registry import ModelConfig
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
 from dew.training import LocalTracker, MeshSpec, ProfileWindow, prepare_process
-from dew.training.optim import Cosine
 
 PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
 
@@ -105,14 +105,13 @@ def synthetic_records(directory: Path, count: int, size: int) -> None:
 def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
     """The same run at the size a laptop finishes: one device, tiny everything."""
     synthetic_records(out / "data", count=16, size=16)
+    train, held = Files(str(out / "data" / "*.array_record"), format="array_record").holdout(records=4)
+    loading = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
     return DiffusionRunConfig(
         model=ModelConfig.from_model(SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
                                                dtype=jnp.float32)),
-        data=ImageData(source=Files(str(out / "data" / "*.array_record"), format="array_record"),
-                    image_size=16, augment=None,
-                    validation=HoldOut(records=4)),
-        validation_records=4,
-        loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),
+        data=train.shuffle(seed=0).repeat().pipe(presets.images, 16, batch=4).loading(loading),
+        validation=held.pipe(presets.images, 16, batch=4).loading(loading),
         preset=EDM(regime="pixel"),
         objective=ObjectiveConfig("diffusion", {"solver": Heun(), "guidance": CFG(2.0), "steps": 2,
                                                 "ema_decay": 0.9}),
@@ -120,7 +119,7 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
         val_metrics=(MetricConfig("fid", {"weights": config.inception_weights}),
                      MetricConfig("clip_score", {"modelname": config.clip_model})),
         optim=OptimConfig(learning_rate=1e-3),
-        trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), batch_size=4, steps=3,
+        trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), steps=3,
                               log_every=1, eval_every=3, checkpoint_every=3,
                               mesh=MeshSpec(fsdp=1), multi_host=False,
                               compilation_cache_dir=None))
@@ -132,25 +131,27 @@ def slice_config(config: Config) -> DiffusionRunConfig:
         raise ValueError("--data is the prepared record directory; --smoke writes its own")
     path = str(config.data.expanduser())
     records = (config.data / "manifest.json").is_file() or (config.data / "_dew_manifest.json").is_file()
-    prepared = ImageData(source=Files(path, format="array_record") if records else
-                      TFDS("oxford_flowers102", split="all", path=path),
-                      caption_templates=() if records else ("a photo of a {}",),
-                      augment=Augment(flip=True, jitter=True))
+    # Prepared records carry their captions; the TFDS source's are its class names.
+    source = (Files(path, format="array_record") if records
+              else TFDS("oxford_flowers102", split="all", path=path))
+    caption = None if records else images.caption("a photo of a {label}")
+    train, held = source.holdout(records=4 * config.batch_size)
     return DiffusionRunConfig(
         model=ModelConfig.from_model(SimpleDiT(**config.model, dtype=jnp.bfloat16)),
-        data=replace(prepared, image_size=config.image_size,
-                     validation=HoldOut(records=4 * config.batch_size)),
+        data=train.shuffle(seed=0).repeat().pipe(presets.images, config.image_size, batch=config.batch_size,
+                                                 augment=True, caption=caption),
+        validation=held.pipe(presets.images, config.image_size, batch=config.batch_size, caption=caption),
         preset=EDM(regime="pixel"),
         objective=ObjectiveConfig("diffusion", {"solver": Heun(), "guidance": CFG(config.guidance),
                                                 "steps": config.sampling_steps, "ema_decay": 0.9999}),
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
         val_metrics=(MetricConfig("fid", {"weights": config.inception_weights}),
                      MetricConfig("clip_score", {"modelname": config.clip_model})),
-        optim=OptimConfig(weight_decay=0.01, schedule=Cosine(
-            peak=config.learning_rate, warmup_steps=2000, init=config.learning_rate,
-            end=2e-4)),
+        optim=OptimConfig(weight_decay=0.01, learning_rate=Cosine(
+            peak_value=config.learning_rate, warmup_steps=2000, init_value=config.learning_rate,
+            end_value=2e-4)),
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"),
-                              batch_size=config.batch_size, steps=config.steps,
+                              steps=config.steps,
                               log_every=50, eval_every=2000, checkpoint_every=2000,
                               profile=ProfileWindow(str(config.out / "profile"), steps=5,
                                                     warmup=20),
@@ -169,21 +170,21 @@ def main(config: Config) -> Path:
         config = replace(config, clip_model=str(SMOKE_CLIP), inception_weights=str(SMOKE_INCEPTION))
     run = smoke_config(config, config.out) if config.smoke else slice_config(config)
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
-                    run.trainer.compilation_cache_dir, layout=run.trainer.layout)
+                    run.trainer.compilation_cache_dir)
     if not config.smoke:
         # Only now: counting devices opens the backend, which has to come
         # after the slice's processes join, and a pool's count is every
         # host's devices.
         run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
+    # The objective encodes each batch's captions with its text condition as the run reads them.
     objective = run.build()
-    data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
-                validation_records=run.validation_records, host=(EncodeCaptions(objective.inputs.tokenize),))
     name = "smoke" if config.smoke else f"flowers-{config.image_size}"
     # The run scores FID and CLIPScore over the held-out split at its end, on every process's
     # share at once, with the extractor and the CLIP the flags name (`val_metrics`), and logs
     # them under its last step.
-    state = run.train(objective, data, name=name, metrics=run.build_eval_metrics(),
+    state = run.train(objective, run.data, validation=run.validation, name=name,
+                      metrics=run.validation_metrics(validates=True),
                       summary={"prompts": list(PROMPTS)})
 
     # The run directory read back as a pipeline, which draws over every process's

@@ -1,5 +1,6 @@
-"""The float64 oracle the delta rules' tests share: the gated delta rule token by token (`rule_math`),
-grouped value heads and packed documents over it (`recurrence`), the gradient harness every rule
+"""The float64 oracle the delta rules' tests share: the gated delta rule token by token (`rule_math`), a chunk
+at a time for a real shape's gradient (`checkpointed`), grouped value heads and packed documents over it
+(`recurrence`), the gradient harness every rule
 is run through (`through`), fla's own outputs and gradients, the ports' reference (`fla_side`), the
 float64 terms of the decay gradient Kimi's port sums (`fla_decay_terms`), the portable math and its
 float64 terms (`math`, `float64_truth`), and the port's plain decay prefix (`plain_prefix`)."""
@@ -15,14 +16,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import float64_terms, widened
+from reference_error import float64_terms, widened, with_gradients
 
-from dew.nn import linear
-from dew.nn.kernels import fla_gdn
+from dew.nn.kernels import fla_gdn, recurrence_algebra, recurrence_chunk
 
 CHUNKED = 64
-"""The terms a chunk sums in another order than the portable math: a port's fp32 floor over the
-math's distance (`assert_leaves_as_exact`'s `reductions`)."""
+"""The port's chunk length in tokens: the chunks `fla_decay_parts` sums within and `plain_prefix`
+re-cuts the decay by, each by default."""
 
 
 def rule_math(q, k, v, g, beta, h0):
@@ -40,6 +40,25 @@ def rule_math(q, k, v, g, beta, h0):
 
     final, out = jax.lax.scan(step, h0, tuple(jnp.moveaxis(x, 1, 0) for x in (q, k, v, g, beta)))
     return jnp.moveaxis(out, 0, 1), final
+
+
+def checkpointed(chunk: int):
+    """`rule_math`, its tokens scanned a `chunk` at a time with each chunk's scan recomputed on the way back,
+    so its gradient keeps one memory a chunk rather than one a token: the float64 oracle at a model's real
+    shape (`gdn_cases`), whose memory a token would not fit a GPU. Its values are `rule_math`'s."""
+    def rule(q, k, v, g, beta, h0):
+        def blocked(x):
+            return jnp.moveaxis(x.reshape(x.shape[0], x.shape[1] // chunk, chunk, *x.shape[2:]), 1, 0)
+
+        @jax.checkpoint
+        def block(state, inputs):
+            out, state = rule_math(*inputs, state)
+            return state, out
+
+        final, out = jax.lax.scan(block, h0, tuple(blocked(x) for x in (q, k, v, g, beta)))
+        return jnp.moveaxis(out, 0, 1).reshape(v.shape), final
+
+    return rule
 
 
 def recurrence(q, k, v, g, beta, h0, cuts=None, rule=rule_math):
@@ -64,13 +83,11 @@ def recurrence(q, k, v, g, beta, h0, cuts=None, rule=rule_math):
 
 
 def through(rule, do, dht):
-    """`rule`'s output, final memory and its operands' gradients under the cotangents `do`, `dht`."""
-    def loss(*args):
-        out, final = rule(*args)
-        return jnp.sum(out.astype(do.dtype) * do) + jnp.sum(final.astype(dht.dtype) * dht), (out, final)
-
+    """`rule`'s output, final memory and its operands' gradients under the cotangents `do`, `dht`, each
+    cast to its output's dtype, pulled back through the gate (`reference_error.with_gradients`)."""
     def run(*args):
-        (_, (out, final)), grads = jax.value_and_grad(loss, argnums=range(len(args)), has_aux=True)(*args)
+        out, final = jax.eval_shape(rule, *args)
+        (out, final), *grads = with_gradients(rule)(*args, (do.astype(out.dtype), dht.astype(final.dtype)))
         return out, final, *grads
 
     return run
@@ -81,37 +98,42 @@ import sys, numpy as np, torch
 from fla.ops.gated_delta_rule import chunk_gated_delta_rule
 from fla.ops.kda import chunk_kda
 given, dtype = np.load(sys.argv[1]), getattr(torch, sys.argv[3])
+kinds = dict(zip(("q", "k", "v", "g", "beta", "h0", "do", "dht"), str(given["dtypes"]).split(",")))
 load = lambda name, as_dtype: torch.from_numpy(given[name]).to("cuda", as_dtype)
-q, k, v, do, beta = (load(n, dtype) for n in ("q", "k", "v", "do", "beta"))
-g, h0, dht = (load(n, torch.float32) for n in ("g", "h0", "dht"))
+q, k, v, g, beta, h0, do, dht = (load(n, getattr(torch, kinds[n])) for n in kinds)
 cu_seqlens = load("cu_seqlens", torch.long) if "cu_seqlens" in given else None
 leaves = [x.requires_grad_() for x in (q, k, v, g, beta, h0)]
 rule = chunk_kda if g.dim() == 4 else chunk_gated_delta_rule
-o, final = rule(*leaves[:5], scale=q.shape[-1] ** -0.5, initial_state=leaves[5], output_final_state=True,
+# Each leaf in its own dtype, its copy in the kernels' (fla's layer's common dtype), so a gradient
+# rounds back to its leaf's dtype as a mixed call's does.
+o, final = rule(*(x.to(dtype) for x in leaves[:3]), leaves[3].float(), leaves[4].to(dtype),
+                scale=q.shape[-1] ** -0.5, initial_state=leaves[5].float(), output_final_state=True,
                 cu_seqlens=cu_seqlens)
-torch.autograd.backward((o, final), (do, dht))
+torch.autograd.backward((o, final), (do.to(o.dtype), dht.float()))
 np.savez(sys.argv[2], **{name: x.detach().float().cpu().numpy() for name, x in
                          zip(sys.argv[4:], (o, final, *(leaf.grad for leaf in leaves)), strict=True)})
 '''
 """fla's side of the comparison, in the interpreter `DEW_FLA_PYTHON` names: fla 0.5.2's `chunk_kda`, or
-`chunk_gated_delta_rule` for a decay per head, on the operands of an npz, its outputs and gradients
-into another under the names it is given (`NAMES`); packed documents as its varlen sequences, each
-with a memory of its own."""
+`chunk_gated_delta_rule` for a decay per head, on the operands of an npz, each leaf in the dtype it
+names and the kernels in the given one, its outputs and gradients into another under the names it is
+given (`NAMES`); packed documents as its varlen sequences, each with a memory of its own."""
 
 NAMES = ("o", "final", "dq", "dk", "dv", "dg", "dbeta", "dh0")
 """The outputs and gradients each side gives, in `through`'s order."""
 
 
 def fla_side(inputs, cuts, dtype) -> list[np.ndarray]:
-    """fla's outputs and gradients on `inputs` (one row), run in a process of its own. Packed into
-    documents at `cuts`, the row's memory is its first document's and its final memory and cotangent
-    its last's: the others start from zero and give theirs no cotangent."""
+    """fla's outputs and gradients on `inputs` (one row), run in a process of its own, its kernels in
+    `dtype` and each input a leaf in its own dtype. Packed into documents at `cuts`, the row's memory
+    is its first document's and its final memory and cotangent its last's: the others start from
+    zero and give theirs no cotangent."""
     python = os.environ.get("DEW_FLA_PYTHON")
     if not python:
         pytest.fail("DEW_FLA_PYTHON names no interpreter with fla 0.5.2 and torch: the GPU tier's reference, "
                     "which a run selecting fla's gate gives it")
     given = dict(zip(("q", "k", "v", "g", "beta", "h0", "do", "dht"),
                      (np.asarray(x, np.float32) for x in inputs), strict=True))
+    given["dtypes"] = np.asarray(",".join(jnp.dtype(x.dtype).name for x in inputs))
     if cuts is not None:
         others = np.zeros((len(cuts) - 1, *given["h0"].shape[1:]), np.float32)
         given["h0"] = np.concatenate([given["h0"], others])
@@ -170,11 +192,12 @@ def fla_decay_parts(q, k, v, g, beta, h0, do, dht, starts=None, chunk: int = CHU
     decay = jnp.where(lower[..., None], jnp.exp(gc[..., :, None, :] - gc[..., None, :, :]), 0.0)
     akk = jnp.where(strict, jnp.einsum('...sd,...td,...std->...st', k * beta, k, decay), 0.0)
     aqk = jnp.einsum('...sd,...td,...std->...st', q, k, decay)
-    inverse = linear.strictly_lower_inverse(-akk)
+    inverse = recurrence_algebra.factor(-akk)
     w, u = inverse @ (k * beta * gated), inverse @ (v * beta)
     last_decay = jnp.exp(last - gc)
     leaving = k * last_decay
-    entered, corrected, _ = linear.xla_chunk_states(k, w, u, gc, last_decay, h0)
+    kept = jnp.ones((1, 1, gc.shape[2], 1, 1), gc.dtype)
+    entered, corrected, _ = recurrence_chunk.xla_chunk_states(k, w, u, gated, last_decay, h0, kept)
     daqk = jnp.where(lower, do @ jnp.swapaxes(corrected, -1, -2), 0.0)
     local = jnp.swapaxes(aqk, -1, -2) @ do
 
@@ -237,7 +260,8 @@ def math(q, k, v, g, beta, h0, starts=None):
     group = v.shape[2] // q.shape[2]
     q, k = (jnp.repeat(x, group, axis=2) for x in (q, k))
     starts = None if starts is None else jnp.asarray(starts)
-    return linear.chunk_delta_rule(q, k, v, g if g.ndim == 4 else g[..., None], beta, h0, starts=starts)
+    return recurrence_chunk.chunk_delta_rule(q, k, v, g if g.ndim == 4 else g[..., None], beta, h0,
+                                             starts=starts)
 
 
 HEADS = 8
@@ -324,7 +348,7 @@ def _per_document(block, cuts) -> list[np.ndarray]:
 
 
 def plain_prefix(g, chunk: int = CHUNKED):
-    """`g` re-cut from the port's plain fp32 prefix (`fla_gdn.chunk_local_cumsum`, fla's): each chunk
+    """`g` re-cut from the port's plain fp32 prefix (`recurrence.cumulated`, fla's): each chunk
     of `chunk` tokens from the row's start summed, then scaled to base 2 (`fla_gdn.RCP_LN2`), each
     token's decay the difference of its prefix and the one before carried back to natural log. The
     portable rule, rebuilding the prefixes, then takes every range as the port does, the difference
@@ -335,3 +359,18 @@ def plain_prefix(g, chunk: int = CHUNKED):
     earlier = jnp.pad(prefix[:, :, :-1], ((0, 0), (0, 0), (1, 0), *((0, 0),) * (g.ndim - 2)))
     recut = ((prefix - earlier) / fla_gdn.RCP_LN2).reshape(padded.shape)[:, :length]
     return g + jax.lax.stop_gradient(recut - g)
+
+
+def fused_step(token, held, taps, gate, beta, log_a, bias, z, weight, state, *, epsilon: float,
+               activation: str, dtype, active=None):
+    """`(output, history', state')` of a gated delta net's decode token whole in the recurrence's step
+    (`dew.nn.kernels.recurrence.step`), the layer's operands in the order its fused token hands them:
+    the conv's token, history and taps, the gates before their activations, A_log and dt_bias, the
+    output gate and the gated norm's weight, and the state."""
+    from dew.nn.kernels import recurrence
+
+    hooks = recurrence.Hooks(conv=recurrence.Conv('silu'), l2norm=True, decay='scalar',
+                             gates=recurrence.Gates(), output=recurrence.OutputNorm(epsilon, activation))
+    operands = recurrence.Step(state, token=token, held=held, taps=taps, gate=gate, beta=beta, log_a=log_a,
+                               bias=bias, z=z, weight=weight, active=active)
+    return recurrence.step(hooks, operands, dtype=dtype)

@@ -7,7 +7,9 @@ Pallas launch the step holds is measured here and stored beside the
 compilation cache (`dew.cache.kernel_picks_path`), where every later run on
 a GPU of this model reads it. FSDP splits the parameters, not the rows a norm
 or an expert matmul reads, so one device at a pool's per-device batch holds
-the launches each of the pool's devices runs. Run it on a GPU it has to
+the launches each of the pool's devices runs. It prints the step's kernel
+report first (`dew.training._lowering.KernelReport`: each dispatch's route
+and each kernel's launches, configs and FLOPs). Run it on a GPU it has to
 itself (`gpu-run`, never `-n 0.5`, where nothing is measured):
 
     gpu-run python tools/kernel_picks.py --config Qwen/Qwen3-30B-A3B --batch 2 --seq 4096
@@ -64,20 +66,24 @@ def main() -> None:
     state = jax.eval_shape(trainer.initial_state, trainer.objective.initializer, trainer.key)
     batch = {"text": jax.ShapeDtypeStruct((arguments.batch, arguments.seq + 1), jnp.int32)}
 
+    reports = []
+
     def step() -> jax.stages.Lowered:
-        """The first step, which `compile` under `lower_for` lowers and raises."""
+        """The first step, which `compile` under `lower_for` lowers and raises, its kernel report kept."""
         try:
             trainer.compile(state, batch)
         except Lowered as lowered:
+            reports.append(lowered.kernels)
             return lowered.lowered
         raise AssertionError("a trainer under lower_for raises its lowered step")
 
     _, launches = tuning.tune(step, measure=True)
+    print(json.dumps({"kernels": reports[-1].record()}))
     launches = json.loads(launches)
     path = Path(cache.kernel_picks_path(jax.devices()[0].device_kind))
     # A store exists once a launch has been measured on this GPU model: a step with no Pallas launch
     # there (the dense 1.1B on an RTX PRO 6000 Blackwell) leaves none.
-    stored = () if not path.is_file() else tokamax.AutotuningResult.load(path.open()).data
+    stored = [] if not path.is_file() else list(tuning._read(str(path))[0].values())
     for ba, timings in stored:
         fastest = timings.prune()
         print(json.dumps({"kernel": type(ba.op).__name__, "key": str(dict(ba.autotuning_cache_key)),

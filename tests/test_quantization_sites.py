@@ -20,7 +20,7 @@ from interop_support import NVFP4_QDQ_CASES, nvfp4_qdq_case
 from reference_error import FACTOR, assert_as_exact_as_the_reference, distance, float64_forward
 
 import dew
-from dew.inference.projections import inference_projections, projection_groups
+from dew.inference.projections import inference_projections, pending, projection_groups
 from dew.interop import Pretrained
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.sharding import pipeline_microbatches
@@ -64,6 +64,18 @@ def test_the_scanned_stack_quantizes_each_layer_with_its_own_scales(case):
     assert_quantized(scanned.apply(loaded.variables, reference["ids"].astype(np.int32)), reference, "scanned")
 
 
+def quantized_apart(case):
+    """The case's loaded model, its scanned clone, its ids, and a copy of its variables whose second
+    layer's query projection is left unquantized: layers quantized apart, which one scanned body
+    cannot read alike."""
+    _, loaded, reference = case
+    variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
+    layer = variables[QUANTIZATION]["layers_1"]
+    mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
+    layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
+    return loaded, loaded.model.clone(scan_layers=True), reference["ids"].astype(np.int32), variables
+
+
 def test_layers_quantized_apart_run_as_scanned_runs_of_their_own(case):
     """A checkpoint that quantizes two otherwise like layers differently, here
     one with a projection left unquantized, gives them different scale trees,
@@ -72,13 +84,7 @@ def test_layers_quantized_apart_run_as_scanned_runs_of_their_own(case):
     the plain loop of the same weights is, against their own float64
     forward. The stored tree stays one subtree per layer, so the scanned and
     the plain model read and init the same tree."""
-    _, loaded, reference = case
-    scanned = loaded.model.clone(scan_layers=True)
-    ids = reference["ids"].astype(np.int32)
-    variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
-    layer = variables[QUANTIZATION]["layers_1"]
-    mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
-    layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
+    loaded, scanned, ids, variables = quantized_apart(case)
     plain = np.asarray(loaded.model.apply(variables, ids))
     truth, terms = float64_forward(loaded.model, variables, ids)
     assert_as_exact_as_the_reference(np.asarray(scanned.apply(variables, ids)), plain, truth,
@@ -93,13 +99,7 @@ def test_layers_quantized_apart_that_one_bank_holds_are_refused(case):
     rows are refused by name, rather than read as runs of their own the store does not hold."""
     from dew.nn.backbones.layer_plan import group_name
 
-    _, loaded, reference = case
-    scanned = loaded.model.clone(scan_layers=True)
-    ids = reference["ids"].astype(np.int32)
-    variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
-    layer = variables[QUANTIZATION]["layers_1"]
-    mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
-    layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
+    loaded, scanned, ids, variables = quantized_apart(case)
     params = dict(variables["params"])
     for first, count in scanned.bind(loaded.variables).groups:
         if count > 1:
@@ -182,7 +182,7 @@ def test_members_scaled_apart_stay_unpacked(case):
 
 
 def test_the_served_pipeline_quantizes_as_the_loaded_model(case):
-    """`dew.pipeline` packs the projections while it places them; its task
+    """`dew.pipeline` packs the projections once it has placed them; its task
     computes the loaded model's quantized logits."""
     directory, _, reference = case
     task = dew.pipeline(str(directory), dtype=jnp.float32)
@@ -190,10 +190,28 @@ def test_the_served_pipeline_quantizes_as_the_loaded_model(case):
     assert_quantized(logits, reference, "pipeline")
 
 
+def test_a_generation_over_the_loaded_tree_packs_under_its_one_scale_in_the_call(case):
+    """A task over the loaded model's own tree, its query, key and value apart, packs them inside
+    its compiled generation, under the one input scale `pending` finds on the loaded scales before
+    the call: it draws, bit for bit, what a task over the tree packed beforehand draws. The
+    pipeline's task, packed at its load, generates too."""
+    directory, loaded, reference = case
+    ids = reference["ids"].astype(np.int32)[:1, :4]
+    borrowed = loaded.text_generation()
+    assert pending(loaded.model, loaded.variables)
+    prepacked = borrowed.bind(inference_projections(loaded.model, loaded.variables))
+    drawn, expected = (task(ids, 3, key=0).host() for task in (borrowed, prepacked))
+    np.testing.assert_array_equal(drawn.tokens, expected.tokens)
+    np.testing.assert_array_equal(drawn.raw_log_probs, expected.raw_log_probs)
+    assert drawn.lengths[0] == 3 and np.isfinite(drawn.raw_log_probs).all()
+    generated = dew.pipeline(str(directory), dtype=jnp.float32)(ids, 3, key=0).host()
+    assert generated.lengths[0] == 3 and np.isfinite(generated.raw_log_probs).all()
+
+
 def test_a_server_of_the_packed_task_reloads_the_loaded_models_own_tree(case):
     """`dew.pipeline` serves the query, key and value packed under their one
     input scale. A reload takes the loaded model's own tree, each member's
-    scale at its own scope, and packs it as placement did, so the server
+    scale at its own scope, and packs it as the load did, so the server
     holds the weights it held before. Members scaled apart cannot share the
     packed product's one scale, and their reload is refused."""
     from dew.inference.serving import Server

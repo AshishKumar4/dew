@@ -17,6 +17,14 @@
    "tool": "tools/joint_checkpoint_reference.py",
    "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
+  "hf/k2-horizon-tiny/padding.json": {
+   "tool": "tools/k2_horizon_reference.py",
+   "sources": [{"repo": "IFM/K2-Horizon-0.9B", "version": "383cb66347be", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}]
+  },
+  "hf/mimo-v2-tiny/padding.json": {
+   "tool": "tools/remote_code_reference.py",
+   "sources": [{"repo": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "version": "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}]
+  },
   "hf/phi3-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
@@ -24,6 +32,21 @@
   "hf/phi3-tiny/logits_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt2-tiny/logits_f64.npy": {
+   "tool": "tools/classic_gpt_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
+   "note": "--float64 gpt2-tiny: the stored weights' float64 twin (torch_precision.float64_twin) on the fixture's ids."
+  },
+  "hf/gpt-neox-tiny/logits_f64.npy": {
+   "tool": "tools/classic_gpt_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
+   "note": "--float64 gpt-neox-tiny: the stored weights' float64 twin (torch_precision.float64_twin) on the fixture's ids."
+  },
+  "hf/opt-tiny/logits_f64.npy": {
+   "tool": "tools/classic_gpt_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
+   "note": "--float64 opt-tiny: the stored weights' float64 twin (torch_precision.float64_twin) on the fixture's ids."
   },
   "hf/phi3-tiny/padded_logits.npy": {
    "tool": "tools/hf_reference.py",
@@ -357,7 +380,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -531,6 +554,10 @@
    ],
    "note": "Calls AutoencoderDC encode/decode; bundle contains both conv and shuffle cases."
   },
+  "decoder-default-dropout-float64.jaxexport": {
+   "generator": "dew",
+   "note": "The same pre-dropout CPU forward and gradient graph at 42ddfc1, exported in float64 over the weights widened (tools/generate_decoder_dropout_fixture.py --dtype float64): the float32 export's float64 truth for check 1."
+  },
   "decoder-default-dropout.jaxexport": {
    "generator": "dew",
    "note": "Dew's serialized pre-dropout CPU forward and gradient graph at 42ddfc1 (tools/generate_decoder_dropout_fixture.py); a Dew regression golden."
@@ -609,7 +636,18 @@
      "runs": "diffusers"
     }
    ],
-   "note": "The rounding mode with copies=32. Five pointwise source_schedulers cases use independent initial states and replayed per-step JAX noise on (2, 3, 128), both precisions over the same float32 inputs. CFG epsilon uses 52 pixel orders of the original (2, 3, 4) input and cotangent; each float64 VJP commutes with its order within 1e-12 relative RMS, and order zero reproduces the original float32 gradient bit for bit. Original source_schedulers arrays are unchanged. Torch 2.14.0+cpu, JAX 0.11.2.post3."
+   "note": "The rounding mode with copies=32. Four pointwise source_schedulers cases use independent initial states and replayed per-step JAX noise on (2, 3, 128), both precisions over the same float32 inputs (the fifth, edm.exponential_v_threshold, moved to source_seeds.npz and its arrays left this file). CFG epsilon uses 52 pixel orders of the original (2, 3, 4) input and cotangent; each float64 VJP commutes with its order within 1e-12 relative RMS, and order zero reproduces the original float32 gradient bit for bit. Original source_schedulers arrays are unchanged. Torch 2.14.0+cpu, JAX 0.11.2.post3."
+  },
+  "diffusers/source_seeds.npz": {
+   "tool": "tools/diffusers_source_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    }
+   ],
+   "note": "The seeds mode: edm.exponential_v_threshold's trajectory gradient over check 1's recorded seeds (tools/recorded_references.py's record_case), each seed's initial state at init_noise_sigma and its cotangent drawn by torch's generator, the float32 VJP and the float64 one with the per-step JAX noise of key 0 replayed in both. Torch 2.14.1+cpu, torchsde 0.2.6."
   },
   "diffusers_handoff.npz": {
    "tool": "tools/diffusers_handoff_reference.py",
@@ -760,7 +798,7 @@
      "runs": "jax"
     }
    ],
-   "note": "RK4Sampler.sample_step and MultiStepDPM.take_next_step through DiffusionSampler.sample_step, on KarrasVENoiseScheduler, walked as generate_samples walks its grid, around a stand-in denoiser; x_T and the cotangent are inputs. Also generate_samples as published from x_T (its priors): the closing clean prediction. rounding.npz adds RK4's clipped output over four copies of the independent initial states (128, 64); its float64 namespace widens every explicit jnp.float32 timestep cast so sigma arithmetic also runs in float64. The original solvers.npz arrays are unchanged."
+   "note": "RK4Sampler.sample_step and MultiStepDPM.take_next_step through DiffusionSampler.sample_step, on KarrasVENoiseScheduler, walked as generate_samples walks its grid, around a stand-in denoiser; x_T and the cotangent are inputs. Also generate_samples as published from x_T (its priors) over the float32 grid (its steps_override): the closing clean prediction, unclipped and through clip_images. Recorded over the seeds check 1 draws (record_case, summarized), x_T and the cotangent a seeded NumPy draw the test makes again; the float64 twin widens every explicit jnp.float32 of the schedule and the sampler's common steps, so sigma arithmetic runs in float64 on the float32 grid's times."
   },
   "flow/densities.npz": {
    "tool": "tools/flow_density_reference.py",
@@ -819,7 +857,7 @@
      "runs": "diffusers"
     }
    ],
-   "note": "Flux's calculate_shift read from the installed pipeline module and the scheduler's _time_shift_exponential."
+   "note": "Flux's calculate_shift read from the installed pipeline module; the test runs the scheduler's time_shift live."
   },
   "flux2_published.npz": {
    "tool": "tools/diffusers_flux2_reference.py",
@@ -976,60 +1014,37 @@
    ],
    "note": "Transformers delegates to the fetched kernel's numerics_details.mxfp.downcast_to_mxfp_torch CPU path."
   },
-  "guidance/apg.npz": {
+  "guidance/walk_seeds.npz": {
    "tool": "tools/guidance_reference.py",
    "sources": [
     {
      "repo": "huggingface/diffusers",
      "version": "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2",
      "runs": "fetched"
-    }
-   ],
-   "note": "Fetches and executes Diffusers' published AdaptiveProjectedGuidance guider (BaseGuidance.__init__/set_state, prepare_inputs, forward, _is_apg_enabled, normalized_guidance, MomentumBuffer) without importing diffusers; its batching helper and output container are stand-ins."
-  },
-  "guidance/apg_ensemble.npz": {
-   "tool": "tools/guidance_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/diffusers",
-     "version": "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2",
-     "runs": "fetched"
-    }
-   ],
-   "note": "The apg-ensemble mode executes the same published AdaptiveProjectedGuidance over 1024 independent initial states (torch seed 23), in float32 and float64. Every existing apg.npz result is checked to regenerate bit for bit."
-  },
-  "guidance/apg_projection.npz": {
-   "tool": "tools/guidance_reference.py",
-   "sources": [
-    {
-     "repo": "huggingface/diffusers",
-     "version": "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2",
-     "runs": "fetched"
-    }
-   ],
-   "note": "The apg-projection mode executes the published AdaptiveProjectedGuidance over 1024 pairs of nearly parallel raw predictions (torch seed 29), at ordinary, 1e30 and 1e-20 scales and with branches of different scales, without a norm clip, in float32 and float64. This isolates the projection's precision, exponent range and norm floor from model, norm-clip and Euler rounding."
-  },
-  "guidance/autoguidance.npz": {
-   "tool": "tools/guidance_reference.py",
-   "sources": [
+    },
     {
      "repo": "NVlabs/edm2",
      "version": "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc",
      "runs": "fetched"
-    }
-   ],
-   "note": "Fetches and executes upstream edm_sampler with closed-form stand-in networks."
-  },
-  "guidance/interval.npz": {
-   "tool": "tools/guidance_reference.py",
-   "sources": [
+    },
     {
      "repo": "kynkaat/guidance-interval",
      "version": "be70a2334f7ebf4e55fec981d518d5036a2ca19b",
      "runs": "fetched"
     }
    ],
-   "note": "Fetches and executes the paper's edm_sampler with guidance_interval, closed-form stand-in networks."
+   "note": "The walk-seeds mode records over each site's seeds (tools/recorded_references.py's record_case, inputs drawn again by the test from seeded torch): Diffusers' published AdaptiveProjectedGuidance projection on nearly parallel raw predictions at ordinary, 1e30 and 1e-20 scales and with branches of different scales, without a norm clip; NVlabs/edm2's edm_sampler autoguided with closed-form stand-in networks; and the paper's edm_sampler with guidance_interval. Each seed's float32 and float64 results."
+  },
+  "guidance/apg_seeds.npz": {
+   "tool": "tools/guidance_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2",
+     "runs": "fetched"
+    }
+   ],
+   "note": "The apg-seeds mode fetches and executes Diffusers' published AdaptiveProjectedGuidance guider (BaseGuidance.__init__/set_state, prepare_inputs, forward, _is_apg_enabled, normalized_guidance, MomentumBuffer) without importing diffusers, over each APG case's recorded seeds (tools/recorded_references.py's record_case): a seed's initial state and its float32 and float64 Euler walks. Its batching helper and output container are stand-ins."
   },
   "hf/deepseek-v2-tiny/logits.npy": {
    "tool": "tools/hf_reference_b.py",
@@ -1091,7 +1106,7 @@
     },
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -1245,6 +1260,10 @@
      "runs": "transformers"
     }
    ]
+  },
+  "hf/dream-tiny/padding.json": {
+   "tool": "tools/remote_code_reference.py",
+   "sources": [{"repo": "Dream-org/Dream-v0-Base-7B", "version": "6572adb5535263e4d1a337b56942ba48b6dee2a9", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.46.3", "runs": "transformers"}]
   },
   "hf/gemma-3n-audio-tiny/reference.npz": {
    "tool": "tools/audio_wrapper_reference.py",
@@ -1562,7 +1581,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -1573,7 +1592,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -1629,12 +1648,208 @@
     }
    ]
   },
+  "hf/gemma3n-native-tiny/logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    },
+    {
+     "repo": "huggingface/pytorch-image-models",
+     "version": "1.0.30",
+     "runs": "timm"
+    }
+   ],
+   "note": "float64 gemma3n-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma3n-native-tiny/pixel_gradient_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    },
+    {
+     "repo": "huggingface/pytorch-image-models",
+     "version": "1.0.30",
+     "runs": "timm"
+    }
+   ],
+   "note": "float64 gemma3n-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma3n-native-tiny/training_f64.json": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    },
+    {
+     "repo": "huggingface/pytorch-image-models",
+     "version": "1.0.30",
+     "runs": "timm"
+    }
+   ],
+   "note": "float64 gemma3n-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma3n-native-tiny/updated_logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    },
+    {
+     "repo": "huggingface/pytorch-image-models",
+     "version": "1.0.30",
+     "runs": "timm"
+    }
+   ],
+   "note": "float64 gemma3n-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma4-native-tiny/logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 gemma4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma4-native-tiny/pixel_gradient_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 gemma4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma4-native-tiny/training_f64.json": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 gemma4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/gemma4-native-tiny/updated_logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 gemma4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/llama4-native-tiny/logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 llama4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/llama4-native-tiny/pixel_gradient_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 llama4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/llama4-native-tiny/training_f64.json": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 llama4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/llama4-native-tiny/updated_logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 llama4-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/qwen35-native-tiny/logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 qwen35-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/qwen35-native-tiny/pixel_gradient_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 qwen35-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/qwen35-native-tiny/training_f64.json": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 qwen35-native-tiny: the reference's float64 twin over the stored encoding."
+  },
+  "hf/qwen35-native-tiny/updated_logits_f64.npy": {
+   "tool": "tools/multimodal_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "float64 qwen35-native-tiny: the reference's float64 twin over the stored encoding."
+  },
   "hf/gemma4-ple/logits.npy": {
    "tool": "tools/gemma4_tiny_reference.py",
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -1781,7 +1996,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -1791,7 +2006,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -1812,7 +2027,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -1823,7 +2038,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -1899,6 +2114,10 @@
    ],
    "note": "Dynamic remote import; fla kernels forced IEEE; compressed-tensors 0.17.1 supplies packed/decompressed weight inputs."
   },
+  "hf/kimi-k3-tiny/padding.json": {
+   "tool": "tools/kimi_k3_reference.py",
+   "sources": [{"repo": "moonshotai/Kimi-K3", "version": "f831ab66814297da540d832a5235f8e904f29d06", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
+  },
   "hf/kimi-linear-tiny/numerics.npz": {
    "tool": "tools/kimi_float64_reference.py",
    "sources": [
@@ -1947,6 +2166,30 @@
    ],
    "note": "Dynamic remote import; routing weights use unshifted scores (tools/kimi_linear_reference.py:33); fla kernels forced IEEE."
   },
+  "hf/kimi-linear-tiny/padding.json": {
+   "tool": "tools/kimi_linear_reference.py",
+   "sources": [{"repo": "moonshotai/Kimi-Linear-48B-A3B-Instruct", "version": "e1df551a447157d4658b573f9a695d57658590e9", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
+  },
+  "hf/llada-moe-tiny": {
+   "tool": "tools/llada_moe_reference.py",
+   "sources": [{"repo": "inclusionAI/LLaDA-MoE-7B-A1B-Base", "version": "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf", "runs": "fetched"}, {"repo": "inclusionAI/LLaDA-MoE-7B-A1B-Instruct", "version": "783d3467f108d28ac0a78d3e41af16ab05cabd8d", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
+  },
+  "hf/llada-moe-v2-tiny": {
+   "tool": "tools/llada_moe_reference.py",
+   "sources": [{"repo": "GSAI-ML/LLaDA-MoE-v2-30B-A3B-Base", "version": "2a513f7a4634e426b2ab030e6defb24001d0c847", "runs": "fetched"}, {"repo": "GSAI-ML/LLaDA-MoE-v2-30B-A3B-Instruct", "version": "97cfa32a580778df8d796c1faad72d22c8f8a6ba", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
+  },
+  "hf/llada2-tiny": {
+   "tool": "tools/llada_moe_reference.py",
+   "sources": [{"repo": "inclusionAI/LLaDA2.0-mini", "version": "dad945cac317da394b390f82c7b40691d8a881ed", "runs": "fetched"}, {"repo": "inclusionAI/LLaDA2.0-flash", "version": "744c3f8c6c8317d2377d6d16d8a3d4be2caef563", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
+  },
+  "hf/llada21-tiny": {
+   "tool": "tools/llada_moe_reference.py",
+   "sources": [{"repo": "inclusionAI/LLaDA2.1-mini", "version": "20e64e2ad21644d0e5248586ed9c942cdd45de0f", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/llada22-tiny": {
+   "tool": "tools/llada_moe_reference.py",
+   "sources": [{"repo": "inclusionAI/LLaDA2.2-flash", "version": "9b78da3f9149f1e239fb6d15f20a326fde574b9f", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
   "hf/llada-tiny/logits.npy": {
    "tool": "tools/remote_code_reference.py",
    "sources": [
@@ -1977,12 +2220,16 @@
     }
    ]
   },
+  "hf/llada-tiny/padding.json": {
+   "tool": "tools/remote_code_reference.py",
+   "sources": [{"repo": "GSAI-ML/LLaDA-8B-Base", "version": "0f2787f2d87eac5eed8a087d5ecd24277e6255b2", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.46.3", "runs": "transformers"}]
+  },
   "hf/llama-tiny/beam.npz": {
    "tool": "tools/beam_reference.py",
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -2192,22 +2439,22 @@
   },
   "hf/nemotron-h-moe-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
    "note": "--nemotron-h-only; ungated ReLU² experts, grouped sigmoid top-k with nonzero selection bias, and an ungated shared expert. Seed 2024."
   },
   "hf/nemotron-h-moe-tiny/logits_f64.npy": {
    "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
    "note": "The same fp32 weights widened through SSD, norms, attention, router type casts and head."
   },
   "hf/nemotron-h-moe-latent-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
    "note": "--nemotron-h-only; latent routed experts with unnormalized sigmoid weights and a full-width shared branch. Seed 2024."
   },
   "hf/nemotron-h-moe-latent-tiny/logits_f64.npy": {
    "tool": "tools/hf_reference.py",
-   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "sources": [{"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}],
    "note": "The same fp32 weights widened through SSD, norms, attention, router type casts and head."
   },
   "hf/nemotron-h-tiny/logits.npy": {
@@ -2215,7 +2462,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -2226,7 +2473,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -2292,7 +2539,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -2303,7 +2550,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -2390,7 +2637,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -2456,7 +2703,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -2466,7 +2713,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -2476,7 +2723,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -2758,8 +3005,8 @@
    ],
    "note": "indexer_loss.npz: NumPy transcription documented at tools/indexer_reference.py:12; meta.json present. maxtext.npz: executes MLA.calculate_indexer_loss and Indexer.generate_mask fetched at 538fe7a3 (EPS and DEFAULT_MASK_VALUE from the same commit) under JAX behind Indexer.__call__'s masking and jax.lax.top_k, in float32 and float64."
   },
-  "kda/torch.json": {
-   "note": "Torch 2.14.1+cpu executes the published fp32 chunk/recurrent KDA bodies and l2norm, with only optional hub-kernel decorators removed. Ragged tokens, vector decay, nonzero initial state, outputs, final state and all six operand gradients.",
+  "kda/recorded_rules.npz": {
+   "note": "Torch 2.14.1+cpu executes the published chunk/recurrent KDA bodies and l2norm, with only optional hub-kernel decorators removed, over check 1's seeds in float32 and in float64 (its float32 casts widened). Ragged tokens, vector decay, nonzero initial state, outputs, final state and all six operand gradients; check 1's evidence of each, summarized.",
    "sources": [{"repo": "huggingface/transformers", "version": "93c8b7b485963a10800c91f55304db6be211c2bd", "runs": "fetched"}, {"repo": "pytorch/pytorch", "version": "2.14.1", "runs": "torch"}],
    "tool": "tools/kda_reference.py"
   },
@@ -2921,7 +3168,7 @@
     },
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     },
     {
@@ -3355,22 +3602,6 @@
    ],
    "note": "TRL's own DPOTrainer._compute_loss with its DPOConfig defaults, in fp32 and float64."
   },
-  "rl/flow_transition.npz": {
-   "tool": "tools/parity_flow_grpo.py",
-   "sources": [
-    {
-     "repo": "yifan123/flow_grpo",
-     "version": "879042cf5707f8b90daa98d147d7deac2317c5da",
-     "runs": "fetched"
-    },
-    {
-     "repo": "pytorch/pytorch",
-     "version": "2.14.0+cpu",
-     "runs": "torch"
-    }
-   ],
-   "note": "Loads pinned author source via importlib; conditional_kl calls torch.distributions directly; diffusers 0.34.0 supplies schedule inputs."
-  },
   "rl/grpo.npz": {
    "tool": "tools/parity_grpo.py",
    "sources": [
@@ -3484,7 +3715,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -3494,10 +3725,32 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
+  },
+  "t5/tiny-seeds.npz": {
+   "tool": "tools/t5_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The seeds mode runs transformers' encoder on the committed t5/tiny checkpoint over check 1's seeds (tools/recorded_references.py's record_case, summary): each seed's drawn ids, the fp32 last hidden state's evidence and its float64 truth's sketch, built and run inside tools/torch_precision.py's float64."
+  },
+  "t5/tiny-umt5-seeds.npz": {
+   "tool": "tools/t5_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The seeds mode runs transformers' encoder on the committed t5/tiny-umt5 checkpoint over check 1's seeds (tools/recorded_references.py's record_case, summary): each seed's drawn ids, the fp32 last hidden state's evidence and its float64 truth's sketch, built and run inside tools/torch_precision.py's float64."
   },
   "tiny_diffusers.tar.xz": {
    "tool": "tools/diffusers_pipeline_reference.py",
@@ -3551,7 +3804,7 @@
      "runs": "torch"
     }
    ],
-   "note": "OneCycleLR, ExponentialLR and CosineAnnealingLR values over their steps, and a grouped Adam run with coupled weight decay, a beta1 cycle and a clamp, in float32 on CPU."
+   "note": "OneCycleLR, ExponentialLR and CosineAnnealingLR values over their steps, and a grouped Adam run with coupled weight decay, a beta1 cycle and a clamp, in float64 on float32 initial parameters and gradients, on CPU."
   },
   "tread": {
    "tool": "tools/tread_reference.py",
@@ -3585,7 +3838,7 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
+     "version": "0.39.0",
      "runs": "diffusers"
     },
     {
@@ -3601,7 +3854,7 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
+     "version": "0.39.0",
      "runs": "diffusers"
     },
     {
@@ -3617,7 +3870,7 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
+     "version": "0.39.0",
      "runs": "diffusers"
     }
    ]
@@ -3628,12 +3881,12 @@
     {
      "repo": "huggingface/diffusers",
      "version": "0.34.0",
-     "runs": "diffusers"
+     "runs": "diffusers-0.34"
     },
     {
      "repo": "huggingface/transformers",
      "version": "5.16.1",
-     "runs": "transformers"
+     "runs": "diffusers-0.34"
     }
    ],
    "note": "Includes UMT5 prompt states and pipeline walks (final latents and decoded frames), each in float32 as the pipeline runs and in float64 (diffusers_wan_reference.float64), and float32/float64 UniPC scheduler replays."
@@ -3644,7 +3897,7 @@
     {
      "repo": "huggingface/diffusers",
      "version": "0.34.0",
-     "runs": "diffusers"
+     "runs": "diffusers-0.34"
     }
    ],
    "note": "Float64 oracle widens upstream float32 casts, tools/diffusers_wan_reference.py:95."
@@ -3654,7 +3907,7 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
+     "version": "0.39.0",
      "runs": "diffusers"
     }
    ]
@@ -3664,13 +3917,13 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
+     "version": "0.39.0",
      "runs": "diffusers"
     }
    ],
    "note": "Loads the saved Wan VAE fixture in bfloat16 and records posterior/decode and input gradients."
   },
-  "weighting/weights.npz": {
+  "weighting/recorded_weights.npz": {
    "tool": "tools/weighting_reference.py",
    "sources": [
     {
@@ -3689,7 +3942,7 @@
      "runs": "torch"
     }
    ],
-   "note": "Each repo's own GaussianDiffusion.training_losses at every step; the beta tables in it are inputs."
+   "note": "Each repo's own GaussianDiffusion.training_losses at every step of beta tables check 1 draws (table_inputs), in fp32 and with float64 kept; check 1's evidence of each case over its seeds, summarized."
   },
   "z_image_source.tar.xz": {
    "tool": "tools/diffusers_z_image_reference.py",
@@ -3832,6 +4085,10 @@
    "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
   },
   "hf/ouro-tiny/padded_logits_f64.npy": {
+   "tool": "tools/ouro_reference.py",
+   "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
+  },
+  "hf/ouro-tiny/padding.json": {
    "tool": "tools/ouro_reference.py",
    "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
   },

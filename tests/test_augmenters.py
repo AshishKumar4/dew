@@ -20,38 +20,27 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
-from absl import flags
+from data_support import CAPTION_TEMPLATES, FLIP_JITTER, keep_captions, parse_grain_flags
 
-# grain's worker processes read absl flags; a test that never ran absl.app
-# would trip UnparsedFlagAccessError at any worker_count > 0.
-if not flags.FLAGS.is_parsed():
-    flags.FLAGS.mark_as_parsed()
-
-from dew.config.data import Augment, ImageData, loader
-from dew.data import Loading, Memory, images
+from dew.data import Loading, Memory, images, presets
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.images import EncodeCaptions
 from dew.data.sources.codec import pack_dict_of_byte_arrays, unpack_dict_of_byte_arrays
+
+parse_grain_flags()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 LABELS = ("pink rose", "yellow tulip", "white lily", "blue orchid")
 SCALE = 48
 DRAWS = 32
-def _write_labels(tmp_path):
-    labels = tmp_path / "labels.txt"
-    labels.write_text("\n".join(LABELS) + "\n")
-    return labels
 
 
 def _synthetic_image(seed=0):
     return np.random.RandomState(seed).randint(0, 256, (37, 53, 3), dtype=np.uint8)
 
 
-CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
-"""More than one, so a test can see which the record's rng drew."""
-
-FLIP_JITTER = Augment(flip=True, jitter=True, backend="host")
 
 
 def _element_for(kind, seed=0):
@@ -62,19 +51,23 @@ def _element_for(kind, seed=0):
     return pack_dict_of_byte_arrays({"jpg": encoded, "txt": b"a yellow tulip"})
 
 
-def _spec(kind, augment=FLIP_JITTER):
-    """Labelled pixels or encoded ArrayRecord bytes through the host recipe."""
-    return ImageData(source=Memory([_element_for(kind)] * DRAWS), image_size=SCALE,
-                     caption_templates=CAPTION_TEMPLATES if kind == "tfds" else (),
-                     classes=LABELS if kind == "tfds" else (),
-                     validation=None,
-                     augment=augment)
+def _spec(kind):
+    """Labelled pixels, captioned from CAPTION_TEMPLATES by their label, or encoded ArrayRecord bytes
+    captioned by their own text: `_read`'s rows and caption."""
+    rows = [_element_for(kind)] * DRAWS
+    if kind == "tfds":
+        return {"rows": rows, "caption": images.caption(templates=CAPTION_TEMPLATES, classes=LABELS)}
+    return {"rows": rows}
 
 
-def _read(spec, *, seed=0, batch=8):
-    data = loader(spec, batch=batch, read="indexed", seed=seed,
-                  loading=Loading(workers=0, threads=1, read_buffer=2),
-                  host=(EncodeCaptions(lambda captions: {"caption": np.asarray(captions)}),))
+def _read(rows, *, augment=FLIP_JITTER, caption=None, staging_size=None, seed=0, batch=8):
+    """An epoch of `rows` resized to SCALE pixels, staged at `staging_size` where given, captioned
+    by `caption`, else by their own caption or text, and through the host `augment` steps, read by
+    index in a run's order under `seed`, a record at a time with its caption as words."""
+    chain = Memory(rows).shuffle(seed).repeat().pipe(
+        presets.images, SCALE, batch=batch, augment=augment, staging_size=staging_size, rejects=False,
+        caption=caption or images.caption(), host=(EncodeCaptions(keep_captions),))
+    data = compile(chain, read="indexed", seed=seed, loading=Loading(workers=0, threads=1, read_buffer=2))
     stream = data.train(DataPartition())
     try:
         return [{name: column[index] for name, column in row.items()}
@@ -102,9 +95,8 @@ def _resized(kind, element):
 # torchvision is gone from the import and construction paths
 # ---------------------------------------------------------------------------------
 
-def test_module_imports_and_constructs_without_torchvision(tmp_path):
+def test_module_imports_and_constructs_without_torchvision():
     """A base install without torchvision imports, constructs and augments."""
-    labels_file = _write_labels(tmp_path)
     script = "\n".join(
         [
             "import sys",
@@ -112,12 +104,12 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
             "sys.modules['transformers'] = None",
             "",
             "import numpy as np",
-            "from dew.config.data import ImageData",
-            "from dew.data import images",
+            "from dew.data import Memory, images, presets",
             "",
-            "labels = sys.argv[1]",
             "image = np.zeros((9, 11, 3), dtype=np.uint8)",
-            "ImageData(source=(), labels=labels)",
+            "steps = (images.Flip(), images.ColorJitter())",
+            "presets.images(Memory([{'image': image}]), 8, batch=1, augment=steps,",
+            "               caption=images.caption(templates=('a {}',), classes=('rose',)))",
             "for stage in (images.Flip(), images.ColorJitter()):",
             "    out = stage.random_map({'image': image}, np.random.default_rng(0))['image']",
             "    assert out.dtype == np.uint8 and out.shape == image.shape",
@@ -126,7 +118,7 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
     )
     env = dict(os.environ, PYTHONPATH=str(REPO_ROOT / "src"), JAX_PLATFORMS="cpu")
     result = subprocess.run(
-        [sys.executable, "-c", script, str(labels_file)],
+        [sys.executable, "-c", script],
         capture_output=True, text=True, env=env, cwd=REPO_ROOT,
     )
     assert result.returncode == 0, result.stderr
@@ -164,16 +156,16 @@ _READERS = "\n".join([
     "import dataclasses, io, sys",
     "import numpy as np",
     "from PIL import Image",
-    "from dew.config.data import ImageData, loader",
-    "from dew.data import Loading",
+    "from dew.data import Loading, Memory, presets",
+    "from dew.data.compile import compile",
     "from dew.data.dataset import DataPartition",
     "buffer = io.BytesIO()",
     "Image.fromarray(np.arange(40 * 40 * 3, dtype=np.uint8).reshape(40, 40, 3)).save(",
     "    buffer, format='PNG')",
     "PNG = buffer.getvalue()",
     "",
-    "SPEC = ImageData(source=[{'image': PNG, 'caption': 'a picture'}] * 64, image_size=16,",
-    "                 augment=None, validation=None)",
+    "CHAIN = Memory([{'image': PNG, 'caption': 'a picture'}] * 64).shuffle(0).repeat().pipe(",
+    "    presets.images, 16, batch=32, rejects=False)",
 ])
 
 
@@ -181,7 +173,7 @@ def test_opening_an_image_loader_imports_opencv_before_its_readers_start():
     _fresh_process("\n".join([
         _READERS,
         "loading = Loading(workers=0, threads=32, read_buffer=64)",
-        "data = loader(SPEC, batch=32, read='indexed', loading=loading)",
+        "data = compile(CHAIN, read='indexed', loading=loading)",
         "batch = next(iter(data.train(DataPartition())))",
         "assert batch['image'].shape == (32, 16, 16, 3)",
         "print('ok')",
@@ -195,7 +187,7 @@ def test_opening_an_image_loader_imports_opencv_before_its_readers_start():
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
 def test_none_mode_returns_the_resized_image_bit_identical(kind):
     element = _element_for(kind)
-    for out in _read(_spec(kind, None)):
+    for out in _read(**_spec(kind), augment=False):
         assert out["image"].dtype == np.uint8
         np.testing.assert_array_equal(out["image"], _resized(kind, element))
         if kind == "gcs":
@@ -210,7 +202,7 @@ def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind):
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
     outcomes = set()
-    for row in _read(_spec(kind, Augment(flip=True, jitter=False, backend="host"))):
+    for row in _read(**_spec(kind), augment=images.Flip()):
         out = row["image"]
         assert out.dtype == np.uint8
         assert out.shape == base.shape
@@ -225,7 +217,7 @@ def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind):
     element = _element_for(kind)
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
-    outputs = [row["image"] for row in _read(_spec(kind))]
+    outputs = [row["image"] for row in _read(**_spec(kind))]
 
     for out in outputs:
         assert out.dtype == np.uint8  # ColorJitter must not promote to float
@@ -248,15 +240,12 @@ def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind):
 def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind):
     """The same record must get the same augmentation and the same caption
     whatever the worker or process count, and neither global RNG may move."""
-    first = _spec(kind)
-    other = _spec(kind)
-
     numpy_state = np.random.get_state()[1]
     python_state = random.getstate()
-    one = _read(first, seed=7)
+    one = _read(**_spec(kind), seed=7)
     # an unrelated record in between must not disturb the next one
-    _read(other, seed=999)
-    two = _read(other, seed=7)
+    _read(**_spec(kind), seed=999)
+    two = _read(**_spec(kind), seed=7)
 
     for left, right in zip(one, two, strict=True):
         np.testing.assert_array_equal(left["image"], right["image"])
@@ -267,7 +256,7 @@ def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind):
 
 def test_a_record_with_no_caption_keeps_an_empty_host_caption():
     row = {"image": _synthetic_image(), "url": "x"}
-    out = _read(ImageData(source=Memory([row]), image_size=SCALE, augment=None, validation=None), batch=1)[0]
+    out = _read([row], augment=False, batch=1)[0]
     assert out["caption"] == "" and out["url"] == "x"
     np.testing.assert_array_equal(out["image"], images.resize_image(row["image"], SCALE))
 
@@ -276,8 +265,7 @@ def test_a_hub_record_captions_from_the_record_and_reads_no_label_file():
     """The same image transform serves a hub dataset: what changes is where the
     caption comes from, and that a caption dataset has no class index."""
     element = {"image": _synthetic_image(0), "caption": "a yellow tulip"}
-    out = _read(ImageData(source=Memory([element]), image_size=SCALE, augment=None,
-                          validation=None), batch=1)[0]
+    out = _read([element], augment=False, batch=1)[0]
 
     np.testing.assert_array_equal(
         out["image"], cv2.resize(element["image"], (SCALE, SCALE),
@@ -291,14 +279,9 @@ def test_a_host_crop_reaches_the_output_size_without_a_flip_or_a_jitter():
     not a flip or a jitter rides along, and a crop scale at equal sizes still crops."""
     image = np.random.default_rng(0).integers(0, 256, (2 * SCALE, 2 * SCALE, 3), dtype=np.uint8)
     for crop in ((1.0, 1.0), (0.8, 1.0)):
-        spec = ImageData(source=Memory([{"image": image}]), image_size=SCALE, staging_size=2 * SCALE,
-                         validation=None,
-                         augment=Augment(flip=False, jitter=False, crop_scale=crop, backend="host"))
-        out = _read(spec, batch=1)[0]
+        out = _read([{"image": image}], augment=images.RandomCrop(SCALE, scale=crop), staging_size=2 * SCALE,
+                    batch=1)[0]
         assert out["image"].shape == (SCALE, SCALE, 3)
     small = image[:SCALE, :SCALE]
-    spec = ImageData(source=Memory([{"image": small}]), image_size=SCALE,
-                     validation=None,
-                     augment=Augment(flip=False, jitter=False, crop_scale=(0.5, 0.5), backend="host"))
-    cropped = _read(spec, batch=1)[0]
+    cropped = _read([{"image": small}], augment=images.RandomCrop(SCALE, scale=(0.5, 0.5)), batch=1)[0]
     assert cropped["image"].shape == (SCALE, SCALE, 3) and not np.array_equal(cropped["image"], small)

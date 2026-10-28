@@ -18,7 +18,7 @@ in two environments:
   and no other adapter state, and writes tests/fixtures/lora_exports/<case>.npz:
   the inputs, the adapted and the merged (PEFT's `merge_and_unload`,
   Diffusers' `fuse_lora`) outputs in float32 and float64
-  (`diffusers_wan_reference.float64`) and the output without the adapter.
+  (`torch_precision.float64`) and the output without the adapter.
 
 The decoders are tests/fixtures/hf/llama-tiny under PEFT's `PeftModel`;
 the pipelines are the tiny SD (its PyTorch UNet), FLUX and SD3 sources
@@ -291,6 +291,7 @@ def consume() -> None:
     import transformers
 
     from tools.diffusers_reference_helpers import restore_transformers_names
+    from tools.reference_source import saved_fixture
 
     # Before Diffusers' pipelines: the transformers names they import.
     restore_transformers_names()
@@ -311,8 +312,7 @@ def consume() -> None:
         meta = {"peft": peft.__version__,
                 "transformers": transformers.__version__, "diffusers": diffusers.__version__,
                 "torch": torch.__version__}
-        arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-        np.savez_compressed(FIXTURES / f"{name}.npz", **arrays)
+        saved_fixture(FIXTURES / f"{name}.npz", arrays, meta)
         gap = float(np.abs(arrays["fp32.adapted"] - arrays["fp64.adapted"]).max())
         moved_by = float(np.abs(arrays["fp32.adapted"] - arrays["fp32.base"]).max())
         print(f"{name}: fp32 off float64 by {gap:.3g}, the adapter moves the output by {moved_by:.3g}")

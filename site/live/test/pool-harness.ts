@@ -130,6 +130,13 @@ export default {
 			await pool.configure(generation);
 			return Response.json({ desired: (await pool.left()).pool!.desired.snapshot.id });
 		}
+		if (scenario === 'full') {
+			await pool.configure(generation);
+			await pool.runAlarm();
+			const hosts: string[] = [];
+			while ((await pool.image()) !== null) hosts.push(await pool.allocate(`session-${hosts.length}`, 'snapshot'));
+			return Response.json({ first: hosts[0], image: await pool.image(), held: await pool.allocated('session-0'), fresh: await pool.allocated('session-new') });
+		}
 		await pool.configure(generation);
 		const before = await pool.image();
 		await pool.runAlarm();

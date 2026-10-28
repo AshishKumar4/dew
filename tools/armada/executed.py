@@ -7,6 +7,10 @@ pytest's collection's own listings are not, as what they find is recorded as it 
 is wrapped so that a path it opens relative to a directory descriptor is placed (`followed.opening`).
 Hidden directories (the checkout's .git and environments) and compiled bytecode are never inputs.
 
+A native reader raises no audit event (Rust's tokenizers and safetensors, tensorstore, a child's C
+code): the data files a task's processes open are its supervisor's to see (`watched`, held by
+`ci.py`'s `tested` around the whole run), each the input of every file the task ran.
+
 It counts a file once per test file through sys.monitoring's function-start event, disabled after
 the first and restarted at each test file, so it costs about nothing. What collection and
 session-scoped fixtures execute serves every test file after them, so it joins every file's record.
@@ -33,8 +37,8 @@ from pathlib import Path
 
 import followed
 import pytest
-from ci import MARKS
 from followed import CHILDREN, checkout, reads_backend
+from session import DURATIONS, MARKS
 
 TOOL = 3
 """sys.monitoring's tool ids 0-2 and 5 are the debugger's, coverage's, the profiler's and the optimizer's."""
@@ -57,6 +61,11 @@ everywhere: set[str] = set()
 """What session-scoped fixtures read, and module bodies before collection."""
 readers: list[set[str]] = []
 """Where a read is kept. conftest.py's reads are every test's, so they are left out."""
+collected: dict[str, int] = {}
+"""Each test file's tests as collection found them, before any hook chose among them; a module of none
+is 0."""
+deselected: dict[str, int] = {}
+"""Each test file's tests the selection set aside, as pytest reports it (`pytest_deselected`)."""
 starts: dict[str, int] = {}
 """How many followed children each test file's own process started (`followed.start`)."""
 children = Path(tempfile.mkdtemp(prefix="dew-children-"))
@@ -102,7 +111,9 @@ def conftest(name: str) -> bool:
 def audited(event, args):
     if event in followed.READS:
         read = followed.read(event, args, root)
-        if read is not None:
+        # The durations record is split.py's, which cuts a split file from it: the file's own entries are its
+        # groups' input (ci.py's `cache_key`), and no other file's.
+        if read is not None and read != str(DURATIONS):
             current[-1].add(read)
         return
     kind = followed.start(event, args, str(children)) if running else None
@@ -122,6 +133,8 @@ os.environ |= {CHILDREN: str(children), "DEW_EXECUTED_ROOT": root,
                "DEW_EXECUTED_FOLLOWER": str(Path(followed.__file__).resolve()),
                "DEW_EXECUTED_SHARE": os.environ.get(followed.FRACTION, "")}
 followed.opening(lambda read: current[-1].add(read), root)
+
+
 sys.monitoring.use_tool_id(TOOL, "dew-test-cache")
 sys.monitoring.register_callback(TOOL, sys.monitoring.events.PY_START, started)
 sys.monitoring.set_events(TOOL, sys.monitoring.events.PY_START)
@@ -156,6 +169,27 @@ def pytest_make_collect_report(collector):
         yield
     finally:
         readers.pop()
+
+
+def pytest_collectreport(report):
+    if report.passed and report.nodeid.endswith(".py"):
+        collected.setdefault(report.nodeid, 0)
+
+
+def tally(counts: dict[str, int], items) -> None:
+    """Each item's test file counted once more in `counts`."""
+    for item in items:
+        name = item.nodeid.split("::")[0]
+        counts[name] = counts.get(name, 0) + 1
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items):
+    tally(collected, items)
+
+
+def pytest_deselected(items):
+    tally(deselected, items)
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -193,6 +227,10 @@ def pytest_sessionfinish(session):
                                               | child["reads"]),
                               "peak": peak, "shares": child["shares"], "pools": child["pools"]}
         Path(out).write_text(json.dumps(recorded))
+    # Each file's collection, which accounts for a file whose every test the selection set aside (`ci.py`).
+    if counted := os.environ.get("DEW_COLLECTED"):
+        Path(counted).write_text(json.dumps({name: {"collected": count, "deselected": deselected.get(name, 0)}
+                                             for name, count in collected.items()}))
 
 
 def gpu_peak() -> int | None:

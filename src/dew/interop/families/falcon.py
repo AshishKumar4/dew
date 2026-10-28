@@ -3,11 +3,12 @@
 from collections.abc import Mapping
 from functools import partial
 
-from dew import records
+from dew import _records
 from dew.interop.decoder_parts import (
+    MEGATRON_NAMES,
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
-    Renames,
     base_config,
     decoder_tensors,
     grouped_qkv,
@@ -33,36 +34,25 @@ def _falcon_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         refuse('parallel_attn', 'Falcon-7B sums attention and MLP before residual dropout')
     if hf.get('hidden_dropout', 0.):
         refuse('hidden_dropout', 'Falcon drops the summed parallel branch; Falcon-7B uses zero dropout')
-    hidden = records.integer(hf.get('hidden_size', 4544), 'hidden_size')
-    heads = records.integer(hf.get('num_attention_heads', 71), 'num_attention_heads')
-    activation = records.text(hf.get('activation', 'gelu') or 'gelu', 'activation')
+    hidden = _records.integer(hf.get('hidden_size', 4544), 'hidden_size')
+    heads = _records.integer(hf.get('num_attention_heads', 71), 'num_attention_heads')
+    activation = _records.text(hf.get('activation', 'gelu') or 'gelu', 'activation')
     mlp = ungated_mlp(activation, ('gelu', 'gelu_new', 'relu'), 'activation', 'Falcon')
     config = base_config({**hf, 'hidden_size': hidden, 'num_attention_heads': heads,
                            'num_key_value_heads': 1 if hf.get('multi_query', True) else heads,
                            'intermediate_size': hf.get('ffn_hidden_size') or 4 * hidden,
-                           'hidden_act': 'silu'}, used, reads=frozenset(), tie_embeddings=True)
+                           'hidden_act': 'silu'}, used, rope=PLAIN_SPELLING, reads=frozenset(),
+                         tie_embeddings=True)
     config.update({
         'mlp': mlp, 'mlp_bias': bool(hf.get('bias', False)),
         'attention_bias': bool(hf.get('bias', False)),
         'norm_type': 'layer', 'norm_bias': True, 'scale_after_cast': False,
-        'norm_eps': records.number(hf.get('layer_norm_epsilon', 1e-5) or 1e-5, 'layer_norm_epsilon'),
+        'norm_eps': _records.number(hf.get('layer_norm_epsilon', 1e-5) or 1e-5, 'layer_norm_epsilon'),
         'parallel_residual': True, 'shared_parallel_norm': True,
-        'dropout_rate': records.number(hf.get('hidden_dropout', 0.) or 0., 'hidden_dropout'),
-        'attention_dropout_rate': records.number(hf.get('attention_dropout', 0.) or 0., 'attention_dropout'),
+        'dropout_rate': _records.number(hf.get('hidden_dropout', 0.) or 0., 'hidden_dropout'),
+        'attention_dropout_rate': _records.number(hf.get('attention_dropout', 0.) or 0., 'attention_dropout'),
     })
     return config
-
-
-_FALCON_NAMES: Renames = (
-    ('transformer.word_embeddings', 'model.embed_tokens'), ('transformer.ln_f', 'model.norm'),
-    ('transformer.h', 'model.layers'), ('self_attention.dense', 'self_attn.o_proj'),
-    ('mlp.dense_h_to_4h', 'mlp.up_proj'), ('mlp.dense_4h_to_h', 'mlp.down_proj'))
-
-
-def _falcon_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    if '.self_attention.query_key_value.' in name:
-        return None
-    return renamed_path(_FALCON_NAMES, name, config)
 
 
 def _falcon_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -83,8 +73,9 @@ FALCON = DecoderFamily(
     lambda fields: fields.shared_parallel_norm and fields.mlp == 'gelu_exact'
                    and fields.partial_rotary_factor is None,
     'falcon', 'FalconForCausalLM', _falcon_export,
-    weight_path=_falcon_path, export_path=partial(renamed_name, _FALCON_NAMES),
+    weight_path=partial(renamed_path, MEGATRON_NAMES), export_path=partial(renamed_name, MEGATRON_NAMES),
     packed=grouped_qkv('.self_attention.query_key_value'), export_weights=decoder_tensors,
     preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
+    defaults={'max_position_embeddings': 2048},
 )

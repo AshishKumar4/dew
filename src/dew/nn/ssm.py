@@ -7,6 +7,9 @@ Spatial-Mamba's, and the two together are the SSM mixer of `ModulatedBlock`.
 """
 
 
+import functools
+import operator
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -17,8 +20,28 @@ from dew.nn.dense import Dense
 
 from .conv import Conv
 from .flops import conv_flops, projection_flops
-from .precision import at_least_fp32
+from .inputs import sequence_blocks
+from .precision import at_least_fp32, float32_dot_general, float32_einsum
 
+
+def affine_spans(left, right, multiply=operator.mul, add=operator.add):
+    """Two consecutive spans of the affine recurrence `h_t = a_t h_(t-1) + b_t` as one,
+    `(a1, b1) then (a2, b2)` being `(a1 a2, a2 b1 + b2)`: the combine every associative scan of a
+    linear recurrence runs (Mamba's `combine_fn`, S5's), over native real or complex arrays, or
+    over real `(re, im)` pairs with `multiply` and `add` their complex product and sum
+    (`_pair_product`, `_pair_sum`)."""
+    (a1, b1), (a2, b2) = left, right
+    return multiply(a1, a2), add(multiply(a2, b1), b2)
+
+
+def _pair_product(x, y):
+    """The complex product of two real `(re, im)` pairs."""
+    return x[0] * y[0] - x[1] * y[1], x[0] * y[1] + x[1] * y[0]
+
+
+def _pair_sum(x, y):
+    """The complex sum of two real `(re, im)` pairs."""
+    return x[0] + y[0], x[1] + y[1]
 
 def hippo_a_imag_init(key, shape, dtype=jnp.float32):
     """S4D-Lin imaginary part: A_imag_n = pi * n."""
@@ -56,16 +79,11 @@ def _carried(pole: jax.Array, last: jax.Array) -> jax.Array:
     for the first chunk, then `e_(c-1)` of `e_c = pole * e_(c-1) + last_c`,
     run by `associative_scan` over the chunks' own last states `last`
     `[B, 2, C, N]` with `pole` the `[N]` complex power that spans one chunk."""
-    def combine(earlier, later):
-        a_re, a_im, b_re, b_im = earlier
-        c_re, c_im, d_re, d_im = later
-        return (a_re * c_re - a_im * c_im, a_re * c_im + a_im * c_re,
-                c_re * b_re - c_im * b_im + d_re, c_re * b_im + c_im * b_re + d_im)
-
     chunks = last.shape[2]
     span = (jnp.broadcast_to(pole.real, (1, chunks, pole.shape[0])),
             jnp.broadcast_to(pole.imag, (1, chunks, pole.shape[0])))
-    *_, end_re, end_im = jax.lax.associative_scan(combine, (*span, last[:, 0], last[:, 1]), axis=1)
+    combine = functools.partial(affine_spans, multiply=_pair_product, add=_pair_sum)
+    _, (end_re, end_im) = jax.lax.associative_scan(combine, (span, (last[:, 0], last[:, 1])), axis=1)
     ends = jnp.stack([end_re, end_im], axis=1)
     return jnp.pad(ends[:, :, :-1], ((0, 0), (0, 0), (1, 0), (0, 0)))
 
@@ -90,17 +108,17 @@ def diagonal_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int = SCAN_CH
     chunks = -(-steps // length)
     highest = jax.lax.Precision.HIGHEST
     powers = _powers(pole, length)
-    blocks = jnp.pad(inputs, ((0, 0), (0, chunks * length - steps), (0, 0)))
-    blocks = blocks.reshape(batch, chunks, length, 2, states).transpose(0, 1, 3, 2, 4)
+    blocks = sequence_blocks(inputs, length).reshape(batch, chunks, length, 2, states)
+    blocks = blocks.transpose(0, 1, 3, 2, 4)
     # Entry (k, j) is pole^(k - j) where k >= j, and zero above the diagonal:
     # a one-hot product, exact at full precision, whose transpose is a
     # product too rather than a scatter or a stack of shifted copies.
     lag = np.arange(length)[:, None] - np.arange(length)[None, :]
     picks = (lag[..., None] == np.arange(length)).astype(np.float32)
-    within_re, within_im = (jnp.einsum("kjt,tn->kjn", picks, part, precision=highest)
+    within_re, within_im = (float32_einsum("kjt,tn->kjn", picks, part, precision=highest)
                             for part in (powers[:length].real, powers[:length].imag))
-    local = jnp.einsum("kjn,bcjn->bckn", _complex_blocks(within_re, within_im),
-                       blocks.reshape(batch, chunks, 2 * length, states), precision=highest)
+    local = float32_einsum("kjn,bcjn->bckn", _complex_blocks(within_re, within_im),
+                           blocks.reshape(batch, chunks, 2 * length, states), precision=highest)
     local = local.reshape(batch, chunks, 2, length, states)
     if chunks > 1:
         carry = _carried(powers[-1], local[:, :, :, -1].transpose(0, 2, 1, 3))[:, :, :, None]
@@ -219,14 +237,14 @@ def _chunked_directions(u: jax.Array, operators, reversed_: tuple[bool, ...], dt
     u = u.astype(compute_dtype(dtype))
     width = 2 * operators[0][0].shape[0]
     stacked = jnp.concatenate([jnp.concatenate([b.real, b.imag]) for _, b, _, _ in operators])
-    projected = jnp.einsum('bsf,nf->bsn', u, stacked)
+    projected = float32_einsum('bsf,nf->bsn', u, stacked)
     out = []
     for index, ((pole, _, c, d), backwards) in enumerate(zip(operators, reversed_, strict=True)):
         v = projected[..., index * width:(index + 1) * width]
         x = (jnp.flip(diagonal_recurrence(pole, jnp.flip(v, axis=1)), axis=1) if backwards
              else diagonal_recurrence(pole, v))
         # The k-th output is Re(C x_k), the real form's [C_re, -C_im] product.
-        y = jnp.einsum('bsn,fn->bsf', x, jnp.concatenate([c.real, -c.imag], -1)) + d * u
+        y = float32_einsum('bsn,fn->bsf', x, jnp.concatenate([c.real, -c.imag], -1)) + d * u
         out.append(y.astype(dtype))
     return out
 
@@ -241,8 +259,8 @@ def _scanned_directions(u: jax.Array, operators, reversed_: tuple[bool, ...], dt
         read = jnp.flip(u, axis=1) if backwards else u
         read = read.astype(compute_dtype(dtype))
         bu = jnp.einsum('bsf,nf->bsn', read, b)
-        _, x = jax.lax.associative_scan(lambda e1, e2: (e1[0] * e2[0], e2[0] * e1[1] + e2[1]),
-                                        (jnp.broadcast_to(pole[None, None, :], bu.shape), bu), axis=1)
+        _, x = jax.lax.associative_scan(affine_spans, (jnp.broadcast_to(pole[None, None, :], bu.shape), bu),
+                                        axis=1)
         y = (jnp.einsum('fn,bsn->bsf', c, x).real + d[None, None, :] * read).astype(dtype)
         out.append(jnp.flip(y, axis=1) if backwards else y)
     return out
@@ -273,7 +291,8 @@ class BidirectionalS5Layer(nn.Module):
                           for name in ("s5_forward", "s5_backward"))
         y_fwd, y_bwd = _directions(u, operators, (False, True), dtype)
         y_cat = jnp.concatenate([y_fwd, y_bwd], axis=-1)  # [B, S, 2F]
-        return Dense(features=self.features, dtype=self.dtype, name="out_proj")(y_cat)
+        return Dense(features=self.features, dtype=self.dtype, name="out_proj",
+                     dot_general=float32_dot_general)(y_cat)
 
 
 class SpatialFusionConv(nn.Module):

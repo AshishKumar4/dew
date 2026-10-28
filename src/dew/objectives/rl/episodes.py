@@ -1,4 +1,4 @@
-"""Tool episodes collected outside jit and projected into ordinary GRPO rows.
+"""Tool episodes collected outside jit, each a session the rollout scheduler packs.
 
 Execution belongs to a user-supplied, context-managed environment. Dew has
 no default executor. Each model call retains its exact context and sampled
@@ -8,7 +8,6 @@ likelihoods; observations are inputs to later calls and never loss targets.
 from __future__ import annotations
 
 import hashlib
-import math
 from asyncio import CancelledError as AsyncCancelledError
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import CancelledError
@@ -21,26 +20,21 @@ from uuid import uuid4
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental import multihost_utils
 
-from dew.coordination import PeerFailure, agree_process_phase, agreed, broadcast_from_process_zero
-from dew.data.dataset import DataPartition
-from dew.nn.inputs import ModelInputs, local_rows, mesh_of
-from dew.objectives.base import Batch, Variables
-from dew.sampling.text import Generation, Sampling
-from dew.training.state import TrainState
-
-from .sessions import (
-    OLD_LOG_PROBS_KEY,
-    Call,
-    Session,
-    Status,
-    Transcript,
-    check_credit,
-    json_objects,
-    pack,
-    sampled_values,
+from dew._coordination import (
+    PeerFailure,
+    agree_process_phase,
+    agreed,
+    agreed_same,
+    broadcast_from_process_zero,
 )
+from dew.batch import Variables, token_id
+from dew.data.dataset import DataPartition
+from dew.inference.rollouts import Draw
+from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows
+from dew.sampling.text import Generation, Sampling
+
+from .sessions import Call, Session, Snapshot, Status, Task, Transcript, finite_reward, json_objects
 
 if TYPE_CHECKING:
     from .journal import EpisodeJournal, JournalRun
@@ -58,7 +52,10 @@ class EpisodeId:
     """The identity of one sample within an attempt, reproducible from checkpointed work.
 
     `task` is the task id, `attempt` the trainer step that collected the
-    sample, `sample` its global index, and `seed` the key data drawn for it.
+    sample, `sample` its global index, `seed` the key data drawn for it, and
+    `branch` the cooldown branch that drew it (`Snapshot.branch`), None for
+    the run's own: a branch draws at the run's steps and keys under other
+    weights, and its episodes are its own.
     The harness can use this identity for its own idempotency records. Dew
     does not guarantee exactly-once external effects across process failure.
     """
@@ -67,6 +64,7 @@ class EpisodeId:
     attempt: int
     sample: int
     seed: tuple[int, ...]
+    branch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -96,67 +94,33 @@ class Observation:
         if self.reward is not None:
             object.__setattr__(self, "reward", finite_reward(self.reward))
         object.__setattr__(self, "messages", json_objects(self.messages, "an observation's messages"))
-        if any(type(token) is not int or token < 0 for token in self.context):
-            raise ValueError("observation context must contain nonnegative token ids")
+        object.__setattr__(self, "context", tuple(token_id(token, where="an observation's context")
+                                                  for token in self.context))
         if self.status == EpisodeStatus.RUNNING and not self.context:
             raise ValueError("a running environment must supply a model context")
 
 
 @dataclass(frozen=True)
-class Action:
-    """One actual model call, with its EOS and its likelihoods under both distributions.
-
-    `raw_log_probs` are the unmodified model's likelihoods, or None when
-    the server that drew the action does not report them, as vLLM and
-    SGLang do not. `behavior_log_probs` include the `Sampling` controls.
-    EOS ends the model turn, not the episode. Context and action ids are
-    nonnegative integers. An action stops at the first configured EOS, and
-    `terminated` is true exactly when its last token is that EOS; anything
-    else raises ValueError. Checking ids against the vocabulary size is
-    left to the caller, which knows the model.
-    """
-
-    context: tuple[int, ...]
-    tokens: tuple[int, ...]
-    raw_log_probs: tuple[float, ...] | None
-    behavior_log_probs: tuple[float, ...]
-    terminated: bool
-    policy_step: int
-    sampling: Sampling
-    _binding_id: str = field(default="", repr=False, compare=False, kw_only=True)
-
-    def __post_init__(self) -> None:
-        for name, ids in (("context", self.context), ("tokens", self.tokens)):
-            if not ids:
-                raise ValueError(f"sampled action {name} must be nonempty")
-            if any(type(token) is not int or token < 0 for token in ids):
-                raise ValueError(f"sampled action {name} must contain nonnegative integer token ids")
-        if len(self.tokens) != len(self.behavior_log_probs) or (
-                self.raw_log_probs is not None and len(self.tokens) != len(self.raw_log_probs)):
-            raise ValueError("every sampled action token needs its likelihoods")
-        for probabilities in (self.raw_log_probs or (), self.behavior_log_probs):
-            if not all(math.isfinite(value) for value in probabilities):
-                raise ValueError("sampled action likelihoods must be finite")
-        if type(self.terminated) is not bool:
-            raise ValueError("sampled action terminated must be a boolean")
-        stops = self.sampling.stops
-        if self.terminated != (self.tokens[-1] in stops):
-            raise ValueError("inference termination disagrees with the sampled EOS token")
-        for index, token in enumerate(self.tokens):
-            if token in stops and index != len(self.tokens) - 1:
-                raise ValueError("sampled action cannot contain tokens after EOS")
-
-
-@dataclass(frozen=True)
 class Transition:
-    action: Action
+    """One model call of an episode, the `Draw` its environment acted on, and the observation that
+    followed it."""
+
+    action: Draw
     observation: Observation
 
 
 @dataclass(frozen=True)
 class Episode:
+    """One episode as its driver ran it: its identity, the policy version every call was drawn
+    under, the `sampling` policy that drew them, the environment's first observation, every call
+    with the observation after it, and how it ended.
+
+    An action ends as `sampling` ends a draw (`dew.inference.rollouts.check_ending`). EOS or a
+    stop string ends the model turn, not the episode."""
+
     identity: EpisodeId
     policy_step: int
+    sampling: Sampling
     initial: Observation | None
     transitions: tuple[Transition, ...]
     status: EpisodeStatus
@@ -165,7 +129,7 @@ class Episode:
     # A collection binds exactly once. Its private origin is independent of
     # clocks, which can coincide across different runs or parameter trees.
     # Exclude the origin from value equality so replayed numerical records
-    # remain comparable; project checks it explicitly before admitting data.
+    # remain comparable; the journal checks it before resuming a cohort.
     _binding_id: str = field(default="", repr=False, compare=False, kw_only=True)
 
 
@@ -180,7 +144,7 @@ class Environment(Protocol):
 
     def reset(self) -> Observation: ...
 
-    def step(self, action: Action) -> Observation: ...
+    def step(self, action: Draw) -> Observation: ...
 
 
 @runtime_checkable
@@ -235,19 +199,11 @@ class _StatusStop(RuntimeError):
     """An environment returned an explicit error or cancellation outcome."""
 
 
-def finite_reward(value: float) -> float:
-    """Return a verifier's or reward's score as a float, refusing a non-finite one with ValueError."""
-    reward = float(value)
-    if not math.isfinite(reward):
-        raise ValueError(f"a reward must be a finite number, got {reward}")
-    return reward
-
-
 @dataclass
 class EpisodeProgress:
     """One episode while a driver runs it: what its environment showed, its calls and how it ended.
 
-    `EpisodeRollout` advances a cohort of these in lock step, and
+    `EpisodeCollector` advances a cohort of these in lock step, and
     `EnvironmentSource` one per session. Both adopt observations, apply the
     turn and context limits, record each call with the observation that
     followed it and score finished episodes through it. Each keeps its own
@@ -255,11 +211,12 @@ class EpisodeProgress:
     """
 
     identity: EpisodeId
+    sampling: Sampling
     environment: Environment | None = None
     initial: Observation | None = None
     observation: Observation | None = None
     transitions: list[Transition] = field(default_factory=list)
-    pending: Action | None = None
+    pending: Draw | None = None
     """A call already drawn whose observation is not in yet."""
     status: EpisodeStatus = EpisodeStatus.RUNNING
     detail: str = ""
@@ -310,7 +267,7 @@ class EpisodeProgress:
             return None
         return observation.context
 
-    def commit(self, action: Action, observation: Observation) -> None:
+    def commit(self, action: Draw, observation: Observation) -> None:
         """Record `action`, the pending call, with the observation that followed it, and adopt that."""
         self.observe(observation)
         self.transitions.append(Transition(action, observation))
@@ -342,7 +299,7 @@ class EpisodeProgress:
 
     def episode(self, policy_step: int, binding_id: str) -> Episode:
         """Freeze this slot's progress into an `Episode` record."""
-        return Episode(self.identity, policy_step, self.initial, tuple(self.transitions),
+        return Episode(self.identity, policy_step, self.sampling, self.initial, tuple(self.transitions),
                        self.status, self.detail, self.reward, _binding_id=binding_id)
 
 
@@ -352,44 +309,40 @@ def _halted(slot: EpisodeProgress) -> None:
         raise _StatusStop(slot.detail)
 
 
-def step_action(environment: Environment, action: Action) -> Observation:
-    """Step the environment with an action that ended on EOS; one that
-    hit its token limit truncates instead."""
+def step_action(environment: Environment, action: Draw) -> Observation:
+    """Step the environment with an action that ended its turn, on EOS or a
+    stop string; one that hit its token limit truncates instead."""
     if action.terminated:
         return environment.step(action)
     return Observation((), EpisodeStatus.TRUNCATED, "model turn reached its token limit")
 
 
 @dataclass(frozen=True)
-class EpisodeRollout:
-    """Collects complete episode groups under one policy snapshot and turns their actions into training rows.
+class EpisodeCollector:
+    """Collects tool episodes in lock step under the trainer's own snapshot (`sessions.Collector`).
 
-    Input batches hold integer `task_id` rows. The `environment` factory
-    resolves each task and is responsible for its tools, timeouts and
-    isolation. Completed and truncated episodes need a finite reward from
-    `verifier`. An error or a cancellation aborts the whole group before a
-    `Trainer` update, and `record` receives the partial episodes before the
-    exception propagates. `groups` must be at least 2, and `sampling` must
-    set an EOS id.
+    Its tasks are integer task ids (`scheduler.task_ids`). The `environment`
+    factory resolves each task and is responsible for its tools, timeouts
+    and isolation. Completed and truncated episodes need a finite reward
+    from `verifier`. An error or a cancellation aborts the whole cohort
+    before a `Trainer` update, and `record` receives the partial episodes
+    before the exception propagates. `sampling` must set an EOS id or a stop
+    string.
 
-    Episodes train through `sessions.pack`. A call whose context extends the
-    previous call's context and actions merges into that call's chain, and
-    chains share rows of `max_prompt_tokens + max_new_tokens` ids, so set
-    the objective's `seq_len` one below that. The batch keeps one row per
-    possible call, so it always fits and its shapes stay fixed. An episode's
-    return is the verifier's reward plus the step rewards its observations
-    carry (`Observation.reward`). With `credit="session"` every action of
-    an episode gets the group advantage of that return; with
-    `credit="turn"` each turn's actions get the group advantage of the
-    return still ahead of that turn, compared with the group's at the same
-    turn (`sessions.advantages`). Truncated episodes are masked. Host
-    records and numeric rows record the trainer's committed
-    update count. Raw and behavior likelihoods come from the actual draws.
+    A call whose context extends the previous call's context and actions
+    merges into that call's chain (`sessions.pack`), and chains share rows
+    of `max_prompt_tokens + max_new_tokens` ids, so set the objective's
+    `seq_len` one below that. A collection packs into one row per possible
+    call, so it always fits and its shapes stay fixed. An episode's return
+    is the verifier's reward plus the step rewards its observations carry
+    (`Observation.reward`). Each episode becomes a `Session` (`session_of`).
+    Host records and numeric rows record the trainer's committed update
+    count. Raw and behavior likelihoods come from the actual draws.
 
-    `policy.bind` fixes one immutable variables snapshot for the whole
-    collection, and the policy must generate from it, not from a mutable
-    serving default. The `Trainer` cannot update or donate the tree until
-    this call returns. An `EpisodeJournal` (`journal`) saves each turn
+    `policy.bind` fixes the snapshot's variables for the whole collection,
+    and the policy must generate from them, not from a mutable serving
+    default. The `Trainer` cannot update or donate the tree until the
+    collection returns. An `EpisodeJournal` (`journal`) saves each turn
     durably for environments that provide `get_state` and `set_state`. The
     environment itself must make pending external effects idempotent; the
     optimizer still recovers only from `Trainer` checkpoints.
@@ -402,20 +355,25 @@ class EpisodeRollout:
     max_new_tokens: int
     max_turns: int
     sampling: Sampling
-    groups: int = 2
     record: EpisodeRecorder | None = None
     journal: EpisodeJournal | None = None
-    credit: str = "session"
 
     def __post_init__(self) -> None:
         for name in ("max_prompt_tokens", "max_new_tokens", "max_turns"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        if type(self.groups) is not int or self.groups < 2:
-            raise ValueError("an episode group needs at least two samples")
-        if self.sampling.eos_token_ids is None:
-            raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
-        check_credit(self.credit)
+        if self.sampling.eos_token_ids is None and not self.sampling.stop:
+            raise ValueError("tool episodes need an EOS id or a stop string to tell a turn that ended "
+                             "from one cut at its token limit")
+
+    @property
+    def width(self) -> int:
+        """A packed row's ids: the longest context and the most one turn draws."""
+        return self.max_prompt_tokens + self.max_new_tokens
+
+    def rows(self, tasks: int, samples: int) -> int:
+        """One row per possible call of every episode, so a collection always fits."""
+        return tasks * samples * self.max_turns
 
     def _persist(self, slot: EpisodeProgress, run: JournalRun | None, policy_step: int, binding: str) -> None:
         """Commit one slot's turn and environment snapshot, when a journal is open."""
@@ -464,30 +422,23 @@ class EpisodeRollout:
         occupies its row: the shapes have to match across ranks, and its
         draw is discarded rather than skipped.
         """
-        tokens = np.full((len(slots), self.max_prompt_tokens), self.sampling.pad, np.int32)
-        valid = np.zeros_like(tokens, bool)
-        for row, slot in enumerate(slots):
+        contexts = []
+        for slot in slots:
             context = None
             if len(slot.transitions) == turn and slot.pending is None:
                 context = slot.next_context(max_prompt_tokens=self.max_prompt_tokens)
-            if context is not None:
-                tokens[row, -len(context):] = context
-                valid[row, -len(context):] = True
-            if not valid[row].any():
-                # Keep global row indices and collective shapes stable. The
-                # draw for a finished slot is discarded, never executed or trained.
-                valid[row, -1] = True
-        # Contexts that fill the width leave no padded slot, and a cohort of
-        # those carries no validity field at all.
-        fields = {} if valid.all() else {"attention_mask": jnp.asarray(valid)}
-        return ModelInputs(jnp.asarray(tokens), fields)
+            # A finished slot keeps its row, one padding id, so global row indices and collective
+            # shapes stay stable. Its draw is discarded, never executed or trained.
+            contexts.append([self.sampling.pad] if context is None or not len(context) else context)
+        tokens, fields = pad_token_rows(contexts, pad_id=self.sampling.pad, width=self.max_prompt_tokens)
+        return ModelInputs(jnp.asarray(tokens), {name: jnp.asarray(value) for name, value in fields.items()})
 
     def _advance(self, slots: list[EpisodeProgress], generation: Generation, policy_step: int,
                  binding_id: str, turn: int, run: JournalRun | None) -> None:
         """Record this turn's draws, then step each slot's environment with them.
 
-        A model turn that stopped on its token limit instead of EOS
-        truncates the episode rather than calling the environment.
+        A model turn that stopped on its token limit instead of EOS or a stop
+        string truncates the episode rather than calling the environment.
         """
         if not isinstance(generation, Generation):
             raise TypeError("tool episodes require an autoregressive Generation")
@@ -504,9 +455,7 @@ class EpisodeRollout:
             ):
                 observation = slot.observation
                 assert observation is not None
-                slot.pending = slot.invoke(
-                    self._action, rows, row, observation.context, policy_step, binding_id
-                )
+                slot.pending = slot.invoke(self._action, rows, row, observation.context, policy_step)
                 self._persist(slot, run, policy_step, binding_id)
         for slot in slots:
             action = slot.pending
@@ -569,9 +518,8 @@ class EpisodeRollout:
         row: int,
         context: tuple[int, ...],
         policy_step: int,
-        binding_id: str,
-    ) -> Action:
-        """Read one cohort row as an `Action`, validating its provenance first.
+    ) -> Draw:
+        """Read one cohort row as a `Draw`, validating its provenance first.
 
         The environment acts on this record, so the row has to carry back
         the exact context that was requested.
@@ -598,26 +546,28 @@ class EpisodeRollout:
             raise ValueError("inference must record a boolean EOS termination flag")
         count = int(lengths[row])
         actions = tuple(int(value) for value in tokens[width:width + count])
-        return Action(context, actions, tuple(float(value) for value in raw[:count]),
-                      tuple(float(value) for value in behavior[:count]),
-                      bool(ended[row]), policy_step, self.sampling, _binding_id=binding_id)
+        return Draw(context, actions, tuple(float(value) for value in behavior[:count]),
+                    "stop" if bool(ended[row]) else "length", policy_step,
+                    tuple(float(value) for value in raw[:count])).checked(self.sampling)
 
-    def _slots(self, tasks, state: TrainState, key: jax.Array, rank: int) -> list[EpisodeProgress]:
-        """Build one session per task and group, each with its own identity.
+    def _slots(self, tasks: np.ndarray, samples: int, snapshot: Snapshot,
+               rank: int) -> list[EpisodeProgress]:
+        """Build one session per task and sample, each with its own identity.
 
         The identity is drawn from the cohort key and the sample's global
         index, so a rank's slots are reproducible from checkpointed work.
         """
         slots = []
         for index, task in enumerate(tasks):
-            for group in range(self.groups):
-                sample = (rank * tasks.size + index) * self.groups + group
-                draw = jax.random.fold_in(key, sample)
-                slots.append(EpisodeProgress(EpisodeId(int(task), int(state.step), int(sample),
-                    tuple(int(value) for value in np.asarray(jax.random.key_data(draw))))))
+            for group in range(samples):
+                sample = (rank * tasks.size + index) * samples + group
+                draw = jax.random.fold_in(snapshot.key, sample)
+                slots.append(EpisodeProgress(EpisodeId(int(task), snapshot.step, int(sample),
+                    tuple(int(value) for value in np.asarray(jax.random.key_data(draw))), snapshot.branch),
+                    self.sampling))
         return slots
 
-    def _bound_journal(self, journal_stack: ExitStack, state: TrainState, key: jax.Array, tasks,
+    def _bound_journal(self, journal_stack: ExitStack, snapshot: Snapshot, tasks: np.ndarray,
                        signature, processes: int, rank: int, binding: str) -> tuple[JournalRun, str]:
         """Open this cohort's journal and agree on the binding it records under.
 
@@ -631,9 +581,11 @@ class EpisodeRollout:
         def open_journal():
             from .journal import policy_digest
 
-            cohort = repr((int(state.step), tuple(np.asarray(jax.random.key_data(key)).tolist())))
+            clock = (snapshot.step, tuple(np.asarray(jax.random.key_data(snapshot.key)).tolist()))
+            # A cooldown branch's cohorts are its own, apart from the run's at the same step and key.
+            cohort = repr(clock if snapshot.branch is None else (snapshot.branch, *clock))
             fingerprint = repr((signature.tobytes().hex(), tasks.tolist(), processes, rank,
-                                policy_digest(state.variables)))
+                                policy_digest(snapshot.variables)))
             return journal_stack.enter_context(journal.open(cohort, fingerprint, binding))
 
         run = agreed("episode journal open", open_journal)
@@ -664,8 +616,14 @@ class EpisodeRollout:
                     slots, generation, policy_step, binding_id, turn, run))
             agreed("episode verification", lambda: self._verify(slots, policy_step, binding_id, run))
 
-    def collect(self, state: TrainState, batch: Batch, key: jax.Array) -> tuple[Episode, ...]:
-        """Collect and return the episodes for one batch of tasks.
+    def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> list[list[Session]]:
+        """`samples` episodes of each task under `snapshot` (`episodes`), as sessions by task
+        (`session_of`)."""
+        sessions = [session_of(episode, group="") for episode in self.episodes(snapshot, tasks, samples)]
+        return [sessions[index * samples:(index + 1) * samples] for index in range(len(tasks))]
+
+    def episodes(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> tuple[Episode, ...]:
+        """Collect `samples` episodes of each task under `snapshot`, task by task.
 
         The cohorts have fixed shapes, and every process agrees on each host
         phase before each generation. `record`, when set, receives every
@@ -673,34 +631,33 @@ class EpisodeRollout:
         environment is opened.
         """
         def prepare():
-            mesh = mesh_of(state.variables)
+            mesh = mesh_of(snapshot.variables)
             if mesh is not None and DataPartition.of(mesh).readers > 1:
                 raise ValueError("native episodes do not support replicated data-share readers")
-            tasks = local_rows(batch["task_id"])
-            if tasks.ndim != 1 or not tasks.size or not np.issubdtype(tasks.dtype, np.integer):
-                raise ValueError("task_id must be a nonempty vector of integer task identities")
-            policy = self.policy.bind(state.variables)
-            signature = (tasks.size, self.groups, self.max_turns, self.max_prompt_tokens,
-                         self.max_new_tokens, self.sampling, int(state.step), int(state.updates),
-                         tuple(np.asarray(jax.random.key_data(key)).tolist()), self.journal is not None)
-            return tasks, policy, np.frombuffer(hashlib.sha256(repr(signature).encode()).digest(), np.uint8)
-        tasks, policy, signature = agreed("episode preparation", prepare)
+            if not all(task.id.removeprefix("-").isdigit() for task in tasks):
+                raise ValueError("an episode collection's tasks are integer task ids (`task_ids`)")
+            ids = np.asarray([int(task.id) for task in tasks], np.int64)
+            policy = self.policy.bind(snapshot.variables)
+            key_words = tuple(np.asarray(jax.random.key_data(snapshot.key)).tolist())
+            signature = (ids.size, samples, self.max_turns, self.max_prompt_tokens, self.max_new_tokens,
+                         self.sampling, snapshot.step, snapshot.updates, key_words, self.journal is not None)
+            return ids, policy, repr(signature)
+        ids, policy, described = agreed("episode preparation", prepare)
+        described = agreed_same("episode cohort (task counts, budgets, sampling and clocks)",
+                                lambda: described)
+        signature = np.frombuffer(hashlib.sha256(described.encode()).digest(), np.uint8)
         processes, rank = jax.process_count(), jax.process_index()
-        if processes > 1:
-            multihost_utils.assert_equal(
-                signature, "episode task counts, budgets, sampling and clocks must agree"
-            )
         binding_id = broadcast_from_process_zero(uuid4().hex if rank == 0 else None)
-        policy_step = int(state.updates)
-        slots = self._slots(tasks, state, key, rank)
+        policy_step = snapshot.updates
+        slots = self._slots(ids, samples, snapshot, rank)
         error = None
         try:
             with ExitStack() as journal_stack:
                 run = None
                 if self.journal is not None:
                     run, binding_id = self._bound_journal(
-                        journal_stack, state, key, tasks, signature, processes, rank, binding_id)
-                self._turns(slots, policy, key, run, policy_step, binding_id)
+                        journal_stack, snapshot, ids, signature, processes, rank, binding_id)
+                self._turns(slots, policy, snapshot.key, run, policy_step, binding_id)
         except BaseException as failure:
             error = failure
         try:
@@ -708,6 +665,7 @@ class EpisodeRollout:
         except BaseException as failure:
             self._failed(slots, failure, policy_step, binding_id)
         records = tuple(slot.episode(policy_step, binding_id) for slot in slots)
+
         def record() -> None:
             if self.record is not None:
                 for episode in records:
@@ -716,79 +674,14 @@ class EpisodeRollout:
         return records
 
 
-    def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> dict[str, np.ndarray]:
-        episodes = self.collect(state, batch, key)
-        return agreed("episode projection", lambda: self.project(episodes))
-
-    def project(self, episodes: Sequence[Episode]) -> dict[str, np.ndarray]:
-        """Pack one collection's episodes into GRPO rows through `sessions.pack`.
-
-        Each episode becomes a `Session` (`session_of`). Its calls merge into
-        one chain wherever the environment's next context extends the
-        previous one, and the chains share `[rows, width]` rows with segment
-        ids. `old_log_probs` holds the sampler's raw likelihoods, recorded
-        under the same snapshot. A truncated episode is masked, not scored.
-
-        Every episode and action must keep the private binding id of the
-        collection that produced it, because equal training step counts do
-        not prove equal weight snapshots. Episodes from different
-        collections, incomplete groups, episodes that are not verified as
-        completed or truncated, and an action without raw likelihoods raise
-        ValueError.
-        """
-        if not episodes or len(episodes) % self.groups:
-            raise ValueError("projection requires complete episode groups")
-        if len({episode.identity for episode in episodes}) != len(episodes):
-            raise ValueError("each episode sample must have a distinct identity")
-        policy_step = episodes[0].policy_step
-        binding_id = episodes[0]._binding_id
-        if not binding_id:
-            raise ValueError("episode records must retain their collection binding")
-        for index, episode in enumerate(episodes):
-            if (episode._binding_id != binding_id
-                    or any(turn.action._binding_id != binding_id for turn in episode.transitions)):
-                raise ValueError("episode records must come from the same collection binding")
-            if (episode.policy_step != policy_step
-                    or episode.identity.attempt != episodes[0].identity.attempt
-                    or any(turn.action.policy_step != policy_step for turn in episode.transitions)):
-                raise ValueError("an episode batch must share one policy snapshot and attempt")
-            if (
-                episode.status not in (EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED)
-                or episode.reward is None
-            ):
-                raise ValueError("only verified completed or truncated episodes may train")
-            if len(episode.transitions) > self.max_turns:
-                raise ValueError("episode exceeds max_turns")
-            group_start = episodes[index - index % self.groups]
-            if episode.identity.task != group_start.identity.task:
-                raise ValueError("an advantage group must contain the same task")
-        sessions = [session_of(episode, group=str(index // self.groups))
-                    for index, episode in enumerate(episodes)]
-        batch = pack(sessions, self.max_prompt_tokens + self.max_new_tokens,
-                     rows=len(episodes) * self.max_turns, credit=self.credit)
-
-        def raw(index: int, number: int) -> tuple[float, ...]:
-            likelihoods = episodes[index].transitions[number].action.raw_log_probs
-            if likelihoods is None:
-                raise ValueError("old_log_probs are each action's raw likelihoods, and one recorded none")
-            return likelihoods
-
-        batch[OLD_LOG_PROBS_KEY] = sampled_values(batch, raw)
-        return batch
-
-
 def session_of(episode: Episode, *, group: str) -> Session:
     """Return `episode` as an engine-style `Session` in the advantage group `group`.
 
-    Each transition's action becomes one call. The call's prompt is the
-    action's context, its sampled ids are the action's tokens with their
-    behavior likelihoods, its reward is the step reward the observation after
-    it carries, its transcript lists the messages the observations before it
-    carried (none where they carried none), and its finish reason is `stop`
-    when the action ended on EOS and `length` otherwise. An error the
-    environment reports
-    becomes `INFRA_ERROR`, because the verifier's reward, not the status,
-    says how well the agent did.
+    Each transition's draw becomes one call (`Call.of`), its reward the step
+    reward the observation after it carries and its transcript the messages
+    the observations before it carried (none where they carried none). An
+    error the environment reports becomes `INFRA_ERROR`, because the
+    verifier's reward, not the status, says how well the agent did.
     """
     status = {
         EpisodeStatus.COMPLETED: Status.COMPLETED,
@@ -799,10 +692,8 @@ def session_of(episode: Episode, *, group: str) -> Session:
     said = list(() if episode.initial is None else episode.initial.messages)
     calls = []
     for turn in episode.transitions:
-        calls.append(Call(turn.action.context, turn.action.tokens, turn.action.behavior_log_probs,
-                          "stop" if turn.action.terminated else "length", turn.action.policy_step,
-                          reward=turn.observation.reward,
-                          transcript=Transcript(tuple(said)) if said else None))
+        calls.append(Call.of(turn.action, reward=turn.observation.reward,
+                             transcript=Transcript(tuple(said)) if said else None))
         said.extend(turn.observation.messages)
     identity = episode.identity
     return Session(str(identity.task), group, identity.sample, identity.attempt, tuple(calls), status,

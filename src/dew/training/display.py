@@ -45,8 +45,9 @@ from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
+from dew.data.pipeline import cut_unit
 from dew.logging import display_console
-from dew.nn.sharding import EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
+from dew.mesh import EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 from dew.objectives.base import Shown
 from dew.telemetry.records import FitStarted
 from dew.training.evaluation import Evaluation
@@ -250,8 +251,10 @@ TRAINER_SHOWN = {"loss": Shown(better="lower"),
                  "mfu": Shown(better="higher", percent=True, group="throughput"),
                  "hfu": Shown(better="higher", percent=True, group="throughput"),
                  "hlo_flops_util": Shown(better="higher", percent=True, group="throughput"),
-                 **{f"{name}_lower_bound": Shown(better="higher", percent=True, group="throughput")
-                    for name in ("hfu", "hlo_flops_util")}, "unsized_kernels": Shown(group="throughput"),
+                 # A utilization some launches' work went uncounted in is at least the value shown.
+                 **{f"{name}_lower_bound": Shown(better="higher", percent=True, group="throughput",
+                                                 label=f"{name} ≥") for name in ("hfu", "hlo_flops_util")},
+                 "unsized_kernels": Shown(group="throughput", label="uncounted kernels"),
                  "tokens": Shown(group="throughput"),
                  "tokens_per_s": Shown(better="higher", group="throughput"),
                  "rollout_seconds": Shown(better="lower", group="throughput")}
@@ -282,9 +285,11 @@ def data_line(counters: Mapping[str, float]) -> Text | None:
     (`data/rows/<label>`), as they are, since a chain's labels count different stages (a mixture's
     corpora the rows they fed it, the mixture those a later step kept) and no sum of them is the
     run's; the records rejected, summed over the labels, with each reason only where something was
-    rejected for it (`data/rejected/<label>/<reason>`); and the share of the rows truncated where
-    any was (`data/truncated/<label>`, each label's share of its own rows). None where the run
-    reports no rows."""
+    rejected for it (`data/rejected/<label>/<reason>`); the share of the rows truncated where
+    any was (`data/truncated/<label>`, each label's share of its own rows); and each cut by what it
+    cut, the rows it shortened and the tokens it removed, summed over the labels, where any was
+    (`data/cut/<label>/<kind>`, `data/cut_removed/<label>/<kind>`). None where the run reports no
+    rows."""
     rows = {name.removeprefix("data/rows/"): value for name, value in counters.items()
             if name.startswith("data/rows/")}
     if not rows:
@@ -305,6 +310,19 @@ def data_line(counters: Mapping[str, float]) -> Text | None:
     weight = sum(rows[label] for label in shares)
     if weight and (truncated := sum(share * rows[label] for label, share in shares.items())):
         line.append("  ·  ", LABEL).append(f"{truncated / weight:.1%}", "bold").append(" truncated", LABEL)
+    cut: collections.Counter[str] = collections.Counter()
+    removed: collections.Counter[str] = collections.Counter()
+    for name, value in counters.items():
+        if name.startswith("data/cut/"):
+            cut[name.rpartition("/")[2]] += int(value)
+        elif name.startswith("data/cut_removed/"):
+            removed[name.rpartition("/")[2]] += int(value)
+    for kind, count in cut.items():
+        if count:
+            line.append("  ·  ", LABEL).append(f"{count:,}", "bold").append(f" {kind} cut", LABEL)
+            unit = cut_unit(kind)
+            if unit is not None:
+                line.append(f" ({removed[kind]:,} {unit})", LABEL)
     return line
 
 
@@ -337,8 +355,11 @@ class TrainingDisplay:
     # as one line (`data_line`) rather than as rows; the trackers keep each of them.
     corpus_counts: Mapping[str, float] = dataclasses.field(default_factory=dict)
     # Each split's last `TREND` evaluations, in the order they completed,
-    # scores only: the trackers keep the previews. A new evaluation rebinds
-    # its split's list, so the refresh thread never iterates one that grows.
+    # scores only: the trackers keep the previews. A split reported in parts
+    # at one step, as the summaries are (each formed by the evaluation that
+    # completes the splits it weighs), is one evaluation at that step. A new
+    # evaluation rebinds its split's list, so the refresh thread never
+    # iterates one that grows.
     evaluations: dict[str, list[Evaluation]] = dataclasses.field(default_factory=dict)
     # Whether evaluation scores the objective's EMA, which each split's label says.
     averaged: bool = False
@@ -427,7 +448,7 @@ class TrainingDisplay:
             shown = self.shown.get(rest or prefix, PLAIN)
             rows = self.groups.setdefault(shown.group or prefix, {})
             if name not in rows:
-                rows[name] = Row(rest or prefix, shown, collections.deque(maxlen=TREND))
+                rows[name] = Row(self.named(rest or prefix), shown, collections.deque(maxlen=TREND))
             rows[name].values.append(value)
         self.reported = frozenset(scalars) - self.corpus_counts.keys()
         if self.live is None:
@@ -442,8 +463,12 @@ class TrainingDisplay:
 
     def evaluation(self, evaluation: Evaluation) -> None:
         self.phase = ""
-        self.evaluations[evaluation.split] = [*self.evaluations.get(evaluation.split, ()),
-                                              dataclasses.replace(evaluation, previews=())][-TREND:]
+        history, scores = self.evaluations.get(evaluation.split, []), evaluation.scores
+        if history and history[-1].step == evaluation.step:
+            *history, latest = history
+            scores = {**latest.scores, **scores}
+        self.evaluations[evaluation.split] = [
+            *history, dataclasses.replace(evaluation, scores=scores, previews=())][-TREND:]
         if self.live is not None:
             return
         counts = f"{evaluation.records} records in {evaluation.elapsed_seconds:.2f} s"
@@ -487,6 +512,7 @@ class TrainingDisplay:
         rate = (steps - 1) / stepping if steps > 1 and stepping > 0 else None
         fraction = f"{goodput['goodput/step_fraction']:.1%} of the wall time in steps"
         console = Console()
+        named = self.named("loss")
         if not redraws(console):
             timing = f"Trained {steps} steps in {duration(seconds)}"
             if first is not None:
@@ -494,7 +520,7 @@ class TrainingDisplay:
             if rate is not None:
                 timing += f", then {rate:.1f} step/s"
             self.note(timing)
-            self.note(fraction + ("" if loss is None else f", final loss {number(loss)}"))
+            self.note(fraction + ("" if loss is None else f", final {named} {number(loss)}"))
             return
         rows: list[tuple[str, RenderableType]] = [("trained", f"{steps} steps in {duration(seconds)}")]
         if first is not None:
@@ -503,7 +529,7 @@ class TrainingDisplay:
             rows.append(("then", f"{rate:.1f} step/s"))
         rows.append(("goodput", fraction))
         if loss is not None:
-            rows.append(("final loss", Text(number(loss), "bold")))
+            rows.append((f"final {named}", Text(number(loss), "bold")))
         for split, history in self.evaluations.items():
             evaluation = history[-1]
             rows.append((f"{self.label(split)} at {evaluation.step}", self.scores(evaluation, history=True)))
@@ -524,6 +550,10 @@ class TrainingDisplay:
         """The split's name, marked when its scores are of the averaged weights."""
         return f"{split} (ema)" if self.averaged else split
 
+    def named(self, metric: str) -> str:
+        """The name the display shows `metric` under: its `Shown.label`, else its own."""
+        return self.shown.get(metric, PLAIN).label or metric
+
     def rows(self) -> list[tuple[str, Row]]:
         """The metrics the last interval logged, as (group, row) pairs, grouped in the order each
         group was first logged."""
@@ -540,7 +570,8 @@ class TrainingDisplay:
         for index, (name, value) in enumerate(evaluation.scores.items()):
             bare = name.removeprefix(evaluation.split + "/")
             shown = self.shown.get(bare, PLAIN)
-            text.append("   " if index else "").append(f"{bare} ", LABEL).append(number(value, shown), "bold")
+            text.append("   " if index else "").append(f"{self.named(bare)} ", LABEL)
+            text.append(number(value, shown), "bold")
             if previous is not None and name in previous.scores:
                 text.append(" ").append_text(change(previous.scores[name], value, shown))
             if history:
@@ -557,8 +588,9 @@ class TrainingDisplay:
             for name in latest.scores:
                 bare = name.removeprefix(split + "/")
                 values = collections.deque(record.scores[name] for record in history if name in record.scores)
-                rows.append((f"{self.label(split)} · step {latest.step}",
-                             Row(bare, self.shown.get(bare, PLAIN), values)))
+                shown = self.shown.get(bare, PLAIN)
+                heading = f"{self.label(split)} · step {latest.step}"
+                rows.append((heading, Row(self.named(bare), shown, values)))
         return rows
 
     def rate(self) -> float | None:

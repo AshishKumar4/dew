@@ -31,7 +31,8 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
-from dew.nn.protocols import IntervalModel
+from dew.nn.protocols import IntervalModel, Lacks
+from dew.nn.sharding import explicit_spec, rows_taken
 from dew.objectives.base import Aux, Step, model_rngs
 from dew.sampling.solvers import Euler, Solver
 
@@ -41,16 +42,19 @@ Velocity = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
 """An average velocity u(z, t, r) over [r, t]."""
 
 
-def intervals(t: jax.Array, r: jax.Array, instantaneous: float) -> tuple[jax.Array, jax.Array]:
+def intervals(t: jax.Array, r: jax.Array, instantaneous: float, places: jax.Array | None = None,
+              total: int | None = None) -> tuple[jax.Array, jax.Array]:
     """Return MeanFlow's (t, r) interval draw from two independent times.
 
     The later time is t and the earlier is r. The first `instantaneous`
-    fraction of the rows takes r = t, the plain flow-matching case (the
-    reference's `sample_tr`).
+    fraction of the update's `total` examples takes r = t, the plain
+    flow-matching case (the reference's `sample_tr`), by each row's place
+    among them (`Step.places`; by default the rows, all of the update).
     """
     t, r = jnp.maximum(t, r), jnp.minimum(t, r)
-    count = t.shape[0]
-    return t, jnp.where(jnp.arange(count) < int(count * instantaneous), t, r)
+    places = jnp.arange(t.shape[0]) if places is None else places
+    total = t.shape[0] if total is None else total
+    return t, jnp.where(places < int(total * instantaneous), t, r)
 
 
 def guided_velocity(v, unconditional, conditional, omega, kappa):
@@ -137,7 +141,7 @@ def _interval_velocity(model: nn.Module, process: Process, method: str, preset: 
         raise ValueError(f"{method} trains an interval model of velocity on the unshifted linear path; "
                          f"build the process with {preset}")
     if not (isinstance(model, IntervalModel) and model.interval):
-        raise TypeError(f"{method} hands its model each interval's duration, and a "
+        raise Lacks("interval", f"{method} hands its model each interval's duration, and a "
                         f"{type(model).__name__} embeds none: train an IntervalModel with interval set, "
                         f"as simple_dit(interval=True)")
 
@@ -189,23 +193,30 @@ class MeanFlowObjective(DiffusionObjective):
         self.guidance_interval = guidance_interval
         self.norm_p, self.norm_eps = norm_p, norm_eps
 
-    def _draws(self, key, count: int, shape) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        """The loss's randomness: two training times per row, the noise, and a
-        uniform per row, whose count under `unconditional_prob` is how many
-        rows drop their condition."""
-        later, earlier, noise, dropping = jax.random.split(key, 4)
+    def _draws(self, step: Step, count: int, shape) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """The loss's randomness, each row's its example's own (`Step.sample`): two training times per
+        row, the noise, and a uniform per row, whose count under `unconditional_prob` is how many rows
+        drop their condition."""
         schedule = self.process.schedule
-        return (schedule.sample_t(later, count), schedule.sample_t(earlier, count),
-                jax.random.normal(noise, shape, dtype=jnp.float32), jax.random.uniform(dropping, (count,)))
+
+        def time(key):
+            return schedule.sample_t(key, 1)[0]
+
+        return (step.sample("times", time, rows=count), step.sample("earlier times", time, rows=count),
+                step.sample("noise", jax.random.normal, shape[1:], dtype=jnp.float32, rows=count),
+                step.sample("condition dropout", jax.random.uniform, (), dtype=jnp.float32, rows=count))
 
     def loss(self, variables, batch, step: Step):
-        encode_key, condition_key, draw_key, dropout_key = jax.random.split(step.key, 4)
-        samples = self.clean_samples(variables, batch, encode_key)
+        encode_key, condition_key, _, dropout_key = jax.random.split(step.key, 4)
+        samples = self.clean_samples(variables, batch, encode_key, step)
         count = samples.shape[0]
         schedule = self.process.schedule
-        given, blank = self._conditions(variables, batch, condition_key)
-        first, second, noise, uniform = self._draws(draw_key, count, samples.shape)
-        t, r = intervals(first, second, self.instantaneous)
+        given, blank = self._conditions(variables, batch, condition_key, step)
+        first, second, noise, _ = self._draws(step, count, samples.shape)
+        # The update's first examples by place take each role, as its whole batch's first rows do.
+        places, total = step.places(count)
+        t, r = intervals(first, second, self.instantaneous, places, total)
+        t, r = step.boundary("interval end", t), step.boundary("interval start", r)
         z, _, v = self.process.prediction.forward_diffusion(
             samples, noise, broadcast_rates(schedule, t, samples)
         )
@@ -228,7 +239,9 @@ class MeanFlowObjective(DiffusionObjective):
             )
         else:
             guided = v
-        dropped = jnp.arange(count) < jnp.sum(uniform < self.unconditional_prob)
+        update = step.sample_update("condition dropout", jax.random.uniform, (), dtype=jnp.float32,
+                                    rows=count)
+        dropped = step.boundary("dropped conditions", places < jnp.sum(update < self.unconditional_prob))
         conditions = jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value),
                                   given, blank)
         guided = jnp.where(expand(dropped, v), v, guided)
@@ -270,45 +283,76 @@ class ShortcutObjective(DiffusionObjective):
         _interval_velocity(self.model, self.process, "a shortcut model", "presets.Shortcut")
         self.sections, self.bootstrap_every = sections, bootstrap_every
 
-    def _draws(self, key, count: int, grid: jax.Array, shape) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """The loss's randomness: each row's time index below its `grid`, the
-        noise, and whether a flow-matching row drops its condition."""
-        times, noise, dropping = jax.random.split(key, 3)
-        return (jax.random.randint(times, (count,), 0, grid.astype(jnp.int32)),
-                jax.random.normal(noise, shape, dtype=jnp.float32),
-                jax.random.bernoulli(dropping, self.unconditional_prob, (count,)))
+    def _draws(self, step: Step, count: int, grid: jax.Array, shape
+               ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """The loss's randomness, each row's its example's own (`Step.sample`): each row's time index
+        below its `grid`, an integer below `sections` reduced by the grid, which divides it, the noise,
+        and whether a flow-matching row drops its condition."""
+        sections = self.sections
+        drawn = step.sample("time index", lambda key: jax.random.randint(key, (), 0, sections, jnp.int32),
+                            rows=count)
+        probability = jnp.float32(self.unconditional_prob)
+        return (drawn % grid.astype(jnp.int32),
+                step.sample("noise", jax.random.normal, shape[1:], dtype=jnp.float32, rows=count),
+                step.sample("condition dropout", lambda key: jax.random.bernoulli(key, probability),
+                            rows=count))
 
     def loss(self, variables, batch, step: Step):
-        encode_key, condition_key, draw_key, dropout_key = jax.random.split(step.key, 4)
-        samples = self.clean_samples(variables, batch, encode_key)
+        encode_key, condition_key, _, dropout_key = jax.random.split(step.key, 4)
+        samples = self.clean_samples(variables, batch, encode_key, step)
         count = samples.shape[0]
-        rows = count // self.bootstrap_every
         schedule = self.process.schedule
-        given, blank = self._conditions(variables, batch, condition_key)
+        given, blank = self._conditions(variables, batch, condition_key, step)
 
-        levels = shortcut_levels(rows, self.sections)
-        grid = jnp.concatenate([2.0 ** levels, jnp.full((count - rows,), float(self.sections))])
-        index, noise, dropping = self._draws(draw_key, count, grid, samples.shape)
+        # The update's first examples by place bootstrap, one in `bootstrap_every`, each at its level.
+        places, total = step.places(count)
+        rows = total // self.bootstrap_every
+        bootstrap = places < rows
+        levels = shortcut_levels(max(rows, 1), self.sections)
+        level = rows_taken(levels, jnp.clip(places, 0, levels.shape[0] - 1))
+        grid = step.boundary("level grid", jnp.where(bootstrap, 2.0 ** level, float(self.sections)))
+        index, noise, dropping = self._draws(step, count, grid, samples.shape)
         # Data at t = index / grid in the reference's time, on its path; Dew's sigma is 1 - t.
-        t = index / grid
+        t = step.boundary("data times", index / grid)
         sigma = 1 - t
         x = (1 - (1 - _NOISE_FLOOR) * expand(t, samples)) * noise + expand(t, samples) * samples
         v = (1 - _NOISE_FLOOR) * noise - samples
-        step_size = jnp.concatenate([2.0 ** -levels, jnp.full((count - rows,), 1 / self.sections)])
-        dropped = (jnp.arange(count) >= rows) & dropping
+        step_size = jnp.where(bootstrap, 2.0 ** -level, 1 / self.sections)
+        dropped = step.boundary("dropped conditions", ~bootstrap & dropping)
         conditions = jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value),
                                   given, blank)
 
         velocity = functools.partial(_model_velocity, self.model, schedule, dropout_key)
         teacher = self.model_variables(jax.lax.stop_gradient(variables if step.ema is None else step.ema))
-        leading = jax.tree.map(lambda value: value[:rows], given)
-        bootstrapped = shortcut_target(velocity(teacher, leading, train=False), x[:rows], sigma[:rows],
-                                       step_size[:rows])
-        target = jnp.concatenate([bootstrapped, v[rows:]])
+        def taught(conditions):
+            return velocity(teacher, conditions, train=False)
+
+        # A target computed apart from the model the loss trains, which a whole update and its parts
+        # take by different paths (`_bootstrapped`), so each example's is a boundary of its own.
+        target = step.boundary("shortcut targets", jnp.where(expand(bootstrap, v), self._bootstrapped(
+            taught, given, bootstrap, rows, count, total, x, sigma, step_size), v))
         u = velocity(self.model_variables(variables), conditions, train=step.training)(
             x, sigma, sigma - step_size)
         losses = jnp.square(u - target)
         return self.row_mean(losses, batch), Aux(metrics={})
+
+    @staticmethod
+    def _bootstrapped(taught, given, bootstrap, rows, count, total, x, sigma, step_size) -> jax.Array:
+        """The self-consistency target of every row the update bootstraps (`bootstrap`), any value
+        elsewhere, `taught(conditions)` the teacher's velocity. A batch that is its whole update, on a
+        mesh with no Explicit axis, holds exactly the `rows` such rows, which the teacher reads alone,
+        gathered; a part of an update holds a number its layout sets, so the teacher reads every row and
+        the loss keeps the bootstrapping ones', at the cost of the teacher's two half steps on them all."""
+        if count != total or explicit_spec(x) is not None:
+            return shortcut_target(taught(given), x, sigma, step_size)
+        held = jnp.nonzero(bootstrap, size=rows)[0]
+
+        def picked(value):
+            return jnp.take(value, held, axis=0)
+
+        target = shortcut_target(taught(jax.tree.map(picked, given)), picked(x), picked(sigma),
+                                 picked(step_size))
+        return jnp.zeros_like(x).at[held].set(target)
 
 
 __all__ = ["MeanFlowObjective", "ShortcutObjective", "adaptive_loss", "guided_velocity", "intervals",

@@ -6,17 +6,10 @@ from pathlib import Path
 import numpy as np
 import torch
 import transformers
-from transformers import (
-    AutoProcessor,
-    Qwen3_5MoeConfig,
-    Qwen3_5MoeForConditionalGeneration,
-    Qwen3VLProcessor,
-    Qwen3VLVideoProcessor,
-)
-from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+from transformers import Qwen3_5MoeConfig, Qwen3_5MoeForConditionalGeneration
 
 from dew.interop.verify import scatter_weights
-from multimodal_reference import _row_slices, _tokenizer
+from multimodal_reference import _row_slices, qwen3_vl_processor
 
 
 def main():
@@ -55,16 +48,7 @@ def main():
     scatter_weights(model)
     model = model.to('cuda')
     model.save_pretrained(directory)
-    special = {'<pad>': 0, '<eos>': 1, '<bos>': 2, '<unk>': 3,
-               '<image_soft_token>': 200, '<video>': 201,
-               '<start_of_image>': 202, '<end_of_image>': 203}
-    tokenizer = _tokenizer(256, special, video_token='<video>',
-                           vision_start_token='<start_of_image>', vision_end_token='<end_of_image>')
-    processor = Qwen3VLProcessor(
-        Qwen2VLImageProcessor(patch_size=8, temporal_patch_size=2, merge_size=2, do_resize=False),
-        tokenizer, Qwen3VLVideoProcessor(patch_size=8, temporal_patch_size=2, merge_size=2))
-    processor.save_pretrained(directory)
-    processor = AutoProcessor.from_pretrained(directory, local_files_only=True)
+    processor, tokenizer = qwen3_vl_processor(directory)
     images = np.random.default_rng(1735).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
     prompts = ['token7 <start_of_image><image_soft_token><end_of_image> token9',
                'token5 <start_of_image><image_soft_token><end_of_image> token8 '

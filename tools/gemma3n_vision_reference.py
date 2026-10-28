@@ -66,12 +66,9 @@ def reference_model():
     return model
 
 
-def arrays(state):
-    return {name: value.detach().cpu().float().numpy().copy() for name, value in state.items()}
-
-
 def write_reference(directory: Path):
     from reference_releases import require
+    from reference_torch import host_arrays
 
     require("timm", "transformers")
     torch.set_num_threads(2)
@@ -85,7 +82,7 @@ def write_reference(directory: Path):
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n")
     image_state = {name: tensor for name, tensor in model.state_dict().items()
                    if not name.startswith(("model.audio_tower.", "model.embed_audio."))}
-    save_file(arrays(image_state), str(directory / "model.safetensors"))
+    save_file(host_arrays(image_state), str(directory / "model.safetensors"))
     generator = torch.Generator().manual_seed(SEED + 1)
     for name, height, width in (("odd", 33, 29), ("even", 32, 32), ("pooled", 64, 64)):
         pixels = torch.randn((1, 3, height, width), generator=generator)

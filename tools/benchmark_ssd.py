@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Time the Mamba-2 SSD chunked scan: the XLA einsums against the Pallas kernel.
+"""Time the Mamba-2 SSD chunked scan: the template's portable math in XLA against the Pallas kernel.
 
-`dew.nn.mixers.mamba2.chunk_ssd` picks between `xla_chunk_scan` and
-`dew.nn.kernels.ssd.ssd_chunk_scan` from the backend and the geometry. This
+`dew.nn.mixers.mamba2.chunk_ssd` picks between the recurrence template's
+portable math (`portable_scan`) and `dew.nn.kernels.ssd.ssd_chunk_scan` from
+the backend and the geometry. This
 tool times the two on the same chunked operands, forward and forward+backward,
 so the selection rule in `ssd_kernel_runs` can be checked against numbers
 instead of against the tile arithmetic its constants are written from. Every
@@ -33,9 +34,9 @@ import jax
 import jax.numpy as jnp
 import tyro
 
+from dew.nn.kernels.recurrence_chunk import chunk_delta_rule
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
-from dew.nn.mixers.mamba2 import xla_chunk_scan
-from dew.telemetry.benchmark import samples
+from dew.telemetry.benchmark import largest_difference, samples
 
 IMPLEMENTATIONS = ('xla', 'kernel')
 
@@ -93,19 +94,23 @@ def kernel_platform(config: BenchmarkConfig) -> str:
     return platform
 
 
+def portable_scan(x, B, C, a, carried, chunk_size: int):
+    """The scan as the recurrence template's portable math runs it, on `ssd_chunk_scan`'s operands
+    (`x` scaled by `dt`, `B` and `C` a head each, `a` the per-step `A dt`, `carried` `[B, H, P, N]`):
+    `chunk_delta_rule` without the delta rule, every write gate one."""
+    out, final = chunk_delta_rule(C, B, x, a[..., None], jnp.ones(a.shape, a.dtype),
+                                  jnp.swapaxes(carried, -1, -2), chunk_size, delta=False, scale=1.0)
+    return out, jnp.swapaxes(final, -1, -2)
+
+
 def scan_fn(implementation: str, platform: str, chunk_size: int):
     if implementation == 'kernel':
         return lambda *args: ssd_chunk_scan(*args, chunk_size, platform)
-    return lambda *args: xla_chunk_scan(*args, chunk_size)
+    return lambda *args: portable_scan(*args, chunk_size)
 
 
 def failure(error: BaseException) -> str:
     return f"{type(error).__name__}: {str(error).splitlines()[0][:160]}"
-
-
-def largest(left, right) -> float:
-    return max(float(jnp.max(jnp.abs(a.astype(jnp.float32) - b.astype(jnp.float32))))
-               for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
 
 
 def measure(case: dict, config: BenchmarkConfig) -> dict:
@@ -131,16 +136,19 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
     except (ValueError, NotImplementedError, jax.errors.JaxRuntimeError) as error:
         return {**row, 'served': False, 'reason': failure(error)}
 
-    def loss(*args):
-        scanned, final = scan(*args)
-        return jnp.sum(scanned * cotangents[0]) + jnp.sum(final * cotangents[1])
+    def trained(*args):
+        # The scan's results returned with their gradients, as a training step reads both: a pass
+        # returning the gradients alone leaves XLA to drop every forward launch the backward does not
+        # read (the forward's readout).
+        out, pull = jax.vjp(scan, *args)
+        return out, pull(cotangents)
 
     row['served'] = True
-    gradient = jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4)))
+    gradient = jax.jit(trained)
     gradients = None
     if not config.forward_only:
         try:
-            gradients = jax.block_until_ready(gradient(*built))
+            gradients = jax.block_until_ready(gradient(*built))[1]
         except (ValueError, NotImplementedError, jax.errors.JaxRuntimeError) as error:
             row['backward_reason'] = failure(error)
 
@@ -154,14 +162,14 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
     if config.parity and case['implementation'] == 'kernel':
         reference = scan_fn('xla', platform, config.chunk_size)
         expected = jax.jit(reference)(*built)
-        row['forward_error'] = largest(scanned, expected)
+        row['forward_error'] = largest_difference(scanned, expected)
         row['forward_scale'] = float(jnp.max(jnp.abs(expected[0])))
         if gradients is not None:
             wanted = jax.jit(jax.grad(
                 lambda *a: (jnp.sum(reference(*a)[0] * cotangents[0])
                             + jnp.sum(reference(*a)[1] * cotangents[1])),
                 argnums=(0, 1, 2, 3, 4)))(*built)
-            row['gradient_error'] = largest(gradients, wanted)
+            row['gradient_error'] = largest_difference(gradients, wanted)
             row['gradient_scale'] = float(max(jnp.max(jnp.abs(g)) for g in wanted))
     return row
 

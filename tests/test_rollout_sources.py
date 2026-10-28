@@ -20,9 +20,9 @@ import dataclasses
 import json
 import socket
 import threading
-from concurrent.futures import Future
+from concurrent.futures import Future, wait
 from contextlib import contextmanager
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import jax
 import numpy as np
@@ -34,8 +34,9 @@ from dew.data.prompts import PromptRecord
 from dew.inference import Draw, VLLMGenerateServer
 from dew.objectives.rl.episodes import EpisodeStatus, Observation
 from dew.objectives.rl.records import episode_from_record
+from dew.objectives.rl.rollout import prompt_tasks
 from dew.objectives.rl.sessions import Status, Task, Transcript, pack
-from dew.objectives.rl.sources import EnvironmentSource, PromptSource, prompt_tasks
+from dew.objectives.rl.sources import EnvironmentSource, PromptSource
 from dew.rl.sandbox import ContainerRunner, SandboxFleet
 from dew.sampling import Sampling
 
@@ -53,8 +54,9 @@ def words(key):
 class Server:
     """Draws `(5, EOS)`, or `tokens`, at the version served on submission; `hold` keeps draws pending."""
 
-    def __init__(self, tokens=(5, EOS), raw=True, sampling=SAMPLING, hold=False):
+    def __init__(self, tokens=(5, EOS), raw=True, sampling=SAMPLING, hold=False, ending=None):
         self.version, self.tokens, self.raw, self._sampling, self.hold = 0, tokens, raw, sampling, hold
+        self.ending = ending
         self.held, self.prompts, self.keys = [], [], []
 
     @property
@@ -65,8 +67,12 @@ class Server:
         self.prompts.append(tuple(prompt))
         self.keys.append(words(key))
         future = Future()
+        ending = self.ending
+        if ending is None:
+            ending = "stop" if self.tokens and self.tokens[-1] == EOS else "length"
         draw = Draw(tuple(prompt), self.tokens, (-.5,) * len(self.tokens),
-                    (-.4,) * len(self.tokens) if self.raw else None, self.tokens[-1] == EOS, self.version)
+                    ending, self.version,
+                    (-.4,) * len(self.tokens) if self.raw else None)
         if self.hold:
             self.held.append((future, draw))
         else:
@@ -95,7 +101,7 @@ class Counter:
             return Observation((), EpisodeStatus.ERROR, "container exited")
         if self.fail == "malformed":
             return {"context": [1, 2]}
-        self.context = action.context + action.tokens + (4,)
+        self.context = action.prompt + action.tokens + (4,)
         reward = None if self.paid is None else self.paid[self.steps - 1]
         if self.steps == self.turns:
             return Observation((), EpisodeStatus.COMPLETED, "tests passed", reward)
@@ -136,7 +142,7 @@ def test_a_multi_turn_session_keeps_each_calls_version_and_packs_into_one_chain(
     assert [call.version for call in rollout.calls] == [0, 1, 2]
     # Turn t of sample 0 draws under fold_in(fold_in(key, 0), t), the key's own stream.
     assert server.keys == [words(jax.random.fold_in(jax.random.fold_in(KEY, 0), turn)) for turn in range(3)]
-    assert [call.prompt_ids for call in rollout.calls] == [
+    assert [call.prompt for call in rollout.calls] == [
         (1, 2),
         (1, 2, 5, EOS, 4),
         (1, 2, 5, EOS, 4, 5, EOS, 4),
@@ -225,7 +231,7 @@ def test_each_call_lists_the_messages_the_observations_before_it_carried():
                                                             for step in (1, 2))]
     assert [call.transcript for call in rollout.calls] == [
         Transcript((user,)), Transcript((user, tools[0])), Transcript((user, *tools))]
-    assert [call.prompt_ids for call in rollout.calls] == [
+    assert [call.prompt for call in rollout.calls] == [
         (1, 2), (1, 2, 5, EOS, 4), (1, 2, 5, EOS, 4, 5, EOS, 4)]
     (episode,) = recorded
     assert episode_from_record(json.loads(json.dumps(asdict(episode)))) == episode
@@ -402,6 +408,62 @@ def test_a_draw_that_breaks_its_contract_fails_both_sources_rollouts():
     prompts.close()
 
 
+def test_tokens_after_eos_never_execute_an_environment_turn():
+    """A completed server future is still untrusted: a token after EOS must fail admission before
+    a tool sees it or a verifier assigns it reward, and the opened environment is released."""
+    entered, exited, stepped, scored = [], [], [], []
+    server = Server(tokens=(EOS, 7), ending="stop")
+
+    def reward(task, episode):
+        scored.append(episode)
+        return 1.0
+
+    episodes = source(server, factory(entered, exited, on_step=lambda _: stepped.append(True)),
+                      verifier=reward)
+    try:
+        with pytest.raises(ValueError):
+            episodes.submit(Task("1"), 1, version=0, key=KEY)[0].result(timeout=10)
+    finally:
+        episodes.close()
+    assert entered and exited == entered
+    assert not stepped and not scored
+
+
+@pytest.mark.parametrize("ending", ["length", "stop"])
+def test_empty_server_actions_fail_before_tools_or_rewards(ending):
+    entered, exited, stepped, rewarded = [], [], [], []
+    server = Server(tokens=(), ending=ending, sampling=replace(SAMPLING, stop=("finished",)))
+
+    def reward(*args):
+        rewarded.append(args)
+        return 1.0
+
+    episodes = source(server, factory(entered, exited, on_step=lambda _: stepped.append(True)),
+                      verifier=reward)
+    prompts = PromptSource(server, reward, decode=str, max_new_tokens=4)
+    [task] = prompt_tasks(prompt_batch())
+    try:
+        for collector in (episodes, prompts):
+            with pytest.raises(ValueError):
+                collector.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
+    finally:
+        episodes.close()
+        prompts.close()
+    assert entered and exited == entered
+    assert not stepped and not rewarded
+
+
+def test_a_tool_call_finish_is_a_completed_single_turn_sample():
+    [task] = prompt_tasks(prompt_batch())
+    prompts = PromptSource(Server(ending="tool_calls"), lambda *_: 1.0, decode=str, max_new_tokens=4)
+    try:
+        session = prompts.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
+    finally:
+        prompts.close()
+    assert session.status == Status.COMPLETED
+    assert session.calls[0].terminated and session.reward == 1.0
+
+
 def test_an_environment_exit_that_fails_after_broken_code_does_not_turn_it_into_a_retry():
     """The environment returns no Observation, then its exit fails with an OSError. The OSError
     that `with` raises carries the broken code's error, and the rollout fails with it."""
@@ -566,3 +628,27 @@ def test_a_non_finite_reward_or_a_failing_decode_fails_the_prompt_rollouts_futur
     with pytest.raises(failure):
         prompts.submit(task, 1, version=0, key=KEY)[0].result(timeout=10)
     prompts.close()
+
+
+def test_closing_the_prompt_source_cancels_the_rollouts_whose_rewards_never_started():
+    """One reward thread, held in a reward, and a second draw's reward queued behind it: closing
+    the source lets the running reward finish and cancels the queued rollout, so a scheduler waiting
+    on it wakes, where it once waited on a future nothing would settle."""
+    started, release = threading.Event(), threading.Event()
+
+    def reward(text, record):
+        started.set()
+        release.wait(timeout=30)
+        return 1.0
+
+    prompts = PromptSource(Server(), reward, decode=lambda ids: "text", max_new_tokens=4, scorers=1)
+    task = Task("t", {"prompt": (1, 2), "record": PromptRecord("rule", "1")})
+    running, queued = prompts.submit(task, 2, version=0, key=KEY)
+    assert started.wait(timeout=30)
+    closing = threading.Thread(target=prompts.close)
+    closing.start()
+    done, _ = wait([queued], timeout=30)
+    release.set()
+    closing.join(timeout=30)
+    assert done and queued.cancelled()
+    assert running.result(timeout=30).status is Status.COMPLETED

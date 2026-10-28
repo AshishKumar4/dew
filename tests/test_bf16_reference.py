@@ -74,7 +74,7 @@ def test_projection_biases_sum_their_gradients_over_the_batch_as_exactly_as_torc
     import torch
     from transformers import AutoModelForCausalLM
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     directory = FIXTURES / name
     batches = np.random.default_rng(0).integers(0, 256, (4, 64, 128))
@@ -146,7 +146,7 @@ def test_the_diffusion_denoiser_is_as_exact_as_its_reference_in_bf16():
         with np.load(directory / name) as stored:
             reference.update({key: stored[key] for key in stored.files})
     model = adapter.build(config, dtype="bfloat16", attention_impl="xla")
-    variables = adapter.translate_weights(tensors, config)
+    variables, _ = adapter.translate_weights(tensors, config)
     image = (reference["image_prompt"],
              ({"image_indices": jnp.where(reference["image_prompt"] == 60, 0, -1)},
               {"pixel_values": jnp.asarray(reference["pixels"])}))

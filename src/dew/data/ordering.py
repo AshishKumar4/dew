@@ -9,7 +9,8 @@ import grain.experimental as gx
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew.batch import Batch
+from dew.data.dataset import Ranges
 
 
 class BlockShuffle(grain.MapDataset[Batch]):
@@ -18,9 +19,9 @@ class BlockShuffle(grain.MapDataset[Batch]):
         if not sizes or any(size < 0 for size in sizes) or sum(sizes) == 0:
             raise ValueError("block shuffle needs authoritative positive physical shard counts")
         self._rows, self._sizes, self._block, self._seed = parent, sizes, block, seed
-        self._starts = np.cumsum((0, *sizes[:-1]))
+        self._shards = Ranges(sizes)
         self._total = sum(sizes)
-        self._epochs: dict[int, tuple[tuple[int, ...], np.ndarray]] = {}
+        self._epochs: dict[int, tuple[tuple[int, ...], Ranges]] = {}
         self._lock = threading.Lock()
 
     def __getstate__(self) -> dict:
@@ -35,7 +36,7 @@ class BlockShuffle(grain.MapDataset[Batch]):
     def __len__(self) -> int:
         return len(self._rows)
 
-    def _epoch(self, epoch: int) -> tuple[tuple[int, ...], np.ndarray]:
+    def _epoch(self, epoch: int) -> tuple[tuple[int, ...], Ranges]:
         cached = self._epochs.get(epoch)
         if cached is None:
             with self._lock:
@@ -43,29 +44,27 @@ class BlockShuffle(grain.MapDataset[Batch]):
                 if cached is None:
                     order = tuple(int(index) for index in np.random.default_rng(
                         [self._seed, epoch]).permutation(len(self._sizes)))
-                    ends = np.cumsum([
+                    blocks = Ranges(tuple(
                         sum(self._sizes[index] for index in order[start : start + self._block])
                         for start in range(0, len(order), self._block)
-                    ])
-                    cached = order, ends
+                    ))
+                    cached = order, blocks
                     # Published dictionaries never change under concurrent readers.
                     self._epochs = {**dict(list(self._epochs.items())[-1:]), epoch: cached}
         return cached
 
     def index(self, index: int) -> int:
         epoch, position = divmod(index, self._total)
-        order, ends = self._epoch(epoch)
-        block = int(np.searchsorted(ends, position, side="right"))
+        order, blocks = self._epoch(epoch)
+        block, place = blocks.locate(position)
         members = order[block * self._block : (block + 1) * self._block]
-        start = 0 if block == 0 else int(ends[block - 1])
-        size = int(ends[block]) - start
         seed = int(np.random.SeedSequence([self._seed, epoch, block]).generate_state(1)[0])
         # Grain's shuffle of an integer range, `MapDataset.range(size).shuffle(seed)`, at one index
         # of its first epoch (`ShuffleMapDataset._shuffled_index`).
-        offset = gx.index_shuffle(position - start, max_index=size - 1, seed=seed, rounds=4)
+        offset = gx.index_shuffle(place, max_index=blocks.counts[block] - 1, seed=seed, rounds=4)
         for member in members:
             if offset < self._sizes[member]:
-                return epoch * self._total + int(self._starts[member]) + offset
+                return epoch * self._total + self._shards.start(member) + offset
             offset -= self._sizes[member]
         raise RuntimeError("physical shard block does not cover its record index")
 

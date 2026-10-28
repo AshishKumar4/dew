@@ -23,11 +23,13 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from dew.batch import Batch, Variables
 from dew.nn.attention import l2_normalized
-from dew.nn.blocks import torch_bicubic_resize
+from dew.nn.blocks import IMAGENET_MEAN, IMAGENET_STD, torch_bicubic_resize
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
-from dew.objectives.base import Batch, Objective, Variables
+from dew.nn.precision import at_least_fp32
+from dew.objectives.base import Objective
 
 ALIGNMENT = "alignment_projector"
 """The projector's key in `params`, beside the model's own modules."""
@@ -35,8 +37,6 @@ ALIGNMENT = "alignment_projector"
 REPRESENTATION = "representation"
 """The variables collection that holds the frozen encoder's weights, as `encoders` hold theirs."""
 
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
 class Projector(nn.Module):
@@ -130,11 +130,11 @@ class Alignment:
         if self.source is None:
             raise ValueError(f"the alignment's encoder takes its weights from the starting tree's "
                              f"{REPRESENTATION!r}, which holds none, or from a source; name one")
-        from dew.interop.pretrained import split_revision
+        from dew.interop.sources import SourceReference
         from dew.nn.autoencoders.rae import load_dinov2
 
-        name, revision = split_revision(self.source)
-        module, params, _ = load_dinov2(name, revision=revision,
+        reference = SourceReference.parse(self.source)
+        module, params, _ = load_dinov2(reference.name, revision=reference.revision,
                                         params=None if held is None else held["params"])
         if self.encoder is not None:
             module = self.encoder
@@ -147,7 +147,7 @@ class Alignment:
 
         Under iREPA (`spatial_norm` set) the features are spatially normalized.
         """
-        dtype = jnp.promote_types(images.dtype, jnp.float32)
+        dtype = at_least_fp32(images.dtype)
         pixels = (images.astype(dtype) + 1) / 2
         pixels = (pixels - jnp.asarray(self.mean)) / jnp.asarray(self.std)
         if self.resolution is not None and self.resolution != pixels.shape[1]:
@@ -157,7 +157,7 @@ class Alignment:
         if not isinstance(features, jax.Array):
             raise TypeError("a representation encoder must return one array of patch features")
         features = features.reshape(features.shape[0], -1, features.shape[-1]).astype(
-            jnp.promote_types(features.dtype, jnp.float32))
+            at_least_fp32(features.dtype))
         if self.spatial_norm is not None:
             features = spatial_zscore(features, self.spatial_norm)
         return jax.lax.stop_gradient(features)
@@ -182,7 +182,7 @@ class Alignment:
                              f"match the encoder's {targets.shape[1]} patches")
         projected = self.module(targets.shape[-1]).apply(projector, hidden)
         assert isinstance(projected, jax.Array)
-        projected = projected.astype(jnp.promote_types(projected.dtype, jnp.float32))
+        projected = projected.astype(at_least_fp32(projected.dtype))
         return -Objective.row_mean(jnp.sum(l2_normalized(projected) * l2_normalized(targets), axis=-1),
                                    batch).mean()[0]
 

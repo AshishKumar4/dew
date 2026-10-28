@@ -34,11 +34,13 @@ from collections.abc import Mapping
 
 import tyro
 
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.config.data import TextData
-from dew.data.dataset import DataPhase
-from dew.objectives.lm import LMRunConfig
-from dew.training.optim import ParamGroup, Power, PowerTail
+from dew.config import ObjectiveConfig, TrainerConfig
+from dew.config.lm import LMRunConfig
+from dew.data import mix, phases, presets
+from dew.data.pipeline import Pipeline
+from dew.data.sources.tokens import TokenFiles
+from dew.optim import OptimConfig, ParamGroup, Power, PowerTail
+from dew.registry import ModelConfig
 
 LAYERS = 40
 VOCAB = 100_352
@@ -89,35 +91,53 @@ def optim_config(width: int, steps: int, batch: int, seq_len: int) -> OptimConfi
     scale = steps / STEPS
     return OptimConfig(
         optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-10},
-        schedule=Power(peak=0.01, warmup_steps=max(round(5_000 * scale), 1),
+        learning_rate=Power(peak_value=0.01, warmup_steps=max(round(5_000 * scale), 1),
                        a=4.0 * batch, b=-0.51, c=float(batch * seq_len),
                        tail=PowerTail(start=round(DECAY_START * scale))),
         weight_decay=0.1, clip_grads=1.0, param_groups=ParamGroup.mup(width / 128))
 
 
-def phases(corpora: Mapping[str, str], steps: int) -> tuple[DataPhase, ...]:
-    """Rigel's phases over the named corpus directories, boundaries rescaled
-    to `steps`; empty phases extend the preceding mixture, or the first
-    non-empty mixture when they lead the run."""
+def schedule(corpora: Mapping[str, str], steps: int) -> tuple[tuple[dict[str, float], int | None], ...]:
+    """Rigel's phases over the named corpus directories, each mixture of directories by share and the
+    step it ends before, boundaries rescaled to `steps`, the last running to the end; a phase of one
+    store holds it at 1.0. An empty phase extends the preceding mixture, or the first non-empty
+    mixture when it leads the run."""
     scale = steps / STEPS
-    out: list[DataPhase] = []
+    mixtures: list[tuple[dict[str, float], int | None]] = []
     for until, shares in PHASES:
         end = None if until is None else round(until * scale)
         mixture = {corpora[name]: share for name, share in shares.items() if name in corpora}
         if not mixture:
-            if out:
-                out[-1] = DataPhase(out[-1].path, end)
+            if mixtures:
+                mixtures[-1] = (mixtures[-1][0], end)
             continue
-        path: str | dict[str, float] = next(iter(mixture)) if len(mixture) == 1 else mixture
-        if out and out[-1].path == path:
-            out[-1] = DataPhase(path, end)
+        # One store reads all of its phase, whatever its share.
+        mixture = dict.fromkeys(mixture, 1.0) if len(mixture) == 1 else mixture
+        if mixtures and mixtures[-1][0] == mixture:
+            mixtures[-1] = (mixture, end)
         else:
-            out.append(DataPhase(path, end))
-    if not out:
+            mixtures.append((mixture, end))
+    if not mixtures:
         raise ValueError(f"none of {sorted(corpora)} is a Rigel corpus: "
                          f"{sorted({name for _, shares in PHASES for name in shares})}")
-    out[-1] = DataPhase(out[-1].path, None)
-    return tuple(out)
+    mixtures[-1] = (mixtures[-1][0], None)
+    return tuple(mixtures)
+
+
+def phased(corpora: Mapping[str, str], steps: int, seq_len: int, batch: int) -> Pipeline:
+    """Rigel's phases (`schedule`) as one chain: each store packed by itself into rows of `seq_len + 1`
+    tokens, a phase's stores mixed by their tokens, and the phases shuffled, repeated and batched
+    together."""
+    def packed(url: str) -> Pipeline:
+        return TokenFiles(url).pipe(presets.lm, None, seq_len=seq_len, batch=None, pack="first-fit", bins=8)
+
+    def phase(mixture: dict[str, float]) -> Pipeline:
+        if len(mixture) == 1:
+            return packed(next(iter(mixture)))
+        return mix([packed(url) for url in mixture], list(mixture.values()), by="tokens")
+
+    return phases(*((phase(mixture), until) for mixture, until in schedule(corpora, steps))
+                  ).shuffle(0).repeat().batch(batch)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -139,13 +159,11 @@ def run_config(args: RigelArgs) -> LMRunConfig:
     """The LM run config for `args`."""
     return LMRunConfig(
         model=ModelConfig("causal_transformer", {**model_config(args.width), "dtype": "bfloat16"}),
-        data=TextData(source="", phases=phases(args.corpora, args.steps),
-                  seq_len=args.seq_len, pack="first-fit"),
-        validation_records=4 * args.batch_size,
+        data=phased(args.corpora, args.steps, args.seq_len, args.batch_size),
         optim=optim_config(args.width, args.steps, args.batch_size, args.seq_len),
-        trainer=TrainerConfig(batch_size=args.batch_size, steps=args.steps,
-                              eval_every=None, checkpoint_every=5_000),
-        objective=ObjectiveConfig("lm", {"aux_loss_alpha": 0.001, "seq_aux": False, "router_z_loss": 0.0001}),
+        trainer=TrainerConfig(steps=args.steps, eval_every=None, checkpoint_every=5_000),
+        objective=ObjectiveConfig("lm", {"balance": {
+            "aux_loss_alpha": 0.001, "seq_aux": False, "router_z_loss": 0.0001}}),
         tokenizer=args.tokenizer, max_new_tokens=0)
 
 

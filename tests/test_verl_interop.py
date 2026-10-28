@@ -15,8 +15,7 @@ import numpy as np
 import pyarrow.parquet as pq
 import pytest
 
-from dew.config.data import PromptData
-from dew.data import Loading
+from dew.data import Files, Loading, presets
 from dew.data.compile import iterate
 from dew.data.prompts import INFO_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
 from dew.objectives.rl.sessions import (
@@ -60,10 +59,10 @@ def test_native_rows_round_trip_through_rollouts():
     tool = trajectories[0].session
     first, second = tool.calls
     wire = rows[0]
-    assert first.prompt_ids == tuple(wire["prompt_ids"])
-    assert first.sampled_ids == tuple(wire["response_ids"][:5])
-    assert second.prompt_ids == tuple(wire["prompt_ids"] + wire["response_ids"][:15])
-    assert second.sampled_ids == tuple(wire["response_ids"][15:])
+    assert first.prompt == tuple(wire["prompt_ids"])
+    assert first.tokens == tuple(wire["response_ids"][:5])
+    assert second.prompt == tuple(wire["prompt_ids"] + wire["response_ids"][:15])
+    assert second.tokens == tuple(wire["response_ids"][15:])
     assert (first.finish_reason, second.finish_reason) == ("tool_calls", "stop")
     assert first.version == second.version == 7
     assert trajectories[1].extras["mm_processor_output"] == rows[1]["mm_processor_output"]
@@ -144,9 +143,9 @@ def test_rollouts_round_trip_through_verl_rows_losslessly():
 
 def test_the_verl_rl_parquet_reads_its_nested_ground_truth():
     table = pq.read_table(PARQUET).to_pylist()
-    pipeline, _, _ = PromptData(source=str(PARQUET), tokenizer="tests/fixtures/tokenizers/tiny-tools",
-                             max_prompt_len=512, long="truncate").pipelines()
-    rows = list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
+    prompts = Files(str(PARQUET)).pipe(presets.prompts, "tests/fixtures/tokenizers/tiny-tools",
+                                       max_prompt_len=512, batch=None, long="truncate")
+    rows = list(iterate(prompts, read="memory", loading=Loading(workers=0)))
     for index, expected in enumerate(table):
         batch = rows[index]
         assert read(batch[SOURCE_KEY]) == expected["data_source"] == "openai/gsm8k"

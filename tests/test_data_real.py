@@ -18,8 +18,8 @@ import os
 import numpy as np
 import pytest
 
-from dew.config.data import Augment, HoldOut, ImageData, loader
-from dew.data import TFDS, Loading
+from dew.data import TFDS, Loading, images, presets
+from dew.data.compile import compile, held
 from dew.data.dataset import DataPartition
 
 pytestmark = pytest.mark.network
@@ -34,12 +34,17 @@ VAL_RECORDS = 4 * BATCH
 
 @pytest.fixture(scope="module")
 def flowers():
-    """The Dataset a recipe loads from the registered spec, in-process."""
-    return loader(ImageData(source=TFDS("oxford_flowers102", path=os.environ["DEW_FLOWERS_PATH"],
-                                        split="all"),
-                       image_size=SIZE, augment=Augment(flip=True, jitter=True),
-                       caption_templates=("a photo of a {}",), validation=HoldOut(records=VAL_RECORDS)),
-                batch=BATCH, read="memory", loading=Loading(workers=0))
+    """The corpus through the images preset, its first records held out: the training loader and
+    the validation reader, in-process."""
+    store = TFDS("oxford_flowers102", path=os.environ["DEW_FLOWERS_PATH"], split="all")
+    train, val = store.holdout(records=VAL_RECORDS)
+    caption = images.caption(templates=("a photo of a {}",))
+    loader = compile(train.shuffle(0).repeat().pipe(presets.images, SIZE, batch=BATCH, augment=True,
+                                                    caption=caption, rejects=False),
+                     read="memory", loading=Loading(workers=0))
+    validation = held(val.pipe(presets.images, SIZE, batch=BATCH, caption=caption, rejects=False)
+                      .read("memory").loading(Loading(workers=0)))
+    return loader, validation
 
 
 def labels_of(batch):
@@ -47,10 +52,11 @@ def labels_of(batch):
 
 
 def test_train_batches_carry_resized_images_and_labels(flowers):
-    assert flowers.records == RECORDS - VAL_RECORDS
-    assert flowers.batch == BATCH
+    loader, _ = flowers
+    assert loader.records == RECORDS - VAL_RECORDS
+    assert loader.batch == BATCH
 
-    train = flowers.train(DataPartition())
+    train = loader.train(DataPartition())
     first, second = next(train), next(train)
 
     for batch in (first, second):
@@ -68,12 +74,13 @@ def test_train_batches_carry_resized_images_and_labels(flowers):
 def test_the_validation_pass_reads_the_split_once_and_stops(flowers):
     """The pass is the four held-out batches and nothing after them.
 
-    grain's DataLoader batched inside each worker, and the loader defaults to
-    eight of them, so a batch came out of one worker's four records read
-    twice and the pass ran on for good. Two records of Flowers are never the
-    same image, so counting distinct rows counts records.
+    Grain's DataLoader once batched inside each worker, so a batch came out of
+    one worker's four records read twice and the pass ran on for good. Two
+    records of Flowers are never the same image, so counting distinct rows
+    counts records.
     """
-    rows = [image.tobytes() for batch in itertools.islice(flowers.val(DataPartition()), 8)
+    _, validation = flowers
+    rows = [image.tobytes() for batch in itertools.islice(validation(DataPartition()), 8)
             for image in batch["image"]]
 
     assert len(rows) == VAL_RECORDS

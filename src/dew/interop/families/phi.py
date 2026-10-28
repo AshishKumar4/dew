@@ -1,16 +1,20 @@
 """Phi's one-norm parallel biased block, sliced rotary and affine output head."""
 
+import dataclasses
 from collections.abc import Mapping
 from functools import partial
 
-from dew import records
+from dew import _records
 from dew.interop.decoder_parts import (
+    PLAIN_SPELLING,
     DecoderFamily,
     DecoderFields,
     Renames,
     base_config,
     decoder_tensors,
     hf_ungated,
+    partial_rope,
+    read_rope,
     refuse,
     renamed_name,
     renamed_path,
@@ -20,28 +24,27 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
 def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    parameters = records.record(hf.get('rope_parameters') or {}, 'rope_parameters')
-    partial = records.number(parameters.get('partial_rotary_factor', hf.get('partial_rotary_factor', .5)),
-                              'partial_rotary_factor')
-    theta = records.number(parameters.get('rope_theta', hf.get('rope_theta', 10000.)), 'rope_theta')
-    rope = {key: value for key, value in parameters.items() if key != 'partial_rotary_factor'}
-    activation = records.text(hf.get('hidden_act', 'gelu_new'), 'hidden_act')
+    # PhiRotaryEmbedding builds any rope_type the rope utilities do over the rotated
+    # half, YaRN among them (modeling_phi.py:42-45, `_compute_yarn_parameters`).
+    theta, partial, rope = partial_rope(hf, PLAIN_SPELLING, default_factor=.5)
+    flat = {**hf, 'rope_theta': theta, 'rope_parameters': rope or None}
+    ropes = read_rope(flat, used, PLAIN_SPELLING)
+    activation = _records.text(hf.get('hidden_act', 'gelu_new'), 'hidden_act')
     mlp = ungated_mlp(activation, ('gelu_new', 'gelu_pytorch_tanh', 'gelu', 'relu'), 'hidden_act', 'Phi')
     if hf.get('qk_layernorm', False):
         refuse('qk_layernorm', 'Phi q/k LayerNorm has no RMSNorm counterpart')
-    config = base_config({**hf, 'hidden_act': 'silu', 'rope_theta': theta,
-                           'rope_parameters': rope or None}, used, reads=frozenset())
+    config = base_config({**flat, 'hidden_act': 'silu'}, used, rope=ropes, reads=frozenset())
     used.update(('partial_rotary_factor', 'qk_layernorm', 'layer_norm_eps', 'resid_pdrop',
                  'embd_pdrop', 'attention_dropout'))
     config.update({
         'mlp': mlp, 'mlp_bias': True,
         'norm_type': 'layer', 'norm_bias': True, 'scale_after_cast': False,
-        'norm_eps': records.number(hf.get('layer_norm_eps', 1e-5), 'layer_norm_eps'),
+        'norm_eps': _records.number(hf.get('layer_norm_eps', 1e-5), 'layer_norm_eps'),
         'parallel_residual': True, 'shared_parallel_norm': True, 'head_bias': True,
         'attention_bias': True, 'partial_rotary_factor': partial, 'partial_rotary_type': 'default',
-        'dropout_rate': records.number(hf.get('resid_pdrop', 0.), 'resid_pdrop'),
-        'embedding_dropout_rate': records.number(hf.get('embd_pdrop', 0.), 'embd_pdrop'),
-        'attention_dropout_rate': records.number(hf.get('attention_dropout', 0.) or 0., 'attention_dropout'),
+        'dropout_rate': _records.number(hf.get('resid_pdrop', 0.), 'resid_pdrop'),
+        'embedding_dropout_rate': _records.number(hf.get('embd_pdrop', 0.), 'embd_pdrop'),
+        'attention_dropout_rate': _records.number(hf.get('attention_dropout', 0.) or 0., 'attention_dropout'),
     })
     return config
 
@@ -57,8 +60,12 @@ def _phi_export(model: CausalTransformer) -> Mapping[str, object]:
         'layer_norm_eps': model.norm_eps, 'qk_layernorm': False,
         'resid_pdrop': model.dropout_rate, 'embd_pdrop': model.embedding_dropout_rate,
         'attention_dropout': model.attention_dropout_rate,
-        'rope_parameters': {'rope_type': 'default', 'rope_theta': model.rope_theta,
+        # One record holds the rotated fraction beside the ramp, as PhiConfig reads it.
+        'rope_parameters': {**({'rope_type': 'default'} if model.yarn is None else {
+            key: value for key, value in dataclasses.asdict(model.yarn).items() if value is not None}),
+                            'rope_theta': model.rope_theta,
                             'partial_rotary_factor': model.partial_rotary_factor or 1.},
+        **({} if model.yarn is None else {'rope_scaling': None}),
         'attention_bias': None, 'rms_norm_eps': None, 'head_dim': None,
     }
 
@@ -69,4 +76,7 @@ PHI = DecoderFamily(
     'phi', 'PhiForCausalLM', _phi_export,
     weight_path=partial(renamed_path, _PHI_NAMES), export_path=partial(renamed_name, _PHI_NAMES),
     export_weights=decoder_tensors, preserve_source_layout=False,
+    # PhiConfig's context (configuration_phi.py:73), which a YaRN record's omitted lengths read.
+    defaults={'max_position_embeddings': 2048},
+    padding_idx=True,
 )

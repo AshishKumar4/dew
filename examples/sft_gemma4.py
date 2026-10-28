@@ -13,7 +13,7 @@ them, and the run directory itself scores through the harness:
     python -m dew.eval --model dew --model_args run=runs/gemma4-sft/checkpoints/gemma4-sft \\
         --tasks hellaswag --limit 64
 
-The `ChatData` recipe reads the Hub dataset through its `hf://` source, so the URL
+The `sft` preset reads the Hub dataset through its `hf://` source, so the URL
 on the command line is what the run trains on: it renders every conversation
 with the checkpoint's own chat template and packs them into windows.
 
@@ -28,15 +28,18 @@ import jax
 import jax.numpy as jnp
 import tyro
 
-from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.config.data import ChatData, HoldOut, loader
-from dew.data import HFTokenizer, Loading
+from dew.config import TrainerConfig
+from dew.config.lm import LMRunConfig
+from dew.data import HFTokenizer, Loading, presets
 from dew.data.chat import Role
-from dew.data.sources import Read
+from dew.data.sources import Read, source as data_source
 from dew.inference import RunProcessor
 from dew.interop import PretrainedDecoder
-from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity, Samples
-from dew.training import MeshSpec, TrainState, prepare_process
+from dew.objectives.lm import LMObjective, Perplexity, Samples
+from dew.optim import OptimConfig
+from dew.registry import ModelConfig
+from dew.state import TrainState
+from dew.training import MeshSpec, prepare_process
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
 SMOKE_MODEL = FIXTURES / "hf/gemma4-ple"
@@ -76,7 +79,7 @@ class Config:
 
 
 def write_conversations(conversations: list, out: Path) -> Path:
-    """The canned turns as the JSONL file the `Chat` recipe reads line by line."""
+    """The canned turns as the JSONL file the `sft` preset reads line by line."""
     out.mkdir(parents=True, exist_ok=True)
     jsonl = out / "chat.jsonl"
     jsonl.write_text("".join(json.dumps({"messages": turns}) + "\n" for turns in conversations))
@@ -97,16 +100,16 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
     smoke = config.smoke
     # A row budget is the split slice `datasets` already understands.
     split = config.split if config.rows is None else f"{config.split}[:{config.rows}]"
+    # A Hub split is downloaded and prepared where the run first reads it; a local file, as the
+    # smoke run's, reads as it is.
+    train, held = data_source(chat, split=split).holdout(records=config.held_out)
+    loading = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1) if smoke else Loading(workers=4)
+    windows = {"seq_len": config.sequence_length, "batch": config.batch_size, "messages": config.column}
     return LMRunConfig(
-        data_read=config.data_read,
-        # A Hub split is downloaded and prepared where the run first reads it; a local file, as the
-        # smoke run's, reads as it is.
-        provision=True,
-        data=ChatData(tokenizer=tokenizer, source=chat, validation=HoldOut(records=config.held_out),
-                  column=config.column, split=split, seq_len=config.sequence_length, long="chunk"),
-        validation_records=config.batch_size,
-        loading=Loading(workers=0, threads=1, read_buffer=2,
-                        worker_buffer=1) if smoke else Loading(workers=4),
+        data=(train.shuffle(seed=0).repeat().pipe(presets.sft, tokenizer, **windows, long="chunk")
+              .read(config.data_read).loading(loading)),
+        validation=(held.pipe(presets.sft, tokenizer, **windows, records=config.batch_size)
+                    .read(config.data_read).loading(loading)),
         tokenizer=tokenizer,
         max_new_tokens=4 if smoke else 64,
         optim=OptimConfig(learning_rate=config.learning_rate, weight_decay=0.0,
@@ -114,7 +117,7 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
         # A smoke run stays out of any process pool; a real run joins one
         # when a cluster started it and runs alone otherwise.
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"),
-                              batch_size=config.batch_size, steps=config.steps,
+                              steps=config.steps,
                               accumulation=config.accumulation, log_every=1 if smoke else 20,
                               eval_every=config.steps, checkpoint_every=config.steps,
                               multi_host=False if smoke else None,
@@ -130,14 +133,15 @@ def main(config: Config) -> Path:
 
     run = run_config(config, tokenizer, chat)
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
-                    run.trainer.compilation_cache_dir, layout=run.trainer.layout)
+                    run.trainer.compilation_cache_dir)
     # Only now: counting devices opens the backend, which has to come after
     # the pool forms, and a pool's count is every process's devices.
     run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
     source = PretrainedDecoder.load(config.model, dtype=jnp.float32 if config.smoke else jnp.bfloat16,
                                     attention_impl="xla" if config.smoke else "auto",
-                                    max_seq_len=config.sequence_length + run.max_new_tokens)
+                                    max_seq_len=config.sequence_length + run.max_new_tokens,
+                                    on_host=True)  # the trainer places it over its fsdp mesh
     words = HFTokenizer(tokenizer)
     # The run decodes through this tokenizer, so its checkpoints record its name.
     objective = LMObjective(
@@ -151,11 +155,8 @@ def main(config: Config) -> Path:
     # rebuild the checkpoint's own architecture at the precision it trained in.
     run = replace(run, model=ModelConfig.from_model(source.model))
 
-    data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read,
-                provision=run.provision, loading=run.loading,
-                validation_records=run.validation_records)
     name = config.out.name
-    state: TrainState = run.train(objective, data, name=name,
+    state: TrainState = run.train(objective, run.data, validation=run.validation, name=name,
                                   metrics=(Perplexity(),),
                                   summary={"model": dict(source.model_config)})
 

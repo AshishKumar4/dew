@@ -16,15 +16,23 @@ import optax
 import pytest
 from diffusion_stubs import label_table
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle, chain_roundings
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_computes_the_oracle,
+    chain_roundings,
+)
 from test_lpips import drawn_weights
 from test_mean_flow import CLASSES
 
 from dew.diffusion import presets
 from dew.eval.lpips import variables_from_torch
+from dew.inference import TextToImage
 from dew.inputs import Condition, Field, InputSpec, unit_range
+from dew.nn.autoencoders.api import AutoEncoder
 from dew.nn.autoencoders.dc_ae import DCAE, DCAutoencoder
 from dew.nn.autoencoders.kl import AutoencoderKL
+from dew.nn.autoencoders.pretrained import REGISTRATIONS
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.nn.autoencoders.vae import translate_vae_weights
 from dew.nn.backbones import SimpleDiT
@@ -41,7 +49,8 @@ from dew.objectives.diffusion.end_to_end import (
     TunedAutoEncoder,
 )
 from dew.objectives.diffusion.objective import DISCRIMINATOR
-from dew.sampling import Euler, TextToImage
+from dew.sampling import Euler
+from dew.telemetry.instrumentation import Compiles
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -159,18 +168,22 @@ def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
     later = TextToImage.from_objective(task, {**state.variables, LATENT_STATS: moved})
     assert later.autoencoder == published.autoencoder
     assert hash(later.autoencoder) == hash(published.autoencoder)
-    decode = jax.jit(lambda autoencoder, params, z: autoencoder.decode(params, z), static_argnums=0)
+    def decoded(autoencoder, params, z):
+        return autoencoder.decode(params, z)
+
+    decode = jax.jit(decoded, static_argnums=0)
     z = jax.random.normal(jax.random.PRNGKey(4), (1, *task.latent_shape))
-    for publication, statistics in ((published, after), (later, moved)):
-        shift = np.asarray(statistics["mean"])
-        scale = 1 / np.sqrt(np.asarray(statistics["var"]))
-        np.testing.assert_allclose(np.asarray(publication.autoencoder.normalization(
-            publication.variables["autoencoder"])[1]), scale, rtol=1e-6)
-        weights = tuned[TUNED_WEIGHTS]
-        expected = task.autoencoder.decode_batch(weights, z / jnp.asarray(scale) + jnp.asarray(shift))
-        decoded = decode(publication.autoencoder, publication.variables["autoencoder"], z)
-        np.testing.assert_allclose(np.asarray(decoded), np.asarray(expected), rtol=1e-5, atol=1e-6)
-    assert decode._cache_size() == 1
+    with Compiles("decoded") as compiled:
+        for publication, statistics in ((published, after), (later, moved)):
+            shift = np.asarray(statistics["mean"])
+            scale = 1 / np.sqrt(np.asarray(statistics["var"]))
+            np.testing.assert_allclose(np.asarray(publication.autoencoder.latent_affine(
+                publication.variables["autoencoder"], jnp.float32).factor), scale, rtol=1e-6)
+            weights = tuned[TUNED_WEIGHTS]
+            expected = task.autoencoder.decode_batch(weights, z / jnp.asarray(scale) + jnp.asarray(shift))
+            image = decode(publication.autoencoder, publication.variables["autoencoder"], z)
+            np.testing.assert_allclose(np.asarray(image), np.asarray(expected), rtol=1e-5, atol=1e-6)
+    assert compiled.count == 1
 
 
 SIDE, LATENT, PATCH, WIDTH, FEATURES, PROJECTOR, DROPOUT, DISCRIMINATOR_WIDTH = 32, 4, 2, 12, 6, 10, 0.1, 8
@@ -398,7 +411,17 @@ def _repae_step(tmp_path: Path, dtype) -> SimpleNamespace:
                                                   "var": STEPPED[f"bn/running_var_before{tail}"]})}
     batch = {"image": jnp.asarray(STEPPED["pixels"], dtype),
              **inputs.tokenize([str(label) for label in STEPPED["classes"]])}
-    step = Step(step=jnp.asarray(0), key=jax.random.key(int(STEPPED["key"])), ema=None)
+    # The step reads train_repae's own posterior draw, times, noise and dropped labels by name
+    # (`Step.tape`), the floats tools/repae_reference.py drew and replayed, as it recorded them: a
+    # float drawn again here may round otherwise (bible: floats through a rounding chain are not
+    # bit-identical across programs), and the float64 rule would see one ulp of a draw.
+    rows = len(STEPPED["classes"])
+    assert STEPPED["draw/posterior"].shape == (rows, *task.latent_shape)
+    tape = {"posterior": jnp.asarray(STEPPED["draw/posterior"], jnp.float32),
+            "times": jnp.asarray(STEPPED["draw/times"], jnp.float32),
+            "noise": jnp.asarray(STEPPED["draw/noise"], jnp.float32),
+            "condition dropout": jnp.asarray(STEPPED["dropped"])}
+    step = Step(step=jnp.asarray(0), key=jax.random.key(int(STEPPED["key"])), ema=None, tape=tape)
 
     def loss(tree):
         return task.scalar_loss({**variables, "params": tree}, batch, step)
@@ -505,7 +528,8 @@ def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_ste
                                1 / np.sqrt(STEPPED["bn/running_var_f64"]), rtol=4 * np.finfo(np.float64).eps)
     decoder, decoding = task.published_autoencoder({**variables, "params": params, LATENT_STATS: statistics})
     assert isinstance(decoder, TunedAutoEncoder)
-    shift, scale = decoder.normalization(decoding["autoencoder"])
+    affine = decoder.latent_affine(decoding["autoencoder"], jnp.float32)
+    shift, scale = affine.shift, affine.factor
     np.testing.assert_array_equal(np.asarray(shift), np.asarray(statistics["mean"]))
     np.testing.assert_allclose(np.asarray(scale, np.float64),
                                1 / np.sqrt(np.asarray(statistics["var"], np.float64)), rtol=gamma(2), atol=0)
@@ -574,11 +598,13 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     running statistics, and samples exactly as the trained objective's own
     task does."""
     from diffusion_stubs import batch_for
+    from diffusion_support import images_of, saved_after_one_step
 
-    from dew.checkpoints import Checkpoints
-    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.config.data import ImageData
-    from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
+    from dew.config import ObjectiveConfig, TrainerConfig
+    from dew.config.diffusion import DiffusionRunConfig
+    from dew.inputs import TextCondition
+    from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
+    from dew.registry import ModelConfig
 
     for name in ("tiny_diffusers", "rae"):
         with tarfile.open(FIXTURES / f"{name}.tar.xz") as archive:
@@ -586,8 +612,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 2, "num_heads": 2,
                                          "mlp_ratio": 1, "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102",
-                       image_size=32), preset=presets.Flow(), val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", 32), preset=presets.Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "tiny_diffusers/sd/vae"), dtype="float32"),
@@ -596,16 +621,8 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
                                    resolution=112),
             "end_to_end": EndToEnd(perceptual_weight=0.0, discriminator_width=8), "solver": Euler(),
             "guidance": None, "steps": 2, "ema_decay": None}))
-    task = config.build()
-    trainer = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3))
-    state = trainer.initial_state()
-    batch = batch_for(task, 32)
-    state, *_ = trainer.compile(state, batch)(state, batch)
     run = tmp_path / "run"
-    checkpoints = Checkpoints(str(run))
-    checkpoints.save(1, state, None, artifact=task.inference_record())
-    checkpoints.wait()
-    config.save(str(run))
+    task, state, _ = saved_after_one_step(config, lambda task: batch_for(task, 32), run, 1e-2)
 
     # The saved tree carries the encoder's weights, so restoring reads its
     # checkpoint's config and nothing else.
@@ -622,3 +639,48 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(restored(["a red bird"], key=9).host().images, expected)
+
+
+BUILT_INS = tuple(entry.wrapper for entry in REGISTRATIONS)
+"""Every built-in autoencoder, one per registration (the sources `pretrained.REGISTRATIONS` loads)."""
+
+
+def test_only_the_kl_autoencoders_with_a_posterior_reach_end_to_end_tuning():
+    """End-to-end tuning trains through `moments`; a built-in without one is refused when the objective
+    is built (`_check_end_to_end`), so the start below covers every built-in a run can tune."""
+    exposes = {wrapper for wrapper in BUILT_INS if wrapper.moments is not AutoEncoder.moments}
+    assert exposes == {StableDiffusionVAE}
+
+
+def test_the_running_statistics_start_by_normalizing_as_the_autoencoder_does():
+    """REPA-E's start, `normalized` by `initial_statistics` of the autoencoder's shift and scale with
+    the batch norm's epsilon at zero, normalizes a posterior's latents as `encode` does
+    (`AutoEncoder.latent_affine`, which `encode` applies to its draw): neither the identity nor
+    twice."""
+    autoencoder = objective(EndToEnd()).autoencoder
+    tuning = EndToEnd(epsilon=0.0)
+    statistics = tuning.initial_statistics(autoencoder.latent_shift, autoencoder.latent_scale,
+                                           autoencoder.latent_channels)
+
+    def draw(seed):
+        return (jax.random.normal(jax.random.key(seed), (8, 4, 4, autoencoder.latent_channels)),)
+
+    def started(latents):
+        return tuning.normalized(latents, jax.tree.map(lambda value: value.astype(latents.dtype), statistics))
+
+    def encoded(latents):
+        return autoencoder.latent_affine(autoencoder.params, latents.dtype).normalized(latents)
+
+    assert_as_exact(jax.jit(started), jax.jit(encoded), draw, "end-to-end start", seeds=8)
+
+
+def test_a_tuned_autoencoder_has_no_fixed_normalization_to_read_or_replace():
+    """Its normalization is each call's running statistics: a fixed shift, scale or replacement is
+    refused, not the base's identity."""
+    autoencoder = objective(EndToEnd()).autoencoder
+    tuned = TunedAutoEncoder(autoencoder, {TUNED_WEIGHTS: autoencoder.params})
+    for read in (lambda: tuned.latent_shift, lambda: tuned.latent_scale,
+                 lambda: tuned.with_normalization(autoencoder.normalization)):
+        with pytest.raises(TypeError):
+            read()
+

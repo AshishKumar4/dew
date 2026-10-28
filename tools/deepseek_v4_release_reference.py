@@ -27,7 +27,6 @@ under `v4/` and `v4_1/`. Run from the checkout with torch 2.14 on the CPU:
     python tools/deepseek_v4_release_reference.py
 """
 
-import importlib.util
 import sys
 import tempfile
 import types
@@ -35,8 +34,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import CACHE, loaded, saved_fixture, verified
 from safetensors.torch import load_file, save_file
-from reference_source import CACHE, saved_fixture, verified
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "codecs" / "deepseek_v4_release.npz"
@@ -63,14 +62,6 @@ def fetched(release: str, path: str) -> Path:
                     SHA256[release, path])
 
 
-def load(name: str, path: Path):
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
 def e4m3(rng, shape) -> torch.Tensor:
     """Random E4M3FN codes, both NaN codes left out."""
     codes = rng.integers(0, 0x7F, shape, dtype=np.uint8) | rng.choice(np.uint8([0, 0x80]), shape)
@@ -90,7 +81,7 @@ def raw(tensor: torch.Tensor) -> np.ndarray:
 def convert(release: str, rng, arrays: dict) -> None:
     """The release's convert.py `main` over a one-layer, one-expert checkpoint."""
     _, _, block = RELEASES[release]
-    module = load(f"{release}_convert", fetched(release, "inference/convert.py"))
+    module = loaded(f"{release}_convert", fetched(release, "inference/convert.py"))
     out, inputs = 2 * block, 3 * block
     # E8M0 bytes 0 and 254 take the products to float32 subnormals and past 448 * 2 ** 127.
     exponents = rng.integers(100, 150, (2, 3))
@@ -141,8 +132,8 @@ def engram(rng, arrays: dict) -> None:
         setattr(kernel, name, refuse)
     sys.modules["kernel"] = kernel
     for name in ("engram", "vision", "image_processor"):
-        load(name, fetched("v4_1", f"inference/{name}.py"))
-    model = load("v4_1_model", fetched("v4_1", "inference/model.py"))
+        loaded(name, fetched("v4_1", f"inference/{name}.py"))
+    model = loaded("v4_1_model", fetched("v4_1", "inference/model.py"))
     table = model.ParallelEngramEmbedding(9, 256)
     weight, scale = e4m3(rng, (9, 256)), rng.integers(110, 140, (9, 8))
     scale.flat[:2] = 0, 254

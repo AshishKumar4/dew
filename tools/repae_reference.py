@@ -66,9 +66,9 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from einops import rearrange
 from lpips_weights import drawn_weights
 from recorded_draws import Tape, TorchDraws
-from torch_precision import float_as, replaced
 from reference_source import defined_in, fetched, ran
 from safetensors.torch import load as load_safetensors
+from torch_precision import float_as, replaced
 from torchvision import models
 
 from dew.diffusion import presets
@@ -113,7 +113,7 @@ def regularizer() -> None:
     total = F.l1_loss(images, reconstruction) + KL_WEIGHT * torch.sum(kl) / kl.shape[0]
 
     latents = torch.randn(3, 4, 4, 4, generator=generator, dtype=torch.float64) * 1.7 + 0.4
-    norm = torch.nn.BatchNorm2d(4, eps=1e-4, momentum=0.1, affine=False).double()
+    norm = torch.nn.BatchNorm2d(4, eps=1e-4, momentum=0.1, affine=False, dtype=torch.float64)
     norm.running_mean = torch.full((4,), SHIFT, dtype=torch.float64)
     norm.running_var = torch.full((4,), 1 / SCALE, dtype=torch.float64).pow(2)
     trained = norm.train()(latents)
@@ -257,8 +257,9 @@ def weights() -> dict[str, np.ndarray]:
 
 
 def draws(pixels: np.ndarray) -> tuple[list[np.ndarray], np.ndarray]:
-    """DiffusionObjective.loss's draws from `jax.random.key(KEY)`, channels
-    first, in the step's order, and the rows its label dropout blanks."""
+    """The step's draws from `jax.random.key(KEY)`, channels first, in the step's order, and the rows
+    its label dropout blanks: the test hands DiffusionObjective.loss the posterior's draw, the times,
+    the noise and the dropped rows by name (`Step.tape`)."""
     encode, drop, time, noise, _ = jax.random.split(jax.random.key(KEY), 5)
     latents = (pixels.shape[0], SIDE // DOWNSCALE, SIDE // DOWNSCALE, LATENT)
     uniforms = np.asarray(jax.random.uniform(drop, (pixels.shape[0],)))
@@ -355,7 +356,7 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
     # `Tensor.float()`, which `preprocess_imgs_vae` and the loss's forward call, as the run's precision.
     with replaced(float_as(dtype)):
         ran(statements, scope, "train_repae.py")
-    assert not tape.replayed, "the step drew fewer times than DiffusionObjective.loss"
+    tape.spent()
 
     tail = "_f64" if dtype == torch.float64 else ""
     result = {f"grad/vae.{name}{tail}": accelerator.gradients[value].numpy()
@@ -393,6 +394,10 @@ def step() -> None:
     replayed, dropped = draws(pixels)
     arrays = {f"weights/{name}": value for name, value in drawn.items()}
     arrays.update(pixels=pixels, classes=classes, key=np.asarray(KEY), dropped=dropped)
+    # The draws as the test's step reads them, in Dew's layout: a float drawn again may round otherwise.
+    last = (0, 2, 3, 1)
+    arrays.update({"draw/posterior": replayed[0].transpose(last), "draw/times": replayed[1].reshape(-1),
+                   "draw/noise": replayed[2].transpose(last)})
     for dtype in (torch.float64, torch.float32):
         arrays.update(run(dtype, drawn, pixels, classes, replayed))
     np.savez(FIXTURE / "step.npz", **arrays)

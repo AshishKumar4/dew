@@ -25,15 +25,19 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.coordination import agreed, broadcast_from_process_zero, collective_host
+from dew._coordination import agreed, agreed_same, broadcast_from_process_zero, collective_host
+from dew.batch import Batch, Variables
+from dew.data.dataset import rows_of
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceGrid
+from dew.distributed.batches import row_origins, shared_host_fields, split_fields, with_host
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import OMITTED, Aux, Batch, Omitted, Ratio, Shown, Step, Variables
+from dew.nn.precision import at_least_fp32, weighted_total
+from dew.objectives.base import OMITTED, Aux, Omitted, Ratio, Shown, Step
 from dew.objectives.diffusion.objective import DiffusionObjective
-from dew.registry import metrics
+from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG, Walk
@@ -45,7 +49,7 @@ REWARDS_KEY = "rewards"
 """The batch field that holds each image's reward, the score its trajectory got."""
 
 if TYPE_CHECKING:
-    from dew.training.state import TrainState
+    from dew.state import TrainState
 
 Predictor = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
 
@@ -85,27 +89,23 @@ class FlowGRPOObjective(DiffusionObjective):
     `sde` configures both the rollout and the rescoring. `variables` is the
     whole variables tree the policy starts from, as `DiffusionObjective`
     takes it: the model's collections, `encoders` and any `autoencoder`.
-    `reward`, `groups`, `rollout_steps` and `train_steps` are the rollout
-    `rollout` builds; a rollout over another reward is a `FlowRollout` of its own.
+    The batches it trains on are a `FlowRollout`'s, which a run builds from
+    its `FlowRolloutConfig`.
     """
 
     # The loss is a policy-gradient surrogate, shown without a direction.
     shown: Mapping[str, Shown] = {"loss": Shown(), "reward": Shown(better="higher")}
     # With beta > 0 the EMA slot holds the frozen reference, so pipelines,
     # evaluation and previews read the live weights.
-    _ema_is_reference = True
+    ema_is_reference = True
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
                  sde: FlowSDE = _DEFAULT_SDE, beta: float = 0.0,
                  clip_range: float = 1e-4, adv_clip_max: float = 5.0,
                  autoencoder: AutoEncoder | None = None,
                  guidance: CFG | None = _DEFAULT_GUIDANCE, solver: Solver = _DEFAULT_SOLVER,
-                 steps: int = 41, variables: Variables | None = None, reward: str = "clip_score",
-                 groups: int = 4, rollout_steps: int = 11, train_steps: int | None = None,
+                 steps: int = 41, variables: Variables | None = None,
                  grid: SourceGrid | None | Omitted = OMITTED):
-        if ":" not in reward and reward not in metrics:
-            raise ValueError(f"reward names {reward!r}, which no metric alias names; the aliases are "
-                             f"{sorted(metrics)}, or name a metric by its import path")
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("beta must be finite and non-negative")
         if not math.isfinite(clip_range) or not 0 <= clip_range < 1:
@@ -119,34 +119,12 @@ class FlowGRPOObjective(DiffusionObjective):
         super().__init__(model, process, inputs, autoencoder=autoencoder,
                          unconditional_prob=0, ema_decay=1.0, solver=solver,
                          guidance=guidance, steps=steps, variables=variables, grid=grid)
-        sde.validate(self.process, self.process.times(rollout_steps))
         if beta == 0:
             self.ema = None
         self.sde = sde
         self.beta = beta
         self.clip_range = clip_range
         self.adv_clip_max = adv_clip_max
-        self.reward, self.groups = reward, groups
-        self.rollout_steps, self.train_steps = rollout_steps, train_steps
-
-    def rollout(self) -> FlowRollout:
-        """The trainer's rollout over this objective: `groups` samples of each
-        prompt over `rollout_steps` time points, the first `train_steps`
-        transitions trained, each scored by the image metric `reward` names
-        against its own prompt, higher being better (`clip_score`)."""
-        from dew.artifacts import ImageGrid
-        from dew.eval.common import ImageMetric
-
-        metric = metrics[self.reward]()
-        if not isinstance(metric, ImageMetric):
-            raise ValueError(f"reward {self.reward!r} is a {type(metric).__name__}, and Flow-GRPO "
-                             "scores each sample with an image metric's per-sample measure")
-
-        def reward(images, batch):
-            return np.asarray(metric.fn(ImageGrid(images), batch))
-
-        return FlowRollout(self, reward, groups=self.groups, steps=self.rollout_steps,
-                           train_steps=self.train_steps)
 
     @property
     def validation_loss_refusal(self) -> str | None:
@@ -174,13 +152,15 @@ class FlowGRPOObjective(DiffusionObjective):
         """Read and validate one batch's recorded transitions.
 
         Returns the latents, the latents they step to, and both endpoints'
-        times, all detached: a rollout's record is data, not a path the
-        gradient runs back through.
+        times, all detached, in float32 or the latents' dtype where it is
+        wider: a rollout's record is data, not a path the gradient runs back
+        through.
         """
-        latents = jnp.asarray(batch["latents"], jnp.float32)
-        following = jnp.asarray(batch["next_latents"], jnp.float32)
-        times = jnp.asarray(batch["timesteps"], jnp.float32)
-        next_times = jnp.asarray(batch["next_timesteps"], jnp.float32)
+        dtype = at_least_fp32(jnp.result_type(batch["latents"]))
+        latents = jnp.asarray(batch["latents"], dtype)
+        following = jnp.asarray(batch["next_latents"], dtype)
+        times = jnp.asarray(batch["timesteps"], dtype)
+        next_times = jnp.asarray(batch["next_timesteps"], dtype)
         if latents.ndim != len(self.latent_shape) + 2 or latents.shape[2:] != self.latent_shape:
             raise ValueError(f"latents must hold [batch, transitions, {self.latent_shape}]")
         if following.shape != latents.shape:
@@ -245,16 +225,16 @@ class FlowGRPOObjective(DiffusionObjective):
             surrogate, _ = clipped_surrogate_terms((current - previous)[:, None], advantage, keep[:, None],
                                                    epsilon_low=self.clip_range, epsilon_high=self.clip_range,
                                                    dual_clip=None)
-            pg = jnp.where(keep, surrogate[:, 0], 0).sum()
+            pg, mass = weighted_total(surrogate[:, 0], keep)
             ratio = jnp.exp(current - previous)
             kl = jnp.asarray(0.0)
             if reference is not None:
                 # The released scripts/train_sd3.py that the module docstring
                 # compares this KL with is at 879042cf5707f8b90daa98d147d7deac2317c5da.
                 reference_mean = self._transition(reference.at((), index), x, t, s).mean
-                kl = jnp.where(keep, transition.kl(reference_mean) / dimensions, 0).sum()
+                kl, _ = weighted_total(transition.kl(reference_mean) / dimensions, keep)
             clipped_count = (keep & (jnp.abs(ratio - 1) > self.clip_range)).sum()
-            return None, (pg, kl, keep.astype(jnp.float32).sum(), clipped_count)
+            return None, (pg, kl, mass, clipped_count)
 
         _, summed = jax.lax.scan(terms, None, (*(jnp.swapaxes(value, 0, 1) for value in (
             latents, following, times, next_times, old, advantages, mask)), jnp.arange(times.shape[1])))
@@ -318,6 +298,7 @@ class FlowRollout:
             raise ValueError("train_steps must select between one and steps-1 transitions")
         if self.objective.sde.noise_level == 0:
             raise ValueError("online FlowGRPO needs positive noise for stochastic transitions")
+        self.objective.sde.validate(self.objective.process, self.objective.process.times(self.steps))
         reserved = {"latents", "next_latents", "timesteps", "next_timesteps", "rollout_steps", "spatial",
                     OLD_LOG_PROBS_KEY, ADVANTAGES_KEY, REWARDS_KEY, "transition_mask"}
         if any(condition.field in reserved for condition in self.objective.inputs.conditions.values()):
@@ -360,6 +341,10 @@ class FlowRollout:
         rows = np.asarray(sorted(owned), np.int64)
         return (rows[:, None] * self.groups + np.arange(self.groups)).reshape(-1)
 
+    def _grouped(self, value, xp=jnp):
+        """`value`'s rows each repeated into its group of samples, in the array namespace `xp`."""
+        return xp.repeat(value, self.groups, axis=0)
+
     def _expanded(self, batch: Batch) -> tuple[Batch, slice | np.ndarray, int]:
         """Repeat every source row into its group of samples.
 
@@ -383,7 +368,7 @@ class FlowRollout:
                     f"a flow rollout over a pool of {jax.process_count()} processes reads a batch placed "
                     f"across them (shard_batch), and a {value.shape} leaf of this one is held by this "
                     f"process alone")
-            return jnp.repeat(value, self.groups, axis=0)
+            return self._grouped(value)
 
         return jax.tree.map(repeat, batch), owned, count
 
@@ -395,12 +380,10 @@ class FlowRollout:
         `train_steps` transitions train, and a row whose group gave it no
         advantage is masked out of the loss.
         """
-        grouped = rewards.reshape(-1, self.groups)
-        centered = grouped - grouped.mean(axis=1, keepdims=True)
-        # The author code uses float64 population statistics. The shared
-        # JAX group estimator fixes float32 and ddof=1, which changes this loss.
-        deviation = grouped.std(axis=1, keepdims=True)
-        advantages = (centered / (deviation + 1e-4)).astype(np.float32).reshape(-1)
+        # The author code uses float64 population statistics on the host, and 1e-4; text GRPO's
+        # estimator (`group_advantage`) float32 and ddof=1, which would change this loss.
+        advantages = group_normalised(rewards.reshape(-1, self.groups), ddof=0, eps=1e-4, xp=np)
+        advantages = advantages.astype(np.float32).reshape(-1)
         if not np.isfinite(advantages).all():
             raise ValueError("flow group advantages must remain finite")
         selected = self.steps - 1 if self.train_steps is None else self.train_steps
@@ -434,17 +417,40 @@ class FlowRollout:
         `train_steps` transitions. The processes agree that each phase
         succeeded before the next collective runs.
         """
+        # The text a reward reads stays on each host (`split_fields`); the rest is placed. Every process
+        # agrees which host fields there are before any of them gathers them.
+        batch, host = split_fields(batch)
+        fields = agreed_same("flow rollout host fields", lambda: sorted(
+            jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(
+                host, is_leaf=lambda column: not isinstance(column, Mapping))))
         expanded, owned, count = agreed("flow rollout setup", lambda: self._expanded(batch))
         # The objective owns the program; the rollout fixes only its count of time points.
         generate = self.objective.program(f"flow rollout over {self.steps} time points", self._generate_impl)
         generated = agreed("flow rollout generation", lambda: generate(state.variables, expanded, key))
-        (trajectory, images, spatial), context = collective_host(
-            (generated, expanded), phase="flow rollout")
+        source = _source(self.objective.inputs, batch)
+        # In a pool the source is placed across processes (`_expanded`), and each source row's origin rides
+        # the rollout's own collective (`row_origins`), so its host fields meet in that order.
+        placed = source.sharding
+        mesh = (placed.mesh if isinstance(placed, jax.sharding.NamedSharding)
+                and isinstance(placed.mesh, jax.sharding.Mesh) and not source.is_fully_addressable else None)
+        rows = rows_of(host) if fields else 0
+        origins = row_origins(mesh, rows) if fields and mesh is not None else None
+        (trajectory, images, spatial), context, origins = collective_host(
+            (generated, expanded, origins), phase="flow rollout")
+        # The reward reads the host fields beside the samples' context, each source row's repeated into its
+        # group as the context's are; the training rows read neither.
+        scored = context
+        if fields:
+            held = (host if origins is None or mesh is None
+                    else shared_host_fields(mesh, host, np.asarray(origins), rows))
+            grouped = jax.tree.map(lambda column: self._grouped(np.asarray(column), np), held,
+                                   is_leaf=lambda column: not isinstance(column, Mapping))
+            scored = with_host(context, grouped)
 
         def score() -> np.ndarray | None:
             if jax.process_index() != 0:
                 return None
-            rewards = np.asarray(self.reward(np.asarray(images), context), np.float64)
+            rewards = np.asarray(self.reward(np.asarray(images), scored), np.float64)
             if rewards.shape != (count * self.groups,) or not np.isfinite(rewards).all():
                 raise ValueError("a flow reward must return one finite scalar per generated sample")
             return rewards

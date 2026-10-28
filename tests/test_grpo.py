@@ -4,10 +4,10 @@ The loss must match verl 0.9's PPO path with the GRPO settings
 (`compute_policy_loss_vanilla` with `clip_ratio` 0.2 both sides,
 `clip_ratio_c` 3.0 and `token-mean`, plus `beta` times the `token-mean` k3
 from `kl_penalty_forward`). The reference is tests/fixtures/rl/grpo.npz,
-written by tools/parity_grpo.py from torch over one fixed rollout: old,
-current and reference log-probabilities, both-signed advantages, and a mask
-with short tails, with entries past every clip point. `GRPOObjective` reads
-the same terms out of the rolled-out batch.
+recorded by tools/parity_grpo.py from torch over the seeds check 1 draws,
+each a rollout: old, current and reference log-probabilities, both-signed
+advantages, and a mask with short tails, with entries past every clip point.
+`GRPOObjective` reads the same terms out of the rolled-out batch.
 """
 
 from pathlib import Path
@@ -17,14 +17,20 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    declared_seeds,
+    indexed_recording,
+    recording,
+    with_gradients,
+)
 from rl_support import TinyHead, TinyLogits, clipped_surrogate, token_mean
 from steady_state import steady_state
 
-from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
+from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, _utf8
 from dew.objectives.base import Step
-from dew.objectives.rl import GRPOObjective
-from dew.objectives.rl.rollout import SampledRollout
+from dew.objectives.rl import GRPOObjective, RolloutScheduler
 from dew.objectives.rl.sessions import (
     ADVANTAGES_KEY,
     BEHAVIOR_LOG_PROBS_KEY,
@@ -46,35 +52,34 @@ ROWS = 2
 
 @pytest.fixture(scope="module")
 def reference():
-    return dict(np.load(FIXTURE, allow_pickle=True))
-
-
-def terms(fixture):
-    """The fixture rollout as float32 arrays with the KL strength."""
-    def get(key):
-        return np.asarray(fixture[key], np.float32)
-    return (get("old_log_probs"), get("current_log_probs"), get("ref_log_probs"),
-            get("advantages"), get("response_mask"), float(fixture["beta"]))
+    return recording(FIXTURE)
 
 
 def test_grpo_loss_and_gradient_match_verl(reference):
     """Dew's composition against verl 0.9.0's own `compute_policy_loss_vanilla`
-    and `kl_penalty` (tools/parity_grpo.py) on the fixed rollout, held to the
-    float64 rule over the loss and its gradient in the current
-    log-probabilities: Dew's RMS error from verl's float64 values at most
-    twice verl's own fp32 error."""
-    old, current, ref, advantages, mask, beta = terms(reference)
+    and `kl_penalty` (tools/parity_grpo.py), the loss and its gradient in the
+    current log-probabilities on par with verl's fp32 over the recorded
+    rollouts (check 1), its float64 run the truth."""
+    beta = float(reference["beta"])
+    seeds = declared_seeds(FIXTURE)["grpo"]
+    recorded_draw, recorded, truth = indexed_recording(reference, "grpo", seeds)
 
-    def loss(current):
-        ratio = token_log_ratio(current, jnp.asarray(old))
-        pg, _ = clipped_surrogate(ratio, jnp.asarray(advantages), jnp.asarray(mask))
-        kl = token_mean(k3_kl(current, jnp.asarray(ref)), jnp.asarray(mask))
-        return pg + beta * kl
+    @jax.jit
+    def dew(index, rollout, cotangent):
+        def loss(current):
+            ratio = token_log_ratio(current, rollout["old_log_probs"])
+            pg, _ = clipped_surrogate(ratio, rollout["advantages"], rollout["response_mask"])
+            kl = token_mean(k3_kl(current, rollout["ref_log_probs"]), rollout["response_mask"])
+            return pg + beta * kl
 
-    value, gradient = jax.value_and_grad(loss)(jnp.asarray(current))
-    assert_as_exact_as_the_reference(
-        np.append(value, gradient), np.append(reference["verl_loss"], reference["verl_current_grad"]),
-        np.append(reference["verl_loss_f64"], reference["verl_current_grad_f64"]), "GRPO loss and gradient")
+        value, gradient = with_gradients(loss)(rollout["current_log_probs"], cotangent)
+        return {"loss": value, "grad": gradient}
+
+    # The recording holds the loss's gradient, a scalar loss's under the cotangent 1, which each draw
+    # carries for Dew's arm.
+    assert_as_exact(dew, lambda index, rollout, cotangent: recorded(index, rollout),
+                    lambda seed: (*recorded_draw(seed), np.float32(1)), "GRPO loss and gradient", seeds=seeds,
+                    truth_fn=lambda index, rollout, cotangent: truth(index, rollout))
 
 
 # --- the objective -------------------------------------------------------------
@@ -104,12 +109,12 @@ def rollout_batch(seed=0):
 def test_a_prompt_dataset_trains_as_the_prompt_config_does():
     """`Trainer.fit` compiles a Dataset with the objective's own stages.
     GRPO adds none, so one rollout step over `prompts.encode` rows moves the
-    policy exactly as one over the same prompts through `PromptData`."""
+    policy exactly as one over the same prompts through the prompts preset."""
     import optax
     from bank_support import identical
 
-    from dew.config.data import PromptData, loader
-    from dew.data import Loading, Memory, prompts
+    from dew.data import Loading, Memory, presets, prompts
+    from dew.data.compile import compile
     from dew.data.text import tokenizer_for
     from dew.training import Layout, Trainer
 
@@ -119,15 +124,15 @@ def test_a_prompt_dataset_trains_as_the_prompt_config_does():
 
     def trained(data):
         objective = GRPOObjective(TinyHead(vocab_size=vocab), 8 + 4 - 1)
-        rollout = SampledRollout(objective, lambda text, record: float(len(text)), groups=2,
-                                 max_new_tokens=4, sampling=Sampling(temperature=1.0))
+        rollout = RolloutScheduler.sampled(objective, lambda text, record: float(len(text)), groups=2,
+                                           max_new_tokens=4, sampling=Sampling(temperature=1.0))
         trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0),
                           layout=Layout(min_shard=1, tolerance=1.0), rollout=rollout)
         return trainer.fit(data, steps=1).variables
 
     identical(trained(Memory(rows).filter_map(prompts.encode(tokenizer, max_prompt_len=8)).batch(8)),
-              trained(loader(PromptData(source=tuple(rows), tokenizer=tokenizer, max_prompt_len=8), batch=8,
-                             read="memory", loading=Loading(workers=0))))
+              trained(compile(Memory(rows).pipe(presets.prompts, tokenizer, max_prompt_len=8, batch=8),
+                              read="memory", loading=Loading(workers=0))))
 
 
 def test_the_loss_reads_the_rolled_out_batch():
@@ -191,12 +196,12 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
     advantages by name and nothing else (`steady_state`). The prompts reach
     the device as each batch arrives, so only reads are held."""
     objective = GRPOObjective(TinyHead(vocab_size=VOCAB), PROMPT_WIDTH + RESPONSE_WIDTH - 1, beta=0.01)
-    state = SimpleNamespace(variables=objective.init(jax.random.key(0)), updates=0)
-    rollout = SampledRollout(objective, lambda *args: float(len(args[0]) % 3), groups=2,
-                             max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=1.0))
+    state = SimpleNamespace(variables=objective.init(jax.random.key(0)), step=0, updates=0)
+    rollout = RolloutScheduler.sampled(objective, lambda *args: float(len(args[0]) % 3), groups=2,
+                                       max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=1.0))
     info = len("other")
     def pad(text):
-        return np.pad(np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, info - len(text)))
+        return _utf8(text, info)
 
     def batch(offset):
         rows = np.arange(PROMPT_WIDTH, dtype=np.int32)[None] + np.arange(2)[:, None] + offset
@@ -210,3 +215,18 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
     with steady_state(allow=("host_to_device",)):
         rolled = [rollout(state, batch(offset), key) for offset, key in zip((1, 2), keys[1:], strict=True)]
     assert all(rows[IDS_KEY].shape == (4, PROMPT_WIDTH + RESPONSE_WIDTH) for rows in rolled)
+
+
+def test_a_small_log_ratios_k3_estimate_keeps_its_leading_term():
+    """The k3 estimate `exp(d) - d - 1` of a log ratio `d` near zero is `d**2 / 2` to leading order. In
+    float32 `exp(d)` rounds to a spacing of `2**-24` about 1, which `- 1` leaves standing: at `d` of 1e-6
+    the estimate is off by most of itself. Through `expm1` (`dew.rl.surrogate.sampled_kl`) the estimate
+    is on par with NumPy's float32 `expm1(d) - d` from float64's (check 1)."""
+    from dew.rl.surrogate import sampled_kl
+
+    log_ratio = np.asarray([1e-6, -1e-6, 3e-5, -2e-4, 0.1, -0.5], np.float32)
+    estimate = np.asarray(k3_kl(jnp.zeros_like(log_ratio), jnp.asarray(log_ratio)))
+    wide = log_ratio.astype(np.float64)
+    assert_as_exact_as_the_reference(estimate, np.expm1(log_ratio) - log_ratio, np.expm1(wide) - wide,
+                                     "k3 at small log ratios")
+    np.testing.assert_array_equal(np.asarray(sampled_kl(jnp.asarray(log_ratio))), estimate)

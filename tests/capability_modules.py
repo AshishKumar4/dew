@@ -21,7 +21,9 @@ from flax.nnx import bridge
 
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs.encoders import CharTable, ConditionEncoder
+from dew.nn.blocks import sinusoidal_time
 from dew.nn.dit import masked_mean
+from dew.nn.protocols import Lacks
 
 
 class TokenModel(nn.Module):
@@ -48,8 +50,8 @@ class TokenModel(nn.Module):
 
     def hidden_states(self, tokens, *, train=False, segment_ids=None, positions=None, **fields):
         if segment_ids is not None or positions is not None:
-            raise ValueError("this model reads one document a row; it takes no packed segment_ids "
-                             "or positions")
+            raise Lacks("packing", "this model reads one document a row; it takes no packed segment_ids "
+                                   "or positions")
         x = self.embed(tokens)
         mask = nn.make_causal_mask(tokens) if self.causal else None
         return self.norm(x + self.attention(x, mask=mask, deterministic=not train))
@@ -64,14 +66,6 @@ class TokenModel(nn.Module):
         return self.logits(tokens, train=train, **fields)
 
 
-def time_features(time: jax.Array, features: int) -> jax.Array:
-    """Sinusoidal features of a `[B]` time, `[B, features]`."""
-    half = features // 2
-    frequencies = jnp.exp(-jnp.log(1e4) * jnp.arange(half) / half)
-    angles = time.astype(jnp.float32)[:, None] * frequencies
-    return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=-1)
-
-
 class Denoiser(nn.Module):
     """Two convolutions around the noise level, the mean of the prompt's
     states and, set `interval`, the duration of the interval it denoises."""
@@ -83,10 +77,11 @@ class Denoiser(nn.Module):
     def __call__(self, sample, time, textcontext=None, *, duration=None, train=False):
         if duration is not None and not self.interval:
             raise ValueError("this denoiser reads no interval; set interval=True")
-        level = time_features(time, self.features)
+        level = sinusoidal_time(time, self.features, dtype=jnp.float32, cosine_first=False)
         if self.interval:
             level = level + nn.Dense(self.features)(
-                time_features(jnp.zeros_like(time) if duration is None else duration, self.features))
+                sinusoidal_time(jnp.zeros_like(time) if duration is None else duration, self.features,
+                                dtype=jnp.float32, cosine_first=False))
         if textcontext is not None:
             level = level + nn.Dense(self.features)(masked_mean(textcontext.hidden, textcontext.mask))
         x = nn.Conv(self.features, (3, 3))(sample) + nn.Dense(self.features)(level)[:, None, None, :]
@@ -129,7 +124,7 @@ class FamilyText(ConditionEncoder[str, DenoisingCondition]):
     def captions(self, tokens) -> tuple[str, ...]:
         return self.table.captions(tokens)
 
-    def to_json(self) -> dict:
+    def recorded_fields(self) -> dict:
         return {"checkpoint": "char_table", "width": self.width, "pooled": self.pooled,
                 "guidance": self.guidance, "masked": self.masked}
 
@@ -145,8 +140,8 @@ class NNXLanguageModel(nnx.Module):
 
     def hidden_states(self, tokens, *, train=False, segment_ids=None, positions=None, **fields):
         if segment_ids is not None or positions is not None:
-            raise ValueError("this model reads one document a row; it takes no packed segment_ids "
-                             "or positions")
+            raise Lacks("packing", "this model reads one document a row; it takes no packed segment_ids "
+                                   "or positions")
         x = jax.nn.gelu(self.mix(self.embed(tokens)))
         return jnp.cumsum(x, axis=1) / jnp.arange(1, tokens.shape[1] + 1)[None, :, None]
 
@@ -182,7 +177,7 @@ class NNXDenoiser(nnx.Module):
         self.outer = nnx.Conv(features, channels, (3, 3), rngs=rngs)
 
     def __call__(self, sample, time, textcontext=None, *, train=False):
-        level = time_features(time, self.features)
+        level = sinusoidal_time(time, self.features, dtype=jnp.float32, cosine_first=False)
         if textcontext is not None:
             level = level + self.text(masked_mean(textcontext.hidden, textcontext.mask))
         x = self.inner(sample) + self.level(level)[:, None, None, :]

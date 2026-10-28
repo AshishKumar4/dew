@@ -39,14 +39,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from diffusion_support import images_of
 
-from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.config.data import ImageData
+from dew.config import ObjectiveConfig, TrainerConfig
+from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
+from dew.inputs import TextCondition
+from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 from dew.objectives.base import Step
-from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 from dew.objectives.diffusion.objective import VALIDATION_SAMPLES
+from dew.registry import ModelConfig
 from dew.sampling import Euler
 from dew.training import Trainer
 
@@ -66,8 +69,8 @@ def run_config(directory):
         model=ModelConfig("simple_mmdit", {"patch_size": 2, "emb_features": 32, "num_layers": 1,
                                                "num_heads": 2, "mlp_ratio": 1,
                                                "dtype": "float32", "attention_impl": "reference"}),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=RES),
-        trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=BATCH, steps=2),
+        data=images_of("tfds://oxford_flowers102", RES, batch=BATCH),
+        trainer=TrainerConfig(checkpoint_dir=str(directory), steps=2),
         preset=Flow(), text=TextCondition(encoder="t5", checkpoint=str(T5_TINY), max_length=8),
         autoencoder=PretrainedAutoencoder(modelname=str(VAE_TINY), dtype="float32"),
         val_metrics=(),

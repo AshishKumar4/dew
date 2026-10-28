@@ -35,29 +35,30 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import recurrence, through
+from delta_rule_support import fused_step, recurrence, through
 from flax import linen as nn
 from model_support import decode_through
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
-from tuned import each_config, launches, timed
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
 
-from dew.nn import linear
-from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
+from dew.batch import coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import tuning
+from dew.nn.kernels.recurrence_algebra import decays, factor
+from dew.nn.kernels.recurrence_chunk import chunk_delta_rule, chunk_gated_delta_rule, fla_rule
 from dew.nn.linear import (
     GatedDeltaNet,
     _masked_conv1d,
     causal_conv1d,
-    chunk_decay,
-    chunk_delta_rule,
-    chunk_gated_delta_rule,
     held_conv1d,
     l2norm,
     recurrent_gated_delta_rule,
-    strictly_lower_inverse,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "linear_attention"
+
+SHARDED_SEEDS = 128
+"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
+`seeds_for`: the fewest for which one device compared with itself resolves the factor."""
 
 
 @pytest.fixture(scope="module")
@@ -85,6 +86,25 @@ def largest(left, right) -> float:
     return float(np.max(np.abs(np.asarray(left) - np.asarray(right))))
 
 
+def assert_matches(outputs, reference, name: str):
+    """A form's output and final state within 1e-5 of the reference's recording `name`."""
+    out, state = outputs
+    assert largest(out, reference[f"{name}.output"]) < 1e-5
+    assert largest(state, reference[f"{name}.state"]) < 1e-5
+
+
+def decode_operands(rng, rows: int, heads: int, width: int, held=jnp.float32):
+    """A decode token's operands from `rng`: unit queries and keys, values, a log decay in (-3, 0], a
+    write gate in [0, 1), each fp32, and a memory of scale 0.1 held in `held`."""
+    unit = [rng.normal(size=(rows, 1, heads, width)) for _ in range(2)]
+    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
+    value = jnp.asarray(rng.normal(size=(rows, 1, heads, width)), jnp.float32)
+    g = jnp.asarray(-rng.random((rows, 1, heads)) * 3, jnp.float32)
+    beta = jnp.asarray(rng.random((rows, 1, heads)), jnp.float32)
+    state = jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, held)
+    return query, key, value, g, beta, state
+
+
 def test_the_chunked_rule_matches_the_reference(reference):
     """`torch_chunk_gated_delta_rule` on 70 tokens: a full chunk and a padded
     one, so both the in-chunk operator and the cross-chunk memory are read.
@@ -93,8 +113,7 @@ def test_the_chunked_rule_matches_the_reference(reference):
     `tril(..., -1)`) the output moves by 1.5e-01."""
     out, state = chunk_gated_delta_rule(*operands(reference))
 
-    assert largest(out, reference["chunk.output"]) < 1e-5
-    assert largest(state, reference["chunk.state"]) < 1e-5
+    assert_matches((out, state), reference, "chunk")
 
 
 def portable(query, key, value, g, beta, state=None):
@@ -128,8 +147,7 @@ def test_the_recurrent_rule_matches_the_reference(reference):
     of `q^T S` the output moves by 4.7e-01."""
     out, state = recurrent_gated_delta_rule(*operands(reference))
 
-    assert largest(out, reference["recurrent.output"]) < 1e-5
-    assert largest(state, reference["recurrent.state"]) < 1e-5
+    assert_matches((out, state), reference, "recurrent")
 
 
 def test_the_chunked_and_recurrent_forms_agree(reference):
@@ -144,30 +162,46 @@ def test_the_chunked_and_recurrent_forms_agree(reference):
     assert largest(chunked_state, recurrent_state) < 1e-5
 
 
+PACKED_RULE_SEEDS = {(1, False): 32, (1, True): 128, (8, False): 16, (8, True): 128}
+"""Declared seeds for check 1, sized by `seeds_for` on armada, 2026-10-20: the separate documents'
+chunked rule against the float64 recurrence, for each decay width and strength."""
+
+
 @pytest.mark.parametrize("strong", [False, True], ids=["drawn decay", "strong decay"])
 @pytest.mark.parametrize("decay_width", [1, 8], ids=["per head", "per key dimension"])
 def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, strong):
     """Packed documents in the chunked rule, one starting on a chunk's first token, one four tokens before a
     chunk's end and one spanning chunks: each document's output, the final memory and every gradient
-    as near the float64 recurrence run document by document as the chunked rule run on each document
-    alone (`assert_leaves_as_exact`), and within 1e-4 of it, the row's first document from the row's
-    memory and every other from zero, for a decay per head (the gated delta net) and per key dimension
-    (Kimi's delta attention), each sized by the packed rule's float64 terms. At a strong decay (-4 a
-    token) the chunk's earlier document sits 96 below its last one's, past exp's fp32 range."""
+    on par with the chunked rule on each document alone, both measured from the float64 recurrence.
+    The first document reads the row's memory and every other starts from zero. Each draw has fresh
+    operands and cotangents, with the key and value dimensions consistently permuted, an exact
+    symmetry of the rule. Decay is per head (the gated delta net) or per key dimension (Kimi delta
+    attention); at a strong decay (-4 a token) an earlier document sits 96 below the last one's,
+    past exp's fp32 range."""
     batch, length, heads, width, chunk = 1, 160, 2, 8, 32
     begins = (0, 32, 60, 110)
     starts = np.zeros((batch, length), bool)
     starts[0, list(begins[1:])] = True
-    keys = jax.random.split(jax.random.key(23), 8)
-    q = l2norm(jax.random.normal(keys[0], (batch, length, heads, width)))
-    k = l2norm(jax.random.normal(keys[1], (batch, length, heads, width)))
-    v = jax.random.normal(keys[2], (batch, length, heads, width))
-    g = (jnp.full((batch, length, heads, decay_width), -4.0) if strong else
-         -jnp.exp(jax.random.normal(keys[3], (batch, length, heads, decay_width)) - 2.0))
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, heads)))
-    h0 = 0.1 * jax.random.normal(keys[5], (batch, heads, width, width))
-    do = jax.random.normal(keys[6], v.shape)
-    dht = 0.1 * jax.random.normal(keys[7], h0.shape)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(23 + seed), 8)
+        q = l2norm(jax.random.normal(keys[0], (batch, length, heads, width)))
+        k = l2norm(jax.random.normal(keys[1], (batch, length, heads, width)))
+        v = jax.random.normal(keys[2], (batch, length, heads, width))
+        g = (jnp.full((batch, length, heads, decay_width), -4.0) if strong else
+             -jnp.exp(jax.random.normal(keys[3], (batch, length, heads, decay_width)) - 2.0))
+        beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, heads)))
+        h0 = 0.1 * jax.random.normal(keys[5], (batch, heads, width, width))
+        do = jax.random.normal(keys[6], v.shape)
+        dht = 0.1 * jax.random.normal(keys[7], h0.shape)
+        rng = np.random.default_rng(seed)
+        key_order, value_order = rng.permutation(width), rng.permutation(width)
+        q, k = (x[..., key_order] for x in (q, k))
+        v, do = (x[..., value_order] for x in (v, do))
+        h0, dht = (x[..., key_order, :][..., value_order] for x in (h0, dht))
+        if decay_width > 1:
+            g = g[..., key_order]
+        return q, k, v, g, beta, h0, do, dht
 
     def packed(*args):
         return chunk_delta_rule(*args, chunk, starts=jnp.asarray(starts))
@@ -175,22 +209,21 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, 
     def chunked(*args):
         return chunk_delta_rule(*args, chunk)
 
-    got = jax.jit(through(packed, do, dht))(q, k, v, g, beta, h0)
-    alone = jax.jit(through(functools.partial(recurrence, cuts=(begins,), rule=chunked), do, dht))
-    reference = alone(q, k, v, g, beta, h0)
-    with jax.enable_x64(new_val=True):
-        operands = widened((q, k, v, g, beta, h0, do, dht))
-        want = through(functools.partial(recurrence, cuts=(begins,)), *operands[6:])(*operands[:6])
-        want = widened(want)
-        _, terms = float64_terms(through(packed, *operands[6:]), *operands[:6])
-    assert_leaves_as_exact(got, reference, want, reductions=chunk, terms=terms)
-    for name, mine, theirs in zip(("out", "final", "q", "k", "v", "g", "beta", "h0"), got, want, strict=True):
-        assert largest(mine, theirs) < 1e-4 * max(1.0, float(np.max(np.abs(theirs)))), name
+    def evaluated(rule, *inputs):
+        with jax.default_matmul_precision("highest"):
+            return through(rule, *inputs[6:])(*inputs[:6])
+
+    dew = jax.jit(functools.partial(evaluated, packed))
+    reference = jax.jit(functools.partial(
+        evaluated, functools.partial(recurrence, cuts=(begins,), rule=chunked)))
+    truth = jax.jit(functools.partial(evaluated, functools.partial(recurrence, cuts=(begins,))))
+    label = f"packed delta rule {decay_width=} {strong=}"
+    assert_as_exact(dew, reference, draw, label, seeds=PACKED_RULE_SEEDS[decay_width, strong], truth_fn=truth)
 
 
 @pytest.mark.parametrize("per_key", [False, True], ids=["gated delta net", "Kimi delta attention"])
 def test_the_port_takes_each_packed_tokens_output_and_gradients_as_its_document_alone_does(per_key):
-    """The port (`linear.fla_rule`, interpreted off a GPU) runs each packed document as a sequence of
+    """The port (`fla_rule`, interpreted off a GPU) runs each packed document as a sequence of
     its own, so each packed token's output and its gradients of the token's query, key, value, decay
     and beta are bitwise those of the same row with every other document's tokens zero: no token's
     value or gradient carries another document's, the decay's rounding included. The same program
@@ -214,7 +247,7 @@ def test_the_port_takes_each_packed_tokens_output_and_gradients_as_its_document_
             *rule, do = operands
 
             def loss(*rule):
-                out = linear.fla_rule(*rule, starts=starts)[0]
+                out = fla_rule(*rule, starts=starts)[0]
                 return jnp.sum(out * do), out
             (_, out), grads = jax.value_and_grad(loss, argnums=tuple(range(5)), has_aux=True)(*rule)
             return {"out": out, **dict(zip(("q", "k", "v", "g", "beta"), grads, strict=True))}
@@ -237,10 +270,10 @@ def test_the_port_takes_each_packed_tokens_output_and_gradients_as_its_document_
 def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound():
     """Two right-padded rows of two packed documents each (segment 0 after them) at the tightest
     bound their coordinates give (`Coordinates.max_segments`, two): each document's output on the
-    port (`linear.fla_rule`) is bitwise the document run alone, a row's first from the row's memory.
+    port (`fla_rule`) is bitwise the document run alone, a row's first from the row's memory.
     A row's padding runs as a sequence of its own, so a bound without it ran the second row's last
     document on from its first."""
-    from dew.nn.inputs import coordinates
+    from dew.batch import coordinates
 
     segments = jnp.asarray([[1] * 70 + [2] * 50 + [0] * 8, [1] * 50 + [2] * 50 + [0] * 28])
     tokens = coordinates(segments=segments, max_segments=2, right_padded=True)
@@ -249,9 +282,9 @@ def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound()
     g = -0.1 * jax.nn.softplus(jax.random.normal(keys[3], (2, 128, 1)))
     beta = jnp.full((2, 128, 1), 0.5)
     h0 = 0.1 * jax.random.normal(keys[4], (2, 1, 64, 64))
-    packed = jax.jit(lambda *a: linear.fla_rule(*a, starts=tokens.starts, max_segments=tokens.max_segments))
+    packed = jax.jit(lambda *a: fla_rule(*a, starts=tokens.starts, max_segments=tokens.max_segments))
     out, _ = packed(q, k, v, g, beta, h0)
-    rule = jax.jit(linear.fla_rule)
+    rule = jax.jit(fla_rule)
     for row, cuts in ((0, (0, 70, 120)), (1, (0, 50, 100))):
         for begin, end in itertools.pairwise(cuts):
             alone, _ = rule(*(x[row:row + 1, begin:end] for x in (q, k, v, g, beta)),
@@ -288,12 +321,10 @@ def test_an_initial_state_is_carried_by_both_forms(reference):
     initial = jnp.asarray(reference["rule.initial_state"])
 
     out, state = chunk_gated_delta_rule(*operands(reference), initial)
-    assert largest(out, reference["chunk_carried.output"]) < 1e-5
-    assert largest(state, reference["chunk_carried.state"]) < 1e-5
+    assert_matches((out, state), reference, "chunk_carried")
 
     out, state = recurrent_gated_delta_rule(*operands(reference), initial)
-    assert largest(out, reference["recurrent_carried.output"]) < 1e-5
-    assert largest(state, reference["recurrent_carried.state"]) < 1e-5
+    assert_matches((out, state), reference, "recurrent_carried")
 
 
 def test_a_sequence_split_in_two_carries_its_memory_across_the_cut(reference):
@@ -606,30 +637,43 @@ def test_a_right_padded_row_convolves_as_the_masked_conv(case, history, packed):
             assert largest(gradient, wanted) < 1e-6
 
 
+RIGHT_PADDED_SEEDS = 8
+"""The right-padded layer's declared draws against the masked call (check 1), sized by `seeds_for`
+paired with the declared call on the CPU."""
+
+
 def test_a_right_padded_layer_keeps_its_real_tokens_states(reference, geometry):
     """The mixer told its rows are right-padded gives the masked call's
-    outputs, zero at the padding: as close
-    to float64 as the masked call is (tests/reference_error.py), the two
-    being separate programs, which a GPU rounds apart (1.7e-6 on an H100)."""
+    outputs, zero at the padding: on par with the masked call from its
+    float64 run over drawn hidden states (check 1), the two being separate
+    programs, which a GPU rounds apart (1.7e-6 on an H100)."""
     module = layer(geometry)
     variables = layer_params(reference)
-    hidden = jnp.asarray(reference["layer.hidden"])[:, :9]
+    shape = jnp.asarray(reference["layer.hidden"])[:, :9].shape
     valid = jnp.arange(9)[None, :] < jnp.asarray([[6], [9]])
 
     def call(metadata, variables=variables):
-        return jax.jit(lambda hidden: module.apply(variables, hidden, MixerCall(metadata)))
+        return lambda hidden: module.apply(variables, hidden, MixerCall(metadata))
 
     masked = AttentionMetadata(coordinates=coordinates(valid=valid))
     declared = AttentionMetadata(coordinates=coordinates(valid=valid, right_padded=True))
-    mine, theirs = call(declared)(hidden), call(masked)(hidden)
 
-    assert jnp.array_equal(mine[0, 6:], jnp.zeros_like(hidden[0, 6:]))
-    cpu = jax.devices("cpu")[0]
-    with jax.enable_x64(new_val=True), jax.default_device(cpu):
-        wide = jax.tree.map(lambda x: jax.device_put(np.asarray(x, np.float64), cpu), variables)
-        truth = call(AttentionMetadata(coordinates=coordinates(valid=jax.device_put(np.asarray(valid), cpu))),
-                     wide)(jax.device_put(np.asarray(hidden, np.float64), cpu))
-    assert_as_exact_as_the_reference(mine, theirs, truth, "right-padded output")
+    def draw(seed):
+        return (jnp.asarray(np.random.default_rng(seed).standard_normal(shape), jnp.float32),)
+
+    def truth(hidden):
+        # On the host, as a GPU's float64 is not every one's.
+        cpu = jax.devices("cpu")[0]
+        with jax.default_device(cpu):
+            wide = jax.device_put(widened(variables), cpu)
+            on_host = jax.device_put(np.asarray(valid), cpu)
+            metadata = AttentionMetadata(coordinates=coordinates(valid=on_host))
+            return call(metadata, wide)(jax.device_put(hidden, cpu))
+
+    (hidden,) = draw(0)
+    assert jnp.array_equal(jax.jit(call(declared))(hidden)[0, 6:], jnp.zeros_like(hidden[0, 6:]))
+    assert_as_exact(call(declared), call(masked), draw, "right-padded output", seeds=RIGHT_PADDED_SEEDS,
+                    truth_fn=truth)
 
 
 @pytest.mark.parametrize("chunk", [4, 16, 64])
@@ -641,7 +685,7 @@ def test_the_chunk_inverse_is_exact_where_its_series_cancels(chunk):
     256-token prompt and its logits NaN."""
     a = -jnp.tril(jnp.ones((2, chunk, chunk), jnp.float32), -1)
     want = np.eye(chunk) - np.eye(chunk, k=-1)
-    np.testing.assert_allclose(strictly_lower_inverse(a), np.broadcast_to(want, a.shape), atol=1e-6)
+    np.testing.assert_allclose(factor(a), np.broadcast_to(want, a.shape), atol=1e-6)
 
 
 def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():
@@ -654,7 +698,7 @@ def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():
     ~128 u on a decay between neighbours, which the KDA gradient amplified
     to twice the reference's distance from float64 (tests/test_kimi_linear.py)."""
     g = np.random.default_rng(7).uniform(-3, -1, (2, 64, 4)).astype(np.float32)
-    _, decay = chunk_decay(jnp.asarray(g))
+    _, decay = decays(jnp.asarray(g))
     wide = np.asarray(g, np.float64)
     rows, cols = np.tril_indices(64)
     ranges = [wide[:, c + 1:r + 1] for r, c in zip(rows, cols, strict=True)]
@@ -682,19 +726,19 @@ def test_the_decay_gradient_sums_only_the_pairs_spanning_each_position():
     cotangent = rng.standard_normal((2, 64, 64, 4)).astype(np.float32)
 
     def gradient(g, cotangent):
-        _, pull = jax.vjp(lambda g: chunk_decay(g)[1], g)
+        _, pull = jax.vjp(lambda g: decays(g)[1], g)
         return pull(cotangent)[0]
 
     got = np.asarray(gradient(jnp.asarray(g), jnp.asarray(cotangent)), np.float64)
     with jax.enable_x64(new_val=True):
         wide = widened((g, cotangent))
         want = np.asarray(gradient(*wide))
-        weighed = np.abs(np.asarray(wide[1] * chunk_decay(wide[0])[1]))
+        weighed = np.abs(np.asarray(wide[1] * decays(wide[0])[1]))
     spans = np.array([weighed[:, i:, :i].sum((1, 2)) for i in range(64)]).transpose(1, 0, 2)
     bound = 2 * 64 * (np.finfo(np.float32).eps / 2) * spans
     assert np.all(np.abs(got - want) <= bound), float(np.max(np.abs(got - want) / np.maximum(bound, 1e-30)))
     tangent = rng.standard_normal(g.shape).astype(np.float32)
-    _, forward = jax.jvp(lambda g: chunk_decay(g)[1], (jnp.asarray(g),), (jnp.asarray(tangent),))
+    _, forward = jax.jvp(lambda g: decays(g)[1], (jnp.asarray(g),), (jnp.asarray(tangent),))
     paired = float(jnp.vdot(forward, cotangent))
     np.testing.assert_allclose(paired, float(np.vdot(tangent, got)), rtol=1e-5)
 
@@ -720,56 +764,57 @@ def test_the_chunked_rule_holds_with_aligned_keys():
     np.testing.assert_allclose(state, want_state, atol=2e-4)
 
 
+DECODE_SEEDS = {("small", jnp.float32): 64, ("small", jnp.bfloat16): 64, ("0.8b-3", jnp.float32): 8,
+                ("0.8b-3", jnp.bfloat16): 8, ("0.8b-32", jnp.float32): 8, ("0.8b-32", jnp.bfloat16): 8}
+"""Each decode kernel case's declared draws against the recurrence (check 1), by its geometry's id and
+the dtype its state is held in: sized by `seeds_for` paired with the kernel on an A100."""
+DECODE_GEOMETRIES = {"small": (3, 2, 64), "0.8b-3": (3, 16, 128), "0.8b-32": (32, 16, 128)}
+
+
 @pytest.mark.parametrize("held", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("rows, heads, width", [
-    pytest.param(3, 2, 64, id="small"),
-    pytest.param(3, 16, 128, marks=pytest.mark.gpu(reason="the 0.8B's widths are a GPU's"), id="0.8b-3"),
-    pytest.param(32, 16, 128, marks=pytest.mark.gpu(reason="the 0.8B's widths are a GPU's"), id="0.8b-32"),
-])
-def test_the_decode_kernel_steps_as_the_recurrence_does(rows, heads, width, held):
-    """One decode token through `dew.nn.kernels.delta_rule` (one read and one
-    write of the state) gives the recurrence's output and state at every
-    config of the launch's space (`tuning.pinned`): an fp32 state's within
-    the float64 gate of the fp32 recurrence's, at Qwen3.5-0.8B's widths (16
-    heads, 128 wide) on a GPU and interpreted at a small width. A state held
-    in bf16 is read and stepped in fp32 and written back rounded once,
-    stochastically: within one bf16 step of the fp32 one. The tuner times the
-    launch on every row active, where the default operands' zeros idle them."""
-    from dew.nn.kernels import delta_rule
+@pytest.mark.gpu(reason="the kernel compiled, as a GPU runs it: a CPU's decode takes the portable step "
+                        "(`decode_kernel`), and its interpretation of the kernel judges its own arithmetic")
+@pytest.mark.parametrize("geometry", ["small", "0.8b-3", "0.8b-32"])
+def test_the_decode_kernel_steps_as_the_recurrence_does(geometry, held):
+    """One decode token through `dew.nn.kernels.recurrence.step` (one read and one write of the state)
+    gives the recurrence's output and state, on par with the fp32 recurrence's from float64 over drawn
+    tokens (check 1), at a small width and at Qwen3.5-0.8B's (16 heads, 128 wide), compiled on a GPU:
+    an fp32 state's output and state. A state held in bf16 is read and stepped in fp32 and written back
+    rounded once, stochastically: its output on par, and its state within one bf16 step of the fp32
+    one. A CPU interprets the kernel, whose output there sat 1.63 times the recurrence's error from
+    float64 over 320 draws, all on par on an A100: what a CPU's arithmetic makes of the kernel, not the
+    kernel's, and no CPU decode runs it."""
     from dew.nn.linear import decode_gated_delta_rule
 
-    rng = np.random.default_rng(0)
-    unit = [rng.normal(size=(rows, 1, heads, width)) for _ in range(2)]
-    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
-    value = jnp.asarray(rng.normal(size=(rows, 1, heads, width)), jnp.float32)
-    g = jnp.asarray(-rng.random((rows, 1, heads)) * 3, jnp.float32)
-    beta = jnp.asarray(rng.random((rows, 1, heads)), jnp.float32)
-    state = jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, held)
-    operands = (query, key, value, g, beta, state.astype(jnp.float32))
-    want, want_state = recurrent_gated_delta_rule(*operands)
-    with jax.enable_x64(new_val=True):
-        truth = [np.asarray(x) for x in recurrent_gated_delta_rule(*widened(operands))]
-    found = each_config(delta_rule.DeltaStep, decode_gated_delta_rule, query, key, value, g, beta, state)
-    assert len(found) > 1
-    # Timed on every row active (`KernelOp.operands`): each row-head's output is written.
-    [step] = launches(decode_gated_delta_rule, query, key, value, g, beta, state)
-    assert np.all(np.any(np.asarray(timed(step)[1]) != 0, axis=-1))
-    for config in found:
-        with tuning.pinned({delta_rule.DeltaStep: config}):
-            got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
-        assert got_state.dtype == held
-        assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), truth[0], f"{config} out")
-        if held == jnp.float32:
-            assert_as_exact_as_the_reference(np.asarray(got_state), np.asarray(want_state), truth[1],
-                                             f"{config} state")
-        else:
-            np.testing.assert_allclose(np.asarray(got_state, np.float32), want_state, atol=2e-6, rtol=2 ** -7)
+    rows, heads, width = DECODE_GEOMETRIES[geometry]
+
+    def draw(seed):
+        return decode_operands(np.random.default_rng(seed), rows, heads, width, held)
+
+    def decoded(*operands):
+        out, state = decode_gated_delta_rule(*operands)
+        return (out, state) if held == jnp.float32 else (out,)
+
+    def recurrent(query, key, value, g, beta, state):
+        # The held state read as fp32 at least: a bf16 one widened as the kernel reads it, the truth's as is.
+        state = state.astype(jnp.promote_types(state.dtype, jnp.float32))
+        out, stepped = recurrent_gated_delta_rule(query, key, value, g, beta, state)
+        return (out, stepped) if held == jnp.float32 else (out,)
+
+    assert_as_exact(decoded, recurrent, draw, f"the decode kernel, {geometry} held in {jnp.dtype(held).name}",
+                    seeds=DECODE_SEEDS[geometry, held])
+    operands = draw(0)
+    got_state = jax.jit(decode_gated_delta_rule)(*operands)[1]
+    assert got_state.dtype == held
+    if held == jnp.bfloat16:
+        want_state = recurrent_gated_delta_rule(*operands[:5], operands[5].astype(jnp.float32))[1]
+        np.testing.assert_allclose(np.asarray(got_state, np.float32), want_state, atol=2e-6, rtol=2 ** -7)
 
 
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("axis, split", [("data", 0), ("tensor", 2)])
 def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
-    """One decode token through `dew.nn.kernels.delta_rule` over rows split two
+    """One decode token through `dew.nn.kernels.recurrence.step` over rows split two
     ways, or heads split two ways, idle rows among the drawing ones, runs per
     shard (`sharded.assert_runs_per_shard`): its output and state within the
     float64 gate of one device's, from the recurrence's in float64 (an idle
@@ -780,20 +825,19 @@ def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
 
     from dew.nn.linear import decode_gated_delta_rule
 
-    rng = np.random.default_rng(2)
     rows, H, D = 4, 4, 32
-    unit = [rng.normal(size=(rows, 1, H, D)) for _ in range(2)]
-    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
-    value = jnp.asarray(rng.normal(size=(rows, 1, H, D)), jnp.float32)
-    g = jnp.asarray(-rng.random((rows, 1, H)) * 3, jnp.float32)
-    beta = jnp.asarray(rng.random((rows, 1, H)), jnp.float32)
-    state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, jnp.float32)
     active = jnp.asarray([True, False, True, False])
-    with jax.enable_x64(new_val=True):
-        operands = widened((query, key, value, g, beta, state))
-        out, final = recurrent_gated_delta_rule(*operands)
-        drawing = np.asarray(active)[:, None, None, None]
-        truth = (np.where(drawing, np.asarray(out), 0.0), np.where(drawing, np.asarray(final), operands[-1]))
+
+    def draw(seed):
+        rng = np.random.default_rng(2 + seed)
+        query, key, value, g, beta, state = decode_operands(rng, rows, H, D)
+        return query, key, value, g, beta, state, active
+
+    def exact(*operands):
+        """The recurrence in float64, an idle row's output zero and its state as it was."""
+        out, final = recurrent_gated_delta_rule(*operands[:6])
+        drawing = np.asarray(operands[6])[:, None, None, None]
+        return np.where(drawing, np.asarray(out), 0.0), np.where(drawing, np.asarray(final), operands[5])
 
     def spec(rank: int, at: int):
         return PartitionSpec(*(axis if dim == at else None for dim in range(rank)))
@@ -801,8 +845,9 @@ def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
     heads_at = {0: 0, 2: 1}[split]
     specs = [spec(4, split)] * 3 + [spec(3, split)] * 2 + [spec(4, heads_at), spec(1, split)]
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
-    assert_runs_per_shard(decode_gated_delta_rule, (query, key, value, g, beta, state, active), specs, mesh,
-                          truth)
+    # The kernel aliases its state into its output, and serving donates it (`donate`).
+    assert_runs_per_shard(decode_gated_delta_rule, draw, specs, mesh, f"delta decode split over {axis}",
+                          seeds=SHARDED_SEEDS, truth_fn=exact, donate=(5,))
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
@@ -814,12 +859,7 @@ def test_the_decode_kernel_leaves_an_idle_row_alone():
 
     rng = np.random.default_rng(1)
     rows, H, D = 8, 16, 128
-    unit = [rng.normal(size=(rows, 1, H, D)) for _ in range(2)]
-    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
-    value = jnp.asarray(rng.normal(size=(rows, 1, H, D)), jnp.float32)
-    g = jnp.asarray(-rng.random((rows, 1, H)) * 3, jnp.float32)
-    beta = jnp.asarray(rng.random((rows, 1, H)), jnp.float32)
-    state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, jnp.float32)
+    query, key, value, g, beta, state = decode_operands(rng, rows, H, D)
     active = jnp.asarray([True, False, True, True, False, False, True, False])
     every, every_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
     got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state, active)
@@ -834,7 +874,7 @@ def fused_case(heads, width, rows, dtype, held):
     """A gated delta net of `heads` value heads over half as many key heads, `width` wide, and its
     cache after a 5-token prefill of `rows` rows in `dtype` with its recurrent state `held`, and the
     next token: the layer's own conv, gates, update and gated norm unfused, and the decode token's
-    inputs as the fused step takes them (`delta_rule.fused_step`)."""
+    inputs as the fused step takes them (`fused_step`)."""
     layer = GatedDeltaNet(emb_features=64, num_k_heads=heads // 2, num_v_heads=heads, head_k_dim=width,
                           head_v_dim=width, dtype=dtype)
     hidden = jax.random.normal(jax.random.key(7), (rows, 6, 64), jnp.float32).astype(dtype)
@@ -864,13 +904,11 @@ def fused_inputs(layer, variables, cache, token):
     pytest.param(16, 128, 4, marks=pytest.mark.gpu(reason="the 0.8B's widths are a GPU's"), id="0.8b"),
 ])
 def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, held):
-    """A gated delta net's decode token in one launch (`delta_rule.fused_step`: the conv over the
-    held history, the gates, the update and the gated norm) at every config of its space: its output
+    """A gated delta net's decode token in one launch (`fused_step`: the conv over the
+    held history, the gates, the update and the gated norm): its output
     through the layer's projection, its history and its state, fp32 or bf16, within
     tests/reference_error.py's rule of the layer's own unfused token, holding the same state, against
     the float64 layer's. Compiled on a GPU, interpreted elsewhere."""
-    from dew.nn.kernels import delta_rule
-
     layer, variables, cache, token = fused_case(heads, width, rows, jnp.float32, held)
     step = MixerCall(decode=True)
     fp32 = {**cache, "recurrent_state": cache["recurrent_state"].astype(jnp.float32)}
@@ -882,56 +920,49 @@ def test_the_fused_decode_step_computes_the_layers_token(heads, width, rows, hel
                                         step, mutable=["cache"])
 
     def fused(*operands):
-        out, history, state = delta_rule.fused_step(*operands, epsilon=layer.norm_eps,
+        out, history, state = fused_step(*operands, epsilon=layer.norm_eps,
                                                     activation=layer.gate_activation, dtype=jnp.float32)
         flat = out.reshape(out.shape[0], 1, -1)
         projected = layer.apply(variables, flat, method=lambda module, out: module.out_proj(out))
         return projected, history, state
 
     operands = fused_inputs(layer, variables, cache, token)
-    found = each_config(delta_rule.FusedStep, fused, *operands)
-    assert len(found) > 1
-    for config in found:
-        with tuning.pinned({delta_rule.FusedStep: config}):
-            out, history, state = jax.jit(fused)(*operands)
-        assert_as_exact_as_the_reference(np.asarray(out), np.asarray(want), np.asarray(exact),
-                                         f"{config} out")
-        np.testing.assert_array_equal(np.asarray(history), np.asarray(after["cache"]["conv_state"]))
-        assert state.dtype == held
-        assert_as_exact_as_the_reference(np.asarray(state), np.asarray(unfused["recurrent_state"]),
-                                         np.asarray(exact_after["cache"]["recurrent_state"]),
-                                         f"{config} state")
+    out, history, state = jax.jit(fused)(*operands)
+    assert_as_exact_as_the_reference(np.asarray(out), np.asarray(want), np.asarray(exact), "fused out")
+    np.testing.assert_array_equal(np.asarray(history), np.asarray(after["cache"]["conv_state"]))
+    assert state.dtype == held
+    assert_as_exact_as_the_reference(np.asarray(state), np.asarray(unfused["recurrent_state"]),
+                                     np.asarray(exact_after["cache"]["recurrent_state"]), "fused state")
 
 
-def test_a_cached_layer_choosing_the_fused_step_takes_a_jvp_through_the_recurrence():
-    """A cached gated delta net whose A100 row chooses the fused step (`generation.chosen`), traced for
-    `jax.jvp` (`forward_mode_attention`, as MeanFlow and consistency training trace it), decodes its
-    token through the differentiable recurrence, which gives the tangent the in-place kernels do not,
-    and reports that route with its stable code."""
+def test_a_cached_layer_traced_for_a_jvp_decodes_its_token():
+    """A cached gated delta net on an A100, whose row's step kernel decodes its tokens, traces for
+    `jax.jvp` (`forward_mode_attention`, as MeanFlow and consistency training trace it): its token
+    decodes with a tangent, which the in-place kernels do not give."""
     from dew.nn.attention import forward_mode_attention
-    from dew.nn.kernels.generation import assumed, chosen, routes
+    from dew.nn.kernels.generation import assumed
 
     layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
 
     def step(token):
         return layer.apply({**variables, "cache": cache}, token, MixerCall(decode=True), mutable=["cache"])[0]
 
-    tangent = jax.random.normal(jax.random.key(9), token.shape)
-    with assumed("sm80"), chosen(delta_decode="fused"), forward_mode_attention(), routes() as found:
+    def traced():
+        tangent = jax.random.normal(jax.random.key(9), token.shape)
         jax.make_jaxpr(lambda token, tangent: jax.jvp(step, (token,), (tangent,)))(token, tangent)
-    (decode,) = [route for route in found if route.choice == "delta_decode"]
-    assert (decode.kernel, decode.preferred, decode.refusal.code) == ("xla", "fused", "forward_mode")
+
+    with assumed("sm80"), forward_mode_attention():
+        traced()
 
 
 def test_the_fused_decode_step_leaves_an_idle_row_alone():
     """A row the fused step marks idle: its history and state as they were, bitwise, and its output
     zeros, beside an active row that moves."""
-    from dew.nn.kernels import delta_rule
 
     layer, variables, cache, token = fused_case(4, 32, 2, jnp.float32, jnp.float32)
     operands = fused_inputs(layer, variables, cache, token)
     out, history, state = jax.jit(functools.partial(
-        delta_rule.fused_step, epsilon=layer.norm_eps, activation=layer.gate_activation,
+        fused_step, epsilon=layer.norm_eps, activation=layer.gate_activation,
         dtype=jnp.float32, active=jnp.asarray([False, True])))(*operands)
     np.testing.assert_array_equal(np.asarray(out[0]), 0)
     np.testing.assert_array_equal(np.asarray(history[0]), np.asarray(cache["conv_state"][0]))
@@ -945,10 +976,9 @@ def test_the_fused_decode_step_leaves_an_idle_row_alone():
 def test_a_layer_choosing_the_fused_step_decodes_as_the_unfused_one(dtype):
     """A gated delta net of 4 value heads over 2 key heads 32 wide decoding 65 tokens after a 5-token
     prefill with its generation's choice 'delta_decode' set to 'fused' (`generation.chosen`): the
-    decode tokens run the fused step, and the outputs are within tests/reference_error.py's rule of
+    outputs are within tests/reference_error.py's rule of
     the unfused layer's against the float64 parallel forward."""
     from dew.nn.kernels.generation import chosen
-    from dew.training._lowering import triton_kernels
 
     module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=32, head_v_dim=32,
                            dtype=dtype)
@@ -963,10 +993,6 @@ def test_a_layer_choosing_the_fused_step_decodes_as_the_unfused_one(dtype):
     unfused = np.asarray(decode_through(module, variables, hidden, prefill=5)[0], np.float64)
     with chosen(delta_decode="fused"):
         fused = np.asarray(decode_through(module, variables, hidden, prefill=5)[0], np.float64)
-        _, _, cache = decode_through(module, variables, hidden[:, :6], prefill=5)
-        step = jax.jit(lambda cache, token: module.apply({**variables, "cache": cache}, token,
-                                                         MixerCall(decode=True), mutable=["cache"]))
-        assert "gated_delta_decode" in triton_kernels(step.trace(cache, hidden[:, 6:7]).lower())
     assert_as_exact_as_the_reference(fused, unfused, truth, f"{jnp.dtype(dtype).name} decode")
 
 
@@ -1009,7 +1035,8 @@ def test_a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device(axis
         truth = np.asarray(module.clone(dtype=jnp.float64).apply(widened(variables), widened(hidden)))
     with chosen(delta_decode="fused"):
         alone = np.asarray(decode_through(module, variables, hidden, prefill=3)[0])
-        mesh = MeshSpec(**{axis: 2}).build(jax.devices()[:2])
+        # The data axis takes the devices the others leave.
+        mesh = MeshSpec(**({} if axis == 'data' else {axis: 2})).build(jax.devices()[:2])
         with jax.set_mesh(mesh):
             placed = jax.device_put(hidden, NamedSharding(mesh, PartitionSpec()))
             split = np.asarray(decode_through(module, variables, placed, prefill=3)[0])
@@ -1022,11 +1049,10 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
     conv of 4 taps over an fp32 history, a bf16 state) and at Qwen3.5-9B's value heads over half as
     many key heads, at every config of its space, lowered for each GPU on this CPU and compiled by
     Triton within its block's shared memory."""
-    pytest.importorskip("triton")
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_kernels, failures
 
-    from dew.nn.kernels import delta_rule
+    from dew.nn.kernels.recurrence import Launch, StepLaunch
 
     def case(key_heads, value_heads, warps):
         rows, width = 8, 128
@@ -1041,8 +1067,8 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
                  jax.ShapeDtypeStruct((rows, value_heads, width, width), jnp.bfloat16))
 
         def run(*operands):
-            with tuning.pinned({delta_rule.FusedStep: delta_rule.Warps(warps)}):
-                return delta_rule.fused_step(*operands, epsilon=1e-6, activation="silu", dtype=jnp.bfloat16)
+            with tuning.pinned({StepLaunch: Launch(0, warps)}):
+                return fused_step(*operands, epsilon=1e-6, activation="silu", dtype=jnp.bfloat16)
         return run, specs
 
     cases = [KernelCase(f"fused/{key}x{value}/warps{warps}",
@@ -1053,56 +1079,24 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
     assert not failures(found), "\n".join(failures(found))
 
 
-def test_a_decode_token_reports_the_fused_step_as_its_route_where_its_target_takes_it():
-    """A gated delta net's decode token traced for an A100 on this CPU, the generation's choice
-    'delta_decode' set to 'fused', reports the fused step as its route; at widths neither the fused nor
-    the step kernel's blocks take, the portable recurrence with the refusal's code; with no choice, the
-    step kernel, as the rule's row names the port; and with the rule's math chosen, the portable
-    recurrence, so an unfused reference decodes unfused."""
-    from dew.nn.kernels.generation import assumed, chosen, routes
-
-    def decode_routes(width):
-        module = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=4, head_k_dim=width,
-                               head_v_dim=width, dtype=jnp.bfloat16)
-        x = jnp.zeros((2, 1, 64), jnp.bfloat16)
-        step = MixerCall(decode=True)
-        params = jax.eval_shape(lambda: module.init(jax.random.key(0), x))
-        cache = jax.eval_shape(lambda v: module.apply(v, x, step, mutable=["cache"])[1], params)
-        with assumed("sm80"), routes() as found:
-            jax.eval_shape(lambda v: module.apply(v, x, step, mutable=["cache"]), {**params, **cache})
-        return [(found_route.kernel, found_route.preferred, found_route.refusal and found_route.refusal.code)
-                for found_route in found if found_route.choice == "delta_decode"]
-
-    assert decode_routes(32)[-1] == ("step", "step", None)
-    with chosen(gated_delta_rule="xla"):
-        assert decode_routes(32)[-1] == ("xla", "xla", None)
-    with chosen(delta_decode="fused"):
-        assert decode_routes(32)[-1] == ("fused", "fused", None)
-        assert decode_routes(24)[-1] == ("xla", "fused", "widths")
-
-
 @pytest.mark.gpu(reason="launch timing and occupancy vary on a GPU")
 def test_the_fused_decode_step_gives_the_same_bits_however_its_launches_are_timed():
-    """The fused decode step at each config of its space, run 20 times, each run beside a large matmul
+    """The fused decode step, run 20 times, each run beside a large matmul
     that holds most of the GPU or alone, gives the same output, history and state bits every run: no
     value head reads a history or state another program is writing, whatever order they run in."""
-    from dew.nn.kernels import delta_rule
-
     layer, variables, cache, token = fused_case(16, 128, 4, jnp.bfloat16, jnp.bfloat16)
     operands = fused_inputs(layer, variables, cache, token)
     load = jnp.ones((8192, 8192), jnp.bfloat16)
     busy = jax.jit(lambda a: a @ a)
 
     def fused(*operands):
-        return delta_rule.fused_step(*operands, epsilon=layer.norm_eps, activation=layer.gate_activation,
+        return fused_step(*operands, epsilon=layer.norm_eps, activation=layer.gate_activation,
                                      dtype=jnp.bfloat16)
 
-    for config in each_config(delta_rule.FusedStep, fused, *operands):
-        with tuning.pinned({delta_rule.FusedStep: config}):
-            run = jax.jit(fused)
-            first = jax.tree.map(np.asarray, run(*operands))
-            for repeat in range(20):
-                if repeat % 2:
-                    busy(load)
-                for mine, theirs in zip(jax.tree.leaves(run(*operands)), jax.tree.leaves(first), strict=True):
-                    np.testing.assert_array_equal(np.asarray(mine), theirs, err_msg=f"{config}, run {repeat}")
+    run = jax.jit(fused)
+    first = jax.tree.map(np.asarray, run(*operands))
+    for repeat in range(20):
+        if repeat % 2:
+            busy(load)
+        for mine, theirs in zip(jax.tree.leaves(run(*operands)), jax.tree.leaves(first), strict=True):
+            np.testing.assert_array_equal(np.asarray(mine), theirs, err_msg=f"run {repeat}")

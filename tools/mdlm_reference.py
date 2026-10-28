@@ -36,6 +36,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import torch
+from recorded_draws import Tape
 from reference_source import fetched, ran, selected
 from torch_precision import replaced
 
@@ -89,11 +90,11 @@ def stand_in(reference, backbone) -> object:
 
 @contextlib.contextmanager
 def drawn(*draws: torch.Tensor):
-    """Each `torch.rand` call returns the next of `draws`."""
-    queue = list(draws)
-    with replaced((torch, "rand", lambda *_, **__: queue.pop(0))):
+    """Each `torch.rand` call returns the next of `draws`, every one taken."""
+    tape = Tape(draws)
+    with replaced((torch, "rand", lambda *_, **__: tape.next())):
         yield
-    assert not queue, "a stored draw was not taken"
+    tape.spent()
 
 
 def recording(q_xt, seen: list):

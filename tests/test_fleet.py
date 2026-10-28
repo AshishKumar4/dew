@@ -56,6 +56,15 @@ def test_a_program_reads_stdin_and_completes(fleet):
     assert outcome.exit_code == 0 and outcome.stdout == "42\n"
 
 
+def test_a_program_that_closes_its_output_still_reads_its_whole_input(fleet):
+    """The collector feeds stdin until the program has it all, whether or not its output streams
+    are still open: one that closes them first and then reads more than a pipe holds completes."""
+    source = ("import os, sys\nos.close(1)\nos.close(2)\n"
+              "raise SystemExit(0 if len(sys.stdin.buffer.read()) == 200000 else 1)\n")
+    outcome = fleet.run([program(source, "x" * 200000)])[0]
+    assert outcome.verdict is Verdict.COMPLETED and outcome.exit_code == 0
+
+
 def test_exit_status_and_exceptions_are_failures(fleet):
     exited, raised = fleet.run([program("raise SystemExit(3)"), program("1 / 0")])
     assert exited.verdict is Verdict.FAILED and exited.exit_code == 3

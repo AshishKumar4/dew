@@ -19,14 +19,17 @@ On TPU, XLA's space-to-batch rewrite corrupts a convolution feeding a strided
 strided convolution's input, whatever the global batch, since a shard's may
 be small; its derivative and batching rules are identities.
 
-A dilated 3x3 depthwise convolution runs on CUDA as an undilated one over
-its interleaved grids (`_polyphase_depthwise_3x3`), since cuDNN's dilated
-grouped kernels are slow: on the RTX 4080 at 16x16x768, batch 16, bf16
-forward and VJP take 0.097 ms (dilation 2) against 1.6 ms dilated, and the
-176M hybrid DiT's bf16 step runs 70.2 ms against 75.3
-(`tools/benchmark_depthwise.py`). Accumulation stays fp32 and ordinary JAX
-differentiation keeps higher-order derivatives; other backends use lax, as
-does a convolution a Qwix rule quantizes (`dew.quantization`).
+A dilated 3x3 depthwise convolution runs on CUDA in the form measured faster
+for its dtype, since cuDNN's dilated grouped kernels are slow: in bf16 as an
+undilated one over its interleaved grids (`_polyphase_depthwise_3x3`), whose
+forward and VJP on the RTX 4080 at 16x16x768, batch 16, take 0.097 ms at
+dilation 2 against 0.31 ms as nine shifted products, the 176M hybrid DiT's
+bf16 step 70.2 ms against 75.3; in fp32 as those nine products held in memory
+(`_materialized_depthwise_3x3`), where cuDNN's grouped direct kernels make the
+polyphase form slower (docs/performance.md, `tools/benchmark_depthwise.py`).
+Accumulation stays fp32 and ordinary JAX differentiation keeps higher-order
+derivatives; other backends use lax, as does a convolution a Qwix rule
+quantizes (`dew.quantization`).
 """
 
 import math
@@ -43,9 +46,11 @@ from jax.interpreters import ad, batching, mlir
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
+from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, logical_spec, mesh_axes
+
 from .flops import conv_flops
-from .precision import biased
-from .sharding import SEQUENCE_AXIS, STAGE_AXIS, auto_part, logical_spec, mesh_axes
+from .precision import biased, float32_products, products_dtype
+from .sharding import auto_part, in_pipeline_stage
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
 # from either leaves the same convolution chain open to the faulty rewrite.
@@ -65,21 +70,30 @@ def _barrier(x: jax.Array) -> jax.Array:
 def _automatic_axes(mesh: jax.sharding.AbstractMesh) -> list[str]:
     """The mesh axes above size one that GSPMD places: neither a
     `shard_map`'s manual axes, an Explicit axis, which an array's type
-    places, nor the stage axis, which a pipeline's stage vmap holds."""
+    places, nor, inside a pipeline's stage (`in_pipeline_stage`), the stage
+    axis, which the stage's vmap holds. Outside one, a convolution runs on
+    every stage, and the stage axis replicating its input and output doubled
+    its kernel gradient as the first bug does (a JEPA's patch embedding over
+    stage 2 and sequence 2, tests/test_stage_blocks.py), so it splits them
+    like any other axis."""
     return [axis for axis in mesh.axis_names if mesh.shape[axis] > 1 and axis not in mesh.manual_axes
-            and axis not in mesh.explicit_axes and axis != STAGE_AXIS]
+            and axis not in mesh.explicit_axes and not (axis == STAGE_AXIS and in_pipeline_stage())]
+
+
+def _whole(kernel: jax.Array) -> jax.Array:
+    """`kernel` placed whole on every device (the module docstring's second
+    bug). Where no automatic mesh axis is above size one, it is left as it is."""
+    if _automatic_axes(jax.sharding.get_abstract_mesh()):
+        return jax.lax.with_sharding_constraint(kernel, P())
+    return kernel
 
 
 def _promoted_whole(*arrays: jax.Array | None, dtype: DTypeLike | None = None,
                     inexact: bool = True) -> list[jax.Array | None]:
     """flax's dtype promotion of a convolution's input, kernel and bias,
-    with the kernel then placed whole on every device (the module
-    docstring's second bug). Where no automatic mesh axis is above size
-    one, the kernel is left as it is."""
+    with the kernel then placed whole (`_whole`)."""
     inputs, kernel, bias = promote_dtype(*arrays, dtype=dtype, inexact=inexact)
-    if _automatic_axes(jax.sharding.get_abstract_mesh()):
-        kernel = jax.lax.with_sharding_constraint(kernel, P())
-    return [inputs, kernel, bias]
+    return [inputs, _whole(kernel), bias]
 
 
 def _unreplicated(x: jax.Array, spatial: int) -> jax.Array:
@@ -88,8 +102,8 @@ def _unreplicated(x: jax.Array, spatial: int) -> jax.Array:
     `activation_batch` splits rows, then every other automatic axis the first
     later dimension it divides, the sequence axis first (a patch embedding's
     rows already sit where its tokens go) and the features last; an axis that
-    divides nothing replicates. The stage axis is left to the pipeline's vmap,
-    and with no automatic axis above one `x` is left as it is."""
+    divides nothing replicates. Inside a pipeline's stage the stage axis is
+    left to its vmap, and with no automatic axis above one `x` is left as it is."""
     mesh = jax.sharding.get_abstract_mesh()
     automatic = _automatic_axes(mesh)
     if not automatic:
@@ -136,36 +150,26 @@ def _polyphase_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> j
     return output.reshape(batch, rows * dilation, columns * dilation, features)[:, :height, :width]
 
 
-def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
-    """The depthwise convolution as its nine shifted products, summed in the
-    kernel's row-major order in fp32 and rounded once to the input's dtype.
+def _taps(padded: jax.Array, kernel: jax.Array, dilation: int, height: int, width: int) -> list[jax.Array]:
+    """The depthwise convolution's nine fp32 products, in the kernel's row-major order: each tap of the
+    padded input, shifted by its row and column times `dilation`, times the kernel's weight there, which
+    `_materialized_depthwise_3x3` sums as it rounds."""
+    return [padded[:, row * dilation:row * dilation + height, column * dilation:column * dilation + width, :]
+            * kernel[row, column, 0] for row in range(3) for column in range(3)]
 
-    The optimization barrier rounds each product to fp32 before it is
-    added, where XLA would otherwise contract it into a fused multiply-add.
-    For more than 16 features that is XLA:CPU's library convolution's
-    arithmetic (YNNPACK, jax 0.11.2), bit for bit in fp32 and bf16, which on
-    the hybrid DiT's 2 x 16 x 16 x 768 maps takes 6.4 ms a call against 1.4
-    here; it sums 16 features or fewer otherwise, so those keep the
-    convolution. If a jax or YNNPACK release changes that summation,
-    tests/test_depthwise_conv.py's
-    test_cpu_depthwise_is_the_library_convolution_bit_for_bit fails."""
-    height, width = lhs.shape[1:3]
-    padded = jnp.pad(lhs, ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))).astype(jnp.float32)
-    kernel = rhs.astype(jnp.float32)
-    products = jax.lax.optimization_barrier([
-        padded[:, i * dilation:i * dilation + height, j * dilation:j * dilation + width, :] * kernel[i, j, 0]
-        for i in range(3) for j in range(3)])
-    total = products[0]
-    for product in products[1:]:
+
+def _accumulated(total: jax.Array, products: Sequence[jax.Array]) -> jax.Array:
+    """`total` plus each of `products` in order, one fp32 add at a time: the materialized depthwise
+    form's accumulation onto its seed."""
+    for product in products:
         total = total + product
-    return total.astype(lhs.dtype)
+    return total
 
 
 def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
-    """The depthwise convolution as its nine shifted products in fp32, with
-    its fp32 input, kernel and output held in memory (`_barrier`, in the
-    cotangents too), so XLA fuses the products and their weight reductions
-    into kernels of their own rather than into a neighbour's.
+    """The depthwise convolution's taps (`_taps`) summed onto zeros, its fp32 input, kernel and output
+    held in memory (`_barrier`, in the cotangents too), so XLA fuses the products and their weight
+    reductions into kernels of their own rather than into a neighbour's.
 
     CUDA runs a dilated one in this form in fp32 and in the polyphase form
     in bf16: the 176M hybrid DiT's training step on an RTX 4080, ms, with
@@ -183,13 +187,10 @@ def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -
     height, width = lhs.shape[1:3]
     border = ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))
     padded = jnp.pad(_barrier(lhs.astype(jnp.float32)), border)
-    kernel = _barrier(rhs.astype(jnp.float32))
-    output = jnp.zeros(lhs.shape, jnp.float32)
-    for row in range(3):
-        for column in range(3):
-            top, left = row * dilation, column * dilation
-            output = output + padded[:, top:top + height, left:left + width, :] * kernel[row, column, 0, :]
-    return _barrier(output).astype(lhs.dtype)
+    # Onto a positive zero, as the form has summed: XLA:CUDA, where this form runs, drops it (A100 and
+    # H100), so an output whose nine taps are all negative zero is the sum's negative zero.
+    products = _taps(padded, _barrier(rhs.astype(jnp.float32)), dilation, height, width)
+    return _barrier(_accumulated(jnp.zeros(lhs.shape, jnp.float32), products)).astype(lhs.dtype)
 
 
 def _conv_general_dilated(
@@ -211,7 +212,7 @@ def _conv_general_dilated(
         return jax.lax.conv_general_dilated(
             x, w, window_strides, padding, lhs_dilation=lhs_dilation, rhs_dilation=rhs_dilation,
             dimension_numbers=dimension_numbers, feature_group_count=feature_group_count,
-            batch_group_count=batch_group_count, precision=precision,
+            batch_group_count=batch_group_count, precision=float32_products(products_dtype(x, w), precision),
             preferred_element_type=preferred_element_type, out_sharding=out_sharding)
 
     dilation = (1, 1) if rhs_dilation is None else tuple(rhs_dilation)
@@ -229,12 +230,33 @@ def _conv_general_dilated(
         if dilated is None:
             dilated = _polyphase_depthwise_3x3 if lhs.dtype == jnp.bfloat16 else _materialized_depthwise_3x3
         return jax.lax.platform_dependent(
-            lhs, rhs,
-            cuda=convolve if dilation[0] == 1 else lambda x, w: dilated(x, w, dilation[0]),
-            cpu=((lambda x, w: _shifted_depthwise_3x3(x, w, dilation[0]))
-                 if feature_group_count > 16 else convolve),
+            lhs, rhs, cuda=convolve if dilation[0] == 1 else lambda x, w: dilated(x, w, dilation[0]),
             default=convolve)
     return convolve(lhs, rhs)
+
+
+def _placed(inputs: jax.Array, spatial: int, strides: Sequence[int],
+            convolve: Callable[[jax.Array], jax.Array]) -> jax.Array:
+    """`convolve(inputs)` with its input and output split over every mesh
+    axis (the module docstring's first bug) and, on TPU, a barrier at a
+    strided 2D convolution's input (its third)."""
+    inputs = _unreplicated(inputs, spatial)
+    if spatial == 2 and any(stride > 1 for stride in strides):
+        inputs = jax.lax.platform_dependent(inputs, tpu=_barrier, default=lambda x: x)
+    return _unreplicated(convolve(inputs), spatial)
+
+
+def convolution(inputs: jax.Array, kernel: jax.Array, padding: Sequence[tuple[int, int]]) -> jax.Array:
+    """`Conv`'s stride-1 convolution of `inputs` `[batch, *spatial, features]`
+    by a `[*spatial, in, out]` kernel of the inputs' dtype that the caller
+    holds, placed and dispatched as `Conv` places and dispatches its own:
+    the product of a layer that transforms its kernel first
+    (`dew.nn.mp.MPConv`)."""
+    spatial = kernel.ndim - 2
+    letters = "HWD"[:spatial]
+    return _placed(inputs, spatial, (1,) * spatial, lambda x: _conv_general_dilated(
+        x, _whole(kernel), (1,) * spatial, padding,
+        dimension_numbers=(f"N{letters}C", f"{letters}IO", f"N{letters}C")))
 
 
 class Conv(nn.Conv):
@@ -287,13 +309,9 @@ class Conv(nn.Conv):
     def __call__(self, inputs: jax.Array) -> jax.Array:
         kernel_size = (self.kernel_size,) if isinstance(self.kernel_size, int) else tuple(self.kernel_size)
         spatial = len(kernel_size)
-        inputs = _unreplicated(inputs, spatial)
-        if spatial == 2 and self.strides is not None:
-            strided = (self.strides > 1 if isinstance(self.strides, int)
-                       else any(stride > 1 for stride in self.strides))
-            if strided:
-                inputs = jax.lax.platform_dependent(inputs, tpu=_barrier, default=lambda x: x)
-        return _unreplicated(self._convolved(inputs, kernel_size), spatial)
+        strides = 1 if self.strides is None else self.strides
+        strides = (strides,) * spatial if isinstance(strides, int) else tuple(strides)
+        return _placed(inputs, spatial, strides, lambda placed: self._convolved(placed, kernel_size))
 
     @nn.nowrap
     def _convolved(self, inputs: jax.Array, kernel_size: tuple[int, ...]) -> jax.Array:

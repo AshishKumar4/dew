@@ -16,22 +16,21 @@ three times, with fp32 and float64 logits, left-padded logits, the cached
 greedy continuation and each pass's exit-gate logits. ouro-1.4b/ pins the
 released config; `--full` adds probe.npz, the released model's argmax and 64
 of its logit columns on the probe ids, which the network test holds the
-loaded checkpoint to.
+loaded checkpoint to. `--padding` records instead the rows the release's own
+token lookup leaves untrained under ouro-tiny's config with its pad id stated,
+left out and null (`reference_source.record_padding`), as padding.json there.
 """
 
 import argparse
+import json
 import shutil
-import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
-import transformers
-from diffusers_wan_reference import float64
 from huggingface_hub import hf_hub_download
-
-from dew.interop.verify import probe_ids, scatter_weights
+from reference_source import config_lookups, hub_modules, record_padding
+from torch_precision import float64, float64_twin
 
 REPO, REVISION = 'ByteDance/Ouro-1.4B', '574fa66cb8bf5abdc979642d01cf2b79b16bfab1'
 FIXTURES = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf'
@@ -40,13 +39,7 @@ COLUMNS = np.random.RandomState(11).choice(49152, 64, replace=False)
 
 def remote():
     """Ouro's modeling module, imported from the pinned remote code as a package."""
-    package = Path(tempfile.mkdtemp()) / 'ouro_remote'
-    package.mkdir()
-    (package / '__init__.py').write_text('')
-    for name in ('configuration_ouro.py', 'modeling_ouro.py'):
-        shutil.copy(hf_hub_download(REPO, name, revision=REVISION), package / name)
-    sys.path.insert(0, str(package.parent))
-    import ouro_remote.modeling_ouro as modeling
+    _, modeling = hub_modules('ouro_remote', REPO, REVISION, ('configuration_ouro.py', 'modeling_ouro.py'))
     return modeling
 
 
@@ -68,6 +61,8 @@ def outputs(model, ids, mask=None, positions=None):
 
 
 def write_tiny(modeling) -> None:
+    from dew.interop.verify import probe_ids, scatter_weights
+
     directory = FIXTURES / 'ouro-tiny'
     directory.mkdir(parents=True, exist_ok=True)
     config = modeling.OuroConfig(
@@ -91,12 +86,10 @@ def write_tiny(modeling) -> None:
     with torch.no_grad():
         arrays['generated'] = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
                                              max_new_tokens=6, eos_token_id=None, pad_token_id=0).numpy()
+    # Its float64 twin (`float64_twin`): built inside the widening, so the rotary table is computed in
+    # float64 rather than widened from fp32; the weights are the same.
+    truth = last_pass(float64_twin(model, lambda: modeling.OuroForCausalLM(config)))
     with float64():
-        # Built inside the widening, so the rotary table is computed in
-        # float64 rather than widened from fp32; the weights are the same.
-        truth = modeling.OuroForCausalLM(config).double()
-        truth.load_state_dict(model.state_dict())
-        truth = last_pass(truth)
         arrays['logits_f64'], arrays['exit_logits_f64'] = outputs(truth, ids)
         arrays['padded_logits_f64'], _ = outputs(truth, padded, mask, positions)
     for name, array in arrays.items():
@@ -105,6 +98,8 @@ def write_tiny(modeling) -> None:
 
 
 def write_released(modeling, full: bool) -> None:
+    from dew.interop.verify import probe_ids
+
     directory = FIXTURES / 'ouro-1.4b'
     directory.mkdir(parents=True, exist_ok=True)
     shutil.copy(hf_hub_download(REPO, 'config.json', revision=REVISION), directory / 'config.json')
@@ -123,9 +118,16 @@ def write_released(modeling, full: bool) -> None:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--full', action='store_true', help="also run the released model for probe.npz")
+    parser.add_argument('--padding', action='store_true', help="record the rows the lookup leaves untrained")
+    arguments = parser.parse_args()
     from reference_releases import require
 
     require("ouro")
     modeling = remote()
-    write_tiny(modeling)
-    write_released(modeling, parser.parse_args().full)
+    if arguments.padding:
+        tiny = FIXTURES / 'ouro-tiny'
+        lookups = config_lookups(lambda fields: modeling.OuroConfig(**fields), modeling.OuroForCausalLM)
+        record_padding(*lookups, json.loads((tiny / 'config.json').read_text()), tiny)
+    else:
+        write_tiny(modeling)
+        write_released(modeling, arguments.full)

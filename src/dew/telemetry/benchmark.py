@@ -1,5 +1,7 @@
-"""Wall-clock timing of calls: `samples`, which every benchmark tool in Dew measures with, and
-`benchmark`, which lays out many calls' timings as a table.
+"""Wall-clock timing of calls: `samples`, which every benchmark tool in Dew measures independent
+calls with, `carried`, which times calls that carry a state from one to the next, and `benchmark`,
+which lays out many calls' timings as a table; and the process's resident memory as the kernel
+reports it (`resident_memory`), which the memory benchmarks read.
 
 A run is timed from the call to the moment its output is ready on the devices
 (`jax.block_until_ready`), so an asynchronous dispatch is timed as the work it
@@ -17,6 +19,7 @@ import time
 from collections.abc import Callable, Hashable, Mapping
 
 import jax
+import jax.numpy as jnp
 
 
 @dataclasses.dataclass(frozen=True)
@@ -77,6 +80,30 @@ class Benchmark[T]:
         return self.table()
 
 
+def resident_memory() -> dict[str, int]:
+    """This process's memory fields of Linux's /proc/self/status (VmRSS, RssAnon, RssFile, VmHWM,
+    ...), each in bytes, under the kernel's names; a benchmark keeps the fields and unit it reports.
+
+    The resident counts are the kernel's running counters, which since Linux 6.2 each CPU batches
+    before they reach the process's total: a reading lags the pages just written by up to a batch
+    for each CPU the writing threads ran on, on a machine of many CPUs tens of MiB."""
+    fields = {}
+    with open("/proc/self/status") as handle:
+        for line in handle:
+            name, _, value = line.partition(":")
+            match value.split():
+                case [amount, "kB"]:
+                    fields[name] = int(amount) * 1024
+    return fields
+
+
+def largest_difference(left, right) -> float:
+    """The largest elementwise difference between two pytrees of arrays, in fp32: how far one
+    implementation's outputs sit from another's."""
+    return max(float(jnp.max(jnp.abs(a.astype(jnp.float32) - b.astype(jnp.float32))))
+               for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
+
+
 def samples[T](fn: Callable[..., T], *args, warmup: int = 3, repeats: int = 10,
                calls: int = 1) -> list[float]:
     """Seconds per call of `fn(*args)`, one sample a synchronized group of
@@ -97,6 +124,29 @@ def samples[T](fn: Callable[..., T], *args, warmup: int = 3, repeats: int = 10,
         measured.append((time.perf_counter() - start) / calls)
         del outputs
     return measured
+
+
+def carried[S](step: Callable[[S], S], state: S, count: int, *, each: bool = False) -> tuple[S, list[float]]:
+    """`count` calls of `step`, each handed the state the last returned (a training step's state, a
+    decoder's cache), and the seconds they took, with the state the last call returned. With `each`,
+    one sample a call, synchronized before the next starts, which times every call alone; otherwise
+    one sample the window, its calls dispatched as a run dispatches them and synchronized once at its
+    end, which times their throughput. A carried state is never released between calls, so its
+    windows are timed apart from `samples`, whose calls are independent. Refuses no call."""
+    if count < 1:
+        raise ValueError(f"a measured window takes at least one call, not {count}")
+    if each:
+        seconds = []
+        for _ in range(count):
+            start = time.perf_counter()
+            state = jax.block_until_ready(step(state))
+            seconds.append(time.perf_counter() - start)
+        return state, seconds
+    start = time.perf_counter()
+    for _ in range(count):
+        state = step(state)
+    state = jax.block_until_ready(state)
+    return state, [time.perf_counter() - start]
 
 
 def benchmark[T](calls: Mapping[Hashable, Callable[[], T]], *, warmup: int = 1,
@@ -125,4 +175,4 @@ def benchmark[T](calls: Mapping[Hashable, Callable[[], T]], *, warmup: int = 1,
     return Benchmark(seconds, outputs)
 
 
-__all__ = ["Benchmark", "benchmark", "samples"]
+__all__ = ["Benchmark", "benchmark", "carried", "samples"]

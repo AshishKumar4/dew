@@ -60,11 +60,12 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Protocol
 
+from dew._records import JSON, finite
+from dew.cleanup import exit_code, groups_ended, process_group, signal_group
 from dew.data.prompts import PromptRecord
-from dew.inference.rollouts import InfrastructureError
-from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
-from dew.objectives.rl.records import messages, real
-from dew.records import JSON
+from dew.inference.rollouts import Draw, InfrastructureError
+from dew.objectives.rl.episodes import Environment, EpisodeId, EpisodeStatus, Observation
+from dew.objectives.rl.records import messages
 
 
 @dataclass(frozen=True)
@@ -106,34 +107,34 @@ def _observation(value: object) -> Observation:
         state = EpisodeStatus[status.upper()]
     except KeyError:
         raise ValueError(f"unknown sandbox observation status {status!r}") from None
-    return Observation(tuple(context), state, detail, None if reward is None else real(reward, "reward"),
+    return Observation(tuple(context), state, detail, None if reward is None else finite(reward, "reward"),
                        messages(value.get("messages", []), "messages"))
 
 
-def launch(command: tuple[str, ...], limits: SandboxLimits, directory: str) -> subprocess.Popen[bytes]:
-    """Start `command` in `directory` under `limits`, in its own session, with piped streams.
+def launched(command: tuple[str, ...], limits: SandboxLimits,
+             directory: str) -> contextlib.AbstractContextManager[subprocess.Popen[bytes]]:
+    """`command` started in `directory` under `limits`, in its own session, with piped streams, whose
+    process group ends and whose streams close with the block, however it ends (`process_group`).
 
     The launcher applies RLIMIT_CPU, RLIMIT_AS and no core dumps, installs the
     parent-death signal, then execs the command with a minimal environment.
     """
     launcher = str(Path(__file__).with_name("_sandbox_exec.py"))
-    return subprocess.Popen(
+    return process_group(
         [sys.executable, "-I", launcher, str(limits.cpu_seconds), str(limits.memory_bytes),
          str(os.getpid()), *command], cwd=directory,
         env={"PATH": os.defpath, "LANG": "C.UTF-8", "PYTHONUNBUFFERED": "1"},
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        start_new_session=True)
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
 
 class _ProcessEnvironment:
     """Drive one sandboxed worker process over a line-delimited JSON protocol."""
 
-    def __init__(self, command: tuple[str, ...], limits: SandboxLimits,
-                 identity: EpisodeId, directory: str):
+    def __init__(self, process: subprocess.Popen[bytes], limits: SandboxLimits, identity: EpisodeId):
         self.identity, self.limits = identity, limits
         self.deadline = time.monotonic() + limits.wall_seconds
         self.output = bytearray()
-        self.process = launch(command, limits, directory)
+        self.process = process
         assert (
             self.process.stdin is not None
             and self.process.stdout is not None
@@ -160,23 +161,7 @@ class _ProcessEnvironment:
         nothing left is unregistered, so the selector itself reports when
         the worker can no longer answer.
         """
-        descriptor = event.fd
-        if event.data == "stdin":
-            try:
-                sent += os.write(descriptor, request[sent:])
-            except BrokenPipeError:
-                ready.unregister(self.stdin)
-            else:
-                if sent == len(request):
-                    ready.unregister(self.stdin)
-            return sent
-        chunk = os.read(descriptor, 65536)
-        if not chunk:
-            ready.unregister(event.fileobj)
-        elif event.data == "stdout":
-            self.output.extend(chunk)
-        else:
-            diagnostic.extend(chunk)
+        sent, _ = _pumped(ready, event, request, sent, self.output, diagnostic)
         if len(self.output) + len(diagnostic) > self.limits.message_bytes:
             raise ValueError("sandbox response exceeds message_bytes")
         return sent
@@ -207,17 +192,18 @@ class _ProcessEnvironment:
                     return self._decoded()
                 for event, _ in ready.select(min(remaining, .1)):
                     sent = self._pump(ready, event, request, sent, diagnostic)
-                if self.process.poll() is not None and not ready.get_map():
+                # Read unreaped, so the sandbox's group keeps its id until `launched` ends it.
+                code = exit_code(self.process)
+                if code is not None and not ready.get_map():
                     raise ChildProcessError(
-                        f"sandbox exited with code {self.process.returncode}: "
-                        f"{diagnostic.decode('utf-8', errors='replace')}")
+                        f"sandbox exited with code {code}: {diagnostic.decode('utf-8', errors='replace')}")
 
     def reset(self) -> Observation:
         return _observation(self._request("reset", {"episode": asdict(self.identity)}))
 
-    def step(self, action: Action) -> Observation:
-        record = {"context": list(action.context), "tokens": list(action.tokens),
-                  "terminated": action.terminated, "policy_step": action.policy_step}
+    def step(self, action: Draw) -> Observation:
+        record = {"context": list(action.prompt), "tokens": list(action.tokens),
+                  "terminated": action.terminated, "policy_step": action.version}
         return _observation(self._request("step", {"action": record}))
 
     def get_state(self) -> bytes:
@@ -231,16 +217,6 @@ class _ProcessEnvironment:
         reply = self._request("set_state", {"state": base64.b64encode(state).decode("ascii")})
         if not isinstance(reply, Mapping) or reply.get("restored") is not True:
             raise ValueError("sandbox set_state must acknowledge restored state")
-
-    def close(self) -> None:
-        # The group is already gone when the sandbox exited on its own.
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(self.process.pid, signal.SIGKILL)
-        try:
-            self.process.wait(timeout=5)
-        finally:
-            for stream in (self.stdin, self.stdout, self.stderr):
-                stream.close()
 
 
 @dataclass(frozen=True)
@@ -275,12 +251,9 @@ class SubprocessEnvironment:
 
     @contextmanager
     def __call__(self, identity: EpisodeId) -> Iterator[Environment]:
-        with tempfile.TemporaryDirectory(prefix="dew-episode-") as directory:
-            worker = _ProcessEnvironment(self.command, self.limits, identity, directory)
-            try:
-                yield worker
-            finally:
-                worker.close()
+        with (tempfile.TemporaryDirectory(prefix="dew-episode-") as directory,
+              launched(self.command, self.limits, directory) as process):
+            yield _ProcessEnvironment(process, self.limits, identity)
 
 class Verdict(Enum):
     """How a program ended."""
@@ -349,6 +322,31 @@ def _written(program: Program, directory: str) -> None:
         path.write_text(text)
 
 
+def _pumped(ready: selectors.BaseSelector, key: selectors.SelectorKey, request: bytes, sent: int,
+            stdout: bytearray, stderr: bytearray) -> tuple[int, bool]:
+    """One ready stream's turn of a bounded byte-stream pump over a process's three pipes, each
+    registered under its name: the rest of `request` written to stdin, which is unregistered once
+    all of it is written or its reader is gone (True, so a caller may close it), or a chunk of
+    stdout read into `stdout` or of stderr into `stderr`, a stream unregistered at its end. Returns
+    how much of `request` is written, and whether stdin finished on this turn."""
+    if key.data == "stdin":
+        try:
+            sent += os.write(key.fd, request[sent:])
+        except BrokenPipeError:
+            ready.unregister(key.fileobj)
+            return sent, True
+        if sent == len(request):
+            ready.unregister(key.fileobj)
+            return sent, True
+        return sent, False
+    chunk = os.read(key.fd, 65536)
+    if not chunk:
+        ready.unregister(key.fileobj)
+    else:
+        (stdout if key.data == "stdout" else stderr).extend(chunk)
+    return sent, False
+
+
 @dataclass
 class _Streams:
     stdout: bytearray = field(default_factory=bytearray)
@@ -357,7 +355,8 @@ class _Streams:
 
 def _collected(process: subprocess.Popen[bytes], stdin: bytes, deadline: float,
                limit: int) -> tuple[_Streams, Verdict | None]:
-    """Feed stdin, read both output streams until they close, and wait for the exit.
+    """Feed stdin until it is all written or its reader is gone, read both output streams until
+    they close, and wait for the exit.
 
     Returns what was read, and TIMEOUT or OUTPUT_LIMIT when the process had
     to be stopped for it, else None. The caller kills and reaps.
@@ -371,36 +370,22 @@ def _collected(process: subprocess.Popen[bytes], stdin: bytes, deadline: float,
             ready.register(process.stdin, selectors.EVENT_WRITE, "stdin")
         else:
             process.stdin.close()
-        ready.register(process.stdout, selectors.EVENT_READ, streams.stdout)
-        ready.register(process.stderr, selectors.EVENT_READ, streams.stderr)
-        while any(key.data != "stdin" for key in ready.get_map().values()):
+        ready.register(process.stdout, selectors.EVENT_READ, "stdout")
+        ready.register(process.stderr, selectors.EVENT_READ, "stderr")
+        while ready.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return streams, Verdict.TIMEOUT
             for key, _ in ready.select(remaining):
-                if key.data == "stdin":
-                    try:
-                        sent += os.write(key.fd, stdin[sent:])
-                    except BrokenPipeError:
-                        sent = len(stdin)
-                    if sent == len(stdin):
-                        ready.unregister(key.fileobj)
-                        process.stdin.close()
-                    continue
-                chunk = os.read(key.fd, 65536)
-                if not chunk:
-                    ready.unregister(key.fileobj)
-                    continue
-                key.data.extend(chunk)
+                sent, finished = _pumped(ready, key, stdin, sent, streams.stdout, streams.stderr)
+                if finished:
+                    process.stdin.close()
                 if len(streams.stdout) + len(streams.stderr) > limit:
                     return streams, Verdict.OUTPUT_LIMIT
-    try:
-        # Closed streams are not an exit: wait for it, so a kill that follows
-        # never lands between a program's last write and its exit status.
-        process.wait(timeout=max(deadline - time.monotonic(), 0))
-    except subprocess.TimeoutExpired:
-        return streams, Verdict.TIMEOUT
-    return streams, None
+    # Closed streams are not an exit: wait for it, so a kill that follows never lands between a
+    # program's last write and its exit status, and unreaped, so its group keeps its id for that kill.
+    groups_ended((process,), max(deadline - time.monotonic(), 0))
+    return streams, Verdict.TIMEOUT if exit_code(process) is None else None
 
 
 def _outcome(process: subprocess.Popen[bytes], streams: _Streams, stopped: Verdict | None,
@@ -449,16 +434,9 @@ class ProcessRunner:
             _written(program, directory)
             started = time.monotonic()
             deadline = started + limits.wall_seconds
-            process = launch(program.command, limits, directory)
-            try:
+            with launched(program.command, limits, directory) as process:
                 streams, stopped = _collected(process, program.stdin.encode(), deadline, limits.message_bytes)
-            finally:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
-            try:
-                return _outcome(process, streams, stopped, started, deadline)
-            finally:
-                _closed(process)
+            return _outcome(process, streams, stopped, started, deadline)
 
 
 _REMOVAL_SECONDS = 60
@@ -528,12 +506,11 @@ class ContainerRunner:
             try:
                 streams, stopped = _collected(process, program.stdin.encode(), deadline, limits.message_bytes)
             finally:
-                if process.poll() is None:
+                if exit_code(process) is None:
                     # The client dies first so it makes no further API call;
                     # `rm --force` then removes the container whether it is
                     # still being created, created or running.
-                    with contextlib.suppress(ProcessLookupError):
-                        os.killpg(process.pid, signal.SIGKILL)
+                    signal_group(process, signal.SIGKILL)
                     try:
                         subprocess.run([self.runtime, "rm", "--force", name], capture_output=True,
                                        timeout=_REMOVAL_SECONDS, check=False)

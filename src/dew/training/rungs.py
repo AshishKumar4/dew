@@ -29,15 +29,15 @@ import jax
 import numpy as np
 from jax.sharding import Mesh
 
+from dew._records import JSON, json_value, record
 from dew.files import write_atomically
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import trace_context
-from dew.records import JSON, json_value, record
 from dew.telemetry.instrumentation import StepFlops, step_flops
 
 if TYPE_CHECKING:
-    from dew.objectives.base import Batch
-    from dew.training.state import TrainState
+    from dew.batch import Batch
+    from dew.state import TrainState
     from dew.training.trainer import StepFn
 
 
@@ -129,6 +129,8 @@ def recorded_launches(recorded: JSON, plan: Mapping[str, JSON]) -> str | None:
     record beside its FLOPs (`plan_flops`)."""
     kept = dict(record(recorded, 'recorded plan')) if recorded is not None else {}
     kept.pop('flops', None)
+    # What a cheaper rung measured is advice beside the plan (`FitSearch.cheaper`), no part of it.
+    kept.pop('cheaper', None)
     launches = kept.pop('launches', None)
     return launches if kept == plan and isinstance(launches, str) else None
 

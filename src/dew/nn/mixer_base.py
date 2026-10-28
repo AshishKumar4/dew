@@ -24,7 +24,34 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.kv_cache import KVCache
 from dew.nn.ngpt import NGPT
-from dew.nn.rope import LongRopeScaling, RopeScaling, YarnScaling
+from dew.nn.rope import LongRopeScaling, RopeScaling, Scaling, YarnScaling
+
+QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
+ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
+MLP_RESIDUALS = ('gate_proj', 'up_proj', 'down_proj')
+DELTA_RESIDUALS = ('delta_decay', 'delta_inverse', 'delta_memory')
+MEMORY_RESIDUALS = ('memory_carry',)
+RESIDUALS = (*ATTENTION_RESIDUALS, 'context', 'scan', 'conv', *DELTA_RESIDUALS, *MEMORY_RESIDUALS,
+             *MLP_RESIDUALS)
+"""The values a block names as it runs, each after the projection that
+produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
+a mixer's output before `o_proj`, the attention kernel's or a recurrence's,
+`scan` a recurrence's (an SSM's or a delta rule's) alone, which a backward
+that drops it recomputes by running the scan again, `conv` a
+linear-attention or SSM mixer's short conv output (`causal_conv1d`,
+its queries, keys and values for a delta rule), `delta_decay`,
+`delta_inverse` and `delta_memory` the rule's cumulated decay, chunk inverse
+and memory (with `w` and the corrected values) the port saves for its
+backward (`dew.nn.kernels.fla_gdn`), `memory_carry` an in-context memory's
+network and momentum as each chunk of its scan hands them on
+(`dew.nn.memory.CARRY`), and the MLP names cover the dense MLP
+and the routed experts alike. A remat policy picks from these; a
+name off the list is a typo that would otherwise recompute silently."""
+ATTENTION_CONTEXT_RESIDUALS = (*ATTENTION_RESIDUALS, 'context')
+"""An attention mixer's names, its projections and its context."""
+DELTA_RULE_RESIDUALS = ('context', 'scan', 'conv', *DELTA_RESIDUALS)
+"""A delta-rule mixer's names: its scan's output as its context and as a scan, its convolution's output,
+the delta rule's three."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -122,6 +149,14 @@ class MixerContext:
     """The std of the projection back to the residual stream, which a
     depth-scaled init shrinks; None follows `init_std`."""
 
+    def rotary_scaling(self) -> Scaling | None:
+        """The layer's one rope scaling, which every rotation it makes takes (`rotary_freqs`): its
+        kind-resolved YaRN record or its Llama 3.1 or LongRoPE ramp. A layer given both is refused by
+        name: they are two scalings of the same frequencies."""
+        if self.yarn is not None and self.rope_scaling is not None:
+            raise ValueError("yarn and rope_scaling are two rope scalings; a layer takes one")
+        return self.rope_scaling if self.yarn is None else self.yarn
+
     def policies(self) -> dict[str, bool]:
         """Whether this layer asks each of the attention policies that change
         what a mixer computes, beyond its geometry: a mixer implements each it
@@ -138,11 +173,25 @@ class MixerContext:
         }
 
     def refuse(self, kind: str, asked: Mapping[str, object], why: str) -> None:
-        """Raise naming every entry of `asked` this layer sets (a truthy value:
-        a flag on, a field given), none of which mixer `kind` implements: `why`."""
+        """Raise `MixerRefused` naming every entry of `asked` this layer sets (a
+        truthy value: a flag on, a field given), none of which mixer `kind`
+        implements: `why`."""
         names = sorted(name for name, value in asked.items() if value)
         if names:
-            raise ValueError(f"the {kind} mixer has no {', '.join(names)}: {why}")
+            raise MixerRefused(kind, tuple(names), why)
+
+
+class MixerRefused(ValueError):
+    """A layer asking mixer `kind` for the context entries `names`, which it does not implement, and
+    `why` (`MixerContext.refuse`)."""
+
+    def __init__(self, kind: str, names: tuple[str, ...], why: str):
+        super().__init__(f"the {kind} mixer has no {', '.join(names)}: {why}")
+        self.kind, self.names, self.why = kind, names, why
+
+    def __reduce__(self):
+        # Rebuilt from its own fields, as a pickle or a process boundary carries it.
+        return type(self), (self.kind, self.names, self.why)
 
 
 class MixerBase:
@@ -158,13 +207,14 @@ class MixerBase:
 
     keeps_triton_gemm = False
     """Whether a step with this mixer keeps XLA's Triton GEMM fusions where
-    `gpu_target().kernels['xla_triton_gemm']` turns them off."""
+    the GPU turns them off (`GpuTarget.triton_gemm_fusions`)."""
 
     residuals: ClassVar[tuple[str, ...] | None] = None
-    """The names (`dew.nn.backbones.decoder_block.RESIDUALS`) the mixer this kind
+    """The names (`dew.nn.mixer_base.RESIDUALS`) the mixer this kind
     builds marks for a remat policy to keep, or every name where None: a
     decoder skips a remat rung that keeps nothing more of its layers' names
-    than the next (`CausalTransformer.recompute_more`)."""
+    than the next (`CausalTransformer.recompute_more`). The class's default,
+    which every reader takes through `marks`."""
 
     keeps_cache = True
     """Whether the mixer this kind builds keeps a decode cache, which a loop's
@@ -175,6 +225,11 @@ class MixerBase:
     (`dew.nn.inputs.Admitted`) as the separate decode and prefill calls
     would, or keeps no cache for it to read: one that does not read the
     call's layout would take its one row of tokens as one sequence."""
+
+    def marks(self) -> tuple[str, ...] | None:
+        """The names this kind's mixer marks (`residuals`): its class's,
+        unless its configuration chooses the path it runs."""
+        return self.residuals
 
     def mixed_refusal(self, ctx: MixerContext) -> str | None:
         """Why the mixer this kind builds over `ctx` would not run a server's

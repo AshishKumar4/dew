@@ -4,8 +4,9 @@
 conditions it is given, keyed by the model's own keyword arguments. A
 `Condition` holds an encoder, the batch field it reads and the raw datum that
 stands for "no condition", which classifier-free guidance and conditioning
-dropout substitute. Nothing here runs a model. The spec only describes the
-inputs, and the objective does the encoding.
+dropout substitute. The spec only describes the inputs; `encode_conditions`
+runs its encoders over their weights, the one encoding a training step and a
+sampling task share.
 
 Image and video batches arrive as uint8 pixels in [0, 255], as the data
 workers write them. `unit_range` is the one conversion to [-1, 1], the range
@@ -15,19 +16,24 @@ every diffusion loss, sample, artifact and image metric uses, and
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew import registry
+from dew import _records, registry
+from dew.batch import Batch, Variables
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Batch, Variables
+from dew.nn.precision import at_least_fp32, divided
+from dew.nn.text_encoders import DEFAULT_MODEL
+from dew.registry import DtypeName
 
 from .diffusion import DiffusionConditioner
-from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text, rebuild
+from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text
 
 
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
@@ -37,7 +43,8 @@ def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
     stay float64.
     """
     pixels = jnp.asarray(pixels)
-    return (pixels.astype(jnp.promote_types(pixels.dtype, jnp.float32)) - 127.5) / 127.5
+    # IEEE division: XLA takes a division by a constant as a product with its rounded reciprocal.
+    return divided(pixels.astype(at_least_fp32(pixels.dtype)) - 127.5, 127.5)
 
 
 @dataclass(frozen=True)
@@ -53,6 +60,17 @@ class Field:
         if any(axis < 0 or axis >= len(self.shape) for axis in self.variable_axes):
             raise ValueError("variable field axes must index its per-sample shape")
 
+    @classmethod
+    def of(cls, key: str, batch: Batch) -> Field:
+        """The field `key` at the per-example shape `batch` holds under it, a `ModelInputs`'s its token
+        rows', read from shapes alone."""
+        value = batch[key]
+        return cls(key, tuple(np.shape(value.tokens if isinstance(value, ModelInputs) else value)[1:]))
+
+    def held(self, batch: Batch) -> tuple[int, ...]:
+        """The per-example shape `batch` holds under this field (`of`)."""
+        return Field.of(self.key, batch).shape
+
 
 @dataclass(frozen=True)
 class Condition:
@@ -63,21 +81,13 @@ class Condition:
     field: str = "text"
     unconditional: str | float | Mapping[str, object] = ""
 
-    def to_json(self) -> dict:
-        return {
-            "encoder": {"class": registry.import_path(type(self.encoder)), "fields": self.encoder.to_json()},
-            "field": self.field,
-            "unconditional": self.unconditional,
-        }
-
-    @classmethod
-    def from_json(cls, record: Mapping, *, params: Variables | None = None) -> Condition:
-        encoder = record["encoder"]
-        return cls(
-            encoder=rebuild(encoder["class"], encoder["fields"], params=params),
-            field=record["field"],
-            unconditional=record["unconditional"],
-        )
+    @staticmethod
+    def bound(record: Mapping[str, object], *, params: Variables | None = None) -> Condition:
+        """The condition a run recorded (`dew.registry.to_record`), its encoder rebuilt around `params`
+        where given (`ConditionEncoder.bound`) and its other fields read as the registry reads them."""
+        encoder = ConditionEncoder.bound(_records.record(record["encoder"], "encoder"), params=params)
+        # The encoder is built, which the registry leaves as it is (`registry.from_record`).
+        return registry.from_record(Condition, {**record, "encoder": encoder})
 
 
 @dataclass(frozen=True)
@@ -121,6 +131,12 @@ class InputSpec:
             if condition.encoder.reads_captions
         }
 
+    @property
+    def encoders(self) -> tuple[tuple[str, ConditionEncoder], ...]:
+        """Each condition's encoder by the keyword it is passed under, a hashable value a compiled
+        encoding takes as a static argument (`encode_conditions`)."""
+        return tuple((keyword, condition.encoder) for keyword, condition in self.conditions.items())
+
     def dependencies(self) -> Mapping[str, object]:
         """What `tokenize` and `encode_fields` make of a batch depends on: each condition's field
         and its encoder's own (`ConditionEncoder.dependencies`)."""
@@ -152,8 +168,7 @@ class InputSpec:
                 continue
             if declared.key not in batch:
                 raise ValueError(f"objective.inputs needs field {declared.key!r} in the training batch")
-            value = batch[declared.key]
-            actual = np.shape(value.tokens if isinstance(value, ModelInputs) else value)[1:]
+            actual = declared.held(batch)
             matches = len(actual) == len(declared.shape) and all(
                 0 < size <= bound if axis in declared.variable_axes else size == bound
                 for axis, (size, bound) in enumerate(zip(actual, declared.shape, strict=True))
@@ -164,55 +179,102 @@ class InputSpec:
                     f"but the first training batch has shape {tuple(actual)}"
                 )
 
-    def to_json(self) -> dict:
-        return {
-            "sample": {
-                "key": self.sample.key,
-                "shape": list(self.sample.shape),
-                **({"variable_axes": list(self.sample.variable_axes)} if self.sample.variable_axes else {}),
-            },
-            "conditions": {keyword: condition.to_json() for keyword, condition in self.conditions.items()},
-            **(
-                {
-                    "mask": {
-                        "key": self.mask.key,
-                        "shape": list(self.mask.shape),
-                        **(
-                            {"variable_axes": list(self.mask.variable_axes)}
-                            if self.mask.variable_axes
-                            else {}
-                        ),
-                    }
-                }
-                if self.mask is not None
-                else {}
-            ),
-        }
+    @staticmethod
+    def bound(record: Mapping[str, object], *, params: Mapping[str, Variables] | None = None) -> InputSpec:
+        """The spec a run recorded (`dew.registry.to_record`), each condition's encoder rebuilt around
+        its parameters, `params` by the keyword it is passed under (`Condition.bound`); without
+        `params` each encoder loads its own weights. The other fields are read as the registry reads
+        them."""
+        conditions = {keyword: Condition.bound(_records.record(condition, keyword),
+                                               params=None if params is None else params[keyword])
+                      for keyword, condition in _records.record(record.get("conditions", {}),
+                                                                "conditions").items()}
+        return registry.from_record(InputSpec, {**record, "conditions": conditions})
 
-    @classmethod
-    def from_json(cls, record: Mapping, *, params: Mapping[str, Variables] | None = None) -> InputSpec:
-        """Rebuild the spec from its JSON record, around the given condition parameters.
+@dataclasses.dataclass(frozen=True)
+class TextCondition:
+    """Text conditioning: which registered encoder reads the batch's tokens, and from which checkpoint."""
 
-        `params` maps each condition's keyword to its encoder's parameters.
-        When it is None, each encoder loads its own weights."""
-        sample = record["sample"]
-        return cls(
-            sample=Field(sample["key"], tuple(sample["shape"]), tuple(sample.get("variable_axes", ()))),
-            conditions={
-                keyword: Condition.from_json(condition, params=None if params is None else params[keyword])
-                for keyword, condition in record["conditions"].items()
-            },
-            mask=Field(
-                record["mask"]["key"],
-                tuple(record["mask"]["shape"]),
-                tuple(record["mask"].get("variable_axes", ())),
-            )
-            if "mask" in record
-            else None,
-        )
+    encoder: str = "clip_text"
+    checkpoint: str = DEFAULT_MODEL
+    dtype: DtypeName | None = None
+    """The encoder's compute dtype; None follows the model's compute dtype."""
+    param_dtype: DtypeName = "float32"
+    """The storage dtype when loading source weights; supplied params keep theirs."""
+    field: str = "text"
+    """The batch field holding the tokenized text."""
+    unconditional: str = ""
+    """The prompt the unconditional branch is encoded from."""
+    max_length: int | None = None
+    """The token length every prompt is padded to.
+
+    None keeps the encoder's own default, which for CLIP is the checkpoint's
+    context length.
+    """
+    revision: str | None = None
+    """The checkpoint's git revision.
+
+    With it, a rerun conditions on the weights the run named, even after the
+    branch has moved on.
+    """
+
+    def build(self, *, params: Variables | None = None,
+              dtype: DtypeName | None = None) -> Condition:
+        """Build the encoder over supplied params, without loading source weights or casting storage.
+
+        `dtype` is the run's own compute dtype, which an unset `self.dtype` follows:
+        the tower runs next to the model it conditions in every step, so a checkpoint
+        stored in float32 is no reason to run it in float32.
+        """
+        fields = {name: value for name, value in
+                  (("max_length", self.max_length), ("revision", self.revision))
+                  if value is not None}
+        return Condition(
+            ConditionEncoder.bound({"class": self.encoder, "fields": {
+                "checkpoint": self.checkpoint, "dtype": dtype if self.dtype is None else self.dtype,
+                "param_dtype": self.param_dtype, **fields}}, params=params),
+            field=self.field, unconditional=self.unconditional)
+
+
+@dataclasses.dataclass(frozen=True)
+class AudioCondition:
+    """Audio conditioning on each clip, through an audio tower.
+
+    `checkpoint` names the `hf_audio` tower, whose feature extractor encodes the
+    waveform in the batch's `audio` field on the host.
+    The dataset's clip length sets the waveform length used to encode every
+    clip and the silent unconditional input, so the two always agree.
+    """
+
+    encoder: ClassVar[str] = "hf_audio"
+    checkpoint: str = "facebook/wav2vec2-base-960h"
+    dtype: DtypeName | None = None
+    """The tower's compute dtype; None follows the model's compute dtype."""
+    param_dtype: DtypeName = "float32"
+    """The storage dtype when loading source weights; supplied params keep theirs."""
+
+    def build(self, seconds: float, *, params: Variables | None = None,
+              dtype: DtypeName | None = None) -> Condition:
+        """Build the tower over supplied params for waveforms of `seconds` (the clips' `audio_seconds`,
+        `Dataset.facts`), without loading source weights or casting storage."""
+        return Condition(
+            ConditionEncoder.bound({"class": self.encoder, "fields": {
+                "checkpoint": self.checkpoint, "seconds": seconds,
+                "dtype": dtype if self.dtype is None else self.dtype, "param_dtype": self.param_dtype}},
+                params=params),
+            field="audio", unconditional=0.0)
+
+
+def encode_conditions(encoders: Sequence[tuple[str, ConditionEncoder]], weights: Mapping[str, Variables],
+                      tokens: Mapping[str, object]) -> dict:
+    """Each of `encoders` (`InputSpec.encoders`) over the tokens under its keyword, with the weights
+    under its keyword: the conditions a model is passed, by keyword. The one encoding a training
+    step (`DiffusionObjective.encode`) and a sampling task (`TextToImage`) run."""
+    return {keyword: encoder.encode(weights[keyword], tokens[keyword]) for keyword, encoder in encoders}
 
 
 __all__ = [
+    "AudioCondition",
     "CLIPText",
     "CharTable",
     "Condition",
@@ -222,5 +284,6 @@ __all__ = [
     "HFAudio",
     "InputSpec",
     "T5Text",
+    "TextCondition",
     "unit_range",
 ]

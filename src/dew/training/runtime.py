@@ -21,33 +21,34 @@ from typing import TYPE_CHECKING
 import jax
 from jax.experimental import multihost_utils
 
+from dew._coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew.cache import enable_compilation_cache, persist_compilations
-from dew.coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
-from dew.logging import configure as configure_logging
-from dew.pool import (
-    COORDINATOR,
-    PREEMPTED_EXIT,
-    PROCESS_COUNT,
-    PROCESS_ID,
-    detected_cluster,
-    local_gpu_count,
-    refuse_idle_gpus,
-    runs_on_gpu,
-    slurm_tasks_here,
-)
-from dew.telemetry.devices import (
+from dew.devices import (
     apply_xla_flags,
+    backend_open,
     cuda_plugin,
+    flags_hold,
     preallocate_gpu_pool,
     refuse_cpu_only_jax,
     xla_flag,
+)
+from dew.logging import configure as configure_logging
+from dew.pool import (
+    PREEMPTED_EXIT,
+    PROCESS_COUNT,
+    PROCESS_ID,
+    joins_pool,
+    local_gpu_count,
+    pool_cluster,
+    refuse_idle_gpus,
+    runs_on_gpu,
+    slurm_tasks_here,
 )
 
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from dew.config import Wandb
-    from dew.training.distributed import Layout
+    from dew.training.tracker import Wandb
 
 
 EXECUTION_TIMEOUT = "30m"
@@ -68,12 +69,11 @@ another."""
 def prepare_process(wandb: Wandb | None = None,
                     multi_host: bool | None = None,
                     xla_flags: str | None = None,
-                    compilation_cache_dir: str | None = None,
-                    *, layout: Layout | None = None) -> None:
+                    compilation_cache_dir: str | None = None) -> None:
     """Set the environment variables and XLA flags, raise the soft file
     descriptor limit, and join the JAX process pool.
 
-    `wandb` is the run's `dew.config.Wandb`, or None for a run without a
+    `wandb` is the run's `dew.training.tracker.Wandb`, or None for a run without a
     tracker. Only its offline switch is read, and it has to be read before
     wandb opens a run. `multi_host=True` requires a pool, False never joins
     one, and None joins the pool the environment describes, if any.
@@ -87,26 +87,32 @@ def prepare_process(wandb: Wandb | None = None,
     opens a backend. So this call has to come before the first JAX call in
     the process, and it is the first line of every recipe. If you use the
     library without a recipe, set XLA_FLAGS in the environment yourself.
-
-    `layout` is the same `Layout` you pass to `Trainer`. When its `host`
-    includes "variables", the master copy of the whole train state is kept
-    on the CPU and the optimizer update runs there, so this call checks the
-    CPU devices that this requires.
-    JAX_PLATFORMS must then allow CPU beside the accelerator, and
-    JAX_NUM_CPU_DEVICES or the existing XLA flags must give one CPU device
-    per local accelerator before this call. The check raises `ValueError`
-    when they do not, and it never changes the backend configuration after
-    JAX has initialized.
+    A state kept on the CPU (`Layout(host=("variables",))`) needs one CPU
+    device per local accelerator, which the trainer checks on its own mesh
+    (`dew.distributed.host.companion_mesh`).
     """
     _set_environment(wandb, xla_flags, compilation_cache_dir)
     _raise_limits()
     _join_process_pool(multi_host)
     ready_process()
-    if layout is not None and "variables" in layout.host:
-        from dew.training.distributed import MeshSpec
-        from dew.training.host import companion_mesh
-        companion_mesh(MeshSpec().build())
     _log.info("Number of devices: %s", jax.device_count())
+
+
+def unprepared(multi_host: bool | None, xla_flags: str | None,
+               compilation_cache_dir: str | None) -> list[str]:
+    """Which of `prepare_process`'s options a run states that this process does not carry: a flag of
+    `xla_flags` that does not hold as XLA reads its flags (`flags_hold`), a compilation cache JAX keeps
+    elsewhere, a pool it has not joined (`multi_host=True`; False only says never to join one). Each
+    acts as JAX opens its backend, and `prepare_process` sets none after (`_set_environment`), so a
+    run trained in a process no `prepare_process` set up with them would run without them."""
+    missed = []
+    if xla_flags and not flags_hold(xla_flags):
+        missed.append("xla_flags")
+    if compilation_cache_dir and jax.config.jax_compilation_cache_dir != compilation_cache_dir:
+        missed.append("compilation_cache_dir")
+    if multi_host and not jax.distributed.is_initialized():
+        missed.append("multi_host")
+    return missed
 
 
 def ready_process() -> None:
@@ -114,7 +120,7 @@ def ready_process() -> None:
     (`dew.logging.configure`), the persistent compilation cache under the user's cache directory
     (`dew.cache.persist_compilations`), which a run's own directory, a pool whose processes do not
     share it, or JAX_ENABLE_COMPILATION_CACHE=false leaves alone, and the refusal of a machine with
-    an NVIDIA GPU whose JAX opened with none (`dew.telemetry.devices.refuse_cpu_only_jax`), which
+    an NVIDIA GPU whose JAX opened with none (`dew.devices.refuse_cpu_only_jax`), which
     opens the backend, so the cache's flags come first. `prepare_process` readies the process once
     its flags are set and its pool joined, and `Trainer.fit` readies one no `prepare_process` did;
     each step is idempotent."""
@@ -132,7 +138,12 @@ def _set_environment(wandb: Wandb | None, xla_flags: str | None,
         os.environ['WANDB_MODE'] = 'offline'
     # HF tokenizers fork a thread pool; grain's workers fork the process.
     os.environ['TOKENIZERS_PARALLELISM'] = "false"
-    apply_xla_flags(xla_flags)
+    if xla_flags and not flags_hold(xla_flags):
+        if backend_open():
+            raise ValueError(f"XLA reads its flags as JAX opens its backend, which has opened: {xla_flags!r} "
+                             "would not take effect. Call prepare_process before anything calls JAX, or "
+                             "set XLA_FLAGS before the process starts")
+        apply_xla_flags(xla_flags)
     preallocate_gpu_pool()
     if compilation_cache_dir:
         enable_compilation_cache(compilation_cache_dir)
@@ -177,19 +188,14 @@ def _join_process_pool(multi_host: bool | None) -> None:
     """
     # The cluster JAX's detection would take, in its own order: Open MPI's
     # ranks when mpirun started them, then Slurm's tasks.
-    cluster = None if multi_host is False or PROCESS_COUNT in os.environ else detected_cluster()
-    one_task = (multi_host is None and cluster is not None and cluster.name == "slurm"
-                and cluster.count == 1)
+    cluster = pool_cluster(multi_host)
     tasks = slurm_tasks_here()
     if (cluster is not None and cluster.name == "slurm" and cluster.count > 1 and tasks is not None
             and runs_on_gpu(os.environ)):
         # Before joining: a pool whose ranks see GPUs they will not use
         # trains on fewer than it was given, and nothing reports it.
         refuse_idle_gpus(tasks, local_gpu_count(), "this slurm step")
-    if multi_host is False or one_task:
-        return
-    declared = cluster is not None or any(name in os.environ for name in (PROCESS_COUNT, COORDINATOR))
-    if multi_host is None and not declared:
+    if not joins_pool(multi_host, cluster):
         return
     if PROCESS_COUNT in os.environ:
         jax.distributed.initialize(num_processes=int(os.environ[PROCESS_COUNT]),
@@ -266,6 +272,9 @@ class PreemptionNotice:
     def __init__(self):
         self._pool = jax.distributed.is_initialized()
         self._signalled = False
+        # The notice's checks, each process's in step with its peers': the pool's sync points count
+        # them, so a run's cooldown branches ask between their own steps too (`reached`).
+        self._asked = 0
         self._previous: Callable[[int, types.FrameType | None], object] | int | None = None
         self._installed = False
         # Only the main thread may set a handler; a fit run on another thread
@@ -285,18 +294,21 @@ class PreemptionNotice:
     def _caught(self, _signum: int, _frame: types.FrameType | None) -> None:
         self._signalled = True
 
-    def reached(self, step: int) -> bool:
-        """Return whether to stop at `step`.
+    def reached(self) -> bool:
+        """Return whether to stop here, at this check.
 
-        In a pool, that is whether every process agreed to stop there, and a
-        pool without the preemption service never stops. A process outside a
-        pool stops once SIGTERM has arrived.
+        In a pool, that is whether every process agreed to stop at this check,
+        the sync point counting each check every process makes in step (each
+        step's, and each step of a cooldown branch), so it grows across a
+        run however its steps run; a pool without the preemption service
+        never stops. A process outside a pool stops once SIGTERM has arrived.
         """
         if not self._pool:
             return self._signalled
         if not preemption_service():
             return False
-        return multihost_utils.reached_preemption_sync_point(step)
+        self._asked += 1
+        return multihost_utils.reached_preemption_sync_point(self._asked)
 
 
 def run_timestamp() -> str:
@@ -309,4 +321,4 @@ def run_timestamp() -> str:
     return broadcast_from_process_zero(datetime.now().strftime("%Y-%m-%d_%H:%M:%S"))
 
 
-__all__ = ["Preempted", "PreemptionNotice", "prepare_process", "run_timestamp"]
+__all__ = ["Preempted", "PreemptionNotice", "prepare_process", "run_timestamp", "unprepared"]

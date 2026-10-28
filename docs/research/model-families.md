@@ -62,15 +62,20 @@ code. Checked against the source on 2026-09-22:
   `moe`, `mla`, `gpt_oss`, `linear_attention`, `mamba2`), written by the
   `tools/*_reference.py` scripts.
 - Dew translates these `model_type` values from a Hugging Face config
-  (`_FAMILY_ENTRIES`, `src/dew/interop/hf_decoders.py`): `deepseek_v2`,
-  `deepseek_v3`, `deepseek_v32`, `deepseek_v4`, `deepseek_v41`,
-  `diffusion_gemma_text`, `dream`, `gemma`, `gemma2`, `gemma3_text`,
-  `gemma3n_text`, `gemma4_text`, `glm4_moe`, `glm5_next_text`, `glm_moe_dsa`,
-  `gpt_oss`, `kimi_k2`, `kimi_k25`, `kimi_k3`, `kimi_linear`, `llada`, `llama`,
-  `llama4_text`, `mamba2`, `mistral`, `mixtral`, `olmo3`, `qwen2`, `qwen3`,
-  `qwen3_moe`, `qwen3_next`, `qwen3_5_text` and `qwen3_5_moe_text`. The
-  MiniMax families, `nemotron_h`, `qwen4_exp` and `llada2_moe` are not in
-  that list.
+  (`ENTRIES`, `src/dew/interop/decoder_families.py`): `bloom`,
+  `deepseek_v2`, `deepseek_v3`, `deepseek_v32`, `deepseek_v4`,
+  `deepseek_v41`, `diffusion_gemma_text`, `dory`, `dream`, `falcon`,
+  `gemma`, `gemma2`, `gemma3_text`, `gemma3n_text`, `gemma4_text`,
+  `glm4_moe`, `glm5_next_text`, `glm_moe_dsa`, `gpt2`, `gpt_bigcode`,
+  `gpt_neo`, `gpt_neox`, `gpt_oss`, `gptj`, `granitemoe`, `k2_horizon`,
+  `kimi_k2`, `kimi_k25`, `kimi_k3`, `kimi_linear`, `lfm3`, `llada`, `llama`,
+  `llama4_text`, `mamba`, `mamba2`, `mimo_v2`, `mimo_v2_flash`,
+  `minimax_m2`, `ministral`, `mistral`, `mixtral`, `modernbert`,
+  `muse_glimmer_text`, `nemotron_h`, `olmo3`, `opt`, `ouro`, `phi`, `phi3`,
+  `qwen2`, `qwen2_moe`, `qwen3`, `qwen3_5_moe_text`, `qwen3_5_text`,
+  `qwen3_moe`, `qwen3_next` and `starcoder2`. Of the families above,
+  `minimax` (MiniMax-Text-01 and M1), `qwen4_exp` and `llada2_moe` are not
+  in that list.
 
 ## How this was checked
 
@@ -132,6 +137,7 @@ Component by family. "Dew today" is the last row: what
 | Kimi Linear (`kimi_linear`) | 3 KDA then 1 MLA with NoPE (`mla_use_nope`) | RMSNorm | SwiGLU | sigmoid + bias, top-8 of 256 in one group, scaling 2.446, 1 shared | 0 | remote code on the hub, not in transformers 5.16.1; its gate adds the bias in place, so its weights carry it, which K3's revision and vLLM do not |
 | Kimi K2.5 (`kimi_k25`) | DeepSeek-V3 MLA text backbone | RMSNorm | SwiGLU | sigmoid, top-8 of 384 | 0 | `kimi_k25` maps its text config to `deepseek_v3` |
 | Kimi K3 (`kimi_k3`, text `kimi_linear`) | 3 KDA (full-rank output gate) then 1 NoPE MLA with a sigmoid output gate, Attention Residuals over blocks of 12 | RMSNorm | SiTU (betas 4, 25) | sigmoid + bias, top-16 of 896, latent experts at 3584 with a norm, 2 shared | 0 | routed experts ship compressed-tensors MXFP4; `A_log` padded 96 to 128 |
+| LFM3 (`lfm3`) | gated short convolutions (7 taps, no activation) between GQA layers, full ones turning half of each head (zero tail) at 1e6, sliding ones (window 256) at 1e4; q/k norms and a sigmoid gate a head | RMSNorm, sandwich norms | SwiGLU | none | 0 | remote code on the hub at 40ebe0a, which runs under transformers 5.18.0 on: 5.15.0-5.17.0 remap its `conv` layer type to `linear_attention` and its mask lookup fails |
 | MiniMax-Text-01 / M1 (`minimax`) | lightning attention alternating with full attention, per-block alpha/beta scaling | RMSNorm | SwiGLU | softmax top-2 of 8 | no | decay slopes per head |
 | MiniMax-M2 (`minimax_m2`) | full GQA every layer, qk-norm over the whole projection | RMSNorm | SwiGLU experts | sigmoid top-8 of 256, no renormalisation | no | FP8 weights |
 | MiniMax-M3 (`minimax_m3_vl`) | GQA, partial rotary 0.5 | RMSNorm | clamped SwiGLU (7.0) | sigmoid + `e_score_correction_bias`, top-4 of 128, shared expert | 1 layer | 1M context |
@@ -385,6 +391,20 @@ Lineup, all ungated: `google/gemma-4-E2B`, `-E4B`, `-12B`, `-31B`,
 `-26B-A4B`, each with an `-it` variant, plus `-26B-A4B-it-assistant`,
 `-12B-it-assistant` and QAT copies. `gemma-4-12B` reports
 `model_type=gemma4_unified`; E2B, E4B, 31B and 26B-A4B report `gemma4`.
+
+For Unified, Dew follows the ordinary forward's vision-block mask in both training and serving:
+vision tokens in the same contiguous block attend bidirectionally in full and sliding layers.
+The block overlay is applied after the sliding window, so the full block stays visible even when
+it is longer than that window.
+Transformers 5.17.0's `Gemma4UnifiedModel.forward` passes block IDs to the generic mask builder
+(`modeling_gemma4_unified.py:1095-1107`, `masking_utils.py:1520-1598`), whose causal and sliding
+builders OR the block overlay in (`masking_utils.py:975-977,1215-1217`). Its stock generation method
+instead calls the vision-specific builder, which adds that overlay only to sliding layers and
+then intersects it with the window
+(`modeling_gemma4_unified.py:1186-1247,1355-1383`). This is an upstream forward/generation difference;
+Dew keeps one mask policy and compares against the ordinary forward. A call without
+`mm_token_type_ids` has no blocks in either (its block IDs stay -1), so its vision tokens read
+causally, in Dew as in transformers.
 
 `Gemma4TextConfig` (`TF/models/gemma4/configuration_gemma4.py:152-183`) plus
 `__post_init__` (`:185-225`):
@@ -1146,7 +1166,7 @@ Dew's seams today, for reference:
   (`scaled_dot_product_attention` in `src/dew/nn/attention.py`), which is
   where sinks and top-k masks go.
 - The decode cache is opened per module in the flax style
-  (`open_kv_cache` in `src/dew/nn/attention.py`).
+  (`open_kv_cache` in `src/dew/nn/kv_cache.py`).
 
 > 2026-09-22: this list describes Dew on 2026-09-02. The feed-forward can
 > be a `moe.SparseMLP`, `LAYER_TYPES` is gone and the mixer is a registry. See the
@@ -1208,7 +1228,7 @@ output gate.
 This is the step that needs a new cache kind: a conv state of shape
 `[B, conv_dim, kernel - 1]` and a recurrent state of shape
 `[B, heads, k_dim, v_dim]`, both written every step. Dew's
-`open_kv_cache` in `src/dew/nn/attention.py` is the place that has to
+`open_kv_cache` in `src/dew/nn/kv_cache.py` is the place that has to
 learn about non-KV state.
 
 Unlocks: Qwen3-Next, Qwen3.5, Qwen3.6, Qwen3.8 dense (with step 4),

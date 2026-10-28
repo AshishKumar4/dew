@@ -29,8 +29,9 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.activations import gelu_tanh
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
-from dew.nn.blocks import sinusoidal_time
+from dew.nn.blocks import modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import (
     MissingFlopsCount,
@@ -40,7 +41,7 @@ from dew.nn.flops import (
     patch_lengths,
     projection_flops,
 )
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
 from dew.nn.sharding import logical_axes
 
@@ -79,7 +80,8 @@ def _rotary_positions(lengths: jax.Array, text: int, rows: int, columns: int) ->
 
 
 def _dense(features: int, name: str, dtype, precision) -> Dense:
-    return Dense(features, use_bias=False, dtype=dtype, precision=precision, name=name)
+    return Dense(features, use_bias=False, dtype=dtype, precision=precision, name=name,
+                 dot_general=float32_dot_general)
 
 
 def _per_rows(x, values, image: int, apply):
@@ -243,14 +245,22 @@ class QwenImageTransformer(nn.Module):
                  + projection_flops(timed, *maps['modulation'])
                  + projection_flops(rows, *maps['norm_out_linear'])
                  + projection_flops(lengths, *maps['proj_out']))
-        block = _Block(self.features, self.heads, self.head_dim, self.mlp_ratio, parent=None)
+        block = self._block(parent=None)
         return count + self.num_layers * block.multisequence_flops(lengths, context_lengths)
+
+    @nn.nowrap
+    def _block(self, **where) -> _Block:
+        """A joint block as the model runs it, named by `where` (or unbound, `parent=None`, where a FLOP
+        count reads it): one factory, so the count and the execution build the same block."""
+        return _Block(self.features, self.heads, self.head_dim, self.mlp_ratio, self.eps, dtype=self.dtype,
+                      precision=self.precision, attention_impl=self.attention_impl, **where)
 
     def _time(self, time):
         """`QwenImage21TimestepProjEmbeddings`: cosines first, then two
         bias-free linears with a SiLU between."""
         sinusoids = sinusoidal_time(time, TIME_FEATURES, dtype=at_least_fp32(self.dtype))
-        return embedding(sinusoids.astype(self.dtype or jnp.float32), self.features, "timestep_embedder",
+        time = sinusoids.astype(self.dtype or jnp.float32)
+        return embedding(self, time, self.features, "timestep_embedder",
                          bias=False, dtype=self.dtype, precision=self.precision)
 
     @nn.compact
@@ -280,28 +290,25 @@ class QwenImageTransformer(nn.Module):
         # read under `causal_condition`.
         wide = at_least_fp32(self.dtype)
         times = jnp.broadcast_to(jnp.asarray(time, wide).reshape(-1), (batch,))
-        embedded = self._time(jnp.concatenate([times, jnp.zeros((1,), wide)]))
-        embedded, zero = embedded[:batch], embedded[batch:]
-        projected = _dense(maps['modulation'][1], "modulation", self.dtype, self.precision)(
-            nn.silu(jnp.concatenate([embedded, zero])))
+        timed = self._time(jnp.concatenate([times, jnp.zeros((1,), wide)]))
+        projected = modulation(timed, self.features, 4, name="modulation", bias=False, dtype=self.dtype,
+                               precision=self.precision)
+        embedded = timed[:batch]
         sampled = jnp.split(projected[:batch], 4, axis=-1)
         still = jnp.split(projected[batch:], 4, axis=-1) if self.causal_condition else sampled
-        modulation = tuple(zip(still, sampled, strict=True))
+        modulations = tuple(zip(still, sampled, strict=True))
 
         rotation = axis_tables(_rotary_positions(lengths, text, rows, columns), self.axes_dims_rope, 10000.0,
                                dtype=wide)
         for index in range(self.num_layers):
-            joint = _Block(
-                self.features, self.heads, self.head_dim, self.mlp_ratio, self.eps,
-                dtype=self.dtype, precision=self.precision, attention_impl=self.attention_impl,
-                name=f"transformer_blocks_{index}")(joint, modulation, rotation, lengths,
-                                                     image_tokens)
+            joint = self._block(name=f"transformer_blocks_{index}")(joint, modulations, rotation, lengths,
+                                                                     image_tokens)
 
         # Only the image's rows leave; the text's final norm and projection
         # are rows the source computes and its pipeline drops.
         image = joint[:, :image_tokens]
-        scale = _dense(maps['norm_out_linear'][1], "norm_out_linear", self.dtype, self.precision)(
-            nn.silu(embedded))
+        scale = modulation(embedded, self.features, 1, name="norm_out_linear", bias=False, dtype=self.dtype,
+                           precision=self.precision)
         image = _scaled(layer_norm(self.dtype, self.eps)(image), scale[:, None])
         output = _dense(maps['proj_out'][1], "proj_out", self.dtype, self.precision)(image)
         return output.reshape(batch, rows, columns, self.out_channels)
@@ -323,8 +330,10 @@ class _TextIn(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = RMSNorm(epsilon=self.eps, scale_offset=True, dtype=self.dtype, name="text_norm")(x)
-        x = nn.gelu(_dense(self.features, "in_layer", self.dtype, self.precision)(x), approximate=True)
-        return _dense(self.features, "out_layer", self.dtype, self.precision)(x)
+        mlp = GatedMLP(self.features, self.features, in_features=x.shape[-1], activation=gelu_tanh,
+                        names=("in_layer", "out_layer"), dtype=self.dtype, precision=self.precision)
+        nn.share_scope(self, mlp)
+        return mlp(x)
 
 
 __all__ = ["QwenImageTransformer"]

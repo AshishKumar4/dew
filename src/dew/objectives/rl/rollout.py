@@ -1,37 +1,45 @@
-"""Host-side grouped completions, packed as one-call sessions with their sampling likelihoods."""
+"""Single-turn prompt tasks, scored draws and the collector that draws them from the trainer's policy."""
 
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Mapping, Sequence
-from typing import ClassVar
+import hashlib
+from collections.abc import Callable, Sequence
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.coordination import agreed
+from dew._coordination import agreed
+from dew.batch import Batch
+from dew.data.dataset import DataPartition
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
-from dew.nn.inputs import ModelInputs, local_rows, mesh_of
-from dew.objectives.base import Shown
+from dew.inference.rollouts import INFRASTRUCTURE, Draw, response
+from dew.nn.inputs import ModelInputs, local_rows, mesh_of, pad_token_rows
 from dew.sampling.text import Sampling
 
 from ..lm import TokenScorer
-from .sessions import (
-    OLD_LOG_PROBS_KEY,
-    Call,
-    Session,
-    Status,
-    check_estimator,
-    check_truncation,
-    pack,
-    sampled_values,
-)
+from .sessions import Call, Session, Snapshot, Status, Task, finite_reward
 
 type Reward = Callable[[str, PromptRecord], float]
 """A function that scores a completion against its prompt's `PromptRecord` and returns the reward.
 
 verl's four-argument `compute_score` enters through `dew.objectives.rl.verl.verl_reward`."""
+
+
+def scored_draw(task: str, sample: int, call: Call, text: str, record: PromptRecord,
+                reward: Reward) -> Session:
+    """One draw's one-call session: COMPLETED where its call stopped, TRUNCATED where it ran out,
+    scored by `reward(text, record)` on its decoded `text`. A reward whose external boundary failed
+    (`INFRASTRUCTURE`: a sandbox, a service) leaves an INFRA_ERROR session
+    naming it, which a scheduler retries; a non-finite score is refused."""
+    try:
+        score = reward(text, record)
+    except INFRASTRUCTURE as error:
+        return Session(task, "", sample, 0, (call,), Status.INFRA_ERROR, None, {},
+                       f"reward: {type(error).__name__}: {error}")
+    status = Status.COMPLETED if call.terminated else Status.TRUNCATED
+    return Session(task, "", sample, 0, (call,), status, finite_reward(score))
+
 
 def prompt_rows(batch) -> tuple[np.ndarray, np.ndarray, list[PromptRecord]]:
     """Read one host prompt batch: left-padded ids, lengths and each row's `PromptRecord`.
@@ -52,106 +60,120 @@ def prompt_rows(batch) -> tuple[np.ndarray, np.ndarray, list[PromptRecord]]:
     return prompts, prompt_lengths, records
 
 
-@dataclasses.dataclass(frozen=True)
-class SampledRollout:
-    """Draws `groups` completions per prompt from the objective's policy and packs them as one-call sessions.
+def prompt_tasks(batch: Batch) -> list[Task]:
+    """Return one single-turn task per prompt row, with its prompt ids, its `PromptRecord` and the
+    width the batch pads its prompts to, which a collector drawing them together pads to again.
 
-    EOS counts as an action in the response mask, but the text passed to
-    `reward` leaves it out. The batch has `pack`'s layout, `prompts * groups`
-    rows of the objective's `seq_len + 1`; a draw longer than a row, its
-    prompt and completion together, raises ValueError there. Every
-    completion is scored. One that ran out of `max_new_tokens` is TRUNCATED,
-    and `truncation` decides whether it trains; the default, `score`, trains
-    it on its reward. `old_log_probs` holds the raw likelihoods the cached
-    model recorded at each sampled action, and `behavior_log_probs` holds
-    the sampling ones. `metrics` holds the latest call's mean reward, mean
-    completion length and truncated share, which the trainer logs as
-    `rollout/<name>`.
+    A task's id is a digest of its prompt ids, so repeated prompts share an
+    id; their groups keep them apart.
+    """
+    prompts, lengths, records = prompt_rows(batch)
+    rows, width = prompts.shape
+    tasks = []
+    for row in range(rows):
+        ids = tuple(int(token) for token in prompts[row, width - int(lengths[row]):])
+        name = hashlib.sha256(np.asarray(ids, np.int64).tobytes()).hexdigest()[:16]
+        tasks.append(Task(name, {"prompt": ids, "record": records[row], "width": width}))
+    return tasks
+
+
+@dataclasses.dataclass(frozen=True)
+class PromptTask:
+    """What a single-turn prompt task holds (`prompt_tasks`): its prompt ids under `prompt`, the
+    `PromptRecord` its reward reads under `record`, and under `width` the width its batch padded
+    it to, which a task built outside a batch need not state: its own length is its width."""
+
+    ids: tuple[int, ...]
+    record: PromptRecord
+    width: int
+
+    @classmethod
+    def of(cls, task: Task) -> PromptTask:
+        ids, record = task.data.get("prompt"), task.data.get("record")
+        if not (isinstance(ids, tuple) and isinstance(record, PromptRecord)):
+            raise TypeError(f"task {task.id!r} is not a prompt task: it needs prompt ids and a PromptRecord")
+        width = task.data.get("width", len(ids))
+        if type(width) is not int or width < len(ids):
+            raise TypeError(f"task {task.id!r} states a width of {width!r}, which must hold its {len(ids)} "
+                            "prompt ids")
+        return cls(ids, record, width)
+
+
+@dataclasses.dataclass(frozen=True)
+class PolicyCollector:
+    """Draws completions of `prompt_tasks` tasks from the trainer's own policy, scored on decoded
+    text (`sessions.Collector`; `RolloutScheduler.sampled` builds the usual scheduler over it).
+
+    A call draws every task's `samples` continuations in one generation
+    (`TextGeneration`'s `n`, one prefill per prompt) from the snapshot's
+    variables under its key, and scores each by `reward` on its decoded
+    text. EOS counts as an action in the response mask, but the text passed
+    to `reward` leaves it out. A completion that ran out of
+    `max_new_tokens` is TRUNCATED, and the scheduler's `truncation` decides
+    whether it trains. Each call keeps the raw likelihoods the cached model
+    recorded at its sampled actions, the proximal policy's, and the
+    sampling ones as its behavior likelihoods. The packed rows are the
+    objective's `seq_len + 1` ids wide, and a draw longer than a row, its
+    prompt and completion together, raises ValueError when packed.
     """
 
     objective: TokenScorer
     reward: Reward
     decode: Callable[[Sequence[int]], str] = lambda ids: " ".join(str(token) for token in ids)
-    groups: int = 4
     max_new_tokens: int = 32
-    estimator: str = "group"
-    truncation: str = "score"
     sampling: Sampling = dataclasses.field(default_factory=Sampling)
-    metrics: dict[str, float] = dataclasses.field(default_factory=dict, init=False, compare=False)
-    shown: ClassVar[Mapping[str, Shown]] = {"reward/mean": Shown(better="higher"),
-                                             "status/truncated": Shown(better="lower", percent=True)}
 
     def __post_init__(self) -> None:
-        if type(self.groups) is not int or self.groups < 2:
-            raise ValueError(f"groups is {self.groups}: an advantage needs at least two completions")
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 1:
             raise ValueError("a rollout generates at least one token")
-        check_estimator(self.estimator)
-        check_truncation(self.truncation)
+        # The policy's own: the reward's text trims at the end-of-sequence ids generation stops at.
+        object.__setattr__(self, "sampling", self.objective.sampled(self.sampling))
 
-    def _prepared(self, batch, key: jax.Array):
-        """Validate one prompt batch and build the inputs generation reads.
+    @property
+    def width(self) -> int:
+        return self.objective.seq_len + 1
 
-        Returns the prompt ids, their lengths, the `PromptRecord` each row's
-        reward is called with, and the `ModelInputs` the policy is given.
-        """
-        prompts, prompt_lengths, records = prompt_rows(batch)
-        width = prompts.shape[1]
-        # The lengths are already here on the host, so a batch of whole
-        # prompts states its validity by carrying none.
-        padded = bool(np.any(prompt_lengths < width))
-        inputs = ModelInputs(jnp.asarray(prompts), {
-            "attention_mask": jnp.arange(width)[None, :] >= width - jnp.asarray(prompt_lengths)[:, None]
-        } if padded else {})
-        return prompts, prompt_lengths, records, inputs
+    def rows(self, tasks: int, samples: int) -> int:
+        return tasks * samples
 
-    def __call__(self, state, batch, key: jax.Array) -> dict[str, np.ndarray]:
-        """Draw `groups` completions per prompt and pack them as GRPO rows.
+    def _prepared(self, tasks: Sequence[Task]) -> tuple[list[PromptTask], int, ModelInputs]:
+        """The tasks' prompts, the width they pad to and the inputs the policy is given."""
+        prompts = [PromptTask.of(task) for task in tasks]
+        width = max(prompt.width for prompt in prompts)
+        rows, fields = pad_token_rows([prompt.ids for prompt in prompts], pad_id=self.sampling.pad,
+                                      width=width)
+        return prompts, width, ModelInputs(jnp.asarray(rows), {name: jnp.asarray(value)
+                                                               for name, value in fields.items()})
 
-        A prompt's group is the policy's `groups` continuations of one
-        request under `key` (`TextGeneration`'s `n`), drawn from one policy
-        snapshot over one prefill and scored by `reward`, and the advantages
-        are computed within each prompt's group. The returned columns are the
-        batch a GRPO loss reads.
-        """
-        # Validation completes on every rank before generation enters collectives.
-        prepared = (agreed("rollout input preparation", lambda: self._prepared(batch, key))
-                    if mesh_of(state.variables) is not None else self._prepared(batch, key))
-        prompts, prompt_lengths, records, inputs = prepared
-        rows, width = prompts.shape
-        generated = self.objective.policy(state.variables, self.sampling)(
-            inputs, self.max_new_tokens, key=key, n=self.groups).host()
+    def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> list[list[Session]]:
+        # Every process of the mesh validates its prompts before generation enters its collectives.
+        mesh = mesh_of(snapshot.variables)
+        prompts, width, inputs = (self._prepared(tasks) if mesh is None
+                                  else agreed("rollout input preparation", lambda: self._prepared(tasks)))
+        generated = self.objective.policy(snapshot.variables, self.sampling)(
+            inputs, self.max_new_tokens, key=snapshot.key, n=samples).host()
+        if mesh is not None and DataPartition.of(mesh).reader != 0:
+            # A share's later reader drew its part of the program; the first reader scores the share.
+            return []
 
         def grouped(values: np.ndarray) -> np.ndarray:
-            return values.reshape(rows, self.groups, *values.shape[1:])
+            return values.reshape(len(prompts), samples, *values.shape[1:])
 
         sampled = grouped(generated.tokens[:, width:])
-        lengths, terminated = grouped(generated.lengths), grouped(generated.terminated)
+        counts, terminated = grouped(generated.lengths), grouped(generated.terminated)
         raw, behavior = grouped(generated.raw_log_probs), grouped(generated.behavior_log_probs)
-        def completion(row: int, group: int) -> str:
-            end = int(lengths[row, group]) - int(terminated[row, group])
-            return self.decode(sampled[row, group, :end].tolist())
+        collected = []
+        for row, (task, prompt) in enumerate(zip(tasks, prompts, strict=True)):
+            sessions = []
+            for sample in range(samples):
+                count = int(counts[row, sample])
+                tokens = tuple(int(token) for token in sampled[row, sample, :count])
+                drawn, proximal = (tuple(float(value) for value in values[row, sample, :count])
+                                   for values in (behavior, raw))
+                finish = "stop" if terminated[row, sample] else "length"
+                draw = Draw(prompt.ids, tokens, drawn, finish, snapshot.updates, proximal)
+                text = self.decode(list(response(tokens, self.sampling)))
+                sessions.append(scored_draw(task.id, sample, Call.of(draw), text, prompt.record, self.reward))
+            collected.append(sessions)
+        return collected
 
-        rewards = np.asarray([[self.reward(completion(row, group), records[row])
-                               for group in range(self.groups)] for row in range(rows)], np.float32)
-        sessions, version = [], int(state.updates)
-        for row in range(rows):
-            prompt = tuple(int(token) for token in prompts[row, width - int(prompt_lengths[row]):])
-            for group in range(self.groups):
-                count, stopped = int(lengths[row, group]), bool(terminated[row, group])
-                call = Call(prompt, tuple(int(token) for token in sampled[row, group, :count]),
-                            tuple(float(value) for value in behavior[row, group, :count]),
-                            "stop" if stopped else "length", version)
-                sessions.append(Session(str(row), "", group, 0, (call,),
-                                        Status.COMPLETED if stopped else Status.TRUNCATED,
-                                        float(rewards[row, group])))
-        # Session `row * groups + group` is that draw, which is what `sampled_values` hands its callback.
-        # The rows are the objective's, which `pack` refuses a draw too long for.
-        packed = pack(sessions, self.objective.seq_len + 1, rows=rows * self.groups,
-                      estimator=self.estimator, truncation=self.truncation)
-        packed[OLD_LOG_PROBS_KEY] = sampled_values(
-            packed, lambda index, _: raw[index // self.groups, index % self.groups,
-                                         :int(lengths[index // self.groups, index % self.groups])].tolist())
-        self.metrics.update({"reward/mean": float(rewards.mean()), "length/mean": float(lengths.mean()),
-                             "status/truncated": float(1 - terminated.mean())})
-        return packed

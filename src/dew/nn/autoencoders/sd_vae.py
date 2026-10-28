@@ -1,9 +1,8 @@
 """Pretrained variational image autoencoders behind the AutoEncoder seam."""
 import jax.numpy as jnp
 
-from .api import ModuleAutoEncoder
+from .api import LatentNormalization, ModuleAutoEncoder
 from .kl import AutoencoderKL
-from .vae import load_pretrained_vae
 
 
 def published_normalization(config: dict) -> tuple[float, float]:
@@ -15,9 +14,6 @@ def published_normalization(config: dict) -> tuple[float, float]:
 
 class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
     """Encodes and decodes images with a frozen native `AutoencoderKL` and its latent normalization."""
-
-    record_name = 'sd_vae'
-    record_module = AutoencoderKL
 
     def __init__(self, modelname="CompVis/stable-diffusion-v1-4", revision="bf16",
                  dtype=jnp.bfloat16, latent_shift=None, latent_scale=None, params=None,
@@ -36,9 +32,10 @@ class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
         self.revision = revision
         self.dtype = dtype
         if model is None:
-            pretrained = load_pretrained_vae(modelname, revision=revision, params=params)
-            config = pretrained["config"]
-            params = pretrained["params"]
+            from .pretrained import load_kl_vae
+
+            _, params, _, config = load_kl_vae(modelname, dtype, revision=revision, subfolder=None,
+                                               params=params)
             model = AutoencoderKL.from_diffusers(config, dtype)
             shift, scale = published_normalization(config)
             latent_shift = shift if latent_shift is None else latent_shift
@@ -46,13 +43,13 @@ class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
         if params is None:
             raise ValueError("A native autoencoder requires explicit parameters")
         super().__init__(model, params)
-        self.latent_shift = 0.0 if latent_shift is None else latent_shift
-        self.latent_scale = 0.18215 if latent_scale is None else latent_scale
+        shift = 0.0 if latent_shift is None else latent_shift
+        scale = 0.18215 if latent_scale is None else latent_scale
+        self.normalization = LatentNormalization({'latent_shift': shift, 'latent_scale': scale}, shift, scale)
 
     def record_arguments(self) -> dict:
         from dew.registry import dtype_name
-        return {'dtype': dtype_name(self.dtype), 'latent_shift': self.latent_shift,
-                'latent_scale': self.latent_scale}
+        return {'dtype': dtype_name(self.dtype), **self.normalization.record}
 
     def moments(self, params, images):
         """Return `AutoencoderKL.moments` of the frames, which `encode_batch` draws its latent from."""

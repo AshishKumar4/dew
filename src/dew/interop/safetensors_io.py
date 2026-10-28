@@ -21,9 +21,10 @@ import jax
 import ml_dtypes
 import numpy as np
 
+from dew._records import JSON
 from dew.files import replacing, write_atomically
+from dew.interop.unread import Stored, Unread
 from dew.interop.weights import ParamTree, insert
-from dew.records import JSON
 
 SEPARATOR = "/"
 WEIGHTS_FILE = "model.safetensors"
@@ -336,19 +337,20 @@ def header_specs(path) -> dict[str, jax.ShapeDtypeStruct]:
         return {name: stored_spec(name, view.get_shape(), view.get_dtype(), filename) for name, view in views}
 
 
-class LazyTensors(Mapping[str, np.ndarray]):
+class LazyTensors[T: np.ndarray | Unread](Mapping[str, T]):
     """Named host tensors, each built only when it is read.
 
     `specs` gives every tensor's shape and dtype up front, which is all a
     shard plan needs; `build(name)` makes the tensor. A writer that reads one
-    shard's tensors at a time holds one shard on the host, not the model.
+    shard's tensors at a time holds one shard on the host, not the model. A
+    load without its weights builds `Unread` ones (`dew.interop.unread`).
     """
 
-    def __init__(self, specs: Mapping[str, jax.ShapeDtypeStruct], build: Callable[[str], np.ndarray]):
+    def __init__(self, specs: Mapping[str, jax.ShapeDtypeStruct], build: Callable[[str], T]):
         self.specs = specs
         self._build = build
 
-    def __getitem__(self, name: str) -> np.ndarray:
+    def __getitem__(self, name: str) -> T:
         if name not in self.specs:
             raise KeyError(name)
         return self._build(name)
@@ -358,6 +360,12 @@ class LazyTensors(Mapping[str, np.ndarray]):
 
     def __len__(self) -> int:
         return len(self.specs)
+
+
+def tensor_specs(tensors: Mapping[str, Stored]) -> Mapping[str, jax.ShapeDtypeStruct]:
+    """Stored shape and dtype metadata without reading deferred tensor values."""
+    return (tensors.specs if isinstance(tensors, LazyTensors)
+            else {name: jax.ShapeDtypeStruct(array.shape, array.dtype) for name, array in tensors.items()})
 
 
 def write_index(directory: Path, weight_map: Mapping[str, str], total_size: int | None = None,
@@ -422,8 +430,7 @@ def save_sharded(
     from huggingface_hub import split_state_dict_into_shards_factory
 
     folder = Path(directory)
-    specs = (tensors.specs if isinstance(tensors, LazyTensors)
-             else {name: jax.ShapeDtypeStruct(array.shape, array.dtype) for name, array in tensors.items()})
+    specs = tensor_specs(tensors)
     split = split_state_dict_into_shards_factory(
         dict(specs), get_storage_size=lambda spec: math.prod(spec.shape) * np.dtype(spec.dtype).itemsize,
         filename_pattern=stem + "{suffix}.safetensors", max_shard_size=max_shard_size)
@@ -458,7 +465,8 @@ def save_hf_layout(params, config: Mapping[str, object], directory,
     """Write the weights and config.json into `directory`, the layout a Hugging Face style loader reads.
 
     `save_sharded` writes the weights, as one file or as shards of at most
-    `max_shard_size`. `params` is a flat table of named tensors, or a tree
+    `max_shard_size`, and every file is replaced whole (`dew.files.replacing`), so a reader of the
+    directory never reads one half written. `params` is a flat table of named tensors, or a tree
     whose '/'-joined paths name them. The config is written as given; Dew
     does not translate its own config vocabulary into anyone else's.
     """
@@ -467,5 +475,4 @@ def save_hf_layout(params, config: Mapping[str, object], directory,
         # Leaves stay where they are; `save_sharded` brings one shard at a time to the host.
         params = flatten(params)
     save_sharded(params, directory, max_shard_size)
-    with open(os.path.join(directory, CONFIG_FILE), "w") as handle:
-        json.dump(config, handle, indent=2)
+    write_atomically(os.path.join(directory, CONFIG_FILE), json.dumps(config, indent=2))

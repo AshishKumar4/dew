@@ -8,13 +8,14 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Regression, dataset
+from model_support import largest_difference
 
+from dew.averaging import coefficients, exponent, power_decay
 from dew.checkpoints import Checkpoints, Ranking
-from dew.config import OptimConfig, RunConfig
+from dew.config import RunConfig
 from dew.objectives.base import EMASpec
+from dew.optim import OptimConfig, PowerProfilesState, power_profiles
 from dew.training import Layout, Trainer
-from dew.training.optim import PowerProfilesState, power_profiles
-from dew.training.posthoc import coefficients, exponent, power_decay
 
 # Outputs of NVlabs/edm2 training/phema.py (std_to_exp, power_function_beta,
 # solve_posthoc_coefficients) on the same inputs, float64.
@@ -64,13 +65,10 @@ def test_a_reconstructed_average_matches_one_tracked_directly(tmp_path):
     rebuilt = Checkpoints(str(tmp_path / "run")).posthoc_ema(0.07)
     stored = checkpoints.restore_profiles(96)
 
-    def distance(a, b):
-        return max(float(np.max(np.abs(x - y))) for x, y in zip(jax.tree.leaves(a), jax.tree.leaves(b),
-                                                                 strict=True))
     scale = max(float(np.max(np.abs(leaf))) for leaf in jax.tree.leaves(direct))
     bound = 2 * np.finfo(np.float32).eps * scale
-    assert distance(rebuilt, direct) <= bound
-    assert all(distance(average, direct) > 100 * bound for average in stored)
+    assert largest_difference(rebuilt, direct) <= bound
+    assert all(largest_difference(average, direct) > 100 * bound for average in stored)
     assert jax.tree.map(lambda leaf: leaf.dtype, rebuilt) == jax.tree.map(lambda leaf: leaf.dtype, direct)
 
 

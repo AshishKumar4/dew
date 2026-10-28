@@ -1,29 +1,41 @@
 """A published autoencoder, built as its own config names it."""
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
 
+import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
-from dew.interop.components import bind_component, component_source
-from dew.objectives.base import Variables
+from dew.batch import Variables
+from dew.interop.components import bind_component
+from dew.registry import DtypeName
 
-from .api import AutoEncoder
-from .dc_ae import load_dc_ae
-from .flux2 import load_flux2_vae
+from . import dc_ae, flux2, qwen_image, rae, wan
+from .api import AutoEncoder, LatentNormalization, published_source
+from .dc_ae import DCAutoencoder, load_dc_ae
+from .flux2 import Flux2Autoencoder, load_flux2_vae
 from .kl import AutoencoderKL
-from .qwen_image import load_qwen_image_vae
-from .rae import load_rae
+from .qwen_image import QwenImageAutoencoder, load_qwen_image_vae
+from .rae import RAEAutoencoder, load_rae
 from .sd_vae import StableDiffusionVAE, published_normalization
-from .vae import FLAX_REVISIONS, _vae_path
-from .wan import load_wan_vae
+from .vae import (
+    FLAX_REVISIONS,
+    FLAX_WEIGHTS,
+    PUBLISHED as KL_PUBLISHED,
+    TORCH_WEIGHTS,
+    _vae_path,
+    flax_vae,
+    located_vae,
+)
+from .wan import WanAutoencoder, load_wan_vae
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -48,35 +60,71 @@ class Loader(Protocol):
                  ) -> tuple[AutoEncoder, Variables, tuple[WeightLayout, ...], dict]: ...
 
 
-LOADERS: Mapping[str, Loader] = MappingProxyType({
-    "AutoencoderDC": load_dc_ae,
-    "AutoencoderKLWan": load_wan_vae,
-    "AutoencoderRAE": load_rae,
-    "AutoencoderKLQwenImage21": load_qwen_image_vae,
-    "AutoencoderKLFlux2": load_flux2_vae,
-})
-"""Every published autoencoder but an AutoencoderKL, by the `_class_name`
-its config states. A standalone load (`load_autoencoder`) and a pipeline's
-(`dew.interop.pipeline_assembly`) both build from this one table; each
-reads an AutoencoderKL its own way."""
-
-
 def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
-                subfolder: str = "vae", param_dtype: str = "float32", params: Variables | None = None,
+                subfolder: str | None = "vae", param_dtype: str = "float32", params: Variables | None = None,
                 lazy: bool = False, shapes: Mapping[str, tuple[int, ...]] | None = None
                 ) -> tuple[StableDiffusionVAE, Variables, tuple[WeightLayout, ...], dict]:
-    """Build a pipeline's AutoencoderKL, its parameters and their source
-    layouts from the torch safetensors in `subfolder`, as `Loader` does. A
-    standalone one is read by `StableDiffusionVAE` instead, which also reads
-    the SD1-era flax layouts on their own revisions (`load_pretrained_vae`)."""
-    directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
+    """Build an AutoencoderKL, its parameters and their source layouts, as `Loader` does: a pipeline's
+    from the torch safetensors in `subfolder`, a standalone one's (`subfolder` None) where its repo or
+    directory holds it, the SD1-era flax layouts on their own revisions included (`vae.located_vae`,
+    `revision` as it reads it, `bf16` by default). Those flax params keep the dtype their branch stores
+    (bf16 on `bf16`), the tree this module's is, their layouts written back as the torch names
+    (`vae.flax_vae`)."""
+    if subfolder is None:
+        directory, config, weights = located_vae(str(name_or_dir), revision or "bf16", params=params)
+    else:
+        directory, config = published_source(name_or_dir, revision, subfolder, KL_PUBLISHED,
+                                             weights=params is None, nameless=True)
+        weights = TORCH_WEIGHTS
+    if weights == FLAX_WEIGHTS and params is None:
+        params, shapes = flax_vae(directory / FLAX_WEIGHTS)
     model = AutoencoderKL.from_diffusers(config, compute)
     shift, scale = published_normalization(config)
+    image = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
+                                 jnp.float32)
     return bind_component(
         directory, "vae", config, model, _vae_path,
         lambda bound: StableDiffusionVAE(str(name_or_dir), dtype=compute, params=bound, model=model,
                                          latent_shift=shift, latent_scale=scale),
-        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, shapes=shapes)
+        prefix=("autoencoder",), params=params, param_dtype=param_dtype, lazy=lazy, inputs=(image,),
+        shapes=shapes)
+
+
+@dataclasses.dataclass(frozen=True)
+class Registration:
+    """One built-in autoencoder a source loads: its wrapper, the `_class_name`s a published config states
+    (an AutoencoderKL's, where it states none: `nameless`), and the loader that builds it from a pipeline's
+    directory or a repo, which a standalone load reads from its config's subfolder, or, where the
+    autoencoder `finds` its own (an AutoencoderKL's, whose SD1-era flax layouts live on their own
+    revisions: `load_kl_vae` with no subfolder), where it lives."""
+    wrapper: Callable[..., AutoEncoder]
+    published: tuple[str, ...]
+    load: Loader
+    nameless: bool = False
+    finds: bool = False
+
+
+REGISTRATIONS: tuple[Registration, ...] = (
+    Registration(StableDiffusionVAE, KL_PUBLISHED, load_kl_vae, nameless=True, finds=True),
+    Registration(DCAutoencoder, dc_ae.PUBLISHED, load_dc_ae),
+    Registration(WanAutoencoder, wan.PUBLISHED, load_wan_vae),
+    Registration(RAEAutoencoder, rae.PUBLISHED, load_rae),
+    Registration(Flux2Autoencoder, flux2.PUBLISHED, load_flux2_vae),
+    Registration(QwenImageAutoencoder, qwen_image.PUBLISHED, load_qwen_image_vae),
+)
+"""Every built-in autoencoder a source loads: one registration each."""
+
+LOADERS: Mapping[str, Loader] = MappingProxyType({
+    name: entry.load for entry in REGISTRATIONS for name in entry.published})
+"""Every published autoencoder's loader, by each `_class_name` its config may state: what a pipeline's load
+(`dew.interop.pipeline_assembly`) builds from, a config naming none taken as an AutoencoderKL's."""
+
+
+def registration(class_name: str | None) -> Registration | None:
+    """The registration of a published `_class_name` (None, an AutoencoderKL's: `Registration.nameless`),
+    None for one no built-in registers."""
+    return next((entry for entry in REGISTRATIONS
+                 if class_name in entry.published or (class_name is None and entry.nameless)), None)
 
 
 def _published(modelname: str, revision: str) -> tuple[str | None, str | None]:
@@ -110,32 +158,67 @@ def _published(modelname: str, revision: str) -> tuple[str | None, str | None]:
 def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike = jnp.bfloat16,
                      latent_shift: float | None = None, latent_scale: float | None = None,
                      params: Variables | None = None) -> AutoEncoder:
-    """The autoencoder `modelname` publishes: the one `LOADERS` builds for the
-    class its config names, and otherwise a Stable Diffusion AutoencoderKL.
+    """The autoencoder `modelname` publishes: the one its config's class registers (`registration`), by
+    its registration's loader (where it lives, for one that finds it: an AutoencoderKL's, read where the
+    config names no class), and refused by name where it names one no built-in registers.
 
     `modelname` is a local directory or a Hub repo; `revision` is as
-    `load_pretrained_vae` reads it, so a class of `LOADERS` takes `main` or a
+    `vae.located_vae` reads it, so a class of `LOADERS` takes `main` or a
     commit. Supplied `params` are bound unchanged and only metadata is read,
     but for FLUX.2's latent statistics, its batch norm's running statistics
     in the weights (`load_flux2_vae`). `latent_shift` and `latent_scale`
     replace the checkpoint's normalization where given, an autoencoder's
     whose record keeps them: one that normalizes by published per-channel
     statistics records those, so a run rebuilt from its record
-    (`AutoEncoder.from_json`) would lose the override, and refuses it.
+    (`AutoEncoder.bound`) would lose the override, and refuses it.
     """
     class_name, subfolder = _published(modelname, revision)
-    if class_name is None or class_name not in LOADERS:
-        return StableDiffusionVAE(modelname, revision=revision, dtype=dtype, latent_shift=latent_shift,
-                                  latent_scale=latent_scale, params=params)
-    autoencoder, *_ = LOADERS[class_name](modelname, dtype, revision=revision, subfolder=subfolder or "",
-                                          params=params)
+    entry = registration(class_name)
+    if entry is None:
+        raise ValueError(f"{modelname} holds a {class_name}, which no built-in autoencoder registers")
+    if entry.finds:
+        # A local pipeline's autoencoder is read from its `vae/` folder; a Hub repo's, where its loader
+        # finds it.
+        source = str(Path(modelname) / subfolder) if subfolder and os.path.isdir(modelname) else modelname
+        autoencoder, *_ = load_kl_vae(source, dtype, revision=revision, subfolder=None, params=params)
+    else:
+        autoencoder, *_ = entry.load(modelname, dtype, revision=revision, subfolder=subfolder or "",
+                                     params=params)
     given = {name for name, value in (("latent_shift", latent_shift), ("latent_scale", latent_scale))
              if value is not None}
     if given - autoencoder.record_arguments().keys():
         raise ValueError(f"{class_name} normalizes by its published statistics, which its record keeps: "
                          f"{sorted(given)} would not survive the run's rebuild from that record")
-    if latent_shift is not None:
-        autoencoder.latent_shift = latent_shift
-    if latent_scale is not None:
-        autoencoder.latent_scale = latent_scale
-    return autoencoder
+    if not given:
+        return autoencoder
+    shift = autoencoder.latent_shift if latent_shift is None else latent_shift
+    scale = autoencoder.latent_scale if latent_scale is None else latent_scale
+    record = dict(autoencoder.normalization.record)
+    record.update(latent_shift=shift, latent_scale=scale)
+    return autoencoder.with_normalization(LatentNormalization(record, shift, scale))
+
+
+@dataclasses.dataclass(frozen=True)
+class PretrainedAutoencoder:
+    """A published autoencoder for latent diffusion.
+
+    It is the class the checkpoint's config names, one of
+    `dew.nn.autoencoders.pretrained.LOADERS`, or a Stable Diffusion
+    AutoencoderKL (`dew.nn.autoencoders.pretrained.load_autoencoder`).
+    """
+
+    modelname: str = "pcuenq/sd-vae-ft-mse-flax"
+    revision: str = "bf16"
+    dtype: DtypeName = "bfloat16"
+    latent_shift: float | None = None
+    latent_scale: float | None = None
+    """Per-dataset latent statistics; None keeps the checkpoint's."""
+
+    def build(self, *, params: Variables | None = None) -> AutoEncoder:
+        """Build the autoencoder from its config over supplied params."""
+        return load_autoencoder(self.modelname, revision=self.revision, dtype=jnp.dtype(self.dtype),
+                                latent_shift=self.latent_shift, latent_scale=self.latent_scale,
+                                params=params)
+
+
+__all__ = ["PretrainedAutoencoder"]

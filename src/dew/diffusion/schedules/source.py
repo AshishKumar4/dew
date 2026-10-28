@@ -18,7 +18,7 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
 from dew.diffusion.schedules.flow import FlowMatchingScheduler
 from dew.diffusion.schedules.karras import EDMNoiseScheduler
-from dew.diffusion.schedules.source_grids import empirical_mu as empirical_mu, published_betas, sampling_grid
+from dew.diffusion.schedules.source_grids import sampling_grid
 from dew.diffusion.schedules.source_policy import Origin as Origin, SourcePolicy, resolve_config
 from dew.diffusion.transforms import PredictionTransform
 from dew.sampling.solvers import Solver
@@ -70,7 +70,8 @@ class SourceSchedule:
         if self.policy.family == "flow":
             flow = self.policy.flow
             shift = 1.0 if flow is None else flow.base(tokens)
-            return Process(FlowMatchingScheduler(shift=shift), self.prediction)
+            return Process(FlowMatchingScheduler(shift=shift, dynamic=flow is not None and flow.dynamic),
+                           self.prediction)
         if self.policy.flow_shift is not None:
             return Process(FlowMatchingScheduler(shift=self.policy.flow_shift), self.prediction)
         if self.policy.family == "edm":
@@ -120,4 +121,4 @@ class SourceGrid:
         return self.schedule.sampling(steps, tokens=self.tokens, origin=self.origin)
 
 
-__all__ = ["SourceGrid", "SourceSchedule", "published_betas"]
+__all__ = ["SourceGrid", "SourceSchedule"]

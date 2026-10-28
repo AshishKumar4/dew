@@ -4,24 +4,19 @@ their training shapes."""
 
 import dataclasses
 import functools
-from collections.abc import Callable, Iterator
+import importlib
+from collections.abc import Callable, Iterator, Mapping
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from gdn_cases import CASES
 
-from dew.nn.kernels import fla_gdn, fla_kda, generation, short_conv, tuning
+from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence, short_conv, tuning
+from dew.nn.precision import l2norm
 
-COMPILED_SHAPES = {
-    "0.8b": {"batch": 8, "length": 3072, "key_heads": 16, "value_heads": 16,
-             "width": 128, "columns": 128, "chunk": 64},
-    "9b": {"batch": 4, "length": 3072, "key_heads": 16, "value_heads": 32,
-           "width": 128, "columns": 128, "chunk": 64},
-    "wide keys": {"batch": 1, "length": 512, "key_heads": 2, "value_heads": 4,
-                  "width": 256, "columns": 128, "chunk": 64},
-}
-"""The shapes every declared config compiles at: the training shapes, whose heads are `fla_gdn.WIDEST`
-wide, and the widest keys the port takes in 16 bits (`fla_gdn.WIDEST_KEYS`)."""
+COMPILED_SHAPES = {name: CASES[name] for name in ("0.8b", "9b", "27b", "wide keys")}
+"""The shapes every declared config compiles at (`gdn_cases`): the training shapes and the widest keys."""
 
 
 class KernelCase(NamedTuple):
@@ -30,12 +25,19 @@ class KernelCase(NamedTuple):
 
     name: str
     call: Callable[[], tuple[Callable, tuple[jax.ShapeDtypeStruct, ...]]]
+    models: Mapping[str, Mapping[str, int]] | None = None
+    """Each of its Mosaic GPU kernels' resources by its template's model, by kernel name: the registers a
+    consumer thread holds (`registers`), the budget a launch holds them within (`budget`), its consumer
+    warpgroups (`consumers`), a producer warpgroup's registers a thread (`producer`, 0 without one) and the
+    most programs its family runs a multiprocessor (`most`), which the compile gate decides on as it decides
+    on ptxas's need (`kernel_compile.mosaic_failures`)."""
 
 
 def _pinned(launch, tiles, *args, **kwargs):
-    """`launch`'s kernel on `args`, pinned to `tiles` (`tuning.pinned`)."""
+    """`launch`'s kernel on `args`, pinned to `tiles` (`tuning.pinned`): the function its module
+    names as the launch (`NAME`)."""
     with tuning.pinned({type(launch): tiles}):
-        return getattr(fla_gdn, launch.NAME)(*args, **kwargs)
+        return getattr(importlib.import_module(type(launch).__module__), launch.NAME)(*args, **kwargs)
 
 
 def _case_call(launch, tiles, shape, dtype, *, reverse=False):
@@ -53,7 +55,7 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
     entered = jax.ShapeDtypeStruct((batch * (length // chunk), value_heads, width, columns), narrow)
     state = jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32)
     operands = {
-        "chunk_local_cumsum": (gated,),
+        "cumulated": (gated,),
         "kkt_solve": (keyed, gated, beta),
         "recompute_w_u": (keyed, valued, beta, inverse, gated),
         "chunk_fwd_h": (keyed, weighted, valued, gated, state),
@@ -64,30 +66,65 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
         "prepare_wy_repr_bwd": (keyed, valued, beta, gated, inverse, weighted, valued, keyed),
     }
     kwargs = {"chunk": chunk, "interpret": False}
-    if kernel == "chunk_local_cumsum":
+    if kernel == "cumulated":
         kwargs.update(scale=fla_gdn.RCP_LN2, reverse=reverse)
     elif kernel in ("chunk_fwd_o", "chunk_bwd_dv_local", "chunk_bwd_dhu", "chunk_bwd_dqkwg"):
         kwargs["scale"] = width ** -0.5
     return functools.partial(_pinned, launch, tiles, **kwargs), operands[kernel]
 
 
-def kernel_cases(target: str) -> Iterator[KernelCase]:
-    """Each kernel pinned to the tiles `target` runs it with unmeasured (its launch's `PICKS`) for both
-    dtypes at each shape, and the reverse cumsum, for the compile test."""
+def kernel_cases(target: str, dtypes: tuple[str, ...] = ("bfloat16", "float32")) -> Iterator[KernelCase]:
+    """Each kernel pinned to the tiles `target` runs it with (its launch's `PICKS`, the reverse
+    recurrence's `WIDE_KEYS_PICK` past `WIDEST` keys) for each of `dtypes` at each shape, and the reverse
+    cumsum, for the compile test."""
     with generation.assumed(target):
-        wide = fla_gdn._wide()
-    for dtype in ("bfloat16", "float32"):
-        for launch in (x for x in vars(fla_gdn).values() if isinstance(x, fla_gdn._Launch)):
-            kernel, tiles = launch.NAME, launch.PICKS[dtype, wide]
-            config = {field: value for field, value in dataclasses.asdict(tiles).items() if value}
+        wide = chunked_launch._wide()
+    for dtype in dtypes:
+        launches = [*vars(fla_gdn).values(), *vars(recurrence).values()]
+        for launch in (x for x in launches if isinstance(x, chunked_launch._Launch)):
             for shape_name, shape in COMPILED_SHAPES.items():
                 if shape["width"] > fla_gdn.WIDEST and dtype == "float32":
                     continue
+                kernel, tiles = launch.NAME, launch.PICKS[dtype, wide]
+                if shape["width"] > fla_gdn.WIDEST and isinstance(launch, fla_gdn.ChunkBwdDhu):
+                    tiles = launch.WIDE_KEYS_PICK
+                config = {field: value for field, value in dataclasses.asdict(tiles).items() if value}
                 flags = "-".join(f"{key}{value}" for key, value in sorted(config.items()))
-                for reverse in ((False, True) if kernel == "chunk_local_cumsum" else (False,)):
+                for reverse in ((False, True) if kernel == "cumulated" else (False,)):
                     name = f"{target}/{kernel}/{dtype}/{flags}/{shape_name}" + "/reverse" * reverse
                     yield KernelCase(name, functools.partial(_case_call, launch, tiles, shape, dtype,
                                                              reverse=reverse))
+
+
+def delta_operands(seed: int, batch: int, length: int, key_heads: int, value_heads: int, width: int,
+                   columns: int, dtype=jnp.float32, *, per_key: bool = False, decay_shift: float = 3.0):
+    """A delta rule's operands and cotangents as a layer hands them over, the one draw every test of the
+    rule's kernels takes: l2-normalised queries and keys, values, a natural-log decay a head (or a key
+    dimension where `per_key`) `-exp(N - decay_shift)`, beta, an initial memory, and the output's and the
+    final memory's cotangents, `(q, k, v, g, beta, h0, do, dht)`, from `seed`'s eight keys; the queries,
+    keys, values, beta and the output's cotangent in `dtype`."""
+    keys = jax.random.split(jax.random.key(seed), 8)
+    q, k = (l2norm(jax.random.normal(key, (batch, length, key_heads, width))).astype(dtype)
+            for key in keys[:2])
+    v = jax.random.normal(keys[2], (batch, length, value_heads, columns)).astype(dtype)
+    g = -jnp.exp(jax.random.normal(keys[3], (batch, length, value_heads, *(width,) * per_key)) - decay_shift)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (batch, length, value_heads))).astype(dtype)
+    h0 = 0.1 * jax.random.normal(keys[5], (batch, value_heads, width, columns))
+    do = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)
+    dht = 0.1 * jax.random.normal(keys[7], (batch, value_heads, width, columns))
+    return q, k, v, g, beta, h0, do, dht
+
+
+def head_chunks(x, chunk: int):
+    """`x` `[B, T, H, ...]` as `[B, T / chunk, H, chunk, ...]`: each head's tokens in chunks."""
+    batch, length, heads = x.shape[:3]
+    return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, heads, *x.shape[3:]), 3, 2)
+
+
+def scanned_chunks(x, chunk: int):
+    """`x` `[B, T, ...]` as `[T / chunk, B, chunk, ...]`: the chunks in the order a scan takes them."""
+    batch, length = x.shape[:2]
+    return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, *x.shape[2:]), 1, 0)
 
 
 def pairwise(g):
@@ -95,9 +132,40 @@ def pairwise(g):
     return g[..., :, None] - g[..., None, :]
 
 
+def solve_inverse(kc, bc, gc):
+    """The inverse of `I + tril(beta k k^T exp2(g_s - g_t), -1)` of chunked keys, beta and cumulated decay
+    (`head_chunks`' layout), each chunk and head's, by a direct inverse (`jnp.linalg.inv`) in whatever dtype
+    they are given: the reference every test of the solve and the WY products reads, written apart from
+    the port's and the template's forward substitution."""
+    lower = jnp.tril(jnp.einsum('bnhsk,bnhtk->bnhst', kc, kc, precision=jax.lax.Precision.HIGHEST)
+                     * jnp.exp2(pairwise(gc)) * bc[..., :, None], -1)
+    return jnp.linalg.inv(jnp.eye(kc.shape[-2], dtype=kc.dtype) + lower)
+
+
+def wy(kc, vc, bc, gc):
+    """The WY representation `(w, u, inverse)` of chunked keys, values, beta and cumulated decay
+    (`solve_inverse`'s), in whatever dtype they are given."""
+    inverse = solve_inverse(kc, bc, gc)
+    return inverse @ (kc * (bc * jnp.exp2(gc))[..., None]), inverse @ (vc * bc[..., None]), inverse
+
+
+def range_gradient(pairs, after):
+    """Each token's decay gradient from terms through ranges of its chunk's cumulated decay, by the
+    ranges' definition: `pairs` `[..., C, C]`, each `(i, j)` a term through `(j, i]`, and `after`
+    `[..., C]`, each `s` a term through `[0, s]`; token `t` sums the terms whose range holds it, every
+    `(i, j)` with `j < t <= i` and every `s >= t`, as one masked sum over the three indices. Written apart
+    from production's running-sum form (`fla_gdn._summed_back`), so it catches a defect there rather than
+    repeating it."""
+    index = jnp.arange(pairs.shape[-1])
+    t, i, j = index[:, None, None], index[None, :, None], index[None, None, :]
+    holds = (j < t) & (t <= i)
+    through = jnp.sum(jnp.where(holds, pairs[..., None, :, :], 0.0), axis=(-2, -1))
+    return through + jnp.sum(jnp.where(index[None, :] >= index[:, None], after[..., None, :], 0.0), axis=-1)
+
+
 def _slotted(passing, rows):
     """Memories passing between a row's chunks `[B, C - 1, ...]` and a row's own `[B, ...]` at their
-    slots (`fla_gdn.Sequences`): the passing ones row by row, then the rows'."""
+    slots (`chunked_launch.Sequences`): the passing ones row by row, then the rows'."""
     return jnp.concatenate([passing.reshape(-1, *passing.shape[2:]), rows])
 
 
@@ -162,16 +230,9 @@ def reference_kkt_solve(k, g, beta, *, chunk: int = 64):
     k = jnp.repeat(k, group, axis=2).astype(jnp.float32)
     batch, length, heads = beta.shape
 
-    def chunks(x):
-        return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, heads, *x.shape[3:]), 3, 2)
-
-    kc, bc = chunks(k), chunks(beta.astype(jnp.float32))
-    gc = chunks(g.astype(jnp.float32))
-    a = jnp.einsum('bnhsk,bnhtk->bnhst', kc, kc, precision=jax.lax.Precision.HIGHEST)
-    a = a * jnp.exp2(pairwise(gc))
-    a = a * bc[..., :, None]
-    a = jnp.tril(a, -1)
-    inverse = jnp.linalg.inv(jnp.eye(chunk) + a)
+    kc, bc = head_chunks(k, chunk), head_chunks(beta.astype(jnp.float32), chunk)
+    gc = head_chunks(g.astype(jnp.float32), chunk)
+    inverse = solve_inverse(kc, bc, gc)
     return jnp.moveaxis(inverse, 2, 3).reshape(batch, length, heads, chunk).astype(dtype)
 
 
@@ -182,11 +243,7 @@ def reference_h(k, w, u, g, h0, *, chunk: int = 64):
     group = u.shape[2] // k.shape[2]
     dtype = k.dtype
     k = jnp.repeat(k, group, axis=2)
-    batch, length = u.shape[:2]
     exact = jax.lax.Precision.HIGHEST
-
-    def chunks(x):
-        return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, *x.shape[2:]), 1, 0)
 
     def step(state, inputs):
         keys, weights, values, gate = inputs
@@ -207,8 +264,8 @@ def reference_h(k, w, u, g, h0, *, chunk: int = 64):
         state = state * decay + update
         return state, (entered, corrected.astype(u.dtype))
 
-    final, (h, corrected) = jax.lax.scan(step, h0.astype(jnp.float32),
-                                     (chunks(k), chunks(w), chunks(u), chunks(g.astype(jnp.float32))))
+    chunked = tuple(scanned_chunks(x, chunk) for x in (k, w, u, g.astype(jnp.float32)))
+    final, (h, corrected) = jax.lax.scan(step, h0.astype(jnp.float32), chunked)
     return jnp.moveaxis(h, 0, 1), jnp.moveaxis(corrected, 0, 1).reshape(u.shape), final
 
 
@@ -220,11 +277,7 @@ def reference_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64):
     group = do.shape[2] // q.shape[2]
     q_dtype, k_dtype = q.dtype, k.dtype
     q, k = (jnp.repeat(x, group, axis=2) for x in (q, k))
-    batch, length = do.shape[:2]
     exact = jax.lax.Precision.HIGHEST
-
-    def chunks(x):
-        return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, *x.shape[2:]), 1, 0)
 
     def step(grad, inputs):
         queries, keys, weights, gate, out_grad, local = inputs
@@ -244,7 +297,7 @@ def reference_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64):
 
     initial, (dh, dv2) = jax.lax.scan(
         step, dht.astype(jnp.float32),
-        (chunks(q), chunks(k), chunks(w), chunks(g.astype(jnp.float32)), chunks(do), chunks(dv)),
+        tuple(scanned_chunks(x, chunk) for x in (q, k, w, g.astype(jnp.float32), do, dv)),
         reverse=True)
     return jnp.moveaxis(dh, 0, 1), initial, jnp.moveaxis(dv2, 0, 1).reshape(dv.shape)
 
@@ -305,8 +358,7 @@ def reference_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
     pairs = pairs.at[..., -1, :].add(jnp.where(index < chunk - 1, leaving, 0.0))
     after = jnp.moveaxis(jnp.einsum('bnshk,bnshk->bnsh', dq, qc.astype(f32)), 3, 2)
     after = after.at[..., -1].add(dg_last)
-    through = jnp.cumsum(pairs, axis=-1) - pairs
-    dg = jnp.moveaxis(jnp.sum(jnp.where(causal, through + after[..., :, None], 0.0), axis=-2), 2, 3)
+    dg = jnp.moveaxis(range_gradient(pairs, after), 2, 3)
     ds = ds.astype(k_dtype).astype(f32)
     dq = dq + jnp.einsum('bnhst,bnthk->bnshk', ds, kc.astype(f32), precision=exact)
     dk = dk + jnp.einsum('bnhst,bnshk->bnthk', ds, qc.astype(f32), precision=exact)
@@ -321,7 +373,7 @@ KDA_TRAINING = (1, 4096, 32, 128)
 
 def kda_training_cases() -> Iterator[KernelCase]:
     """The port's forward and backward in bf16 through the rule's VJP: at the training shape, and with
-    keys of 256, the widest 16-bit keys `port_refusal` hands it (`fla_gdn.WIDEST_KEYS`)."""
+    keys of 256, the widest 16-bit keys the port takes (`fla_gdn.WIDEST_KEYS`)."""
     batch, length, heads, width = KDA_TRAINING
 
     def case(name, width, columns, heads):
@@ -354,9 +406,9 @@ CONV_SHAPES = {
 }
 
 
-def _conv_case(name, shape, parts, out, bias, valid, packed, pin=None) -> KernelCase:
+def _conv_case(name, shape, parts, out, bias, valid, packed) -> KernelCase:
     """Both kernels through the conv's VJP over bf16 rows `shape` into `parts` in `out`, each launch at
-    its `pin` (`tuning.pinned`), else its heuristic."""
+    its config."""
     def call():
         x = jax.ShapeDtypeStruct((*shape, sum(width for width, _ in parts)), jnp.bfloat16)
         weights = jax.ShapeDtypeStruct((x.shape[-1], 4), jnp.float32)
@@ -369,8 +421,7 @@ def _conv_case(name, shape, parts, out, bias, valid, packed, pin=None) -> Kernel
                 out_ = short_conv.conv(x, weights, shift, kept, segments, parts, activation=True,
                                        eps=1e-6, dtype=jnp.dtype(out), interpret=False)
                 return sum(jnp.sum(piece.astype(jnp.float32)) for piece in out_)
-            with tuning.pinned(pin or {}):
-                return jax.grad(loss, argnums=(0, 1, 2))(x, weights, shift)
+            return jax.grad(loss, argnums=(0, 1, 2))(x, weights, shift)
         return grads, (x, weights, shift, kept, segments)
     return KernelCase(name, call)
 
@@ -385,15 +436,3 @@ def conv_training_cases() -> Iterator[KernelCase]:
     for packed in (False, True):
         yield _conv_case("mamba/packed" if packed else "mamba", (8, 3072), ((3072, None),), jnp.float32,
                          bias=True, valid=False, packed=packed)
-
-
-def conv_config_cases() -> Iterator[KernelCase]:
-    """Each config of each launch's space (`short_conv.TILES`, `short_conv.WALKS`), pinned, through the
-    9B's packed delta conv, the widest pieces a training shape gives."""
-    shape, parts = CONV_SHAPES["9b"]
-    spaces = ((short_conv.ConvForward, short_conv.TILES), (short_conv.ConvBackward, short_conv.WALKS))
-    for op, space in spaces:
-        for config in sorted(space, key=dataclasses.astuple):
-            flags = "-".join(str(value) for value in dataclasses.astuple(config))
-            yield _conv_case(f"9b/packed/{op.__name__}/{flags}", shape, parts, jnp.bfloat16, bias=False,
-                             valid=False, packed=True, pin={op: config})

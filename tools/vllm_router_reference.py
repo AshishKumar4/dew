@@ -14,7 +14,7 @@ is off (`VLLM_USE_FUSED_MOE_GROUPED_TOPK` false, no CUDA platform) and the
 top-k is sorted (`VLLM_BATCH_INVARIANT`), so it takes the torch path. For
 each case it records gate logits, the bias, the chosen experts and their
 weights: once in float32 and once in float64
-(`diffusers_wan_reference.widened`, which widens the function's float32
+(`torch_precision.widened`, which widens the function's float32
 return cast), the truth tests/reference_error.py measures both from. Every
 token's k-th and (k+1)-th selection scores, and its groups' scores where it
 chooses among groups, are at least MARGIN apart in float64, so float32
@@ -36,19 +36,17 @@ Run with the Dew test environment's torch, on CPU:
 """
 
 import contextlib
-import json
 import sys
 import types
 from pathlib import Path
 
 import numpy as np
 import torch
-from reference_source import CACHE as UPSTREAM, ran, selected, verified
+from reference_source import github, ran, saved_fixture, selected
 
 REPO, COMMIT = "vllm-project/vllm", "ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 PATH = "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py"
 DIGEST = "048339e1799cdd42c9dae686a6cb891046577fb391b500f0d12eed73c8f61e52"
-CACHE = UPSTREAM / "vllm" / COMMIT
 CASES = {
     "kimi": {"experts": 256, "topk": 8, "renormalize": True, "num_expert_group": 1, "topk_group": 1,
              "scoring_func": "sigmoid", "routed_scaling_factor": 2.446, "bias": True},
@@ -66,7 +64,7 @@ SEED = 61
 
 def grouped_topk():
     """vLLM's `grouped_topk` at `COMMIT`, its body unchanged, on the torch path."""
-    local = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{PATH}", CACHE / PATH, DIGEST)
+    local = github(REPO, COMMIT, PATH, DIGEST)
     [function] = selected(local.read_text(), {"grouped_topk"}, filename=str(local))
     function.decorator_list = []
     namespace = {
@@ -98,7 +96,7 @@ def margins(logits: np.ndarray, bias: np.ndarray, config: dict) -> np.ndarray:
 
 
 def main():
-    from diffusers_wan_reference import widened
+    from torch_precision import widened
 
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
@@ -135,8 +133,7 @@ def main():
         arrays.update({f"{case}/{key}": value for key, value in record.items()})
     meta = {"repo": REPO, "commit": COMMIT, "path": PATH, "sha256": DIGEST, "cases": CASES,
             "margin": MARGIN, "torch": torch.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(sys.argv[1], **arrays)
+    saved_fixture(Path(sys.argv[1]), arrays, meta)
     print(f"{sys.argv[1]}: {Path(sys.argv[1]).stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays")
 
 

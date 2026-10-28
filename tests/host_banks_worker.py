@@ -36,8 +36,8 @@ def layouts(tensor: int):
     parameter axes and the memory kind is the only thing the two layouts
     disagree about.
     """
+    from dew.mesh import DEFAULT_RULES
     from dew.training import Layout
-    from dew.training.distributed import DEFAULT_RULES
 
     rules = (
         DEFAULT_RULES
@@ -143,7 +143,7 @@ def _checkpointed(args, scanned, plain, tokens, mesh, resident_layout, host_layo
     state, _, _ = trainer.place()
     batch = {"text": np.tile(np.arange(1, SEQ_LEN + 1, dtype=np.int32)[None],
                              (jax.device_count(), 1))}
-    from dew.training.distributed import shard_batch
+    from dew.distributed.batches import shard_batch
     placed = shard_batch(trainer.device_mesh, batch)
     state = trainer.compile(state, placed)(state, placed)[0]
     checkpoints.save(int(state.step), state, None, metrics={"loss": 1.0})

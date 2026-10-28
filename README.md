@@ -72,9 +72,6 @@ PY
 Here is an abridged [`examples/train_flowers.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_flowers.py). The full file adds command-line options and the sampling step:
 
 ```python
-from dew.data import Loading, TFDS
-from dew.config.data import Augment, loader
-from dew.data.images import EncodeCaptions
 from pathlib import Path
 
 import jax
@@ -82,8 +79,7 @@ import jax.numpy as jnp
 import optax
 
 from dew import Checkpoints, Field, InputSpec, Trainer
-from dew.data import Loading
-from dew.config.data import ImageData
+from dew.data import TFDS, presets
 from dew.diffusion.presets import EDM
 from dew.objectives.diffusion import DiffusionObjective
 from dew.nn.backbones import SimpleDiT
@@ -91,7 +87,10 @@ from dew.nn.backbones import SimpleDiT
 
 def train():
     data_path = Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"
-    data = loader(ImageData(source=TFDS(name="oxford_flowers102", split="train", path=str(data_path)), image_size=64, caption_templates=("a photo of a {}",), augment=Augment(flip=True, jitter=True, backend="device")), batch=16, read="memory", loading=Loading(workers=2, threads=2, read_buffer=16, worker_buffer=2))
+    data = (TFDS("oxford_flowers102", split="train", path=str(data_path))
+            .shuffle(seed=0).repeat()
+            .pipe(presets.images, 64, batch=16, augment=True)
+            .workers(2))
 
     model = SimpleDiT(
         patch_size=4,
@@ -119,7 +118,7 @@ if __name__ == "__main__":
     state = train()
 ```
 
-The `__main__` guard lets Grain start its data-loading worker processes. `Field` describes one image, and the dataset yields batches of 16. The objective adds noise and builds the denoising targets. The trainer runs the optimizer and writes checkpoints, and `state.averaged` holds the EMA weights you sample from.
+The `__main__` guard lets Grain start its data-loading worker processes. The `images` preset decodes and resizes each image, augments the batch on the accelerator, and batches 16 at a time; `Field` describes one image. The objective adds noise and builds the denoising targets. The trainer runs the optimizer and writes checkpoints, and `state.averaged` holds the EMA weights you sample from.
 
 Run the full script. It also saves a sample grid to `runs/flowers64/samples.png`:
 
@@ -387,7 +386,7 @@ A training run combines a model, an objective, a dataset, and an optimizer:
 |---|---|
 | Flax model | Forward computation and variable structure |
 | `Objective` | Initialization, loss, evaluation outputs, and optional previews |
-| `Dataset` | Training and validation iterator factories |
+| `Dataset` | Records from a source through your steps and a preset, in batches |
 | `Trainer` | Differentiation, optimizer updates, placement, checkpoints, and logging |
 | `TrainState` | Parameters, optimizer state, random key, progress, and EMA variables |
 
@@ -419,25 +418,26 @@ PY
 Each row holds 257 token IDs: the model receives the first 256 and predicts the following 256.
 
 ```python
-from dew.config.data import loader
 import jax
 import jax.numpy as jnp
 import optax
 
 from dew import Trainer
-from dew.data import HFTokenizer, Loading
-from dew.config.data import TextData
+from dew.data import HFTokenizer, presets
+from dew.data.sources import TokenFiles
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
 
 tokenizer = HFTokenizer("gpt2")
-data = loader(TextData(source="data/tinystories/train", validation="data/tinystories/val", seq_len=256), batch=32, read="memory", loading=Loading(workers=0), validation_records=(4) * (32))
+train, val = TokenFiles("data/tinystories/train"), TokenFiles("data/tinystories/val")
+data = train.shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=256, batch=32)
+held = val.pipe(presets.token_windows, seq_len=256, batch=32, records=128)
 model = CausalTransformer(vocab_size=tokenizer.vocab_size, emb_features=256, num_layers=4,
                           num_heads=4, max_seq_len=256, dtype=jnp.bfloat16)
 objective = LMObjective(model, seq_len=256, ema_decay=0.999)
 lm_state = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0)).fit(
-    data, steps=2000, log_every=500, eval_every=1000, metrics=(Perplexity(),))
+    data, validation=held, steps=2000, log_every=500, eval_every=1000, metrics=(Perplexity(),))
 continuation = generate(model, lm_state.variables, [tokenizer.encode("Once upon a time")],
                         max_new_tokens=40, key=jax.random.key(1),
                         sampling=Sampling(temperature=0.0))
@@ -450,11 +450,11 @@ On one Colab L4 GPU the run takes about three minutes. The training loss falls f
 
 `temperature=0` selects the highest-probability token. GPU reductions are not bitwise repeatable by default, so a second run can continue differently after the first sentence. Validation uses EMA weights, which lag the live parameters during a short run: at step 1,000 their perplexity is 29.3.
 
-To pack whole documents into the windows instead, set `TextData(pack="first-fit")`. It adds segment IDs and positions, and splits the stream at the producer-recorded EOS boundaries. `Chat` reads conversations from a parquet file, a JSONL file or a Hub dataset ID, renders them with the tokenizer's chat template, and records each token's role. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md) for checkpoint loading and text tokenization.
+`TokenFiles` reads each token store, and the `token_windows` preset cuts it into windows by index: each store is one stream with no document ends. Given documents, `presets.lm` tokenizes them and packs whole documents into each row by default (`pack="first-fit"`), recording each row's documents in `text_coordinates`. `presets.sft` reads conversations, from a Parquet or JSONL file or a Hub dataset, renders them with the tokenizer's chat template, and records each token's role. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md) for checkpoint loading and text tokenization.
 
 ### Supervised fine-tuning
 
-Next, fine-tune the decoder above on one response to a prompt. Each token has a role: the prompt's tokens are `Role.USER` and the response's are `Role.ASSISTANT`. When you read conversation data, `Chat` builds this role column from the chat template.
+Next, fine-tune the decoder above on one response to a prompt. Each token has a role: the prompt's tokens are `Role.USER` and the response's are `Role.ASSISTANT`. When you read conversation data, `presets.sft` builds this role column from the chat template.
 
 ```python
 import itertools
@@ -488,42 +488,38 @@ sft_state = Trainer(
 ).fit(sft_data, steps=20, log_every=10)
 ```
 
-The loss counts only the assistant targets, after the next-token shift; the prompt tokens are still there as context. For conversation files, `Chat` also keeps tool calls, tool responses and tool schemas.
+The loss counts only the assistant targets, after the next-token shift; the prompt tokens are still there as context. For conversation files, `presets.sft` also keeps tool calls, tool responses and tool schemas.
 
 ### Preference optimization
 
 This continues from `model` and `lm_state` above, with a chosen and a rejected response to the same prompt. The masks limit the loss to the response tokens.
 
 ```python
-from dew.data import Loading
-from dew.config.data import loader
-import json
-
-from dew.config.data import PreferenceData
+from dew.data import Memory, presets
 from dew.objectives.rl import DPOObjective
 
 rejected = tokenizer.encode(" He kicked kicked kicked it.")
 pair = {"chosen": prompt + response, "rejected": prompt + rejected,
         "chosen_mask": [0] * len(prompt) + [1] * len(response),
         "rejected_mask": [0] * len(prompt) + [1] * len(rejected)}
-pairs = loader(PreferenceData(source=tuple(json.loads(row) for row in (json.dumps(pair),) * 8), seq_len=16), batch=8, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2), validation_records=(4) * (8))
+pairs = Memory([pair] * 8).repeat().pipe(presets.preferences, seq_len=16, batch=8)
 dpo = DPOObjective(model, seq_len=15, beta=0.1, variables=lm_state.variables)
 dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
 
-`DPOObjective` keeps the starting policy as a frozen reference and raises the likelihood of the chosen response relative to the rejected one. `Preferences.seq_len` is the width of the whole ID row, and shorter pairs are padded to it. The objective scores one position fewer because of the next-token shift.
+`DPOObjective` keeps the starting policy as a frozen reference and raises the likelihood of the chosen response relative to the rejected one. The preset's `seq_len` is the width of the whole ID row, and shorter pairs are padded to it. The objective scores one position fewer because of the next-token shift.
 
 `FlowGRPOObjective` applies group-relative rewards to stochastic flow trajectories. `FlowRollout` samples groups of images, computes their rewards, and records the transition densities that the clipped policy objective uses. [FlowGRPO](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) has a complete example with an image reward.
 
-For online reinforcement learning, `SampledRollout` generates groups of responses and calls a reward function on them. `GRPOObjective` then trains on their advantages, old log probabilities and response masks. [`recipes/chain.py`](https://github.com/AshishKumar4/dew/blob/main/recipes/chain.py) connects pretraining, SFT, distillation, DPO, GRPO and PPO stages. The [post-training guide](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) covers reward callbacks and rollout settings.
+For online reinforcement learning, `RolloutScheduler.sampled` generates groups of responses and calls a reward function on them. `GRPOObjective` then trains on their advantages, old log probabilities and response masks. [`recipes/chain.py`](https://github.com/AshishKumar4/dew/blob/main/recipes/chain.py) connects pretraining, SFT, distillation, DPO, GRPO and PPO stages. The [post-training guide](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) covers reward callbacks and rollout settings.
 
 ### Reinforcement learning with a reward function
 
-This example keeps training the same decoder and rewards stories that mention a dog. A task verifier could replace the reward function. The prompt batch has the same numeric layout that `Prompts` produces, including the UTF-8 reward metadata.
+This example keeps training the same decoder and rewards stories that mention a dog. A task verifier could replace the reward function. The prompt batch has the same numeric layout that `presets.prompts` produces, including the UTF-8 reward metadata.
 
 ```python
-from dew.objectives.rl import GRPOObjective, SampledRollout
+from dew.objectives.rl import GRPOObjective, RolloutScheduler
 from dew.data.dataset import Loader
 
 prompt = tokenizer.encode("Once upon a time, there was a little")
@@ -558,9 +554,9 @@ rl_objective = GRPOObjective(
     beta=0.01,
     variables=lm_state.variables,
 )
-rollout = SampledRollout(
+rollout = RolloutScheduler.sampled(
     rl_objective,
-    reward=reward,
+    reward,
     groups=4,
     max_new_tokens=8,
     sampling=Sampling(temperature=1.0, top_k=40),
@@ -574,7 +570,7 @@ rl_state = Trainer(
 ).fit(rl_data, steps=20, log_every=10)
 ```
 
-Each prompt gets four responses, and `SampledRollout.decode` turns each one into the text the reward reads. The advantages come from how each response's reward compares with the others in its group. GRPO uses a clipped policy objective and an optional KL term against the reference; `beta` sets the KL coefficient. `seq_len` covers the prompt and the 8 response tokens, minus one for the next-token shift.
+Each prompt gets four responses, and `decode` turns each one into the text the reward reads. The advantages come from how each response's reward compares with the others in its group. GRPO uses a clipped policy objective and an optional KL term against the reference; `beta` sets the KL coefficient. `seq_len` covers the prompt and the 8 response tokens, minus one for the next-token shift.
 
 In the Colab run, 3 of 128 responses sampled from the policy before these 20 steps mention a dog, and all 128 sampled after them do.
 
@@ -583,12 +579,11 @@ In the Colab run, 3 of 128 responses sampled from the policy before these 20 ste
 Masked diffusion trains a bidirectional decoder to recover masked tokens. There is no next-token shift, so each input row holds exactly `seq_len` tokens. Windows of `seq_len=127` hold 128 IDs each, which is what the 128-token objective needs. The mask token takes the first ID after GPT-2's vocabulary.
 
 ```python
-from dew.data import Loading
-from dew.config.data import TextData, loader
 from dew.diffusion.discrete import MDLM
 from dew.objectives.diffusion import MaskedDiffusionObjective
 
-masked_data = loader(TextData(source="data/tinystories/train", validation="data/tinystories/val", seq_len=127), batch=64, read="memory", loading=Loading(workers=0), validation_records=(4) * (64))
+masked_data = train.shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=127, batch=64)
+masked_held = val.pipe(presets.token_windows, seq_len=127, batch=64, records=256)
 mask_id = tokenizer.vocab_size
 process = MDLM(mask_id=mask_id)()
 masked_model = CausalTransformer(
@@ -605,7 +600,7 @@ masked_state = Trainer(
     masked_objective,
     optax.adamw(1e-3),
     key=jax.random.key(4),
-).fit(masked_data, steps=4000, log_every=1000, eval_every=2000,
+).fit(masked_data, validation=masked_held, steps=4000, log_every=1000, eval_every=2000,
       metrics=(Perplexity(),))
 drawn = process.generate(masked_model, masked_state.averaged,
                          [tokenizer.encode("Once upon a time")], 48, key=jax.random.key(5))
@@ -623,21 +618,19 @@ LLaDA and Dream train the same way. Diffusion Gemma uses a different process, wi
 A JEPA encoder learns by predicting the representations of masked image patches. This example uses the Flowers data prepared in [Getting started](#getting-started), with 8×8 patches and a smaller predictor.
 
 ```python
-from dew.data import TFDS
-from dew.config.data import Augment, HoldOut, loader
 from pathlib import Path
 
 import jax
 import optax
 
 from dew import Field, Trainer
-from dew.data import Loading
-from dew.config.data import ImageData
+from dew.data import TFDS, presets
 from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, KnnProbe, MultiBlockMask
 
 
 def train_jepa():
-    data = loader(ImageData(source=TFDS(name="oxford_flowers102", split="train", path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1")), image_size=64, caption_templates=("a photo of a {}",), augment=Augment(flip=True, jitter=True, backend="device"), validation=HoldOut(records=(2) * (16))), batch=16, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2))
+    data_path = Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"
+    train, val = TFDS("oxford_flowers102", split="train", path=str(data_path)).holdout(records=32)
     encoder = JepaEncoder(
         patch_size=8,
         emb_features=64,
@@ -663,7 +656,8 @@ def train_jepa():
         optax.adamw(1e-3),
         key=jax.random.key(0),
     ).fit(
-        data,
+        train.shuffle(seed=0).repeat().pipe(presets.images, 64, batch=16, augment=True),
+        validation=val.pipe(presets.images, 64, batch=16),
         steps=20,
         log_every=10,
         eval_every=20,
@@ -769,15 +763,14 @@ use one with `checkpoint_every`. `objective.pipeline` returns a
 An objective can train any Linen module. This example fits `y = 2x + 1` with a single dense layer.
 
 ```python
-from dew.data import Loading
-from dew.config.data import RecordsData, loader
 import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew import Aux, Dataset, Field, InputSpec, Objective, Trainer
+from dew import Aux, Field, InputSpec, Objective, Trainer
+from dew.data import Memory
 
 class Regression(Objective):
     model = nn.Dense(1)
@@ -792,7 +785,7 @@ class Regression(Objective):
         return loss, Aux(metrics={"mse": loss})
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
-data = loader(RecordsData(source={"x": x, "y": 2 * x + 1}), batch=32, read="memory", loading=Loading(workers=0))
+data = Memory({"x": x, "y": 2 * x + 1}).repeat().batch(32)
 objective = Regression()
 state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(
     data, steps=100, log_every=25)
@@ -930,7 +923,7 @@ finally:
     prof.stop()
 ```
 
-Each capture goes in a new directory, so restarting a profiler keeps the earlier results. Without a path, the first start creates a temporary directory that is not deleted, available as `prof.directory`. A capture keeps the native XPlane traces, the HLO files that exist, and XProf's overview, input, kernel, memory and other supported reports. Its manifest records the backend, package versions, capture options and which reports are available. A counter the backend does not provide is recorded as missing, not as zero. The `profile` extra installs XProf's viewer, and each manifest stores the command that opens its capture under `view_command`, for example `xprof --logdir=profiles/run/capture-<id>`.
+Each capture goes in a new directory, so restarting a profiler keeps the earlier results. Without a path, the first start creates a temporary directory that is not deleted, available as `prof.directory`. A capture keeps the native XPlane traces, the HLO files that exist, and XProf's overview, input, kernel, memory and other supported reports. Its manifest records the backend, package versions, capture options and which reports are available, and whether the capture holds what its run did: `capture_status` is `partial`, with `capture_reasons`, when a local accelerator has no kernel track in the trace or a GPU capture reached CUPTI's activity-event cap, past which events are dropped (`activity_cap` on the window raises it). A counter the backend does not provide is recorded as missing, not as zero. The `profile` extra installs XProf's viewer, and each manifest stores the command that opens its capture under `view_command`, for example `xprof --logdir=profiles/run/capture-<id>`.
 
 A capture leaves JAX's Python tracer off. That tracer records every Python and C call and slows Python-heavy host work several times over, so the host time in its traces is not time the run would spend without it. To trace differently, pass `Profiler` an `options=` value. To start a trace yourself with the same settings, use `jax.profiler.start_trace(directory, profiler_options=capture_options())`, with `capture_options` from `dew.telemetry.profile`.
 
@@ -942,17 +935,19 @@ To trace a window of training, pass `Trainer` a `ProfileWindow` with the trace `
 
 ```python
 from dew import Evaluation, LocalTracker
-from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config import RunConfig, TrainerConfig
+from dew.optim import OptimConfig
+from dew.registry import ModelConfig
 from dew.config.sweep import GridSearch
-from dew.config.data import TextData
+from dew.data import Memory
 
 config = RunConfig(
-    # The run records the model it trains, and the batches above stand in
-    # for the dataset this names.
+    # The run records the model and the data it trains; the batches above
+    # stand in for the records this chain reads.
     model=ModelConfig.from_model(objective.model),
-    data=TextData(source="", seq_len=16),
+    data=Memory(batch).repeat().batch(8),
     optim=OptimConfig(optimizer="adam"),
-    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=40, batch_size=8,
+    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=40,
                           eval_every=None, checkpoint_every=None),
 )
 
@@ -1051,10 +1046,6 @@ EMA copy merged over the live parameters, so you don't repeat the model
 configuration at generation time.
 
 ```python
-from dew.data.images import EncodeCaptions
-from dew.config.data import loader
-from dew.data import TFDS
-from dew.config.data import Augment
 from pathlib import Path
 
 import jax
@@ -1062,22 +1053,24 @@ import jax.numpy as jnp
 import optax
 
 from dew import Checkpoints, Trainer
-from dew.config import ModelConfig, TrainerConfig
-from dew.data import Loading
-from dew.config.data import ImageData
-from dew.diffusion import presets
+from dew.config import TrainerConfig
+from dew.registry import ModelConfig
+from dew.data import TFDS, presets
+from dew.diffusion.presets import EDM
 from dew.inference import TextToImage
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.diffusion import DiffusionRunConfig
+from dew.config.diffusion import DiffusionRunConfig
 from dew.sampling import Heun
 
 run = Path("runs/flowers-run")
+data_path = Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1"
+flowers = TFDS("oxford_flowers102", split="all", path=str(data_path))
 config = DiffusionRunConfig(
     model=ModelConfig.from_model(SimpleDiT(patch_size=4, emb_features=128, num_layers=4,
                                            num_heads=4, dtype=jnp.bfloat16)),
-    data=ImageData(source=TFDS(name="oxford_flowers102", split="all", path=str(Path.home() / ".cache/dew/datasets/oxford_flowers102/2.1.1")), image_size=64, caption_templates=("a photo of a {}",), augment=Augment(flip=True, jitter=True, backend="device")),
-    trainer=TrainerConfig(checkpoint_dir=str(run), batch_size=16, steps=20, keep=1),
-    preset=presets.EDM(regime="pixel"),
+    data=flowers.shuffle(seed=0).repeat().pipe(presets.images, 64, batch=16, augment=True),
+    trainer=TrainerConfig(checkpoint_dir=str(run), steps=20, keep=1),
+    preset=EDM(regime="pixel"),
     text=None,
 )
 
@@ -1086,10 +1079,7 @@ def main():
     objective = config.build()
     checkpoints = Checkpoints(str(run), keep=1)
     state = Trainer(objective, optax.adamw(2e-4), key=jax.random.key(0),
-                    checkpoints=checkpoints).fit(
-        loader(config.data, batch=16, read="memory", loading=Loading(workers=0),
-             host=(EncodeCaptions(objective.inputs.tokenize),)),
-        steps=20, log_every=20, checkpoint_every=20)
+                    checkpoints=checkpoints).fit(config.data, steps=20, log_every=20, checkpoint_every=20)
     checkpoints.wait()
     config.save(str(run))
     print(sorted(path.name for path in run.iterdir()))
@@ -1107,10 +1097,8 @@ if __name__ == "__main__":
 The run directory then holds `['20', 'run.json']` and the task draws
 `(2, 64, 64, 3)` images clipped to `[-1, 1]`. `text=None` trains an
 unconditional model, so the prompt list only sets how many images to draw; a
-run with a `TextCondition` encodes the prompts with the encoder it names.
-`load` applies `EncodeCaptions(objective.inputs.tokenize)` as a common host
-stage because the objective's conditions read captions. It runs in the
-training process after batching and closes with the iterator.
+run with a `TextCondition` encodes the prompts with the encoder it names, and
+its objective encodes each batch's captions as the trainer reads them.
 
 ### Exporting a decoder and serving it
 
@@ -1145,7 +1133,6 @@ PY
 ```
 
 ```python
-from dew.config.data import loader
 from pathlib import Path
 
 import jax
@@ -1154,8 +1141,8 @@ import numpy as np
 import optax
 
 from dew import Trainer
-from dew.data import HFTokenizer, Loading
-from dew.config.data import TextData
+from dew.data import HFTokenizer, presets
+from dew.data.sources import TokenFiles
 from dew.interop import PretrainedDecoder
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
@@ -1165,7 +1152,7 @@ tokens = Path("runs/tokens")
 export = Path("runs/dew-decoder")
 tokenizer = HFTokenizer("tests/fixtures/tokenizers/tiny-tools")
 
-data = loader(TextData(source=str(tokens / "train"), validation=str(tokens / "val"), seq_len=128), batch=16, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2), validation_records=(4) * (16))
+data = TokenFiles(str(tokens / "train")).shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=128, batch=16)
 model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           emb_features=128, num_layers=4, num_heads=4, num_kv_heads=2,
                           mlp_features=256, max_seq_len=128, dtype=jnp.float32,
@@ -1282,15 +1269,12 @@ Every host runs the same script. The example below uses two hosts with two GPUs 
 Prepare byte-token data from your corpus and place it on shared storage:
 
 ```bash
-dew data export records /shared/tokens \
-    --fields '{"source": "corpus.txt"}' \
-    --format array_record --tokenizer byte --read memory
+dew data export corpus.txt /shared/tokens --tokenizer byte --read memory
 ```
 
 Save this as `train_multihost.py`. `prepare_process` joins the process pool, so call it before you create any device array.
 
 ```python
-from dew.config.data import loader
 import os
 
 import jax
@@ -1305,12 +1289,13 @@ def main():
         import jax.numpy as jnp
 
         from dew import Checkpoints, MeshSpec, Trainer
-        from dew.data import Loading
-        from dew.config.data import TextData
+        from dew.data import presets
+        from dew.data.sources import TokenFiles
         from dew.nn.backbones import CausalTransformer
         from dew.objectives.lm import LMObjective
 
-        data = loader(TextData(source=os.environ["DEW_TOKEN_DIR"], seq_len=128), batch=16, read="memory", loading=Loading(workers=0, threads=1, read_buffer=2), validation_records=(4) * (16))
+        tokens = TokenFiles(os.environ["DEW_TOKEN_DIR"])
+        data = tokens.shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=128, batch=16)
         model = CausalTransformer(
             vocab_size=256,
             emb_features=128,
@@ -1424,9 +1409,9 @@ Each worker needs access to the checkpoint and tokenizer files. A shared downloa
 
 ## Data and configuration
 
-Dew's dataset specifications build batches with Grain. The token loaders read fixed windows or packed documents, and the chat, preference and prompt loaders read post-training data. Image and video data can come from local files, Hugging Face datasets, TFDS, ArrayRecord shards or URL streams.
+A Dew dataset is one chain: a source, your own steps, then a preset that ends in batches, lowered to Grain. The `lm` preset reads fixed windows or packs whole documents, and the `sft`, `preferences` and `prompts` presets read post-training data. Images and video can come from local files, Hugging Face datasets, TFDS, ArrayRecord shards or URL streams.
 
-`Loading` sets the number of workers, read threads and buffers. `Dataset` also accepts your own iterator factories, as in the fine-tuning examples above. [Data loading](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/data.md) covers transforms, deterministic randomness, batching and who owns the iterators.
+`workers(n)`, `threads(n)` and `prefetch(n)` set how the chain runs. `Trainer.fit` also accepts your own iterator factories (a `Loader`), as in the fine-tuning examples above. [Data loading](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/data.md) covers transforms, deterministic randomness, batching and who owns the iterators.
 
 The recipes turn dataclass configurations into command-line options with tyro. `ModelConfig`, `OptimConfig` and `TrainerConfig` hold the model, optimizer and run settings, and task-specific configurations add diffusion or language-model options. `--help` lists the options:
 
@@ -1447,19 +1432,30 @@ curl -LsSf https://dewml.dev/install.sh | sh
 The script finds the hardware and the build it runs (an NVIDIA GPU and the CUDA version its driver supports, a TPU VM, or the CPU), asks where to install, installs [uv](https://docs.astral.sh/uv/) if it is missing, and installs Dew there.
 
 <!-- BEGIN least Python (site/scripts/gen_install.py) -->
-Dew needs Python 3.12 or newer.
+Dew needs Python 3.12 or newer, and CI tests 3.12 and 3.14.
 <!-- END least Python -->
 
-I recommend 3.14, and CI tests both. To install it yourself, choose the extra for your hardware; each installs the accelerator build of the JAX version Dew requires:
+I recommend the newest of them. To install it yourself, choose the extra for your hardware; each installs the accelerator build of the JAX version Dew requires:
 
+<!-- BEGIN install commands (site/scripts/gen_install.py) -->
 | Hardware | uv | pip |
 |---|---|---|
 | CPU | `uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple` | `pip install dewml --extra-index-url https://pypi.dewml.dev/simple` |
-| NVIDIA GPU, driver 580+ | `uv pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` |
-| NVIDIA GPU, driver 525+ | `uv pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` |
+| NVIDIA GPU, driver 580+ (CUDA 13) | `uv pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` |
+| NVIDIA GPU, driver 525+ (CUDA 12) | `uv pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` |
 | Google TPU VM | `uv pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` |
+<!-- END install commands -->
 
-Dew runs on its own build of JAX 0.11.2, which only its package index serves; without `--extra-index-url https://pypi.dewml.dev/simple` the install stops at resolving jax ([installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#dews-jax-build)).
+<!-- BEGIN pip (site/scripts/gen_install.py) -->
+Use pip 26.2.2 or newer and uv 0.13.4 or newer: older ones trust the roots of eMudhra's compromised certificate authorities (October 2026). Update pip from its wheel by hash, so the update holds whatever the older pip trusts, and uv through the system's certificates once they are updated:
+
+```bash
+python -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+UV_SYSTEM_CERTS=true uv self update
+```
+<!-- END pip -->
+
+Dew runs on its own build of JAX, which only its package index serves; without `--extra-index-url https://pypi.dewml.dev/simple` the install stops at resolving jax ([installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#dews-jax-build)).
 
 CUDA 13 also needs a GPU of compute capability 7.5 or later ([which CUDA build](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#which-cuda-build)).
 
@@ -1473,7 +1469,7 @@ source .venv/bin/activate
 uv pip install -e ".[cuda12]" --extra-index-url https://pypi.dewml.dev/simple
 ```
 
-To install the main branch without cloning it, run `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`. The extras install the accelerator build of jaxlib 0.11.2 under Dew's JAX build. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on.
+To install the main branch without cloning it, run `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`. The extras install the accelerator build of jaxlib that matches Dew's JAX build. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on.
 
 `pyproject.toml` lists every optional extra, and the installation guide's [Optional extras](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#optional-extras) says what each adds. `interop` reads and writes safetensors, `vision` provides the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs used in the serving section. The sections above name the extra each feature needs. The [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md) covers development dependencies and dataset preparation.
 

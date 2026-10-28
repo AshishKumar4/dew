@@ -1,0 +1,26 @@
+{
+ "released": {
+  "repo": "inclusionAI/LLaDA2.2-flash",
+  "revision": "9b78da3f9149f1e239fb6d15f20a326fde574b9f",
+  "files": [
+   "config.json",
+   "configuration_llada2_moe.py",
+   "modeling_llada2_moe.py"
+  ]
+ },
+ "transformers": {
+  "version": "5.16.1"
+ },
+ "torch": {
+  "version": "2.9.0+cpu"
+ },
+ "generator": "tools/llada_moe_reference.py llada22-tiny --draw",
+ "seed": 0,
+ "routing": "Unlike 2.0 and 2.1, 2.2 selects expert_capacity experts per block_size row-major tokens by each expert's maximum biased score in the block, then selects top-k for each token. The release uses block_size=32 and expert_capacity=48; this fixture uses 4 and 4 over 16 experts.",
+ "sampling": "The release also offers DELETE and SPLIT editing during block-wise generation. These are sampler operations, not an architectural forward change. Dew uses its shared MDLM sampler.",
+ "recording": {
+  "file": "released.npz",
+  "by": "tools/recorded_references.py record_case, summary",
+  "torch": "2.14.1+cpu"
+ }
+}

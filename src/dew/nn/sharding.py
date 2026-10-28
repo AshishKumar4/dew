@@ -18,17 +18,19 @@ A parameter that no declaration names (a convolution, a state matrix, a
 projection with no side worth naming) gets the shape heuristic, which
 places it on its largest divisible axis.
 
-This module also defines the mesh axis names and the functions that read
-the mesh in context: `pipeline_stages` for the decoder's stage count,
-`microbatches` for the schedule the trainer sets in context around its
-compiled step, `sequence_shards` for how many ways attention and the Mamba-2
-mixer split a sequence, `row_axes` for the axes their `shard_map`s split
-rows over, and `manual_map` for those maps.
+This module also defines the functions that read the mesh in context:
+`pipeline_stages` for a pipeline's stage count, `microbatches` for the
+schedule the trainer sets in context around its compiled step,
+`in_pipeline_stage` for whether a stage's body is tracing, whose vmap holds
+the stage axis,
+`sequence_shards` for how many ways attention and the Mamba-2 mixer split a
+sequence, and `manual_map` for their `shard_map`s, whose rows split over the
+axes `dew.mesh.row_axes` names.
 
-`DEFAULT_RULES` maps the logical names onto the mesh, for parameters and
-activations alike. `logical_spec` reads it (or the rules a layout sets in
-context) to place a parameter or an activation, and `constrain` applies that
-placement to an activation.
+The mesh's axis names, the rule table that maps the logical names onto them
+(`dew.mesh.DEFAULT_RULES`, for parameters and activations alike) and the spec
+it gives an array (`dew.mesh.logical_spec`) are `dew.mesh`'s, below the models
+and the data; `constrain` applies that spec to an activation.
 """
 
 from __future__ import annotations
@@ -42,132 +44,24 @@ from collections.abc import Callable, Iterator, Mapping
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
-from flax.linen import spmd
 
-type LogicalAxes = tuple[str | None, ...]
+from dew.mesh import (
+    SEQUENCE_AXIS,
+    STAGE_AXIS,
+    TENSOR_AXIS,
+    LogicalAxes,
+    LogicalAxisRules,
+    MeshAxes,
+    axis_rules,
+    logical_spec,
+    mesh_axes,
+    row_axes,
+)
+
 type Suffix = tuple[str, ...]
 
-DATA_AXIS = 'data'
-EXPERT_AXIS = 'expert'
-FSDP_AXIS = 'fsdp'
-TENSOR_AXIS = 'tensor'
-SEQUENCE_AXIS = 'sequence'
-STAGE_AXIS = 'stage'
-"""The axes of a mesh `MeshSpec.build` builds, plus the stage axis a
-pipeline mesh adds. They are named here because the attention seam and the
-decoder read them off the mesh in context: the sequence axis attention splits
-its queries over, and the tensor and stage axes, which hold a width and a
-pipeline stage and never a row."""
-
-MESH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS, SEQUENCE_AXIS, STAGE_AXIS)
-"""Every mesh's axes, in the order `MeshSpec.build` lays them out."""
-
-BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS)
-"""The mesh axes a batch's rows split over, in mesh order. Sequence holds a
-slice of the positions, stage the pipeline's stages that hand one batch's
-microbatches along, and tensor the widths of Megatron's split, so every
-tensor shard computes its share of the width for every row."""
-
-
-class LayoutRefused(ValueError):
-    """Raised for a mesh layout that a model, an objective or a device set does not run, by design.
-
-    The message names the axis, says why it cannot hold what it would split,
-    and gives a layout that runs. Any other error on a layout is a defect.
-    It is a ValueError, so a caller that catches ValueError catches it too.
-    """
-
-type MeshAxes = str | tuple[str, ...] | None
-type LogicalAxisRules = tuple[tuple[str, MeshAxes], ...]
-
-# Rule order is precedence when two logical dimensions target the one mesh
-# axis. A name written twice is an ordered pair of choices, the form flax
-# documents for `logical_to_mesh_axes`: the second places a dimension the
-# first could not, because another dimension of the same array took that
-# axis, or because its axes do not divide the dimension (`logical_spec`).
-#
-# The tensor axis carries Megatron's split. That is the mlp's hidden width
-# ('mlp'), the attention's query heads ('heads') and its grouped key and value
-# heads ('kv'), the attention width o_proj reads back ('attention'), and the
-# vocabulary of the embedding table and the output head ('vocab'). Each of
-# those is the output side of one matmul and the input side of the next, so
-# splitting it splits both and leaves the block one reduction.
-#
-# 'embed', the residual width every norm, residual add, rotation and the
-# loss share, stays whole on the tensor axis and keeps fsdp: sharding it puts
-# a collective between every pair of sublayers. A kernel holding both splits
-# in two dimensions as MaxText's rules do, the residual width over fsdp and
-# the Megatron width over tensor (the mlp and attention widths name tensor
-# first and fsdp second). Split over fsdp and tensor together, those widths
-# had GSPMD repeat products on both devices of every pair (1.21 times one
-# device's FLOPs, layout_parity's dense decoder on fsdp2_tensor2). The
-# vocabulary, which shares no array with a residual, splits fsdp times
-# tensor ways.
-#
-# fsdp alone stores a split: a parameter it splits is gathered whole for
-# every use, so which dimension it takes changes no product, only how the
-# shards lie in memory. Among the dimensions a rule names it alone for, it
-# takes the array's leading one that no other axis took (`logical_spec`),
-# whatever the rule order: each shard is then one block of the row-major
-# array, so its gather concatenates and its gradient's reduce-scatter cuts,
-# as PyTorch's FSDP2 splits every parameter on dim 0 (`fully_shard`).
-# Split on the mlp width, the gate and up projections transposed their
-# gradients for every update: Llama-3.1-8B over FSDP 2 on two H100 SXMs
-# stepped in 537.8 ms, and in 488.0 split on the residual width.
-# A name whose rule pairs fsdp with tensor (the vocabulary, the heads) splits
-# for a computation, and its rule order stands.
-#
-# The activation_ names place what a step computes rather than what it
-# stores, by the same table: rows over the batch axes, positions over the
-# sequence axis, and the widths of Megatron's split over tensor. The residual
-# width (activation_embed) has no rule, so it stays whole.
-DEFAULT_RULES: LogicalAxisRules = (
-    ("vocab", (FSDP_AXIS, TENSOR_AXIS)),
-    ("mlp", TENSOR_AXIS),
-    ("mlp", FSDP_AXIS),
-    ("modulation", FSDP_AXIS),
-    ("attention", TENSOR_AXIS),
-    ("attention", FSDP_AXIS),
-    # The gated delta net's projected width (keys, values and their gate),
-    # placed like the attention's: the width over the model dimension.
-    ("linear", FSDP_AXIS),
-    ("embed", FSDP_AXIS),
-    ("head_dim", FSDP_AXIS),
-    ("heads", (FSDP_AXIS, TENSOR_AXIS)),
-    ("kv", (FSDP_AXIS, TENSOR_AXIS)),
-    # The latent widths multi-head latent attention compresses through and
-    # the sparse indexer's head dim: model-width-like, so they ride fsdp.
-    ("index", FSDP_AXIS),
-    ("kvlora", FSDP_AXIS),
-    ("qlora", FSDP_AXIS),
-    ("output", FSDP_AXIS),
-    ("exp", EXPERT_AXIS),
-    # A projection from the residual width to the heads, q_proj's shape: the
-    # rule above gave 'embed' fsdp, so the heads take the tensor axis by
-    # itself rather than fall back to replication.
-    ("heads", TENSOR_AXIS),
-    ("kv", TENSOR_AXIS),
-    ("activation_batch", BATCH_AXES),
-    ("activation_length", SEQUENCE_AXIS),
-    # The positions of a stretch of per-token work that splits no width the
-    # tensor axis splits, which every tensor shard would otherwise compute
-    # whole (`SPREAD`): over the tensor axis beside the sequence axis, as
-    # Megatron's sequence parallelism splits the positions of its norms;
-    # over the sequence axis alone where the tensor axis cannot divide them.
-    ("activation_spread", (SEQUENCE_AXIS, TENSOR_AXIS)),
-    ("activation_spread", SEQUENCE_AXIS),
-    ("activation_heads", TENSOR_AXIS),
-    ("activation_kv", TENSOR_AXIS),
-    ("activation_mlp", TENSOR_AXIS),
-    ("activation_vocab", TENSOR_AXIS),
-    # A served paged cache's pool splits its pages as the served rows split,
-    # one part of the pool per group of rows (`dew.inference.serving`).
-    ("pages", BATCH_AXES),
-    # Rows too few for every batch axis split over the first ones.
-    ("activation_batch", (DATA_AXIS, EXPERT_AXIS)),
-    ("activation_batch", DATA_AXIS),
-)
 
 RESIDUAL: LogicalAxes = ("activation_batch", "activation_length", "activation_embed")
 """The logical axes of a `[batch, length, width]` activation between sublayers,
@@ -250,12 +144,34 @@ def microbatches() -> int:
     return pipeline_stages() if schedule.count is None else schedule.count
 
 
+_STAGED: contextvars.ContextVar[bool] = contextvars.ContextVar('pipeline_stage', default=False)
+
+
+@contextlib.contextmanager
+def pipeline_stage() -> Iterator[None]:
+    """Trace one stage's body inside a pipeline over the stage axis, whose vmap places the stage axis
+    (`dew.nn.backbones.decoder_stack.run_pipeline`)."""
+    token = _STAGED.set(True)
+    try:
+        yield
+    finally:
+        _STAGED.reset(token)
+
+
+def in_pipeline_stage() -> bool:
+    """Whether a pipeline stage's body is tracing (`pipeline_stage`): the stage axis is its vmap's
+    there, and an automatic mesh axis like any other everywhere else, where whatever runs outside
+    the pipeline runs on every stage."""
+    return _STAGED.get()
+
+
 @dataclasses.dataclass
 class Link:
     """A mesh axis's interconnect, one device's dense bf16 peak, and whether a projection split over the axis.
 
     The trainer measures the interconnect when it places a step
-    (`dew.training.distributed.link_bandwidth`). `down_projection` and
+    (`dew.training.distributed.link_bandwidth`), or takes it as stated
+    (`Trainer(links=...)`). `down_projection` and
     `split_positions` set `spread` when they decide to split a projection in
     the step over the axis.
     """
@@ -263,12 +179,11 @@ class Link:
     bytes_per_second: float | None
     """The bytes one device receives per second in an all-gather over the axis:
     (N - 1) / N of the result, divided by the time the gather took. None where
-    nothing was measured: on a CPU mesh, or on a device the peak table does not
-    name."""
+    nothing was measured or stated: on a device the peak table does not name,
+    a CPU among them."""
     flops_per_second: float | None
     """One device's dense bf16 peak in FLOPs per second, or None for hardware
     Dew's target table does not name (`dew.nn.kernels.gpu_target(...).bf16_peak`)."""
-    platform: str
     spread: bool = False
 
 
@@ -307,7 +222,7 @@ def trace_context() -> tuple:
     pipeline's microbatch count, the logical-axis rules and the measured links. A program cached by
     its arguments' shapes is reused only under the same (`Objective.program`)."""
     schedule = _SCHEDULE.get()
-    links = tuple(sorted((axis, link.bytes_per_second, link.flops_per_second, link.platform)
+    links = tuple(sorted((axis, link.bytes_per_second, link.flops_per_second)
                          for axis, link in _LINKS.get().items()))
     return (None if schedule is None else schedule.count, axis_rules(), links)
 
@@ -325,10 +240,8 @@ def _spreads(axis: str, x: jax.Array, latent: int, tokens: float, *, padding: fl
     twice that fraction of the fp32 weight gradient. It cannot lose where
     the axis's link moves those bytes in no more time than the device's
     peak takes for the saved FLOPs. The weight gradient is a microbatch's,
-    so it weighs more at fewer tokens. A CPU mesh's devices share one host's
-    memory, which moves a byte in less time than a CPU's matmul spends on a
-    thousand FLOPs, and it splits. Without a measured link, or with a device
-    the peak table does not name, the projection runs on every token."""
+    so it weighs more at fewer tokens. Without a measured or stated link,
+    the projection runs on every token, on every platform alike."""
     link = _LINKS.get().get(axis)
     if link is None:
         return False
@@ -340,12 +253,8 @@ def _spreads(axis: str, x: jax.Array, latent: int, tokens: float, *, padding: fl
     flops = 6 * width * latent * saved
     moved = (1 - 1 / shards) * ((width + latent) * x.dtype.itemsize * (tokens + padding)
                                 + 2 * width * latent * 4)
-    if link.platform == 'cpu':
-        spreads = True
-    elif link.bytes_per_second is None or link.flops_per_second is None:
-        spreads = False
-    else:
-        spreads = link.bytes_per_second * flops >= link.flops_per_second * moved
+    spreads = (link.bytes_per_second is not None and link.flops_per_second is not None
+               and link.bytes_per_second * flops >= link.flops_per_second * moved)
     link.spread = link.spread or spreads
     return spreads
 
@@ -398,7 +307,8 @@ def split_positions(x: jax.Array, head_shape: tuple[int, int],
     unchanged. A cross-attention's context (SD's 77 text tokens) is the input
     this serves; its weight-gradient sum usually outweighs the saved
     projection, so a GPU's link rarely pays (an H100 would need 2.47 TB/s at
-    SDXL's widths), while a CPU mesh splits it."""
+    SDXL's widths); a CPU's devices measure no link and keep the context whole
+    unless the run states one (`Trainer(links=...)`)."""
     shards = sequence_shards()
     length = x.shape[1]
     if shards == 1 or length % shards == 0:
@@ -414,17 +324,6 @@ def split_positions(x: jax.Array, head_shape: tuple[int, int],
         return project(x)
     padded = jnp.pad(x, ((0, 0), (0, padded_length - length)) + ((0, 0),) * (x.ndim - 2))
     return jax.tree.map(lambda out: out[:, :length], project(padded))
-
-
-def row_axes(batch: int, *, mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None
-             ) -> tuple[str, ...]:
-    """The mesh axes a `shard_map` over the sequence axis splits `batch` rows
-    over: the ones `activation_batch` takes for `batch` rows on `mesh`, the
-    mesh in context by default (`logical_spec`). A batch too small for them is
-    computed alike on those axes' shards, the way GSPMD replicates a dimension
-    it cannot split."""
-    spec = logical_spec(("activation_batch",), (batch,), mesh=mesh)
-    return mesh_axes(spec[0]) if spec else ()
 
 
 def manual_map[**Arguments, Result](local: Callable[Arguments, Result], in_specs,
@@ -457,25 +356,6 @@ def manual_map[**Arguments, Result](local: Callable[Arguments, Result], in_specs
                          check_vma=False)
 
 
-def batch_axes(mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh) -> tuple[str, ...]:
-    """The axes of `mesh` a batch's rows split over: every axis
-    `activation_batch` takes, each of which divides `mesh.size` rows."""
-    return row_axes(mesh.size, mesh=mesh)
-
-
-def mesh_axes(assignment: MeshAxes) -> tuple[str, ...]:
-    """Read one entry of a spec or a rule as the mesh axes it names."""
-    if assignment is None:
-        return ()
-    return (assignment,) if isinstance(assignment, str) else tuple(assignment)
-
-
-def axis_rules() -> LogicalAxisRules:
-    """The rules in context, `flax.linen.logical_axis_rules`'s, where the
-    trainer puts its layout's; the default table outside one."""
-    return tuple(nn.get_logical_axis_rules()) or DEFAULT_RULES
-
-
 def grouped_heads(shape: tuple[int, ...], groups: int) -> tuple[MeshAxes, MeshAxes]:
     """The mesh axes the rule table splits a `[B, T, H, ...]` activation's rows and heads over
     (`HEADS`), its heads whole where their split does not divide the `groups` they read (a delta
@@ -487,65 +367,6 @@ def grouped_heads(shape: tuple[int, ...], groups: int) -> tuple[MeshAxes, MeshAx
     if groups % math.prod(mesh.shape[axis] for axis in mesh_axes(heads)):
         heads = None
     return rows, heads
-
-
-def logical_spec(axes: LogicalAxes, shape: tuple[int, ...], *,
-                 rules: LogicalAxisRules | None = None,
-                 mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh | None = None
-                 ) -> jax.sharding.PartitionSpec:
-    """Return the spec that `rules` give, on `mesh`, an array of `shape` whose dimensions `axes` names.
-
-    `rules` and `mesh` default to the ones in context. A mesh axis of size 1
-    shards nothing, and a manual axis belongs to the `shard_map` in context,
-    so both are dropped from the rules before they are read. Such an axis
-    claims no dimension, and a name whose rule named only such axes takes
-    its next rule. With no tensor axis, 'mlp' passes its tensor rule to
-    fsdp. A rule whose axes do not divide its dimension evenly cannot split
-    it, so that rule is set aside for this array: the name takes its next
-    rule, or none, and the mesh axis goes to the next dimension that names
-    it. For example, an odd vocabulary shards the embedding on its width and
-    keeps the table in the layout. fsdp, placed by a name whose first rule
-    names it alone, then moves to the leading dimension of such a name that
-    no other axis took and that it divides (`DEFAULT_RULES`).
-    """
-    rules = axis_rules() if rules is None else rules
-    mesh = jax.sharding.get_abstract_mesh() if mesh is None else mesh
-
-    def splitting(assignment: MeshAxes) -> tuple[str, ...]:
-        return tuple(axis for axis in mesh_axes(assignment)
-                     if axis not in mesh.manual_axes and mesh.shape.get(axis, 1) > 1)
-
-    # A rule of None keeps its name whole and stands; one whose axes all
-    # split nothing is dropped. `stored` names those whose first rule left
-    # names fsdp alone.
-    left: list[tuple[str, MeshAxes]] = []
-    stored: set[str] = set()
-    for name, assignment in rules:
-        used = splitting(assignment)
-        if assignment is not None and not used:
-            continue
-        if all(name != kept for kept, _ in left) and mesh_axes(assignment) == (FSDP_AXIS,):
-            stored.add(name)
-        left.append((name, None if assignment is None else used[0] if len(used) == 1 else used))
-    while True:
-        mapped = spmd.logical_to_mesh_axes(axes, tuple(left))
-        assert mapped is not None, "flax answers None for array_dim_names=None only"
-        assigned = [mesh_axes(assignment) for assignment in mapped]
-        blocked = {(name, assignment) for name, assignment, used, size
-                   in zip(axes, mapped, assigned, shape, strict=True)
-                   if size % math.prod(mesh.shape[axis] for axis in used)}
-        if not blocked:
-            break
-        left = [rule for rule in left if rule not in blocked]
-    # fsdp alone takes the leading such dimension no other axis took (`DEFAULT_RULES`).
-    leading = [dim for dim, (name, used, size) in enumerate(zip(axes, assigned, shape, strict=True))
-               if name in stored and used in ((), (FSDP_AXIS,)) and size % mesh.shape.get(FSDP_AXIS, 1) == 0]
-    if (FSDP_AXIS,) in assigned and assigned.index((FSDP_AXIS,)) in leading:
-        assigned[assigned.index((FSDP_AXIS,))], assigned[leading[0]] = (), (FSDP_AXIS,)
-    entries = [used[0] if len(used) == 1 else used or None for used in assigned]
-    while entries and entries[-1] is None:
-        entries.pop()
-    return jax.sharding.PartitionSpec(*entries)
 
 
 def constrain(x: jax.Array, axes: LogicalAxes) -> jax.Array:
@@ -595,6 +416,14 @@ def explicit_spec(x: jax.Array, trailing: int = 0) -> jax.sharding.NamedSharding
     return jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(*padded))
 
 
+def rows_taken(table: jax.Array, index: jax.Array) -> jax.Array:
+    """`table`'s rows at `index` (`jnp.take` on its first axis), placed as `index` is where an Explicit
+    axis splits it: a replicated table read by each device's own indices, as a schedule's is by each
+    example's time (`dew.objectives.base.Step.sample`)."""
+    placed = explicit_spec(jnp.asarray(index), table.ndim - 1)
+    return jnp.take(table, index, axis=0) if placed is None else table.at[index].get(out_sharding=placed)
+
+
 def rows_spec(like: jax.Array, ndim: int) -> jax.sharding.NamedSharding | None:
     """A placement for an array of `ndim` dimensions whose rows are `like`'s:
     the Explicit axis that splits `like`'s first dimension on its first, the
@@ -624,15 +453,35 @@ def rows_like(x: jax.Array, like: jax.Array) -> jax.Array:
     return x if placed is None else jax.sharding.reshard(x, placed)
 
 
+def automatic_axes() -> tuple[str, ...]:
+    """The axes of the context's mesh larger than one device that no
+    `shard_map` holds manual: those over which XLA's partitioner, not a
+    kernel, would split an operand."""
+    mesh = jax.sharding.get_abstract_mesh()
+    return tuple(name for name in mesh.axis_names if mesh.shape[name] > 1 and name not in mesh.manual_axes)
+
+
 def seen_whole(value: jax.Array) -> bool:
     """Whether a Pallas kernel, which sees local arrays and carries no
     manual-axis type, can take `value` where it is traced: no mesh axis
-    outside a `shard_map` splits it, and no `shard_map` that checks varying
-    axes holds it."""
-    mesh = jax.sharding.get_abstract_mesh()
-    split = any(mesh.shape[name] > 1 for name in mesh.axis_names
-                if name not in mesh.manual_axes)
-    return not split and not jax.typeof(value).mat.varying
+    outside a `shard_map` splits it (`automatic_axes`), and no `shard_map`
+    that checks varying axes holds it."""
+    return not automatic_axes() and not jax.typeof(value).mat.varying
+
+
+def per_shard(kernel: str) -> None:
+    """Raise unless the kernel named `kernel` launches per shard: every
+    axis of the context's mesh larger than one device manual (`manual_map`,
+    a `shard_map`), so each device's launch reads its own operands. Under an
+    automatic axis XLA's partitioner splits the operands around a call that
+    reads them whole, and every device runs the whole batch (row 1923; the
+    gated delta net's template, 1897). The kernels' launch points call it as
+    they trace (`templates.mosaic.Family.kernel`, the TPU and Triton GEMM
+    launches); a selector refuses such a call first (`seen_whole`)."""
+    if axes := automatic_axes():
+        raise ValueError(f"{kernel} launches with the mesh's {', '.join(axes)} automatic: a kernel reads its "
+                         f"operands whole, so it launches only where every axis larger than one device is "
+                         f"manual (`manual_map`), each device on its own rows")
 
 
 def _qualified(cls: type) -> str:
@@ -745,20 +594,48 @@ def boxed(table: Mapping[Suffix, LogicalAxes]) -> Iterator[None]:
         _BOXED.reset(token)
 
 
+ADAPTER_RANK = "adapter_rank"
+"""The logical axis of a low-rank adapter's rank (`LOW_RANK_FACTORS`), which no rule places."""
+
+LOW_RANK_FACTORS = ("lora_A", "lora_B")
+"""The low-rank factors an adapted module holds beside its kernel (`dew.lora`): `lora_A` of shape
+`[in..., r]` and `lora_B` of `[r, out...]`, which `declarations` gives the kernel's axes on each
+one's side of the rank."""
+
+
 def declarations(tree) -> dict[Suffix, LogicalAxes]:
     """The axes `logical_axes` declares for each leaf of `tree`, by the
     leaf's parameter path, the one place the declarations are read: a
     declaration names a module, whose parameters share its axes, or one
     parameter under its module, for a module whose leaves have different
     axes (GPT OSS's fused experts). The parameter's own path is tried first.
+    A low-rank factor under a declared module takes its kernel's axes on its
+    side of the rank and `ADAPTER_RANK` for the rank (`factor_axes`).
     """
     table: dict[Suffix, LogicalAxes] = {}
-    for path, _ in jax.tree_util.tree_leaves_with_path(nn.unbox(tree)):
+    for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(tree)):
         names = parameter_path(path)
-        suffix = _matching(_OWNERS, names) or _matching(_OWNERS, names[:-1])
-        if suffix is not None:
-            table[names] = _OWNERS[suffix][0]
+        if (owned := _matching(_OWNERS, names)) is not None:
+            table[names] = _OWNERS[owned][0]
+        elif (module := _matching(_OWNERS, names[:-1])) is not None:
+            axes = _OWNERS[module][0]
+            factor = names[-1] in LOW_RANK_FACTORS
+            table[names] = factor_axes(axes, names[-1], np.ndim(leaf)) if factor else axes
     return table
+
+
+def factor_axes(kernel: LogicalAxes, factor: str, ndim: int) -> LogicalAxes:
+    """The axes of a layer's low-rank `factor` (`LOW_RANK_FACTORS`) of `ndim` dimensions, under a
+    kernel declared `kernel`: `lora_A`'s are the kernel's leading `ndim - 1` axes, its inputs, then
+    `ADAPTER_RANK`; `lora_B`'s `ADAPTER_RANK` then the kernel's trailing `ndim - 1`, its outputs.
+    Read off the factor alone, so a tree holding one factor without the other (an optimizer's
+    masked partition, a parameter group) declares it as the whole adapter does."""
+    sides = ndim - 1
+    if not 0 < sides < len(kernel):
+        raise ValueError(f"a {factor} of {ndim} dimensions does not split a kernel declared {kernel}")
+    if factor == "lora_A":
+        return (*kernel[:sides], ADAPTER_RANK)
+    return (ADAPTER_RANK, *kernel[len(kernel) - sides:])
 
 
 def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
@@ -778,5 +655,4 @@ def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> Lo
     return axes[len(axes) - ndim:]
 
 
-__all__ = ["DATA_AXIS", "FSDP_AXIS", "RESIDUAL", "LayoutRefused", "Link", "LogicalAxes", "LogicalAxisRules",
-           "Schedule", "logical_axes", "logical_spec"]
+__all__ = ["ADAPTER_RANK", "RESIDUAL", "Link", "Schedule", "logical_axes"]

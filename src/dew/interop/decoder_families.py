@@ -8,14 +8,20 @@ from dew.interop.families.deepseek import (
     DEEPSEEK_V3,
     DEEPSEEK_V4,
     DEEPSEEK_V32,
-    KIMI_K2,
     KIMI_K25,
     MINIMAX_M2,
 )
 from dew.interop.families.deepseek_v41 import DEEPSEEK_V41
 from dew.interop.families.dory import DORY
 from dew.interop.families.falcon import FALCON
-from dew.interop.families.gemma import GEMMA, GEMMA2, GEMMA3_TEXT, GEMMA3N_TEXT, GEMMA4_TEXT
+from dew.interop.families.gemma import (
+    GEMMA,
+    GEMMA2,
+    GEMMA3_TEXT,
+    GEMMA3N_TEXT,
+    GEMMA4_TEXT,
+    GEMMA4_UNIFIED_TEXT,
+)
 from dew.interop.families.glm import GLM4_MOE, GLM5_NEXT_TEXT, GLM_MOE_DSA
 from dew.interop.families.gpt2 import GPT2, GPT_NEO, GPTJ
 from dew.interop.families.gpt_bigcode import GPT_BIGCODE
@@ -23,10 +29,11 @@ from dew.interop.families.gpt_neox import GPT_NEOX
 from dew.interop.families.gpt_oss import GPT_OSS
 from dew.interop.families.k2_horizon import K2_HORIZON
 from dew.interop.families.kimi import KIMI_K3, KIMI_LINEAR
+from dew.interop.families.lfm3 import LFM3
 from dew.interop.families.llama import GRANITEMOE, MISTRAL, MIXTRAL, llama_config, ministral_config
 from dew.interop.families.llama4 import LLAMA4_TEXT
 from dew.interop.families.mamba import MAMBA
-from dew.interop.families.masked_diffusion import DIFFUSION_GEMMA_TEXT, DREAM, LLADA
+from dew.interop.families.masked_diffusion import DIFFUSION_GEMMA_TEXT, DREAM, LLADA, LLADA2_MOE, LLADA_MOE_V2
 from dew.interop.families.mimo import MIMO_V2, MIMO_V2_FLASH
 from dew.interop.families.modernbert import MODERNBERT
 from dew.interop.families.muse import MUSE_GLIMMER_TEXT
@@ -49,6 +56,9 @@ from dew.interop.families.starcoder2 import STARCODER2
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 ENTRIES = (
+    # Its convolution kind first: its gated attention and sliding layers are matched broadly below
+    # (Qwen 3.5's output gate, Ministral's sliding layers).
+    LFM3,
     DORY,
     OURO,
     BLOOM,
@@ -70,6 +80,8 @@ ENTRIES = (
     GLM5_NEXT_TEXT,
     DIFFUSION_GEMMA_TEXT,
     DREAM,
+    LLADA2_MOE,
+    LLADA_MOE_V2,
     LLADA,
     GPT_OSS,
     LLAMA4_TEXT,
@@ -79,7 +91,6 @@ ENTRIES = (
     DEEPSEEK_V4,
     DEEPSEEK_V32,
     DEEPSEEK_V2,
-    KIMI_K2,
     KIMI_K25,
     KIMI_LINEAR,
     KIMI_K3,
@@ -91,6 +102,7 @@ ENTRIES = (
     OLMO3,
     GEMMA3N_TEXT,
     GEMMA4_TEXT,
+    GEMMA4_UNIFIED_TEXT,
     GEMMA3_TEXT,
     GEMMA2,
     GEMMA,
@@ -123,6 +135,9 @@ ENTRIES = (
         "MinistralForCausalLM",
         lambda model: {},
         preserve_source_layout=False,
+        # MinistralConfig's defaults for the fields its decoder reads.
+        defaults={"sliding_window": 4096, "num_key_value_heads": 8, "max_position_embeddings": 131072},
+        padding_idx=True,
     ),
     DecoderFamily(
         ("llama",),
@@ -130,7 +145,15 @@ ENTRIES = (
         lambda fields: True,
         "llama",
         "LlamaForCausalLM",
-        lambda model: {},
+        # LlamaMLP's projections carry biases where mlp_bias says so.
+        lambda model: {"mlp_bias": True} if model.mlp_bias else {},
         preserve_source_layout=False,
+        # LlamaConfig's context (configuration_llama.py:71), which a YaRN record's omitted lengths read.
+        defaults={"max_position_embeddings": 2048},
+        # Megatron's names for its fields, which Nanbeige's releases repeat beside them.
+        repeated={"ffn_hidden_size": "intermediate_size", "num_query_groups": "num_key_value_heads",
+                  "rotary_base": "rope_theta", "kv_channels": "head_dim",
+                  "seq_length": "max_position_embeddings"},
+        padding_idx=True,
     ),
 )

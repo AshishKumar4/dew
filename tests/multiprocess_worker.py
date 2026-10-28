@@ -12,14 +12,16 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import shutil
+import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
+from matrix_support import MATRIX_RECORDS, matrix_prefix, published_matrix
 from process_support import serve_mode, worker_parser
 
-from dew.config.data import loader
 from dew.data import Loading
 from dew.data.dataset import Loader
 from dew.telemetry.records import RECORD_TYPES
@@ -60,27 +62,11 @@ def make_objective():
     devices, and this module is imported before the pool is joined.
     """
     import jax.numpy as jnp
-    import optax
+    from diffusion_support import DeterministicObjective
 
     from dew.artifacts import Representations
-    from dew.inputs import unit_range
-    from dew.nn.backbones.dit import SimpleDiT
-    from dew.objectives.base import Aux, EMASpec, Objective
 
-    class Reconstruction(Objective):
-        def __init__(self):
-            self.model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
-                                   mlp_ratio=1)
-            self.ema = EMASpec(decay=optax.constant_schedule(0.999))
-
-        def fresh_variables(self, key, held):
-            return self.model.init(key, jnp.ones((1, RES, RES, 3)), jnp.zeros((1,)))
-
-        def loss(self, variables, batch, step):
-            data = unit_range(batch["image"])
-            preds = self.model.apply(variables, data, jnp.zeros((data.shape[0],), jnp.float32))
-            return jnp.mean((preds - data) ** 2), Aux({})
-
+    class Reconstruction(DeterministicObjective):
         def evaluate(self, params, batch, step):
             # The validation split here is a token split whose contents the
             # objective has no use for: what the pass exercises is its length.
@@ -200,6 +186,19 @@ def indexed_loader(records: int, batch: int = BATCH):
     )
 
 
+@dataclasses.dataclass(frozen=True)
+class Indexed:
+    """`records` records that say which they are, in the field the objective reads."""
+
+    records: int
+
+    def __len__(self):
+        return self.records
+
+    def __getitem__(self, index):
+        return {"image": np.full((RES, RES, 3), index, np.uint8)}
+
+
 def elastic_loader(records: int, workers: int):
     """The same records compiled to a global order, whose position is a global count.
 
@@ -212,17 +211,71 @@ def elastic_loader(records: int, workers: int):
     from dew.data.compile import compile
     from dew.data.pipeline import Pipeline
 
-    class Indexed:
-        """Records that say which they are, in the field the objective reads."""
-
-        def __len__(self):
-            return records
-
-        def __getitem__(self, index):
-            return {"image": np.full((RES, RES, 3), index, np.uint8)}
-
-    return compile(Pipeline(Memory(Indexed())).shuffle(0).repeat().batch(BATCH), seed=0,
+    return compile(Pipeline(Memory(Indexed(records))).shuffle(0).repeat().batch(BATCH), seed=0,
                    loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
+
+
+def served_image(index: int) -> bytes:
+    """The bytes a pool's server answers record `index`'s url with: its image, as `elastic_loader`'s
+    records hold it."""
+    return np.full((RES, RES, 3), index, np.uint8).tobytes()
+
+
+@dataclasses.dataclass(frozen=True)
+class Pixels:
+    """A fetched record's bytes read back as its image."""
+
+    identity = "pixels@1"
+
+    def __call__(self, row):
+        return {"image": np.frombuffer(row["bytes"], np.uint8).reshape(RES, RES, 3)}
+
+
+def online_pipeline(records: int, address: str, *, shared: bool, epochs: int | None = None):
+    """`elastic_loader`'s records fetched over HTTP from the pool's server at `address`, a url each, in
+    either order a fetch is read in: the catalog shuffled and each process fetching its own share of it
+    (`shared`), or every process fetching the catalog as a memory read does and shuffling what it kept,
+    one global order; `epochs` passes of it, or passes without end."""
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.urls import Fetch
+
+    catalog = Pipeline(Memory([{"url": f"http://{address}/{index}"} for index in range(records)]))
+    fetched = (Fetch(output="bytes"), Pixels())
+    if shared:
+        return catalog.shuffle(0).repeat(epochs).filter_map(*fetched)
+    return catalog.filter_map(*fetched).shuffle(0).repeat(epochs)
+
+
+def online_loader(records: int, workers: int, address: str, *, shared: bool):
+    """`elastic_loader` over records fetched from the pool's server (`online_pipeline`)."""
+    from dew.data.compile import compile
+
+    return compile(online_pipeline(records, address, shared=shared).batch(BATCH), seed=0,
+                   loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
+
+
+@dataclasses.dataclass(frozen=True)
+class Unthirded:
+    """Whether a record's image is not every third one's, so a stream filtered by it drops records."""
+
+    identity = "unthirded@1"
+
+    def __call__(self, row) -> bool:
+        return int(row["image"][0, 0, 0]) % 3 != 0
+
+
+def replicated_loader(records: int, workers: int):
+    """`elastic_loader`'s records filtered, so which rows there are only the whole order states, read
+    elastically (`Pipeline.elastic`): every process reads that order and keeps its share of each
+    batch. A fetch would read it differently on each, which an elastic read over several refuses."""
+    from dew.data import Memory
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+
+    chain = Pipeline(Memory(Indexed(records))).shuffle(0).repeat().filter(Unthirded()).batch(BATCH).elastic()
+    return compile(chain, seed=0, loading=Loading(workers=workers, threads=2, read_buffer=8,
+                                                  worker_buffer=2)).train
 
 
 def batch_records(batch) -> list[int]:
@@ -236,30 +289,25 @@ class BlockUntilKilled:
     A preemption has to land mid-epoch, between two checkpoints. The loop
     spends its waiting time asking the source for a batch, so stopping there
     leaves the process in the state a preempted run dies in, and makes the step
-    it dies on the same on every machine. The wait is bounded so a test that
-    never kills anything fails on the timeout.
+    it dies on the same on every machine. The wait is one blocking wait, bounded
+    so a test that never kills anything fails on the timeout.
     """
 
-    def __init__(self, loader, limit: int, marker: Path, timeout: float = 300.0):
+    def __init__(self, loader, limit: int, timeout: float = 300.0):
         self._iterator = iter(loader)
         self._limit = limit
-        self._marker = marker
         self._timeout = timeout
-        self._handed = 0
+        self.handed = 0
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if self._handed >= self._limit:
-            self._marker.write_text(str(self._handed))
-            deadline = time.monotonic() + self._timeout
-            while time.monotonic() < deadline:
-                time.sleep(0.02)
-            raise RuntimeError(
-                f"alive {self._timeout}s after handing out {self._handed} batches")
+        if self.handed >= self._limit:
+            threading.Event().wait(self._timeout)
+            raise RuntimeError(f"alive {self._timeout}s after handing out {self.handed} batches")
         batch = next(self._iterator)
-        self._handed += 1
+        self.handed += 1
         return batch
 
     def get_state(self):
@@ -267,6 +315,19 @@ class BlockUntilKilled:
 
     def set_state(self, state):
         self._iterator.set_state(state)
+
+
+def blocked(checkpoints, source: BlockUntilKilled, step: int, channel: Path):
+    """An observer's call that, at `step`, the one whose batch is the source's last, waits for the
+    run's checkpoint writes to land and then tells the parent through `channel` (a FIFO it reads)
+    how many batches the source handed out: the moment the run is blocked mid-epoch with its
+    checkpoints on disk, for the parent to kill it at, with no file to poll."""
+    def call(state):
+        if int(as_numpy(state.step)) == step:
+            checkpoints.wait()
+            with open(channel, "w") as told:
+                told.write(str(source.handed))
+    return call
 
 
 def sharding_facts(params) -> dict:
@@ -294,27 +355,13 @@ def dump_params(path: Path, params) -> None:
     np.savez(path, **params_dict(params))
 
 
-class YearAhead(datetime):
-    """A clock a year off, for every process but the first in topology mode.
-
-    Two processes on one machine read the same second nearly always, so a
-    run name that came from each process's own clock would agree in a test
-    and split on a pod. Skewing one clock a year makes the source visible.
-    """
-
-    @classmethod
-    def now(cls, tz=None):
-        return datetime.now(tz) + timedelta(days=400)
-
-
 def mode_topology(args) -> dict:
     import jax
 
+    from dew.distributed.batches import shard_batch
+    from dew.distributed.placement import MeshSpec
     from dew.training import runtime
-    from dew.training.distributed import MeshSpec, shard_batch
 
-    if args.process_id > 0:
-        runtime.datetime = YearAhead
     mesh = MeshSpec(fsdp=args.fsdp_size).build()
     rows = BATCH // args.processes
     local = row_marked_batch()[args.process_id * rows:(args.process_id + 1) * rows]
@@ -347,21 +394,43 @@ def mode_topology(args) -> dict:
         "preserved_rows": sorted({int(value) for shard in owned.addressable_shards
                                   for value in np.asarray(shard.data)[:, 0]}),
         "run_timestamp": runtime.run_timestamp(),
-        "own_year": runtime.datetime.now().year,
+        # This process's own wall clock, in the time zone its environment names (TZ).
+        "own_clock": datetime.now().strftime("%Y-%m-%d_%H:%M:%S"),
     }
+
+
+def token_data(args, *, packed: bool, loading: Loading) -> Loader:
+    """`--tokens` as a run reads it, shuffled and repeated, and `--held-tokens` where given, each cut
+    into windows of `--seq-len` (packed first-fit where `packed`, by the documents' ends the store
+    states) and read in memory in batches of BATCH."""
+    from dew.data import presets
+    from dew.data.compile import compile
+    from dew.data.sources.tokens import TokenFiles
+
+    def held(store):
+        if packed:
+            return store.pipe(presets.lm, None, seq_len=args.seq_len, batch=BATCH)
+        return store.pipe(presets.token_windows, seq_len=args.seq_len, batch=BATCH)
+
+    store = TokenFiles(args.tokens)
+    # Packed in the store's order and ordered after, so the pack is one plan over the whole store
+    # (`PackedSource`) whose windows the processes share; windows read by index are ordered first.
+    train = (store.pipe(presets.lm, None, seq_len=args.seq_len, batch=None).shuffle(0).repeat().batch(BATCH)
+             if packed else store.shuffle(0).repeat().pipe(presets.token_windows, seq_len=args.seq_len,
+                                                            batch=BATCH))
+    validation = None if args.held_tokens is None else held(TokenFiles(args.held_tokens))
+    return compile(train, validation=validation, read="memory", loading=loading)
 
 
 def mode_data(args) -> dict:
     """One pass over the held-out split, which ends by itself."""
     import jax
 
-    from dew.config.data import TextData
     from dew.data.dataset import DataPartition
     from dew.training import MeshSpec
 
-    data = loader(TextData(source=args.tokens, seq_len=args.seq_len), batch=BATCH, read="memory",
-        loading=Loading(workers=args.workers, threads=1,
-                                        read_buffer=8, worker_buffer=1))
+    data = token_data(args, packed=False, loading=Loading(workers=args.workers, threads=1, read_buffer=8,
+                                                          worker_buffer=1))
     partition = DataPartition.of(MeshSpec().build())
     assert data.val is not None
     records, batches = [], 0
@@ -380,16 +449,34 @@ def mode_data(args) -> dict:
     }
 
 
-def mode_packed(args) -> dict:
+def mode_online_data(args) -> dict:
+    """One pass of records fetched from the pool's server, each process fetching its share of the
+    shuffled catalog (`online_pipeline`) to its end: the records it read, by the image each url's bytes
+    hold."""
     import jax
 
-    from dew.config.data import TextData
+    from dew.data.compile import compile
     from dew.data.dataset import DataPartition
     from dew.training import MeshSpec
 
-    data = loader(TextData(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
-        read="memory", loading=Loading(workers=args.workers,
-                                        worker_buffer=1))
+    data = compile(online_pipeline(args.records, args.online, shared=True, epochs=1).batch(BATCH), seed=0,
+                   loading=Loading(workers=args.workers, threads=2, read_buffer=8, worker_buffer=2))
+    partition = DataPartition.of(MeshSpec().build())
+    stream = data.train(partition)
+    try:
+        records = [record for batch in stream for record in batch_records(batch)]
+    finally:
+        stream.close()
+    return {"process_index": jax.process_index(), "records": records}
+
+
+def mode_packed(args) -> dict:
+    import jax
+
+    from dew.data.dataset import DataPartition
+    from dew.training import MeshSpec
+
+    data = token_data(args, packed=True, loading=Loading(workers=args.workers, worker_buffer=1))
     partition = DataPartition.of(MeshSpec().build())
     assert data.val is not None
     documents, windows = set(), 0
@@ -408,7 +495,7 @@ def mode_packed(args) -> dict:
     }
 
 
-def token_trainer(name, checkpoint_base, fsdp: int, seq_len: int):
+def token_trainer(name, checkpoint_base, fsdp: int, seq_len: int, **options):
     """A small decoder over token windows, with checkpoints, as a recipe
     would build it.
 
@@ -431,7 +518,7 @@ def token_trainer(name, checkpoint_base, fsdp: int, seq_len: int):
     return Trainer(
         LMObjective(model, seq_len), optax.sgd(0.1), key=jax.random.key(0),
         mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY),
-        checkpoints=Checkpoints(str(checkpoint_dir(checkpoint_base, name)), keep=4))
+        **{"checkpoints": Checkpoints(str(checkpoint_dir(checkpoint_base, name)), keep=4), **options})
 
 
 class Recording:
@@ -470,22 +557,24 @@ def mode_reads(args) -> dict:
     import jax
     import jax.numpy as jnp
 
+    from dew.distributed.batches import batch_signature, shard_batch
     from dew.training import MeshSpec
-    from dew.training.distributed import batch_signature, shard_batch, step_reads
+    from dew.training.distributed import step_reads
 
     mesh = MeshSpec().build()
     rows = len(mesh.local_devices)
     batch = {"x": np.ones((rows, 3), np.float32), "unused": np.arange(rows)}
     first = shard_batch(mesh, batch)
-    step = jax.jit(lambda state, batch: state + jnp.sum(batch["x"]))
-    compiled = step.lower(jnp.zeros(()), first).compile()
+    # A step's arguments as the trainer's: the moving state, the frozen tree, then the batch.
+    step = jax.jit(lambda state, frozen, batch: state + frozen + jnp.sum(batch["x"]))
+    compiled = step.lower(jnp.zeros(()), jnp.zeros(()), first).compile()
     signature = batch_signature(first)
     placed = shard_batch(mesh, batch, {signature: step_reads(compiled, signature)})
     return {"read_differs_from_placed": batch_signature(batch) != batch_signature(first),
             "unused_on_host": isinstance(placed["unused"], np.ndarray),
             "unused_shape": list(np.shape(placed["unused"])),
             "x_placed": isinstance(placed["x"], jax.Array),
-            "sum": float(compiled(jnp.zeros(()), placed))}
+            "sum": float(compiled(jnp.zeros(()), jnp.zeros(()), placed))}
 
 
 def mode_packed_fit(args) -> dict:
@@ -501,13 +590,9 @@ def mode_packed_fit(args) -> dict:
 
     import jax
 
-    from dew.config.data import TextData
-
     trainer = token_trainer(args.name, args.run_dir, args.fsdp_size, args.seq_len)
     restored_step, restored = restored_state(trainer)
-    data = loader(TextData(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
-        read="memory", loading=Loading(workers=args.workers,
-                                        worker_buffer=1), validation_records=(0) * (BATCH))
+    data = token_data(args, packed=True, loading=Loading(workers=args.workers, worker_buffer=1))
     seen: list = []
     state = trainer.fit(
         dataclasses.replace(data, train=lambda partition: Recording(data.train(partition), seen)),
@@ -539,16 +624,31 @@ def restored_state(trainer):
 
 
 def mode_token_budget(args) -> dict:
-    from dew.config.data import TextData, loader
-
-    trainer = token_trainer(args.name, args.out.parent, fsdp=1, seq_len=4)
-    trainer.checkpoints = None
     tracker = LossRecorder()
-    trainer.tracker = tracker
-    data = loader(TextData(source=args.tokens, seq_len=4), batch=BATCH,
-                loading=Loading(workers=0, threads=1, read_buffer=1))
+    trainer = token_trainer(args.name, args.out.parent, fsdp=1, seq_len=4, checkpoints=None, tracker=tracker)
+    data = token_data(args, packed=False, loading=Loading(workers=0, threads=1, read_buffer=1))
     state = trainer.fit(data, tokens=80, log_every=1)
     return {"step": int(state.step), "updates": int(state.updates), "logged": len(tracker.losses)}
+
+
+def mode_schedule_fit(args) -> dict:
+    """`--steps` of `token_trainer` on a schedule of `--tokens` read in two orders, the first stage for
+    60 committed tokens (`dew.data.schedule`): the step the run reached, the record its first stage
+    ended at in the saved position, and the parameters beside the report."""
+    from dew import position
+    from dew.data import presets, schedule
+    from dew.data.sources.tokens import TokenFiles
+
+    def ordered(seed: int):
+        windows = TokenFiles(args.tokens).shuffle(seed).repeat()
+        return windows.pipe(presets.token_windows, seq_len=args.seq_len, batch=None)
+
+    trainer = token_trainer(args.name, args.out.parent, fsdp=1, seq_len=args.seq_len)
+    state = trainer.fit(schedule([(ordered(0), 60), (ordered(1), None)]).batch(BATCH), steps=args.steps)
+    dump_params(args.out.with_suffix(".npz"), state.variables)
+    _, saved = restored_state(trainer)
+    completed = [] if saved is None else position.read(saved.encode()).completed
+    return {"step": int(as_numpy(state.step)), "stage_ends": [end for _, end in completed]}
 
 
 def mode_steps(args) -> dict:
@@ -558,7 +658,7 @@ def mode_steps(args) -> dict:
     the losses it computed; fit reports them through the tracker on process 0
     alone.
     """
-    from dew.training.distributed import shard_batch
+    from dew.distributed.batches import shard_batch
 
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
     checkpoints = trainer.checkpoints
@@ -587,47 +687,26 @@ def mode_steps(args) -> dict:
     }
 
 
-class Batches:
-    """A metric whose pass score is how many batches the pass scored."""
-    name = "batches"
-
-    def __init__(self):
-        from dew.artifacts import Representations
-        self.reads = Representations
-
-    def __call__(self, artifact, batch):
-        return 1.0
-
-    def merge(self, accumulated, contribution):
-        return accumulated + contribution
-
-    def finalize(self, accumulated):
-        return accumulated
 
 
-def fail_local_save(step: int) -> None:
-    """Make this process's local checkpoint at `step` fail in its background
-    thread, where orbax creates the step's tmp directories."""
-    from orbax.checkpoint._src.path import atomicity
-
-    create = atomicity._create_tmp_directory
-
-    async def failing(async_makedir_func, tmp_dir, *args, **kwargs):
-        path = Path(tmp_dir)
-        # The item's directory under the step's, in this process's local directory.
-        if path.name.startswith("default.") and path.parent.name.startswith(f"{step}.orbax-checkpoint-tmp") \
-                and path.parent.parent.name.startswith("process"):
-            raise FileExistsError(17, "File exists", str(tmp_dir))
-        return await create(async_makedir_func, tmp_dir, *args, **kwargs)
-
-    atomicity._create_tmp_directory = failing
+def failing_local_directory(checkpoints, directory: Path | None, step: int):
+    """An observation (`Observe`'s call, which every process makes alike) that, at step `step - 1`,
+    waits for every save in flight (`Checkpoints.wait`) and puts a file where `directory` was, a
+    process's local checkpoint directory (None on the processes whose saves go on), so that process's
+    local save at `step` fails in orbax's background thread as a full or read-only disk would make it
+    fail, and none before it."""
+    def observed(state):
+        if int(state.step) == step - 1:
+            checkpoints.wait()
+            if directory is not None and directory.is_dir():
+                directory.rename(directory.with_name(directory.name + ".moved"))
+                directory.write_text("not a directory")
+    return observed
 
 
 def mode_fit(args) -> dict:
     import jax
 
-    if args.fail_local_save is not None:
-        fail_local_save(args.fail_local_save)
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size,
                             local_dir=args.local_dir, local_every=args.local_every)
     checkpoints = trainer.checkpoints
@@ -635,41 +714,40 @@ def mode_fit(args) -> dict:
     # Where the checkpoint on disk left this run, read before fit trains past it.
     restored_step, restored = restored_state(trainer)
     rows = BATCH // args.processes
-    if args.elastic:
+    if args.replicated:
+        open_train = replicated_loader(args.records, args.workers)
+    elif args.online:
+        open_train = online_loader(args.records, args.workers, args.online, shared=args.shared)
+    elif args.elastic:
         open_train = elastic_loader(args.records, args.workers)
     else:
         loader = indexed_loader(args.records, rows)
         if args.block_after:
-            loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
+            loader = BlockUntilKilled(loader, args.block_after)
         def open_train(partition):
             return iter(loader)
-    val, available = None, None
-    scored = []
-    evaluate = trainer.objective.evaluate
-    trainer.objective.evaluate = lambda *a: scored.append(1) or evaluate(*a)
-    if args.tokens:
-        # The packed token split, whose documents are strided over the
-        # processes before packing. The objective's evaluation ignores the
-        # batch's contents, so the split only has to shard.
-        from dew.config.data import TextData
-        from dew.data.dataset import DataPartition
-
-        data = loader(TextData(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
-            read="memory", loading=Loading(workers=args.workers),
-                validation_records=(args.val_steps) * (BATCH))
-        val = data.val
-        assert val is not None
-        available = sum(1 for _ in val(DataPartition.of(trainer.device_mesh)))
-    from dew.training import Best, Observe
-    counter = Batches()
+    from dew.training import Observe
     # The variables, split over the processes by fsdp, which an observation gathers whole on each.
     observe = None if args.observe_every is None else Observe(args.observe_every,
                                                               lambda state: state.variables)
-    state = trainer.fit(Loader(open_train, val=val, batch=BATCH, records=args.records),
-                        steps=args.steps, log_every=1,
-                        eval_every=args.steps if args.tokens else None,
-                        checkpoint_every=args.save_every, metrics=(counter,) if args.tokens else (),
-                        best=Best(counter, mode='max') if args.tokens else None, observe=observe)
+    if args.fail_local_save is not None:
+        # The last process's local directory fails.
+        failing = (Path(args.local_dir) / f"process{args.process_id}"
+                   if args.process_id == args.processes - 1 else None)
+        observe = Observe(1, failing_local_directory(checkpoints, failing, args.fail_local_save))
+    if args.block_after:
+        # The source's last batch trains the step `block_after` past where the run restored.
+        observe = Observe(1, blocked(checkpoints, loader, (restored_step or 0) + args.block_after,
+                                     Path(args.notify)))
+    try:
+        state = trainer.fit(Loader(open_train, val=None, batch=BATCH, records=args.records),
+                            steps=args.steps, log_every=1, checkpoint_every=args.save_every, observe=observe)
+    except ValueError as refusal:
+        if not args.refusal:
+            raise
+        # A refusal the run expects: what it refused with, and the steps it observed and saved first.
+        return {"refused": type(refusal).__name__, "written_steps": checkpoints.committed(),
+                "observed": [] if observe is None else [step for step, _ in observe.values]}
     dump_params(args.out.with_suffix(".npz"), state.variables)
     if observe is not None:
         # Each observation is already whole on this host: written as it is, gathered by nothing.
@@ -691,8 +769,6 @@ def mode_fit(args) -> dict:
         "local_steps": None if args.local_dir is None else sorted(
             int(step) for step in checkpoints._open_local().all_steps()),
         "dataset_state": final_position,
-        "val_available": available,
-        "val_batches": None if available is None else len(scored),
     }
 
 
@@ -703,12 +779,13 @@ def mode_pool_refusals(args) -> dict:
     copies, another length, a first read that fails there, a stream that
     runs out after one batch there, and a batch without a field. A resume
     from a newest checkpoint the processes list differently is refused as
-    well. Each outcome is the error's text, or None for a fit that trained."""
+    well, and streams that run out after one batch on both end the fit
+    there. Each outcome is the error's text, or None for a fit that trained."""
     import jax
     import optax
-    import orbax.checkpoint as ocp
     from affine_run import FEATURES, Regression
 
+    from dew import _coordination
     from dew.data import Memory
     from dew.data.compile import compile
     from dew.data.dataset import Loader
@@ -755,7 +832,7 @@ def mode_pool_refusals(args) -> dict:
                           checkpoints=checkpoints)
         try:
             trainer.fit(data, steps=2, log_every=1, **flags)
-        except (ValueError, RuntimeError, StopIteration) as error:
+        except (ValueError, RuntimeError) as error:
             return f"{type(error).__name__}: {error}"
         return None
 
@@ -767,18 +844,20 @@ def mode_pool_refusals(args) -> dict:
         "count": trained(stream(64 + 32 * other, 0)),
         "first_read": trained(reads(fail=other)),
         "eof": trained(reads(ends=1 if other else None)),
+        "ended": trained(reads(ends=1)),
         "layout": trained(reads(fields=("x",) if other else ("x", "y"))),
         "saved": trained(stream(64, 0), Checkpoints(str(Path(args.run_dir) / "saved")), checkpoint_every=1),
     }
     outcomes["latest"] = Checkpoints(str(Path(args.run_dir) / "saved")).latest
+    _coordination.agreed("the saved run's listing", lambda: True)
+    resumed_from = Path(args.run_dir) / "saved"
     if other:
-        # A listing of the shared directory taken before step 2 was committed.
-        listing = type(ocp.step.standard_name_format())
-        listed = listing.find_all
-        listing.find_all = lambda name_format, base: (found for found in listed(name_format, base)
-                                                       if found.step != 2)
+        # A listing taken before step 2 was committed: a copy of the directory without it.
+        resumed_from = Path(args.run_dir) / "saved-before-2"
+        shutil.copytree(Path(args.run_dir) / "saved", resumed_from, ignore=lambda _, names: [
+            name for name in names if name == "2"])
     resumed = Trainer(Regression(), optax.sgd(1e-2), key=jax.random.key(0), mesh=MeshSpec(),
-                      checkpoints=Checkpoints(str(Path(args.run_dir) / "saved")))
+                      checkpoints=Checkpoints(str(resumed_from)))
     try:
         outcomes["stale"] = int(resumed.place()[0].step)
     except (ValueError, RuntimeError) as error:
@@ -793,7 +872,7 @@ def mode_fp8_sites(args) -> dict:
     passes one more agreement, which a rank left behind would block."""
     import jax
 
-    from dew import coordination
+    from dew import _coordination
     from dew.quantization import measured_fp8_sites
 
     full = {"params": {"wide": {"kernel": np.zeros((64, 96), np.float32)},
@@ -803,13 +882,13 @@ def mode_fp8_sites(args) -> dict:
     def outcome(variables) -> str:
         try:
             measured_fp8_sites(variables, ("wide", "narrow"), 8)
-        except (ValueError, coordination.PeerFailure) as error:
+        except (ValueError, _coordination.PeerFailure) as error:
             return f"{type(error).__name__}: {error}"
         return "measured"
 
     unsupported = outcome(full)
     missing = outcome(lacking if jax.process_index() == 1 else full)
-    after = coordination.agreed("after the refusals", lambda: True)
+    after = _coordination.agreed("after the refusals", lambda: True)
     return {"unsupported": unsupported, "missing": missing, "after": after}
 
 
@@ -822,23 +901,9 @@ def mode_profile_failure(args) -> dict:
     import jax
     import optax
 
-    import dew.telemetry.profile as telemetry_profile
-    from dew.coordination import agree_process_phase
+    from dew._coordination import agree_process_phase
     from dew.training import ProfileWindow, Trainer
 
-    # The optional XProf package is absent in the test environment; stubbing
-    # its converter keeps the start path real while export becomes a no-op.
-    class Converter:
-        def xspace_to_tool_names(self, paths):
-            return ["overview_page"]
-
-        def xspace_to_tool_data(self, paths, tool, params):
-            return b"{}", "application/json"
-
-    telemetry_profile.require_profile_support = lambda: Converter()
-    real_version = telemetry_profile.version
-    telemetry_profile.version = (lambda name: "0.0" if name == "xprof"
-                                 else real_version(name))
     profile_dir = Path(args.profile_dir)
     if args.process_id == 0:
         profile_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -900,8 +965,10 @@ def text_to_image(args):
     encoder = CLIPText.from_pretrained(str(FIXTURES / "clip" / "tiny"))
     rows = BATCH // args.processes
     mine = slice(args.process_id * rows, (args.process_id + 1) * rows)
+    # As a run's data holds it (`DiffusionObjective.data`): the prompts' tokens, and the prompts as text.
     batch = {"image": global_images()[mine],
-             "text": {name: value[mine] for name, value in encoder.tokenize(PROMPTS).items()}}
+             "text": {name: value[mine] for name, value in encoder.tokenize(PROMPTS).items()},
+             "captions": np.asarray(PROMPTS)[mine]}
     objective = DiffusionObjective(
         SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1),
         presets.Flow(),
@@ -1018,7 +1085,7 @@ def pipeline_trainer(stage: int, microbatches, fsdp: int):
 def pipeline_losses(trainer, rows, steps: int):
     """`steps` steps of the compiled step over this process's `rows` of the
     token batch, with the losses and the final parameters."""
-    from dew.training.distributed import shard_batch
+    from dew.distributed.batches import shard_batch
 
     state, _, _ = trainer.place()
     batch = shard_batch(trainer.device_mesh, {"text": rows})
@@ -1185,8 +1252,8 @@ def mode_evaluation_contract(args) -> dict:
     Numerical, Ratio, Drawing, batches, validation = _evaluation_parts(case)
 
     objective = Numerical()
-    trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(37))
-    state, _, _ = trainer.place()
+    placed = Trainer(objective, optax.sgd(.01), key=jax.random.key(37))
+    state, _, _ = placed.place()
     data = Loader(train=lambda partition: batches(), val=lambda partition: validation(), records=8, batch=8)
     results = {}
     for failure in ("normal", "repeat", "untracked", "preview_only", "uneven", "empty",
@@ -1195,7 +1262,8 @@ def mode_evaluation_contract(args) -> dict:
                     "deleted_batch", "deleted_preview", "mismatched_plan"):
         case.failure = failure
         events.clear()
-        trainer.tracker = Drawing() if rank == 0 and failure not in ("untracked", "no_consumer") else None
+        trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(37), mesh=placed.mesh, tracker=(
+            Drawing() if rank == 0 and failure not in ("untracked", "no_consumer") else None))
         metric = Ratio()
         if failure == "mismatch" and rank == 1:
             metric.name = "another_metric"
@@ -1284,161 +1352,16 @@ def mode_evaluation_clocks(args) -> dict:
     return {"step": result.step, "event": list(result.event_key), "scores": result.scalars}
 
 
-def _preview_objective(kind):
-    """A preview-failure case's objective and a batch for it. A diffusion or masked
-    objective's compiled sampler is a program of its own, which a case replaces
-    (`replaced`) or takes away with AttributeError."""
-    from dew.diffusion import presets
-    from dew.diffusion.discrete import MDLM
-    from dew.inputs import Field, InputSpec
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.backbones.dit import SimpleDiT
-    from dew.objectives.diffusion import DiffusionObjective
-    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-    from dew.objectives.lm import LMObjective, Samples
-    from dew.sampling import Euler
-
-    def sampled(base):
-        class Sampled(base):
-            replaced = None
-
-            @property
-            def _sample(self):
-                if self.replaced is AttributeError:
-                    raise AttributeError("_sample")
-                return super()._sample if self.replaced is None else self.replaced
-
-        return Sampled
-
-    model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
-                              max_seq_len=8, causal=kind != "masked", dtype="float32", attention_impl="xla")
-    if kind == "lm":
-        return (LMObjective(model, seq_len=4, samples=Samples(prompt=[1, 2], max_new_tokens=1)),
-                {"text": np.ones((3, 5), np.int32)})
-    if kind == "masked":
-        return (sampled(MaskedDiffusionObjective)(model, MDLM(mask_id=7)(), seq_len=4, samples=1, steps=2),
-                {"text": np.ones((3, 4), np.int32)})
-    return (sampled(DiffusionObjective)(SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2),
-                                        presets.EDM(regime="pixel"), InputSpec(Field("image", (RES, RES, 3))),
-                                        steps=2, solver=Euler(), guidance=None),
-            {"image": np.zeros((3, RES, RES, 3), np.uint8)})
-
-
-def _builtin_sampler_failure(kind, phase, source, rank, fault):
-    """A sampler failure at its public invocation or artifact preflight seam."""
-    import jax
-
-    import dew.sampling.text as text_sampling
-
-    def sample_failure(*sample_args, fault=fault, kind=kind, phase=phase, source=source, **kwargs):
-        if phase == "generation" and rank == source:
-            raise fault
-        if kind == "diffusion":
-            result = np.zeros((kwargs["count"], RES, RES, 3), np.float32)
-        else:
-            result = np.ones((1, 3 if kind == "lm" else 4), np.int32)
-        if phase == "preflight" and rank == source:
-            result = jax.device_put(result, jax.local_devices()[0])
-            result.delete()
-        if kind == "lm":
-            return text_sampling.Generation(
-                tokens=result, lengths=jax.numpy.ones((1,), jax.numpy.int32),
-                terminated=jax.numpy.zeros((1,), bool),
-                behavior_log_probs=jax.numpy.zeros((1, 1)),
-                raw_log_probs=jax.numpy.zeros((1, 1)), rows=1)
-        return result
-    return sample_failure
-
-
-def mode_builtin_preview_failures(args) -> dict:
-    """Exercise nested builtin preview failures while both ranks remain alive."""
-    import jax
-    import optax
-
-    from dew.data.dataset import Loader
-    from dew.inference import TextGeneration
-    from dew.training import Trainer
-
-    rank = jax.process_index()
-    reports = {}
-    for kind in ("lm", "diffusion", "masked"):
-        objective, batch = _preview_objective(kind)
-        tracker = ScoreRecorder()
-        trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0),
-                          tracker=tracker if rank == 0 else None)
-        state, _, _ = trainer.place()
-        original = objective._prompt if kind == "lm" else None
-        original_generate = TextGeneration.__call__
-        closed = []
-
-        for phase in ("setup", "generation", "preflight"):
-            for source in (0, 1):
-                case = f"{kind}-{phase}-{source}"
-                fault = ValueError(f"{case}: local sampler failure before device work")
-
-                def validation(*, batch=batch, case=case, closed=closed):
-                    try:
-                        yield batch
-                    finally:
-                        closed.append(case)
-
-                data = Loader(train=lambda partition: validation(), val=lambda partition: validation(),
-                               records=6, batch=6)
-
-                sample_failure = _builtin_sampler_failure(kind, phase, source, rank, fault)
-
-                if phase == "setup":
-                    if rank == source and kind == "lm":
-                        delattr(objective, "_prompt")
-                    elif rank == source:
-                        objective.replaced = AttributeError
-                elif kind == "lm":
-                    TextGeneration.__call__ = sample_failure
-                else:
-                    objective.replaced = sample_failure
-                try:
-                    result = Evaluation.run(objective, state.variables, data.val, key=state.key,
-                          preview=trainer.tracker is not None, mesh=trainer.device_mesh)
-                    trainer._report_evaluation(result)
-                except (AttributeError, ValueError, RuntimeError) as error:
-                    reports[case] = {"type": type(error).__name__, "error": str(error),
-                                     "runtime": isinstance(error, RuntimeError),
-                                     "original": error is fault, "closed": case in closed}
-                else:
-                    reports[case] = {"error": None}
-                finally:
-                    if kind == "lm":
-                        objective._prompt = original
-                    else:
-                        objective.replaced = None
-                    TextGeneration.__call__ = original_generate
-                # Files keep the successful escapee alive without accidentally
-                # matching the stranded rank's next JAX phase agreement.
-                ready = args.out.parent / f"{case}.{rank}.ready"
-                ready.write_text("returned")
-                peer = args.out.parent / f"{case}.{1 - rank}.ready"
-                deadline = time.monotonic() + 30
-                while not peer.exists():
-                    if time.monotonic() >= deadline:
-                        raise RuntimeError(f"{case}: peer never returned from evaluation")
-                    time.sleep(.01)
-        case = f"{kind}-healthy"
-        result = Evaluation.run(objective, state.variables, data.val, key=state.key,
-                          preview=trainer.tracker is not None, mesh=trainer.device_mesh)
-        trainer._report_evaluation(result)
-        reports[case] = {"scores": result.scalars, "drawn": len(tracker.drawn)}
-    return reports
-
-
 def mode_training_contract(args) -> dict:
     """A rejected shard and a partial composite checkpoint in a real pool."""
     import jax
     import jax.numpy as jnp
     import optax
-    from test_training_transactions import ShortScaleTrainer, Tiny
+    from test_training_transactions import SHORT_SCALE, Tiny
 
     from dew.checkpoints import Checkpoints
-    from dew.training.distributed import shard_batch
+    from dew.distributed.batches import shard_batch
+    from dew.training import Trainer
 
     class Rows(Tiny):
         def loss(self, variables, batch, step):
@@ -1446,9 +1369,9 @@ def mode_training_contract(args) -> dict:
 
     checkpoints = Checkpoints(args.run_dir)
     def build():
-        return ShortScaleTrainer(Rows(composite=True), optax.adamw(.03, weight_decay=.1),
-                                 key=jax.random.PRNGKey(9), accumulation=2,
-                                 dynamic_scale=True, checkpoints=checkpoints)
+        return Trainer(Rows(composite=True), optax.adamw(.03, weight_decay=.1),
+                       key=jax.random.PRNGKey(9), accumulation=2,
+                       dynamic_scale=SHORT_SCALE, checkpoints=checkpoints)
     trainer = build()
     state, _, _ = trainer.place()
     rank, processes = jax.process_index(), jax.process_count()
@@ -1483,6 +1406,50 @@ def mode_training_contract(args) -> dict:
             "state": [np.asarray(x).tolist() for x in jax.tree.leaves(resumed)],
             "clocks": [int(resumed.step), int(resumed.microstep), int(resumed.updates)],
             "scale": float(resumed.scale.scale)}
+
+
+def mode_replicated_rollout(args) -> dict:
+    """One synchronous sampled rollout where both processes read the one data share (`tensor`
+    across them), its reward stochastic and different on each process. The share's first reader
+    scores and packs; the other enters the draw, scores nothing and trains on the first reader's
+    rows."""
+    import jax
+    import jax.numpy as jnp
+    import optax
+    from jax.experimental import multihost_utils
+
+    from dew.data.dataset import DataPartition
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.rl import GRPOObjective, RolloutScheduler
+    from dew.sampling import Sampling
+    from dew.training import Layout, MeshSpec, Trainer
+
+    rank, processes = jax.process_index(), jax.process_count()
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
+                              head_dim=8, mlp_features=32, max_seq_len=12,
+                              dtype="float32", attention_impl="xla")
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    drawn = np.random.default_rng(rank)
+    scored = []
+
+    def reward(text, record):
+        scored.append(text)
+        return float(drawn.random())
+
+    objective = GRPOObjective(model, seq_len=7, variables=params)
+    rollout = RolloutScheduler.sampled(objective, reward, groups=2, max_new_tokens=4,
+                                       sampling=Sampling(temperature=0.8, top_k=5, pad_token_id=12))
+    trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.key(5), mesh=MeshSpec(tensor=processes),
+                      layout=Layout(min_shard=TINY), rollout=rollout)
+    state, _, _ = trainer.place()
+    partition = DataPartition.of(trainer.device_mesh)
+    packed = rollout(state, rollout_prompts(), jax.random.key(9))
+    handed = {name: np.asarray(multihost_utils.process_allgather(np.asarray(packed[name])))
+              for name in ("input_ids", "response_mask", "advantages", "old_log_probs")}
+    rewarded = multihost_utils.process_allgather(np.asarray(len(scored), np.int64))
+    return {"partition": {"count": partition.count, "readers": partition.readers},
+            "rewarded": np.asarray(rewarded).tolist(),
+            "handed": {name: value.tolist() for name, value in handed.items()}}
 
 
 def rollout_prompts() -> dict:
@@ -1581,7 +1548,7 @@ def mode_rollout(args) -> dict:
 
     from dew.data.dataset import Loader
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.rl import GRPOObjective, SampledRollout
+    from dew.objectives.rl import GRPOObjective, RolloutScheduler
     from dew.sampling import Sampling, generate
     from dew.training import Layout, MeshSpec, Trainer
 
@@ -1594,23 +1561,15 @@ def mode_rollout(args) -> dict:
     rows = len(batch["prompt"]) // processes
     local = {name: value[rank * rows:(rank + 1) * rows] for name, value in batch.items()}
     # Select a real first token as EOS; other rows reach it at different steps.
-    from dew.nn.inputs import ModelInputs
+    from rl_support import prompt_inputs
 
-    def inputs_for(records):
-        tokens = jnp.asarray(records["prompt"])
-        mask = (
-            jnp.arange(tokens.shape[1])[None, :]
-            >= tokens.shape[1] - jnp.asarray(records["prompt_length"])[:, None]
-        )
-        return ModelInputs(tokens, {"attention_mask": mask})
-
-    greedy = generate(model, params, inputs_for(batch), 4, key=jax.random.key(1),
+    greedy = generate(model, params, prompt_inputs(batch), 4, key=jax.random.key(1),
                       sampling=Sampling(temperature=0))
     eos = int(np.asarray(greedy.tokens)[0, 4])
     sampling = Sampling(temperature=0, eos_token_ids=eos, pad_token_id=12)
     objective = GRPOObjective(model, seq_len=7, variables=params)
-    rollout = SampledRollout(objective, lambda text, record: float(len(text)),
-                             groups=2, max_new_tokens=4, sampling=sampling)
+    rollout = RolloutScheduler.sampled(objective, lambda text, record: float(len(text)),
+                                       groups=2, max_new_tokens=4, sampling=sampling)
     trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.key(5),
                       mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY),
                       rollout=rollout)
@@ -1623,13 +1582,13 @@ def mode_rollout(args) -> dict:
     arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int64))
     # Stochastic draws over the placed parameters: keys fold in the global
     # row index, so the pool draws what one process draws for the same rows.
-    drawn = generate(model, state.variables, inputs_for(local), 4, key=jax.random.key(21),
+    drawn = generate(model, state.variables, prompt_inputs(local), 4, key=jax.random.key(21),
                      sampling=Sampling(temperature=0.8, top_k=5, eos_token_ids=eos, pad_token_id=12)).host()
     # A resident global array reaches the task as it is: a process cannot
     # fetch the rows the other process's devices hold, so a host round trip
     # would fail here before any model ran.
+    from dew.distributed.batches import shard_batch
     from dew.inference import TextGeneration
-    from dew.training.distributed import shard_batch
 
     resident = shard_batch(trainer.device_mesh, {"prompt": local["prompt"]})["prompt"]
     controls = Sampling(temperature=0.8, top_k=5, eos_token_ids=eos, pad_token_id=12)
@@ -1641,7 +1600,7 @@ def mode_rollout(args) -> dict:
     ).host()
     invalid_errors, meshless = {}, {}
     if processes > 1:
-        invalid_errors = _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank)
+        invalid_errors = _rejected_inputs(model, state, local, rollout, sampling, prompt_inputs, rank)
         meshless = _meshless_rollout(trainer.initial_state(), local, rollout, rank)
     single = None
     if processes == 1:
@@ -1770,7 +1729,7 @@ def mode_continuations(args) -> dict:
     from jax.experimental import multihost_utils
 
     from dew.inference import TextGeneration
-    from dew.inference.pipeline import place
+    from dew.inference.loading import place
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.inputs import ModelInputs
     from dew.sampling import Sampling
@@ -1786,13 +1745,13 @@ def mode_continuations(args) -> dict:
     rows = len(prompts) // processes
     local = slice(rank * rows, (rank + 1) * rows)
 
-    def inputs_for(tokens, real):
+    def prompt_inputs(tokens, real):
         mask = np.arange(tokens.shape[1])[None, :] >= tokens.shape[1] - real[:, None]
         return ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(mask)})
 
     task = TextGeneration(model, placed, sampling=Sampling(temperature=0.9, top_k=5,
                                                            eos_token_ids=11, pad_token_id=12), n=3)
-    request = inputs_for(prompts[local], lengths[local])
+    request = prompt_inputs(prompts[local], lengths[local])
     result = task(request, 4, key=7)
     host = result.host()
     rejected = []
@@ -1867,8 +1826,8 @@ def mixed_token_lengths() -> np.ndarray:
 def mixed_validity_inputs(prompts: np.ndarray, lengths: np.ndarray, *, explicit: bool):
     """What a host producer hands generation for these left-padded rows.
 
-    A producer that padded nothing omits validity, the way `SampledRollout`
-    does from the lengths it already holds. `explicit` spells the field out
+    A producer that padded nothing omits validity, the way `PolicyCollector`
+    does (`pad_token_rows`). `explicit` spells the field out
     on every row instead, which is the reference a pool has to reproduce.
     """
     import jax.numpy as jnp
@@ -1923,7 +1882,7 @@ def mixed_validity_step(trainer, batch: dict, out: Path | None = None) -> dict:
     gradients between topologies instead of the state an optimizer with
     memory would have reached.
     """
-    from dew.training.distributed import shard_batch
+    from dew.distributed.batches import shard_batch
 
     state, _, _ = trainer.place()
     placed = shard_batch(trainer.device_mesh, batch)
@@ -1995,7 +1954,7 @@ def mode_decoding_components(args) -> dict:
     from jax.experimental import multihost_utils
 
     from dew.inference import TextGeneration
-    from dew.inference.pipeline import place
+    from dew.inference.loading import place
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.inputs import ModelInputs
     from dew.sampling import Sampling, decoding
@@ -2170,7 +2129,7 @@ def mode_masked_generation(args) -> dict:
     import jax.numpy as jnp
     from jax.experimental import multihost_utils
 
-    from dew.inference.pipeline import place
+    from dew.inference.loading import place
     from dew.interop import Pretrained
     from dew.nn.inputs import ModelInputs
     from dew.training import Layout, MeshSpec
@@ -2231,10 +2190,10 @@ def mode_host_training(args) -> dict:
     import jax.numpy as jnp
     import optax
 
+    from dew.distributed.batches import shard_batch
+    from dew.distributed.host import companion_mesh
     from dew.objectives.base import Aux, Objective
     from dew.training import Layout, MeshSpec, Trainer
-    from dew.training.distributed import shard_batch
-    from dew.training.host import companion_mesh
 
     class Coupled(Objective):
         def fresh_variables(self, key, held):
@@ -2288,7 +2247,7 @@ def mode_step_fits(args) -> dict:
 
     import jax
 
-    from dew.training.distributed import MeshSpec
+    from dew.distributed.placement import MeshSpec
     from dew.training.memory import fits_everywhere, step_fits
 
     # A step over a mesh that spans both processes: each may read only its
@@ -2308,7 +2267,7 @@ def mode_whole_validation(args) -> dict:
     ith, i + nth, ... of them), and in part 0 `Perplexity`'s, on this pool, as
     `tests/test_whole_validation.py` runs them on one process."""
     import jax
-    from objective_cases import corpus_windows
+    from objective_data import corpus_windows
     from test_whole_validation import EVALUATED, evaluated, perplexity
 
     index, parts = (int(value) for value in args.part.split("/"))
@@ -2331,8 +2290,6 @@ def mode_host_fields(args) -> dict:
     return {"seen": named_records(MeshSpec().build())}
 
 
-MATRIX_RECORDS = 96
-
 
 @dataclasses.dataclass(frozen=True)
 class Imaged:
@@ -2345,30 +2302,51 @@ class Imaged:
         return {"image": np.resize(tokens % 256, (RES, RES, 3)).astype(np.uint8)}
 
 
-def matrix_data(read: str, cached: bool, rejecting: bool, packed: bool, cache_dir: Path):
-    """One cell of the data matrix compiled for training: records of one to
-    eight tokens, each holding its own id; a filter that rejects every third;
-    a cache filled by the pool; online packing into eight-token windows; then
-    a global shuffle where the order stays indexed and a windowed one where it
-    streams."""
-    from dew.data import Memory
+def matrix_data(read: str, cached: str, rejecting: bool, packed: bool, cache_dir: Path):
+    """One cell of the data matrix compiled for training: the matrix prefix; a cache the pool fills
+    (`cache`), or the prefix's published generation read in its place (`published`); online packing into
+    eight-token windows (from the published plan where published); then a global shuffle where the order
+    stays indexed and a windowed one where it streams."""
     from dew.data.cache import Cache
     from dew.data.compile import compile
-    from dew.data.pipeline import Pipeline
 
-    records = [{"text": np.full(1 + index % 8, index, np.int32)} for index in range(MATRIX_RECORDS)]
-    pipeline = Pipeline(Memory(records, shard_rows=16))
-    if rejecting:
-        pipeline = pipeline.filter(lambda row: int(row["text"][0]) % 3 != 0, identity="thirds@1")
-    if cached:
+    pipeline = matrix_prefix(rejecting, lengths=cached == "published")
+    if cached == "cache":
         pipeline = pipeline.cache(Cache(str(cache_dir)))
+    elif cached == "published":
+        pipeline = pipeline.cache(published_matrix(rejecting, packed, cache_dir))
     if packed:
         pipeline = pipeline.pack(8, bins=2)
     pipeline = pipeline.map(Imaged(), identity="imaged@1")
-    indexed = read == "memory" or (read == "indexed" and not (cached or rejecting or packed))
+    indexed = read == "memory" or (read == "indexed" and (cached == "published"
+                                                          or not (cached == "cache" or rejecting or packed)))
     order = pipeline.shuffle(0, window=None if indexed else 8).repeat()
     return compile(order.batch(BATCH), read=read, seed=0,
                    loading=Loading(workers=0, threads=1, read_buffer=1))
+
+
+def mode_decision_publish(args) -> dict:
+    """The slot release at `--release`, placed over the pool's devices with its readout partitioned
+    across the processes (`Layout(min_shard=1)`), published as both publishers gather it: written by
+    `SafetensorsReload` into `--run-dir`, and exported as `NCCLPush` sends it, into the `.npz` beside
+    the report. Every process takes part; process 0 writes both."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.inference import rollouts
+    from dew.interop import Pretrained
+    from dew.training import Layout, MeshSpec
+
+    mesh = MeshSpec(fsdp=jax.device_count()).build()
+    placed = Pretrained.load(args.release, dtype="float32", attention_impl="xla", mesh=mesh,
+                             layout=Layout(min_shard=1, tolerance=1.0))
+    written = rollouts.SafetensorsReload(placed, Path(args.run_dir), (), "vllm", dtype="float32")
+    written.write(placed.variables)
+    published = rollouts._published(placed, placed.variables, jnp.dtype("float32"), phase="push gather")
+    if published is not None:
+        np.savez(args.out.with_suffix(".npz"), **published.export())
+    leaves = jax.tree.leaves(placed.head_variables)
+    return {"partitioned": any(not leaf.is_fully_addressable for leaf in leaves)}
 
 
 def mode_matrix(args) -> dict:
@@ -2378,8 +2356,10 @@ def mode_matrix(args) -> dict:
     from dew.data.dataset import tapped
 
     read, cached, rejecting, packed = args.cell.split(",")
-    data = matrix_data(read, cached == "cache", rejecting == "rejecting", packed == "packed",
-                       Path(args.run_dir).parent / "cache")
+    # A published cell reads the generation its test published once (`--prepared`), as every run of a
+    # prepared dataset does; a cache the pool fills lives beside its run.
+    cache_dir = Path(args.prepared) if cached == "published" else Path(args.run_dir).parent / "cache"
+    data = matrix_data(read, cached, rejecting == "rejecting", packed == "packed", cache_dir)
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
     restored_step, _ = restored_state(trainer)
     batches = []
@@ -2395,23 +2375,25 @@ def mode_matrix(args) -> dict:
             "batches": batches}
 
 
-MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
+MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit": mode_schedule_fit,
+         "decision_publish": mode_decision_publish,
          "host_training": mode_host_training, "step_fits": mode_step_fits,
          "whole_validation": mode_whole_validation, "host_fields": mode_host_fields,
-         "topology": mode_topology, "data": mode_data, "packed": mode_packed,
+         "topology": mode_topology, "data": mode_data, "online_data": mode_online_data,
+         "packed": mode_packed,
          "masked_generation": mode_masked_generation,
          "packed_fit": mode_packed_fit, "reads": mode_reads,
          "inference_pipeline": mode_inference_pipeline,
          "continuations": mode_continuations,
          "decoding_components": mode_decoding_components,
          "rollout": mode_rollout, "mixed_validity": mode_mixed_validity,
+         "replicated_rollout": mode_replicated_rollout,
          "steps": mode_steps, "fit": mode_fit, "validate": mode_validate,
          "tracked": mode_tracked, "pipeline": mode_pipeline,
          "training_contract": mode_training_contract,
          "evaluation_contract": mode_evaluation_contract,
          "evaluation_replicas": mode_evaluation_replicas,
          "evaluation_clocks": mode_evaluation_clocks,
-         "builtin_preview_failures": mode_builtin_preview_failures,
          "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals,
          "fp8_sites": mode_fp8_sites}
 
@@ -2432,23 +2414,33 @@ def parse_args(argv=None):
     parser.add_argument("--local-dir", help="every process's local checkpoint directory")
     parser.add_argument("--local-every", type=int)
     parser.add_argument("--records", type=int, default=BATCH * 16)
-    parser.add_argument("--val-steps", type=int, default=0,
-                        help="validation batches per pass, over the packed split of --tokens")
     parser.add_argument("--block-after", type=int,
                         help="batches to hand out before waiting to be killed")
-    parser.add_argument("--marker", help="file written once the source blocks")
+    parser.add_argument("--notify", help="the FIFO told once the source blocks with its checkpoints landed")
     parser.add_argument("--fail-local-save", type=int,
                         help="this process's local save at this step fails in the background, as "
                              "orbax's tmp directory creation once did (FileExistsError)")
-    parser.add_argument("--tokens", help="directory holding train.bin and val.bin")
+    parser.add_argument("--tokens", help="the committed token store the run trains on")
+    parser.add_argument("--held-tokens", help="the committed token store it validates on")
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--part", default="0/1", help="i/n: whole_validation's share of the objectives")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--elastic", action="store_true",
                         help="read the training records through a compiled global order, whose "
                              "saved position is a global record count")
+    parser.add_argument("--release", help="the decision release decision_publish places and publishes")
+    parser.add_argument("--online", help="host:port of the server whose urls the records are fetched from "
+                                         "(`online_loader`)")
+    parser.add_argument("--refusal", action="store_true",
+                        help="fit reports the ValueError it is refused with instead of raising it")
+    parser.add_argument("--replicated", action="store_true",
+                        help="the records filtered and read elastically (`replicated_loader`)")
+    parser.add_argument("--shared", action="store_true",
+                        help="each process fetches its own share of the shuffled catalog (`online_pipeline`)")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")
-    parser.add_argument("--cell", help="read,cache|nocache,rejecting|all,packed|rows for the matrix mode")
+    parser.add_argument("--cell", help="read,cache|nocache|published,rejecting|all,packed|rows for the "
+                                       "matrix mode")
+    parser.add_argument("--prepared", help="the cache holding a published matrix cell's generation")
     return parser.parse_args(argv)
 
 def main(argv=None) -> None:

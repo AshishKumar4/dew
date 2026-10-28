@@ -1,32 +1,33 @@
-"""Dew's long greedy decode held to float64 truth within what its own reference path errs and wavers by,
-after vLLM's Kimi K3 work: error a per-kernel test with synthetic inputs cannot see builds up over
-thousands of decode steps.
+"""Dew's long greedy decode held to float64 truth as the gate holds a port (check 1,
+tests/reference_error.py), after vLLM's Kimi K3 work: error a per-kernel test with synthetic inputs
+cannot see builds up over thousands of decode steps.
 
-    PYTHONPATH=src python tools/decode_drift.py --model DIR [--steps 1536] [--prompt 64] --out drift.json
+    PYTHONPATH=src python tools/decode_drift.py --model DIR [--steps 1536] [--prompt 64] [--seeds 8] \\
+        --out drift.json
 
-1. Dew's server, as it serves (`dew.pipeline`, bf16 weights), decodes one prompt greedily for `--steps`
-   tokens at batch 1: the sequence T and each token's log-probability. It decodes the same prompt again
-   in a batch of 4 beside three others; the record says where the two greedy paths part.
-2. The reference path (attention_impl="reference", and `dew.nn.kernels.generation.chosen` naming XLA for
-   the RMS norm, SwiGLU and the gated delta rule) scores T teacher-forced through its cached decode
-   (`dew.sampling.text.prefill_state`, `decode_ops`): at batch 1; at batch 4, T in row 0; and with every
-   embedding entry one ulp up (`jnp.nextafter`). The two variants measured against batch 1 are its noise:
-   what the reference moves by under a change no answer should depend on.
-3. The truth: T scored by one float64 forward of the model over the prompt and T. The reference's and the
-   server's bf16 prefills of the same are recorded beside it: decode against prefill.
+Each seed draws a prompt (`prompts`). Dew's server, as it serves (`dew.pipeline`, bf16 weights), decodes
+it greedily for `--steps` tokens at batch 1: the sequence T and each token's log-probability. The
+reference path (attention_impl="reference", and `dew.nn.kernels.generation.chosen` naming XLA for the RMS
+norm, SwiGLU and the gated delta rule) scores T teacher-forced through its cached decode
+(`dew.sampling.text.prefill_state`, `decode_ops`). The truth: T scored by one float64 forward of the model
+over the prompt and T. Check 1 (`assert_as_exact`) holds the server's log-probabilities to the reference's
+from that truth over the declared seeds, each `BLOCK` steps a row, so error gathered in one stretch of the
+decode is held by the worst row, not averaged away. `--seeds` is the model's declared count, sized by
+`seeds_for`; the exit code is the verdict's.
 
-The gate (`gate`) holds the server to the float64 truth as the accuracy rule holds a port, against the
-reference's own distance, over the decode and its worst 64-step block; and to the reference within the
-reference's own noise, as vLLM's K3 gate does. `passes` in the record, and the exit code. Qwen3.5's gated
-delta rule decodes through its fused step whatever `chosen` names (dew.nn.linear), so for it the reference
-shares the server's delta step until the decode honours the choice; the record says so
-(`reference_delta_rule`).
+Beside the verdict, the record reports the first seed's prompt decoded again in a batch of `BATCH` beside
+others (where the greedy paths part), the reference rescored at that batch and with its embedding one ulp
+up (what it wavers by under a change no answer should depend on), and both paths' prefills of the same
+tokens: decode against prefill. Qwen3.5's gated delta rule decodes through its fused step whatever
+`chosen` names (dew.nn.linear), so for it the reference shares the server's delta step until the decode
+honours the choice; the record says so (`reference_delta_rule`).
 """
 
 from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import json
 import sys
 from pathlib import Path
@@ -36,7 +37,7 @@ import jax.numpy as jnp
 import numpy as np
 
 import dew
-from dew.accuracy import rms, within
+from dew.accuracy import rms
 from dew.inference.serving import Server
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
@@ -51,10 +52,7 @@ BATCH = 4
 DELTA_RULE_FAMILIES = ("qwen3_next", "qwen3_5_text", "qwen3_5_moe_text")
 """The families whose layers decode a gated delta rule (dew.interop.families.qwen)."""
 BLOCK = 64
-"""Steps a block of the accuracy gate covers (`gate`)."""
-FACTOR, BLOCK_FACTOR = 2.0, 4.0
-"""The accuracy rule's FACTOR and ROW_FACTOR (tests/reference_error.py), its whole RMS and its worst row,
-here the decode's RMS and its worst block."""
+"""Steps a row of check 1 covers: `--steps` is whole blocks."""
 
 
 def greedy(task):
@@ -80,23 +78,26 @@ def served(task, rows: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray]:
     return np.asarray(tokens), np.asarray(first.raw_log_probs[0, :steps], np.float64)
 
 
-def replayed(model, variables, pad: int, rows: np.ndarray, forced: np.ndarray) -> np.ndarray:
-    """Row 0's log-probability of each of `forced`'s tokens, every row fed `forced` through the cached
-    decode one token at a time (teacher forcing)."""
-    model = model.with_cache_capacity(capacity_for(rows.shape[1], len(forced)))
+def replayer(model, variables, pad: int, batch: int, prompt: int, steps: int):
+    """A function of `(rows, forced)` returning row 0's log-probability of each of `forced`'s tokens, the
+    `batch` rows of `prompt` ids fed `forced` through the cached decode one token at a time (teacher
+    forcing): its single-token step compiled once for every call."""
+    model = model.with_cache_capacity(capacity_for(prompt, steps))
     ops = decode_ops(model, variables, pad, depths=None)
-    state, active = prefill_state(model, variables, ModelInputs(jnp.asarray(rows, jnp.int32)), ops)
 
     @jax.jit
-    def step(state, token):
+    def step(state, active, token):
         score = token_log_probs(state.logits[:1], jnp.full((1,), token, jnp.int32))[0]
-        return score, ops.advance(state, jnp.full((len(rows),), token, jnp.int32), active)
+        return score, ops.advance(state, jnp.full((batch,), token, jnp.int32), active)
 
-    scores = []
-    for token in forced:
-        score, state = step(state, int(token))
-        scores.append(score)
-    return np.asarray(jax.device_get(jnp.stack(scores)), np.float64)
+    def replay(rows: np.ndarray, forced: np.ndarray) -> np.ndarray:
+        state, active = prefill_state(model, variables, ModelInputs(jnp.asarray(rows, jnp.int32)), ops)
+        scores = []
+        for token in forced:
+            score, state = step(state, active, int(token))
+            scores.append(score)
+        return np.asarray(jax.device_get(jnp.stack(scores)), np.float64)
+    return replay
 
 
 def prefilled(model, variables, prompt: np.ndarray, forced: np.ndarray) -> np.ndarray:
@@ -106,9 +107,10 @@ def prefilled(model, variables, prompt: np.ndarray, forced: np.ndarray) -> np.nd
     return np.asarray(token_log_probs(logits, jnp.asarray(forced, jnp.int32)), np.float64)
 
 
-def truth(model_dir: str, prompt: np.ndarray, forced: np.ndarray) -> np.ndarray:
-    """`forced`'s tokens scored by the model in float64: its float32 load, every module and weight widened
-    (as tests/reference_error.py's float64_forward widens one), and the log partition in float64."""
+def truth(model_dir: str):
+    """A function scoring a prompt's `forced` tokens by the model in float64: its float32 load, every
+    module and weight widened (as tests/reference_error.py's float64_forward widens one), and the log
+    partition in float64."""
     loaded = Pretrained.load(model_dir, dtype=jnp.float32, param_dtype=jnp.float32,
                              attention_impl="reference")
     model = loaded.model
@@ -118,11 +120,15 @@ def truth(model_dir: str, prompt: np.ndarray, forced: np.ndarray) -> np.ndarray:
         wide = model.clone(dtype=jnp.float64, **inner)
         variables = jax.tree.map(lambda leaf: np.asarray(
             leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), loaded.variables)
-        sequence = jnp.asarray(np.concatenate([prompt, forced])[None, :-1], jnp.int32)
-        logits = wide.apply(variables, sequence, train=False, decode=False)[0, len(prompt) - 1:]
-        scores = jax.nn.log_softmax(logits.astype(jnp.float64), axis=-1)
-        chosen_scores = jnp.take_along_axis(scores, jnp.asarray(forced)[:, None], axis=-1)[:, 0]
-        return np.asarray(chosen_scores, np.float64)
+
+    def scored(prompt: np.ndarray, forced: np.ndarray) -> np.ndarray:
+        with jax.enable_x64(new_val=True):
+            sequence = jnp.asarray(np.concatenate([prompt, forced])[None, :-1], jnp.int32)
+            logits = wide.apply(variables, sequence, train=False, decode=False)[0, len(prompt) - 1:]
+            scores = jax.nn.log_softmax(logits.astype(jnp.float64), axis=-1)
+            chosen_scores = jnp.take_along_axis(scores, jnp.asarray(forced)[:, None], axis=-1)[:, 0]
+            return np.asarray(chosen_scores, np.float64)
+    return scored
 
 
 def perturbed(variables):
@@ -140,59 +146,73 @@ def drift(first: np.ndarray, second: np.ndarray) -> dict:
     return {"rms": rms(gap), "max": float(gap.max()), "worst_step": int(gap.argmax())}
 
 
-def gate(server: np.ndarray, reference: np.ndarray, noise: np.ndarray, true: np.ndarray) -> dict:
-    """Both halves of the module's gate, each `dew.accuracy.within` (a NaN or infinite anything fails).
-
-    Accuracy, the accuracy rule's (tests/reference_error.py): the server's RMS distance from float64 within
-    FACTOR times the reference's, and its worst `BLOCK`-step block within BLOCK_FACTOR times the
-    reference's worst, so error gathered in one stretch of the decode is not averaged away. Noise, vLLM's
-    K3 gate: the server's RMS distance from the reference within the RMS of what the reference itself
-    moves by in a batch of 4 or with its embedding one ulp up, step by step the larger."""
-    blocks = [slice(start, start + BLOCK) for start in range(0, len(true), BLOCK)]
-    mine, theirs = rms(server - true), rms(reference - true)
-    worst = max(rms(server[steps] - true[steps]) for steps in blocks)
-    their_worst = max(rms(reference[steps] - true[steps]) for steps in blocks)
-    accuracy = {"server": mine, "reference": theirs, "server_worst_block": worst,
-                "reference_worst_block": their_worst,
-                "passes": within(mine, FACTOR * theirs) and within(worst, BLOCK_FACTOR * their_worst)}
-    drift, floor = rms(server - reference), rms(noise)
-    wavering = {"server_from_reference": drift, "reference_noise": floor, "passes": within(drift, floor)}
-    return {"accuracy": accuracy, "noise": wavering, "passes": accuracy["passes"] and wavering["passes"]}
+def prompts(vocab_limit: int, length: int, seed: int) -> np.ndarray:
+    """A seed's `BATCH` prompts of `length` token ids below `vocab_limit`: its first is the one decoded
+    alone, the rest the batch beside it."""
+    return np.random.default_rng([0xD0DE, seed]).integers(0, vocab_limit, (BATCH, length), dtype=np.int32)
 
 
 def main() -> int:
+    from reference_error import as_given, assert_as_exact
+
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--model", required=True)
     parser.add_argument("--steps", type=int, default=1536)
     parser.add_argument("--prompt", type=int, default=64)
+    parser.add_argument("--seeds", type=int, default=8, help="the model's declared draws (`seeds_for`)")
     parser.add_argument("--vocab-limit", type=int, default=30_000)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    rows = np.random.default_rng(0).integers(0, args.vocab_limit, (BATCH, args.prompt), dtype=np.int32)
+    if args.steps % BLOCK:
+        parser.error(f"--steps is whole blocks of {BLOCK}")
 
     task = greedy(dew.pipeline(args.model, dtype="bfloat16", param_dtype="bfloat16"))
-    tokens, optimized = served(task, rows[:1], args.steps)
-    together, _ = served(task, rows, args.steps)
-    parted = np.flatnonzero(together != tokens)
-
     loaded = Pretrained.load(args.model, dtype="bfloat16", param_dtype="bfloat16",
                              attention_impl="reference")
     reference = greedy(loaded.text_generation())
     pad = task.sampling.pad
+    true = truth(args.model)
     with chosen(**REFERENCE_KERNELS):
-        alone = replayed(reference.model, reference.variables, pad, rows[:1], tokens)
-        batched = replayed(reference.model, reference.variables, pad, rows, tokens)
-        moved = replayed(reference.model, perturbed(reference.variables), pad, rows[:1], tokens)
+        alone_of = replayer(reference.model, reference.variables, pad, 1, args.prompt, args.steps)
+        batched_of = replayer(reference.model, reference.variables, pad, BATCH, args.prompt, args.steps)
+        moved_of = replayer(reference.model, perturbed(reference.variables), pad, 1, args.prompt, args.steps)
+
+    @functools.cache
+    def draw(seed):
+        """The seed's prompts and Dew's server's greedy decode of the first alone: its tokens and their
+        log-probabilities."""
+        rows = prompts(args.vocab_limit, args.prompt, seed)
+        return (rows, *served(task, rows[:1], args.steps))
+
+    def blocks(scores) -> np.ndarray:
+        return np.asarray(scores).reshape(-1, BLOCK)
+
+    def replay(rows, tokens, scores):
+        with chosen(**REFERENCE_KERNELS):
+            return blocks(alone_of(rows[:1], tokens))
+
+    finding = None
+    try:
+        # Both arms read the decode's scores on the host, as given.
+        assert_as_exact(as_given(lambda rows, tokens, scores: blocks(scores)), as_given(replay), draw,
+                        f"{args.model}'s decode", seeds=args.seeds,
+                        truth_fn=lambda rows, tokens, scores: blocks(true(rows[0], tokens)))
+    except AssertionError as failed:
+        finding = str(failed)
+
+    rows, tokens, optimized = draw(0)
+    together, _ = served(task, rows, args.steps)
+    parted = np.flatnonzero(together != tokens)
+    with chosen(**REFERENCE_KERNELS):
+        alone, moved = alone_of(rows[:1], tokens), moved_of(rows[:1], tokens)
+        batched = batched_of(rows, tokens)
         reference_prefill = prefilled(reference.model, reference.variables, rows[0], tokens)
     served_prefill = prefilled(task.model, task.variables, rows[0], tokens)
-    true = truth(args.model, rows[0], tokens)
-    noise = np.maximum(np.abs(alone - batched), np.abs(alone - moved))
-    verdict = gate(optimized, alone, noise, true)
     config = json.loads((Path(args.model) / "config.json").read_text())
     delta_rule = config.get("text_config", config)["model_type"] in DELTA_RULE_FAMILIES
     record = {
-        "model": args.model, "steps": args.steps, "prompt": args.prompt,
-        "device": jax.devices()[0].device_kind, "gate": verdict, "passes": verdict["passes"],
+        "model": args.model, "steps": args.steps, "prompt": args.prompt, "seeds": args.seeds,
+        "device": jax.devices()[0].device_kind, "passes": finding is None, "finding": finding,
         "greedy_paths_part_at": int(parted[0]) if len(parted) else None,
         "reference_batch_4": drift(alone, batched), "reference_embedding_ulp": drift(alone, moved),
         "server_from_reference": drift(optimized, alone),
@@ -201,11 +221,13 @@ def main() -> int:
         "reference_delta_rule": "the fused decode step (it ignores chosen)" if delta_rule else None,
         "steps_scored": {"tokens": tokens.tolist(), "server": optimized.tolist(), "reference": alone.tolist(),
                          "reference_batch_4": batched.tolist(), "reference_embedding_ulp": moved.tolist(),
-                         "truth": true.tolist()}}
+                         "truth": true(rows[0], tokens).tolist()}}
     args.out.write_text(json.dumps(record, indent=1) + "\n")
-    print(json.dumps({key: record[key] for key in ("gate", "greedy_paths_part_at", "passes")}))
+    print(json.dumps({key: record[key] for key in ("passes", "finding", "greedy_paths_part_at")}))
     return 0 if record["passes"] else 1
 
 
 if __name__ == "__main__":
+    # The tests' reference_error, as the test suite imports it.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
     sys.exit(main())

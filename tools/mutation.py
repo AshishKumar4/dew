@@ -14,6 +14,10 @@ import time
 from collections import Counter
 from pathlib import Path
 
+# The tests CI selects (tools/armada/session.py), which a mutant's tests are too.
+sys.path.insert(0, str(Path(__file__).resolve().parent / "armada"))
+from session import SELECTION
+
 
 @dataclasses.dataclass(frozen=True)
 class Target:
@@ -124,8 +128,8 @@ def report(database) -> dict:
 def collected(tests: tuple[str, ...]) -> None:
     """Refuse a selection pytest cannot collect, a deleted file or test among it, before the
     baseline spends the session's budget on it."""
-    found = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", "-m", "not network",
-                            *tests], capture_output=True, text=True)
+    found = subprocess.run([sys.executable, "-m", "pytest", "--collect-only", "-q", *SELECTION, *tests],
+                           capture_output=True, text=True)
     if found.returncode:
         raise ValueError(f"pytest cannot collect {list(tests)}:\n{found.stdout[-2000:]}"
                          f"{found.stderr[-2000:]}")
@@ -174,8 +178,8 @@ def run(target: Target, directory: Path, shard: int, shards: int, timeout: float
     from cosmic_ray.work_item import WorkItem
 
     collected(target.tests)
-    command = shlex.join([sys.executable, "-m", "pytest", "-x", "-q", "--tb=short",
-                          "-m", "not network", *target.tests])
+    command = shlex.join([sys.executable, "-m", "pytest", "-x", "-q", "--tb=short", *SELECTION,
+                          *target.tests])
     modules = list(find_modules([Path(target.path)]))
     identity = {"source_digest": source_digest(modules), "path": target.path,
                 "tests_digest": source_digest([Path(test.split("::", 1)[0]) for test in target.tests]

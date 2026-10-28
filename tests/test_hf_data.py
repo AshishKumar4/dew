@@ -1,4 +1,4 @@
-"""Image recipes decode Arrow records and preserve captions and held-out rows."""
+"""The images preset decodes Arrow records and preserves captions and held-out rows."""
 
 import io
 
@@ -6,20 +6,29 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from data_support import keep_captions
 from PIL import Image
 
-from dew.config.data import Augment, ImageData, loader
-from dew.data import Files, Loading
+from dew.batch import VALID_ROWS
+from dew.data import Files, Loading, presets
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.images import EncodeCaptions
-from dew.objectives.base import VALID_ROWS
 
 SCALE = 8
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
 
-def keep_captions(captions):
-    return {"caption": np.asarray(captions)}
+def run(train, validation=None, *, read="memory", loading=READ, host=(), field="image"):
+    """`train`'s images as a run reads them, shuffled, in windows of 64 where streamed, and repeated,
+    and `validation`'s read once, each resized to SCALE pixels, its other fields as they are, in
+    batches of four read by the `host` steps."""
+    def pictures(dataset):
+        return dataset.pipe(presets.images, SCALE, batch=4, field=field, rejects=False, host=host)
+
+    order = train.shuffle(0, window=64 if read == "streamed" else None).repeat()
+    held = None if validation is None else pictures(validation)
+    return compile(pictures(order), validation=held, read=read, loading=loading)
 
 
 def image_table(path, count=16, *, struct=False):
@@ -28,8 +37,8 @@ def image_table(path, count=16, *, struct=False):
         with io.BytesIO() as output:
             Image.fromarray(np.full((12, 12, 3), index + 1, np.uint8)).save(output, format="PNG")
             payloads.append(output.getvalue())
-    images = [{"bytes": payload, "path": None} for payload in payloads] if struct else payloads
-    pq.write_table(pa.table({"image": images, "caption": [f"caption {index}" for index in range(count)],
+    stored = [{"bytes": payload, "path": None} for payload in payloads] if struct else payloads
+    pq.write_table(pa.table({"image": stored, "caption": [f"caption {index}" for index in range(count)],
                             "label": list(range(count))}), path, row_group_size=3)
     return Files(str(path), format="parquet")
 
@@ -38,10 +47,8 @@ def image_table(path, count=16, *, struct=False):
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_parquet_images_and_captions_reach_real_worker_batches(tmp_path, workers, read):
     source = image_table(tmp_path / "images.parquet")
-    data = loader(ImageData(source=source, image_size=SCALE, augment=None, validation=source),
-                batch=4, read=read,
-                loading=Loading(workers=workers, threads=1, read_buffer=2, worker_buffer=1),
-                host=(EncodeCaptions(keep_captions),))
+    loading = Loading(workers=workers, threads=1, read_buffer=2, worker_buffer=1)
+    data = run(source, source, read=read, loading=loading, host=(EncodeCaptions(keep_captions),))
     assert data.val is not None
     stream = data.val(DataPartition())
     try:
@@ -59,8 +66,7 @@ def test_parquet_images_and_captions_reach_real_worker_batches(tmp_path, workers
 
 def test_hugging_face_image_structs_decode_their_embedded_bytes(tmp_path):
     source = image_table(tmp_path / "hub-images.parquet", 4, struct=True)
-    data = loader(ImageData(source=source, image_size=SCALE, augment=None, validation=None), batch=4,
-                read="memory", loading=READ)
+    data = run(source)
     stream = data.train(DataPartition())
     try:
         batch = next(stream)
@@ -73,8 +79,7 @@ def test_hugging_face_image_structs_decode_their_embedded_bytes(tmp_path):
 def test_a_second_validation_source_leaves_every_training_record_available(tmp_path):
     train = image_table(tmp_path / "train.parquet", 16)
     held = image_table(tmp_path / "held.parquet", 5)
-    data = loader(ImageData(source=train, validation=held, image_size=SCALE, augment=None),
-                batch=4, read="memory", loading=READ)
+    data = run(train, held)
     assert data.records == 16 and data.held_out == 0 and data.val is not None
     stream = data.val(DataPartition())
     try:
@@ -101,8 +106,7 @@ def test_an_uncaptioned_class_dataset_reads_as_rgb_whatever_mode_it_stores(tmp_p
     path = tmp_path / "classes.parquet"
     pq.write_table(pa.table({"img": payloads, "label": list(range(4))}), path)
     source = Files(str(path), format="parquet")
-    data = loader(ImageData(source=source, field="img", validation=source, image_size=SCALE,
-                            augment=None), batch=4, read="memory", loading=READ)
+    data = run(source, source, field="img")
     stream = data.val(DataPartition())
     try:
         batch = next(stream)
@@ -112,33 +116,6 @@ def test_an_uncaptioned_class_dataset_reads_as_rgb_whatever_mode_it_stores(tmp_p
     np.testing.assert_array_equal(batch["image"][:, 0, 0], np.repeat([[0], [16], [32], [255]], 3, 1))
     np.testing.assert_array_equal(batch["label"], [0, 1, 2, 3])
     assert "caption" not in batch
-
-
-def test_validation_never_applies_the_training_crop_or_colour_jitter(tmp_path):
-    source = image_table(tmp_path / "images.parquet", 8)
-    images = []
-    for augment in (None, Augment(flip=True, jitter=True, crop_scale=(0.5, 0.9))):
-        data = loader(ImageData(source=source, validation=source, image_size=SCALE,
-                           staging_size=16, augment=augment), batch=4, read="memory", loading=READ)
-        assert data.val is not None
-        stream = data.val(DataPartition())
-        try:
-            images.append(next(stream)["image"])
-        finally:
-            stream.close()
-    np.testing.assert_array_equal(images[0], images[1])
-
-
-def test_an_unconditional_batch_discards_host_caption_strings(tmp_path):
-    source = image_table(tmp_path / "images.parquet", 4)
-    data = loader(ImageData(source=source, image_size=SCALE, augment=None, validation=None), batch=4,
-                  read="memory", loading=READ)
-    stream = data.train(DataPartition())
-    try:
-        batch = next(stream)
-    finally:
-        stream.close()
-    assert set(batch) == {"image", "label"}
 
 
 @pytest.mark.parametrize("streamed", [False, True])

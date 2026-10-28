@@ -32,11 +32,11 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 from dew.diffusion.presets import EDM, Cosine, Flow
+from dew.distributed.batches import batch_shardings
 from dew.figures import THEMES, Figure
 from dew.nn.backbones import CausalTransformer, Mixture
 from dew.rl import clipped_surrogate_terms, group_advantage, k3_kl
 from dew.training import Layout, MeshSpec
-from dew.training.distributed import batch_shardings
 
 HERE = Path(__file__).resolve().parent
 
@@ -140,7 +140,7 @@ def training_step_figure():
         box(svg, 288, 90, 432, 66, "objective.loss(variables, batch, step)",
             ["→ Ratio(total, mass), Aux(metrics)"], accent=True)
         box(svg, 288, 172, 432, 66, "gradient", ["of the mean over the accumulation window"])
-        box(svg, 288, 254, 432, 66, "optimizer.update, optax.apply_updates",
+        box(svg, 288, 254, 432, 66, "optimizer.update, dew.optim.stepped",
             ["when the window closes"])
         box(svg, 288, 336, 432, 62, "ema_update", ["of the leaves objective.ema selects"])
         for y in (156, 238, 320):
@@ -306,7 +306,7 @@ def post_training_figure():
              "input_ids", ["completion_mask", "both [B, 2, S]"], "DPOObjective",
              ["policy against the frozen", "reference in TrainState.ema"]),
             ("GRPO", "Prompts", ["left-padded prompt,", "prompt_length, reward fields"],
-             "SampledRollout → pack", ["G completions per prompt,", "reward → advantages"],
+             "PolicyCollector → pack", ["G completions per prompt,", "reward → advantages"],
              "GRPOObjective", ["clipped ratio + beta · KL", "to the reference in .ema"]),
         ]
         for row, (name, source, source_lines, fields, field_lines, objective, objective_lines) in enumerate(lanes):

@@ -26,7 +26,7 @@ from dew.inference import NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.rl import EnvironmentSource, EpisodeStatus, GRPOObjective, Observation
-from dew.objectives.rl.scheduler import RolloutScheduler
+from dew.objectives.rl.scheduler import Asynchronous, RolloutScheduler
 from dew.objectives.rl.sessions import Status, pack
 from dew.sampling import Sampling
 from dew.training import Layout, Trainer
@@ -49,7 +49,7 @@ class Tools:
         self.steps += 1
         if self.steps == 2:
             return Observation((), EpisodeStatus.COMPLETED, "done")
-        self.context = action.context + action.tokens + (4,)
+        self.context = action.prompt + action.tokens + (4,)
         return Observation(self.context)
 
 
@@ -132,7 +132,10 @@ def rig(environment, verifier, *, tasks, log, workers=16, scheduler=RolloutSched
     episodes = EnvironmentSource(server, environment, verifier, max_prompt_tokens=32, max_new_tokens=16,
                                  max_turns=3, workers=workers)
     watched = Watched(episodes)
-    rollout = scheduler(target, watched, server, width=WIDTH, rows=2 * tasks, groups=2, log=log, **options)
+    acquired = {name: options.pop(name) for name in ("ahead", "max_lag", "sync_every", "max_attempts")
+                if name in options}
+    rollout = scheduler(Asynchronous(watched, server, target, width=WIDTH, rows=2 * tasks, **acquired),
+                        groups=2, log=log, **options)
     stream = rollout.tasks(
         Loader(
             train=replayed(lambda partition: (

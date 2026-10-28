@@ -9,6 +9,7 @@ relabeled as a native raw-policy or behavior-policy likelihood.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import io
@@ -20,8 +21,9 @@ from typing import TYPE_CHECKING, Literal, Protocol
 import jax
 import numpy as np
 
-from dew.nn.inputs import key_seed, token_id
-from dew.records import JSON
+from dew._records import JSON, record as section
+from dew.batch import token_id
+from dew.nn.inputs import key_seed
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -112,12 +114,6 @@ def _invoke[T](call: Callable[..., T], fields: Mapping[str, object]) -> T:
     return call(**fields)
 
 
-def _object(value: object, name: str) -> Mapping[str, object]:
-    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
-        raise ValueError(f"{name} must be an object")
-    return {key: entry for key, entry in value.items() if isinstance(key, str)}
-
-
 def _count(value: object, name: str) -> int | None:
     if value is None:
         return None
@@ -151,7 +147,7 @@ def _prompts(prompts: str | Sequence[str], budget: int, seed: int | None) -> lis
 def _bound(options: Mapping[str, object], fixed: Mapping[str, object]) -> Mapping[str, object]:
     overlap = options.keys() & fixed.keys()
     if options.get("extra_body") is not None:
-        extensions = _object(options["extra_body"], "extra_body")
+        extensions = dict(section(options["extra_body"], "extra_body"))
         overlap |= extensions.keys() & (fixed.keys() | {"n"})
     if overlap:
         raise ValueError(f"fields {sorted(overlap)} are supplied by the bound task")
@@ -170,7 +166,7 @@ def _ollama_budget(options: object, budget: int, seed: int | None,
     from ollama import Options
 
     supplied = options.model_dump(exclude_none=True) if isinstance(options, Options) else options
-    fields = {} if supplied is None else _object(supplied, "options")
+    fields = {} if supplied is None else dict(section(supplied, "options"))
     request_only = (
         _ollama_request_names("generate") | _ollama_request_names("chat")
     ) - Options.model_fields.keys()
@@ -301,7 +297,9 @@ class OllamaCompletion:
                     key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
         requests = self._generations(prompts, max_new_tokens, key, parameters)
         client = self._async()
-        return _ollama_result([await _invoke(client.generate, body) for body in requests])
+        # Every row's request is in flight at once, its answer kept in its row's place.
+        answers = await asyncio.gather(*(_invoke(client.generate, body) for body in requests))
+        return _ollama_result(list(answers))
 
     async def astream(self, prompt: str, max_new_tokens: int, *, key: int | jax.Array | None = None,
                       **parameters: RequestField) -> AsyncIterator[OllamaResponse]:
@@ -329,33 +327,60 @@ def _choice_tokens(entry: Mapping[str, object]) -> tuple[tuple[int, ...] | None,
     of the logprob tokens; text tokens are not reverse-mapped through a
     vocabulary.
     """
+    ids = listed_ids(entry)
+    reported = reported_log_probs(entry)
+    if reported is None:
+        return ids, None
+    rendered, probabilities = reported
+    if ids is not None:
+        if len(ids) != len(probabilities):
+            raise ValueError("choice token_ids must be aligned with its token_logprobs")
+        return ids, probabilities
+    rendered_ids: list[int] = []
+    for token in rendered:
+        if not token.startswith("token_id:"):
+            return None, probabilities
+        rendered_ids.append(int(token.removeprefix("token_id:")))
+    return tuple(rendered_ids), probabilities
+
+
+def listed_ids(entry: Mapping[str, object]) -> tuple[int, ...] | None:
+    """A choice's `token_ids` list (SGLang's `return_token_ids`), or None where it has none."""
     listed = entry.get("token_ids")
-    if listed is not None and (not isinstance(listed, list) or any(
-            type(token) is not int or token < 0 for token in listed)):
-        raise ValueError("choice token_ids must be a list of nonnegative ids")
-    ids = None if listed is None else tuple(listed)
+    if listed is None:
+        return None
+    if not isinstance(listed, list):
+        raise ValueError(f"a choice's token_ids are a list, got {type(listed).__name__}")
+    return tuple(token_id(token, where="a choice's token_ids") for token in listed)
+
+
+def matched_stop(entry: Mapping[str, object]) -> str | int | None:
+    """The stop a choice says ended it, a string or a token id: vLLM's `stop_reason` and SGLang's
+    `matched_stop`. None where it names none, as for its model's own EOS or at its budget."""
+    matched = entry.get("stop_reason", entry.get("matched_stop"))
+    if isinstance(matched, bool) or (matched is not None and not isinstance(matched, (str, int))):
+        raise ValueError(f"a choice's matched stop is a string or a token id, not {matched!r}")
+    return matched
+
+
+def reported_log_probs(entry: Mapping[str, object]) -> tuple[tuple[str, ...], tuple[float, ...]] | None:
+    """A choice's logprob tokens as rendered and their log-probabilities, or None where it reports
+    none."""
     logprobs = entry.get("logprobs")
     if logprobs is None:
-        return ids, None
-    record = _object(logprobs, "choice logprobs")
+        return None
+    record = dict(section(logprobs, "choice logprobs"))
     rendered, values = record.get("tokens"), record.get("token_logprobs")
     if not isinstance(rendered, list) or not isinstance(values, list) or len(rendered) != len(values):
         raise ValueError("choice logprobs need aligned tokens and token_logprobs lists")
+    if not all(isinstance(token, str) for token in rendered):
+        raise ValueError("choice logprobs tokens must be the rendered tokens' text")
     probabilities: list[float] = []
     for value in values:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ValueError("each reported token log-probability must be a number")
         probabilities.append(float(value))
-    if ids is not None:
-        if len(ids) != len(probabilities):
-            raise ValueError("choice token_ids must be aligned with its token_logprobs")
-        return ids, tuple(probabilities)
-    rendered_ids: list[int] = []
-    for token in rendered:
-        if not isinstance(token, str) or not token.startswith("token_id:"):
-            return None, tuple(probabilities)
-        rendered_ids.append(int(token.removeprefix("token_id:")))
-    return tuple(rendered_ids), tuple(probabilities)
+    return tuple(rendered), tuple(probabilities)
 
 
 def decode_routed_experts(encoded: object) -> np.ndarray:
@@ -373,14 +398,14 @@ def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
     from openai.types import Completion as SDKCompletion
     if not isinstance(response, SDKCompletion):
         raise ValueError("a non-streaming completion request returned an incompatible response")
-    fields = _object(raw, "completion response")
+    fields = dict(section(raw, "completion response"))
     choices = fields.get("choices")
     if not isinstance(choices, list) or len(choices) != expected:
         raise ValueError(f"expected {expected} completion choices")
     ordered: dict[int, tuple[str, str | None, tuple[int, ...] | None, tuple[float, ...] | None,
                              np.ndarray | None]] = {}
     for choice in choices:
-        entry = _object(choice, "completion choice")
+        entry = dict(section(choice, "completion choice"))
         index, text = entry.get("index"), entry.get("text")
         if type(index) is not int or index < 0 or index >= expected or index in ordered:
             raise ValueError("choice indices must be a permutation of the expected prompt-choice indices")
@@ -391,7 +416,7 @@ def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
         ordered[index] = (text, _reason(entry.get("finish_reason")), *_choice_tokens(entry), experts)
     usage = None
     if fields.get("usage") is not None:
-        supplied = _object(fields["usage"], "usage")
+        supplied = dict(section(fields["usage"], "usage"))
         usage = Usage(*(_count(supplied.get(name), name) for name in
                         ("prompt_tokens", "completion_tokens", "total_tokens")))
     per_choice = (usage.completion_tokens,) if expected == 1 and usage is not None else (None,) * expected
@@ -443,6 +468,22 @@ def _openai_fields(model: str, prompts: str | Sequence[str] | TokenRows, budget:
     if seed is not None:
         fixed["seed"] = seed
     return _bound(parameters, fixed), count * n
+
+
+def _engine_stops(sampling: Sampling, provider: Literal["vllm", "sglang"]) -> Mapping[str, JSON]:
+    """The request fields that end an engine's draw on `sampling.stops`.
+
+    vLLM ends a draw on its model's EOS and its generation config's EOS ids unless told to ignore
+    them, and on `stop_token_ids` either way (vllm/sampling_params.py:690-718 at v0.30.0), so it
+    is told to ignore them and given the stops: exact for every policy. SGLang's `ignore_eos`
+    turns off every token stop, `stop_token_ids` too, and otherwise it also ends on its model's
+    EOS ids (sglang/srt/managers/schedule_batch.py:1707-1729 at v0.5.20): a policy without stops
+    is exact there, and one with stops ends on its model's EOS as well, which a draw that checks
+    its finish refuses where the policy leaves that EOS out."""
+    stops: list[JSON] = list(sampling.stops)
+    if provider == "vllm":
+        return {"ignore_eos": True, **({"stop_token_ids": stops} if stops else {})}
+    return {"stop_token_ids": stops} if stops else {"ignore_eos": True}
 
 
 @dataclass(frozen=True)
@@ -497,9 +538,9 @@ class OpenAICompletion:
         controls: dict[str, object] = {"top_k": -1 if sampling.top_k is None else sampling.top_k,
                                       "min_p": sampling.min_p,
                                       "repetition_penalty": sampling.repetition_penalty}
-        if sampling.eos_token_ids is not None:
-            controls["stop_token_ids"] = list(sampling.stops)
-        extra = {} if fields.get("extra_body") is None else _object(fields["extra_body"], "extra_body")
+        if self.provider != "openai":
+            controls.update(_engine_stops(sampling, self.provider))
+        extra = {} if fields.get("extra_body") is None else dict(section(fields["extra_body"], "extra_body"))
         if self.provider == "openai" and controls.keys() & extra.keys():
             raise ValueError(
                 "top-k, min-p, repetition and EOS-token controls in extra_body require "

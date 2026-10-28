@@ -11,7 +11,8 @@ partitioner, which replicates it and gathers its inputs to every device
 unless the kernel runs per shard. Every such kernel's entry point keeps one
 contract, which `assert_runs_per_shard` checks on a mesh of CPU devices in
 the suite and of GPUs on a multi-GPU host: split over the mesh it computes
-what it computes on one device, within the float64 gate, its compiled step
+what it computes on one device, on par with it over the site's draws (check
+1 of the float64 gate, `assert_as_exact`), its compiled step
 moves none of its operands between devices, and no copy or transpose sits
 at its boundary (`boundary_copies`): a Pallas-Triton call takes and gives
 row-major arrays, so a producer or consumer laid out otherwise costs a pass
@@ -23,12 +24,14 @@ hold; the third needs the GPU.
 import math
 
 import jax
+import jax.numpy as jnp
 import numpy as np
-from jax.sharding import NamedSharding
-from reference_error import assert_leaves_as_exact
+from jax.sharding import NamedSharding, PartitionSpec
+from reference_error import as_given, assert_as_exact, without_ynn
 
-from dew.telemetry.instrumentation import collective, custom_call_kind, hlo_instructions
-from dew.training.distributed import parameter_axes
+from dew.distributed.placement import parameter_axes
+from dew.telemetry.instrumentation import custom_call_kind, hlo_instructions
+from dew.telemetry.trace import collective
 
 
 def split_axes(tree) -> set[str]:
@@ -52,6 +55,22 @@ def collectives(text: str) -> list[tuple[str, list[tuple[int, ...]]]]:
     parser (`hlo_instructions`): an async pair once, by its `-done`, which holds what moved."""
     return [(kind, list(instruction.shapes)) for instruction in hlo_instructions(text).values()
             if (kind := collective(instruction.op)) and not instruction.op.endswith("-start")]
+
+
+def collective_axes(text: str, mesh: jax.sharding.Mesh) -> set[tuple[str, frozenset[str]]]:
+    """`(op, axes)` of every collective in compiled HLO `text` over `mesh`: the axes along which
+    the devices of one of its groups (`HloInstruction.groups`) differ, each group's positions read
+    in the program's device assignment, `mesh`'s devices in order. An async pair once, by its
+    `-start`, which holds the groups."""
+    found = set()
+    for instruction in hlo_instructions(text).values():
+        if (kind := collective(instruction.op)) is None or instruction.op.endswith("-done"):
+            continue
+        groups = instruction.groups or (tuple(range(mesh.size)),)
+        coordinates = [np.unravel_index(list(group), mesh.devices.shape) for group in groups]
+        found.add((kind, frozenset(name for index, name in enumerate(mesh.axis_names)
+                                   if any(len(set(within[index].tolist())) > 1 for within in coordinates))))
+    return found
 
 
 def collective_bytes(text: str, ops) -> int:
@@ -86,26 +105,56 @@ def tpu_lowering(fn, args, mesh: jax.sharding.Mesh) -> str:
         return jax.export.export(jax.jit(fn), platforms=["tpu"])(*args).mlir_module()
 
 
-def assert_runs_per_shard(fn, args, specs, mesh, truth, *, moves=()) -> None:
-    """The custom-kernel contract (module docstring): `fn(*args)` with `args` placed on `mesh` by
-    `specs` (PartitionSpecs) is within the float64 gate (`assert_leaves_as_exact`) of `fn` on one
-    device, both measured from `truth`, the float64 tree of `fn`'s outputs; its compiled step holds
-    no collective that moves entries between devices (`MOVES`) beyond the ops `moves` names (a
-    sequence split's intended exchange), which XLA, unable to split an opaque call, would otherwise
-    insert to replicate it; and no copy or transpose at a kernel call's edge (`boundary_copies`)."""
-    run = jax.jit(fn)
-    whole = run(*args)
+def placed(tree, mesh: jax.sharding.Mesh, *spec):
+    """`tree`'s arrays as abstract values placed on `mesh` by `PartitionSpec(*spec)`, for a step traced
+    and lowered for a mesh it does not run on."""
+    sharding = NamedSharding(mesh, PartitionSpec(*spec))
+    return jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sharding), tree)
+
+
+def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=(),
+                          donate=(), arm=None) -> None:
+    """The custom-kernel contract (module docstring): `fn` on `draw(seed)`'s arguments placed on `mesh`
+    by `specs` (PartitionSpecs) is on par with `fn` on one device over the site's declared `seeds`
+    (check 1, `assert_as_exact`), both measured from `truth_fn`, the float64 tree of `fn`'s outputs on
+    the arguments widened; its compiled step, every draw's one program, holds no collective that moves
+    entries between devices (`MOVES`) beyond the ops `moves` names (a sequence split's intended
+    exchange), which XLA, unable to split an opaque call, would otherwise insert to replicate it; and no
+    copy or transpose at a kernel call's edge (`boundary_copies`). `donate` names the arguments `fn`
+    takes in place, as its callers donate them (a kernel that aliases its state into its output): a
+    call that keeps them would make XLA copy each before the kernel overwrites it. Both arms are Dew's
+    programs, compiled here as the gate compiles two Dew arms (`without_ynn`) and run as given: the
+    split one is the executable whose collectives the contract reads. `arm`, when given, is the arm the
+    split is compared with in place of `fn` on one device: a call whose rounding depends on the shapes it
+    runs at is compared with the shapes its shards run. A caller passing `arm` also asserts the split
+    against the reference path (check 1 against float64), so the comparison with `arm` alone is not the
+    whole contract."""
+    run = without_ynn(fn, donate_argnums=donate)
+
+    def put(args):
+        return [jax.device_put(arg, NamedSharding(mesh, spec)) for arg, spec in zip(args, specs, strict=True)]
+
     with jax.set_mesh(mesh):
-        placed = [jax.device_put(arg, NamedSharding(mesh, spec))
-                  for arg, spec in zip(args, specs, strict=True)]
-        compiled = run.lower(*placed).compile()
-        split = compiled(*placed)
+        compiled = run.lower(*put(draw(0))).compile()
     text = compiled.as_text()
     moved = [(op, shapes) for op, shapes in collectives(text) if op in MOVES and op not in moves]
     assert not moved, f"the step moves operands between devices: {moved}"
     copies = boundary_copies(text)
     assert not copies, f"XLA re-lays out arrays at the kernel's boundary: {copies}"
-    assert_leaves_as_exact(jax.tree.map(np.asarray, split), jax.tree.map(np.asarray, whole), truth)
+
+    def kept(args):
+        # A donated argument is consumed; the draw's own array goes on to the other arm and the truth.
+        return [jnp.copy(arg) if index in donate else arg for index, arg in enumerate(args)]
+
+    def split(*args):
+        with jax.set_mesh(mesh):
+            return compiled(*put(kept(args)))
+
+    def one_device(*args):
+        return run(*kept(args))
+
+    assert_as_exact(as_given(split), as_given(one_device) if arm is None else arm, draw, label, seeds=seeds,
+                    truth_fn=truth_fn)
 
 
 VIEWS = frozenset({"bitcast", "get-tuple-element", "tuple", "parameter"})

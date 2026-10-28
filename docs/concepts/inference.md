@@ -14,7 +14,7 @@ import numpy as np
 
 from dew import Trainer
 from dew.data.dataset import Loader
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data import ByteTokenizer
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
@@ -108,7 +108,7 @@ The byte vocabulary has no Hugging Face tokenizer files, so the loaded task has 
 
 ## Weights
 
-For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline`, the tasks' `from_run` and `from_pretrained`, `objective.pipeline` and `Pretrained.from_run` all default to `ema=None`, which uses the EMA copy when the run or state has one and the live weights otherwise. DPO, GRPO and PPO keep a frozen reference in the EMA slot, so their pipelines always use the trained policy and never the reference. PPO's pipeline also leaves out the critic.
+For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` asks for the moving-average weights and raises if the run or state has no EMA copy, and `ema=False` reads the live weights. `dew.pipeline`, the tasks' `from_run` and `from_saved`, `objective.pipeline` and `Pretrained.from_run` all default to `ema=None`, which uses the EMA copy when the run or state has one and the live weights otherwise. DPO, GRPO and PPO keep a frozen reference in the EMA slot, so their pipelines always use the trained policy and never the reference. PPO's pipeline also leaves out the critic.
 
 `objective.pipeline(state)` picks weights by the same rule and keeps the arrays where the trainer already placed them. `LMObjective.policy(params, sampling)` returns a `TextGeneration` over the given parameter tree, and GRPO rollouts sample with that task. `task.bind(variables)` makes a task over another set of variables. It copies the mapping structure but shares the array buffers, so do not change or donate those arrays while a task uses them.
 
@@ -138,11 +138,11 @@ On the RTX 4080, the 176M text-to-image model then holds 183 MiB of denoiser wei
 ```python
 import jax.numpy as jnp
 
-from dew.sampling import TextToImage
+import dew
 from dew.quantization import Quantization
 
-pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
-                                   revision="4b322022189373fd9086313241269aa5cea92b86")
+pipe = dew.pipeline("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
+                    revision="8d891d967319e51cd0e73d3e5b7c29d68a238b52")
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```
@@ -157,7 +157,7 @@ Results hold global arrays sharded by row, including any filler rows that were a
 
 ### SSD-backed decoder banks
 
-`SafetensorsBanks` and its `stream` run a decoder whose layer weights do not fit in device memory or in host RAM. The source reads a local Hugging Face safetensors checkpoint through read-only memory maps and the ordinary decoder translator. The banked inference loop then fetches each layer when it runs, with one host read-ahead slot for the next layer, so the full decoder stack is never loaded or captured as a compiled constant.
+`SafetensorsBanks` and its `stream` run a decoder whose layer weights do not fit in device memory or in host RAM. The source reads a local Hugging Face safetensors checkpoint (a decoder, a media wrapper around one, or the native backbone of a decision release whose readout is stored apart) through read-only memory maps and `Pretrained.load`'s own native reader. The banked inference loop then fetches each layer when it runs, with one host read-ahead slot for the next layer, so the full decoder stack is never loaded or captured as a compiled constant.
 
 <!-- not run: needs a local gpt-oss-20b BF16 checkpoint -->
 ```python
@@ -313,7 +313,7 @@ Calling the server with a batch submits every prompt, steps until they all finis
 | `prefix_cache` | Share the full prompt pages of an earlier request that began with the same tokens. Needs a paged cache. |
 | `decode_steps` | Decode iterations per device call (default 1). |
 
-A decoder tells the server what its layers allow through `dew.nn.protocols.Serving`: `inference_projection_groups` names the projection groups the variables hold packed, or as members the server packs for decoding (a model that does not decode autoregressively names none), `cache_rebuild_position` is where LongRoPE's cached keys go stale, which refuses paged and mixed serving, `mixed_admission_refusal` says why one mixed prefill-and-decode forward would compute differently, and `split_prefill_refusal` says why a prompt must be prefilled whole, which refuses `chunk` and `prefix_cache`. `CausalTransformer` implements it. A custom decoder that does not implement it packs no projections (`dew.inference.projections.projection_groups`) and runs prefill and decode as separate forwards (`dew.inference.serving_kernel.mixed_refusal`), and the server takes its prefill as safe to split (`dew.inference.serving`), so a decoder whose prefill depends on seeing the prompt whole implements `Serving` and says so in `split_prefill_refusal`.
+A decoder tells the server what its layers allow through `dew.nn.protocols.Serving`: `inference_projection_groups` names the projection groups a decode step reads packed (a model that does not decode autoregressively names none), `cache_rebuild_position` is where LongRoPE's cached keys go stale, which refuses paged and mixed serving, `mixed_admission_refusal` says why one mixed prefill-and-decode forward would compute differently, and `split_prefill_refusal` says why a prompt must be prefilled whole, which refuses `chunk` and `prefix_cache`. `CausalTransformer` implements it. A custom decoder that does not implement it packs no projections (`dew.inference.projections.projection_groups`) and runs prefill and decode as separate forwards (`dew.inference.serving_kernel.mixed_refusal`), and the server takes its prefill as safe to split (`dew.inference.serving`), so a decoder whose prefill depends on seeing the prompt whole implements `Serving` and says so in `split_prefill_refusal`. A task loaded from a source or a saved run packs a decoder's projection groups once, after placing its weights, and keeps one copy. A task over a live objective's weights packs them inside each generation's compiled call, outside its per-token step, and frees them when the call returns. A group packs only where its members share one placement that leaves their output axis whole, so a tensor-parallel layout that splits the heads keeps the query, key and value apart. A server serves the weights its task holds, and `reload` packs a canonical tree as the served one is packed.
 
 `KVCache` (`dew.nn.kv_cache`) sets the cache layout. It is passed as `kv_cache=` to `from_task`, or set as a `CausalTransformer`'s `kv_cache` field for `TextGeneration`:
 
@@ -373,7 +373,7 @@ Measured on the same A100 with a randomly initialized 12-layer, 1024-wide bf16 d
 
 ### Serving on a mesh
 
-A server runs on the mesh its task's weights are placed on. `Server.from_task` over such a task runs one step program over every device, and it places its own state with the same rule table that places the weights (`dew.nn.sharding.DEFAULT_RULES`). The slots are split the way a batch's rows are (`activation_batch`: the data, expert and fsdp axes), so each group of devices keeps its own rows and their dense cache, or its own part of a paged pool. A request is seated in a group that has room for it and, with a prefix cache, in the group that already holds its prefix. The tensor axis splits the heads, the MLP and the vocabulary as in training, and the cache's heads are split over it too. The number of slots, the admission and a paged pool's page count must all be multiples of the number of groups.
+A server runs on the mesh its task's weights are placed on. `Server.from_task` over such a task runs one step program over every device, and it places its own state with the same rule table that places the weights (`dew.mesh.DEFAULT_RULES`). The slots are split the way a batch's rows are (`activation_batch`: the data, expert and fsdp axes), so each group of devices keeps its own rows and their dense cache, or its own part of a paged pool. A request is seated in a group that has room for it and, with a prefix cache, in the group that already holds its prefix. The tensor axis splits the heads, the MLP and the vocabulary as in training, and the cache's heads are split over it too. The number of slots, the admission and a paged pool's page count must all be multiples of the number of groups.
 
 The server refuses a mesh whose sequence axis is larger than one, because the decoder refuses to decode under such an axis: the axis splits a sequence's positions, and the cache holds whole sequences. It refuses a stage axis larger than one because the decoder refuses to decode through the training pipeline, and a mesh over several processes because one process schedules all the rows.
 

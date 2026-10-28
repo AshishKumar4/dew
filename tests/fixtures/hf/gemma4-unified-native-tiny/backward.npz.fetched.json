@@ -1,0 +1,9 @@
+{
+ "bytes": 43474814,
+ "license": "Apache-2.0",
+ "path": "recordings/4a0f866a6569e246d73ab48f1731074703900f4e028f07d09ad4aea5a816788b.npz",
+ "reference": "transformers Gemma4 Unified",
+ "repo": "dewml/fixtures",
+ "revision": "54c3a0767a0ff0aa1597a268e0237993f07af868",
+ "sha256": "4a0f866a6569e246d73ab48f1731074703900f4e028f07d09ad4aea5a816788b"
+}

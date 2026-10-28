@@ -3524,15 +3524,17 @@
    ],
    "float32"
   ],
-  "params/embed/hilbert_projection/bias": [
+  "params/embed/patch_embed/Conv_0/bias": [
    [
     768
    ],
    "float32"
   ],
-  "params/embed/hilbert_projection/kernel": [
+  "params/embed/patch_embed/Conv_0/kernel": [
    [
-    16,
+    2,
+    2,
+    4,
     768
    ],
    "float32"

@@ -1,12 +1,12 @@
 name: Proven commit
-description: Find a successful workflow run at this exact commit, excluding pull requests.
+description: Find a successful workflow run at this exact commit, excluding pull requests, or, for main's push, the land queue's proof of the tip it graded green.
 inputs:
   workflow:
     description: Workflow file name
     required: true
 outputs:
   run:
-    description: Successful run ID, or empty when this commit is unproven
+    description: Successful run ID (or the land queue's status ID, on main), or empty when this commit is unproven
     value: ${{ steps.find.outputs.run }}
 runs:
   using: composite
@@ -17,8 +17,19 @@ runs:
         GH_TOKEN: ${{ github.token }}
         WORKFLOW: ${{ inputs.workflow }}
       run: |
-        # A pull request's run tested a merge, not this commit.
+        # A pull request's run tested a merge, not this commit; a base/<producer> promote's (ci/base-*) and the
+        # background whole suite's (ci/full-whole-*) ran no gangs, which proves the commit for no other run.
         run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$GITHUB_SHA&status=success" \
-          --jq '[.workflow_runs[] | select(.event != "pull_request")][0].id // empty')
+          --jq '[.workflow_runs[] | select(.event != "pull_request" and (.head_branch | test("^ci/(base|full-whole)-") | not))][0].id // empty')
+        if [ -n "$run" ]; then
+          echo "passed in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"
+        elif [ "$GITHUB_REF" = refs/heads/main ]; then
+          # Main moves only to a tip the land queue graded green, on its first round or on a red whose rows its
+          # regrade passed and recorded as flaky; it posts that proof (context land-queue) before main moves, as
+          # the train's own run, red on such a row, proves nothing here (Main, 2026-10-27: train 229's main push
+          # re-ran the suite for 11 minutes and held the next train's test job). A lane's push reads no status.
+          run=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/statuses" \
+            --jq '[.[] | select(.context == "land-queue" and .state == "success")][0].id // empty')
+          if [ -n "$run" ]; then echo "graded green by the land queue (commit status $run)"; fi
+        fi
         echo "run=$run" >> "$GITHUB_OUTPUT"
-        if [ -n "$run" ]; then echo "passed in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"; fi

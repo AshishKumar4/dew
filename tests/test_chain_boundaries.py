@@ -11,11 +11,11 @@ import grain.python as grain
 import numpy as np
 import pytest
 
+from dew.batch import VALID_ROWS
 from dew.data import Loading, Memory, preferences, presets, prompts
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
 from dew.data.ordering import BlockShuffle
-from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 

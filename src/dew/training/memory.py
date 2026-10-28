@@ -8,25 +8,28 @@ splits the step's batch until the step fits everywhere
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import re
 from collections.abc import Mapping, Sequence
-from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, NamedSharding
 
+from dew._records import JSON, integers, json_value
+from dew.batch import FROZEN, Batch, Variables
 from dew.data.dataset import rows_of
+from dew.devices import gpu_free_bytes, xla_flag
+from dew.distributed.placement import parameter_axes
+from dew.mesh import batch_axes, mesh_axes
+from dew.nn.backbones.decoder_block import DECODER_REMAT, remat_record
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
-from dew.nn.kernels.options import compiler_options
-from dew.nn.protocols import Recomputing, TritonGemm
-from dew.nn.sharding import mesh_axes
-from dew.objectives.base import Batch, Objective, Variables
-from dew.records import JSON, integers, json_value
-from dew.telemetry.devices import gpu_free_bytes, xla_flag
-from dew.training.distributed import parameter_axes
-from dew.training.state import TrainState
+from dew.nn.kernels.options import Option, compiler_options
+from dew.nn.protocols import Recomputing, RematChoosing, TritonGemm
+from dew.objectives.base import Objective
+from dew.state import TrainState
 
 _log = logging.getLogger(__name__)
 
@@ -75,14 +78,14 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     and 4 x 32 run faster merged. The boundary includes 128, so no step runs
     slower than XLA's default, and 1 x 128 gives up the 1.6 ms it would gain apart.
 
-    Only an LM objective gives the tokens per row, its `seq_len`, so any other
+    Only an objective whose rows hold tokens gives them (`Objective.row_tokens`), so any other
     objective's frozen step runs apart. Triton GEMM fusions are turned off where
-    `gpu_target().kernels['xla_triton_gemm']` measured a win and no module the step runs
-    keeps them (`TritonGemm`), and wherever a module the step runs computes in int8
+    the GPU measured a win without them (`GpuTarget.triton_gemm_fusions`) and no module the step
+    runs keeps them (`TritonGemm`), and wherever a module the step runs computes in int8
     (`compiler_options`).
     """
     generation = device_generation()
-    options: dict[str, bool | int] = {}
+    options: dict[str, Option] = {}
     if backend() == 'gpu' and devices > 1:
         options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
     small = tokens <= 128
@@ -90,18 +93,18 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
             and not (frozen and small)):
         options['xla_gpu_dot_merger_threshold_mb'] = 0
     modules = [entry.module for entry in objective.program_key()]
-    if (gpu_target(generation).kernels.get('xla_triton_gemm') == 'off'
+    if (not gpu_target(generation).triton_gemm_fusions
             and xla_flag('xla_gpu_enable_triton_gemm') is None
             and modules and not any(isinstance(module, TritonGemm) and module.keeps_triton_gemm
                                     for module in modules)):
         options['xla_gpu_enable_triton_gemm'] = False
-    options.update(compiler_options(*modules))
+    options.update(compiler_options(*objective.towers()))
     return options or None
 
 
 def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.CompilerOptions | None,
                         refusals: list[RuntimeError]) -> jax.stages.Compiled | None:
-    """Return `program` compiled under `options`, or None if XLA refuses it for memory.
+    """Return `program` compiled under `options`, or None if XLA refuses it for memory (`refused_for_memory`).
 
     A refusal is appended to `refusals`. XLA:TPU checks a program's temporaries
     against HBM while it compiles and raises RESOURCE_EXHAUSTED instead of
@@ -113,11 +116,37 @@ def compiled_if_it_fits(program: jax.stages.Lowered, options: jax.stages.Compile
     try:
         return program.compile(options)
     except jax.errors.JaxRuntimeError as error:
-        if error.error_code_string != 'RESOURCE_EXHAUSTED':
+        if not refused_for_memory(error.error_code_string, str(error)):
             raise
         _log.info("XLA refused the step for memory: %s", error)
         refusals.append(error)
         return None
+
+
+AUTOTUNED_FAILURES = re.compile(r"^Failures \((\d+)\):$", re.MULTILINE)
+"""The head of a GPU GEMM autotuner's list of what failed (XLA's `PickBestConfig`, config_selector.cc): every
+config's failure (`ConfigRunner::Failure::ToString`, config_runner.cc: `EXECUTION FAILED`, `COMPILATION
+FAILED`, `REDZONE CHECK FAILED` or `WRONG RESULTS`, then its status) and every excluded backend's line, one
+a line, as many as the head counts."""
+
+EXECUTED_OUT_OF_MEMORY = re.compile(r"^EXECUTION FAILED: RESOURCE_EXHAUSTED: ", re.MULTILINE)
+
+
+def refused_for_memory(code: str, message: str) -> bool:
+    """Whether XLA refused a program it compiled for memory, by its error's status `code` and `message`:
+    RESOURCE_EXHAUSTED, or on a GPU its GEMM autotuner finding no config it could profile (NOT_FOUND)
+    where each of the failures it lists (`AUTOTUNED_FAILURES`) is a config's execution out of device
+    memory. One that failed to compile, failed its redzone check or gave wrong results, or a backend
+    excluded beside them, is no memory refusal, and the error is raised. An A100 with 0.30 of its memory
+    to a decoder's step refused it so at the whole head's f32[65536,32000] GEMM, each of its eight configs
+    7.83 GiB short (node receipt TL-a100-offload-1338-d): the step at a rung that holds less compiles."""
+    if code == 'RESOURCE_EXHAUSTED':
+        return True
+    listed = AUTOTUNED_FAILURES.search(message)
+    if code != 'NOT_FOUND' or listed is None:
+        return False
+    count = int(listed.group(1))
+    return count > 0 and len(EXECUTED_OUT_OF_MEMORY.findall(message, listed.end())) == count
 
 
 def split_share(params: Variables) -> float:
@@ -137,18 +166,21 @@ def split_share(params: Variables) -> float:
     return split / total if total else 0.0
 
 
-@runtime_checkable
-class _TokenRows(Protocol):
-    seq_len: int | None
+def step_options[LossT, EffectsT](objective: Objective[LossT, EffectsT], micro: Batch, variables: Variables,
+                                  mesh: Mesh) -> jax.stages.CompilerOptions | None:
+    """The options a step over microbatches of `micro` on `mesh` compiles with
+    (`step_compiler_options`): by the tokens one device steps of a microbatch split over the
+    mesh's batch axes, and whether `variables` hold frozen weights it trains beside."""
+    shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
+    return step_compiler_options(objective, device_tokens(objective, micro, shards), FROZEN in variables,
+                                 mesh.devices.size)
 
 
 def device_tokens[LossT, EffectsT](objective: Objective[LossT, EffectsT], batch: Batch, shards: int) -> float:
-    """The tokens one device steps of `batch`, split over `shards` row shards,
-    or infinity. An `Objective` declares no tokens in a row, since images and
-    pairs have no context, so the trainer reads it at this boundary: LM
-    objectives name theirs `seq_len`. Rows are counted only then, so another
-    objective's batch, one that holds no rows among them, is never asked."""
-    per_row = objective.seq_len if isinstance(objective, _TokenRows) else None
+    """The tokens one device steps of `batch`, split over `shards` row shards, or infinity where its
+    rows hold no token geometry (`Objective.row_tokens`), an image's. Rows are counted only then, so
+    another objective's batch, one that holds no rows among them, is never asked."""
+    per_row = objective.row_tokens(batch)
     return math.inf if per_row is None else rows_of(batch) // shards * per_row
 
 
@@ -204,16 +236,17 @@ def recompute_record[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> 
     return records[0] if len(records) == 1 else records or None
 
 
-def rung_record[LossT, EffectsT](objective: Objective[LossT, EffectsT],
-                                 xla_defaults: bool) -> dict[str, JSON]:
+def rung_record[LossT, EffectsT](objective: Objective[LossT, EffectsT], xla_defaults: bool, *,
+                                 narrow: bool) -> dict[str, JSON]:
     """The rung of the fit ladder a step compiles at, as a checkpoint records
     it: the objective's head tile and whether that head is fused, its trained
-    modules' remat (`recompute_record`) and whether the step keeps XLA's
-    default options, the half rung above each. Each decides the program a
-    step runs."""
+    modules' remat (`recompute_record`), whether the step keeps XLA's
+    default options, the half rung above each, and whether it reads the
+    parameters through narrow copies (`dew.training.narrow`), the ladder's
+    first rung. Each decides the program a step runs."""
     tile = head_tile_of(objective)
     return {'head_tile': None if tile is None else list(tile), 'head_fused': head_fused_of(objective),
-            'remat': recompute_record(objective), 'xla_defaults': xla_defaults}
+            'remat': recompute_record(objective), 'xla_defaults': xla_defaults, 'narrow': narrow}
 
 
 def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0) -> int | None:
@@ -252,6 +285,27 @@ def peak_memory_gib() -> float | None:
     peaks = [stats['peak_bytes_in_use'] for device in jax.local_devices()
              if (stats := device.memory_stats()) is not None and 'peak_bytes_in_use' in stats]
     return max(peaks) / 1024 ** 3 if peaks else None
+
+
+def local_devices(mesh: Mesh) -> list:
+    """This process's devices of `mesh`, whose memory the fit check reads."""
+    process = jax.process_index()
+    return [device for device in mesh.devices.flat if device.process_index == process]
+
+
+def first_run(loss: jax.Array, step: int, fitted: JSON, mesh: Mesh) -> None:
+    """Wait for a newly compiled step's first run, and raise its failure on the devices as the step's,
+    with the check that said it fits (`fitted`, `memory_record`) and what `mesh`'s devices of this
+    process hold now."""
+    try:
+        loss.block_until_ready()
+    except jax.errors.JaxRuntimeError as error:
+        now = [{"id": device.id, **{key: value for key, value in (device.memory_stats() or {}).items()
+                                    if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
+               for device in local_devices(mesh)]
+        raise RuntimeError(
+            f"the training step compiled for step {step} failed on its first run. It was checked to "
+            f"fit: {json.dumps(fitted)}; the devices now hold {json.dumps(now)}") from error
 
 
 def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int, *, fits: bool) -> JSON:
@@ -325,13 +379,21 @@ def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
     return memory['pool_bytes'] >= memory['bytes_limit'] and partitioning.lower() not in ('false', '0')
 
 
+def temporaries_factor(mesh: Mesh) -> int:
+    """How many times its temporaries a step needs room for on this process's tightest device of
+    `mesh` (`strands_temporaries`): 2 where an allocator can strand them, else 1."""
+    local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
+    return max((2 if (memory := device.memory_stats()) is not None
+                and strands_temporaries(device.platform, memory) else 1) for device in local)
+
+
 def fits_everywhere(headroom: int | None) -> bool:
     """Whether every process's headroom is non-negative, with the same answer on every process.
 
     A process reads only its own devices' memory, so the pool takes the minimum;
     a process that reports none does not affect the result.
     """
-    from dew.coordination import from_every_process
+    from dew._coordination import from_every_process
 
     return min((value for value in from_every_process(headroom) if value is not None), default=0) >= 0
 
@@ -423,6 +485,32 @@ def remat_half[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list |
     objective.substitute([entry.module if module is None else module
                           for module, entry in zip(half, entries, strict=True)])
     return held
+
+
+def remat_below[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list[list]:
+    """The modules the objective trains at each rung of their remat ladders below where they stand,
+    cheapest first, each the list `objective.substitute` takes. Each module's own rungs are those its
+    climb from no recomputation stands at (`RematChoosing.with_remat`, `Recomputing.recompute_more`)
+    before the ladder reaches its own policy (`DECODER_REMAT`, a rung that keeps what the next keeps
+    passed as the search passes it); the k-th list holds each module at its k-th, or at its own where
+    it has fewer. Empty where no trained module chooses a remat on its ladder above none."""
+    entries = objective.program_key()
+    ladder = [remat_record(policy) for policy in DECODER_REMAT]
+    prefixes: list[list | None] = []
+    for entry in entries:
+        module = entry.module
+        if not (entry.trained and isinstance(module, Recomputing) and isinstance(module, RematChoosing)
+                and module.recompute_record() in ladder):
+            prefixes.append(None)
+            continue
+        own, rungs, climbed = ladder.index(module.recompute_record()), [], module.with_remat(None)
+        while climbed is not None and ladder.index(climbed.recompute_record()) < own:
+            rungs.append(climbed)
+            climbed = climbed.recompute_more()
+        prefixes.append(rungs)
+    depth = max((len(rungs) for rungs in prefixes if rungs is not None), default=0)
+    return [[entry.module if not rungs else rungs[min(index, len(rungs) - 1)]
+             for entry, rungs in zip(entries, prefixes, strict=True)] for index in range(depth)]
 
 
 def remat_more[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:

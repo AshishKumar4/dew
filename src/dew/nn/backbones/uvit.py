@@ -25,11 +25,13 @@ from ..dit import (
     RematLadder,
     _TransformerOptions,
     remat_block,
+    scan_ordered,
 )
 from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
-from ..precision import at_least_fp32
+from ..mlp import GatedMLP
+from ..precision import at_least_fp32, float32_dot_general
 from ..rope import rotary_freqs
-from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
+from ..scan_orders import unscanned
 
 
 def u_walk(x, down, middle, merges, up, run):
@@ -69,8 +71,8 @@ class UViT(_TransformerOptions):
     go up; each up block first projects [x, skip] back to the width. A final
     LN and dense layer read the patches, which are unpatchified and, with
     `conv`, refined by a 3x3 convolution. The text attends unmasked, padding
-    included, as U-ViT's CLIP states do. A Hilbert `scan_order` orders the
-    patches along the curve, each projected by a dense layer, and the
+    included, as U-ViT's CLIP states do. A Hilbert `scan_order` gathers the
+    embedded patches along the curve (`dew.nn.dit.scan_ordered`), and the
     position rows follow that order.
     """
     output_channels: int = 3
@@ -88,7 +90,7 @@ class UViT(_TransformerOptions):
     @nn.nowrap
     def projections(self, input_channels: int = 0, text_features: int = 0) -> dict[str, tuple[int, int]]:
         width = self.emb_features
-        maps = {'hilbert_projection': (self.patch_size**2 * input_channels, width),
+        maps = {'patch_embed': (self.patch_size**2 * input_channels, width),
                 'context_embed': (text_features, width), 'skip_linear': (2 * width, width),
                 'decoder_pred': (width, self.patch_size**2 * self.output_channels)}
         if self.mlp_time_embed:
@@ -111,7 +113,7 @@ class UViT(_TransformerOptions):
         joined, rows = (image + text + 1).astype(np.int64), np.ones(image.shape, np.int64)
         width, patch = self.emb_features, self.patch_size**2
         maps = self.projections(input_channels, text_features)
-        count = (projection_flops(lengths, *maps['hilbert_projection'])
+        count = (projection_flops(lengths, *maps['patch_embed'])
                  + projection_flops(context_lengths, *maps['context_embed']))
         block = ModulatedBlock(width, self.num_heads, modulated=False, **self._block_options(), parent=None)
         count += (self.num_layers + 1) * block.model_flops(joined)
@@ -138,17 +140,18 @@ class UViT(_TransformerOptions):
         maps = self.projections()
         def dense(name, **options):
             key = 'skip_linear' if name.startswith('skip_linear_') else name
-            return Dense(maps[key][1], dtype=self.dtype, precision=self.precision, name=name, **options)
-        if self.scan_order == "hilbert":
-            self.hilbert_proj = dense("hilbert_projection")
-        else:
-            self.patch_embed = PatchEmbedding(patch_size=self.patch_size, embedding_dim=self.emb_features,
-                                              dtype=self.dtype, precision=self.precision, name="patch_embed")
+            return Dense(maps[key][1], dtype=self.dtype, precision=self.precision, name=name, **options,
+                         dot_general=float32_dot_general)
+        self.patch_embed = PatchEmbedding(patch_size=self.patch_size, embedding_dim=self.emb_features,
+                                          dtype=self.dtype, precision=self.precision, name="patch_embed")
         patches = (self.image_size // self.patch_size) ** 2
         self.pos_embed = self.param("pos_embed", nn.initializers.truncated_normal(0.02),
                                     (1, 1 + self.text_tokens + patches, self.emb_features))
         if self.mlp_time_embed:
-            self.time_mlp = [dense("time_embed_0"), dense("time_embed_2")]
+            self.time_mlp = GatedMLP(4 * self.emb_features, self.emb_features, activation=nn.silu,
+                                      use_bias=True, names=("time_embed_0", "time_embed_2"),
+                                      dtype=self.dtype, precision=self.precision)
+            nn.share_scope(self, self.time_mlp)
         self.context_embed = dense("context_embed")
         block = partial(ModulatedBlock, features=self.emb_features, num_heads=self.num_heads, modulated=False,
                         qkv_bias=False, gelu_approximate=False, **self._block_options())
@@ -173,17 +176,12 @@ class UViT(_TransformerOptions):
         if num_patches > rows:
             raise ValueError(f"{num_patches} patches exceed the position table's {rows} "
                              f"(image_size {self.image_size})")
-        inverse = None
-        if self.scan_order == "hilbert":
-            patches, inverse = hilbert_patchify(x, self.patch_size)
-            patches = self.hilbert_proj(patches)
-        else:
-            patches = self.patch_embed(x)
+        patches, inverse = self.patch_embed.scanned(x, self.scan_order)
 
         wide = at_least_fp32(self.dtype)
         time = sinusoidal_time(jnp.asarray(temb, wide) * self.time_scale, self.emb_features, dtype=wide)
         if self.mlp_time_embed:
-            time = self.time_mlp[1](nn.silu(self.time_mlp[0](time.astype(self.dtype))))
+            time = self.time_mlp(time.astype(self.dtype))
         tokens = [time.astype(patches.dtype)[:, None]]
         positions = [self.pos_embed[:, :1]]
         if textcontext is not None:
@@ -194,7 +192,9 @@ class UViT(_TransformerOptions):
             tokens.append(self.context_embed(text.astype(self.dtype)).astype(patches.dtype))
             positions.append(self.pos_embed[:, 1:1 + text.shape[1]])
         tokens.append(patches)
-        positions.append(self.pos_embed[:, 1 + self.text_tokens:1 + self.text_tokens + num_patches])
+        # Each patch's learned position follows it into the scan order (`scan_ordered`), as its token did.
+        raster = self.pos_embed[:, 1 + self.text_tokens:1 + self.text_tokens + num_patches]
+        positions.append(scan_ordered(raster, self.scan_order, H // self.patch_size, W // self.patch_size)[0])
         x = jnp.concatenate(tokens, axis=1) + jnp.concatenate(positions, axis=1).astype(patches.dtype)
         extras = x.shape[1] - num_patches
 
@@ -202,10 +202,7 @@ class UViT(_TransformerOptions):
                    lambda block, x: block(x, conditioning=None, freqs_cis=None, train=train))
 
         out = self.decoder_pred(self.norm(x))[:, extras:]
-        if inverse is not None:
-            image = hilbert_unpatchify(out, inverse, self.patch_size, H, W, self.output_channels)
-        else:
-            image = unpatchify(out, self.patch_size, H, W, self.output_channels)
+        image = unscanned(out, inverse, self.patch_size, H, W, self.output_channels)
         return self.final_layer(image) if self.conv else image
 
 
@@ -233,8 +230,7 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
 
     @nn.nowrap
     def projections(self, input_channels: int = 0) -> dict[str, tuple[int, int]]:
-        return {'hilbert_projection': (self.patch_size**2 * input_channels, self.emb_features),
-                'up_dense': (2 * self.emb_features, self.emb_features)}
+        return {'up_dense': (2 * self.emb_features, self.emb_features)}
 
     def _block(self, remat: RematChoice = False, **scope) -> ModulatedBlock:
         return remat_block(ModulatedBlock, remat)(features=self.emb_features, num_heads=self.num_heads,
@@ -271,13 +267,6 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
             precision=self.precision,
             name="patch_embed"
         )
-        if self.scan_order == "hilbert":
-            self.hilbert_proj = Dense(
-                features=self.projections()['hilbert_projection'][1],
-                dtype=self.dtype,
-                precision=self.precision,
-                name="hilbert_projection"
-            )
         self.conditioning = self._conditioning(self.emb_features, text_pooling=self.text_pooling)
 
         block = partial(self._block, self.remat)
@@ -288,7 +277,7 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
                 features=self.projections()['up_dense'][1],
                 dtype=self.dtype,
                 precision=self.precision,
-                name=f"up_dense_{i}"
+                name=f"up_dense_{i}", dot_general=float32_dot_general
             ) for i in range(half_layers)
         ]
         self.up_blocks = [block(name=f"up_block_{i}") for i in range(half_layers)]
@@ -301,12 +290,7 @@ class SimpleUDiT(RematLadder, _TransformerOptions):
             "Image dimensions must be divisible by patch size"
         )
 
-        hilbert_inv_idx = None
-        if self.scan_order == "hilbert":
-            patches_raw, hilbert_inv_idx = hilbert_patchify(x, self.patch_size)
-            x_seq = self.hilbert_proj(patches_raw)
-        else:
-            x_seq = self.patch_embed(x)
+        x_seq, hilbert_inv_idx = self.patch_embed.scanned(x, self.scan_order)
 
         cond_emb = self.conditioning(temb, textcontext)
         freqs_cis = rotary_freqs(jnp.arange(x_seq.shape[1]), self.emb_features // self.num_heads,

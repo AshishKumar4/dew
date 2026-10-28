@@ -11,13 +11,11 @@ against the float64 one beside the committed output; a committed output
 further from float64 than twice the fresh one stops the script, since the new
 files would then describe different weights or a different reference.
 
-    uv venv ~/.cache/dew/reference-venvs/numerics --python 3.12
-    uv pip install --python ~/.cache/dew/reference-venvs/numerics/bin/python \
-        torch --index-url https://download.pytorch.org/whl/cpu
-    uv pip install --python ~/.cache/dew/reference-venvs/numerics/bin/python \
-        transformers==5.16.1 safetensors numpy huggingface_hub sentencepiece
-    PYTHONPATH=tools ~/.cache/dew/reference-venvs/numerics/bin/python \
-        tools/numerics_reference.py
+    PYTHONPATH=src:tools python tools/numerics_reference.py
+
+in the repository's environment, which holds torch and transformers 5.16.1
+beside JAX: the artifact check is the gate's (tests/reference_error.py
+`assert_same_artifact`), which reads Dew.
 
 What lands, beside each fixture's own files:
 
@@ -26,7 +24,7 @@ What lands, beside each fixture's own files:
   on the committed `input_ids.npy` with weights and activations in float64
   and in bfloat16 (stored as float32, which holds every bfloat16 exactly).
   The float64 run is the truth both precisions are measured from, with every
-  float32 pin of the model widened (`diffusers_wan_reference.float64`):
+  float32 pin of the model widened (`torch_precision.float64`):
   its norms', rotary tables' and attention softmax's casts, which otherwise
   round the truth at float32 where Gemma-family models pin them (the
   diffusion-gemma truth moved 1.7e-7 to 2.4e-7 RMS, about half the fp32
@@ -55,15 +53,18 @@ What lands, beside each fixture's own files:
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
-import transformers
-from diffusers_wan_reference import float64
 from safetensors.torch import load_file
+from torch_precision import float64
 from transformers import AutoModelForCausalLM
 from transformers.generation.logits_process import TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+from reference_error import assert_same_artifact
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 DECODERS = ("llama-tiny", "qwen3-tiny", "gemma3-tiny", "mixtral-tiny", "deepseek-v3-tiny",
@@ -73,18 +74,6 @@ PROMPT_LENGTHS = (4, 7, 5)
 NEW_TOKENS = 10
 TEMPERATURE, TOP_K, TOP_P, SAMPLE_SEED = 0.7, 20, 0.9, 5
 PAD = 0
-
-
-def same(name: str, recomputed: np.ndarray, committed: np.ndarray, f64: np.ndarray) -> None:
-    """The committed output is an evaluation of these weights at its own
-    precision: another torch build sums in another order, so the two need
-    not agree bit for bit, but the committed one may sit no further from
-    float64 than twice the fresh one does."""
-    fresh, stored = (float(np.max(np.abs(value - f64))) for value in (recomputed, committed))
-    print(f"{name}: committed {stored:.3e} and recomputed {fresh:.3e} from float64, "
-          f"{float(np.max(np.abs(recomputed - committed))):.3e} apart")
-    if stored > 2 * fresh:
-        raise SystemExit(f"{name}: the committed fixture is not this reference's output")
 
 
 def eager(model):
@@ -112,8 +101,8 @@ def write_decoder(name: str) -> None:
     ids = np.load(directory / "input_ids.npy")
     with float64():
         f64 = logits(decoder(name, torch.float64), ids)
-    same(name, logits(decoder(name, torch.float32), ids).astype(np.float32),
-         np.load(directory / "logits.npy"), f64)
+    assert_same_artifact(logits(decoder(name, torch.float32), ids).astype(np.float32),
+                         np.load(directory / "logits.npy"), f64, name)
     bf16 = logits(decoder(name, torch.bfloat16), ids).astype(np.float32)
     np.savez(directory / "numerics.npz", f64=f64, bf16=bf16)
     report(name, np.load(directory / "logits.npy"), bf16, f64)
@@ -160,7 +149,7 @@ def write_workflow() -> None:
         f64 = workflow_outputs(workflow(torch.float64), reference, torch.float64)
     fp32 = workflow_outputs(workflow(torch.float32), reference, torch.float32)
     for key, value in fp32.items():
-        same(f"workflow {key}", value.astype(np.float32), reference[key], f64[key])
+        assert_same_artifact(value.astype(np.float32), reference[key], f64[key], f"workflow {key}")
     bf16 = workflow_outputs(workflow(torch.bfloat16), reference, torch.bfloat16)
     arrays = {f"{key}_f64": value for key, value in f64.items()}
     arrays.update({f"{key}_bf16": value.astype(np.float32) for key, value in bf16.items()})
@@ -215,7 +204,8 @@ def write_denoiser() -> None:
     with float64():
         f64 = denoiser_outputs(denoiser(torch.float64), torch.float64)
     for key, value in denoiser_outputs(denoiser(torch.float32), torch.float32).items():
-        same(f"denoiser {key}", value.astype(np.float32), np.load(directory / f"{key}.npy"), f64[key])
+        assert_same_artifact(value.astype(np.float32), np.load(directory / f"{key}.npy"), f64[key],
+                             f"denoiser {key}")
     bf16 = denoiser_outputs(denoiser(torch.bfloat16), torch.bfloat16)
     arrays = {f"{key}_f64": value for key, value in f64.items()}
     arrays.update({f"{key}_bf16": value.astype(np.float32) for key, value in bf16.items()})

@@ -1,0 +1,25 @@
+{
+ "released": {
+  "repo": "inclusionAI/LLaDA2.1-mini",
+  "revision": "20e64e2ad21644d0e5248586ed9c942cdd45de0f",
+  "files": [
+   "config.json",
+   "configuration_llada2_moe.py",
+   "modeling_llada2_moe.py"
+  ]
+ },
+ "transformers": {
+  "version": "5.16.1"
+ },
+ "torch": {
+  "version": "2.9.0+cpu"
+ },
+ "generator": "tools/llada_moe_reference.py llada21-tiny --draw",
+ "seed": 0,
+ "attention": "The release now uses create_bidirectional_mask; it accepts the same additive block-causal mask used for these probes. Its router remains group-limited sigmoid with selection-only expert_bias.",
+ "recording": {
+  "file": "released.npz",
+  "by": "tools/recorded_references.py record_case, summary",
+  "torch": "2.14.1+cpu"
+ }
+}

@@ -16,7 +16,6 @@ Run with the Dew test environment's jax, on CPU:
     python tools/maxtext_capacity_reference.py OUTPUT.npz
 """
 
-import json
 import math
 import sys
 import types
@@ -25,12 +24,11 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_source import CACHE as UPSTREAM, defined_in, verified
+from reference_source import defined_in, github, saved_fixture
 
 REPO, COMMIT = "AI-Hypercomputer/maxtext", "733b5a9147ed87ecf509fbb4779ed187f56c6045"
 PATH = "src/maxtext/layers/moe.py"
 DIGEST = "1d427dcdd4db0e8b7677d9c57426f69390e20883b676caacae0d6f83fea7a5d1"
-CACHE = UPSTREAM / "maxtext" / COMMIT
 # case: (batch, length, experts, top_k, capacity factor), each dropping slots
 CASES = {
     "whole-sequences": (4, 12, 8, 2, 1.0),
@@ -43,7 +41,7 @@ SEED = 73
 
 def generate_masks():
     """`RoutedMoE.generate_masks` at `COMMIT`, its body unchanged, as a function."""
-    local = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{PATH}", CACHE / PATH, DIGEST)
+    local = github(REPO, COMMIT, PATH, DIGEST)
     namespace = {"math": math, "jax": jax, "jnp": jnp,
                  "max_logging": types.SimpleNamespace(log=lambda message: None)}
     return defined_in(local.read_text(), {"generate_masks"}, namespace, within="RoutedMoE",
@@ -79,8 +77,7 @@ def main():
     meta = {"repo": REPO, "commit": COMMIT, "path": PATH, "sha256": DIGEST,
             "cases": {case: dict(zip(("batch", "length", "experts", "top_k", "factor"), shape, strict=True))
                       for case, shape in CASES.items()}, "jax": jax.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(sys.argv[1], **arrays)
+    saved_fixture(Path(sys.argv[1]), arrays, meta)
     print(f"{sys.argv[1]}: {Path(sys.argv[1]).stat().st_size / 1e6:.3f} MB, {len(arrays)} arrays")
 
 

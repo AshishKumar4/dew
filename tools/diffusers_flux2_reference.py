@@ -8,7 +8,7 @@ the timestep it divides by a thousand, and the distilled guidance. Every case
 records the forward, the vector-Jacobian products against a fixed cotangent
 for the latent and the text states, and the gradient of every parameter,
 unmodified, in float32, the reference, and in float64, the truth
-(`diffusers_wan_reference.float64`: the source's float32 pins widened). Every
+(`torch_precision.float64`: the source's float32 pins widened). Every
 other walk below is recorded the same two ways.
 
 Every parameter is moved off its initialization, so the RMS norms' scales
@@ -38,9 +38,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import perturb, recording, saved_pipeline, tiny_qwen3_encoder
-from diffusers_wan_reference import float64
+from diffusers_reference_helpers import flux2_ids, perturb, recording, saved_pipeline, tiny_qwen3_encoder
 from reference_releases import RELEASES
+from torch_precision import float64, float64_twin
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
 BASE = {"patch_size": 1, "in_channels": 8, "num_layers": 2, "num_single_layers": 2, "attention_head_dim": 16,
@@ -69,18 +69,20 @@ CASES: dict[str, Case] = {
 }
 
 
-def ids(rows: int, columns: int) -> tuple[torch.Tensor, torch.Tensor]:
-    """`Flux2Pipeline._prepare_text_ids` and `_prepare_latent_ids`."""
-    text = torch.cartesian_prod(torch.arange(1), torch.arange(1), torch.arange(1), torch.arange(TOKENS))
-    image = torch.cartesian_prod(torch.arange(1), torch.arange(rows), torch.arange(columns), torch.arange(1))
-    return text, image
+def widened_walk(walk, model) -> dict[str, np.ndarray]:
+    """`walk(model, torch.float64)` inside `float64`, the flow-matching scheduler's own tables widened
+    around every call into it (`float64_scheduler`)."""
+    from diffusers.schedulers import scheduling_flow_match_euler_discrete
+    from diffusers_wan_reference import float64_scheduler
+
+    with float64(), float64_scheduler(scheduling_flow_match_euler_discrete):
+        return walk(model, torch.float64)
 
 
 def twice(walk, model) -> dict[str, np.ndarray]:
-    """`walk(model, dtype)` in float32 and, `model` widened, in float64 (`fp64.`)."""
+    """`walk(model, dtype)` in float32 and, on `model`'s float64 twin (`float64_twin`), in float64 (`fp64.`)."""
     narrow = walk(model, torch.float32)
-    with float64():
-        wide = walk(copy.deepcopy(model).double(), torch.float64)
+    wide = widened_walk(walk, float64_twin(model))
     return {**narrow, **{f"fp64.{key}": value for key, value in wide.items()}}
 
 
@@ -102,7 +104,7 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     context = torch.randn((batch, TOKENS, config["joint_attention_dim"]), generator=generator)
     times = torch.tensor([731.0, 42.0])
     guidance = torch.tensor(case.guidance) if config["guidance_embeds"] else None
-    text_ids, image_ids = ids(rows, columns)
+    text_ids, image_ids = flux2_ids(rows, columns, TOKENS)
     probe = torch.randn((batch, rows * columns, config.get("out_channels") or config["in_channels"]),
                         generator=generator)
 
@@ -280,8 +282,12 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
         return arrays
 
     narrow = walk(pipe, torch.float32)
-    with float64():
-        wide = walk(copy.deepcopy(pipe).to(torch.float64), torch.float64)
+    # The pipeline's float64 run: each of its modules' float64 twin (`float64_twin`).
+    twin = copy.deepcopy(pipe)
+    for name, component in pipe.components.items():
+        if isinstance(component, torch.nn.Module):
+            setattr(twin, name, float64_twin(component))
+    wide = widened_walk(walk, twin)
     print(f"pipeline: latents {narrow['latents.0'].shape} images {narrow['images.0'].shape}")
     return {"pipeline.x_T": latents.numpy(), **{f"pipeline.{key}": value for key, value in narrow.items()},
             **{f"pipeline.fp64.{key}": value for key, value in wide.items()}}

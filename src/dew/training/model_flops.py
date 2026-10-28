@@ -11,8 +11,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import VALID_ROWS, Batch
 from dew.data.dataset import rows_of
-from dew.objectives.base import Batch, Objective
+from dew.objectives.base import Objective
 
 TRAINING_FLOPS = "__dew_training_flops"
 TOKENS = "__dew_real_tokens"
@@ -56,12 +57,11 @@ def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Ba
     rows = rows_of(batch)
     counted = dict(batch)
     if objective.counts_tokens:
-        tokens = []
-        for index in range(rows):
-            row = jax.tree.map(lambda leaf, index=index: leaf[index:index + 1]
-                               if np.ndim(leaf) and np.shape(leaf)[0] == rows else leaf, batch)
-            tokens.append(np.sum(objective.real_lengths(row), dtype=np.uint64))
-        counted[TOKENS] = _TokenCount.words(tokens)
+        # The targets each row's loss scores, none on a repeat that fills the batch (`VALID_ROWS`).
+        tokens = np.asarray(objective.scored_tokens(batch), np.uint64).reshape(rows)
+        valid = batch.get(VALID_ROWS)
+        counted[TOKENS] = _TokenCount.words(tokens if valid is None else
+                                            np.where(np.asarray(valid).reshape(rows) > 0, tokens, 0))
     if count_model:
         # Partition the assembled scalar over the batch's row shards. A
         # shared conditioning row is counted once, not once per example.

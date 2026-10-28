@@ -14,8 +14,6 @@ import ml_dtypes
 import numpy as np
 from flax import linen as nn
 
-from .precision import two_product
-
 E2M1 = np.arange(16, dtype=np.uint8).view(ml_dtypes.float4_e2m1fn).astype(np.float32)
 """Each E2M1 code's value in code order (ml_dtypes' float4_e2m1fn): 0 to 6
 by codes 0-7, then their negatives with the sign in bit 3, -0 included. The
@@ -99,14 +97,48 @@ def straight_through(x, rounded):
     return jax.lax.stop_gradient(rounded.astype(x.dtype)) - (jax.lax.stop_gradient(x) - x)
 
 
+def fp8_scaled_blocks(x, block: int):
+    """`x` in fp32 blocks of `block` channels and each block's power-of-two scale (act_quant with scale_fmt
+    ue8m0, kernel.py:40-124): amax floored at 1e-4, the scale the ceiling power of two of amax / 448."""
+    blocks = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, block)
+    amax = jnp.maximum(jnp.max(jnp.abs(blocks), -1, keepdims=True), 1e-4)
+    return blocks, _power_of_two_ceil(amax * jnp.float32(1 / _E4M3_MAX))
+
+
+def fp8_rounded(x, blocks, scale):
+    """`x` as E4M3 of its `blocks` over their `scale` (`fp8_scaled_blocks`), clamped to +-448, times the
+    scale."""
+    rounded = _round_e4m3fn(jnp.clip(blocks / scale, -_E4M3_MAX, _E4M3_MAX))
+    return straight_through(x, (rounded * scale).reshape(x.shape))
+
+
 def fake_quant_fp8(x, block: int):
     """E4M3 per `block` channels under a power-of-two scale (act_quant with
     scale_fmt ue8m0, kernel.py:40-124): amax floored at 1e-4, scale the
     ceiling power of two of amax / 448, value clamped to +-448 and rounded."""
+    return fp8_rounded(x, *fp8_scaled_blocks(x, block))
+
+
+def fp4_scaled_blocks(x, block: int, e4m3_scale: bool):
+    """`x` in fp32 blocks of `block` channels and each block's scale (fp4_act_quant, kernel.py:127-204):
+    with `e4m3_scale` the E4M3 of amax / 6 with amax floored at 6 * 2**-9 (the compressed KV), else the
+    ceiling power of two of amax / 6 with amax floored at 6 * 2**-126 (the indexer)."""
     blocks = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, block)
-    amax = jnp.maximum(jnp.max(jnp.abs(blocks), -1, keepdims=True), 1e-4)
-    scale = _power_of_two_ceil(amax * jnp.float32(1 / _E4M3_MAX))
-    rounded = _round_e4m3fn(jnp.clip(blocks / scale, -_E4M3_MAX, _E4M3_MAX))
+    amax = jnp.max(jnp.abs(blocks), -1, keepdims=True)
+    if e4m3_scale:
+        # the kernel's cast saturates at E4M3's 448 (cvt.rn.satfinite)
+        floored = jnp.maximum(amax, _E2M1_MAX * 2 ** -9)
+        return blocks, _round_e4m3fn(jnp.minimum(floored / _E2M1_MAX, _E4M3_MAX))
+    return blocks, _power_of_two_ceil(jnp.maximum(amax, _E2M1_MAX * 2 ** -126) * jnp.float32(1 / _E2M1_MAX))
+
+
+def fp4_rounded(x, blocks, scale, e4m3_scale: bool):
+    """`x` as E2M1 of its `blocks` over their `scale` (`fp4_scaled_blocks`), clamped to +-6, times the
+    scale: an E4M3 scale compared against (`_e2m1_quotient`), a power of two divided by exactly."""
+    if e4m3_scale:
+        rounded = _e2m1_quotient(blocks, scale)
+    else:
+        rounded = _e2m1(jnp.clip(blocks / scale, -_E2M1_MAX, _E2M1_MAX))
     return straight_through(x, (rounded * scale).reshape(x.shape))
 
 
@@ -115,60 +147,26 @@ def fake_quant_fp4(x, block: int, e4m3_scale: bool):
     E4M3 scale amax / 6 with amax floored at 6 * 2**-9 (the compressed KV),
     or under the ceiling power of two of amax / 6 with amax floored at
     6 * 2**-126 (the indexer); the value clamped to +-6 and rounded."""
-    blocks = x.astype(jnp.float32).reshape(*x.shape[:-1], -1, block)
-    amax = jnp.max(jnp.abs(blocks), -1, keepdims=True)
-    if e4m3_scale:
-        # the kernel's cast saturates at E4M3's 448 (cvt.rn.satfinite)
-        scale = _round_e4m3fn(jnp.minimum(jnp.maximum(amax, _E2M1_MAX * 2 ** -9) / _E2M1_MAX, _E4M3_MAX))
-        rounded = _e2m1_quotient(blocks, scale)
-    else:
-        scale = _power_of_two_ceil(
-            jnp.maximum(amax, _E2M1_MAX * 2 ** -126) * jnp.float32(1 / _E2M1_MAX))
-        rounded = _e2m1(jnp.clip(blocks / scale, -_E2M1_MAX, _E2M1_MAX))
-    return straight_through(x, (rounded * scale).reshape(x.shape))
+    return fp4_rounded(x, *fp4_scaled_blocks(x, block, e4m3_scale), e4m3_scale)
 
 
 class FakeQuantizing(nn.Module):
     """A layer whose activations round through the fake quantizers as its own
     methods, so a caller sees and can stand in for each rounding through
     `nn.intercept_methods`, as `tools/deepseek_v41_numerics.py` does to replay
-    a float64 twin's roundings in the given run."""
+    a float64 twin's roundings in the given run. Each rounding reads its
+    blocks and their scales from a method of their own (`fp8_scaled_blocks`,
+    `fp4_scaled_blocks`), so a caller reads what a forward rounded, and how
+    near a rounding's boundary it was, through `capture_intermediates`."""
+
+    def fp8_scaled_blocks(self, x, block: int):
+        return fp8_scaled_blocks(x, block)
 
     def fp8(self, x, block: int):
-        return fake_quant_fp8(x, block)
+        return fp8_rounded(x, *self.fp8_scaled_blocks(x, block))
+
+    def fp4_scaled_blocks(self, x, block: int, e4m3_scale: bool):
+        return fp4_scaled_blocks(x, block, e4m3_scale)
 
     def fp4(self, x, block: int, e4m3_scale: bool):
-        return fake_quant_fp4(x, block, e4m3_scale)
-
-
-def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike) -> jax.Array:
-    """The correctly rounded fp32 quotient, IEEE division's, on XLA's approximate
-    dividers too: XLA:CPU and XLA:GPU divide through a reciprocal, and a
-    quantizer's scales and quotients must round as the reference's host or
-    CUDA division does (compressed-tensors' NVFP4, the FP8 block cast).
-
-    A Dekker TwoProduct gives the exact residual of the approximate
-    quotient, split into two fp32 values. One residual correction puts the
-    quotient within one ulp; comparing its exact residual with each
-    neighbour's half-spacing times the divisor chooses nearest-even.
-    That threshold product is exact because the half-spacing is a power
-    of two. The quantizer's observed scales and quotients keep these
-    intermediates normal; dense and midpoint checks hold the result to
-    NumPy's IEEE divide without enabling x64. Dense keeps its own precision.
-    """
-    quotient = numerator / denominator
-    product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
-    residual = (numerator - product) - error
-    quotient = quotient + residual / denominator
-    product, error = two_product(quotient, denominator, bit_split=True, subtract=True)
-    difference = numerator - product
-    high = difference - error
-    recovered = high - difference
-    low = (difference - (high - recovered)) - (error + recovered)
-    above, below = jnp.nextafter(quotient, jnp.inf), jnp.nextafter(quotient, -jnp.inf)
-    upper = (above - quotient) * 0.5 * denominator
-    lower = (quotient - below) * 0.5 * denominator
-    odd = (jax.lax.bitcast_convert_type(quotient, jnp.uint32) & 1) != 0
-    up = (high > upper) | ((high == upper) & ((low > 0) | ((low == 0) & odd)))
-    down = (high < -lower) | ((high == -lower) & ((low < 0) | ((low == 0) & odd)))
-    return jnp.where(up, above, jnp.where(down, below, quotient))
+        return fp4_rounded(x, *self.fp4_scaled_blocks(x, block, e4m3_scale), e4m3_scale)

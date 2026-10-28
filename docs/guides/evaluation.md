@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data.dataset import Loader
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
@@ -86,21 +86,21 @@ artifact whose type `reads` names. This LM metric measures top-1 accuracy
 from the logits, and the run ranks its checkpoints by it:
 
 ```python
-from dew.data import Loading
-from dew.config.data import RecordsData, loader
 from dew import Checkpoints, Mean
 from dew.artifacts import TokenScores
+from dew.data import Memory
 
 accuracy = Mean(
     lambda scores, batch: (np.sum(scores.correct * scores.weights), np.sum(scores.weights)),
     reads=TokenScores, name="accuracy", better="higher",
 )
 language_model = LMObjective(model, seq_len=8, ema_decay=None)
-accuracy_data = loader(RecordsData(source={"text": train_tokens}, validation={"text": val_tokens}), batch=8, read="memory", loading=Loading(workers=0))
+accuracy_train = Memory({"text": train_tokens}).repeat().batch(8)
+accuracy_val = Memory({"text": val_tokens}).batch(8)
 run = Trainer(language_model, OptimConfig(optimizer="adam", learning_rate=0.01), key=jax.random.key(0),
               checkpoints=Checkpoints("runs/lm-accuracy"))
 state = run.fit(
-    accuracy_data, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
+    accuracy_train, validation=accuracy_val, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
 )
 run.checkpoints.wait()
 assert run.checkpoints.best is not None
@@ -187,17 +187,18 @@ The example continues the previous one and reuses `objective`, `data`, `Perplexi
 
 ```python
 from dew import Evaluation, LocalTracker
-from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config import RunConfig, TrainerConfig
+from dew.optim import OptimConfig
+from dew.registry import ModelConfig
 from dew.config.sweep import GridSearch
-from dew.config.data import TextData
 
 config = RunConfig(
-    # The run records the model it trains, and the batches above stand in
-    # for the dataset this names.
+    # The run records the model and the data it trains; the batches above
+    # stand in for the records this chain reads.
     model=ModelConfig.from_model(objective.model),
-    data=TextData(source="", seq_len=8),
+    data=Memory({"text": train_tokens}).repeat().batch(8),
     optim=OptimConfig(optimizer="adam"),
-    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=10, batch_size=8,
+    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=10,
                           eval_every=None, checkpoint_every=None),
 )
 
@@ -237,8 +238,8 @@ Each evaluation event derives its random key from the run key and the training s
 
 All processes take part in the objective's numerical work and in gathering global arrays. Only process zero computes host metrics, decodes previews and writes tracking output, and the host metric kernels use one process-local device.
 
-Before any transfer, evaluation uses `dew.coordination.collective_host` to check the local conversions and addressable shards on every process. The processes then agree on the global gather plan and share each transfer's outcome before the next gather starts. Built-in previews agree on their local setup and generation outcomes before they start that transfer. A custom hook with its own collectives must also call `agree_process_phase` at those points. The trainer's own agreement on the hook comes at the end and cannot replace those calls. Finish all gathers before decoding on process zero alone. For local arrays, plain `host` still works on process zero alone. A dead process, a blocked loader, or a failure inside a device collective that is already running still needs the distributed runtime's timeout and the launcher's failure handling.
+Before any transfer, evaluation uses `dew.distributed.collective_host` to check the local conversions and addressable shards on every process. The processes then agree on the global gather plan and share each transfer's outcome before the next gather starts. Built-in previews agree on their local setup and generation outcomes before they start that transfer. A custom hook with its own collectives must also call `agree_process_phase` at those points. The trainer's own agreement on the hook comes at the end and cannot replace those calls. Finish all gathers before decoding on process zero alone. For local arrays, plain `host` still works on process zero alone. A dead process, a blocked loader, or a failure inside a device collective that is already running still needs the distributed runtime's timeout and the launcher's failure handling.
 
-All processes read their validation shards in step, and a pass reads every record of the split exactly once. The last batch is padded to full size with repeats of its own rows, and a process whose shard ends before another's scores a copy of its last batch in which every row is a repeat. Each evaluation batch holds `VALID_ROWS` (`dew.objectives.base`), one bool per row that marks the real rows. An objective's loss and its batch-wide terms count only those rows through `Objective.row_mean`, and the metrics read only those rows. `evaluation/coordinated_batches` is the number of batches every process scored, and `evaluation/records` the number of real records in them. The record count comes from the placed global batch, so sequence and pipeline-stage replicas count once and scalar metadata adds no rows. The trainer's printed evaluation line shows the scores, the record count and the elapsed time. An empty coordinated validation pass generates no preview and returns no metric values. A non-empty pass with no counted language target raises an error.
+All processes read their validation shards in step, and a pass reads every record of the split exactly once. The last batch is padded to full size with repeats of its own rows, and a process whose shard ends before another's scores a copy of its last batch in which every row is a repeat. Each evaluation batch holds `VALID_ROWS` (`dew.batch`), one bool per row that marks the real rows. An objective's loss and its batch-wide terms count only those rows through `Objective.row_mean`, and the metrics read only those rows. `evaluation/coordinated_batches` is the number of batches every process scored, and `evaluation/records` the number of real records in them. The record count comes from the placed global batch, so sequence and pipeline-stage replicas count once and scalar metadata adds no rows. The trainer's printed evaluation line shows the scores, the record count and the elapsed time. An empty coordinated validation pass generates no preview and returns no metric values. A non-empty pass with no counted language target raises an error.
 
 When you compare generative scores, record the seed, the numbers of generated and real samples consumed, the conditioning data, the solver, the number of sampling steps, the guidance, and the feature and preprocessing definition. Keep the run configuration with the results.

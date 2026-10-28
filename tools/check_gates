@@ -1,0 +1,34 @@
+# Every gate tools/check.sh runs, one a line: its name, a tab, and its command, which runs from the checkout's
+# top under sh with tools/lint_inputs.sh read first, PYTHON naming the suite environment's interpreter and BASE
+# the ref SLOP020's ratchet holds the inventory to (origin/main, or the target a promotion lands on). check.sh
+# runs them all, one, or lists them (`--list`); the lanes' lint gate on armada reads this file at a commit and
+# runs each gate on its own container. Lines starting with # are comments.
+locks	sh tools/lock_environment.sh && git diff --exit-code --stat locks/
+flake8	"$PYTHON" -m flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --extend-exclude=.venv*
+ruff	"$PYTHON" -m ruff check $ruff_inputs
+slop	JAX_PLATFORMS=cpu "$PYTHON" tools/lint_slop.py
+# The ratchet reads the inventory's whole history, which a shallow checkout fetches first.
+ratchet	sh tools/base_history.sh && "$PYTHON" tools/lint_slop.py --ratchet --base="$BASE"
+# No forecasts in the prose and messages a change adds (the bible).
+public-text	sh tools/base_history.sh && "$PYTHON" tools/public_text.py "$BASE"
+fixtures	"$PYTHON" tools/fetched_fixtures.py check
+complexity	"$PYTHON" tools/complexity.py src/dew tools/lint_slop.py tools/lint_scopes.py examples recipes > complexity.json
+# A tutorial pinned to a commit is checked against that commit's API, which a shallow checkout fetches first.
+api-pages	sh tools/base_history.sh && uv run --no-project --with-requirements site/scripts/requirements.txt python site/scripts/gen_api.py --check
+api-tests	uv run --no-project --with-requirements site/scripts/requirements.txt --with pytest python -m pytest -q --noconftest tests/test_gen_api.py
+install-script	"$PYTHON" site/scripts/gen_install.py --check
+theme	"$PYTHON" site/scripts/gen_theme.py --check
+model-pin	"$PYTHON" site/scripts/gen_pin.py --check
+landing-programs	"$PYTHON" site/snippets/cells.py --check
+models	JAX_PLATFORMS=cpu "$PYTHON" site/scripts/gen_models.py --check
+examples	"$PYTHON" site/scripts/gen_examples.py --check
+exports	"$PYTHON" tools/gen_exports.py --check
+pythons	"$PYTHON" tools/armada/ci.py pythons --check
+# pyright runs on Node, whose default heap limit follows the machine's memory: 2,240 MiB on an armada medium
+# container (12 GiB), where checking src/dew ran out of heap. With 8 GiB it passed, the task peaking at 4.3 GiB;
+# 8 GiB also fits GitHub's runner (16 GiB), so both check alike.
+pyright	NODE_OPTIONS=--max-old-space-size=8192 uvx pyright@1.1.406 --pythonpath "$(command -v "$PYTHON")" src/dew
+# Main still holds structural copies (ledger 896-1287, 1309), so a checkout is held to adding none to origin/main's,
+# whose history a shallow checkout fetches first; main holds no text copy, so any fails.
+duplicate-text	"$PYTHON" tools/duplicates.py --reading=text $duplicate_roots
+duplicate-structure	sh tools/base_history.sh && "$PYTHON" tools/duplicates.py --reading=structure --base=origin/main $duplicate_roots

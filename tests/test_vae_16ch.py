@@ -44,22 +44,18 @@ def autoencoder():
     return StableDiffusionVAE(str(TINY), dtype=np.float32)
 
 
-def test_the_encoder_matches_the_reference_latent(autoencoder):
-    """The posterior mean of the reference, from the same pixels, before the
-    latent normalization the seam applies."""
+@pytest.mark.parametrize(("walk", "given", "output", "what"), [
+    ("encode_batch", "sample", "latent", "latent"),
+    ("decode_batch", "latent", "decoded", "reconstruction"),
+], ids=("encode", "decode"))
+def test_each_walk_matches_the_reference(autoencoder, walk, given, output, what):
+    """The encoder's posterior mean from the reference's pixels, before the latent normalization
+    the seam applies, and the decoder's reconstruction of the reference's latent."""
     expected = reference()
-    raw = autoencoder.encode_batch(autoencoder.params, np.asarray(expected["sample"], np.float32))
+    result = getattr(autoencoder, walk)(autoencoder.params, np.asarray(expected[given], np.float32))
 
-    difference = largest_difference(raw, expected["latent"])
-    assert difference < TOLERANCE, f"max |latent difference| {difference:.3e}"
-
-
-def test_the_decoder_matches_the_reference_reconstruction(autoencoder):
-    expected = reference()
-    decoded = autoencoder.decode_batch(autoencoder.params, np.asarray(expected["latent"], np.float32))
-
-    difference = largest_difference(decoded, expected["decoded"])
-    assert difference < TOLERANCE, f"max |reconstruction difference| {difference:.3e}"
+    difference = largest_difference(result, expected[output])
+    assert difference < TOLERANCE, f"max |{what} difference| {difference:.3e}"
 
 
 def test_the_normalized_latent_round_trips(autoencoder):

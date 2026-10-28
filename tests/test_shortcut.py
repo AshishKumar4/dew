@@ -13,10 +13,12 @@ from dew.objectives.diffusion.few_step import ShortcutObjective
 
 def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
     from diffusion_stubs import batch_for
+    from diffusion_support import images_of
 
-    from dew.config import ModelConfig, ObjectiveConfig
-    from dew.config.data import ImageData
-    from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
+    from dew.config import ObjectiveConfig
+    from dew.config.diffusion import DiffusionRunConfig
+    from dew.inputs import TextCondition
+    from dew.registry import ModelConfig
     from dew.sampling import Euler
     from dew.training import Trainer
 
@@ -26,7 +28,7 @@ def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
             {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
              "dtype": "float32", "attention_impl": "xla"},
         ),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=4),
+        data=images_of("tfds://oxford_flowers102", 4),
         preset=presets.Shortcut(),
         val_metrics=(),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),

@@ -24,6 +24,7 @@ import pytest
 from interop_support import (
     assert_autoencoder_vjp,
     assert_layout_tensors,
+    channels_last,
     extract_fixture,
     fixture_arrays,
     scaled_gap,
@@ -47,10 +48,6 @@ def source(tmp_path_factory):
 def variant(request, source):
     directory = source / request.param
     return directory, load_dc_ae(directory), fixture_arrays(directory / "reference.npz")
-
-
-def channels_last(array):
-    return np.asarray(array).transpose(0, 2, 3, 1)
 
 
 def parameters(layouts):
@@ -79,24 +76,21 @@ def test_the_quadratic_attention_matches_the_source(variant):
     assert max(gaps.values()) < FORWARD, gaps
 
 
-def test_encoder_gradients_match_the_source(variant):
-    _, (autoencoder, params, layouts, _), reference = variant
-    model = autoencoder.model
-    latent = assert_autoencoder_vjp(
-        "encode", lambda params, image: model.apply({"params": params}, image, method=model.encode), params,
-        channels_last(reference["image"]), [channels_last(reference["probe_latent"])], parameters(layouts),
-        reference, channels_last(reference["encode.grad_image"]), GRADIENT)
-    assert scaled_gap(latent, channels_last(reference["latent"])) < FORWARD
+WALKS = {"encode": ("image", "probe_latent", "latent"), "decode": ("code", "probe", "pixels")}
+"""Each walk's operand, output probe and output, by their names in the source's reference."""
 
 
-def test_decoder_gradients_match_the_source(variant):
+@pytest.mark.parametrize("method", WALKS)
+def test_gradients_match_the_source(variant, method):
+    """The encoder's or decoder's output and its parameter and input gradients against the source's."""
+    given, probe, output = WALKS[method]
     _, (autoencoder, params, layouts, _), reference = variant
     model = autoencoder.model
-    pixels = assert_autoencoder_vjp(
-        "decode", lambda params, code: model.apply({"params": params}, code, method=model.decode), params,
-        channels_last(reference["code"]), [channels_last(reference["probe"])], parameters(layouts), reference,
-        channels_last(reference["decode.grad_code"]), GRADIENT)
-    assert scaled_gap(pixels, channels_last(reference["pixels"])) < FORWARD
+    result = assert_autoencoder_vjp(
+        method, lambda params, x: model.apply({"params": params}, x, method=getattr(model, method)), params,
+        channels_last(reference[given]), [channels_last(reference[probe])], parameters(layouts), reference,
+        channels_last(reference[f"{method}.grad_{given}"]), GRADIENT)
+    assert scaled_gap(result, channels_last(reference[output])) < FORWARD
 
 
 def test_the_autoencoder_scales_as_the_pipeline_does(variant):
@@ -134,7 +128,7 @@ def test_a_run_trains_behind_the_dc_ae_its_checkpoint_names(source, tmp_path):
     """`PretrainedAutoencoder` reads the checkpoint's own config: a DC-AE
     builds as one, and a run's saved params bind without the weights."""
     from dew.nn.autoencoders.dc_ae import DCAutoencoder
-    from dew.objectives.diffusion import PretrainedAutoencoder
+    from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 
     shutil.copytree(source / "conv", tmp_path / "dc-ae")
     spec = PretrainedAutoencoder(modelname=str(tmp_path / "dc-ae"), dtype="float32", latent_scale=0.5)
@@ -155,11 +149,14 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     (a bare `proj_out`) left the run unable to place its variables."""
     import optax
     from diffusion_stubs import STUB_TEXT
+    from diffusion_support import images_of
 
-    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.config.data import ImageData
+    from dew.config import ObjectiveConfig, TrainerConfig
+    from dew.config.diffusion import DiffusionRunConfig
     from dew.data.dataset import Loader
-    from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
+    from dew.inputs import TextCondition
+    from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
+    from dew.registry import ModelConfig
     from dew.sampling import Euler
     from dew.training import Trainer
 
@@ -169,8 +166,8 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
             {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1,
              "dtype": "float32", "attention_impl": "reference"},
         ),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=16),
-        trainer=TrainerConfig(batch_size=8, steps=2),
+        data=images_of("tfds://oxford_flowers102", 16, batch=8),
+        trainer=TrainerConfig(steps=2),
         text=TextCondition(encoder=STUB_TEXT, checkpoint="stub-clip"),
         autoencoder=PretrainedAutoencoder(modelname=str(source / "conv"), dtype="float32"),
         objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 2}),

@@ -1,10 +1,12 @@
 """The tabulated variance-preserving schedule every beta table shares."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+from dew.nn.sharding import rows_taken
 
 from .common import NoiseScheduler
 
@@ -51,14 +53,29 @@ class DiscreteNoiseScheduler(NoiseScheduler):
 
     def rates(self, t):
         index = self.index(t)
-        return self.sqrt_alpha_cumprod[index], self.sqrt_one_minus_alpha_cumprod[index]
+        return (rows_taken(self.sqrt_alpha_cumprod, index),
+                rows_taken(self.sqrt_one_minus_alpha_cumprod, index))
 
     def variances(self, t):
         index = self.index(t)
-        return self.alpha_cumprod[index], self.one_minus_alpha_cumprod[index]
+        return rows_taken(self.alpha_cumprod, index), rows_taken(self.one_minus_alpha_cumprod, index)
 
     def sample_t(self, key, n):
-        return jax.random.randint(key, (n,), 0, self.T)
+        return jax.random.randint(key, (n,), 0, self.T, jnp.int32)
 
     def weight(self, t):
-        return self.p2_loss_weights[self.index(t)]
+        return rows_taken(self.p2_loss_weights, self.index(t))
+
+
+class BetaTable(DiscreteNoiseScheduler):
+    """A schedule whose betas a named table makes from the step count and two endpoints (`table`),
+    the three kept as the schedule's record. The P2 weight arguments are `DiscreteNoiseScheduler`'s."""
+
+    table: Callable[[int, float, float], np.ndarray]
+    """The betas of `timesteps` steps between the two endpoints, a static method of each table's class."""
+
+    def __init__(self, timesteps: int, beta_start: float, beta_end: float,
+                 p2_loss_weight_k: float = 1, p2_loss_weight_gamma: float = 1):
+        super().__init__(type(self).table(timesteps, beta_start, beta_end),
+                         p2_loss_weight_k=p2_loss_weight_k, p2_loss_weight_gamma=p2_loss_weight_gamma)
+        self.timesteps, self.beta_start, self.beta_end = timesteps, beta_start, beta_end

@@ -21,28 +21,40 @@ from __future__ import annotations
 
 import argparse
 import ast
+import functools
+import io
 import json
 import re
+import shlex
+import subprocess
 import sys
-from collections.abc import Iterator
+import tempfile
+import tokenize
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import griffe
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
+import lint_scopes as scopes
+
 DEW_GROUPS: list[tuple[str, list[str]]] = [
-    ("Top level", ["dew"]),
-    ("Training", ["dew.training", "dew.training.state", "dew.training.optim", "dew.training.quantization",
-                  "dew.training.runtime", "dew.training.distributed", "dew.training.posthoc"]),
+    ("Top level", ["dew", "dew.batch", "dew.mesh"]),
+    ("Training", ["dew.training", "dew.training.budget", "dew.training.cooldown", "dew.state", "dew.optim",
+                  "dew.training.quantization", "dew.training.runtime", "dew.distributed.placement",
+                  "dew.distributed.batches", "dew.averaging"]),
     ("Objectives", ["dew.objectives", "dew.objectives.base", "dew.objectives.lm", "dew.objectives.diffusion",
+                    "dew.objectives.routing",
                     "dew.objectives.diffusion.adversarial",
                     "dew.objectives.diffusion.alignment", "dew.objectives.diffusion.consistency",
                     "dew.objectives.diffusion.end_to_end", "dew.objectives.diffusion.few_step",
                     "dew.objectives.diffusion.guidance_distillation",
-                    "dew.objectives.jepa", "dew.objectives.supervised", "dew.objectives.rl",
+                    "dew.objectives.jepa", "dew.objectives.supervised", "dew.objectives.residuals",
+                    "dew.objectives.perturbation", "dew.objectives.rl",
                     "dew.objectives.rl.flow",
                     "dew.objectives.rl.scheduler", "dew.rl.sandbox", "dew.interop.gateway",
-                    "dew.interop.harness", "dew.interop.harbor"]),
+                    "dew.interop.harness", "dew.interop.harbor", "dew.interop.openenv"]),
     ("Data", ["dew.data", "dew.data.presets", "dew.data.pipeline", "dew.data.holdout", "dew.data.compile",
               "dew.data.dataset", "dew.data.plan", "dew.data.mixing", "dew.data.cache",
               "dew.data.storage", "dew.data.sinks",
@@ -59,9 +71,11 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                 "dew.nn.backbones.edm2", "dew.nn.backbones.joint", "dew.nn.backbones.flux",
                 "dew.nn.backbones.flux2",
                 "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3", "dew.nn.backbones.wan",
-                "dew.nn.backbones.z_image", "dew.nn.mp",
-                "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal",
-                "dew.nn.autoencoders", "dew.nn.inputs", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.nn.sharding",
+                "dew.nn.backbones.z_image", "dew.nn.mp", "dew.nn.fourier",
+                "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal", "dew.nn.cross_attention",
+                "dew.nn.memory",
+                "dew.nn.autoencoders", "dew.nn.autoencoders.pretrained", "dew.nn.categorical", "dew.nn.inputs", "dew.nn.mixers.attention", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.nn.sharding",
+                "dew.nn.wrapping", "dew.nn.scatter", "dew.nn.precision",
                 "dew.lora"]),
     ("Diffusion and sampling", ["dew.diffusion", "dew.diffusion.process", "dew.diffusion.schedules",
                                 "dew.diffusion.schedules.source", "dew.diffusion.schedules.source_grids",
@@ -71,10 +85,12 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Inference and interop", ["dew.inference", "dew.inference.banks", "dew.inference.tasks",
                               "dew.interop", "dew.interop.diffusion_gemma"]),
     ("Decision models", ["dew.decision", "dew.decision.config", "dew.decision.data", "dew.decision.objective",
-                         "dew.decision.layout", "dew.decision.task"]),
-    ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
-    ("Configuration", ["dew.config", "dew.config.data", "dew.config.sweep"]),
-    ("Utilities", ["dew.rl", "dew.artifacts", "dew.coordination", "dew.records", "dew.telemetry.profile",
+                         "dew.decision.rows", "dew.decision.layout", "dew.decision.task"]),
+    ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.calibration",
+                                   "dew.eval.harness"]),
+    ("Configuration", ["dew.config", "dew.config.lm", "dew.config.jepa", "dew.config.diffusion",
+                       "dew.config.sweep"]),
+    ("Utilities", ["dew.rl", "dew.artifacts", "dew.distributed", "dew.telemetry.profile",
                    "dew.telemetry.benchmark", "dew.figures"]),
 ]
 # Places that show users Dew code; every Dew name they use must resolve to the
@@ -100,6 +116,8 @@ class Package:
     overview_title: str = ""  # with a title, the page is written afresh; without, it is extended
     generated: str = "site/src/generated"  # the sidebar and the name index
     usage: list[str] = field(default_factory=list)  # files whose imports must resolve
+    declared: str = "site/scripts/gen_api.py"  # the file declaring `groups` at any commit (`groups_at`)
+    distribution: str = "dewml"  # the name pip installs the package by (`pinned`)
     usage_skip: tuple[str, ...] = ()
     special: tuple[str, ...] = ()  # private-looking methods a class documents, such as "__call__"
     fence_indented: bool = False  # an indented block after a blank line in a docstring is Python
@@ -218,7 +236,7 @@ def public_entries(module: griffe.Module) -> Iterator[Entry]:
 
 
 def is_flax_module(cls: griffe.Class) -> bool:
-    return any(re.search(r"(^|\.)(nn\.)?Module$", str(base)) and "linen" in str(base) or str(base) == "nn.Module"
+    return any((re.search(r"(^|\.)(nn\.)?Module$", str(base)) and "linen" in str(base)) or str(base) == "nn.Module"
                for base in cls.bases)
 
 
@@ -541,53 +559,47 @@ def usage_code(relative: str, path: Path) -> Iterator[tuple[str, set[int] | None
         yield path.read_text(), None
 
 
-@dataclass(frozen=True)
-class Instance:
-    """A name a unit bound to an instance of a Dew class: `cls`'s members are
-    its attributes, and calling one is calling a method."""
+INSTANCE = "<instance>"
+"""What a name `name = Class(...)` binds stands for in a scope's table (`held`): this, then the class's
+path, which no import's dotted path starts with."""
 
-    cls: griffe.Object
+
+def reached(package: griffe.Module, dotted: str) -> griffe.Object | None:
+    """The Dew object an import's dotted path names, or None for another package's name or one Dew
+    does not have; an alias that does not resolve raises `Unresolved`."""
+    head, *parts = dotted.split(".")
+    if head != P.package:
+        return None
+    current: griffe.Object = package
+    for part in parts:
+        member = current.members.get(part)
+        if member is None:
+            return None
+        current = resolve(member)
+    return current
 
 
 def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[str, Page],
-                    code: str, shown: set[int] | None,
-                    bound: dict[str, griffe.Object | Instance]) -> Iterator[str]:
+                    code: str, shown: set[int] | None, bound: dict[str, str]) -> Iterator[str]:
     """Each dotted use of a Dew name in `code` that does not reach the
     documented API: an attribute a module or class does not have, or a
     module member no page documents. Names come from `import dew...` and
-    `from dew... import ...`, in this unit or an earlier one of the same file
-    (`bound`, which this updates); a name the code assigns is its own, except
-    `name = Class(...)`, which binds an `Instance` whose calls must be methods."""
+    `from dew... import ...` as Python's scopes read them (tools/lint_scopes.py):
+    in this unit or an earlier one of the same file (`bound`, the module
+    scope's names, which this updates), except where a scope binds the name
+    itself; `name = Class(...)` binds an instance, whose calls must be methods."""
     try:
         tree = ast.parse(code)
     except SyntaxError as error:
         yield f"a Python unit does not parse, so none of its names is checked: {error}"
         return
-    assigned = {node.id for node in ast.walk(tree)
-                if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)}
-    assigned |= {node.name for node in ast.walk(tree)
-                 if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef)}
-    assigned |= {node.arg for node in ast.walk(tree) if isinstance(node, ast.arg)}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                if alias.name == P.package or alias.name.startswith(P.package + "."):
-                    name = alias.asname or P.package
-                    target = alias.name if alias.asname else P.package
-                    try:
-                        bound[name] = module_at(package, target)
-                    except KeyError:
-                        continue
-        elif (isinstance(node, ast.ImportFrom) and node.module
-              and (node.module + ".").startswith(P.package + ".")):
-            try:
-                module = module_at(package, node.module)
-                for alias in node.names:
-                    member = module.members.get(alias.name)
-                    if member is not None:
-                        bound[alias.asname or alias.name] = resolve(member)
-            except (KeyError, Unresolved):
-                continue
+    imports = {id(node): table for node, table in scopes.scoped(tree.body, bound, ())}
+    tables = {id(node): table for node, table in
+              scopes.scoped(tree.body, bound, (), held=held(tree, imports, package))}
+    if tree.body:
+        bound.clear()
+        bound.update(tables[id(tree.body[0])])
+
     def chain(node: ast.expr) -> list[str] | None:
         if isinstance(node, ast.Name):
             return [node.id]
@@ -596,13 +608,9 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
             return None if inner is None else [*inner, node.attr]
         return None
 
-    built = instances(tree, bound, chain)
-    for name in assigned:
-        bound.pop(name, None)
-    bound.update(built)
     called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
-
-    # Only the outermost dotted name counts, so a method and its class are not counted twice.
+    # Only the outermost dotted name counts, so a method and its class are not counted twice; one
+    # spelling is checked once a binding.
     inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
     seen = set()
     for node in ast.walk(tree):
@@ -610,47 +618,41 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
                 or (shown is not None and node.lineno not in shown)):
             continue
         path = chain(node)
-        if path is None or path[0] not in bound or ".".join(path) in seen:
+        target = None if path is None else tables[id(node)].get(path[0])
+        if target is None or (target, *path) in seen:
             continue
-        seen.add(".".join(path))
-        start = bound[path[0]]
-        held = start if isinstance(start, Instance) else None
+        seen.add((target, *path))
         try:
-            problem = unresolved_chain(start.cls if held else start, path, home, pages)
-            if problem is None and held is not None and id(node) in called and len(path) == 2:
-                problem = called_attribute(held.cls, path)
+            found = reached(package, target.removeprefix(INSTANCE))
+            if found is None:
+                continue
+            problem = unresolved_chain(found, path, home, pages)
+            # An instance's members are its class's, and calling one is calling a method.
+            if problem is None and target.startswith(INSTANCE) and id(node) in called and len(path) == 2:
+                problem = called_attribute(found, path)
         except Unresolved as error:
             problem = f"`{'.'.join(path)}`: {error}"
         if problem:
             yield problem
 
 
-def instances(tree: ast.Module, bound: dict[str, griffe.Object | Instance], chain) -> dict[str, Instance]:
-    """The names `tree` binds to an instance of a Dew class, each to that
-    class: a name every assignment of which is `name = Class(...)` for one
-    class the unit's imports reach (`objective = DiffusionObjective(...)`)."""
-    stores: dict[str, int] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            stores[node.id] = stores.get(node.id, 0) + 1
-    built: dict[str, list[griffe.Object]] = {}
+def held(tree: ast.Module, imports: dict[int, Mapping[str, str]], package: griffe.Module) -> dict[int, str]:
+    """Each `name = Class(...)` in `tree` whose class the scope's imports reach as a Dew class: the
+    stored name's node identity, to `INSTANCE` and the class's path (`objective =
+    DiffusionObjective(...)`), which lint_scopes binds the name to where every binding of it in its
+    scope is one such, of one class."""
+    instances: dict[int, str] = {}
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Assign) and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name) and isinstance(node.value, ast.Call)):
             continue
-        path = chain(node.value.func)
-        if path is None or path[0] not in bound or isinstance(bound[path[0]], Instance):
-            continue
-        current = bound[path[0]]
         try:
-            for attribute in path[1:]:
-                current = resolve(current.members[attribute])
-        except (KeyError, Unresolved):
+            made = reached(package, scopes.resolved(node.value.func, imports[id(node.value.func)]))
+        except Unresolved:
             continue
-        if current.is_class:
-            built.setdefault(node.targets[0].id, []).append(current)
-    return {name: Instance(classes[0]) for name, classes in built.items()
-            if len(classes) == stores[name] and len({cls.path for cls in classes}) == 1}
+        if made is not None and made.is_class:
+            instances[id(node.targets[0])] = INSTANCE + made.path
+    return instances
 
 
 def called_attribute(cls: griffe.Object, path: list[str]) -> str | None:
@@ -721,9 +723,10 @@ def unresolved_chain(start: griffe.Object, path: list[str], home: dict[str, str]
     return None
 
 
-def load() -> griffe.Module:
-    """Load the package with its namespace subpackages, which griffe's finder skips."""
-    root = P.repo / "src"
+def load(root: Path | None = None) -> griffe.Module:
+    """Load the package with its namespace subpackages, which griffe's finder skips, from the source under
+    `root` (the repository's src/, or a commit's)."""
+    root = root or P.repo / "src"
     loader = griffe.GriffeLoader(search_paths=[str(root)])
     package = loader.load(P.package)
     for directory in sorted((root / P.package).rglob("*")):
@@ -758,15 +761,16 @@ def module_of(package: griffe.Module, path: str) -> griffe.Module:
     return obj
 
 
-def documented(package: griffe.Module) -> tuple[dict[str, Page], dict[str, str]]:
-    """Each page, and each documented object's home: the page with the longest
-    module prefix of its path, else the first page that exports it."""
+def documented(package: griffe.Module, paths: list[str]) -> tuple[dict[str, Page], dict[str, str]]:
+    """Each page of the modules `paths` names (`P.pages`, or a pinned commit's), and each documented
+    object's home: the page with the longest module prefix of its path, else the first page that exports
+    it."""
     pages = {path: Page(module_of(package, path), list(public_entries(module_of(package, path))))
-             for path in P.pages}
+             for path in paths}
     home: dict[str, str] = {}
-    for path in P.pages:
+    for path in paths:
         for entry in pages[path].entries:
-            prefixes = [page for page in P.pages if entry.canonical.startswith(page + ".")
+            prefixes = [page for page in paths if entry.canonical.startswith(page + ".")
                         and any(e.canonical == entry.canonical for e in pages[page].entries)]
             home.setdefault(entry.canonical, max(prefixes, key=len) if prefixes else path)
     return pages, home
@@ -775,7 +779,7 @@ def documented(package: griffe.Module) -> tuple[dict[str, Page], dict[str, str]]
 def unresolved_in(file: str, path: Path, package: griffe.Module, pages: dict[str, Page],
                   home: dict[str, str]) -> list[str]:
     """Unresolved code and declaration references, with each Python unit seeing earlier units' bindings."""
-    bound: dict[str, griffe.Object | Instance] = {}
+    bound: dict[str, str] = {}
     problems = [problem for code, shown in usage_code(file, path)
                 for problem in unresolved_uses(package, home, pages, code, shown, bound)]
     if path.suffix == ".md":
@@ -832,17 +836,28 @@ def main() -> None:
         P = Package.read(args.config)
     content, generated = P.repo / P.content, P.repo / P.generated
     package = load()
-    pages, home = documented(package)
+    pages, home = documented(package, P.pages)
 
     linker = linked(pages, home)
 
     # Coverage: every module that declares __all__ has a page, and every exported
     # name and every name the docs import is documented.
     problems = undocumented(package, pages, home)
-    for file, module_path, name in usage_imports():
+    # A file shows the API as it is, or as the commit its install pins holds it (`pinned`).
+    shown: dict[str, tuple[griffe.Module, dict[str, Page], dict[str, str]]] = {}
+    for file, path in usage_files():
         try:
-            module = (module_of(package, module_path) if module_path == P.package
-                      else module_at(package, module_path))
+            commit = pinned(path)
+            shown[file] = (package, pages, home) if commit is None else at_commit(commit)
+        except Unresolved as error:
+            problems.append(f"{file}: {error}")
+    for file, module_path, name in usage_imports():
+        if file not in shown:
+            continue
+        shown_package, shown_pages, shown_home = shown[file]
+        try:
+            module = (module_of(shown_package, module_path) if module_path == P.package
+                      else module_at(shown_package, module_path))
             member = module.members.get(name)
             if member is None:
                 problems.append(f"{file}: `from {module_path} import {name}`: {module_path} has no {name}")
@@ -852,14 +867,15 @@ def main() -> None:
             problems.append(f"{file}: `from {module_path} import {name}`: {error}")
             continue
         if target.is_module:
-            if name in target.members and target.path + "." + name in home:
+            if name in target.members and target.path + "." + name in shown_home:
                 continue
-            if target.path not in pages:
+            if target.path not in shown_pages:
                 problems.append(f"{file}: imports the module {target.path}, which has no API page")
-        elif target.path not in home:
+        elif target.path not in shown_home:
             problems.append(f"{file}: imports {module_path}.{name} ({target.path}), which no API page documents")
     for file, path in usage_files():
-        problems.extend(f"{file}: {problem}" for problem in unresolved_in(file, path, package, pages, home))
+        if file in shown:
+            problems.extend(f"{file}: {problem}" for problem in unresolved_in(file, path, *shown[file]))
     if problems:
         print("gen_api: the API reference does not cover what is public:", file=sys.stderr)
         for problem in sorted(set(problems)):
@@ -927,6 +943,85 @@ def main() -> None:
     (generated / "api-index.json").write_text(json.dumps(linker.by_path, indent=1, sort_keys=True) + "\n")
     count = sum(1 for path in P.pages for entry in pages[path].entries if home[entry.canonical] == path)
     print(f"gen_api: {len(P.pages)} pages, {count} objects documented")
+
+
+REQUIREMENT = re.compile(r"^(?P<name>[A-Za-z0-9._-]+)(?:\[[^\]]*\])?\s*"
+                         r"(?:@\s*git\+(?P<url>[^@\s]+)(?:@(?P<rev>\S+))?)?(?:[=<>!~].*)?$")
+"""A requirement a pip install names: a distribution, its extras, and a git repository and revision it
+installs from, if any (`dewml[cuda13] @ git+https://github.com/AshishKumar4/dew@<revision>`, with or
+without the spaces)."""
+COMMIT = re.compile(r"[0-9a-f]{7,40}")
+
+
+def install_commands(source: str) -> Iterator[list[str]]:
+    """The arguments of each `pip install` or `uv pip install` a code cell runs as IPython does: a line
+    that starts with `%` or `!`, outside a Python string, with its backslash continuations joined."""
+    lines = source.splitlines()
+    magic = [index for index, line in enumerate(lines) if line.lstrip().startswith(("%", "!"))]
+    # A magic line inside a string literal is the string's text: read the cell as Python with each magic
+    # line a statement, and keep those no string token spans.
+    python = "\n".join("pass" if index in magic else line for index, line in enumerate(lines))
+    tokens = tokenize.generate_tokens(io.StringIO(python).readline)
+    strings = [(token.start[0], token.end[0]) for token in tokens if token.type == tokenize.STRING]
+    index = 0
+    while index < len(lines):
+        command, start = lines[index], index
+        while command.endswith("\\") and index + 1 < len(lines):
+            index += 1
+            command = command[:-1] + " " + lines[index]
+        index += 1
+        if start in magic and not any(first < start + 1 <= last for first, last in strings):
+            words = shlex.split(command.lstrip().lstrip("%!"), comments=True)
+            if words[:2] == ["pip", "install"] or words[:3] == ["uv", "pip", "install"]:
+                yield words
+
+
+def pinned(path: Path) -> str | None:
+    """The commit a notebook's installs of the package (`Package.distribution`) pin it to, which the API
+    it shows is that commit's; None where it installs none, or the package as published or at a branch or
+    tag. Two installs of different revisions are refused: which API a cell sees would turn on the cell."""
+    if path.suffix != ".ipynb":
+        return None
+    repository = P.source.split("/blob/")[0].removesuffix("/")
+    revisions: list[str | None] = []
+    for cell in json.loads(path.read_text())["cells"]:
+        for words in install_commands("".join(cell["source"])) if cell["cell_type"] == "code" else ():
+            for found in filter(None, map(REQUIREMENT.match, words)):
+                if found["name"] == P.distribution:
+                    url = (found["url"] or "").removesuffix(".git").removesuffix("/")
+                    revisions.append(found["rev"] if url == repository and found["rev"] else None)
+    if len(set(revisions)) > 1:
+        raise Unresolved(f"it installs the package at {len(set(revisions))} revisions: "
+                         f"{', '.join(str(revision) for revision in revisions)}")
+    return revisions[0] if revisions and revisions[0] and COMMIT.fullmatch(revisions[0]) else None
+
+
+def groups_at(commit: str) -> list[tuple[str, list[str]]]:
+    """The reference's groups as `commit` declared them (`Package.declared`): a JSON file's `groups`, or
+    the Python file's `DEW_GROUPS`."""
+    text = subprocess.run(["git", "-C", str(P.repo), "show", f"{commit}:{P.declared}"], check=True,
+                          stdout=subprocess.PIPE, text=True).stdout
+    if P.declared.endswith(".json"):
+        return json.loads(text)["groups"]
+    for node in ast.parse(text).body:
+        if (isinstance(node, ast.Assign | ast.AnnAssign) and node.value is not None
+                and any(isinstance(target, ast.Name) and target.id == "DEW_GROUPS"
+                        for target in (node.targets if isinstance(node, ast.Assign) else [node.target]))):
+            return ast.literal_eval(node.value)
+    raise Unresolved(f"{P.declared} declares no DEW_GROUPS at {commit}")
+
+
+@functools.cache
+def at_commit(commit: str) -> tuple[griffe.Module, dict[str, Page], dict[str, str]]:
+    """The package's API at `commit` and the reference it documented there: its source read as `load`
+    reads the checkout's, and its pages as that commit's groups name them (`groups_at`). A file pinned
+    there may use any name that commit documented, whatever pages the reference has now."""
+    archive = subprocess.run(["git", "-C", str(P.repo), "archive", commit, "src"], check=True,
+                             stdout=subprocess.PIPE).stdout
+    with tempfile.TemporaryDirectory() as root:
+        subprocess.run(["tar", "-x", "-C", root], input=archive, check=True)
+        package = load(Path(root) / "src")
+    return package, *documented(package, [module for _, modules in groups_at(commit) for module in modules])
 
 
 def iter_modules(module: griffe.Module) -> Iterator[griffe.Module]:

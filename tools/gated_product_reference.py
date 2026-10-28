@@ -89,8 +89,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", required=True)
     args = parser.parse_args()
-    if torch.__version__.split("+")[0] != "2.14.0":
-        raise RuntimeError("This fixture is pinned to Torch 2.14.0")
+    from reference_releases import require
+
+    require("torch")
     rng = np.random.default_rng(2112)
     arrays = {}
     for name, (oracle, activate) in ACTIVATIONS.items():

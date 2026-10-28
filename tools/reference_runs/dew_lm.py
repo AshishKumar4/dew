@@ -38,7 +38,6 @@ from common import (
     WorkloadWork,
     attach_xplane_profile,
     documents,
-    git_head,
     host,
     peak_flops,
     run_arguments,
@@ -48,6 +47,7 @@ from common import (
     window_rows,
     write_record,
 )
+from reference_source import dew_revision
 
 
 class NormState(NamedTuple):
@@ -82,12 +82,12 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--head-chunks", type=int, default=4)
     parser.add_argument("--split", type=int, default=None,
                         help="the microbatches a step's batch is read in (Trainer's split); unset plans it")
-    parser.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32",
+    parser.add_argument("--state-dtype", choices=("float32", "bfloat16", "int8"), default="float32",
                         help="Adam's moments in memory (OptimConfig.state_dtype)")
     parser.add_argument("--remat", default=None, choices=sorted(REMAT_POLICIES),
                         help="the decoder's starting remat policy; unset, the model's")
     parser.add_argument("--aux-loss-alpha", type=float, default=None,
-                        help="MoE: LMObjective's aux_loss_alpha (Switch balance loss per router)")
+                        help="MoE: ExpertBalance's aux_loss_alpha (Switch balance loss per router)")
     parser.add_argument("--seq-aux", action="store_true",
                         help="MoE: the per-sequence balance loss instead of the batch-wide one")
     return parser.parse_args()
@@ -119,16 +119,16 @@ def build(args: argparse.Namespace) -> Run:
 
     from work import measure
 
-    from dew.config import OptimConfig
+    from dew.batch import TEXT_KEY, coordinates
+    from dew.distributed.batches import batch_shardings
     from dew.interop import Pretrained
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.multimodal import MultimodalTransformer
-    from dew.objectives.lm import TEXT_KEY, LMObjective
+    from dew.objectives.lm import LMObjective
+    from dew.objectives.routing import ExpertBalance
+    from dew.optim import Cosine, OptimConfig, ParamGroup
     from dew.training import MeshSpec, Trainer
-    from dew.training.distributed import batch_shardings
-    from dew.training.optim import Cosine, ParamGroup
-
-    from dew.nn.inputs import coordinates
+    from dew.training.planning import Trials
 
     data = np.load(args.data)
     windows, order = data["windows"], data["order"]
@@ -140,21 +140,26 @@ def build(args: argparse.Namespace) -> Run:
     schedule_steps = steps_for(order, args.batch)
     total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
 
+    # On the host: the trainer places the weights over its mesh.
     pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype="float32",
-                                 attention_impl=args.attention)
-    model = pretrained.model
-    if args.remat is not None and isinstance(model, MultimodalTransformer):
-        # A multimodal checkpoint's decoder is its language model.
-        model = model.clone(language_model=model.language_model.clone(remat=args.remat))
-    elif args.remat is not None:
+                                 attention_impl=args.attention, on_host=True)
+    model, variables = pretrained.model, pretrained.variables
+    if isinstance(model, MultimodalTransformer):
+        # A text run trains a multimodal checkpoint's decoder, its language model, alone: the towers
+        # read no text, and would only carry their weights and moments through every step.
+        model = model.language_model
+        variables = {collection: tree["language_model"] for collection, tree in variables.items()
+                     if "language_model" in tree}
+    if args.remat is not None:
         model = model.clone(remat=args.remat)
     if args.dispatch is not None:
         if not isinstance(model, CausalTransformer) or model.mixture is None:
             raise SystemExit(f"--dispatch sets a mixture's dispatch, and {args.model} builds no mixture")
         model = model.clone(mixture=dataclasses.replace(model.mixture, dispatch=args.dispatch))
+    balance = None if args.aux_loss_alpha is None else ExpertBalance(
+        aux_loss_alpha=args.aux_loss_alpha, seq_aux=args.seq_aux)
     objective = LMObjective(model, seq, ema_decay=None, head_chunks=args.head_chunks,
-                            variables=pretrained.variables, aux_loss_alpha=args.aux_loss_alpha,
-                            seq_aux=args.seq_aux)
+                            variables=variables, balance=balance)
     def rows(indices) -> dict:
         """The windows' rows, a packed run's documents laid out beside them."""
         if segments is None:
@@ -164,12 +169,14 @@ def build(args: argparse.Namespace) -> Run:
 
     work = measure(objective, rows(np.arange(args.batch)))
     work.write(args.work)
-    schedule = Cosine(peak=args.lr_peak, warmup_steps=args.warmup, end=args.lr_end, init=args.lr_init)
+    schedule = Cosine(peak_value=args.lr_peak, warmup_steps=args.warmup, end_value=args.lr_end,
+                      init_value=args.lr_init)
     # One group over every parameter, as torch_lm.py's AdamW decays the norms
     # and biases too.
     solver = OptimConfig(
         optimizer="adamw", b1=args.b1, b2=args.b2, optimizer_opts={"eps": args.eps},
-        state_dtype=args.state_dtype, schedule=schedule, weight_decay=args.weight_decay, clip_grads=args.clip,
+        state_dtype=args.state_dtype, learning_rate=schedule, weight_decay=args.weight_decay,
+        clip_grads=args.clip,
         param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
@@ -183,8 +190,10 @@ def build(args: argparse.Namespace) -> Run:
         return jax.device_put(rows(window_rows(order, step, args.batch)), placement)
 
     compile_start = time.perf_counter()
-    step = trainer.compile(state, batch(0))
-    return Run(trainer, state, step, batch, schedule.schedule(schedule_steps), windows, seq, total,
+    # As `fit` plans: a frontier the plan opens is timed, and the run goes on from the state it timed.
+    trials = Trials(state, batch(0))
+    step = trainer.compile(state, batch(0), trials)
+    return Run(trainer, trials.state, step, batch, schedule.schedule(schedule_steps), windows, seq, total,
                schedule_steps, time.perf_counter() - compile_start, work)
 
 
@@ -194,7 +203,7 @@ class RouterProbe:
     it is called on."""
 
     def __init__(self, run: Run, rows: int):
-        from dew.objectives.lm.objective import _router_scores
+        from dew.objectives.routing import router_scores
 
         objective = run.trainer.objective
         self.mesh = run.trainer.device_mesh
@@ -205,7 +214,7 @@ class RouterProbe:
         def scores(params, tokens):
             routing = objective.token_scores(params, tokens, routing=True).routing
             loads, entropies = [], []
-            for probs, indices in _router_scores(routing):
+            for probs, indices in router_scores(routing):
                 loads.append(jnp.bincount(indices.ravel(), length=probs.shape[-1]) / indices.size)
                 p = probs.astype(jnp.float32)
                 entropies.append(-jnp.mean(jnp.sum(p * jnp.log(jnp.maximum(p, 1e-30)), axis=-1)))
@@ -267,7 +276,7 @@ def train(args: argparse.Namespace, run: Run, probe: RouterProbe | None) -> tupl
 def versions() -> dict:
     """The versions a record names, read before the run so an untraceable
     checkout fails at once rather than after it."""
-    return {"jax": jax.__version__, "dew": git_head(Path(__file__).resolve().parents[2]),
+    return {"jax": jax.__version__, "dew": dew_revision(),
             "optax": optax.__version__, "flax": __import__("flax").__version__}
 
 
@@ -292,7 +301,7 @@ def record(args: argparse.Namespace, run: Run, curves: Curves, probe: RouterProb
                    "mesh": dict(run.trainer.device_mesh.shape),
                    "optimizer": "optax.chain(recorded_norm, clip_by_global_norm, adamw) "
                                 "via OptimConfig.build",
-                   "schedule": "dew.training.optim.Cosine", "ema": None,
+                   "schedule": "dew.optim.Cosine", "ema": None,
                    "model_config": {k: v for k, v in run.trainer.objective.model.__dict__.items()
                                     if isinstance(v, (int, float, str, bool, type(None)))}},
         "versions": built_from,

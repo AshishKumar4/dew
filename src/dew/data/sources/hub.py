@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import cached_property
 from pathlib import Path
 
-import grain.python as grain
 import numpy as np
 
 from dew.cache import HubAnswer, hub_answer, recorded_hub_answer
@@ -16,19 +16,48 @@ from dew.data.pipeline import Dataset
 
 from .base import Read, ShardManifest, Source, preparing
 from .files import Files, Format
-from .hf import _undecoded, class_names
-from .memory import _record
+from .hf import arrow_rows, class_names
 
 
 def hold_progress_lock() -> None:
-    """Give `datasets`' progress-bar class a lock of its own, before a Hub read. `datasets` reads a split's
-    shards through tqdm's thread_map, which lends the class a lock for the map and deletes it after where
-    the class held none. Two splits read at once (compile's readers: a holdout's train and held) then
-    delete it under each other's bars: "type object 'tqdm' has no attribute '_lock'". Held, each map
-    restores it instead."""
-    from datasets.utils.tqdm import tqdm as bars
+    """Give tqdm's own progress-bar class a lock, before any call into `datasets`. `datasets` maps a split's
+    files through tqdm's thread_map (resolving a listing's files to a split, reading or preparing its
+    shards), which lends the bar class it is given a lock for the map and deletes it after where neither
+    the class nor a class it derives from held one. Two maps at once (compile's readers: a holdout's train
+    and held; several streamed sources discovered together) then delete it under each other's bars:
+    "type object 'tqdm' has no attribute '_lock'". Held by tqdm's class, which every bar class `datasets`
+    lends a map derives from, each map finds it and restores it instead."""
+    from tqdm import tqdm as bars
 
     bars.get_lock()
+
+
+def split_files(paths: Sequence[str], split: str) -> list[str]:
+    """The `paths` of a repository listing that `datasets` gives `split`, by its default patterns
+    (`datasets.data_files.get_data_patterns`), resolved as it resolves a split's patterns
+    (`DataFilesList.from_patterns`), over an empty in-memory copy of the listing: the listing itself,
+    which the Hub answered once and offline replays, is all the patterns read."""
+    from datasets.data_files import DataFilesList, get_data_patterns
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    if not paths:
+        # No file, so none of any split's, and no copy of the listing to make or remove.
+        return []
+    # `from_patterns` resolves the files through tqdm's thread_map.
+    hold_progress_lock()
+    fs, root = MemoryFileSystem(), f"/dew-hub-listing/{uuid.uuid4().hex}"
+    for path in paths:
+        fs.pipe_file(f"{root}/{path}", b"")
+    base = f"memory://{root}"
+    try:
+        # A listing with no data files at all is datasets' FileNotFoundError (EmptyDatasetError).
+        patterns = {str(name): found for name, found in get_data_patterns(base).items()}
+        resolved = set(DataFilesList.from_patterns(list(patterns.get(split, ())), base_path=base))
+    except FileNotFoundError:
+        resolved = set()
+    finally:
+        fs.rm(root, recursive=True)
+    return sorted(url.split(root + "/", 1)[1] for url in resolved)
 
 
 @dataclass(frozen=True)
@@ -205,23 +234,20 @@ class Hub(Dataset):
         return {}
 
     def _selected(self, revision: str) -> tuple[list[str], Format]:
-        paths = self._listed(revision)
+        """This split's native shards at `revision`, in the first format of Parquet and JSONL that has
+        any: the files `datasets` resolves to the split from the revision's listing
+        (`datasets.data_files.get_data_patterns` and `resolve_pattern`, its sharded names, its split
+        keywords in file and directory names, `dev` for `validation` among them, a lone file as
+        `train`), under the configuration's directory where one is named."""
+        listed = [path for path in self._listed(revision)
+                  if self.name is None or f"/{self.name}/" in "/" + path]
+        paths = split_files(listed, self.split)
         # Not Arrow: the `.arrow` files a dataset repo holds are what `save_to_disk` and
         # `push_to_hub` write, Arrow's stream format, which no reader can cut into shards or count
         # without reading it whole; such a split streams its Parquet conversion, or is prepared.
         formats: tuple[Format, ...] = ("parquet", "jsonl")
         for format in formats:
-            matches = [
-                path
-                for path in paths
-                if path.endswith("." + format)
-                and (
-                    f"/{self.split}/" in "/" + path
-                    or Path(path).name.startswith(self.split + "-")
-                    or Path(path).stem == self.split
-                )
-                and (self.name is None or f"/{self.name}/" in "/" + path)
-            ]
+            matches = [path for path in paths if path.endswith("." + format)]
             if matches:
                 return matches, format
         return [], "parquet"
@@ -280,10 +306,15 @@ class Hub(Dataset):
             raise TypeError(f"{self.describe()} did not resolve to one split")
         if self.columns is not None:
             dataset = dataset.select_columns(list(self.columns))
-        return grain.MapDataset.source(_undecoded(dataset)).map(_record)
+        return arrow_rows(dataset)
 
     def manifest(self) -> ShardManifest:
         return self.files.manifest()
+
+    def stated(self) -> Mapping[str, object]:
+        """Its builder's info, which its metadata is, no row read; a split never prepared, with the Hub
+        offline, states nothing."""
+        return {} if self._builder is None else self.metadata()
 
     def metadata(self) -> Mapping[str, object]:
         splits = self.builder.info.splits

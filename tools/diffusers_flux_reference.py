@@ -8,7 +8,7 @@ guidance a guidance-embedded checkpoint takes. Every case records the
 forward, the vector-Jacobian products against a fixed cotangent for the
 latent, the text tokens and the pooled vector, and the gradient of every
 parameter, unmodified, in float32, the reference, and in float64, the truth
-(`diffusers_wan_reference.float64`: the source's float32 pins widened). The
+(`torch_precision.float64`: the source's float32 pins widened). The
 pipeline half records the prompt states and the walk the same two ways.
 
 The variants are the ones whose wiring differs: the distilled checkpoint's
@@ -32,9 +32,9 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import numpy as np
 import torch
-from diffusers_reference_helpers import restore_transformers_names
+from diffusers_reference_helpers import recording, restore_transformers_names, saved_pipeline
 from diffusers_sd3_reference import bundle, clip_tokenizers, t5_tokenizer
-from diffusers_wan_reference import float64
+from torch_precision import float64
 
 BASE = dict(patch_size=1, in_channels=16, num_layers=2, num_single_layers=2,
             attention_head_dim=12, num_attention_heads=2, joint_attention_dim=16,
@@ -164,14 +164,9 @@ def reload(directory: str, recorded: str) -> None:
 def main(destination: str) -> None:
     import diffusers
 
-    from reference_releases import require
-
-    require("diffusers")
+    root = recording(destination, "diffusers")
     # Diffusers 0.34.0's pipeline modules import names transformers 5 dropped.
     restore_transformers_names()
-    torch.set_num_threads(2)
-    root = Path(destination)
-    root.mkdir(parents=True, exist_ok=True)
     arrays: dict[str, np.ndarray] = {}
     cases: dict[str, dict[str, object]] = {}
     record: dict[str, object] = {"diffusers": diffusers.__version__, "base": BASE, "tokens": TOKENS,
@@ -242,14 +237,7 @@ def build_pipeline(root: Path):
         vae=vae, text_encoder=text_encoder, tokenizer=tokenizer,
         text_encoder_2=text_encoder_2, tokenizer_2=tokenizer_2,
         transformer=FluxTransformer2DModel(**PIPELINE).eval())
-    pipe.save_pretrained(directory, safe_serialization=True)
-    pipe.set_progress_bar_config(disable=True)
-    # The class declares no sample size, so the directory declares the
-    # geometry it is read at, which is what these keys are for.
-    index = json.loads((directory / "model_index.json").read_text())
-    index.update(dew_height=PIPELINE_SIZE, dew_width=PIPELINE_SIZE)
-    (directory / "model_index.json").write_text(json.dumps(index, indent=2))
-    return pipe, directory
+    return saved_pipeline(pipe, directory, PIPELINE_SIZE, PIPELINE_SIZE), directory
 
 
 def pipeline_record(root: Path) -> dict[str, np.ndarray]:

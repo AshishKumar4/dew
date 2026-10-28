@@ -17,12 +17,12 @@ def main() -> None:
     if processes > 1:
         jax.distributed.initialize(coordinator_address=coordinator, num_processes=processes,
                                    process_id=rank, local_device_ids=[0], initialization_timeout=30)
-    from episode_support import Harness, SquareSession, build
+    from episode_support import Harness, SquareSession, build, episode_scheduler
 
-    from dew.coordination import collective_host
+    from dew._coordination import collective_host
     from dew.data.dataset import Loader
+    from dew.distributed.batches import shard_batch
     from dew.objectives.rl import EpisodeStatus, Observation
-    from dew.training.distributed import shard_batch
 
     harness = Harness()
     records = []
@@ -43,9 +43,16 @@ def main() -> None:
         finally:
             harness.closed.append(identity)
 
-    trainer, rollout = build(environment=environment, record=records.append)
+    trainer, collector = build(environment=environment, record=records.append)
     if mode == "mismatch" and rank == 1:
-        rollout = replace(rollout, max_turns=rollout.max_turns + 1)
+        collector = replace(collector, max_turns=collector.max_turns + 1)
+    scheduler, trained = episode_scheduler(collector), []
+
+    def rollout(state, batch, key):
+        """The scheduler's call, keeping the batch it hands the step."""
+        trained.append(scheduler(state, batch, key))
+        return trained[-1]
+
     trainer.rollout = rollout
     width = 2 // processes
     task_ids = np.arange(2, dtype=np.int32)[rank * width:(rank + 1) * width]
@@ -53,31 +60,30 @@ def main() -> None:
         train=lambda partition: itertools.repeat({"task_id": task_ids}), val=None, records=2, batch=2
     )
     state = None
-    failed = None
+    failed = failure = None
     try:
         state = trainer.fit(data, steps=1, log_every=1)
     except BaseException as error:
         if mode == "ok":
             raise
-        failed = f"{type(error).__name__}: {error}"
+        failed, failure = f"{type(error).__name__}: {error}", type(error).__name__
     if mode == "ok":
         assert state is not None
         parameters = collective_host(state.variables, phase="episode pool test parameters")
         np.savez(output.with_suffix(".npz"), **{
             jax.tree_util.keystr(path): np.asarray(value)
             for path, value in jax.tree_util.tree_flatten_with_path(parameters)[0]})
-        batch = rollout.project(records)
-        arrays = collective_host(shard_batch(trainer.device_mesh, batch), phase="episode pool test batch")
+        arrays = collective_host(shard_batch(trainer.device_mesh, trained[0]),
+                                 phase="episode pool test batch")
         np.savez(output.with_suffix(".batch.npz"), **arrays)
     public, bindings = [], set()
     for episode in records:
         row = asdict(episode)
         bindings.add(row.pop("_binding_id"))
-        for transition in row["transitions"]:
-            bindings.add(transition["action"].pop("_binding_id"))
         public.append(row)
     output.write_text(json.dumps({
-        "episodes": public, "bindings": sorted(bindings), "error": failed, "opened": len(harness.opened),
+        "episodes": public, "bindings": sorted(bindings), "error": failed, "failure": failure,
+        "opened": len(harness.opened),
         "closed": len(harness.closed), "updates": int(state.updates) if state is not None else None,
     }))
     if processes > 1:

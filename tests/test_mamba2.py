@@ -21,20 +21,38 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import decode_through
-from reference_error import FACTOR, assert_as_exact_as_the_reference, widened
+from reference_error import (
+    FACTOR,
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    declared_seeds,
+    indexed_recording,
+    recording,
+    widened,
+)
+from ssd_support import mamba2_draw, mamba2_run
 
 from dew.accuracy import distance
+from dew.batch import coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import AttentionMetadata, MixerCall, ModelInputs, coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall, ModelInputs
 from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd, recurrent_ssd
 from dew.objectives.lm import LMObjective
+from dew.training import MeshSpec
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
+SEEDED = FIXTURES / "ssd_seeded.npz"
 
 
 @pytest.fixture(scope="module")
 def reference():
     return dict(np.load(FIXTURES / "ssd.npz"))
+
+
+@pytest.fixture(scope="module")
+def seeded_reference():
+    return recording(SEEDED)
 
 
 @pytest.fixture(scope="module")
@@ -82,24 +100,26 @@ def operands(reference):
     )
 
 
-def test_the_chunked_scan_matches_the_reference(reference):
-    out, final = chunk_ssd(*operands(reference), None, 32)
-    as_exact((out, final), (reference["scan.output"], reference["scan.final"]),
-             (reference["scan.output_f64"], reference["scan.final_f64"]), "the scan")
+def assert_recorded_as_exact(reference, site):
+    """The recorded reference and its torch-float64 truth on each fresh native-input/orbit draw."""
+    seeds = declared_seeds(SEEDED)[site]
+    # The truth is Dew's float64 path, which the recorder held to transformers' float64 at every seed.
+    draw, recorded, truth = indexed_recording(reference, site, seeds, inputs_of=mamba2_draw,
+                                              truth_fn=jax.jit(lambda inputs: mamba2_run(site, inputs)))
+    run = jax.jit(lambda index, inputs: mamba2_run(site, inputs))
+    assert_as_exact(run, recorded, draw, f"transformers {site}", seeds=seeds, truth_fn=truth)
 
 
-def test_a_carried_state_matches_the_reference(reference):
-    out, final = chunk_ssd(*operands(reference), jnp.asarray(reference["scan.initial"]), 32)
-    as_exact((out, final), (reference["scan.output_carried"], reference["scan.final_carried"]),
-             (reference["scan.output_carried_f64"], reference["scan.final_carried_f64"]), "the carried scan")
+def test_the_chunked_scan_matches_the_reference(seeded_reference):
+    assert_recorded_as_exact(seeded_reference, "scan")
 
 
-def test_one_recurrent_step_matches_selective_state_update(reference):
-    x, step, A, B, C, D = operands(reference)
-    out, final = recurrent_ssd(x[:, :1], step[:, :1], A, B[:, :1], C[:, :1], D,
-                               jnp.asarray(reference["scan.initial"]))
-    as_exact((out[:, 0], final), (reference["step.output"], reference["step.state"]),
-             (reference["step.output_f64"], reference["step.state_f64"]), "the step")
+def test_a_carried_state_matches_the_reference(seeded_reference):
+    assert_recorded_as_exact(seeded_reference, "carried")
+
+
+def test_one_recurrent_step_matches_selective_state_update(seeded_reference):
+    assert_recorded_as_exact(seeded_reference, "step")
 
 
 def test_the_chunked_and_recurrent_forms_agree(reference):
@@ -120,12 +140,22 @@ def test_a_sequence_split_in_two_carries_its_state_across_the_cut(reference):
              in_float64(chunk_ssd, x, step, A, B, C, D, None, 32), "the cut sequence")
 
 
-def test_the_chunk_size_does_not_change_the_scan(reference):
-    x, step, A, B, C, D = operands(reference)
-    at_32 = chunk_ssd(x, step, A, B, C, D, None, 32)
-    truth = in_float64(chunk_ssd, x, step, A, B, C, D, None, 32)
+CHUNK_SIZE_SEEDS = 64
+"""Sized by seeds_for against the 32-token XLA chunk scan (2026-10-20, armada)."""
+
+
+def chunk_size_draw(seed):
+    """Fresh inputs at the fixture geometry under joint head, P-channel and N-coordinate permutations."""
+    arrays = mamba2_draw(seed)
+    arrays["dt"] = jax.nn.softplus(jnp.asarray(arrays["dt"]) + jnp.asarray(arrays["dt_bias"]))
+    return tuple(arrays[name] for name in ("x", "dt", "A", "B", "C", "D"))
+
+
+def test_the_chunk_size_does_not_change_the_scan():
+    at_32 = jax.jit(lambda *inputs: chunk_ssd(*inputs, None, 32))
     for size in (7, 256):
-        as_exact(chunk_ssd(x, step, A, B, C, D, None, size), at_32, truth, f"a chunk of {size}")
+        run = jax.jit(lambda *inputs, size=size: chunk_ssd(*inputs, None, size))
+        assert_as_exact(run, at_32, chunk_size_draw, f"a chunk of {size}", seeds=CHUNK_SIZE_SEEDS)
 
 
 def layer(geometry, **overrides) -> Mamba2:
@@ -207,6 +237,28 @@ def test_the_layer_decodes_as_it_prefills(reference, geometry):
     as_exact(decoded, parallel, wide_apply(module, variables, hidden), "decoded")
 
 
+def test_the_layer_takes_forward_mode(reference, geometry):
+    """`jax.jvp` through the layer, as MeanFlow and consistency training trace a model: its tangent along a
+    seeded direction of the reference's input on par from float64 with the same product its reverse mode
+    gives (the Jacobian `jax.jacrev` builds, contracted with the direction). The D skip's custom VJP refused
+    forward mode on every target (row 1933), so a hybrid with Mamba-2 layers trained on neither."""
+    module = layer(geometry)
+    variables = layer_params(reference)
+    hidden = jnp.asarray(reference["layer.hidden"])
+    direction = jnp.asarray(np.random.default_rng(1933).standard_normal(hidden.shape, np.float32))
+
+    def tangent(x, d):
+        return jax.jvp(lambda x: module.apply(variables, x), (x,), (d,))[1]
+
+    def reverse(x, d):
+        jacobian = jax.jacrev(lambda x: module.apply(variables, x))(x)
+        return jnp.tensordot(jacobian, d, axes=d.ndim)
+
+    as_exact(jax.jit(tangent)(hidden, direction), jax.jit(reverse)(hidden, direction),
+             in_float64(lambda x, d: jax.jvp(lambda x: module.clone(dtype=jnp.float64).apply(
+                 widened(variables), x), (x,), (d,))[1], hidden, direction), "the layer's tangent")
+
+
 def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):
     """A row paused on padding neither writes its state nor advances its
     conv history, and its padded slots emit zero: the other row's stream,
@@ -225,6 +277,118 @@ def test_padded_rows_preserve_the_state_and_the_history(reference, geometry):
     as_exact(padded[0], plain[0], wide_apply(module, variables, hidden[:1])[0], "the full row")
     as_exact(padded[1][valid[1]], closed[0], wide_apply(module, variables, compact)[0], "the padded row")
     assert not jnp.any(padded[1][~valid[1]])
+
+
+SPLIT_ROWS = {
+    # Every slot real, as a pool of processes fills validity where no producer padded.
+    "all_valid": (np.ones(32, bool), None),
+    # Right-padded: real tokens first, the tail padding inside the last two shards.
+    "right_padded": (np.arange(32) < 21, None),
+    # Left-padded: a prompt's padding in front, across the first shard and into the second.
+    "left_padded": (np.arange(32) >= 11, None),
+    # Gaps inside a document, one at a shard's cut, and a shard holding a single real token, fewer
+    # than the conv's three-token history: its next shard reads the ones before it too.
+    "gaps": (~np.isin(np.arange(32), [2, 7, 8, 13, 16, 17, 18, 19, 20, 21, 22, 25]), None),
+    # Packed documents with gaps between and inside them, one starting on a shard's first real token.
+    "packed": (~np.isin(np.arange(32), [5, 6, 14, 15, 30, 31]),
+               np.repeat([1, 1, 2, 3], [5, 11, 8, 8])),
+    # A whole interior shard of padding with real tokens on both sides: the history and the state
+    # cross it unchanged.
+    "empty_shard": (~((np.arange(32) >= 8) & (np.arange(32) < 16)), None),
+    # The same with one document continuing across the empty shard and another starting after it.
+    "empty_shard_packed": (~((np.arange(32) >= 8) & (np.arange(32) < 16)),
+                           np.repeat([1, 2], [20, 12])),
+}
+"""Each row of the sequence split's check: its real tokens and its documents (None for one)."""
+
+SPLIT_BATCH = 8
+"""The rows a sequence-split draw holds: every parameter's gradient, the heads' `D` and `A_log` too,
+sums over all of them."""
+
+SPLIT_SEEDS = {"all_valid": 64, "right_padded": 128, "left_padded": 128, "gaps": 128, "packed": 256,
+               "empty_shard": 256, "empty_shard_packed": 64}
+"""Each row's declared draws, sized by `seeds_for` on armada paired with the unsplit layer: the two arms
+share every upstream rounding (the same weights and hidden states), and the gradients of `A_log`, `D`
+and the conv's parameters, sums of the whole draw into a few values, are heavy-tailed across draws, so
+that the unsplit layer against itself resolves none of them within 512 draws."""
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("row", sorted(SPLIT_ROWS))
+def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_ones(reference, geometry, row):
+    """Under a sequence axis of 4, the layer runs rows with padding as `held_scan` runs them on one
+    device: a padded slot neither reads nor advances the conv or the state, each real token's conv
+    reading the real tokens before it in its document across gaps and shards, and padded slots emit
+    zero. Output and input gradient are check 1's against the unsplit layer, from float64, over drawn
+    hidden states, and so are the parameters' gradients. A pool of processes always carries
+    validity, so this is every multi-host run."""
+    module = layer(geometry)
+    variables = layer_params(reference)
+    valid, segments = SPLIT_ROWS[row]
+    fields = {"valid": jnp.asarray(np.broadcast_to(valid, (SPLIT_BATCH, 32)))}
+    if segments is not None:
+        fields["segments"] = jnp.asarray(np.broadcast_to(segments, (SPLIT_BATCH, 32)), jnp.int32)
+    call = MixerCall(AttentionMetadata(coordinates=coordinates(**fields)))
+    width = geometry["hidden_size"]
+
+    def draw(seed):
+        rng = np.random.default_rng([0x5E9, seed])
+        return (rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32),
+                rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32))
+
+    def run(model, params, mesh=None):
+        def pulled(hidden, cotangent):
+            out, pull = jax.vjp(lambda params, hidden: model.apply(params, hidden, call), params, hidden)
+            return out, *pull(cotangent)
+        if mesh is None:
+            return jax.jit(pulled)
+        @as_given
+        def split(hidden, cotangent):
+            with jax.set_mesh(mesh):
+                return jax.jit(pulled)(hidden, cotangent)
+        return split
+
+    @as_given
+    def truth(hidden, cotangent):
+        with jax.enable_x64(new_val=True):
+            return run(module.clone(dtype=jnp.float64), widened(variables))(*widened((hidden, cotangent)))
+
+    mesh = MeshSpec(sequence=4).build(jax.devices()[:4])
+    assert_as_exact(run(module, variables, mesh), run(module, variables), draw,
+                    f"mamba2 split over the sequence, {row}", seeds=SPLIT_SEEDS[row], truth_fn=truth)
+    split = run(module, variables, mesh)(*draw(0))[0]
+    assert not np.any(np.asarray(split)[:, ~valid])
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("masked", [False, True], ids=["whole rows", "valid rows"])
+def test_a_layer_split_over_the_sequence_names_its_scan_for_remat(reference, geometry, masked):
+    """Under a sequence axis of 4, the layer's scan output carries both names a remat policy keeps it by,
+    a mixer's 'context' and a recurrence's 'scan', with or without the rows' validity, as on one device
+    (`Mamba2.residuals`): a checkpoint saving either name alone holds more residuals for its backward
+    (the pullback's arrays, traced) than one saving nothing."""
+    from dew.nn.backbones.decoder_block import RematPolicy
+
+    module = layer(geometry)
+    variables = layer_params(reference)
+    fields = {"valid": jnp.ones((2, 32), bool)} if masked else {}
+    call = MixerCall(AttentionMetadata(coordinates=coordinates((2, 32), **fields)))
+    drawn = np.random.default_rng(0).standard_normal((2, 32, geometry["hidden_size"]))
+    hidden = jnp.asarray(drawn, jnp.float32)
+    mesh = MeshSpec(sequence=4).build(jax.devices()[:4])
+
+    def loss(params):
+        return jnp.sum(module.apply(params, hidden, call) ** 2)
+
+    def kept(names) -> int:
+        """The residual arrays the pullback holds under a policy saving `names`, traced, not run."""
+        checkpointed = jax.checkpoint(loss, policy=RematPolicy(save=names).checkpoint_policy())
+        with jax.set_mesh(mesh):
+            pull = jax.eval_shape(lambda params: jax.vjp(checkpointed, params)[1], variables)
+        return len(jax.tree.leaves(pull))
+
+    nothing = kept(())
+    assert [name for name in ("context", "scan") if kept((name,)) <= nothing] == []
 
 
 def test_packed_documents_run_as_if_each_ran_alone(reference, geometry):

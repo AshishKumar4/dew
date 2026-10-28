@@ -7,7 +7,10 @@ import threading
 import urllib.parse
 from pathlib import Path
 
-import lane_environment  # configures the backend before JAX reads the environment
+import lane_environment
+
+# The lane's environment, before JAX reads it.
+os.environ.update(lane_environment.configured(os.environ))
 import jax
 import pytest
 import remote_cache
@@ -27,6 +30,10 @@ if os.environ.get("DEW_TEST_NO_CACHE"):
 else:
     _cache = default_compilation_cache_dir()
     if _cache:
+        # A worker that keeps bundles of the shared cache below writes a directory of its own, so the
+        # programs a bundle gains are that worker's whole writes, not another's half-written one.
+        if os.environ.get("PYTEST_XDIST_WORKER") and os.environ.get("DEW_XLA_CACHE_URL"):
+            _cache = os.path.join(_cache, os.environ["PYTEST_XDIST_WORKER"])
         enable_compilation_cache(_cache)
         # On armada, where each task's container starts cold, a cache the tasks share.
         _remote = remote_cache.install_from_environment()
@@ -62,6 +69,25 @@ def pytest_runtest_protocol(item, nextitem):
         _remote.closed(bundle(item))
 
 
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    """A test the gate fails reports its findings as data (`reference_error.Finding`), the JUnit property
+    `gate_findings`, a JSON list of each finding's leaf, rule, measure (an infinite one `Infinity`) and
+    the phase it failed: what a promotion matches a candidate's failures to its parent's by."""
+    outcome = yield
+    if call.excinfo is not None:
+        from reference_error import GateFailure
+
+        if isinstance(call.excinfo.value, GateFailure):
+            found = ("gate_findings", json.dumps([{"leaf": finding.leaf, "rule": finding.rule,
+                                                   "measure": finding.measure, "phase": call.when}
+                                                  for finding in call.excinfo.value.findings]))
+            # This phase's report, and the item's, which its teardown's report copies and the JUnit
+            # report reads a test's properties from where only one phase fails.
+            outcome.get_result().user_properties.append(found)
+            item.user_properties.append(found)
+
+
 def pytest_sessionfinish(session, exitstatus):
     if _remote is not None:
         _remote.drain()
@@ -78,9 +104,10 @@ def pytest_runtest_setup(item):
     if jax.device_count() < needed:
         pytest.skip(f"needs a {needed}-device mesh; this run has "
                     f"{jax.device_count()} {jax.default_backend()} device(s)")
-    marker = item.get_closest_marker("gpu")
-    if marker and jax.default_backend() != "gpu":
-        pytest.skip(marker.kwargs.get("reason", "runs on a cuda device"))
+    for backend, device in (("gpu", "a cuda device"), ("tpu", "a tpu")):
+        marker = item.get_closest_marker(backend)
+        if marker and jax.default_backend() != backend:
+            pytest.skip(marker.kwargs.get("reason", f"runs on {device}"))
 
 
 @pytest.fixture(autouse=True)
@@ -89,6 +116,13 @@ def own_rung_records(monkeypatch, tmp_path_factory):
     shares one compilation cache, beside which a run records its step's
     rung, and a rung one test forces would be another's floor."""
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path_factory.mktemp("rungs")))
+
+
+@pytest.fixture(autouse=True)
+def own_data_cache(monkeypatch, tmp_path_factory):
+    """Each test keeps its own automatic data cache (`dew.data.cache.automatic_root`): records one
+    test's maps made are not another's to read back."""
+    monkeypatch.setenv("DEW_DATA_CACHE", str(tmp_path_factory.mktemp("data-cache")))
 
 
 @pytest.fixture(autouse=True)
@@ -147,9 +181,8 @@ def without_deterministic_ops(monkeypatch):
     variable at the compile above, so taking the flag back out of the
     environment leaves this executable's reductions as they are and lets a
     test reach the cudnn path it is about."""
-    kept = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-            if not flag.startswith("--xla_gpu_deterministic_ops")]
-    monkeypatch.setenv("XLA_FLAGS", " ".join(kept))
+    flags = os.environ.get("XLA_FLAGS", "")
+    monkeypatch.setenv("XLA_FLAGS", lane_environment.without_deterministic_ops(flags))
 
 
 @pytest.fixture
@@ -176,9 +209,12 @@ def rng():
 @pytest.fixture
 def cache_worker():
     """The dew-xla-cache Worker's protocol over a dict: GET, PUT, a listing two keys a page, a 404 on
-    a miss, a 401 without the token, and Cloudflare's 403 for urllib's own User-Agent, which never
-    reaches the Worker. Each request's path is kept."""
+    a miss, a 401 without the token, Cloudflare's 403 for urllib's own User-Agent, which never
+    reaches the Worker, and the Worker's 413 for a body outside its contract's bounds
+    (tools/armada/r2.json). Each request's path is kept."""
     stored, seen = {}, []
+    contract = Path(__file__).resolve().parents[1] / "tools" / "armada" / "r2.json"
+    bounds = json.loads(contract.read_text())
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -218,6 +254,11 @@ def cache_worker():
 
         def do_PUT(self):
             if not self._authorized():
+                return
+            if not bounds["min_bytes"] <= int(self.headers["Content-Length"]) <= bounds["max_bytes"]:
+                self.send_response(413)
+                self.send_header("Connection", "close")
+                self.end_headers()
                 return
             stored[self.path] = self.rfile.read(int(self.headers["Content-Length"]))
             self.send_response(204)

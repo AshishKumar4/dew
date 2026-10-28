@@ -13,22 +13,23 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import fixture_arrays
 from moe_support import by_expert, router_variables
 
+from dew.batch import TEXT_KEY
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.moe import Router, global_router_loss
 from dew.objectives.base import Step
-from dew.objectives.lm import TEXT_KEY, LMObjective
-from dew.objectives.lm.objective import router_moments
+from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance, router_moments
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "moe"
 CONFIG = json.loads((FIXTURES / "config.json").read_text())["deepseek_v2"]
 
 
 def fixture() -> dict:
-    with np.load(FIXTURES / "deepseek_v2.npz") as data:
-        return {key: np.asarray(value) for key, value in data.items()}
+    return fixture_arrays(FIXTURES / "deepseek_v2.npz")
 
 
 def v2_router(normalize_weights: bool = CONFIG["norm_topk_prob"],
@@ -70,7 +71,7 @@ def test_the_objective_adds_every_sparse_layers_balance_loss():
                                               score_function="softmax"))
     tokens = jax.random.randint(jax.random.PRNGKey(1), (2, 9), 0, 32)
     plain = LMObjective(model, 8)
-    balanced = LMObjective(model, 8, aux_loss_alpha=0.05, seq_aux=False)
+    balanced = LMObjective(model, 8, balance=ExpertBalance(aux_loss_alpha=0.05, seq_aux=False))
     params = plain.init(jax.random.PRNGKey(0))
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
     base, _ = plain.scalar_loss(params, {TEXT_KEY: tokens}, step)

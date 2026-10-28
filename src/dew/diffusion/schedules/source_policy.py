@@ -6,11 +6,12 @@ import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Literal, NamedTuple, Protocol
+from typing import Literal, NamedTuple, Protocol, get_args
 
 import numpy as np
 
-from dew import records
+from dew import _records
+from dew._records import JSON
 from dew.diffusion.schedules.flow import token_mu
 from dew.diffusion.schedules.source_grids import named_choice, published_betas
 from dew.diffusion.transforms import (
@@ -23,7 +24,6 @@ from dew.diffusion.transforms import (
     SourceLimitedPrediction,
     VPredictionTransform,
 )
-from dew.records import JSON
 from dew.sampling.solvers import (
     DDIM,
     DDPM,
@@ -50,8 +50,8 @@ Spacing = Literal["leading", "linspace", "trailing"]
 Transform = Literal["none", "karras", "exponential", "beta"]
 Terminal = Literal["zero", "sigma_min"]
 
-_SPACINGS: tuple[Spacing, ...] = ("leading", "linspace", "trailing")
-_TERMINALS: tuple[Terminal, ...] = ("zero", "sigma_min")
+_SPACINGS: tuple[Spacing, ...] = get_args(Spacing)
+_TERMINALS: tuple[Terminal, ...] = get_args(Terminal)
 _SIGMA_SCHEDULES: tuple[Transform, ...] = ("karras", "exponential")
 # Each sigma transformation with the control that turns it on.
 _TRANSFORM_CONTROLS: tuple[tuple[Transform, str], ...] = (
@@ -102,7 +102,7 @@ _DISTILLED = _fields(_THRESHOLD, {"original_inference_steps": 50, "clip_sample":
 
 _ALL_PREDICTIONS = ("epsilon", "sample", "v_prediction")
 _NO_SAMPLE = ("epsilon", "v_prediction")
-_DPM_ALGORITHMS: tuple[Algorithm, ...] = ("dpmsolver++", "dpmsolver", "sde-dpmsolver++", "sde-dpmsolver")
+_DPM_ALGORITHMS: tuple[Algorithm, ...] = get_args(Algorithm)
 _SOLVER_TYPES = ("midpoint", "heun", "logrho", "bh1", "bh2")
 
 
@@ -116,7 +116,7 @@ class _Controls(NamedTuple):
     corrector: tuple[int, ...]
 
     def flag(self, key: str) -> bool:
-        return records.boolean(self.value(key), key)
+        return _records.boolean(self.value(key), key)
 
 
 def _never_rounds(value: Control) -> bool:
@@ -362,7 +362,7 @@ def resolve_config(config: Mapping[str, object]
         this class declares no such control."""
         if key not in declared:
             return absent
-        return records.json_value(config[key], key) if key in config else declared[key]
+        return _records.json_value(config[key], key) if key in config else declared[key]
 
     for key, inactive in _UNIMPLEMENTED.items():
         if key in declared and value(key) != inactive:
@@ -370,7 +370,7 @@ def resolve_config(config: Mapping[str, object]
     # A flow file declares no prediction type: its class fixes the
     # convention, so the family names the transform. A log-SNR class on
     # flow sigmas reads the velocity its flow checkpoint predicts.
-    flow_sigmas = records.boolean(value("use_flow_sigmas", absent=False), "use_flow_sigmas")
+    flow_sigmas = _records.boolean(value("use_flow_sigmas", absent=False), "use_flow_sigmas")
     if flow_sigmas and not source.flow_sigmas:
         walked = " and ".join(name for name, other in _SOURCES.items() if other.flow_sigmas)
         raise ValueError(f"Native source scheduling reconstructs use_flow_sigmas for {walked}, not {kind}")
@@ -382,7 +382,7 @@ def resolve_config(config: Mapping[str, object]
         count=value("num_train_timesteps"), start=value("beta_start"),
         end=value("beta_end"), schedule=value("beta_schedule"),
         trained=value("trained_betas"),
-        zero_snr=records.boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr"),
+        zero_snr=_records.boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr"),
         schedules=source.schedules))
     betas.setflags(write=False)
     policy, solver = _resolve(kind, source, value, betas)
@@ -416,20 +416,20 @@ def _x0_limit(kind: str, source: _Class, value: Control,
     an active one rather than quietly limited, and so is thresholding where
     the step predicts noise (`predict_x0` off), which its noise branch skips."""
     declared = source.fields
-    thresholding = "thresholding" in declared and records.boolean(value("thresholding"), "thresholding")
-    clipping = "clip_sample" in declared and records.boolean(value("clip_sample"), "clip_sample")
+    thresholding = "thresholding" in declared and _records.boolean(value("thresholding"), "thresholding")
+    clipping = "clip_sample" in declared and _records.boolean(value("clip_sample"), "clip_sample")
     if (thresholding or clipping) and not source.limits:
         raise ValueError(f"The published {kind} step reads neither thresholding nor clipping")
     if thresholding:
-        if not records.boolean(value("predict_x0", absent=True), "predict_x0"):
+        if not _records.boolean(value("predict_x0", absent=True), "predict_x0"):
             raise ValueError(f"The published epsilon-prediction {kind} step ignores thresholding")
-        ratio = records.number(value("dynamic_thresholding_ratio"), "dynamic_thresholding_ratio")
-        maximum = records.number(value("sample_max_value"), "sample_max_value")
+        ratio = _records.number(value("dynamic_thresholding_ratio"), "dynamic_thresholding_ratio")
+        maximum = _records.number(value("sample_max_value"), "sample_max_value")
         if not 0 < ratio <= 1 or maximum < 1:
             raise ValueError("Dynamic thresholding needs a ratio in (0, 1] and a maximum above 1")
         return None, (ratio, maximum)
     if clipping:
-        clip = records.number(value("clip_sample_range"), "clip_sample_range")
+        clip = _records.number(value("clip_sample_range"), "clip_sample_range")
         if clip < 0:
             raise ValueError("clip_sample_range must be nonnegative")
         return clip, None
@@ -440,13 +440,13 @@ def _flow_controls(value: Control) -> FlowShift:
     """A flow file's shift controls, checked and turned into numbers."""
     terminal = value("shift_terminal")
     return FlowShift(
-        shift=records.number(value("shift", 1.0), "shift"),
-        dynamic=records.boolean(value("use_dynamic_shifting", absent=False), "use_dynamic_shifting"),
-        base_shift=records.number(value("base_shift", 0.5), "base_shift"),
-        max_shift=records.number(value("max_shift", 1.15), "max_shift"),
-        base_tokens=records.integer(value("base_image_seq_len", 256), "base_image_seq_len"),
-        max_tokens=records.integer(value("max_image_seq_len", 4096), "max_image_seq_len"),
-        terminal=None if terminal is None else records.number(terminal, "shift_terminal"),
+        shift=_records.number(value("shift", 1.0), "shift"),
+        dynamic=_records.boolean(value("use_dynamic_shifting", absent=False), "use_dynamic_shifting"),
+        base_shift=_records.number(value("base_shift", 0.5), "base_shift"),
+        max_shift=_records.number(value("max_shift", 1.15), "max_shift"),
+        base_tokens=_records.integer(value("base_image_seq_len", 256), "base_image_seq_len"),
+        max_tokens=_records.integer(value("max_image_seq_len", 4096), "max_image_seq_len"),
+        terminal=None if terminal is None else _records.number(terminal, "shift_terminal"),
         kind=named_choice(value("time_shift_type", "exponential"), "time_shift_type",
                      ("exponential", "linear")))
 
@@ -458,7 +458,7 @@ def _sigma_transform(family: str, declared: Mapping[str, JSON], value: Control) 
     its grid outright instead.
     """
     active: list[Transform] = [name for name, key in _TRANSFORM_CONTROLS
-                               if key in declared and records.boolean(value(key), key)]
+                               if key in declared and _records.boolean(value(key), key)]
     if len(active) > 1:
         raise ValueError("Only one of the Karras, exponential and beta sigma grids can be used")
     if family == "edm":
@@ -493,7 +493,7 @@ def _lambda_clipping(family: Family, value: Control, betas: np.ndarray) -> tuple
     log-SNR falls below it, counted off the training betas the way the
     source counts them.
     """
-    zero_snr = records.boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr")
+    zero_snr = _records.boolean(value("rescale_betas_zero_snr", absent=False), "rescale_betas_zero_snr")
     zero_snr_tail = zero_snr and family != "tabulated"
     limit = value("lambda_min_clipped", -float("inf"))
     if limit == -float("inf"):
@@ -503,7 +503,7 @@ def _lambda_clipping(family: Family, value: Control, betas: np.ndarray) -> tuple
         alphas[-1] = 2.0 ** -24
     lambdas = 0.5 * (np.log(alphas) - np.log(1 - alphas))
     return zero_snr_tail, int(np.searchsorted(np.flip(lambdas),
-                                              records.number(limit, "lambda_min_clipped")))
+                                              _records.number(limit, "lambda_min_clipped")))
 
 
 def _flow_shift(value: Control, transform: Transform, algorithm: Algorithm) -> float | None:
@@ -513,17 +513,17 @@ def _flow_shift(value: Control, transform: Transform, algorithm: Algorithm) -> f
     on, and converts velocity only to a clean prediction, so a flow file
     with either is refused rather than walked on sigmas it was not trained on.
     """
-    if not records.boolean(value("use_flow_sigmas", absent=False), "use_flow_sigmas"):
+    if not _records.boolean(value("use_flow_sigmas", absent=False), "use_flow_sigmas"):
         return None
     if transform != "none":
         raise ValueError("use_flow_sigmas under a Karras, exponential or beta grid walks the "
                          "beta table's sigmas on the flow path; the source refuses neither")
     clean = (algorithm in ("dpmsolver++", "sde-dpmsolver++")
-             and records.boolean(value("predict_x0", absent=True), "predict_x0"))
+             and _records.boolean(value("predict_x0", absent=True), "predict_x0"))
     if not clean:
         raise ValueError("The source converts flow velocity to a clean prediction only; "
                          "use_flow_sigmas needs a dpmsolver++ algorithm or predict_x0")
-    shift = records.number(value("flow_shift"), "flow_shift")
+    shift = _records.number(value("flow_shift"), "flow_shift")
     if not shift > 0:
         raise ValueError("flow_shift must be positive")
     return shift
@@ -533,7 +533,7 @@ def _resolve(kind: str, source: _Class, value: Control,
              betas: np.ndarray) -> tuple[SourcePolicy, Solver]:
     """Every control the class declares, checked and turned into a number."""
     declared, family = source.fields, source.family
-    train_steps = records.integer(value("num_train_timesteps"), "num_train_timesteps")
+    train_steps = _records.integer(value("num_train_timesteps"), "num_train_timesteps")
     transform = _sigma_transform(family, declared, value)
     algorithm = _algorithm(source, value)
     spacing: Spacing = named_choice(value("timestep_spacing", "linspace"), "timestep_spacing",
@@ -544,38 +544,38 @@ def _resolve(kind: str, source: _Class, value: Control,
         raise ValueError("Native source scheduling does not implement learned variance")
     clip, threshold = _x0_limit(kind, source, value)
     zero_snr_tail, lambda_clipped = _lambda_clipping(family, value, betas)
-    original_steps = records.integer(value("original_inference_steps", train_steps),
+    original_steps = _records.integer(value("original_inference_steps", train_steps),
                               "original_inference_steps")
     if not 0 < original_steps <= train_steps:
         raise ValueError("original_inference_steps must be positive and fit the training table")
     corrector = value("disable_corrector", [])
     if not isinstance(corrector, (list, tuple)):
         raise ValueError("disable_corrector must be a sequence of step indices")
-    disabled = tuple(records.integer(index, "disable_corrector") for index in corrector)
+    disabled = tuple(_records.integer(index, "disable_corrector") for index in corrector)
     sigma_min, sigma_max = value("sigma_min"), value("sigma_max")
-    order = records.integer(value("solver_order", 2), "solver_order")
+    order = _records.integer(value("solver_order", 2), "solver_order")
     flow = _flow_controls(value) if family == "flow" else None
     flow_shift = _flow_shift(value, transform, algorithm)
     policy = SourcePolicy(
         kind=kind, family=family, train_steps=train_steps,
         spacing=spacing,
-        offset=records.integer(value("steps_offset", 0), "steps_offset"),
+        offset=_records.integer(value("steps_offset", 0), "steps_offset"),
         transform=transform,
         karras_round=source.karras_round(value),
         terminal=terminal,
         grid_terminal=source.grid_terminal,
         zero_snr_tail=zero_snr_tail, lambda_clipped=lambda_clipped,
-        sigma_min=None if sigma_min is None else records.number(sigma_min, "sigma_min"),
-        sigma_max=None if sigma_max is None else records.number(sigma_max, "sigma_max"),
-        sigma_data=records.number(value("sigma_data", 0.5), "sigma_data"),
-        rho=records.number(value("rho", 7.0), "rho"),
+        sigma_min=None if sigma_min is None else _records.number(sigma_min, "sigma_min"),
+        sigma_max=None if sigma_max is None else _records.number(sigma_max, "sigma_max"),
+        sigma_data=_records.number(value("sigma_data", 0.5), "sigma_data"),
+        rho=_records.number(value("rho", 7.0), "rho"),
         stride=source.stride,
-        clean_terminal=records.boolean(value("set_alpha_to_one", absent=True), "set_alpha_to_one"),
+        clean_terminal=_records.boolean(value("set_alpha_to_one", absent=True), "set_alpha_to_one"),
         clip=clip, threshold=threshold,
         recompute_epsilon=source.recompute_epsilon or algorithm in ("dpmsolver", "sde-dpmsolver"),
         distilled="original_inference_steps" in declared,
         original_steps=original_steps,
-        timestep_scaling=records.number(value("timestep_scaling", 10.0), "timestep_scaling"),
+        timestep_scaling=_records.number(value("timestep_scaling", 10.0), "timestep_scaling"),
         flow=flow, flow_shift=flow_shift)
     return policy, source.solver(_Controls(value, order, algorithm, terminal, disabled))
 
@@ -604,7 +604,7 @@ def _ddpm(controls: _Controls) -> Solver:
 
 def _optional_seed(value: Control) -> int | None:
     seed = value("noise_sampler_seed")
-    return None if seed is None else records.integer(seed, "noise_sampler_seed")
+    return None if seed is None else _records.integer(seed, "noise_sampler_seed")
 
 
 def _prediction_transform(policy: SourcePolicy, prediction: str, source: _Class) -> PredictionTransform:

@@ -27,7 +27,8 @@ from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general
+from dew.nn.rope import sincos_grid, sinusoid_frequencies
 from dew.nn.scan_orders import unpatchify
 from dew.nn.sharding import logical_axes
 
@@ -52,18 +53,15 @@ def sincos_position(channels: int, grid: int, *, base_size: int):
     The leading half of the channels encodes the column and the trailing half
     the row, each as sines then cosines over 10000^-(2i/half), with both axes
     divided by `grid / base_size`. This only initializes the buffer; a loaded
-    checkpoint brings its stored buffer.
+    checkpoint brings its stored buffer. Diffusers builds it as here: the steps in float32, the
+    frequencies and the sinusoids in float64, rounded once to float32.
     """
-    steps = jnp.arange(grid, dtype=jnp.float32) / (grid / base_size)
-    columns, rows = jnp.meshgrid(steps, steps, indexing="xy")  # width goes first
-    half = channels // 2
-    omega = 1.0 / 10000 ** (jnp.arange(half // 2, dtype=jnp.float32) / (half / 2.0))
-
-    def axis(values):
-        angles = values.reshape(-1)[:, None] * omega[None, :]
-        return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=1)
-
-    return jnp.concatenate([axis(columns), axis(rows)], axis=1)[None]
+    steps = np.arange(grid, dtype=np.float32) / np.float32(grid / base_size)
+    columns, rows = np.meshgrid(steps, steps, indexing="xy")  # width goes first
+    # `1 / 10000 ** (i / (half / 2))` over half the channels an axis (an odd half divides by a
+    # half-integer, as the reference does).
+    frequencies = sinusoid_frequencies(channels // 4, channels / 4, dtype=np.float64)
+    return jnp.asarray(sincos_grid(frequencies, columns, rows, dtype=np.float32)[None])
 
 
 @logical_axes({("context_embedder",): (None, "embed"), ("proj_out",): ("embed", None),
@@ -112,10 +110,7 @@ class SD3Transformer(TextStream, nn.Module):
                  + embedding_flops(rows, TIME_FEATURES, self.features)
                  + embedding_flops(rows, pooled_features, self.features))
         for index in range(self.num_layers):
-            block = DoubleStreamBlock(self.features, self.heads, self.head_dim,
-                                       context_pre_only=index == self.num_layers - 1,
-                                       dual_attention=index in self.dual_attention_layers, parent=None)
-            count += block.multisequence_flops(lengths, context_lengths)
+            count += self._block(index, parent=None).multisequence_flops(lengths, context_lengths)
         return (count + self._output_modulation().model_flops(rows)
                 + projection_flops(lengths, self.features, self.patch_size**2 * self.out_channels))
 
@@ -137,6 +132,15 @@ class SD3Transformer(TextStream, nn.Module):
         top, left = (maximum - height) // 2, (maximum - width) // 2
         cropped = table[:, top:top + height, left:left + width, :]
         return cropped.reshape(1, height * width, self.features)
+
+    @nn.nowrap
+    def _block(self, index: int, **where) -> DoubleStreamBlock:
+        """Joint block `index` as the model runs it, named by `where` (or unbound, `parent=None`, where a
+        FLOP count reads it): one factory, so the count and the execution build the same block."""
+        return DoubleStreamBlock(
+            self.features, self.heads, self.head_dim, qk_norm=self.qk_norm is not None,
+            context_pre_only=index == self.num_layers - 1, dual_attention=index in self.dual_attention_layers,
+            attention_impl=self.attention_impl, dtype=self.dtype, precision=self.precision, **where)
 
     @nn.nowrap
     def _output_modulation(self):
@@ -171,22 +175,20 @@ class SD3Transformer(TextStream, nn.Module):
 
         times = sinusoidal_time(time, TIME_FEATURES, dtype=at_least_fp32(self.dtype))
         times = times.astype(conditioning.pooled.dtype)
-        conditioned = (embedding(times, self.features, "timestep_embedder", **dense)
-                       + embedding(conditioning.pooled, self.features, "text_embedder", **dense))
+        conditioned = (embedding(self, times, self.features, "timestep_embedder", **dense)
+                       + embedding(self, conditioning.pooled, self.features, "text_embedder", **dense))
 
-        context = Dense(self.caption_projection_dim, name="context_embedder", **dense)(
+        context = Dense(self.caption_projection_dim, name="context_embedder", **dense,
+                        dot_general=float32_dot_general)(
             conditioning.context)
-        dual = set(self.dual_attention_layers)
         for index in range(self.num_layers):
-            image, context = DoubleStreamBlock(
-                self.features, self.heads, self.head_dim, qk_norm=self.qk_norm is not None,
-                context_pre_only=index == self.num_layers - 1, dual_attention=index in dual,
-                attention_impl=self.attention_impl, name=f"transformer_blocks_{index}", **dense)(
-                    image, context, conditioned)
+            image, context = self._block(index, name=f"transformer_blocks_{index}")(
+                image, context, conditioned)
 
         scale, shift = self._output_modulation()(conditioned)
         image = modulate(layer_norm(self.dtype)(image), shift, scale)
-        image = Dense(patch * patch * self.out_channels, name="proj_out", **dense)(image)
+        image = Dense(patch * patch * self.out_channels, name="proj_out", **dense,
+                      dot_general=float32_dot_general)(image)
         return unpatchify(image, patch, rows * patch, columns * patch, self.out_channels)
 
 

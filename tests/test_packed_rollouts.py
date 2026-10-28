@@ -61,7 +61,7 @@ def _rollout(rng, task="t", group="g", sample=0, reward=1.0, status=Status.COMPL
             expected.append([number])
         call = _call(rng, prompt, number)
         calls.append(call)
-        history = call.prompt_ids + call.sampled_ids
+        history = call.prompt + call.tokens
     return Session(task, group, sample, 0, tuple(calls), status, reward), expected
 
 
@@ -99,14 +99,14 @@ def test_strict_merge_follows_append_only_history_and_splits_on_any_rewrite(seed
         mine = sorted((row, start, stop) for owner, row, start, stop in found if owner == index)
         assert len(mine) == len(expected)
         # Each expected chain is its last call's prompt plus that call's sampled ids.
-        wanted = {rollout.calls[calls[-1]].prompt_ids + rollout.calls[calls[-1]].sampled_ids: calls
+        wanted = {rollout.calls[calls[-1]].prompt + rollout.calls[calls[-1]].tokens: calls
                   for calls in expected}
         for row, start, stop in mine:
             tokens = tuple(int(value) for value in batch[IDS_KEY][row, start:stop])
             assert tokens in wanted
             calls = wanted.pop(tokens)
             sampled = np.flatnonzero(batch[RESPONSE_MASK_KEY][row, start:stop]) + start
-            expected_ids = [token for number in calls for token in rollout.calls[number].sampled_ids]
+            expected_ids = [token for number in calls for token in rollout.calls[number].tokens]
             np.testing.assert_array_equal(batch[IDS_KEY][row, sampled], expected_ids)
             np.testing.assert_array_equal(
                 batch[BEHAVIOR_LOG_PROBS_KEY][row, sampled],
@@ -116,10 +116,10 @@ def test_strict_merge_follows_append_only_history_and_splits_on_any_rewrite(seed
             )
             np.testing.assert_array_equal(
                 batch[VERSIONS_KEY][row, sampled],
-                [number for number in calls for _ in rollout.calls[number].sampled_ids])
+                [number for number in calls for _ in rollout.calls[number].tokens])
             np.testing.assert_array_equal(
                 batch[CALL_INDEX_KEY][row, sampled],
-                [number for number in calls for _ in rollout.calls[number].sampled_ids])
+                [number for number in calls for _ in rollout.calls[number].tokens])
             others = np.setdiff1d(np.arange(start, stop), sampled)
             assert (batch[VERSIONS_KEY][row, others] == -1).all()
             assert (batch[BEHAVIOR_LOG_PROBS_KEY][row, others] == 0).all()
@@ -144,7 +144,7 @@ def test_masked_rollouts_take_no_rows_and_no_baseline():
     batch = pack(rollouts, 3)
     assert set(np.unique(batch[SESSION_INDEX_KEY])) == {0, 1}
     # One call a session: its advantage is the session's.
-    np.testing.assert_allclose(np.concatenate(advantages(rollouts, "mean")), [.5, -.5, 0, 0])
+    np.testing.assert_array_equal(np.concatenate(advantages(rollouts, "mean")), [.5, -.5, 0, 0])
     lonely = [rollouts[0], rollouts[2]]
     assert (np.concatenate(advantages(lonely)) == 0).all()
 

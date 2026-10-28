@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 import dew
 
 SOURCE = Path(dew.__file__).parent.parent
@@ -38,7 +40,8 @@ from flax import linen as nn
 from dew.diffusion import DirectPredictionTransform, FlowMatchingScheduler, Process
 from dew.inputs import Field, InputSpec
 from dew.interop import load_params, save_params
-from dew.sampling import Euler, TextToImage
+from dew.inference import TextToImage
+from dew.sampling import Euler
 
 class Zero(nn.Module):
     def __call__(self, x, time, train=False):
@@ -61,11 +64,13 @@ np.testing.assert_array_equal(result.images, np.zeros((1, 2, 2, 1), np.float32))
     assert run.returncode == 0, run.stderr
 
 
-def test_importing_the_data_layer_reads_no_configuration_and_its_workers_run(tmp_path):
-    """Importing dew.data reads no storage configuration, so a broken one fails the first store
-    that resolves, not the import, yet registers Dew's bounded cache, through which fsspec reads a
-    file before any store resolves; and a data pass with worker processes runs in a program that never parsed
-    absl's flags (`import dew` marks them parsed, as absl.app would)."""
+@pytest.mark.parametrize("named", ["DEW_STORAGE_CONFIG", "DEW_CONFIG_DIR"])
+def test_importing_the_data_layer_reads_no_configuration_and_its_workers_run(tmp_path, named):
+    """Importing dew.data reads no storage configuration, so a broken one, named by its own variable
+    or found in Dew's configuration directory as every configuration of Dew's is, fails the first
+    store that resolves, not the import, yet registers Dew's bounded cache, through which fsspec reads
+    a file before any store resolves; and a data pass with worker processes runs in a program that
+    never parsed absl's flags (`import dew` marks them parsed, as absl.app would)."""
     broken = tmp_path / "storage.toml"
     broken.write_text("this is not toml [")
     script = r"""
@@ -96,7 +101,7 @@ reader.close()
 """
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=600,
                             env={**os.environ, "PYTHONPATH": str(SOURCE), "JAX_PLATFORMS": "cpu",
-                                 "DEW_STORAGE_CONFIG": str(broken)})
+                                 named: str(broken if named == "DEW_STORAGE_CONFIG" else tmp_path)})
     assert result.returncode == 0, result.stderr[-2000:]
     reported = json.loads(result.stdout.splitlines()[-1])
     assert reported == {"refused": "TOMLDecodeError", "cached": "cached bytes", "ids": list(range(8))}
@@ -117,6 +122,24 @@ print(json.dumps(sorted(training)))
                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
     assert run.returncode == 0, run.stderr
     assert json.loads(run.stdout.splitlines()[-1]) == []
+
+
+@pytest.mark.parametrize("module", ["dew.config", "dew.training.budget"])
+def test_a_config_or_a_package_imports_no_trainer_until_a_run_trains(module):
+    """A run's configuration reads its dataclasses' types and none of the trainer, which a run reads
+    where it trains (`RunConfig.train`), and a module of the training layer reads that module, its
+    package's names imported as they are used: each imports in a fresh interpreter without
+    `dew.training.trainer`."""
+    script = f"""
+import json
+import sys
+import {module}
+print(json.dumps("dew.training.trainer" in sys.modules))
+"""
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                         env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(SOURCE)}, timeout=120)
+    assert run.returncode == 0, run.stderr
+    assert json.loads(run.stdout.splitlines()[-1]) is False
 
 
 def test_only_the_rl_packages_import_dew_rl_and_it_imports_no_training():

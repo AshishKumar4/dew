@@ -11,36 +11,25 @@ from abc import ABC, abstractmethod
 import jax
 import jax.numpy as jnp
 
+from dew.nn.precision import at_least_fp32
+
 
 def expand(coefficient, x):
     """Return a per-example coefficient `[B]` reshaped to broadcast against `x` `[B, ...]`."""
     return jnp.reshape(coefficient, (-1,) + (1,) * (x.ndim - 1))
 
 
-def divided(numerator, rate):
-    """`numerator / rate`, rounded once, as a source written in PyTorch divides a state by a rate.
-
-    A workaround for openxla/xla#51148: on CPU, XLA's algebraic simplifier rewrites a division by
-    a broadcast, a per-row rate against a `[B, ...]` state among them, into a multiplication by its
-    reciprocal without fast math (`HandleDivide`, behind `executing_on_cpu` and
-    `enable_sink_broadcast`, which no option turns off), two roundings where the division makes
-    one: 29% of float32 quotients come out an ulp off. The divisor here is the rate plus the
-    numerator times zero, a full-shape operand that no simplification folds back to the broadcast
-    (folding would change an infinite numerator's NaN), so the division stays one, inside the
-    fusion around it and with no buffer of its own. A finite numerator leaves the rate exact.
-    Other backends keep the division as written (the rewrite is the CPU compiler's alone), so
-    there it is the plain one, at the plain one's cost. Remove this once XLA keeps such
-    divisions IEEE.
-    """
-    return jax.lax.platform_dependent(numerator, rate, cpu=lambda value, by: value / (by + value * 0),
-                                      default=lambda value, by: value / by)
-
+def ancestral_variance(sigma, following):
+    """following^2 (sigma^2 - following^2) / sigma^2, the variance of the fresh noise an ancestral
+    step from `sigma` to `following` adds (k-diffusion's `get_ancestral_step` at eta 1, before its
+    root), on a number or an array of either library: each caller takes its own root, cap or clamp."""
+    return following ** 2 * (sigma ** 2 - following ** 2) / sigma ** 2
 
 
 def times(t) -> jax.Array:
     """`t` as an array of at least float32: a float64 run's times stay float64."""
     t = jnp.asarray(t)
-    return t.astype(jnp.promote_types(t.dtype, jnp.float32))
+    return t.astype(at_least_fp32(t.dtype))
 
 class NoiseScheduler(ABC):
     """Defines a forward process x_t = alpha(t) x_0 + sigma(t) eps on the time domain [0, T].
@@ -56,7 +45,10 @@ class NoiseScheduler(ABC):
 
     @abstractmethod
     def sample_t(self, key, n: int) -> jax.Array:
-        """Draw `n` training times from this schedule's training distribution."""
+        """Draw `n` training times from this schedule's training distribution, independent and alike:
+        an objective draws each example's time as `sample_t(its key, 1)` (`Step.sample`), so a draw
+        that couples the `n` (stratified, antithetic) is the objective's, over the update's places
+        (`Step.places`), as MDLM's is."""
 
     @abstractmethod
     def weight(self, t) -> jax.Array:
@@ -116,7 +108,7 @@ class ContinuousNoiseScheduler(NoiseScheduler):
     T = 1.0
 
     def sample_t(self, key, n):
-        return jax.random.uniform(key, (n,), minval=0.0, maxval=self.T)
+        return jax.random.uniform(key, (n,), jnp.float32, 0.0, self.T)
 
 
 class GeneralizedNoiseScheduler(ContinuousNoiseScheduler):
@@ -137,6 +129,13 @@ class GeneralizedNoiseScheduler(ContinuousNoiseScheduler):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
+
+    @property
+    def sigma_range(self) -> tuple[float, float]:
+        """The least and greatest sigma the schedule's grid reaches, which a solver keeps its sigmas
+        inside (Heun's churn, the Brownian tree): `sigma_min` and `sigma_max` where the grid runs
+        between its arguments, as every member's but FlaxDiff's tangent grid does."""
+        return self.sigma_min, self.sigma_max
 
     @abstractmethod
     def sigmas(self, t) -> jax.Array:

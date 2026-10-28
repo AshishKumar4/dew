@@ -20,8 +20,9 @@ from transformers.generation.logits_process import (
 
 from dew.inference import TextGeneration, tasks
 from dew.nn.inputs import ModelInputs
-from dew.sampling import Sampling, text
+from dew.sampling import Sampling
 from dew.sampling.text import generate
+from dew.telemetry.instrumentation import Compiles
 
 
 @pytest.fixture
@@ -64,7 +65,7 @@ def test_padless_tokenizer_batches_match_unpadded_rows_without_changing_exports(
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-    from dew.interop.pretrained import Processor
+    from dew.interop.processors import Processor
 
     vocabulary = {"<unk>": 0, "one": 1, "two": 2, "three": 3, "<eos>": 4}
     vocabulary.update({f"t{index}": index for index in range(5, task.model.vocab_size)})
@@ -173,9 +174,10 @@ def test_a_source_binds_a_chain_only_for_controls_its_policy_lacks(task):
     assert bound.logits is None and bound.n == 2
     assert (bound.sampling.repetition_penalty, bound.sampling.typical_p) == (2.0, 0.9)
     rare = replace(altered, generation_config={**altered.generation_config, "epsilon_cutoff": 0.01})
+    # Its unset top_k samples the top 50, as transformers' chain does (`TRANSFORMERS_TOP_K`).
     assert [type(transform) for transform in rare.text_generation().logits] == [
-        decoding.RepetitionPenalty, decoding.Temperature, decoding.TopP, decoding.MinP, decoding.Typical,
-        decoding.EpsilonCutoff]
+        decoding.RepetitionPenalty, decoding.Temperature, decoding.TopK, decoding.TopP, decoding.MinP,
+        decoding.Typical, decoding.EpsilonCutoff]
     override = rare.text_generation(sampling=Sampling(temperature=0))
     assert override.logits is None and override.sampling.repetition_penalty == 1.0 and override.n == 2
     plain = override([[1, 2]], 6, key=jax.random.key(1), n=1)
@@ -223,6 +225,40 @@ def test_a_call_policy_takes_the_tasks_eos_and_pad_ids(task):
     np.testing.assert_array_equal(drawn.tokens[0, 4:], 11)
     named = bound([[1, 2]], 4, key=1, sampling=Sampling(temperature=0, eos_token_ids=12, pad_token_id=0))
     assert named.lengths.tolist() == [4] and not named.terminated.any()
+
+
+@pytest.mark.parametrize(("stated", "cut"), [({}, 50), ({"top_k": None}, 50), ({"top_k": 0}, None),
+                                             ({"top_k": 7}, 7)], ids=["absent", "null", "zero", "seven"])
+def test_a_sampled_source_cuts_to_the_top_k_transformers_generate_samples_from(task, stated, cut):
+    """A sampled source that leaves top_k unset samples from transformers' top 50, as its `generate`
+    does; a stated 0 asks for no cut, and any other count is its cut."""
+    from pathlib import Path
+
+    from dew.interop.pretrained import PretrainedDecoder
+
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
+                               generation_config={"do_sample": True, **stated})
+    assert source.text_generation().sampling.top_k == cut
+
+
+@pytest.mark.parametrize("changed", [{"temperature": True}, {"top_p": np.True_}, {"top_k": True},
+                                     {"repetition_penalty": "1.1"}, {"eos_token_ids": True}])
+def test_a_policy_refuses_as_it_is_built_a_flag_or_a_non_number_where_a_setting_goes(changed):
+    """A policy checks its settings by the controls' own rules, so a flag where a rate or a count
+    goes, or a value that is no number, is refused when the policy is built, not run at a rate
+    nobody asked for."""
+    valid = {"temperature": 0.7, "top_p": 0.9, "top_k": 5, "repetition_penalty": 1.1, "eos_token_ids": 3}
+    Sampling(**valid)
+    with pytest.raises(ValueError):
+        Sampling(**{**valid, **changed})
+
+
+def test_a_policy_built_from_numpy_numbers_is_the_policy_of_the_numbers_they_hold():
+    """A config's or a sweep's NumPy scalars are ordinary settings: the policy holds the numbers
+    they hold, as Python's, so it records and compares as one built from those."""
+    given = {"temperature": np.float32(0.7), "top_p": np.float64(0.9), "min_p": np.float32(0.05),
+             "top_k": np.int64(5), "repetition_penalty": np.float32(1.1), "presence_penalty": np.int32(1)}
+    assert Sampling(**given) == Sampling(**{name: value.item() for name, value in given.items()})
 
 
 def test_source_total_length_and_explicit_continuation_budget_have_defined_precedence(task):
@@ -293,26 +329,25 @@ def test_prompts_inside_one_bucket_trace_once_and_draw_what_their_own_width_draw
     """
     exact = {width: generate(roomy.model, roomy.variables, ramp(width), 8, key=0,
                              sampling=roomy.sampling) for width in (100, 120)}
-    compiled = text._compiled(None, ())
-    traced = compiled._cache_size()
-    for width, reference in exact.items():
-        drawn = roomy(ramp(width), 8, key=0)
-        assert drawn.tokens.shape == (1, width + 8)
-        np.testing.assert_array_equal(drawn.tokens, reference.tokens)
-        tokens = np.asarray(reference.tokens)
-        logits = roomy.model.apply(roomy.variables, jnp.asarray(tokens))
-        bound = 16 * np.finfo(np.float32).eps * float(jnp.max(jnp.abs(logits)))
-        for field in ("raw_log_probs", "behavior_log_probs"):
-            np.testing.assert_allclose(getattr(drawn, field), getattr(reference, field),
-                                       rtol=0, atol=bound, err_msg=field)
-        attended = jnp.concatenate([jnp.zeros((1, 128 - width), jnp.int32), jnp.asarray(tokens)], axis=1)
-        unmasked = roomy.model.apply(roomy.variables, attended)[:, 128 - width:]
-        drawn_ids = jnp.asarray(tokens[:, width:, None])
-        moved = jnp.max(jnp.abs(
-            jnp.take_along_axis(jax.nn.log_softmax(logits[:, width - 1:-1]), drawn_ids, axis=-1)
-            - jnp.take_along_axis(jax.nn.log_softmax(unmasked[:, width - 1:-1]), drawn_ids, axis=-1)))
-        assert float(moved) > 1e3 * bound, (float(moved), bound)
-    assert compiled._cache_size() - traced == 1
+    with Compiles("_checked") as compiled:
+        for width, reference in exact.items():
+            drawn = roomy(ramp(width), 8, key=0)
+            assert drawn.tokens.shape == (1, width + 8)
+            np.testing.assert_array_equal(drawn.tokens, reference.tokens)
+            tokens = np.asarray(reference.tokens)
+            logits = roomy.model.apply(roomy.variables, jnp.asarray(tokens))
+            bound = 16 * np.finfo(np.float32).eps * float(jnp.max(jnp.abs(logits)))
+            for field in ("raw_log_probs", "behavior_log_probs"):
+                np.testing.assert_allclose(getattr(drawn, field), getattr(reference, field),
+                                           rtol=0, atol=bound, err_msg=field)
+            attended = jnp.concatenate([jnp.zeros((1, 128 - width), jnp.int32), jnp.asarray(tokens)], axis=1)
+            unmasked = roomy.model.apply(roomy.variables, attended)[:, 128 - width:]
+            drawn_ids = jnp.asarray(tokens[:, width:, None])
+            moved = jnp.max(jnp.abs(
+                jnp.take_along_axis(jax.nn.log_softmax(logits[:, width - 1:-1]), drawn_ids, axis=-1)
+                - jnp.take_along_axis(jax.nn.log_softmax(unmasked[:, width - 1:-1]), drawn_ids, axis=-1)))
+            assert float(moved) > 1e3 * bound, (float(moved), bound)
+    assert compiled.count == 1
 
 
 def processor_rows(width):
@@ -335,18 +370,17 @@ def test_a_processor_prompt_is_bucketed_like_bare_ids(roomy):
     # of this test's: the count starts after them.
     references = {width: generate(roomy.model, roomy.variables, ramp(width), 8, key=0,
                                   sampling=roomy.sampling) for width in (100, 120)}
-    compiled = text._compiled(None, ())
-    traced = compiled._cache_size()
-    for width, reference in references.items():
-        drawn = roomy(processor_rows(width), 8, key=0)
-        assert drawn.tokens.shape == (1, width + 8)
-        np.testing.assert_array_equal(drawn.tokens, reference.tokens)
-        logits = roomy.model.apply(roomy.variables, jnp.asarray(reference.tokens))
-        bound = 16 * np.finfo(np.float32).eps * float(jnp.max(jnp.abs(logits)))
-        for field in ("raw_log_probs", "behavior_log_probs"):
-            np.testing.assert_allclose(getattr(drawn, field), getattr(reference, field),
-                                       rtol=0, atol=bound, err_msg=field)
-    assert compiled._cache_size() - traced == 1
+    with Compiles("_checked") as compiled:
+        for width, reference in references.items():
+            drawn = roomy(processor_rows(width), 8, key=0)
+            assert drawn.tokens.shape == (1, width + 8)
+            np.testing.assert_array_equal(drawn.tokens, reference.tokens)
+            logits = roomy.model.apply(roomy.variables, jnp.asarray(reference.tokens))
+            bound = 16 * np.finfo(np.float32).eps * float(jnp.max(jnp.abs(logits)))
+            for field in ("raw_log_probs", "behavior_log_probs"):
+                np.testing.assert_allclose(getattr(drawn, field), getattr(reference, field),
+                                           rtol=0, atol=bound, err_msg=field)
+    assert compiled.count == 1
 
 
 def test_a_budget_inside_a_bucket_returns_the_budget_and_what_the_budget_draws(roomy):
@@ -359,14 +393,14 @@ def test_a_budget_inside_a_bucket_returns_the_budget_and_what_the_budget_draws(r
     assert (shaped.tokens.shape[1], trips, capacity) == (64, 128, 256)
     exact = generate(tasks.cache_sized(roomy.model, capacity), roomy.variables, shaped, budget,
                      key=3, sampling=roomy.sampling)
-    compiled = text._compiled(None, ())
-    traced = compiled._cache_size()
-    drawn = roomy(prompt, budget, key=3)
+    with Compiles("_checked") as compiled:
+        drawn = roomy(prompt, budget, key=3)
     assert drawn.tokens.shape == (1, 40 + budget) and drawn.behavior_log_probs.shape == (1, budget)
     np.testing.assert_array_equal(drawn.tokens[:, -budget:], exact.tokens[:, -budget:])
     np.testing.assert_array_equal(drawn.lengths, exact.lengths)
     np.testing.assert_array_equal(drawn.terminated, exact.terminated)
     np.testing.assert_array_equal(drawn.raw_log_probs, exact.raw_log_probs)
-    assert compiled._cache_size() - traced == 1
-    roomy(prompt, 128, key=3)
-    assert compiled._cache_size() - traced == 1
+    assert compiled.count == 1
+    with Compiles("_checked") as again:
+        roomy(prompt, 128, key=3)
+    assert again.count == 0

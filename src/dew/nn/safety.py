@@ -5,6 +5,7 @@ from flax.typing import Dtype
 
 from dew.nn.attention import l2_normalized
 from dew.nn.dense import Dense
+from dew.nn.precision import float32_dot_general, float32_matmul
 from dew.nn.text_encoders import CLIPVisionTransformer
 
 
@@ -25,7 +26,8 @@ class CLIPSafetyHead(nn.Module):
     dtype: Dtype = jnp.float32
 
     def setup(self):
-        self.visual_projection = Dense(self.projection_dim, use_bias=False, dtype=self.dtype)
+        self.visual_projection = Dense(self.projection_dim, use_bias=False, dtype=self.dtype,
+                                       dot_general=float32_dot_general)
         self.concept_embeds = self.param(
             "concept_embeds", nn.initializers.ones, (self.concepts, self.projection_dim)
         )
@@ -50,7 +52,7 @@ class CLIPSafetyHead(nn.Module):
         def scores(concepts, threshold):
             """Cosine similarity to each concept, less that concept's threshold."""
             concepts = l2_normalized(concepts)
-            return images @ concepts.T - threshold
+            return float32_matmul(images, concepts.T) - threshold
         special = jnp.round(scores(self.special_care_embeds, self.special_care_embeds_weights), 3)
         adjustment = jnp.any(special > 0, axis=-1, keepdims=True) * 0.01
         concepts = jnp.round(scores(self.concept_embeds, self.concept_embeds_weights) + adjustment, 3)

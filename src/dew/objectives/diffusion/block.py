@@ -16,23 +16,25 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
+from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.artifacts import TokenScores
+from dew.batch import FROZEN, Batch, Variables, real_places, shifted_span, thaw, token_layout
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.inputs import ModelInputs, token_layout
-from dew.nn.protocols import BlockDenoiser, CacheCapacity, LayerScalars
+from dew.nn.inputs import ModelInputs
+from dew.nn.precision import at_least_fp32, weighted_total
+from dew.nn.protocols import BlockDenoiser, CacheCapacity, Lacks, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
+from dew.nn.visibility import same_group
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
     Aux,
-    Batch,
     EMASpec,
     Objective,
     Omitted,
@@ -40,11 +42,11 @@ from dew.objectives.base import (
     Ratio,
     Source,
     Step,
-    Variables,
+    ended,
     model_rngs,
-    thaw,
 )
-from dew.objectives.lm.chunked import head_cross_entropy, model_logits
+from dew.objectives.lm.chunked import model_logits
+from dew.objectives.lm.head import HeadedObjective
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
@@ -66,12 +68,6 @@ class BlockSFTStatistics:
     support: jax.Array
 
 
-def _positions(valid: jax.Array) -> jax.Array:
-    """Number the valid tokens of each row from zero, padding included."""
-    counts = jnp.cumsum(valid, axis=-1)
-    return counts - (counts >= 1)
-
-
 def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, canvas_size: int,
                     positions: jax.Array | None = None, image_groups: jax.Array | None = None):
     """Build the attention masks and positions of one SFT step.
@@ -91,13 +87,12 @@ def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, c
     physical = jnp.arange(total)
     ordered = jnp.argsort(~valid, axis=-1, stable=True)
     packed_valid = jnp.take_along_axis(valid, ordered, axis=-1)
-    positions = _positions(valid) if positions is None else positions
+    positions = real_places(valid) if positions is None else positions
     packed_positions = jnp.take_along_axis(positions, ordered, axis=-1)
     encoder_mask = ordered[:, None, :] <= physical[None, :, None]
     if image_groups is not None:
         key_groups = jnp.take_along_axis(image_groups, ordered, axis=-1)
-        encoder_mask |= ((image_groups[:, :, None] == key_groups[:, None, :])
-                         & (image_groups[:, :, None] >= 0))
+        encoder_mask |= same_group(image_groups[:, :, None], key_groups[:, None, :])
     encoder_mask &= packed_valid[:, None, :]
     write_slots = (prompt_length + selected[:, None] * canvas_size
                    + jnp.arange(response)[None, :]) % total
@@ -119,19 +114,34 @@ def _row_losses(losses: jax.Array, mask: jax.Array, batch: Batch) -> Ratio:
     The mass is the row count, so accumulation weighs rows equally however
     many tokens each one counted.
     """
-    mass = mask.sum(axis=-1)
-    return Objective.row_mean(jnp.sum(jnp.where(mask != 0, losses, 0) * mask, axis=-1) / jnp.maximum(mass, 1),
-                              batch)
+    total, mass = weighted_total(losses, mask.astype(losses.dtype), axis=-1)
+    return Objective.row_mean(total / jnp.maximum(mass, 1), batch)
 
 
-class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
+def _observed_maxima(*passes: Variables) -> Variables:
+    """The attention logit maxima of several passes, merged by module path (`Aux.qk_stats`).
+
+    A module that more than one pass observed keeps the elementwise maximum of what each sowed: a logit is
+    bounded by the largest any of them reads. A module only one pass observed keeps what it sowed, as an
+    image's vision tower does, since the encoder pass alone runs it.
+    """
+    found: dict[tuple[str, ...], list[object]] = {}
+    for tree in passes:
+        for path, sown in flatten_dict(tree).items():
+            found.setdefault(path, []).append(sown)
+    return unflatten_dict({path: jax.tree.map(lambda *leaves: jnp.max(jnp.stack(leaves), axis=0), *sown)
+                           for path, sown in found.items()})
+
+
+class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
     """Fine-tunes DiffusionGemma on clean ``text`` rows split into a prompt and canvases.
 
     A row has ``prompt_length + canvas_size * num_canvases`` tokens. ``text``
     holds token arrays or `ModelInputs`, and any media in it conditions only
     the clean encoder. When the batch supplies attention validity, that
-    decides which cache slots are occupied; otherwise the pad ID and the
-    canvas mask decide. The optional ``canvas_mask`` and
+    decides which cache slots are occupied; otherwise the ``prompt_mask`` and
+    ``canvas_mask`` a canvas row carries decide (`dew.data.steps.chat.ResponseCanvases`),
+    and the pad ID marks a bare row's context. The optional ``canvas_mask`` and
     ``encoder_target_mask`` select the text targets, and media placeholders
     are never labels. By default an encoder target requires adjacent valid
     slots, as Google's SequenceTargetShift does. Every response token is
@@ -139,15 +149,22 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     diffusion cross entropy.
 
     `model` may be the loaded SFT source, and `variables` and `processor`
-    override its own (`Objective.bind_model`).
+    override its own (`Objective.bind_model`), as `eos_token_ids`, the ids its
+    task's responses stop at, overrides the source's (`ended`).
 
-    Both cross entropies score the final states through the bounded head
-    (`dew.objectives.lm.chunked.head_cross_entropy`), `head_chunks`
-    vocabulary tiles at a time. The backward pass therefore never holds
-    vocabulary-sized fp32 logits or the softmax of a whole row, unless an
-    adapter on the head leaves no matrix to tile. The one place a full row
-    of logits always exists is the first denoising pass, whose logits
-    condition the second pass and receive no gradient.
+    Both cross entropies score the final states through the head by the one
+    policy every token objective takes (`dew.objectives.lm.head`, `head_chunks`
+    and `head_tile` as an LM's): its whole logits kept where they fit, and
+    tiled where the fit ladder moves it, whose backward then holds no
+    vocabulary-sized fp32 logits, unless an adapter on the head leaves no
+    matrix to tile. The one place a full row of logits always exists is the
+    first denoising pass, whose logits condition the second pass and receive
+    no gradient.
+
+    A step whose optimizer clips by the attention logit maxima (`Step.qk_stats`, a QK-Clip) gets the
+    maxima of the attention its passes run through the trained projections, merged by module path
+    (`_observed_maxima`): a module several passes observe keeps their elementwise maximum, and one only
+    the encoder reaches keeps its own (`Aux.qk_stats`).
     """
 
     saved_task = BlockGeneration
@@ -160,13 +177,16 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                  stop_gradient_from_denoiser_to_encoder: bool = False,
                  encoder_loss_weight: float = 1.0, decoder_loss_weight: float = 1.0,
                  ema_decay: float | None = None, head_chunks: int = 4,
-                 processor: Processor | None | Omitted = OMITTED):
+                 head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
+                 processor: Processor | None | Omitted = OMITTED,
+                 eos_token_ids: Sequence[int] | Omitted = OMITTED):
+        self.eos_token_ids = ended(model, eos_token_ids)
         model = self.bind_model(model, variables=variables, processor=processor)
         if not (isinstance(model, BlockDenoiser) and isinstance(model, LayerScalars)):
-            raise TypeError(
-                f"block diffusion encodes a clean prefix into a model's cache and denoises canvases "
-                f"against it, with the layer scalars the published SFT trains, as DiffusionGemma "
-                f"does, and a {type(model).__name__} does none of that")
+            raise Lacks("canvas",
+                        f"block diffusion encodes a clean prefix into a model's cache and denoises canvases "
+                        f"against it, with the layer scalars the published SFT trains, as DiffusionGemma "
+                        f"does, and a {type(model).__name__} does none of that")
         canvas_size = model.canvas_length if canvas_size is None else canvas_size
         for name, value in (("prompt_length", prompt_length), ("num_canvases", num_canvases),
                             ("canvas_size", canvas_size), ("head_chunks", head_chunks)):
@@ -202,7 +222,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.decoder_loss_weight = decoder_loss_weight
         self.inputs = InputSpec(sample=Field("text", (self.sequence_length,)))
         self.ema = EMASpec.constant(ema_decay)
-        self.head_chunks = head_chunks
+        self.use_head(head_chunks, head_tile)
 
     def data(self, tokenizer=None):
         from dew.data.pipeline import ObjectiveData
@@ -219,27 +239,17 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
 
     def task_settings(self) -> BlockSettings:
-        """The sequence length, canvas budget, block process, pad id, and tokenizer or source
-        processor: the task's own."""
+        """The sequence length, canvas budget, block process, pad id, end-of-sequence ids, and
+        tokenizer or source processor: the task's own."""
         return BlockSettings(seq_len=self.sequence_length, max_new_tokens=self.canvas_size,
                              process=self._process(), pad_token_id=self.pad_token_id,
+                             eos_token_ids=self.eos_token_ids,
                              tokenizer=recorded_tokenizer(self.processor),
                              processor=recorded_processor(self.processor))
 
-    def build_task(self, variables: Variables, *,
-                   processor: Processor | None | Omitted = OMITTED) -> BlockGeneration:
-        """Return the model over `variables` as a `BlockGeneration` task.
-
-        The sampler keeps the published defaults, and the caller sets the
-        tokenizer's EOS ids.
-        """
-        return BlockGeneration.from_settings(self.model, variables, self.task_settings(),
-                                             self.processor if processor is OMITTED else processor)
-
-    @property
-    def bank_sites(self) -> tuple[DecoderBank, ...]:
-        """The shared text stack, as the training model declares it."""
-        return self.training_model.bank_sites
+    def bank_sites(self, store: Variables) -> tuple[DecoderBank, ...]:
+        """The shared text stack, as the training model declares it over `store`."""
+        return self.training_model.bank_sites(store)
 
     def held_variables(self) -> Variables | None:
         """The SFT source this objective starts from, its split kept, read as
@@ -262,8 +272,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return {**moved, "params": pretrained["params"], FROZEN: moved["params"]}
 
     def program_key(self) -> tuple[ProgramModule, ...]:
-        """The model the losses run, sized to the SFT sequence, trained."""
-        return (ProgramModule(self.training_model, None, trained=True),)
+        """The model the losses run, sized to the SFT sequence, trained, with its head."""
+        return (self.head_program(self.training_model),)
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         (trained,) = modules
@@ -279,32 +289,32 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        stats, _ = self._scored(variables, batch, step.key, train=step.training)
+        stats, _, qk = self._scored(variables, batch, step, train=step.training)
         return stats, Aux(metrics={"canvas_ce": stats.canvas.mean()[0],
-                                  "encoder_ce": stats.encoder.mean()[0]})
+                                  "encoder_ce": stats.encoder.mean()[0]}, qk_stats=qk)
 
-    def _evaluation_scores(self, params: Variables, batch: Batch, key: jax.Array) -> TokenScores:
+    def _evaluation_scores(self, params: Variables, batch: Batch, step: Step) -> TokenScores:
         """Return the denoiser's cross entropy on every canvas target of the batch.
 
-        One noise level and one canvas per row are drawn from the pass's key,
-        as in training, with dropout off. So `perplexity` over a validation
+        One noise level and one canvas per row are drawn by each example, as
+        in training (`Step.sample`), with dropout off. So `perplexity` over a validation
         pass is the exponential of the denoising loss per target."""
-        _, scores = self._scored(params, batch, key, train=False)
+        _, scores, _ = self._scored(params, batch, step, train=False)
         assert scores is not None
         return scores
 
     def _validation_scores(self, params: Variables, batch: Batch, step: Step
                            ) -> tuple[BlockSFTStatistics, TokenScores]:
-        stats, scores = self._scored(params, batch, step.key, train=False)
+        stats, scores, _ = self._scored(params, batch, step, train=False)
         assert scores is not None
         return stats, scores
 
-    def _scored(self, params: Variables, batch: Batch, key: jax.Array, *, train: bool
-                ) -> tuple[BlockSFTStatistics, TokenScores | None]:
-        """The SFT statistics and, out of training, the canvas targets'
-        scores, from one scoring of the batch."""
-        canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct = self._token_losses(
-            params, batch, key, train=train)
+    def _scored(self, params: Variables, batch: Batch, step: Step, *, train: bool
+                ) -> tuple[BlockSFTStatistics, TokenScores | None, Variables | None]:
+        """The SFT statistics, out of training the canvas targets' scores, and the attention logit maxima
+        the step asks for (`Step.qk_stats`, else None), from one scoring of the batch."""
+        canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct, qk = self._token_losses(
+            params, batch, step, train=train)
         support = (
             self.decoder_loss_weight * self.row_mean(target_mask, batch).total
             + self.encoder_loss_weight * self.row_mean(encoder_target_mask, batch).total
@@ -312,7 +322,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         stats = BlockSFTStatistics(_row_losses(canvas_losses, target_mask, batch),
                                    _row_losses(encoder_losses, encoder_target_mask, batch), support)
         return stats, None if correct is None else TokenScores(
-            canvas_losses, target_mask.astype(canvas_losses.dtype), correct)
+            canvas_losses, target_mask.astype(canvas_losses.dtype), correct), qk
 
     def _row(self, batch: Batch):
         """Read one batch's rows and the masks every later phase reads.
@@ -342,8 +352,14 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         canvas_mask = jnp.asarray(batch.get("canvas_mask", response_valid), bool)
         if canvas_mask.shape != response.shape:
             raise ValueError("canvas_mask must align with all response tokens")
+        # A context's own ids as its row marks them (`ResponseCanvases`' prompt_mask), so an id the
+        # vocabulary also pads with is read; bare rows mark none, and read the pad id as padding.
+        unmarked = tokens[:, : self.prompt_length] != self.pad_token_id
+        prompt_valid = jnp.asarray(batch.get("prompt_mask", unmarked), bool)
+        if prompt_valid.shape != (tokens.shape[0], self.prompt_length):
+            raise ValueError("prompt_mask must align with the prompt's tokens")
         full_valid = (
-            jnp.concatenate([tokens[:, : self.prompt_length] != self.pad_token_id, canvas_mask], axis=-1)
+            jnp.concatenate([prompt_valid, canvas_mask], axis=-1)
             if validity is None
             else jnp.asarray(validity, bool)
         )
@@ -357,24 +373,30 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             response = jnp.where(text_slots[:, self.prompt_length:], response, 0)
         return prepared, tokens, response, validity, full_valid, canvas_mask, text_slots
 
-    def _corrupted(self, response: jax.Array, canvas_mask: jax.Array, key: jax.Array):
-        """Draw one noise level and corrupt the response at it.
+    def _corrupted(self, response: jax.Array, canvas_mask: jax.Array, step: Step):
+        """Draw a noise level for each row and corrupt the response at it, each row's draws its
+        example's own (`Step.sample`).
 
-        Returns the corrupted tokens, the canvas each row scores, and the
-        key the self-conditioning draw still needs.
+        Returns the corrupted tokens, the canvas each row scores, and whether
+        each row conditions on its first pass.
         """
-        time_key, corruption_key, canvas_key, sc_key = jax.random.split(key, 4)
-        time = jax.random.uniform(time_key, (response.shape[0], 1),
-                                  minval=self.safety_epsilon, maxval=1 - self.safety_epsilon)
-        keep_key, noise_key = jax.random.split(corruption_key)
-        keep = jax.random.bernoulli(keep_key, jnp.broadcast_to(1 - time, response.shape), mode="high")
-        noise = jax.random.randint(noise_key, response.shape, 0, self.model.vocab_size)
-        noisy = jnp.where(keep, response, noise)
-        eligible = canvas_mask.reshape(response.shape[0], self.num_canvases, self.canvas_size).any(axis=-1)
+        rows, length = response.shape
+        low, high = self.safety_epsilon, 1 - self.safety_epsilon
+        time = step.sample("times", lambda key: jax.random.uniform(key, (1,), jnp.float32, low, high),
+                           rows=rows)
+        keep = step.sample("kept", jax.random.uniform, (length,), dtype=jnp.float32, rows=rows) < 1 - time
+        vocab = self.model.vocab_size
+        noise = step.sample("noise", lambda key: jax.random.randint(key, (length,), 0, vocab, jnp.int32),
+                            rows=rows)
+        noisy = step.boundary("noised input", jnp.where(keep, response, noise))
+        eligible = canvas_mask.reshape(rows, self.num_canvases, self.canvas_size).any(axis=-1)
         valid_canvases = eligible.sum(axis=-1)
-        rank = jax.random.randint(canvas_key, valid_canvases.shape, 0, jnp.maximum(valid_canvases, 1))
+        rank = (step.sample("canvas uniform", jax.random.uniform, (), dtype=jnp.float32, rows=rows)
+                * jnp.maximum(valid_canvases, 1)).astype(jnp.int32)
         selected = jnp.argmax(jnp.cumsum(eligible, axis=-1) > rank[:, None], axis=-1)
-        return noisy, selected, sc_key
+        use_sc = step.sample("self conditioning uniform", jax.random.uniform, (), dtype=jnp.float32,
+                             rows=rows) < self.self_cond_prob
+        return noisy, step.boundary("canvas", selected), step.boundary("self conditioning", use_sc)
 
     def _encoder_targets(self, batch: Batch, tokens: jax.Array, validity, full_valid: jax.Array,
                          text_slots) -> tuple[jax.Array, jax.Array]:
@@ -387,9 +409,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         shifted = jnp.concatenate(
             [tokens[:, 1:], jnp.full((tokens.shape[0], 1), self.pad_token_id, jnp.int32)], axis=-1
         )
-        adjacent = full_valid & jnp.concatenate(
-            [full_valid[:, 1:], jnp.zeros((tokens.shape[0], 1), bool)], axis=-1
-        )
+        adjacent = jnp.pad(shifted_span(tokens.shape, 1, valid=full_valid), ((0, 0), (0, 1)))
         encoder_target_mask = jnp.asarray(batch.get("encoder_target_mask", adjacent), jnp.float32)
         if encoder_target_mask.shape != tokens.shape:
             raise ValueError("encoder_target_mask must align with the full sequence")
@@ -401,60 +421,70 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             )
         return jnp.where(encoder_target_mask != 0, shifted, 0), encoder_target_mask
 
-    def _token_losses(self, params: Variables, batch: Batch, key: jax.Array, *, train: bool
-                      ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None]:
+    def _token_losses(self, params: Variables, batch: Batch, step: Step, *, train: bool
+                      ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None,
+                                 Variables | None]:
         """Score both SFT passes over one batch.
 
         Returns the denoiser's per-token cross entropies over the response
         and the encoder's over the full row, each with the mask of the
-        targets it counts.
+        targets it counts, the canvas's argmax hits where the head reports
+        them, and the attention logit maxima of the passes that run the trained projections, merged by
+        module path, where the step asks for them (`Step.qk_stats`).
         """
         params = thaw(params)
         prepared, tokens, response, validity, full_valid, canvas_mask, text_slots = self._row(batch)
-        noisy, selected, sc_key = self._corrupted(response, canvas_mask, key)
+        noisy, selected, use_sc = self._corrupted(response, canvas_mask, step)
         fields = prepared.token_fields
         positions, encoder_mask, encoder_keys, decoder_mask, decoder_keys = _cache_geometry(
             full_valid, selected, self.prompt_length, self.canvas_size,
             fields.get("positions"), fields.get("image_groups"))
         model = self.training_model
-        rngs = model_rngs(key, training=train)
+        rngs = model_rngs(step.key, training=train)
+        observed = ["qk"] if step.qk_stats else []
         cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
         encoder_kwargs = prepared.kwargs()
         encoder_kwargs.update(positions=positions, attention_mask=full_valid)
         encoder_states, mutated = model.apply(
             {**params, "cache": cache}, tokens, **encoder_kwargs,
             attention_pairwise_mask=encoder_mask, attention_key_positions=encoder_keys,
-            method=model.encode, train=train, states=True, mutable=["cache"], rngs=rngs,
+            method=model.encode, train=train, states=True, mutable=["cache", *observed], rngs=rngs,
             capture_intermediates=False)
         cache = mutated["cache"]
         if self.stop_gradient_from_denoiser_to_encoder:
             cache = jax.lax.stop_gradient(cache)
+
         def denoise(sc_logits):
-            return model.apply(
+            read = model.apply(
                 {**params, "cache": cache}, noisy, self_conditioning_logits=sc_logits,
                 train=train, rngs=rngs, positions=positions[:, self.prompt_length:],
                 attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys,
-                states=True)
+                states=True, mutable=observed or False)
+            return read if observed else (read, {})
 
-        zero_logits = jnp.zeros((*response.shape, self.model.vocab_size), jnp.float32)
-        # The conditioning pass carries no gradient, so its states stop it
-        # before the head and nothing of that pass is kept for the backward.
+        # The zero signal in the dtype the model's states compute in, at least fp32, so a float64 model's
+        # first pass mixes its table in float64 (`soft_embeddings`), as its second does.
+        zero_logits = jnp.zeros((*response.shape, self.model.vocab_size), at_least_fp32(encoder_states.dtype))
+        # The conditioning pass carries no gradient, so its states stop it before the head and nothing of
+        # that pass is kept for the backward. Its maxima still count: it runs the trained projections, so
+        # its logits are the trained weights' too, and the clip bounds them with the other passes'.
+        first_states, first_sown = denoise(zero_logits)
         first = jax.lax.stop_gradient(constrain(model_logits(
-            model, params, jax.lax.stop_gradient(denoise(zero_logits))), LOGITS))
-        use_sc = jax.random.uniform(sc_key, (tokens.shape[0],)) < self.self_cond_prob
+            model, params, jax.lax.stop_gradient(first_states)), LOGITS))
         sc_logits = jnp.where(use_sc[:, None, None], first, zero_logits)
-        states = denoise(sc_logits)
+        states, second_sown = denoise(sc_logits)
+        qk = None
+        if step.qk_stats:
+            qk = _observed_maxima(mutated["qk"], first_sown["qk"], second_sown["qk"])
         chosen = jnp.arange(response.shape[1])[None, :] // self.canvas_size == selected[:, None]
         target_mask = canvas_mask & chosen
         if text_slots is not None:
             target_mask &= text_slots[:, self.prompt_length:]
-        canvas_losses, predicted, _ = head_cross_entropy(model, params, states, response, self.head_chunks,
-                                                         predict=not train)
+        canvas_losses, predicted, _ = self.head_terms(model, params, states, response, predict=not train)
         shifted, encoder_target_mask = self._encoder_targets(batch, tokens, validity, full_valid, text_slots)
-        encoder_losses, _, _ = head_cross_entropy(model, params, encoder_states, shifted, self.head_chunks,
-                                                  predict=False)
+        encoder_losses, _, _ = self.head_terms(model, params, encoder_states, shifted, predict=False)
         correct = None if predicted is None else predicted == response
-        return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct
+        return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct, qk
 
     def reduce_loss(self, stats: BlockSFTStatistics):
         canvas, _ = stats.canvas.mean()

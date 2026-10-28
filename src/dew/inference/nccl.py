@@ -16,7 +16,10 @@ version when the group opens. The trainer mints the group's unique id and posts
 it base64-encoded (`nccl_unique_id_b64`), and both sides enter
 `ncclCommInitRank` together, since that rendezvous has no store to wait on.
 The workers' communicator then runs a one-element all-reduce, which this side
-matches before its first broadcast.
+matches before its first broadcast. This side's communicators are nonblocking,
+so while it waits on the rendezvous or on a broadcast it also watches the
+HTTP calls the engine answers, and aborts the group when one of them fails
+rather than waiting on a peer that never comes.
 
 A push runs the vLLM publication lifecycle `SafetensorsReload` runs: it pauses
 each replica with `mode=wait`, delivers, resets the prefix cache and resumes,
@@ -24,17 +27,16 @@ and stops at a phase that fails on any replica. Its delivery starts the update,
 posts `/update_weights`, which returns once every tensor has landed, while this
 side broadcasts them, and finishes the update under the version. Every process of a pool calls the push,
 and the policy is gathered to process 0 as `SafetensorsReload` gathers it, in
-groups of at most `dew.coordination.GATHER_BYTES`.
+groups of at most `dew._coordination.GATHER_BYTES`.
 """
 
 from __future__ import annotations
 
 import base64
 import ctypes
-import threading
 import time
 from collections.abc import Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
@@ -44,27 +46,54 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import SingleDeviceSharding
 
-from dew.coordination import agreed, collective_host
+from dew._coordination import agreed, byte_groups
+from dew._records import JSON
+from dew.batch import Variables
+from dew.devices import primary_context
 from dew.nn.inputs import mesh_of
-from dew.objectives.base import Variables
-from dew.records import JSON
-from dew.telemetry.devices import primary_context
 
-from .rollouts import _on_every, _post, _served, _vllm_publication
+from .rollouts import _on_every, _post, _published, _vllm_publication
 
 if TYPE_CHECKING:
+    import httpx
+
     from dew.interop.pretrained import Pretrained
 
 _DTYPES = {"int8": 0, "uint8": 1, "int32": 2, "uint32": 3, "int64": 4, "uint64": 5, "float16": 6,
-           "float32": 7, "float64": 8, "bfloat16": 9}
-"""`ncclDataType_t` by numpy dtype name (nccl.h)."""
+           "float32": 7, "float64": 8, "bfloat16": 9, "float8_e4m3fn": 10}
+"""`ncclDataType_t` by numpy dtype name (nccl.h; `ncclFloat8e4m3` is the code vLLM's `pynccl_wrapper`
+receives its FP8 weights as, the E4M3 a requantized FP8 source exports)."""
 
 _SUM = 0
 """`ncclSum` (nccl.h)."""
 
+_IN_PROGRESS = 7
+"""`ncclInProgress` (nccl.h): a nonblocking communicator's call that has not finished."""
+
+_NOT_READY = 600
+"""`CUDA_ERROR_NOT_READY` (cuda.h): a stream with work still running."""
+
 
 class _UniqueId(ctypes.Structure):
     _fields_: ClassVar = [("internal", ctypes.c_byte * 128)]
+
+
+class _Config(ctypes.Structure):
+    """`ncclConfig_t` as NCCL 2.17 lays it out (nccl.h.in, v2.17.1-1). A later NCCL reads the
+    fields this size and version declare and keeps its own defaults for the rest
+    (init.cc `parseCommConfig`, v2.27.7-1)."""
+
+    _fields_: ClassVar = [
+        ("size", ctypes.c_size_t), ("magic", ctypes.c_uint), ("version", ctypes.c_uint),
+        ("blocking", ctypes.c_int), ("cga_cluster_size", ctypes.c_int), ("min_ctas", ctypes.c_int),
+        ("max_ctas", ctypes.c_int), ("net_name", ctypes.c_char_p),
+    ]
+
+
+def _nonblocking() -> _Config:
+    """A config that opens a nonblocking communicator, every other field NCCL's default."""
+    undefined = -2 ** 31
+    return _Config(ctypes.sizeof(_Config), 0xCAFEBEEF, 21700, 0, undefined, undefined, undefined, None)
 
 
 class _Library:
@@ -73,14 +102,15 @@ class _Library:
     A communicator binds to the device whose context is current on the calling
     thread when it opens, and every call runs on that thread, so each call
     makes the sender device's primary context current first. Collectives run on
-    the default stream; `synchronize` waits for them before a buffer is freed.
+    the default stream; `settled` waits for them before a buffer is freed.
     """
 
     def __init__(self, library: str, ordinal: int) -> None:
         self.nccl = ctypes.CDLL(library)
         self.nccl.ncclGetErrorString.restype = ctypes.c_char_p
-        self.nccl.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId,
-                                               ctypes.c_int]
+        self.nccl.ncclCommInitRankConfig.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId,
+                                                     ctypes.c_int, ctypes.POINTER(_Config)]
+        self.nccl.ncclCommGetAsyncError.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int)]
         collective = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
                       ctypes.c_void_p, ctypes.c_void_p]
         self.nccl.ncclAllReduce.argtypes = collective
@@ -96,6 +126,11 @@ class _Library:
         if status != 0:
             raise RuntimeError(f"NCCL error {status}: {self.nccl.ncclGetErrorString(status).decode()}")
 
+    def _issued(self, status: int) -> None:
+        """Check a nonblocking communicator's call, which may still be running (`settled` waits)."""
+        if status != _IN_PROGRESS:
+            self._checked(status)
+
     def current(self) -> None:
         self._driver(self.cuda.cuCtxSetCurrent(self.context))
 
@@ -105,23 +140,64 @@ class _Library:
         return uid
 
     def open(self, uid: _UniqueId, rank: int, world: int) -> ctypes.c_void_p:
+        """Start opening a nonblocking communicator; it is open once `settled` returns."""
         self.current()
         comm = ctypes.c_void_p()
-        self._checked(self.nccl.ncclCommInitRank(ctypes.byref(comm), world, uid, rank))
+        config = _nonblocking()
+        status = self.nccl.ncclCommInitRankConfig(ctypes.byref(comm), world, uid, rank, ctypes.byref(config))
+        try:
+            self._issued(status)
+        except RuntimeError:
+            # NCCL may hand out the communicator before its start fails, and only an abort frees it.
+            if comm.value is not None:
+                self.abort(comm)
+            raise
         return comm
 
     def all_reduce(self, comm: ctypes.c_void_p, pointer: int, count: int, dtype: str) -> None:
         self.current()
-        self._checked(self.nccl.ncclAllReduce(pointer, pointer, count, _DTYPES[dtype], _SUM, comm, None))
+        self._issued(self.nccl.ncclAllReduce(pointer, pointer, count, _DTYPES[dtype], _SUM, comm, None))
 
     def broadcast(self, comm: ctypes.c_void_p, pointer: int, count: int, dtype: str) -> None:
         self.current()
-        self._checked(self.nccl.ncclBroadcast(pointer, pointer, count, _DTYPES[dtype], 0, comm, None))
+        self._issued(self.nccl.ncclBroadcast(pointer, pointer, count, _DTYPES[dtype], 0, comm, None))
 
-    def synchronize(self) -> None:
-        """Wait for the collectives on the default stream, not the trainer's own streams."""
-        self.current()
-        self._driver(self.cuda.cuStreamSynchronize(None))
+    def ready(self, comms: Sequence[ctypes.c_void_p], peers: Sequence[Future[httpx.Response]]) -> None:
+        """Wait until none of `comms` is still issuing a call, as `settled` waits, leaving its
+        collectives running on the stream. A nonblocking communicator takes no call while its last
+        is in progress (NCCL's `ncclCommEnsureReady` refuses it), so each collective waits here
+        before the next goes to the same communicator."""
+        self._waited(comms, peers, stream=False)
+
+    def settled(self, comms: Sequence[ctypes.c_void_p], peers: Sequence[Future[httpx.Response]]) -> None:
+        """Wait until every one of `comms` has finished its calls and the default stream its
+        collectives (not the trainer's own streams), polling NCCL between waits on `peers`, the
+        replicas' HTTP calls that run meanwhile. A call that fails raises; the caller aborts the
+        comms."""
+        self._waited(comms, peers, stream=True)
+
+    def _waited(self, comms: Sequence[ctypes.c_void_p], peers: Sequence[Future[httpx.Response]], *,
+                stream: bool) -> None:
+        """Poll `comms`, and with `stream` the default stream, until no call is in progress, watching
+        `peers` between polls (`settled`)."""
+        state = ctypes.c_int()
+        while True:
+            self.current()
+            issuing = False
+            for comm in comms:
+                self._checked(self.nccl.ncclCommGetAsyncError(comm, ctypes.byref(state)))
+                if state.value != _IN_PROGRESS:
+                    self._checked(state.value)
+                issuing = issuing or state.value == _IN_PROGRESS
+            running = self.cuda.cuStreamQuery(None) if stream else 0
+            if running != _NOT_READY:
+                self._driver(running)
+            if not issuing and running == 0:
+                return
+            answered, _ = wait(peers, timeout=0.001, return_when=FIRST_EXCEPTION)
+            failure = next((peer.exception() for peer in answered if peer.exception() is not None), None)
+            if failure is not None:
+                raise RuntimeError("a replica's HTTP call failed while its NCCL group waited") from failure
 
     def abort(self, comm: ctypes.c_void_p) -> None:
         """Free `comm` without waiting for its peers or its operations."""
@@ -150,7 +226,9 @@ class NCCLPush:
     describes the handshake and the push in full.
 
     - `source` is the `Pretrained` the replicas were launched from; its
-      `export` gives the tensors.
+      `export` gives the tensors, of the trained tree and of every other tree
+      the source exports (a decision release's readout), each gathered from
+      the pool to process 0 first.
     - `engines` are the replicas' root URLs, not their `/v1` API URLs.
     - `library` is the engine's own libnccl.so.2, because NCCL refuses a
       peer of another version when the group opens.
@@ -192,11 +270,11 @@ class NCCLPush:
         # Process 0 holds the gathered policy, so it sends, from its first device of the mesh.
         sender = jax.local_devices()[0] if mesh is None else next(
             device for device in mesh.devices.flat if device.process_index == 0)
-        served = collective_host(_served(variables, jnp.dtype(self.dtype)), phase="weight push gather",
-                                 held_by="first")
+        # Every tree the source exports, a decision release's readout beside the trained backbone.
+        published = _published(self.source, variables, jnp.dtype(self.dtype), phase="weight push gather")
         self.timings["gather"] = time.perf_counter() - began
-        agreed("weight push", lambda: None if served is None else self._push(
-            served, SingleDeviceSharding(sender), sender.local_hardware_id, version))
+        agreed("weight push", lambda: None if published is None else self._push(
+            published, SingleDeviceSharding(sender), sender.local_hardware_id, version))
         self.timings["total"] = time.perf_counter() - began
 
     def close(self) -> None:
@@ -213,11 +291,16 @@ class NCCLPush:
                 self._library.abort(comm)
         self._groups.clear()
 
-    def _push(self, served: Variables, target: SingleDeviceSharding, ordinal: int, version: int) -> None:
+    def _push(self, published: Pretrained, target: SingleDeviceSharding, ordinal: int, version: int) -> None:
         began = time.perf_counter()
-        exported = self.source.export(served)
+        exported = published.export()
         names = sorted(exported)
         tensors = [exported[name] for name in names]
+        # Named before any replica pauses for the update, which a dtype the collectives cannot carry
+        # would leave paused.
+        uncarried = sorted({str(tensor.dtype) for tensor in tensors} - _DTYPES.keys())
+        if uncarried:
+            raise ValueError(f"an NCCL push carries {sorted(_DTYPES)}; the publication exports {uncarried}")
         self.timings["export"] = time.perf_counter() - began
         library = self._opened(target, ordinal)
         began = time.perf_counter()
@@ -254,7 +337,7 @@ class NCCLPush:
             receives = [(root, pool.submit(_post, root, "/update_weights", listing, self.timeout))
                         for root in self.engines]
             try:
-                self._broadcast(library, target, tensors)
+                self._broadcast(library, target, tensors, [receive for _, receive in receives])
             except BaseException:
                 self.close()
                 raise
@@ -277,52 +360,46 @@ class NCCLPush:
             uid = library.unique_id()
             body: JSON = {"init_info": {"nccl_unique_id_b64": base64.b64encode(bytes(uid.internal)).decode(),
                                         "rank_offset": 1, "world_size": 1 + workers, "packed": False}}
-            failures: list[BaseException] = []
-
-            def join(root: str = root, body: JSON = body, failures=failures) -> None:
+            with ThreadPoolExecutor(max_workers=1, thread_name_prefix="dew-weight-join") as pool:
+                joining = pool.submit(_post, root, "/init_weight_transfer_engine", body, self.timeout)
+                comm = library.open(uid, 0, 1 + workers)
                 try:
-                    _post(root, "/init_weight_transfer_engine", body, self.timeout)
-                except BaseException as failure:
-                    failures.append(failure)
-
-            joining = threading.Thread(target=join)
-            joining.start()
-            comm = library.open(uid, 0, 1 + workers)
-            # The workers' communicator all-reduces one float32 as it opens.
-            warm = jax.device_put(np.zeros(1, np.float32), target).block_until_ready()
-            library.all_reduce(comm, warm.unsafe_buffer_pointer(), 1, "float32")
-            library.synchronize()
-            joining.join()
-            if failures:
-                library.abort(comm)
-                raise RuntimeError(f"{root} did not open the weight-transfer group") from failures[0]
+                    library.settled([comm], [joining])
+                    # The workers' communicator all-reduces one float32 as it opens.
+                    warm = jax.device_put(np.zeros(1, np.float32), target).block_until_ready()
+                    library.all_reduce(comm, warm.unsafe_buffer_pointer(), 1, "float32")
+                    library.settled([comm], [joining])
+                    if (failure := joining.exception()) is not None:
+                        raise RuntimeError(f"{root} did not open the weight-transfer group") from failure
+                except BaseException:
+                    library.abort(comm)
+                    raise
             self._groups[root] = comm
         return library
 
     def _broadcast(
-        self, library: _Library, target: SingleDeviceSharding, tensors: Sequence[np.ndarray]
+        self, library: _Library, target: SingleDeviceSharding, tensors: Sequence[np.ndarray],
+        receives: Sequence[Future[httpx.Response]],
     ) -> None:
         """Broadcast `tensors` in order to every group, `chunk` bytes resident at a time.
 
         The next chunk's copies are issued before the current chunk broadcasts,
         so the host-to-device copies overlap the transfers; a chunk is released
-        only after the default stream has finished with it.
+        only after the default stream has finished with it, or a replica's
+        receive (`receives`) has failed. Each tensor goes to every group, and
+        the next waits until each group has issued it (`_Library.ready`).
         """
-        chunks: list[list[np.ndarray]] = [[]]
-        size = 0
-        for tensor in tensors:
-            if chunks[-1] and size + tensor.nbytes > self.chunk:
-                chunks.append([])
-                size = 0
-            chunks[-1].append(tensor)
-            size += tensor.nbytes
+        chunks = [[tensors[index] for index in group]
+                  for group in byte_groups(tensors, self.chunk, nbytes=lambda tensor: tensor.nbytes)] or [[]]
+        groups = list(self._groups.values())
         placed = jax.device_put(chunks[0], target)
         for index in range(len(chunks)):
             following = jax.device_put(chunks[index + 1], target) if index + 1 < len(chunks) else None
             for buffer in jax.block_until_ready(placed):
-                for comm in self._groups.values():
+                for comm in groups:
                     library.broadcast(comm, buffer.unsafe_buffer_pointer(), buffer.size, str(buffer.dtype))
-            library.synchronize()
+                library.ready(groups, receives)
+            library.settled(groups, receives)
             if following is not None:
                 placed = following
 

@@ -9,6 +9,7 @@ import pytest
 from reference_error import assert_computes_the_oracle, chain_roundings
 
 from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 
 FIXTURE = Path(__file__).parent / "fixtures" / "gpt_oss" / "attention.npz"
 
@@ -55,8 +56,9 @@ def test_sinks_a_softcap_and_dropout_compose_on_one_reference_path(dropout_rate)
         sink = jnp.broadcast_to(sinks[None, :, None, None], (2, 4, 6, 1))
         weights = jax.nn.softmax(jnp.concatenate([logits, sink], -1), axis=-1)[..., :-1]
         if dropout_rate:
-            kept = jax.random.bernoulli(rng, 1 - dropout_rate, weights.shape)
-            weights = weights * kept / (1 - dropout_rate)
+            keep = dropout_keep(dropout_seed(rng), dropout_rate, weights.shape)
+            scale = jnp.asarray(1.0 / (1.0 - dropout_rate), weights.dtype)
+            weights = weights * jnp.where(keep, scale, 0)
         truth = jnp.einsum("bhqk,bkhd->bqhd", weights, value[:, :, group])
         assert_computes_the_oracle(
             np.asarray(attend(query, key, value, sinks)), np.asarray(truth), "sinks, softcap and dropout",
@@ -69,3 +71,23 @@ def test_fused_attention_refuses_sinks_by_name(implementation):
     with pytest.raises(ValueError):
         scaled_dot_product_attention(heads, heads, heads,
                                      implementation=implementation, sinks=jnp.zeros(2))
+
+
+@pytest.mark.parametrize("heads, kv_heads", [(4, 1), (4, 2)], ids=["shared", "grouped"])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16])
+def test_a_masked_key_weighs_nothing_beside_a_sink_however_low_its_logit(heads, kv_heads, dtype):
+    """Beside a sink a masked key is out of the softmax: a row whose every key is masked attends the
+    sink alone and reads nothing, even where the sink's logit sits at or below the dtype's most
+    negative finite value, where a finite floor let every masked key share the row."""
+    from dew.nn.attention import reference_attention
+
+    query = jax.random.normal(jax.random.key(0), (1, 3, heads, 8), dtype)
+    key, value = (jax.random.normal(jax.random.key(seed), (1, 5, kv_heads, 8), dtype) for seed in (1, 2))
+    mask = jnp.zeros((1, 1, 3, 5), bool).at[..., :2, :].set(True)
+    # At float32's most negative finite logit, or below float16's, where a finite floor ties the sink.
+    sinks = jnp.full((heads,), float(jnp.finfo(dtype).min) * (2 if dtype == jnp.float16 else 1), jnp.float32)
+    out = reference_attention(query, key, value, mask=mask, sinks=sinks)
+    assert out.dtype == dtype
+    np.testing.assert_array_equal(np.asarray(out[:, 2]), 0)
+    assert bool(jnp.all(jnp.isfinite(out)))
+

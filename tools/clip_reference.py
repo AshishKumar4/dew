@@ -46,6 +46,7 @@ import argparse
 import json
 import shutil
 import string
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -55,6 +56,9 @@ from transformers import (
     AutoTokenizer, CLIPConfig, CLIPImageProcessorPil, CLIPModel, CLIPTextConfig,
     CLIPTokenizer, CLIPVisionConfig,
 )
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reference_source import recipe_images
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "clip"
 REAL_MODEL = "openai/clip-vit-large-patch14"
@@ -77,12 +81,6 @@ REAL_PROMPTS = [
 # as a photograph for parity, and a recipe is smaller than pixels.
 TINY_IMAGES = {"seed": 0, "shape": [4, 16, 12, 3]}
 REAL_IMAGES = {"seed": 0, "shape": [3, 64, 48, 3]}
-
-
-def synthetic_images(recipe) -> np.ndarray:
-    """uint8 RGB images from a recipe, reproduced the same way by the tests."""
-    return np.random.RandomState(recipe["seed"]).randint(
-        0, 256, tuple(recipe["shape"]), dtype=np.uint8)
 
 
 def tiny_tokenizer() -> CLIPTokenizer:
@@ -161,8 +159,10 @@ def write_fp64(path: Path) -> None:
     """The real tower in fp64 throughout, the evidence behind the fp32 tolerance.
 
     The reference softmax is hardcoded to fp32 (eager_attention_forward), which
-    caps any comparison at fp32 precision, so it is unwrapped here. Nothing
-    committed reads this file; it is written where a run can point dew at it:
+    caps any comparison at fp32 precision, so the tower is the published one's
+    float64 twin run inside the shared `float64` context, which widens that pin
+    with every other. Nothing committed reads this file; it is written where a
+    run can point dew at it:
 
         JAX_ENABLE_X64=1 python - <<'PY'
         import functools, json, numpy as np, jax, jax.numpy as jnp
@@ -181,23 +181,16 @@ def write_fp64(path: Path) -> None:
         print(np.abs(np.asarray(out.last_hidden_state) - pure["last_hidden_state"]).max())
         PY
     """
-    from torch_precision import replaced
+    from torch_precision import float64, float64_twin
 
-    original = torch.nn.functional.softmax
-
-    def kept_dtype(input, dim=None, dtype=None, **kwargs):
-        return original(input, dim=dim, **kwargs)
-
-    with replaced((torch.nn.functional, "softmax", kept_dtype)):
-        tokenizer = AutoTokenizer.from_pretrained(REAL_MODEL)
-        model = CLIPModel.from_pretrained(REAL_MODEL, dtype=torch.float32).double()
-        model.eval()
-        model.set_attn_implementation("eager")
-        tokens = tokenizer(REAL_PROMPTS, padding="max_length", max_length=MAX_LENGTH,
-                           truncation=True, return_tensors="pt")
-        with torch.no_grad():
-            outputs = model.text_model(input_ids=tokens["input_ids"],
-                                       attention_mask=tokens["attention_mask"])
+    tokenizer = AutoTokenizer.from_pretrained(REAL_MODEL)
+    model = float64_twin(CLIPModel.from_pretrained(REAL_MODEL, dtype=torch.float32))
+    model.set_attn_implementation("eager")
+    tokens = tokenizer(REAL_PROMPTS, padding="max_length", max_length=MAX_LENGTH,
+                       truncation=True, return_tensors="pt")
+    with float64(), torch.no_grad():
+        outputs = model.text_model(input_ids=tokens["input_ids"],
+                                   attention_mask=tokens["attention_mask"])
     np.savez(path, last_hidden_state=outputs.last_hidden_state.numpy(),
              pooler_output=outputs.pooler_output.numpy())
     print(f"{path}: fp64 reference for {len(REAL_PROMPTS)} prompts")
@@ -220,7 +213,7 @@ def write_tiny(directory: Path) -> None:
     assert (ids.argmax(axis=-1) != (ids == 1).argmax(axis=-1)).any(), (
         "the argmax and eos branches of the pooled row agree on every prompt, "
         "so this fixture would not tell them apart")
-    reference.update(encode_images(model, processor, synthetic_images(TINY_IMAGES)))
+    reference.update(encode_images(model, processor, recipe_images(TINY_IMAGES)))
 
     np.savez(directory / "reference.npz", **reference)
     (directory / "prompts.json").write_text(json.dumps(
@@ -237,7 +230,7 @@ def write_real(directory: Path) -> None:
     reference = encode(model, tokenizer, REAL_PROMPTS)
     # The pixel values are 1.8 MB of upsampled noise; the test recomputes them
     # with the same processor.
-    images = encode_images(model, processor, synthetic_images(REAL_IMAGES))
+    images = encode_images(model, processor, recipe_images(REAL_IMAGES))
     reference["image_embeds"] = images["image_embeds"]
     np.savez_compressed(directory / "reference.npz", **reference)
     (directory / "prompts.json").write_text(json.dumps(

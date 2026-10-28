@@ -24,8 +24,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from dew._records import JSON
 from dew.objectives.rl.sessions import Status, Task
-from dew.records import JSON
 
 from .gateway import Recorded, engine_failure, number, refused_prompt
 from .harness import Judged, Trial
@@ -177,7 +177,11 @@ class Harbor:
             harness_exit = _harness_exit(trial.artifacts)
         except ValueError as error:
             return Judged(Status.INFRA_ERROR, detail=f"unreadable harness trajectory: {error}")
-        return outcome(json.loads(trial_result.read_text()), recorded, harness_exit=harness_exit)
+        try:
+            reported = json.loads(trial_result.read_text())
+        except json.JSONDecodeError as error:
+            return Judged(Status.INFRA_ERROR, detail=f"unreadable result.json: {error}")
+        return outcome(reported, recorded, harness_exit=harness_exit)
 
 
 def _harness_exit(trial: Path) -> str | None:

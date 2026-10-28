@@ -11,24 +11,26 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+from flax.core import freeze as frozen_dict
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 from steady_state import steady_state
-from test_training_transactions import ShortScaleTrainer, Terms, Tiny, batches
+from test_training_transactions import SHORT_SCALE, Terms, Tiny, batches
 
+from dew.batch import FROZEN, freeze
 from dew.checkpoints import Checkpoints
-from dew.config.data import RecordsData, loader
-from dew.data import Loading
+from dew.data import Loading, Memory
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import DeviceStep
+from dew.distributed.host import companion_mesh, transfer
 from dew.inference.banks import spread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import FROZEN, Aux, EMASpec, Objective, Ratio, freeze
+from dew.objectives.base import Aux, EMASpec, Objective, Ratio
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, Trainer
-from dew.training.host import companion_mesh, transfer
 
 HOST = Layout(host=("variables",), min_shard=1, tolerance=1.)
 DEVICE = Layout(min_shard=1, tolerance=1.)
@@ -80,7 +82,7 @@ def platforms_agree(resident, host, steps: int):
 def close(left, right, bound=STREAMED_BOUND):
     """`left`, a CPU-owned state, agrees with `right`, a device one, leaf by
     leaf; the frozen collection is compared per layer, the host's banks
-    (`execution.banked`) read row by row."""
+    (`dew.inference.banks.banked`) read row by row."""
     if isinstance(left, dict) and FROZEN in left:
         left = {**left, FROZEN: unbanked(left[FROZEN])}
     elif FROZEN in getattr(left, "variables", {}):
@@ -139,29 +141,30 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
     data = batches()
     states = []
     for layout in (DEVICE, HOST):
-        trainer = ShortScaleTrainer(
+        trainer = Trainer(
             Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-            accumulation=2, dynamic_scale=True, layout=layout)
+            accumulation=2, dynamic_scale=SHORT_SCALE, layout=layout)
         state, _, _ = trainer.place()
         step = trainer.compile(state, data[0])
         prefix, *_ = step(state, data[0])
         # the step consumes the state
         prefix_params = jax.tree.map(np.asarray, prefix.variables)
-        prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
         rejected, _, _, _, accepted, _ = step(prefix, data[1])
         assert not bool(accepted)
+        # The rejection drops its window (`dropped_window`); the next two microbatches make the update.
         equal(prefix_params, rejected.variables)
-        equal(prefix_accumulation, rejected.accumulation)
+        assert int(rejected.microstep) == 0
         state, *_ = step(rejected, data[2])
+        state, *_ = step(state, data[3])
         assert int(state.updates) == 1
-        assert float(state.variables["stats"]["seen"]) == 2
+        assert float(state.variables["stats"]["seen"]) == 3
         states.append(state)
     platforms_agree(*states, steps=1)
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
-    trainer = ShortScaleTrainer(
+    trainer = Trainer(
         Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-        accumulation=2, dynamic_scale=True, layout=HOST, checkpoints=checkpoints)
+        accumulation=2, dynamic_scale=SHORT_SCALE, layout=HOST, checkpoints=checkpoints)
     start, _, _ = trainer.place()
     step = trainer.compile(start, data[0])
     prefix, *_ = step(start, data[0])
@@ -173,6 +176,7 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
     resumed_step = trainer.compile(restored, data[1])
     resumed, *_ = resumed_step(restored, data[1])
     resumed, *_ = resumed_step(resumed, data[2])
+    resumed, *_ = resumed_step(resumed, data[3])
     equal(resumed, states[1])
 
 
@@ -197,8 +201,8 @@ def test_dropout_composite_replay_restarts_with_effects_and_ema_intact(tmp_path)
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2,
                               mlp_features=16, max_seq_len=8, scan_layers=True, dropout_rate=.4,
                               mixture=Mixture(experts=4, top_k=2, bias=True))
-    objective = LMObjective(model, 8, head_chunks=1, aux_loss_alpha=.2, seq_aux=False,
-                            balance_rate=.01, ema_decay=.9)
+    objective = LMObjective(model, 8, head_chunks=1, ema_decay=.9,
+                            balance=ExpertBalance(balance_rate=.01, aux_loss_alpha=.2, seq_aux=False))
     checkpoints = Checkpoints(str(tmp_path / "dropout"))
     def make(checkpoints=None):
         return Trainer(objective, optax.chain(optax.clip_by_global_norm(.5), optax.adam(.001)),
@@ -225,8 +229,8 @@ def test_nonfinite_optimizer_candidate_rolls_back_all_cpu_owned_fields():
     optimizer = optax.GradientTransformation(lambda params: optax.EmptyState(), update)
     results = []
     for layout in (DEVICE, HOST):
-        trainer = ShortScaleTrainer(Tiny(), optimizer, key=jax.random.PRNGKey(9),
-                                    dynamic_scale=True, layout=layout)
+        trainer = Trainer(Tiny(), optimizer, key=jax.random.PRNGKey(9),
+                                    dynamic_scale=SHORT_SCALE, layout=layout)
         initial, _, _ = trainer.place()
         data = batches()[0]
         # the step consumes the state
@@ -527,8 +531,8 @@ def test_a_cpu_owned_lora_run_loads_through_the_pipeline_in_a_fresh_process(tmp_
     checkpoints = Checkpoints(str(tmp_path / "run"))
     rows = [{"text": np.arange(1, 10, dtype=np.int32)} for _ in range(8)]
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST, checkpoints=checkpoints)
-    data = loader(RecordsData(source=rows), batch=jax.device_count(), loading=Loading(workers=0),
-                  read="memory")
+    data = Memory(rows).shuffle().repeat().batch(jax.device_count()).read("memory").loading(
+        Loading(workers=0))
     state = trainer.fit(data, steps=1, checkpoint_every=1, log_every=100)
     checkpoints.wait()
     assert any(group_layers(name) and len(group_layers(name)) > 1 for name in state.variables[FROZEN])
@@ -665,7 +669,7 @@ def test_a_shared_text_owner_sums_both_block_losses_through_one_bank(detached):
             scanned, prompt_length=4, num_canvases=2, variables=loaded.variables,
             stop_gradient_from_denoiser_to_encoder=detached)
 
-    (site,) = objective().bank_sites
+    (site,) = objective().bank_sites(loaded.variables)
     assert site.namespace == ("text",)
     resident = updated(objective(), batch, DEVICE, optimizer=optax.sgd(.001))
     host = updated(objective(), batch, HOST, optimizer=optax.sgd(.001))
@@ -725,6 +729,25 @@ def test_place_streams_the_held_tree_and_releases_each_source():
     )
 
 
+def test_a_tree_of_frozen_dicts_is_placed_as_a_tree_of_dicts_is():
+    """An objective given its tree as Flax `FrozenDict`s, as a loaded task holds one, holds it as
+    dicts: the placed arrays stream into it as they land and its frozen rows become the run's bank,
+    as a dict tree's do."""
+    model = decoder()
+    given = frozen_dict(freeze(
+        jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32))),
+        lambda path: path[-2:] == ("q_proj", "kernel")))
+    objective = LMObjective(model, 8, head_chunks=1, variables=given)
+    state, _, _ = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST).place()
+    held = objective.held_variables()
+    assert held is not None
+    for path, leaf in _named_leaves(held):
+        assert isinstance(leaf, jax.Array), path
+    bank = state.variables[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"]
+    assert held[FROZEN]["layers_0"]["mlp"]["gate_proj"]["kernel"] is bank
+    assert held[FROZEN]["layers_1"]["mlp"]["gate_proj"]["kernel"] is bank
+
+
 class _Scaled(DeviceStep):
     """A device step whose setting its repr leaves out, as a plain class's repr does."""
 
@@ -775,3 +798,59 @@ def test_a_later_run_of_one_objective_releases_the_device_steps_an_earlier_run_c
     _scaled_fit(shared, _Scaled(1.0))
     gc.collect()
     assert released() is None
+
+
+def test_a_tasks_held_weights_leave_the_callers_private_mapping_as_it_changed_it(tmp_path):
+    """A task's weights are placed into a tree of their own (`held`), so the caller's host arrays stay
+    as they were: a copy-on-write mapping's changed pages are not given back to the file they came from,
+    which would turn them back into the file's values."""
+    from dew.inference.tasks import held
+
+    path = tmp_path / "kernel.bin"
+    np.arange(4096, dtype=np.float32).tofile(path)
+    kernel = np.memmap(path, np.float32, mode="c", shape=(4096,))
+    kernel[:] = -1.0
+    placed = held({"params": {"kernel": kernel}})
+    np.testing.assert_array_equal(kernel, np.full(4096, -1.0, np.float32))
+    np.testing.assert_array_equal(np.asarray(placed["params"]["kernel"]), np.full(4096, -1.0, np.float32))
+
+
+def test_a_streamed_node_takes_the_one_target_its_placement_gives_it_whole():
+    """A placement may give a node of several arrays one sharding, as `jax.device_put` takes a prefix:
+    `stream` places each of the node's arrays there, read-only mappings of targets included, and the
+    tree the sources came from (`held`) is handed the placed node, so the two share one copy."""
+    import types
+
+    from dew.distributed.host import stream
+
+    sharding = NamedSharding(Mesh(np.asarray(jax.devices()[:1]), ("data",)), P())
+    pair = (np.arange(4, dtype=np.float32), np.ones((2, 3), np.float32))
+    held = {"params": {"kernel": pair}}
+    placed = stream({"params": {"kernel": pair}},
+                    types.MappingProxyType({"params": types.MappingProxyType({"kernel": sharding})}), held)
+    for got, want in zip(placed["params"]["kernel"], pair, strict=True):
+        assert isinstance(got, jax.Array) and got.sharding == sharding
+        np.testing.assert_array_equal(got, want)
+    assert held["params"]["kernel"] is placed["params"]["kernel"]
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_node_two_places_share_goes_to_each_places_own_target():
+    """A node held at two places of the tree it is streamed from, the tree also the one its sources
+    came from, lands at each place on that place's own target; and a held tree beside a tree whose
+    mapping is rebuilt (a defaultdict) is handed the placed node all the same."""
+    import collections
+
+    from dew.distributed.host import stream
+
+    first, second = (SingleDeviceSharding(device) for device in jax.devices()[:2])
+    pair = (np.arange(4, dtype=np.float32), np.ones((2, 3), np.float32))
+    state = {"params": {"first": pair, "second": pair}}
+    stream(state, {"params": {"first": first, "second": second}}, state)
+    for name, sharding in (("first", first), ("second", second)):
+        assert all(leaf.sharding == sharding for leaf in state["params"][name]), name
+
+    held = {"params": {"kernel": pair}}
+    placed = stream({"params": collections.defaultdict(dict, {"kernel": pair})},
+                    {"params": {"kernel": first}}, held)
+    assert held["params"]["kernel"] is placed["params"]["kernel"]

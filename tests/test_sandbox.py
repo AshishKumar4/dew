@@ -10,37 +10,18 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from episode_support import (
-    CALL_THREE,
-    EOS,
-    GROUPS,
-    IDENTITY,
-    NINE,
-    PROMPT,
-    START,
-    action,
-    build,
-    collect,
-    environment,
-    verify,
-)
+from episode_support import IDENTITY, action, build, environment, trained_batch, verify
+from process_support import running
+from tool_policy import CALL_THREE, EOS, GROUPS, NINE, PROMPT, START
 
 from dew.objectives.rl import EpisodeStatus
 
 
-def alive(pid):
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    return True
-
-
 def wait_gone(pids, seconds=5.):
     deadline = time.monotonic() + seconds
-    while any(alive(pid) for pid in pids) and time.monotonic() < deadline:
+    while any(running(pid) for pid in pids) and time.monotonic() < deadline:
         time.sleep(.02)
-    return [pid for pid in pids if alive(pid)]
+    return [pid for pid in pids if running(pid)]
 
 
 def test_worker_round_trip_and_process_group_cleanup():
@@ -49,7 +30,7 @@ def test_worker_round_trip_and_process_group_cleanup():
         initial = session.reset()
         assert initial.context == (START,) and initial.status == EpisodeStatus.RUNNING
         pids = json.loads(initial.detail)
-        assert len(pids) == 2 and all(alive(pid) for pid in pids)
+        assert len(pids) == 2 and all(running(pid) for pid in pids)
         after_call = session.step(action(initial.context, CALL_THREE, EOS))
         assert after_call.context == (START, CALL_THREE, EOS, NINE)
         final = session.step(action(after_call.context, 5, EOS))
@@ -73,7 +54,7 @@ def test_parent_death_kills_the_worker(tmp_path):
                               env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")})
     assert parent.stdout is not None
     worker = int(parent.stdout.readline())
-    assert alive(worker)
+    assert running(worker)
     parent.send_signal(signal.SIGKILL)
     parent.wait()
     assert wait_gone([worker]) == []
@@ -82,14 +63,14 @@ def test_parent_death_kills_the_worker(tmp_path):
 def test_episodes_collect_through_subprocess_workers():
     """The rollout collects a cohort from real workers and scores it."""
     harness = environment()
-    trainer, rollout = build(harness)
+    episodes = []
+    trainer, collector = build(harness, record=episodes.append)
     state = trainer.initial_state()
-    episodes = collect(rollout, state)
+    batch = trained_batch(collector, state)
     assert len(episodes) == GROUPS
     assert {episode.status for episode in episodes} <= {EpisodeStatus.COMPLETED, EpisodeStatus.TRUNCATED}
     assert {verify(episode) for episode in episodes} <= {-1., 0., 1.}
-    batch = rollout.project(episodes)
-    assert batch["input_ids"].shape[1] == PROMPT + rollout.max_new_tokens
+    assert batch["input_ids"].shape[1] == PROMPT + collector.max_new_tokens
     assert np.isfinite(batch["advantages"]).all()
 
 

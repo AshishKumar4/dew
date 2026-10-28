@@ -8,9 +8,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dew.batch import Batch
 from dew.data.pipeline import Dataset
 
-from ..dataset import Batch, Records, describe
+from ..dataset import Records, describe
 from .base import Read, ShardManifest, _indexed_manifest
 
 if TYPE_CHECKING:
@@ -82,7 +83,11 @@ class Torch(Dataset):
     dataset: TorchDataset
     fields: tuple[str, ...] | None = None
     identity: str | None = None
-    facts: Mapping[str, object] | None = None
+    known: Mapping[str, object] | None = None
+    """Facts of its records the caller states, which its metadata and `Dataset.facts` carry."""
+
+    def stated(self) -> Mapping[str, object]:
+        return dict(self.known or {})
 
     def label(self) -> str:
         return self.identity or "torch"
@@ -110,10 +115,10 @@ class Torch(Dataset):
     def manifest(self) -> ShardManifest:
         """The map-style records as a stream of consecutive index ranges (`_indexed_manifest`), as a
         memory source streams."""
-        return _indexed_manifest(self, "torch", self.describe(), 1024)
+        return _indexed_manifest(self, self.describe(), 1024)
 
     def metadata(self) -> Mapping[str, object]:
-        return {**(self.facts or {}), "rows": len(self.records("indexed"))}
+        return {**(self.known or {}), "rows": len(self.records("indexed"))}
 
     def lengths(self) -> np.ndarray | None:
         return None

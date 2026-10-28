@@ -23,7 +23,7 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping
 
-from dew import records
+from dew import _records
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
@@ -59,10 +59,10 @@ _DEFAULTS = {'vocab_size': 131072, 'hidden_size': 2560, 'num_hidden_layers': 72,
 def _layer_types(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:
     """Each layer's kind, the stated ones or DoryConfig's default pattern (configs/dory.py:41-49):
     an attention, sliding or full, or an MLP, as DoryConfig validates them (configs/dory.py:63-74)."""
-    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     stated = hf_config.get('layer_types')
     used.add('layer_types')
-    types = (tuple(records.strings(stated, 'layer_types')) if stated is not None else tuple(
+    types = (tuple(_records.strings(stated, 'layer_types')) if stated is not None else tuple(
         'mlp' if index % 2 else 'full_attention' if index % 8 == 6 else 'sliding_attention'
         for index in range(layers)))
     if len(types) != layers:
@@ -80,21 +80,21 @@ def _rope(hf_config: Mapping[str, object], kinds: tuple[str, ...], used: set[str
     DoryConfig requires (configs/dory.py:114-137), and a stated set names every attention kind and
     no other."""
     stated = hf_config.get('rope_parameters')
-    parameters = records.record(stated or {}, 'rope_parameters')
+    parameters = _records.record(stated or {}, 'rope_parameters')
     missing, unknown = sorted(set(kinds) - set(parameters)), sorted(set(parameters) - set(_SUBLAYERS))
     if stated is not None and (missing or unknown):
         refuse(f'rope_parameters without {missing} or with {unknown}',
                'Dory reads one rope record per attention kind, sliding or full')
     plain, factors = {}, {}
     for kind, entry in parameters.items():
-        entry = dict(records.record(entry, f'rope_parameters.{kind}'))
-        factor = records.number(entry.pop('partial_rotary_factor', 1.0),
+        entry = dict(_records.record(entry, f'rope_parameters.{kind}'))
+        factor = _records.number(entry.pop('partial_rotary_factor', 1.0),
                                 f'rope_parameters.{kind} partial_rotary_factor')
         if not 0.0 < factor <= 1.0:
             refuse(f'rope_parameters.{kind} partial_rotary_factor {factor}',
                    'a fraction of the head in (0, 1]')
         plain[kind], factors[kind] = entry, factor
-    ropes = read_rope({**hf_config, 'rope_parameters': plain or None}, used, None, _SPELLING, ramps=())
+    ropes = read_rope({**hf_config, 'rope_parameters': plain or None}, used, _SPELLING, ramps=())
     return ropes, factors
 
 
@@ -104,26 +104,26 @@ def _dory_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFiel
     (configs/dory.py:39-133)."""
     types = _layer_types(hf_config, used)
     layers = len(types)
-    first = records.integer(hf_config['n_input_layers'], 'n_input_layers')
-    outputs = records.integer(hf_config['n_output_layers'], 'n_output_layers')
+    first = _records.integer(hf_config['n_input_layers'], 'n_input_layers')
+    outputs = _records.integer(hf_config['n_output_layers'], 'n_output_layers')
     given = hf_config['n_recurrent_layers']
-    recurrent = layers - first - outputs if given is None else records.integer(given, 'n_recurrent_layers')
+    recurrent = layers - first - outputs if given is None else _records.integer(given, 'n_recurrent_layers')
     if min(first, recurrent, outputs) < 0 or first + recurrent + outputs != layers:
         refuse(f'n_input_layers {first}, n_recurrent_layers {recurrent}, n_output_layers {outputs}',
                f'they partition the {layers} layers')
-    loops = records.integer(hf_config['n_recurrent_loops'], 'n_recurrent_loops')
-    mode = records.text(hf_config['recurrent_kv_cache_mode'], 'recurrent_kv_cache_mode')
+    loops = _records.integer(hf_config['n_recurrent_loops'], 'n_recurrent_loops')
+    mode = _records.text(hf_config['recurrent_kv_cache_mode'], 'recurrent_kv_cache_mode')
     if mode not in ('per_loop', 'last_loop'):
         refuse(f'recurrent_kv_cache_mode {mode!r}', "Dory caches 'per_loop' or 'last_loop'")
     if loops < 1:
         refuse(f'n_recurrent_loops {loops}', 'a loop runs its block at least once')
-    std = records.number(hf_config['initializer_range'], 'initializer_range')
+    std = _records.number(hf_config['initializer_range'], 'initializer_range')
     if std <= 0:
         refuse(f'initializer_range {std}', "nGPT's gains divide by it")
-    alpha = records.number(hf_config['ngpt_alpha_init'], 'ngpt_alpha_init')
+    alpha = _records.number(hf_config['ngpt_alpha_init'], 'ngpt_alpha_init')
     stated_gate = hf_config['attention_output_gate_logit_scale_init']
     gate = (None if stated_gate is None
-            else records.number(stated_gate, 'attention_output_gate_logit_scale_init'))
+            else _records.number(stated_gate, 'attention_output_gate_logit_scale_init'))
     used.update(('n_input_layers', 'n_recurrent_layers', 'n_output_layers', 'n_recurrent_loops',
                  'recurrent_kv_cache_mode', 'initializer_range', 'ngpt_alpha_init',
                  'attention_output_gate_logit_scale_init'))
@@ -176,7 +176,7 @@ _LAYER = re.compile(r'backbone\.layers\.(\d+)\.(.+)')
 
 def _sublayer(index: int, config: Mapping[str, object]) -> dict[str, tuple[str, ...]]:
     """Layer `index`'s tensors by their paths: an MLP's or an attention's, as its kind says."""
-    kind = records.strings(config['layer_types'], 'layer_types')[index]
+    kind = _records.strings(config['layer_types'], 'layer_types')[index]
     return _MLP if kind == 'mlp' else _ATTENTION
 
 

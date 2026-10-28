@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.decision import DecisionInputs, Encoded, LayaCheckpoint, MarkerLayout, Question
+from dew.decision import Decide, DecisionInputs, Encoded, Question
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
 TINY = FIXTURES / "tiny"
@@ -21,9 +21,10 @@ def cases() -> dict:
     return json.loads((FIXTURES / "cases.json").read_text())
 
 
-def rows(checkpoint: LayaCheckpoint, *, parallel: bool):
+def rows(checkpoint: Decide, *, parallel: bool):
     """Every question of every case, laid out by Dew, keyed as the fixture keys them."""
-    layout = MarkerLayout(checkpoint.layout.max_len, checkpoint.layout.head_max_len, parallel=parallel)
+    # The release's layout, its budgets as it states them, in each option order.
+    layout = replace(checkpoint.layout, parallel=parallel)
     name = "parallel" if parallel else "sequential"
     for case, request in cases().items():
         state = layout.state(checkpoint.tokenizer, checkpoint.specials, request["state"])
@@ -39,7 +40,7 @@ def test_the_marker_layout_lays_out_what_laya_does(parallel):
     """Token for token, marker for marker: instructions cut to the option
     budget, options cut evenly past it, a conversation keeping its end, the
     marker text cut out of what the caller wrote, and the parallel positions."""
-    checkpoint = LayaCheckpoint.load(TINY)
+    checkpoint = Decide.from_pretrained(TINY)
     expected = json.loads((TINY / "layouts.json").read_text())
     for key, _, encoded in rows(checkpoint, parallel=parallel):
         assert list(encoded.tokens) == expected[key]["ids"], key
@@ -54,7 +55,7 @@ def markers(encoded: Encoded) -> list[int]:
     return [start for start, _ in encoded.questions[0].options]
 
 
-def logits(checkpoint: LayaCheckpoint, *, parallel: bool) -> dict[str, np.ndarray]:
+def logits(checkpoint: Decide, *, parallel: bool) -> dict[str, np.ndarray]:
     """Each question's option logits, one row per question as Laya runs them."""
     found = {}
     for key, _, encoded in rows(checkpoint, parallel=parallel):
@@ -67,7 +68,7 @@ def logits(checkpoint: LayaCheckpoint, *, parallel: bool) -> dict[str, np.ndarra
 def test_laya_logits_match_laya_under_the_float64_rule(parallel):
     """Every case's option logits, sequential and parallel, held to twice
     Laya's own fp32 distance from its float64 run."""
-    checkpoint = LayaCheckpoint.load(TINY, attention_impl="xla")
+    checkpoint = Decide.from_pretrained(TINY, attention_impl="xla")
     found = logits(checkpoint, parallel=parallel)
     with np.load(TINY / "logits.npz") as reference:
         keys = sorted(found)
@@ -80,7 +81,7 @@ def test_laya_logits_match_laya_under_the_float64_rule(parallel):
 def test_the_rule_catches_a_head_that_ignores_the_question_type():
     """The type embedding is the only place a choice and a noul differ in
     the head; dropping it moves the logits past the rule."""
-    checkpoint = LayaCheckpoint.load(TINY, attention_impl="xla")
+    checkpoint = Decide.from_pretrained(TINY, attention_impl="xla")
     with np.load(TINY / "logits.npz") as reference:
         found = {}
         for key, _, encoded in rows(checkpoint, parallel=False):
@@ -100,7 +101,7 @@ def test_padded_rows_score_as_they_do_alone():
     the encoder's nor the head's attention, so the batch is held to Laya's
     one-row runs under the same rule, and a short row's missing options
     score -inf."""
-    checkpoint = LayaCheckpoint.load(TINY, attention_impl="xla")
+    checkpoint = Decide.from_pretrained(TINY, attention_impl="xla")
     laid = list(rows(checkpoint, parallel=False))
     inputs = DecisionInputs.collate([encoded for _, _, encoded in laid], checkpoint.specials.pad)
     batched = np.asarray(checkpoint.model.logits(checkpoint.variables, inputs))[:, 0]
@@ -128,11 +129,11 @@ def test_the_released_english_checkpoint_matches_laya():
     reductions carry through 28 layers."""
     source = json.loads((FIXTURES / "real" / "source.json").read_text())
     with jax.default_matmul_precision("highest"):
-        checkpoint = LayaCheckpoint.load(source["repo"], revision=source["revision"], attention_impl="xla")
+        checkpoint = Decide.from_pretrained(source["repo"], revision=source["revision"], attention_impl="xla")
         compare_released(checkpoint)
 
 
-def compare_released(checkpoint: LayaCheckpoint) -> None:
+def compare_released(checkpoint: Decide) -> None:
     expected = json.loads((FIXTURES / "real" / "layouts.json").read_text())
     for parallel in (False, True):
         for key, _, encoded in rows(checkpoint, parallel=parallel):

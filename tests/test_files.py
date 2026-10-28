@@ -6,7 +6,7 @@ import stat
 
 import pytest
 
-from dew.files import replacing, staged, write_atomically
+from dew.files import published, replacing, staged, write_atomically
 
 
 def test_a_write_that_fails_leaves_the_old_file_and_no_temporary(tmp_path):
@@ -68,3 +68,28 @@ def test_what_is_published_has_the_mode_a_plain_write_gives(tmp_path):
         os.umask(previous)
     modes = {path.name: stat.S_IMODE(path.stat().st_mode) for path in tmp_path.iterdir()}
     assert modes == {"run.json": 0o640, "ledger.json": 0o644, "entry": 0o755, "plain": 0o644}
+
+
+def test_a_file_whose_name_is_the_longest_the_filesystem_allows_is_published(tmp_path):
+    """The temporary beside a target is named apart from the target's own name, so a target whose name
+    is as long as the directory allows (NAME_MAX) is still written, and so is such a directory."""
+    longest = os.pathconf(tmp_path, "PC_NAME_MAX")
+    write_atomically(tmp_path / ("f" * longest), "whole")
+    assert (tmp_path / ("f" * longest)).read_text() == "whole"
+    with staged(tmp_path / ("d" * longest)) as staging:
+        (staging / "inside").write_text("whole")
+    assert (tmp_path / ("d" * longest) / "inside").read_text() == "whole"
+
+
+def test_a_built_directory_published_second_leaves_the_first_whole(tmp_path):
+    """Two writers build the same directory apart and publish it by one rename each: the first's
+    stands whole, and the second's is removed, not merged into it or moved inside it."""
+    directory = tmp_path / "published"
+    for writer in ("first", "second"):
+        built = tmp_path / f"built-{writer}"
+        built.mkdir()
+        (built / "who").write_text(writer)
+        assert published(built, directory) == (writer == "first")
+        assert not built.exists()
+    assert sorted(path.name for path in directory.iterdir()) == ["who"]
+    assert (directory / "who").read_text() == "first"

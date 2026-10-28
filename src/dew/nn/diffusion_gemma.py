@@ -11,35 +11,30 @@ zero signal.
 
 from __future__ import annotations
 
-import functools
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Self
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike, VariableDict
 
-from dew.interop.weights import ParamTree, translate_parameters
-from dew.nn.activations import gated_product
+from dew.interop.unread import Stored
+from dew.interop.weights import Tree, translate_parameters
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_stack import DecoderBank
-from dew.nn.dense import Dense
+from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS
+from dew.nn.mlp import GatedMLP
 from dew.nn.multimodal import VisionConditioner
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_einsum
 from dew.nn.protocols import OutputTable
-
-if TYPE_CHECKING:
-    from dew.nn.backbones.decoder_block import RematPolicy
-    from dew.nn.kv_cache import KVCache
-    from dew.records import JSON
+from dew.nn.wrapping import DecoderWrapper
 
 
 # The layers follow Transformers' modeling_diffusion_gemma.py:790-823.
 class SelfConditioning(nn.Module):
-    """Folds the previous step's soft embeddings into the canvas embeddings."""
+    """Folds the previous step's soft embeddings into the canvas embeddings: a GeGLU feed-forward
+    (`GatedMLP`, its gate, up and down projections at this module's own scope) of the normed signal,
+    added to the embeddings and normed again."""
 
     hidden_size: int
     intermediate_size: int
@@ -53,16 +48,12 @@ class SelfConditioning(nn.Module):
         self.post_norm = RMSNorm(
             epsilon=self.norm_eps, with_scale=False, dtype=self.dtype,
             name="post_norm")
-        dense = functools.partial(Dense, use_bias=False,
-                                  dtype=self.dtype, precision=self.precision)
-        self.gate_proj = dense(self.intermediate_size, name="gate_proj")
-        self.up_proj = dense(self.intermediate_size, name="up_proj")
-        self.down_proj = dense(self.hidden_size, name="down_proj")
+        self.feed_forward = GatedMLP(hidden_features=self.intermediate_size, out_features=self.hidden_size,
+                                     activation='geglu', dtype=self.dtype, precision=self.precision)
+        nn.share_scope(self, self.feed_forward)
 
     def __call__(self, inputs_embeds, signal):
-        normed = self.pre_norm(signal)
-        gated = self.down_proj(gated_product('geglu')(self.gate_proj(normed), self.up_proj(normed)))
-        return self.post_norm(inputs_embeds + gated)
+        return self.post_norm(inputs_embeds + self.feed_forward(self.pre_norm(signal)))
 
 
 def soft_embeddings(logits: jax.typing.ArrayLike, embed_weight: jax.typing.ArrayLike,
@@ -77,11 +68,12 @@ def soft_embeddings(logits: jax.typing.ArrayLike, embed_weight: jax.typing.Array
     logits = jnp.asarray(logits)
     wide = at_least_fp32(logits.dtype)
     probs = jax.nn.softmax(logits.astype(wide), axis=-1)
-    return jnp.einsum('...v,vd->...d', probs, jnp.asarray(embed_weight),
-                      preferred_element_type=wide) * jnp.asarray(scale, wide)
+    table = jnp.asarray(embed_weight)
+    mixed = float32_einsum('...v,vd->...d', probs, table, preferred_element_type=wide)
+    return mixed * jnp.asarray(scale, wide)
 
 
-class DiffusionGemma(nn.Module):
+class DiffusionGemma(DecoderWrapper):
     """Reads one text parameter tree causally for the context and bidirectionally for canvases.
 
     ``encode`` appends clean tokens to the cache. ``__call__`` refines a canvas
@@ -90,7 +82,12 @@ class DiffusionGemma(nn.Module):
     through the same causal encoder over the whole sequence, with no cache.
     Each method is a separate apply. The encoder and the decoder share one
     scope, so their parameters are identical and no second tree is stored.
+    The training and cache hooks are its text model's (`DecoderWrapper`), which the decoder
+    clones: the decoder shares text's scope, another reader, not another bank, and `causal` is
+    the encoder's, which `setup` holds causal.
     """
+
+    wraps = "text"
 
     text: CausalTransformer
     canvas_length: int
@@ -109,44 +106,12 @@ class DiffusionGemma(nn.Module):
             norm_eps=self.text.norm_eps, dtype=self.text.dtype, precision=self.text.precision)
 
     @property
-    def vocab_size(self) -> int:
-        return self.text.vocab_size
-
-    @property
-    def bank_sites(self) -> tuple[DecoderBank, ...]:
-        # decoder shares text's scope; it is another reader, not another bank.
-        return tuple(DecoderBank(("text", *site.namespace), site.view, site.scanned)
-                     for site in self.text.bank_sites)
-
-    @property
-    def max_seq_len(self) -> int:
-        return self.text.max_seq_len
-
-    @property
-    def emb_features(self) -> int:
-        return self.text.emb_features
-
-    @property
     def dtype(self) -> Dtype | None:
         return self.text.dtype
 
     @property
     def precision(self) -> PrecisionLike:
         return self.text.precision
-
-    @property
-    def final_logit_softcap(self) -> float | None:
-        return self.text.final_logit_softcap
-
-    @property
-    def causal(self) -> bool:
-        """Whether `hidden_states` attend causally: they are the encoder's,
-        which `setup` holds causal."""
-        return self.text.causal
-
-    @property
-    def mask_token_id(self) -> int | None:
-        return self.text.mask_token_id
 
     def with_trainable_layer_scalars(self) -> DiffusionGemma:
         """Return this model with its layer scalars as parameters, the model the published SFT trains.
@@ -174,10 +139,11 @@ class DiffusionGemma(nn.Module):
         if self.text.layer_scalar != "frozen":
             raise ValueError(f"layer_scalar is {self.text.layer_scalar!r}, so this model's tree holds "
                              f"no layer scalars to move")
+        trainable, frozen = LAYER_SCALAR_COLLECTIONS["trainable"], LAYER_SCALAR_COLLECTIONS["frozen"]
         values = dict(variables)
-        params = dict(values["params"])
+        params = dict(values[trainable])
         text = dict(params["text"])
-        constants = dict(values["constants"])
+        constants = dict(values[frozen])
         text_constants = dict(constants["text"])
         for index in range(self.text.num_layers):
             layer = f"layers_{index}"
@@ -192,75 +158,22 @@ class DiffusionGemma(nn.Module):
             else:
                 del text_constants[layer]
         params["text"] = text
-        values["params"] = params
+        values[trainable] = params
         if text_constants:
             constants["text"] = text_constants
         else:
             del constants["text"]
         if constants:
-            values["constants"] = constants
+            values[frozen] = constants
         else:
-            del values["constants"]
+            del values[frozen]
         return values
 
     def init_cache(self, batch_size: int):
         self.text.init_cache(batch_size)
 
-    # The training and cache hooks (`dew.nn.protocols`), its text model's,
-    # which the decoder clones.
-
-    @nn.nowrap
-    def with_cache_capacity(self, capacity: int) -> Self:
-        return self.clone(text=self.text.with_cache_capacity(capacity))
-
-    @property
-    def kv_cache(self) -> KVCache:
-        return self.text.kv_cache
-
-    @nn.nowrap
-    def with_kv_cache(self, layout: KVCache) -> Self:
-        return self.clone(text=self.text.with_kv_cache(layout))
-
-    @nn.nowrap
-    def projected(self, params, *, updated: bool):
-        """The text decoder's projection of its own parameters (`ProjectsParameters`)."""
-        if 'text' not in params:
-            return params
-        return {**params, 'text': self.text.projected(params['text'], updated=updated)}
-
-    @nn.nowrap
-    def generation_refusal(self) -> str | None:
-        return self.text.generation_refusal()
-
-    @nn.nowrap
-    def with_remat(self, policy: RematPolicy | None) -> Self:
-        """Choose the shared text decoder's layer policy."""
-        return self.clone(text=self.text.with_remat(policy))
-
-    @nn.nowrap
-    def recompute_record(self) -> JSON:
-        return self.text.recompute_record()
-
-    @nn.nowrap
-    def recompute_more(self) -> Self | None:
-        text = self.text.recompute_more()
-        return None if text is None else self.clone(text=text)
-
-    @nn.nowrap
-    def recompute_half(self) -> Self | None:
-        text = self.text.recompute_half()
-        return None if text is None else self.clone(text=text)
-
-    @nn.nowrap
-    def restore_recompute(self, record: JSON) -> Self:
-        return self.clone(text=self.text.restore_recompute(record))
-
-    @property
-    def keeps_triton_gemm(self) -> bool:
-        return self.text.keeps_triton_gemm
-
     def encode(self, tokens, *, positions=None, segment_ids=None, image_indices=None,
-               attention_mask=None, image_groups=None, rotary_positions=None,
+               attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                attention_pairwise_mask=None, attention_key_positions=None,
                conditioning: Mapping[str, jax.Array] | None = None, train: bool = False,
                states: bool = False):
@@ -276,7 +189,7 @@ class DiffusionGemma(nn.Module):
         return read(tokens, decode=True, train=train, positions=positions,
                     segment_ids=segment_ids, input_embeddings=embeddings,
                     attention_mask=attention_mask,
-                    image_groups=image_groups, rotary_positions=rotary_positions,
+                    image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
                     attention_pairwise_mask=attention_pairwise_mask,
                     attention_key_positions=attention_key_positions)
 
@@ -354,8 +267,8 @@ class DiffusionGemma(nn.Module):
 
 
 def translate_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> ParamTree:
+    hf_tensors: Mapping[str, Stored], *, param_dtype: str = "float32"
+) -> Tree[Stored]:
     """Self-conditioning parameters, cast per weight before the layout copy."""
     paths = {
         "pre_norm.weight": ("pre_norm", "scale"),

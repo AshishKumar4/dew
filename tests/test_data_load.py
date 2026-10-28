@@ -1,4 +1,6 @@
-"""Named data and run specs read the same chains, with disjoint default holdouts."""
+"""Hub, TFDS and file stores read through `compile`: a Hub split prepared at its pinned revision
+when provisioned and left unprepared when a read is refused, and holdouts that keep each record on
+one side."""
 
 import itertools
 import shutil
@@ -8,16 +10,23 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from hub_support import native_builder
-from token_support import write_token_corpus
 
-from dew.config.data import HoldOut, ImageData, RecordsData, TextData
-from dew.data import TFDS, Hub, Loading, Memory, load, presets
+from dew.data import TFDS, Hub, Loading, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
-from dew.objectives.base import VALID_ROWS
+from dew.data.pipeline import Pipeline
 
 FIXTURES = Path(__file__).parent / "fixtures"
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
+
+
+def run(source, *, held=256, batch=8, seed=0, read="indexed", provision=False):
+    """`source` with its first `held` records held out to validate on and the rest as a run reads
+    them: shuffled by `seed`, in windows of 64 where streamed, repeated, in batches of `batch`."""
+    train, scored = Pipeline(source).holdout(records=held)
+    order = train.shuffle(seed, window=64 if read == "streamed" else None).repeat()
+    return compile(order.batch(batch), validation=scored.batch(batch), read=read, seed=seed, loading=READ,
+                   provision=provision)
 
 
 def batches(data, *, held=False):
@@ -25,24 +34,12 @@ def batches(data, *, held=False):
     assert reader is not None
     stream = reader(DataPartition())
     try:
-        taken = list(itertools.islice(stream, 1000 if held else data.records // data.batch))
+        taken = list(itertools.islice(stream, 1000 if held else data.steps_per_epoch))
         if held:
             assert next(stream, None) is None
         return taken
     finally:
         stream.close()
-
-
-def documents(rows):
-    found = set()
-    for batch in rows:
-        kept = batch.get(VALID_ROWS, np.ones(len(batch["text"]), bool))
-        laid = np.asarray(batch["text_coordinates"].segments)
-        for tokens, segments in zip(batch["text"][kept], laid[kept], strict=True):
-            for segment in np.unique(segments):
-                if segment:
-                    found.add(bytes(tokens[segments == segment][:-1].tolist()))
-    return found
 
 
 @pytest.fixture
@@ -79,11 +76,11 @@ def hub(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("revision", [None, "release"])
-def test_named_hub_records_prepare_the_pinned_split_and_hold_out_its_first_256(hub, revision):
+def test_hub_records_prepare_the_pinned_split_and_hold_out_its_first_256(hub, revision):
     builders, _ = hub
     pinned = "frozen-release" if revision else "frozen-default"
     assert not Path(builders[pinned].cache_dir, "dataset_info.json").exists()
-    data = load("hf/acme/simple" + ("@release" if revision else ""), batch=8, seed=19, loading=READ)
+    data = run(Hub("acme/simple", revision=revision), seed=19, read="memory", provision=True)
     assert Path(builders[pinned].cache_dir, "dataset_info.json").exists()
     assert data.records == data.held_out == 256
     train = [int(index) for batch in batches(data) for index in batch["id"]]
@@ -94,31 +91,16 @@ def test_named_hub_records_prepare_the_pinned_split_and_hold_out_its_first_256(h
     assert set(train).isdisjoint(held)
 
 
-@pytest.mark.parametrize("options", [{"seq_len": 127}, {"tokenizer": "byte"}])
-@pytest.mark.parametrize("named", [True, False])
-def test_text_forms_pack_each_document_on_only_one_side_of_the_default_holdout(hub, options, named):
-    _, texts = hub
-    source = Hub("acme/simple")
-    data = load("hf/acme/simple" if named else source, batch=1, loading=READ, **options)
-    train, held = source.holdout(0.01)
-    reference = compile(presets.lm(train, "byte", seq_len=options.get("seq_len", 256), batch=1),
-                        validation=presets.lm(held, "byte", seq_len=options.get("seq_len", 256), batch=1),
-                        read="memory", loading=READ)
-    trained, scored = documents(batches(data)), documents(batches(data, held=True))
-    assert trained and scored and trained.isdisjoint(scored)
-    assert trained | scored == {text.encode() for text in texts["frozen-default"]}
-    assert trained == documents(batches(reference))
-    assert scored == documents(batches(reference, held=True))
-    assert all(batch["text"].shape[1] == options.get("seq_len", 256) + 1 for batch in batches(data))
-
-
 RACE = """
-import io, sys, threading
-from datasets.utils.tqdm import tqdm as bars
+import importlib, io, sys, threading
 from tqdm.contrib.concurrent import thread_map
-if sys.argv[1] == "held":
+bars = importlib.import_module(sys.argv[2]).tqdm
+if sys.argv[1] == "read":
     from dew.data.sources.hub import hold_progress_lock
     hold_progress_lock()
+if sys.argv[1] == "listing":
+    from dew.data.sources.hub import split_files
+    split_files(["data/train-00000.parquet"], "train")
 started, opened, failures = threading.Event(), threading.Event(), []
 def other():
     started.wait()
@@ -138,142 +120,63 @@ closer = threading.Thread(target=other)
 closer.start(); mapped.start(); closer.join()
 print(failures)
 """
-"""A `datasets` bar opened while another thread reads shards through tqdm's thread_map, as `datasets` reads
-a split's Arrow shards, and closed once the map has ended, in a fresh interpreter: before any read or after
-the lock a Hub read holds (`hold_progress_lock`)."""
+"""A bar of the class `sys.argv[2]` names, opened while another thread maps shards through tqdm's
+thread_map with that class, as `datasets` reads or prepares a split's shards and resolves a listing's
+files, and closed once the map has ended, in a fresh interpreter: before any Hub call, or after a Hub
+read (`hold_progress_lock`) or a listing's discovery (`split_files`)."""
 
 
-def test_a_bar_alive_across_another_threads_shard_read_closes_once_a_hub_read_holds_the_lock():
-    """`datasets`' thread_map deletes its bar class's lock under a bar of another thread's read that outlives
-    the map, as two splits read at once do; after a Hub read holds the class's lock, the map restores it
-    and the bar closes."""
+@pytest.mark.parametrize("bars", ["datasets.utils.tqdm", "tqdm.auto"], ids=["datasets", "auto"])
+@pytest.mark.parametrize("call", ["read", "listing"])
+def test_a_bar_alive_across_another_threads_shard_read_closes_once_a_hub_call_holds_the_lock(call, bars):
+    """tqdm's thread_map deletes its bar class's lock under a bar of another thread's map that outlives
+    it, as two splits read at once, or two streamed sources discovered at once, do; after a Hub read or
+    a listing's discovery, a lock tqdm's class holds is the one every map's class finds, so the map
+    restores it and the bar closes, whichever class `datasets` lends it: its own for a listing's files
+    and a split's shards, tqdm's default for a prepared split's."""
     import subprocess
     import sys
 
     def race(mode: str) -> str:
-        return subprocess.run([sys.executable, "-c", RACE, mode], capture_output=True, text=True,
+        return subprocess.run([sys.executable, "-c", RACE, mode, bars], capture_output=True, text=True,
                               check=True).stdout.strip()
 
     assert race("bare") != "[]"
-    assert race("held") == "[]"
+    assert race(call) == "[]"
 
 
 def test_a_refused_read_and_disabled_provisioning_leave_the_hub_cache_unprepared(hub):
     builders, _ = hub
     for options in ({"read": "streamed"}, {"read": "memory", "provision": False}):
         with pytest.raises(ValueError):
-            load("hf/acme/simple", batch=8, loading=READ, **options)
+            run(Hub("acme/simple"), **options)
         assert not Path(builders["frozen-default"].cache_dir, "dataset_info.json").exists()
-    data = load("hf/acme/simple", batch=8, read="memory", loading=READ)
+    data = run(Hub("acme/simple"), read="memory", provision=True)
     assert data.plan.order["read"] == "memory"
     assert sorted(int(value) for batch in batches(data) for value in batch["id"]) == list(range(256, 512))
 
 
-@pytest.mark.parametrize("name", ["records", "acme/simple", "hf/", "hf/@release", "hf/acme/simple@",
-                                  "hf://datasets/acme/simple", "tfds/", "tfds/dew_images:",
-                                  "tfds://dew_images", "data/train.jsonl"])
-def test_other_names_are_refused_before_reading_a_source(name):
-    with pytest.raises(ValueError):
-        load(name, batch=1)
-
-
 @pytest.mark.parametrize("version", [None, "1.0.0"])
-def test_named_tfds_reads_the_prepared_fixture_and_refuses_an_oversized_holdout(tmp_path, monkeypatch,
-                                                                           version):
+def test_tfds_reads_the_prepared_split_in_dews_cache_and_refuses_a_version_it_lacks(tmp_path, monkeypatch,
+                                                                                   version):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     directory = tmp_path / "cache" / "dew" / "tfds" / "dew_images" / "1.0.0"
     shutil.copytree(FIXTURES / "tfds" / "dew_images" / "1.0.0", directory)
-    with pytest.raises(ValueError):
-        load("tfds/dew_images" + (":" + version if version else ""), batch=4, loading=READ,
-             provision=False)
     source = TFDS("dew_images", version=version)
     assert source.metadata()["rows"] == 16
-    data = RecordsData(source, validation=HoldOut(records=4)).load(batch=4, read="memory", loading=READ)
+    data = run(source, held=4, batch=4, read="memory")
     train = [int(image[0, 0, 0]) for batch in batches(data) for image in batch["image"]]
     held = [int(image[0, 0, 0]) for batch in batches(data, held=True) for image in batch["image"]]
     assert sorted(train) == list(range(14, 26)) and held == list(range(10, 14))
     assert set(train).isdisjoint(held)
     with pytest.raises((FileNotFoundError, ValueError)):
-        load("tfds/dew_images:2.0.0", batch=4, loading=READ, provision=False)
+        run(TFDS("dew_images", version="2.0.0"), batch=4, read="memory")
 
 
-def test_a_dataset_keeps_its_steps_while_its_record_default_is_held_out():
-    source = Memory([{"id": index} for index in range(320)]).map(
-        lambda row: {"id": row["id"], "twice": 2 * row["id"]})
-    data = load(source, batch=8, loading=READ, provision=False)
-    train, held = batches(data), batches(data, held=True)
-    trained = {int(value) for batch in train for value in batch["id"]}
-    scored = {int(value) for batch in held for value in batch["id"]}
-    assert trained == set(range(256, 320)) and scored == set(range(256))
-    assert trained.isdisjoint(scored)
-    for batch in train + held:
-        np.testing.assert_array_equal(batch["twice"], 2 * batch["id"])
-
-
-def draw(row, rng):
-    return {**row, "draw": rng.integers(2**16)}
-
-
-def test_load_keeps_an_indexed_datasets_random_draws_and_resumed_position_at_the_requested_seed():
-    source = Memory([{"id": index} for index in range(320)]).random_map(draw)
-    options = {"batch": 8, "read": "indexed", "seed": 37, "loading": READ}
-    data = load(source, **options)
-    train, held = source.holdout(records=256)
-    reference = compile(train.batch(8), validation=held.batch(8), read="indexed", seed=37, loading=READ)
-    actual, expected = data.train(DataPartition()), reference.train(DataPartition())
-    changed = load(source, **{**options, "seed": 38}).train(DataPartition())
-    try:
-        first = next(actual)
-        np.testing.assert_array_equal(first["draw"], next(expected)["draw"])
-        assert not np.array_equal(first["draw"], next(changed)["draw"])
-        saved = actual.get_state()
-        following = next(actual)
-        resumed = load(source, **options).train(DataPartition())
-        try:
-            resumed.set_state(saved)
-            restored = next(resumed)
-            for field in following:
-                np.testing.assert_array_equal(restored[field], following[field])
-        finally:
-            resumed.close()
-    finally:
-        actual.close()
-        expected.close()
-        changed.close()
-
-
-def test_text_data_defaults_end_documents_and_hold_out_tokens_without_replacing_named_validation():
-    source = [{"text": "v" * 10 + "t" * 990}]
-    data = TextData(source, seq_len=1).load(batch=1, read="memory", loading=READ)
-    train, held = batches(data), batches(data, held=True)
-    assert data.records == 990 and len(held) == 9
-    assert {int(token) for batch in train for token in batch["text"].flat} == {ord("t"), 255}
-    assert {int(token) for batch in held for token in batch["text"].flat} == {ord("v")}
-    named = TextData(source, seq_len=1, validation=[{"text": "z" * 10}]).load(
-        batch=1, read="memory", loading=READ)
-    assert named.records == 1000
-    assert {int(token) for batch in batches(named, held=True) for token in batch["text"].flat} == {
-        ord("z"), 255}
-    entire = TextData(source, seq_len=1, token_holdout=None).load(batch=1, read="memory", loading=READ)
-    assert entire.records == 1000 and entire.val is None
-
-
-def test_a_token_store_keeps_its_producer_validation_split_with_text_data_defaults(tmp_path):
-    write_token_corpus(tmp_path, np.arange(100, 201, dtype=np.uint16),
-                       np.arange(500, 525, dtype=np.uint16))
-    data = TextData(str(tmp_path), seq_len=4).load(batch=1, read="memory", loading=READ)
-    assert data.records == 25
-    trained = {int(token) for batch in batches(data) for token in batch["text"].flat}
-    scored = {int(token) for batch in batches(data, held=True) for token in batch["text"].flat}
-    assert trained == set(range(100, 201)) and scored == set(range(500, 525))
-    assert trained.isdisjoint(scored)
-
-
-def test_a_stream_of_images_holds_out_a_hash_fraction_or_nothing_where_its_default_slice_is_refused(
-        tmp_path):
-    """The default holdout, the first 256 records, reads by index, so a streamed read of a Parquet
-    file refuses it before reading a row. The stream takes what that refusal names instead: a hash
-    fraction, each record on one side of it, or no holdout."""
+def test_a_stream_of_images_holds_out_a_hash_fraction_or_nothing_where_a_slice_is_refused(tmp_path):
+    """A holdout of the first records reads by index, so a streamed read of a Parquet file refuses it
+    before reading a row. The stream takes what that refusal names instead: a hash fraction, each
+    record on one side of it, or no holdout."""
     import cv2
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -285,6 +188,11 @@ def test_a_stream_of_images_holds_out_a_hash_fraction_or_nothing_where_its_defau
     pq.write_table(pa.Table.from_pylist(rows), tmp_path / "images.parquet")
     source = Files(str(tmp_path / "images.parquet"))
 
+    def loaded(train, held=None):
+        return compile(train.shuffle(0, window=64).repeat().pipe(presets.images, 4, batch=1),
+                       validation=None if held is None else held.pipe(presets.images, 4, batch=1),
+                       read="streamed", loading=READ)
+
     def labels(reader, rows=None):
         stream = reader(DataPartition())
         try:
@@ -293,29 +201,14 @@ def test_a_stream_of_images_holds_out_a_hash_fraction_or_nothing_where_its_defau
             stream.close()
 
     with pytest.raises(ValueError):
-        ImageData(source, image_size=4, augment=None).load(batch=1, read="streamed", loading=READ)
-    data = ImageData(source, image_size=4, augment=None, validation=HoldOut(fraction=0.1, by="hash")).load(
-        batch=1, read="streamed", loading=READ)
+        loaded(*source.holdout(records=256))
+    data = loaded(*source.holdout(0.1))
     assert data.val is not None
     scored = labels(data.val)
     # The training stream repeats a pass it shuffles in a window, so three passes' rows hold every record.
     trained = set(labels(data.train, 3 * 320))
     assert scored and trained.isdisjoint(scored) and sorted(trained | set(scored)) == list(range(320))
-    whole = ImageData(source, image_size=4, augment=None, validation=None).load(batch=1, read="streamed",
-                                                                               loading=READ)
+    whole = loaded(source)
     assert whole.val is None and sorted(set(labels(whole.train, 3 * 320))) == list(range(320))
 
 
-def test_image_data_defaults_hold_out_256_records_and_resize_both_parts():
-    source = [{"image": np.full((8, 8, 3), index % 256, np.uint8), "label": index}
-              for index in range(320)]
-    data = ImageData(source, image_size=4, augment=None).load(batch=8, read="memory", loading=READ)
-    train, held = batches(data), batches(data, held=True)
-    trained = {int(label) for batch in train for label in batch["label"]}
-    scored = {int(label) for batch in held for label in batch["label"]}
-    assert data.records == 64 and data.held_out == 256
-    assert trained == set(range(256, 320)) and scored == set(range(256))
-    assert trained.isdisjoint(scored)
-    for batch in train + held:
-        np.testing.assert_array_equal(batch["image"], np.broadcast_to(
-            (batch["label"] % 256).astype(np.uint8)[:, None, None, None], (8, 4, 4, 3)))

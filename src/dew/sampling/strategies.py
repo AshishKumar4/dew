@@ -22,9 +22,12 @@ from flax import struct
 from jax import lax
 from jax.experimental import checkify
 
+from dew._distributions import row_draw, wellformed
+from dew.batch import Variables
+from dew.nn import categorical
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
-from dew.nn.scatter import DROPPED
-from dew.objectives.base import Variables, token_log_probs
+from dew.nn.scatter import DROPPED, gather_positions
+from dew.objectives.base import token_log_probs
 from dew.sampling import decoding
 from dew.sampling.decoding import Finish, StepState
 from dew.sampling.guided import Grammar
@@ -175,21 +178,10 @@ def as_pytree(value: Strategy) -> Strategy:
     return jax.tree_util.Partial(value) if jax.tree_util.all_leaves([value]) else value
 
 
-def wellformed(scores: jax.Array) -> jax.Array:
-    """Which rows hold a distribution: every score finite or `-inf`, one finite.
-
-    A NaN or a `+inf` beside a finite score makes the softmax undefined and
-    the draw arbitrary; a row with nothing finite has no distribution at all.
-    """
-    return (jnp.all(jnp.isfinite(scores) | jnp.isneginf(scores), axis=-1)
-            & jnp.any(jnp.isfinite(scores), axis=-1))
-
-
 def select(keys: jax.Array, scores: jax.Array, active: jax.Array) -> jax.Array:
     """One categorical draw per row from `scores`, refusing an undefined row."""
-    checkify.check(jnp.all(wellformed(scores) | ~active),
-                   "the transform chain left an active row without a distribution to draw from")
-    return jax.vmap(jax.random.categorical)(keys, scores).astype(jnp.int32)
+    return row_draw(keys, scores, active,
+                    "the transform chain left an active row without a distribution to draw from")
 
 
 def draw(state: StepState, logits: jax.Array,
@@ -219,6 +211,36 @@ def draw(state: StepState, logits: jax.Array,
         behavior = token_log_probs(scores, token)
     selected = token_log_probs(raw, token)
     return token, behavior, selected
+
+
+@struct.dataclass
+class RowStep:
+    """One draw of every row (`row_step`): the token each drew, its behaviour and raw likelihoods
+    (zero where the row did not draw), the state committed with it, how the stopping criteria finish
+    it, and the grammar's state after it (None without one)."""
+
+    token: jax.Array
+    behavior: jax.Array
+    raw: jax.Array
+    committed: StepState
+    finished: Finish
+    automaton: jax.Array | None
+
+
+def row_step(state: StepState, logits: jax.Array, transform: Callable[[StepState, jax.Array], jax.Array],
+             stopping: Callable[[StepState, jax.Array], Finish],
+             guide: tuple[Grammar, jax.Array] | None = None) -> RowStep:
+    """Every active row of `state` draws its next token from `logits` (`draw`), under `transform`
+    guided by a grammar from each row's automaton state where `guide` gives them, and commits it: the
+    step both decoding loops take, `Sample`'s scan and the server's (`dew.inference.serving_kernel`),
+    each keeping its own model call and its own rule for which rows go on drawing."""
+    active = state.active
+    guided = transform if guide is None else guide[0].guiding(transform, guide[1])
+    token, behavior, raw = draw(state, logits, guided)
+    committed = state.commit(token, active)
+    return RowStep(token, jnp.where(active, behavior, 0.0), jnp.where(active, raw, 0.0), committed,
+                   stopping(committed, token),
+                   None if guide is None else guide[0].advanced(guide[1], token, active))
 
 
 def continuations(start: StepState, n: int,
@@ -270,16 +292,13 @@ def _sample_rows(state: DecoderState, start: StepState, ops: DecodeOps,
     def step(carry, _):
         state, step_state, terminated, automaton = carry
         active = step_state.active
-        chain = transform if grammar is None else grammar.guiding(transform, automaton)
-        token, behavior, raw = draw(step_state, state.logits, chain)
-        committed = step_state.commit(token, active)
-        finished = stopping(committed, token)
-        stopped = active & finished.done
-        following = ops.advance(state, token, active)
-        carry = (following, dataclasses.replace(committed, active=active & ~stopped),
-                 terminated | (active & finished.ended),
-                 None if grammar is None else grammar.advanced(automaton, token, active))
-        return carry, (token, active, jnp.where(active, behavior, 0.0), jnp.where(active, raw, 0.0))
+        drew = row_step(step_state, state.logits, transform, stopping,
+                        None if grammar is None else (grammar, automaton))
+        stopped = active & drew.finished.done
+        following = ops.advance(state, drew.token, active)
+        carry = (following, dataclasses.replace(drew.committed, active=active & ~stopped),
+                 terminated | (active & drew.finished.ended), drew.automaton)
+        return carry, (drew.token, active, drew.behavior, drew.raw)
 
     initial = (state, start, jnp.zeros(start.rows, bool),
                None if grammar is None else grammar.start(start.rows))
@@ -362,12 +381,6 @@ class Beam:
         return _beam_search(state, start, ops, transform, stopping, budget, n, self)
 
 
-def _pick(leaf, index):
-    """`leaf[:, index]` per prompt, over a `[prompts, count, ...]` leaf."""
-    return jnp.take_along_axis(leaf, index.reshape(index.shape + (1,) * (leaf.ndim - 2)),
-                               axis=1)
-
-
 def _beam_rows(parent, prompts: int, width: int):
     """Cache rows of a `[prompts, count]` parent-beam index."""
     return (parent + jnp.arange(prompts)[:, None] * width).reshape(-1)
@@ -377,8 +390,8 @@ def _beam_continue(state: DecoderState, beams: StepState, ops: DecodeOps, parent
                    forward, real, prompts: int, width: int):
     """The `width` beams the step carries on with, each parent's decode state
     gathered onto its child's row before the child's token is committed."""
-    parents = _pick(parent, forward)
-    selected = _pick(token, forward).reshape(-1)
+    parents = gather_positions(parent, forward)
+    selected = gather_positions(token, forward).reshape(-1)
     state = ops.reindex(state, _beam_rows(parents, prompts, width))
     beams = jax.tree.map(lambda leaf: jnp.take(leaf, _beam_rows(parents, prompts, width), axis=0),
                          beams)
@@ -403,8 +416,8 @@ def _completed(done: Completed, search: Beam, top, extending, position: int, *,
     order = lax.top_k(merged, width)[1]
     return Completed(
         score=jnp.take_along_axis(merged, order, axis=1),
-        tokens=_pick(jnp.concatenate([done.tokens, tokens], axis=1), order),
-        raw=_pick(jnp.concatenate([done.raw, raw], axis=1), order),
+        tokens=gather_positions(jnp.concatenate([done.tokens, tokens], axis=1), order),
+        raw=gather_positions(jnp.concatenate([done.raw, raw], axis=1), order),
         flag=jnp.take_along_axis(jnp.concatenate([done.flag, hit & top], axis=1), order, axis=1),
         length=jnp.take_along_axis(
             jnp.concatenate([done.length,
@@ -470,7 +483,7 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         done = _completed(carry.done, search, top, carry.extending & (position < limit), position,
                           best=best, hit=hit, ended=ended, tokens=grown, raw=traced)
 
-        live = _pick(alive, forward)
+        live = gather_positions(alive, forward)
         # `never` estimates the best score still reachable from the whole
         # budget where the penalty rewards length; otherwise from here.
         reach = limit.astype(jnp.float32) if never and penalty > 0 else (position + 1.0)
@@ -478,8 +491,8 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         extending = carry.extending & jnp.any(live[:, :1] / jnp.power(reach, penalty) > worst,
                                 axis=-1, keepdims=True)
         state = ops.advance(state, selected, real)
-        drawn = _pick(grown, forward).reshape(prompts * width, budget)
-        scored = _pick(traced, forward).reshape(prompts * width, budget)
+        drawn = gather_positions(grown, forward).reshape(prompts * width, budget)
+        scored = gather_positions(traced, forward).reshape(prompts * width, budget)
         return _BeamCarry(state, beams, live, drawn, scored, extending, done), None
 
     initial = _beam_start(state, start, ops, prompts, width, budget)
@@ -501,7 +514,7 @@ def _beam_candidates(state: DecoderState, beams: StepState, transform, live, rea
     checkify.check(jnp.all(wellformed(state.logits.astype(jnp.float32)).reshape(
         prompts, width) | ~genuine),
         "the model produced a live beam without a distribution to score")
-    raw = jax.nn.log_softmax(state.logits.astype(jnp.float32))
+    raw = categorical.log_probs(state.logits)
     scores = transform(beams, raw)
     checkify.check(jnp.all(wellformed(scores).reshape(prompts, width) | ~genuine),
                    "the transform chain left a live beam without a distribution to search")
@@ -517,18 +530,21 @@ def _beam_start(state: DecoderState, start: StepState, ops: DecodeOps, prompts: 
 
     Only beam zero starts alive, so the first step's continuations all come
     from the one prefilled row and the search does not begin by scoring
-    `width` copies of the same distribution.
+    `width` copies of the same distribution. Scores and log probabilities
+    are held as the categorical computes them (`categorical.widened`), a
+    float64 model's in float64.
     """
+    scored = categorical.widened(state.logits).dtype
     return _BeamCarry(
         ops.reindex(state, jnp.repeat(jnp.arange(prompts), width)),
         jax.tree.map(lambda leaf: jnp.repeat(leaf, width, axis=0), start),
-        jnp.broadcast_to(jnp.where(jnp.arange(width) == 0, 0.0, DEAD), (prompts, width)),
+        jnp.broadcast_to(jnp.where(jnp.arange(width) == 0, 0.0, DEAD).astype(scored), (prompts, width)),
         jnp.zeros((prompts * width, budget), jnp.int32),
-        jnp.zeros((prompts * width, budget), jnp.float32),
+        jnp.zeros((prompts * width, budget), scored),
         jnp.ones((prompts, 1), bool),
-        Completed(jnp.full((prompts, width), DEAD, jnp.float32),
+        Completed(jnp.full((prompts, width), DEAD, scored),
                   jnp.zeros((prompts, width, budget), jnp.int32),
-                  jnp.zeros((prompts, width, budget), jnp.float32),
+                  jnp.zeros((prompts, width, budget), scored),
                   jnp.zeros((prompts, width), bool),
                   jnp.zeros((prompts, width), jnp.int32),
                   jnp.zeros((prompts, width), bool)))

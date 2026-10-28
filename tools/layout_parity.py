@@ -63,7 +63,8 @@ batch is placed from every process alike:
     python tools/layout_parity.py --models dense moe --references refs --prepare  # one device
     python tools/layout_parity.py --models dense moe --references refs              # every device
     python tools/layout_parity.py --models moe --layouts expert4,data2_expert2,expert2_fsdp2 \\
-        --mixture '{"experts": 32, "top_k": 8, "dispatch": "exchange"}' --objective '{"aux_loss_alpha": 0.01}'
+        --mixture '{"experts": 32, "top_k": 8, "dispatch": "exchange"}' \\
+        --objective '{"balance": {"aux_loss_alpha": 0.01}}'
     python tools/layout_parity.py --models dense --layouts stage4,stage2_sequence2 --devices 4
     dew launch --processes-per-host 4 --devices-per-process 1 -- \\
         python tools/layout_parity.py --models dense,dit --out parity.json
@@ -74,7 +75,7 @@ count: `--devices 4` runs it on the process's first four, where four stages
 leave no axis for the rows.
 
 Process 0 prints a line per layout and writes the rows. A layout Dew refuses
-by design (`dew.nn.sharding.LayoutRefused`: a stage axis over a model that
+by design (`dew.mesh.LayoutRefused`: a stage axis over a model that
 runs no pipeline) is a row with its reason, listed again at the end, and
 passes the run; the exit status is nonzero when a layout mismatches, repeats
 work or fails in any other way.
@@ -87,7 +88,6 @@ import functools
 import hashlib
 import json
 import math
-import os
 import sys
 import time
 import traceback
@@ -197,7 +197,9 @@ def zoo() -> dict[str, Any]:
     split repeats each row's conditioning on every shard by design, which the FLOPs bound would
     count against a row of only a few patches. The last two MoE models and DiffusionGemma keep their
     released configs' routing and layer kinds. The layers a sequence axis
-    splits differently come too: latent attention (MLA), a window (12 rows:
+    splits differently come too: a dense layer before routed ones and a tail
+    sharing the keys and values one layer stored, which a pipeline runs on
+    every stage, latent attention (MLA), a window (12 rows:
     a sequence split two ways reads it from one neighbour, four ways through
     the exchange), Mamba-2 alone, Mamba-1 alone, and packed rows of three
     documents whose boundaries fall inside the shards, in the dense decoder,
@@ -265,7 +267,6 @@ def zoo() -> dict[str, Any]:
     diffused = {f"{name}_mdlm": Case("causal_transformer", bidirectional(config),
                                      decoder_objective="mdlm", **lm)
                 for name, config in decoders.items() if name != "hybrid"}
-    images: ImageRows = {"batch_size": 8, "channels": 4, "fsdp_min_param_size": 256}
     return {
         "dense": Case("causal_transformer", dense, **lm),
         "grouped": Case("causal_transformer", {**dense, "norms": GROUPED_NORMS}, **lm),
@@ -273,6 +274,8 @@ def zoo() -> dict[str, Any]:
         "moe": Case("causal_transformer", moe, **lm),
         "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
+        **{name: Case("causal_transformer", config, **lm)
+           for name, config in _placed_zoo(dense, moe).items()},
         "nemotron_h": Case("causal_transformer", nemotron_h, **lm),
         "nemotron_h_moe": Case("causal_transformer", _nemotron_h_moe(), orders=True, **lm),
         "window": Case("causal_transformer", window, **lm),
@@ -288,6 +291,45 @@ def zoo() -> dict[str, Any]:
                        batch_size=8, seq_len=31, fsdp_min_param_size=256),
         **trained,
         **diffused,
+        **_image_zoo(),
+        "multimodal": Case("multimodal_transformer", dense, media={
+            "family": "gemma3", "image_token_id": 511, "images": 1, "pixels": [3, 16, 16],
+            "tower": {"class": "siglip", "fields": {"hidden_size": 32, "intermediate_size": 64, "num_layers": 1,
+                      "num_heads": 4, "image_size": 16, "patch_size": 8}},
+            "projector": {"class": "gemma", "fields": {"text_width": 64, "patches_per_side": 2,
+                          "tokens_per_side": 2}}}, **lm),
+    }
+
+
+def _placed_zoo(dense: dict[str, object], moe: dict[str, object]) -> dict[str, dict[str, object]]:
+    """The zoo's decoders a layout places apart (`zoo`), built on its `dense` and `moe` ones.
+
+    The expert exchange runs under a capacity, whose buckets hold what each
+    device's sequences keep, one round, so its program splits evenly;
+    dropless, it also compiles the rounds a skewed routing needs, which a
+    static count of the step's FLOPs reads whether or not they run.
+    DeepSeek's class puts a dense first layer before eight routed ones, each
+    layer reading its own per-layer input (Gemma's): a pipeline runs the
+    dense layer on every stage and slices the inputs past it, each of four
+    stages scanning two. Gemma 3n's has its last two layers read the keys
+    and values the fourth stored, which a pipeline runs on every stage."""
+    mixture = moe["mixture"]
+    assert isinstance(mixture, dict)
+    return {
+        "moe_exchange": {**moe, "mixture": {**mixture, "dispatch": "exchange", "capacity_factor": 2.0}},
+        "routed_tail": {**dense, "num_layers": 9, "per_layer_input_dim": 8,
+                        "mixture": {**mixture, "layers": tuple(range(1, 9))}},
+        "shared_tail": {**dense, "num_layers": 6, "kv_shared_layers": (4, 5)},
+    }
+
+
+def _image_zoo() -> dict[str, Any]:
+    """The zoo's image models (`zoo`): a conditional UNet and an MMDiT (SD3's) denoising latents, and
+    a JEPA encoder predicting its masked patches' features."""
+    from benchmark_cases import Case
+
+    images: ImageRows = {"batch_size": 8, "channels": 4, "fsdp_min_param_size": 256}
+    return {
         "unet": Case("unet_2d_condition", {"stages": [{"features": 32, "heads": 4},
                                                       {"features": 64, "heads": 4}],
                                            "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},
@@ -302,12 +344,6 @@ def zoo() -> dict[str, Any]:
                      predictor={"grid": (4, 4), "emb_features": 32, "predictor_features": 16,
                                 "num_layers": 1, "num_heads": 4, "mlp_ratio": 2},
                      batch_size=8, image_size=16, fsdp_min_param_size=256),
-        "multimodal": Case("multimodal_transformer", dense, media={
-            "family": "gemma3", "image_token_id": 511, "images": 1, "pixels": [3, 16, 16],
-            "tower": {"class": "siglip", "fields": {"hidden_size": 32, "intermediate_size": 64, "num_layers": 1,
-                      "num_heads": 4, "image_size": 16, "patch_size": 8}},
-            "projector": {"class": "gemma", "fields": {"text_width": 64, "patches_per_side": 2,
-                          "tokens_per_side": 2}}}, **lm),
     }
 
 
@@ -334,7 +370,7 @@ def placed(batch, mesh):
     import jax
     import numpy as np
 
-    from dew.training.distributed import batch_shardings
+    from dew.distributed.batches import batch_shardings
 
     def put(leaf, sharding):
         array = np.asarray(leaf)
@@ -352,7 +388,7 @@ def reordered(batch, seed: int):
     return jax.tree.map(lambda leaf: np.asarray(leaf)[order], batch)
 
 
-def _drawn(params, key):
+def zeros_drawn(params, key):
     """`params` with every leaf its initializer left all zeros drawn from a
     normal of std 0.02 instead, each from its own fold of `key`.
 
@@ -385,27 +421,29 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     """The trainer of `case` on the layout `fields` names over the first
     `devices` devices (every device by default), or on this process's first
     device, stashing each gradient the optimizer is handed. Its initial
-    parameters have no all-zero leaf (`_drawn`). In a one-process run, once
-    the case's one-device state is computed (`_initial`), a trainer whose
-    mesh shards the variables in a way the case has not yet drawn them
-    computes its own state and must find it bitwise equal to that one, and
-    every other trainer copies it: the same state, without a compile of the
-    model's initialization on every layout."""
+    parameters have no all-zero leaf (`zeros_drawn`). In a one-process run, once
+    the case's one-device state is computed (`_initial`), every other
+    trainer copies it onto its mesh: every layout starts from the very state
+    one device does, without a compile of the model's initialization on each.
+    A layout's own draw of it is another program, whose rounding a bitwise
+    comparison would judge (docs/design/testing.md)."""
     import benchmark_models as bench
     import jax
-    import numpy as np
     import optax
 
+    from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
+    from dew.nn.kernels.generation import gpu_target
+    from dew.nn.sharding import Link
     from dew.training import Layout, MeshSpec, Trainer
-    from dew.training.memory import refuse_wide_floats
 
     class Drawn(Trainer):
         def initial_state(self, initializer=None, key=None):
             state = super().initial_state(initializer, key)
             with jax.ensure_compile_time_eval():
                 drawing = jax.random.key(7)
-            params = {**state.variables, "params": _drawn(state.variables["params"], drawing)}
-            return dataclasses.replace(state, variables=params, opt_state=self.optimizer.init(params["params"]))
+            params = {**state.variables, "params": zeros_drawn(state.variables["params"], drawing)}
+            return dataclasses.replace(state, variables=params,
+                                       opt_state=self.optimizer.init(params["params"]))
 
         def place(self):
             held = _initial.get((repr(case), accumulation)) if jax.process_count() == 1 else None
@@ -415,36 +453,19 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
                 if one_device:
                     _initial[(repr(case), accumulation)] = jax.tree.map(lambda leaf: leaf.copy(), state)
                 return state, shardings, position
-            abstract = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), held)
-            refuse_wide_floats(abstract, self.device_mesh)
-            shardings = self.shardings(abstract)
-            self.check(abstract.variables, shardings.variables)
-            # The mesh axes the variables split over, with their sizes: an
-            # initializer drawn under a split the case has not drawn under
-            # yet could come out different, so that split draws its own.
-            split = tuple(sorted({(axis, self.device_mesh.shape[axis])
-                                  for sharding in jax.tree.leaves(shardings.variables)
-                                  for entry in sharding.spec if entry is not None
-                                  for axis in ((entry,) if isinstance(entry, str) else entry)
-                                  if self.device_mesh.shape[axis] > 1}))
-            if split and (repr(case), split) not in _drawn_splits:
-                state, shardings, position = super().place()
-                drawn, _ = jax.tree_util.tree_flatten_with_path(jax.device_get(state.variables))
-                wanted = jax.tree.leaves(jax.device_get(held.variables))
-                differing = [jax.tree_util.keystr(path)
-                             for (path, here), there in zip(drawn, wanted, strict=True)
-                             if np.asarray(here).tobytes() != np.asarray(there).tobytes()]
-                if differing:
-                    raise ValueError(f"the variables drawn split over {split} differ from one device's "
-                                     f"at {differing[:4]}")
-                _drawn_splits.add((repr(case), split))
-                return state, shardings, position
+            shardings, _ = self._validated(jax.tree.map(
+                lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), held))
             return jax.device_put(jax.tree.map(lambda leaf: leaf.copy(), held), shardings), shardings, None
 
+    # Devices the peak table does not name (a CPU's) measure no link, so no projection would spread
+    # over them; the layouts state one fast enough that every projection that can spread does, as
+    # it would over NVLink, so the matrix holds the spread path wherever it runs.
+    unmeasured = gpu_target(jax.devices()[0].device_kind).bf16_peak is None
+    links = {axis: Link(1e15, 1e12) for axis in (TENSOR_AXIS, SEQUENCE_AXIS)} if unmeasured else None
     trainer = Drawn(bench.build_objective(case), optax.chain(stash(), optax.adam(1e-3)),
                       key=jax.random.key(0), **bench.trainer_mesh(fields),
                       layout=Layout(min_shard=case.fsdp_min_param_size, tolerance=1.0),
-                      accumulation=accumulation, checkpoints=None, tracker=None)
+                      accumulation=accumulation, checkpoints=None, tracker=None, links=links)
     if one_device:
         trainer.device_mesh = MeshSpec().build([jax.local_devices()[0]])
     elif devices is not None:
@@ -457,8 +478,6 @@ _initial: dict[tuple[str, int], Any] = {}
 one-device trainer placed it on this process's first device: every layout's
 trainer draws the same state from the same key, so later trainers copy it
 onto their mesh."""
-_drawn_splits: set[tuple[str, tuple[tuple[str, int], ...]]] = set()
-"""Each case's variable splits whose own draw was found equal to `_initial`'s."""
 
 
 def _gradient(state) -> dict[str, NDArray]:
@@ -482,8 +501,25 @@ def compiled_step(case, fields: dict[str, int], batch, *, one_device: bool = Fal
     data = placed(batch, trainer.device_mesh)
     step = trainer.compile(state, data)
     compiled = {"flops_per_device": trainer.step_flops and trainer.step_flops.hardware,
-                "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()}}
+                "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
+                "replicated": replicated_share(case, trainer.objective, fields.get("stage", 1))}
     return state, data, step, compiled
+
+
+def replicated_share(case, objective, stages: int) -> float:
+    """The share of `objective`'s model's forward work over the case's rows a pipeline of `stages`
+    runs on every stage (`replicated_flops`); none without a pipeline, and none for a model with no
+    decoder to pipeline, whose work the even split then judges whole."""
+    import numpy as np
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.wrapping import DecoderWrapper
+
+    model = next(iter(objective.program_key()), None)
+    if stages == 1 or model is None or not isinstance(model.module, (CausalTransformer, DecoderWrapper)):
+        return 0.0
+    lengths = np.full(case.batch_size, case.seq_len)
+    return model.module.replicated_flops(stages, lengths) / model.module.model_flops(lengths)
 
 
 def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool = False,
@@ -586,31 +622,39 @@ def permutation_floor(case, batch, reference: Mapping[str, NDArray],
     return leaves, loss
 
 
-def anchor_program(case, batch, state):
-    """The same fp64 loss/gradient executable reused for each residual order."""
+def anchor_loss(case, batch, state):
+    """The fp64 loss of the trainer's first step over `state`'s widened variables, as a function of
+    the parameters and the batch, and those widened parameters."""
     import benchmark_models as bench
     import jax
-    import jax.numpy as jnp
 
     from dew.objectives.base import Step
-    from dew.training.transaction import with_ema
+    from dew.training.transaction import example_fields, with_ema
 
-    def widened(tree):
-        return jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
-                            if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, tree)
+    sys.path.insert(0, str(REPO / "tests"))
+    from reference_error import widened
 
     wide = widened(state.variables)
     objective = bench.build_objective(case, widened=True)
-    # The trainer's first step: its key folded with the step, which draws a
-    # diffusion objective's noise and a masked one's masks, and the frozen
-    # EMA DPO and GRPO score against.
+    # The trainer's first step: its key folded with the step, its examples' (`example_fields`), which
+    # draw a diffusion objective's noise and a masked one's masks, and the frozen EMA DPO and GRPO
+    # score against.
     step = Step(state.microstep, jax.random.fold_in(state.key, state.step),
-                with_ema(wide, None if state.ema is None else widened(state.ema)))
+                with_ema(wide, None if state.ema is None else widened(state.ema)),
+                **example_fields(state, 0, 1, batch))
 
     def loss(variables, batch):
         return objective.scalar_loss({**wide, "params": variables}, batch, step)[0]
 
-    return jax.jit(jax.value_and_grad(loss)).lower(wide["params"], batch).compile()
+    return loss, wide["params"]
+
+
+def anchor_program(case, batch, state):
+    """The same fp64 loss/gradient executable reused for each residual order."""
+    import jax
+
+    loss, params = anchor_loss(case, batch, state)
+    return jax.jit(jax.value_and_grad(loss)).lower(params, batch).compile()
 
 
 def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
@@ -686,9 +730,11 @@ def _cache_name(kind: str, case, batch, **parts: object) -> tuple[str, dict[str,
         array = np.ascontiguousarray(leaf)
         digest.update(f"{array.dtype}{array.shape}".encode())
         digest.update(array.tobytes())
+    from dew.nn.precision import wide_cpu_arithmetic
+
     inputs = {"case": dataclasses.asdict(case), "batch": digest.hexdigest(), "jax": jax.__version__,
               "jaxlib": importlib.metadata.version("jaxlib"), "x64": jax.config.jax_enable_x64,
-              "source": source_digest(), **parts}
+              "wide_cpu_arithmetic": wide_cpu_arithmetic(), "source": source_digest(), **parts}
     name = hashlib.sha256(json.dumps(inputs, sort_keys=True, default=str).encode()).hexdigest()[:24]
     return f"{kind}-{name}.npz", inputs
 
@@ -698,13 +744,13 @@ def _write(path: Path, arrays: Mapping[str, NDArray], meta: dict[str, Any]) -> N
     whole or not at all."""
     import numpy as np
 
+    from dew.files import replacing
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    partial = path.with_name(f".{path.name}.{os.getpid()}")
-    with partial.open("wb") as file:
+    with replacing(path) as partial, partial.open("wb") as file:
         # Stored as arr_0 (the metadata), arr_1, ... in the names' order.
         np.savez(file, np.array(json.dumps({**meta, "names": list(arrays)})),
                  *[np.asarray(array, np.float64) for array in arrays.values()])
-    partial.replace(path)
 
 
 def _read(path: Path) -> tuple[dict[str, NDArray], dict[str, Any]]:
@@ -778,13 +824,15 @@ def rounding_limit(dtype: str) -> float:
     return float(jnp.finfo(dtype).eps) ** 0.5
 
 
-def flops_bound(fields: Mapping[str, int]) -> float:
+def flops_bound(fields: Mapping[str, int], replicated: float = 0.0) -> float:
     """The FLOPs a layout's devices may compute together over one device's:
     an even split, and a pipeline of S stages and M microbatches holds each
-    stage's work for M + S - 1 microbatches' time (GPipe's bubble), times
-    FLOPS_SLACK."""
+    stage's work for M + S - 1 microbatches' time (GPipe's bubble) and runs
+    the `replicated` share of the model's work, its layers outside the run
+    the stages repeat (`CausalTransformer.replicated_flops`), on every stage,
+    times FLOPS_SLACK."""
     stages, microbatches = fields.get("stage", 1), fields.get("microbatches", 1)
-    return (microbatches + stages - 1) / microbatches * FLOPS_SLACK
+    return ((1 - replicated) * (microbatches + stages - 1) / microbatches + replicated * stages) * FLOPS_SLACK
 
 
 def widest_floor(floors: dict[str, float], dtype: str) -> str:
@@ -878,8 +926,11 @@ def judged_orders(reference: Mapping[str, Sequence[float]], layout: Mapping[str,
 
 
 def order_invariance(actual: Mapping[str, NDArray], truth: Mapping[str, NDArray],
-                     loss: float, truth_loss: float) -> float:
-    """A residual permutation preserves the entire fp64 gradient and loss to 1e-12 relative.
+                     loss: float, truth_loss: float, *, roundings: int) -> float:
+    """A residual permutation preserves the entire fp64 gradient and loss, each within float64's
+    rounding of the computation (`reference_error.assert_computes_the_oracle`) over `roundings`, its
+    program's longest chain (`chain_roundings`); a value that is not finite fails it. Returns the
+    gradient's distance relative to its scale.
 
     The gradient is one vector over all parameters, so cancelled leaves are
     measured on its scale instead of being divided by their own near-zero norm.
@@ -888,15 +939,19 @@ def order_invariance(actual: Mapping[str, NDArray], truth: Mapping[str, NDArray]
     """
     import numpy as np
 
+    sys.path.insert(0, str(REPO / "tests"))
+    from reference_error import assert_computes_the_oracle
+
     if actual.keys() != truth.keys():
         raise ValueError('float64 orders hold different leaves')
-    apart = math.sqrt(sum(float(np.sum(np.square(actual[name] - truth[name]))) for name in truth))
-    scale = math.sqrt(sum(float(np.sum(np.square(values))) for values in truth.values()))
-    relative = apart / scale if scale else 0.0 if apart == 0 else float('inf')
-    if relative > 1e-12 or abs(loss - truth_loss) > 1e-12 * abs(truth_loss):
-        raise ValueError(
-            f'float64 residual order changes the function: gradient relative error {relative:.3e}')
-    return relative
+    ordered, expected = (np.concatenate([np.ravel(tree[name]) for name in truth]) for tree in (actual, truth))
+    if not (np.isfinite(ordered).all() and np.isfinite(loss)):
+        raise ValueError('a float64 residual order computes a value that is not finite')
+    assert_computes_the_oracle(ordered, expected, 'float64 residual order', roundings=roundings)
+    assert_computes_the_oracle(np.asarray([loss]), np.asarray([truth_loss]), 'float64 residual order loss',
+                               roundings=roundings)
+    apart, scale = float(np.linalg.norm(ordered - expected)), float(np.linalg.norm(expected))
+    return apart / scale if scale else 0.0
 
 
 def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, devices: int | None,
@@ -916,7 +971,7 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
     import numpy as np
 
     sys.path.insert(0, str(REPO / "tests"))
-    from reference_error import ORDERS, distance
+    from reference_error import ORDERS, chain_roundings, distance
     from residual_orders import orders, permuted, residual_width
 
     if jax.process_count() != 1:
@@ -934,6 +989,8 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
             base, ref_data, ref_step, ref_compiled = compiled_step(reference, {}, batch, one_device=True)
             programs = {name: compiled_step(case, LAYOUTS[name], batch, devices=devices) for name in layouts}
         truth_step = anchor_program(reference, batch, base)
+        anchor, wide = anchor_loss(reference, batch, base)
+        roundings = chain_roundings(jax.make_jaxpr(jax.value_and_grad(anchor))(wide, batch))
         drawn = orders(residual_width(base.variables), ORDERS, seed=2024)
         ref_shardings = jax.tree.map(lambda leaf: leaf.sharding, base)
         model_out = out / model
@@ -964,7 +1021,8 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
             truth_loss, truth = float(truth_loss), flat(truth_tree, order)
             if identity is None:
                 identity, identity_loss = truth, truth_loss
-            invariance.append(order_invariance(truth, identity, truth_loss, identity_loss))
+            invariance.append(order_invariance(truth, identity, truth_loss, identity_loss,
+                                               roundings=roundings))
             ref_state, ref_loss, _, _, _, _ = ref_step(ordered_state(base, order, ref_shardings), ref_data)
             ref_gradient = flat(ref_state.opt_state[0]['gradient'], order)
             keys = (*truth, '@loss')
@@ -993,7 +1051,7 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
             if compiled['flops_per_device'] and ref_compiled['flops_per_device']:
                 row['flops_ratio'] = (compiled['flops_per_device'] * math.prod(compiled['mesh'].values())
                                       / ref_compiled['flops_per_device'])
-                row['flops_bound'] = flops_bound(LAYOUTS[name])
+                row['flops_bound'] = flops_bound(LAYOUTS[name], compiled['replicated'])
                 if row['status'] == 'works' and row['flops_ratio'] > row['flops_bound']:
                     row['status'] = 'REDUNDANT'
             rows.append(row)
@@ -1066,8 +1124,8 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
     import benchmark_models as bench
     import jax
 
-    from dew.coordination import agreed
-    from dew.nn.sharding import LayoutRefused
+    from dew._coordination import agreed
+    from dew.mesh import LayoutRefused
 
     rows = []
     for model in models:
@@ -1129,7 +1187,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                     # Above one when devices compute what one device need not.
                     size = math.prod(compiled["mesh"].values())
                     row["flops_ratio"] = compiled["flops_per_device"] * size / judge.flops_per_device
-                    row["flops_bound"] = flops_bound(LAYOUTS[name])
+                    row["flops_bound"] = flops_bound(LAYOUTS[name], compiled["replicated"])
                     if row["status"] == "works" and row["flops_ratio"] > row["flops_bound"]:
                         row["status"] = "REDUNDANT"
             except LayoutRefused as refusal:
@@ -1173,7 +1231,7 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
          mixture: Annotated[str, tyro.conf.arg(
              help="JSON merged into each model's mixture, e.g. '{\"dispatch\": \"exchange\"}'")] = "{}",
          objective: Annotated[str, tyro.conf.arg(
-             help="JSON of LMObjective keywords, e.g. '{\"aux_loss_alpha\": 0.01}'")] = "{}",
+             help="JSON of LMObjective keywords, e.g. '{\"balance\": {\"aux_loss_alpha\": 0.01}}'")] = "{}",
          references: Annotated[Path | None, tyro.conf.arg(
              help="a directory of references a --prepare run wrote, read instead of computed")] = None,
          prepare: Annotated[bool, tyro.conf.arg(

@@ -12,21 +12,23 @@ import numpy as np
 import optax
 import pytest
 from diffusion_stubs import batch_for
-from diffusion_support import saved_after_one_step
+from diffusion_support import TanhLayer, images_of, saved_after_one_step
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
 
 import dew
-from dew.checkpoints import Checkpoints
-from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.config.data import ImageData
+from dew.config import ObjectiveConfig, TrainerConfig
+from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion.presets import Flow
+from dew.inference import TextToImage
+from dew.inputs import TextCondition
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import TEACHER, Step
-from dew.objectives.diffusion import AdversarialDistillationObjective, DiffusionRunConfig, TextCondition
+from dew.objectives.diffusion import AdversarialDistillationObjective
 from dew.objectives.diffusion.adversarial import Head
 from dew.objectives.diffusion.objective import DISCRIMINATOR, SPECTRAL
-from dew.sampling import Consistency, Euler, TextToImage
+from dew.registry import ModelConfig
+from dew.sampling import Consistency, Euler
 from dew.training import Trainer
 
 HEAD = np.load(Path(__file__).resolve().parent / "fixtures" / "stylegan_t" / "head.npz")
@@ -38,16 +40,14 @@ def test_a_head_is_stylegan_ts_at_grid_height_one():
     with a (1, 9) kernel, from the same weights and spectral-norm vectors.
     Both run in float64, so the gap is a few roundings of O(1) logits."""
     with jax.enable_x64(new_val=True):
-        def conv(name):
-            return {"kernel": jnp.asarray(HEAD[f"{name}.kernel"]), "bias": jnp.asarray(HEAD[f"{name}.bias"])}
+        def layer(name, *fields):
+            return {field: jnp.asarray(HEAD[f"{name}.{field}"]) for field in fields}
 
-        def norm(name):
-            return {"weight": jnp.asarray(HEAD[f"{name}.weight"]), "bias": jnp.asarray(HEAD[f"{name}.bias"])}
-
+        conv, norm = ("kernel", "bias"), ("weight", "bias")
         condition_width = HEAD["c"].shape[-1]
-        params = {"block_0": {"conv": conv("main.0.0"), "norm": norm("main.0.1")},
-                  "block_1": {"conv": conv("main.1.fn.0"), "norm": norm("main.1.fn.1")},
-                  "cls": conv("cls"),
+        params = {"block_0": {"conv": layer("main.0.0", *conv), "norm": layer("main.0.1", *norm)},
+                  "block_1": {"conv": layer("main.1.fn.0", *conv), "norm": layer("main.1.fn.1", *norm)},
+                  "cls": layer("cls", *conv),
                   "cmapper_weight": jnp.asarray(HEAD["cmapper.weight"]) * np.sqrt(condition_width),
                   "cmapper_bias": jnp.asarray(HEAD["cmapper.bias"])}
         spectral = {"block_0": {"conv": {"u": jnp.asarray(HEAD["main.0.0.u"])}},
@@ -61,12 +61,6 @@ def test_a_head_is_stylegan_ts_at_grid_height_one():
 
 
 STEP = np.load(Path(__file__).resolve().parent / "fixtures" / "ladd" / "step.npz")
-
-
-class Layer(nn.Module):
-    @nn.compact
-    def __call__(self, tokens):
-        return jnp.tanh(tokens @ self.param("kernel", nn.initializers.zeros, (tokens.shape[-1],) * 2))
 
 
 class Tokens(nn.Module):
@@ -83,7 +77,7 @@ class Tokens(nn.Module):
         tokens = (flat @ self.param("embed", nn.initializers.zeros, (flat.shape[-1], self.width))
                   + (time / 1000).reshape(-1, 1, 1)
                   * self.param("time", nn.initializers.zeros, (self.width,)))
-        layer_b = Layer(name="layer_b")(Layer(name="layer_a")(tokens))
+        layer_b = TanhLayer(name="layer_b")(TanhLayer(name="layer_a")(tokens))
         head = self.param("head", nn.initializers.zeros, (self.width, flat.shape[-1]))
         return (layer_b @ head).reshape(x.shape)
 
@@ -138,7 +132,11 @@ def test_one_step_is_the_papers_equations_on_stylegan_ts_heads():
         student[name] = {"kernel": student[name]}
     params = {**student, DISCRIMINATOR: unflattened("heads")}
     variables = {**variables, SPECTRAL: unflattened("initial")}
-    step = Step(step=jnp.asarray(0), key=jax.random.key(settings["key"]), ema=None)
+    # The step reads the oracle's own draws (`Step.tape`): each row's student time, its noise, its
+    # renoising level and noise.
+    tape = {"student times": STEP["draws/indices"], "noise": STEP["draws/noise"],
+            "renoise times": STEP["draws/level"], "renoise": STEP["draws/renoise"]}
+    step = Step(step=jnp.asarray(0), key=jax.random.key(settings["key"]), ema=None, tape=tape)
 
     def loss(params):
         return task.scalar_loss({**variables, "params": params}, {"image": pixels}, step)
@@ -180,22 +178,15 @@ def runs(tmp_path_factory):
         model=ModelConfig("simple_dit",
                           {"patch_size": 2, "emb_features": 16, "num_layers": 2, "num_heads": 2,
                            "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=4), preset=Flow(), val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig("diffusion",
                                   {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
-    objective = teacher.build()
-    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
-    state = trainer.initial_state()
-    batch = batch_for(objective, 4)
-    state, *_ = trainer.compile(state, batch)(state, batch)
-    checkpoints = Checkpoints(str(root / "teacher"))
-    checkpoints.save(1, state, None, artifact=objective.inference_record())
-    checkpoints.wait()
-    teacher.save(str(root / "teacher"))
-    student = dataclasses.replace(teacher, objective=ObjectiveConfig("ladd", {
-        "teacher_run": str(root / "teacher"), "feature_layers": ["dit_block_0", "dit_block_1"], "cmap_dim": 8,
+    _, _, batch = saved_after_one_step(teacher, lambda task: batch_for(task, 4), root / "teacher", 1e-2,
+                                       key=0)
+    student = dataclasses.replace(teacher, teacher_run=str(root / "teacher"), objective=ObjectiveConfig(
+        "ladd", {"feature_layers": ["dit_block_0", "dit_block_1"], "cmap_dim": 8,
         "kernel_size": [3, 3], "solver": Consistency(), "steps": 2, "ema_decay": None}))
     return student, batch
 
@@ -205,9 +196,11 @@ def test_validation_does_not_advance_the_spectral_statistics(runs):
     task = config.build()
     variables = task.init(jax.random.key(1))
     step = Step(jnp.asarray(0), jax.random.key(2), None)
-    validation, aux = task.validation_loss(variables, batch, step)
-    training, trained = task.loss(variables, batch, step)
-    assert validation.mean()[0] != training.mean()[0]
+    _, aux = task.validation_loss(variables, batch, step)
+    _, trained = task.loss(variables, batch, step)
+    # The heads' spectral norms enter the discriminator's hinge; the total hides them, the generator's
+    # hinge on the same scores cancelling the discriminator's fake term wherever both are linear.
+    assert aux.metrics["discriminator"] != trained.metrics["discriminator"]
     assert aux.variables is None
     assert any(not np.array_equal(before, after) for before, after in zip(
         jax.tree.leaves(variables[SPECTRAL]), jax.tree.leaves(trained.variables[SPECTRAL]), strict=True))
@@ -248,7 +241,7 @@ def test_each_side_trains_on_its_own_loss(runs):
 
 def test_a_saved_student_samples_in_one_step(runs, tmp_path):
     config, batch = runs
-    task, state = saved_after_one_step(config, batch, tmp_path / "student", 1e-3)
+    task, state, _ = saved_after_one_step(config, batch, tmp_path / "student", 1e-3)
     restored = TextToImage.from_run(str(tmp_path / "student"))
     assert TEACHER not in restored.variables and DISCRIMINATOR not in restored.variables["params"]
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
@@ -263,9 +256,9 @@ def test_a_lora_student_distills_beside_its_whole_teacher():
     """The teacher runs through its own model, so a LoRA student over its
     weights distills: a step trains its factors and the heads, and the
     weights it froze stay the teacher's."""
+    from dew.batch import FROZEN
     from dew.inputs import Field, InputSpec
     from dew.lora import LoRA
-    from dew.objectives.base import FROZEN
 
     model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2)
     teacher = model.init(jax.random.PRNGKey(0), jnp.zeros((1, 4, 4, 3)), jnp.ones((1,)))

@@ -13,13 +13,13 @@ Linear and DeepSeek releases do, where vLLM divides by the sum alone; the
 fixture's sums are far above where that shows in float32.
 """
 
-import json
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import fixture_with_meta
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.moe import Router
@@ -30,9 +30,7 @@ CASES = ("kimi", "grouped", "softmax", "unbiased")
 
 @pytest.fixture(scope="module")
 def reference():
-    with np.load(FIXTURE) as loaded:
-        arrays = dict(loaded)
-    return arrays, json.loads(arrays.pop("meta").tobytes())
+    return fixture_with_meta(FIXTURE)
 
 
 @pytest.mark.parametrize("case", CASES)

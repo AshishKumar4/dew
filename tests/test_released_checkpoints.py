@@ -2,44 +2,18 @@
 
 SmolLM2-135M and Qwen3-0.6B are revision-pinned below. Dew and Transformers
 5.16.1 load the same snapshot in float32; the Torch reference stays on CPU.
-The GPU run uses the suite's highest matmul precision. Lowering precision to
-TF32 made four Qwen cases fail at the unchanged bounds.
+The GPU run uses the suite's highest matmul precision.
 
-`LOGITS` is per checkpoint because the fp32 forward residual is per
-checkpoint, and it is not 1e-4. What sets it, measured on these two
-revisions over the prompts below:
-
-                  CPU fp32   GPU fp32   fp64, both sides widened
-  SmolLM2-135M    1.469e-4   1.590e-4   2.149e-13
-  Qwen3-0.6B      7.820e-5   3.586e-4   2.487e-13
-
-The last column is the exactness proof, and it says the arithmetic is the
-same arithmetic. Both implementations deliberately pin several operations to
-fp32 whatever the model's compute dtype: the rotary tables
-(`dew.nn.rope.rotary_freqs`, `modeling_llama.py:108-125`), RMSNorm
-(`dew.nn.attention.RMSNorm`, `modeling_llama.py:62-67`) and the attention
-softmax (`flax/linen/attention.py:143-144`, `modeling_llama.py:208`). Widen
-exactly those on both sides, run the trunk in double, and the two agree to
-2e-13, five decimal orders inside 1e-4: rope, norm epsilon, attention
-scaling, grouped-query repetition and the gated MLP are not merely close,
-they are the same operators. The ids are identical too, which
-`test_the_load_hands_back_the_checkpoints_own_tokenizer` asserts.
-
-What remains in fp32 is therefore rounding, not a difference, and no change
-to dew drives it under 1e-4. The residual stream of these checkpoints
-carries massive activations, peaking near 19279 for SmolLM2 and 6560 for
-Qwen3, where one fp32 ulp is already 1.95e-3 and 4.88e-4; the measured
-per-layer residuals sit at one to four of those ulps, and the final norm and
-unembedding carry that into logits of magnitude 36.1 and 20.7 as a few tens
-of eps. TF32 is not the cause either: the CPU lane has no TF32 at all and
-lands within 1.1x (SmolLM2) and 4.6x (Qwen3) of the GPU lane, both lanes
-being accumulation order over the same operators.
-
-The bounds below are the tightest the numerics support, each about twice its
-checkpoint's worst measured lane. That leaves room for a backend
-reassociating a sum without leaving room for a wrong operator: an eps-scale
-bug in any operation above moves these residuals by orders of magnitude, not
-by a factor of two.
+Each numeric comparison holds Dew to transformers by the accuracy gate's
+reference rule (`assert_as_exact_as_the_reference`): Dew's fp32 result as near
+the float64 truth as transformers' fp32 result over the same ids, mask and
+positions, the truth transformers' float64 twin of the same weights
+(`tools.torch_precision.float64_twin`), each logit sized by Dew's own float64
+terms. No bound is fitted to a measured residual: these checkpoints' residual
+streams carry massive activations (near 19279 for SmolLM2 and 6560 for
+Qwen3), so their fp32 logits round by tens of eps, and the rule scales with
+whatever the reference's own rounding is, where a wrong operator moves Dew
+by orders of magnitude.
 
 Each prompt is tokenized individually, then the public numeric-input seam
 assembles padded rows. This does not exercise raw-text batch padding when
@@ -47,13 +21,14 @@ the source tokenizer has no pad token; masked fill uses its EOS id instead.
 """
 
 import math
-import os
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from model_support import flat_tree
+from reference_error import assert_as_exact_as_the_reference, float64_forward
 
 from dew.interop import Pretrained
 from dew.objectives.base import Step
@@ -74,24 +49,9 @@ PROMPTS = ("The Cascade Range runs from northern California through Oregon and W
 SEQ = 32
 NEW_TOKENS = 12
 RATE = 1e-4
-LOGITS = {"SmolLM2-135M": 3e-4, "Qwen3-0.6B": 7e-4}
-TOKEN_LOSS = 5e-3
-UPDATE = 1e-6
-
-
-def available(repo: str, revision: str) -> bool:
-    if os.environ.get("DEW_NETWORK_TESTS") == "1":
-        return True
-    from huggingface_hub import try_to_load_from_cache
-    return isinstance(try_to_load_from_cache(repo, "model.safetensors", revision=revision), str)
 
 
 pytestmark = pytest.mark.network
-
-
-def flat(tree):
-    return {".".join(str(entry.key) for entry in path): leaf
-            for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
 
 def stop_ids(generation_config) -> tuple[int, ...] | None:
@@ -103,8 +63,7 @@ def stop_ids(generation_config) -> tuple[int, ...] | None:
 
 @pytest.fixture(scope="module", params=list(CHECKPOINTS), ids=list(CHECKPOINTS))
 def checkpoint(request):
-    """Which pinned checkpoint the case runs on: the key into `CHECKPOINTS`
-    and `LOGITS`, since the forward residual is a property of the weights."""
+    """Which pinned checkpoint the case runs on: the key into `CHECKPOINTS`."""
     return request.param
 
 
@@ -112,8 +71,6 @@ def checkpoint(request):
 def bundle(checkpoint):
     """One released checkpoint as a native model, loaded once per checkpoint."""
     repo, revision = CHECKPOINTS[checkpoint]
-    if not available(repo, revision):
-        pytest.skip(f"{repo} at {revision[:8]} is neither cached nor DEW_NETWORK_TESTS=1")
     return Pretrained.load(repo, dtype="float32", attention_impl="reference",
                            max_seq_len=SEQ, revision=revision)
 
@@ -156,8 +113,22 @@ def reference(bundle):
     return model
 
 
-def reference_logits(model, ids, mask=None, positions=None) -> np.ndarray:
-    """`model`'s logits for exactly the ids, mask and positions dew was given."""
+def wide_logits(model, ids, mask=None, positions=None) -> np.ndarray:
+    """`model`'s float64 twin's logits for exactly the ids, mask and positions dew was given, the twin
+    released as soon as they are read: a 0.6B model's float64 copy beside the float32 ones is most of
+    a CI task's memory."""
+    from tools.torch_precision import float64, float64_twin
+
+    twin = float64_twin(model)
+    with float64():
+        logits = reference_logits(twin, ids, mask, positions, wide=True)
+    del twin
+    return logits
+
+
+def reference_logits(model, ids, mask=None, positions=None, *, wide: bool = False) -> np.ndarray:
+    """`model`'s logits for exactly the ids, mask and positions dew was given, in float32, or as the
+    model computes them where `wide`."""
     import torch
 
     def rows(value):
@@ -168,7 +139,8 @@ def reference_logits(model, ids, mask=None, positions=None) -> np.ndarray:
         fields["attention_mask"] = rows(mask)
         fields["position_ids"] = rows(positions)
     with torch.no_grad():
-        return model(**fields).logits.to(torch.float32).numpy()
+        logits = model(**fields).logits
+        return (logits if wide else logits.to(torch.float32)).numpy()
 
 
 @pytest.fixture(scope="module")
@@ -176,8 +148,8 @@ def scoring(bundle, batch):
     """The objective the scoring and the training step share, and its rows.
 
     Module-scoped because a second copy of a real parameter tree buys these
-    tests nothing. No EMA: the averaged weights are not what the export or
-    the gradient check reads.
+    tests nothing. No EMA: the averaged weights are not what the export
+    reads.
     """
     inputs, _, fill = batch
     ids = np.asarray(inputs.tokens)
@@ -189,7 +161,8 @@ def scoring(bundle, batch):
 
 @pytest.fixture(scope="module")
 def trained(scoring):
-    """One real `Trainer` step of plain SGD over the released weights."""
+    """The state after one real `Trainer` step of plain SGD over the released
+    weights."""
     import grain
 
     from dew.data.dataset import Loader
@@ -202,9 +175,8 @@ def trained(scoring):
     stream = (grain.MapDataset.source(entries).repeat().to_iter_dataset()
               .batch(count, drop_remainder=True))
     data = Loader(train=lambda partition: iter(stream), val=None, records=count, batch=count)
-    state = Trainer(objective, optax.sgd(RATE), key=jax.random.key(2)).fit(
+    return Trainer(objective, optax.sgd(RATE), key=jax.random.key(2)).fit(
         data, steps=1, log_every=1)
-    return state, {"text": tokens}
 
 
 def test_the_load_hands_back_the_checkpoints_own_tokenizer(bundle, batch):
@@ -225,25 +197,27 @@ def test_the_load_hands_back_the_checkpoints_own_tokenizer(bundle, batch):
 def test_the_released_logits_match_transformers_on_the_same_ids(
         bundle, batch, reference, checkpoint):
     """The parity claim on real weights: dew's fp32 forward over the released
-    checkpoint against transformers over the same directory, the same ids,
-    the same mask and the same positions."""
+    checkpoint as exact as transformers' over the same directory, the same
+    ids, the same mask and the same positions (`assert_as_exact_as_the_reference`),
+    the truth transformers' float64 twin of the same weights."""
     inputs, _, _ = batch
-    valid = np.asarray(inputs.token_fields["attention_mask"])
+    valid = np.asarray(inputs.token_fields["attention_mask"]).astype(bool)
+    positions = inputs.token_fields["positions"]
     ours = np.asarray(bundle.model.apply(bundle.variables, inputs.tokens, **inputs.kwargs()),
                       np.float32)
-    theirs = reference_logits(reference, inputs.tokens, valid,
-                              inputs.token_fields["positions"])
-
-    assert np.array_equal(np.argmax(ours[valid], -1), np.argmax(theirs[valid], -1))
-    difference = float(np.max(np.abs(ours[valid] - theirs[valid])))
-    assert difference < LOGITS[checkpoint], f"max |logit difference| {difference:.3e}"
+    theirs = reference_logits(reference, inputs.tokens, valid, positions)
+    wide = wide_logits(reference, inputs.tokens, valid, positions)
+    _, terms = float64_forward(bundle.model, bundle.variables, inputs.tokens, **inputs.kwargs())
+    assert_as_exact_as_the_reference(ours[valid], theirs[valid], wide[valid], f"{checkpoint} logits",
+                                     terms=np.asarray(terms)[valid])
 
 
 def test_the_objectives_token_scores_are_the_references_cross_entropy(
-        batch, reference, scoring):
+        batch, reference, scoring, checkpoint):
     """`LMObjective.evaluate` is the shifted cross entropy of the reference's
-    own logits, position by position, and the fill it is handed counts for
-    nothing."""
+    own logits, position by position, as exact as the reference's
+    (`assert_as_exact_as_the_reference`, the truth the cross entropy of its
+    float64 twin's logits), and the fill it is handed counts for nothing."""
     import torch
 
     inputs, _, _ = batch
@@ -252,15 +226,19 @@ def test_the_objectives_token_scores_are_the_references_cross_entropy(
     scores = objective.evaluate(variables, {"text": jnp.asarray(rows)},
                                 Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None))
     losses, weights = np.asarray(scores.losses), np.asarray(scores.weights)
-    expected = torch.nn.functional.cross_entropy(
-        torch.from_numpy(reference_logits(reference, rows[:, :-1])).transpose(1, 2),
-        torch.from_numpy(rows[:, 1:].astype(np.int64)), reduction="none").numpy()
+    targets = torch.from_numpy(rows[:, 1:].astype(np.int64))
 
+    def cross_entropy(logits):
+        return torch.nn.functional.cross_entropy(torch.from_numpy(logits).transpose(1, 2), targets,
+                                                 reduction="none").numpy()
+
+    expected = cross_entropy(reference_logits(reference, rows[:, :-1]))
+    truth = cross_entropy(wide_logits(reference, rows[:, :-1]))
     counted = weights > 0
     # Every real token but each row's first is a target; the fill is not.
     assert int(counted.sum()) == int(valid.sum()) - rows.shape[0]
-    difference = float(np.max(np.abs(losses[counted] - expected[counted])))
-    assert difference < TOKEN_LOSS, f"max |token loss difference| {difference:.3e}"
+    assert_as_exact_as_the_reference(losses[counted], expected[counted], truth[counted],
+                                     f"{checkpoint} token losses")
 
 
 def test_greedy_generation_draws_the_references_greedy_continuation(bundle, batch, reference):
@@ -290,36 +268,20 @@ def test_greedy_generation_draws_the_references_greedy_continuation(bundle, batc
                 == [int(token) for token in expected[0][lengths[row]:]]), text
 
 
-def test_one_trainer_step_moves_the_weights_by_the_objectives_gradient(scoring, trained):
-    """A real `Trainer.fit(steps=1)` over the released weights: with plain
-    SGD the new parameters are the loaded ones less the rate times the
-    objective's own gradient, on every leaf."""
-    objective, variables, _ = scoring
-    state, batch = trained
-    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-    gradient = jax.grad(lambda values: objective.scalar_loss(values, batch, step)[0])(variables)
-
-    held, updated, grads = flat(variables), flat(state.variables), flat(gradient)
-    assert int(state.updates) == 1 and held.keys() == updated.keys()
-    difference = max(float(np.max(np.abs(np.asarray(updated[name])
-                                         - (np.asarray(leaf) - RATE * np.asarray(grads[name])))))
-                     for name, leaf in held.items())
-    assert difference < UPDATE, f"max |update difference| {difference:.3e}"
-
-
 def test_the_trained_export_reloads_and_transformers_reads_it(
         bundle, batch, trained, checkpoint, tmp_path):
     """`Pretrained.save` writes the trained weights back into the released
     layout: `Pretrained.load` reads them back leaf for leaf, rebuilds the
     same model and still carries a tokenizer, and transformers loads the
     same directory, consuming every tensor and wanting none, and computes
-    the same logits."""
+    logits Dew's are as exact as (`assert_as_exact_as_the_reference`), the
+    truth its float64 twin of the exported weights."""
     import torch
     from transformers import AutoModelForCausalLM
 
     inputs, _, _ = batch
-    state, _ = trained
-    valid = np.asarray(inputs.token_fields["attention_mask"])
+    state = trained
+    valid = np.asarray(inputs.token_fields["attention_mask"]).astype(bool)
     export = tmp_path / "trained"
 
     bundle.save(export, variables=state.variables)
@@ -329,8 +291,8 @@ def test_the_trained_export_reloads_and_transformers_reads_it(
 
     assert again.model == bundle.model, "the exported config rebuilds a different model"
     assert again.processor is not None, "the export carries no tokenizer"
-    held = flat(state.variables)
-    for name, leaf in flat(again.variables).items():
+    held = flat_tree(state.variables)
+    for name, leaf in flat_tree(again.variables).items():
         assert np.array_equal(np.asarray(leaf), np.asarray(held[name])), name
     reloaded = np.asarray(again.model.apply(again.variables, inputs.tokens, **inputs.kwargs()),
                           np.float32)
@@ -348,7 +310,10 @@ def test_the_trained_export_reloads_and_transformers_reads_it(
 
     read_back.eval()
     read_back.set_attn_implementation("eager")
-    theirs = reference_logits(read_back, inputs.tokens, valid, inputs.token_fields["positions"])
-    assert np.array_equal(np.argmax(theirs[valid], -1), np.argmax(ours[valid], -1))
-    difference = float(np.max(np.abs(theirs[valid] - ours[valid])))
-    assert difference < LOGITS[checkpoint], f"max |logit difference| {difference:.3e}"
+    positions = inputs.token_fields["positions"]
+    theirs = reference_logits(read_back, inputs.tokens, valid, positions)
+    wide = wide_logits(read_back, inputs.tokens, valid, positions)
+    del read_back
+    _, terms = float64_forward(bundle.model, state.variables, inputs.tokens, **inputs.kwargs())
+    assert_as_exact_as_the_reference(ours[valid], theirs[valid], wide[valid], f"{checkpoint} export",
+                                     terms=np.asarray(terms)[valid])

@@ -6,7 +6,7 @@
     JAX_PLATFORMS=cpu python examples/train_masked_lm.py --smoke --out /tmp/mdlm-smoke
 
 The first run reads the dataset's train split with `datasets` and tokenizes it
-once into Dew's cache (`HubText`), each row a document ended by the
+once into Dew's cache, each row a document ended by the
 tokenizer's eos id. Later runs read the cached ids offline. The head 1% of
 that stream is held out, and training never reads it. A bidirectional
 `CausalTransformer` learns MDLM's negative ELBO (`MaskedDiffusionObjective`).
@@ -32,16 +32,15 @@ import jax
 import tyro
 
 import dew
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.config.data import HoldOut, TextData, loader
-from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading
+from dew.config import ObjectiveConfig, TrainerConfig
+from dew.config.lm import LMRunConfig
+from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading, presets, text
 from dew.data.compile import iterate
-from dew.data.pipeline import Pipeline
-from dew.data.text import Tokenize
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-from dew.objectives.lm import LMRunConfig, Perplexity
+from dew.objectives.lm import Perplexity
+from dew.optim import Cosine, OptimConfig
+from dew.registry import ModelConfig
 from dew.training import Evaluation, MeshSpec
-from dew.training.optim import Cosine
 
 SMOKE_TEXT = (
     "The cat sat on the warm mat and watched the rain.\n",
@@ -97,13 +96,26 @@ def main(config: Config) -> Path:
     if config.smoke:
         config, source = smoke_config(config)
     tokenizer = ByteTokenizer() if config.tokenizer == "byte" else HFTokenizer(config.tokenizer)
-    # The window is one id shorter than a row: Text adds the id a
-    # next-token target shifts by, and MDLM denoises the whole row.
-    data = TextData(source=source, tokenizer=config.tokenizer, eos=True,
-                seq_len=config.sequence_length - 1, token_holdout=HoldOut(fraction=0.01))
+    documents = source.map(text.tokenize(config.tokenizer, eos=True))
+    train, held = documents.holdout(tokens=0.01, fields=("text",))
+    # The window is one id shorter than a row: the lm preset adds the id a
+    # next-token target shifts by, and MDLM denoises the whole row. The ids
+    # are tokenized already, so the preset takes no tokenizer.
+    window = config.sequence_length - 1
+    loading = Loading(workers=0, threads=4)
+    # The windows are cut first, then shuffled one by one, as the held-out split's are read.
+    data = (train.pipe(presets.lm, None, seq_len=window, batch=None, pack=None)
+            .shuffle(seed=0).repeat().batch(config.batch_size)
+            .read("memory").loading(loading))
+    records = None if config.val_batches is None else config.val_batches * config.batch_size
+    validation = (held.pipe(presets.lm, None, seq_len=window, batch=config.batch_size, pack=None,
+                            records=records)
+                  .read("memory").loading(loading))
+    # The final score reads every held-out window.
+    whole = held.pipe(presets.lm, None, seq_len=window, batch=config.batch_size, pack=None).read("memory")
     name = f"mdlm-{config.dataset.rsplit('/', 1)[-1].lower()}"
     trainer = TrainerConfig(name=name, checkpoint_dir=str(config.out / "checkpoints"), keep=1,
-                            batch_size=config.batch_size, steps=config.steps,
+                            steps=config.steps,
                             log_every=1 if config.smoke else 100, eval_every=config.eval_every,
                             checkpoint_every=config.eval_every, mesh=MeshSpec(fsdp=1), multi_host=False)
     # The mask is the id past the tokenizer's, so no text can contain it.
@@ -111,14 +123,13 @@ def main(config: Config) -> Path:
         model=ModelConfig("causal_transformer", {
             **config.model, "causal": False, "mask_token_id": tokenizer.vocab_size,
             "dtype": "float32" if config.smoke else "bfloat16"}),
-        data=data, data_read="memory", tokenizer=config.tokenizer, provision=not config.smoke,
-        validation_records=None if config.val_batches is None else config.val_batches * config.batch_size,
-        loading=Loading(workers=0, threads=4),
+        data=data, validation=validation, tokenizer=config.tokenizer,
         objective=ObjectiveConfig("masked_diffusion", {
-            "steps": config.sample_steps, "ema_decay": 0.9 if config.smoke else 0.999}),
-        optim=OptimConfig(weight_decay=0.03, clip_grads=1.0, schedule=Cosine(
-            peak=config.learning_rate, warmup_steps=config.warmup_steps,
-            end=config.learning_rate / 10)),
+            "steps": config.sample_steps, "ema_decay": 0.9 if config.smoke else 0.999,
+            "eos_token_ids": () if tokenizer.eos_id is None else (tokenizer.eos_id,)}),
+        optim=OptimConfig(weight_decay=0.03, clip_grads=1.0, learning_rate=Cosine(
+            peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
+            end_value=config.learning_rate / 10)),
         trainer=replace(trainer, compilation_cache_dir=None) if config.smoke else trainer)
     started = time.perf_counter()
     run.run()
@@ -128,15 +139,12 @@ def main(config: Config) -> Path:
     # task its objective saved, and both the score and the samples read it.
     run_dir = config.out / "checkpoints" / name
     task = dew.pipeline(str(run_dir))
-    task = replace(task, eos_token_ids=() if tokenizer.eos_id is None else (tokenizer.eos_id,))
-    whole = loader(data, batch=config.batch_size, read="memory", loading=run.loading)
     scored = Evaluation.run(MaskedDiffusionObjective(task.model, task.process, config.sequence_length),
-                            task.variables, whole.val, key=jax.random.key(0), metrics=[Perplexity()],
+                            task.variables, whole, key=jax.random.key(0), metrics=[Perplexity()],
                             loss=True)
     generated = task(list(config.prompts), config.max_new_tokens, key=1)
     samples = [prompt + text for prompt, text in zip(config.prompts, task.decode(generated), strict=True)]
-    token_rows = iterate(Pipeline(source).map(Tokenize(config.tokenizer, eos=True)), read="memory",
-                         loading=run.loading)
+    token_rows = iterate(documents, read="memory", loading=loading)
     reader = iter(token_rows)
     try:
         total_tokens = sum(len(row["text"]) for row in reader)

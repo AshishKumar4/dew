@@ -15,7 +15,6 @@ real tensors of V4-Flash, V4-Flash-Base and V4.1-Flash at pinned commits.
 """
 
 import json
-import os
 import re
 import struct
 from pathlib import Path
@@ -81,6 +80,23 @@ def test_an_untrained_re_export_writes_the_same_values(dtype):
     before, after = (np.stack([packed & 15, packed >> 4]) for packed in (codes, again["m.weight_packed"]))
     moved = before != after
     assert set(before[moved].tolist()) <= {8} and set(after[moved].tolist()) <= {0}
+
+
+@pytest.mark.parametrize("param_dtype, kept", [("auto", ml_dtypes.bfloat16), ("float32", np.float32),
+                                                ("bfloat16", ml_dtypes.bfloat16), ("float16", np.float16)])
+def test_mxfp4_decodes_into_its_kept_dtype_as_float32_then_a_cast_does(param_dtype, kept):
+    """GPT OSS's MXFP4 experts decode straight into the dtype the load keeps them in (the bf16 they
+    decode to under `auto`), each expert on its own: every value, signed zeros, the subnormal scales of
+    byte 0 and the NaN of byte 255 included, is the float32 decode's cast to that dtype, bit for bit."""
+    rng = np.random.default_rng(0x1718)
+    blocks = rng.integers(0, 256, (3, 5, 4, codecs.GROUP // 2), dtype=np.uint8)
+    scales = rng.integers(0, 256, (3, 5, 4), dtype=np.uint8)
+    scales[0, 0, :3] = [0, 254, 255]
+    reference = codecs.decode_e2m1(blocks.reshape(3, 5, 4 * codecs.GROUP // 2), scales).swapaxes(1, 2)
+    decoded = codecs.MXFP4.dequantize({"w_blocks": blocks, "w_scales": scales}, param_dtype=param_dtype)["w"]
+    assert decoded.dtype == np.dtype(kept) and decoded.flags.c_contiguous
+    expected = np.ascontiguousarray(reference.astype(kept))
+    np.testing.assert_array_equal(decoded.view(np.uint8), expected.view(np.uint8))
 
 
 def test_a_group_rounding_past_the_largest_power_of_two_is_refused():
@@ -457,10 +473,6 @@ def released_tensor(repo: str, name: str, rows: tuple[int, int] | None) -> np.nd
 
 
 @pytest.mark.network
-@pytest.mark.skipif(os.environ.get("DEW_NETWORK_TESTS") != "1",
-                    reason="reads six tensors of DeepSeek-V4-Flash, V4-Flash-Base and V4.1-Flash and their "
-                           "scales from the hub; "
-                           "DEW_NETWORK_TESTS=1 runs it")
 @pytest.mark.parametrize("repo, name, rows, block, fp4_experts", [
     ("deepseek-ai/DeepSeek-V4-Flash", "layers.0.attn.wkv.weight", None, 128, True),
     ("deepseek-ai/DeepSeek-V4-Flash", "layers.0.ffn.experts.0.w2.weight", None, 128, True),

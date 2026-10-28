@@ -40,10 +40,8 @@ class Scalar:
         self.value = value
 
     @classmethod
-    def from_run(cls, directory, *, ema=None, step=None, mesh=None, layout=None, dtype=None,
-                 param_dtype=None):
-        from dew.checkpoints import Checkpoints
-        variables = Checkpoints(directory).variables(ema=ema, step=step, mesh=mesh, layout=layout)
+    def from_saved(cls, run, *, ema=None, mesh=None, layout=None, dtype=None, param_dtype=None):
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout)
         return cls(float(variables["params"]["w"]))
 
 
@@ -74,12 +72,10 @@ def test_dew_pipeline_loads_a_packages_run_only_when_trusted(tmp_path):
     run = tmp_path / "run"
     train = ("import jax, numpy as np, optax\n"
              "from dew import Checkpoints, Trainer\n"
-             "from dew.config.data import RecordsData, loader\n"
-             "from dew.data import Loading\n"
+             "from dew.data import Loading, Memory\n"
              "from toypackage.models import Shift\n"
-             "rows = RecordsData(source={'x': np.full((8,), 3.0, np.float32)})\n"
-             "loading = Loading(workers=0, threads=1, read_buffer=1)\n"
-             "data = loader(rows, batch=8, read='memory', loading=loading)\n"
+             "rows = Memory({'x': np.full((8,), 3.0, np.float32)}).read('memory')\n"
+             "data = rows.shuffle().repeat().batch(8).loading(Loading(workers=0, threads=1, read_buffer=1))\n"
              "trainer = Trainer(Shift(), optax.sgd(0.5), key=jax.random.key(0),\n"
              f"                  checkpoints=Checkpoints({str(run)!r}))\n"
              "state = trainer.fit(data, steps=3, log_every=3, checkpoint_every=3)\n"
@@ -115,10 +111,10 @@ from flax import linen as nn
 from flax import struct
 
 from dew.config import Prepared, RunConfig, TrainerConfig
-from dew.data import Loading
-from dew.data.dataset import Loader
+from dew.data import Loading, Memory
+from dew.mesh import DEFAULT_RULES
 from dew.objectives.base import Objective, mean_of_totals, merge_totals
-from dew.training import DEFAULT_RULES, Layout, MeshSpec
+from dew.training import Layout, MeshSpec
 
 
 @struct.dataclass
@@ -179,22 +175,22 @@ class ActivityRun(RunConfig):
 
     def prepare(self):
         rows = np.random.default_rng(0).normal(size=(64, 8)).astype(np.float32)
-        from dew.config.data import RecordsData, loader
-
-        data = loader(RecordsData(source={"x": rows}, validation={"x": rows[:20]}),
-                      batch=self.trainer.batch_size,
-                    read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
+        loading = Loading(workers=0, threads=1, read_buffer=1)
+        data = Memory({"x": rows}).read("memory").shuffle().repeat().batch(8).loading(loading)
+        held = Memory({"x": rows[:20]}).read("memory").batch(8).loading(loading)
         objective = Rate(self.model.build(), self.target)
-        return Prepared(self, lambda name: self.train(objective, data, name=name, metrics=(MeanRate(),)))
+        return Prepared(self, lambda name: self.train(objective, data, name=name, metrics=(MeanRate(),),
+                                                      validation=held))
 '''
 
 TRAIN_RUN = '''
 import dataclasses, sys
-from dew.config import ModelConfig, TrainerConfig
+from dew.config import TrainerConfig
+from dew.registry import ModelConfig
 from toypackage.models import ActivityRun
 default = ActivityRun().trainer
 run = ActivityRun(model=ModelConfig("toypackage.models:Population", {"neurons": 64}),
-                  trainer=dataclasses.replace(default, steps=4, batch_size=8, eval_every=4, log_every=1,
+                  trainer=dataclasses.replace(default, steps=4, eval_every=4, log_every=1,
                                               checkpoint_dir=sys.argv[1], name="activity",
                                               compilation_cache_dir=None, multi_host=False))
 state = run.run()

@@ -26,7 +26,6 @@ What lands:
   reference release.
 """
 
-import contextlib
 import json
 import sys
 from pathlib import Path
@@ -34,8 +33,8 @@ from pathlib import Path
 import numpy as np
 import torch
 import transformers
-from hf_reference import FIXTURES, write_tiny
-from torch_precision import default_dtype, float_as, replaced, widened_to
+from hf_reference import FIXTURES, transformers_record, write_tiny
+from torch_precision import float64
 from transformers.models.mamba2.configuration_mamba2 import Mamba2Config
 from transformers.models.mamba2.modeling_mamba2 import (
     Mamba2ForCausalLM,
@@ -45,7 +44,6 @@ from transformers.models.mamba2.modeling_mamba2 import (
 )
 
 SSD = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "mamba2"
-TRANSFORMERS_REVISION = "93c8b7b485963a10800c91f55304db6be211c2bd"
 SEED = 2024
 # The scan fixture's geometry: batch, tokens, heads, head dim, groups, state, chunk.
 B, S, H, P, G, N, CHUNK = 2, 70, 4, 6, 2, 5, 32
@@ -117,16 +115,6 @@ def write_ssd() -> None:
     print(f"{SSD / 'ssd.npz'}: {(SSD / 'ssd.npz').stat().st_size / 1e3:.0f} kB")
 
 
-@contextlib.contextmanager
-def float64():
-    """The reference in float64 throughout (tools/torch_precision.py): torch's default dtype float64,
-    and each of its casts to float32, `.float()` and the gated norm's `.to(torch.float32)`
-    (modeling_mamba2.py:113,116), casting to float64 instead."""
-    with default_dtype(torch.float64), replaced(float_as(torch.float64),
-                                                (torch.Tensor, "to", widened_to(torch.Tensor.to))):
-        yield
-
-
 def write_float64() -> None:
     """ssd.npz's outputs again in float64 on its own stored operands and weights (`float64`), each
     beside its fp32 output as `<name>_f64`; nothing it held before changes."""
@@ -169,15 +157,86 @@ def write_mamba2_tiny(name: str = "mamba2-tiny") -> None:
     write_tiny(name, model, seed=SEED)
     directory = FIXTURES / name
     (directory / "source.json").write_text(json.dumps({
-        "transformers": {"version": transformers.__version__, "revision": TRANSFORMERS_REVISION},
+        "transformers": transformers_record(),
         "seed": SEED,
     }, indent=1) + "\n")
     (directory / "model.safetensors").chmod(0o644)
     print(f"{directory}: source.json written")
 
 
+def write_seeded() -> None:
+    """Fresh native-input/orbit draws with transformers' fp32 and torch-float64 outputs.
+
+    PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded
+    """
+    import jax
+    from recorded_references import provenance, record_case, save
+    from reference_error import assert_computes_the_oracle, chain_roundings, widened
+    from ssd_support import mamba2_draw, mamba2_run
+
+    def draw(seed):
+        inputs = mamba2_draw(seed, (B, S, H, P, G, N))
+        redrawn = mamba2_draw(seed)
+        assert inputs.keys() == redrawn.keys(), f"transformers seed {seed}: regenerated inputs differ"
+        for name, value in inputs.items():
+            other = redrawn[name]
+            assert (value.dtype == other.dtype and value.shape == other.shape
+                    and value.tobytes() == other.tobytes()), f"transformers seed {seed}: {name} differs"
+        return inputs
+
+    def reference(site, arrays):
+        x, dt, A, Bm, Cm, D, bias, initial = (arrays[name] for name in
+                                             ("x", "dt", "A", "B", "C", "D", "dt_bias", "h0"))
+        if site == "step":
+            state = initial.clone()
+            output = mamba2_selective_state_update(
+                state, x[:, 0], dt[:, 0][..., None].expand(-1, -1, P),
+                A[:, None, None].expand(-1, P, N), Bm[:, 0], Cm[:, 0],
+                D[:, None].expand(-1, P), dt_bias=bias[:, None].expand(-1, P), dt_softplus=True)
+        else:
+            output, state = mamba2_chunk_scan(
+                x, dt, A, Bm, Cm, chunk_size=CHUNK, D=D, dt_bias=bias, dt_softplus=True,
+                initial_states=initial if site == "carried" else None, return_final_states=True)
+        return {"output": output.detach().numpy(), "final": state.detach().numpy()}
+
+    stored = {}
+    for site in ("scan", "carried", "step"):
+        exact_run = jax.jit(lambda inputs, site=site: mamba2_run(site, inputs))
+        with jax.enable_x64(new_val=True):
+            roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(draw(0))))
+
+        def evaluate(inputs, site=site, exact_run=exact_run, roundings=roundings):
+            """The reference's fp32 outputs and its torch float64 truth, Dew's float64 path held to that
+            truth at this seed: the recording keeps the reference's evidence alone, and the test's truth
+            is Dew's float64 path (`indexed_recording`'s `truth_fn`)."""
+            tensors = {name: torch.from_numpy(value) for name, value in inputs.items()}
+            with torch.no_grad():
+                narrow = reference(site, tensors)
+                with float64():
+                    exact = reference(site, {name: value.double() for name, value in tensors.items()})
+            with jax.enable_x64(new_val=True):
+                twin = jax.tree.map(np.asarray, exact_run(widened(inputs)))
+            for name, value in exact.items():
+                assert_computes_the_oracle(twin[name], value, f"transformers float64 {site} {name}",
+                                           roundings=roundings)
+            return narrow, exact
+
+        stored.update(record_case(site, draw, evaluate, lambda inputs, site=site: mamba2_run(site, inputs),
+                                  store_inputs=False, summary=True))
+    stored["provenance"] = provenance(
+        f"transformers {transformers.__version__}", transformers_record()["revision"], "cpu",
+        "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded",
+        truth="transformers reference in torch float64 through tools/torch_precision.py")
+    destination = SSD / "ssd_seeded.npz"
+    written = save(destination, stored, reference=f"transformers {transformers.__version__}",
+                   license="Apache-2.0")
+    print(f"wrote {destination.name}: {written} ({written.stat().st_size:,} bytes)", flush=True)
+
+
 if __name__ == "__main__":
-    if sys.argv[1:] == ["float64"]:
+    if sys.argv[1:] == ["seeded"]:
+        write_seeded()
+    elif sys.argv[1:] == ["float64"]:
         write_float64()
     else:
         write_ssd()

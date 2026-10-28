@@ -4,7 +4,6 @@ routed size, each against transformers' logits (see test_hf_decoders).
 """
 
 import json
-import os
 from pathlib import Path
 
 import jax.numpy as jnp
@@ -12,7 +11,13 @@ import numpy as np
 import pytest
 from model_support import flat_tree
 from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
-from test_hf_decoders import GEMMA4_MOE, fixture_config, fp32_decoder
+from test_hf_decoders import (
+    GEMMA4_MOE,
+    assert_padded_speculation_is_greedy,
+    fixture_config,
+    fp32_decoder,
+    recorded_logit_difference,
+)
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.codecs import dequantize_mxfp4, quantize_mxfp4
@@ -21,130 +26,28 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
-QWEN2_MOE = FIXTURES / 'qwen2-moe-tiny'
+ROUTED = {'qwen2-moe-tiny': 'Qwen2-MoE', 'granitemoe-tiny': 'Granite MoE', 'minimax-m2-tiny': 'MiniMax-M2'}
+"""Routed decoders whose recorded fixtures carry the reference's float32 and float64 logits, whole,
+padded and cached: Qwen2-MoE's fused experts and shared gate, Granite MoE's packed experts, MiniMax-M2's
+router state, recorded from the corrected reference."""
 
 
-def test_qwen2_moe_logits_match_the_reference():
-    model, variables = fp32_decoder(QWEN2_MOE)
-    ids = np.load(QWEN2_MOE / 'input_ids.npy')
-    reference = np.load(QWEN2_MOE / 'logits.npy')
-    truth = np.load(QWEN2_MOE / 'logits_f64.npy')
-    logits = np.asarray(model.apply(variables, ids))
-    assert_as_exact_as_the_reference(logits, reference, truth, 'Qwen2-MoE logits')
+@pytest.mark.parametrize('name', (*ROUTED, 'minimax-m2-fp8-tiny'))
+def test_a_routed_decoders_logits_match_the_reference(name):
+    directory = FIXTURES / name
+    model, variables = fp32_decoder(directory)
+    reference = np.load(directory / 'logits.npy')
+    logits = np.asarray(model.apply(variables, np.load(directory / 'input_ids.npy')))
+    truth = np.load(directory / 'logits_f64.npy')
+    assert_as_exact_as_the_reference(logits, reference, truth, f'{name} logits')
     np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
-    print('Qwen2-MoE RMS ratio', distance(logits, truth) / distance(reference, truth))
 
 
-def test_qwen2_moe_decode_matches_the_reference():
-    model, variables = fp32_decoder(QWEN2_MOE)
-    ids = np.load(QWEN2_MOE / 'input_ids.npy')
-    state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
-    out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
-    pieces = [np.asarray(out)]
-    for index in range(4, ids.shape[1]):
-        out, state = model.apply({**variables, **state}, ids[:, index:index + 1],
-                                 decode=True, mutable=['cache'])
-        pieces.append(np.asarray(out))
-    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1),
-        np.load(QWEN2_MOE / 'logits.npy'), np.load(QWEN2_MOE / 'logits_f64.npy'), 'Qwen2-MoE cache')
-
-
-def test_qwen2_moe_padded_routing_matches_the_reference():
-    model, variables = fp32_decoder(QWEN2_MOE)
-    arrays = np.load(QWEN2_MOE / 'padded.npz')
-    logits = np.asarray(model.apply(
-        variables, arrays['input_ids'], positions=arrays['position_ids'],
-        attention_mask=arrays['attention_mask']))
-    valid = arrays['attention_mask']
-    assert_as_exact_as_the_reference(logits[valid], arrays['logits'][valid],
-                                     arrays['logits_f64'][valid], 'Qwen2-MoE padded')
-    print('Qwen2-MoE padded RMS ratio', distance(logits[valid], arrays['logits_f64'][valid])
-          / distance(arrays['logits'][valid], arrays['logits_f64'][valid]))
-
-
-def test_qwen2_moe_export_keeps_fused_experts_and_shared_gate(tmp_path):
-    loaded = Pretrained.load(str(QWEN2_MOE), dtype='float32', attention_impl='reference')
-    loaded.save(tmp_path / 'export')
-    again = Pretrained.load(str(tmp_path / 'export'), dtype='float32', attention_impl='reference')
-    for path, leaf in flat_tree(loaded.variables).items():
-        np.testing.assert_array_equal(leaf, flat_tree(again.variables)[path])
-    assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config('qwen2-moe-tiny')
-
-
-GRANITEMOE = FIXTURES / 'granitemoe-tiny'
-
-
-def test_granitemoe_logits_match_the_reference():
-    model, variables = fp32_decoder(GRANITEMOE)
-    ids = np.load(GRANITEMOE / 'input_ids.npy')
-    reference = np.load(GRANITEMOE / 'logits.npy')
-    truth = np.load(GRANITEMOE / 'logits_f64.npy')
-    logits = np.asarray(model.apply(variables, ids))
-    assert_as_exact_as_the_reference(logits, reference, truth, 'Granite MoE logits')
-    np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
-    print('Granite MoE RMS ratio', distance(logits, truth) / distance(reference, truth))
-
-
-def test_granitemoe_prefill_and_steps_match_the_reference():
-    model, variables = fp32_decoder(GRANITEMOE)
-    ids = np.load(GRANITEMOE / 'input_ids.npy')
-    state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
-    out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
-    pieces = [np.asarray(out)]
-    for index in range(4, ids.shape[1]):
-        out, state = model.apply({**variables, **state}, ids[:, index:index + 1],
-                                 decode=True, mutable=['cache'])
-        pieces.append(np.asarray(out))
-    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1),
-        np.load(GRANITEMOE / 'logits.npy'), np.load(GRANITEMOE / 'logits_f64.npy'), 'Granite MoE cache')
-
-
-def test_granitemoe_padded_routing_matches_the_reference():
-    model, variables = fp32_decoder(GRANITEMOE)
-    arrays = np.load(GRANITEMOE / 'padded.npz')
-    logits = np.asarray(model.apply(
-        variables, arrays['input_ids'], positions=arrays['position_ids'],
-        attention_mask=arrays['attention_mask']))
-    valid = arrays['attention_mask']
-    assert_as_exact_as_the_reference(logits[valid], arrays['logits'][valid],
-                                     arrays['logits_f64'][valid], 'Granite MoE padded')
-    print('Granite MoE padded RMS ratio', distance(logits[valid], arrays['logits_f64'][valid])
-          / distance(arrays['logits'][valid], arrays['logits_f64'][valid]))
-
-
-def test_granitemoe_export_keeps_packed_experts_and_tied_head(tmp_path):
-    from safetensors.numpy import load_file
-
-    loaded = Pretrained.load(str(GRANITEMOE), dtype='float32', attention_impl='reference')
-    loaded.save(tmp_path / 'export')
-    tensors = load_file(str(tmp_path / 'export/model.safetensors'))
-    assert 'model.layers.0.block_sparse_moe.input_linear.weight' in tensors
-    assert 'lm_head.weight' not in tensors
-    again = Pretrained.load(str(tmp_path / 'export'), dtype='float32', attention_impl='reference')
-    for path, leaf in flat_tree(loaded.variables).items():
-        np.testing.assert_array_equal(leaf, flat_tree(again.variables)[path])
-    assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config('granitemoe-tiny')
-
-
-MINIMAX_M2 = FIXTURES / 'minimax-m2-tiny'
-
-
-@pytest.mark.parametrize('name', ('minimax-m2-tiny', 'minimax-m2-fp8-tiny'))
-def test_minimax_m2_logits_match_the_corrected_reference(name):
+@pytest.mark.parametrize('name', ROUTED)
+def test_a_routed_decoders_prefill_and_token_steps_match_the_reference(name):
     directory = FIXTURES / name
     model, variables = fp32_decoder(directory)
     ids = np.load(directory / 'input_ids.npy')
-    reference = np.load(directory / 'logits.npy')
-    truth = np.load(directory / 'logits_f64.npy')
-    logits = np.asarray(model.apply(variables, ids))
-    assert_as_exact_as_the_reference(logits, reference, truth, 'MiniMax-M2 logits')
-    np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
-    print(name, 'RMS ratio', distance(logits, truth) / distance(reference, truth))
-
-
-def test_minimax_m2_prefill_and_token_steps_match_the_corrected_reference():
-    model, variables = fp32_decoder(MINIMAX_M2)
-    ids = np.load(MINIMAX_M2 / 'input_ids.npy')
     state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
     out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
     pieces = [np.asarray(out)]
@@ -152,30 +55,43 @@ def test_minimax_m2_prefill_and_token_steps_match_the_corrected_reference():
         out, state = model.apply({**variables, **state}, ids[:, index:index + 1],
                                  decode=True, mutable=['cache'])
         pieces.append(np.asarray(out))
-    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1),
-        np.load(MINIMAX_M2 / 'logits.npy'), np.load(MINIMAX_M2 / 'logits_f64.npy'), 'MiniMax-M2 cache')
+    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1), np.load(directory / 'logits.npy'),
+                                     np.load(directory / 'logits_f64.npy'), f'{ROUTED[name]} cache')
 
 
-def test_minimax_m2_padded_routing_matches_the_corrected_reference():
-    model, variables = fp32_decoder(MINIMAX_M2)
-    arrays = np.load(MINIMAX_M2 / 'padded.npz')
+@pytest.mark.parametrize('name', ROUTED)
+def test_a_routed_decoders_padded_routing_matches_the_reference(name):
+    model, variables = fp32_decoder(FIXTURES / name)
+    arrays = np.load(FIXTURES / name / 'padded.npz')
     logits = np.asarray(model.apply(
         variables, arrays['input_ids'], positions=arrays['position_ids'],
         attention_mask=arrays['attention_mask']))
     valid = arrays['attention_mask']
     assert_as_exact_as_the_reference(logits[valid], arrays['logits'][valid],
-                                     arrays['logits_f64'][valid], 'MiniMax-M2 padded')
-    print('MiniMax-M2 padded RMS ratio', distance(logits[valid], arrays['logits_f64'][valid])
-          / distance(arrays['logits'][valid], arrays['logits_f64'][valid]))
+                                     arrays['logits_f64'][valid], f'{ROUTED[name]} padded')
 
 
-def test_minimax_m2_export_keeps_source_weights_and_router_state(tmp_path):
-    loaded = Pretrained.load(str(MINIMAX_M2), dtype='float32', attention_impl='reference')
+@pytest.mark.parametrize('name', ROUTED)
+def test_a_routed_decoders_export_reloads_its_weights_and_source_config(name, tmp_path):
+    """The export reloads to the same weights and writes the source's config, Qwen2-MoE's fused experts
+    and shared gate, Granite MoE's packed experts and MiniMax-M2's router state included."""
+    loaded = Pretrained.load(str(FIXTURES / name), dtype='float32', attention_impl='reference')
     loaded.save(tmp_path / 'export')
     again = Pretrained.load(str(tmp_path / 'export'), dtype='float32', attention_impl='reference')
     for path, leaf in flat_tree(loaded.variables).items():
         np.testing.assert_array_equal(leaf, flat_tree(again.variables)[path])
-    assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config('minimax-m2-tiny')
+    assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config(name)
+
+
+def test_granitemoe_export_writes_packed_experts_and_ties_its_head(tmp_path):
+    """Granite MoE's export writes its experts packed and its head tied, as its source does."""
+    from safetensors.numpy import load_file
+
+    Pretrained.load(str(FIXTURES / 'granitemoe-tiny'), dtype='float32', attention_impl='reference').save(
+        tmp_path / 'export')
+    tensors = load_file(str(tmp_path / 'export/model.safetensors'))
+    assert 'model.layers.0.block_sparse_moe.input_linear.weight' in tensors
+    assert 'lm_head.weight' not in tensors
 
 
 # --------------------------------------------------------------------------
@@ -190,14 +106,8 @@ def test_gpt_oss_logits_match_the_reference_implementation():
     max |logit difference| 2.5e-06 with identical argmax."""
     pretrained = Pretrained.load(str(GPT_OSS), dtype="float32", attention_impl="xla")
     model, variables = pretrained.model, pretrained.variables
-    ids = np.load(GPT_OSS / "input_ids.npy")
-    reference = np.load(GPT_OSS / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, GPT_OSS)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
     flat = flat_tree(variables["params"])
     assert flat["layers_0.self_attn.sinks"].shape == (4,)
     assert flat["layers_1.mlp.experts.gate_up_proj_bias"].shape == (4, 128)
@@ -245,28 +155,32 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
         assert np.array_equal(np.asarray(leaf), flat_tree(expected["params"])[path]), path
 
 
+GPT_OSS_20B = ("openai/gpt-oss-20b", "6cee5e81ee83917806bbde320786a8fb61efebee")
+"""The released GPT OSS 20B and the commit both sides read."""
+
+
 @pytest.mark.network
-@pytest.mark.skipif(not os.environ.get("DEW_NETWORK_TESTS"),
-                    reason="DEW_NETWORK_TESTS=1 downloads openai/gpt-oss-20b")
 def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
     """The released MXFP4 checkpoint through the loader against transformers'
     own dequantized bf16 forward at the same prompt. Tolerance on the top-32
     logits 5e-2 for bf16 accumulation over 24 layers; the argmax must agree
     everywhere. The largest observed difference is not recorded here: the
-    test needs the download."""
+    test needs the download. The weights stay in the bf16 the MXFP4 blocks
+    decode to (`param_dtype="auto"`), as the reference holds them: 42 GB on
+    the device, where FP32 master weights would take 84."""
     import torch
     from transformers import AutoTokenizer, GptOssForCausalLM
 
+    repo, revision = GPT_OSS_20B
     prompt = "The Cascade Range runs from northern California through Oregon"
-    ids = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")(
+    ids = AutoTokenizer.from_pretrained(repo, revision=revision)(
         prompt, return_tensors="np")["input_ids"].astype(np.int32)
-    pretrained = Pretrained.load("openai/gpt-oss-20b", dtype="bfloat16",
-                                 attention_impl="xla",
-                                 max_seq_len=int(ids.shape[1]))
+    pretrained = Pretrained.load(repo, dtype="bfloat16", param_dtype="auto", attention_impl="xla",
+                                 max_seq_len=int(ids.shape[1]), revision=revision)
     model, variables = pretrained.model, pretrained.variables
     logits = np.asarray(model.apply(variables, jnp.asarray(ids)), np.float32)[0]
 
-    reference = GptOssForCausalLM.from_pretrained("openai/gpt-oss-20b", dtype=torch.bfloat16)
+    reference = GptOssForCausalLM.from_pretrained(repo, dtype=torch.bfloat16, revision=revision)
     reference.eval()
     reference.set_attn_implementation("eager")
     with torch.no_grad():
@@ -291,14 +205,8 @@ def test_deepseek_v2_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 2.3e-06
     with identical argmax."""
     model, variables = fp32_decoder(DEEPSEEK_V2)
-    ids = np.load(DEEPSEEK_V2 / "input_ids.npy")
-    reference = np.load(DEEPSEEK_V2 / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, DEEPSEEK_V2)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
     assert "moe" not in variables, "V2 keeps no balancing bias"
 
 
@@ -307,21 +215,6 @@ def test_deepseek_v2_logits_match_the_reference_implementation():
 # --------------------------------------------------------------------------
 
 KIMI_K25 = FIXTURES / "kimi-k25-tiny"
-
-
-def test_kimi_k25_logits_match_the_reference_implementation():
-    """fp32 parity of the text half against Kimi_K25ForConditionalGeneration
-    on input_ids alone: tolerance 1e-4, observed max |logit difference|
-    the bound applies to the complete vocabulary at every input position."""
-    model, variables = fp32_decoder(KIMI_K25)
-    ids = np.load(KIMI_K25 / "input_ids.npy")
-    reference = np.load(KIMI_K25 / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
 
 def test_a_kimi_k25_export_writes_the_source_names_and_the_vision_bytes(tmp_path):
@@ -357,20 +250,6 @@ def test_a_kimi_k25_export_writes_the_source_names_and_the_vision_bytes(tmp_path
 GLM4_MOE = FIXTURES / "glm4-moe-tiny"
 
 
-def test_glm4_moe_logits_match_the_reference_implementation():
-    """fp32 parity of the trunk: tolerance 1e-4, observed max |logit
-    difference| 3.3e-06 with identical argmax."""
-    model, variables = fp32_decoder(GLM4_MOE)
-    ids = np.load(GLM4_MOE / "input_ids.npy")
-    reference = np.load(GLM4_MOE / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
-
-
 def test_the_glm4_moe_mtp_depth_matches_the_reference_composition():
     """The checkpoint's model.layers.2.* depth loads as mtp_0 with the
     trunk's routing and computes what the engines running the released
@@ -378,24 +257,34 @@ def test_the_glm4_moe_mtp_depth_matches_the_reference_composition():
     observed max |logit difference| 3.2e-06 with identical argmax. Swapping
     the two norms, the order today's from-scratch code had, disagrees."""
 
-    model, variables = fp32_decoder(GLM4_MOE)
-    ids = jnp.asarray(np.load(GLM4_MOE / "input_ids.npy"), jnp.int32)
-    reference = np.load(GLM4_MOE / "mtp_logits.npy")
-    depth = variables["params"]["mtp_0"]
-    assert set(depth) == {"enorm", "hnorm", "eh_proj", "block", "final_norm"}
-    assert depth["block"]["mlp"]["experts"]["gate_proj"]["kernel"].shape == (8, 32, 16)
+    variables, depth, depth_logits = mtp_depth(GLM4_MOE, experts=(8, 32, 16))
     assert "mtp_0" in variables["moe"]
-
-    hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
-    logits = np.asarray(model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0])
-    difference = float(np.max(np.abs(logits - reference)))
-    assert difference < 1e-4, f"max |mtp logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
     swapped = {**variables, "params": {**variables["params"], "mtp_0": {
         **depth, "enorm": depth["hnorm"], "hnorm": depth["enorm"]}}}
-    other = np.asarray(model.apply(swapped, hidden, ids, method=CausalTransformer.mtp_logits)[0])
-    assert float(np.max(np.abs(other - reference))) > 1e-2
+    other = depth_logits(swapped)
+    assert float(np.max(np.abs(other - np.load(GLM4_MOE / "mtp_logits.npy")))) > 1e-2
+
+
+def mtp_depth(directory, *, experts):
+    """A checkpoint's MTP depth, loaded as `mtp_0` with its routed experts' `experts` shape, computing
+    the reference composition's recorded logits over the fixture's ids (mtp_logits.npy): its variables,
+    the depth's parameters and the depth's logits under any variables."""
+    model, variables = fp32_decoder(directory)
+    ids = jnp.asarray(np.load(directory / "input_ids.npy"), jnp.int32)
+    depth = variables["params"]["mtp_0"]
+    assert set(depth) == {"enorm", "hnorm", "eh_proj", "block", "final_norm"}
+    assert depth["block"]["mlp"]["experts"]["gate_proj"]["kernel"].shape == experts
+
+    def depth_logits(held):
+        hidden = model.apply(held, ids, method=CausalTransformer.hidden_states)
+        return np.asarray(model.apply(held, hidden, ids, method=CausalTransformer.mtp_logits)[0])
+
+    logits, reference = depth_logits(variables), np.load(directory / "mtp_logits.npy")
+    difference = float(np.max(np.abs(logits - reference)))
+    assert difference < 1e-4, f"max |mtp logit difference| {difference:.3e}"
+    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    return variables, depth, depth_logits
 
 
 # --------------------------------------------------------------------------
@@ -469,21 +358,6 @@ def test_kimi_k25_text_only_placeholders_match_reference():
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
 
 
-def test_glm_moe_dsa_logits_match_the_reference_implementation():
-    """fp32 parity of the trunk: tolerance 1e-4, observed max |logit
-    difference| 2.7e-05 with identical argmax, over four selecting layers
-    and four that share the previous full layer's top-k."""
-    model, variables = fp32_decoder(GLM_MOE_DSA)
-    ids = np.load(GLM_MOE_DSA / "input_ids.npy")
-    reference = np.load(GLM_MOE_DSA / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
-
-
 def test_the_glm_moe_dsa_mtp_depth_matches_the_reference_composition():
     """The checkpoint's model.layers.8.* depth loads as mtp_0 with its own
     indexer and the trunk's routing, and computes what the engines running
@@ -491,18 +365,7 @@ def test_the_glm_moe_dsa_mtp_depth_matches_the_reference_composition():
     GlmMoeDsaDecoderLayer): tolerance 1e-4, observed max |logit difference|
     6.7e-06 with identical argmax."""
 
-    model, variables = fp32_decoder(GLM_MOE_DSA)
-    ids = jnp.asarray(np.load(GLM_MOE_DSA / "input_ids.npy"), jnp.int32)
-    reference = np.load(GLM_MOE_DSA / "mtp_logits.npy")
-    depth = variables["params"]["mtp_0"]
-    assert set(depth) == {"enorm", "hnorm", "eh_proj", "block", "final_norm"}
-    assert depth["block"]["mlp"]["experts"]["gate_proj"]["kernel"].shape == (8, 32, 12)
-
-    hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
-    logits = np.asarray(model.apply(variables, hidden, ids, method=CausalTransformer.mtp_logits)[0])
-    difference = float(np.max(np.abs(logits - reference)))
-    assert difference < 1e-4, f"max |mtp logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+    mtp_depth(GLM_MOE_DSA, experts=(8, 32, 12))
 
 
 def test_glm_moe_dsa_decodes_what_it_computes_in_one_pass():
@@ -530,18 +393,42 @@ def test_glm_moe_dsa_decodes_what_it_computes_in_one_pass():
 # --------------------------------------------------------------------------
 
 DEEPSEEK_V4 = FIXTURES / "deepseek-v4-tiny"
-def test_deepseek_v4_logits_match_the_reference_implementation():
-    """fp32 parity over all three attention kinds and both routers:
-    tolerance 1e-4 on logits of magnitude 4.4."""
-    model, variables = fp32_decoder(DEEPSEEK_V4)
-    ids = np.load(DEEPSEEK_V4 / "input_ids.npy")
-    reference = np.load(DEEPSEEK_V4 / "logits.npy")
 
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
 
-    difference = float(np.max(np.abs(logits - reference)))
+@pytest.mark.parametrize("directory", [KIMI_K25, GLM4_MOE, GLM_MOE_DSA, DEEPSEEK_V4],
+                         ids=["kimi-k25", "glm4-moe", "glm-moe-dsa", "deepseek-v4"])
+def test_a_moe_decoders_logits_match_the_reference_implementation(directory):
+    """fp32 parity against each release's reference, the complete vocabulary at every input position
+    within 1e-4 with identical argmax: Kimi K2.5's text half on input_ids alone; GLM-4 MoE's trunk
+    (observed 3.3e-06); GLM MoE DSA's over four selecting layers and four that share the previous
+    full layer's top-k (observed 2.7e-05); DeepSeek V4's over all three attention kinds and both
+    routers, on logits of magnitude 4.4."""
+    model, variables = fp32_decoder(directory)
+    difference = recorded_logit_difference(model, variables, directory)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+
+def test_deepseek_v4_draws_each_output_group_at_its_own_fan_in():
+    """A from-scratch DeepSeek V4's grouped output projection (`o_a_proj`, one `[in, o_lora_rank]`
+    block per head group) starts each group at lecun's variance over that group's inputs, as
+    `DeepseekV4GroupedLinear`'s per-group blocks are each a projection of their own: at eight groups
+    of 128 inputs, each group's 8,192 entries pass the chi-square test of variance 1 / 128 at one in a
+    billion each side, where counting the groups as inputs starts them at 1 / 1024."""
+    import jax
+    from scipy import stats
+
+    from dew.registry import models
+
+    config = translate_config({**fixture_config("deepseek-v4-tiny"), "num_attention_heads": 16,
+                               "head_dim": 64, "o_groups": 8, "o_lora_rank": 64})
+    model = models.build("causal_transformer", config)
+    params = jax.jit(model.init)(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))["params"]
+    kernels = [leaf for path, leaf in flat_tree(params).items() if "o_a_proj" in path]
+    assert kernels and all(kernel.shape == (8, 128, 64) for kernel in kernels)
+    low, high = stats.chi2.ppf([1e-9, 1 - 1e-9], 128 * 64 - 1)
+    for kernel in kernels:
+        statistics = (128 * 64 - 1) * 128 * np.var(np.asarray(kernel, np.float64), axis=(1, 2), ddof=1)
+        assert np.all((low < statistics) & (statistics < high)), (statistics, low, high)
 
 
 def test_deepseek_v4_a_left_padded_row_pools_its_compressed_windows_over_its_own_tokens():
@@ -628,22 +515,10 @@ def test_a_v4_grouped_output_projection_under_the_reference_models_names_loads_a
 
 
 def test_deepseek_v4_public_speculation_preserves_padded_rows():
-    from dew.nn.inputs import ModelInputs
-    from dew.sampling import Sampling, Speculative
-
-    source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
-    tokens = np.load(DEEPSEEK_V4 / 'input_ids.npy')[[0, 1, 0], :5].copy()
-    valid = np.arange(5)[None, :] >= np.asarray([0, 2, 4])[:, None]
-    tokens[~valid] = 0
-    inputs = ModelInputs(jnp.asarray(tokens), {'attention_mask': jnp.asarray(valid)})
-    task = source.text_generation(sampling=Sampling(temperature=0))
-    ordinary = task(inputs, max_new_tokens=7, key=0).host()
-    speculative = task(inputs, max_new_tokens=7, key=0, strategy=Speculative(block=3)).host()
     # Three rows differ from the two residual streams: a row mask must not
     # accidentally broadcast along the stream axis during predictor reseeding.
-    np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
-    np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
-    np.testing.assert_array_equal(speculative.terminated, ordinary.terminated)
+    source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    assert_padded_speculation_is_greedy(source)
 
 
 def test_deepseek_v4_cached_chunks_match_transformers():
@@ -727,14 +602,8 @@ def test_llama4_logits_match_the_reference_implementation():
     """fp32 parity: tolerance 1e-4, observed max |logit difference| 3.5e-06
     with identical argmax. The fused expert kernels arrive split in place."""
     model, variables = fp32_decoder(LLAMA4)
-    ids = np.load(LLAMA4 / "input_ids.npy")
-    reference = np.load(LLAMA4 / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, LLAMA4)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
     experts = variables["params"]["layers_1"]["mlp"]["experts"]
     assert experts["gate_proj"]["kernel"].shape == (4, 32, 48)
     assert experts["down_proj"]["kernel"].shape == (4, 48, 32)
@@ -753,14 +622,8 @@ def test_gemma4_moe_logits_match_the_reference_implementation():
     with identical argmax. The fused expert kernels arrive split in place,
     the global layer holds no v_proj, and every layer holds its scalar."""
     model, variables = fp32_decoder(GEMMA4_MOE)
-    ids = np.load(GEMMA4_MOE / "input_ids.npy")
-    reference = np.load(GEMMA4_MOE / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, GEMMA4_MOE)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
     params = variables["params"]
     experts = params["layers_0"]["moe"]["experts"]
     assert experts["gate_proj"]["kernel"].shape == (4, 32, 16)

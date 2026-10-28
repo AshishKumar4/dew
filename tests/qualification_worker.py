@@ -5,9 +5,12 @@ dropout, EMA, two-micro-step accumulation, dynamic loss scaling and a clipped
 AdamW, and checkpoints every CHECKPOINT_STEP. The `interrupted` run blocks
 after step INTERRUPT_STEP, once that checkpoint has landed, for the test to
 SIGKILL it. The `resumed` run restores that checkpoint in the middle of an
-accumulation. Each finished run writes its whole state, its export and the
-export's fp32 logits; the baseline also writes the fp32 loss and the gradient
-of every source tensor, for the test to hold to transformers.
+accumulation. The runs share one persistent compilation cache, so the resumed
+run's fit finds every program it needs there, as the earlier runs compiled
+them. Each finished run writes its whole state, its export, the export's fp32
+logits and its fit's cache hits and misses; the baseline also writes the fp32
+loss and the gradient of every source tensor, for the test to hold to
+transformers.
 
     python tests/qualification_worker.py <directory> baseline|interrupted|resumed
 """
@@ -24,14 +27,17 @@ import numpy as np
 import optax
 
 from dew.checkpoints import Checkpoints
-from dew.config.data import TextData, loader
-from dew.data import Loading
+from dew.data import Loading, presets
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition, GlobalStream
+from dew.data.sources.tokens import TokenFiles
 from dew.files import write_atomically
 from dew.interop import Pretrained
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.telemetry.instrumentation import compilation_cache_counts
 from dew.training import Trainer
+from dew.training.runtime import prepare_process
 from dew.training.tracker import LocalTracker
 
 STEPS = 24
@@ -98,6 +104,7 @@ def export(run: Path, source, variables, probe) -> None:
 
 
 def run(directory: Path, mode: str) -> None:
+    prepare_process(compilation_cache_dir=str(directory / "compiled"))
     out = directory / ("baseline" if mode == "baseline" else "restarted")
     out.mkdir(parents=True, exist_ok=True)
     checkpoints = Checkpoints(str(out / "checkpoints"), keep=2)
@@ -115,8 +122,12 @@ def run(directory: Path, mode: str) -> None:
     source = Pretrained.load(directory / "source", dtype="float32", attention_impl="xla")
     objective = LMObjective(source.model.clone(dropout_rate=0.1), SEQUENCE,
                             variables=source.variables, ema_decay=0.9)
-    data = loader(TextData(source=str(directory / "tokens"), seq_len=SEQUENCE), batch=BATCH, read="memory",
-                seed=17, validation_records=BATCH, loading=Loading(workers=0, threads=1))
+    tokens = directory / "tokens"
+    train = TokenFiles(str(tokens / "train")).shuffle(17).repeat().pipe(
+        presets.token_windows, seq_len=SEQUENCE, batch=BATCH)
+    held = TokenFiles(str(tokens / "val")).pipe(presets.token_windows, seq_len=SEQUENCE, batch=BATCH,
+                                                 records=BATCH)
+    data = compile(train, validation=held, read="memory", seed=17, loading=Loading(workers=0, threads=1))
     trainer = Trainer(objective, optax.chain(optax.clip_by_global_norm(0.5),
                                              optax.adamw(0.003, weight_decay=0.01)),
                       key=jax.random.key(11), accumulation=2, dynamic_scale=True,
@@ -135,6 +146,7 @@ def run(directory: Path, mode: str) -> None:
     if mode == "baseline":
         write_reference(out / "reference.npz", source, before.variables, probe, step)
     state = trainer.fit(data, steps=STEPS, log_every=1, checkpoint_every=CHECKPOINT_STEP)
+    cache = compilation_cache_counts()
     stats, _, _ = objective.predict(state.variables, probe, step, train=False)
     final_loss = float(objective.reduce_loss(stats)[0])
     restored, _, position = trainer.place()
@@ -147,6 +159,7 @@ def run(directory: Path, mode: str) -> None:
         "restored_position": None if before_position is None else before_position.decode(),
         "step": int(state.step), "microstep": int(state.microstep), "updates": int(state.updates),
         "position": position.decode(), "state_structure": str(jax.tree.structure(state)),
+        "cache_hits": cache["train/cache_hits"], "cache_misses": cache["train/cache_misses"],
     }))
 
 

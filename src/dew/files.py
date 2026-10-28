@@ -91,15 +91,26 @@ def staged(directory: Path) -> Iterator[Path]:
     staging.mkdir()
     try:
         yield staging
-        try:
-            os.replace(staging, directory)
-        except OSError:
-            if not directory.is_dir():
-                raise
+        published(staging, directory)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
 
+def published(built: Path, directory: Path) -> bool:
+    """Publish the directory `built`, written on `directory`'s filesystem, as `directory` by one
+    rename, whether this call published it. A `directory` another writer published first is kept,
+    whole, and `built` removed: every writer of it publishes by the one rename (`staged`)."""
+    try:
+        os.replace(built, directory)
+    except OSError:
+        if not directory.is_dir():
+            raise
+        shutil.rmtree(built, ignore_errors=True)
+        return False
+    return True
+
+
 def _beside(target: Path, suffix: str) -> Path:
-    """A name in `target`'s directory that no other write uses."""
-    return target.with_name(f".{target.name}.{secrets.token_hex(8)}{suffix}")
+    """A name in `target`'s directory that no other write uses, named apart from `target`'s own, so a
+    target whose name is as long as the filesystem allows has a temporary too."""
+    return target.with_name(f".dew-{secrets.token_hex(8)}{suffix}")

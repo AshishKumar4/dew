@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew.interop import diffusion_gemma as adapter
@@ -28,7 +28,7 @@ WORKFLOW = FIXTURES / "diffusion-gemma-workflow"
 def system():
     config = json.loads((WORKFLOW / "config.json").read_text())
     model = adapter.build(config, dtype="float32", attention_impl="xla")
-    variables = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
+    variables, _ = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
     process = adapter.generation_process(
         config, json.loads((WORKFLOW / "generation_config.json").read_text())
     )
@@ -43,6 +43,34 @@ def prefill(model, variables, prompt):
     cache = model.apply(variables, prompt.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
     return model.apply({**variables, "cache": cache}, prompt, method=model.encode,
                        mutable=["cache"])[1]["cache"]
+
+
+def test_diffusion_gemma_deferred_translation_materializes_the_same_model(system):
+    """Text checkpoint leaves stay deferred until placement asks for their arrays, while their
+    materialized tree retains the eager decoder's parameter values."""
+    from dew.interop.streaming import SourceLeaf, materialize
+
+    _, eager, _, _, config = system
+    tensors = load_file(str(WORKFLOW / "model.safetensors"))
+    deferred, _ = adapter.translate_weights(tensors, config, lazy=True)
+    assert any(isinstance(leaf, SourceLeaf) for leaf in jax.tree.leaves(deferred["params"]["text"]))
+    restored = materialize(deferred)
+    for actual, expected in zip(jax.tree.leaves(restored), jax.tree.leaves(eager), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+
+
+def test_diffusion_gemma_export_reads_only_the_requested_decoder_tensor(system):
+    """A resident model's export can name and plan its tensors without transferring values back
+    to the host. Looking up a tensor later yields the stored source's values."""
+    model, variables, _, _, config = system
+    resident = jax.tree.map(jax.device_put, variables)
+    with jax.transfer_guard_device_to_host("disallow"):
+        result = adapter.export_weights(model, resident, config)
+        specs = result.specs
+        assert specs
+    original = load_file(str(WORKFLOW / "model.safetensors"))
+    name = next(name for name in result if name in original and name.startswith("model.decoder."))
+    np.testing.assert_array_equal(result[name], original[name])
 
 
 def test_native_shared_model_forward_matches_reference(system):
@@ -175,9 +203,14 @@ def test_eos_finishes_rows_independently_and_padding_is_not_a_token(system):
 def test_checkpoint_export_keeps_updated_weights_and_generation(system):
     model, variables, process, reference, config = system
     changed = jax.tree.map(lambda value: value + jnp.asarray(0.001, value.dtype), variables)
-    restored = adapter.translate_weights(adapter.export_weights(model, changed, config), config)
-    for wanted, actual in zip(jax.tree.leaves(changed), jax.tree.leaves(restored), strict=True):
-        np.testing.assert_array_equal(actual, wanted)
+    _, read = adapter.translate_weights(load_file(str(WORKFLOW / "model.safetensors")), config)
+    # The vision tower and embedder go back through the layouts the load read them by, and through
+    # those a tree built in Dew gives, alike.
+    for vision in (read, None):
+        exported = adapter.export_weights(model, changed, config, vision)
+        restored, _ = adapter.translate_weights(exported, config)
+        for wanted, actual in zip(jax.tree.leaves(changed), jax.tree.leaves(restored), strict=True):
+            np.testing.assert_array_equal(actual, wanted)
     inputs = ModelInputs(jnp.asarray(reference["prompt"]))
     wanted = process.generate(model, changed, inputs, 7, key=jax.random.key(11))
     actual = process.generate(model, restored, inputs, 7, key=jax.random.key(11))
@@ -207,7 +240,7 @@ def test_the_released_layout_denoiser_matches_the_reference():
     config = {"model_type": "diffusion_gemma", "canvas_length": 4,
               "text_config": json.loads((directory / "config.json").read_text())}
     model = adapter.build(config, dtype="float32", attention_impl="xla")
-    variables = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
+    variables, _ = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
     cache = prefill(model, variables, np.load(directory / "prompt.npy"))
     canvas = np.load(directory / "canvas.npy")
     with np.load(directory / "numerics.npz") as exact:
@@ -231,7 +264,7 @@ def test_a_sliding_denoiser_reads_its_whole_canvas_past_its_window():
     config = {"model_type": "diffusion_gemma", "canvas_length": 6,
               "text_config": json.loads((directory / "config.json").read_text())}
     model = adapter.build(config, dtype="float32", attention_impl="xla")
-    variables = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
+    variables, _ = adapter.translate_weights(load_file(str(directory / "model.safetensors")), config)
     cache = prefill(model, variables, np.load(directory / "prompt.npy"))
     logits = model.apply({**variables, "cache": cache}, np.load(directory / "canvas.npy"))
     reference = np.load(directory / "logits.npy")
@@ -299,3 +332,40 @@ def test_canvas_generation_rejects_lossy_token_coercion_and_batched_keys(system)
     with pytest.raises(ValueError):
         process.generate(model, variables, reference["prompt"], 3,
                          key=jax.random.split(jax.random.key(1), 2))
+
+
+TEMPER_SEEDS = 8
+"""Check 1's declared seeds for the tempered logits over every step, sized by `seeds_for`."""
+
+
+def test_the_tempered_logits_divide_by_the_reference_temperature_at_every_step():
+    """The temperature at n steps remaining is the reference's t_min + (t_max - t_min) n / N, and the
+    tempered logits, the logits over it, are on par with the reference's float32 quotient at every
+    step (check 1, float64 the truth), however XLA lowers its division by the constant N."""
+    from reference_error import assert_as_exact
+
+    from dew.diffusion.block import BlockProcess
+
+    process = BlockProcess(canvas_length=4, vocab_size=64, max_steps=48)
+    remaining = np.arange(1, 49, dtype=np.int32)
+    tempered = jax.jit(jax.vmap(process.temper))
+
+    def draw(seed):
+        return (np.random.default_rng(seed).normal(0, 4, (48, 64)).astype(np.float32), remaining)
+
+    @as_given
+    def reference(logits, steps):
+        temperature = np.asarray([0.4 + (0.8 - 0.4) * (int(n) / 48) for n in steps])
+        return logits / temperature.astype(logits.dtype)[:, None]
+
+    assert_as_exact(tempered, reference, draw, "tempered logits", seeds=TEMPER_SEEDS)
+
+
+def test_a_canvas_whose_model_scores_nothing_refuses_rather_than_draw_a_token(system):
+    """A canvas refinement draws each unfinished position from the model's scores; scores of NaN
+    hold no distribution, so generation raises instead of committing arbitrary tokens."""
+    model, variables, process, reference, _ = system
+    poisoned = jax.tree.map(lambda leaf: jnp.full_like(leaf, jnp.nan), variables)
+    with pytest.raises(ValueError):
+        process.generate(model, poisoned, ModelInputs(jnp.asarray(reference["prompt"])), 3,
+                         key=jax.random.key(11))

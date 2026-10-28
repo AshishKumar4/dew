@@ -12,26 +12,29 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from diffusion_support import SourceOracle, relative_gap, walk
-from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
+from diffusion_support import SourceOracle, relative_gap, source_final, walk
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_as_exact_over_orders,
+    declared_seeds,
+    distance,
+    indexed_recording,
+    recording,
+    without_ynn,
+)
 
-from dew.diffusion import expand
-from dew.sampling import CFG, DPMSolverSDE, sample
+from dew.sampling import DPMSolverSDE, sample
 
 DIFFUSERS_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "diffusers"
 SOURCE = json.loads((DIFFUSERS_FIXTURES / "source_schedulers.json").read_text())
 SOURCE_ARRAYS = np.load(DIFFUSERS_FIXTURES / "source_schedulers.npz")
 SOURCE_ROUNDING = np.load(DIFFUSERS_FIXTURES / "source_rounding.npz")
-
-
-class ConditionalSourceOracle(nn.Module):
-    """The same model offset by its condition, so a guided walk reads back the
-    combination that was applied."""
-
-    @nn.compact
-    def __call__(self, x, temb, label):
-        return jnp.sin(x) * 0.07 + expand(temb, x) * 0.001 + expand(label, x)
+SOURCE_SEEDS = DIFFUSERS_FIXTURES / "source_seeds.npz"
+SOURCE_SEEDED = recording(SOURCE_SEEDS)
+"""The seeded pointwise cases' trajectory gradients over check 1's seeds (`tools/diffusers_source_reference.py
+seeds`), each name's arrays under its own prefix."""
 
 
 def source_case(name: str):
@@ -83,19 +86,23 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     tree answered, whose interval the reconstruction is checked to prepare.
     Every native walk and VJP runs in float32.
 
-    The VJP is held to twice the source's own RMS distance from its
-    float64 evaluation, using reference_error's common rounding rule.
-    The source fixture widens every scheduler table and retains that
-    gradient in float64, so its oracle shares no float32 arithmetic with
-    the reference whose rounding it measures. Five pointwise cases average
-    32 independent copies (768 gradient entries) in source_rounding.npz:
-    pixel permutations reproduce the same draw on both sides. A 256-copy
-    pilot's disjoint original-size subsets reached ratio 3.52, while every
-    32-copy subset stayed below 1.40 on default/AVX/Ice Lake CPU codegen.
-    The chosen new draws reach 1.43. Thresholding's maximum is 1 in these
-    cases, so the quantile is clamped to a constant and the limit is a
-    pointwise clip. CFG epsilon instead averages 52 pixel orders of its
-    per-sample variance reductions.
+    The VJP is held to the source's own rounding from its float64
+    evaluation, which widens every scheduler table and keeps that gradient
+    in float64, so its truth shares no float32 arithmetic with the reference
+    whose rounding it measures. In pointwise cases pixel permutations
+    reproduce one rounding draw. Exponential v-prediction with thresholding
+    is on par over the seeds its recording declares (check 1,
+    source_seeds.npz): its one draw's ratio was 1.70, 0.99 over 128 seeds.
+    Four others, whose few unclipped entries carry too heavy a tail for
+    seeds to resolve, average 32 independent copies (768 gradient entries)
+    in source_rounding.npz, held to twice the source's own distance; a
+    256-copy pilot's disjoint original-size subsets reached ratio 3.52,
+    while every 32-copy subset stayed below 1.40 on default/AVX/Ice Lake
+    CPU codegen. Thresholding's maximum is 1 in these cases, so the
+    quantile is clamped to a constant and the limit is a pointwise clip.
+    CFG epsilon instead averages 52 pixel orders of its per-sample variance
+    reductions; the rest are held to twice the source's own distance on
+    their one recorded draw.
     """
     schedule, process, times, x_T = source_case(name)
     rescale = SOURCE["cases"][name]["guidance"]
@@ -110,34 +117,21 @@ def test_source_config_rebuilds_its_scheduler_trajectory_and_gradient(name):
     assert abs(prior - float(SOURCE_ARRAYS[f"{name}.prior"])) < 1e-5 * max(prior, 1.0)
     expected = SOURCE_ARRAYS[f"{name}.latents"]
     cotangent = jnp.asarray(SOURCE_ARRAYS[f"{name}.cotangent"])
+    final = source_final(schedule, process, times, rescale, SOURCE["label"], SOURCE["guidance_scale"])
     if rescale is None:
-        model = SourceOracle()
-        params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
-        denoise = process.denoiser(model, params, {})
-        solver = schedule.solver
-        def run(value):
-            return walk(solver, process, model, value, times)
-        latents = run(x_T)
+        latents = walk(schedule.solver, process, SourceOracle(), x_T, times)
         assert latents.shape == expected.shape
         assert relative_gap(latents, expected) < 1e-4
-        def final(value):
-            return run(value)[-1]
     else:
-        model = ConditionalSourceOracle()
-        rows = x_T.shape[0]
-        params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])),
-                            jnp.ones((1,)), jnp.ones((1,)))
-        denoise = process.denoiser(model, params, {"label": jnp.full((rows,), SOURCE["label"])},
-                                   {"label": jnp.zeros((rows,))})
-        guidance = CFG(SOURCE["guidance_scale"], rescale=rescale)
-
-        def final(value):
-            return sample(denoise, value, solver=schedule.solver, guidance=guidance,
-                          key=jax.random.PRNGKey(0), times=times, final_denoise=False)
-
         assert relative_gap(final(x_T)[None], expected[-1:]) < 1e-4
     if name == "cfg.epsilon":
         source_gradient_over_orders(final, x_T, cotangent)
+    elif f"{name}.seeds" in SOURCE_SEEDED:
+        seeds = declared_seeds(SOURCE_SEEDS)[name]
+        draw, recorded, truth = indexed_recording(SOURCE_SEEDED, name, seeds)
+        gradient = jax.jit(lambda value, cot: {"grad": jax.vjp(final, value)[1](cot)[0]})
+        assert_as_exact(lambda index, inputs: gradient(inputs["x_T"], inputs["cotangent"]), recorded, draw,
+                        name, seeds=seeds, truth_fn=truth)
     elif f"{name}.x_T" in SOURCE_ROUNDING:
         gradient = jax.jit(lambda value, cot: jax.vjp(final, value)[1](cot)[0])(
             jnp.asarray(SOURCE_ROUNDING[f"{name}.x_T"]), jnp.asarray(SOURCE_ROUNDING[f"{name}.cotangent"]))
@@ -179,6 +173,10 @@ def test_one_row_walks_each_source_grid_as_it_walks_in_a_batch(config):
         np.testing.assert_allclose(run(x_T[row:row + 1])[0], batch[row], rtol=1e-6, atol=1e-6)
 
 
+REPEATED_SEEDS = 8
+"""Check 1's declared seeds for the repeated-model-time walks (`seeds_for`, paired)."""
+
+
 @pytest.mark.parametrize("kind, extra", [
     ("EulerDiscrete", {"sigma_min": 30000, "sigma_max": 80000}),
     ("KDPM2Discrete", {}),
@@ -186,8 +184,9 @@ def test_one_row_walks_each_source_grid_as_it_walks_in_a_batch(config):
 ])
 def test_source_grids_walk_repeated_initial_model_times(kind, extra):
     """Repeated model times keep their own sigma rows, as an explicitly indexed source walk does:
-    each walked latent is as near the source's float64 walk as its own float32 walk is. The float64
-    walk builds its tables in float64 (`float64_scheduler`), at the float32 walk's integer times."""
+    over drawn starting latents, each walked latent on par with the source's own float32 walk against
+    the source's float64 walk (check 1). The float64 walk builds its tables in float64
+    (`float64_scheduler`), at the float32 walk's integer times."""
     import contextlib
 
     import torch
@@ -212,25 +211,32 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
     assert np.count_nonzero(model_times == model_times[0]) > 1
     sigmas = process.sampler_schedule.sigmas(times)
     assert np.all(np.diff(sigmas) < 0)
-    initial = np.random.default_rng(7).normal(size=(2, 3, 64)).astype(np.float32)
     model = SourceOracle()
     denoise = process.denoiser(model, {}, {})
-    _, walked = sample(denoise, jnp.asarray(initial), solver=schedule.solver, key=0,
-                       times=times, final_denoise=False, record=lambda x, _: x)
+
+    def draw(seed):
+        return (np.random.default_rng([7, seed]).normal(size=(2, 3, 64)).astype(np.float32),)
+
+    @as_given
+    def dew(initial):
+        _, walked = sample(denoise, jnp.asarray(initial), solver=schedule.solver, key=0,
+                           times=times, final_denoise=False, record=lambda x, state, denoised: x)
+        return {f"step {index}": np.asarray(latent) for index, latent in enumerate(walked)}
 
     precision = load("diffusers_wan_reference")
-    reference = []
-    published = None
-    for dtype in (torch.float32, torch.float64):
+
+    published = getattr(module, kind + "Scheduler").from_config(config)
+    published.set_timesteps(6)
+    published = published.timesteps.clone()
+
+    def source_walk(initial, dtype):
         context = precision.float64_scheduler(module) if dtype == torch.float64 else contextlib.nullcontext()
         with context:
             source = getattr(module, kind + "Scheduler").from_config(config)
             source.set_timesteps(6)
             # A pipeline can choose its first sigma by index, without a model-time lookup.
             source.set_begin_index(0)
-            if published is None:
-                published = source.timesteps.clone()
-            elif not published.is_floating_point():
+            if dtype == torch.float64 and not published.is_floating_point():
                 # Integer conditioning times are the published ones, not a float64 rounding of them.
                 source.timesteps = published
             x = torch.tensor(initial, dtype=dtype)
@@ -241,10 +247,13 @@ def test_source_grids_walk_repeated_initial_model_times(kind, extra):
                 x = source.step(prediction, time, x).prev_sample
                 if kind != "KDPM2Discrete" or index % 2 == 1 or index == len(source.timesteps) - 1:
                     latents.append(x.numpy().copy())
-        reference.append(np.stack(latents))
-    for index, actual in enumerate(walked):
-        assert_as_exact_as_the_reference(actual, reference[0][index], reference[1][index],
-                                         f"{kind} repeated model time, step {index}")
+        # A leaf a step, so each step is judged on its own, as the walk records it.
+        return {f"step {index}": latent for index, latent in enumerate(latents)}
+
+    reference = as_given(lambda initial: source_walk(np.asarray(initial, np.float32), torch.float32))
+    truth = as_given(lambda initial: source_walk(np.asarray(initial), torch.float64))
+    assert_as_exact(dew, reference, draw, f"{kind} repeated model time", seeds=REPEATED_SEEDS,
+                    truth_fn=truth)
 
 
 def walked(config: dict, steps: int) -> jax.Array:
@@ -306,3 +315,63 @@ def test_a_source_noise_sampler_seed_pins_the_brownian_path():
     np.testing.assert_array_equal(run(pinned, 0), run(pinned, 1))
     free = DPMSolverSDE()
     assert not np.allclose(run(free, 0), run(free, 1), atol=1e-3)
+
+
+BROWNIAN_SEEDS = 8
+"""Check 1's declared seeds for the Brownian walk against Levy's construction unrolled (`seeds_for`)."""
+
+
+def test_the_brownian_walk_descends_every_level_as_levys_construction_unrolled():
+    """The walk reads its point off Levy's construction to its depth (`_brownian_walk`), one level a
+    loop iteration: on par with the construction unrolled level by level in Python (check 1), at the
+    full depth and at one level, over drawn keys and queries of a grid's interval, its ends, its
+    middle and points between. A loop and its unrolled levels fuse apart, so they round apart. The
+    truth is the construction in float64 on the same float32 draws, its position and the branch
+    each level takes read in float64 too: the path is continuous, so where float32's rounding of the
+    position crosses a cell's end, the cell beside it meets it at the node they share."""
+    from dew.sampling.solvers.brownian import MAX_BROWNIAN_DEPTH, _Brownian, _brownian_walk
+
+    low, high, shape = np.float32(0.03), np.float32(14.6), (3, 4)
+
+    def draw(seed):
+        between = np.random.default_rng(seed).uniform(low, high, 9)
+        points = np.concatenate([[low, high, (low + high) / 2], between]).astype(np.float32)
+        return jax.random.PRNGKey(seed), points
+
+    def walked(depth):
+        def walk(key, points):
+            state = _Brownian(key, jnp.float32(low), jnp.float32(high))
+            return jax.vmap(lambda point: _brownian_walk(state, point, shape, depth))(points)
+        return walk
+
+    def unrolled(depth):
+        def construction(key, points):
+            # The values in the points' dtype, float32 for the reference and float64 for the truth.
+            dtype = points.dtype
+            span = jnp.asarray(high, dtype) - jnp.asarray(low, dtype)
+            root = jax.random.normal(jax.random.fold_in(key, 0), shape, dtype=jnp.float32)
+
+            def one(point):
+                position = jnp.clip((point - jnp.asarray(low, dtype)) / span, 0.0, 1.0)
+                start, end = jnp.zeros(shape, dtype), jnp.sqrt(span) * root.astype(dtype)
+                index = jnp.zeros((), jnp.int32)
+                for level in range(1, depth + 1):
+                    node = jax.random.fold_in(jax.random.fold_in(key, level), 2 * index + 1)
+                    deviation = 0.5 * jnp.sqrt(span * 2.0 ** (1 - level))
+                    middle = 0.5 * (start + end) + deviation * jax.random.normal(
+                        node, shape, dtype=jnp.float32).astype(dtype)
+                    position = position * 2.0
+                    # The next binary digit of the position, exact for a doubled value in [0, 2].
+                    right = jnp.floor(position).astype(bool)
+                    position = jnp.subtract(position, right.astype(dtype))
+                    start, end = jnp.where(right, middle, start), jnp.where(right, end, middle)
+                    index = 2 * index + right.astype(jnp.int32)
+                return start + position * (end - start)
+
+            return jax.vmap(one)(points)
+        return construction
+
+    for depth in (1, MAX_BROWNIAN_DEPTH):
+        assert_as_exact(without_ynn(walked(depth)), without_ynn(unrolled(depth)), draw,
+                        f"the Brownian walk at depth {depth}", seeds=BROWNIAN_SEEDS,
+                        truth_fn=jax.jit(unrolled(depth)))

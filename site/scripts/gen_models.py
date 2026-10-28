@@ -50,6 +50,7 @@ DECODERS = {
     "gemma3_text": ("Gemma 3, text", "Dense decoders"),
     "gemma3n_text": ("Gemma 3n, text", "Dense decoders"),
     "gemma4_text": ("Gemma 4, text", "Dense decoders"),
+    "gemma4_unified_text": ("Gemma 4 Unified, text", "Dense decoders"),
     "olmo3": ("OLMo 3", "Dense decoders"),
     "mixtral": ("Mixtral", "Mixture of experts"),
     "minimax_m2": ("MiniMax-M2", "Mixture of experts"),
@@ -73,10 +74,13 @@ DECODERS = {
     "nemotron_h": ("Nemotron-H", "Hybrid and linear attention"),
     "glm5_next_text": ("GLM-5.3-Flash, text", "Hybrid and linear attention"),
     "kimi_linear": ("Kimi Linear", "Hybrid and linear attention"),
+    "lfm3": ("LFM3", "Hybrid and linear attention"),
     "kimi_k3": ("Kimi K3, text", "Hybrid and linear attention"),
     "mamba": ("Mamba", "Hybrid and linear attention"),
     "mamba2": ("Mamba-2", "Hybrid and linear attention"),
     "llada": ("LLaDA", "Diffusion language models"),
+    "llada_moe_v2": ("LLaDA-MoE v2", "Diffusion language models"),
+    "llada2_moe": ("LLaDA2 MoE", "Diffusion language models"),
     "dream": ("Dream", "Diffusion language models"),
     "Dream": ("Dream", "Diffusion language models"),
     "diffusion_gemma_text": ("Diffusion Gemma", "Diffusion language models"),
@@ -86,10 +90,13 @@ WRAPPERS = {
     "gemma3": ("Gemma 3", "Images"),
     "gemma3n": ("Gemma 3n", "Images, audio"),
     "gemma4": ("Gemma 4", "Images, video, audio"),
+    "gemma4_unified": ("Gemma 4 Unified", "Images, video, audio"),
     "qwen3_5": ("Qwen 3.5", "Images, video"),
     "qwen3_5_moe": ("Qwen 3.5 MoE", "Images, video"),
     "llama4": ("Llama 4", "Images"),
     "deepseek_v41": ("DeepSeek V4.1", "Images"),
+    "muse_glimmer": ("Muse Glimmer", "Images"),
+    "lfm3_vl": ("LFM3-VL", "None yet: its language model alone (`text_only`)"),
 }
 PIPELINES = {
     "StableDiffusionPipeline": ("Stable Diffusion", "Text to image"),
@@ -214,7 +221,8 @@ def main() -> None:
         sections += [f"## {group}", "", table(["Family", "`model_type`", "Architecture", "Checked with"], rows), ""]
     sections += ["## Multimodal checkpoints", "",
                  "These load the whole checkpoint: the text decoder listed above, the media towers and the "
-                 "checkpoint's own processor.", "",
+                 "checkpoint's own processor, but where the media column says the language model alone, "
+                 "whose towers have no port yet.", "",
                  table(["Family", "`model_type`", "Media"],
                        [[WRAPPERS[t][0], f"`{t}`", WRAPPERS[t][1]] for t in wrapped]), ""]
     by_family: dict[str, list[tuple[str, str]]] = {}

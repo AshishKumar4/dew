@@ -7,9 +7,14 @@ directly, without `fit`, so every cpu-smoke case runs here, end to end, on
 every suite run.
 """
 
+import json
+import os
+import subprocess
+import sys
+
 import numpy as np
 import pytest
-from tool_support import load
+from tool_support import REPO_ROOT, load
 
 from tools.benchmark_cases import cpu_smoke_cases
 
@@ -19,7 +24,7 @@ pytestmark = pytest.mark.mesh
 
 @pytest.mark.parametrize("architecture, fixed_batch", [
     *[(case.architecture, False) for case in cpu_smoke_cases()], ("causal_transformer", True)])
-def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architecture, fixed_batch):
+def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architecture, fixed_batch, monkeypatch):
     """The tool's row is the trainer's own compiled step run for real: a
     finite loss out of it, timed over the steps asked for, for every case of
     the preset, and whether each step reads a fresh placement or reuses one.
@@ -28,17 +33,75 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     from dew.nn.flops import MissingFlopsCount
 
     tool = load("benchmark_step")
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
+    import benchmark_models as models  # the objective and batch the tool builds its step from
     config = tool.BenchmarkConfig(preset='cpu-smoke', architectures=[architecture],
                                   warmup=1, steps=2, dtype='float32', fixed_batch=fixed_batch)
     (case,) = tool.build_cases(config)
 
-    row = tool.measure(case, config)
+    row = tool.measure(case, config, None)
 
     assert row["finite"] and np.isfinite(row["loss"])
     assert row["measured_steps"] == 2 and row["fixed_batch"] is fixed_batch
     assert row["ms_per_step"] > 0 and row["p50_ms"] > 0
     try:
-        counted = tool.build_objective(case).training_flops(None, tool.global_batch(case))
+        counted = models.build_objective(case).training_flops(None, models.global_batch(case))
     except MissingFlopsCount:
         counted = None
     assert row["training_flops"] == counted
+
+
+def peak_row(tmp_path, platform: str, *arguments: str, settings: dict[str, str] | None = None) -> dict:
+    """The causal_transformer smoke case's row, the tool run as a person runs it on one device of
+    `platform` with `arguments` and the environment's `settings`, its peak measured in a process of the
+    case's own."""
+    out = tmp_path / "rows.json"
+    environment = {name: value for name, value in os.environ.items() if name != "XLA_FLAGS"}
+    environment |= settings or {}
+    tool = str(REPO_ROOT / "tools/benchmark_step.py")
+    done = subprocess.run([sys.executable, tool, "--preset", "cpu-smoke",
+                           "--architectures", "causal_transformer", "--warmup", "1", "--steps", "2",
+                           "--dtype", "float32", "--mesh", "{}", "--json-out", str(out), *arguments],
+                          env={**environment, "JAX_PLATFORMS": platform,
+                               "PYTHONPATH": os.pathsep.join((str(REPO_ROOT / "src"), str(tmp_path)))},
+                          capture_output=True, text=True, timeout=900)
+    assert done.returncode == 0, done.stderr[-4000:]
+    (row,) = json.loads(out.read_text())
+    return row
+
+
+def test_a_cases_peak_is_read_in_a_process_of_its_own_inside_the_cases_context(tmp_path):
+    """The tool's peak memory comes from a process of the case's own that loaded every program from a cache
+    and compiled nothing (a compile there refuses the run), one high-water a device, the bytes XLA planned
+    beside it; that process runs inside the context a diagnostic names (`--within`), as the case does."""
+    (tmp_path / "marking.py").write_text(
+        "import contextlib, os\n"
+        "@contextlib.contextmanager\n"
+        "def marked():\n"
+        f"    with open({str(tmp_path / 'entered')!r}, 'a') as file: file.write(f'{{os.getpid()}}\\n')\n"
+        "    yield\n")
+    row = peak_row(tmp_path, "cpu", "--within", "marking:marked")
+    assert row["devices"] == 1 and len(row["peak_bytes_by_device"]) == 1 and row["planned_device_bytes"] > 0
+    assert len(set((tmp_path / "entered").read_text().split())) == 3, "this process and both peak processes"
+
+
+def test_a_cache_its_caller_names_keeps_what_the_step_compiled_and_a_run_alone_compiles_cold(tmp_path):
+    """perf_gate names each tree's compile cache, so its later rounds load what its first compiled: the step
+    compiled into it; run alone, the tool compiles cold, writing nothing to Dew's own cache (row 1577)."""
+    named, own = tmp_path / "tree-cache", tmp_path / "home-cache"
+    peak_row(tmp_path, "cpu", settings={
+        "JAX_COMPILATION_CACHE_DIR": str(named), "JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS": "0",
+        "JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES": "-1", "XDG_CACHE_HOME": str(own)})
+    assert [entry for entry in named.iterdir() if entry.name.startswith("jit_")]
+    peak_row(tmp_path, "cpu", settings={"XDG_CACHE_HOME": str(own)})
+    assert not list(own.rglob("jit_*"))
+
+
+@pytest.mark.gpu(reason="a GPU's allocator keeps the high-water the measured peak reads")
+@pytest.mark.mesh(devices=1)
+def test_a_cases_measured_peak_holds_at_least_the_bytes_xla_planned(tmp_path):
+    """On a GPU the measured peak is each device's allocator high-water over the case's run, its native
+    workspaces and its profiled steps included (their traces apart): at least what XLA planned."""
+    row = peak_row(tmp_path, "cuda", "--profile-dir", str(tmp_path / "traces"), "--profile-steps", "1")
+    assert row["peak_device_bytes"] == row["peak_bytes_by_device"][0] >= row["planned_device_bytes"] > 0
+    assert any((tmp_path / "traces/peak-run").rglob("*.xplane.pb"))

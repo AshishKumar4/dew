@@ -2,7 +2,7 @@
   "model": {
     "model": "dewml/hybrid-dit-176m",
     "revision": "90d1717ac262e1b33a65ac602812ef442129c7ea",
-    "loaded_with": "dew.sampling.TextToImage.from_run(pull_from_hub('dewml/hybrid-dit-176m', revision=...)), the run from_pretrained loads",
+    "loaded_with": "dew.pipeline('dewml/hybrid-dit-176m', revision=...)",
     "checkpoint_step": 1350000,
     "parameters": 175640848,
     "dew_commit": "aaffb62c07ffad78c72b29758673d1c4f5c37f4a",
@@ -31,7 +31,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=28, steps=40, unconditional=negative); pipe(inputs, key=28, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=28, steps=40, unconditional=negative); pipe(inputs, key=28, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
       "clip_score": 28.24,
       "aesthetic": 5.758,
       "framing": "square",
@@ -65,7 +65,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
       "clip_score": 27.69,
       "aesthetic": 6.026,
       "framing": "square",
@@ -99,7 +99,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=3, steps=30, unconditional=negative); pipe(inputs, key=3, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=3, steps=30, unconditional=negative); pipe(inputs, key=3, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
       "clip_score": 28.66,
       "aesthetic": 6.609,
       "framing": "square",
@@ -133,7 +133,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=60, steps=30, unconditional=negative); pipe(inputs, key=60, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=60, steps=30, unconditional=negative); pipe(inputs, key=60, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
       "clip_score": 29.0,
       "aesthetic": 6.337,
       "framing": "square",
@@ -167,7 +167,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
       "clip_score": 30.3,
       "aesthetic": 6.216,
       "framing": "square",
@@ -201,7 +201,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=32, steps=30, unconditional=negative); pipe(inputs, key=32, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=32, steps=30, unconditional=negative); pipe(inputs, key=32, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
       "clip_score": 26.57,
       "aesthetic": 6.184,
       "framing": "wide",
@@ -234,7 +234,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=40, unconditional=negative); pipe(inputs, key=61, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=40, unconditional=negative); pipe(inputs, key=61, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
       "clip_score": 29.38,
       "aesthetic": 6.163,
       "framing": "square",
@@ -268,7 +268,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
       "clip_score": 24.5,
       "aesthetic": 6.025,
       "framing": "square",
@@ -302,7 +302,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
       "clip_score": 26.71,
       "aesthetic": 6.3,
       "framing": "square",
@@ -336,7 +336,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=32, steps=30, unconditional=negative); pipe(inputs, key=32, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=32, steps=30, unconditional=negative); pipe(inputs, key=32, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
       "clip_score": 30.88,
       "aesthetic": 6.115,
       "framing": "square",
@@ -370,7 +370,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
       "clip_score": 28.39,
       "aesthetic": 5.446,
       "framing": "square",
@@ -404,7 +404,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=50, steps=30, unconditional=negative); pipe(inputs, key=50, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
       "clip_score": 29.75,
       "aesthetic": 6.319,
       "framing": "square",
@@ -438,7 +438,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=60, steps=40, unconditional=negative); pipe(inputs, key=60, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=60, steps=40, unconditional=negative); pipe(inputs, key=60, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
       "clip_score": 27.21,
       "aesthetic": 6.091,
       "framing": "square",
@@ -472,7 +472,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=40, unconditional=negative); pipe(inputs, key=61, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=40, unconditional=negative); pipe(inputs, key=61, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
       "clip_score": 24.76,
       "aesthetic": 6.089,
       "framing": "square",
@@ -506,7 +506,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=5, steps=40, unconditional=negative); pipe(inputs, key=5, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=5, steps=40, unconditional=negative); pipe(inputs, key=5, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
       "clip_score": 31.84,
       "aesthetic": 6.043,
       "framing": "square",
@@ -540,7 +540,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=54, steps=40, unconditional=negative); pipe(inputs, key=54, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=54, steps=40, unconditional=negative); pipe(inputs, key=54, steps=40, solver=DPMSolverMultistep(), guidance=CFG(7.5, interval=(0.15, 0.9)))",
       "clip_score": 27.24,
       "aesthetic": 6.129,
       "framing": "wide",
@@ -573,7 +573,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=61, steps=30, unconditional=negative); pipe(inputs, key=61, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
       "clip_score": 30.572383880615234,
       "aesthetic": 6.274466037750244,
       "framing": "square",
@@ -599,7 +599,7 @@
         256,
         256
       ],
-      "call": "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=3, steps=30, unconditional=negative); pipe(inputs, key=3, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
+      "call": "pipe = dew.pipeline('dewml/hybrid-dit-176m'); inputs = pipe.prepare([prompt], key=3, steps=30, unconditional=negative); pipe(inputs, key=3, steps=30, solver=UniPC(), guidance=CFG(6.0, interval=(0.2, 0.9)))",
       "clip_score": 28.530746459960938,
       "aesthetic": 6.208670616149902,
       "framing": "square",

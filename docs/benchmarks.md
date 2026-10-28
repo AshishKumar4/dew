@@ -11,7 +11,8 @@ The FLOP counts come from the optimized HLO of the compiled executable, through 
 | `GFLOP/step` | FLOPs of the compiled step, counted from the optimized HLO. |
 | `util` | Measured FLOPs over step time and device peak (`train/hfu`). |
 | `mfu` | The objective's training FLOPs over step time and the mesh's peak (`train/mfu`); `n/a` where the model has no count or the device no peak. Tables recorded before 2026-10-16 lack it. |
-| `peak GiB` | Peak device memory of the process. |
+| `peak GiB` | Peak device memory, measured: each device's allocator high-water over the case's run, native workspaces included, read in a process of the case's own that loads the step from a compilation cache and compiles nothing; the largest device's. Tables recorded before `plan GiB` was a column read the high-water in the process that compiled the step, so their peak can include the compile's own. |
+| `plan GiB` | The bytes XLA planned for the step: its arguments, outputs and temporaries, without native workspaces. |
 | `compile s` | Time to compile the step. |
 
 ## Small preset on one RTX 4080, 2026-09-02
@@ -107,7 +108,7 @@ python tools/benchmark_data.py data:oxford-flowers --batch 8 \
     --data.source <prepared version directory>
 ```
 
-The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 records, resized to 64px, with flip and jitter augmentation and CLIP tokenization per record. The measurement predates the recipe API. The current equivalent is Images over a prepared TFDS Source, with explicit augmentation and caption encoding; preparation remains separate.
+The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 records, resized to 64px, with flip and jitter augmentation and CLIP tokenization per record. The measurement predates the chain API, and the command above is the one it ran. Today the tool times a run's chain, `python tools/benchmark_data.py --steps 100 --data run.py`, here the `images` preset over a prepared `TFDS` source with `augment=True` and its captions; preparation remains separate.
 
 | grain workers | samples/s | p50 step | p95 step |
 |---------------|-----------|----------|----------|
@@ -116,4 +117,4 @@ The dataset was Oxford Flowers 102 from local TFDS ArrayRecord files: 8189 recor
 
 With workers, the p50 is a queue read, so the loader only shows up in the p95. At 8 workers the pipeline delivers 505 images/s. The image rows of the first step table consume 489-2036 samples/s, and all but `hierarchical_mmdit` (489) are above 505. So at 64px this loader keeps up with `hierarchical_mmdit` and starves the other image models; if an image run shows a low `train/mfu`, check the loader first. The video rows count 8-frame clips, and this image loader does not measure video throughput.
 
-These two points are not the loader's ceiling. The measured run read with 16 threads, and `tools/benchmark_data.py` now has no read-thread setting of its own. It reads with the dataset spec's `Loading`, whose defaults are no worker processes and 16 threads, set with `--loading.workers` and `--loading.threads`. Oxford Flowers is also only 8189 small records, far from a sharded 12M-record set.
+These two points are not the loader's ceiling. The measured run read with 16 threads. `tools/benchmark_data.py` times a chain under its own loading, as a run reads it; `--loading.workers` and `--loading.threads` set a `Loading` the compile takes over the chain's own `loading(...)` or `threads(n)`, though a chain's explicit `workers(n)` stage still runs as written. Oxford Flowers is also only 8189 small records, far from a sharded 12M-record set.

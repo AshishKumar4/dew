@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, Self, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -12,21 +12,21 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
+from dew._model_types import GEMMA4_TYPES
+from dew.batch import Coordinates, coordinates as build_coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
-from dew.nn.inputs import Coordinates, coordinates as build_coordinates, next_position
+from dew.nn.inputs import CrossContext, next_position
 from dew.nn.kv_cache import POSITION
-from dew.nn.protocols import OutputTable, ProjectionGroup
+from dew.nn.protocols import OutputTable, ProjectionGroup, ReadsTrain, held_groups
 from dew.nn.sharding import explicit_spec
-from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
+from dew.nn.vision import ProjectorBase, TowerBase, TowerGeometry
+from dew.nn.wrapping import DecoderWrapper
 
 if TYPE_CHECKING:
-    from dew.nn.backbones.decoder_block import RematPolicy
+    from dew.nn.cross_attention import CrossAttention
     from dew.nn.hyper_connections import HyperConnections
-    from dew.nn.kv_cache import KVCache
     from dew.nn.mla import MLAMixer
-    from dew.records import JSON
 
 
 @runtime_checkable
@@ -51,14 +51,30 @@ class Fusion:
     media: jax.Array | None
 
 
+@overload
+def _conditioner_modules(tower: TowerBase, projector: ProjectorBase, dtype, precision
+                          ) -> tuple[nn.Module, ProjectorBase]: ...
+
+
+@overload
+def _conditioner_modules(tower: None, projector: ProjectorBase, dtype, precision
+                          ) -> tuple[None, ProjectorBase]: ...
+
+
+def _conditioner_modules(tower: TowerBase | None, projector: ProjectorBase, dtype, precision):
+    """A media tower and native projector in the conditioner's compute policy."""
+    return (None if tower is None else tower.build().clone(dtype=dtype, precision=precision),
+            projector.clone(dtype=dtype, precision=precision))
+
+
 class VisionConditioner(nn.Module):
     """An image encoder and projector with row-aligned media inputs.
 
     Pixels have shape [batch, images, channels, height, width]. All images
     in a numeric batch share their processed resolution; the processor keeps
     per-image lengths and does not substitute preprocessing inside the model.
-    `train` reaches the one tower with stochastic layers, Gemma 3n's
-    MobileNet and its drop-path.
+    `train` reaches a tower that reads it (`ReadsTrain`), as Gemma 3n's
+    MobileNet does for its drop path, whichever inputs it takes.
     """
 
     vision: TowerBase
@@ -67,8 +83,8 @@ class VisionConditioner(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        self.tower = self.vision.build().clone(dtype=self.dtype, precision=self.precision)
-        self.projector = self.projection.build().clone(dtype=self.dtype, precision=self.precision)
+        self.tower, self.projector = _conditioner_modules(self.vision, self.projection,
+                                                         self.dtype, self.precision)
 
     def __call__(self, conditioning: Mapping[str, jax.Array], train: bool = False) -> jax.Array:
         pixels = conditioning["pixel_values"]
@@ -80,15 +96,14 @@ class VisionConditioner(nn.Module):
             raise ValueError("pixel_values must be row-aligned NCHW images or positioned patch pixels")
         batch, images = pixels.shape[:2]
         flat = pixels.reshape(batch * images, *pixels.shape[2:])
+        stochastic = {"train": train} if isinstance(self.tower, ReadsTrain) and self.tower.reads_train else {}
         if grid is not None:
-            features = self.tower(flat, grid_thw=grid.reshape(batch * images, 3))
-        elif isinstance(self.vision, Gemma3nVision):
-            features = self.tower(flat, train=train)
+            features = self.tower(flat, grid_thw=grid.reshape(batch * images, 3), **stochastic)
         elif positions is None:
-            features = self.tower(flat)
+            features = self.tower(flat, **stochastic)
         else:
             features = self.tower(
-                flat, pixel_position_ids=positions.reshape(batch * images, *positions.shape[2:])
+                flat, pixel_position_ids=positions.reshape(batch * images, *positions.shape[2:]), **stochastic
             )
         projected = self.projector(features)
         return projected.reshape(batch, images * projected.shape[1], projected.shape[-1])
@@ -127,7 +142,7 @@ class AudioConditioner(nn.Module):
     carry the embedder's padding token, as modeling_gemma3n.py does.
     """
 
-    audio: TowerBase
+    audio: TowerBase | None
     projection: ProjectorBase
     soft_tokens: int | None = None
     padding_id: int | None = None
@@ -135,9 +150,8 @@ class AudioConditioner(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        # Named for the shared root scope beside the vision tower and projector.
-        self.audio_tower = self.audio.build().clone(dtype=self.dtype, precision=self.precision)
-        self.audio_projector = self.projection.build().clone(dtype=self.dtype, precision=self.precision)
+        self.audio_tower, self.audio_projector = _conditioner_modules(
+            self.audio, self.projection, self.dtype, self.precision)
 
     def __call__(self, conditioning: Mapping[str, jax.Array]) -> jax.Array:
         features = conditioning["input_features"]
@@ -145,16 +159,19 @@ class AudioConditioner(nn.Module):
         if features.ndim != 4 or mask.shape != features.shape[:3]:
             raise ValueError("input_features must be [B, A, T, F] with a [B, A, T] frame mask")
         batch, clips = features.shape[:2]
-        encoding = self.audio_tower(features.reshape(batch * clips, *features.shape[2:]),
-                              mask.reshape(batch * clips, features.shape[2]))
-        projected = self.audio_projector(encoding.features)
+        flat = features.reshape(batch * clips, *features.shape[2:])
+        valid = mask.reshape(batch * clips, features.shape[2])
+        if self.audio_tower is not None:
+            encoding = self.audio_tower(flat, valid)
+            flat, valid = encoding.features, encoding.mask
+        projected = self.audio_projector(flat)
         if self.soft_tokens is not None:
             if not isinstance(self.audio_projector, HardVocabularyEmbedder) or self.padding_id is None:
                 raise ValueError("fixed audio slots require the Gemma 3n embedder and its padding token")
             padding = self.audio_projector.embed_hard(jnp.full((1, 1), self.padding_id, jnp.int32)).astype(
                 projected.dtype
             )
-            projected = jnp.where(encoding.mask[..., None], projected, padding)
+            projected = jnp.where(valid[..., None], projected, padding)
             missing = self.soft_tokens - projected.shape[1]
             if missing < 0:
                 raise ValueError(
@@ -168,8 +185,13 @@ class AudioConditioner(nn.Module):
 
     def initialize_parameters(self) -> None:
         """Create the audio leaves during a token-only model init."""
-        mel = self.audio.geometry().mel_features or 128
-        frames = 16 if self.soft_tokens is None else 16 * self.soft_tokens
+        geometry = TowerGeometry() if self.audio is None else self.audio.geometry()
+        # Without an audio tower, raw frames are the projector's input.
+        mel = self.projection.input_width if self.audio is None else geometry.mel_features or 128
+        if mel is None:
+            raise ValueError("a raw-audio projector declares its input width")
+        # Fixed slots take no more encoded frames than they hold: one token's frames a slot.
+        frames = 16 if self.soft_tokens is None else (geometry.frames_per_token or 16) * self.soft_tokens
         self({"input_features": jnp.zeros((1, 1, frames, mel), self.dtype or jnp.float32),
               "input_features_mask": jnp.ones((1, 1, frames), bool)})
 
@@ -182,7 +204,7 @@ def _place(embeddings: jax.Array, table: jax.Array, indices: jax.Array) -> jax.A
 
 
 
-class MultimodalTransformer(nn.Module):
+class MultimodalTransformer(DecoderWrapper):
     """Conditions the shared decoder on images and audio, using the ordinary decoder cache and head.
 
     ``image_indices`` and ``audio_indices`` give, for each token slot, the
@@ -193,12 +215,17 @@ class MultimodalTransformer(nn.Module):
     names, and audio adds `audio_tower` and `audio_projector`. Gemma 3n also
     embeds its hard vision and audio vocabulary ranges through the embedders,
     and keeps placeholder ids for its per-layer inputs, as modeling_gemma3n.py
-    does.
+    does. The serving and training hooks are its language model's (`DecoderWrapper`); a
+    clone keeps the towers and every variable's path. So is its cross-attention
+    (`CrossAttending`): a call's context entries (`dew.nn.inputs.CONTEXT`) go to the
+    language model's layers, beside the media the towers read.
     """
 
+    wraps = "language_model"
+
     language_model: CausalTransformer
-    vision: TowerBase
-    projection: ProjectorBase
+    vision: TowerBase | None
+    projection: ProjectorBase | None
     family: str
     image_token_id: int
     pad_token_id: int = 0
@@ -211,14 +238,36 @@ class MultimodalTransformer(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """Text-only decoder work. Media inputs require their own tower geometry."""
+        """The language model's work over the real tokens; the media towers' and projectors' work is left
+        out. A model with an audio encoder refuses: its encoder's work over its frames has no count here.
+        A projector of raw audio frames alone (Gemma 4 Unified) is left out, as a vision projector is."""
         if self.audio is not None:
-            raise MissingFlopsCount("MultimodalTransformer needs its hard-audio-vocabulary matrix geometry")
+            raise MissingFlopsCount("MultimodalTransformer has no count of its audio encoder's work")
         return counted_flops(self.language_model, lengths)
 
     @nn.nowrap
     def parameter_flops(self, lengths) -> float:
         return parameter_flops(self.language_model, lengths)
+
+    @property
+    def cross_attention(self) -> CrossAttention | None:
+        return self.language_model.cross_attention
+
+    @property
+    def context_width(self) -> int:
+        return self.language_model.context_width
+
+    @property
+    def context_dtype(self) -> jnp.dtype:
+        return self.language_model.context_dtype
+
+    @nn.nowrap
+    def cross_flops(self, lengths, context_lengths) -> float:
+        return self.language_model.cross_flops(lengths, context_lengths)
+
+    @nn.nowrap
+    def with_cross_attention(self, cross: CrossAttention | None) -> Self:
+        return self._over(self.language_model.with_cross_attention(cross))
 
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
@@ -235,47 +284,21 @@ class MultimodalTransformer(nn.Module):
         raise MissingFlopsCount(f"MultimodalTransformer has no matrix usage for {'/'.join(relative)}")
 
     def setup(self):
-        self.conditioner = VisionConditioner(
-            self.vision, self.projection,
-            dtype=self.dtype, precision=self.precision)
-        nn.share_scope(self.conditioner, self)
-        if (self.audio is None) != (self.audio_projection is None):
-            raise ValueError("an audio tower and its projector arrive together")
-        if self.audio is not None and self.audio_projection is not None:
+        if (self.vision is None) != (self.projection is None):
+            raise ValueError("a vision embedding and its projector arrive together")
+        if self.vision is not None and self.projection is not None:
+            self.conditioner = VisionConditioner(
+                self.vision, self.projection,
+                dtype=self.dtype, precision=self.precision)
+            nn.share_scope(self.conditioner, self)
+        if self.audio is not None and self.audio_projection is None:
+            raise ValueError("an audio tower requires its projector")
+        if self.audio_projection is not None:
             self.audio_conditioner = AudioConditioner(
                 self.audio, self.audio_projection, self.audio_soft_tokens,
                 self.vocab_size - 1 if self.family == "gemma3n" else None,
                 dtype=self.dtype, precision=self.precision)
             nn.share_scope(self.audio_conditioner, self)
-
-    @property
-    def vocab_size(self) -> int:
-        return self.language_model.vocab_size
-
-    @property
-    def bank_sites(self) -> tuple[DecoderBank, ...]:
-        return tuple(DecoderBank(("language_model", *site.namespace), site.view, site.scanned)
-                     for site in self.language_model.bank_sites)
-
-    @property
-    def max_seq_len(self) -> int:
-        return self.language_model.max_seq_len
-
-    @property
-    def emb_features(self) -> int:
-        return self.language_model.emb_features
-
-    @property
-    def final_logit_softcap(self) -> float | None:
-        return self.language_model.final_logit_softcap
-
-    @property
-    def causal(self) -> bool:
-        return self.language_model.causal
-
-    @property
-    def mask_token_id(self) -> int | None:
-        return self.language_model.mask_token_id
 
     @property
     def num_nextn_predict_layers(self) -> int:
@@ -292,7 +315,7 @@ class MultimodalTransformer(nn.Module):
         ranges, so it runs this path with no payloads too; any other call
         without payloads leaves the decoder its own lookup.
         """
-        if self.family == "gemma4":
+        if self.family in GEMMA4_TYPES:
             placeholder = tokens == self.image_token_id
             for token_id in self.extra_placeholder_ids:
                 placeholder = placeholder | (tokens == token_id)
@@ -318,8 +341,10 @@ class MultimodalTransformer(nn.Module):
             )
         else:
             decoder_tokens = jnp.where(media, 0, tokens)
+        # The decoder's own lookup (`token_embeddings`), so a placeholder no media fills reads as its
+        # decoder reads it.
         embeddings = self.language_model.scaled_embeddings(
-            self.language_model.embed_tokens(decoder_tokens))
+            self.language_model.token_embeddings(decoder_tokens))
         if self.family == "gemma3n":
             embedders = [self.conditioner.projector]
             if self.audio is not None:
@@ -329,24 +354,28 @@ class MultimodalTransformer(nn.Module):
                     raise TypeError("Gemma 3n media embedders carry the hard vocabulary")
                 embeddings = embedder.merge_hard_embeddings(embeddings, tokens)
         if conditioning is not None and image_indices is not None:
+            if self.vision is None:
+                raise ValueError("image_indices require a vision embedding")
             embeddings = self.conditioner.fuse(embeddings, image_indices, conditioning, train=train)
         if conditioning is not None and audio_indices is not None:
-            if self.audio is None:
-                raise ValueError("audio_indices require an audio tower")
+            if self.audio_projection is None:
+                raise ValueError("audio_indices require an audio projector")
             embeddings = _place(embeddings, self.audio_conditioner(conditioning), audio_indices)
         return Fusion(decoder_tokens, embeddings, media)
 
     def mtp_hidden_states(self, hidden, tokens, train: bool = False, positions=None,
                           segment_ids=None, image_indices=None, conditioning=None,
-                          attention_mask=None, image_groups=None, rotary_positions=None,
+                          attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                           audio_indices=None, coordinates: Coordinates | None = None):
         """Run the multi-token prediction layers over the same media embeddings and
         token fields as the main decoder (`hidden_states`)."""
-        fused = self._fused(tokens, image_indices, audio_indices, conditioning, train=train)
+        _, media = CrossContext.parted(conditioning)
+        fused = self._fused(tokens, image_indices, audio_indices, media, train=train)
         return self.language_model.mtp_hidden_states(
             hidden, fused.tokens, train=train, positions=positions, segment_ids=segment_ids,
             input_embeddings=fused.embeddings, attention_mask=attention_mask,
-            image_groups=image_groups, rotary_positions=rotary_positions, coordinates=coordinates)
+            image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
+            coordinates=coordinates)
 
     def mtp_logits(self, hidden, tokens, **kwargs):
         """Return the shared language head's logits for each media-aware prediction depth."""
@@ -377,7 +406,7 @@ class MultimodalTransformer(nn.Module):
     def hidden_states(self, tokens, train: bool = False, decode: bool = False,
                       positions=None, segment_ids=None, image_indices=None,
                       conditioning: Mapping[str, jax.Array] | None = None,
-                      attention_mask=None, image_groups=None, rotary_positions=None,
+                      attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                       audio_indices=None, routed_experts=None, routed=None, right_padded: bool = False,
                       coordinates: Coordinates | None = None):
         """Run the decoder over text with the media embeddings spliced in.
@@ -416,34 +445,40 @@ class MultimodalTransformer(nn.Module):
             assert following is not None
             if allocated:
                 cursor.value = jnp.where(valid.any(axis=1), following, cursor.value)
-        if conditioning is None and self.is_initializing():
-            self.conditioner.initialize_parameters()
-            if self.audio is not None:
+        # The towers read the media; the language model reads the context, and checks it.
+        context, media = CrossContext.parted(conditioning)
+        if media is None and self.is_initializing():
+            if self.vision is not None:
+                self.conditioner.initialize_parameters()
+            if self.audio_projection is not None:
                 self.audio_conditioner.initialize_parameters()
-        fused = self._fused(tokens, image_indices, audio_indices, conditioning, train=train)
+        fused = self._fused(tokens, image_indices, audio_indices, media, train=train)
         return self.language_model.hidden_states(
             fused.tokens, train=train, decode=decode, input_embeddings=fused.embeddings,
-            image_groups=image_groups, rotary_positions=rotary_positions, media_mask=fused.media,
-            routed_experts=routed_experts, routed=routed, coordinates=coordinates)
+            image_groups=image_groups, block_groups=block_groups, rotary_positions=rotary_positions,
+            media_mask=fused.media,
+            routed_experts=routed_experts, routed=routed, coordinates=coordinates, conditioning=context)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,
                  conditioning: Mapping[str, jax.Array] | None = None,
-                 attention_mask=None, image_groups=None, rotary_positions=None,
+                 attention_mask=None, image_groups=None, block_groups=None, rotary_positions=None,
                  audio_indices=None, coordinates: Coordinates | None = None):
         hidden = self.hidden_states(tokens, train=train, decode=decode, positions=positions,
                                     segment_ids=segment_ids, image_indices=image_indices,
                                     conditioning=conditioning, attention_mask=attention_mask,
-                                    image_groups=image_groups, rotary_positions=rotary_positions,
-                                    audio_indices=audio_indices, coordinates=coordinates)
+                                    image_groups=image_groups, block_groups=block_groups,
+                                    rotary_positions=rotary_positions, audio_indices=audio_indices,
+                                    coordinates=coordinates)
         if self.is_initializing() and self.language_model.dspark is not None:
             self.language_model.reach_drafter(tokens, hidden.dtype)
         if self.is_initializing() and self.num_nextn_predict_layers:
             self.mtp_hidden_states(hidden, tokens, train=train, positions=positions,
                                    segment_ids=segment_ids, image_indices=image_indices,
                                    conditioning=conditioning, attention_mask=attention_mask,
-                                   image_groups=image_groups, rotary_positions=rotary_positions,
-                                   audio_indices=audio_indices, coordinates=coordinates)
+                                   image_groups=image_groups, block_groups=block_groups,
+                                   rotary_positions=rotary_positions, audio_indices=audio_indices,
+                                   coordinates=coordinates)
         return self.language_model.logits_from_hidden(hidden)
 
     def logits(self, tokens, *, train: bool = False, **fields):
@@ -455,6 +490,35 @@ class MultimodalTransformer(nn.Module):
     def logits_from_hidden(self, hidden):
         """Return the decoder's logits of final states `hidden`."""
         return self.language_model.logits_from_hidden(hidden)
+
+    @property
+    def in_context(self) -> bool:
+        """Whether the decoder holds a continuum level (`SteppedInContext`)."""
+        return self.language_model.in_context
+
+    def affine_head(self) -> bool:
+        """Whether the decoder's head past its level is affine in its states (`SteppedInContext`)."""
+        return self.language_model.affine_head()
+
+    @nn.nowrap
+    def in_context_level(self, variables):
+        """The decoder's continuum level's parameters in `variables` (`SteppedInContext`)."""
+        held = {**variables, "params": variables["params"][self.wraps]}
+        return self.language_model.in_context_level(held)
+
+    @nn.nowrap
+    def with_in_context_level(self, variables, level):
+        """`variables` holding `level` as the decoder's continuum level (`SteppedInContext`)."""
+        held = self.language_model.with_in_context_level({"params": variables["params"][self.wraps]}, level)
+        return {**variables, "params": {**variables["params"], self.wraps: held["params"]}}
+
+    def continuum_states(self, hidden):
+        """The decoder's final states `hidden` past its continuum level (`SteppedInContext`)."""
+        return self.language_model.continuum_states(hidden)
+
+    def head_logits(self, states):
+        """The decoder's head over states its continuum level already read (`SteppedInContext`)."""
+        return self.language_model.head_logits(states)
 
     def states_and_logits(self, tokens, **kwargs):
         """Return the final hidden states and their logits from one media-aware forward pass."""
@@ -486,71 +550,17 @@ class MultimodalTransformer(nn.Module):
         self.variable("cache", POSITION, jnp.zeros, (batch_size,), jnp.int32)
         self.language_model.init_cache(batch_size)
 
-    # The serving and training hooks (`dew.nn.protocols`), its language
-    # model's; a clone keeps the towers and every variable's path.
-
-    @nn.nowrap
-    def with_cache_capacity(self, capacity: int) -> Self:
-        return self.clone(language_model=self.language_model.with_cache_capacity(capacity))
-
-    @property
-    def kv_cache(self) -> KVCache:
-        return self.language_model.kv_cache
-
-    @nn.nowrap
-    def with_kv_cache(self, layout: KVCache) -> Self:
-        return self.clone(language_model=self.language_model.with_kv_cache(layout))
-
-    @nn.nowrap
-    def projected(self, params, *, updated: bool):
-        """The language model's projection of its own parameters (`ProjectsParameters`); the
-        towers' as they are."""
-        if 'language_model' not in params:
-            return params
-        return {**params, 'language_model': self.language_model.projected(params['language_model'],
-                                                                           updated=updated)}
-
-    @nn.nowrap
-    def generation_refusal(self) -> str | None:
-        return self.language_model.generation_refusal()
-
-    @nn.nowrap
-    def with_remat(self, policy: RematPolicy | None) -> Self:
-        """Choose the language model's layer policy, leaving the towers as they were."""
-        return self.clone(language_model=self.language_model.with_remat(policy))
-
-    @nn.nowrap
-    def recompute_record(self) -> JSON:
-        return self.language_model.recompute_record()
-
-    @nn.nowrap
-    def recompute_more(self) -> Self | None:
-        language_model = self.language_model.recompute_more()
-        return None if language_model is None else self.clone(language_model=language_model)
-
-    @nn.nowrap
-    def recompute_half(self) -> Self | None:
-        language_model = self.language_model.recompute_half()
-        return None if language_model is None else self.clone(language_model=language_model)
-
-    @nn.nowrap
-    def restore_recompute(self, record: JSON) -> Self:
-        return self.clone(language_model=self.language_model.restore_recompute(record))
-
     @nn.nowrap
     def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
                     backprop_steps: int | None = None, remat: bool | None = None) -> Self | None:
         language_model = self.language_model.with_passes(steps, layers, backprop_steps=backprop_steps,
                                                          remat=remat)
-        return None if language_model is None else self.clone(language_model=language_model)
+        return None if language_model is None else self._over(language_model)
 
     @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
-        """The towers run once per prefill and keep their layout."""
-        text = {collection: tree["language_model"] for collection, tree in variables.items()
-                if "language_model" in tree}
-        return tuple(dataclasses.replace(group, path=("language_model", *group.path))
-                     for group in self.language_model.inference_projection_groups(text))
+        """The language model's (`held_groups`); the towers run once per prefill and keep their layout."""
+        return held_groups(self.language_model, "language_model", variables)
 
     @property
     def cache_rebuild_position(self) -> int | None:
@@ -569,10 +579,6 @@ class MultimodalTransformer(nn.Module):
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]:
         return self.language_model.indexed_mixers
-
-    @property
-    def keeps_triton_gemm(self) -> bool:
-        return self.language_model.keeps_triton_gemm
 
 
 __all__ = ["MultimodalTransformer"]

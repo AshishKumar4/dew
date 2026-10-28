@@ -49,7 +49,6 @@ gradient returned to the original order. The float64 reference checks that
 each order computes the same function.
 """
 
-import json
 import os
 import sys
 import types
@@ -60,7 +59,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_source import CACHE as UPSTREAM, verified
+from reference_source import github, saved_fixture
 
 REPO, COMMIT = "AshishKumar4/FlaxDiff", "15c55b001304604147a2a8002a76cf5d4c32092f"
 # In import order: each module's own imports come before it.
@@ -78,7 +77,6 @@ FILES = {
     "video_dit": "cecd0c05fa53f2078cf5dc7fcc5e55232be3cc9bb722de43429997616d377bac",
     "unet_3d": "ec1323014ec4cedcccac84c7dfe6af46a1dbed9bb1fd8a5a9493a4063916ea6a",
 }
-CACHE = UPSTREAM / "FlaxDiff" / COMMIT
 ATTENTION = {"attention_impl": None, "force_fp32_for_softmax": False}
 # case: (module, class, config, image [(T,) H, W, C], text [tokens, width])
 CASES = {
@@ -150,8 +148,7 @@ def flaxdiff(wide: bool) -> dict[str, types.ModuleType]:
         sys.modules[package] = module
     modules = {}
     for stem, digest in FILES.items():
-        local = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/flaxdiff/models/{stem}.py",
-                         CACHE / "flaxdiff" / "models" / f"{stem}.py", digest)
+        local = github(REPO, COMMIT, f"flaxdiff/models/{stem}.py", digest)
         source = local.read_text()
         if wide:
             source = source.replace("jnp.float32", "jnp.float64")
@@ -299,8 +296,7 @@ def main():
             "cases": {case: {"module": module, "class": cls, "config": config}
                       for case, (module, cls, config, _, _) in CASES.items()},
             "times": TIMES, "jax": jax.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(sys.argv[1], **arrays)
+    saved_fixture(Path(sys.argv[1]), arrays, meta)
     print(f"{sys.argv[1]}: {Path(sys.argv[1]).stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays")
 
 

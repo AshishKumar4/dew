@@ -127,8 +127,7 @@ def kernel_kind(name: str, launch: str, phase: str) -> tuple[str, str]:
 
 def attribute(path: Path, steps: int, intermediate: int) -> dict:
     """Join device kernels to host launches and keep the evidence for every name."""
-    from common import chrome_trace_kernels, kernel_summary
-    from trace_window import window_split
+    from common import chrome_trace_kernels, kernel_summary, trace
 
     events = json.loads(path.read_text())["traceEvents"]
     cpu = {str(e["args"]["External id"]): e for e in events
@@ -181,7 +180,7 @@ def attribute(path: Path, steps: int, intermediate: int) -> dict:
         raise RuntimeError("CUDA profile contains no device kernels")
     if len({device for *_, device in kernels}) != 1:
         raise RuntimeError("the reference requires exactly one profiled device")
-    split = window_split([(name, start, end) for name, start, end, _ in kernels])
+    split = trace.window_split([(name, start, end) for name, start, end, _ in kernels])
     scale = 1e-6 / steps
     return {"capture": str(path), "steps": steps, "step_program": "torch.compile",
             "device_busy_ms_per_step": split["busy"] * scale,
@@ -416,8 +415,9 @@ def result_record(args: argparse.Namespace, model, device, batch: int, seq: int,
                   observed_sdpa, work) -> dict:
     """The unprofiled metrics and later launch evidence keep separate scopes."""
     import torch
-    from common import chrome_trace_kernels, git_head, host, peak_flops, throughput, trim_trace
+    from common import chrome_trace_kernels, host, peak_flops, throughput, trim_trace
     from qwen35 import MODEL, REVISION, WHOLE_PEAK_SCOPE, workload
+    from reference_source import git_head
     from torch._dynamo.utils import counters
 
     config = model.backbone.config

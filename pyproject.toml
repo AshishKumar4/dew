@@ -12,19 +12,19 @@ authors = [
   { name="Ashish Kumar Singh", email="ashishkmr472@gmail.com" }
 ]
 dependencies = [
-    # flax.nnx imports on jax 0.11.2 from 0.12.10 on (jax.experimental.hijax's
+    # flax.nnx imports on jax 0.12.0.1 from 0.12.10 on (jax.experimental.hijax's
     # HiPrim; qwix imports nnx); <0.13 so that a flax that changes linen or nnx
     # arrives through a bump the suite checks, as jax does below.
     "flax>=0.12.10,<0.13",
-    # Dew's JAX build: 0.11.2 with the fixes no release has yet (constraints.txt
+    # Dew's JAX build: 0.12.0.1 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post6; a release sorts below it, so an
+    # first build with every fix is post30; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). The accelerator builds the
-    # cuda12, cuda13 and tpu extras name are 0.11.2's. A bump runs the GPU
+    # cuda12, cuda13 and tpu extras name are 0.12.0.1's. A bump runs the GPU
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
-    "jax>=0.11.2.post6,<0.11.3",
+    "jax>=0.12.0.1.post30,<0.12.1",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
@@ -32,6 +32,11 @@ dependencies = [
     # dew.data.images decodes, resizes and jitters every image record with it.
     "opencv-python-headless",
     "einops",
+    # dew.nn.engram draws its bucket primes with sympy.nextprime.
+    "sympy",
+    # dew.nn.kv_cache's Hadamard rotation (scipy.linalg.hadamard) and dew.nn.mlp's
+    # Gaussian cutoff (scipy.special.erfinv); jax already depends on scipy.
+    "scipy",
     # dew.data.dataset's close budget holds grain's worker kill timeout
     # (GRAIN_KILL_SECONDS); 0.2.18 is the release that was tested.
     "grain>=0.2.18,<0.3",
@@ -87,12 +92,12 @@ dew = "dew.cli.main:main"
 [project.optional-dependencies]
 # JAX owns its accelerator requirements; the core dependency pins its release.
 # FlashAttention-2 (kernels/flash_attn), which attention_impl 'auto' runs on an
-# A100 or an Ada GPU; its wheels are built for Linux x86_64 alone.
+# A100 or an Ada GPU; these extras install its wheels on Linux x86_64 and aarch64 (a GH200).
 cuda12 = ["jax[cuda12]",
-          "dew-flash-attn-cu12~=0.3.4; sys_platform == 'linux' and platform_machine == 'x86_64'"]
+          "dew-flash-attn-cu12~=0.3.6; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
 cuda13 = ["jax[cuda13]",
-          "dew-flash-attn-cu13~=0.3.4; sys_platform == 'linux' and platform_machine == 'x86_64'"]
-tpu = ["libtpu==0.0.48.*", "requests"]
+          "dew-flash-attn-cu13~=0.3.6; sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')"]
+tpu = ["libtpu==0.0.50.*", "requests"]
 # dew.telemetry.profile reads XProf's native converters, the same in 2.23.1
 # and 2.23.2. xprof 2.23.2 declares setuptools<70.0.0, which torch>=2.13's
 # setuptools>=77.0.3 cannot meet; the cap is the build lock's, read into the
@@ -109,9 +114,6 @@ test = [
     "moto[server,s3]>=5.1.15",
     # Delta source and publication scenarios use the optional table implementation.
     "dewml[delta]",
-    # tests/test_kernel_configs.py compiles every declared Pallas kernel config with Triton's own
-    # compiler for each GPU generation on a CPU: the release torch 2.14 (the torchax extra) takes.
-    "triton~=3.8.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     # The gate's behavior tests run the same linter and rule set as CI.
     "ruff==0.14.3",
     # tools/check.sh's duplicate-code gate (tools/duplicates.py) and its red fixture run this pylint.
@@ -129,8 +131,10 @@ test = [
     "scipy",
     # tests/test_reporting.py exercises the WandbTracker adapter.
     "dewml[wandb]",
-    # The committed VAE fixture was generated with this reference release.
-    "diffusers==0.34.0",
+    # The Diffusers references the tests run live (Flux 2's and Z-Image's transformers among them),
+    # and the release the committed VAE fixture records: 0.39.0, the last that ships Diffusers' Flax
+    # modules, which the Flax VAE, UNet and pipeline references read (0.40.0 removed them).
+    "diffusers==0.39.0",
     # tests/test_wan_source.py cleans prompts as Wan's pipelines do (the wan extra).
     "dewml[wan]",
     # tests/test_tools.py imports FlaxDiff's reference, whose hilbert module imports matplotlib.
@@ -140,12 +144,10 @@ test = [
     "dewml[live]",
     # tests/test_notebook_display.py executes a notebook in a Jupyter kernel and reads it back saved.
     "dewml[notebooks]",
-    # Every decoder and MoE parity number is calibrated against this exact
-    # release: the fixtures record it (tests/fixtures/hf/*/meta.json), the
-    # tests cite its line numbers, and a resolve that moved it would compare
-    # dew against a different reference while the tolerances stayed. The
-    # library accepts this release and later; the reference suite pins it.
-    "transformers==5.16.1",
+    # The reference suite runs this exact release: the fixtures that record their release
+    # (tests/fixtures/hf/*/meta.json) were recorded under it, and a resolve that moved it would
+    # compare Dew against a different reference unseen. The library accepts 5.16.1 and later.
+    "transformers==5.17.0",
     # tests/test_reference_helpers.py holds tools/kimi_k3_reference.py's MXFP4
     # encoding, this release's compressor, the one that tool's environment names.
     "compressed-tensors==0.17.1",
@@ -192,6 +194,10 @@ streaming = ["datasets>=5.0.1"]
 # holds it, so locks/cpu.txt, which the container installs under, pins every one.
 live = ["websockets==17.1", "jupyter-kernel-gateway==3.0.1", "ipykernel", "ipywidgets"]
 delta = ["deltalake>=1.0"]
+# dew.data.text's curation steps (Language, Quality, Classifier, Decontaminated): DataTrove's language,
+# quality, fastText and n-gram decontamination filters. DataTrove splits English into words with a blank
+# spaCy pipeline, which its own multilingual extra brings beside TensorFlow; spaCy alone is enough here.
+curation = ["datatrove[processing]==0.10.1", "spacy>=3.8.2"]
 # lm-evaluation-harness task suites through dew.eval.harness.DewLM, which
 # subclasses TemplateLM. Before 0.4.10, TemplateLM keeps the BOS that DewLM's
 # tokenizer puts at the start of an empty-context continuation, and scores it
@@ -218,7 +224,7 @@ wan = ["ftfy"]
 # GGUF files (Pretrained.load(..., gguf_file=)): llama.cpp's reader and block dequantizers.
 gguf = ["gguf==0.19.0"]
 # Official client transports and native request/result schemas; no model runtime.
-inference-clients = ["ollama>=0.6.2,<0.7", "openai>=3.8,<4"]
+inference-clients = ["ollama>=0.6.2,<0.7", "openai>=3.14,<4"]
 # examples/serve_decisions.py: a decision model behind HTTP in Jev's wire format.
 serve = ["starlette>=0.40", "uvicorn>=0.30"]
 # Agent environments and remote sandboxes for rollouts: OpenEnv's environments and the Modal, E2B and
@@ -234,16 +240,33 @@ augment = ["albumentations>=2"]
 # JAX. torchax 0.0.13 fails to import on torch 2.14; this nightly is the build
 # the fallback's tests ran against.
 torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
+# tests/kernel_compile.py compiles every declared Pallas kernel config for each GPU generation with the
+# compiler the GPU runs, XLA's CUDA backend of this jaxlib for a compile-only device (the Triton jaxlib
+# bundles, CUDA's libdevice and ptxas from the nvcc wheel, which Mosaic GPU's kernels compile through
+# too), and each Mosaic TPU kernel with libtpu for a compile-only TPU, on a host with no accelerator:
+# locks/cpu.txt takes this extra, and a GPU host's lock has its own CUDA plugin already
+# (tools/lock_environment.sh).
+kernel-compile = ["jax-cuda12-plugin==0.12.0.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "jax-cuda12-pjrt==0.12.0.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "libtpu==0.0.50.*; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
-ci = ["dewml[test,av,tfds,metrics,inference-clients,serve,environments,vision,augment,quantization,profile,torchax,gguf]",
+ci = ["dewml[test,av,tfds,metrics,inference-clients,serve,environments,vision,augment,quantization,profile,torchax,gguf,curation]",
       "flake8"]
 # The tutorial notebooks' environment outside Colab: the extras they import and a Jupyter kernel.
 # Tutorial 01, Diffusion from scratch, draws with matplotlib, which Colab installs.
 tutorials = ["dewml[streaming,interop,notebooks]", "matplotlib"]
 # Execute notebooks through a Jupyter kernel of the selected interpreter.
 notebooks = ["nbclient", "nbformat", "ipykernel"]
+
+# The least uv: 0.13.4 is the first whose own CA store leaves out emSign's (GHSA-hq85-5cpj-mr62). uv refuses
+# to run older in this project, setup-uv installs a release at least this, and site/scripts/gen_install.py
+# writes it into the installers that bootstrap uv before any checkout (install.sh, tools/armada/setup.sh, dew
+# tpu setup's script) and into the installation advice.
+[tool.uv]
+required-version = ">=0.13.4"
 
 [tool.ruff]
 target-version = "py312"
@@ -271,7 +294,7 @@ max-statements = 75
 
 [tool.ruff.lint.isort]
 known-first-party = ["dew"]
-# The lane bootstrap must execute before JAX reads backend configuration.
+# conftest sets the lane's environment (lane_environment.configured) before JAX reads it.
 force-to-top = ["lane_environment"]
 # `from x import A as B, C` is one line in this tree; splitting it per alias
 # turns three-name imports into three lines and hides the shared origin.
@@ -305,8 +328,9 @@ markers = [
     "distributed: tests that need real processes with jax.distributed",
     "mesh(devices=8): tests that need that many devices; tests/conftest.py skips them, naming both device counts, on a run with fewer",
     "gpu(reason): tests only a cuda device runs; tests/conftest.py skips them on any other backend, and a GPU session runs them with -m gpu",
+    "tpu(reason): tests only a tpu runs; tests/conftest.py skips them on any other backend, and the TPU tier (dew-ops' dewops.node.tpu, a Colab TPU at main's tip after each train) runs them with -m tpu",
     "torchax: tests whose code imports torchax, which renames torch's privateuse1 backend process-wide; CI runs these files in tasks of their own (tools/armada/ci.py)",
-    "kernel: tests of a GPU kernel's code (Pallas, Triton, fla): the CPU suite lowers and interprets them, and the kernel lab's GPU tier runs every one, with every gpu test, on each target GPU before the kernel lands",
+    "kernel: tests of a GPU kernel's code (Pallas, Triton, fla): the CPU suite lowers and interprets them, and the kernel lab's GPU tier runs every one, with every gpu test, on each target GPU before the kernel lands, but for check 1 on the TPU SSD kernel, which no user runs on a GPU",
 ]
 # A warning is a failure waiting to be reported, so the ones dew is
 # responsible for are errors. The module field is matched against the module
@@ -342,6 +366,11 @@ filterwarnings = [
     # Qwix 0.1.8 aliases a flax name flax removed; scoped to qwix so the same
     # warning from dew's own code still fails the run.
     'ignore:.VariableState. was removed:DeprecationWarning:qwix',
+    # jaxlib 0.12.0.1 builds the native type of a trace event's stats with no __module__ the first time a
+    # process reads one, and CPython warns of it in the reading frame, dew.telemetry.trace's: raised there,
+    # the error above aborts the process natively. Shown, not raised, for that message in that module
+    # alone; it goes once jaxlib gives the type a module.
+    'default:builtin type event_stats has no __module__ attribute:DeprecationWarning:dew\.telemetry\.trace',
 ]
 
 [tool.coverage.run]

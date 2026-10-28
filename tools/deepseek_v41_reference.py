@@ -25,7 +25,8 @@ quantizers and the stand-ins to. `--search N` ranks N seeds from `--seed` by
 what fp32 noise can reach in them (`search`); SEED is the first of 119.
 `--vision` writes the vision half beside the fixture (`write_vision`), and
 `--fp64`, run after both, the float64 truth of everything they wrote
-(`write_truth`).
+(`write_truth`). `--padding` records the rows the release's token lookup leaves
+untrained, its pad id stated, left out and null (`write_padding`).
 
 It writes tests/fixtures/hf/deepseek-v41-tiny: the release's config.json
 spelling at toy width, a model.safetensors under the release's tensor names,
@@ -80,6 +81,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import loaded, record_padding, saved_fixture
 
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash"
 DEEPSEEK_V41_REVISION = "dba1be0a40aa45a94ad051997016db3960a90277"
@@ -197,8 +199,13 @@ def build(model_module, engram_module, args, seed: int, widen: bool = False):
     weights drawn. `float` and `double` leave the complex rotary tables as
     they were built. The vision half draws from a generator of its own, so
     the decoder's weights are the same with it or without."""
+    from torch_precision import float64
+
     torch.manual_seed(seed)
-    net = model_module.Transformer(args, tokenizer())
+    # Built inside the shared `float64` when widened, so every value its constructor computes is
+    # float64's; the run's own widening (`widened`) is the caller's.
+    with float64() if widen else contextlib.nullcontext():
+        net = model_module.Transformer(args, tokenizer())
     net = net.double() if widen else net.float()
     generator = torch.Generator().manual_seed(seed)
     media = torch.Generator().manual_seed(seed + 2)
@@ -279,11 +286,14 @@ def reset(net):
 
 
 def forward(net, ids, start_pos=0):
-    """Transformer.forward (model.py:1241-1272) under autograd, full logits."""
+    """The release's Transformer.forward (V4.1's model.py:1241-1272, V4 DSpark's 912-926) under
+    autograd, every position's logits."""
     return type(net).forward.__wrapped__(net, ids, start_pos)
 
 
 def draft(net, ids, main_hidden, start_pos):
+    """The release's Transformer.forward_spec (V4.1's model.py:1274-1282, V4 DSpark's 928-936),
+    DSpark's draft."""
     return type(net).forward_spec.__wrapped__(net, ids, main_hidden, start_pos)
 
 
@@ -498,14 +508,15 @@ def stepped(net, gradients, ids) -> np.ndarray:
     return logits.numpy()
 
 
-def cached(net, ids) -> dict[str, np.ndarray]:
-    """The prefill of the first PROMPT tokens, the teacher-forced steps after
-    it and DSpark's draft after each."""
+def cached(net, ids, *, reset=reset, prompt=PROMPT, length=LENGTH) -> dict[str, np.ndarray]:
+    """The prefill of the first `prompt` tokens after the caller's `reset`, the
+    teacher-forced steps after it to `length` and DSpark's draft after each: the
+    driver every DSpark release's reference runs (deepseek_v4_dspark_reference.py)."""
     decode_logits, draft_ids, draft_logits, draft_confidence = [], [], [], []
     reset(net)
-    next_ids, prompt_logits, main_hidden = forward(net, ids[:, :PROMPT])
+    next_ids, prompt_logits, main_hidden = forward(net, ids[:, :prompt])
     draft(net, next_ids[:, -1], main_hidden, 0)
-    for position in range(PROMPT, LENGTH):
+    for position in range(prompt, length):
         next_ids, step_logits, main_hidden = forward(net, ids[:, position:position + 1], position)
         decode_logits.append(step_logits[:, 0])
         drafted = draft(net, next_ids[:, -1], main_hidden, position)
@@ -716,12 +727,8 @@ def official_kernels():
     revision), under a name of their own beside the stand-in `kernel`."""
     from huggingface_hub import hf_hub_download
 
-    path = hf_hub_download(REPO, "inference/kernel.py", revision=DEEPSEEK_V41_REVISION)
-    spec = importlib.util.spec_from_file_location("deepseek_v41_tilelang_kernels", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return loaded("deepseek_v41_tilelang_kernels",
+                  hf_hub_download(REPO, "inference/kernel.py", revision=DEEPSEEK_V41_REVISION))
 
 
 def write_kernels():
@@ -792,8 +799,7 @@ def write_kernels():
     meta = {"repo": REPO, "revision": DEEPSEEK_V41_REVISION, "code": "inference/kernel.py",
             "device": torch.cuda.get_device_name(), "torch": torch.__version__,
             "tilelang": tilelang.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(FIXTURE / "kernels.npz", **arrays)
+    saved_fixture(FIXTURE / "kernels.npz", arrays, meta)
     print(f"{FIXTURE / 'kernels.npz'}: {len(arrays)} arrays, {meta['device']}")
 
 
@@ -956,6 +962,16 @@ def write(seed: int):
     print(f"{FIXTURE}: {len(tensors)} tensors, loss {outputs['loss']:.6f}")
 
 
+def write_padding() -> None:
+    """padding.json beside the fixture (`reference_source.record_padding`): the release builds its
+    token lookup of ModelArgs alone, `ParallelEmbedding(args.vocab_size, args.dim)` (model.py:1201),
+    which reads no pad id, so each case's config is the fixture's and the lookup the same."""
+    model, _ = import_reference()
+    args = model.ModelArgs(**TINY)
+    record_padding(lambda variant: model.ParallelEmbedding(args.vocab_size, args.dim), lambda variant: None,
+                   json.loads((FIXTURE / "config.json").read_text()), FIXTURE)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", nargs="?", choices=("orders",))
@@ -966,6 +982,7 @@ def main():
                         help="write the tilelang kernels' outputs (kernels.npz) on CUDA")
     parser.add_argument("--fp64", action="store_true", help="write the fixture's float64 truth")
     parser.add_argument("--vision", action="store_true", help="write the vision half beside the fixture")
+    parser.add_argument("--padding", action="store_true", help="record the rows the lookup leaves untrained")
     options = parser.parse_args()
     torch.set_default_dtype(torch.float32)
     # One thread keeps every reduction in one order, so a rerun writes the
@@ -981,6 +998,8 @@ def main():
         write_truth(options.seed)
     elif options.vision:
         write_vision(options.seed)
+    elif options.padding:
+        write_padding()
     elif options.search:
         search(options.seed, options.search)
     else:

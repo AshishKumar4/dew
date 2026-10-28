@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import decoder
+from model_support import initialized_decoder
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained
@@ -32,8 +32,7 @@ VOCAB = 13
 
 @pytest.fixture(scope="module")
 def model():
-    module = decoder()
-    return module, module.init(jax.random.key(0), jnp.ones((1, 3), jnp.int32))
+    return initialized_decoder(length=3)
 
 
 def next_log_probs(model, params, rows):

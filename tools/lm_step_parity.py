@@ -26,7 +26,8 @@ import numpy as np
 import optax
 
 import dew.nn.backbones  # noqa: F401  (registers the kind)
-from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.batch import TEXT_KEY
+from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import MeshSpec, Trainer
 
@@ -55,8 +56,7 @@ def run(config: dict[str, object], batch: int, seq: int, steps: int,
     trainer = Trainer(LMObjective(model, seq), optax.adam(1e-4),
                       key=jax.random.key(0), mesh=MeshSpec(fsdp=1),
                       checkpoints=None, tracker=None)
-    abstract = jax.eval_shape(trainer.initial_state)
-    state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
+    state, _, _ = trainer.place()
 
     # The benchmark's fixed batch, byte for byte the same on both sides.
     generator = np.random.default_rng(0)

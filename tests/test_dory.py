@@ -13,9 +13,12 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from decision_support import decision_rows
 from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import (
     ORDERS,
+    as_given,
+    assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
@@ -28,10 +31,8 @@ from reference_error import (
 from tool_support import load as load_tool
 
 from dew.checkpoints import Checkpoints
-from dew.config.data import loader
 from dew.data.dataset import Loader, replayed
 from dew.decision import Choice, DecisionObjective, Example, JointLayout, JointSchemaHead
-from dew.decision.data import Decisions
 from dew.inference import TextGeneration
 from dew.inference.serving import Server
 from dew.interop import Pretrained, PretrainedDecoder, hf_decoders
@@ -44,6 +45,7 @@ from dew.nn.kernels import generation
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mlp import MLPMixer
+from dew.nn.ngpt import stepped
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling import Sampling
@@ -290,26 +292,117 @@ def test_a_shared_loop_cache_takes_each_prompt_whole(options):
         Server.from_task(greedy('last_loop'), slots=2, capacity=32, **options)
 
 
+DORY_GRADIENT_SEEDS = {'trained': 32, 'truncated': 64}
+"""Declared seeds for check 1, sized by `seeds_for` on armada, 2026-10-20: the live torch reference's
+six checkpoint gradients, through every pass or through the last pass alone."""
+
+
 @pytest.mark.parametrize(('name', 'loops', 'backprop_steps'), [('trained', 2, None), ('truncated', 3, 1)])
 def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_steps):
-    """The gradient of a loss over the logits in every tensor of the checkpoint, as the
-    reference's autograd takes it, within the rule: through every pass, and with the loop cut
-    before its last pass, where the input layers still train through what that pass reinjects
-    (Huginn's truncation). Each is named by the export, as the checkpoint stores it, and the
-    export names every tensor the reference does."""
+    """The gradient of a loss over the logits in the embeddings, an input layer's output-gate
+    projection, a looped feed-forward and attention gain, an output layer's step and the logit
+    gain, as the reference's autograd takes it, within the rule: through every pass, and with the
+    loop cut before its last pass, where the input layers still train through what that pass
+    reinjects (Huginn's truncation). Each draw has fresh token ids and cotangents, with their batch
+    rows permuted together, an exact symmetry of the summed loss. The same torch reference that
+    wrote the fixture runs live in fp32 and float64; every gradient keeps its checkpoint name. At
+    the fixture's own ids and cotangent, every tensor of the checkpoint's gradient holds to the
+    reference's stored ones within the same rule, and the export names every tensor the reference
+    does."""
     loaded = load()
     model = loaded.model.with_passes(loops, backprop_steps=backprop_steps)
+    tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+    cut = None if backprop_steps is None else loops - backprop_steps
+
+    def shapes(dtype):
+        return {tensor: jax.ShapeDtypeStruct(tensors[tensor].shape, dtype) for tensor in TOOL.GRADIENTS}
+
     ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent']
 
     def loss(params):
         return jnp.sum(model.apply({**loaded.variables, 'params': params}, ids) * cotangent)
 
     gradients = loaded.export({'params': jax.grad(loss)(loaded.variables['params'])})
-    tensors = {key.split('/', 1)[1] for key in REFERENCE.files if key.startswith(f'gradient_{name}/')}
-    assert set(gradients) == tensors
-    for tensor in sorted(tensors):
+    named = {key.split('/', 1)[1] for key in REFERENCE.files if key.startswith(f'gradient_{name}/')}
+    assert set(gradients) == named
+    for tensor in sorted(named):
         assert_as_exact_as_the_reference(gradients[tensor], REFERENCE[f'gradient_{name}/{tensor}'],
                                          REFERENCE[f'gradient_{name}_f64/{tensor}'], f'{name} {tensor}')
+
+    def exported(gradients):
+        written = loaded.export({'params': gradients})
+        return {tensor: np.asarray(written[tensor]) for tensor in TOOL.GRADIENTS}
+
+    def dew(ids, cotangent):
+        def loss(params):
+            return jnp.sum(model.apply({**loaded.variables, 'params': params}, ids) * cotangent)
+
+        gradients = jax.grad(loss)(loaded.variables['params'])
+        return jax.pure_callback(exported, shapes(cotangent.dtype), gradients)
+
+    def torch_gradients(ids, cotangent):
+        dtype = TOOL.torch.float64 if cotangent.dtype == np.float64 else TOOL.torch.float32
+        reference = TOOL.DoryReference(loaded.config, tensors, dtype, loops=loops)
+        return reference.gradients(np.array(ids), np.array(cotangent), TOOL.GRADIENTS, cut=cut)
+
+    def reference(ids, cotangent):
+        return jax.pure_callback(torch_gradients, shapes(cotangent.dtype), ids, cotangent)
+
+    def draw(seed):
+        rng = np.random.default_rng(5 + seed)
+        ids = rng.integers(12, loaded.config['vocab_size'], REFERENCE['input_ids'].shape, dtype=np.int32)
+        cotangent = rng.normal(size=REFERENCE['cotangent'].shape).astype(np.float32)
+        order = rng.permutation(len(ids))
+        return ids[order], cotangent[order]
+
+    dew, reference = jax.jit(dew), jax.jit(reference)
+    label = f'Dory {name} gradients'
+    assert_as_exact(dew, reference, draw, label, seeds=DORY_GRADIENT_SEEDS[name])
+
+
+def test_a_step_computes_in_the_widest_of_its_operands():
+    """nGPT's residual step runs in at least fp32 of its residual, its branch and its rate: a float32
+    residual stepped toward a float64 branch by a float64 rate, or by a float64 rate alone, takes its
+    rate and its difference in float64 and rounds once to the residual's float32."""
+    with jax.enable_x64(new_val=True):
+        residual = jnp.ones((2, 4), jnp.float32)
+        for branch, alpha in ((jnp.ones((2, 4), jnp.float64), jnp.ones(4, jnp.float64)),
+                              (jnp.ones((2, 4), jnp.float32), jnp.ones(4, jnp.float64))):
+            traced = jax.make_jaxpr(lambda residual, branch, alpha: stepped(residual, branch, alpha, 0.5))(
+                residual, branch, alpha)
+            stepping = {equation.outvars[0].aval.dtype for equation in traced.jaxpr.eqns
+                        if equation.primitive.name in ("abs", "sub")}
+            assert stepping == {np.dtype(np.float64)}
+            assert traced.out_avals[0].dtype == np.float32
+
+
+def test_a_float64_model_computes_in_float64():
+    """A float64 Dory computes its logits and gradients in float64 end to end, its nGPT attention
+    included: each within float64's rounding of the torch reference's own float64 run, an
+    independent implementation of the same tensors (`assert_computes_the_oracle`), where one fp32
+    rounding point on the path would sit many orders further."""
+    loaded = load()
+    tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+    with jax.enable_x64(new_val=True):
+        model = loaded.model.clone(dtype=jnp.float64)
+        variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), loaded.variables)
+        ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent'].astype(np.float64)
+
+        def loss(params):
+            return jnp.sum(model.apply({**variables, 'params': params}, ids) * cotangent)
+
+        logits = np.asarray(model.apply(variables, ids))
+        written = loaded.export({'params': jax.grad(loss)(variables['params'])})
+        forward = chain_roundings(jax.make_jaxpr(lambda variables: model.apply(variables, ids))(variables))
+        backward = chain_roundings(jax.make_jaxpr(jax.grad(loss))(variables['params']))
+    reference = TOOL.DoryReference(loaded.config, tensors, TOOL.torch.float64)
+    expected = reference.forward(ids)
+    gradients = reference.gradients(np.array(ids), np.array(cotangent), TOOL.GRADIENTS)
+    assert logits.dtype == np.float64
+    assert_computes_the_oracle(logits, expected, 'float64 logits', roundings=forward)
+    for tensor in TOOL.GRADIENTS:
+        assert_computes_the_oracle(np.asarray(written[tensor]), gradients[tensor], f'float64 {tensor}',
+                                   roundings=backward)
 
 
 def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_reads():
@@ -392,6 +485,10 @@ def peft_merged(checkpoint: Path, adapter: Path) -> dict[str, np.ndarray]:
     return merged
 
 
+MERGED_SEEDS = 8
+"""The merged-adapter site's declared draws (`seeds_for`)."""
+
+
 def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     """A rank-2 adapter on all eight projections of every layer, the attention's output gate
     (`g_proj`) apart from the feed-forward's `gate_proj`: one step moves every B factor, so the
@@ -399,7 +496,8 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     steps end; the saved factors load back to the same logits; PEFT, the saved adapter's consumer,
     merges it into every projection the checkpoint holds by its name there, and the transcription
     over that merge computes the adapted model's logits within the rule of its own run against
-    float64; and the merged checkpoint reloads to the adapted model's logits within the same rule."""
+    float64; and the merged checkpoint reloads to logits on par with the adapted model's from
+    float64."""
     from safetensors.numpy import load_file
 
     loaded = load()
@@ -438,9 +536,22 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
                                      'the adapter as PEFT merges it')
     adapted.save(tmp_path / 'merged', variables=resumed)
     merged = Pretrained.load(tmp_path / 'merged', dtype='float32', attention_impl='xla')
-    truth, terms = float64_forward(adapted.model, resumed, ids)
-    assert_as_exact_as_the_reference(np.asarray(merged.model.apply(merged.variables, ids)), logits,
-                                     np.asarray(truth), 'the merged adapter', terms=np.asarray(terms))
+    # Merging folds each adapter into its projection's weight, a rounding of its own: the merged
+    # model's logits are on par with the adapted model's over drawn ids, both from the adapted
+    # model's float64 forward (check 1).
+    vocabulary = adapted.model.vocab_size
+
+    def draw(seed):
+        return (np.random.default_rng([0xD0E, seed]).integers(0, vocabulary, ids.shape, dtype=np.int32),)
+
+    def merged_logits(drawn):
+        return merged.model.apply(merged.variables, drawn)
+
+    def adapted_logits(drawn):
+        return adapted.model.apply(resumed, drawn)
+
+    assert_as_exact(merged_logits, adapted_logits, draw, 'merged adapter logits', seeds=MERGED_SEEDS,
+                    truth_fn=as_given(lambda drawn: float64_forward(adapted.model, resumed, drawn)[0]))
 
 
 INTENT = Choice('which team?', {'billing': 'payments', 'technical': 'outages', 'sales': 'pricing'})
@@ -464,8 +575,7 @@ def test_a_joint_decision_head_reads_dorys_vocabulary_rows_and_trains(tmp_path):
                                      REFERENCE['logits_2_f64'], "Dory's vocabulary rows")
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
     objective = DecisionObjective(loaded, layout=JointLayout(max_len=1024), head=head)
-    data = loader(Decisions(source=EXAMPLES, validation=EXAMPLES), batch=8, read='memory',
-                  objective=objective.data())
+    data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=Checkpoints(str(tmp_path)))
     initial = trainer.initial_state()
     # The step donates the state it is handed; the host keeps what it started from.

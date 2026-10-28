@@ -25,7 +25,6 @@ time: `1 - u` for a uniform, the negated normal for a logit-normal.
 from __future__ import annotations
 
 import ast
-import contextlib
 import json
 import tarfile
 import types
@@ -36,8 +35,8 @@ import numpy as np
 import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
-from reference_source import CACHE, selected, simple_statements, verified
-from torch_precision import replaced
+from recorded_draws import fixed_draws
+from reference_source import github, selected, simple_statements
 
 from dew.diffusion.presets import Flow
 
@@ -61,9 +60,7 @@ its unshifted training table."""
 
 def published(name: str) -> str:
     file, digest = SCRIPTS[name]
-    path = f"examples/dreambooth/{file}"
-    return verified(f"https://raw.githubusercontent.com/huggingface/diffusers/{COMMIT}/{path}",
-                    CACHE / "diffusers" / COMMIT / path, digest).read_text()
+    return github("huggingface/diffusers", COMMIT, f"examples/dreambooth/{file}", digest).read_text()
 
 
 def defaults(text: str) -> dict[str, object]:
@@ -84,14 +81,6 @@ def statements(text: str) -> tuple[str, str]:
     helper = next(node for node in ast.walk(main)
                   if isinstance(node, ast.FunctionDef) and node.name == "get_sigmas")
     return ast.get_source_segment(text, helper), "\n".join(simple_statements(text, main, STATEMENTS))
-
-
-@contextlib.contextmanager
-def drawn(base: np.ndarray):
-    """`torch.normal(mean, std, size)` and `torch.rand(size)` return `base`'s values."""
-    with replaced((torch, "normal", lambda mean, std, size, **_: mean + std * torch.from_numpy(base)),
-                  (torch, "rand", lambda size, **_: torch.from_numpy(base))):
-        yield
 
 
 def scheduler(name: str) -> FlowMatchEulerDiscreteScheduler:
@@ -118,7 +107,7 @@ def main() -> None:
                  "noise_scheduler_copy": scheduler(name),
                  "accelerator": types.SimpleNamespace(device="cpu"),
                  "model_input": torch.zeros((DRAWS, 4, 2, 2))}
-        with drawn(base):
+        with fixed_draws(torch.from_numpy(base)):
             exec(helper, scope)
             exec(lines, scope)
         weighting = np.broadcast_to(scope["weighting"].flatten().numpy(), (DRAWS,)).copy()

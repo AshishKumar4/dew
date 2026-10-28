@@ -21,8 +21,13 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
-from dew.interop.weights import ParamTree, placed
+from dew import _records
+from dew.interop.unread import Stored
+from dew.interop.weights import Tree, check_shapes, native_shape, placed
 from dew.nn.dense import Dense
+from dew.nn.inputs import sequence_blocks
+from dew.nn.precision import accumulated, capped_logits, float32_dot_general, float32_products, products_dtype
+from dew.nn.rope import sinusoid_frequencies, sinusoids
 from dew.registry import from_record
 
 from .activations import activation
@@ -68,7 +73,7 @@ class Gemma3nAudio(TowerBase):
         return Gemma3nAudioEncoder(self)
 
     def geometry(self) -> TowerGeometry:
-        return TowerGeometry(mel_features=self.input_feat_size)
+        return TowerGeometry(mel_features=self.input_feat_size, frames_per_token=encoded_frame_stride(self))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -128,7 +133,8 @@ def _clip(x, bound: float):
 def _dense(config: Gemma3nAudio | Gemma4Audio, dtype: Dtype | None, precision: PrecisionLike):
     """The encoders' bias-free linear map, its kernel drawn at `initializer_range`."""
     return functools.partial(Dense, use_bias=False, dtype=dtype, precision=precision,
-                             kernel_init=nn.initializers.normal(config.initializer_range))
+                             kernel_init=nn.initializers.normal(config.initializer_range),
+                             dot_general=float32_dot_general)
 
 
 @logical_axes({("linear",): ("embed", "mlp")})
@@ -148,8 +154,13 @@ class AudioLinear(nn.Module):
 
 def _clippable(config: Gemma4Audio, dtype: Dtype | None, precision: PrecisionLike):
     """Gemma 4's linear map: each one an `AudioLinear`."""
-    return functools.partial(AudioLinear, dense=_dense(config, dtype, precision),
-                             use_clipped_linears=config.use_clipped_linears)
+    dense = _dense(config, dtype, precision)
+
+    def linear(features, *, name=None, **fields):
+        return AudioLinear(features, dense=functools.partial(dense, **fields),
+                           use_clipped_linears=config.use_clipped_linears, name=name)
+
+    return linear
 
 
 class CumulativeGroupNorm(nn.Module):
@@ -242,19 +253,12 @@ def _block_context(x, chunk: int, left: int, right: int):
     return x[:, indices]
 
 
-def _queries(x, chunk: int):
-    """Split the frames into whole chunks: `[B, blocks, chunk, ...]`."""
-    blocks = -(-x.shape[1] // chunk)
-    x = jnp.pad(x, ((0, 0), (0, blocks * chunk - x.shape[1])) + ((0, 0),) * (x.ndim - 2))
-    return x.reshape(x.shape[0], blocks, chunk, *x.shape[2:])
-
-
 def _position_signal(width: int, positions, dtype):
     """Embed each relative position as `width` sinusoids, sines then cosines."""
     half = width // 2
-    inv = jnp.exp(jnp.arange(half, dtype=jnp.float32) * (-math.log(10000.0) / max(half - 1, 1)))
-    angles = positions.astype(jnp.float32)[:, None] * inv[None, :]
-    return jnp.concatenate((jnp.sin(angles), jnp.cos(angles)), axis=-1).astype(dtype)
+    # `exp(-ln(10000) i / (half - 1))`, which is `10000 ** (-i / (half - 1))`, rounded once from float64.
+    inv = jnp.asarray(sinusoid_frequencies(half, max(half - 1, 1), dtype=np.float32))
+    return sinusoids(positions.astype(jnp.float32)[:, None] * inv[None, :]).astype(dtype)
 
 
 def _relative_logits(query, key, positional, precision: PrecisionLike = None):
@@ -270,9 +274,11 @@ def _relative_logits(query, key, positional, precision: PrecisionLike = None):
     batch, blocks, chunk, heads, dim = query.shape
     context = key.shape[2]
     q = query.transpose(0, 3, 1, 2, 4)
-    content = jnp.matmul(q, key.transpose(0, 3, 1, 4, 2), precision=precision)
+    products = float32_products(products_dtype(q, key, positional), precision)
+    matmul = functools.partial(accumulated, functools.partial(jnp.matmul, precision=products))
+    content = matmul(q, key.transpose(0, 3, 1, 4, 2))
     positions = positional.reshape(-1, heads, dim).transpose(1, 2, 0)
-    relative = jnp.matmul(q.reshape(batch, heads, blocks * chunk, dim), positions, precision=precision)
+    relative = matmul(q.reshape(batch, heads, blocks * chunk, dim), positions)
     relative = relative.reshape(batch, heads, blocks, chunk, -1)
     relative = jnp.pad(relative, ((0, 0),) * 4 + ((0, context + 1 - relative.shape[-1]),))
     relative = relative.reshape(batch, heads, blocks, chunk * (context + 1))
@@ -295,15 +301,16 @@ def _chunked_attention(query, key, value, positional, valid, chunk: int, left: i
     dtype (modeling_gemma3n.py:523, modeling_gemma4.py:348).
     """
     batch, length, heads, dim = query.shape
-    query = _queries(query, chunk)
+    query = sequence_blocks(query, chunk)
     key, value = (_block_context(z, chunk, left, right) for z in (key, value))
     logits = _relative_logits(query, key, positional, precision)
-    logits = jnp.tanh(logits / cap) * cap
+    logits = capped_logits(logits, cap)
     distance = left + jnp.arange(chunk)[:, None] - jnp.arange(chunk + left + right)[None, :]
     allowed = _block_context(valid, chunk, left, right)[:, None, :, None, :] & window(distance)
     logits = jnp.where(allowed, logits, fill)
     probabilities = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(value.dtype)
-    out = jnp.matmul(probabilities, value.transpose(0, 3, 1, 2, 4), precision=precision)
+    out = accumulated(functools.partial(jnp.matmul, precision=float32_products(value.dtype, precision)),
+                      probabilities, value.transpose(0, 3, 1, 2, 4))
     return out.transpose(0, 2, 3, 1, 4).reshape(batch, -1, heads * dim)[:, :length]
 
 
@@ -385,13 +392,19 @@ class AudioFeedForward(nn.Module):
     linear: Callable[..., nn.Module]
     activation: str = "silu"
     dtype: Dtype | None = None
+    precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, x):
         residual = x
         x = RMSNorm(dtype=self.dtype, epsilon=1e-6, name="pre_layer_norm")(_clip(x, self.clipping))
-        x = activation(self.activation)(self.linear(self.width * 4, name="ffw_layer_1")(x))
-        x = self.linear(self.width, name="ffw_layer_2")(x)
+        from .mlp import GatedMLP
+
+        mlp = GatedMLP(self.width * 4, self.width, activation=activation(self.activation),
+                        names=("ffw_layer_1", "ffw_layer_2"), linear=self.linear, dtype=self.dtype,
+                        precision=self.precision)
+        nn.share_scope(self, mlp)
+        x = mlp(x)
         x = RMSNorm(dtype=self.dtype, epsilon=1e-6, name="post_layer_norm")(_clip(x, self.clipping))
         return residual + x * self.residual_weight
 
@@ -455,7 +468,8 @@ class Gemma3nConformer(nn.Module):
         cfg = self.config
         dense = _dense(cfg, self.dtype, self.precision)
         feed_forward = functools.partial(AudioFeedForward, cfg.hidden_size, cfg.conf_residual_weight,
-                                         cfg.gradient_clipping, dense, dtype=self.dtype)
+                                         cfg.gradient_clipping, dense, dtype=self.dtype,
+                                         precision=self.precision)
         x = feed_forward(name="ffw_layer_start")(x)
         x = Gemma3nConformerAttention(cfg, dtype=self.dtype, precision=self.precision, name="attention")(
             x, valid
@@ -477,7 +491,8 @@ class Gemma4Conformer(nn.Module):
         cfg = self.config
         linear = _clippable(cfg, self.dtype, self.precision)
         feed_forward = functools.partial(AudioFeedForward, cfg.hidden_size, cfg.residual_weight,
-                                         cfg.gradient_clipping, linear, cfg.hidden_act, dtype=self.dtype)
+                                         cfg.gradient_clipping, linear, cfg.hidden_act, dtype=self.dtype,
+                                         precision=self.precision)
         x = feed_forward(name="feed_forward1")(x)
         residual = x
         x = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm_pre_attn")(_clip(x, cfg.gradient_clipping))
@@ -543,13 +558,12 @@ class Gemma4AudioEncoder(nn.Module):
                 x, mask
             )
         x = Dense(cfg.output_proj_dims, use_bias=True, dtype=self.dtype, precision=self.precision,
-                  kernel_init=nn.initializers.normal(cfg.initializer_range), name="output_proj")(x)
+                  kernel_init=nn.initializers.normal(cfg.initializer_range), name="output_proj",
+                  dot_general=float32_dot_general)(x)
         return AudioEncoding(x, mask)
 
 
-_METADATA = frozenset({"model_type", "architectures", "transformers_version", "torch_dtype", "dtype",
-                       "output_hidden_states", "output_attentions", "return_dict", "is_encoder_decoder",
-                       "id2label", "label2id", "problem_type", "chunk_size_feed_forward"})
+_METADATA = _records.HF_METADATA | {"model_type"}
 
 
 def audio_config(record: Mapping[str, object]) -> Gemma3nAudio | Gemma4Audio:
@@ -593,7 +607,7 @@ def _audio_template(config: Gemma3nAudio | Gemma4Audio):
     template = jax.eval_shape(config.build().init, jax.random.key(0),
                               jax.ShapeDtypeStruct((1, 16, features), jnp.float32),
                               jax.ShapeDtypeStruct((1, 16), jnp.bool_))
-    return {tuple(str(k.key) for k in path): value
+    return {tuple(str(k.key) for k in path): value.shape
             for path, value in jax.tree_util.tree_leaves_with_path(template)}
 
 
@@ -617,11 +631,11 @@ def audio_weight_path(name: str, config: Gemma3nAudio | Gemma4Audio) -> tuple[st
 
 
 def audio_weights(
-    tensors: Mapping[str, np.ndarray],
+    tensors: Mapping[str, Stored],
     config: Gemma3nAudio | Gemma4Audio,
     *,
     param_dtype: str = "float32",
-) -> tuple[ParamTree, tuple[WeightLayout, ...]]:
+) -> tuple[Tree[Stored], tuple[WeightLayout, ...]]:
     """Translate reference weights into params and frozen clipping constants, with the layouts
     that write each tensor back from them (`placed`).
 
@@ -629,21 +643,7 @@ def audio_weights(
     requested storage precision; clipping state stays FP32. Integer tensors
     retain their native dtype, and every shape is checked against the encoder.
     """
-    expected = _audio_template(config)
-    seen = set()
-
-    def path_of(name: str) -> tuple[str, ...]:
-        path = audio_weight_path(name, config)
-        shape = tensors[name].shape
-        if path[-1] == "kernel":
-            shape = (*shape[2:], shape[1], shape[0])
-        if path not in expected or shape != expected[path].shape:
-            raise ValueError(f"audio tensor {name!r} with shape {shape} does not match the encoder")
-        seen.add(path)
-        return path
-
-    tree, layouts = placed(tensors, path_of, param_dtype)
-    missing = expected.keys() - seen
-    if missing:
-        raise ValueError(f"audio checkpoint is missing {sorted('/'.join(path) for path in missing)}")
-    return tree, layouts
+    paths = {name: audio_weight_path(name, config) for name in tensors}
+    check_shapes(((path, native_shape(path, tensors[name].shape)) for name, path in paths.items()),
+                 _audio_template(config))
+    return placed(tensors, paths.__getitem__, param_dtype)

@@ -23,6 +23,7 @@ that collapse shows in the training curves, before a probe run.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
@@ -32,8 +33,9 @@ import optax
 from flax import linen as nn
 
 from dew.artifacts import Representations
+from dew.batch import Variables, dicts, part, thaw, under
 from dew.inputs import Field, InputSpec, unit_range
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import accumulated, at_least_fp32
 from dew.nn.sharding import explicit_spec, whole_spec
 from dew.objectives.base import (
     Aux,
@@ -43,14 +45,10 @@ from dew.objectives.base import (
     Ratio,
     Shown,
     Step,
-    Variables,
     joined,
     model_rngs,
-    part,
     projected_draw,
     projected_parts,
-    thaw,
-    under,
 )
 
 from .masking import MultiBlockMask
@@ -75,7 +73,8 @@ def representation_health(z) -> dict[str, jax.Array]:
     batch_size, dim = z.shape
     z = z.astype(jnp.float32)
     centered = z - jnp.mean(z, axis=0, keepdims=True)
-    cov = jnp.matmul(centered.T, centered, out_sharding=whole_spec(centered, 2)) / max(batch_size - 1, 1)
+    product = functools.partial(jnp.matmul, out_sharding=whole_spec(centered, 2))
+    cov = accumulated(product, centered.T, centered) / max(batch_size - 1, 1)
     off_diagonal = cov * (1.0 - jnp.eye(dim, dtype=cov.dtype))
     return {
         "repr_std": jnp.mean(jnp.std(z, axis=0)),
@@ -83,16 +82,21 @@ def representation_health(z) -> dict[str, jax.Array]:
     }
 
 
-def normalize_targets(x, epsilon: float = 1e-6):
-    """Layer-normalize `x` over its feature axis, with no learned affine.
+def normalize_targets(x: jax.Array, epsilon: float = 1e-5) -> jax.Array:
+    """Layer-normalize `x` over its feature axis, with no learned affine, through Flax's `LayerNorm`
+    at exact variance. Its statistics are at least float32 and its `epsilon` PyTorch's default, as
+    I-JEPA's `F.layer_norm(h, (h.size(-1),))` takes them (src/train.py), and the result keeps `x`'s
+    dtype.
 
     The objective applies it to the target encoder's output, so the
     prediction problem keeps a fixed scale as the encoder drifts, and
     shrinking the representation does not lower the loss.
     """
-    mean = jnp.mean(x, axis=-1, keepdims=True)
-    variance = jnp.var(x, axis=-1, keepdims=True)
-    return (x - mean) * jax.lax.rsqrt(variance + epsilon)
+    normalized = nn.LayerNorm(epsilon=epsilon, use_scale=False, use_bias=False,
+                              use_fast_variance=False).apply({}, x)
+    # `mutable` is unset, so apply returns the output alone, not a pair.
+    assert not isinstance(normalized, tuple)
+    return normalized
 
 
 @runtime_checkable
@@ -150,8 +154,8 @@ class JepaObjective(Objective[Ratio]):
         self.mask = mask
         self.sample = sample
         self.label_key = label_key
-        self.encoder_variables = encoder_variables
-        self.predictor_variables = predictor_variables
+        self.encoder_variables = dicts(encoder_variables)
+        self.predictor_variables = dicts(predictor_variables)
         self.is_video = len(sample.shape) == 4
         self.inputs = InputSpec(sample=sample)
         self.ema = EMASpec(
@@ -217,8 +221,12 @@ class JepaObjective(Objective[Ratio]):
     def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.sample.key])
         batch_size = samples.shape[0]
-        mask_key, dropout_key = jax.random.split(step.key)
-        context_idx, target_idx = self.mask.sample(mask_key, batch_size)
+        # The masks are each example's own (`Step.sample`); the encoders' dropout is the attempt's.
+        _, dropout_key = jax.random.split(step.key)
+        drawn = [step.sample(f"mask {name}", draw, shape, rows=batch_size) for name, draw, shape in
+                 zip(("shapes", "corners", "order"), self.mask.draws(), self.mask.draw_shapes(), strict=True)]
+        context_idx, target_idx = self.mask.placed(*drawn)
+        context_idx, target_idx = step.boundary("context", context_idx), step.boundary("targets", target_idx)
         num_targets = self.mask.num_targets
 
         # The target branch reads the whole view through the EMA encoder, without gradients.
@@ -239,7 +247,7 @@ class JepaObjective(Objective[Ratio]):
         predictions = self.predictor.apply(
             thaw(part(variables, PREDICTOR)),
             repeated,
-            jnp.repeat(context_idx, num_targets, axis=0),
+            jnp.repeat(context_idx, num_targets, axis=0, out_sharding=explicit_spec(context_idx)),
             target_idx.reshape(batch_size * num_targets, -1),
             train=step.training, rngs=model_rngs(dropout_key, training=step.training),
         )

@@ -31,10 +31,12 @@ import numpy as np
 from flax import linen as nn
 from jax.typing import ArrayLike
 
-from dew.nn.autoencoders import AutoEncoder
+from dew.batch import Batch, Variables
+from dew.nn.autoencoders import AutoEncoder, LatentAffine
 from dew.nn.autoencoders.kl import posterior_moments
 from dew.nn.conv import Conv
-from dew.objectives.base import Batch, Objective, Variables
+from dew.nn.precision import at_least_fp32
+from dew.objectives.base import Objective
 
 AUTOENCODER = "autoencoder"
 """Where the trained autoencoder's parameters sit in `params`."""
@@ -59,7 +61,7 @@ class _BatchNorm(nn.Module):
         width = hidden.shape[-1]
         weight = self.param("weight", lambda key, shape: 1 + 0.02 * jax.random.normal(key, shape), (width,))
         bias = self.param("bias", nn.initializers.zeros, (width,))
-        mean, var = _moments(hidden, batch)
+        mean, var = Objective.row_moments(hidden, batch, tuple(range(hidden.ndim - 1)))
         return (hidden - mean) / jnp.sqrt(var + 1e-5) * weight + bias
 
 
@@ -87,14 +89,14 @@ class TunedAutoEncoder(AutoEncoder):
     def __hash__(self) -> int:
         return hash((TunedAutoEncoder, id(self.autoencoder)))
 
-    def encode_batch(self, params, x, key=None):
-        return self.autoencoder.encode_batch(params[TUNED_WEIGHTS], x, key=key)
+    def encode_batch(self, params, x, key=None, noise=None):
+        return self.autoencoder.encode_batch(params[TUNED_WEIGHTS], x, key=key, noise=noise)
 
     def decode_batch(self, params, z):
         return self.autoencoder.decode_batch(params[TUNED_WEIGHTS], z)
 
-    def encode_video(self, params, x, key=None):
-        return self.autoencoder.encode_video(params[TUNED_WEIGHTS], x, key)
+    def encode_video(self, params, x, key=None, noise=None):
+        return self.autoencoder.encode_video(params[TUNED_WEIGHTS], x, key, noise)
 
     def decode_video(self, params, z):
         return self.autoencoder.decode_video(params[TUNED_WEIGHTS], z)
@@ -104,35 +106,37 @@ class TunedAutoEncoder(AutoEncoder):
         return self.autoencoder.downscale_factor
 
     @property
+    def stochastic(self) -> bool:
+        return self.autoencoder.stochastic
+
+    @property
     def latent_channels(self) -> int:
         return self.autoencoder.latent_channels
 
     def latent_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
         return self.autoencoder.latent_shape(shape)
 
-    def normalization(self, params, dtype=jnp.float32) -> tuple[jax.Array, jax.Array]:
-        """The latent shift and scale the running statistics in `params` give, in `dtype`."""
+    def latent_affine(self, params, dtype) -> LatentAffine:
+        """The latent shift and scale the running statistics in `params` give, in `dtype`, which the
+        base `encode` and `decode` apply."""
         statistics = params[LATENT_STATS]
-        return jnp.asarray(statistics["mean"], dtype), jnp.asarray(jax.lax.rsqrt(statistics["var"]), dtype)
+        return LatentAffine(jnp.asarray(statistics["mean"], dtype),
+                            jnp.asarray(jax.lax.rsqrt(statistics["var"]), dtype))
 
-    def encode(self, params, x, key=None):
-        latent = self.encode_video(params, x, key) if x.ndim == 5 else self.encode_batch(params, x, key=key)
-        shift, scale = self.normalization(params, latent.dtype)
-        return (latent - shift) * scale
+    @property
+    def latent_shift(self):
+        raise TypeError("a tuned autoencoder's latent shift is its run's running statistics, which each "
+                        "call's variables hold (`latent_affine`)")
 
-    def decode(self, params, z):
-        shift, scale = self.normalization(params, z.dtype)
-        z = z / scale + shift
-        return self.decode_video(params, z) if z.ndim == 5 else self.decode_batch(params, z)
+    @property
+    def latent_scale(self):
+        raise TypeError("a tuned autoencoder's latent scale is its run's running statistics, which each "
+                        "call's variables hold (`latent_affine`)")
 
+    def with_normalization(self, normalization):
+        raise TypeError("a tuned autoencoder normalizes by its run's running statistics, which each "
+                        "call's variables hold, not by a fixed normalization")
 
-def _moments(values: jax.Array, batch: Batch) -> tuple[jax.Array, jax.Array]:
-    """`values`' mean and biased variance over every axis but the channels,
-    over `batch`'s rows (`Objective.row_mean`), as `jnp.mean` and `jnp.var` take them."""
-    axes = tuple(range(values.ndim - 1))
-    mean, _ = Objective.row_mean(values, batch, axes).mean()
-    var, _ = Objective.row_mean(jnp.square(values - mean), batch, axes).mean()
-    return mean, var
 
 
 class PatchDiscriminator(nn.Module):
@@ -272,7 +276,7 @@ class EndToEnd:
         rows (`Objective.row_mean`). This is torch's `BatchNorm2d` in training mode,
         whose running variance is unbiased.
         """
-        mean, var = _moments(latents, batch)
+        mean, var = Objective.row_moments(latents, batch, tuple(range(latents.ndim - 1)))
         count = Objective.row_mean(latents[..., 0], batch).mass
         following = {"mean": (1 - self.momentum) * statistics["mean"] + self.momentum * mean,
                      "var": (1 - self.momentum) * statistics["var"]
@@ -295,7 +299,7 @@ class EndToEnd:
             return Objective.row_mean(values, batch).mean()[0]
 
         # At least float32, and a float64 run stays float64.
-        dtype = jnp.promote_types(jnp.result_type(moments, reconstruction), jnp.float32)
+        dtype = at_least_fp32(jnp.result_type(moments, reconstruction))
         mean, log_variance = posterior_moments(moments.astype(dtype))
         axes = tuple(range(1, mean.ndim))
         kl = mean_of(0.5 * jnp.sum(jnp.square(mean) + jnp.exp(log_variance) - 1.0 - log_variance, axis=axes))

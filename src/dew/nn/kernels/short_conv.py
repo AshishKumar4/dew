@@ -26,9 +26,9 @@ tokens (`Walk`), and a loop steps all of them forward one token at a time, carry
 pre-activation gradients, so each token's conv, silu, norm and their gradients are computed once. A
 run reads the K-1 tokens before it and computes K-1 past its end, `(K - 1) / steps` extra.
 
-Both launches are the tuner's (`dew.nn.kernels.tuning`): each takes the config measured for its GPU
-and shape where there is one, `TILE` and `WALK` without, and its float64 gate holds at every config
-of its space (tests/test_short_conv.py).
+The conv selector (`CONV`) runs them where their requirements hold and XLA's conv elsewhere, reported
+as the call's route ('short_conv'). Each launch takes its one config, `TILE` and `WALK`
+(`dew.nn.kernels.tuning`), whose float64 gate tests/test_short_conv.py holds.
 
 The arithmetic is `causal_conv1d`'s in fp32, each output rounded once to its dtype: the conv's
 products summed tap by tap, as XLA sums them, and the sigmoid's quotient and the norm's root and
@@ -46,9 +46,12 @@ from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import pallas as pl
 
 from . import generation, tuning
+from .generation import INHERENT
+from .selection import Kernel, Op, Requirement
 
 WIDEST_TAPS = 8
 """The longest conv the kernels unroll: each tap is a register tile the walk carries."""
@@ -74,21 +77,52 @@ def _fits(width: int, head: int | None) -> bool:
     return block & (block - 1) == 0 and 16 <= block <= (128 if head is None else 256) and width % block == 0
 
 
-def refusal(x, taps, parts, dtype) -> str | None:
-    """Why the kernels do not take a conv of `x` `[B, T, C]` by `taps` `[C, K]` into `parts` in `dtype`,
-    or None where they do."""
-    channels = x.shape[-1]
-    return generation.first_refusal(
-        (x.ndim == 3 and x.shape[1] > 0, f"a conv over {x.shape}; the kernels take [B, T, C]"),
-        (jnp.dtype(x.dtype) in DTYPES and jnp.dtype(dtype) in DTYPES,
-         f"{x.dtype} inputs into {jnp.dtype(dtype)}; the kernels read and write float32, bfloat16 or "
-         "float16, summing in float32"),
-        (2 <= taps.shape[-1] <= WIDEST_TAPS, f"{taps.shape[-1]} taps; the kernels unroll 2 to {WIDEST_TAPS}"),
-        (sum(width for width, _ in parts) == channels, f"pieces {parts} of {channels} channels"),
-        (all(_fits(width, head) for width, head in parts),
-         f"pieces {parts}: each a multiple of its block, a normalised piece's power-of-two head up to "
-         "256, another's 16 to 128 channels"),
-    )
+@dataclasses.dataclass(frozen=True)
+class ConvCase:
+    """A conv as the conv selector reads it (`CONV`): whether the kernels run here (`placed`), whether
+    the call is reverse mode's (`reverse`: a caller differentiating forward sets `FORWARD_MODE`, and the
+    kernels implement a VJP), whether no mesh axis splits its operand (`whole`), the operand's `shape`
+    and `dtype`, the dtype it is written in (`out`), its `taps` and its pieces (`parts`, `(width, head)`
+    each)."""
+
+    placed: bool
+    reverse: bool
+    whole: bool
+    shape: tuple[int, ...]
+    dtype: np.dtype
+    out: np.dtype
+    taps: int
+    parts: tuple[tuple[int, int | None], ...]
+
+
+SUPPORTS: tuple[Requirement[ConvCase], ...] = (
+    Requirement('capability', lambda case: case.placed, "the kernels need a GPU of sm80 or later",
+                row=INHERENT),
+    Requirement('forward_mode', lambda case: case.reverse,
+                "a JVP trace needs forward-mode derivatives; the kernels implement a VJP", row=INHERENT),
+    Requirement('placement', lambda case: case.whole,
+                "a mesh axis splits the conv's operands, and the kernels see whole arrays",
+                row='ledger 1306'),
+    Requirement('shape', lambda case: len(case.shape) == 3 and case.shape[1] > 0,
+                lambda case: f"a conv over {case.shape}; the kernels take [B, T, C]", row=INHERENT),
+    Requirement('dtype', lambda case: case.dtype in DTYPES and case.out in DTYPES,
+                lambda case: f"{case.dtype} inputs into {case.out}; the kernels read and write float32, "
+                             "bfloat16 or float16, summing in float32", row=INHERENT),
+    Requirement('taps', lambda case: 2 <= case.taps <= WIDEST_TAPS,
+                lambda case: f"{case.taps} taps; the kernels unroll 2 to {WIDEST_TAPS}", row=INHERENT),
+    Requirement('pieces', lambda case: sum(width for width, _ in case.parts) == case.shape[-1],
+                lambda case: f"pieces {case.parts} of {case.shape[-1]} channels", row=INHERENT),
+    Requirement('blocks', lambda case: all(_fits(width, head) for width, head in case.parts),
+                lambda case: f"pieces {case.parts}: each a multiple of its block, a normalised piece's "
+                             "power-of-two head up to 256, another's 16 to 128 channels", row=INHERENT),
+)
+"""What the kernels need of a conv: a GPU they compile for, reverse mode, an operand no mesh axis splits,
+and the shapes and dtypes they take."""
+
+CONV: Op[ConvCase] = Op('short_conv', (Kernel('pallas', SUPPORTS), Kernel('xla', (), generic=True)),
+                        lambda case: 'pallas' if generation.backend() == 'gpu' else 'xla')
+"""The conv selector: the kernels on a GPU where their requirements hold, else XLA's conv
+(`dew.nn.linear.xla_conv1d`)."""
 
 
 def _program(first: int, block: int, segments: int, steps: int):
@@ -313,22 +347,14 @@ class Walk:
 
 
 TILE = Tile(rows=16, warps=4)
-"""The forward's launch without a measurement: 16 tokens a tile, each window loaded at once."""
-
-TILES = frozenset(Tile(rows, warps) for rows in (8, 16, 32) for warps in (2, 4, 8))
-"""The forward's configs the tuner measures: each holds the float64 gate (tests/test_short_conv.py) and
-compiles within every GPU's block (tests/test_kernel_configs.py)."""
+"""The forward's launch: 16 tokens a tile, each window loaded at once."""
 
 WALK = Walk(segments=8, steps=64, warps=4)
-"""The backward's launch without a measurement, its runs no longer than a row's share: eight runs a
-tile, with a 128-channel block 1024 elements, eight an fp32 register of each of four warps' threads,
-and 64 tokens a run, whose K-1 extra tokens are 5% of it at the K of 4 every mixer uses."""
-
-WALKS = frozenset(Walk(segments, steps, warps) for segments in (4, 8, 16) for steps in (32, 64)
-                  for warps in (4, 8))
-"""The backward's configs the tuner measures, held and compiled as `TILES` are. A run sums its taps'
-products token by token, so its rounding grows with its steps: runs of 128 put the 0.8B's bf16 tap
-gradients 2.06 times as far from float64 as XLA's on an A100, past the gate."""
+"""The backward's launch, its runs no longer than a row's share: eight runs a tile, with a 128-channel
+block 1024 elements, eight an fp32 register of each of four warps' threads, and 64 tokens a run, whose
+K-1 extra tokens are 5% of it at the K of 4 every mixer uses. A run sums its taps' products token by
+token, so its rounding grows with its steps: runs of 128 put the 0.8B's bf16 tap gradients 2.06 times
+as far from float64 as XLA's on an A100, past the gate."""
 
 
 def _inputs(x, w, bias, valid, documents):
@@ -374,9 +400,10 @@ class _ConvLaunch(tuning.KernelOp):
 @dataclasses.dataclass(frozen=True)
 class ConvForward(_ConvLaunch):
     """Every piece's forward in one launch (`_forward_kernel`): at one decoding row the conv's cost is
-    its launches. A program takes a `Tile`, `TILE` without a measurement."""
+    its launches. A program takes a `Tile`, `TILE`."""
 
     config_cls: ClassVar[type[Tile]] = Tile
+
     ROWS: ClassVar[tuple[str, ...]] = ('x', 'valid', 'documents')
 
     def _fwd(self, x: jax.Array, taps: jax.Array, bias: jax.Array | None, valid: jax.Array | None,
@@ -404,17 +431,15 @@ class ConvForward(_ConvLaunch):
     def _get_heuristics_config(self, ba) -> Tile:
         return TILE
 
-    def _get_autotuning_configs(self, ba) -> set[Tile]:
-        return set(TILES)
-
 
 @dataclasses.dataclass(frozen=True)
 class ConvBackward(_ConvLaunch):
     """One piece's backward (`_backward_kernel`): the projection's gradient at the piece's columns,
     written into the gradient the piece before wrote (`before`, aliased) where there is one, and each
-    tile's tap and bias gradients. A program walks a `Walk`, `WALK` without a measurement."""
+    tile's tap and bias gradients. A program walks a `Walk`, `WALK` at the call's length (`_walk`)."""
 
     config_cls: ClassVar[type[Walk]] = Walk
+
     ROWS: ClassVar[tuple[str, ...]] = ('x', 'valid', 'documents', 'before', 'dy')
 
     def _fwd(self, x: jax.Array, taps: jax.Array, bias: jax.Array | None, valid: jax.Array | None,
@@ -452,9 +477,6 @@ class ConvBackward(_ConvLaunch):
     def _get_heuristics_config(self, ba) -> Walk:
         return self._walk(ba, WALK)
 
-    def _get_autotuning_configs(self, ba) -> set[Walk]:
-        return {self._walk(ba, walk) for walk in WALKS}
-
     @staticmethod
     def _walk(ba, walk: Walk) -> Walk:
         """`walk` with its runs no longer than a row's tokens shared among its segments."""
@@ -483,10 +505,6 @@ def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bo
     return dx, dw, None if bias is None else jnp.concatenate(db).astype(bias.dtype)
 
 
-def _conv(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret):
-    return _forward(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret)
-
-
 def _conv_fwd(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret):
     out = _forward(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret)
     return out, (x, taps, bias, valid, documents)
@@ -498,7 +516,7 @@ def _conv_bwd(parts, activation, eps, dtype, interpret, residual, cotangents):
     return dx, dw, db, None, None
 
 
-conv = jax.custom_vjp(_conv, nondiff_argnums=(5, 6, 7, 8, 9))
+conv = jax.custom_vjp(_forward, nondiff_argnums=(5, 6, 7, 8, 9))
 """`linear.causal_conv1d` on the kernels: `x` `[B, T, C]` convolved causally by `taps` `[C, K]` behind
 K-1 zero tokens, plus `bias` `[C]` or None, silu'd where `activation`, as the `parts` pieces
 `((width, head), ...)` of its channels in order, each `[B, T, width]` in `dtype`, a piece with a `head`

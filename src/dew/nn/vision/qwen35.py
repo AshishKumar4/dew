@@ -7,21 +7,25 @@ from collections.abc import Mapping
 
 from flax import linen as nn
 
-from dew import records
+from dew import _records
 from dew._model_types import _QWEN35_VISION_TYPES
+from dew.interop.weights import in_params
 from dew.nn.text_encoders import TOWER_ACTIVATIONS
 from dew.registry import Record
 
 from .common import (
     ProjectorBase,
+    ProjectorLayout,
     TowerBase,
     TowerGeometry,
+    TowerLayout,
     _vision_section,
     activation_name,
     block_tensor_path,
     head_width,
+    merger_projector,
 )
-from .vit import MergeProjector, VisionTransformer, ViTLayout
+from .vit import LearnedPositions, MergeProjector, VisionTransformer, ViTLayout, translate_vit_weights
 
 
 @dataclasses.dataclass(frozen=True)
@@ -56,7 +60,7 @@ class Qwen35Vision(TowerBase):
             norm_type="fast_layer", norm_eps=1e-6, norm_bias=True, mlp_bias=True, packed=True,
             patch_bias=True,
             attention=("full",) * self.depth, order=("patches",) * self.depth, sinks=(False,) * self.depth,
-            position_table=self.num_position_embeddings)
+            positions=LearnedPositions(round(self.num_position_embeddings ** 0.5)))
 
     def build(self) -> nn.Module:
         return VisionTransformer(self.layout())
@@ -66,21 +70,11 @@ class Qwen35Vision(TowerBase):
                              channels=self.in_channels)
 
 
-@dataclasses.dataclass(frozen=True)
-class Qwen35Projector(ProjectorBase):
+class Qwen35Projector(MergeProjector, ProjectorBase):
     """Qwen 3.5's projector fields: the trunk width, the merge size, the
     merged width the text embeddings read directly. The merger
     (modeling_qwen3_5.py, Qwen3_5VisionPatchMerger) is `MergeProjector`: norm,
     each merge block grouped, two maps around an exact GELU."""
-
-    vision_width: int
-    merge_size: int
-    out_width: int
-
-    def build(self) -> nn.Module:
-        return MergeProjector(hidden_size=self.vision_width, spatial_merge_size=self.merge_size,
-                              width=self.vision_width * self.merge_size ** 2, out_width=self.out_width)
-
 
 _QWEN35_VISION_TENSORS = {
     "patch_embed.proj.weight": ("patch_embed", "kernel"),
@@ -121,42 +115,35 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Record:
     if vision.get("model_type", "qwen3_5_vision") not in _QWEN35_VISION_TYPES:
         raise ValueError(
             f"vision model_type {vision.get('model_type')!r} is not the Qwen 3.5 tower")
-    table = records.integer(vision["num_position_embeddings"], "num_position_embeddings")
+    table = _records.integer(vision["num_position_embeddings"], "num_position_embeddings")
     if int(table ** 0.5) ** 2 != table:
         raise ValueError(
             f"num_position_embeddings ({table}) is not a square, this trunk "
             "resamples a square table")
     return {
         "class": "qwen3_5", "fields": {
-        "depth": records.integer(vision["depth"], "depth"),
-        "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
+        "depth": _records.integer(vision["depth"], "depth"),
+        "hidden_size": _records.integer(vision["hidden_size"], "hidden_size"),
         "hidden_act": activation_name(vision, TOWER_ACTIVATIONS, "gelu_pytorch_tanh"),
-        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
-        "num_heads": records.integer(vision["num_heads"], "num_heads"),
-        "in_channels": records.integer(vision.get("in_channels", 3), "in_channels"),
-        "patch_size": records.integer(vision["patch_size"], "patch_size"),
-        "spatial_merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
-        "temporal_patch_size": records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
+        "intermediate_size": _records.integer(vision["intermediate_size"], "intermediate_size"),
+        "num_heads": _records.integer(vision["num_heads"], "num_heads"),
+        "in_channels": _records.integer(vision.get("in_channels", 3), "in_channels"),
+        "patch_size": _records.integer(vision["patch_size"], "patch_size"),
+        "spatial_merge_size": _records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
+        "temporal_patch_size": _records.integer(vision["temporal_patch_size"], "temporal_patch_size"),
         "num_position_embeddings": table,
     }}
 
 
 def translate_qwen35_projector_config(hf_config: Mapping[str, object],
                                       text_width: int) -> Record:
-    """A Qwen 3.5 wrapper's projector fields: trunk width, merge, output.
+    """A Qwen 3.5 wrapper's projector fields: trunk width, merge, output (`merger_projector`)."""
+    return merger_projector(hf_config, text_width, "qwen3_5")
 
-    The merged features enter the text embeddings directly, so a merger width
-    beside the decoder width refuses.
-    """
-    vision = _vision_section(hf_config)
-    merged = records.integer(vision["out_hidden_size"], "out_hidden_size")
-    if merged != int(text_width):
-        raise ValueError(
-            f"out_hidden_size ({merged}) is not the decoder width ({text_width}), "
-            "the merger output enters the text embeddings as it is")
-    return {
-        "class": "qwen3_5", "fields": {
-        "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
-        "merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
-        "out_width": merged,
-    }}
+
+Qwen35Vision.checkpoint = TowerLayout("visual.", in_params(qwen35_vision_path), read=translate_vit_weights)
+Qwen35Projector.checkpoint = ProjectorLayout("visual.merger.", {
+    "norm.weight": ("norm", "scale"), "norm.bias": ("norm", "bias"),
+    "linear_fc1.weight": ("fc1", "kernel"), "linear_fc1.bias": ("fc1", "bias"),
+    "linear_fc2.weight": ("fc2", "kernel"), "linear_fc2.bias": ("fc2", "bias"),
+}, strip="merger.")

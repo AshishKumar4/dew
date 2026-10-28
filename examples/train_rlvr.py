@@ -62,11 +62,11 @@ import jax
 import jax.numpy as jnp
 import tyro
 
-from dew.config import OptimConfig
-from dew.config.data import PromptData, loader
-from dew.data import HFTokenizer, Loading
+from dew.data import HFTokenizer, Memory, presets
+from dew.data.compile import compile
 from dew.data.prompts import PromptRecord
 from dew.inference import (
+    Draw,
     NativeRolloutServer,
     OpenAICompletion,
     OpenAIRolloutServer,
@@ -78,7 +78,7 @@ from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop import PretrainedDecoder
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.objectives.rl import (
-    Action,
+    Asynchronous,
     EnvironmentSource,
     Episode,
     EpisodeStatus,
@@ -90,6 +90,7 @@ from dew.objectives.rl import (
     Task,
     prompt_tasks,
 )
+from dew.optim import OptimConfig
 from dew.rl.sandbox import ContainerRunner, ProcessRunner, Program, SandboxFleet, SandboxLimits, outputs_match
 from dew.sampling import Sampling
 from dew.training import Trainer
@@ -330,7 +331,7 @@ def rollout_width(config: Config) -> int:
 
 def attempt_scorer(
     reward: CodeReward, decode: Callable[[Sequence[int]], str]
-) -> Callable[[str, Action], float]:
+) -> Callable[[str, Draw], float]:
     """The fraction of `cases` an attempt's program passes, its EOS excluded; each program runs once."""
     @functools.lru_cache(maxsize=4096)
     def passed(cases: str, program: tuple[int, ...]) -> float:
@@ -346,14 +347,14 @@ class Attempts:
     attempt extends the ids before it and a session packs as one chain.
     """
 
-    def __init__(self, task: Task, score: Callable[[str, Action], float], encode: Callable[[str], list[int]]):
+    def __init__(self, task: Task, score: Callable[[str, Draw], float], encode: Callable[[str], list[int]]):
         self.prompt, self.cases = tuple(task.data["prompt"]), task.data["record"].ground_truth
         self.score, self.encode = score, encode
 
     def reset(self) -> Observation:
         return Observation(self.prompt)
 
-    def step(self, action: Action) -> Observation:
+    def step(self, action: Draw) -> Observation:
         passed = self.score(self.cases, action)
         if passed == 1.0:
             return Observation((), EpisodeStatus.COMPLETED, "every test passes")
@@ -361,7 +362,7 @@ class Attempts:
             f"\n\nThat program passed {round(3 * passed)} of 3 tests. Reply with one corrected "
             "```python code block.\n"
         )[:FEEDBACK_TOKENS]
-        return Observation(action.context + action.tokens + tuple(report))
+        return Observation(action.prompt + action.tokens + tuple(report))
 
 
 def attempts_source(server, reward: CodeReward, decode: Callable[[Sequence[int]], str],
@@ -541,7 +542,8 @@ def main(config: Config) -> dict:
     # refuses a context past the export's; the next shape bucket covers both.
     context = next(bucket for bucket in SHAPE_BUCKETS if bucket >= engine_context(config))
     source = PretrainedDecoder.load(config.model, dtype=jnp.float32 if config.smoke else jnp.bfloat16,
-                             param_dtype=jnp.float32, max_seq_len=context)
+                             param_dtype=jnp.float32, max_seq_len=context,
+                             on_host=True)  # the trainer places the weights over its mesh
     stock = source.text_generation().sampling
     words = HFTokenizer(tokenizer)
     # An attempt ends on EOS; the committed tiny Qwen2 names none, its tokenizer does.
@@ -578,16 +580,15 @@ def main(config: Config) -> dict:
             lambda text: words.tokenizer.encode(text, add_special_tokens=False),
             config,
         )
-    data = loader(PromptData(tokenizer=tokenizer,
-        source=tuple(json.loads(row) for row in records(config.tasks, config.seed)),
-                        thinking=config.thinking, max_prompt_len=config.prompt_tokens, long="truncate",
-                        pad_id=sampling.pad_token_id), batch=config.prompts, read="memory",
-                loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1), seed=config.seed)
+    prompts = Memory([json.loads(row) for row in records(config.tasks, config.seed)])
+    data = compile(prompts.shuffle(seed=config.seed).repeat().pipe(
+        presets.prompts, tokenizer, max_prompt_len=config.prompt_tokens, batch=config.prompts,
+        pad_id=sampling.pad_token_id, long="truncate", thinking=config.thinking), seed=config.seed)
     # Every session packs as one chain within the width.
-    rollout = RolloutScheduler(objective, sessions, server, width=width, rows=config.prompts * config.groups,
-                               tasks=prompt_tasks, groups=config.groups,
-                               max_lag=config.max_lag, ahead=config.max_lag, truncation="score",
-                               log=history.append)
+    rollout = RolloutScheduler(
+        Asynchronous(sessions, server, objective, width=width, rows=config.prompts * config.groups,
+                     max_lag=config.max_lag, ahead=config.max_lag),
+        tasks=prompt_tasks, groups=config.groups, truncation="score", log=history.append)
     optimizer = OptimConfig(learning_rate=config.learning_rate, b2=0.99, weight_decay=0.0, clip_grads=1.0)
     trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed), rollout=rollout,
                       accumulation=config.accumulation)

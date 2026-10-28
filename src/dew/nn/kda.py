@@ -19,10 +19,10 @@ modeling_glm5_next.py:584-733):
   (:416-424).
 
 `chunk_kimi_delta_attention` (:482-578) is the gated delta rule's chunked form
-with a decay per key dimension, `dew.nn.linear.chunk_gated_delta_rule`: on a
+with a decay per key dimension, `dew.nn.kernels.recurrence_chunk.chunk_gated_delta_rule`: on a
 GPU fla's chunked KDA ported to Pallas (`dew.nn.kernels.fla_kda`), elsewhere
 the portable math in fp32; the recurrent form is
-`dew.nn.linear.recurrent_delta_rule` (:428-478). tests/test_kda.py holds the
+`dew.nn.kernels.recurrence_chunk.recurrent_delta_rule` (:428-478). tests/test_kda.py holds the
 math to a float64 oracle of the reference, and tests/test_fla_kda.py the port.
 """
 
@@ -41,17 +41,10 @@ from dew.nn.dense import Dense
 
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
-from .linear import (
-    CHUNK_SIZE,
-    DepthwiseConv1d,
-    RMSNormGated,
-    chunk_gated_delta_rule,
-    held_scan,
-    on_the_port,
-    recurrent_delta_rule,
-)
-from .mixer_base import MixerBase, MixerContext
-from .precision import at_least_fp32
+from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel_routed, recurrent_delta_rule
+from .linear import DepthwiseConv1d, RMSNormGated, held_scan
+from .mixer_base import DELTA_RULE_RESIDUALS, MixerBase, MixerContext
+from .precision import at_least_fp32, float32_dot_general
 from .sharding import logical_axes
 
 
@@ -117,7 +110,8 @@ class KimiDeltaAttention(nn.Module):
                 + delta_flops(lengths, self.num_heads, self.head_dim, self.head_dim))
 
     def setup(self):
-        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         self.q_proj = dense(self.qkv_features, name='q_proj')
         self.k_proj = dense(self.qkv_features, name='k_proj')
         self.v_proj = dense(self.qkv_features, name='v_proj')
@@ -188,16 +182,18 @@ class KimiDeltaAttention(nn.Module):
                 return recurrent_delta_rule(query, key, value, g, beta, held, starts=starts)
             # A held history can make the convolved operands vary where the projections did not, so the
             # route is asked again of them.
+            # The batch's documents' firsts, built once with it (`Coordinates.firsts`).
             return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size,
-                                          ported=ported and on_the_port(query, key, value),
-                                          starts=starts, max_segments=tokens.max_segments)
+                                          starts=starts, max_segments=tokens.max_segments,
+                                          floor=self.lower_bound, firsts=tokens.firsts)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
         # allocation-only call returns before any state is written. The conv
         # normalises the queries and keys (`l2norm`) and rounds once, to the
         # dtype the rule takes: the projections' where the port runs it, as
         # fla's layer hands them over, the wide one for the math.
-        ported = S > 1 and on_the_port(*(split(part) for part in jnp.split(projected, 3, axis=-1)))
+        rows, keys, values = (split(part) for part in jnp.split(projected, 3, axis=-1))
+        ported = S > 1 and kernel_routed(rows, keys, values, g, beta, floor=self.lower_bound)
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         out = held_scan(self, projected, taps, None, scan,
                         (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
@@ -218,7 +214,7 @@ class KimiDeltaAttentionMixer(MixerBase):
     window and the forget gate's lower bound (configuration_glm5_next.py:143-146),
     and Kimi K3's `use_full_rank_gate` output gate."""
 
-    residuals = ('context', 'conv', 'delta_decay', 'delta_inverse', 'delta_memory')
+    residuals = DELTA_RULE_RESIDUALS
 
     linear_num_heads: int = 64
     linear_head_dim: int = 128

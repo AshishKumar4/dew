@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import numbers
 from collections.abc import Callable, Sequence
 from typing import NamedTuple, Protocol, runtime_checkable
 
@@ -35,7 +36,10 @@ import numpy as np
 from flax import struct
 from jax import lax
 
-from dew.nn.inputs import valid_order
+from dew._distributions import wellformed
+from dew._records import finite
+from dew.batch import token_ids, valid_order
+from dew.nn import categorical
 from dew.nn.scatter import DROPPED
 from dew.sampling.vocabulary import (
     Referencing,
@@ -158,41 +162,31 @@ def _counts(tokens: jax.Array, valid: jax.Array, vocab: int) -> jax.Array:
     return jnp.zeros((tokens.shape[0], vocab), jnp.float32).at[rows, slots].add(1.0, mode="drop")
 
 
-def _ids(name: str, value: int | Sequence[int]) -> tuple[int, ...]:
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must hold non-negative token ids")
-    ids = (value,) if isinstance(value, int) else tuple(value)
-    if not ids or any(type(token) is not int or token < 0 for token in ids):
-        raise ValueError(f"{name} must hold non-negative token ids")
-    return ids
+def id_row(name: str, value: int | Sequence[int]) -> tuple[int, ...]:
+    """`value`, one token id or a sequence of them (a range, an array's row), as a tuple, read by the
+    one law of token ids (`dew.batch.token_id`)."""
+    row = (value,) if isinstance(value, int | np.integer) else value
+    return tuple(token_ids(row if isinstance(row, np.ndarray) else tuple(row), where=name))
 
 
-def _positive(name: str, value: float | int | str | bool | None) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value <= 0
-    ):
+def positive(name: str, value: float) -> float:
+    rate = finite(value, name)
+    if rate <= 0:
         raise ValueError(f"{name} must be a finite positive number")
-    return float(value)
+    return rate
 
 
-def _unit(name: str, value: float | int | str | bool | None) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or not 0 <= value <= 1
-    ):
+def unit_interval(name: str, value: float) -> float:
+    rate = finite(value, name)
+    if not 0 <= rate <= 1:
         raise ValueError(f"{name} must be finite and between zero and one")
-    return float(value)
+    return rate
 
 
-def _size(name: str, value: int) -> int:
-    if type(value) is not int or value < 1:
+def positive_size(name: str, value: object) -> int:
+    if isinstance(value, bool | np.bool_) or not isinstance(value, numbers.Integral) or value < 1:
         raise ValueError(f"{name} must be a positive integer")
-    return value
+    return int(value)
 
 
 @runtime_checkable
@@ -233,9 +227,7 @@ class Greedy:
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
         best = jnp.argmax(logits, axis=-1)[:, None]
         point = jnp.where(jnp.arange(logits.shape[-1])[None, :] == best, 0.0, FILTER)
-        shaped = jnp.all(jnp.isfinite(logits) | jnp.isneginf(logits), axis=-1, keepdims=True)
-        return jnp.where(shaped & jnp.any(jnp.isfinite(logits), axis=-1, keepdims=True),
-                         point, logits)
+        return jnp.where(wellformed(logits)[:, None], point, logits)
 
 
 class _Numerical:
@@ -257,7 +249,7 @@ class Temperature(_Numerical):
     value: float = struct.field(pytree_node=False, default=1.0)
 
     def __post_init__(self) -> None:
-        _positive("temperature", self.value)
+        positive("temperature", self.value)
 
     def numerical(self) -> jax.tree_util.Partial:
         return jax.tree_util.Partial(Temperature.apply, self.value)
@@ -274,7 +266,7 @@ class TopK:
     k: int = struct.field(pytree_node=False, default=1)
 
     def __post_init__(self) -> None:
-        _size("top_k", self.k)
+        positive_size("top_k", self.k)
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
         keep = min(self.k, logits.shape[-1])
@@ -293,7 +285,7 @@ class TopP(_Numerical):
     p: float = struct.field(pytree_node=False, default=1.0)
 
     def __post_init__(self) -> None:
-        _unit("top_p", self.p)
+        unit_interval("top_p", self.p)
 
     def numerical(self) -> jax.tree_util.Partial:
         # The tail's mass is subtracted on the host, as the reference does, before it is traced.
@@ -317,7 +309,7 @@ class MinP(_Numerical):
     p: float = struct.field(pytree_node=False, default=0.0)
 
     def __post_init__(self) -> None:
-        _unit("min_p", self.p)
+        unit_interval("min_p", self.p)
 
     def numerical(self) -> jax.tree_util.Partial:
         return jax.tree_util.Partial(MinP.apply, self.p)
@@ -336,7 +328,7 @@ class Typical(_Numerical):
     mass: float = struct.field(pytree_node=False, default=1.0)
 
     def __post_init__(self) -> None:
-        _unit("typical_p", self.mass)
+        unit_interval("typical_p", self.mass)
 
     def numerical(self) -> jax.tree_util.Partial:
         return jax.tree_util.Partial(Typical.apply, self.mass)
@@ -344,9 +336,7 @@ class Typical(_Numerical):
     @staticmethod
     def apply(mass: float, state: StepState, logits: jax.Array) -> jax.Array:
         normalized = jax.nn.log_softmax(logits)
-        probabilities = jnp.exp(normalized)
-        entropy = -jnp.sum(jnp.where(jnp.isneginf(normalized), 0.0, normalized * probabilities),
-                           axis=-1, keepdims=True)
+        entropy = categorical.entropy(logits)[..., None]
         shifted = jnp.abs(-normalized - entropy)
         order = jnp.argsort(shifted, axis=-1, stable=True)
         sorted_shift = jnp.take_along_axis(shifted, order, axis=-1)
@@ -366,7 +356,7 @@ class EpsilonCutoff(_Numerical):
     epsilon: float = struct.field(pytree_node=False, default=0.0)
 
     def __post_init__(self) -> None:
-        _unit("epsilon_cutoff", self.epsilon)
+        unit_interval("epsilon_cutoff", self.epsilon)
 
     def numerical(self) -> jax.tree_util.Partial:
         return jax.tree_util.Partial(EpsilonCutoff.apply, self.epsilon)
@@ -386,16 +376,15 @@ class EtaCutoff(_Numerical):
     epsilon: float = struct.field(pytree_node=False, default=0.0)
 
     def __post_init__(self) -> None:
-        _unit("eta_cutoff", self.epsilon)
+        unit_interval("eta_cutoff", self.epsilon)
 
     def numerical(self) -> jax.tree_util.Partial:
         return jax.tree_util.Partial(EtaCutoff.apply, self.epsilon)
 
     @staticmethod
     def apply(epsilon: float, state: StepState, logits: jax.Array) -> jax.Array:
-        normalized = jax.nn.log_softmax(logits)
-        probabilities = jnp.exp(normalized)
-        entropy = -jnp.sum(jnp.where(jnp.isneginf(normalized), 0.0, normalized * probabilities), axis=-1)
+        probabilities = jnp.exp(jax.nn.log_softmax(logits))
+        entropy = categorical.entropy(logits)
         cutoff = jnp.asarray(epsilon, jnp.float32)
         eta = jnp.minimum(cutoff, jnp.sqrt(cutoff) * jnp.exp(-entropy))[:, None]
         best = jnp.max(logits, axis=-1, keepdims=True)
@@ -423,7 +412,7 @@ class TopH(_Numerical):
     fraction: float = struct.field(pytree_node=False, default=1.0)
 
     def __post_init__(self) -> None:
-        if _unit("top_h", self.fraction) <= 0:
+        if unit_interval("top_h", self.fraction) <= 0:
             raise ValueError("top_h must be finite and above zero up to one")
 
     def numerical(self) -> jax.tree_util.Partial:
@@ -474,7 +463,7 @@ class RepetitionPenalty(_Numerical):
     penalty: float = struct.field(pytree_node=False, default=1.0)
 
     def __post_init__(self) -> None:
-        _positive("repetition_penalty", self.penalty)
+        positive("repetition_penalty", self.penalty)
 
     def numerical(self) -> jax.tree_util.Partial:
         return jax.tree_util.Partial(RepetitionPenalty.apply, self.penalty)
@@ -496,7 +485,7 @@ class PromptRepetitionPenalty(_Numerical):
     penalty: float = struct.field(pytree_node=False, default=1.0)
 
     def __post_init__(self) -> None:
-        _positive("encoder_repetition_penalty", self.penalty)
+        positive("encoder_repetition_penalty", self.penalty)
 
     def numerical(self) -> jax.tree_util.Partial:
         # The reference's inversion, on the host.
@@ -567,7 +556,7 @@ class NoRepeatNGram:
     size: int = struct.field(pytree_node=False, default=0)
 
     def __post_init__(self) -> None:
-        _size("no_repeat_ngram_size", self.size)
+        positive_size("no_repeat_ngram_size", self.size)
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
         tokens, lengths = state.history()
@@ -587,7 +576,7 @@ class PromptNoRepeatNGram:
     size: int = struct.field(pytree_node=False, default=0)
 
     def __post_init__(self) -> None:
-        _size("encoder_no_repeat_ngram_size", self.size)
+        positive_size("encoder_no_repeat_ngram_size", self.size)
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
         tokens, lengths = state.history()
@@ -645,7 +634,7 @@ def sequence_bias(entries: Sequence[tuple[Sequence[int], float]]) -> SequenceBia
     """A `SequenceBias` table from `(token ids, bias)` pairs."""
     pairs = [(tuple(ids), float(value)) for ids, value in entries]
     for ids, _ in pairs:
-        _ids("sequence_bias", ids)
+        id_row("sequence_bias", ids)
     width = max((len(ids) for ids, _ in pairs), default=1)
     table = np.zeros((len(pairs), width), np.int32)
     for row, (ids, _) in enumerate(pairs):
@@ -661,7 +650,7 @@ def bad_words(ids: Sequence[Sequence[int]], eos_token_ids: int | Sequence[int] |
     Single-token sequences that name an EOS id are dropped, as the reference
     drops them, so banning bad words cannot ban termination.
     """
-    stops = () if eos_token_ids is None else _ids("eos_token_ids", eos_token_ids)
+    stops = () if eos_token_ids is None else id_row("eos_token_ids", eos_token_ids)
     kept = [tuple(word) for word in ids if not (len(word) == 1 and word[0] in stops)]
     return sequence_bias([(word, -math.inf) for word in kept])
 
@@ -800,7 +789,7 @@ class ExponentialDecayLengthPenalty(_Numerical):
     eos: jax.Array = struct.field(default_factory=lambda: jnp.zeros((0,), jnp.int32))
 
     def __post_init__(self) -> None:
-        _positive("exponential_decay_length_penalty factor", self.factor)
+        positive("exponential_decay_length_penalty factor", self.factor)
 
     def numerical(self) -> jax.tree_util.Partial:
         return jax.tree_util.Partial(ExponentialDecayLengthPenalty.apply, self.start, self.factor, self.eos)

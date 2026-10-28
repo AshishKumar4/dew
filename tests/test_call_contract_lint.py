@@ -1,6 +1,7 @@
 """SLOP014: a layer's call reads what its block hands it, and a mixer's `reads` is what it reads."""
 
 import textwrap
+from pathlib import Path
 
 import pytest
 from tool_support import load
@@ -88,3 +89,35 @@ def test_a_call_that_drops_its_arguments_or_misdeclares_its_reads_is_reported(li
     [module] = [module for module in lint.collect(["src/dew/nn"], tmp_path, "dew")
                 if module.path.stem == "layer"]
     assert any(True for _ in lint.calls(module)) is reported
+
+
+@pytest.mark.parametrize("body, reported", [
+    ("assert step._cache_size() == 1\n", True),
+    ("with Compiles('step') as compiled:\n    step()\nassert compiled.count == 1\n", False),
+], ids=["private cache size", "public compile count"])
+def test_a_read_of_jaxs_private_cache_size_is_reported(lint, body, reported, tmp_path):
+    """SLOP021: a jitted function's private `_cache_size` is read nowhere; its compiles are counted
+    through the public compile event (`dew.telemetry.instrumentation.Compiles`)."""
+    assert reported_in_tests(lint, tmp_path, body, "SLOP021") is reported
+
+
+def reported_in_tests(lint, tmp_path: Path, body: str, code: str) -> bool:
+    """Whether lint_slop reports `code` in a test file holding `body`."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_linted.py").write_text(body)
+    [module] = lint.collect(["tests"], tmp_path, "dew")
+    return any(finding.code == code for finding in lint.check(module))
+
+
+
+@pytest.mark.parametrize("body, reported", [
+    ("size = (FIXTURES / 'm' / 'model.safetensors').stat().st_size\n", True),
+    ("size = os.path.getsize('tests/fixtures/m/model.safetensors')\n", True),
+    ("size = len((FIXTURES / 'm' / 'model.safetensors').read_bytes())\n", False),
+    ("size = (tmp_path / 'out.bin').stat().st_size\n", False),
+], ids=["a fixture's stat", "a fixture's getsize", "a fixture read", "a scratch file's stat"])
+def test_a_fixtures_size_read_without_opening_it_is_reported(lint, body, reported, tmp_path):
+    """SLOP023: a test reads no fixture's size or metadata without opening it (stat, getsize): the test cache
+    records a fixture as its openers' input, and a stat is no open, so a resized fixture would reuse a stale
+    green (Main, 2026-10-28); a fixture read, or a scratch file's stat, is no finding."""
+    assert reported_in_tests(lint, tmp_path, body, "SLOP023") is reported

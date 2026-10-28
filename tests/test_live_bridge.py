@@ -11,23 +11,27 @@ from pathlib import Path
 
 import pytest
 from aiohttp import web
-from tool_support import load
+from tool_support import run_from
 
 CONTAINER = Path(__file__).resolve().parents[1] / "site/live/container"
 SECRET = "bridge-secret"
+FRAME = 4000
 
 
 @pytest.fixture(scope="module")
 def bridge():
-    sys.path.insert(0, str(CONTAINER))
-    yield load("shared_bridge", "site/live/container")
-    sys.path.remove(str(CONTAINER))
+    with run_from("shared_bridge", "site/live/container") as module:
+        yield module
 
 
 class Kernels:
     """The Kernel Gateway's REST and channel protocol over a set of kernels. A phase in `held`
     ("create", or "preload", a context loading its client) sets its `entered` event and waits for
-    its `release`; a cell whose code is `sleep N` runs N seconds, or until the kernel is interrupted.
+    its `release`; a cell whose code is `sleep N` runs N seconds, or until the kernel is interrupted;
+    one whose code is `panel N` shows a display under an id, as IPython's display handle does, and
+    updates it N times with frames of FRAME characters, as the notebook panel does; `display N` shows
+    N displays of FRAME characters under one id, and `redraw N` clears with wait=True and shows a
+    frame N times, as a cell redrawing a plot does.
     The next `failing` deletes fail. `live` holds the kernels created and not deleted, and `created`
     counts every one."""
 
@@ -36,6 +40,8 @@ class Kernels:
         self.entered = {phase: asyncio.Event() for phase in ("create", "preload")}
         self.release = {phase: asyncio.Event() for phase in ("create", "preload")}
         self.live, self.interrupts, self.created = set(), {}, 0
+        # The code of every cell a kernel ran, its client's loading aside.
+        self.ran: list[str] = []
 
     async def phase(self, name):
         if name in self.held:
@@ -74,8 +80,24 @@ class Kernels:
                                                    "content": content}))
 
             status = "ok"
+            if not code.startswith(("import model_client", "import live_training")):
+                self.ran.append(code)
             if code.startswith(("import model_client", "import live_training")):
                 await self.phase("preload")
+            elif code.startswith("panel "):
+                transient = {"display_id": "panel"}
+                await reply("display_data", {"data": {"text/plain": "frame 0"}, "transient": transient})
+                for frame in range(1, int(code.split()[1]) + 1):
+                    text = f"frame {frame} ".ljust(FRAME, ".")
+                    await reply("update_display_data", {"data": {"text/plain": text}, "transient": transient})
+            elif code.startswith("display "):
+                for _ in range(int(code.split()[1])):
+                    await reply("display_data", {"data": {"text/plain": "x" * FRAME},
+                                                 "transient": {"display_id": "same"}})
+            elif code.startswith("redraw "):
+                for _ in range(int(code.split()[1])):
+                    await reply("clear_output", {"wait": True})
+                    await reply("display_data", {"data": {"text/plain": "x" * FRAME}})
             elif code.startswith("sleep "):
                 # Its seconds, unless an interrupt ends it first, as an error.
                 self.interrupts[kernel].clear()
@@ -182,6 +204,49 @@ def test_a_page_runs_or_queues_at_most_its_cells_of_either_kind(bridge, monkeypa
     asyncio.run(scenario())
 
 
+def test_a_display_updated_in_place_is_one_output_its_frames_replace(bridge, monkeypatch):
+    """A training cell's panel is one display that IPython's handle updates eight times a second: the
+    bridge sends each frame under the display's id, an update marked as one, and counts against the
+    cell's output allowance what the page shows, so a long run's frames, past the allowance together,
+    end the cell as it ends (7fb1f1bd3's preview: the finetune cell stopped at 101 s), as do a redraw's
+    cleared frames; displays that share an id each count."""
+    monkeypatch.setattr(bridge, "available", lambda: 1 << 40)
+    frames = bridge.MAX_OUTPUT // FRAME * 2
+
+    async def scenario():
+        kernels = Kernels()
+        _, server, runner, port = await serving(bridge, kernels)
+        try:
+            socket = await page(port, str(uuid.uuid4()))
+            await socket.send(json.dumps({"op": "execute", "id": "train", "cell": "finetune",
+                                          "kernel": "train", "code": f"panel {frames}"}))
+            heard = await answer(socket, "train")
+            assert heard[-1]["status"] == "ok", heard[-1]
+            shown = [message for message in heard if message["type"] == "display"]
+            assert len(shown) == frames + 1
+            assert {message["display"] for message in shown} == {"panel"}
+            assert [message.get("update", False) for message in shown] == [False] + [True] * frames
+            assert shown[-1]["text"].startswith(f"frame {frames} ")
+            # A cell that redraws, clearing as it shows each frame, shows one frame at a time.
+            await socket.send(json.dumps({"op": "execute", "id": "redraw", "cell": "finetune",
+                                          "kernel": "train", "code": f"redraw {frames}"}))
+            heard = await answer(socket, "redraw")
+            assert heard[-1]["status"] == "ok", heard[-1]
+            assert heard[0] == {"id": "redraw", "type": "clear", "wait": True}
+            # Every display the page appends counts, whatever id it shares with the others.
+            await socket.send(json.dumps({"op": "execute", "id": "same", "cell": "finetune",
+                                          "kernel": "train", "code": f"display {frames}"}))
+            heard = await answer(socket, "same")
+            assert heard[-2]["type"] == "error" and "output allowance" in heard[-2]["evalue"], heard[-2:]
+            await socket.close()
+            await settled(kernels)
+        finally:
+            server.close()
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("phase", ["create", "preload"])
 @pytest.mark.parametrize("ending", ["disconnect", "restart"])
 def test_a_context_ended_while_it_starts_leaves_no_kernel(bridge, monkeypatch, phase, ending):
@@ -220,6 +285,72 @@ def test_a_context_ended_while_it_starts_leaves_no_kernel(bridge, monkeypatch, p
             await socket.close()
             await settled(kernels)
             assert kernels.live == set()
+        finally:
+            server.close()
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_a_session_closed_while_its_first_context_starts_leaves_no_kernel(bridge, monkeypatch):
+    """The Worker's close of a session while the gateway still creates its first context (the container's
+    create and close RPCs, `Gateway.create` and `Gateway.close`) ends that creation: the create says the
+    session was closed, the kernel the gateway then makes is deleted, and the session can start again."""
+    monkeypatch.setattr(bridge, "available", lambda: 1 << 40)
+
+    async def scenario():
+        kernels = Kernels()
+        gateway, server, runner, _ = await serving(bridge, kernels)
+        try:
+            session = str(uuid.uuid4())
+            kernels.held.add("create")
+            created = asyncio.ensure_future(gateway.create(session))
+            await asyncio.wait_for(kernels.entered["create"].wait(), 30)
+            await gateway.close(session)
+            kernels.held.clear()
+            kernels.release["create"].set()
+            with pytest.raises(RuntimeError):
+                await created
+            await settled(kernels)
+            assert kernels.live == set() and session not in gateway.contexts
+            assert None in await gateway.create(session)
+            await gateway.close(session)
+            await settled(kernels)
+            assert kernels.live == set()
+        finally:
+            server.close()
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("kind", ["python3", "train"])
+def test_a_cell_stopped_while_its_context_starts_never_runs(bridge, monkeypatch, kind):
+    """The page's Stop of a cell, a training one too, while its context loads its client: the cell ends
+    aborted once the context is up, its code never sent to the kernel, and the next cell runs as usual."""
+    monkeypatch.setattr(bridge, "available", lambda: 1 << 40)
+
+    async def scenario():
+        kernels = Kernels()
+        _, server, runner, port = await serving(bridge, kernels)
+        try:
+            socket = await page(port, str(uuid.uuid4()))
+            await socket.send(json.dumps({"op": "execute", "id": "first", "cell": "a", "code": "print(1)"}))
+            await answer(socket, "first")
+            kernels.held.add("preload")
+            await socket.send(json.dumps({"op": "execute", "id": "stopped", "cell": "b", "code": "print(2)",
+                                          **({"kernel": "train"} if kind == "train" else {})}))
+            await asyncio.wait_for(kernels.entered["preload"].wait(), 30)
+            await socket.send(json.dumps({"op": "interrupt", "cell": "b"}))
+            await asyncio.sleep(0.5)
+            kernels.held.clear()
+            kernels.release["preload"].set()
+            assert (await answer(socket, "stopped"))[-1]["status"] == "aborted"
+            assert "print(2)" not in kernels.ran
+            await socket.send(json.dumps({"op": "execute", "id": "next", "cell": "b", "code": "print(3)"}))
+            assert (await answer(socket, "next"))[-1]["status"] == "ok"
+            await socket.close()
+            await settled(kernels)
         finally:
             server.close()
             await runner.cleanup()
@@ -300,40 +431,39 @@ def test_every_connection_of_a_session_ends_at_the_session_end(bridge, monkeypat
 def test_the_context_smoke_loads_beside_the_bridge_it_reports_with(bridge):
     """benchmark_gateway.py, the preparation's required context smoke, imports and reports the host's
     load through the bridge's own probe."""
-    sys.path.insert(0, str(CONTAINER))
-    try:
-        smoke = load("benchmark_gateway", "site/live/container")
-    finally:
-        sys.path.remove(str(CONTAINER))
-    assert {"loadavg", "stalls", "cpu_ticks"} <= set(smoke.load())
+    with run_from("benchmark_gateway", "site/live/container") as smoke:
+        assert {"loadavg", "stalls", "cpu_ticks"} <= set(smoke.load())
 
 
-def test_a_training_context_caps_the_batch_of_every_way_a_cell_loads_data_and_its_steps(tmp_path):
-    """In a training context (live_training.install), a cell's bare source through dew.data.load, a
-    recipe through its loader and a recipe's own load each read batches of BATCH rows, and its fit,
-    called by another name with its steps unpacked, trains STEPS steps, each saying so first: IPython
-    runs the cell with its calls capped, and Dew's own functions are untouched."""
-    import numpy as np
-
-    np.arange(400, dtype=np.uint16).tofile(tmp_path / "train.bin")
-    np.arange(400, dtype=np.uint16).tofile(tmp_path / "val.bin")
-    cell = f"""
+def test_a_training_context_caps_the_batch_of_every_way_a_cell_loads_data_and_its_steps():
+    """In a training context (live_training.install), a cell's dataset batched itself, by any name and
+    with its size passed either way, a preset called and a preset through `pipe` each read batches of
+    BATCH rows, and its fit, called by another name with its steps unpacked, trains STEPS steps, each
+    saying so first: IPython runs the cell with its calls capped, and Dew's own functions are untouched;
+    a call that reads its caller's frame (`locals`, however named) still reads the cell's."""
+    cell = """
+import numpy as np
 from dew import Trainer
-from dew.config import OptimConfig
-from dew.config.data import TextData, loader
-from dew.data import Loading, Memory, load
+from dew.optim import OptimConfig
+from dew.data import Memory, presets
+from dew.data.compile import compile as compile_data
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
-windows = TextData(source={str(tmp_path)!r}, seq_len=4, stride=1)
-options = dict(read="memory", loading=Loading(workers=0), validation_records=32)
-bare = load(Memory([{{"id": index}} for index in range(320)]), batch=64, provision=False,
-            loading=Loading(workers=0))
-batches = [bare.batch, loader(windows, batch=64, **options).batch, windows.load(batch=64, **options).batch]
+records = Memory([{"id": index} for index in range(320)])
+tokens = Memory([{"text": np.arange(400, dtype=np.int32)}])
+windows = dict(seq_len=4, pack=None, stride=1)
+rows = records.batch
+batches = [compile_data(records.batch(64)).batch, compile_data(rows(64)).batch,
+           compile_data(rows(size=64)).batch,
+           compile_data(presets.lm(tokens, None, batch=64, **windows)).batch,
+           compile_data(tokens.pipe(presets.lm, None, batch=64, **windows)).batch]
 model = CausalTransformer(vocab_size=400, emb_features=8, num_layers=1, num_heads=1, mlp_features=16,
                           max_seq_len=4)
 run = Trainer(LMObjective(model, seq_len=4), OptimConfig(learning_rate=1e-3), key=0).fit
-state = run(windows.load(batch=64, **options), **dict(steps=1000))
-print("ran", json.dumps([batches, int(state.step), load is dew.data.load]))
+state = run(tokens.pipe(presets.lm, None, batch=64, **windows), **dict(steps=1000))
+read, import_builtins = locals, __import__("builtins")
+frames = ["records" in read(), "records" in import_builtins.locals(), "records" in locals()]
+print("ran", json.dumps([batches, int(state.step), presets.lm is dew.data.presets.lm, frames]))
 """
     code = f"""
 import json, sys
@@ -342,16 +472,16 @@ from IPython.core.interactiveshell import InteractiveShell
 import live_training
 shell = InteractiveShell.instance()
 live_training.install()
-shell.run_cell("import json, dew.data")
+shell.run_cell("import json, dew.data.presets")
 shell.run_cell({cell!r}).raise_error()
 """
     done = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=600,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.returncode == 0, done.stderr[-4000:]
     lines = done.stdout.strip().splitlines()
-    assert json.loads(lines[-1].removeprefix("ran ")) == [[8, 8, 8], 20, True]
+    assert json.loads(lines[-1].removeprefix("ran ")) == [[8, 8, 8, 8, 8], 20, True, [True, True, True]]
     assert [line for line in lines if line.startswith("Live run:")] == [
-        "Live run: batch 64 -> 8, so it fits a shared 4-vCPU host."] * 4 + [
+        "Live run: batch 64 -> 8, so it fits a shared 4-vCPU host."] * 6 + [
         "Live run: steps 1000 -> 20, log_every 100 -> 5, so it finishes in about two minutes."]
 
 

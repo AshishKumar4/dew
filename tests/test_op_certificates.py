@@ -157,6 +157,29 @@ def test_exp_rounds_as_interval_arithmetic_does(fmt):
 
 
 @pytest.mark.parametrize("fmt", FORMATS, ids=lambda fmt: fmt.name)
+def test_exp2_rounds_as_interval_arithmetic_does(fmt):
+    """Random arguments over 2^x's whole range in `fmt`, the ones whose float64 2^x lies nearest a
+    midpoint (the oracle's interval path), and the edges: integers, whose powers are exact, the
+    subnormals and their ties at half the least one (2^-134 in bf16, 2^-150 in fp32), overflow."""
+    rng = np.random.default_rng(7)
+    values = oc.exact_cast(rng.uniform(-150.0, 128.0, 1 << 20), fmt)
+    values = values[np.isfinite(values)]
+    # The hardest of the non-integers: an integer's power is a power of two, on fmt's grid or its tie.
+    fractional = values[values != np.rint(values)]
+    hard = _near_midpoints(fractional, np.exp2(fractional), fmt, 64)
+    edges = oc.exact_cast(np.array([-151.0, -150.0, -149.5, -149.0, -134.0, -133.5, -133.0, -126.0, -0.5, 0.0,
+                                    -0.0, 0.5, 1.0, 1e-30, 127.0, 127.99, 128.0]), fmt)
+    sample = np.concatenate([values[:2000], hard, edges])
+    whole = sample == np.rint(sample)
+    expected = np.empty_like(sample)
+    # An integer's power is a rational, rounded exactly: interval arithmetic cannot decide its tie.
+    expected[whole] = [oc.fraction_rounded(fractions.Fraction(2) ** int(value), fmt)
+                       for value in sample[whole]]
+    expected[~whole] = _interval_rounded(lambda iv, x: iv.exp(x * iv.log(2)), sample[~whole], fmt)
+    assert not oc.mismatches(oc.exp2_rounded(sample, fmt), expected, fmt).any()
+
+
+@pytest.mark.parametrize("fmt", FORMATS, ids=lambda fmt: fmt.name)
 def test_rsqrt_rounds_as_interval_arithmetic_does(fmt):
     rng = np.random.default_rng(5)
     values = np.abs(_values(rng, 1 << 20, fmt))
@@ -184,6 +207,48 @@ def test_the_exp_enclosure_holds_its_proven_bound():
 
     with mpmath.workprec(300):
         worst = max(abs((wide(high) + wide(low)) / mpmath.exp(wide(v)) - 1)
+                    for v, high, low in zip(x, hi, lo, strict=True))
+    assert worst <= oc.EXP_BOUND, float(worst)
+
+
+@pytest.mark.parametrize("fmt", FORMATS, ids=lambda fmt: fmt.name)
+def test_the_interval_path_decides_what_the_enclosure_leaves(fmt, monkeypatch):
+    """With the enclosures' bound widened to half `fmt`'s precision, most elements are left undecided
+    and mpmath's interval exp and 2^x decide them, as interval arithmetic does on its own."""
+    rng = np.random.default_rng(9)
+    sample = oc.exact_cast(rng.uniform(-100.0, 80.0, 200), fmt)
+    sample = sample[sample != np.rint(sample)]
+    exp_expected = _interval_rounded(lambda iv, x: iv.exp(x), sample, fmt)
+    exp2_expected = _interval_rounded(lambda iv, x: iv.exp(x * iv.log(2)), sample, fmt)
+    monkeypatch.setattr(oc, "EXP_BOUND", 2.0 ** -(fmt.precision // 2))
+    opened = []
+    interval_precision = oc.interval_precision
+    monkeypatch.setattr(oc, "interval_precision", lambda precision: opened.append(precision) or
+                        interval_precision(precision))
+    for oracle, expected in ((oc.exp_rounded, exp_expected), (oc.exp2_rounded, exp2_expected)):
+        opened.clear()
+        assert not oc.mismatches(oracle(sample, fmt), expected, fmt).any()
+        # Each undecided element opens one interval context or more.
+        assert len(opened) > len(sample) // 2, (oracle.__name__, len(opened), len(sample))
+
+
+def test_the_exp2_enclosure_holds_its_proven_bound():
+    """`_exp2_enclosed` against mpmath at 300 bits, on fp32 arguments over its whole range, the integers
+    and half-integers its reduction splits at, and the arguments whose results are fp32 subnormals:
+    every relative error within EXP_BOUND."""
+    import mpmath
+
+    rng = np.random.default_rng(8)
+    x = np.concatenate([rng.uniform(-150.0, 128.0, 2000), np.arange(-298, 255) / 2, [1e-30, -1e-30]])
+    x = oc.exact_cast(x, oc.FLOAT32)
+    x = x[(x > -150) & (x < 128)]
+    hi, lo = oc._exp2_enclosed(x)
+
+    def wide(value):
+        return mpmath.mpf(float(value))
+
+    with mpmath.workprec(300):
+        worst = max(abs((wide(high) + wide(low)) / mpmath.power(2, wide(v)) - 1)
                     for v, high, low in zip(x, hi, lo, strict=True))
     assert worst <= oc.EXP_BOUND, float(worst)
 

@@ -15,12 +15,14 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew._records import JSON
 from dew.nn.dense import Dense
-from dew.records import JSON
+from dew.nn.dropout import Dropout
 
 from ..activations import GatedActivation, gated_product
 from ..attention import LayerNorm, RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
+from ..cross_attention import NAME as CROSS_ATTENTION
 from ..flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock
 from ..gemma4_moe import Gemma4Experts
@@ -31,14 +33,16 @@ from ..hyper_connections import (
     HyperConnections,
     HyperHead,
     collapse_by,
+    collapse_streams,
     mix_streams,
 )
-from ..inputs import LayerInputs, MixerCall, PredictionPhase
-from ..linear import recomputing
+from ..inputs import LayerInputs, MixerCall, PredictionPhase, routing_blocks
+from ..kernels.recurrence_chunk import recomputing
+from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
-from ..precision import scaled
-from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
+from ..precision import float32_dot_general, scaled
+from ..protocols import ProjectionGroup, ReadsTrain, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
@@ -102,14 +106,6 @@ class SeamNorm(Protocol):
 
 
 @runtime_checkable
-class ReadsTrain(Protocol):
-    """A token mixer or feed-forward whose call takes `train`, for a dropout of its own."""
-
-    @property
-    def reads_train(self) -> bool: ...
-
-
-@runtime_checkable
 class ReadsMixing(Protocol):
     """A token mixer's declaration of the `MIXING` fields of its call it reads
     (`dew.nn.inputs.MixerCall`), or `TOKENWISE` for one that reads no other
@@ -141,6 +137,8 @@ class Mixture:
     mesh axis that divides the expert count. `hash_layers` route by DeepSeek
     V4's token table, `latent_features` gives Kimi K3's latent MoE, and
     `media_bias` is DeepSeek-V4.1's image-span bias (`SparseMLP`, `Router`).
+    `bias_in_weights` gates on the balancing bias as LLaDA-MoE does, and
+    `routing_block` with `block_experts` is LLaDA2.2's block routing.
     """
 
     experts: int
@@ -153,6 +151,9 @@ class Mixture:
     groups_per_token: int = 1
     group_score: str = 'top2'
     bias: bool = False
+    bias_in_weights: bool = False
+    routing_block: int | None = None
+    block_experts: int | None = None
     scale_inputs: bool = False
     parallel: bool = False
     expert_features: int | None = None
@@ -171,10 +172,10 @@ class Mixture:
             object.__setattr__(self, "layers", tuple(self.layers))
         if self.hash_layers is not None:
             object.__setattr__(self, "hash_layers", tuple(int(index) for index in self.hash_layers))
-            if self.groups != 1 or self.parallel:
+            if self.groups != 1 or self.parallel or self.routing_block is not None:
                 raise ValueError(
                     "hash routing selects by the token table alone, so it has no "
-                    "expert groups and is not Gemma 4's parallel branch")
+                    "expert groups, no routing blocks and is not Gemma 4's parallel branch")
         if self.experts < 1:
             raise ValueError(
                 f"a mixture needs experts to route to, got {self.experts}; a "
@@ -201,13 +202,19 @@ class Mixture:
             raise ValueError(
                 f"capacity_factor scales each expert's share of a sequence, so it is "
                 f"positive, got {self.capacity_factor}; None keeps every slot")
+        if self.bias_in_weights and not self.bias:
+            raise ValueError("bias_in_weights gates on the balancing bias, which bias holds")
+        if (self.routing_block is None) != (self.block_experts is None):
+            raise ValueError("block routing names its block of tokens and the experts a block may use, "
+                             f"got routing_block={self.routing_block} and block_experts={self.block_experts}")
         if self.parallel and (
                 self.score_function != 'softmax' or not self.norm_topk_prob
                 or self.scaling != 1.0 or self.groups != 1 or self.bias
+                or self.bias_in_weights or self.routing_block is not None
                 or self.scale_inputs or self.shared_features or self.latent_features is not None):
             raise ValueError(
                 "a parallel mixture routes with Gemma 4's router, which has no "
-                "score function, scaling, groups, balancing bias, input scaling "
+                "score function, scaling, groups, balancing bias, routing blocks, input scaling "
                 "or shared branch to set")
 
     @property
@@ -225,6 +232,11 @@ class Mixture:
         `dew.inference.serving.Server` step runs the model before it draws, so
         it serves the exchange; `dispatch='global'` computes the same layer.
         This refusal goes once a jax release carries the fix."""
+        if self.routing_block is not None:
+            return ("block routing chooses each block's experts from every token in it, which a cached "
+                    "decode step, holding one token of its block, cannot: the step's routing would differ "
+                    "from the full forward's. Generate by refining whole sequences (dew.diffusion.discrete) "
+                    "or route without blocks")
         if self.dispatch != 'exchange':
             return None
         return ("generation cannot run dispatch='exchange' until jax fixes jax-ml/jax#40907: checkify, "
@@ -248,7 +260,8 @@ class Mixture:
             # GPT OSS's experts and router are its own: a knob they do not read is refused.
             plain = Mixture(experts=self.experts, top_k=self.top_k)
             ignored = [name for name in ('score_function', 'norm_topk_prob', 'scaling', 'groups',
-                                         'groups_per_token', 'group_score', 'bias', 'scale_inputs',
+                                         'groups_per_token', 'group_score', 'bias', 'bias_in_weights',
+                                         'routing_block', 'block_experts', 'scale_inputs',
                                          'parallel', 'expert_features', 'shared_features', 'hash_layers',
                                          'latent_features', 'latent_norm', 'media_bias')
                        if getattr(self, name) != getattr(plain, name)]
@@ -276,7 +289,9 @@ class Mixture:
             score_function=self.score_function, normalize_weights=self.norm_topk_prob,
             routed_scaling_factor=self.scaling, expert_groups=self.groups,
             groups_per_token=self.groups_per_token,
-            group_score=self.group_score, expert_bias=self.bias, media_bias=self.media_bias,
+            group_score=self.group_score, expert_bias=self.bias, bias_in_weights=self.bias_in_weights,
+            media_bias=self.media_bias, routing_block=self.routing_block,
+            block_experts=self.block_experts,
             scale_inputs=self.scale_inputs, swiglu_limit=swiglu_limit,
             shared=None if not self.shared_features else functools.partial(
                 dense, hidden_features=self.shared_features),
@@ -285,6 +300,23 @@ class Mixture:
                 RMSNorm, epsilon=norm_eps, scale_offset=scale_offset, scale_after_cast=scale_after_cast,
                 dtype=dtype) if self.latent_norm else None,
             dtype=dtype, precision=precision)
+
+
+LAYER_SCALAR_COLLECTIONS = {"trainable": "params", "frozen": "constants"}
+"""The collection a block keeps its layer scalar in, by mode (`BlockWiring.layer_scalar`): Google's
+release makes it a parameter, and Transformers a buffer, which Dew keeps as a constant."""
+
+
+def layer_scalar_mode(variables: Mapping[str, object], path: tuple[str, ...]) -> str | None:
+    """The mode whose collection holds the layer scalar at `path` within it, or None where neither does:
+    a tree being written decides, so an export agrees with whichever collection training left it in."""
+    for mode, collection in LAYER_SCALAR_COLLECTIONS.items():
+        node: object = variables.get(collection)
+        for part in path:
+            node = node.get(part) if isinstance(node, Mapping) else None
+        if node is not None:
+            return mode
+    return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -311,6 +343,8 @@ class BlockWiring:
     parallel_residual: bool = False
     shared_parallel_norm: bool = False
     layer_scalar: Literal["frozen", "trainable"] | None = None
+    branch_scale: float | None = None
+    """Initial value of learned per-feature attention and feed-forward residual scales."""
     ngpt: NGPT | None = None
 
     def __post_init__(self):
@@ -324,23 +358,6 @@ class BlockWiring:
             raise ValueError("layer_scalar must be None, frozen or trainable")
 
 
-QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
-ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
-MLP_RESIDUALS = ('gate_proj', 'up_proj', 'down_proj')
-DELTA_RESIDUALS = ('delta_decay', 'delta_inverse', 'delta_memory')
-RESIDUALS = (*ATTENTION_RESIDUALS, 'context', 'conv', *DELTA_RESIDUALS, *MLP_RESIDUALS)
-"""The values a block names as it runs, each after the projection that
-produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
-the attention kernel's or the gated delta rule's output before `o_proj`,
-`conv` a linear-attention or SSM mixer's short conv output (`causal_conv1d`,
-its queries, keys and values for a delta rule), `delta_decay`,
-`delta_inverse` and `delta_memory` the rule's cumulated decay, chunk inverse
-and memory (with `w` and the corrected values) the port saves for its
-backward (`dew.nn.kernels.fla_gdn`), and the MLP names cover the dense MLP
-and the routed experts alike. A remat policy picks from these; a
-name off the list is a typo that would otherwise recompute silently."""
-
-
 @dataclasses.dataclass(frozen=True)
 class RematPolicy:
     """What a recomputed block keeps for its backward pass, and where it keeps it.
@@ -350,7 +367,7 @@ class RematPolicy:
     `offload` names those to move to pinned host memory. Both empty is
     MaxText's `full`. `recompute` instead names the only residuals recomputed,
     each by the layer that computes it (a delta rule its memory,
-    `dew.nn.linear.RECOMPUTED`), the block running without remat and keeping
+    `dew.nn.kernels.recurrence_chunk.RECOMPUTED`), the block running without remat and keeping
     every other value; it takes neither list. A checkpoint policy cannot
     say it: one that saves anything but a name saves the value the name
     marks from the op that made it.
@@ -395,6 +412,7 @@ class RematPolicy:
 REMAT_POLICIES: Mapping[str, RematPolicy] = {
     'full': RematPolicy(),
     'all_but_delta_memory': RematPolicy(recompute=('delta_memory',)),
+    'minimal_with_scan_and_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, 'scan', 'conv', *MLP_RESIDUALS)),
     'minimal_with_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, 'conv', *MLP_RESIDUALS)),
     'minimal': RematPolicy(save=ATTENTION_RESIDUALS + MLP_RESIDUALS),
     'minimal_with_context': RematPolicy(save=(*ATTENTION_RESIDUALS, 'context', *MLP_RESIDUALS)),
@@ -408,7 +426,11 @@ REMAT_POLICIES: Mapping[str, RematPolicy] = {
 }
 """MaxText's remat recipes (nnx_decoders.py, get_remat_policy), fastest and
 largest first, and Dew's `all_but_delta_memory`, which recomputes only a
-delta rule's memory. `full` keeps nothing but the block's inputs."""
+delta rule's memory, and `minimal_with_scan_and_conv` and
+`minimal_with_conv`, which keep a recurrence's scan output and its conv, or
+the conv alone, beside `minimal`'s. The context recipes keep a mixer's output
+of either kind, attention's context or a recurrence's scan. `full` keeps
+nothing but the block's inputs."""
 
 
 def remat_policy(
@@ -441,16 +463,23 @@ def remat_policy(
 
 
 DECODER_REMAT: tuple[RematPolicy | None, ...] = (
-    None, REMAT_POLICIES['all_but_delta_memory'], REMAT_POLICIES['minimal_with_conv'],
-    REMAT_POLICIES['minimal'], REMAT_POLICIES['save_dot_except_mlp'], REMAT_POLICIES['full'])
+    None, REMAT_POLICIES['all_but_delta_memory'], REMAT_POLICIES['minimal_with_scan_and_conv'],
+    REMAT_POLICIES['minimal_with_conv'], REMAT_POLICIES['minimal'], REMAT_POLICIES['save_dot_except_mlp'],
+    REMAT_POLICIES['full'])
 """What a decoder recomputes in its backward pass when its step does not fit,
 weakest first; each rung is slower and holds less (docs/performance.md). On
 Qwen 3.5-0.8B at 8 x 3072 on an A100, 'minimal' cost 14.7% a token over none
 and kept 13.5 GiB of temporaries, 'save_dot_except_mlp' 18.4% and 6.4 GiB,
 none 59 GiB; 'all_but_delta_memory' recomputes a delta rule's memory alone,
-as fla's backward always does; 'minimal_with_conv' keeps a linear-attention
-or SSM layer's short conv output beside 'minimal''s. A decoder's own remat is where it
-starts, and it moves up one rung at a time (`CausalTransformer.recompute_more`),
+as fla's backward always does; 'minimal_with_scan_and_conv' keeps a
+recurrence's scan output and its short conv output beside 'minimal''s, so a
+step that does not fit recomputes the rest of a layer before its scan (on an
+A100 an 8-layer Mamba-2 decoder's bf16 step over 16,384 tokens took 145.6 ms
+there and 149.4 ms at 'minimal_with_conv', for 1.1 GB more at its peak,
+docs/performance.md); 'minimal_with_conv' keeps the conv alone. A decoder
+without a recurrence skips both, as it would compile 'minimal''s step. A
+decoder's own remat is where it starts, and it moves up one rung at a time
+(`CausalTransformer.recompute_more`),
 past a rung that keeps nothing more of its layers' names than the next, never
 past a policy the ladder names."""
 
@@ -470,6 +499,9 @@ def remat_record(remat: RematPolicy | None) -> JSON:
 @logical_axes({
     ("per_layer_input_gate",): ("embed", "mlp"),
     ("per_layer_projection",): ("mlp", "embed"),
+    # nGPT's per-feature step rates live on the residual stream, as its norms' scales do.
+    ("attn_alpha",): ("embed",),
+    ("mlp_alpha",): ("embed",),
 })
 class _Plain(NamedTuple):
     """The plain residual `[B, S, D]` inside a block, and Gemma 3n's AltUp
@@ -534,7 +566,10 @@ class DecoderBlock(nn.Module):
     the attention residual is divided by sqrt(2).
 
     `engram` first writes the layer's n-gram lookup into the streams, reading
-    the metadata's `engram_ids` at `engram_index`. A DSpark target layer
+    the metadata's `engram_ids` at `engram_index`. `cross` is the layer's gated
+    cross-attention factory (`dew.nn.cross_attention`): its block reads the
+    metadata's `context` and joins the residual, in its form, before the mixer
+    reads it. A DSpark target layer
     (`prediction_target`) sows the mean of the streams its attention reads, or
     of those it hands on when `prediction_site` is 'output', as
     `prediction_inputs/draft_context`.
@@ -570,6 +605,7 @@ class DecoderBlock(nn.Module):
     media_routed: bool = False  # the feed-forward routes a media span by its own bias
     engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
     engram_index: int | None = None
+    cross: Callable[..., nn.Module] | None = None  # the layer's GatedCrossAttention factory
     prediction_target: bool = False  # records its streams' mean for DSpark
     prediction_site: Literal['input', 'output'] = 'input'  # where `prediction_target` records
     attention_norm: bool = True  # False: the attention reads its input unnormed (ModernBERT's first block)
@@ -664,13 +700,11 @@ class DecoderBlock(nn.Module):
             self.moe = self.parallel(name='moe')
         if self.wiring.ngpt is not None:
             self._ngpt_rates(self.wiring.ngpt)
-        if self.wiring.layer_scalar == "frozen":
-            self.output_scalar = self.variable("constants", "layer_scalar", jnp.ones, (1,), jnp.float32).value
-        elif self.wiring.layer_scalar == "trainable":
-            self.output_scalar = self.param("layer_scalar", nn.initializers.ones, (1,), jnp.float32)
+        self._residual_scales()
         if self.per_layer_input_dim:
             dense = functools.partial(
-                Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+                Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                dot_general=float32_dot_general)
             self.per_layer_input_gate = dense(projections['per_layer_input_gate'][1],
                                               name='per_layer_input_gate')
             self.per_layer_projection = dense(projections['per_layer_projection'][1],
@@ -725,7 +759,9 @@ class DecoderBlock(nn.Module):
                 raise ValueError("an engram lookup gates into mHC's residual streams and reads "
                                  "one engram layer's bucket ids, so it needs both")
             self.engram_layer = self.engram(name='engram')
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
+        if self.cross is not None:
+            self.cross_attention = self.cross(name=CROSS_ATTENTION)
+        self.dropout = Dropout(rate=self.dropout_rate)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """The packed groups its mixer and its feed-forward declare (`ProjectionSites`)."""
@@ -791,6 +827,9 @@ class DecoderBlock(nn.Module):
         every form.
         """
         state = self._enter(x, train, attention_metadata)
+        if self.cross is not None:
+            state = self._crossed(state, None if attention_metadata is None else attention_metadata.context,
+                                  decode, train)
         state, read, site = self._read(state, "attention")
         if not (self.wiring.pre_norms and self.attention_norm):
             normed = read
@@ -804,7 +843,7 @@ class DecoderBlock(nn.Module):
             routes if self._mixer_routes else {})
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
-        attention_branch = self._branch(mixed, train)
+        attention_branch = self._branch(mixed, train, "attention")
         joined = self._joined(state)
         if not (self.wiring.parallel_residual or joined):
             state = self._write(state, "attention", attention_branch, site)
@@ -824,7 +863,7 @@ class DecoderBlock(nn.Module):
                 mlp_input = (normed if self.wiring.shared_parallel_norm else
                              self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
             hidden = self.mlp(mlp_input,
-                              **self._feedforward_inputs(attention_metadata),
+                              **self._feedforward_inputs(attention_metadata, mlp_input.shape),
                               **({} if self.parallel is not None else routes),
                               **({"train": train} if isinstance(self.mlp, ReadsTrain) and self.mlp.reads_train
                                  else {}))
@@ -832,13 +871,30 @@ class DecoderBlock(nn.Module):
                 hidden = self.moe(read, hidden, **routes)
             if self.wiring.output_norms:
                 hidden = self.mlp_output_norm(hidden)
-            mlp_branch = self._branch(hidden, train)
+            mlp_branch = self._branch(hidden, train, "mlp")
             if self.wiring.parallel_residual:
                 # GPT-NeoX adds the two branches first, then the residual;
                 # both norms read the block's original stream.
                 mlp_branch = mlp_branch + attention_branch
             state = self._write(state, "mlp", mlp_branch, site)
         return self._leave(state, train, per_layer_input)
+
+    def _crossed(self, state: _BlockState, context, decode: bool, train: bool) -> _BlockState:
+        """The state after the cross-attention block joins it: the plain stream (AltUp's active
+        copy among them, nGPT's unit one), mHC's streams through their mean, or the depth
+        state's partial block through the mixture the attention reads."""
+        cross = functools.partial(self.cross_attention, decode=decode, train=train)
+        if isinstance(state, _Plain):
+            return state._replace(x=constrain(cross(state.x, context), RESIDUAL))
+        if isinstance(state, _Streams):
+            streams = cross(state.streams, context, read=lambda streams: collapse_streams(streams, None))
+            return state._replace(streams=constrain(streams, STREAMS))
+
+        def mixture(partial):
+            if not state.finished:
+                return partial
+            return self.attention_res(sources(state.blocks, state.finished, partial))
+        return state._replace(partial=cross(state.partial, context, read=mixture))
 
     def _joined(self, state: _BlockState) -> tuple[SeamNorm, _Plain] | None:
         """The MLP's pre-norm and the plain stream, where that norm adds the
@@ -859,10 +915,25 @@ class DecoderBlock(nn.Module):
         stream, normed = norm.seam(state.x, branch, axes=RESIDUAL)
         return state._replace(x=constrain(stream, RESIDUAL)), normed
 
-    def _branch(self, output, train: bool):
+    def _residual_scales(self):
+        """Initialize the output scalar and the learned vectors on the two residual branches."""
+        if self.wiring.layer_scalar == "frozen":
+            self.output_scalar = self.variable(LAYER_SCALAR_COLLECTIONS["frozen"], "layer_scalar", jnp.ones,
+                                               (1,), jnp.float32).value
+        elif self.wiring.layer_scalar == "trainable":
+            self.output_scalar = self.param("layer_scalar", nn.initializers.ones, (1,), jnp.float32)
+        if self.wiring.branch_scale is not None:
+            start = nn.initializers.constant(self.wiring.branch_scale)
+            self.attention_scale = self.param("attention_scale", start, (self.emb_features,))
+            if self.feedforward is not None:
+                self.mlp_scale = self.param("mlp_scale", start, (self.emb_features,))
+
+    def _branch(self, output, train: bool, site: Literal["attention", "mlp"]):
         """A sublayer's output as it joins the residual: times
         `residual_multiplier` (lm-engine's m_residual, GraniteMoeHybrid's
         residual_multiplier) in its own dtype, then dropped out."""
+        if self.wiring.branch_scale is not None:
+            output = output * (self.attention_scale if site == "attention" else self.mlp_scale)
         return self.dropout(scaled(output, self.residual_multiplier), deterministic=not train)
 
     def _enter(self, residual, train: bool, attention_metadata) -> _BlockState:
@@ -947,7 +1018,10 @@ class DecoderBlock(nn.Module):
         """The state after the sublayer at `site` adds `output` to it."""
         if isinstance(state, _Plain) and self.wiring.ngpt is not None:
             alpha = self.attn_alpha if site == "attention" else self.mlp_alpha
-            stepped_x = stepped(state.x, output, alpha, self.wiring.ngpt.step)
+            # The stepped residual is a fusion boundary. Every later sublayer reads it, and without one
+            # XLA's GPU priority fusion clones each earlier sublayer's normalization into every later one:
+            # 556 of a 72-layer Dory prefill's 664 s compile on an A100 (ledger 635).
+            stepped_x = jax.lax.optimization_barrier(stepped(state.x, output, alpha, self.wiring.ngpt.step))
             return state._replace(x=constrain(stepped_x, RESIDUAL))
         if isinstance(state, _Plain):
             return state._replace(x=constrain(state.x + output, RESIDUAL))
@@ -1026,10 +1100,14 @@ class DecoderBlock(nn.Module):
             **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
         )
 
-    def _feedforward_inputs(self, attention_metadata) -> dict:
+    def _feedforward_inputs(self, attention_metadata, shape: tuple[int, ...]) -> dict:
         """The token ids for a hash-routed feed-forward, the media mask, when
-        the call has one, for one that routes a media span apart, nothing for
-        the rest."""
+        the call has one, for one that routes a media span apart, each token's
+        block (`routing_blocks`, over the call's `shape[:2]`) for one that
+        routes blocks together, nothing for the rest."""
+        blocked = routing_blocks(self.mlp, attention_metadata, shape)
+        if blocked:
+            return blocked
         if self.media_routed:
             media = None if attention_metadata is None else attention_metadata.media
             return {} if media is None else {"media": media}
@@ -1141,7 +1219,7 @@ class MTPBlock(nn.Module):
         maps = self.projections()
         def dense(name):
             return Dense(maps[name][1], use_bias=False, dtype=self.dtype,
-                         precision=self.precision, name=name)
+                         precision=self.precision, name=name, dot_general=float32_dot_general)
         if self.hyper_connections is None:
             self.eh_proj = dense('eh_proj')
         else:

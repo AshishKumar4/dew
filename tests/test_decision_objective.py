@@ -10,10 +10,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from decision_support import decision_rows
 
 from dew.artifacts import Decisions
+from dew.batch import FROZEN, VALID_ROWS
 from dew.checkpoints import Checkpoints
-from dew.config.data import loader
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import (
@@ -33,10 +34,9 @@ from dew.decision import (
     StateFirstLayout,
     Weights,
 )
-from dew.decision.data import Decisions as DecisionRecipe
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import FROZEN, VALID_ROWS, joined
+from dew.objectives.base import joined
 from dew.training.trainer import Trainer
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
@@ -116,8 +116,7 @@ def test_the_loss_scores_a_soft_target_as_its_rule_does():
             for index in range(8)]
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                   shuffle_options=False)
-    data = loader(DecisionRecipe(source=soft, validation=soft), batch=8, read="memory",
-        objective=objective.data())
+    data = decision_rows(soft, 8, soft, objective=objective.data())
     (batch,) = list(data.val(DataPartition()))
     batch = {name: value for name, value in batch.items() if name != VALID_ROWS}
     variables = objective.init(jax.random.key(0))
@@ -142,8 +141,7 @@ def test_a_held_pass_scores_a_soft_target_as_its_training_charges_it(rule):
             for index in range(8)]
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                   loss=rule, shuffle_options=False)
-    data = loader(DecisionRecipe(source=soft, validation=soft), batch=8, read="memory",
-                  objective=objective.data())
+    data = decision_rows(soft, 8, soft, objective=objective.data())
     result = Evaluation.run(objective, objective.init(jax.random.key(0)), data.val, key=0, metrics=(rule,),
                             loss=True)
     assert result.scores[f"val/{rule.name}"] == pytest.approx(result.scores["val/loss"], rel=1e-5)
@@ -163,8 +161,8 @@ def test_a_held_pass_packs_its_rows_and_scores_every_row_once():
     and the pass's log loss is the mean of its questions'."""
     from test_decision_packing import alone, owners, rows_of
 
+    from dew.distributed.placement import MeshSpec
     from dew.objectives.base import Step
-    from dew.training.distributed import MeshSpec
     from dew.training.evaluation import Evaluation
 
     layout = replace(LAYOUT, max_len=192)
@@ -173,8 +171,7 @@ def test_a_held_pass_packs_its_rows_and_scores_every_row_once():
                                   shuffle_options=False)
     variables = objective.init(jax.random.key(0))
     step = Step(jnp.asarray(0), jax.random.key(0), None)
-    data = loader(DecisionRecipe(source=HELD, validation=HELD), batch=4, read="memory",
-                objective=objective.data())
+    data = decision_rows(HELD, 4, HELD, objective=objective.data())
     expected = {}
     for index, example in enumerate(HELD):
         asked = {name: example.questions[name] for name in example.labels()}
@@ -239,8 +236,7 @@ def test_lora_trains_its_factors_and_the_head_over_a_fixed_base_and_reloads_from
     adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(model, base, key=1)
     objective = DecisionObjective(adapter, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                   loss=LogLoss() + 0.5 * Brier())
-    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
-        objective=objective.data())
+    data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path), keep=1)
     start = objective.init(jax.random.key(2))
     state = Trainer(objective, optax.adam(1e-2), key=0, checkpoints=checkpoints).fit(
@@ -305,8 +301,7 @@ def test_a_joint_head_trains_on_the_rows_of_a_head_no_one_matrix_is(head, tmp_pa
                                   specials=SPECIALS, layout=JointLayout(max_len=1536),
                                   head=JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2,
                                                        feedforward=32))
-    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
-                  objective=objective.data())
+    data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
     trainer = Trainer(objective, optax.adam(1e-2), key=0, checkpoints=Checkpoints(str(tmp_path)))
     initial = trainer.initial_state()
     # The step donates the state it is handed; the host keeps what it started from.
@@ -326,12 +321,10 @@ def test_a_held_out_row_fewer_than_a_batch_counts_once_in_the_loss_and_the_metri
     from dew.training.evaluation import Evaluation
 
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES[:1]), batch=8, read="memory",
-        objective=objective.data())
+    data = decision_rows(EXAMPLES, 8, EXAMPLES[:1], objective=objective.data())
     variables = objective.init(jax.random.key(0))
     result = Evaluation.run(objective, variables, data.val, key=0, metrics=(Accuracy(),), loss=True)
-    alone = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES[:1]), batch=1, read="memory",
-        objective=objective.data())
+    alone = decision_rows(EXAMPLES, 1, EXAMPLES[:1], objective=objective.data())
     (row,) = list(alone.val(DataPartition()))
     row = {name: value for name, value in row.items() if name != VALID_ROWS}
     loss, _ = objective.scalar_loss(variables, row, Step(jnp.asarray(0), jax.random.key(0), None))
@@ -372,14 +365,7 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
     base = DecisionObjective(source, tokenizer=tokenizer, layout=layout)
     task = Decide(base.model, base.init(jax.random.key(0)), layout, tokenizer, base.specials,
                   processor=source.processor)
-    objective = DecisionObjective(task)
-    data = loader(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
-    run = tmp_path / "run"
-    checkpoints = Checkpoints(str(run), keep=1)
-    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
-        data, steps=1, log_every=100, checkpoint_every=1)
-    checkpoints.wait()
-    live, reloaded = objective.pipeline(state), Decide.from_run(str(run))
+    objective, live, reloaded = saved_and_reloaded(task, tmp_path / "run")
     images = [Image.fromarray(array) for array in np.load(directory / "images.npy")]
     asked = {"team": INTENT}
     first = live("charged twice!", asked, images=images)["team"].probabilities
@@ -387,9 +373,24 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
 
     assert reloaded.processor is not None
     np.testing.assert_array_equal(second, first)
-    assert reloaded.processor.source == str(directory)
-    assert objective.inference_record()["processor"] == str(directory)
+    from dew.interop.sources import SourceReference
+    from dew.registry import from_record
+
+    assert reloaded.processor.source == SourceReference(str(directory))
+    held_source = from_record(SourceReference, objective.inference_record()["processor"])
+    assert held_source == reloaded.processor.source
     assert not np.array_equal(second, reloaded("charged twice!", asked)["team"].probabilities)
+
+
+def saved_and_reloaded(task, run):
+    """`task`'s decision objective, the task one checkpointed step over EXAMPLES trains, and that task
+    as `Decide.from_run` reads it back from the run directory `run`."""
+    objective = DecisionObjective(task)
+    checkpoints = Checkpoints(str(run), keep=1)
+    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+        decision_rows(EXAMPLES, 8, objective=objective.data()), steps=1, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+    return objective, objective.pipeline(state), Decide.from_run(str(run))
 
 
 def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_path):
@@ -399,27 +400,16 @@ def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_pat
     decision task lays out text with ByteTokenizer. Saving that task keeps
     no media processor to reload, and never treats `byte` as a Hub repo.
     """
+    from model_support import tokenized_qwen3
+
     from dew.interop import Pretrained
 
-    fixtures = Path(__file__).parent / "fixtures" / "hf"
-    directory = tmp_path / "source"
-    directory.mkdir()
-    for name in ("config.json", "model.safetensors"):
-        shutil.copyfile(fixtures / "qwen3-tiny" / name, directory / name)
-    for name in ("tokenizer.json", "tokenizer_config.json"):
-        shutil.copyfile(fixtures / "qwen38-dense-tiny" / name, directory / name)
-    source = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=128)
+    source = Pretrained.load(tokenized_qwen3(tmp_path / "source"), dtype="float32", attention_impl="xla",
+                             max_seq_len=128)
     base = DecisionObjective(source, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
     task = Decide(base.model, base.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS,
                   processor=source.processor)
-    objective = DecisionObjective(task)
-    data = loader(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
-    run = tmp_path / "run"
-    checkpoints = Checkpoints(str(run), keep=1)
-    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
-        data, steps=1, log_every=100, checkpoint_every=1)
-    checkpoints.wait()
-    live, reloaded = objective.pipeline(state), Decide.from_run(str(run))
+    objective, live, reloaded = saved_and_reloaded(task, tmp_path / "run")
 
     assert source.processor is not None
     assert objective.inference_record()["processor"] is None
@@ -442,8 +432,7 @@ def test_a_saved_one_question_head_refuses_multi_question_requests(tmp_path):
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout, head=DecisionHead(32, layers=1),
                                   shuffle_options=False)
-    data = loader(DecisionRecipe(source=examples, validation=examples), batch=8, read="memory",
-                  objective=objective.data())
+    data = decision_rows(examples, 8, examples, objective=objective.data())
     (batch,) = list(data.val(DataPartition()))
     assert int(np.asarray(batch["segments"]).max()) == 2
     checkpoints = Checkpoints(str(tmp_path), keep=1)
@@ -479,7 +468,7 @@ def test_a_saved_head_reloads_in_the_numerics_it_trained_in(tmp_path):
     head = DecisionHead(32, layers=1, dtype=jnp.bfloat16, precision=jax.lax.Precision.HIGHEST)
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                   head=head)
-    data = loader(DecisionRecipe(source=EXAMPLES), batch=8, read="memory", objective=objective.data())
+    data = decision_rows(EXAMPLES, 8, objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path), keep=1)
     state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
         data, steps=1, log_every=100, checkpoint_every=1)
@@ -502,11 +491,12 @@ def test_a_head_records_the_matmul_precision_it_computes_at(precision):
     assert precision_names(Head.from_record(record, 32).precision) == precision_names(precision)
 
 
-@pytest.mark.parametrize("record", [{"features": 32, "layers": 1}, {"name": "DecisionHead", "layers": 1}],
-                         ids=["unnamed", "flat"])
+@pytest.mark.parametrize("record", [{"features": 32, "layers": 1}, {"class": "DecisionHead", "layers": 1},
+                                    {"class": "dew.decision.layout:FramedLayout", "fields": {}}],
+                         ids=["unnamed", "flat", "not a head"])
 def test_a_head_record_names_its_head_and_holds_its_fields(record):
-    """A run records a head as its name and its fields (`Head.record`); a
-    record of another shape is refused rather than read as Laya's head."""
+    """A run records a head as the registry's class record, its class and its fields (`Head.record`); a
+    record of another shape, or of a class that is no head, is refused rather than read as Laya's head."""
     from dew.decision.head import Head
 
     with pytest.raises(ValueError):
@@ -518,8 +508,7 @@ def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
     on; trained further, the run's latest weights refuse it rather than
     reuse it stale."""
     objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
-        objective=objective.data())
+    data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path), keep=2)
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints)
     state = trainer.fit(data, steps=1, log_every=100, checkpoint_every=1)
@@ -531,7 +520,9 @@ def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
     calibrated.save(str(tmp_path))
     reloaded = Decide.from_run(str(tmp_path))
     assert reloaded.calibration == calibrated.calibration
-    assert json.loads((tmp_path / "decide.json").read_text())["weights"] == {"step": 1, "ema": False}
+    # One run's weights average no runs; a file written before the field reads as one that names none.
+    assert json.loads((tmp_path / "decide.json").read_text())["weights"] == {"step": 1, "ema": False,
+                                                                           "averaged": []}
 
     trainer.fit(data, steps=2, log_every=100, checkpoint_every=1)
     checkpoints.wait()
@@ -555,8 +546,7 @@ def test_diffusion_gemma_reads_each_row_once_whole_and_reloads_from_the_run(tmp_
     chosen = DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS).layout
     assert isinstance(chosen, StateFirstLayout)
     objective = DecisionObjective(model, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    data = loader(DecisionRecipe(source=EXAMPLES, validation=EXAMPLES), batch=8, read="memory",
-        objective=objective.data())
+    data = decision_rows(EXAMPLES, 8, EXAMPLES, objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path), keep=1)
     state = Trainer(objective, optax.adam(1e-2), key=0, checkpoints=checkpoints).fit(
         data, steps=2, log_every=100, checkpoint_every=2)
@@ -623,6 +613,36 @@ def test_a_hub_tokenizer_lays_rows_out_from_the_revision_its_identity_names(monk
     np.testing.assert_array_equal(sent(EXAMPLES[0], ("team",), None)["tokens"],
                                   local(EXAMPLES[0], ("team",), None)["tokens"])
     assert resolved == [("acme/tokenizer", None)]
+
+
+@pytest.mark.parametrize("joint", [False, True])
+def test_a_head_reads_none_of_its_rows_padding(joint):
+    """A batch's rows of unequal length pad the shorter: Laya's head and the joint head give the same
+    logits whatever states the backbone leaves on that padding, NaN included, as a padded or diverged
+    row's can be."""
+    from dew.decision import DecisionInputs, JointLayout, JointSchemaHead
+    from dew.objectives.base import part
+
+    layout = JointLayout(max_len=1024) if joint else StateFirstLayout(max_len=512)
+    head = JointSchemaHead(hidden_size=32, width=32, routing_layers=1, layers=1, heads=2,
+                           feedforward=64) if joint else None
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout, head=head)
+    rows = [layout.rows(TOKENIZER, SPECIALS, text, {"team": INTENT})[0]
+            for text in ("short", "a much longer state than the first")]
+    inputs = DecisionInputs.collate(rows, SPECIALS.pad)
+    padding = ~np.asarray(inputs.valid)
+    assert padding.any() and not padding.all(axis=1).any()
+    variables = objective.init(jax.random.key(0))
+    model = objective.model
+    states = np.asarray(model.states(variables, inputs))
+    diverged = np.where(padding[..., None], np.nan, states).astype(states.dtype)
+    table = model.table(variables) if model.head.reads_table else None
+
+    def logits(given):
+        return np.asarray(model.head.apply(part(variables, "head"), jnp.asarray(given), inputs, table))
+
+    np.testing.assert_array_equal(logits(diverged), logits(states))
 
 
 @pytest.mark.parametrize("joint", [False, True])

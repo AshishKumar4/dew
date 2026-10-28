@@ -15,14 +15,15 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.batch import Variables
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs.encoders import ConditionEncoder, ConditionWork
 from dew.nn.blocks import torch_nearest_resize
 from dew.nn.flops import counted_flops, projection_flops
+from dew.nn.precision import accumulated
 from dew.nn.protocols import LayerStates
 from dew.nn.safety import CLIPSafetyHead
 from dew.nn.text_encoders import CLIPTextTransformer, CLIPTowerOutput, T5EncoderTransformer
-from dew.objectives.base import Variables
 from dew.registry import dtype_name
 
 if TYPE_CHECKING:
@@ -30,8 +31,8 @@ if TYPE_CHECKING:
     from transformers import CLIPTokenizer, PreTrainedTokenizerBase
 
     from dew.data.text import PinnedTokenizer
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.training.distributed import Layout, MeshSpec
 
 
 def _prompt(record: Mapping[str, object], key: str, default: str) -> str:
@@ -59,7 +60,7 @@ def _row_guidance(record: Mapping[str, object], default: float | None) -> float:
     return float(value)
 
 
-def latent_image_conditions(autoencoder, params, pixels, mask, key):
+def latent_image_conditions(autoencoder, params, pixels, mask, key, noise=None):
     """Turns normalized pixels and a binary pixel mask into native UNet inputs.
 
     Returns mask [B,h,w,1] and masked_image [B,h,w,C] under the model keyword
@@ -71,7 +72,7 @@ def latent_image_conditions(autoencoder, params, pixels, mask, key):
     if mask.shape != (*pixels.shape[:-1], 1):
         raise ValueError("Image and mask geometry must match, with one mask channel")
     mask = (mask >= 0.5).astype(jnp.float32)
-    latent = autoencoder.encode(params, pixels * (mask < 0.5), key)
+    latent = autoencoder.encode(params, pixels * (mask < 0.5), key, noise=noise)
     mask = torch_nearest_resize(mask, *latent.shape[1:3])
     return {"mask": mask, "masked_image": latent}
 
@@ -285,7 +286,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         return outputs
 
     def _projected(self, params, name: str, pooled):
-        return pooled @ params[name]["text_projection"]["kernel"]
+        return accumulated(jnp.matmul, pooled, params[name]["text_projection"]["kernel"])
 
     def _t5_states(self, params, tokens, rows: int, dtype) -> jax.Array:
         """The T5 segment, or the zero segment SD3 writes without a third encoder.
@@ -347,7 +348,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         ids = tokens["input_ids"][:, 0] if self.stacked else tokens["input_ids"]
         return tuple(self.tokenizers[0].batch_decode(np.asarray(ids), skip_special_tokens=True))
 
-    def to_json(self):
+    def recorded_fields(self):
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.towers[0].dtype),
                 "param_dtype": self.param_dtype, "height": self.height, "width": self.width}
 
@@ -416,7 +417,7 @@ class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
     def captions(self, tokens):
         return tuple(self.tokenizer.batch_decode(np.asarray(tokens["input_ids"]), skip_special_tokens=True))
 
-    def to_json(self):
+    def recorded_fields(self):
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.tower.dtype),
                 "param_dtype": self.param_dtype, "tokens": self.tokens}
 
@@ -448,19 +449,27 @@ class QwenImageConditioner(_LanguageText):
     """The system turn's token count, which the pipeline derives the same way."""
 
     SYSTEM: ClassVar[str] = "Comprehend and analyze the provided prompt."
-    USER: ClassVar[tuple[str, str]] = ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n")
     assets = "processor"
 
     def __post_init__(self):
         system = [{"role": "system", "content": [{"type": "text", "text": self.SYSTEM}]}]
         self.drop = len(self.tokenizer.apply_chat_template(system, tokenize=True, return_dict=False))
 
+    @property
+    def framing(self) -> tuple[str, str]:
+        """The pipeline's template around a prompt: the system turn and the user's turn up to the
+        prompt, then the rest of it and the assistant's opening, as the encoder's own chat template
+        renders them (`dew.data.chat.framed`), the turn the system count (`drop`) reads too."""
+        from dew.data.chat import framed
+
+        return framed(self.tokenizer, self.SYSTEM, where=self.checkpoint)
+
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
-        system = f"<|im_start|>system\n{self.SYSTEM}<|im_end|>\n"
+        before, after = self.framing
         rows = []
         for prompt in texts:
             record: Mapping[str, object] = {"text": prompt} if isinstance(prompt, str) else prompt
-            rows.append(f"{system}{self.USER[0]}{_prompt(record, 'text', '') or ' '}{self.USER[1]}")
+            rows.append(f"{before}{_prompt(record, 'text', '') or ' '}{after}")
         length = self.drop + self.tokens
         encoded = self.tokenizer(rows, padding="max_length", padding_side="right",
                                  max_length=length)
@@ -555,10 +564,7 @@ class HiddenStatesConditioner(_LanguageText):
         return tokens
 
     def conditioning_flops(self, tokens) -> ConditionWork:
-        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
-        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
-        return ConditionWork(counted_flops(self.tower, lengths), lengths, spans,
-                             self.tower.emb_features * len(self.layers))
+        return ConditionWork.of_tokens(self.tower, tokens, self.tower.emb_features * len(self.layers))
 
     def encode(self, params, tokens) -> DenoisingCondition:
         ids = jnp.asarray(tokens["input_ids"])
@@ -611,11 +617,9 @@ class WanConditioner(_LanguageText):
                 "attention_mask": np.asarray(encoded.attention_mask, np.int32)}
 
     def conditioning_flops(self, tokens) -> ConditionWork:
-        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
         # The encoder masks padding, but Wan reads its zero-filled fixed
         # output budget without a mask; those keys remain in its softmax.
-        output = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
-        return ConditionWork(counted_flops(self.tower, lengths), lengths, output, self.tower.emb_features)
+        return ConditionWork.of_tokens(self.tower, tokens, self.tower.emb_features)
 
     def encode(self, params, tokens) -> DenoisingCondition:
         mask = jnp.asarray(tokens["attention_mask"])
@@ -653,7 +657,7 @@ def _cubic_weights(source: int, target: int) -> tuple[np.ndarray, np.ndarray]:
 @dataclass(frozen=True)
 class CLIPImageTransform:
     """Runs the published CLIP preprocessing as JAX arithmetic over uint8 NHWC
-    pixels.
+    pixels, integer levels in any dtype.
 
     The reference is the PIL image processor: `CLIPImageProcessor` as
     transformers 4 ran it, which the safety fixtures were generated with
@@ -725,7 +729,11 @@ class CLIPImageTransform:
                                           (pad_w - pad_w // 2, pad_w // 2), (0, 0)))
             top, left = (pixels.shape[1] - crop_h) // 2, (pixels.shape[2] - crop_w) // 2
             pixels = pixels[:, top:top + crop_h, left:left + crop_w]
-        pixels = pixels * self.rescale
+        # transformers rescales in float64 and rounds once to float32 (`image_transforms.rescale`); over
+        # integer pixels that is a table of the 256 levels, rounded on the host. A float32 product with
+        # the rounded factor rounds twice, half again as far from the exact levels.
+        levels = jnp.asarray(np.arange(256, dtype=np.float64) * self.rescale, jnp.float32)
+        pixels = jnp.take(levels, pixels.astype(jnp.int32))
         if self.normalize:
             pixels = (pixels - jnp.asarray(self.mean, jnp.float32)) / jnp.asarray(self.std, jnp.float32)
         return pixels.transpose(0, 3, 1, 2)

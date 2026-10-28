@@ -51,7 +51,7 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
     `assert_as_exact_over_orders`. Dew's RMS over them is 0.95 of the
     reference's on CPU, 0.73 on an AVX-512 CPU (Intel SDE's Ice Lake server,
     the CI runners' ISA) and 0.56 on an RTX 4080. The gradient through the
-    KDA decays is where `chunk_decay`'s compensated sums matter.
+    KDA decays is where `recurrence_algebra.decays`' compensated sums matter.
 
     The export writes every source name back at its stored shape, A_log as
     [1, 1, heads, 1], and reloading restores the trained weights exactly."""

@@ -44,7 +44,8 @@ import numpy as np
 
 from dew.diffusion.discrete import MDLM
 from dew.interop.pretrained import Pretrained
-from tools.decoder_export_reference import RATE, Trip, logits, source_tensors, stepped, trained_export
+from dew.interop.sources import load_shards
+from tools.decoder_export_reference import RATE, Trip, logits, stepped, trained_export
 
 if TYPE_CHECKING:
     from transformers import PretrainedConfig
@@ -213,7 +214,7 @@ def reference_logits(case: Case, export: Path, ids: np.ndarray,
     from dew.interop.safetensors_io import write_file
 
     config, tensors = case.reference(json.loads((export / "config.json").read_text()),
-                                     source_tensors(export))
+                                     load_shards(export))
     view = workspace / f"{case.name}-reference"
     view.mkdir(parents=True, exist_ok=True)
     config.save_pretrained(str(view))
@@ -242,7 +243,7 @@ def round_trip(case: Case, workspace: Path) -> RoundTrip:
     theirs, report = reference_logits(case, export, ids, workspace)
     return RoundTrip(source=source, trained=trained, export=export, ids=ids,
                      ours=logits(source, trained, ids), reloaded=reloaded, theirs=theirs,
-                     source_tensors=source_tensors(directory), exported_tensors=source_tensors(export),
+                     source_tensors=load_shards(directory), exported_tensors=load_shards(export),
                      case=case, report=report)
 
 

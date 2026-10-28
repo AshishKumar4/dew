@@ -24,33 +24,32 @@ float64.
 
 import argparse
 import importlib
-import sys
-import tempfile
-import urllib.request
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from reference_source import package, published_files
 
 jax.config.update("jax_enable_x64", val=True)
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO, COMMIT = "google-research/google-research", "adb2c533488cc9b27b3878c7e34603a95f4540ef"
+FILES = {
+    "diffusion_distillation/diffusion_distillation/dpm.py":
+        "c5a325617ee83e80fef458a834a253c716117a1a768b5130bc080f7061f6231c",
+    "diffusion_distillation/diffusion_distillation/utils.py":
+        "2855d1aa553a3081b93e355c5f6fbae9f3e8d09abe24a0a9b3c4aabe9dcc5f21",
+}
+"""diffusion_distillation's files the dpm module reads, to their SHA-256."""
 STEPS = 1000
 SHAPE = (6, 4, 4, 3)
 
 
 def published() -> object:
     """diffusion_distillation's dpm module, from its own files at the pinned commit."""
-    package = Path(tempfile.mkdtemp()) / "diffusion_distillation"
-    package.mkdir()
-    (package / "__init__.py").write_text("")
-    for name in ("dpm.py", "utils.py"):
-        url = f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/diffusion_distillation/diffusion_distillation/{name}"
-        with urllib.request.urlopen(url, timeout=60) as response:
-            (package / name).write_bytes(response.read())
-    sys.path.insert(0, str(package.parent))
+    package("diffusion_distillation",
+            published_files(REPO, COMMIT, FILES) / "diffusion_distillation" / "diffusion_distillation")
     return importlib.import_module("diffusion_distillation.dpm")
 
 

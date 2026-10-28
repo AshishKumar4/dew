@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
-from dew.records import JSON
+from dew._records import JSON
 
 
 @runtime_checkable
@@ -67,7 +67,7 @@ class Fast(Protocol):
 class Referencing(Protocol):
     """A processor that holds the source's own processor or tokenizer as `reference`.
 
-    `dew.interop.pretrained.Processor` is one.
+    `dew.interop.processors.Processor` is one.
     """
 
     @property
