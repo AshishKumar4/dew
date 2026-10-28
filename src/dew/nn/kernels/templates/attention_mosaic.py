@@ -365,12 +365,13 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     """The registers a backward launch's consumer holds at `config` (`resources.live_registers`): a dQ
     consumer's dQ sums `[bq, D]` fp32 carried (and the accurate form's keyed sums), beside a step's logits and
     output cotangents' products fp32, then its score cotangents fp32 and their parts in the operands' dtype; a
-    dK/dV consumer's dK and dV sums `[bk, D]`, `[bk, Dv]` fp32 carried, beside a step's two products, and a
-    fused launch's dQ tile `[bq, D]` fp32."""
+    dK/dV consumer's dK and dV sums `[bk, D]`, `[bk, Dv]` fp32 carried, beside a step's two products, a
+    fused launch's dQ tile `[bq, D]` fp32 and its per-query statistics; every sum its share of the
+    `columns`."""
     block_q, block_k = config.block_q, config.block_k
     products = [(block_q, block_k, jnp.float32)] * 2
     if dq:
-        carried = [(block_q, width, jnp.float32)] * (2 if accurate else 1)
+        carried = [(block_q, width // config.columns, jnp.float32)] * (2 if accurate else 1)
         cotangents = [(block_q, block_k, jnp.float32), *[(block_q, block_k, dtype)] * _parts(accurate, dtype)]
         return resources.live_registers(family, carried, products, cotangents)
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
