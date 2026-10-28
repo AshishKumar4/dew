@@ -43,6 +43,7 @@ from dew.nn.kernels.options import program
 
 from ..activations import silu
 from ..attention import l2_normalized, scaled_dot_product_attention
+from ..blocks import Upsample
 from ..conv import Conv
 from ..precision import at_least_fp32
 from .api import AutoEncoder, LatentNormalization, published_source
@@ -225,9 +226,8 @@ class _Upsample(nn.Module):
                 later = later.reshape(batch, frames, height, width, 2, channels)
                 later = later.transpose(0, 1, 4, 2, 3, 5).reshape(batch, 2 * frames, height, width, channels)
                 x = jnp.concatenate([first, later], axis=1)
-        x = jnp.repeat(jnp.repeat(x, 2, axis=2), 2, axis=3)
-        conv = Conv(self.features // 2, (3, 3), padding=((1, 1), (1, 1)), dtype=self.dtype, name="resample_1")
-        return _frames(conv, x)
+        # Each frame doubled by nearest resize and convolved to half the channels (`blocks.Upsample`).
+        return _frames(Upsample(self.features // 2, 2, dtype=self.dtype, name="resample_1"), x)
 
 
 class _Encoder(nn.Module):
@@ -429,6 +429,9 @@ def wan_vae_path(name: str, ndim: int) -> tuple[str, ...]:
     if ndim not in _LEAF_RANK[leaf]:
         raise ValueError(f"{name!r} has {ndim} axes, not {' or '.join(map(str, _LEAF_RANK[leaf]))}")
     path = indexed_path("attention_out" if part == "proj" else part for part in parts)
+    if parts[-4:-2] == ["upsamplers", "0"] and parts[-2:] == ["resample", "1"]:
+        # An upsampler's spatial conv is the shared upsampling's (`blocks.Upsample`), its conv `Conv_0`.
+        path = (*path, "Conv_0")
     return (*path, "kernel" if leaf == "weight" else leaf)
 
 
