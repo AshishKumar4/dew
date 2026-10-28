@@ -508,9 +508,12 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         if capacity is not None and seq_len > capacity:
             raise ValueError(f"{seq_len}-token rows read past the {capacity} places {type(model).__name__}'s "
                              "positions cover")
-        # A schedule's later stage may read longer rows, up to what the model declares it holds.
+        # A schedule's later stage may read longer rows, up to what the model declares it holds and no
+        # further than its learned positions cover: a cache resized past a learned table
+        # (`with_cache_capacity`) keeps the table's rows.
         declared = model.max_seq_len if isinstance(model, Bounded) else None
-        self.context = seq_len if declared is None else max(seq_len, declared)
+        context = seq_len if declared is None else max(seq_len, declared)
+        self.context = context if capacity is None else min(context, capacity)
         self.use_head(head_chunks, head_tile)
         self.samples = samples
         self.balance = balance
