@@ -131,7 +131,7 @@ from dew.training._fit import (
     unrecorded_parts,
     waited_read,
 )
-from dew.training._lowering import Lowered
+from dew.training._lowering import Lowered, Routed, routed
 from dew.training.budget import Pause, Plateau, run_length, run_steps, run_tokens
 from dew.training.cooldown import Cooldowns, Pending, check_branches, decay, resolved, schedule_ended
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -911,9 +911,9 @@ class Trainer(Generic[Loss, Effects]):
         (`Trials.profiled`), and its program compiles again guided by their profile (`Planned.guided`),
         the executable it replaces released with its program (`Planned.released`).
         """
-        if self.lower_for is not None:
+        if (target := self.lower_for) is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
-            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for)[0])
+            raise Lowered(target, *routed(lambda: self._lowered_for(state, batch, target)[0]))
         split, unaligned = divmod(int(state.window_size), self.accumulation)
         if unaligned or (state.accumulation is not None and self._split not in (None, split)):
             raise ValueError(f"the state pools windows of {int(state.window_size)} microbatches, and this "
@@ -1064,13 +1064,13 @@ class Trainer(Generic[Loss, Effects]):
             [field for field, kept in built if kept is None and field is not None])
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
-        lower = functools.partial(jitted.lower, *apart(prepared), batch, part)
+        lower = Routed(functools.partial(jitted.lower, *apart(prepared), batch, part))
         if self.tune_kernels:
             lowered, launches = tuning.tune(lower, measure=True)
         else:
             # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
             lowered, launches = lower(), launches or "[]"
-        return Candidate(micro, shapes, copies, shardings, prepared, held, lowered, launches)
+        return Candidate(micro, shapes, copies, shardings, prepared, held, lowered, launches, lower.report())
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int,
                   narrow: bool | None = None):

@@ -45,7 +45,8 @@ from dew.nn.kernels.templates import (
 
 PINS = {attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
         attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2)}
-"""The Triton mainloop's tiles: every family is a block or less, so one tile walks it."""
+"""The Triton mainloop's tiles: a family is a block or less, so one tile walks it, but the equal-weight ones
+over 64 and 256 keys, which walk two and eight."""
 
 INTERPRETED = jax.default_backend() == "cpu"
 """Whether the frozen Triton mainloop runs interpreted, in a CPU process, or compiled, on a GPU: the A100's
@@ -106,6 +107,7 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "ties at scale 1/4, cotangents near 2**125": 64, "a logit near fp32's largest": 8,
          "a logit near fp32's largest at scale 1/4": 8, "values near fp32's largest over 2 equal keys": 8,
          "values near fp32's largest over 64 equal keys": 8,
+         "values near fp32's largest over 256 equal keys": 8,
          "values near fp32's largest over 2 equal keys, bfloat16": 8, "one key": 8, "a sink and one key": 64,
          "a sink near fp32's largest and one key": 8, "a sink and one key, its logit near fp32's largest": 8,
          "a sink near fp32's largest at scale 1/4": 8, "logits near 1e4": 32, "logits near 1e30": 8,
@@ -508,6 +510,11 @@ def _families() -> dict[str, Family]:
                                                                overflows=True),
         "values near fp32's largest over 64 equal keys": Family(_large_values(64), _kept(1, 64),
                                                                 folded=False, overflows=True),
+        # Eight key tiles of 32 (`PINS`, a decode step's `BLOCK`): a walk's chain of its tiles' sums errs past
+        # the reference's, which sums a row whole, unless the walk keeps their additions' roundings
+        # (`algebra.compensates`).
+        "values near fp32's largest over 256 equal keys": Family(_large_values(256), _kept(1, 256),
+                                                                 folded=False, overflows=True),
         "values near fp32's largest over 2 equal keys, bfloat16": Family(
             _large_values(2, top=3.3e38), _kept(1, 2), folded=False, overflows=True, dtype="bfloat16"),
         # A key at its row's maximum weighs 1 exactly in the accurate form; the fold's contracted weight is
@@ -742,7 +749,9 @@ def _differentiable(family: Family, forward: Callable, backward: Callable) -> Ca
 
 def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     """Each template mainloop as `(query, key, value, extra) -> out` at the form `options` names (`ACCURATE`,
-    or none for the default), its derivative the mainloop's own backward (`_differentiable`)."""
+    or none for the default), its derivative the mainloop's own backward (`_differentiable`); on an H100 the
+    Mosaic one's default form in both schedules, its derived one (one launch where the call is hookless) and
+    deterministic mode's two launches (`TWO_LAUNCHES`)."""
     forward_options = {name: value for name, value in options.items() if name in ("natural", "scale")}
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
     mainloop = functools.partial(_differentiable, family)
@@ -769,9 +778,20 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     portable = mainloop(functools.partial(attention_portable.attend, **tiles, **forward_options),
                         functools.partial(attention_portable.backward, **tiles, **options))
     mainloops = {"triton": mainloop(triton_forward, triton_backward), "portable": portable}
+    def two_launch_backward(*operands):
+        with tuning.pinned({attention_mosaic.MosaicBackward: TWO_LAUNCHES}):
+            return mosaic_backward(*operands)
+
     if ON_HOPPER and _mosaic_takes(family):
         mainloops["mosaic"] = mainloop(mosaic_forward, mosaic_backward)
+        if not options and family.draw(0)[3] is None:
+            mainloops["mosaic two launches"] = mainloop(mosaic_forward, two_launch_backward)
     return mainloops
+
+
+TWO_LAUNCHES = attention_mosaic.BackwardTiles(64, 64, 2, 1, fused=False, family="wgmma")
+"""The Mosaic backward's two-launch schedule at the derived tiles, the dQ launch then the dK/dV one at the
+refined D: a hookless fast-form call's in deterministic mode, where its derived one is one launch."""
 
 
 ON_HOPPER = generation.device_generation() == "sm90"
@@ -863,6 +883,21 @@ def test_the_mosaic_mainloops_default_is_finite_where_the_reference_is_at_fp32s_
     (`algebra.walked_launches`), finite in the default form over every family it takes (its legality rule,
     `attention_mosaic.refused`: bf16 operands in its backward, hooks it lowers; `_default_is_finite`)."""
     _default_is_finite(family, "mosaic")
+
+
+HOOKLESS_FAMILIES = [family for family in MOSAIC_FAMILIES if FAMILIES[family].draw(0)[3] is None]
+"""The Mosaic families of no sinks or resumed state, whose fast-form backward derives one launch
+(`MosaicBackward.derived`)."""
+
+
+@pytest.mark.skipif(not ON_HOPPER, reason="runs the Mosaic mainloop compiled, on an H100")
+@pytest.mark.gpu(reason="runs the Mosaic mainloop compiled, on an H100")
+@pytest.mark.parametrize("family", HOOKLESS_FAMILIES)
+def test_the_mosaic_two_launch_backward_is_finite_where_the_reference_is_at_fp32s_edges(family):
+    """The Mosaic backward in two launches (`TWO_LAUNCHES`), deterministic mode's for a hookless call, whose
+    derived backward is one launch (`test_the_mosaic_mainloops_default_is_finite_…`), finite in the default
+    form over every family it takes (`_default_is_finite`)."""
+    _default_is_finite(family, "mosaic two launches")
 
 
 GPU_TRITON_FAMILIES = ("a small weight on a large value, bfloat16",)

@@ -319,9 +319,9 @@ def lookup(table: np.ndarray, index: Stored) -> Stored:
     return np.take(table, index, axis=0)
 
 
-_NUMPY_DTYPED = frozenset({np.concatenate, np.stack, np.hstack, np.vstack, np.append, np.where, np.dot,
-                           np.vdot, np.inner, np.outer, np.tensordot, np.einsum, np.kron, np.clip, np.sum,
-                           np.prod, np.cumsum, np.cumprod, np.mean})
+_NUMPY_DTYPED: frozenset[Callable[..., Operand]] = frozenset({
+    np.concatenate, np.stack, np.hstack, np.vstack, np.append, np.where, np.dot, np.vdot, np.inner, np.outer,
+    np.tensordot, np.einsum, np.kron, np.clip, np.sum, np.prod, np.cumsum, np.cumprod, np.mean})
 """The NumPy functions whose result dtype NumPy's promotion or accumulation decides, which JAX's lattice
 does not follow (an int32 beside a float32 is float64 in NumPy's, float32 in JAX's; an int32 sum is int64),
 and which no operand's shape decides: NumPy answers it on stand-ins of ones of each array operand's rank

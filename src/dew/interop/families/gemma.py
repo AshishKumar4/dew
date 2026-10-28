@@ -58,6 +58,22 @@ def _trailing_sharers(hf_config: Mapping[str, object], layers: int, default: int
     return tuple(range(layers - count, layers)) or None
 
 
+_SHARED_UNUSED = ('k_proj', 'v_proj', 'k_norm')
+"""A kv-shared layer's own key and value projections and key norm, which transformers builds and a
+release may store (google/gemma-4-E4B-it @ee0ef60 does, layers 24-41) but never computes with: the
+layer reads its provider's keys and values (modeling_gemma4.py, Gemma4TextAttention.forward)."""
+
+
+def _shared_unused(name: str, config: Mapping[str, object]) -> bool:
+    """Whether `name` is one of a kv-shared layer's unused tensors (`_SHARED_UNUSED`), which a load
+    leaves unplaced and a save writes back as stored."""
+    parts = name.split('.')
+    sharing = config.get('kv_shared_layers') or ()
+    return (len(parts) == 6 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
+            and parts[3] == 'self_attn' and parts[4] in _SHARED_UNUSED and parts[5] == 'weight'
+            and isinstance(sharing, (tuple, list)) and int(parts[2]) in sharing)
+
+
 def _gemma_layer_types(hf_config: Mapping[str, object], used: set[str], *,
                        last_full: bool = False) -> tuple[str, ...]:
     period = 6
@@ -261,8 +277,11 @@ def _gemma3n_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
     Gemma 3n adds the AltUp and LAuReL leaves beside a Gemma 4 style layer.
     The copies' projections are indexed modules (altup_projections.{i}), which
     land as altup_projections_{i} the way the layers do; the coefficient maps
-    are Linears, so they transpose like any kernel.
+    are Linears, so they transpose like any kernel. A kv-shared layer's unused
+    keys, values and key norm land nowhere (`_shared_unused`).
     """
+    if _shared_unused(name, config):
+        return None
     parts = name.split('.')
     if len(parts) == 4 and parts[0] == 'model' and parts[2].isdigit() and parts[3] == 'weight' \
             and parts[1] in ('altup_projections', 'altup_unembed_projections'):
@@ -536,6 +555,11 @@ _GEMMA4_MOE: dict[tuple[str, ...], tuple[str, ...]] = {
 
 
 def gemma4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+    """The variables-tree path of one Gemma 4 tensor: its routed branch's (`_GEMMA4_MOE`), its layer
+    scalar's collection, the shared names' otherwise; a kv-shared layer's unused keys, values and key
+    norm land nowhere (`_shared_unused`)."""
+    if _shared_unused(name, config):
+        return None
     parts = name.split('.')
     if len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit():
         tail = tuple(parts[3:])

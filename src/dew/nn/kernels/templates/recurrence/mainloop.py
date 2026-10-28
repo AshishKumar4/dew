@@ -56,7 +56,8 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn import precision
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
-from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90
+from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90, resources
+from dew.nn.kernels.templates.gemm import cost
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs the mainloop by off a GPU of a family it claims (a CPU): wgmma's,
@@ -486,8 +487,8 @@ class _Held:
     phases: Sequence = ()
 
     def registers(self, family: mosaic.Family) -> int:
-        """A consumer thread's registers at the program's peak (`mosaic.live_registers`)."""
-        return mosaic.live_registers(family, self.carried, *self.phases)
+        """A consumer thread's registers at the program's peak (`resources.live_registers`)."""
+        return resources.live_registers(family, self.carried, *self.phases)
 
 
 def _f32(rows: int, columns: int) -> tuple:
@@ -520,9 +521,10 @@ class Launch:
     """A launch as planned (`planned`): its name (`recurrence_states`, ...), its programs and each one's
     threads (its bundle's warpgroups, `Family.warpgroups`), the shared memory a program allocates (its
     streams' slots and barriers and its staging tiles, as its bundle declares them), the registers a consumer
-    thread holds at its program's peak (`mosaic.live_registers` of the tiles it states), its steps, the
-    chunks in flight, the bytes a step streams in, a program's tensor FLOPs and exponentials, and the bytes
-    it reads and writes in global memory."""
+    thread holds at its program's peak (`resources.live_registers` of the tiles it states), its steps, the
+    chunks in flight, the bytes a step streams in, a program's tensor FLOPs and exponentials, the bytes it
+    reads and writes in global memory, and the programs a multiprocessor holds of it at once
+    (`resources.plan`)."""
 
     name: str
     programs: int
@@ -535,44 +537,27 @@ class Launch:
     flops: float
     exponentials: float
     device_bytes: int
+    resident: int = 1
 
 
 _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned", default=None)
 """Where `planned` collects its launches; None where they run."""
 
 
-def _allocated(family: mosaic.Family, *allocations, reduces: bool = True, after: tuple = ()) -> int:
-    """The bytes of shared memory a program of `allocations` takes, as Mosaic GPU's resource estimate counts
-    them (`mosaic.allocated`, `mosaic.BARRIER_BYTES`): each tile's (a ring's stages one tile), a pipelined
-    family's streams' stages of each tile (`mosaic_sm80.Pipeline`, which `emit_pipeline` allocates in its
-    walk's own scope: a program's walks one after another, the largest of them; an A100's states launch
-    asked for 16 KiB less than their sum, its memory entered beside its chunks), each barrier's, and where
-    the program `reduces`, the scratch the family's compiler parameters reserve for a reduction across warps
-    (`Family.reduction_scratch`), which the estimate takes for a kernel with any reduction and none without
-    (an A100's solve launch asked for its tiles' 90112 bytes alone, SE-family-a100-0c8018352). Tiles a
-    program scopes `after` its walks, each `(shape, dtype)`, take the larger of them and the walks' on a
-    family that scopes its walks apart (`_walks_scoped`), else their sum."""
-    barrier, tile = (plgpu.Barrier, plgpu.ClusterBarrier), type(plgpu.SMEM((1,), jnp.float32))
-
-    def leaf(x) -> bool:
-        return isinstance(x, (*barrier, tile, mosaic_sm80.Pipeline))
-
-    sizes, pipelines, barriers = [], [0], 0
-    for x in jax.tree.leaves(allocations, is_leaf=leaf):
+def _scope(*allocations, reduces: bool = True, after: tuple = ()) -> resources.Scope:
+    """A program's allocations by lifetime (`resources.Scope`, whose bytes `resources.shared_bytes` counts as
+    Mosaic GPU's resource estimate does): a pipelined family's streams (`mosaic_sm80.Pipeline`, which
+    `emit_pipeline` allocates in its walk's own scope, each its stages of each tile) its walks, every other
+    tile and barrier the program's, the tiles it scopes `after` its walks (`_final_landing`), and whether it
+    `reduces` across warps: Mosaic GPU reserves the reduction scratch for a kernel with any reduction and none
+    without (an A100's solve launch asked for its tiles' 90112 bytes alone, SE-family-a100-0c8018352)."""
+    walks, program = [], []
+    for x in jax.tree.leaves(allocations, is_leaf=lambda x: isinstance(x, mosaic_sm80.Pipeline)):
         if isinstance(x, mosaic_sm80.Pipeline):
-            pipelines.append(mosaic.allocated(*(x.stages * math.prod(shape) * jnp.dtype(dtype).itemsize
-                                                for shape, dtype in x.blocks.values())))
-        elif isinstance(x, barrier):
-            barriers += math.prod(np.atleast_1d(x.num_barriers))
-        elif isinstance(x, tile):
-            sizes.append(math.prod(x.shape) * jnp.dtype(x.dtype).itemsize)
-    scoped = [math.prod(shape) * jnp.dtype(dtype).itemsize for shape, dtype in after]
-    if _walks_scoped(family):
-        pipelines += [mosaic.allocated(size) for size in scoped]
-    else:
-        sizes += scoped
-    scratch = [family.reduction_scratch] if reduces and family.reduction_scratch else []
-    return mosaic.allocated(*sizes, *scratch) + max(pipelines) + mosaic.BARRIER_BYTES * barriers
+            walks.append(tuple(plgpu.SMEM((x.stages, *shape), dtype) for shape, dtype in x.blocks.values()))
+        else:
+            program.append(x)
+    return resources.Scope(program=tuple(program), walks=tuple(walks), after=tuple(after), reduces=reduces)
 
 
 def _inverse_flops() -> float:
@@ -601,18 +586,11 @@ def _memory_landing(call: _Call, bv: int) -> dict:
     return {f"memory{i}": call.memories.landing(call.block, bv) for i in range(call.width // call.block)}
 
 
-def _walks_scoped(family: mosaic.Family) -> bool:
-    """Whether `family` scopes each walk's streams apart (`mosaic_sm80.Pipeline`, which `emit_pipeline`
-    allocates): a tile scoped after a walk takes the larger of the two, and its stores, copied out through
-    registers, finish when they return (`mosaic_sm80.Mma.stored`), nothing in flight."""
-    return isinstance(family, mosaic_sm80.Mma)
-
-
 def _landing_keys(landing: dict, family: mosaic.Family) -> dict:
     """Each store's landing tile by name (`_landed`'s keys): its own, or on a family whose stores finish when
-    they return (`_walks_scoped`) one a shape and dtype, its stores' in turn: an A100's states launch held
-    three 4 KB tiles of one form, which kept its walk one stage deep (two needed 15 KB less)."""
-    shared = _walks_scoped(family)
+    they return (`Family.walks_scoped`) one a shape and dtype, its stores' in turn: an A100's states launch
+    held three 4 KB tiles of one form, which kept its walk one stage deep (two needed 15 KB less)."""
+    shared = family.walks_scoped
     return {name: f"{shape}-{jnp.dtype(dtype).name}" if shared else name
             for name, (shape, dtype) in landing.items()}
 
@@ -626,37 +604,41 @@ def _landed(landing: dict, family: mosaic.Family) -> dict:
     return {keys[name]: plgpu.SMEM(shape, dtype) for name, (shape, dtype) in landing.items()}
 
 
-def held_programs(family: mosaic.Family, target: generation.GpuTarget, shared: int) -> int:
-    """The programs of a launch staging `shared` bytes a multiprocessor of `target` holds at once: the most
-    its registers hold (`Family.programs`, at a thread's whole registers: ptxas's count passes the stated,
-    an H100's states launch's 138 registers against 123, which held it to one program a multiprocessor,
-    SE-family-h100-8def67e3e) whose shares of its shared memory each hold one (`mosaic.program_shared`),
-    at least one."""
-    budget = generation.shared_budget(target)
-    return next((programs for programs in range(family.programs(1), 1, -1)
-                 if shared <= mosaic.program_shared(budget, programs)), 1)
+def _planned_launch(call: _Call, scope: Callable[[int], resources.Scope], registers: int, *, floor: int,
+                    most: int) -> resources.LaunchPlan:
+    """A launch's ring depth and the programs a multiprocessor holds of it (`resources.plan`, at its stated
+    `registers` and its streams `scope`d at each depth from `floor` to `most`), or where it holds at none (a
+    config past the device, which `template.Mosaic.legal` refuses) one stage and one program."""
+    found = resources.plan([resources.Launch(scope, 1, registers, floor=floor, most=most)], call.family,
+                           call.target)
+    if found:
+        return found[0]
+    return resources.LaunchPlan(floor, 1, resources.shared_bytes(call.family, scope(floor)))
 
 
-def _persisted(call: _Call, blocks: dict, staging: tuple, tiles: int, *, reduces: bool) -> tuple[int, int]:
-    """A persistent launch's `(stages, programs)`: as many programs as the device's multiprocessors hold at
-    once (`held_programs`; `Family.persist`), at most its
-    `tiles`, and its streams' rings two deep where they run on (`mosaic.RingFamily`'s) and a multiprocessor
-    holds as many programs two deep as one, so a tile's loads go out under the last tile's work: a launch of
+def _laid(call: _Call, scope: Callable[[int], resources.Scope], registers: int, tiles: int, *,
+          stages: int | None) -> tuple[resources.LaunchPlan, int]:
+    """A launch's plan and its programs: a persistent launch's (`stages` None) as many as a multiprocessor
+    holds at once, at most its `tiles`, its rings two deep where they run on (`mosaic.RingFamily`'s) and two
+    deep hold as many programs as one, so a tile's loads go out under the last tile's work: a launch of
     one-step tiles whose program holds a multiprocessor's registers alone (each launch's 255 registers a
-    thread an H100 holds one of, long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d). An
-    A100's launches held one program each, a quarter of the warps fla's held, with registers for two
-    (SE-family-a100-8c5b5b16a)."""
-    family = call.family
+    thread an H100 holds one of, long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d; an
+    A100's launches held one program each, a quarter of the warps fla's held, SE-family-a100-8c5b5b16a);
+    any other a program a tile at its `stages`."""
+    if stages is None:
+        most = 2 if isinstance(call.family, mosaic.RingFamily) else 1
+        found = _planned_launch(call, scope, registers, floor=1, most=most)
+        return found, min(tiles, (call.target.multiprocessors or 1) * found.programs)
+    return _planned_launch(call, scope, registers, floor=stages, most=stages), tiles
 
-    def shared(depth: int) -> int:
-        return _allocated(family, {"walked": family.streams(blocks, depth, 1)}, staging, reduces=reduces)
 
-    def holding(depth: int) -> int:
-        return held_programs(family, call.target, shared(depth))
-
-    stages = 2 if (isinstance(family, mosaic.RingFamily) and shared(2) <= family.most_shared
-                   and holding(2) == holding(1)) else 1
-    return stages, min(tiles, (call.target.multiprocessors or 1) * holding(stages))
+def _stated(work: Work, tiles: int, arrays, out_type) -> pl.CostEstimate:
+    """A launch's work over its `tiles` as it states it to XLA and to Dew's FLOP count
+    (`templates.gemm.cost`): the model's products (an fp32 call's parts aside), its exponentials, and its
+    operands' and outputs' bytes once (row 1895's kernel report: unstated, the recurrence made MFU a lower
+    bound)."""
+    stated = cost(int(work.flops * tiles), *arrays, *jax.tree.leaves(out_type))
+    return dataclasses.replace(stated, transcendentals=int(work.exponentials * tiles))
 
 
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int, live,
@@ -671,9 +653,9 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     Where `planned` collects launches, the launch's record instead (`Launch`, its `work`), and zeros.
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
-    once, its streams' rings running on across them (`_persisted`); its program gives its tile's walk
+    once, its streams' rings running on across them (`_planned_launch`); its program gives its tile's walk
     (`_walk`) for the grid's indices `_axis` reads. A program that `reduces` none takes no reduction scratch
-    (`_allocated`; the compile gate holds its plan's shared memory to at least the compiled kernel's).
+    (`_scope`; the compile gate holds its plan's shared memory to at least the compiled kernel's).
     `after` are the `(shape, dtype)` tiles its program scopes after its walks (`_final_landing`), which its
     plan counts beside them as its family scopes them."""
     family = call.family
@@ -681,15 +663,21 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     staging = (*staging, landed)
     tiles = math.prod(grid)
     threads = 128 * family.warpgroups(1)
-    if persistent:
-        stages, programs = _persisted(call, blocks, staging, tiles, reduces=reduces)
-    else:
-        programs = tiles
-    # The walked streams and those loaded once, each its own allocation (a pipelined family's stages are
-    # its allocation's), which a program opens with their views by name ('walked', 'once').
-    streams = {"walked": family.streams(blocks, stages, 1)}
-    if once:
-        streams["once"] = family.streams(once, 1, 1)
+
+    def allocations(depth: int) -> dict:
+        # The walked streams and those loaded once, each its own allocation (a pipelined family's stages are
+        # its allocation's), which a program opens with their views by name ('walked', 'once').
+        opened = {"walked": family.streams(blocks, depth, 1)}
+        if once:
+            opened["once"] = family.streams(once, 1, 1)
+        return opened
+
+    def scope(depth: int) -> resources.Scope:
+        return _scope(allocations(depth), staging, reduces=reduces, after=after)
+
+    found, programs = _laid(call, scope, held.registers(family), tiles, stages=None if persistent else stages)
+    stages = found.stages
+    streams = allocations(stages)
     name = f"recurrence{program.__qualname__.split('.')[0]}"
     collected = _PLANNED.get()
     if collected is not None:
@@ -700,11 +688,9 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             # A persistent program's work is its tiles' (`work` is a tile's), the most any program takes.
             each = -(-tiles // programs)
             flops = work.flops * _products(call.held.parts) * each
-            collected.append(Launch(name, programs, threads,
-                                    _allocated(family, streams, staging, reduces=reduces, after=after),
-                                    held.registers(family),
-                                    work.steps * each, stages, stepped, flops, work.exponentials * each,
-                                    moved))
+            collected.append(Launch(name, programs, threads, resources.shared_bytes(family, scope(stages)),
+                                    held.registers(family), work.steps * each, stages, stepped, flops,
+                                    work.exponentials * each, moved, found.programs))
             return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
 
         return recorded
@@ -765,11 +751,13 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
 
     entry.__name__ = name
 
-    if persistent:
-        return family.kernel(entry, out_type=out_type, grid=(programs,), grid_names=("programs",),
-                             consumers=1, interpret=call.interpret)
-    return family.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names, consumers=1,
-                         interpret=call.interpret)
+    def launched(*arrays):
+        laid = ({"grid": (programs,), "grid_names": ("programs",)} if persistent
+                else {"grid": grid, "grid_names": grid_names})
+        return family.kernel(entry, out_type=out_type, **laid, consumers=1, interpret=call.interpret,
+                             name=name, cost=_stated(work, tiles, arrays, out_type))(*arrays)
+
+    return launched
 
 
 def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callable | None = None):
@@ -1154,11 +1142,11 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
 
 def _final_landing(call: _Call, bv: int) -> tuple[dict, tuple]:
     """`_sequence_walk`'s final memory's landing, a key slice `[block, bv]` fp32: `(landing, after)`, the
-    launch's own tile (`landing['final']`) where its family's walks share its scope (`_walks_scoped`), else
-    one the walk scopes after it (`after`, `_kernel`'s), which takes no more than the walk's tiles: an A100's
-    states launch then holds two stages at two programs a multiprocessor."""
+    launch's own tile (`landing['final']`) where its family's walks share its scope, else one the walk
+    scopes after it (`after`, `_kernel`'s; `Family.walks_scoped`), which takes no more than the walk's
+    tiles: an A100's states launch then holds two stages at two programs a multiprocessor."""
     final = ((call.block, bv), jnp.float32)
-    return ({}, (final,)) if _walks_scoped(call.family) else ({"final": final}, ())
+    return ({}, (final,)) if call.family.walks_scoped else ({"final": final}, ())
 
 
 def _gated_write(call: _Call, corrected, loaded, prefix: tuple, last, head) -> tuple:
