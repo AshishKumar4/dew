@@ -225,8 +225,11 @@ class Pretrained:
     It is used by a bundle that has no source processor to write (`from_model`).
     """
     code: Path | None = None
-    """The directory of the source's own Python modules a load ran (`trust_remote_code`), which `save`
-    writes beside the weights: the source's snapshot, which a weights conversion may not be."""
+    """The directory of the source's own Python modules, which `save` writes beside the weights: the
+    modules a load ran (`trust_remote_code`), or, of a source Dew maps natively whose config names its
+    own code (`auto_map`), the modules that names, kept unexecuted, so a save opens through the source's
+    own transformers loader as the source does. The source's snapshot, which a weights conversion may not
+    be."""
     names_tokenizer: ClassVar[bool] = True
     """Whether generation_config.json may record the tokenizer's name.
 
@@ -680,10 +683,12 @@ class PretrainedDecoder(Pretrained):
         # and `export` refuses the blocks themselves.
         config = decoders.export_config(decoder.with_cross_attention(None))
         built = record_fields(decoder, CausalTransformer)
+        released = decoders.release_code(decoder)
         return cls(decoder, variables, None, config, None, built,
                    {**decoders.GENERATION_DEFAULTS, 'use_cache': config.get('use_cache', decoder.causal)}
                    if generation_config is None else generation_config,
-                   export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer)
+                   export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer,
+                   code=None if released is None else sources.release_code(released))
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """Build the text generation task this source describes.
@@ -1240,6 +1245,16 @@ def _unread_overrides(overrides: Mapping[str, object] | None, route: str) -> Non
     """Refuse `overrides` on a route whose model no override reaches, rather than load without them."""
     if overrides is not None:
         raise ValueError(f"modeling_overrides reach a model Dew translates; {route} reads none")
+
+
+def _kept_code(route: SourceRoute, remote: Path | None, config: Mapping[str, object],
+               name_or_dir: str | Path, directory: Path) -> Path | None:
+    """The directory of the source's own modules a bundle keeps for `save` (`Pretrained.code`): those a
+    verification from parts ran, or, of a natively mapped source whose config names its own code
+    (`auto_map`), that code at the snapshot's commit, fetched and never run; None for any other."""
+    if isinstance(route, VerifiedRoute):
+        return remote if route.verified.source is not None else None
+    return sources.remote_code(name_or_dir, directory) if config.get("auto_map") else None
 
 
 def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
@@ -1983,9 +1998,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                     # The weights' commit: a pickle repo's may be its conversion's.
                     revision=resolved_commit,
                     tokenizer="byte" if named == "byte" else None,
-                    # The modules a verification from parts ran, from the source's own snapshot.
-                    code=remote if isinstance(route, VerifiedRoute) and route.verified.source is not None
-                    else None)
+                    code=_kept_code(route, remote, config, name_or_dir, directory))
 
     if family == "diffusion_gemma":
         return bundle(PretrainedBlockDecoder), False

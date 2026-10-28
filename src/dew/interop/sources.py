@@ -19,6 +19,7 @@ import os
 from collections.abc import Collection
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import jax
 import numpy as np
@@ -36,6 +37,9 @@ from dew.interop.safetensors_io import (
     weight_files,
 )
 from dew.interop.unread import Unread, unread
+
+if TYPE_CHECKING:
+    from dew.interop.decoder_parts import ReleaseCode
 
 
 def load_shards(directory: Path) -> dict[str, np.ndarray]:
@@ -182,6 +186,16 @@ def remote_code(name_or_dir: str | Path, directory: Path) -> Path:
 
         snapshot_download(str(name_or_dir), revision=directory.name, allow_patterns=["*.py"])
     return directory
+
+
+def release_code(code: ReleaseCode) -> Path:
+    """The directory holding a release's own modules (`ReleaseCode`) at its pinned commit, each fetched
+    through the hub's cache, which a cached commit's file is read from without the network: the snapshot
+    `PretrainedDecoder.from_model` writes beside an export."""
+    from huggingface_hub import hf_hub_download
+
+    fetched = [Path(hf_hub_download(code.repo, file, revision=code.revision)) for file in code.files]
+    return fetched[0].parent
 
 
 def repo_file(name_or_dir: str | Path, directory: Path, filename: str) -> Path:

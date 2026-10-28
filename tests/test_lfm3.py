@@ -14,12 +14,29 @@ from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained
+from dew.interop.families.lfm3 import LFM3
 
 TINY = Path(__file__).parent / 'fixtures' / 'hf' / 'lfm3-tiny'
 
 
 def fixture(name: str) -> np.ndarray:
     return np.load(TINY / f'{name}.npy')
+
+
+@pytest.fixture
+def release_cache(tmp_path, monkeypatch) -> Path:
+    """The hub's cache seeded with stand-ins for LFM3's release modules at the commit Dew is held to
+    (`DecoderFamily.release_code`), which a native export reads from it without the network: the
+    snapshot directory. The network test fetches the release's own."""
+    import huggingface_hub.constants
+
+    code = LFM3.release_code
+    snapshot = tmp_path / 'hub' / f"models--{code.repo.replace('/', '--')}" / 'snapshots' / code.revision
+    snapshot.mkdir(parents=True)
+    for file in code.files:
+        (snapshot / file).write_text(f'# {file} at {code.revision}\n')
+    monkeypatch.setattr(huggingface_hub.constants, 'HF_HUB_CACHE', str(tmp_path / 'hub'))
+    return snapshot
 
 
 def test_the_text_decoder_computes_the_remote_codes_logits():
@@ -61,7 +78,7 @@ def test_a_saved_decoder_writes_the_releases_tensors_back(tmp_path):
 
 
 @pytest.mark.parametrize('sandwich', [True, False], ids=['sandwich', 'plain'])
-def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, sandwich):
+def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, sandwich, release_cache):
     """A model built in Dew (`PretrainedDecoder.from_model`) is an LFM3 by its convolution kind, ahead of
     the families that match its gated attention or its sliding layers, and saves a config and tensors
     that load back to it, its logits bit for bit, with sandwich norms or without and with its full and
@@ -169,3 +186,54 @@ def test_the_released_lfm3_vl_and_d1_headers_load_their_language_model_or_refuse
     with pytest.raises(ValueError):
         Pretrained.load('LiquidAI/d1-2B', revision='cfe5760ff5d5998f91d9ac56bd4b2dbd96996d41', weights=False,
                         text_only=True)
+
+
+def test_a_saved_remote_code_release_keeps_the_modules_its_auto_map_names(tmp_path):
+    """A release whose config names its own code (`auto_map`), which Dew maps natively and never runs,
+    saves those modules beside its config, which keeps the auto_map: the directory opens through the
+    release's own transformers loader as the release does (ledger 2038). The modules here stand in for
+    the release's, which the network test fetches."""
+    import shutil
+
+    source = tmp_path / 'release'
+    shutil.copytree(TINY, source)
+    config = json.loads((source / 'config.json').read_text())
+    code = LFM3.release_code
+    (source / 'config.json').write_text(json.dumps({**config, 'auto_map': dict(code.auto_map)}))
+    for file in code.files:
+        (source / file).write_text(f'# {file} of the release\n')
+    loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
+    loaded.save(tmp_path / 'saved')
+    assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['auto_map'] == dict(code.auto_map)
+    for file in code.files:
+        assert (tmp_path / 'saved' / file).read_text() == (source / file).read_text()
+
+
+def test_a_native_export_writes_its_familys_release_code_beside_itself(tmp_path, release_cache):
+    """A model built in Dew of a family whose reference is a release's own code (`release_code`) exports
+    with that release's auto_map and its modules at the commit Dew is held to, fetched through the hub's
+    cache, so transformers opens the export with that code (ledger 2038)."""
+    from dew.interop import PretrainedDecoder
+
+    code = LFM3.release_code
+    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / 'saved')
+    assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['auto_map'] == dict(code.auto_map)
+    for file in code.files:
+        assert (tmp_path / 'saved' / file).read_text() == (release_cache / file).read_text()
+
+
+@pytest.mark.network
+def test_a_native_export_fetches_its_familys_release_code_at_its_commit(tmp_path):
+    """The network's half of `test_a_native_export_writes_its_familys_release_code_beside_itself`: the
+    release's own modules, fetched at the commit, written beside the export."""
+    from huggingface_hub import hf_hub_download
+
+    from dew.interop import PretrainedDecoder
+
+    code = LFM3.release_code
+    loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / 'saved')
+    for file in code.files:
+        fetched = Path(hf_hub_download(code.repo, file, revision=code.revision))
+        assert (tmp_path / 'saved' / file).read_bytes() == fetched.read_bytes()

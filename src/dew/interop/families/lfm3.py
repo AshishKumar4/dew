@@ -20,6 +20,7 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Leaves,
+    ReleaseCode,
     Renames,
     Ropes,
     base_config,
@@ -199,6 +200,11 @@ LFM3 = DecoderFamily(
     preserve_source_layout=True,
     padding_idx=True,
     aliases={'norm_eps': 'rms_norm_eps'},
+    release_code=ReleaseCode(
+        'LiquidAI/LFM3-1.7B', '40ebe0aa6662c9d40389c2f5d565b6a2c6aebacd',
+        ('configuration_lfm3.py', 'modeling_lfm3.py', 'lfm3_conv.py'),
+        {'AutoConfig': 'configuration_lfm3.Lfm3Config', 'AutoModel': 'modeling_lfm3.Lfm3Model',
+         'AutoModelForCausalLM': 'modeling_lfm3.Lfm3ForCausalLM'}),
     # Lfm3Config's defaults for the fields its decoder reads (configuration_lfm3.py).
     defaults={'conv_L_cache': 7, 'conv_bias': False, 'use_sandwich_norm': True, 'sliding_window': 256,
               'tie_word_embeddings': True, 'max_position_embeddings': 128000, 'rms_norm_eps': 1e-5,

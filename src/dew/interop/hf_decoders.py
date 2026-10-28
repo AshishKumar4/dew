@@ -48,6 +48,7 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Reading,
+    ReleaseCode,
     WrapperFields,
     _unread,
     held_parts,
@@ -1056,6 +1057,8 @@ def export_config(model) -> Mapping[str, object]:
     config: dict[str, object] = {
         'model_type': family.export_model_type,
         'architectures': [family.architecture],
+        # The release's own code, which `PretrainedDecoder.from_model` writes beside the export.
+        **({} if family.release_code is None else {'auto_map': dict(family.release_code.auto_map)}),
         'hidden_size': model.emb_features,
         'num_hidden_layers': model.num_layers,
         'num_attention_heads': model.num_heads,
@@ -1250,6 +1253,12 @@ def family_entry(family: str | DecoderFamily) -> DecoderFamily:
 
 def _family_of(fields: CausalTransformer) -> DecoderFamily:
     return next(family for family in ENTRIES if family.matches(fields))
+
+
+def release_code(model: CausalTransformer) -> ReleaseCode | None:
+    """The release whose own code is the exported family's reference (`DecoderFamily.release_code`),
+    or None for a family transformers implements."""
+    return _family_of(model).release_code
 
 
 def _family_for_config(config: Mapping[str, object]) -> DecoderFamily:
