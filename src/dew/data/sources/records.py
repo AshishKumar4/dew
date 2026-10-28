@@ -48,6 +48,8 @@ class ShardReaders[K]:
     _registry = threading.Lock()
     _clock = itertools.count()
     _trimming = threading.Lock()
+    # Whether a read asked for a trim no pass has made since (`_trim`), under `_registry`.
+    _requested = False
     # The idle readers every source holds open together, which `_trim` brings back to the bound:
     # counted as each falls idle, is read again or closes, so a read that leaves the process within
     # it scans nothing.
@@ -112,37 +114,53 @@ class ShardReaders[K]:
     def _trim(cls) -> None:
         """Close the least recently read idle readers of every source in the process past the bound
         one source keeps (`_MAX_OPEN_SHARDS`), as a read leaves more idle than that. It waits on no
-        lock: where another read is trimming, that one trims, and a source whose lock is held, a read
-        opening one of its shards say, is passed over, its idle readers trimmed as one of its reads
-        drains. So no read waits on a source it does not read."""
-        if not cls._trimming.acquire(blocking=False):
-            return
-        try:
+        lock: where another read is trimming, it asks that one to trim again (`_requested`), which
+        it does before it lets go, and a source whose lock is held, a read opening one of its shards
+        say, is passed over, its idle readers trimmed as one of its reads drains. So no read waits on
+        a source it does not read, and no request is lost to a trim already past it."""
+        with cls._registry:
+            cls._requested = True
+        while cls._trimming.acquire(blocking=False):
+            try:
+                while True:
+                    with cls._registry:
+                        if not cls._requested:
+                            break
+                        cls._requested = False
+                        live = list(cls._live)
+                    cls._closed_past_bound(live)
+            finally:
+                cls._trimming.release()
+            # A request made between the last look and the release is this read's to serve.
             with cls._registry:
-                live = list(cls._live)
-            idle = []
-            for readers in live:
-                if not readers._lock.acquire(blocking=False):
-                    continue
-                try:
-                    idle.extend((opened.used, id(readers), key, readers)
-                                for key, opened in readers._opened.items() if not opened.reads)
-                finally:
-                    readers._lock.release()
-            idle.sort(key=lambda entry: entry[:2])
-            for _, _, key, readers in idle[:max(0, len(idle) - _MAX_OPEN_SHARDS)]:
-                if not readers._lock.acquire(blocking=False):
-                    continue
-                try:
-                    opened = readers._opened.get(key)
-                    if opened is not None and not opened.reads:
-                        readers._opened.pop(key).reader.close()
-                        cls._idled(-1)
-                        readers._lock.notify_all()
-                finally:
-                    readers._lock.release()
-        finally:
-            cls._trimming.release()
+                if not cls._requested:
+                    return
+
+    @classmethod
+    def _closed_past_bound(cls, live: Sequence[ShardReaders]) -> None:
+        """The trim's pass over `live`'s sources (`_trim`): their idle readers past the bound closed,
+        the least recently read first, each source's lock taken only where it is free."""
+        idle = []
+        for readers in live:
+            if not readers._lock.acquire(blocking=False):
+                continue
+            try:
+                idle.extend((opened.used, id(readers), key, readers)
+                            for key, opened in readers._opened.items() if not opened.reads)
+            finally:
+                readers._lock.release()
+        idle.sort(key=lambda entry: entry[:2])
+        for _, _, key, readers in idle[:max(0, len(idle) - _MAX_OPEN_SHARDS)]:
+            if not readers._lock.acquire(blocking=False):
+                continue
+            try:
+                opened = readers._opened.get(key)
+                if opened is not None and not opened.reads:
+                    readers._opened.pop(key).reader.close()
+                    cls._idled(-1)
+                    readers._lock.notify_all()
+            finally:
+                readers._lock.release()
 
     def close(self) -> None:
         """Close every idle reader, retiring busy ones until their reads drain."""

@@ -881,3 +881,43 @@ def test_a_mix_repeated_whole_goes_on_counting_each_corpus_on_its_second_pass():
     assert (metrics["data/rows/a"], metrics["data/rows/b"]) == (8, 8)
     # Every counter its stages keep goes on, the filter's rejections as the rows it delivered.
     assert (metrics["data/rejected/a/third"], metrics["data/rejected/b/third"]) == (4, 4)
+
+
+def counted_source(name: str):
+    """Six records of corpus `name`, a third of them rejected (`reject_thirds`)."""
+    return from_grain(grain.MapDataset.source([{"i": np.int32(index)} for index in range(6)]), name
+                      ).filter_map(reject_thirds)
+
+
+def test_a_nested_mix_repeated_whole_goes_on_counting_every_corpus_on_its_second_pass():
+    """A mix whose first member is itself a mix, repeated whole: on its second pass each corpus, at
+    either level, goes on counting from the first pass's counts, rows and rejections alike (row
+    2059). Before, the inner mix's corpora, rewound past a parent the outer mix had not opened, lost
+    the first pass's counts."""
+    chain = mix([mix([counted_source("a"), counted_source("b")]), counted_source("c")]).repeat(2)
+    metrics = chain.stats(records=24)
+    assert [metrics[f"data/rows/{name}"] for name in "abc"] == [8, 8, 8]
+    assert [metrics[f"data/rejected/{name}/third"] for name in "abc"] == [4, 4, 4]
+
+
+def test_a_live_mix_restored_to_where_it_opened_no_corpus_counts_none():
+    """A mix read on and then restored, in place, to its start, where it had opened no corpus: its
+    corpora count nothing, as they had counted nothing there. Before, each corpus kept the counts
+    it had reached since, carried into a restore as into a repeat's rewind (row 2059)."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.mixing import state_counts
+
+    data = compile(mix([counted_source("a"), counted_source("b")]).repeat().batch(2), read="streamed",
+                   loading=Loading(workers=0), seed=0)
+    reader = data.train(DataPartition())
+    try:
+        start = reader.get_state()
+        for _ in range(3):
+            next(reader)
+        assert state_counts(reader.get_state())
+        reader.set_state(start)
+        restored = state_counts(reader.get_state())
+        assert all(counts.metrics(name).get(f"data/rows/{name}", 0) == 0 for name, counts in restored.items())
+    finally:
+        reader.close()

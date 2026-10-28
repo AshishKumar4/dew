@@ -375,3 +375,49 @@ def test_a_read_past_the_bound_never_waits_on_another_source_opening_a_shard(arr
         released.set()
         for readers in (*held, late, again):
             readers.close()
+
+
+class Counted:
+    """A shard's reader that says whether it is closed; the one made `slow` closes only once let."""
+
+    def __init__(self, opened: list, slow: tuple[threading.Event, threading.Event] | None = None):
+        self.closed, self.slow = False, slow
+        opened.append(self)
+
+    def __getitem__(self, row: int) -> bytes:
+        return b"row"
+
+    def close(self) -> None:
+        if self.slow is not None:
+            closing, released = self.slow
+            closing.set()
+            assert released.wait(timeout=60)
+        self.closed = True
+
+
+def test_a_trim_asked_for_while_another_trims_is_made_before_the_trimmer_lets_go():
+    """A read that leaves the process past its idle bound while another read's trim is closing a
+    reader asks that trim to go again, which it does before it lets go: once both reads are done the
+    process holds no more idle readers than the bound. Before, the second read's request was dropped
+    and the bound stayed exceeded by the reader it left idle (row 2059)."""
+    from dew.data.sources.records import ShardReaders
+
+    bound, opened = Loading().threads, []
+    closing, released = threading.Event(), threading.Event()
+    first = ShardReaders(lambda key: Counted(opened, (closing, released)))
+    sources = [first, *(ShardReaders(lambda key: Counted(opened)) for _ in range(bound + 1))]
+    try:
+        for readers in sources[:bound]:
+            assert readers.read(0, 0) == b"row"
+        with ThreadPoolExecutor(1) as pool:
+            # Past the bound: this read's trim closes the first source's reader, the least recent.
+            trimming = pool.submit(sources[bound].read, 0, 0)
+            assert closing.wait(timeout=60)
+            assert sources[bound + 1].read(0, 0) == b"row"
+            released.set()
+            assert trimming.result(timeout=60) == b"row"
+        assert sum(not reader.closed for reader in opened) <= bound
+    finally:
+        released.set()
+        for readers in sources:
+            readers.close()
