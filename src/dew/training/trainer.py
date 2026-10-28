@@ -32,6 +32,7 @@ import optax
 from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
+from jax.stages import CompilerOptions
 from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew._coordination import (
@@ -214,6 +215,7 @@ _log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from dew.optim import OptimConfig
     from dew.telemetry.profile import Profiler
+    from dew.training.ahead import AheadOfTime
 
 StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
 """A compiled step's body: the state and the global batch in, the new state,
@@ -254,6 +256,7 @@ class Trainer(Generic[Loss, Effects]):
         rollout: Rollout | None = None,
         profile: ProfileWindow | None = None,
         lower_for: str | None = None,
+        ahead: AheadOfTime | None = None,
         tune_kernels: bool = False,
         record: bool = False,
         links: Mapping[str, Link] | None = None,
@@ -275,7 +278,8 @@ class Trainer(Generic[Loss, Effects]):
         `jax.sharding.Mesh` of any axes, which `layout`'s rules name (`Layout.data_axes` its rows').
         `microbatches` is how many a pipelined step feeds through the mesh's stage axis, a
         multiple of its size; None feeds one a stage. `lower_for`, a CUDA generation, lowers
-        the first step for it in place of compiling it (`dew.training._lowering.Lowered`).
+        the first step for it in place of compiling it (`dew.training._lowering.Lowered`); `ahead`, a
+        step compiled ahead (`dew.training.ahead`), runs as the first step where it is that program.
         `tune_kernels` opts in to the tuner (`dew.nn.kernels.tuning.tune`), else each launch takes its
         derived config. `record` makes each step return in its metrics what each evaluation, replays
         too, sampled or passed as a boundary (`taken_record`).
@@ -304,7 +308,7 @@ class Trainer(Generic[Loss, Effects]):
         self.record = record
         self.records: list[Recorded] = []
         self.profile = profile
-        self.lower_for, self.tune_kernels = lower_for, tune_kernels
+        self.lower_for, self._ahead, self.tune_kernels = lower_for, ahead, tune_kernels
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
         # `fit` keeps them beside each step. The executable is the step as compiled, whose memory analysis a
         # benchmark reads; the program it was lowered from is released with its plan (`Planned.released`).
@@ -435,6 +439,11 @@ class Trainer(Generic[Loss, Effects]):
             with jax.ensure_compile_time_eval():
                 self._key = request_key(self._given_key)
         return self._key
+
+    def reading(self, loader: Loader, prefetch: int = PREFETCH_DEPTH) -> None:
+        """Take `loader`'s device steps, which the step runs on each batch it reads, and the batches to
+        prefetch, as `fit` does before it compiles, and a step compiled ahead (`dew.training.ahead`)."""
+        self._device, self._prefetch = loader.device, prefetch
 
     @functools.cached_property
     def device_mesh(self) -> Mesh:
@@ -940,6 +949,9 @@ class Trainer(Generic[Loss, Effects]):
         if (state.scale is not None) != self.dynamic_scale:
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
         if self.host_master:
+            if self._ahead is not None:
+                raise ValueError("a step compiled ahead runs where the devices hold the state; this "
+                                 "layout keeps the variables on the host")
             return self._compile_host(state, batch)
         mesh = self.device_mesh
         links = self._links(mesh)
@@ -1032,11 +1044,13 @@ class Trainer(Generic[Loss, Effects]):
             lower, lambda candidate: step_options(self.objective, candidate.micro,
                                                   candidate.prepared.variables, mesh),
             self.objective, mesh, self._xla_defaults, self._narrow,
-            None if self._base_rung is None else self._base_rung[1], resumed)
+            None if self._base_rung is None else self._base_rung[1], resumed, ahead=self._ahead)
         plans, probes = search.plans(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
             # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
             frontier=trials is not None and trials.frontier and recorded is None and resumed is None)
+        # Consumed once its first compile took it; a refusal leaves it for the next fit to refuse.
+        self._ahead = search.ahead
         seconds = ([] if trials is None or len(plans) == 1
                    else trials.seconds([self._runner(plan, mesh) for plan in plans]))
         # Every process runs the plan process zero timed clearly faster (`faster`).
@@ -1047,7 +1061,7 @@ class Trainer(Generic[Loss, Effects]):
                                      mesh)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
-        cheaper = self._cheaper(search, planned, recorded, resumed)
+        cheaper = search.advice(planned, recorded, resumed)
         self.validation = self._validation(planned.candidate.prepared)
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
@@ -1061,23 +1075,6 @@ class Trainer(Generic[Loss, Effects]):
         if planned.split != candidates[0] or seconds:
             _log.info("the step fits the devices in the plan %s", self.plan)
         return planned.released(), flops
-
-    @staticmethod
-    def _cheaper(search: FitSearch, planned: Planned, recorded: JSON,
-                 resumed: JSON) -> dict[str, JSON] | None:
-        """The cheaper remat rung the run is told of (`FitSearch.cheaper`): none for a resumed run, which
-        continues its checkpoint's rung; the one a recorded plan's run measured, where the run took that
-        plan, its split and rung, and none where the search moved off it; else measured now."""
-        if resumed is not None:
-            return None
-        if recorded is not None:
-            kept = record(recorded, 'recorded plan')
-            told = json_value(kept.get('cheaper'), 'recorded cheaper rung')
-            plan = {**planned.rung, 'split': planned.split}
-            taken = all(kept.get(field) == value for field, value in plan.items())
-            return told if taken and isinstance(told, dict) else None
-        probe = search.cheaper(planned)
-        return None if probe is None else probe.record()
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
                    split: int, narrow: bool, launches: str | None) -> Candidate:
@@ -1152,15 +1149,17 @@ class Trainer(Generic[Loss, Effects]):
                        out_shardings=(moving, replicated, replicated, replicated, replicated, replicated),
                        donate_argnums=0)
 
-    def _lowered_for(self, state: TrainState, batch: Batch, generation: str, devices: Mesh | None = None
-                     ) -> tuple[jax.stages.Lowered, jax.stages.CompilerOptions | None]:
+    def _lowered_for(self, state: TrainState, batch: Batch, generation: str,
+                     devices: Mesh | None = None) -> tuple[jax.stages.Lowered, CompilerOptions | None]:
         """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered for
         one (`dew.training._lowering`) on this process's devices, and, lowered over `devices`, the
         options its compile there takes (`step_options`). It traces on an abstract mesh of that GPU's
         devices, from which JAX's Pallas lowering reads the GPU, or on `devices`, compile-only GPUs
-        XLA compiles it for (`dew.training.ahead`), at the base rung and the plan's first split: a
-        run that does not fit splits its batch or recomputes more, no other kernel. A CPU-owned
-        state's step realizes its parameters on the host as it runs, and is not lowered."""
+        XLA compiles it for (`dew.training.ahead`), there as the plan's first candidate lowers
+        (`_candidate`), so a run that loads it lowers the same program;
+        at the base rung and the plan's first split: a run that does not fit splits its batch or
+        recomputes more, no other kernel. A CPU-owned state's step realizes its parameters on the host
+        as it runs, and is not lowered."""
         if self.host_master:
             raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
                              "the variables on the host")
@@ -1169,18 +1168,21 @@ class Trainer(Generic[Loss, Effects]):
         with assumed(generation), self._traced_on(mesh) as schedule:
             state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
             split = splits(self._rows, batch, mesh, self.microbatches, self._split)[0]
+            placement = batch_shardings(mesh, batch)
+            replicated = NamedSharding(mesh, P())
+            if devices is not None:
+                candidate = self._candidate(state, placed_shapes(batch, placement), schedule, placement,
+                                            replicated, split, self._narrow, None)
+                return candidate.lowered, step_options(self.objective, candidate.micro,
+                                                       candidate.prepared.variables, devices)
             micro = microbatch_shapes(batch, split)
             shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation)
             shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
                                      self.shardings(prepared))
-            placement = batch_shardings(mesh, batch)
-            replicated = NamedSharding(mesh, P())
             jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
             traced = jitted.trace(*apart(placed_shapes(prepared, shardings)), placed_shapes(batch, placement),
                                   jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated))
-            if devices is None:
-                return traced.lower(lowering_platforms=('cuda',)), None
-            return traced.lower(), step_options(self.objective, micro, prepared.variables, devices)
+            return traced.lower(lowering_platforms=('cuda',)), None
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
@@ -1327,7 +1329,7 @@ class Trainer(Generic[Loss, Effects]):
         loader, held, tokens, steps = run_data(
             self.objective, dataset, handed_splits(validation), steps=steps, epochs=epochs, tokens=tokens,
             examples=examples, accumulation=self.accumulation, startup=self._startup)
-        self._device, self._prefetch = loader.device, device_prefetch
+        self.reading(loader, device_prefetch)
         self._schedule(None if steps is None else steps // self.accumulation)
         plan = self._plan(loader, held, dataset, steps=steps, tokens=tokens,
                           written=(log_every, eval_every, checkpoint_every),
