@@ -12,6 +12,7 @@ and the call's queries and keys pad to whole blocks, which their spans leave unr
 
 import dataclasses
 import functools
+import types
 from collections.abc import Callable, Sequence
 from typing import Literal, overload
 
@@ -100,6 +101,21 @@ def refused(spans: KeySpans, hooks: Hooks | None = None) -> str | None:
         return ("the Triton mainloop is frozen and takes no probability dropout (the route runs a dropping "
                 "call on the reference path, ledger row 1521)")
     return None
+
+
+def unfitted(query: jax.Array, value: jax.Array, *, backward: bool) -> str | None:
+    """Why no config of the forward's (or, `backward`, the backward's) launches fits the GPU's shared memory
+    for a call of `query` and `value`, or None: the route then takes another mainloop rather than a launch
+    that cannot run (`attention_route._mainloop`)."""
+    launch, space = (TritonBackward(), BACKWARD_SPACE) if backward else (TritonForward(), SPACE)
+    target = generation.gpu_target()
+    shapes = types.SimpleNamespace(arguments={"query": query, "value": value})
+    least = min(launch.staged_bytes(shapes, config, target) for config in space)
+    budget = generation.shared_budget(target)
+    if least <= budget:
+        return None
+    return (f"no Triton {'backward' if backward else 'forward'} config fits: the least stages {least} bytes, "
+            f"past the {budget} a block of the GPU holds")
 
 
 def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None):
