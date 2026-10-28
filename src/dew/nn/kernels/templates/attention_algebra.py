@@ -62,8 +62,10 @@ class Forward:
     `initial` state (`raw`), whether natural logits stay `scaled` whatever the scale (`raw`; the fold's
     rewalk, `unfolded`), the call's query count `queries` where a mainloop walks query rows past it
     without spans (a full or causal call padded to whole tiles or whole programs, whose padding rows, a
-    tile's last ones or a whole tile of them, `seen` keeps from every key; None where none does), and
-    whether its walks keep what their running sums' additions drop (`compensated`, `compensates`)."""
+    tile's last ones or a whole tile of them, `seen` keeps from every key; None where none does),
+    whether its walks keep what their running sums' additions drop (`compensated`, `compensates`), and the
+    power of two the queries took before their products (`prescale`, `attention.prescale`), which `scale`
+    is the call's scale over."""
 
     form: str
     keys: int
@@ -76,6 +78,7 @@ class Forward:
     scaled: bool = False
     queries: int | None = None
     compensated: bool = False
+    prescale: float = 1.0
 
     @property
     def raw(self) -> bool:
@@ -103,8 +106,9 @@ class Forward:
         under a query of 1 at scale 0.5 weigh 1 and 0 in the reference and 0.5 each folded, and a
         cotangent of 2**125 then overflows its backward (docs/design/kernel-templates.md, §3, the
         exponent's forms). On drawn inputs both forms pass check 1."""
-        # The factor as the kernel multiplies by it, rounded to fp32.
-        factor = abs(float(np.float32(self.scale * LOG2E)))
+        # The factor as the kernel would multiply the call's own products by it, rounded to fp32: the call's
+        # scale, its products' power of two (`prescale`) times the scale left after it.
+        factor = abs(float(np.float32(self.scale * self.prescale * LOG2E)))
         return not self.natural and self.score_mod is None and factor < 1.0
 
     @property
@@ -354,7 +358,7 @@ def walked[C: (Partial, tuple), O](spec: Forward, walk: Callable[[Forward, jax.A
         return finished(spec, guarded_walk(spec, functools.partial(walked_plain, spec)))
     carry = walk(spec, None)
     state = carry if isinstance(carry, Partial) else carry[0]
-    reach = jnp.max(jnp.where(finite(state.m), jnp.abs(state.m), 0.0))
+    reach = reach_of(state.m)
     natural = unfolded(spec)
 
     def folded() -> C:
@@ -365,6 +369,15 @@ def walked[C: (Partial, tuple), O](spec: Forward, walk: Callable[[Forward, jax.A
 
     return jax.lax.cond(reach >= FOLD_REACH, lambda: finished(natural, unfolded_walk()),
                         lambda: finished(spec, guarded_walk(spec, folded)))
+
+
+def reach_of(maxima: jax.Array) -> jax.Array:
+    """How far a folded walk's row `maxima` reach (`walked`, against `FOLD_REACH`): their largest magnitude,
+    a row that saw no key (-inf) none, and one whose maximum the fold took past fp32's largest, or to no
+    number, past every reach, so the call walks again natural, where its logits are finite (a product near
+    fp32's largest before a small scale, times log2(e))."""
+    reached = jnp.where(jnp.isnan(maxima), jnp.inf, jnp.abs(maxima))
+    return jnp.max(jnp.where(maxima == -jnp.inf, 0.0, reached))
 
 
 type Launch[O] = Callable[[Forward, jax.Array | None], tuple[O, jax.Array, jax.Array]]
@@ -391,7 +404,7 @@ def walked_launches[O](spec: Forward, launch: Launch[O], kept: Callable[[jax.Arr
     outputs, maxima, over = launch(spec, None)
     if not spec.base2:
         return guarded_launch(spec, outputs, over)
-    reach = jnp.max(jnp.where(finite(maxima), jnp.abs(maxima), 0.0))
+    reach = reach_of(maxima)
     natural = unfolded(spec)
 
     def unfolded_launch() -> O:
@@ -1320,7 +1333,8 @@ def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool) -> jax.A
 def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.Array, jax.Array]:
     """The block's residual rows (`finish`'s): the maximum (0 for a query that saw nothing and started from no
     state, as the reference's) in the units the backward recomputes its logits in, natural, or raw products
-    where the forward's are (`Forward.raw`), and the denominator, unshifted (`room`)."""
+    where the forward's are (`Forward.raw`), the products of the query its call's power of two took
+    (`Forward.prescale`), and the denominator, unshifted (`room`)."""
     m = state.m if spec.raw else spec.naturalized(state.m)
     if spec.guarded or initial:
         m = jnp.where(m == -jnp.inf, 0.0, m)
@@ -1584,6 +1598,16 @@ NO_SHIFT = -1024.0
 """The exponent of an empty sum of coefficients (`DqSums.keyed_shift`): below every composed coefficient's
 (a weight's, a scale's and an inverse denominator's exponents together reach about -430), so any tile's
 exponent is the larger, and `power2` of a zero mantissa by it stays zero."""
+
+
+def no_dq_sums(rows: int, width: int, kinds: int) -> DqSums:
+    """A dQ pass's sums before its first key (`DqSums`) over `rows` queries `width` wide and `kinds` HEAD and
+    QUERY hook parameters: zeros, and an empty sum of coefficients (`NO_SHIFT`)."""
+    nothing = jnp.zeros((rows,), jnp.float32)
+    zeros = jnp.zeros((rows, width), jnp.float32)
+    params = (nothing,) * kinds
+    return DqSums(zeros, nothing, nothing, params, params, zeros, nothing,
+                  jnp.full((rows,), NO_SHIFT, jnp.float32))
 
 
 def _split(x: jax.Array) -> tuple[jax.Array, jax.Array]:

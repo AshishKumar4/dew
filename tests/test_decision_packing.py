@@ -2,6 +2,7 @@
 
 import collections
 import copy
+import functools
 import itertools
 from dataclasses import replace
 from pathlib import Path
@@ -65,10 +66,10 @@ def qwen35(length: int) -> Pretrained:
     return Pretrained.load(str(QWEN35), dtype="float32", attention_impl="reference", max_seq_len=length)
 
 
-def attending(length: int) -> CausalTransformer:
-    """A decoder of attention alone, which the parallel layout's pairwise mask needs."""
+def attending(length: int, implementation: str = "xla") -> CausalTransformer:
+    """A decoder of attention alone, which the parallel layout's key runs need, on `implementation`."""
     return CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
-                             max_seq_len=length, attention_impl="xla")
+                             max_seq_len=length, attention_impl=implementation)
 
 
 ROWS = StateFirstLayout(max_len=256, head_max_len=64, option_tokens=8)
@@ -78,12 +79,15 @@ ARMS = {
     "joint": (JointLayout(max_len=1536), qwen35,
              lambda: JointSchemaHead(64, width=32, routing_layers=1, layers=1, heads=2, feedforward=64)),
     "marker": (ROWS, qwen35, lambda: DecisionHead(64, layers=1)),
-    "parallel": (replace(ROWS, parallel=True), attending, lambda: DecisionHead(32, layers=1)),
+    # The parallel arm's decoder on the attention template, which reads the layout's key runs as its spans
+    # (`DecisionModel._read`, row 1835).
+    "parallel": (replace(ROWS, parallel=True), functools.partial(attending, implementation="template"),
+                 lambda: DecisionHead(32, layers=1)),
     "readout": (replace(ROWS, head_max_len=128, option_tokens=24, labels=LABELS), qwen35,
                 lambda: LabelReadout(64, LABELS.ids(TOKENIZER, 3))),
 }
 """Joint rows under the joint schema head and rows of one question under the marker head,
-both over Qwen3.5; parallel options, whose pairwise mask Gated DeltaNet refuses, over attention;
+both over Qwen3.5; parallel options, whose key runs Gated DeltaNet refuses, over the attention template;
 options under labels read at each row's answer cue by the backbone's own logits, over Qwen3.5."""
 
 
@@ -221,14 +225,16 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     question's logits and the parameters' gradients each row gives alone where its window packed it,
     through Qwen3.5's Gated DeltaNet conv and state and its attention, and through the head, within
     the float64 gate: no state, attention, pooled span or last-token feature crosses a row. The float64
-    truth is the rows in windows of their own in float64.
+    truth is the rows in windows of their own in float64, on the reference attention (the template takes
+    fp32, bf16 and fp16).
 
     The reference runs the same kernels at the same shapes as the window (`rows_alone`), so this
     holds what packing does; on a GPU the delta rule runs on its port in both, and its algorithm's
     parity with fla is held at the layer, against fla's own packed sequences (test_fla_gdn,
     test_fla_kda)."""
     objective = objective_for(arm)
-    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
+    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64,
+                                                                         attention_impl="reference"),
                                           objective.model.head.clone(dtype=jnp.float64)), PACKING_SEEDS[arm],
                               PACKING_WINDOWS.get(arm, 2))
 
