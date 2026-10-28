@@ -1586,10 +1586,11 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts)
     rows = chunks * CHUNK
     given = _Operand(rows, _parts(dtype), dtype)
-    # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it (the port is
-    # its reference); without the delta rule fp32, its three parts, as the portable math and mamba_ssm hold their
-    # scores, written values and memories (a 16-bit call's rounded to bf16 put the template's output 1.7 times and
-    # its final memory up to 540 times the portable math's distance from float64, on an H100 and interpreted).
+    # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it
+    # (the port is its reference); without the delta rule fp32, its three parts, as the portable math and
+    # mamba_ssm hold their scores, written values and memories (a 16-bit call's rounded to bf16 put the
+    # template's output 1.7 times and its final memory up to 540 times the portable math's distance from
+    # float64, on an H100 and interpreted).
     held = given if delta else _Operand(rows, PARTS, jnp.dtype(jnp.float32))
     call = _Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                  interpret, generation.gpu_target())
