@@ -139,7 +139,10 @@ def _extracted(values):
     whole as `high`. Elementwise and a row maximum: a Triton kernel's own ops, where a sequential loop over
     a tile's columns lowered to garbage on an A100's."""
     largest = jnp.max(jnp.abs(values), axis=1, keepdims=True) * values.shape[1]
-    unit = jnp.exp2(jnp.ceil(jnp.log2(jnp.where(largest > 0, largest, 1.0))) + 1.0)
+    # A power of two at least twice the largest sum, exactly: its exponent's bits alone, times four (an
+    # exp2 of a log2's ceiling rounds on a CPU).
+    exponent = jax.lax.bitcast_convert_type(jnp.where(largest > 0, largest, 1.0), jnp.int32) & 0x7F800000
+    unit = jax.lax.bitcast_convert_type(exponent, jnp.float32) * 4.0
     finite = jnp.isfinite(unit)
     high = jnp.where(finite, (unit + values) - unit, values)
     return high, values - high
@@ -239,8 +242,9 @@ def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int)
 
     # The documents count up along a row, from the chunk's first step's to its last's; the pair rounded
     # once to its sum and what that dropped (`two_sum`).
+    zero = jnp.zeros(parts[0].shape, jnp.float32)
     hi_ref[:, steps], lo_ref[:, steps] = two_sum(*jax.lax.fori_loop(
-        seq[0][start], seq[0][start + chunk - 1] + 1, document, (jnp.zeros(parts[0].shape, jnp.float32),) * 2))
+        seq[0][start], seq[0][start + chunk - 1] + 1, document, (zero, zero)))
 
 
 @dataclasses.dataclass(frozen=True)
