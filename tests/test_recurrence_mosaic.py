@@ -405,7 +405,8 @@ def _model(launch: mainloop.Launch, family: mosaic.Family) -> dict:
     roles = launch.consumers
     producer = family.warpgroups(roles) > roles
     return {"registers": launch.registers, "budget": family.registers(roles), "consumers": roles,
-            "most": family.programs(roles), "producer": resources.PRODUCER_REGISTERS if producer else 0}
+            "most": family.programs(roles), "register_step": family.register_step,
+            "producer": resources.PRODUCER_REGISTERS if producer else 0}
 
 
 def compiled_cases(target: str, plans: dict, refused: list) -> list:
