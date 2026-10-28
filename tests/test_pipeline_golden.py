@@ -20,7 +20,6 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 import tensorflow_datasets as tfds
-from array_record.python.array_record_module import ArrayRecordWriter
 from token_support import write_token_corpus
 
 from dew.data import Memory, images, phases, presets
@@ -65,15 +64,8 @@ def _oracle():
 
 
 def _image_sources(root, pixels):
-    image_root = root / "images"
-    image_root.mkdir()
-    writer = ArrayRecordWriter(str(image_root / "00.array_record"), "group_size:1")
-    for row in pixels:
-        writer.write(pack_dict_of_byte_arrays({"image": row["image"].tobytes(),
-                                               "shape": np.asarray([16, 16], "<i4").tobytes(),
-                                               "caption": row["caption"].encode(),
-                                               "label": np.asarray(row["label"], np.int32).tobytes()}))
-    writer.close()
+    """`pixels` as the frozen reference wrote them (`image_records`), and as a parquet of PNGs."""
+    image_root = _oracle().image_records(root, pixels, pack_dict_of_byte_arrays)
     image_file = root / "images.parquet"
     pq.write_table(pa.Table.from_pylist([
         {**row, "image": {"bytes": cv2.imencode(".png", row["image"][..., ::-1])[1].tobytes(), "path": None}}
