@@ -132,6 +132,88 @@ def test_a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100(consumers):
     np.testing.assert_array_equal(np.asarray(summed), _expected(x))
 
 
+FED_STEPS = 5
+FED_ROWS, FED_WIDTH = 64, 128
+
+
+def _fed_products(p, x, *, interpret):
+    """`p @ x` over `FED_STEPS` steps of 64 rows of `x` (`p`'s 64 columns a step), on warpgroup MMA without a
+    producer (`mosaic_sm90.FED`, two consumers): both consumers walk every step of one ring the first fills
+    (`Family.fed`), each multiplying its 32 of the step's rows (a 32-row contraction, its blocks staged at
+    `mosaic.swizzle_for`'s 64 bytes), and their sums meet before one store (`mosaic.summed_across`)."""
+    from dew.nn.kernels.templates import mosaic_sm90
+    family, consumers, half = mosaic_sm90.FED, 2, FED_ROWS // 2
+    swizzle = mosaic.swizzle_for(jnp.bfloat16, half)
+
+    def body(p_gmem, x_gmem, out_gmem):
+        allocated = family.streams({'p': ((FED_ROWS, FED_ROWS), jnp.bfloat16),
+                                    'x': ((FED_ROWS, FED_WIDTH), jnp.bfloat16)}, STAGES, consumers,
+                                   swizzles={'p': swizzle, 'x': swizzle})
+
+        def scoped(*, streams):
+            rings, wg = family.opened(streams), jax.lax.axis_index("wg")
+            views = {'p': (p_gmem, lambda j: (0, j)), 'x': (x_gmem, lambda j: (j, 0))}
+            feed = family.fed(rings, views, jnp.int32(0), jnp.int32(FED_STEPS), wg)
+
+            def step(at, slots, carry, accumulators):
+                del at
+                (acc,) = accumulators
+                block, rows = slots['p'], slots['x']
+                product = family.products(acc, block.at[:, pl.ds(wg * half, half)],
+                                          rows.at[pl.ds(wg * half, half)], interpret)
+                return carry, (product,)
+
+            _, (summed,) = family.walk(feed, ((step, 0, FED_STEPS),), (), ((FED_ROWS, FED_WIDTH),),
+                                       interpret)
+
+            def total(parts, ready):
+                mosaic.summed_across(summed, parts, ready, wg, consumers,
+                                     lambda value: out_gmem.__setitem__(slice(None), value))
+
+            pl.run_scoped(lambda parts, ready: total(parts, ready),
+                          **mosaic.summing((FED_ROWS, FED_WIDTH), consumers), collective_axes="wg")
+
+        family.scoped(scoped, streams=allocated)
+
+    return family.kernel(body, out_type=jax.ShapeDtypeStruct((FED_ROWS, FED_WIDTH), jnp.float32), grid=(1,),
+                         grid_names=("programs",), consumers=consumers, interpret=interpret, name="fed")(p, x)
+
+
+def _fed_operands():
+    """Small integers, so the product is exact in fp32 whatever its order."""
+    keys = jax.random.split(jax.random.key(1))
+    p = jax.random.randint(keys[0], (FED_ROWS, FED_STEPS * FED_ROWS), -4, 4).astype(jnp.bfloat16)
+    x = jax.random.randint(keys[1], (FED_STEPS * FED_ROWS, FED_WIDTH), -4, 4).astype(jnp.bfloat16)
+    return p, x
+
+
+@INTERPRETS
+def test_two_consumers_feeding_their_own_ring_split_a_step_and_meet_before_the_store():
+    """Interpreted: two consumers with no producer walk every step of one ring through slot reuse (five
+    steps over two slots), each its half of a step's rows, and store their sum once: exactly the product."""
+    p, x = _fed_operands()
+    got = _fed_products(p, x, interpret=INTERPRETED)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(p, np.float32) @ np.asarray(x, np.float32))
+
+
+def test_the_fed_walk_lowers_for_an_h100():
+    """The fed walk's kernel, its 32-row contraction staged at 64 bytes, lowers for an H100 on any host."""
+    p, x = (jax.ShapeDtypeStruct(each.shape, each.dtype) for each in _fed_operands())
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        jax.jit(functools.partial(_fed_products, interpret=False)).trace(p, x).lower(
+            lowering_platforms=("cuda",))
+
+
+@ON_HOPPER
+@pytest.mark.gpu(reason="runs the toolkit's kernels compiled, on an H100")
+def test_two_consumers_feeding_their_own_ring_split_a_step_on_an_h100():
+    """The fed walk compiled and run on an H100, where the interpreter's no-op waits are real."""
+    p, x = _fed_operands()
+    got = jax.jit(functools.partial(_fed_products, interpret=False))(p, x)
+    np.testing.assert_array_equal(np.asarray(got), np.asarray(p, np.float32) @ np.asarray(x, np.float32))
+
+
 def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
     """A program's shared memory (`resources.shared_bytes`): each array rounded up to 1 KiB, its walks the
     largest of them, every barrier 8 bytes; a tile scoped after its walks beside the program's on a family
