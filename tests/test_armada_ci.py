@@ -965,8 +965,11 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
         "from pathlib import Path\n"
         "def test_ok():\n"
         "    with Path('runs').open('a') as runs: runs.write('x')\n"
+        "    Path('tests/fixture.json').read_text()\n"
         "    assert not os.environ.get('FAIL')\n"
         "    if os.environ.get('EXIT'): os._exit(3)\n")
+    fixture = tmp_path / "tests/fixture.json"
+    fixture.write_text("{}")
     interpreter(tmp_path, "3.12")
     url, _, _ = cache_worker
     cached(monkeypatch, url)
@@ -997,21 +1000,18 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     assert run("GenuineIntel-6-143", policy="off") == 7
     monkeypatch.delenv("EXIT")
     assert run("GenuineIntel-6-143") == 8
-    # Another commit's run between a commit's run and its retry: a fixture's change is every file's input.
-    fixture = tmp_path / "tests/fixture.json"
+    # Another commit's run between a commit's run and its retry: the fixture the test reads is its input.
+    fixture.write_text('{"changed": true}')
+    assert run("GenuineIntel-6-143") == 9
     fixture.write_text("{}")
     assert run("GenuineIntel-6-143") == 9
-    fixture.write_text('{"changed": true}')
-    assert run("GenuineIntel-6-143") == 10
-    fixture.write_text("{}")
-    assert run("GenuineIntel-6-143") == 10
     monkeypatch.setenv("FAIL", "1")
-    assert run("GenuineIntel-6-143", policy="off") == 11
+    assert run("GenuineIntel-6-143", policy="off") == 10
     monkeypatch.delenv("FAIL")
     fixture.write_text('{"changed": true}')
-    assert run("GenuineIntel-6-143") == 11
+    assert run("GenuineIntel-6-143") == 10
     fixture.write_text("{}")
-    assert run("GenuineIntel-6-143") == 12
+    assert run("GenuineIntel-6-143") == 11
 
 
 
@@ -1209,9 +1209,10 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
         ci, tmp_path, monkeypatch, cache_worker):
     """A file's green row is kept across a change its tests never meet, the plan's own code (ci.py, which
-    runs outside every test process), or another test module; it runs again once what its test process
-    runs or reads changes: a plugin loaded into it, a fixture, a Python file added that can change what an
-    import finds (a conftest.py, a top-level package under src/), or the process group it runs as."""
+    runs outside every test process), another test module, or a fixture it never opens (its openers'
+    input alone); it runs again once what its test process runs or reads changes: a plugin loaded into
+    it, a Python file added that can change what an import finds (a conftest.py, a top-level package
+    under src/), or the process group it runs as."""
     (tmp_path / "tests/test_kept.py").write_text(
         "from pathlib import Path\n"
         "def test_kept():\n"
@@ -1223,9 +1224,9 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
                ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
-               ("tests/fixtures/data.json", "{}\n", 3), ("tests/conftest.py", "VALUE = 1\n", 4),
-               ("src/package/__init__.py", "", 5), ("tests/more/test_added.py", "VALUE = 2\n", 5),
-               ("tools/armada/child_groups.py", "# its process group\n", 6)]
+               ("tests/fixtures/data.json", "{}\n", 2), ("tests/conftest.py", "VALUE = 1\n", 3),
+               ("src/package/__init__.py", "", 4), ("tests/more/test_added.py", "VALUE = 2\n", 4),
+               ("tools/armada/child_groups.py", "# its process group\n", 5)]
     for path, text, runs in changes:
         if path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
@@ -1238,8 +1239,7 @@ def test_a_fixture_reruns_its_readers_alone_though_a_native_reader_reads_it(
         ci, tmp_path, monkeypatch, cache_worker):
     """A fixture is the input of the files that open it, whatever opens it: a tokenizer's JSON that Rust's
     `Tokenizer.from_file` reads, which raises no audit event, runs its test again once changed (tests/
-    test_text_data.py reads one so); a fixture no test opens runs none; and an open by a test file's thread
-    after the file has ended joins the record of the file then running, which it can only widen (owner,
+    test_text_data.py reads one so), and no other file; a fixture no test opens runs none (owner,
     2026-10-27: one fixture re-recorded reran all 1,300 rows)."""
     tokenizers = pytest.importorskip("tokenizers")
 
@@ -1249,49 +1249,29 @@ def test_a_fixture_reruns_its_readers_alone_though_a_native_reader_reads_it(
 
     (tmp_path / "tests/fixtures/tok").mkdir(parents=True)
     tokenizer({"a": 0})
-    for name in ("unread.json", "late.json"):
-        (tmp_path / f"tests/fixtures/{name}").write_text("{}\n")
+    (tmp_path / "tests/fixtures/unread.json").write_text("{}\n")
     written(tmp_path, {
         "test_a_native.py": "from pathlib import Path\nfrom tokenizers import Tokenizer\n"
                             "def test_native():\n"
                             "    with Path('runs-native').open('a') as runs: runs.write('x')\n"
                             "    loaded = Tokenizer.from_file('tests/fixtures/tok/tokenizer.json')\n"
                             "    assert loaded.get_vocab_size()\n",
-        # Its thread opens late.json once the next file has begun (its flag), after this file has ended.
-        "test_b_starter.py": "import threading, time\nfrom pathlib import Path\n"
-                             "def test_starter():\n"
-                             "    with Path('runs-starter').open('a') as runs: runs.write('x')\n"
-                             "    def late():\n"
-                             "        while not Path('flag').exists(): time.sleep(0.01)\n"
-                             "        Path('tests/fixtures/late.json').read_text()\n"
-                             "        Path('opened').touch()\n"
-                             "    threading.Thread(target=late, daemon=True).start()\n",
-        # It waits for that late open while the starter's thread runs, and not past a bound where the starter
-        # was reused and started none.
-        "test_c_later.py": "import time\nfrom pathlib import Path\n"
-                           "def test_later():\n"
-                           "    with Path('runs-later').open('a') as runs: runs.write('x')\n"
-                           "    Path('flag').touch()\n"
-                           "    bound = time.monotonic() + 10\n"
-                           "    while not Path('opened').exists() and time.monotonic() < bound:\n"
-                           "        time.sleep(0.01)\n"
-                           "    Path('flag').unlink(); Path('opened').unlink(missing_ok=True)\n"})
+        "test_b_other.py": "from pathlib import Path\n"
+                           "def test_other():\n"
+                           "    with Path('runs-other').open('a') as runs: runs.write('x')\n"})
     verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
 
     def run() -> list[int]:
         rows = armada_task(ci, monkeypatch, verdict)
-        assert [row["exitCode"] for row in rows] == [0, 0, 0]
-        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("native", "starter", "later")]
+        assert [row["exitCode"] for row in rows] == [0, 0]
+        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("native", "other")]
 
-    assert run() == [1, 1, 1]
-    assert run() == [1, 1, 1]
+    assert run() == [1, 1]
+    assert run() == [1, 1]
     tokenizer({"a": 0, "b": 1})
-    assert run() == [2, 1, 1]
+    assert run() == [2, 1]
     (tmp_path / "tests/fixtures/unread.json").write_text("[]\n")
-    assert run() == [2, 1, 1]
-    # The late open widened the later file's record: its change runs that file again.
-    (tmp_path / "tests/fixtures/late.json").write_text("[]\n")
-    assert run()[2] == 2
+    assert run() == [2, 1]
 
 
 def test_a_tree_past_the_watch_limit_keeps_no_row(ci, tmp_path, monkeypatch, cache_worker):
