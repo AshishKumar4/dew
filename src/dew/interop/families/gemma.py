@@ -188,7 +188,7 @@ def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
                           tie_embeddings=True, layer_types=layer_types,
                           reads=frozenset({'layer_types', 'sliding_window', 'attention_bias'}))
     sliding = kinds_of(config).get('sliding_attention', native_fields(LayerKind)())
-    if 'rope_theta' in sliding or 'yarn' in sliding or 'rope_scaling' in sliding:
+    if 'rope_theta' in sliding or 'rope_scaling' in sliding:
         refuse("rope_parameters.sliding_attention",
                 "Gemma2RotaryEmbedding rotates every layer at one base and ramp")
     _gemma_softcaps(hf_config, used, config)
@@ -466,7 +466,7 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
             mixer.bidirectional_images or mixer.bidirectional_blocks or mixer.mrope_section is not None
         ):
             refuse(f'kinds.{name}.mixer', 'multimodal attention metadata needs its source wrapper')
-        if kind.rope_scaling is not None or kind.yarn is not None:
+        if kind.rope_scaling is not None:
             refuse(f'kinds.{name}.rope', 'Gemma4 uses plain local and proportional global rotary')
     full = model.kind_of('full_attention')
     local = model.kind_of('sliding_attention') if 'sliding_attention' in types else full

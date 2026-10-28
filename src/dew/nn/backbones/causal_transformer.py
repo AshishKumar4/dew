@@ -96,7 +96,7 @@ from ..precision import (
     scaled_logits,
 )
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
-from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
+from ..rope import LongRopeScaling, Scaling, rope_scaling_from_record
 from ..sharding import RESIDUAL, constrain, logical_axes, pipeline_stages
 from .decoder_block import (
     DECODER_REMAT,
@@ -220,7 +220,8 @@ class CausalTransformer(nn.Module):
     position_embedding_offset: int = 0
     """The number of reserved rows before learned position zero; OPT checkpoints have two."""
     rope_theta: float = 10000.0              # the base a kind does not override
-    rope_scaling: RopeScaling | LongRopeScaling | None = None
+    rope_scaling: Scaling | None = None
+    """The model's rope scaling: Llama 3.1's ramp, LongRoPE's factors or YaRN's record (`rotary_freqs`)."""
     partial_rotary_factor: float | None = None  # None: every dim rotates
     partial_rotary_type: str = 'proportional'  # 'proportional' (Gemma 4) | 'default' (Qwen3.5)
     narrow_rotary_tables: bool = False
@@ -267,7 +268,6 @@ class CausalTransformer(nn.Module):
     """The factor that multiplies the values as they are projected, before
     they are cached: MiMo-V2-Flash's `attention_value_scale`."""
     attention_sinks: bool = False
-    yarn: YarnScaling | None = None
     attn_logit_softcap: float | None = None  # Gemma 2's attn_logit_softcapping
     output_gate: bool = False                 # Qwen3.5 gates the attention branch
     embedding_scale: bool = False            # Gemma scales embeddings by sqrt(d)
@@ -551,18 +551,15 @@ class CausalTransformer(nn.Module):
 
     def kind_of(self, layer_type: str) -> "ResolvedKind":
         """Return the `ResolvedKind` of `layer_type`, with the model's defaults where the kind is unset.
-        A rope scaling is one setting, YaRN's record or a Llama 3.1 or LongRoPE ramp: a kind that gives
-        either takes it in place of the model's, never beside it (`MixerContext.rotary_scaling`)."""
+        A kind's rope scaling takes the model's place."""
         kind = (self.kinds or {}).get(layer_type, LayerKind())
-        scaled = kind.rope_scaling is not None or kind.yarn is not None
         return ResolvedKind(
             window=kind.window,
             bidirectional_window=kind.bidirectional_window,
             chunk=kind.chunk,
             num_kv_heads=self.kv_heads if kind.num_kv_heads is None else kind.num_kv_heads,
             rope_theta=self.rope_theta if kind.rope_theta is None else kind.rope_theta,
-            rope_scaling=kind.rope_scaling if scaled else self.rope_scaling,
-            yarn=kind.yarn if scaled else self.yarn,
+            rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
             partial_rotary_factor=self._kind_rotary(kind),
             sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
@@ -638,7 +635,7 @@ class CausalTransformer(nn.Module):
                       kv_shared: bool) -> MixerContext:
         """Return one layer's mixer geometry as a `MixerContext` built from the resolved kind.
 
-        `head_dim`, `rope_theta`, `window`, the two rotary ramps, the partial
+        `head_dim`, `rope_theta`, `window`, the rope scaling, the partial
         rotary, the sinks and the query-key norm take the layer kind's resolved values
         (`kind_of`), and the precision the model's layers take (`products`). Every other field
         is the model's field of the same name. A kind builds its `DecoderBlock` factory
@@ -647,7 +644,7 @@ class CausalTransformer(nn.Module):
         """
         resolved = {
             "num_kv_heads": kind.num_kv_heads, "head_dim": kind.head_dim,
-            "rope_theta": kind.rope_theta, "rope_scaling": kind.rope_scaling, "yarn": kind.yarn,
+            "rope_theta": kind.rope_theta, "rope_scaling": kind.rope_scaling,
             "sliding_window": kind.window, "bidirectional_window": kind.bidirectional_window,
             "attention_chunk": kind.chunk,
             "k_eq_v": self.attention_k_eq_v and kind.window is None,

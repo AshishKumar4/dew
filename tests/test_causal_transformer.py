@@ -37,7 +37,7 @@ from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 from dew.nn.mixers import AttentionMixer
 from dew.nn.precision import FP32_SUMS
-from dew.nn.rope import YarnScaling
+from dew.nn.rope import LongRopeScaling, RopeScaling, YarnScaling
 
 VOCAB = 37
 SEQ = 12
@@ -536,12 +536,31 @@ def test_learned_positions_continue_from_the_models_own_count_whatever_its_first
     decoded_against_full(model, 4, "learned hybrid decode", SEEDS['learned hybrid decode'], batch=16)
 
 
+@pytest.mark.parametrize("scaling", [
+    YarnScaling(factor=4.0, original_max_position_embeddings=8),
+    RopeScaling(factor=8.0, low_freq_factor=1.0, high_freq_factor=4.0, original_max_position_embeddings=4),
+    LongRopeScaling(short_factor=(1.0, 1.5), long_factor=(2.0, 3.0), original_max_position_embeddings=4)],
+    ids=["yarn", "llama3", "longrope"])
+def test_a_scaled_decoder_and_its_kind_rebuild_from_their_own_fields(scaling):
+    """A decoder and a layer kind each given one rope scaling, YaRN's, Llama 3.1's or LongRoPE's, rebuild
+    from the fields the registry records for them (`record_fields`), the union's class record read as its
+    class, so a plain constructor over a saved record makes the same model (ledger 1898)."""
+    from dew.nn.backbones.layer_plan import LayerKind
+    from dew.registry import record_fields
+
+    kind = LayerKind(window=4, rope_scaling=scaling)
+    assert LayerKind(**record_fields(kind, LayerKind)) == kind
+    model = tiny(rope_scaling=scaling, layer_types=("sliding_attention", "full_attention"),
+                 kinds={"sliding_attention": kind})
+    assert type(model)(**record_fields(model, type(model))) == model
+
+
 def test_a_yarn_layer_refuses_a_proportional_partial_rotary(rng):
     """YaRN ramps the rotated width and has no proportional form (`dew.nn.rope.rotary_freqs`), so a
     layer given YaRN and a partial rotary under the proportional convention, the default, refuses at
     its first call."""
     with pytest.raises(ValueError):
-        tiny(partial_rotary_factor=0.5, yarn=YarnScaling()).init(rng, tokens(rng))
+        tiny(partial_rotary_factor=0.5, rope_scaling=YarnScaling()).init(rng, tokens(rng))
 
 
 def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):

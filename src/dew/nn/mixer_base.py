@@ -24,7 +24,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.kv_cache import KVCache
 from dew.nn.ngpt import NGPT
-from dew.nn.rope import LongRopeScaling, RopeScaling, Scaling, YarnScaling
+from dew.nn.rope import Scaling
 
 QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
 ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
@@ -63,7 +63,7 @@ class MixerContext:
     on a windowed kind (partial rotary belongs to the full-sequence kinds),
     and `kv_shared` with `kv_store_key` mark a layer that reads another
     layer's keys and values. A kind's own record (LoRA ranks, head splits, a
-    yarn scaling) lives on the kind's value; this holds what the backbone
+    rope scaling) lives on the kind's value; this holds what the backbone
     configures. `CausalSelfAttention` holds it whole (`ctx`) and reads its
     geometry and policies off it.
     """
@@ -78,9 +78,9 @@ class MixerContext:
     at its own width and widened only inside the kernel."""
     causal: bool = True
     rope_theta: float = 10000.0
-    """The kind-resolved rotary base; a kind's yarn record transforms it."""
-    rope_scaling: RopeScaling | LongRopeScaling | None = None
-    """The kind-resolved llama3 ramp over the base frequencies, or None for plain rope."""
+    """The kind-resolved rotary base; a kind's rope scaling transforms it."""
+    rope_scaling: Scaling | None = None
+    """The kind-resolved rope scaling (Llama 3.1's, LongRoPE's or YaRN's), or None for plain rope."""
     qk_norm: bool = True
     qk_norm_scope: str = 'head'
     """Where the q/k RMSNorm applies: 'head' norms each head after the split
@@ -113,7 +113,6 @@ class MixerContext:
     read them (MiMo-V2-Flash's `attention_value_scale`)."""
     attention_dropout_rate: float = 0.0
     attention_sinks: bool = False
-    yarn: YarnScaling | None = None
     attn_logit_softcap: float | None = None
     """Gemma 2's tanh on the logits (attn_logit_softcapping)."""
     partial_rotary_factor: float | None = None
@@ -148,14 +147,6 @@ class MixerContext:
     output_init_std: float | None = None
     """The std of the projection back to the residual stream, which a
     depth-scaled init shrinks; None follows `init_std`."""
-
-    def rotary_scaling(self) -> Scaling | None:
-        """The layer's one rope scaling, which every rotation it makes takes (`rotary_freqs`): its
-        kind-resolved YaRN record or its Llama 3.1 or LongRoPE ramp. A layer given both is refused by
-        name: they are two scalings of the same frequencies."""
-        if self.yarn is not None and self.rope_scaling is not None:
-            raise ValueError("yarn and rope_scaling are two rope scalings; a layer takes one")
-        return self.rope_scaling if self.yarn is None else self.yarn
 
     def policies(self) -> dict[str, bool]:
         """Whether this layer asks each of the attention policies that change
