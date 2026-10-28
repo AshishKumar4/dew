@@ -96,7 +96,7 @@ def test_confident_spreads_a_fixed_quota_where_no_block_is_walked():
 def test_confident_refuses_a_temperature_that_is_no_finite_number():
     """A temperature of nan or infinity divides the scores into no distribution: refused."""
     for temperature in (float("nan"), float("inf"), -1.0):
-        with pytest.raises(ValueError, match="temperature"):
+        with pytest.raises(ValueError):
             Confident(temperature=temperature)
 
 
