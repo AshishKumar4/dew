@@ -369,8 +369,6 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
         carried = [(block_q, width, jnp.float32)] * (2 if accurate else 1)
         cotangents = [(block_q, block_k, jnp.float32), *[(block_q, block_k, dtype)] * _parts(accurate, dtype)]
         return resources.live_registers(family, carried, products, cotangents)
-    # A dK/dV step's tiles one of its query tile's sub-tiles' (`BackwardTiles.dkv_splits`).
-    products = [(block_q // config.dkv_splits, block_k, jnp.float32)] * 2
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
                                                                  jnp.float32)]
     fused = [(block_q, width, jnp.float32)] if config.fused else []
