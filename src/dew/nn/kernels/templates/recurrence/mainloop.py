@@ -1419,27 +1419,24 @@ def _output_held(call: _Call, bv: int) -> _Held:
     whose products complete in turn. So an A100's need was 232, 240, None and 216 registers at value blocks
     16, 32, 64 and 128 wide of 128 values, and None at 128 of 256; an H100's 224, 224, 232/240 and None
     (the 1971 gate's dump: where both phases were stated at once, 456 refused 216). Under a decay a key
-    dimension the value block's phase beside the intra launch's scores in fp32 and their masks, and the
-    first step's: a key block's prefix halves, its decay raised from them and its queries widened, staged
-    for every step (`algebra.key_gated`), held as the scores' phase is."""
+    dimension the value block's phase, and apart from it the first step's: a key block's prefix halves, its
+    decay raised from them and its queries widened, staged for every step (`algebra.key_gated`)."""
     held, memories, given, family = call.held, call.memories, call.given, call.family
-    values = ([_f32(CHUNK, bv)] * (2 if family.products_overlap else 1) + _held(held, CHUNK, bv)
-              + _widest(_product(call, (given, CHUNK, call.block), (memories, call.block, bv)),
-                        _product(call, (held, CHUNK, CHUNK), (held, CHUNK, bv))))
-    one_block = call.value_width // bv == 1
+    products = _widest(_product(call, (given, CHUNK, call.block), (memories, call.block, bv)),
+                       _product(call, (held, CHUNK, CHUNK), (held, CHUNK, bv)))
     if call.per_key:
-        # The intra launch's scores in fp32 and masked beside the value block's sum; at the first step the
-        # key blocks' gated queries, staged for every step.
-        values = ([_f32(CHUNK, bv)] + _held(held, CHUNK, bv) + [_f32(CHUNK, CHUNK)] + _masks(CHUNK, CHUNK)
-                  + _held(held, CHUNK, CHUNK) + _widest(
-                      _product(call, (given, CHUNK, call.block), (memories, call.block, bv)),
-                      _product(call, (held, CHUNK, CHUNK), (held, CHUNK, bv))))
-        keyed = [_f32(CHUNK, call.block)] * 4
-        return _Held(phases=(values, keyed) if one_block else (values + keyed,))
+        # One accumulator for every product (`_Issuer.summed`) beside the values, the intra launch's scores
+        # in fp32 and their masked narrow form; apart from it, at the first step, the key blocks' gated
+        # queries, staged before any product (an A100's held 64- and 128-wide value blocks at 247 registers,
+        # an H100's 128-wide at 248).
+        values = ([_f32(CHUNK, bv)] + _held(held, CHUNK, bv) + [_f32(CHUNK, CHUNK)]
+                  + _held(held, CHUNK, CHUNK) + products)
+        return _Held(phases=(values, [_f32(CHUNK, call.block)] * 4))
+    values = [_f32(CHUNK, bv)] * (2 if family.products_overlap else 1) + _held(held, CHUNK, bv) + products
     scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
               + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
               + _product(call, (given, CHUNK, call.block), (given, call.block, CHUNK)))
-    if one_block and not family.products_overlap:
+    if call.value_width // bv == 1 and not family.products_overlap:
         return _Held(phases=(values, scores))
     return _Held(phases=(values + scores,))
 
