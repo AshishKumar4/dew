@@ -285,8 +285,8 @@ class _Call:
     """A call's static geometry: value heads over key heads (`group`), key and value widths (whole blocks),
     the chunk-laid rows (`rows`), the inputs' operand form (`given`, the queries', keys' and values') and the
     values passed between the launches' (`held`), whether its decay is a key dimension's (`per_key`), whether
-    it runs the delta rule (`delta`), the bundle its launches issue by (`family`), whether they are
-    interpreted, and the key block a launch narrows its own tiles to (`narrowed`, `_narrowed`)."""
+    it runs the delta rule (`delta`), the bundle its launches issue by (`family`), and whether they are
+    interpreted."""
 
     heads: int
     group: int
@@ -300,7 +300,6 @@ class _Call:
     family: mosaic.Family
     interpret: bool
     target: generation.GpuTarget
-    narrowed: int | None = None
 
     @property
     def gates(self) -> _Operand:
@@ -313,30 +312,13 @@ class _Call:
 
     @property
     def block(self) -> int:
-        """A tile's width (`block_of`), or the key block a launch narrows its own to (`narrowed`)."""
-        return self.narrowed or block_of(self.family)
-
+        """A tile's width (`block_of`)."""
+        return block_of(self.family)
 
     @property
     def memories(self) -> _Operand:
         """The memories the chunks enter, `[chunks * heads * width, value_width]` as `held`."""
         return dataclasses.replace(self.held, rows=self.chunks * self.heads * self.width)
-
-
-def _narrowed(call: _Call, held: Callable[[_Call], "_Held"]) -> _Call:
-    """`call` at the widest key block (halving the family's `block_of` down to the narrowest a staged operand
-    block takes, `Family.narrowest_columns`) dividing its keys at which a consumer thread holds the launch's
-    tiles (`held`) within its registers (`Family.registers`), the narrowest where none does: a decay a key
-    dimension's launches hold a key block's prefix halves, exponent and gated rows and keys beside their
-    products, Kimi delta attention's intra launch 328 registers a thread 64 columns wide on an A100 and its
-    weighted launch 264, past the 255 a thread holds, an H100's intra launch 264, past 256."""
-    block, narrowest = block_of(call.family), call.family.narrowest_columns(jnp.bfloat16)
-    widths = [width for width in (block >> step for step in range(block.bit_length()))
-              if width >= narrowest and call.width % width == 0]
-    budget = call.family.registers(1)
-    return next((narrowed for narrowed in (dataclasses.replace(call, narrowed=width) for width in widths)
-                 if held(narrowed).registers(call.family) <= budget),
-                dataclasses.replace(call, narrowed=widths[-1]))
 
 
 def _streamed(**blocks) -> dict:
@@ -917,16 +899,13 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
 
 
 def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
-    """`(A, Aqk)` of each chunk and value head under a decay a key dimension, `[R, HV * C]` each: its
-    keys' strictly lower system `A` fp32, unrounded, for the solve (`_solve`), and the chunk's scores as
-    `call.held`, each pair's decay factored over the chunk's sub-chunks (`algebra.key_decayed_pairs`, which
-    the call's declared floor bounds), their products on the tensor cores: fla_kda's intra rows. Without
-    the delta rule, `(Aqk,)` alone. Its key block is the widest whose tiles a thread holds (`_narrowed`).
-    The solve is a launch of its own: beside the pairs, Kimi delta attention's doubling needed more than an
-    H100's 255 registers a thread at every key block, where the pairs alone need 232 (ptxas's need)."""
-    call = _narrowed(call, _intra_held)
+    """`((I + A)^-1, Aqk)` of each chunk and value head under a decay a key dimension, `[R, HV * C]` each as
+    `call.held`: the chunk's scores and its keys' system, each pair's decay factored over the chunk's
+    sub-chunks (`algebra.key_decayed_pairs`, which the call's declared floor bounds), their products on the
+    tensor cores, and the system inverted (`algebra.doubled`): fla_kda's intra rows and solve, fused.
+    Without the delta rule, `(Aqk,)` alone."""
     width, held, gates = call.width, dataclasses.replace(call.held, rows=call.rows), call.gates
-    square, family = dataclasses.replace(_SYSTEM, rows=call.rows), call.family
+    family = call.family
 
     def program(q_ref, k_ref, hi_ref, lo_ref, beta_ref, taken_ref, *outs, streams, staging, landing):
         n, h = _axis("chunks"), _axis("heads")
@@ -936,20 +915,13 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
                        keys=call.given.views(k_ref, row, CHUNK, keyed, width),
                        gates=gates.views(hi_ref, row, CHUNK, h * width, width),
                        lows=gates.views(lo_ref, row, CHUNK, h * width, width))
-        (pairing,) = staging
+        pairing, *merges = staging
 
         def step(index, slots, carry, accumulators):
             del index
-            # Each stream's key blocks' views taken before the pairs' loop reads them: a ring's slot is the
-            # step's, which a loop's trace may not hold.
-            viewed = {(name, c): _tile(slots, name, operand, columns=pl.ds(c * call.block, call.block))
-                      for name, operand in (("queries", call.given), ("keys", call.given), ("gates", gates),
-                                            ("lows", gates))
-                      for c in range(width // call.block)}
 
             def block(name, operand, c):
-                del operand
-                return viewed[name, c].value()
+                return _tile(slots, name, operand, columns=pl.ds(c * call.block, call.block)).value()
 
             def operand(name):
                 return lambda c: block(name, call.given, c).astype(jnp.float32)
@@ -973,75 +945,34 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
             if call.delta:
                 betas = family.rows_of(beta_ref.at[h, span])
                 system = pairs(lambda c: operand("keys")(c) * betas[:, None], operand("keys"), strict=True)
-                square.store(outs[0], system, row, CHUNK, h * CHUNK, CHUNK, family=family,
-                              smem=landing["system"])
+                rows, cols = (family.iota((CHUNK, CHUNK), dimension) for dimension in (0, 1))
+                inverse = algebra.doubled(-system, _merging(tuple(merges), call))
+                held.store(outs[0], inverse - jnp.where(rows == cols, 1.0, 0.0), row, CHUNK, h * CHUNK, CHUNK,
+                           family=family, smem=landing["square"])
             return carry, accumulators
 
         _walk(streams, views, step, call)
 
     blocks = _streamed(queries=((CHUNK, width), call.given), keys=((CHUNK, width), call.given),
                        gates=((CHUNK, width), gates), lows=((CHUNK, width), gates))
-    out_type = (square.shape(call.heads * CHUNK),) * call.delta + (held.shape(call.heads * CHUNK),)
-    # Each sub-chunk's and key block's gated rows and keys and their product, for the scores and the system.
+    out_type = (held.shape(call.heads * CHUNK),) * (1 + call.delta)
+    # Each sub-chunk's and key block's gated rows and keys and their product, for the scores and the system,
+    # then the inverse's doubling.
     pairs = (CHUNK // algebra.SUB) * (1 + call.delta)
-    work = Work(pairs * 2 * CHUNK * CHUNK * width, exponentials=pairs * 2 * CHUNK * width)
-    landing = {"square": held.landing(CHUNK, CHUNK), **({"system": square.landing(CHUNK, CHUNK)} if call.delta
-                                                       else {})}
+    work = Work(pairs * 2 * CHUNK * CHUNK * width + (_inverse_flops() if call.delta else 0),
+                exponentials=pairs * 2 * CHUNK * width)
+    # The sum of the pairs, beside a sub-chunk's and key block's prefix halves, exponent, gated rows and
+    # keys; then the doubling's, as the solve's.
+    held_tiles = _Held(phases=(
+        [_f32(CHUNK, CHUNK)] + [_f32(CHUNK, call.block)] * 4 + _masks(CHUNK, call.block) * 2
+        + _fragments(call, (_pairing_operand(call), CHUNK, call.block), (_pairing_operand(call), CHUNK,
+                                                                              call.block)),
+        [_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK) * 2))
+    staging = (_pairing(call), *(_merges(call) if call.delta else ()))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(5), work=work,
-                   held=_intra_held(call), staging=(_pairing(call),), landing=landing,
+                   held=held_tiles, staging=staging, landing={"square": held.landing(CHUNK, CHUNK)},
                    persistent=True)(q, k, hi, lo, beta, taken)
-
-
-_SYSTEM = _Operand(0, 1, jnp.dtype(jnp.float32))
-"""A chunk's strictly lower system `A` as `_intra` stores it for the solve: fp32, unrounded (its rows a
-call's)."""
-
-
-def _solve(a, taken, call: _Call):
-    """`(I + A)^-1 - I` `[R, HV * C]` as `call.held` of each chunk's and value head's strictly lower system
-    `A` (`_intra`'s, fp32), by `algebra.doubled` on the tensor cores: the identity apart, as
-    `algebra.weighted` takes it, fla_kda's solve."""
-    held = dataclasses.replace(call.held, rows=call.rows)
-    system = dataclasses.replace(_SYSTEM, rows=call.rows)
-    family = call.family
-
-    def program(a_ref, taken_ref, out_ref, *, streams, staging, landing):
-        n, h = _axis("chunks"), _axis("heads")
-        row = n * CHUNK
-        views = _views(system=system.views(a_ref, row, CHUNK, h * CHUNK, CHUNK))
-
-        def step(index, slots, carry, accumulators):
-            del index
-            rows, cols = (family.iota((CHUNK, CHUNK), dimension) for dimension in (0, 1))
-            inverse = algebra.doubled(-_tile(slots, "system", system).value(), _merging(staging, call))
-            held.store(out_ref, inverse - jnp.where(rows == cols, 1.0, 0.0), row, CHUNK, h * CHUNK, CHUNK,
-                       family=family, smem=landing["square"])
-            return carry, accumulators
-
-        _walk(streams, views, step, call)
-
-    return _kernel(program, call, out_type=held.shape(call.heads * CHUNK), grid=(call.chunks, call.heads),
-                   grid_names=("chunks", "heads"), blocks=_streamed(system=((CHUNK, CHUNK), system)),
-                   stages=1, live=_taken(1), work=Work(_inverse_flops()), held=_solve_held(),
-                   staging=_merges(call), landing={"square": held.landing(CHUNK, CHUNK)},
-                   persistent=True)(a, taken)
-
-
-def _solve_held() -> _Held:
-    """The solve's registers (`_solve`): the doubling's, the system and each level's inverse with their
-    products and the rows' and columns' masks (`algebra.doubled`)."""
-    return _Held(phases=([_f32(CHUNK, CHUNK)] * 4 + _masks(CHUNK, CHUNK) * 2,))
-
-
-def _intra_held(call: _Call) -> _Held:
-    """The intra launch's registers (`_intra`): the sum of the pairs, beside a sub-chunk's and key block's
-    prefix halves and exponent, its rows and keys widened and each one's exponential, gated (seven tiles);
-    the doubling is the solve's (`_solve_held`)."""
-    pairing = (_pairing_operand(call), CHUNK, call.block)
-    return _Held(phases=(
-        [_f32(CHUNK, CHUNK)] + [_f32(CHUNK, call.block)] * 7 + _masks(CHUNK, call.block) * 2
-        + _fragments(call, pairing, pairing),))
 
 
 def _pairing_operand(call: _Call) -> _Operand:
@@ -1064,9 +995,7 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
     """`(w [R, HV * Dk], u [R, HV * Dv])` as `call.held` (`algebra.weighted`): the inverse against the decayed
     write-gated keys and against the write-gated values; under a decay a key dimension, also the keys decayed
     to their chunk's end, `[R, HV * Dk]` as `call.held` (`algebra.key_decayed_write`), which the memory takes,
-    and those alone without the delta rule (`a` None). Its key and value blocks are the widest whose tiles a
-    thread holds (`_narrowed`)."""
-    call = _narrowed(call, _weighted_held)
+    and those alone without the delta rule (`a` None)."""
     width, value_width, gates, family = call.width, call.value_width, call.gates, call.family
     held = dataclasses.replace(call.held, rows=call.rows)
 
@@ -1148,25 +1077,21 @@ def _weighted(k, v, a, hi, lo, beta, taken, call: _Call):
     # Without the delta rule the inverse's place takes the keys, an operand no step reads.
     work = Work(2 * CHUNK * CHUNK * (width + value_width) if call.delta else 0,
                 exponentials=CHUNK * width if call.per_key else 0)
+    # The inverse beside a block's product, its decay and its keys or values; under a decay a key dimension
+    # the block's prefix halves and its decayed write too.
+    held_tiles = _Held(phases=(
+        _held(held, CHUNK, CHUNK) + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
+        + [_f32(CHUNK, call.block)] * 3 * call.per_key
+        + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block)),))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"),
                    blocks=_streamed(**given) | _vector_blocks(call, *(("write",) if call.delta else ()),
                                                               *(() if call.per_key else ("gate", "low"))),
                    stages=1, live=_taken(6),
-                   work=work, held=_weighted_held(call),
+                   work=work, held=held_tiles,
                    staging=_staging(held, (CHUNK, call.block)) if call.delta else (),
                    landing={"block": held.landing(CHUNK, call.block)}, persistent=True)(
         k, v, k if a is None else a, hi, lo, beta, taken)
-
-
-def _weighted_held(call: _Call) -> _Held:
-    """The weighted launch's registers (`_weighted`): the inverse beside a block's product, its decay and its
-    keys or values; under a decay a key dimension the block's prefix halves and its decayed write too."""
-    held = dataclasses.replace(call.held, rows=call.rows)
-    return _Held(phases=(
-        _held(held, CHUNK, CHUNK) + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
-        + [_f32(CHUNK, call.block)] * 3 * call.per_key
-        + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block)),))
 
 
 def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, walked: tuple, step, start,
@@ -1429,9 +1354,7 @@ def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
     if call.per_key:
         given = {"gates": ((CHUNK, width), gates), "lows": ((CHUNK, width), gates),
                  "scores": ((CHUNK, CHUNK), held)}
-        # A key block's gated queries, then the scores, square: the key block narrows below a chunk
-        # (`_narrowed`).
-        staging = _staging(held, (CHUNK, call.block), (CHUNK, CHUNK))
+        staging = _staging(held, (CHUNK, call.block))
     else:
         given = {"keys": ((CHUNK, width), call.given)}
         staging = _staging(held, (CHUNK, CHUNK))
@@ -1446,14 +1369,12 @@ def _output_held(call: _Call, bv: int) -> _Held:
     under a decay a head the first step's scores too, their sum, their pairs' decays and their masks (an
     fp32 call's split into parts), held with the value block's tiles, the step's whole set (as its phases
     alone, a 64-wide value block's output spilled 16 bytes a thread on an A100's at 200 stated registers);
-    under one a key dimension a key block's prefix halves, its decay raised from them and its queries widened,
-    and the scores in fp32 (at the halves alone an H100's compile spilled 100 bytes a thread, Kimi delta
-    attention's at 216 stated registers)."""
+    under one a key dimension a key block's prefix halves and the scores in fp32."""
     held, memories = call.held, call.memories
     values = [_f32(CHUNK, bv)] * 2 + _held(held, CHUNK, bv) + _fragments(
         call, (call.given, CHUNK, call.block), (memories, call.block, bv), (held, CHUNK, CHUNK))
     if call.per_key:
-        return _Held(phases=(values + [_f32(CHUNK, call.block)] * 4 + [_f32(CHUNK, CHUNK)],))
+        return _Held(phases=(values + [_f32(CHUNK, call.block)] * 2 + [_f32(CHUNK, CHUNK)],))
     return _Held(phases=(values + [_f32(CHUNK, bv)] + [_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
                          + (_held(held, CHUNK, CHUNK) if held.parts > 1 else []),))
 
@@ -1464,10 +1385,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
     value block: under a decay a head its own pairs' scores taken once, at the first step, and staged for
     every block's (`algebra.chunk_scores`, `chunk_output`), under one a key dimension the intra launch's
     (`scores`, `_intra`; `algebra.key_decayed_output`)."""
-    bv = tiles.output_block
-    # Under a decay a key dimension its key block is the widest whose tiles a thread holds (`_narrowed`).
-    call = _narrowed(call, lambda narrowed: _output_held(narrowed, bv)) if call.per_key else call
-    width, value_width, gates = call.width, call.value_width, call.gates
+    width, value_width, bv, gates = call.width, call.value_width, tiles.output_block, call.gates
     held, memories, family = dataclasses.replace(call.held, rows=call.rows), call.memories, call.family
     steps = value_width // bv
 
@@ -1475,7 +1393,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                 streams, staging, landing):
         n, h = _axis("chunks"), _axis("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
-        staged, *scored = staging
+        (staged,) = staging
         if call.per_key:
             given = {"gates": gates.views(hi_ref, row, CHUNK, h * width, width),
                      "lows": gates.views(lo_ref, row, CHUNK, h * width, width),
@@ -1510,7 +1428,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                 out = algebra.key_decayed_output(
                     lambda c: block("queries", call.given, c).value(), decays, entered, width // call.block,
                     _tile(slots, "scores", held).value().astype(jnp.float32), value, scale,
-                    _Issuer(call, {"memory": staged, "local": scored[0]}))
+                    _Issuer(call, {"memory": staged, "local": staged}))
             else:
                 assert loaded is not None, "a decay a head's prefix loads in the prologue"
                 (gate, low), laid = loaded
@@ -1736,8 +1654,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     q, k, v = (given.split(laid(x).reshape(rows, -1)) for x in (q, k, v))
     a, w, u, keys, scores = None, None, v, k, None
     if per_key and delta:
-        system, scores = _intra(q, k, hi, lo, beta, taken, call, scale=scale)
-        a = _solve(system, taken, call)
+        a, scores = _intra(q, k, hi, lo, beta, taken, call, scale=scale)
         w, u, keys = _weighted(k, v, a, hi, lo, beta, taken, call)
     elif per_key:
         (scores,) = _intra(q, k, hi, lo, beta, taken, call, scale=scale)
