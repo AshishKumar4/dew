@@ -1342,8 +1342,8 @@ def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, mon
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
         ci, tmp_path, monkeypatch, cache_worker):
     """A file's green row is kept across a change its tests never meet, the plan's own code (ci.py, which
-    runs outside every test process), another test module, or a fixture it never opens (its openers'
-    input alone); it runs again once what its test process runs or reads changes: a plugin loaded into
+    runs outside every test process), another test module, or a change to a fixture it never opens (its
+    openers' input alone); it runs again once what its test process runs or reads changes: a plugin loaded into
     it, a Python file added that can change what an import finds (a conftest.py, a top-level package
     under src/), or the process group it runs as."""
     (tmp_path / "tests/test_kept.py").write_text(
@@ -1354,6 +1354,8 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
     armada.mkdir(parents=True)
     for tool in (ROOT / "tools/armada").glob("*.py"):
         (armada / tool.name).write_text(tool.read_text())
+    (tmp_path / "tests/fixtures").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests/fixtures/data.json").write_text("{}\n")
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
                ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),

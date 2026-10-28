@@ -234,10 +234,12 @@ def shared(python: str) -> str:
     # a collection by presence) without opening it, which no record sees, so an arrival or a removal is every
     # file's input; a file's contents stay its openers' (train 253's review: a test asserting a fixture's
     # absence was reused green once the fixture came).
-    for root in ("tests", "src"):
-        for path in sorted(Path(root).rglob("*")):
-            if path.is_file() and path.suffix != ".py" and "__pycache__" not in path.parts:
-                digest.update(b"fixture:" + str(path).encode())
+    # The commit's own files (git ls-files): a build's output and a fetched payload, which a planner's
+    # checkout lacks, are its manifest's (`contents`) and its build's.
+    listed = subprocess.run(["git", "ls-files", "-z", "--", "tests", "src"], capture_output=True, text=True,
+                            check=True).stdout.split("\0")
+    for name in sorted(name for name in listed if name and not name.endswith(".py")):
+        digest.update(b"fixture:" + name.encode())
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
