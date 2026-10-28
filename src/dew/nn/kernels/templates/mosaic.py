@@ -543,6 +543,11 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """Each role of a program: `consumer(index)` the compute roles', `producer()` the loads' where the
         family streams from a role of its own."""
 
+    def lifetimes(self, streams: Allocated) -> tuple[tuple, tuple]:
+        """A program's `streams` (`streams`') by lifetime (`resources.Scope`): those the program holds whole,
+        and each walk's own where its walks scope their streams apart (`walks_scoped`)."""
+        return (streams,), ()
+
     @abc.abstractmethod
     def streams(self, blocks: dict, stages: int, consumers: int,
                 multicast: tuple[str, ...] = ()) -> Allocated:

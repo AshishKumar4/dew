@@ -191,6 +191,11 @@ class Mma(mosaic.Family):
         _one(consumers, clustered=bool(multicast))
         return Pipeline(blocks, stages)
 
+    def lifetimes(self, streams: Pipeline) -> tuple[tuple, tuple]:
+        # `emit_pipeline` allocates a walk's slots in its own scope.
+        return (), (tuple(plgpu.SMEM((streams.stages, *shape), dtype)
+                          for shape, dtype in streams.blocks.values()),)
+
     def opened(self, allocated, views: dict | None = None):
         if views is None:
             raise ValueError("a pipelined family's streams take their views where they open (its walk loads)")

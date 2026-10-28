@@ -32,7 +32,6 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     kept_dtype,
     power_of_two,
-    prescale,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import (
     _dkv_allocations,
@@ -251,9 +250,8 @@ class MosaicForward(_Mainloop[Tiles]):
         steps = _padded(query.shape[1], key.shape[1], config)[1] // config.block_k
         allocations = _forward_allocations(family, config, width, value_width, query.dtype,
                                            bool(ba.arguments.get("residuals")), min(config.stages, steps))
-        reduces = reducing(family, config.consumers, self.score_mod, self.output_mod)
-        return resources.shared_bytes(family, resources.Scope(program=allocations,
-                                                              reducing_warpgroups=reduces))
+        return resources.shared_bytes(family, _scope(family, allocations, reducing(
+            family, config.consumers, self.score_mod, self.output_mod)))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         family = bundle_of(config, ba.arguments["query"].dtype)
@@ -350,6 +348,14 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                 tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop)
 
 
+def _scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int) -> resources.Scope:
+    """A launch's `allocations` (`(scoped, streams)`, `Family.scoped`'s) by lifetime (`Family.lifetimes`),
+    with its `reducing_warpgroups`' scratch (`resources.Scope`)."""
+    scoped, streams = allocations
+    held, walks = family.lifetimes(streams)
+    return resources.Scope(program=(scoped, *held), walks=walks, reducing_warpgroups=reducing_warpgroups)
+
+
 def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
                         accurate: bool, dq: bool) -> int:
     """The registers a backward launch's consumer holds at `config` (`resources.live_registers`): a dQ
@@ -444,18 +450,14 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         dtype = query.dtype
         width, value_width = (_width(array.shape[-1], family, dtype) for array in (query, value))
         padded_q, padded_k = _padded(query.shape[1], key.shape[1], config)
-        # The dK/dV program holds its keys taken by the query's power where the call's query takes one.
-        prescaled = prescale(dtype, query.shape[-1], self.scale)[0] != 1.0
         launches = [_dkv_allocations(family, config, width, value_width, dtype,
                                      parts=_parts(self.accurate, dtype),
-                                     stages=min(config.stages, padded_q // config.block_q),
-                                     prescaled=prescaled)]
+                                     stages=min(config.stages, padded_q // config.block_q))]
         if not config.fused:
             launches.append(_dq_allocations(family, config, width, value_width, dtype,
                                             min(config.stages, padded_k // config.block_k)))
         reduces = reducing(family, config.consumers, self.score_mod)
-        return max(resources.shared_bytes(family, resources.Scope(program=allocations,
-                                                                  reducing_warpgroups=reduces))
+        return max(resources.shared_bytes(family, _scope(family, allocations, reduces))
                    for allocations in launches)
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
