@@ -456,13 +456,13 @@ def split_delta_rule(mixed, g, beta, segments, starts, valid, taps, *, widths, p
     """A delta-rule mixer's conv and rule over this shard's slice of whole training sequences, inside a
     `shard_map` that holds the sequence axis manual (`over_sequence`): the conv with its halo
     (`sequence_conv`, its `parts` the queries', keys' and values' widths, the first two l2-normalised), the
-    pieces in heads of their `widths`, and `rule(query, key, value, g, beta, state, starts)` from the
+    pieces in heads of their `widths`, and `rule(query, key, value, g, beta, state, starts=)` from the
     memory this shard's slice enters with (`entering_memory`), its output named as `held_scan`'s."""
     query, key, value = (piece.reshape(*piece.shape[:2], -1, width) for piece, width in
                          zip(sequence_conv(mixed, taps, None, segments, valid, parts=parts, dtype=dtype),
                              widths, strict=True))
     state = entering_memory(rule, query, key, value, g, beta, starts, axis=SEQUENCE_AXIS)
-    out, _ = rule(query, key, value, g, beta, state, starts)
+    out, _ = rule(query, key, value, g, beta, state, starts=starts)
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')
 
 

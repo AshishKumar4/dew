@@ -819,7 +819,7 @@ def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, stat
     transfer): `Z` the write its last document leaves from zero, `F` its transfer, zero where that document
     starts inside the slice. The summaries are gathered over `axis` and composed in order, `E_r = F_{r-1}
     E_{r-1} + Z_{r-1}` from the row's `state` (zero where None) on the first shard; a slice that starts a
-    document (its first token's `starts`) enters from zero. `rule(query, key, value, g, beta, state,
+    document (its first token's `starts`) enters from zero. `rule(query, key, value, g, beta, state, *,
     starts)` returns `(output, final memory)`."""
     batch, _, heads, columns = value.shape
     width = key.shape[-1]
@@ -831,7 +831,7 @@ def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, stat
                          jnp.broadcast_to(jnp.eye(width, dtype=wide), (batch, heads, width, width)))
     widened = jnp.concatenate([value.astype(wide), jnp.zeros((*value.shape[:-1], width), wide)], axis=-1)
     _, summary = rule(query.astype(wide), key.astype(wide), widened, g, beta.astype(wide),
-                      jnp.concatenate([zero, identity], axis=-1), starts)
+                      jnp.concatenate([zero, identity], axis=-1), starts=starts)
     writes, transfers = (jax.lax.all_gather(part, axis) for part in (summary[..., :columns],
                                                                         summary[..., columns:]))
     memory = zero if state is None else state.astype(wide)
