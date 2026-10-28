@@ -252,6 +252,33 @@ def _erfinv_special(value):
     return expected, ~(np.abs(value) < 1) | (value == 0)
 
 
+def _logistic_interval(values, bits):
+    """logistic's outward enclosure, 1 / (1 + exp(-x)), at each finite value, taken at EXP_RANGE's nearer
+    end beyond it: below it every logistic is under exp(-110), between +0 and the least subnormal of a
+    format no wider than fp32, and above it within exp(-90) of one, between one and the largest value
+    below it, the verdicts of the ends'."""
+    return _interval(lambda iv, x: 1 / (1 + iv.exp(-x)))(np.clip(values, *EXP_RANGE), bits)
+
+
+def _logistic_special(value):
+    """logistic's limits at the infinities and its one exact value, logistic(±0) = 1/2, named."""
+    named = ~np.isfinite(value) | (value == 0)
+    return np.select([value == np.inf, value == -np.inf, value == 0], [1.0, 0.0, 0.5], np.nan), named
+
+
+def _rsqrt_special(value):
+    """rsqrt's pole at zero, of the zero's sign, its zero at infinity, NaN below zero, and its exact
+    values, at the powers of four (2^(2k), whose root's reciprocal 2^-k is on every grid; at no other
+    value is it), named."""
+    mantissa, exponent = np.frexp(np.where(np.isfinite(value) & (value > 0), value, 1.0))
+    four = np.isfinite(value) & (value > 0) & (mantissa == 0.5) & ((exponent - 1) % 2 == 0)
+    named = np.isnan(value) | (value <= 0) | (value == np.inf) | four
+    expected = np.select([value < 0, value == 0, value == np.inf, four],
+                         [np.nan, np.copysign(np.inf, value), 0.0, np.ldexp(1.0, -(exponent - 1) // 2)],
+                         np.nan)
+    return expected, named
+
+
 def _transcendental(enclose, special):
     """A transcendental's levels (`LEVELS`): where `special(value)` names an exact result (a limit, a
     pole, outside the domain), 0 at that result and UNREACHED elsewhere; at every other value at least
@@ -685,6 +712,8 @@ LEVELS = {
     "log": _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
     "exp": _transcendental(_exp_interval, _exp_special),
     "erf_inv": _transcendental(_erfinv_enclosed, _erfinv_special),
+    "rsqrt": _transcendental(_interval(lambda iv, x: 1 / iv.sqrt(x)), _rsqrt_special),
+    "logistic": _transcendental(_logistic_interval, _logistic_special),
 }
 """Each rounding primitive's measure, `levels(operands, result, fmt, flushes) -> level`, element by
 element, on a lane that flushes or not: 0 where the result is its exact value rounded to nearest (an
@@ -705,8 +734,10 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
     from about 2^-140 (subnormal on a lane that keeps subnormals) to 2^126; roots of every binade,
     subnormals included; logarithms of every binade and a quarter near one; exponentials across fp32's
     range and a quarter near zero; inverse error functions across (-1, 1) and a quarter near its poles;
-    and each transcendental at its exact value (exp(0), log(1), erf_inv(0)), which a lane must return
-    exactly. One fixed draw per primitive and format."""
+    reciprocal roots of every binade, a quarter at the powers of four where they are exact; logistics
+    across fp32's range and a quarter near zero; and each transcendental at its exact value (exp(0),
+    log(1), erf_inv(0), logistic(0)), which a lane must return exactly. One fixed draw per primitive and
+    format."""
     rng = np.random.default_rng([*name.encode(), fmt.precision])
     quarter = PROBES // 4
 
@@ -730,10 +761,14 @@ def _probes(name: str, fmt: Format) -> list[np.ndarray]:
         value[:quarter] = 1 + rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         value[0] = 1.0
         drawn = [value]
-    elif name == "exp":
+    elif name in ("exp", "logistic"):
         value = rng.uniform(-104, 89, PROBES)
         value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
         value[0] = 0.0
+        drawn = [value]
+    elif name == "rsqrt":
+        value = np.abs(scaled(-149, 127))
+        value[:quarter] = 4.0 ** rng.integers(-74, 64, quarter)
         drawn = [value]
     else:
         value = rng.uniform(-1, 1, PROBES)
@@ -770,6 +805,8 @@ def lane() -> Lane:
 
 CONTRACTS = {
     "add": _rounding("add", _wrapping(np.add)),
+    # A cotangents' sum, the add its transpose emits, lowered as `add` is: held at add's reach.
+    "add_any": _rounding("add", _wrapping(np.add)),
     "sub": _rounding("sub", _wrapping(np.subtract)),
     "mul": _rounding("mul", _wrapping(np.multiply)),
     "square": _rounding("square", _wrapping(lambda a: a * a)),
@@ -783,6 +820,8 @@ CONTRACTS = {
     "log": _rounding("log", None),
     "exp": _rounding("exp", None),
     "erf_inv": _rounding("erf_inv", None),
+    "rsqrt": _rounding("rsqrt", None),
+    "logistic": _rounding("logistic", None),
     "reduce_sum": _reduced_sum,
     "cumsum": _cumulative,
     "dot_general": _dot,
@@ -814,6 +853,9 @@ CONTRACTS = {
     "copy": _moved(lambda params, a: a),
     "copy_p": _moved(lambda params, a: a),
     "optimization_barrier": _moved(lambda params, a: a),
+    "name": _moved(lambda params, a: a),
+    "rev": _moved(lambda params, a: np.flip(a, tuple(params["dimensions"]))),
+    "split": _moved(lambda params, a: a),
     "pad": _moved(_padded),
     "iota": _moved(_iota),
     "gather": _moved(_gathered),
@@ -830,9 +872,20 @@ operation wrapped to its width; or a result with no rounding at all, bit for bit
 sign operation, a comparison), every operand read as the lane reads it (`Lane.flushes`). A primitive
 missing here cannot be certified, which fails the site's coverage, as does an integer result of a
 primitive with no integer form (`div`, `sqrt`, a transcendental)."""
-POSITIONAL = {"optimization_barrier"}
-"""The primitives whose each result is the operand in its own position, so their contract reads that
-operand alone (`_held`)."""
+def _piece(params, value, index):
+    """lax.split's `index`-th result: its operand's run of `sizes[index]` along `axis`, after the earlier
+    sizes'."""
+    start = sum(params["sizes"][:index])
+    return np.take(value, np.arange(start, start + params["sizes"][index]), axis=params["axis"])
+
+
+RESULT_OPERANDS = {
+    "optimization_barrier": lambda params, operands, index: [operands[index]],
+    "split": lambda params, operands, index: [_piece(params, operands[0], index)],
+}
+"""The primitives of several results whose each result is a move of a part of their operands of its own
+position, `parts(params, operands, index)`, which its contract reads alone (`_held`): an optimization
+barrier's i-th operand, a split's i-th piece."""
 
 
 def certified(fn, *arguments) -> tuple:
@@ -924,8 +977,8 @@ def _held(eqn, operands, results, findings, at) -> None:
             return
     for index, result in enumerate(results):
         fmt = _format(getattr(_host(result), "dtype", np.float32))
-        # An optimization barrier's i-th result is its i-th operand: its contract reads that one alone.
-        given = [hosted[index]] if name in POSITIONAL else hosted
+        # A result of its own position reads its own part of the operands alone (a barrier's, a split's).
+        given = RESULT_OPERANDS[name](eqn.params, hosted, index) if name in RESULT_OPERANDS else hosted
         try:
             ok = np.asarray(CONTRACTS[name](eqn.params, given, _host(result), fmt))
         except TypeError:

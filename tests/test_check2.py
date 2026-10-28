@@ -9,6 +9,7 @@ import ml_dtypes
 import numpy as np
 import op_certificates as oc
 import pytest
+from jax.ad_checkpoint import checkpoint_name
 
 
 @pytest.mark.parametrize("dtype, subnormal, halves", [
@@ -28,8 +29,9 @@ def test_the_lane_flushes_operands_and_results_alike_however_it_compiles(dtype, 
 
 
 @pytest.mark.parametrize("name, fn, operands", [
-    ("add", jnp.add, 2), ("sub", jnp.subtract, 2), ("mul", jnp.multiply, 2), ("div", jnp.divide, 2),
-    ("sqrt", jnp.sqrt, 1), ("log", jnp.log, 1), ("exp", jnp.exp, 1)])
+    ("add", jnp.add, 2), ("add_any", jnp.add, 2), ("sub", jnp.subtract, 2), ("mul", jnp.multiply, 2),
+    ("div", jnp.divide, 2), ("sqrt", jnp.sqrt, 1), ("rsqrt", jax.lax.rsqrt, 1), ("log", jnp.log, 1),
+    ("exp", jnp.exp, 1), ("logistic", jax.lax.logistic, 1)])
 def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(name, fn, operands):
     """The lane's own result of each operation on random float32 operands, subnormal products and
     quotients included, holds its contract at the lane's measured reach; the same result moved past
@@ -39,12 +41,13 @@ def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(n
     rng = np.random.default_rng(1)
     values = [np.float32(rng.uniform(0.01, 4, 256) * rng.choice([1, 2.0 ** -70], 256))
               for _ in range(operands)]
-    if name in ("sqrt", "log"):
+    if name in ("sqrt", "rsqrt", "log"):
         values = [np.abs(values[0])]
     result = np.asarray(jax.jit(fn)(*values))
     contract = ct.CONTRACTS[name]
     assert np.all(contract({}, values, result, oc.FLOAT32))
-    reach = ct.lane().reach[name, "float32"]
+    # A cotangents' sum is held at add's reach, as it lowers as add does.
+    reach = ct.lane().reach["add" if name == "add_any" else name, "float32"]
     stepped = result.copy()
     stepped[3] = np.nextafter(stepped[3], np.float32(np.inf)) if stepped[3] else np.float32(1e-30)
     for _ in range(2 * max(reach, 1)):
@@ -321,22 +324,61 @@ def _off_by_one_element(result):
     ("stack", lambda a, b: jnp.stack([a, b], axis=1), [np.float32([1, 2, 3]), np.float32([4, 5, 6])]),
     ("optimization_barrier", lambda a, b: jax.lax.optimization_barrier((a, b)),
      [np.float32([1, 2]), np.float32([[3, 4, 5]])]),
+    ("rev", lambda a: jax.lax.rev(a, (0, 1)), [np.float32(np.arange(12).reshape(3, 4))]),
+    ("split", lambda a: jax.lax.split(a, (1, 3), axis=1), [np.float32(np.arange(12).reshape(3, 4))]),
+    ("name", lambda a: checkpoint_name(a, "held"), [np.float32([1, 2, 3])]),
 ], ids=["pad", "iota", "gather", "gather clipped", "gather filled", "gather batched", "gather clipped bf16",
-        "gather bf16", "stack", "barrier"])
+        "gather bf16", "stack", "barrier", "rev", "split", "name"])
 def test_each_move_holds_its_own_result_and_refuses_one_element_off_it(name, fn, operands):
     """Every move check 2 certifies by a numpy oracle of XLA's semantics (`CONTRACTS`), padding with
-    interior and negative edges, an iota, a gather in each mode and batched, a stack and an optimization
-    barrier of two operands: the program certifies, its contract holding the lane's own result at every
-    element, and the contract refuses that result with one element a step off."""
+    interior and negative edges, an iota, a gather in each mode and batched, a stack, an optimization
+    barrier of two operands, a reversal, a split in two and a checkpoint name: the program certifies,
+    its contract holding the lane's own result at every element, and the contract refuses that result
+    with one element a step off."""
     assert ct.certified(fn, *operands)[1] == []
     params, given, results = _first_equation(fn, operands, name)
     contract = ct.CONTRACTS[name]
     for index, result in enumerate(results):
         native = np.asarray(result)
-        # As `_held` hands it: a positional primitive's contract reads its own operand alone.
-        operands = [given[index]] if name in ct.POSITIONAL else given
+        # As `_held` hands it: a result of its own position reads its own part of the operands alone.
+        operands = ct.RESULT_OPERANDS[name](params, given, index) if name in ct.RESULT_OPERANDS else given
         assert np.all(contract(params, operands, native, None)), name
         assert not np.all(contract(params, operands, _off_by_one_element(native), None)), name
+
+
+def test_a_split_holds_each_piece_to_its_own_run():
+    """A split into two pieces of one shape: its pieces in place hold, the two swapped break, though each
+    is a run of the operand."""
+    a = np.float32(np.arange(8).reshape(2, 4))
+
+    def split(a):
+        return jax.lax.split(a, (2, 2), axis=1)
+
+    _, given, results = _first_equation(split, [a], "split")
+    eqn = jax.make_jaxpr(split)(a).jaxpr.eqns[0]
+    findings = []
+    ct._held(eqn, given, results, findings, "split")
+    assert findings == []
+    ct._held(eqn, given, results[::-1], findings, "split")
+    assert len(findings) == 2, findings
+
+
+def test_rsqrt_and_logistic_name_their_exact_values():
+    """rsqrt is exact at the powers of four and logistic at zero, which their contracts hold bit for bit:
+    a result a step off there breaks, as do a wrong pole sign and a missed limit."""
+    fours = np.float32([1.0, 4.0, 0.25, 2.0 ** -148, 2.0 ** 126])
+    roots = np.float32([1.0, 0.5, 2.0, 2.0 ** 74, 2.0 ** -63])
+    assert np.all(ct.CONTRACTS["rsqrt"]({}, [fours], roots, oc.FLOAT32))
+    off = np.nextafter(roots, np.float32(np.inf))
+    assert not np.any(ct.CONTRACTS["rsqrt"]({}, [fours], off, oc.FLOAT32))
+    poles = np.float32([0.0, -0.0, np.inf])
+    assert np.all(ct.CONTRACTS["rsqrt"]({}, [poles], np.float32([np.inf, -np.inf, 0.0]), oc.FLOAT32))
+    assert not np.any(ct.CONTRACTS["rsqrt"]({}, [poles], np.float32([-np.inf, np.inf, 1e-30]), oc.FLOAT32))
+    limits = np.float32([0.0, np.inf, -np.inf])
+    assert np.all(ct.CONTRACTS["logistic"]({}, [limits], np.float32([0.5, 1.0, 0.0]), oc.FLOAT32))
+    assert not np.any(ct.CONTRACTS["logistic"]({}, [limits],
+                                               np.nextafter(np.float32([0.5, 1.0, 0.0]), np.float32(0.25)),
+                                               oc.FLOAT32))
 
 
 def test_a_barrier_holds_each_result_to_its_own_operand():

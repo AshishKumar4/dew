@@ -21,15 +21,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from certified import assert_certified
 from model_support import decode_through
-from reference_error import (
-    assert_as_exact,
-    declared_seeds,
-    indexed_recording,
-    recording,
-    widened,
-    with_gradients,
-)
+from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, with_gradients
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
@@ -227,33 +221,30 @@ def test_the_layer_gradients_match_the_oracle():
     assert_as_exact(ours, theirs, draw, "layer gradients", seeds=SEEDS['layer gradients'])
 
 
-BOUND = 1e-4
-"""The existing bound (`test_default_eps_gradients_hold_their_prior_bound`), its gradients'
-largest error over their largest value."""
+CERTIFIED_SEEDS = 2
+"""The draws the default eps gradients are certified on (check 2): each a whole layer's backward, one
+primitive at a time."""
 
 
-def scaled(actual, wanted) -> float:
-    return float(np.max(np.abs(np.asarray(actual, np.float64) - wanted)) / np.max(np.abs(wanted)))
+def test_default_eps_gradients_certify_element_by_element(monkeypatch):
+    """At the gated norm's own eps 1e-5 (ledger row 1348) a gradient through the norm of a near-zero row
+    errs as the row's inverse square, a tail check 1 cannot resolve within 512 seeds, so the layer's
+    gradients there are certified instead: the layer's backward run one primitive at a time, every
+    element of every operation within its own operation's certified bound (check 2), whatever a row's
+    norm. The program certified is the library's own, which every platform runs: without the test
+    lane's wide CPU arithmetic (`precision.WIDE_CPU_ARITHMETIC`), each of its float32 sums certified as
+    the sum it is. Check 1 holds the gradients at eps 1e-2 (`test_the_layer_gradients_match_the_oracle`)."""
+    from dew.nn import precision
 
-
-def test_default_eps_gradients_hold_their_prior_bound():
-    """An existing bound (ledger row 1348): at the gated norm's own eps 1e-5, a gradient through the norm
-    of a near-zero row errs as the row's inverse square, a tail check 1 cannot resolve, so the layer's
-    gradients there keep the prior bound, their largest error within BOUND of their largest value from
-    the transcription's float64 gradients (its autodiff, where central differences were), until the
-    zero-element certificate (tests/zero_elements.py) judges those rows."""
+    monkeypatch.setenv(precision.WIDE_CPU_ARITHMETIC, "0")
     module, _, variables = layer_and_params(-5.0)
-    x = jnp.asarray(np.random.RandomState(4).randn(B, S, E), jnp.float32)
-    cotangent = jnp.asarray(np.random.RandomState(5).randn(B, S, E), jnp.float32)
 
-    _, grad_params, grad_x = with_gradients(module.apply)(variables, x, cotangent)
-    ours = {"x": grad_x, **oracle_params(grad_params)}
-    with jax.enable_x64(new_val=True):
-        _, wanted_x, wanted = with_gradients(partial(oracle_forward, eps=1e-5))(
-            *widened((x, oracle_params(variables), cotangent)))
-        wanted = {"x": wanted_x, **wanted}
-    for name, value in ours.items():
-        assert scaled(value, np.asarray(wanted[name])) < BOUND, name
+    def draw(seed):
+        rng = np.random.RandomState(seed)
+        return (variables, jnp.asarray(rng.randn(B, S, E), jnp.float32),
+                jnp.asarray(rng.randn(B, S, E), jnp.float32))
+
+    assert_certified(with_gradients(module.apply), draw, "KDA's gradients at eps 1e-5", seeds=CERTIFIED_SEEDS)
 
 
 def test_prefill_then_token_steps_reproduce_the_parallel_layer():
