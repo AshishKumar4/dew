@@ -331,8 +331,10 @@ def test_an_examples_run_trains_each_record_once_under_the_schedule_its_plan_siz
     assert_as_exact(trained, descended, records, "examples run", seeds=EXAMPLES_SEEDS)
 
 
+@dataclasses.dataclass(frozen=True)
 class Repeated:
-    """An objective's expansion of each record into `id % 3 + 1` copies of its row, read after the bound."""
+    """An objective's expansion of each record into `id % 3 + 1` copies of its row, read after the bound;
+    a frozen record, so a resumed run knows it for the step it saved."""
 
     def flat_map(self, element):
         return tuple({"x": element["x"]} for _ in range(int(element["id"]) % 3 + 1))
