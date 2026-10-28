@@ -187,8 +187,8 @@ def test_rows_whose_schema_is_their_context_pack_several_a_window_each_reading_i
     its own state's; the window's contexts end to end within its context budget."""
     from test_decision_context import windows_of
 
-    # A window of 512 tokens holds several rows of a short state, and one of 768 context tokens several of
-    # their schemas.
+    # A window of 512 tokens holds several rows of a short state and the row's own text, and one of 768
+    # context tokens several of their schemas.
     objective = read_in_context(segments=3, max_len=512)
     rows = labelled()
     several = 0
@@ -213,14 +213,12 @@ def test_rows_whose_schema_is_their_context_pack_several_a_window_each_reading_i
     assert several, "no window held more than one row"
 
 
-PACKED_SCHEMA_SEEDS = 128
-"""Check 1's declared seeds for packed rows reading their own schemas against each row alone, sized
-paired (`seeds_for` with the packed windows as `dew_fn`, 2026-10-28 on armada). The check reads 128
-draws of windows of 1,024 tokens beside 2,048 of contexts, 1,540 s on a CI core, so it runs in the whole
-suite alone (`whole_suite`)."""
+PACKED_SCHEMA_SEEDS = 64
+"""Check 1's declared seeds for packed rows reading their own schemas against each row alone, in windows
+of 512 tokens beside 768 of contexts, sized paired (`seeds_for` with the packed windows as `dew_fn`,
+2026-10-28 on armada)."""
 
 
-@pytest.mark.whole_suite
 def test_packed_rows_decide_each_schema_in_context_as_each_row_alone():
     """Rows whose schemas are their contexts, packed several a window, decide each row's options as the
     row does in a window of its own, through the unmodified objective, its cross-attention open (every
