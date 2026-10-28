@@ -2125,8 +2125,8 @@ def _query_key_held(call: _Call) -> _Held:
     then `sum(S dS)` (`_memory_sum`): the memories' product and its diagonal's mask where products read
     registers, with a block of each operand, else the memories in fp32."""
     held, memories, given = call.held, call.memories, call.given
-    summed = ([_f32(call.block, call.block)] + _masks(call.block, call.block)
-              + _fragments(call, (memories, call.block, call.block), (memories, call.block, call.block))
+    block = (memories, call.block, call.block)
+    summed = ([_f32(call.block, call.block), *_masks(call.block, call.block), *_fragments(call, block, block)]
               if call.family.operands_in_registers else [_f32(call.block, call.block)] * 2)
     return _Held(phases=(
         [_f32(CHUNK, call.block)] * 4
