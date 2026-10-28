@@ -392,7 +392,8 @@ def mosaic_failures(found: list[dict]) -> list[str]:
     registers, or one whose template's model (the case's `models`) decides otherwise than ptxas's register
     need (`register_need`, `decisions`): admitted where the need does not fit its budget or refused where
     it does, or another count of programs a multiprocessor (owner, 10-27: neither spills nor wastes
-    occupancy; docs/design/kernel-templates.md)."""
+    occupancy; docs/design/kernel-templates.md), or whose scratch is not the bytes its planner sized it by
+    (the model's `shared`, `resources.scratch_bytes`, where it states them)."""
     failed = failures(found)
     for record in found:
         if refused(record):
@@ -411,6 +412,9 @@ def mosaic_failures(found: list[dict]) -> list[str]:
             admitted = model is None or decisions(model["registers"], model)[0]
             if admitted and (why := found.failure(record["limit"], record["tmem_limit"])) is not None:
                 failed.append(f"{record['name']} {found.kernel}: {why}")
+            if model is not None and model.get("shared") not in (None, found.shared):
+                failed.append(f"{record['name']} {found.kernel}: its planner sized {model['shared']} bytes "
+                              f"of scratch, the kernel asks for {found.shared}")
             if model is not None and decisions(model["registers"], model) != decisions(need, model):
                 failed.append(f"{record['name']} {found.kernel}: the model's {model['registers']} registers "
                               f"decide {decisions(model['registers'], model)}, ptxas's need of {need} "

@@ -710,15 +710,20 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         """The launch the planner sizes at `config`'s shape (`resources.plan`): its allocations at a ring
         depth (`_allocations`), its consumers, its registers a consumer thread (`registers`), and at most
         the stages its program's share of the family's shared memory holds of a step's two operand blocks
-        at an element a byte, at least two."""
+        at an element a byte and its contraction has steps, at least two."""
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+        depth = self._generated_extents(ba)[1]
+        steps = None if depth is None else -(-depth // config.block_k)
 
         def scope(stages: int) -> resources.Scope:
             staged = dataclasses.replace(config, stages=stages)
-            return self._allocations(ba, staged, family).scope(family, staged)
+            return self._allocations(ba, staged, family).scope(family, staged, steps)
 
         shared = resources.program_shared(family.most_shared, config.programs)
         most = shared // ((config.block_m + config.block_n) * config.block_k)
+        if steps is not None:
+            # A ring deeper than its contraction's steps holds no more of them.
+            most = min(most, max(2, steps))
         return resources.Launch(scope, config.warpgroups, self.registers(ba, config), most=most)
 
     def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
@@ -835,13 +840,13 @@ class MosaicGmm(_Mosaic):
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
              trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
-        # Never set: the launch is not eligible for exact sums; a dense call is one group, as any.
-        del exact_sums, dense
+        # Exact sums are ineligible for this launch.
+        del exact_sums
         return mosaic_gpu.gmm(tokens, kernel, sizes, tiles=config, transpose_rhs=trans_rhs,
                               out_dtype=out_dtype, multiprocessors=self._launched(config, interpret),
                               interpret=INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
-                              **hooks.kernel_options()), None
+                              dense=dense, **hooks.kernel_options()), None
 
 
 @dataclasses.dataclass(frozen=True)
