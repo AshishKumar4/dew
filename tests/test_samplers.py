@@ -728,11 +728,13 @@ def assert_walks_as_edm(name: str, *, final_denoise: bool) -> None:
     denoiser = edm_grid(steps).denoiser(EDMOracle(), {}, {})
     times = np.arange(steps, 0 if final_denoise else -1, -1, dtype=np.float32)
 
+    # The closing walk takes `sample`'s default, which is the closing denoise.
+    closing = {} if final_denoise else {"final_denoise": False}
+
     @jax.jit
     def walked(index, inputs):
         x_T = jnp.asarray(inputs["latents"]) * np.float32(80.0)
-        return {"result": sample(denoiser, x_T, solver=solver, key=inputs["key"], times=times,
-                                 final_denoise=final_denoise)}
+        return {"result": sample(denoiser, x_T, solver=solver, key=inputs["key"], times=times, **closing)}
 
     seeds = declared_seeds(EDM)[name]
     draw, recorded, truth = indexed_recording(stored, name, seeds, inputs_of=edm_generator().draw)
