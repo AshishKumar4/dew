@@ -28,6 +28,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _streamed,
     _views_of,
     approximate,
+    reducing,
     stated,
 )
 
@@ -278,6 +279,7 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
         entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
         interpret=walk.interpret, approx_math=walk.approx_math, name="attention_dq",
+        reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
         # dQ's product, the model's this launch owns (`stated`): its `S` and `dP` recomputed.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries, width, query, key, value, dout))(
             query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
@@ -463,6 +465,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         grid=(heads, keys_padded // pair, batch), grid_names=("heads", "k_tiles", "batch"),
         consumers=consumers, interpret=walk.interpret, approx_math=walk.approx_math,
         name="attention_dkv_fused" if walk.fused else "attention_dkv",
+        reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
         # The model's products this launch owns (`stated`): dK's, dV's and dP's, and dQ's where it adds it;
         # its `S` recomputed.
         cost=stated(walk.spec, batch, heads, walk.spec.queries or queries,

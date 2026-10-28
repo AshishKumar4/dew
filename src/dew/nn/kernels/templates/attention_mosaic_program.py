@@ -186,6 +186,14 @@ def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differ
     return not any(_primitives(jaxpr) & APPROXIMATED for jaxpr in traced)
 
 
+def reducing(family: mosaic.Family, consumers: int, *hooks) -> int:
+    """The warpgroups of a launch of `consumers` whose arithmetic may reduce across warps implicitly, each
+    reserving its share of Mosaic GPU's reduction scratch (`Family.kernel`'s `reducing_warpgroups`): a hook's
+    unit row, which the fork selects by a reduction across warps (ledger 1428), so every warpgroup of a
+    launch that runs a hook (`hooks`, its score and output hooks, None where it has none); none otherwise."""
+    return family.warpgroups(consumers) if any(hook is not None for hook in hooks) else 0
+
+
 def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
                  differentiated: bool = False) -> list[jax_core.Jaxpr]:
     """`hooks` traced as a launch runs them on `tile`, its outputs `value_width` wide: the score hook (and,
