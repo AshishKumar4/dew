@@ -31,6 +31,7 @@ from dew.decision import (
     StateFirstLayout,
 )
 from dew.decision.rows import Encoding, Fit, QuestionRows, _encoded_unit, _window_groups
+from dew.decision.sources import LAYA_BUDGETS
 from dew.decision.task import laid_out
 from dew.nn import categorical
 from dew.objectives.base import Ratio, Step, Weighted
@@ -305,8 +306,8 @@ def _joint_layout(window: int) -> JointLayout:
 
 
 UNITS = {
-    "trimmed": (_trimmed_pair, lambda window: StateFirstLayout(max_len=window), 1.0, range(256, 424, 8),
-                None),
+    "trimmed": (_trimmed_pair, lambda window: StateFirstLayout(max_len=window, **LAYA_BUDGETS), 1.0,
+                range(256, 424, 8), None),
     "joint": (_joint_pair, _joint_layout, 0.5, range(896, 1248, 16),
               JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)),
 }
@@ -318,7 +319,8 @@ def test_a_unit_the_fit_holds_fits_its_window_however_training_draws_its_options
     place, question by question, lays a unit out within the window the fit held it in. A row of a
     question each may be longest with the option in place of the right one, since adding one can cut
     the options harder (`trimmed`); a joint row's questions draw apart, and a question that offers the
-    option already keeps its own (`joint`). The windows between the unit as it is and at its longest
+    option already keeps its own (`joint`); a fresh layout keeps every question whole, so the cut is a
+    release's declared budgets' (Laya's). The windows between the unit as it is and at its longest
     hold the one but not the other."""
     build, layout_of, rate, windows, head = UNITS[case]
     pair, width = build()

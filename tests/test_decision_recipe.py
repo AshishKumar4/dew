@@ -684,6 +684,38 @@ def test_a_decision_run_lays_its_rows_in_blocks_its_source_reads_whole():
         dataclasses.replace(run, head=JointShape()).prepare()
 
 
+def test_a_decision_run_writes_its_rows_in_the_order_and_blocks_it_names():
+    """`--order` writes a fresh head's rows in its order and `--split` splits them where it says, the
+    whole row one block where its source reads blocks; a split of rows its source reads in order is
+    refused, a run of the rows' own segments and an order beside them too, and a framing of the
+    layout's own row, which is written unframed."""
+    from dew.config import SourceOptions
+    from dew.decision.layout import AnswerCue, Framing, Instructions, OptionLines, QuestionLayout, State
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    source = SourceOptions(text_only=True, attention={"full_attention": "block_bidirectional"})
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, source=source,
+                              order="re_read", split="whole")
+    objective, _ = run.prepare().train("x")
+    layout = objective.layout
+    assert isinstance(layout, QuestionLayout)
+    assert (layout.order, layout.split, layout.blocks) == ("re_read", "whole", True)
+    [row] = layout.rows(objective.tokenizer, objective.specials, "my card is lost",
+                        {"q": Choice("Which?", ["a", "b"])})
+    assert row.blocks == (0,) * len(row.tokens)
+    plain = dataclasses.replace(run, source=SourceOptions(text_only=True))
+    with pytest.raises(ValueError):
+        plain.prepare()
+    ordered, _ = dataclasses.replace(plain, split=None, order="question_first").prepare().train("x")
+    assert isinstance(ordered.layout, QuestionLayout) and ordered.layout.order == "question_first"
+    with pytest.raises(ValueError):
+        dataclasses.replace(plain, split=None, segments=(Instructions({"choice": "{}"}), OptionLines(),
+                                                         State(), AnswerCue())).prepare()
+    with pytest.raises(ValueError):
+        dataclasses.replace(plain, split=None, framing=Framing()).prepare()
+
+
 def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():
     """A decision run that trains an adapter over a source reads the source onto its trainer's mesh
     (`TrainerConfig.source_placement`), as an LM run does: its objective's frozen base is device

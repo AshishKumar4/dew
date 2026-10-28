@@ -486,7 +486,8 @@ class LabelReadout(Head):
     A row's labels are the head's, its first as many as the question has options (`validate_rows`);
     option slots past the labels, a batch's padding, read -inf. A head drawn with no ids reads `count`
     labels, named where its tokenizer is known: the layout's own names, or where they name none, the
-    first `count` its tokenizer spells as one token each (`labelled`, `Labels.spelled`)."""
+    first `count` its tokenizer spells as one token each (`labelled`, `Labels.spelled`); with no count,
+    every label it letters (`Labels.capacity`)."""
 
     features: int
     label_ids: tuple[tuple[int, ...], ...]
@@ -503,12 +504,11 @@ class LabelReadout(Head):
     def labelled(self, labels: Labels, tokenizer: Tokenizer) -> tuple["LabelReadout", Labels]:
         if self.label_ids:
             return self, labels
-        if labels.names is None and not self.count:
-            raise ValueError("a letter readout drawn with no label ids reads labels that name their count, "
-                             "or a count of labels its tokenizer names")
-        # A count reads that many labels: the layout's own first names, or its tokenizer's (`spelled`).
-        named = (labels if not self.count else labels.spelled(tokenizer, self.count) if labels.names is None
-                 else dataclasses.replace(labels, names=labels.names_for(self.count)))
+        # A count reads that many labels: the layout's own first names, or its tokenizer's (`spelled`);
+        # no count reads every label the tokenizer letters (`Labels.capacity`).
+        count = self.count or labels.capacity(tokenizer)
+        named = (labels.spelled(tokenizer, count) if labels.names is None
+                 else dataclasses.replace(labels, names=labels.names_for(count)))
         return self.clone(label_ids=named.ids(tokenizer, len(named.names or ()))), named
 
     @nn.nowrap
