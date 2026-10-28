@@ -464,7 +464,7 @@ def _(value: TokenScores, prefix: Path) -> list[Path]:
 def _arrays(prefix: Path, **arrays) -> list[Path]:
     """`arrays`, brought home, saved together under `prefix` as one .npz preview."""
     path = prefix.with_suffix('.npz')
-    np.savez(path, **{name: _home(array) for name, array in arrays.items()})
+    np.savez(path, allow_pickle=False, **{name: _home(array) for name, array in arrays.items()})
     return [path]
 
 

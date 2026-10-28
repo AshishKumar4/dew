@@ -813,7 +813,8 @@ class Checkpointable(Protocol):
     def set_state(self, state: Position) -> None: ...
 
 
-def restore_parent(parent: Checkpointable, state: Mapping[str, object], key: str, what: str) -> None:
+def restore_parent(parent: pygrain.DatasetIterator, state: Mapping[str, object], key: str,
+                   what: str) -> None:
     """Set `parent`, the stream a wrapper reads, to the position the wrapper's own `state` saved for it
     under `key`, `what` naming it where the record is no position."""
     parent.set_state(record(state[key], what))
