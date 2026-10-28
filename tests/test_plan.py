@@ -950,9 +950,9 @@ def test_a_run_that_sets_its_remat_keeps_it_and_is_told_of_the_cheapest_rung_bel
         monkeypatch, caplog, tmp_path):
     """A run that sets remat 'full', with room for its step and for the step at 'minimal', trains at
     'full', as it asked, and its plan record and its log name the cheapest rung below that fits too,
-    with its headroom: no recomputation where its step fits, else 'minimal' (row 2026). A run that sets
-    no remat, or whose search climbed from none, has no rung below to be told of. Before, a run's own
-    remat was the plan's whole story."""
+    with its headroom: no recomputation where its step fits, else 'minimal' (row 2026); a later run of
+    the same step reads the advice from the plan it recorded. A run that sets no remat has no rung
+    below to be told of. Before, a run's own remat was the plan's whole story."""
     def needed(remat):
         return needs(monkeypatch, lm(split=1, remat=None if remat is None else REMAT_POLICIES[remat]))
 
@@ -969,6 +969,10 @@ def test_a_run_that_sets_its_remat_keeps_it_and_is_told_of_the_cheapest_rung_bel
     assert (cheaper["remat"], cheaper["fits"]) == (None if none <= room else "minimal", True)
     assert cheaper["headroom"] >= 0
     assert any("set remat to it" in record.getMessage() for record in caplog.records)
+    # A later run of the same step takes the plan its record holds, and the advice with it.
+    again = lm(split=1, remat=REMAT_POLICIES["full"])
+    trained(again, steps=0)
+    assert again.plan.get("cheaper") == cheaper
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "none"))
     unset = lm(split=1)
     trained(unset, steps=0)

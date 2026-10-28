@@ -1015,8 +1015,7 @@ class Trainer(Generic[Loss, Effects]):
             lower, lambda candidate: step_options(self.objective, candidate.micro,
                                                   candidate.prepared.variables, mesh),
             self.objective, mesh, self._xla_defaults, self._narrow,
-            None if self._base_rung is None else self._base_rung[1], resumed,
-            advise=recorded is None and resumed is None)
+            None if self._base_rung is None else self._base_rung[1], resumed)
         plans, probes = search.plans(
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
             # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
@@ -1031,6 +1030,7 @@ class Trainer(Generic[Loss, Effects]):
                                      mesh)
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
+        cheaper = self._cheaper(search, planned, recorded, resumed)
         self.validation = self._validation(planned.candidate.prepared)
         self.objective.substitute(list(planned.modules))
         self.objective.restore_head(planned.tile, fused=planned.fused)
@@ -1038,11 +1038,25 @@ class Trainer(Generic[Loss, Effects]):
         chosen = {**self._rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
-            keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
-        self.plan = settled(planned, plans, seconds, probes, search.cheaper_fit)
+            keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches,
+                                         'cheaper': cheaper})
+        self.plan = settled(planned, plans, seconds, probes, cheaper)
         if planned.split != candidates[0] or seconds:
             _log.info("the step fits the devices in the plan %s", self.plan)
         return planned.released(), flops
+
+    @staticmethod
+    def _cheaper(search: FitSearch, planned: Planned, recorded: JSON,
+                 resumed: JSON) -> dict[str, JSON] | None:
+        """The cheaper remat rung the run is told of (`FitSearch.cheaper`): the one a recorded plan's run
+        measured, none for a resumed run, which continues its checkpoint's rung, else measured now."""
+        if recorded is not None:
+            told = json_value(record(recorded, 'recorded plan').get('cheaper'), 'recorded cheaper rung')
+            return told if isinstance(told, dict) else None
+        if resumed is not None:
+            return None
+        probe = search.cheaper(planned)
+        return None if probe is None else probe.record()
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
                    split: int, narrow: bool, launches: str | None) -> Candidate:

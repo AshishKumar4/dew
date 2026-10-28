@@ -24,6 +24,7 @@ from dew.data.dataset import rows_of
 from dew.devices import gpu_free_bytes, xla_flag
 from dew.distributed.placement import parameter_axes
 from dew.mesh import batch_axes, mesh_axes
+from dew.nn.backbones.decoder_block import DECODER_REMAT, remat_record
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.protocols import Recomputing, RematChoosing, TritonGemm
@@ -488,32 +489,28 @@ def remat_half[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list |
 
 def remat_below[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list[list]:
     """The modules the objective trains at each rung of their remat ladders below where they stand,
-    cheapest first, each the list `objective.substitute` takes: every trained module put at no
-    recomputation (`RematChoosing.with_remat`) and moved up its own ladder a rung at a time
-    (`Recomputing.recompute_more`), as the fit search climbs, until the rung they stand at. Empty where
-    a trained module chooses no remat, stands at no recomputation, or off its ladder, where no rung is
-    below it."""
+    cheapest first, each the list `objective.substitute` takes. Each module's own rungs are those its
+    climb from no recomputation stands at (`RematChoosing.with_remat`, `Recomputing.recompute_more`)
+    before the ladder reaches its own policy (`DECODER_REMAT`, a rung that keeps what the next keeps
+    passed as the search passes it); the k-th list holds each module at its k-th, or at its own where
+    it has fewer. Empty where no trained module chooses a remat on its ladder above none."""
     entries = objective.program_key()
-    trained = [entry.trained and isinstance(entry.module, Recomputing) for entry in entries]
-    if not any(trained) or not all(isinstance(entry.module, RematChoosing)
-                                   for entry, chosen in zip(entries, trained, strict=True) if chosen):
-        return []
-
-    def records(modules) -> list:
-        return [module.recompute_record() if chosen else None
-                for module, chosen in zip(modules, trained, strict=True)]
-    here = records([entry.module for entry in entries])
-    modules = [entry.module.with_remat(None) if chosen else entry.module
-               for entry, chosen in zip(entries, trained, strict=True)]
-    below: list[list] = []
-    while records(modules) != here:
-        below.append(modules)
-        stronger = [module.recompute_more() if chosen else module
-                    for module, chosen in zip(modules, trained, strict=True)]
-        if any(module is None for module in stronger):
-            return []
-        modules = stronger
-    return below
+    ladder = [remat_record(policy) for policy in DECODER_REMAT]
+    prefixes: list[list | None] = []
+    for entry in entries:
+        module = entry.module
+        if not (entry.trained and isinstance(module, Recomputing) and isinstance(module, RematChoosing)
+                and module.recompute_record() in ladder):
+            prefixes.append(None)
+            continue
+        own, rungs, climbed = ladder.index(module.recompute_record()), [], module.with_remat(None)
+        while climbed is not None and ladder.index(climbed.recompute_record()) < own:
+            rungs.append(climbed)
+            climbed = climbed.recompute_more()
+        prefixes.append(rungs)
+    depth = max((len(rungs) for rungs in prefixes if rungs is not None), default=0)
+    return [[entry.module if not rungs else rungs[min(index, len(rungs) - 1)]
+             for entry, rungs in zip(entries, prefixes, strict=True)] for index in range(depth)]
 
 
 def remat_more[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:
