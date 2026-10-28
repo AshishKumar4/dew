@@ -187,31 +187,36 @@ def test_the_served_weights_are_restored_in_the_dtype_they_serve_in(example):
 def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(decide, caplog):
     """A scoring server (`ScoringServer.from_task`) over a task whose budget declares the questions and
     options a pass pads to (`Budget`), the run's widest, compiles every pass's program up front, a few
-    shapes the task declares once (`Decide.pass_shapes`): a lone request's and a full pass's at each of
-    the layout's lengths. Then requests of every length, question and option count, alone and
-    together, compile none while it serves, where each such shape compiled its own program as it came
-    (ledger 2033)."""
+    shapes the task declares once (`Decide.pass_shapes`): a few row counts at each of the layout's
+    lengths. Then requests of every length, question and option count, alone and together, compile no
+    forward while it serves; a server that compiled none up front compiles them as they come, which
+    the same log shows (ledger 2033)."""
     import logging
 
     from test_decision_batches import CASES
 
     from dew.decision.task import Budget
 
-    declared = replace(decide, budget=Budget(questions=4, options=16))
-    task, variables = declared.scoring()
-    with jax.log_compiles():
-        server = ScoringServer.from_task(task, variables)
-        assert server.programs == declared.pass_shapes
-        assert len(set(server.programs)) == len(server.programs) <= 8
+    bodies = [*CASES.values(), {**REQUEST, "state": REQUEST["state"] * 6}]
+    single = {**REQUEST, "questions": dict(list(REQUEST["questions"].items())[:1])}
+
+    def compiled_while_serving(server: ScoringServer) -> list[str]:
         caplog.clear()
         with caplog.at_level(logging.WARNING):
-            bodies = [*CASES.values(), {**REQUEST, "state": REQUEST["state"] * 6}]
-            futures = [server.submit(body) for body in bodies]
-            server.run()
-            for future in futures:
-                future.result()
-            single = server.submit({**REQUEST, "questions": dict(list(REQUEST["questions"].items())[:1])})
-            server.run()
-            single.result()
-    # The forward's own programs (`Decide._forward`); a host-side pad compiles in microseconds.
-    assert not [record for record in caplog.records if record.getMessage().startswith("Compiling logits")]
+            for batch in (bodies, [single]):
+                futures = [server.submit(body) for body in batch]
+                server.run()
+                for future in futures:
+                    future.result()
+        # The forward's own programs (`Decide._forward`, jitted as jit(logits)); a host-side pad is not one.
+        return [record.getMessage() for record in caplog.records
+                if record.getMessage().startswith("Compiling jit(logits)")]
+
+    with jax.log_compiles():
+        cold = replace(decide, budget=Budget(questions=5, options=16))
+        assert compiled_while_serving(ScoringServer(*cold.scoring(), rows=64))
+        declared = replace(decide, budget=Budget(questions=4, options=16))
+        server = ScoringServer.from_task(*declared.scoring())
+        assert server.programs == declared.pass_shapes
+        assert len(set(server.programs)) == len(server.programs) <= 16
+        assert not compiled_while_serving(server)

@@ -122,8 +122,7 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         compiled up front (`Scoring.compile`, the shapes in `programs`); a step looks at most `rows`
         requests. A server built directly compiles each program on its first pass."""
         server = cls(task, variables, rows=rows)
-        with server._context():
-            server.programs = tuple(task.compile(server.variables))
+        server.programs = tuple(task.compile(server.variables))
         return server
 
     @property

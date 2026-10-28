@@ -2,6 +2,7 @@
 
 import base64
 import binascii
+import contextlib
 import functools
 import io
 import json
@@ -475,30 +476,31 @@ class Decide(SavedRunTask):
 
     def fits(self, rows: Sequence[Encoded]) -> bool:
         """Whether `rows` are one of `logits`' passes: as many as its shape holds (`pass_shapes`)."""
-        return len(rows) <= self._shape(rows, alone=False).rows
+        return len(rows) <= self._shape(rows).rows
 
     @functools.cached_property
     def pass_shapes(self) -> tuple[PassShape, ...]:
         """The shapes a text pass pads to, declared once: the layout's window and its halvings
-        (`dew.inference.tasks.length_ladder`), each as one row, a lone request's pass, and as many rows
-        as the budget's tokens and rows allow, every other pass's; each with the budget's questions and
-        options (`Budget`). Where the budget declares both, each shape is one program, which
-        `compile_scoring` compiles."""
+        (`dew.inference.tasks.length_ladder`), each at a few row counts, one row (a lone request's pass),
+        the powers of 8 below the most the budget's tokens and rows allow, and that most, so a pass
+        pads to at most 8 times its rows; each with the budget's questions and options (`Budget`).
+        Where the budget declares both, each shape is one program, which `compile_scoring` compiles."""
         shapes = []
         for length in length_ladder(self.layout.max_len, len(self._probe[0].tokens)):
-            counts = sorted({1, max(1, min(self.budget.rows, self.budget.tokens // length))})
+            most = max(1, min(self.budget.rows, self.budget.tokens // length))
+            counts = sorted({*(8 ** power for power in range(math.floor(math.log(most, 8)) + 1)), most})
             shapes.extend(PassShape(length, count, self.budget.questions, self.budget.options)
                           for count in counts)
         return tuple(shapes)
 
-    def _shape(self, rows: Sequence[Encoded], *, alone: bool = True) -> PassShape:
+    def _shape(self, rows: Sequence[Encoded]) -> PassShape:
         """The shape of the pass over `rows` (`pass_shapes`): of the shortest length that holds the
-        longest row, one row where `rows` is one and `alone`, else the most rows."""
+        longest row, the fewest rows that hold them, or the most there are, which `fits` refuses past."""
         longest = max(len(row.tokens) for row in rows)
         # The layout refuses a row past its window (`_encoded`), which the last length is.
         length = next(shape.length for shape in self.pass_shapes if shape.length >= longest)
         sized = [shape for shape in self.pass_shapes if shape.length == length]
-        return sized[0] if alone and len(rows) == 1 else sized[-1]
+        return next((shape for shape in sized if shape.rows >= len(rows)), sized[-1])
 
     def compile_scoring(self, variables: Variables | None = None) -> tuple[PassShape, ...]:
         """Compile every text pass's program (`pass_shapes`) over `variables` (the task's own by
@@ -508,14 +510,22 @@ class Decide(SavedRunTask):
         comes, and none is compiled here."""
         if self.budget.questions is None or self.budget.options is None:
             return ()
+        mesh = mesh_of(self.variables if variables is None else variables)
+
+        def compiled(shape: PassShape) -> None:
+            # Each worker traces under the mesh a pass serves under: a thread's mesh is its own.
+            with contextlib.nullcontext() if mesh is None else jax.set_mesh(mesh):
+                self._pass(self._probe, variables, shape)
+
         with ThreadPoolExecutor(max_workers=len(self.pass_shapes)) as pool:
-            list(pool.map(lambda shape: self._pass(self._probe, variables, shape), self.pass_shapes))
+            list(pool.map(compiled, self.pass_shapes))
         return self.pass_shapes
 
     @functools.cached_property
     def _probe(self) -> list[Encoded]:
-        """The layout's shortest row (`Layout.shortest`), which every pass shape holds."""
-        return [self.layout.shortest(self.tokenizer, self.specials)]
+        """The layout's shortest row, one one-option question about an empty state, laid out in its
+        window, which the shortest length (`pass_shapes`) is."""
+        return self.layout.rows(self.tokenizer, self.specials, "", {"q": Choice("x", ["0"])})
 
     def _seen(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
               context: JSON | None = None) -> tuple[dict[str, Answer], Usage]:
@@ -605,9 +615,11 @@ class Decide(SavedRunTask):
         """One forward pass at its declared shape (`pass_shapes`, the shortest that holds `rows` unless
         `shape` is given), its rows placed on the weights' mesh (`RowPlan`)."""
         shape = self._shape(rows) if shape is None else shape
-        questions = shape.questions or shape_bucket(max(len(row.questions) for row in rows), 1)
-        options = shape.options or shape_bucket(
-            max(len(laid.options) for row in rows for laid in row.questions), 1)
+        asked = max(len(row.questions) for row in rows)
+        offered = max(len(laid.options) for row in rows for laid in row.questions)
+        # A declared width holds a pass unless a row asks more, which widens it (a program of its own).
+        questions = shape_bucket(asked, 1) if shape.questions is None else max(shape.questions, asked)
+        options = shape_bucket(offered, 1) if shape.options is None else max(shape.options, offered)
         # Declared widths fix the real options' slots too: as many as the grid holds.
         slots = (None if shape.questions is None or shape.options is None
                  else -(-questions * options // OPTION_TILE) * OPTION_TILE)
