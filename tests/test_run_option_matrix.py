@@ -24,6 +24,14 @@ COUNTED_RECORDS = {"lm", "diffusion", "jepa"}
 """The kinds whose training data states its record count, which an epoch reads; a decision run's
 questions stream through a filter, whose count no read states before it ends."""
 
+EXAMPLES = {"lm": 2, "decision": 16, "diffusion": 16, "jepa": 16}
+"""Examples a run of each kind reads in a few steps: an LM's example is a document, many windows long;
+the other kinds' are a batch's rows."""
+
+GLOBAL_ORDER = {"lm", "diffusion", "jepa"}
+"""The kinds whose training data is compiled to one global record order, which a batch ramp cuts
+its growing batches out of; a decision run's shares cut their own."""
+
 MESH = {"tensor": 2}
 """Eight devices, two a tensor and four row shards of a batch of eight (`MeshSpec`'s data axis takes
 the rest): two rows each, which a split in two and a ramp's first batch of four still divide."""
@@ -83,8 +91,8 @@ def test_a_kinds_run_cools_down_and_skips_its_final_save_as_set(kind, tmp_path):
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_run_is_as_long_as_its_epochs_and_examples(kind, tmp_path):
     """A run of two epochs ends at twice the step one epoch ends at (`epochs`), where the kind's data
-    states its record count, and is refused where it does not; one of sixteen examples, two batches of
-    eight, ends at the second step (`examples`)."""
+    states its record count, and is refused where it does not; one of twice the examples ends at twice
+    the step (`examples`)."""
     if kind in COUNTED_RECORDS:
         once = saved(trained(kind, tmp_path, "once", **{"trainer.epochs": 1}))[-1]
         twice = saved(trained(kind, tmp_path, "twice", **{"trainer.epochs": 2}))[-1]
@@ -92,7 +100,8 @@ def test_a_kinds_run_is_as_long_as_its_epochs_and_examples(kind, tmp_path):
     else:
         with pytest.raises(ValueError):
             trained(kind, tmp_path, "once", **{"trainer.epochs": 1})
-    assert saved(trained(kind, tmp_path, "sixteen", **{"trainer.examples": 16}))[-1] == 2
+    few = saved(trained(kind, tmp_path, "few", **{"trainer.examples": EXAMPLES[kind]}))[-1]
+    assert saved(trained(kind, tmp_path, "more", **{"trainer.examples": 2 * EXAMPLES[kind]}))[-1] == 2 * few
 
 
 @pytest.mark.parametrize("kind", list(KINDS))
@@ -109,8 +118,13 @@ def test_a_kinds_token_budget_ends_its_run_or_is_refused(kind, tmp_path):
 @pytest.mark.parametrize("kind", list(KINDS))
 def test_a_kinds_batch_ramp_compiles_a_step_for_each_batch_it_reads(kind, tmp_path):
     """A batch ramp from four rows to the batch's eight over the first eight examples (`batch_ramp`)
-    reads batches of two sizes, and compiles a step for each."""
+    reads batches of two sizes, and compiles a step for each; a kind whose shares cut their own batches
+    refuses it."""
     ramp = {"start": 4, "increment": 4, "samples": 8}
+    if kind not in GLOBAL_ORDER:
+        with pytest.raises(TypeError):
+            trained(kind, tmp_path, "ramped", **{"trainer.steps": 4, "trainer.batch_ramp": ramp})
+        return
     run = trained(kind, tmp_path, "ramped", **{"trainer.steps": 4, "trainer.batch_ramp": ramp})
     assert len(recorded(run, "StepCompiled")) == 2
 
