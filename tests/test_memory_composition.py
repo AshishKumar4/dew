@@ -513,9 +513,8 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(me
     from its request's own key (`dew.sampling.text.rounding_keys`), Titans' MLP and a linear memory
     whose cache holds the recurrence's state alike: a task call and one live server each repeat a
     request alike, and another key moves its likelihoods though greedy decoding draws nothing. A row's
-    stream is its own (`test_a_cached_memorys_rounding_is_each_rows_own`); a batch-mate's values still
-    enter through the quantization's scales (ledger 2032). Without the stream the decode raised in
-    Qwix's make_rng (ledger 2020)."""
+    stream is its own (`test_a_cached_memorys_rounding_is_each_rows_own`). Without the stream the decode
+    raised in Qwix's make_rng (ledger 2020)."""
     pytest.importorskip("qwix")
     from model_support import Digits
 
@@ -540,6 +539,34 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream(me
         (first,), (again,), (moved,) = generate(["12"], 3), generate(["12"], 3), generate(["12"], 4)
         np.testing.assert_array_equal(likelihoods(again), likelihoods(first))
         assert not np.array_equal(likelihoods(moved), likelihoods(first))
+
+
+def test_a_server_serves_a_quantized_memory_decoder_on_par_with_its_full_forward():
+    """A memory decoder served quantized (`TextGeneration.quantized`: every inner Dense of its heads'
+    networks, weights and activations) through a server's two slots draws tokens whose likelihoods are on
+    par with the served decoder's full forward over the same tokens, against quantized training from its
+    stored W_0 in float64 (check 1; `assert_served_as_exact`). The tokens scored are the server's own: a
+    moving weight's quantization rounds at boundaries that a 1e-7 relative change of the weights crosses,
+    moving the likelihoods by 1.2e-2 where the unquantized decoder moves by 1.4e-6, so a lone task batched
+    with itself already moves its likelihoods by 8.8e-4 and no two programs of it draw alike by rule
+    (ledger 2032; armada probes IG2032 and IG2032c at main 783ea620a)."""
+    pytest.importorskip("qwix")
+    from model_support import Digits
+    from serving_support import Served, assert_served_as_exact
+
+    from dew.inference import RunProcessor, TextGeneration
+    from dew.quantization import Quantization, decoded_stored
+    from dew.sampling import Sampling
+
+    model = decoder().clone(max_seq_len=64)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    spec = Quantization(patterns=(INNER,))
+    task = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
+    bound = task.quantized(spec)
+    # The served decoder computes quantized training from the float its stored W_0 decodes to (`served_site`).
+    assert_served_as_exact(bound, (Served(3), Served(5)), "served quantized memory",
+                           serving={"slots": 2, "capacity": 64}, alone=False,
+                           truth=(spec.apply(model), decoded_stored(bound.variables)))
 
 
 def test_a_cached_memorys_rounding_is_each_rows_own():
