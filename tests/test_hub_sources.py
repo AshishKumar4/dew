@@ -24,8 +24,9 @@ def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monke
 
     from dew.data.sources import Hub
 
+    # The Hub's conversion holds each configuration in a directory of its name.
     def listing(self, repo, *, repo_type, revision):
-        return ["data/train-00000.parquet"] if revision == "converted" else ["train.tar"]
+        return ["default/train/0000.parquet"] if revision == "converted" else ["train.tar"]
 
     conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
@@ -36,7 +37,7 @@ def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monke
     with pytest.raises(FileNotFoundError):
         _ = Hub("owner/data", revision="original").files
     latest = Hub("owner/data").files
-    assert latest.url == ("hf://datasets/owner/data@converted/data/train-00000.parquet",)
+    assert latest.url == ("hf://datasets/owner/data@converted/default/train/0000.parquet",)
 
 
 @pytest.fixture
@@ -368,7 +369,8 @@ def test_hub_shard_capability_and_urls_list_each_revision_once(monkeypatch, revi
         listed.append(revision)
         if not native and revision == "original":
             return ["train.tar"]
-        return ["train-1.parquet", "train-0.parquet"]
+        # The Hub's conversion holds each configuration in a directory of its name.
+        return [f"{'default/' if revision == 'converted' else ''}train-{index}.parquet" for index in (1, 0)]
 
     conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
@@ -380,7 +382,8 @@ def test_hub_shard_capability_and_urls_list_each_revision_once(monkeypatch, revi
     commit = "original" if native else "converted"
     assert source.supports("streamed")
     assert source.streamed == commit
-    assert source.files.url == tuple(f"hf://datasets/owner/data@{commit}/train-{index}.parquet"
+    within = "" if native else "default/"
+    assert source.files.url == tuple(f"hf://datasets/owner/data@{commit}/{within}train-{index}.parquet"
                                      for index in range(2))
     assert source.files.format == "parquet"
     assert source.supports("streamed")
