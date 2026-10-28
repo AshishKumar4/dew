@@ -62,6 +62,11 @@ class Global:
     record count it ended at, oldest first; empty for a run of one order.
     `records` counts every record of the run, the completed phases' too."""
 
+    thresholds: tuple[int, ...] | None = None
+    """The committed tokens each completed phase of a run on the token clock ended at
+    (`dew.data.pipeline.schedule`), as `completed` orders them; None for a run of phases that end in
+    records, and for a position written before they were recorded."""
+
     plan: Mapping[str, object] | None = None
 
 
@@ -86,9 +91,10 @@ def decode(position: bytes) -> Global | None:
             f"a saved global data position is missing {sorted(fields - set(envelope))}; "
             f"the checkpoint's position was written by dew and is damaged")
     completed = tuple((str(order), int(end)) for order, end in envelope["completed"])
-    plan = envelope.get("plan")
+    plan, thresholds = envelope.get("plan"), envelope.get("thresholds")
     return Global(records=int(envelope["records"]), order=str(envelope["order"]),
-                  completed=completed, plan=None if plan is None else record(plan, "data plan"))
+                  completed=completed, plan=None if plan is None else record(plan, "data plan"),
+                  thresholds=None if thresholds is None else tuple(int(tokens) for tokens in thresholds))
 
 
 def read(position: bytes) -> Global:

@@ -1490,6 +1490,8 @@ class PhasedStream:
                 order=self._stream(phase).order,
                 completed=completed,
                 plan={"phases": plans} if any(plan is not None for plan in plans) else None,
+                thresholds=None if self._tokens is None else tuple(int(self._tokens[index] or 0)
+                                                                   for index in range(phase)),
             )
         )
 
@@ -1501,6 +1503,13 @@ class PhasedStream:
             if len(saved.completed) > len(self._ends):
                 raise ValueError(f"the saved run finished {len(saved.completed)} phases, and this run has "
                                  f"{len(self._ends) + 1}")
+            # A completed phase ended at its tokens, which a schedule cannot move under it; the phases
+            # past it stay the run's to change. A position from before they were recorded states none.
+            for index, reached in enumerate(saved.thresholds or ()):
+                if self._tokens[index] != reached:
+                    raise ValueError(f"the saved run completed phase {index} at {reached} committed tokens, "
+                                     f"and this run's phase {index} ends at {self._tokens[index]}; a phase "
+                                     "the run has read cannot change under it")
             # The ends the saved run reached, and none past them, which this run reaches as it reads.
             for index in range(len(self._ends)):
                 self._resolve(index, saved.completed[index][1] if index < len(saved.completed) else None)
