@@ -19,7 +19,9 @@ check 1 draws (`record_case`, tools/recorded_references.py): each loss's
 training sigmas, per-element loss and the gradient of its mean in the
 network's output and in the logvar head's weight, computed as published in
 float32 and by its float64 twin (the float32 casts retargeted), whose
-distance from the first is the float32 run's rounding. A seed's inputs, the
+distance from the first is the float32 run's rounding, summarized (each
+leaf's error from its truth and its truth's sketch, `record_case`'s
+summary). A seed's inputs, the
 stand-in and logvar-head weights among them, are a seeded NumPy draw
 (`draw`) the test makes again.
 
@@ -42,7 +44,10 @@ from torch_precision import replaced
 EDM = "008a4e5316c8e3bfe61a62f874bddba254295afb"
 EDM2 = "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "edm_loss" / "seeds.npz"
-IMAGES, CHANNELS, SIZE, LOGVAR_CHANNELS = 6, 3, 4, 16
+IMAGES, CHANNELS, SIZE, LOGVAR_CHANNELS = 1024, 3, 4, 16
+"""A draw's images: 1024, so each draw's error averages that many lognormal training sigmas. At 6 a draw,
+EDM's paired sizing took all 512 seeds and EDM2's logvar weight gradient did not resolve within them; at
+64 and 256, EDM's sigmas did not; at 1024 EDM's resolve at 128 and EDM2's at 32 (armada, 10-28)."""
 TINY_UNET = {"model_channels": 8, "channel_mult": [1], "num_blocks": 1, "attn_resolutions": []}
 """Precond builds a U-Net it is then given the stand-in in place of; a tiny one."""
 
@@ -186,7 +191,7 @@ def main() -> None:
         # Sized paired, as check 1 judges: the training sigma's lognormal spread makes each arm's
         # error heavy-tailed across draws alike.
         arrays.update(record_case(which, draw, lambda inputs, which=which: evaluated(inputs, which),
-                                  store_inputs=False, dew=dew))
+                                  store_inputs=False, summary=True, dew=dew))
     written = save(FIXTURE, {**arrays, "provenance": provenance(
         "NVlabs/edm, NVlabs/edm2", f"{EDM}, {EDM2}", "cpu", "python tools/edm_loss_reference.py",
         torch=torch.__version__)}, reference="NVlabs/edm, NVlabs/edm2",

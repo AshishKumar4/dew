@@ -67,10 +67,13 @@ def generator():
 
 
 def recorded_site(site: str):
-    """`site`'s draw, recorded reference and truth over its declared seeds (`indexed_recording`), each
-    seed's inputs drawn again (tools/edm_loss_reference.py's `draw`), and the count."""
+    """`site`'s draw, recorded reference and truth over its declared seeds (`indexed_recording` of a
+    summarized recording), each seed's inputs drawn again (tools/edm_loss_reference.py's `draw`) and its
+    truth Dew's loss in float64 (`edm_loss`, `edm2_loss`), held to the recording's sketch of NVlabs' own
+    float64 twin, and the count."""
     seeds = declared_seeds(SEEDS)[site]
-    return (*indexed_recording(recording(SEEDS), site, seeds, inputs_of=generator().draw),
+    truth_fn = {"edm": edm_loss, "edm2": edm2_loss}[site]
+    return (*indexed_recording(recording(SEEDS), site, seeds, inputs_of=generator().draw, truth_fn=truth_fn),
             seeds)
 
 
