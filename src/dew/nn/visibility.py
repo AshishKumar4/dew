@@ -22,11 +22,23 @@ def windowed(query, key, window: int, *, causal: bool):
     (`dew.nn.kernels.templates.attention.spans`), for coordinates no span holds: a stated mask's places,
     which need not run in order, and a banded layout's rows."""
     before, after = window_sides(causal, window)
-    behind = query - key
+    query, key = jnp.asarray(query), jnp.asarray(key)
+    ahead = query >= key
+    within_before = _distance(query, key) <= before
     if causal:
-        return behind <= before
-    # Each side's distance taken in its own order, so no unsigned coordinate wraps.
-    return jnp.where(query >= key, behind <= before, key - query <= after)
+        return jnp.where(ahead, within_before, True)
+    return jnp.where(ahead, within_before, _distance(key, query) <= after)
+
+
+def _distance(far, near):
+    """`far - near` where `far >= near`, exact for every integer pair: integers' difference taken in the
+    unsigned word of their common width, which holds it where the signed one wraps."""
+    common = jnp.result_type(far, near)
+    if not jnp.issubdtype(common, jnp.integer):
+        return far - near
+    unsigned = jnp.dtype(f"uint{common.itemsize * 8}")
+    far, near = (jax.lax.bitcast_convert_type(jnp.asarray(x, common), unsigned) for x in (far, near))
+    return far - near
 
 
 def visible(query, key, *, causal: bool, window: int | None = None):
