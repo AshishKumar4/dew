@@ -109,17 +109,6 @@ def assert_routes_as_recorded(tensors, weights, indices) -> None:
     assert np.max(np.abs(ours_weights - theirs_weights)) < ROUTER_TOLERANCE
 
 
-def test_router_reproduces_the_deepseek_group_limited_choice():
-    """DeepseekV3MoE's router: sigmoid scores, a per-expert selection bias, the
-    node limit over expert groups, renormalise, scale. Largest observed
-    weight difference 2.38e-07 at fp32 on CPU, on weights the
-    routed_scaling_factor of 2.5 has already multiplied."""
-    tensors = fixture("deepseek")
-    weights, indices = deepseek_router().apply(router_variables(tensors, bias=True),
-                                               jnp.asarray(tensors["hidden"]))
-    assert_routes_as_recorded(tensors, weights, indices)
-
-
 def test_the_selection_bias_never_reaches_the_gate_values():
     """DeepSeek's balancing bias decides which experts a token gets and has no
     say in what they contribute, so the weights are the unbiased scores."""
@@ -216,14 +205,17 @@ def v4_router(**overrides) -> Router:
                   top_k=config["num_experts_per_tok"], **settings)
 
 
-def test_router_reproduces_the_deepseek_v4_sqrt_softplus_choice():
-    """`DeepseekV4TopKRouter`: sqrt(softplus) scores, the selection bias,
-    renormalise, scale.
-
-    Tolerance 1e-6; largest observed difference 1.19e-07 at fp32 on CPU.
-    """
-    tensors = fixture("deepseek_v4")
-    weights, indices = v4_router().apply(router_variables(tensors, bias=True), jnp.asarray(tensors["hidden"]))
+@pytest.mark.parametrize(("name", "router"), [
+    pytest.param("deepseek", deepseek_router, id="v3-group-limited"),
+    pytest.param("deepseek_v4", v4_router, id="v4-sqrt-softplus")])
+def test_router_reproduces_the_deepseek_choice(name, router):
+    """DeepseekV3MoE's router (sigmoid scores, a per-expert selection bias, the
+    node limit over expert groups) and `DeepseekV4TopKRouter`'s (sqrt(softplus)
+    scores, the selection bias), each renormalising and scaling: largest
+    observed weight differences 2.38e-07 and 1.19e-07 at fp32 on CPU, on
+    weights the routed scaling factor has already multiplied."""
+    tensors = fixture(name)
+    weights, indices = router().apply(router_variables(tensors, bias=True), jnp.asarray(tensors["hidden"]))
     assert_routes_as_recorded(tensors, weights, indices)
 
 
