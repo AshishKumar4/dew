@@ -93,15 +93,15 @@ def assert_matches(outputs, reference, name: str):
     assert largest(state, reference[f"{name}.state"]) < 1e-5
 
 
-def decode_operands(rng, rows: int, heads: int, width: int):
+def decode_operands(rng, rows: int, heads: int, width: int, held=jnp.float32):
     """A decode token's operands from `rng`: unit queries and keys, values, a log decay in (-3, 0], a
-    write gate in [0, 1) and a memory of scale 0.1, each fp32."""
+    write gate in [0, 1), each fp32, and a memory of scale 0.1 held in `held`."""
     unit = [rng.normal(size=(rows, 1, heads, width)) for _ in range(2)]
     query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
     value = jnp.asarray(rng.normal(size=(rows, 1, heads, width)), jnp.float32)
     g = jnp.asarray(-rng.random((rows, 1, heads)) * 3, jnp.float32)
     beta = jnp.asarray(rng.random((rows, 1, heads)), jnp.float32)
-    state = jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, jnp.float32)
+    state = jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, held)
     return query, key, value, g, beta, state
 
 
@@ -771,18 +771,6 @@ the dtype its state is held in: sized by `seeds_for` paired with the kernel on a
 DECODE_GEOMETRIES = {"small": (3, 2, 64), "0.8b-3": (3, 16, 128), "0.8b-32": (32, 16, 128)}
 
 
-def decode_draw(rows, heads, width, held, seed):
-    """A decode token's operands from `seed`: unit queries and keys, values, a decay and a write gate,
-    and a state held in `held`."""
-    rng = np.random.default_rng(seed)
-    unit = [rng.normal(size=(rows, 1, heads, width)) for _ in range(2)]
-    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
-    value = jnp.asarray(rng.normal(size=(rows, 1, heads, width)), jnp.float32)
-    g = jnp.asarray(-rng.random((rows, 1, heads)) * 3, jnp.float32)
-    beta = jnp.asarray(rng.random((rows, 1, heads)), jnp.float32)
-    return query, key, value, g, beta, jnp.asarray(rng.normal(size=(rows, heads, width, width)) * 0.1, held)
-
-
 @pytest.mark.parametrize("held", [jnp.float32, jnp.bfloat16])
 @pytest.mark.gpu(reason="the kernel compiled, as a GPU runs it: a CPU's decode takes the portable step "
                         "(`decode_kernel`), and its interpretation of the kernel judges its own arithmetic")
@@ -801,7 +789,7 @@ def test_the_decode_kernel_steps_as_the_recurrence_does(geometry, held):
     rows, heads, width = DECODE_GEOMETRIES[geometry]
 
     def draw(seed):
-        return decode_draw(rows, heads, width, held, seed)
+        return decode_operands(np.random.default_rng(seed), rows, heads, width, held)
 
     def decoded(*operands):
         out, state = decode_gated_delta_rule(*operands)
