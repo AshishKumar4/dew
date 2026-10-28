@@ -38,7 +38,6 @@ from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 from dew.nn.mixers import AttentionMixer
 from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling
-from dew.telemetry.instrumentation import hlo_instructions
 
 VOCAB = 37
 SEQ = 12
@@ -338,28 +337,13 @@ def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
     decoded_against_full(model, 4, f"{attention_impl} decode", SEEDS['decode'])
 
 
-@pytest.mark.gpu(reason="FlashAttention runs on CUDA")
-def test_a_cached_prompt_reads_its_cache_through_flash_where_its_wheel_runs(rng, without_deterministic_ops):
-    """A bf16 prompt prefilled into the cache under 'auto' reads it as the documents its tokens end, no
-    mask, which FlashAttention takes wherever its wheel holds code for the GPU (Hopper's declared cell, other
-    GPUs' first kernel by legality): the compiled prefill holds its kernel there, and its logits are on par
-    with the xla kernel's uncached forward from the float64 forward over drawn weights and prompts
-    (check 1)."""
-    from dew.nn.attention import attention_case
-    from dew.nn.attention_kernels import ATTENTION
-
+@pytest.mark.gpu(reason="a cached prefill's kernels on a GPU")
+def test_a_cached_prompts_prefill_is_on_par_with_the_uncached_forward(rng, without_deterministic_ops):
+    """A bf16 prompt prefilled into the cache under 'auto', which reads it as the documents its tokens end,
+    no mask, has logits on par with the xla kernel's uncached forward from the float64 forward over drawn
+    weights and prompts (check 1), on whatever kernel the GPU runs (bible §6: the kernel is no claim)."""
     model = tiny(dtype=jnp.bfloat16)
-    ids = tokens(rng)
-    params = model.init(rng, ids)
-    prompt = ids[:, :6]
     made, step = decode_steps(model)
-    compiled = hlo_instructions(step.lower(params, made(params, prompt.shape[0]), prompt).compile().as_text())
-    probe = jnp.zeros((1, 8, 1, 64), jnp.bfloat16)
-    failed = ATTENTION.kernel('flash').failed(attention_case(probe, probe))
-    flash = not {requirement.code for requirement in failed} & {'not_installed', 'binary_arch'}
-    # FlashAttention-2's and -3's packed calls (dew_flash_attn's custom-call targets).
-    packed = {'dew_flash_mha_varlen_fwd', 'dew_flash3_mha_varlen_fwd'}
-    assert bool(packed & {instruction.target for instruction in compiled.values()}) == flash
     assert_as_exact(lambda params, prompt: step(params, made(params, prompt.shape[0]), prompt)[0],
                     applied(model.clone(attention_impl='xla')), drawn(model, length=6), "cached prefill",
                     seeds=SEEDS['cached prefill'], truth_fn=applied(float64(model)))
