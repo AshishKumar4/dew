@@ -71,6 +71,26 @@ def test_a_sum_holds_in_any_order_and_a_lost_term_breaks_it():
     assert not ct.CONTRACTS["reduce_sum"](params, [terms], lost, oc.FLOAT32)[0]
 
 
+@pytest.mark.parametrize("reverse", [False, True], ids=["forward", "reversed"])
+def test_a_cumulative_sum_holds_each_prefixs_bound_and_a_lost_term_breaks_it(reverse):
+    """A cumulative sum, forward and reversed, of float32 terms over seven binades and of integers that
+    wrap: the lane's own holds at every prefix; one prefix missing its largest term breaks there; an integer
+    one off breaks."""
+    rng = np.random.default_rng(6)
+    terms = np.float32(rng.normal(size=(3, 17)) * 2.0 ** rng.integers(-3, 4, (3, 17)))
+    native = np.asarray(jax.lax.cumsum(terms, axis=1, reverse=reverse))
+    params = {"axis": 1, "reverse": reverse}
+    assert np.all(ct.CONTRACTS["cumsum"](params, [terms], native, oc.FLOAT32))
+    taken = np.arange(8, 17) if reverse else np.arange(0, 9)
+    lost = native.copy()
+    lost[1, 8] -= terms[1, taken[np.argmax(np.abs(terms[1, taken]))]]
+    assert not ct.CONTRACTS["cumsum"](params, [terms], lost, oc.FLOAT32)[1, 8]
+    ints = np.int32([[2 ** 31 - 1, 1, 5], [-7, 3, 2]])
+    native = np.asarray(jax.lax.cumsum(ints, axis=1, reverse=reverse))
+    assert np.all(ct.CONTRACTS["cumsum"](params, [ints], native, None))
+    assert not np.all(ct.CONTRACTS["cumsum"](params, [ints], native + np.int32(1), None))
+
+
 def test_a_dot_holds_its_bound_and_an_element_twice_past_it_breaks_it():
     rng = np.random.default_rng(3)
     a, b = np.float32(rng.standard_normal((5, 300))), np.float32(rng.standard_normal((300, 4)))

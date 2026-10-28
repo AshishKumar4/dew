@@ -401,6 +401,27 @@ def _reduced_sum(params, operands, result, fmt):
     return _terms_hold(result, moved.reshape(*kept, count), fmt, flushes)
 
 
+def _cumulative(params, operands, result, fmt):
+    """A cumulative sum along `axis`, forward or reversed: each prefix's (or suffix's) sum of its terms
+    within its bound in any order (`_terms_hold`, every prefix taken as one of the axis's length, which
+    bounds each shorter one); for integers, each wrapped to the result's width."""
+    (terms,) = operands
+    axis, reverse = params["axis"], params["reverse"]
+    if fmt is None:
+        summed = _wrapping(lambda t: np.flip(np.cumsum(np.flip(t, axis), axis=axis, dtype=np.uint64), axis)
+                           if reverse else np.cumsum(t, axis=axis, dtype=np.uint64))
+        return _bits(result) == _bits(summed(result, terms))
+    flushes = lane().flushes
+    moved = np.moveaxis(_read(terms, flushes), axis, -1)
+    count = moved.shape[-1]
+    taken = np.arange(count)[None, :] >= np.arange(count)[:, None] if reverse else \
+        np.arange(count)[None, :] <= np.arange(count)[:, None]
+    # [..., k, j]: the j-th term where the k-th prefix (or suffix) takes it, zero elsewhere.
+    prefixes = np.where(taken, moved[..., None, :], 0.0)
+    held = _terms_hold(np.moveaxis(np.asarray(result), axis, -1), prefixes, fmt, flushes)
+    return np.moveaxis(held, -1, axis)
+
+
 def _dot(params, operands, result, fmt):
     """A dot_general's products, exact in float64 for operands no wider than fp32, summed (`_terms_hold`)
     over the contracting dimensions in any order; for integers, wrapped to the result's width."""
@@ -771,6 +792,7 @@ CONTRACTS = {
     "exp": _rounding("exp", None),
     "erf_inv": _rounding("erf_inv", None),
     "reduce_sum": _reduced_sum,
+    "cumsum": _cumulative,
     "dot_general": _dot,
     "eq": _compared(lambda params, a, b: np.equal(a, b)),
     "ne": _compared(lambda params, a, b: np.not_equal(a, b)),
