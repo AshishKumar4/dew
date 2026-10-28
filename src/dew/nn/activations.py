@@ -95,7 +95,7 @@ def activation(name: str) -> Activation:
 
 UNGATED: dict[str, Activation] = {
     'gelu': gelu_tanh, 'gelu_exact': gelu_exact_torch, 'relu': jax.nn.relu, 'relu2': relu2,
-    'quick_gelu': quick_gelu}
+    'quick_gelu': quick_gelu, 'silu': silu}
 """The activations an ungated feed-forward takes, by Dew's names."""
 
 

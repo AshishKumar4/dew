@@ -1575,7 +1575,9 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     q, k = (_padded(x.astype(dtype), 3, width) for x in (q, k))
     v = _padded(v.astype(dtype), 3, columns)
     g = _padded(g.astype(jnp.float32), 3, width) if per_key else g.astype(jnp.float32)
-    beta = beta.astype(dtype).astype(jnp.float32)
+    # The delta rule's write gate in the operands' dtype, as fla's layer holds it; without the delta rule the
+    # reference's own fp32 (Mamba-2's `dt`).
+    beta = (beta.astype(dtype) if delta else beta).astype(jnp.float32)
     h0 = (jnp.zeros((batch, heads, width, columns), jnp.float32) if h0 is None
           else _padded(_padded(h0.astype(jnp.float32), 2, width), 3, columns))
     if starts is not None:
@@ -1583,7 +1585,13 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
         h0 = jnp.where(starts[:, 0, None, None, None], 0.0, h0)
     chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments, firsts)
     rows = chunks * CHUNK
-    given = held = _Operand(rows, _parts(dtype), dtype)
+    given = _Operand(rows, _parts(dtype), dtype)
+    # What the launches pass between them: the delta rule's in the operands' dtype, as fla's rounds it
+    # (the port is its reference); without the delta rule fp32, its three parts, as the portable math and
+    # mamba_ssm hold their scores, written values and memories (a 16-bit call's rounded to bf16 put the
+    # template's output 1.7 times and its final memory up to 540 times the portable math's distance from
+    # float64, on an H100 and interpreted).
+    held = given if delta else _Operand(rows, PARTS, jnp.dtype(jnp.float32))
     call = _Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
                  interpret, generation.gpu_target())
     hi, lo = prefix(laid(g).reshape(chunks, CHUNK, -1))

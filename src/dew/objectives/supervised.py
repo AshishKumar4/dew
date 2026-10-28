@@ -29,6 +29,7 @@ from flax import linen as nn
 from dew.batch import FROZEN, Batch, Variables
 from dew.inputs import InputSpec
 from dew.nn import categorical
+from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Aux, Objective, Ratio, Source, Step, model_rngs
 
@@ -107,6 +108,20 @@ class Supervised(Objective[Ratio]):
                                             rngs=model_rngs(step.key, training=step.training),
                                             mutable=held, method="__call__", **mode)
         return self._scored(outputs, batch, dict(updates) if held else None)
+
+    def scored_units(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, jax.Array]:
+        """`loss`'s statistics, its model run as `loss` runs it, its collections open as `loss` opens them
+        and their updates dropped, with each example's share of their total: the sum of its losses, its
+        row weighted as `row_mean` weights it."""
+        held = [name for name in variables if name not in ("params", FROZEN)] if step.training else []
+        mode = {} if self.mode is None else {self.mode: step.training}
+        rngs = model_rngs(step.key, training=step.training)
+        outputs, _ = self.model.apply(variables, batch[self.field], rngs=rngs, mutable=held,
+                                      method="__call__", **mode)
+        losses = self.criterion(outputs, batch)
+        weights = self.row_weights(batch, losses.shape[0])
+        shares = losses.reshape(losses.shape[0], -1).astype(at_least_fp32(losses.dtype)).sum(-1) * weights
+        return self._scored(outputs, batch, None)[0], shares
 
     def _scored(self, outputs: Outputs, batch: Batch, updates: Variables | None) -> tuple[Ratio, Aux]:
         losses = self.criterion(outputs, batch)
