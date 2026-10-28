@@ -25,12 +25,12 @@ from dew.nn.kernels.generation import (
     architecture,
     assumed,
     chosen as kernel_choices,
+    chosen_kernel,
     device_generation,
     family,
     fp8_tensor_cores,
     gpu_mesh,
     gpu_target,
-    measured_kernel,
     route,
     routes,
     runtime_facts,
@@ -63,7 +63,7 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
         assert triton_kernels(jax.jit(_doubled).lower(x)) == {}
 
 
-# The Triton kernels each Pallas choice a KERNELS row can name lowers to, by their `pallas_call` names,
+# The Triton kernels each Pallas kernel a selector can take lowers to, by their `pallas_call` names,
 # and the probe that runs them: an expert layer's forward and backward (`_experts_lowered`), a
 # Mamba-2 layer's (`_mamba2_lowered`), or a model step ("step").
 FAMILIES = {
@@ -81,10 +81,9 @@ FAMILIES = {
         "chunk_cumsum_bwd")}),
 }
 
-GPUS = sorted({generation for generation, target in TARGETS.items()
-               if generation.startswith('sm') and target.kernels}
-              | {'sm80', 'sm120'}, key=lambda generation: int(generation[2:]))
-"""Every CUDA generation a KERNELS row names, and the A100's and the G4's, which Dew's sessions take."""
+GPUS = ['sm80', 'sm89', 'sm90', 'sm120']
+"""The CUDA generations Dew's sessions take and its measured cells name: the A100's, the L4's, the H100's
+and the G4's."""
 
 GMM = 2 * 256 * 128 * 128
 """The multiply-adds of each grouped product of the step `_reported` lowers: forward, input and weight
@@ -185,11 +184,14 @@ def test_a_tpu_grouped_gemm_states_its_cost_to_the_flop_count():
     assert (flops.hardware, flops.unsized) == (2 * GMM, 0)
 
 
-def test_every_pallas_choice_a_row_names_has_a_lowering_probe():
-    """A Pallas kernel KERNELS chooses for some GPU is one this file lowers for that GPU on a CPU: a new
-    row needs its kernels in FAMILIES, so no Triton lowering first runs in a GPU session's compile."""
-    named = {(choice, kernel) for target in TARGETS.values() for choice, kernel in target.kernels.items()
-             if kernel in PALLAS_CHOICES}
+def test_every_pallas_kernel_a_measured_cell_runs_has_a_lowering_probe():
+    """A Pallas kernel a selector's measured cell runs on some GPU (`Op.declared`) is one this file lowers
+    for that GPU on a CPU: a new cell needs its kernels in FAMILIES, so no Triton lowering first runs in a
+    GPU session's compile."""
+    from dew.nn.kernels import grouped_matmul, norm_swiglu
+
+    named = {(op.choice, kernel) for op in (norm_swiglu.NORM, norm_swiglu.SWIGLU, grouped_matmul.GROUPED)
+             for kernel, _ in op.declared.values() if kernel in PALLAS_CHOICES}
     assert named <= set(FAMILIES), sorted(named - set(FAMILIES))
 
 
@@ -245,7 +247,7 @@ def _step_lowered(generation: str):
 @pytest.mark.parametrize("generation", GPUS)
 def test_a_hybrid_language_model_step_lowers_for_every_gpu(generation):
     """A Qwen 3.5 hybrid's training step, its gated delta nets, attention, norms and SwiGLU, lowers on this
-    CPU for every GPU a row names, and the A100's and the G4's: its dry run raises the `Lowered` program."""
+    CPU for every GPU Dew's sessions take (`GPUS`): its dry run raises the `Lowered` program."""
     _step_lowered(generation)
 
 
@@ -732,23 +734,22 @@ def test_a_run_over_gpus_of_two_kinds_is_refused():
         _one_kind([gpu(0, 0, h100), gpu(1, 1, a100)])
 
 
-def test_chosen_kernels_keep_other_choices_and_restore_the_row_after_an_exception():
+def test_chosen_kernels_keep_other_choices_and_restore_them_after_an_exception():
     with assumed("sm80"):
-        measured = measured_kernel("attention", "xla")
         with kernel_choices(attention="xla", ssd="pallas"):
-            assert measured_kernel("attention", "flash") == "xla"
+            assert chosen_kernel("attention", "flash") == "xla"
             with pytest.raises(RuntimeError), kernel_choices(attention="flash"):
-                assert measured_kernel("attention", "xla") == "flash"
-                assert measured_kernel("ssd", "xla") == "pallas"
+                assert chosen_kernel("attention", "xla") == "flash"
+                assert chosen_kernel("ssd", "xla") == "pallas"
                 raise RuntimeError("the comparison ended")
-            assert measured_kernel("attention", "flash") == "xla"
-        assert measured_kernel("attention", "xla") == measured
+            assert chosen_kernel("attention", "flash") == "xla"
+        assert chosen_kernel("attention", "flash") == "flash"
 
 
 def test_a_function_jitted_before_a_choice_traces_again_within_it():
     @jax.jit
     def ported(x):
-        return x + (measured_kernel("ssd", "xla") == "pallas")
+        return x + (chosen_kernel("ssd", "xla") == "pallas")
 
     x = jnp.zeros((), jnp.int32)
     with kernel_choices(ssd="xla"):
@@ -765,22 +766,21 @@ def test_a_choice_no_dispatch_reads_is_refused_by_name():
 
 def test_a_route_records_the_targets_decision_where_its_dispatch_reports_it():
     """`route` records a dispatch's decision in every `routes` block open, an inner block's in the
-    outer's too, as the target decides it: its generation within `assumed`, the kernel the row or
-    `chosen` prefers, a refusal's stable code and the row that tracks it, what the host ran, and the
+    outer's too, as the target decides it: its generation within `assumed`, the kernel `chosen` prefers
+    (else the one it ran), a refusal's stable code and the row that tracks it, what the host ran, and the
     reporting function."""
     def dispatch(kernel, refusal=None, ran=None):
         return route("ssd", kernel=kernel, refusal=refusal, ran=ran)
 
     with assumed("sm90"), routes() as outer:
         assert dispatch("pallas").kernel == "pallas"
-        row = measured_kernel("ssd", "pallas")
         head_dim = Refusal("head_dim", "a 320-wide head", "inherent")
         with kernel_choices(ssd="pallas"), routes() as inner:
             dispatch("xla", head_dim, ran="xla")
     test = test_a_route_records_the_targets_decision_where_its_dispatch_reports_it
     site = f"{__name__}:{test.__qualname__}.<locals>.dispatch"
     assert inner == [Route("ssd", "xla", "pallas", head_dim, "xla", "sm90", site)]
-    assert outer == [Route("ssd", "pallas", row, None, "pallas", "sm90", site), *inner]
+    assert outer == [Route("ssd", "pallas", "pallas", None, "pallas", "sm90", site), *inner]
 
 
 def test_a_route_off_its_preferred_kernel_is_logged_once_at_info_and_one_on_it_not_at_all():

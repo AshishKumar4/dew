@@ -207,7 +207,7 @@ class MixerBase:
 
     keeps_triton_gemm = False
     """Whether a step with this mixer keeps XLA's Triton GEMM fusions where
-    `gpu_target().kernels['xla_triton_gemm']` turns them off."""
+    the GPU turns them off (`GpuTarget.triton_gemm_fusions`)."""
 
     residuals: ClassVar[tuple[str, ...] | None] = None
     """The names (`dew.nn.mixer_base.RESIDUALS`) the mixer this kind
