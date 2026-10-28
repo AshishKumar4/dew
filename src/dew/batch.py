@@ -547,6 +547,7 @@ __all__ = [
     "EXAMPLE_ROWS",
     "FROZEN",
     "PARAMETER_ROOTS",
+    "TEXT_KEY",
     "VALIDITY_FIELD",
     "VALID_ROWS",
     "Batch",

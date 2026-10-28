@@ -1011,3 +1011,11 @@ def test_a_decoder_whose_cache_outgrew_its_learned_positions_admits_rows_its_tab
     objective.inputs.check({TEXT_KEY: np.zeros((2, 9), np.int32)})
     with pytest.raises(ValueError):
         objective.inputs.check({TEXT_KEY: np.zeros((2, 13), np.int32)})
+
+
+def test_the_token_batch_key_is_one_of_dew_batch_s_exports():
+    """The key a token batch packs its ids under (`TEXT_KEY`) lives in `dew.batch` beside the other
+    batch keys, and a star import of the module gives it, as its API reference lists it (row 2065)."""
+    names: dict = {}
+    exec("from dew.batch import *", names)
+    assert names.get("TEXT_KEY") == "text"
