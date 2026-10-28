@@ -15,10 +15,10 @@ from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS
 from dew.config import RunConfig, TrainerConfig
 from dew.data import Memory
 from dew.data.compile import compile
-from dew.data.dataset import Closeable, DataPartition, Loader
+from dew.data.dataset import Closeable, DataPartition, Loader, Loading
 from dew.data.pipeline import Pipeline
 from dew.objectives import Aux, Objective
-from dew.optim import Linear, OptimConfig
+from dew.optim import Cosine, Linear, OneCycle, OptimConfig
 from dew.training import Best, Checkpoints, Pause, Trainer
 
 FEATURES = 4
@@ -231,12 +231,13 @@ def test_each_batch_consumes_the_examples_whose_last_rows_it_holds(packed, worke
     from dew.data.pipeline import ObjectiveData, Pack
 
     owed = consumed_by_row(23)
-    chain = Pipeline(Memory({"id": np.arange(1, 24, dtype=np.int32)})).workers(workers)
+    chain = Pipeline(Memory({"id": np.arange(1, 24, dtype=np.int32)}))
     # The objective packs the rows it makes into windows of up to four rows, as a decision objective does.
     pack = Pack(9, fields=("text",)) if packed else None
     objective = ObjectiveData(train=(Fanned(), LastDropped()), pack=pack)
+    # Loading workers run the objective's steps, so their groups hold its dropped rows' markers.
     loader = compile(chain.batch(BATCH).select_columns("text"), read="streamed", objective=objective,
-                     examples=23)
+                     examples=23, loading=Loading(workers=workers))
     assert loader.example_steps(23) is None
     stream = loader.train(DataPartition())
     total = 0
@@ -397,14 +398,16 @@ def clocked_descent(accumulation: int):
     return descended
 
 
-def clocked_fit(x, accumulation: int, *, directory=None, stop: Pause | None = None, log_every=1):
+def clocked_fit(x, accumulation: int, *, directory=None, stop: Pause | None = None, log_every=1,
+                learning_rate=None):
     """A run bounded to CLOCKED_RECORDS examples of `x`, read in order as a stream, whose objective makes
     `id % 3 + 1` rows of each, under `Linear` from PEAK to CLOCKED_END, updating every `accumulation`
     batches of BATCH rows, checkpointed to `directory` where given: its final state and its tracker."""
     tracker = RecordingTracker()
     ids = np.arange(1, CLOCKED_RECORDS + 1, dtype=np.int32)
     chain = Pipeline(Memory({"x": x, "id": ids})).read("streamed")
-    optim = OptimConfig(optimizer="adam", learning_rate=Linear(peak_value=PEAK, end_value=CLOCKED_END))
+    optim = OptimConfig(optimizer="adam", learning_rate=learning_rate or Linear(peak_value=PEAK,
+                                                                                end_value=CLOCKED_END))
     trainer = Trainer(Echoed(), optim, key=0, tracker=tracker, accumulation=accumulation,
                       checkpoints=None if directory is None else Checkpoints(str(directory)))
     return trainer.fit(chain.batch(BATCH), examples=CLOCKED_RECORDS, log_every=log_every, stop=stop), tracker
@@ -625,3 +628,32 @@ def test_asking_a_streamed_runs_steps_reads_none_of_its_data():
                      examples=23)
     read = len(seen)
     assert loader.example_steps(23) is None and len(seen) == read
+
+
+@pytest.mark.parametrize("schedule", [OneCycle(peak_value=PEAK, warmup_fraction=0.25),
+                                      Cosine(peak_value=PEAK, warmup_steps="25%")],
+                         ids=["one-cycle", "cosine"])
+def test_a_clocked_run_of_a_warmup_as_a_share_trains_and_records_it_as_written(schedule):
+    """A run bounded in examples that counts no steps ahead trains under a schedule whose warmup is a share
+    of the run, which it records at its start as written (`OptimConfig.warmups`), there being no updates
+    ahead to count it in."""
+    state, tracker = clocked_fit(*clocked_records(0), 1, learning_rate=schedule)
+    assert state is not None and int(state.consumed) == CLOCKED_RECORDS
+    from dew.telemetry.records import FitStarted
+
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert started.cadences["warmup_steps.learning_rate"] == "25%"
+
+
+def test_a_causal_windows_last_target_is_consumed_by_the_window_that_holds_it():
+    """A document whose last token is the last target of the stream's final causal window is consumed by
+    that window, the first that holds it, though the next window's stride would begin at it."""
+    import grain.python as grain
+
+    from dew.data.pipeline import CONSUMED, Windows
+    from dew.data.steps.windows import CausalWindows
+
+    documents = grain.MapDataset.source([{"text": np.arange(1, 6, dtype=np.int32),
+                                          CONSUMED: np.asarray([0, 0, 0, 0, 1], np.int32)}]).to_iter_dataset()
+    windows = list(CausalWindows(documents, Windows(seq_len=4, stride=4, fields=("text", CONSUMED))))
+    assert [window[CONSUMED] for window in windows] == [1]

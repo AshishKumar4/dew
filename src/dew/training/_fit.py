@@ -9,7 +9,7 @@ import datetime
 import math
 import time
 import types
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 
 import jax
 import numpy as np
@@ -228,11 +228,18 @@ class FitPlan:
         local = None if checkpoints is None else cadence(checkpoints.local_every, "local_every")
         return logged, evaluated, saved, local, suites
 
-    def recorded(self, config: OptimConfig | None, accumulation: int) -> dict[str, JSON]:
+    @property
+    def example_points(self) -> tuple[int, ...]:
+        """The consumed examples its cooldown branches of examples begin at (`Examples`)."""
+        return tuple(branch.at.every for branch in self.branches if isinstance(branch.at, Examples))
+
+    def recorded(self, config: OptimConfig | None, accumulation: int, *, clocked: bool = False
+                 ) -> dict[str, JSON]:
         """The cadences this plan resolved and the warmups of `config`'s schedules over its updates,
-        `accumulation` microsteps each, as the run's start records them (`dew.telemetry.FitStarted`)."""
+        `accumulation` microsteps each, or as written over a `clocked` run's progress, as the run's
+        start records them (`dew.telemetry.FitStarted`)."""
         warmups = {} if config is None else config.warmups(
-            None if self.steps is None else self.steps // accumulation)
+            None if self.steps is None else self.steps // accumulation, clocked=clocked)
         suites = {f"{name}.every": recorded(suite.every) for name, suite in self.suites.items()
                   if suite.every != self.eval_every}
         local = {} if self.local_every is None else {"local_every": recorded(self.local_every)}
@@ -347,11 +354,16 @@ class FitRun:
             start_capture(profiler)
             self.tracing = True
 
-    def committed_examples(self, interval: Interval, step: int, accumulation: int) -> tuple[int, int]:
-        """At an update's last step, the consumed examples now and at the update before it, which a
-        cooldown point of examples is crossed between (`dew.training.cooldown.Branch.due`), so its branch
-        starts where an update has committed; none crossed at any other step."""
-        if step % accumulation:
+    def committed_examples(self, interval: Interval, points: Sequence[int],
+                           committed: Callable[[], bool]) -> tuple[int, int]:
+        """Where the state's update window has just committed (`committed`, read off the state only
+        while one of the cooldown `points` of examples lies past the last commit), the consumed examples
+        now and at that commit, which a point is crossed between (`dew.training.cooldown.Branch.due`),
+        so its branch starts where an update has committed, a rejected microbatch's window included;
+        none crossed otherwise."""
+        if not any(interval.consumed_committed < point <= interval.consumed for point in points):
+            return 0, 0
+        if not committed():
             return 0, 0
         crossed = interval.consumed, interval.consumed_committed
         interval.consumed_committed = interval.consumed

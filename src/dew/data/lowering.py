@@ -632,7 +632,8 @@ class _Groups:
         if not consumed:
             return outputs
         if not outputs:
-            return [Rejected("batched step made no rows", consumed=sum(consumed))]
+            raise ValueError("a batched step made no rows of a group of a run bounded in examples, which "
+                             "leaves the examples the group consumes on no row; keep a row of each group")
         return [*({**row, CONSUMED: 0} for row in outputs[:-1]), {**outputs[-1], CONSUMED: sum(consumed)}]
 
 

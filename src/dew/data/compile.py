@@ -388,6 +388,15 @@ def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
     return dataclasses.replace(windows, stages=(*windows.stages, *pipeline.stages[at:]))
 
 
+def _native_after_bound(pipeline: Pipeline) -> bool:
+    """Whether `pipeline` counts the examples its rows consume (`Consumed`) and runs a native Grain step
+    after the bound that marks them."""
+    stages = pipeline.stages
+    at = next((index for index, stage in enumerate(stages)
+               if isinstance(stage, Map) and isinstance(stage.step, Consumed)), None)
+    return at is not None and any(isinstance(stage, Native) for stage in stages[at:])
+
+
 def _shuffles_windows(pipeline: Pipeline) -> bool:
     """Whether `pipeline` counts the examples its rows consume (`Consumed`, a run bounded in examples) and
     shuffles in a window after a stage that packs or windows its rows."""
@@ -810,6 +819,12 @@ def _compiled(
     if records == 0:
         raise ValueError(f"corpus {_name(train)} has no accepted rows")
     order_records = _order_records(train, build)
+    if order_records is None and _native_after_bound(train):
+        # A native Grain step rebuilds or reorders rows as it likes, so the examples each row consumes
+        # (`CONSUMED`), which a run no plan counts ahead reads its progress off, are kept by no contract.
+        raise ValueError(f"{_name(train)} runs a native Grain step (`grain`) after its examples bound, which "
+                         "keeps no count of the examples its rows consume: run it before the bound, as a "
+                         "step Dew names, or read the data in a global order")
     if order_records is None and _shuffles_windows(train):
         # A run no plan counts ahead reads its progress off the windows that end its examples
         # (`CONSUMED`), which a later shuffle could draw before the windows holding the rest of them.

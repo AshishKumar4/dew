@@ -1543,6 +1543,11 @@ class ScheduleBase:
         own reads its updates there as anywhere."""
         return False
 
+    def written_warmup(self) -> int | str | None:
+        """Its warmup as written, in its own steps or as a share of the run, which a run that counts no
+        updates ahead records as it is (`OptimConfig.warmups`); None where it has none."""
+        return None
+
     def marks(self) -> dict[str, int]:
         """The update counts its law on a run's progress starts a piece at (`progressed`), by name: the
         end of a warmup counted in updates, say. The run records where its progress stood as its updates
@@ -1601,6 +1606,9 @@ class Cosine(ScheduleBase):
 
     def run_relative(self) -> bool:
         return self.decay_steps is None
+
+    def written_warmup(self) -> int | str | None:
+        return self.warmup_steps
 
     def marks(self) -> dict[str, int]:
         warmup = self.warmup_steps
@@ -1667,6 +1675,9 @@ class Power(ScheduleBase):
 
     def run_relative(self) -> bool:
         return isinstance(self.warmup_steps, str) or (self.tail is not None and self.tail.steps is None)
+
+    def written_warmup(self) -> int | str | None:
+        return self.warmup_steps
 
     def marks(self) -> dict[str, int]:
         tail = self.tail
@@ -1738,6 +1749,9 @@ class Linear(ScheduleBase):
     def run_relative(self) -> bool:
         return self.decay_steps is None
 
+    def written_warmup(self) -> int | str | None:
+        return self.warmup_steps
+
     def marks(self) -> dict[str, int]:
         warmup, start = self.warmup_steps, self.decay_start
         return {**({"warmup": warmup * self.every} if isinstance(warmup, int) and warmup else {}),
@@ -1806,6 +1820,10 @@ class OneCycle(ScheduleBase):
 
     def run_relative(self) -> bool:
         return True
+
+    def written_warmup(self) -> int | str | None:
+        fraction = self.warmup_fraction
+        return fraction if isinstance(fraction, str) else f"{fraction:.0%}"
 
     def progressed(self, rates: Rates, progress: jax.Array, updates: jax.Array,
                    marks: Mapping[str, jax.Array]) -> jax.Array:
@@ -1993,22 +2011,30 @@ class OptimConfig:
     Empty keeps none.
     """
 
-    def warmups(self, steps: int | None) -> dict[str, int]:
+    def warmups(self, steps: int | None, clocked: bool = False) -> dict[str, int | str]:
         """Each of its schedules' warmup in that schedule's own steps over a run of `steps` updates,
         its share of the run resolved (`ScheduleBase.warmup`), by where the config holds it, as a
-        run's plan records it; a schedule with no warmup of steps is not among them."""
+        run's plan records it; a schedule with no warmup of steps is not among them. A `clocked` run
+        counts no updates ahead, so a warmup over the run's progress is recorded as written, its share
+        of the examples the run consumes (`ScheduleBase.progressed`)."""
         held: list[tuple[str, object]] = [] if self.param_groups else [("learning_rate", self.learning_rate)]
         for group in self.param_groups:
             # The schedules the group's solver runs (`ParamGroup.rate`): the config's own where the
             # group names none.
             rate = "learning_rate" if group.schedule is None else f"param_groups.{group.name}.schedule"
             held += [(rate, group.rate(self.learning_rate)), (f"param_groups.{group.name}.b1", group.b1)]
-        warmups = {}
+        warmups: dict[str, int | str] = {}
         for name, schedule in held:
-            if isinstance(schedule, ScheduleBase):
-                warmup = schedule.warmup(None if steps is None else steps // schedule.every)
-                if warmup is not None:
-                    warmups[name] = warmup
+            if not isinstance(schedule, ScheduleBase):
+                continue
+            if clocked and schedule.run_relative():
+                written = schedule.written_warmup()
+                if written:
+                    warmups[name] = written
+                continue
+            warmup = schedule.warmup(None if steps is None else steps // schedule.every)
+            if warmup is not None:
+                warmups[name] = warmup
         return warmups
 
     def build(self, steps: int | None, clocked: bool = False) -> optax.GradientTransformation:

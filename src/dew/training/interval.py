@@ -35,6 +35,10 @@ BAD_LOSS_STEPS = 5
 COMMITTED_TOKENS = "committed_tokens"
 """The checkpoint control field that holds a run's tokens, those its committed updates trained on."""
 
+CONSUMED_COMMITTED = "consumed_committed"
+"""The checkpoint control field that holds the examples consumed at the run's last update boundary
+(`Interval.consumed_committed`), which a cooldown point of examples is crossed from."""
+
 CONSUMED_EXAMPLES = "consumed_examples"
 """The checkpoint control field that holds the examples a run's dispatched batches consumed, as its host
 counted them (`Interval.consumed`), where it counts them."""
@@ -190,19 +194,23 @@ class Interval:
             checked_streak(int(on_host(streak, step)), step, display)
 
     @classmethod
-    def resumed(cls, control: dict, *, last_saved: int | None) -> Interval:
+    def resumed(cls, control: dict, *, last_saved: int | None, consumed: int | None = None) -> Interval:
         """An interval from now on, its token clock read off a checkpoint's `control`
-        (`committed_tokens`), which it takes the clock's field out of."""
-        consumed = int(control.pop(CONSUMED_EXAMPLES, 0))
+        (`committed_tokens`), which it takes the clock's fields out of, its consumed examples the
+        checkpoint's, or a state's it starts from where it is given one (`consumed`)."""
+        held = int(control.pop(CONSUMED_EXAMPLES, 0))
+        consumed = held if consumed is None else consumed
+        committed = int(control.pop(CONSUMED_COMMITTED, consumed))
         return cls(time.time(), last_saved=last_saved, tokens_before_log=committed_tokens(control),
                    resumable=last_saved, consumed=consumed, consumed_before=consumed,
-                   consumed_committed=consumed)
+                   consumed_committed=committed)
 
     @property
     def token_control(self) -> dict[str, int]:
         """The clocks a checkpoint keeps (`Checkpoints.control`): the committed updates' real tokens, and
         the examples consumed where the run counts them."""
-        consumed = {CONSUMED_EXAMPLES: self.consumed} if self.consumed else {}
+        consumed = ({CONSUMED_EXAMPLES: self.consumed, CONSUMED_COMMITTED: self.consumed_committed}
+                    if self.consumed else {})
         return {COMMITTED_TOKENS: self.real_tokens, **consumed}
 
     @property

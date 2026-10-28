@@ -1397,7 +1397,8 @@ class Trainer(Generic[Loss, Effects]):
         current, position, placed, abstract = self._starting(run, plan.dataset, initial, resume)
         run.last_checkpoint = time.perf_counter()
         interval = Interval.resumed(run.stop_control, last_saved=(
-            current if checkpoints is not None and checkpoints.latest is not None else None))
+            current if checkpoints is not None and checkpoints.latest is not None else None),
+            consumed=None if initial is None or initial.consumed is None else int(initial.consumed))
         state, shardings, complete = self._opened(plan, run, interval, current, position, placed, abstract,
                                                   resumed=initial is None and interval.last_saved is not None)
         if complete:
@@ -1496,7 +1497,8 @@ class Trainer(Generic[Loss, Effects]):
         with the microbatches its window holds, known by reading ahead (`FitRun.ends_here`), and the
         stream's position after it, taken before that read, which the step saves; else as read."""
         window = (self._split or 1) * self.accumulation
-        if self._examples is None or window == 1:
+        # A split not yet planned may part the batch into a window of its own.
+        if self._examples is None or (window == 1 and self._split is not None):
             return batch, None
         position = None if run.train is None else run.train.source_state
         return {**batch, CLOSES_WINDOW: np.bool_(run.ends_here(interval))}, position
@@ -1656,7 +1658,8 @@ class Trainer(Generic[Loss, Effects]):
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
-            seed=self.seed, tokens=plan.tokens, cadences=plan.recorded(self._config, self.accumulation))
+            seed=self.seed, tokens=plan.tokens,
+            cadences=plan.recorded(self._config, self.accumulation, clocked=self._examples is not None))
         self._report(started, current)
         if plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
@@ -1793,7 +1796,9 @@ class Trainer(Generic[Loss, Effects]):
         # Before the step's save, so a preemption inside the branch saves this step to run it again; at
         # the run's last step, after its final save (`_wind_down`). The points share one length and
         # decay, so those due together are one branch.
-        crossed = run.committed_examples(interval, current, self.accumulation)
+        window = (self._split or 1) * self.accumulation
+        crossed = run.committed_examples(interval, plan.example_points,
+                                         lambda: int(state.microstep) % window == 0)
         due = next((branch for branch in plan.branches if branch.due(current, real, before, crossed)), None)
         branch = None if due is None else due.pending(current, self.accumulation)
         if ending and branch is not None and checkpoints is not None:

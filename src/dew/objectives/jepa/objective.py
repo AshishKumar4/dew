@@ -161,7 +161,9 @@ class JepaObjective(Objective[Ratio]):
         self.is_video = len(sample.shape) == 4
         self.inputs = InputSpec(sample=sample)
         self.ema = EMASpec(
-            decay=optax.linear_schedule(momentum[0], momentum[1], momentum_steps or 1),
+            # Over the run's progress, from 0 to 1, where it names no updates; an explicit 0 holds the first.
+            decay=optax.linear_schedule(momentum[0], momentum[1],
+                                        1 if momentum_steps is None else momentum_steps),
             select=under("params", CONTEXT_ENCODER),
             progressed=momentum_steps is None,
         )

@@ -13,7 +13,7 @@ from typing import ClassVar, Protocol
 import grain.python as grain
 import numpy as np
 
-from dew._records import integers, record
+from dew._records import integer, integers, record
 from dew.batch import Batch
 from dew.data.pipeline import CONSUMED, Windows
 from dew.data.sources.base import Read, Rows, ShardManifest, View, _indexed_manifest
@@ -112,6 +112,8 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
         self._read, self._windows = parent, windows
         self._held: Batch = {name: np.zeros(0, np.int32) for name in windows.fields}
         self._skip = 0
+        # The leading held tokens whose consumed examples a window already took (`CONSUMED`).
+        self._credited = 0
 
     def __next__(self) -> Batch:
         while True:
@@ -128,12 +130,15 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
                 for name in self._windows.fields
             }
         emitted = windows[0]
+        # The window holds its view's first `length + 1` tokens, its inputs and their targets.
+        end, kept = self._skip + windows.length + 1, self._skip + windows.stride
         if CONSUMED in self._held:
-            # Each token's count goes to one window: the one whose stride begins with it, the tokens a
-            # stride past a window skips going to the next.
-            owned = self._held[CONSUMED][: self._skip + windows.stride]
+            # Each token's count goes to the first window that holds it, the tokens a stride skips going
+            # to the window after them; a token past every window the stream makes is consumed by none.
+            owned = self._held[CONSUMED][self._credited : end]
             emitted = {**emitted, CONSUMED: int(np.sum(owned))}
-        self._held = {name: value[self._skip + windows.stride :] for name, value in self._held.items()}
+            self._credited = max(0, end - kept)
+        self._held = {name: value[kept:] for name, value in self._held.items()}
         self._skip = max(0, windows.stride - windows.size)
         return emitted
 
@@ -141,6 +146,7 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
         return {
             "parent": self._read.get_state(),
             "skip": self._skip,
+            "credited": self._credited,
             "held": {
                 name: {"dtype": value.dtype.str, "tokens": value.tolist()}
                 for name, value in self._held.items()
@@ -160,6 +166,8 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
         if not isinstance(skip, int) or skip < 0:
             raise ValueError("saved causal window skip is invalid")
         self._skip = skip
+        # A position saved before windows took counts credits none of its carry.
+        self._credited = integer(state.get("credited", 0), "saved causal window credit")
 
     def close(self) -> None:
         self._read.close()
