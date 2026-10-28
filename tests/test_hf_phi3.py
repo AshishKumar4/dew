@@ -108,8 +108,9 @@ def test_a_kinds_longrope_rebuilds_the_cache_at_its_crossing_as_the_models_does(
     np.testing.assert_array_equal(walk(kinded), walk(loaded.model))
 
 
-MIXED_SEEDS = 8
-"""The mixed-table rows' declared draws of ids against each row's batch-one reference (check 1)."""
+MIXED_SEEDS = 32
+"""The mixed-table rows' declared draws of ids against each row's batch-one reference (check 1), sized by
+`seeds_for` paired with Dew's rows on the CPU."""
 
 
 def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64_rule():
@@ -157,7 +158,8 @@ def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64
 
 
 PACKED_SEEDS = 8
-"""Each packing's declared draws of ids against each document alone (check 1)."""
+"""Each packing's declared draws of ids against each document alone (check 1), sized by `seeds_for` paired
+with the packed row on the CPU."""
 
 
 def test_phi3_packed_documents_each_take_their_own_longrope_table():
