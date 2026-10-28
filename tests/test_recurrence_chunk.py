@@ -11,7 +11,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_fp32_reduction_bound, chain_roundings, widened
+from jax.sharding import Mesh, PartitionSpec as P
+from reference_error import (
+    FEWEST_SEEDS,
+    assert_as_exact,
+    assert_fp32_reduction_bound,
+    chain_roundings,
+    widened,
+)
 
 from dew.nn.kernels import generation, recurrence, recurrence_algebra as algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
@@ -385,6 +392,41 @@ def test_the_peeled_transition_carries_the_peeled_memory_and_its_adjoint(packed,
              'gradient': np.swapaxes(wide[0], -1, -2) @ np.ones(np.shape(carried))}
     for name, found in (('carried', carried), ('corrected', corrected), ('gradient', gradient)):
         np.testing.assert_array_equal(np.asarray(found, np.float64), exact[name], err_msg=name)
+
+
+@pytest.mark.parametrize('shards', [3, 4])
+@pytest.mark.parametrize('dense', [True, False], ids=['dense', 'decay'])
+def test_each_shard_enters_with_the_spans_before_it_applied_in_turn(dense, shards):
+    """The memory each shard of a sequence enters its span with across a mesh axis (`recurrence_algebra
+    .entering`, a Kogge-Stone prefix of the shards' spans) is the spans before it applied in turn to the
+    initial memory (`Span.applied`), on par from float64 over the fewest draws: a dense transfer (the delta
+    rule's) and a head's decay (Mamba-2's), over a power of two of shards and a count that is not."""
+    batch, heads, width, columns = 2, 3, 4, 5
+
+    def drawn(seed):
+        keys = jax.random.split(jax.random.key(seed), 3)
+        transfer = (jax.random.normal(keys[0], (shards, batch, heads, width, width)) / width if dense
+                    else -jax.random.uniform(keys[0], (shards, batch, heads)))
+        return (transfer, jax.random.normal(keys[1], (shards, batch, heads, width, columns)),
+                jax.random.normal(keys[2], (batch, heads, width, columns)))
+
+    mesh = Mesh(np.asarray(jax.devices()[:shards]), ('shards',))
+
+    def entered(transfer, write, initial):
+        def shard(transfer, write, initial):
+            return algebra.entering(algebra.Span(transfer[0], write[0]), 'shards', initial)[None]
+
+        return jax.shard_map(shard, mesh=mesh, in_specs=(P('shards'), P('shards'), P()),
+                             out_specs=P('shards'))(transfer, write, initial)
+
+    def in_turn(transfer, write, initial):
+        memories = [initial]
+        for index in range(shards - 1):
+            memories.append(algebra.Span(transfer[index], write[index]).applied(memories[-1]))
+        return jnp.stack(memories)
+
+    assert_as_exact(jax.jit(entered), jax.jit(in_turn), drawn, f'{shards} shards entering, dense {dense}',
+                    seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.parametrize('packed', PACKED, ids=['one sequence', 'packed'])
