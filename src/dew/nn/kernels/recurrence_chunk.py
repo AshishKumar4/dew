@@ -827,7 +827,8 @@ def entering_memory(rule, query, key, value, g, beta, starts, *, axis: str, stat
     shard = jax.lax.axis_index(axis)
     begins = (jnp.zeros((batch,), bool) if starts is None else jnp.asarray(starts[:, 0], bool)) & (shard > 0)
     zero = rows_like(jnp.zeros((batch, heads, width, columns), wide), value)
-    identity = jnp.where(begins[:, None, None, None], 0.0, jnp.eye(width, dtype=wide))
+    identity = jnp.where(begins[:, None, None, None], 0.0,
+                         jnp.broadcast_to(jnp.eye(width, dtype=wide), (batch, heads, width, width)))
     widened = jnp.concatenate([value.astype(wide), jnp.zeros((*value.shape[:-1], width), wide)], axis=-1)
     _, summary = rule(query.astype(wide), key.astype(wide), widened, g, beta.astype(wide),
                       jnp.concatenate([zero, identity], axis=-1), starts)
