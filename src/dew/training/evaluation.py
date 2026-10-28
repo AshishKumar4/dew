@@ -449,7 +449,8 @@ def _admitted(objective: Objective[Loss, Effects], batch: Batch, seen: set) -> N
     if inputs is None or signature in seen:
         return
     seen.add(signature)
-    agreed("validation input declaration", lambda: inputs.check(device))
+    # A split may carry fewer fields than training, as an objective that scores from prompts reads.
+    agreed("validation input declaration", lambda: inputs.check(device, whole=False))
 
 
 def admit_split(objective: Objective[Loss, Effects], batches: Reader, mesh: Mesh, split: str) -> None:
