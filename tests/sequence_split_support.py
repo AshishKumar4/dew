@@ -56,25 +56,27 @@ def assert_split_as_whole(module, variables, row: str, seeds: int, site: str, *,
         return (rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32),
                 rng.standard_normal((SPLIT_BATCH, 32, width)).astype(np.float32))
 
-    def run(model, params, mesh=None):
-        def pulled(hidden, cotangent):
+    def pulled(model):
+        """The layer's output and its pullback of a cotangent, `model` over `params`, compiled once for
+        every draw."""
+        def run(params, hidden, cotangent):
             out, pull = jax.vjp(lambda params, hidden: model.apply(params, hidden, call), params, hidden)
             return out, *pull(cotangent)
-        if mesh is None:
-            return jax.jit(pulled)
-        @as_given
-        def split(hidden, cotangent):
-            with jax.set_mesh(mesh):
-                return jax.jit(pulled)(hidden, cotangent)
-        return split
+        return jax.jit(run)
+
+    whole, split_run, wide = pulled(module), pulled(module), pulled(module.clone(dtype=jnp.float64))
+    mesh = MeshSpec(sequence=shards).build(jax.devices()[:shards])
+
+    @as_given
+    def split(hidden, cotangent):
+        with jax.set_mesh(mesh):
+            return split_run(variables, hidden, cotangent)
 
     @as_given
     def truth(hidden, cotangent):
         with jax.enable_x64(new_val=True):
-            return run(module.clone(dtype=jnp.float64), widened(variables))(*widened((hidden, cotangent)))
+            return wide(*widened((variables, hidden, cotangent)))
 
-    mesh = MeshSpec(sequence=shards).build(jax.devices()[:shards])
-    assert_as_exact(run(module, variables, mesh), run(module, variables), draw, site, seeds=seeds,
-                    truth_fn=truth)
-    split = run(module, variables, mesh)(*draw(0))[0]
-    assert not np.any(np.asarray(split)[:, ~valid])
+    assert_as_exact(split, lambda hidden, cotangent: whole(variables, hidden, cotangent), draw, site,
+                    seeds=seeds, truth_fn=truth)
+    assert not np.any(np.asarray(split(*draw(0))[0])[:, ~valid])
