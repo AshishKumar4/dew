@@ -583,6 +583,85 @@ def test_a_hub_jsonl_shard_keeps_its_offset_index_in_its_identity_with_the_hub_o
     assert Hub("owner/lines", revision="pinned").files.fingerprint() == identity
 
 
+CONFIGURED_CARD = """---
+configs:
+- config_name: en
+  data_files:
+  - split: train
+    path: "en/train-*.parquet"
+  - split: test
+    path: "en/test-*.parquet"
+- config_name: fr
+  data_dir: fr
+- config_name: clean
+  data_files:
+    train: processed/clean-*.parquet
+---
+# rows
+"""
+"""A dataset card of three configurations: one by its splits' patterns, one by its directory, and one
+whose files lie outside any directory of its name."""
+CONFIGURED_LISTING = ["README.md", "en/train-0.parquet", "en/test-0.parquet", "fr/train-0.parquet",
+                      "fr/test-0.parquet", "processed/clean-0.parquet", "processed/raw-0.parquet"]
+
+
+@pytest.mark.parametrize("name, expected", [
+    ("en", ["en/train-0.parquet"]),
+    ("fr", ["fr/train-0.parquet"]),
+    ("clean", ["processed/clean-0.parquet"]),
+], ids=["patterns", "directory", "elsewhere"])
+def test_a_named_configurations_split_holds_the_files_its_card_gives_it(name, expected):
+    """A configuration's split holds the files `datasets` resolves to it from the card's `configs`:
+    by its splits' patterns, by default patterns under its directory, or by patterns naming files no
+    directory of its name holds; never another configuration's files (row 1871, DATA-02)."""
+    from dew.data.sources.hub import configuration, split_files
+
+    chosen, data_files, data_dir = configuration(CONFIGURED_CARD, name)
+    assert chosen == name
+    assert split_files(CONFIGURED_LISTING, "train", data_files=data_files, data_dir=data_dir) == expected
+
+
+def test_a_card_of_several_configurations_and_no_default_is_read_only_by_name():
+    """Unnamed, a card of several configurations and no default is refused, as `datasets` refuses it,
+    where a read once took every configuration's files; a card naming one default reads it unnamed,
+    and a repository with no card reads its default patterns as its one configuration."""
+    from dew.data.sources.hub import configuration
+
+    with pytest.raises(ValueError):
+        configuration(CONFIGURED_CARD, None)
+    defaulted = CONFIGURED_CARD.replace("- config_name: fr\n", "- config_name: fr\n  default: true\n")
+    assert configuration(defaulted, None)[0] == "fr"
+    assert configuration(None, None) == ("default", None, None)
+    with pytest.raises(ValueError):
+        configuration(None, "en")
+
+
+def test_a_streamed_split_reads_its_configurations_files_online_and_offline_alike(monkeypatch):
+    """A streamed Hub split of a named configuration reads only that configuration's files, as its
+    card states them, and offline (HF_HUB_OFFLINE) reads the same files from the card and listing the
+    Hub answered online."""
+    from types import SimpleNamespace
+
+    from hub_support import offline
+    from huggingface_hub import HfApi, HfFileSystem
+
+    from dew.data.sources import Hub
+
+    commit = "0123456789abcdef0123456789abcdef01234567"
+    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, revision=None, **options: SimpleNamespace(
+        sha=commit))
+    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **options: list(CONFIGURED_LISTING))
+    monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, mode="rb", **options: io.BytesIO(
+        CONFIGURED_CARD.encode()))
+    monkeypatch.setattr(HfFileSystem, "info", lambda self, path, **options: {
+        "name": path, "type": "file", "size": 64, "blob_id": f"blob:{path}"})
+    root = f"hf://datasets/owner/rows@{commit}/"
+    online = Hub("owner/rows", name="clean").files.urls
+    assert online == (root + "processed/clean-0.parquet",)
+    offline(monkeypatch)
+    assert Hub("owner/rows", name="clean").files.urls == online
+
+
 @pytest.mark.parametrize("listing, split, expected", [
     (["data/dev-00000.parquet", "data/train-00000.parquet"], "validation", ["data/dev-00000.parquet"]),
     (["data/train-00000-of-00002.parquet", "data/train-00001-of-00002.parquet",

@@ -32,12 +32,40 @@ def hold_progress_lock() -> None:
     bars.get_lock()
 
 
-def split_files(paths: Sequence[str], split: str) -> list[str]:
-    """The `paths` of a repository listing that `datasets` gives `split`, by its default patterns
-    (`datasets.data_files.get_data_patterns`), resolved as it resolves a split's patterns
+def configuration(card: str | None, name: str | None) -> tuple[str, str | list | dict | None, str | None]:
+    """The configuration `datasets` reads by `name` from a dataset card (its README's text, None for a
+    repository without one): the card's `configs` metadata (`MetadataConfigs`), `name` or the card's
+    default where None, with its `data_files` and its `data_dir`; a card of no `configs` reads the
+    repository by `datasets`' default patterns, as its one configuration, `default`. A name the card
+    has no configuration of, or None where it has several and no default, is refused, as
+    `load_dataset_builder` refuses it."""
+    from datasets.utils.metadata import MetadataConfigs
+    from huggingface_hub import DatasetCard, DatasetCardData
+
+    metadata = DatasetCard(card).data if card else DatasetCardData()
+    assert isinstance(metadata, DatasetCardData), type(metadata)
+    configs = MetadataConfigs.from_dataset_card_data(metadata)
+    if not configs:
+        if name not in (None, "default"):
+            raise ValueError(f"the dataset's card names no configuration, so none is {name!r}; read it "
+                             "unnamed")
+        return "default", None, None
+    chosen = name if name is not None else configs.get_default_config_name()
+    if chosen is None or chosen not in configs:
+        raise ValueError(f"the dataset's configurations are {sorted(configs)}; name one of them, not "
+                         f"{name!r}")
+    stated = configs[chosen]
+    return chosen, stated.get("data_files"), stated.get("data_dir")
+
+
+def split_files(paths: Sequence[str], split: str, *, data_files: str | list | dict | None = None,
+                data_dir: str | None = None) -> list[str]:
+    """The `paths` of a repository listing that `datasets` gives `split` in a configuration of
+    `data_files` patterns, else its default patterns (`datasets.data_files.get_data_patterns`), under
+    `data_dir` where one is given (`configuration`), resolved as it resolves a split's patterns
     (`DataFilesList.from_patterns`), over an empty in-memory copy of the listing: the listing itself,
     which the Hub answered once and offline replays, is all the patterns read."""
-    from datasets.data_files import DataFilesList, get_data_patterns
+    from datasets.data_files import DataFilesList, get_data_patterns, sanitize_patterns
     from fsspec.implementations.memory import MemoryFileSystem
 
     if not paths:
@@ -48,11 +76,13 @@ def split_files(paths: Sequence[str], split: str) -> list[str]:
     fs, root = MemoryFileSystem(), f"/dew-hub-listing/{uuid.uuid4().hex}"
     for path in paths:
         fs.pipe_file(f"{root}/{path}", b"")
-    base = f"memory://{root}"
+    # A configuration's patterns resolve under its directory, as a builder resolves them.
+    base = f"memory://{root}" + (f"/{data_dir.strip('/')}" if data_dir else "")
     try:
         # A listing with no data files at all is datasets' FileNotFoundError (EmptyDatasetError).
-        patterns = {str(name): found for name, found in get_data_patterns(base).items()}
-        resolved = set(DataFilesList.from_patterns(list(patterns.get(split, ())), base_path=base))
+        stated = sanitize_patterns(data_files) if data_files is not None else get_data_patterns(base)
+        patterns = {str(name): list(found) for name, found in stated.items()}
+        resolved = set(DataFilesList.from_patterns(patterns.get(split, []), base_path=base))
     except FileNotFoundError:
         resolved = set()
     finally:
@@ -217,6 +247,16 @@ class Hub(Dataset):
         return {url: hub_answer(("dataset file", url), lambda url=url: stated(url)).value
                 for url in (*urls, *indexes)}
 
+    def _card(self, revision: str) -> str | None:
+        """The dataset card's text at `revision` (its README.md), None where the repo has none, as the
+        Hub last answered (`dew.cache.hub_answer`): a commit's card never changes."""
+        from huggingface_hub import HfFileSystem
+
+        if "README.md" not in self._listed(revision):
+            return None
+        return hub_answer(("dataset card", self.repo, revision), lambda: HfFileSystem().read_text(
+            f"datasets/{self.repo}@{revision}/README.md")).value
+
     def _listed(self, revision: str) -> list[str]:
         """Every file of the repo at `revision`, as the Hub last answered (`dew.cache.hub_answer`),
         asked once per source: a commit's files never change, so its answer stands for it."""
@@ -235,13 +275,15 @@ class Hub(Dataset):
 
     def _selected(self, revision: str) -> tuple[list[str], Format]:
         """This split's native shards at `revision`, in the first format of Parquet and JSONL that has
-        any: the files `datasets` resolves to the split from the revision's listing
-        (`datasets.data_files.get_data_patterns` and `resolve_pattern`, its sharded names, its split
-        keywords in file and directory names, `dev` for `validation` among them, a lone file as
-        `train`), under the configuration's directory where one is named."""
-        listed = [path for path in self._listed(revision)
-                  if self.name is None or f"/{self.name}/" in "/" + path]
-        paths = split_files(listed, self.split)
+        any: the files `datasets` resolves to the split from the revision's listing in the
+        configuration it reads (`configuration`, from the card at the source's commit): its
+        `data_files` and `data_dir`, else `datasets.data_files.get_data_patterns`' sharded names and
+        split keywords in file and directory names, `dev` for `validation` among them, a lone file as
+        `train`. The Hub's Parquet conversion holds each configuration in a directory of its name."""
+        name, data_files, data_dir = configuration(self._card(self.commit), self.name)
+        converted = revision != self.commit
+        paths = split_files(self._listed(revision), self.split, data_files=None if converted else data_files,
+                            data_dir=name if converted else data_dir)
         # Not Arrow: the `.arrow` files a dataset repo holds are what `save_to_disk` and
         # `push_to_hub` write, Arrow's stream format, which no reader can cut into shards or count
         # without reading it whole; such a split streams its Parquet conversion, or is prepared.
