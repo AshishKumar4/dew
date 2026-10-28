@@ -4,7 +4,7 @@ Each stage kind has one definition here, which every read applies and the
 memory executor (`dew.data.materialize`) calls for the stages it runs over
 the whole source: `_outputs` for a record step, `_reordered` for an order
 stage over indexed rows, `_TokenSplit` for a token split, `_packed` for
-Grain's packers, and `_fill` with `_CachedOutputs` for opening a cache and
+a pack's packer, and `_fill` with `_CachedOutputs` for opening a cache and
 reading what it holds.
 
 `_Build` lowers a pipeline's stages in the order they are written, as the
@@ -83,6 +83,7 @@ from dew.data.mixing import (
     rewound,
     token_weights,
 )
+from dew.data.packing import FirstFitPacked
 from dew.data.pipeline import (
     Artifact,
     Batched,
@@ -820,16 +821,19 @@ class _Inputs(pygrain.MapDataset):
 
 
 def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
-    """`documents` packed by Grain's own packer for the stage's policy."""
+    """`documents` packed for the stage's policy: first-fit as an indexed read's plan places them
+    (`FirstFitPacked`), the rest by Grain's own packers."""
+    if stage.policy == "first-fit":
+        return FirstFitPacked(documents, stage)
     sizes = dict.fromkeys(stage.fields, stage.seq_len) | dict(stage.along)
     if stage.policy == "concat":
         cut = _OverlappedCuts(documents, stage) if stage.overlap else documents
         return _Concatenated(gx.ConcatThenSplitIterDataset(cut, length_struct=sizes))
-    packer = gx.FirstFitPackIterDataset if stage.policy == "first-fit" else gx.BestFitPackIterDataset
     # Fields cut alike with the first share its segments and positions, as the indexed planner's
     # windows do (`packed_window`), so Grain writes no copy of them for the rest.
-    return packer(documents, length_struct=sizes, num_packing_bins=stage.bins, shuffle_bins=False,
-                  max_sequences_per_bin=stage.segments, meta_features=stage.fields[1:])
+    return gx.BestFitPackIterDataset(documents, length_struct=sizes, num_packing_bins=stage.bins,
+                                     shuffle_bins=False, max_sequences_per_bin=stage.segments,
+                                     meta_features=stage.fields[1:])
 
 
 class _Ruled(pygrain.IterDataset):

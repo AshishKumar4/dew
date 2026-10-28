@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import overload
 
 import grain.python as pygrain
@@ -66,50 +66,95 @@ def chunk_lengths(lengths, chunk_len: int, overlap: int) -> np.ndarray:
     return np.minimum(chunk_len, np.asarray(lengths, np.int64)[documents] - starts)
 
 
-def packed_window(chunks: Sequence[Batch], window: int) -> Batch:
-    """`chunks`, each holding the same per-token fields, laid end to end in a
-    zero-padded window of `window` tokens, each field keeping its trailing shape
-    (a token's row of an aligned auxiliary field), as grain's packer keeps it.
+def packed_window(chunks: Sequence[Batch], window: int, along: Mapping[str, int] | None = None) -> Batch:
+    """`chunks`, each holding the same fields, laid end to end in zero-padded
+    windows, as grain's packer lays them: the token fields, which hold one
+    entry a token and so one length, in a window of `window` tokens, and each
+    field `along` an axis of its own in a window of its own length. Each field
+    keeps its trailing shape (a token's row of an aligned auxiliary field).
 
-    Named after the first field (the ids), `<field>_segment_ids` says which
-    chunk of the window each token came from, counted from 1, and 0 for the
-    padding at the end, and `<field>_positions` the token's place inside its
-    chunk. A block-diagonal mask and per-document RoPE read that pair.
-    grain's packer writes one pair per packed feature
-    (`grain/_src/python/dataset/transformations/packing_packed_batch.py:116-117`);
-    chunks are cut the same way in every field here, so one pair describes
-    them all and nothing transfers a second copy to the device.
+    `<field>_segment_ids` says which chunk of the window each entry came from,
+    counted from 1, and 0 for the padding at the end, and `<field>_positions`
+    the entry's place inside its chunk: one pair named after the first token
+    field, which describes every token field, as chunks are cut the same way in
+    each, and one for each field along an axis of its own, as grain's packer
+    writes one for each field it does not take for a meta feature
+    (`grain/_src/python/dataset/transformations/packing_packed_batch.py:85-115`).
+    A block-diagonal mask and per-document RoPE read the token pair.
 
     It is grain's assembly, held to it field for field (tests/test_grain_packing.py), and not grain's
     own: on armada's CPUs grain's `PackedBatch` assembles a twelve-chunk window in 112 us and its
     public packer in 3.6 ms where this takes 28 us, and an indexed read assembles a window a read
     (row 1873).
     """
-    fields = {key: np.zeros((window, *np.shape(value)[1:]), np.asarray(value).dtype)
+    lengths = {key: window if along is None else along.get(key, window) for key in chunks[0]}
+    fields = {key: np.zeros((lengths[key], *np.shape(value)[1:]), np.asarray(value).dtype)
               for key, value in chunks[0].items()}
-    segment_ids = np.zeros(window, np.int32)
-    positions = np.zeros(window, np.int32)
-    filled = 0
+    tokens = next(key for key in fields if along is None or key not in along)
+    paired = (tokens, *(() if along is None else (key for key in fields if key in along)))
+    segment_ids = {key: np.zeros(lengths[key], np.int32) for key in paired}
+    positions = {key: np.zeros(lengths[key], np.int32) for key in paired}
+    filled = dict.fromkeys(fields, 0)
     for segment, chunk in enumerate(chunks, start=1):
-        length = len(next(iter(chunk.values())))
         for key, value in chunk.items():
-            fields[key][filled:filled + length] = value
-        segment_ids[filled:filled + length] = segment
-        positions[filled:filled + length] = np.arange(length, dtype=np.int32)
-        filled += length
-    ids = next(iter(fields))
-    return {**fields, f"{ids}_segment_ids": segment_ids, f"{ids}_positions": positions}
+            start = filled[key]
+            filled[key] = start + len(value)
+            fields[key][start:filled[key]] = value
+            if key in segment_ids:
+                segment_ids[key][start:filled[key]] = segment
+                positions[key][start:filled[key]] = np.arange(filled[key] - start, dtype=np.int32)
+    described = {f"{key}_{part}": value for key in paired
+                 for part, value in (("segment_ids", segment_ids[key]), ("positions", positions[key]))}
+    return {**fields, **described}
+
+
+class FirstFit:
+    """Grain's first-fit placement (`FirstFitPackedBatch.try_add_to_batch`): `bins` open windows,
+    each with room for `rooms` entries of each field, a document going to the first window with
+    room for every field of it and fewer than `segments` documents. Where none has, the packer
+    emits every window that holds a document, in order, and starts afresh
+    (`grain/_src/python/dataset/transformations/packing.py:250-266`).
+
+    The one placement both of Dew's first-fit packers follow: a plan over documents' lengths alone
+    (`first_fit`), and the packer of a stream of them (`dew.data.packing.FirstFitPacked`)."""
+
+    def __init__(self, rooms: Sequence[int], bins: int, segments: int | None = None):
+        if bins < 1:
+            raise ValueError(f"a packer fills at least one window at a time, got {bins}")
+        self.rooms, self.bins, self.segments = tuple(rooms), bins, segments
+        self.restart()
+
+    def restart(self) -> None:
+        """Every window open and empty, as after the packer emits them."""
+        self.free = [list(self.rooms) for _ in range(self.bins)]
+        self.held = [0] * self.bins
+
+    def place(self, sizes: Sequence[int]) -> int | None:
+        """The window a document of `sizes` entries in each field goes to, which takes them, or None
+        where no open window has room for it. One longer than a window is refused, as grain refuses
+        it: no window ever has room for it."""
+        if any(size > room for size, room in zip(sizes, self.rooms, strict=True)):
+            raise ValueError(f"a document of {list(sizes)} entries is longer than the windows of "
+                             f"{list(self.rooms)} it packs into; cut it first")
+        for window, (free, held) in enumerate(zip(self.free, self.held, strict=True)):
+            if (self.segments is None or held < self.segments) and all(
+                    size <= room for size, room in zip(sizes, free, strict=True)):
+                self.free[window] = [room - size for size, room in zip(sizes, free, strict=True)]
+                self.held[window] += 1
+                return window
+        return None
+
+    def holding(self) -> int:
+        """How many windows hold a document: the first ones, since an empty window takes any document
+        a window has room for."""
+        return sum(held > 0 for held in self.held)
 
 
 def first_fit(sizes: np.ndarray, window: int, bins: int,
               segments: int | None = None) -> tuple[np.ndarray, np.ndarray]:
-    """The plan grain's first-fit packer would follow over chunks of `sizes`.
+    """The plan grain's first-fit packer would follow over chunks of `sizes` (`FirstFit`).
 
-    Grain's packer holds `bins` open windows, adds each record to the first
-    with room and fewer than `segments` records, and emits all of them when
-    a record fits in none (`grain/_src/python/dataset/transformations/packing.py:341-355`,
-    `packing_packed_batch.py` `FirstFitPackedBatch`). Run
-    over the lengths alone it is a plan rather than a pass: which window
+    Run over the lengths alone it is a plan rather than a pass: which window
     every chunk belongs to, without reading a token. That plan is what lets
     the packing run ahead of the shard, so a window holds the same chunks at
     any process count.
@@ -125,28 +170,20 @@ def first_fit(sizes: np.ndarray, window: int, bins: int,
     goes to the first window with room and an empty window has room for
     anything.
     """
-    if bins < 1:
-        raise ValueError(f"a packer fills at least one window at a time, got {bins}")
-    room = [window] * bins
-    held = [0] * bins
+    placement = FirstFit((window,), bins, segments)
     plan = np.empty(len(sizes), np.int64)
     closed = 0
     for index, size in enumerate(sizes.tolist()):
-        chosen = -1
-        for candidate, free in enumerate(room):
-            if free >= size and (segments is None or held[candidate] < segments):
-                chosen = candidate
-                break
-        if chosen < 0:
+        chosen = placement.place((size,))
+        if chosen is None:
             # Every open window is short of room or full, so the packer emits
             # all of them and starts this chunk in the first of a fresh set.
             closed += bins
-            room, held = [window] * bins, [0] * bins
-            chosen = 0
+            placement.restart()
+            chosen = placement.place((size,))
+            assert chosen == 0
         plan[index] = closed + chosen
-        room[chosen] -= size
-        held[chosen] += 1
-    windows = closed + bins - room.count(window)
+    windows = closed + placement.holding()
     starts = np.concatenate([np.zeros(1, np.int64),
                              np.cumsum(np.bincount(plan, minlength=windows))])
     return np.argsort(plan, kind="stable"), starts
