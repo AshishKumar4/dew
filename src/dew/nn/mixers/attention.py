@@ -1135,9 +1135,12 @@ class CausalSelfAttention(nn.Module):
         slot = jnp.broadcast_to(jnp.atleast_2d(jnp.asarray(positions, jnp.int32))[:, :1], (rows, 1))
         spans = key_spans(1, key_length, causal=True, sliding_window=window,
                           key_value_seq_lengths=jnp.maximum(slot[:, 0] + 1, 0),
-                          block_groups=history.get("block_groups"), key_valid=valid, query_slots=slot,
-                          rows=rows)
-        return template.dense(spans)[:, None], spans.start[:, 0]
+                          block_groups=history.get("block_groups"), query_slots=slot, rows=rows)
+        # The filled slots ANDed after the spans, which search no ids then (`causal_attention_mask`).
+        seen = template.dense(spans)[:, None]
+        if valid is not None:
+            seen = seen & jnp.asarray(valid, bool)[:, None, None, :]
+        return seen, spans.start[:, 0]
 
     def _cached_call(self, positions, held) -> tuple[CrossDocuments, bool, int | None]:
         """A cache call of several tokens at `positions` `[B, S]` (-1 for padding) over the keys
