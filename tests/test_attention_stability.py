@@ -238,7 +238,9 @@ def _subnormal_share(seed: int, rows: int = 64, *, equal: bool = False):
     # whose values near fp32's largest in the first column overflow its sum, and one of logit -84 to -88
     # whose value near 1e38 sits alone in the second column, its weight over the denominator below fp32's
     # least normal; the cotangent reads the second column alone, so D is that key's share and dQ's other
-    # entries are D times the other keys' weighted rows.
+    # entries are D times the other keys' weighted rows. The cotangent a quarter of a normal draw keeps its
+    # product with that value within fp32's range, as every fp32 arm's backward needs: a draw past 3.4 times
+    # 1e38 takes the reference's dP, a single term, past it too (row 2022, ET-SUBREF-h100).
     key = np.zeros((rows, 256, 1, 16), np.float32)
     if not equal:
         key[:, :255, 0, 0] = -_uniform(seed + 5, 0.0, 1.0, (rows, 255))
@@ -248,7 +250,7 @@ def _subnormal_share(seed: int, rows: int = 64, *, equal: bool = False):
     value[:, :255, 0, 0] = _uniform(seed + 2, 2.9e38, 3.3e38, (rows, 255))
     value[:, 255, 0, 1] = _uniform(seed + 3, 5e37, 1e38, (rows,))
     dout = np.zeros((rows, 1, 1, 16), np.float32)
-    dout[..., 1] = _normal(seed + 4, (rows, 1, 1))[0]
+    dout[..., 1] = _normal(seed + 4, (rows, 1, 1))[0] * np.float32(0.25)
     return _first(np.full((rows, 1), 4.0, np.float32), 16), key, value, None, dout
 
 

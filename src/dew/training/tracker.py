@@ -423,6 +423,12 @@ def write_artifact(value: Reported, prefix: Path) -> list[Path]:
     raise TypeError(f'LocalTracker has no renderer for {type(value).__name__}')
 
 
+def _named(prefix: Path, suffix: str) -> Path:
+    """The file `prefix` names with `suffix` after its whole name: a split's dotted name (`test.v1`) is
+    its name, not a suffix the extension replaces."""
+    return prefix.with_name(prefix.name + suffix)
+
+
 def _write_frames(frames, encode, suffix: str, captions, prefix: Path) -> list[Path]:
     """Write one file per frame, and the captions beside them as JSON."""
     paths = []
@@ -430,7 +436,7 @@ def _write_frames(frames, encode, suffix: str, captions, prefix: Path) -> list[P
         path = prefix.with_name(f'{prefix.name}-{index}{suffix}')
         path.write_bytes(encode(frame))
         paths.append(path)
-    written = prefix.with_suffix('.json')
+    written = _named(prefix, '.json')
     written.write_text(json.dumps(list(captions)))
     return [*paths, written]
 
@@ -447,7 +453,7 @@ def _(value: VideoGrid, prefix: Path) -> list[Path]:
 
 @write_artifact.register
 def _(value: TextSamples, prefix: Path) -> list[Path]:
-    path = prefix.with_suffix('.json')
+    path = _named(prefix, '.json')
     path.write_text(json.dumps({'prompt': value.prompt, 'texts': list(value.texts),
                                 'tokens': _home(value.tokens).tolist()}))
     return [path]
@@ -465,7 +471,7 @@ def _(value: TokenScores, prefix: Path) -> list[Path]:
 
 def _arrays(prefix: Path, **arrays) -> list[Path]:
     """`arrays`, brought home, saved together under `prefix` as one .npz preview."""
-    path = prefix.with_suffix('.npz')
+    path = _named(prefix, '.npz')
     np.savez(path, allow_pickle=False, **{name: _home(array) for name, array in arrays.items()})
     return [path]
 
