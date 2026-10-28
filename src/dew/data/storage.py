@@ -486,17 +486,19 @@ class Store:
     def committed(self, entry: Mapping[str, object] | None) -> CommittedRead:
         """Where this object's bytes are read as `entry` committed them (an export's manifest entry: its
         bytes, its sha256, and the store's version where its writer read one, `store_version`): in place
-        where it is this host's disk or a Hub commit's file, which no store replaces, or where `entry`
-        states nothing; in place, checked at this open against the store's version it was committed
+        where it is this host's disk, this process's memory or a Hub commit's file, which no other writer
+        replaces, or where `entry` states nothing; in place, checked at this open, as the store states it
+        now and not as a listing cached it, against the store's version it was committed
         at, where `entry` holds one; its copy in the transport's mirror, checked whole against the
         sha256 as it downloads (`BoundedFileCache`), where `entry` holds a sha256 alone, and refused
         where the mirror cannot hold it, since a stream read unchecked could read an object replaced
         since it was committed."""
         place = self.readable()
-        if entry is None or local(place.fs) or self._immutable(place):
+        if entry is None or local(place.fs) or in_memory(place.fs) or self._immutable(place):
             return CommittedRead(place, None)
         version = entry.get("version")
         if isinstance(version, str):
+            place.fs.invalidate_cache(place.path)
             live = store_version(place.fs.info(place.path))
             if live != version:
                 raise OSError(f"{self.url} changed since it was committed: the store states its version "

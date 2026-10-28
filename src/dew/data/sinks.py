@@ -200,6 +200,8 @@ def _written(target: Store, prefix: str) -> list[Mapping[str, object]]:
         if any(part.startswith(("_", ".")) for part in PurePosixPath(relative).parts):
             continue
         payload = fs.cat_file(path)
+        # The store's own answer, not the listing's, which states no version.
+        fs.invalidate_cache(path)
         version = store_version(fs.info(path))
         files.append({"path": f"{prefix}/{relative}", "bytes": len(payload),
                       "sha256": hashlib.sha256(payload).hexdigest(),

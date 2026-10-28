@@ -620,6 +620,8 @@ class Files(Dataset):
                         digest = hashlib.file_digest(local, "sha256").hexdigest()
             finally:
                 opened.close()
+            # The store's own answer, not a listing's, which states no version.
+            filesystem.invalidate_cache(path)
             version = store_version(filesystem.info(path))
             files.append(
                 {

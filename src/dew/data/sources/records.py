@@ -181,6 +181,7 @@ class ArrayRecords:
             "storage_options": self.storage_options,
             "record_codec": self.record_codec,
             "counts": self.counts,
+            "committed": self.committed,
         }
 
     def __setstate__(self, state: Mapping[str, object]) -> None:
