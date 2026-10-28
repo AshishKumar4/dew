@@ -407,6 +407,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
             targets=batch["targets"],
             ordinal=inputs.kinds == _SCORE,
             scored=batch["scored"],
+            classes=batch.get("classes"),
         )
 
     @property
@@ -427,7 +428,7 @@ class DecisionObjective(Objective[Ratio | Weighted]):
         evaluating = dataclasses.replace(training, train=False)
         fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head, self.context_length, grouped,
                   self.bounds, self.none_of_the_above)
-        held = dataclasses.replace(fit, none_of_the_above=0.0)
+        held = dataclasses.replace(fit, none_of_the_above=0.0, scored=True)
         # Rows a record spreads into: a layout of a question a row's, or grouped examples' apart.
         expand = (QuestionRows(),)
         options = self.bounds.options if self.layout.joint else None

@@ -25,8 +25,9 @@ from typing import TYPE_CHECKING, Annotated, ClassVar
 
 import jax
 
-from dew._records import number, record
+from dew._records import integer, number, record
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
+from dew.data.pipeline import Dataset, cut_unit
 from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
 from dew.decision.laya import LAYA
 from dew.decision.layout import Framing, Labels, Layout, QuestionLayout, RowSegment, Schema, default_layout
@@ -70,7 +71,10 @@ class Letters:
     gives each label a trainable output row of its own, drawn from the backbone's."""
 
     labels: Labels = dataclasses.field(default_factory=Labels)
-    count: int = 26
+    count: int | None = None
+    """The labels the head holds; None resolves them from the run: the most options a question of its
+    data asks (its `slots` facts, training's and validation's), one more where its objective adds "none
+    of the above", or where the data states none, every label its tokenizer spells as one token."""
     untied: bool = False
 
 
@@ -107,11 +111,14 @@ class DecisionRunConfig(DecoderRunConfig):
     max_len: int | None = None
     """The row's length in tokens; None keeps the checkpoint's (Laya's 512) or the layout's own."""
     head_max_len: int | None = None
-    """The tokens the question and its options share; None keeps the
-    checkpoint's (Laya's 192). A question of many options wants more, or
-    its options are cut to a few tokens each."""
+    """The tokens the question and its options may share, a declared cut; None
+    keeps the checkpoint's (Laya's release declares 192) or a fresh head's,
+    which keeps every question whole. Each row it cuts is counted in the run's
+    data counters, and a row whose cut leaves two options alike is refused."""
     option_tokens: int | None = None
-    """The most tokens one option keeps, in a layout of one row per question."""
+    """The most tokens one option keeps, in a layout of one row per question, a
+    declared cut counted as `head_max_len`'s is; None keeps the checkpoint's
+    (Laya's 48) or a fresh head's, each option whole."""
     max_state_tokens: int | None = None
     """The most tokens a joint row's state keeps, whatever room `max_len` leaves
     it: a row is its state, cut to this, and its schema, so a large schema
@@ -218,7 +225,8 @@ class DecisionRunConfig(DecoderRunConfig):
             derived.update(self._fresh_head(start, blocked, budgets))
         objective = self.objective.build(backbone=start, **derived)
         assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
-        summary: dict[str, object] = {"pretrained": self.pretrained}
+        summary: dict[str, object] = {"pretrained": self.pretrained,
+                                      "capacities": self._capacities(objective, release)}
         # A mixture's weights and the manifest it was made by, as the chain states them (`Dataset.facts`).
         facts = self.chain().facts()
         if "mixture_weights" in facts:
@@ -229,11 +237,28 @@ class DecisionRunConfig(DecoderRunConfig):
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
         dataset, held = self.compiled(objective.data(), self.chain(), self.validation)
         summary["records"] = dataset.records
-        unfit = {name: counter.rejected.get("unfit", 0) for name, counter in dataset.counts.items()}
-        unfit["held out"] = sum(counter.rejected.get("unfit",
-            0) for counter in dataset.validation_counts.values())
-        if any(unfit.values()):
-            summary["unfit"] = unfit
+        # The rows each layout refused, by reason, and the rows and tokens each cut removed, as the
+        # run's data counters count them (`Layout.refusal`, `Encoded.cuts`).
+        for reason in ("unfit", "options_alike"):
+            refused = {name: counter.refused.get(reason, 0) for name, counter in dataset.counts.items()}
+            refused["held out"] = sum(counter.refused.get(reason, 0)
+                                      for counter in dataset.validation_counts.values())
+            if any(refused.values()):
+                summary[reason] = refused
+        cut = {name: {kind: {"examples": counter.cut_examples[kind], "rows": rows,
+                             "removed": counter.cut_removed[kind], "unit": cut_unit(kind)}
+                      for kind, rows in counter.cut_rows.items()}
+               for name, counter in {**dataset.counts, **{f"{name} (held out)": counter for name, counter
+                                                           in dataset.validation_counts.items()}}.items()
+               if counter.cut_rows}
+        if cut:
+            summary["cut"] = cut
+        # The rows whose "none of the above" a training read declines where it draws it, by why their
+        # layout refuses it (`FittedRow.declined`); each such read trains on the row as it was admitted.
+        declined = {name: dict(counter.declined) for name, counter in dataset.counts.items()
+                    if counter.declined}
+        if declined:
+            summary["none_of_the_above_declined"] = declined
 
         def calibrate(state: TrainState, directory: str) -> None:
             """Fit the task's temperatures on the held-out rows; process zero saves them into the run."""
@@ -263,12 +288,50 @@ class DecisionRunConfig(DecoderRunConfig):
             # Its ids are its labels' under the objective's tokenizer, which lays the rows out too and
             # names the labels it spells as one token each where they name none (`LabelReadout.count`).
             labels, (width, head_dtype) = self.head.labels, DecisionModel.head_size(start.model)
+            count = self.head.count if self.head.count is not None else self._options()
             head = LabelReadout(features=width, label_ids=(), untied=self.head.untied, dtype=head_dtype,
-                                count=self.head.count)
+                                count=count or 0)
         # Lettered rows lie one question to a row, as the backbone's order asks.
         one_question = (DecisionHead if head is None else head).one_question or labels is not None
         layout = _fresh_layout(start.model.causal, one_question, budgets, blocked, labels)
         return {"layout": layout} if head is None else {"head": head, "layout": layout}
+
+    def _capacities(self, objective: DecisionObjective, release: bool) -> Mapping[str, Mapping[str, object]]:
+        """Each capacity the run's rows take and where it came from, beside the cuts it causes
+        (`summary["cut"]`): the row's window in tokens, stated, the release's, or the layout's default;
+        the context the cross-attention reads, where it reads one; and the labels a letter readout
+        holds, stated, from the data's questions, or every label the tokenizer letters."""
+        layout = objective.layout
+        found: dict[str, dict[str, object]] = {"window": {
+            "tokens": layout.max_len,
+            "from": "stated" if self.max_len is not None else "release" if release else "default"}}
+        if self.context_layers is not None:
+            stated = self.context_length != type(self).context_length
+            found["context"] = {"tokens": self.context_length, "from": "stated" if stated else "default"}
+        # A lettered layout's labels are named by now, as its head reads them (`Head.labelled`).
+        labels = layout.labels if isinstance(layout, QuestionLayout) else None
+        named = None if labels is None else labels.names
+        if isinstance(self.head, Letters) and named is not None:
+            origin = ("stated" if self.head.count is not None else "data" if self._options() is not None
+                      else "tokenizer")
+            found["labels"] = {"count": len(named), "from": origin}
+        return found
+
+    def _options(self) -> int | None:
+        """The most options a question of the run's data asks, as every dataset it reads states them
+        (`slots`), training's and validation's, with "none of the above" where its objective adds it;
+        None where any dataset leaves it unknown until it is read, so a split the run has not measured
+        never takes fewer labels than it asks."""
+        datasets = [self.chain(), *([] if self.validation is None else
+                                    self.validation.values() if isinstance(self.validation, Mapping)
+                                    else [self.validation])]
+        stated = [record(dataset.facts().get("slots", {}), "slots").get("options")
+                  if isinstance(dataset, Dataset) else None for dataset in datasets]
+        if any(value is None for value in stated):
+            return None
+        widest = max(integer(value, "slots.options") for value in stated)
+        added = number(self.objective.fields.get("none_of_the_above") or 0.0, "none_of_the_above") > 0
+        return widest + int(added)
 
     def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
         """The task's own held-out suite (`default_metrics`), where the data holds held-out rows."""

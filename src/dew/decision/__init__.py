@@ -42,7 +42,7 @@ from dew.decision.layout import (
     Text,
     render,
 )
-from dew.decision.metrics import AURC, ECE, Accuracy, Answered
+from dew.decision.metrics import AURC, ECE, Accuracy, Answered, MacroF1, ScoredQuestions
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.questions import (
@@ -107,6 +107,7 @@ __all__ = [
     "LayaCheckpoint",
     "Layout",
     "LogLoss",
+    "MacroF1",
     "MarkerLayout",
     "Media",
     "Noul",
@@ -120,6 +121,7 @@ __all__ = [
     "Score",
     "ScoreAnswer",
     "Scored",
+    "ScoredQuestions",
     "ScoringRule",
     "Segment",
     "SlotReadout",

@@ -187,8 +187,21 @@ class Encoded:
     state_kept: int
     media: tuple[int, int] | None = None
     """Where the row holds a request's images, as a [start, end) span of its tokens."""
-    trimmed: bool = False
-    """Whether the layout shortened the question's instructions or options to fit its budgets."""
+    instructions_cut: int = 0
+    """The question's instructions' tokens its layout's declared budget cut (`QuestionLayout.head_max_len`);
+    none where they are kept whole."""
+    options_cut: int = 0
+    """The options' tokens its layout's declared budgets cut (`QuestionLayout.head_max_len`,
+    `option_tokens`), over every option; none where each is kept whole."""
+    state_cut: int = 0
+    """The state's tokens the row's cut removed, over every copy of it the row holds, the whole state
+    where the row holds none of it."""
+    state_characters_cut: int = 0
+    """The state's characters a cut removed where the row's text is encoded whole, over every copy: a
+    cut text encodes anew, so its removed tokens are not a count to subtract."""
+    options_alike: bool = False
+    """Whether a cut left two of a question's options as the same tokens where their whole texts
+    differ, which no reading tells apart: such a row is refused (`Layout.refusal`)."""
     context: tuple[int, ...] | None = None
     """The tokens of the context the row reads beside its state, through a backbone's
     cross-attention, or None for none."""
@@ -199,6 +212,25 @@ class Encoded:
     """Each token's block (`QuestionLayout.blocks`): 0 on the row before its question, 1 from the
     question to the row's end, which a backbone that reads blocks attends to whole within each
     (`AttentionMetadata.block_groups`); None for a row read in order."""
+
+    @property
+    def trimmed(self) -> bool:
+        """Whether its layout's budgets cut the question's instructions or options."""
+        return self.instructions_cut > 0 or self.options_cut > 0
+
+    @property
+    def cuts(self) -> dict[str, int]:
+        """The tokens each cut removed from the row, by what it cut (`instructions`, `options`,
+        `state`), or the characters of a state its row encodes whole (`state_characters`), and
+        `options_alike` where its options' cut left two alike; empty where the row holds its state and
+        its questions whole. Training counts them in
+        its data counters and a server in its own (`dew.data.mixing.CorpusCounts`), alike."""
+        kinds = (("instructions", self.instructions_cut), ("options", self.options_cut),
+                 ("state", self.state_cut), ("state_characters", self.state_characters_cut))
+        found = {kind: tokens for kind, tokens in kinds if tokens}
+        # A row whose cut left two options alike counts once, an event that removes nothing beside the
+        # tokens its options lost (`cut_unit`).
+        return {**found, "options_alike": 0} if self.options_alike else found
 
 
 def _blocked(row: Encoded, boundary: int) -> Encoded:
@@ -286,14 +318,15 @@ def render(value: JSON) -> str:
             return json.dumps(value, ensure_ascii=False)
 
 
-def context_tokens(tokenizer: Tokenizer, context: JSON | None, length: int) -> np.ndarray:
+def context_tokens(tokenizer: Tokenizer, context: JSON | None, length: int | None) -> np.ndarray:
     """A context's tokens as a row carries them: its text's (`render`), without specials, and none for
     no context. A context of more than `length` tokens, which the cross-attention reads no more of,
-    is refused (ValueError), never cut: a cut would answer from part of what the caller gave."""
+    is refused (ValueError), never cut: a cut would answer from part of what the caller gave; None
+    reads it whole, as a count of a context no cross-attention reads does."""
     if context is None:
         return np.zeros(0, np.int32)
     tokens = rendered_chunks([Chunk(render(context))], tokenizer, "pieces").tokens
-    if len(tokens) > length:
+    if length is not None and len(tokens) > length:
         raise ValueError(f"the context is {len(tokens)} tokens, more than the {length} its cross-attention "
                          "reads (context_length)")
     return np.asarray(tokens, np.int32)
@@ -400,6 +433,16 @@ class Layout:
         counted as unfit, and a task refuses it."""
         return len(row.tokens) <= self.max_len
 
+    def refusal(self, row: Encoded) -> str | None:
+        """Why training leaves `row` out, or None where it trains: `unfit`, past `max_len` (`fits`),
+        or `options_alike`, where a declared cut left two options the same tokens, which no reading
+        tells apart. Training counts it under the reason (`dew.data.mixing.CorpusCounts`); a server
+        refuses an unfit request under the same reason, and answers one whose options its release's
+        budgets cut alike as the release does, the cut in its usage."""
+        if not self.fits(row):
+            return "unfit"
+        return "options_alike" if row.options_alike else None
+
     def bounds(self, encoder: Tokenizer, specials: Specials, context_length: int | None = None) -> Bounds:
         """The most rows, questions and options a window of `max_len` tokens
         packs, from the fewest tokens each takes in this layout: a row of one
@@ -485,6 +528,15 @@ class Labels:
             raise ValueError(f"{count} options outnumber the layout's {len(self.names)} labels")
         return self.names[:count]
 
+    def capacity(self, encoder: Tokenizer) -> int:
+        """How many options these labels letter under `encoder`: their own names, or every name of
+        `LABEL_NAMES` whose every variant it spells as one token (`spelled`)."""
+        if self.names is not None:
+            return len(self.names)
+        same = _same(encoder)
+        return sum(all(len(_piece(same, variant.format(name))) == 1 for variant in self.variants)
+                   for name in LABEL_NAMES)
+
     def spelled(self, encoder: Tokenizer, count: int) -> "Labels":
         """These labels named for `encoder`: themselves where they name their own, else the first `count` of
         `LABEL_NAMES` whose every variant `encoder` spells as one token, skipping those it spells as
@@ -521,20 +573,31 @@ class QuestionLayout(Layout):
     """A layout of one row per question, scored at one marker token per option.
 
     Each option is rendered as text (`key: description` for a choice,
-    `level i: description` for a score, `false: ...` and `true: ...` for a noul)
-    and cut to `option_tokens`. When the options exceed `head_max_len` minus 16
-    tokens, every option is cut evenly to fit, and the instructions get what the
-    options leave, at least 8 tokens. The state fills the rest of `max_len`; a
-    list state (a conversation) keeps its end, and any other state keeps its
-    start. A marker past `max_len` is dropped.
+    `level i: description` for a score, `false: ...` and `true: ...` for a noul).
+    The question, its instructions and options, is kept whole, and the state
+    fills the rest of `max_len`; a list state (a conversation) keeps its end, and
+    any other state keeps its start. A question that alone passes `max_len` is a
+    row that does not fit, which training leaves out and a task refuses, each
+    counting it (`Layout.refusal`); its text is never cut silently.
+
+    A layout may declare budgets for the question, as Laya's release does: each
+    option cut to `option_tokens`, and where the options exceed `head_max_len`
+    minus 16 tokens every option cut evenly to fit and the instructions given
+    what the options leave, at least 8 tokens. Each cut is counted
+    (`Encoded.instructions_cut`, `options_cut`), and a row whose cut leaves two options alike is
+    refused (`Encoded.options_alike`).
 
     `parallel` starts every option at the same position and lets no option attend
     to another, so the options' order does not affect their scores; whatever
     follows the options continues after the longest one.
     """
 
-    head_max_len: int = 192
-    option_tokens: int = 48
+    head_max_len: int | None = None
+    """The tokens the question, its instructions and its options, may take, as a release declares it
+    (Laya's 192), or None to keep the question whole."""
+    option_tokens: int | None = None
+    """The most tokens one option keeps, as a release declares it (Laya's 48), or None to keep each
+    whole."""
     parallel: bool = False
     labels: Labels | None = None
     """Options rendered as lettered lines and read at an answer cue (`Labels`), or None for a marker
@@ -556,8 +619,10 @@ class QuestionLayout(Layout):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        _least("head_max_len", self.head_max_len, 1)
-        _least("option_tokens", self.option_tokens, 1)
+        if self.head_max_len is not None:
+            _least("head_max_len", self.head_max_len, 1)
+        if self.option_tokens is not None:
+            _least("option_tokens", self.option_tokens, 1)
         if self.segments is not None:
             kinds = [type(segment) for segment in self.segments]
             others = sorted({type(segment).__name__ for segment in self.segments
@@ -571,6 +636,9 @@ class QuestionLayout(Layout):
             if self.labels is None or self.parallel:
                 raise ValueError("a question row of segments reads its options under labels (labels=), one "
                                  "line after another")
+            if self.head_max_len is not None or self.option_tokens is not None:
+                raise ValueError("a question row of segments keeps its question whole; head_max_len and "
+                                 "option_tokens budget the layout's own rows")
         if self.blocks and self.parallel:
             raise ValueError("blocks and parallel options each say what a row's tokens read; a row takes one")
 
@@ -660,51 +728,61 @@ class QuestionLayout(Layout):
                       for at, part in enumerate(chunks)]
             return rendered_chunks(self._framed(encoder, pieces), encoder, self.unit)
 
-        laid, (whole, state_kept) = (self._cut_ids(built, texts, copies, encoder) if self.unit == "pieces"
-                                     else self._cut(built, texts, copies, encoder))
+        laid, held, characters = ((*self._cut_ids(built, texts, copies, encoder), 0) if self.unit == "pieces"
+                                  else self._cut(built, texts, copies, encoder))
+        whole, state_kept = _least_kept(held)
+        if not held:
+            # A row of no State segment holds none of the state: all of it is cut.
+            whole = len(self.state(encoder, specials, state))
+            held = [(whole, 0)]
         tokens = laid.tokens
         row = Laid(name, kind_of(question), laid.marks["question"],
                    tuple(laid.marks[("option", index)] for index in range(len(slots))), tuple(slots),
                    readout=len(tokens) - 1, label_ids=self.labels.ids(encoder, len(slots)))
-        encoded = Encoded(tokens, (row,), None, None, whole, state_kept)
+        # A cut of a row encoded whole is its characters (`_cut`); of a row of pieces, its own tokens.
+        retokenized = self.unit == "whole" and bool(copies)
+        encoded = Encoded(tokens, (row,), None, None, whole, state_kept,
+                          state_cut=0 if retokenized else sum(own - kept for own, kept in held),
+                          state_characters_cut=characters)
         # The prefix is the tokens that end at or before the suffix's first character (serve.patch
         # `token_layout`).
         return _blocked(encoded, laid.points["suffix"]) if self.blocks else encoded
 
     def _cut_ids(self, built: Callable[[Sequence[tuple[int, ...]]], Rendered], texts: Sequence[str],
-                 copies: "Sequence[State]", encoder: Tokenizer) -> tuple[Rendered, tuple[int, int]]:
+                 copies: "Sequence[State]", encoder: Tokenizer) -> tuple[Rendered, list[tuple[int, int]]]:
         """The row `built` over each copy of the state, its own text (`texts`) its own piece of ids,
         each cut to its share of what the rest of the row leaves of `max_len` and to its own budget
-        (`allocated`), keeping its `keep`; and the least-kept copy's tokens and how many it keeps
-        (`_least_kept`): a piece's ids add to the row as they are, so the shares are exact. A copy kept
-        whole is never cut, and a row it leaves too long is `fits`' to refuse."""
+        (`allocated`), keeping its `keep`; and each copy's tokens and how many it keeps: a piece's ids
+        add to the row as they are, so the shares are exact. A copy kept whole is never cut, and a row
+        it leaves too long is `fits`' to refuse."""
         ids = [tuple(encoder.encode(text, add_special_tokens=False)) if text else () for text in texts]
         if not copies:
-            return built([]), (0, 0)
+            return built([]), []
         rest = len(built([()] * len(copies)).tokens)
         counts = allocated([len(own) for own in ids], copies, self.max_len - rest)
         kept = [_kept(own, count, copy.keep) for own, count, copy in zip(ids, counts, copies, strict=True)]
-        return built(kept), _least_kept([(len(own), len(held)) for own, held in zip(ids, kept, strict=True)])
+        return built(kept), [(len(own), len(held)) for own, held in zip(ids, kept, strict=True)]
 
     def _cut(self, built: Callable[[Sequence[str]], Rendered], texts: Sequence[str],
-             copies: "Sequence[State]", encoder: Tokenizer) -> tuple[Rendered, tuple[int, int]]:
+             copies: "Sequence[State]", encoder: Tokenizer) -> tuple[Rendered, list[tuple[int, int]], int]:
         """The row `built` over each copy of the state, its own text (`texts`), encoded whole with the
         rest, each copy cut to its share of what the rest of the row leaves of `max_len` and its own
         budget (`allocated`, counted in its own tokens) at one of its token boundaries
-        (`Offsets`), keeping its `keep`; and the least-kept copy's tokens and how many it keeps,
-        encoded alone (`_least_kept`). A merge across a cut can lengthen the row, so while it does not
+        (`Offsets`), keeping its `keep`; each copy's tokens and how many it keeps, encoded alone; and
+        the characters the cut removed of every copy.
+        A merge across a cut can lengthen the row, so while it does not
         fit the copy that keeps the most steps back one boundary, the row encoded whole again each
         time, until it fits or no copy keeps any, which `fits` then refuses. A copy kept whole is
         never cut."""
         if not copies:
-            return built([]), (0, 0)
+            return built([]), [], 0
         counts = [len(encoder.encode(text, add_special_tokens=False)) if text else 0 for text in texts]
         full = built(list(texts))
         # A copy kept whole is never cut, so its cap sends no row down the cutting path.
         capped = any(copy.keep != "all" and copy.max_tokens is not None and copy.max_tokens < count
                      for copy, count in zip(copies, counts, strict=True))
         if len(full.tokens) <= self.max_len and not capped:
-            return full, _least_kept([(count, count) for count in counts])
+            return full, [(count, count) for count in counts], 0
         if not isinstance(encoder, Offsets):
             raise TypeError(f"a row encoded whole cuts its state at the tokenizer's character offsets, "
                             f"which a {type(encoder).__name__} does not keep")
@@ -752,7 +830,10 @@ class QuestionLayout(Layout):
                 laid = longer
         alone = [len(encoder.encode(own, add_special_tokens=False)) if (own := piece(at)) else 0
                  for at in range(len(copies))]
-        return laid, _least_kept(list(zip(counts, alone, strict=True)))
+        # What the cut removed is characters: a cut text encodes anew, so no count of its own tokens
+        # subtracts from the whole copy's.
+        removed = sum(len(text) - len(piece(at)) for at, text in enumerate(texts))
+        return laid, list(zip(counts, alone, strict=True)), removed
 
     def _framed(self, encoder: Tokenizer, chunks: list[Chunk]) -> list[Chunk]:
         """`chunks` as the user's turn of `self.framing`, none without one: under a whole unit the turn
@@ -814,25 +895,18 @@ class QuestionLayout(Layout):
         if self.labels is not None:
             return self._labelled(encoder, specials, question, head, texts, slots, state, conversation, name)
         whole = [list(_piece(same, " " + texts[slot].replace(specials.marker_text, " "))) for slot in slots]
-        options = [option[:self.option_tokens] for option in whole]
         # Each option's budget counts its marker.
-        budget = self.head_max_len - sum(len(option) + 1 for option in options)
-        if budget < 16:
-            each = max(4, (self.head_max_len - 16) // max(1, len(options)))
-            options = [option[:each - 1] for option in options]
-            budget = self.head_max_len - sum(len(option) + 1 for option in options)
-        kept_head = head[:max(8, budget)]
-        trimmed = len(kept_head) < len(head) or any(
-            len(kept) < len(full) for kept, full in zip(options, whole, strict=True))
+        kept_head, options = self._budgeted(head, whole, each=1, fixed=0)
         tokens, span, markers, spans, kept = self._row(specials, kept_head, options, state, conversation)
         positions, option_slots = (_parallel(spans, len(tokens)) if self.parallel else (None, None))
-        laid = Laid(name, kind_of(question), span,
-                    tuple((marker, marker + 1) for marker in markers if marker < self.max_len), tuple(slots))
+        laid = Laid(name, kind_of(question), span, tuple((marker, marker + 1) for marker in markers),
+                    tuple(slots))
+        # A row its question makes longer than max_len is laid out whole, which `fits` refuses.
         return Encoded(
-            tuple(tokens[:self.max_len]), (laid,),
-            None if positions is None else positions[:self.max_len],
-            None if option_slots is None else option_slots[:self.max_len], len(state), kept,
-            trimmed=trimmed)
+            tuple(tokens), (laid,), positions, option_slots, len(state), kept,
+            instructions_cut=len(head) - len(kept_head),
+            options_cut=sum(map(len, whole)) - sum(map(len, options)), state_cut=len(state) - kept,
+            options_alike=_alike(whole, options))
 
     def _labelled(self, encoder: Tokenizer, specials: Specials, question: Question, head: list[int],
                   texts: tuple[str, ...], slots: Sequence[int], state: Sequence[int], conversation: bool,
@@ -851,15 +925,10 @@ class QuestionLayout(Layout):
         whole = [list(_piece(same, f"\n{label}. " + texts[slot].replace(specials.marker_text, " ")))
                  for label, slot in zip(names, slots, strict=True)]
         cue = list(_piece(same, self.labels.cue))
-        lines = [line[:self.option_tokens] for line in whole]
-        budget = self.head_max_len - sum(map(len, lines)) - len(cue)
-        if budget < 16:
-            each = max(4, (self.head_max_len - 16 - len(cue)) // max(1, len(lines)))
-            lines = [line[:each] for line in lines]
-            budget = self.head_max_len - sum(map(len, lines)) - len(cue)
-        kept_head = head[:max(8, budget)]
-        trimmed = len(kept_head) < len(head) or any(
-            len(kept) < len(full) for kept, full in zip(lines, whole, strict=True))
+        kept_head, lines = self._budgeted(head, whole, each=0, fixed=len(cue))
+        # A line's label tells it from the others whatever its cut leaves: the options it holds are its
+        # tokens past the label's own, where the label encodes apart from them.
+        labelled = [list(_piece(same, f"\n{label}.")) for label in names]
         begin = _begin(specials)
         fixed = len(begin) + len(kept_head) + sum(map(len, lines)) + len(cue) + 2
         kept = self._kept(state, self.max_len - fixed, conversation)
@@ -882,10 +951,34 @@ class QuestionLayout(Layout):
         laid = Laid(name, kind_of(question), span, tuple(spans), tuple(slots), readout=len(tokens) - 1,
                     label_ids=self.labels.ids(encoder, len(slots)))
         return Encoded(tuple(tokens), (laid,), positions, option_slots, len(state), len(kept),
-                       trimmed=trimmed)
+                       instructions_cut=len(head) - len(kept_head),
+                       options_cut=sum(map(len, whole)) - sum(map(len, lines)),
+                       state_cut=len(state) - len(kept),
+                       options_alike=_alike([_unlabelled(line, own) for line, own in zip(whole, labelled,
+                                                                                          strict=True)],
+                                            [_unlabelled(line, own) for line, own in zip(lines, labelled,
+                                                                                          strict=True)]))
 
     _state_first: ClassVar[bool] = True
     """Whether a row starts with the state, before the question; a marker layout puts it after."""
+
+    def _budgeted(self, head: list[int], options: list[list[int]], *, each: int, fixed: int
+                  ) -> tuple[list[int], list[list[int]]]:
+        """The question's `head` and `options` as the layout's declared budgets keep them: each option
+        cut to `option_tokens`, and where they and the `fixed` tokens (a cue) leave the head fewer than
+        16 tokens of `head_max_len`, every option cut evenly to fit and the head given what they leave,
+        at least 8, each option counting `each` tokens more (its marker); whole where none is declared.
+        This is Laya's reference's cut, its release's budgets declared."""
+        cap = self.option_tokens
+        options = [option[:cap] for option in options] if cap is not None else options
+        if self.head_max_len is None:
+            return head, options
+        budget = self.head_max_len - fixed - sum(len(option) + each for option in options)
+        if budget < 16:
+            share = max(4, (self.head_max_len - 16 - fixed) // max(1, len(options)))
+            options = [option[:share - each] for option in options]
+            budget = self.head_max_len - fixed - sum(len(option) + each for option in options)
+        return head[:max(8, budget)], options
 
     def _row(self, specials: Specials, head: list[int], options: list[list[int]], state: Sequence[int],
              conversation: bool) -> tuple[list[int], tuple[int, int], list[int], list[tuple[int, int]], int]:
@@ -1094,6 +1187,17 @@ def _least_kept(pairs: Sequence[tuple[int, int]]) -> tuple[int, int]:
     return min(pairs, key=lambda pair: pair[1] / pair[0] if pair[0] else 1.0, default=(0, 0))
 
 
+def _alike(whole: Sequence[Sequence[int]], kept: Sequence[Sequence[int]]) -> bool:
+    """Whether a cut left two options the same tokens (`kept`) that were not the same whole."""
+    return len({tuple(option) for option in kept}) < len({tuple(option) for option in whole})
+
+
+def _unlabelled(line: Sequence[int], label: Sequence[int]) -> tuple[int, ...]:
+    """An option's tokens on its lettered `line`, past its `label`'s own where the line starts with
+    them; the whole line where the label's tokens merged with the option's."""
+    return tuple(line[len(label):] if tuple(line[:len(label)]) == tuple(label) else line)
+
+
 def _kept(ids: Sequence[int], count: int, keep: Literal["start", "end", "all"]) -> tuple[int, ...]:
     """`count` of the state's `ids`, its first (or, with `keep` the end, its last)."""
     return tuple(ids[:count] if keep != "end" else ids[len(ids) - count:])
@@ -1295,11 +1399,16 @@ class JointLayout(Layout):
                           tuple(marks[(name, number)] for number in range(len(slots))), tuple(slots))
                      for (name, question), slots in zip(questions.items(), self._slots(questions, orders),
                                                         strict=True))
+        held = [len(chunk.ids or ()) for (segment, _), chunk in zip(laid_out, chunks, strict=True)
+                if isinstance(segment, State)]
+        # A row of no State segment holds none of the state: all of it is cut.
+        state_cut = sum(whole - kept for kept in held) if held else whole
         if self.schema_in_context:
             # The schema is the row's context, its spans the context's own positions.
             return [Encoded(row.tokens, laid, None, None, whole, kept_count, row.marks.get(MEDIA_MARK),
-                            context=schema.tokens, spans_in_context=True)]
-        return [Encoded(row.tokens, laid, None, None, whole, kept_count, row.marks.get(MEDIA_MARK))]
+                            context=schema.tokens, spans_in_context=True, state_cut=state_cut)]
+        return [Encoded(row.tokens, laid, None, None, whole, kept_count, row.marks.get(MEDIA_MARK),
+                        state_cut=state_cut)]
 
     def _slots(self, questions: Mapping[str, Question],
                orders: Mapping[str, Sequence[int]] | None) -> list[list[int]]:

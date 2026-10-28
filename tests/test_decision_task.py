@@ -419,7 +419,7 @@ def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
                     truth_fn=lambda variables: tempered(variables, lambda logits, scale: softmax(
                         logits.astype(np.float64), scale)))
     scores = decide.score(examples)
-    assert set(scores) == {"accuracy", "ece", "aurc", "log_loss"}
+    assert set(scores) == {"accuracy", "macro_f1", "ece", "aurc", "log_loss", "brier", "scored_questions"}
     assert scores["accuracy"] == pytest.approx(np.mean([int(np.argmax(answer.probabilities)) == 0
                                                         for answer in answers]))
     # A second score runs the forward the first compiled.

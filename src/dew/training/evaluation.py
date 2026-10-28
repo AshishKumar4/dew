@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import os
 import sys
 import time
 import types
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any, ClassVar, Literal
 
 import jax
@@ -23,7 +25,7 @@ from dew._coordination import (
     collective_host,
     from_every_process,
 )
-from dew.artifacts import Artifact, Artifacts
+from dew.artifacts import Artifact, Artifacts, FixedRows
 from dew.batch import VALID_ROWS, Batch, Variables
 from dew.data.dataset import Closeable, DataPartition, Reader, rows_of, take_rows
 from dew.data.pipeline import Dataset
@@ -31,6 +33,7 @@ from dew.distributed.batches import row_origins, shard_batch, shared_host_fields
 from dew.distributed.placement import MeshSpec
 from dew.objectives.base import Effects, Loss, Metric, Objective, Shown, Step, TrainingScalar
 from dew.training.cadence import Tokens
+from dew.training.tracker import write_artifact
 
 
 @dataclass(frozen=True)
@@ -147,7 +150,8 @@ class Evaluation:
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
             schedule_step: int | jax.Array | None = None, loss: bool = False,
             training: Mapping[str, jax.Array] | None = None, warm: bool = False,
-            updates: int | jax.Array | None = None) -> Evaluation:
+            updates: int | jax.Array | None = None, scored_to: str | os.PathLike[str] | None = None
+            ) -> Evaluation:
         """Evaluate `variables` on the batches every process can read, without an optimizer or a tracker.
 
         Every process calls this with the same objective, metrics and numerical
@@ -181,6 +185,11 @@ class Evaluation:
         before its first step (`Trainer.fit`), and no score of a part of the
         split is checked or read.
 
+        `scored_to`, a directory, takes every batch's scoring artifacts, process 0 writing each batch's
+        real rows (a decision run's `Decisions`) as `<scored_to>/<split>-<batch>.npz`
+        (`dew.training.tracker.write_artifact`), so a pass's metrics pool exactly offline, across
+        batches and splits; a warming pass writes none.
+
         The scores are broadcast to every process. Previews stay on process 0, and
         there is at most one objective preview, however long the validation split
         is. Reporting the result is up to the caller. In a process pool, the callers
@@ -208,7 +217,8 @@ class Evaluation:
             scores, previews, scored, records = _score_split(
                 objective, variables, batches, context, mesh, metrics=metrics, split=split,
                 root=root, preview_enabled=preview_enabled, score_key=score_key,
-                preview_key=preview_key, loss=loss, warm=warm)
+                preview_key=preview_key, loss=loss, warm=warm,
+                written=None if scored_to is None or warm else Path(scored_to) / split)
         scores.update(training_scores)
         elapsed = time.perf_counter() - started
         scores, elapsed = broadcast_from_process_zero((scores, elapsed))
@@ -354,7 +364,8 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                  context: Step, mesh: Mesh | None, *, metrics: Sequence[Metric],
                  split: str, root: bool, preview_enabled: bool,
                  score_key: jax.Array, preview_key: jax.Array, loss: bool = False,
-                 warm: bool = False) -> tuple[dict[str, float], tuple[Artifact, ...], int, int]:
+                 warm: bool = False, written: Path | None = None
+                 ) -> tuple[dict[str, float], tuple[Artifact, ...], int, int]:
     """Score every record of a validation split, or its first `WARM_BATCHES`
     batches unfinalized where `warm`.
 
@@ -406,6 +417,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                     loss_sums.add(statistics)
                     if metrics:
                         produced = _merged(produced, batch, held, scored, mesh=mesh, metrics=metrics,
+                                           written=written,
                                            summaries=summaries, root=root)
             if scored == 0 and preview_enabled:
                 previews = _previewed(objective, variables, batch, context,
@@ -494,7 +506,12 @@ def _cut(leaf, keep: np.ndarray):
 
 
 def _real_artifact[A: Artifact](artifact: A, keep: np.ndarray) -> A:
-    """`artifact` with every per-row field cut to the real rows."""
+    """`artifact` with every per-row field cut to the real rows; one whose metrics read their rows through
+    a mask of its own (`FixedRows`) keeps its batch's fixed shape with that mask cleared on its padding
+    rows, so a metric reads every batch of a split, a short tail among
+    them, in one shape."""
+    if isinstance(artifact, FixedRows):
+        return artifact.unscored(~keep)
     return dataclasses.replace(artifact, **{field.name: _cut(getattr(artifact, field.name), keep)
                                             for field in dataclasses.fields(artifact)})
 
@@ -525,7 +542,7 @@ def _as_placed(leaf) -> np.ndarray:
 
 
 def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metrics: Sequence[Metric],
-            summaries: _Accumulators, root: bool):
+            summaries: _Accumulators, root: bool, written: Path | None = None):
     """Merge one batch into every metric's accumulator on root, returning what
     the objective produced, hosted.
 
@@ -534,7 +551,8 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metr
     it, so nothing copies back; a batch spread over processes comes home
     with the artifacts, its host fields from every share (`_shares_host`).
     One agreement covers every metric, so a failure on root stops its peers
-    there.
+    there. Where `written` names a place, root writes each of the batch's scoring artifacts there,
+    `<written>-<batch>`, its real rows alone (`write_artifact`).
     """
     if all(leaf.is_fully_addressable for leaf in jax.tree.leaves(batch) if isinstance(leaf, jax.Array)):
         produced = collective_host(produced, phase=f"scoring batch {index}")
@@ -560,6 +578,12 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metr
         real = _real_batch(home, keep)
         for metric in metrics:
             summaries.add(metric, metric(_pick(artifacts, metric.reads), real))
+        if written is not None:
+            # Every batch's scoring artifacts, its real rows alone, for pooling a pass offline.
+            written.parent.mkdir(parents=True, exist_ok=True)
+            for at, artifact in enumerate(artifacts):
+                suffix = f"-{at}" if len(artifacts) > 1 else ""
+                write_artifact(artifact, written.with_name(f"{written.name}-{index:05d}{suffix}"))
 
     agreed(f"metrics batch {index}", merge)
     return produced

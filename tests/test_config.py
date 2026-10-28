@@ -589,7 +589,7 @@ def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits():
     from dew.config.jepa import JepaRunConfig
     from dew.config.lm import LMRunConfig
     from dew.decision.config import DecisionRunConfig
-    from dew.decision.metrics import AURC, ECE, Accuracy
+    from dew.decision.metrics import AURC, ECE, Accuracy, MacroF1, ScoredQuestions
     from dew.decision.scoring import Brier, LogLoss
     from dew.objectives.jepa.probes import KnnProbe, LinearProbe
     from dew.objectives.lm.objective import Perplexity
@@ -599,7 +599,8 @@ def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits():
 
     assert kinds(LMRunConfig().validation_metrics(validates=True)) == [Perplexity]
     assert LMRunConfig().validation_metrics(validates=False) == ()
-    assert kinds(DecisionRunConfig().validation_metrics(validates=True)) == [Accuracy, ECE, AURC, LogLoss]
+    assert kinds(DecisionRunConfig().validation_metrics(validates=True)) == [
+        Accuracy, MacroF1, ECE, AURC, LogLoss, Brier, ScoredQuestions]
     assert kinds(JepaRunConfig(probe_classes=7).validation_metrics(validates=True)) == [LinearProbe, KnnProbe]
     linear, knn = JepaRunConfig(probe_classes=7, knn_k=5).validation_metrics(validates=False)
     assert (linear.num_classes, knn.num_classes, knn.k) == (7, 7, 5)
