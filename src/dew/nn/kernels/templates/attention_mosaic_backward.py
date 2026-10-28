@@ -412,7 +412,8 @@ def _dkv_kernel(walk: _Backward, entry, graded: list[Kind], query, key, value, d
         entry, out_type=(dk, dv, *(grad_shapes[kind] for kind in graded)),
         grid=(heads, keys_padded // (consumers * walk.program.tiles.block_k), batch),
         grid_names=("heads", "k_tiles", "batch"), consumers=consumers, interpret=walk.interpret,
-        approx_math=walk.approx_math, name="attention_dkv_fused" if walk.fused else "attention_dkv",
+        approx_math=walk.approx_math, name=("attention_dkv_fused" if walk.fused else "attention_dkv")
+        + ("" if shares[0][1] == width else f"_columns{shares[0][0] // shares[0][1]}"),
         reducing_warpgroups=reducing(family, consumers, walk.spec.score_mod),
         # The model's products this launch owns (`stated`): its shares of dK's and dV's, dP's in the first
         # share's, and dQ's where it adds it; its `S` (and a later share's dP) recomputed.
