@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
+from dew._hashing import fmix32
 from dew.nn.precision import (
     L2NORM_EPS,
     at_least_fp32,
@@ -118,14 +119,12 @@ def round_to_bf16(state, key, value):
     smaller than half a bf16 step still moves the state on average, where
     rounding to nearest would hold it. The noise is a hash of the value's
     bits and the token's `key` `[..., Dk]` and `value` `[..., Dv]`, so it is
-    deterministic and differs from token to token (`precision.stochastic_bf16`, its rounding)."""
+    deterministic and differs from token to token (`fmix32`, the mixer every Dew noise takes;
+    `precision.stochastic_bf16`, its rounding)."""
     bits = jax.lax.bitcast_convert_type(state, jnp.uint32)
     salt = (jax.lax.bitcast_convert_type(key, jnp.uint32)[..., :, None] * jnp.uint32(0x9E3779B1)
             + jax.lax.bitcast_convert_type(value, jnp.uint32)[..., None, :] * jnp.uint32(0x85EBCA77))
-    mixed = bits ^ salt
-    mixed = (mixed ^ (mixed >> 16)) * jnp.uint32(0x7FEB352D)
-    mixed = (mixed ^ (mixed >> 15)) * jnp.uint32(0x846CA68B)
-    return stochastic_bf16(state, mixed ^ (mixed >> 16))
+    return stochastic_bf16(state, fmix32(bits ^ salt))
 
 
 def update(state, query, key, value, decay, write, *, delta: bool):
