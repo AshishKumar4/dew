@@ -44,13 +44,14 @@ import tyro
 from etils import epath
 
 import dew.io
-from dew import registry
+from dew import registry, training
 from dew._coordination import agree_process_phase, agreed
-from dew._records import JSON, duration, is_share, record, recorded_duration
+from dew._records import JSON, duration, is_share, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep, Resume
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.data import records
+from dew.data.compile import fitted
 from dew.data.dataset import Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.distributed.placement import Layout, MeshSpec
@@ -79,8 +80,10 @@ from dew.state import TrainState
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.budget import Pause, budget_tokens, run_length, run_steps
 from dew.training.cooldown import Cooldowns
+from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Summary
 from dew.training.profiling import ProfileReport, ProfileWindow
+from dew.training.quantization import quantize_trunk
 from dew.training.rollout import Rollout
 from dew.training.selection import Best
 from dew.training.tracker import LocalTracker, Tracker, Trackers, Wandb, WandbTracker
@@ -88,7 +91,6 @@ from dew.training.tracker import LocalTracker, Tracker, Trackers, Wandb, WandbTr
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
-    from dew.inputs import Field
     from dew.interop import Pretrained
 
 
@@ -710,21 +712,6 @@ class Prepared:
     train: Callable[[str], TrainState]
 
 
-def media_field(chain: Dataset, run: str) -> "Field":
-    """The batch field a run over images or clips reads, at the size its chain makes it
-    (`Dataset.facts`): a clip's video, else an image. Raises ValueError, naming the `run`, for a chain
-    of neither, or one whose size varies."""
-    from dew.inputs import Field
-
-    fields = record(chain.facts()["fields"], "the chain's fields")
-    name = "video" if "video" in fields else "image"
-    shape = fields.get(name)
-    if not isinstance(shape, list | tuple) or not all(isinstance(size, int) for size in shape):
-        raise ValueError(f"a {run} run trains on images or clips of one size (dew.data.presets.images or "
-                         f"clips); this chain's {name} is {shape!r}")
-    return Field(name, tuple(shape))
-
-
 def flag_selected(given: Sequence[str], selected: Mapping[str, str]) -> list[str]:
     """`given` command-line arguments with each optional setting of `selected`, a field's name and its
     subcommand's, turned on by its own flags: `--lora.rank 16` stands for `lora:lora --lora.rank 16`,
@@ -1300,8 +1287,6 @@ class RunConfig:
         """`dataset` and `validation` as the run trains on them (`fitted`): compiled with `objective`'s
         stages and `data_seed`, the training read bounded to `trainer.examples` where the run counts
         them, so its length is read off the loader this returns."""
-        from dew.data.compile import fitted
-
         return fitted(dataset, validation, objective=objective, seed=self.data_seed,
                       examples=self.trainer.examples)
 
@@ -1437,10 +1422,6 @@ class RunConfig:
         on and the run's directory before the checkpoint is published, as a
         decision run fits its calibration there, so what it writes is published.
         """
-        # The training layer is the run's, read where it trains, so a config read alone reads none of it.
-        from dew.training.display import TrainingDisplay
-        from dew.training.quantization import quantize_trunk
-
         self.check_process()
         dataset, validation = self.compiled(objective.data(), dataset, validation)
         # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
@@ -1512,11 +1493,10 @@ class RunConfig:
         """The run's training (`train`): a `Trainer` of `objective` holding mesh, microbatches, layout,
         accumulation, split, dynamic_scale, profile and tune_kernels as the config states them, fit on
         `dataset` at its length, cadences and policies; prepare_process read the process fields, and
-        the checkpoints and the tracker are the run's."""
-        from dew.training.trainer import Trainer
-
+        the checkpoints and the tracker are the run's. The trainer is the training package's lazy export
+        (`dew.training`), read as the run trains, so a config read alone reads none of it."""
         trainer = self.trainer
-        return Trainer(
+        return training.Trainer(
             objective, self.optim, key=trainer.key, mesh=trainer.mesh,
             microbatches=trainer.microbatches, layout=trainer.layout, accumulation=trainer.accumulation,
             split=trainer.split, dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints,
