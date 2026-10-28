@@ -34,11 +34,13 @@ from dew.nn.memory import CARRY, Gate, InContextMemory, MLPMemory, Objective
 from dew.nn.mlp import GatedMLP
 
 SEEDS = {"memory decoder gradient": 512, "memory decoder decode": 16, "adapted memory": 8, "rows split": 256,
-         "rows split cms": 512}
+         "rows split cms": 512, "served memory moving": 8, "served memory projections": 8,
+         "served memory convolved": 8}
 """The sites' declared seeds where `seeds_for` on armada, each reference compared with itself, sizes them
 apart from `MEMORY_SEEDS`: the memory decoder's gradients, every parameter's leaf, and the
 continuum-memory level's rows split over a data axis at 512; the other memories' rows split at 256; the
-decoder's last logits after a cached decode at 16; an adapted memory decoder at 8."""
+decoder's last logits after a cached decode at 16; an adapted memory decoder at 8; each served memory
+(`SERVED`) at 8, paired with quantized training (`seeds_for(..., dew_fn=)`)."""
 
 
 def decoder(memory: InContextMemory | None = None, **fields):
@@ -424,25 +426,72 @@ def test_a_quantized_memorys_update_rounds_from_its_own_stream():
     assert not np.array_equal(np.asarray(drawn[0]), np.asarray(other[0]))
 
 
-def test_serving_quantization_refuses_a_memorys_moving_inner_weights():
-    """Serving quantization (`quantize_for_serving`) stores each weight a rule selects quantized, and the
-    products read the stored values; Dew does not yet serve a memory's W_0 stored quantized, which a
-    pattern selecting its inner weights is refused for at init (`QuantizedServingRefused`). One
-    selecting the memory's projections alone serves them, the served decoder computing what quantized
-    training computed, bit for bit."""
-    pytest.importorskip("qwix")
-    from dew.nn.memory import QuantizedServingRefused
-    from dew.quantization import Quantization, quantize_for_serving
+class ConvolvedMemory(nn.Module):
+    """An inner network that convolves the view's vector as a one-channel signal, width kept: a memory's
+    network that runs a convolution rather than a matmul."""
 
-    model = decoder()
-    ids = jax.random.randint(jax.random.key(1), (ROWS, LENGTH), 0, 37)
-    variables = model.init(jax.random.key(0), ids)
-    with pytest.raises(QuantizedServingRefused):
-        quantize_for_serving(model, variables, Quantization(patterns=(INNER,)), ids)
-    spec = Quantization(patterns=(r".*self_attn/[qkvo]_proj",))
-    served, held = quantize_for_serving(model, variables, spec, ids)
-    np.testing.assert_array_equal(np.asarray(served.apply(held, ids)),
-                                  np.asarray(spec.apply(model).apply(variables, ids)))
+    dtype: jnp.dtype | None = None
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        return nn.Conv(1, (3,), padding="SAME", dtype=self.dtype, name="conv")(x[..., None])[..., 0]
+
+
+SERVED = {"moving": ((INNER,), None, True), "projections": ((r".*self_attn/[qkvo]_proj",), None, False),
+          "convolved": ((INNER,), ConvolvedMemory(), True)}
+"""The served-memory cases: the patterns serving quantizes, the memory's inner network (None: Titans'
+MLP), and whether those weights move."""
+
+
+def served_site(case: str):
+    """The served-memory site `case` (`SERVED`): the served decoder over its stored tree, from seed 0's
+    serving preparation, and check 1's arms over each seed's: the served decoder, quantized training
+    from the stored W_0, and that training in float64, with the draw."""
+    from model_support import model_draw
+
+    from dew.quantization import Quantization, decoded_stored, quantize_for_serving
+
+    patterns, network, moving = SERVED[case]
+    memory = None if network is None else InContextMemory(
+        network=network, heads=2, head_features=8, chunk=4, normalize=True,
+        learning_rate=Gate(scale=STEP), momentum=Gate(), retention=Gate(bias=-2.0))
+    model, wide = decoder(memory), decoder(memory, dtype=jnp.float64)
+    spec = Quantization(patterns=patterns)
+    draw_model = model_draw(model, (ROWS, LENGTH), 37)
+    served = quantize_for_serving(model, *draw_model(0)[:1], spec, draw_model(0)[1])[0]
+
+    def draw(seed: int):
+        variables, ids = draw_model(seed)
+        stored = quantize_for_serving(model, variables, spec, ids)[1]
+        start = {**variables, "params": decoded_stored(stored)["params"]} if moving else variables
+        return stored, start, ids
+
+    return (served, lambda stored, start, ids: served.apply(stored, ids),
+            lambda stored, start, ids: spec.apply(model).apply(start, ids), draw,
+            lambda stored, start, ids: spec.apply(wide).apply(start, ids))
+
+
+@pytest.mark.parametrize("case", SERVED)
+def test_a_served_memory_computes_the_quantized_memory_from_its_stored_w0(case):
+    """Serving quantization (`quantize_for_serving`) of two memory layers' inner networks stores each
+    head's W_0 quantized, the steps starting from the float it decodes to (`decoded_stored`), and rounds
+    every product of the moving weights, a matmul's or a convolution's, as quantized training does
+    (`moving_weights`): the served decoder computes what quantized training (`Quantization.apply`)
+    computes from the stored W_0, on par against that training in float64 (check 1). Its projections,
+    which no step moves, serve as quantized training computes them from their float weights. The same
+    tree after a round trip through the host computes the same program bit for bit."""
+    pytest.importorskip("qwix")
+    from dew.quantization import Annotated
+
+    served, dew_fn, reference_fn, draw, truth_fn = served_site(case)
+    held, _, ids = draw(0)
+    assert any(isinstance(leaf, Annotated)
+               for leaf in jax.tree.leaves(held, is_leaf=lambda leaf: isinstance(leaf, Annotated)))
+    reloaded = jax.tree.map(jnp.asarray, jax.device_get(held))
+    np.testing.assert_array_equal(np.asarray(served.apply(reloaded, ids)),
+                                  np.asarray(served.apply(held, ids)))
+    assert_as_exact(dew_fn, reference_fn, draw, f"served memory {case}", seeds=SEEDS[f"served memory {case}"],
+                    truth_fn=truth_fn)
 
 
 def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream():
@@ -620,3 +669,35 @@ def test_a_memory_layer_kind_records_and_rebuilds():
     variables = model.init(jax.random.key(0), ids)
     np.testing.assert_array_equal(np.asarray(rebuilt.apply(variables, ids)),
                                   np.asarray(model.apply(variables, ids)))
+
+
+def test_a_memory_draws_its_tokens_keys_from_a_typed_rbg_stream():
+    """A training forward whose streams are typed rbg keys, not the default threefry: the memory's
+    tokens' keys are rewrapped in their stream's own implementation on both its chunked prefill and its
+    token-by-token recurrent readout (ledger 1876 NN-01), so the adapter's dropout draws on them, the
+    same key drawing the same logits and another key others."""
+    from dew.lora import LoRA
+    from dew.objectives.base import training_rngs
+
+    model = decoder(layer("gated_linear_attention"))
+    lora = LoRA(rank=2, modules=("kernel",), dropout=0.5)
+    variables, ids = factor_draw(model, lora)(0)
+    adapted = lora.apply(model, model.init(jax.random.key(0), jnp.asarray(ids)), key=0).model
+
+    @jax.jit
+    def cached(rngs):
+        cache = adapted.apply(variables, ROWS, method=adapted.init_cache, mutable=["cache"])[1]
+        logits, cache = adapted.apply({**variables, **cache}, ids[:, :6], decode=True, mutable=["cache"],
+                                      rngs=rngs)
+        reads = [logits]
+        for t in range(6, LENGTH):
+            logits, cache = adapted.apply({**variables, **cache}, ids[:, t:t + 1], decode=True,
+                                          mutable=["cache"], rngs=rngs)
+            reads.append(logits)
+        return jnp.concatenate(reads, axis=1)
+
+    first, again, other = (np.asarray(cached(training_rngs(jax.random.key(seed, impl="rbg"))))
+                           for seed in (5, 5, 6))
+    assert np.isfinite(first).all()
+    np.testing.assert_array_equal(first, again)
+    assert not np.array_equal(first, other)
