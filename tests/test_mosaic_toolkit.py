@@ -129,3 +129,40 @@ def test_a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100(consumers):
     x = _stream()
     summed = jax.jit(functools.partial(_ring_sums, interpret=False, consumers=consumers))(x)
     np.testing.assert_array_equal(np.asarray(summed), _expected(x))
+
+
+def test_shared_bytes_counts_a_programs_allocations_by_lifetime():
+    """A program's shared memory (`resources.shared_bytes`): each array rounded up to 1 KiB, its walks the
+    largest of them, every barrier 8 bytes; a tile scoped after its walks beside the program's on a family
+    whose walks share a scope (warpgroup MMA), the larger of it and the walks on one that scopes each walk
+    apart (mma.sync's emit_pipeline)."""
+    from dew.nn.kernels.templates import mosaic_sm80, mosaic_sm90, resources
+
+    program = (plgpu.SMEM((100,), jnp.float32), plgpu.Barrier(num_barriers=3))
+    walks = ((plgpu.SMEM((2, 1024), jnp.bfloat16),), (plgpu.SMEM((4, 1024), jnp.bfloat16),))
+    scope = resources.Scope(program=program, walks=walks, after=(((512,), jnp.float32),))
+    # 400 bytes -> 1 KiB; walks 4 KiB and 8 KiB -> 8 KiB; 3 barriers; the after tile's 2 KiB.
+    assert resources.shared_bytes(mosaic_sm90.WGMMA, scope) == 1024 + 2048 + 8192 + 3 * 8
+    assert resources.shared_bytes(mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)), scope) == 1024 + 8192 + 3 * 8
+
+
+def test_a_plan_keeps_its_residency_and_takes_the_deepest_ring_it_holds():
+    """`resources.plan` on an A100 for one mma.sync consumer (two programs a multiprocessor, 81 KiB each):
+    a launch of 16 KiB a stage holds two programs at four stages; one of 40 KiB a stage holds two programs
+    at its floor of two only where it fits, else falls to one program and deepens there; one past every
+    residency at its floor plans nothing."""
+    from dew.nn.kernels.templates import mosaic_sm80, resources
+
+    family = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16))
+
+    def launch(stage_kib: int) -> resources.Launch:
+        return resources.Launch(lambda stages: resources.Scope(
+            program=(plgpu.SMEM((stages * stage_kib * 1024,), jnp.uint8),)), consumers=1, registers=128)
+
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+        share = resources.program_shared(generation.shared_budget(target), 2)
+        small, wide, past = (resources.plan([launch(kib)], family, target) for kib in (16, 40, 200))
+    assert small is not None and (small[0].programs, small[0].stages) == (2, min(8, share // (16 * 1024)))
+    assert wide is not None and wide[0].programs == (2 if share >= 2 * 40 * 1024 else 1)
+    assert past is None

@@ -89,6 +89,18 @@ def kernel_cases(target: str, dtypes: tuple[str, ...] = ("bfloat16", "float32"))
                                                              reverse=reverse))
 
 
+def head_chunks(x, chunk: int):
+    """`x` `[B, T, H, ...]` as `[B, T / chunk, H, chunk, ...]`: each head's tokens in chunks."""
+    batch, length, heads = x.shape[:3]
+    return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, heads, *x.shape[3:]), 3, 2)
+
+
+def scanned_chunks(x, chunk: int):
+    """`x` `[B, T, ...]` as `[T / chunk, B, chunk, ...]`: the chunks in the order a scan takes them."""
+    batch, length = x.shape[:2]
+    return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, *x.shape[2:]), 1, 0)
+
+
 def pairwise(g):
     """`g_s - g_t` for every pair of a chunk's last-axis positions, `[..., C, C]`."""
     return g[..., :, None] - g[..., None, :]
@@ -161,11 +173,8 @@ def reference_kkt_solve(k, g, beta, *, chunk: int = 64):
     k = jnp.repeat(k, group, axis=2).astype(jnp.float32)
     batch, length, heads = beta.shape
 
-    def chunks(x):
-        return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, heads, *x.shape[3:]), 3, 2)
-
-    kc, bc = chunks(k), chunks(beta.astype(jnp.float32))
-    gc = chunks(g.astype(jnp.float32))
+    kc, bc = head_chunks(k, chunk), head_chunks(beta.astype(jnp.float32), chunk)
+    gc = head_chunks(g.astype(jnp.float32), chunk)
     a = jnp.einsum('bnhsk,bnhtk->bnhst', kc, kc, precision=jax.lax.Precision.HIGHEST)
     a = a * jnp.exp2(pairwise(gc))
     a = a * bc[..., :, None]
@@ -181,11 +190,7 @@ def reference_h(k, w, u, g, h0, *, chunk: int = 64):
     group = u.shape[2] // k.shape[2]
     dtype = k.dtype
     k = jnp.repeat(k, group, axis=2)
-    batch, length = u.shape[:2]
     exact = jax.lax.Precision.HIGHEST
-
-    def chunks(x):
-        return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, *x.shape[2:]), 1, 0)
 
     def step(state, inputs):
         keys, weights, values, gate = inputs
@@ -206,8 +211,8 @@ def reference_h(k, w, u, g, h0, *, chunk: int = 64):
         state = state * decay + update
         return state, (entered, corrected.astype(u.dtype))
 
-    final, (h, corrected) = jax.lax.scan(step, h0.astype(jnp.float32),
-                                     (chunks(k), chunks(w), chunks(u), chunks(g.astype(jnp.float32))))
+    chunked = tuple(scanned_chunks(x, chunk) for x in (k, w, u, g.astype(jnp.float32)))
+    final, (h, corrected) = jax.lax.scan(step, h0.astype(jnp.float32), chunked)
     return jnp.moveaxis(h, 0, 1), jnp.moveaxis(corrected, 0, 1).reshape(u.shape), final
 
 
@@ -219,11 +224,7 @@ def reference_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64):
     group = do.shape[2] // q.shape[2]
     q_dtype, k_dtype = q.dtype, k.dtype
     q, k = (jnp.repeat(x, group, axis=2) for x in (q, k))
-    batch, length = do.shape[:2]
     exact = jax.lax.Precision.HIGHEST
-
-    def chunks(x):
-        return jnp.moveaxis(x.reshape(batch, length // chunk, chunk, *x.shape[2:]), 1, 0)
 
     def step(grad, inputs):
         queries, keys, weights, gate, out_grad, local = inputs
@@ -243,7 +244,7 @@ def reference_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64):
 
     initial, (dh, dv2) = jax.lax.scan(
         step, dht.astype(jnp.float32),
-        (chunks(q), chunks(k), chunks(w), chunks(g.astype(jnp.float32)), chunks(do), chunks(dv)),
+        tuple(scanned_chunks(x, chunk) for x in (q, k, w, g.astype(jnp.float32), do, dv)),
         reverse=True)
     return jnp.moveaxis(dh, 0, 1), initial, jnp.moveaxis(dv2, 0, 1).reshape(dv.shape)
 

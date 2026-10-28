@@ -47,7 +47,7 @@ from jax.extend import core as jax_core
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, bundles, cost, mosaic
+from .templates import base, bundles, cost, mosaic, resources
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import Product
 
@@ -203,6 +203,26 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
     # Annotations stay evaluated (no postponed annotations in this module):
     # tokamax serializes a launch's arguments into the program by their types.
     HOOKS: ClassVar[tuple[str, ...]] = ('hooks',)
+
+    def bind(self, *args, **kwargs):
+        """tokamax's binding, its hooks stating the dtypes a kernel traces them at where the call left them
+        unstated (a launch called itself): the prologue's at the tokens' and its side operands' dtypes, the
+        epilogue's at the fp32 accumulator's and its side operands', as `templates.gemm` states them, so
+        every bound launch's hooks key alike (`traced`)."""
+        ba = super().bind(*args, **kwargs)
+        hooks = ba.arguments.get('hooks', NO_HOOKS)
+        if not isinstance(hooks, Hooks):  # a stored launch's, already keyed (`traced`)
+            return ba
+
+        def named(*arrays) -> tuple[str, ...]:
+            return tuple(jnp.dtype(array.dtype).name for array in arrays)
+
+        stated = dataclasses.replace(
+            hooks, prologue_dtypes=hooks.prologue_dtypes or (() if hooks.prologue is None else named(
+                ba.arguments['tokens'], *ba.arguments.get('prologue_operands', ()))),
+            epilogue_dtypes=hooks.epilogue_dtypes or (() if hooks.epilogue is None else (
+                'float32', *named(*ba.arguments.get('epilogue_operands', ())))))
+        return ba if stated == hooks else type(ba)(ba.op, {**ba.arguments, 'hooks': stated})
 
     def traced(self, name: str, value: Callable | str | None) -> str | None:
         """The launch's `Hooks` as its picks key them (`tuning.KernelOp.traced`): each hook by what it
@@ -529,22 +549,25 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                 and self.derived(ba, target) is not None)
 
     def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
-        # A consumer thread's live set (`mosaic.tile_registers`), and where a prologue rewrites its share of
-        # the rows' stage, that share in fp32 beside the accumulator (ptxas spilled 384 bytes at a normed
+        # A consumer thread's live set (`resources.tile_registers`), and where a prologue rewrites its share
+        # of the rows' stage, that share in fp32 beside the accumulator (ptxas spilled 384 bytes at a normed
         # 192 x 128 forward and 156 at a normed 128 x 192 kernel gradient the plain estimate held: the
         # compile gate's H100 run).
         dtype = ba.arguments['tokens'].dtype
         family, block = mosaic_gpu.family_of(config, dtype), (config.block_m, config.block_n, config.block_k)
         # A transposed matrix (the input gradient's) is loaded a step deep and sliced in registers
-        # (`mosaic_sm80.Mma.products`, `mosaic.tile_registers`).
+        # (`mosaic_sm80.Mma.products`, `resources.tile_registers`).
         transposed = bool(ba.arguments.get('trans_rhs', False))
-        plain = mosaic.tile_registers(family, config.warpgroups, block, dtype, transposed=transposed)
-        if ba.arguments['hooks'].prologue is None:
+        hooks = ba.arguments['hooks']
+        stored = hooks.out_dtypes or (ba.arguments['out_dtype'],)
+        plain = resources.tile_registers(family, config.warpgroups, block, dtype, transposed=transposed,
+                                         stored=stored)
+        if hooks.prologue is None:
             return plain
         # The rows' stage a consumer rewrites: its share of a product's rows by the step, or of a kernel
         # gradient's depth by the step's rows, `block_m` by `block_k` over the consumers either way.
         share = config.block_m * config.block_k // config.warpgroups
-        return plain + -(-share // mosaic.THREADS)
+        return plain + -(-share // resources.THREADS)
 
     def register_budget(self, config: mosaic_gpu.Tiles) -> int:
         # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`).
@@ -599,16 +622,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """Whether `config` runs the call on `target` (`Template.legal`): of the launch's family there, in
         its granularity (whole roles of rows for each consumer, whole column units, one of its depths, at
-        most its consumers, one multiprocessor a tile) with a ring of two stages at least (a walk keeping
-        one step's products in flight holds its slot while the next step's loads fill another), its blocks
-        dividing the call's extents, and a one-dimensional side operand's block, copied untiled, at most
-        one copy's extent along its axis (`mosaic.Family.copy_extent`)."""
+        most its consumers, at most the programs its registers hold) with a ring of two stages at least (a
+        walk keeping one step's products in flight holds its slot while the next step's loads fill
+        another), its blocks dividing the call's extents, its cluster at most the family's
+        (`mosaic.Family.cluster`), and a one-dimensional side operand's block, copied untiled, at most one
+        copy's extent along its axis (`mosaic.Family.copy_extent`). A cluster's legality is each
+        multiprocessor's: its staged bytes and registers are a tile's alone."""
         family = self._family(ba, target)
-        if family is None or config.family != family.name or not self._divides(ba, config):
+        if (family is None or config.family != family.name or config.cluster > family.cluster
+                or not self._divides(ba, config)):
             return False
         dtype = ba.arguments['tokens'].dtype
         if (config.warpgroups > family.consumers or config.programs > family.programs(config.warpgroups)
-                or config.cluster != 1 or config.stages < 2
+                or config.stages < 2
                 or config.block_m % (family.role_rows * config.warpgroups)
                 or config.block_n % family.column_unit(dtype) or config.block_k not in family.depths(dtype)):
             return False
@@ -643,32 +669,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return _hooks_lower(ba, dtype, mosaic_gpu_lowering.mosaic_lowering_rules[plgpu_core.WGxWG_SEMANTICS])
 
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles, target) -> int:
-        # Each allocation a program scopes, rounded up to Mosaic's alignment (`mosaic.allocated`): each
-        # stream's stages (both operand blocks and each prologue side's tile), each output's staging (every
-        # output's at once, the columns its family stages at once: `mosaic.Family.output_columns`), each
-        # epilogue side's two staging copies (`mosaic.staging`), and the barriers: each stream stage's two
-        # and each staged side's two (at a block's edge, a Hopper tile's barriers alone took it 128 bytes
-        # past, the reason they are counted).
-        size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
-        hooks = ba.arguments['hooks']
-        outs = [jnp.dtype(dtype).itemsize for dtype in (hooks.out_dtypes or (ba.arguments['out_dtype'],))]
-        extents = self.extents(config)
-        prologue_sides = ba.arguments['prologue_operands']
-        epilogue_sides = ba.arguments.get('epilogue_operands', ())
-        streams = [config.block_m * config.block_k * size, config.block_k * config.block_n * size,
-                   *(_side_tile_bytes((side,), (axes,), extents)
-                     for side, axes in zip(prologue_sides, hooks.prologue_axes, strict=True))]
+        # The kernel's own allocations at `config` (`mosaic_gpu.Allocations`), counted as Mosaic's resource
+        # estimate counts them (`resources.shared_bytes`): its streams' stages, its side operands' staging,
+        # its outputs' staging as its family stages them, and every barrier (at a block's edge, a Hopper
+        # tile's barriers alone took it 128 bytes past). mma.sync's output staging is scoped beside its
+        # pipeline's walk, so the two add (an L4 refused 114688 bytes for a 98304-byte pipeline and its
+        # 16384-byte output, GEN4-gpu-l4).
+        del target
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-        staged = [config.block_m * family.output_columns(config.block_n, (dtype,)) * out
-                  for dtype, out in zip(hooks.out_dtypes or (ba.arguments['out_dtype'],), outs, strict=True)]
-        sides = [2 * _side_tile_bytes((side,), (axes,), extents)
-                 for side, axes in zip(epilogue_sides, hooks.epilogue_axes, strict=True)]
-        barriers = 2 * config.stages * len(streams) + 2 * (len(epilogue_sides) + len(prologue_sides) + 1)
-        # mma.sync's too, though its output's staging is scoped after its pipeline's stages: Mosaic places
-        # both at once (an L4 refused 114688 bytes for a 98304-byte pipeline and its 16384-byte output,
-        # GEN4-gpu-l4).
-        return (mosaic.allocated(*(config.stages * stream for stream in streams), *staged, *sides)
-                + mosaic.BARRIER_BYTES * barriers)
+        return resources.shared_bytes(family, self._allocations(ba, config, family).scope(family, config))
+
+    @abc.abstractmethod
+    def _allocations(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
+        """The kernel's allocations at `config` for the call `ba`."""
 
     @staticmethod
     @abc.abstractmethod
@@ -678,12 +691,13 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def program_shared(self, config: mosaic_gpu.Tiles, target) -> int:
         # The programs a multiprocessor runs at once share its shared memory.
-        return mosaic.program_shared(super().program_shared(config, target), config.programs)
+        return resources.program_shared(super().program_shared(config, target), config.programs)
 
     def _launched(self, config: mosaic_gpu.Tiles, interpret: bool) -> int:
         """The programs the persistent kernel launches: the tile's programs on each multiprocessor
-        (`Tiles.programs`); the interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret)."""
-        return 1 if interpret else _multiprocessors(generation.gpu_target()) * config.programs
+        (`Tiles.programs`); the interpreter runs one cluster (jax/_src/pallas/mosaic_gpu/interpret), one
+        program alone or a pair's two (`Tiles.cluster`)."""
+        return config.cluster if interpret else _multiprocessors(generation.gpu_target()) * config.programs
 
 
 @dataclasses.dataclass(frozen=True)
@@ -691,6 +705,16 @@ class MosaicGmm(_Mosaic):
     """`Gmm` through the Mosaic GPU kernels (`mosaic_gpu.gmm`)."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
+
+    def _allocations(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
+        hooks = ba.arguments['hooks']
+        return mosaic_gpu.gmm_allocations(
+            config, family, dtype=ba.arguments['tokens'].dtype, rhs_dtype=ba.arguments['kernel'].dtype,
+            transpose_rhs=ba.arguments['trans_rhs'], prologue_axes=hooks.prologue_axes,
+            prologue_dtypes=tuple(side.dtype for side in ba.arguments['prologue_operands']),
+            epilogue_axes=hooks.epilogue_axes,
+            epilogue_dtypes=tuple(side.dtype for side in ba.arguments.get('epilogue_operands', ())),
+            dtypes=hooks.out_dtypes or (ba.arguments['out_dtype'],))
 
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
@@ -729,6 +753,13 @@ class MosaicTgmm(_Mosaic):
 
     EXACT_SUMS: ClassVar[bool] = True
 
+    def _allocations(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
+        return mosaic_gpu.tgmm_allocations(
+            config, family, lhs_dtype=ba.arguments['tokens'].dtype,
+            rhs_dtype=ba.arguments['cotangent'].dtype, prologue_axes=ba.arguments['hooks'].prologue_axes,
+            prologue_dtypes=tuple(side.dtype for side in ba.arguments['prologue_operands']),
+            out_dtype=ba.arguments['out_dtype'])
+
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         # A gradient tile's rows are the tokens' width; its steps run over a group's rows, padded to whole
         # steps (`mosaic_gpu.tgmm`).
@@ -739,11 +770,12 @@ class MosaicTgmm(_Mosaic):
         return rows % config.block_m == 0 and width % config.block_n == 0
 
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
-        """`_Mosaic.legal`, a family whose products read registers loading its transposed stage in whole
-        roles of rows (the step, `block_k`: a 32-row stage failed to cast to the 64-row layout, ns-regs2),
-        and with `exact_sums` a second fp32 accumulator, the running sum beside a step's, in each
-        consumer's live set (`mosaic.tile_registers`) within its family's registers."""
-        if not super().legal(ba, config, target):
+        """`_Mosaic.legal` on one multiprocessor a tile (`mosaic_gpu.tgmm` takes no pair), a family whose
+        products read registers loading its transposed stage in whole roles of rows (the step, `block_k`: a
+        32-row stage failed to cast to the 64-row layout, ns-regs2), and with `exact_sums` a second fp32
+        accumulator, the running sum beside a step's, in each consumer's live set (`resources.tile_registers`)
+        within its family's registers."""
+        if config.cluster != 1 or not super().legal(ba, config, target):
             return False
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
         if family.operands_in_registers and config.block_k % family.role_rows:
@@ -752,8 +784,9 @@ class MosaicTgmm(_Mosaic):
             return True
         dtype = ba.arguments['tokens'].dtype
         block = (config.block_m, config.block_n, config.block_k)
-        running = -(-config.block_m * config.block_n // config.warpgroups // mosaic.THREADS)
-        return (mosaic.tile_registers(family, config.warpgroups, block, dtype) + running
+        running = -(-config.block_m * config.block_n // config.warpgroups // resources.THREADS)
+        return (resources.tile_registers(family, config.warpgroups, block, dtype,
+                                         stored=(ba.arguments['out_dtype'],)) + running
                 <= family.registers(config.warpgroups))
 
     @staticmethod
@@ -1096,9 +1129,9 @@ def _multiprocessors(target: generation.GpuTarget) -> int:
 
 @dataclasses.dataclass(frozen=True)
 class GroupedCase:
-    """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run where
-    the call does (`placed`: a GPU's, or a CPU's interpreting them; the template's dispatch runs in the
-    branch its platform places), whether they see its operands whole (`whole`,
+    """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run on its
+    target (`placed`: a GPU of sm80 on, or a TPU; the template's dispatch runs in the branch its platform
+    places), whether they see its operands whole (`whole`,
     `dew.nn.sharding.seen_whole`), the `product` it declares, its `rows`, its launches bound to it
     (`call`) and the `kind` of call it is ('grouped forward', 'dense input_gradient', 'grouped
     kernel_gradient exact', as `gmm_call` and `tgmm_call` state it), which with the device's instruction
@@ -1120,9 +1153,7 @@ _Need = selection.Requirement[GroupedCase]
 """A requirement of a `GroupedCase`."""
 
 SUPPORTS = (
-    _Need('capability', lambda case: case.placed,
-          "the kernels need a GPU of sm80 or later, or a CPU interpreting them where the call asks",
-          row=INHERENT),
+    _Need('capability', lambda case: case.placed, "the kernels need a GPU of sm80 or later", row=INHERENT),
     _Need('placement', lambda case: case.whole,
           "a mesh axis splits the operands, or a shard_map that checks varying axes holds them, and the "
           "kernels see whole arrays", row='ledger 1306'),
@@ -1149,11 +1180,10 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
 
 
 DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
-    ('mma.sync', 'grouped input_gradient'):
-        ('triton', "CONSUMERS3 (b1241ba7b, A100, two programs a multiprocessor): the template's mma.sync "
-                   "tile 1.239x Triton's time, geomean of 6 grouped MoE rows (its forward 0.828x)"),
     ('mma.sync', 'grouped kernel_gradient'):
-        ('triton', "CONSUMERS3: 1.358x Triton's time, geomean of 6 grouped rows"),
+        ('triton', "MWARPS2-a100 (08ceb321c, A100, each tile's warps split to read its operands least): the "
+                   "template's mma.sync tile 1.214x Triton's time, geomean of 6 grouped MoE rows (its input "
+                   "gradient 0.900x and forward 0.751x; MWARPS4, 00d05c0eb, 1.203x, 0.985x, 0.820x)"),
     ('mma.sync', 'dense forward'):
         ('xla', "DENSE1 (A100, 2d1bbd051, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
                 "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens"),
@@ -1162,12 +1192,12 @@ DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
     ('mma.sync', 'dense kernel_gradient'):
         ('xla', "DENSE1 (A100, one program a multiprocessor): Mosaic 1.964x, Triton 1.735x XLA's dot"),
     ('wgmma', 'grouped forward'):
-        ('cutlass', "ALIGNED-route-h100 (ff53d3f39, H100 PCIe, each group's tiles at its first row): the "
-                    "template 1.049x CUTLASS's time, geomean of 7 grouped MoE rows (worst 1.23x, kimi-linear "
-                    "gate_up; R7B's 1.146x before)"),
+        ('cutlass', "PAIR1-h100 (c771912a6, H100 SXM, a pair of multiprocessors a cluster multicasting each "
+                    "group's matrix): the template 1.019x CUTLASS's time, geomean of 7 grouped MoE rows "
+                    "(worst 1.18x, deepseek-v3 down; 0.951x its unpaired time)"),
     ('wgmma', 'grouped input_gradient'):
-        ('cutlass', "ALIGNED-route-h100: 1.119x CUTLASS's time, geomean of 7 grouped rows (worst 1.33x; "
-                    "R7B's 1.237x before)"),
+        ('cutlass', "PAIR1-h100: 1.018x CUTLASS's time, geomean of 7 grouped rows (worst 1.05x; 0.918x "
+                    "its unpaired time)"),
     ('wgmma', 'dense forward'):
         ('xla', "DENSE1 (H100, 2d1bbd051): Mosaic 1.067x and Triton 1.616x XLA's dot (cuBLAS), geomean of "
                 "10 projections at 8192 tokens"),
@@ -1202,30 +1232,32 @@ alone (`DECLARED_ONLY`). Every implementation shares the template's signature, s
 own arguments, `_GMMS`' for a product, `_TGMMS`' for a kernel gradient."""
 
 
-def grouped_case(launches, arguments, options, *, product: Product, whole: bool,
-                 placed: bool = True) -> GroupedCase:
+def grouped_case(launches, arguments, options, *, product: Product, whole: bool) -> GroupedCase:
     """The `GroupedCase` of `launches` called with `arguments` and `options` (`gmm_call`, `tgmm_call`),
     its kind of call as they state it: a kernel gradient (exactly summed or not) from `tgmm_call`'s
-    launches, an input gradient or a forward from `gmm_call`'s, dense or grouped."""
+    launches, an input gradient or a forward from `gmm_call`'s, dense or grouped; and whether the kernels
+    run on its target (`placed`): a TPU's, or a CUDA GPU's from compute capability 8.0
+    (`generation.BF16_GPU`, JAX's bound for its Pallas lowerings: a T4 fails to compile them), never a
+    CPU's (a CPU process interprets a GPU's only as the GPU it states, `generation.assumed`)."""
     if launches is _TGMMS:
         made = 'kernel_gradient exact' if options['exact_sums'] else 'kernel_gradient'
     else:
         made = 'input_gradient' if options['trans_rhs'] else 'forward'
     kind = f"{'dense' if options['dense'] else 'grouped'} {made}"
-    return GroupedCase(placed, whole, product, arguments[0].shape[0],
-                       base.call(launches, *arguments, **options), kind)
+    call = base.call(launches, *arguments, **options)
+    cuda = generation.capability(call.target.generation)
+    floor = cuda is not None and cuda[0] * 10 + cuda[1] >= generation.BF16_GPU
+    placed = generation.tpu(call.target) or floor
+    return GroupedCase(placed, whole, product, arguments[0].shape[0], call, kind)
 
 
 def launched(launches, arguments, options, *, product: Product, whole: bool):
     """The launch of `launches` that runs the call (`arguments`, `options`) as `GROUPED` selects it,
-    ready to call, or None where XLA's program takes it. A CPU process's GPU branch, which runs only where
-    a lowering for the GPU takes it, takes a chosen implementation where it can and the order's next
-    launch where it cannot (mma.sync's where this JAX lowers none: `_family`); every branch a process
-    runs insists on it."""
+    ready to call, or None where XLA's program takes it: on the call's target, a CPU process's own (whose
+    kernels run nowhere, so XLA's program takes every call and a kernel `generation.chosen` names raises)
+    or the GPU it states (`generation.assumed`). Every branch insists on a named kernel."""
     case = grouped_case(launches, arguments, options, product=product, whole=whole)
-    unrun = not options['interpret'] and jax.default_backend() == 'cpu'
-    named = selection.forced(GROUPED.choice) if unrun else None
-    route = selection.select(GROUPED, case, named, insist=not unrun)
+    route = selection.select(GROUPED, case)
     if route.kernel == 'xla':
         return None
     return functools.partial(case.call.implementation(route.kernel), *arguments, **options)

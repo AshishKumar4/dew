@@ -44,9 +44,11 @@ from dew.nn.kernels.chunked_launch import (
     _row,
     _rows,
     _span,
+    laid,
     read_rows,
     sequences,
     slots,
+    spanned,
     write_rows,
 )
 
@@ -226,9 +228,7 @@ def kkt_solve(k, g, beta, *, chunk: int = 64, sub: int = 16, spans: Sequences | 
     fused kkt and solve for 64-token chunks (chunk_fwd.py:367-396). `k` `[B, T, H, K]`, `g`
     the base-2 cumulated decay (`recurrence.cumulated`) and `beta` `[B, T, HV]`. fla autotunes
     `BK` over 32 and 64 and warps over 1, 2 and 4."""
-    batch, length = k.shape[:2]
-    spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _KKT_SOLVE(k, g, beta, *spans, chunk=chunk, sub=sub, interpret=interpret)
+    return spanned(_KKT_SOLVE, k, g, beta, chunk=chunk, spans=spans, sub=sub, interpret=interpret)
 
 
 def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, w_ref, u_ref, *, chunk: int,
@@ -270,13 +270,9 @@ class RecomputeWU(_Launch):
              config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
-        spans = Sequences(chunk_spans, sequence_spans)
         bk, bv, warps, stages = config.bk, config.bv, config.warps, config.stages
-        batch, length, key_heads, width = k.shape
-        value_heads, columns = v.shape[2:]
-        group = value_heads // key_heads
-        tokens = batch * length
-        aligned = _aligned(spans, batch, length, chunk)
+        spans, batch, length, _, width, value_heads, columns, group, tokens, aligned = laid(
+            k, v, chunk_spans, sequence_spans, chunk)
 
         headed = functools.partial(_headed, tokens)
 
@@ -307,10 +303,13 @@ def recompute_w_u(k, v, beta, a, g, *, chunk: int = 64, spans: Sequences | None 
     inverse `(I + beta K K^T)^-1` per chunk `[B, T, HV, BT]` (fla's `A`, rows by token), `g` the
     base-2 cumulated decay `[B, T, HV]` fp32. fla fixes `BK = BV = 64` and autotunes warps over
     2, 4, 8 and stages over 2, 3, 4."""
-    batch, length = k.shape[:2]
-    spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _RECOMPUTE_W_U(k, v, beta, a, g, *spans, chunk=chunk, interpret=interpret)
+    return spanned(_RECOMPUTE_W_U, k, v, beta, a, g, chunk=chunk, spans=spans, interpret=interpret)
 
+
+def _stored(ref, row, memory) -> None:
+    """A row's memory, its 64-key slices in order, into `ref`'s row `row` `[K, V]`."""
+    for i, block in enumerate(memory):
+        ref[row, pl.ds(i * 64, 64), :] = block.astype(ref.dtype)
 
 def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref, ht_ref, *,
               chunk: int, aligned: bool, length: int, exact: bool, per_key: bool = False):
@@ -362,10 +361,7 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref
 
         state = jax.lax.fori_loop(0, -(-count // chunk), step, state)
 
-        @pl.when(last_in_row)
-        def _():
-            for i in range(slices):
-                ht_ref[row, pl.ds(i * 64, 64), :] = state[i].astype(ht_ref.dtype)
+        pl.when(last_in_row)(lambda: _stored(ht_ref, row, state))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -383,13 +379,9 @@ class ChunkFwdH(_Launch):
              config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
-        spans = Sequences(chunk_spans, sequence_spans)
         bv, warps, stages = config.bv, config.warps, config.stages
-        batch, length, key_heads, width = k.shape
-        value_heads, columns = u.shape[2:]
-        group = value_heads // key_heads
-        tokens = batch * length
-        aligned = _aligned(spans, batch, length, chunk)
+        spans, batch, length, _, width, value_heads, columns, group, tokens, aligned = laid(
+            k, u, chunk_spans, sequence_spans, chunk)
 
         def head(i_v, sh):
             return sh % value_heads
@@ -433,9 +425,7 @@ def chunk_fwd_h(k, w, u, g, h0, *, chunk: int = 64, spans: Sequences | None = No
     T, HV, K]` (fla's `gk`, Kimi's delta attention), `h0` `[B, HV, K, V]` fp32, each row's. `K` a
     multiple of 64 (fla's blockdim64 kernel takes up to 256). On an A100 fla's autotuner chose BV 32,
     4 warps, 3 stages (c53)."""
-    batch, length = k.shape[:2]
-    spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _CHUNK_FWD_H(k, w, u, g, h0, *spans, chunk=chunk, interpret=interpret)
+    return spanned(_CHUNK_FWD_H, k, w, u, g, h0, chunk=chunk, spans=spans, interpret=interpret)
 
 
 def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, dh_ref, dh0_ref,
@@ -520,10 +510,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
 
         grad = jax.lax.fori_loop(0, chunks, step, grad)
 
-        @pl.when(first)
-        def _():
-            for i in range(slices):
-                dh0_ref[row, pl.ds(i * 64, 64), :] = grad[i].astype(dh0_ref.dtype)
+        pl.when(first)(lambda: _stored(dh0_ref, row, grad))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -554,13 +541,9 @@ class ChunkBwdDhu(_Launch):
              chunk: int, interpret: bool, config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
-        spans = Sequences(chunk_spans, sequence_spans)
         bv, warps, stages = config.bv, config.warps, config.stages
-        batch, length, key_heads, width = q.shape
-        value_heads, columns = do.shape[2:]
-        group = value_heads // key_heads
-        tokens = batch * length
-        aligned = _aligned(spans, batch, length, chunk)
+        spans, batch, length, _, width, value_heads, columns, group, tokens, aligned = laid(
+            q, do, chunk_spans, sequence_spans, chunk)
         held = slots(spans, batch, length, chunk)
 
         def head(i_v, sh):
@@ -605,10 +588,8 @@ def chunk_bwd_dhu(q, k, w, g, dht, do, dv, *, scale: float, chunk: int = 64,
     (`chunk_bwd_dv_local`); `g` the cumulated decay `[B, T, HV]`, or `[B, T, HV,
     K]` per key dimension (fla's `gk`). fla's
     A100 choice: BV 32, 4 warps, 3 stages (c53)."""
-    batch, length = q.shape[:2]
-    spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _CHUNK_BWD_DHU(q, k, w, g, dht, do, dv, *spans, scale=scale, chunk=chunk,
-                          interpret=interpret)
+    return spanned(_CHUNK_BWD_DHU, q, k, w, g, dht, do, dv, chunk=chunk, spans=spans,
+                   scale=scale, interpret=interpret)
 
 
 def _dv_local_kernel(chunk_ref, q_ref, k_ref, g_ref, do_ref, dv_ref, *, chunk: int, aligned: bool,
@@ -651,13 +632,9 @@ class ChunkBwdDvLocal(_Launch):
              config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
-        spans = Sequences(chunk_spans, sequence_spans)
         bk, bv, warps, stages = config.bk, config.bv, config.warps, config.stages
-        batch, length, key_heads, width = q.shape
-        value_heads, columns = do.shape[2:]
-        group = value_heads // key_heads
-        tokens = batch * length
-        aligned = _aligned(spans, batch, length, chunk)
+        spans, _, _, _, width, value_heads, columns, group, tokens, aligned = laid(
+            q, do, chunk_spans, sequence_spans, chunk)
         keys = pl.BlockSpec((tokens, None, width), lambda i_t, h: (0, h // group, 0))
         values = pl.BlockSpec((tokens, None, columns), lambda i_t, h: (0, h, 0))
         dv = pl.pallas_call(
@@ -682,9 +659,8 @@ def chunk_bwd_dv_local(q, k, g, do, *, scale: float, chunk: int = 64, spans: Seq
     """The corrected values' gradient from each chunk's own output, `[B, T, HV, V]` in `do`'s dtype:
     fla's `chunk_bwd_dv_local` (chunk_o.py:640-676). fla tiles `BK` and `BV` at 64 on an A100
     (its CONST_TILING for ampere and ada shared memory) and chose 2 warps, 3 stages there (c53)."""
-    batch, length = q.shape[:2]
-    spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _CHUNK_BWD_DV_LOCAL(q, k, g, do, *spans, scale=scale, chunk=chunk, interpret=interpret)
+    return spanned(_CHUNK_BWD_DV_LOCAL, q, k, g, do, chunk=chunk, spans=spans,
+                   scale=scale, interpret=interpret)
 
 
 def _split_dot(a, b, *, exact: bool):
@@ -797,13 +773,9 @@ class ChunkBwdDqkwg(_Launch):
              return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
-        spans = Sequences(chunk_spans, sequence_spans)
         bk, bv, warps, stages = config.bk, config.bv, config.warps, config.stages
-        batch, length, key_heads, width = q.shape
-        value_heads, columns = v.shape[2:]
-        group = value_heads // key_heads
-        tokens = batch * length
-        aligned = _aligned(spans, batch, length, chunk)
+        spans, _, _, key_heads, width, value_heads, columns, group, tokens, aligned = laid(
+            q, v, chunk_spans, sequence_spans, chunk)
         keys = pl.BlockSpec((tokens, None, bk), lambda i_k, i_h, i_t: (0, i_h, i_k))
         values = pl.BlockSpec((tokens, group, columns), lambda i_k, i_h, i_t: (0, i_h, 0))
         memory = pl.BlockSpec((h.shape[0], group, bk, columns), lambda i_k, i_h, i_t: (0, i_h, i_k, 0))
@@ -840,10 +812,8 @@ def chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
     H, K]` in `q`'s and `k`'s dtypes; `dw` per value
     head, and `dg` per key block, summed, as fla does. fla tiles `BK`, `BV` at 64 on an A100 and chose
     4 warps, 2 stages (c53)."""
-    batch, length = q.shape[:2]
-    spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _CHUNK_BWD_DQKWG(q, k, v, w, g, h, dv, do, dh, *spans, scale=scale, chunk=chunk,
-                            interpret=interpret)
+    return spanned(_CHUNK_BWD_DQKWG, q, k, v, w, g, h, dv, do, dh, chunk=chunk, spans=spans,
+                   scale=scale, interpret=interpret)
 
 
 def _summed_back(index, pairs, after):
@@ -967,13 +937,9 @@ class PrepareWyReprBwd(_Launch):
              return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
-        spans = Sequences(chunk_spans, sequence_spans)
         bk, bv, warps, stages = config.bk, config.bv, config.warps, config.stages
-        batch, length, key_heads, width = k.shape
-        value_heads, columns = v.shape[2:]
-        group = value_heads // key_heads
-        tokens = batch * length
-        aligned = _aligned(spans, batch, length, chunk)
+        spans, batch, length, key_heads, width, value_heads, columns, group, tokens, aligned = laid(
+            k, v, chunk_spans, sequence_spans, chunk)
 
         headed = functools.partial(_headed, tokens)
 
@@ -1014,9 +980,8 @@ def prepare_wy_repr_bwd(k, v, beta, g, a, dw, du, dk=None, *, chunk: int = 64,
     the keys' gradient so far, which the returned one includes, added in fp32 before its one
     rounding; without it, fla's call. `dk` is summed over each key head's group. fla tiles `BK`,
     `BV` at 64 on an A100 and chose 4 warps, 2 stages (c53)."""
-    batch, length = k.shape[:2]
-    spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _PREPARE_WY_REPR_BWD(k, v, beta, g, a, dw, du, dk, *spans, chunk=chunk, interpret=interpret)
+    return spanned(_PREPARE_WY_REPR_BWD, k, v, beta, g, a, dw, du, dk, chunk=chunk, spans=spans,
+                   interpret=interpret)
 
 
 def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, o_ref, *, chunk: int, aligned: bool,
@@ -1103,9 +1068,8 @@ def chunk_fwd_o(q, k, v, h, g, *, scale: float, chunk: int = 64, spans: Sequence
     chunk (`recurrence.cumulated`) `[B, T, HV]` fp32. Grouped queries: value head `i` reads
     key head `i // (HV // H)`. `T` is a whole number of chunks; `bk`, `bv`, `warps` and `stages` are
     one of fla's configs (`BK, BV` 128/128 at 8 warps, 64/64 at 4, 32/32 at 2, all 3 stages)."""
-    batch, length = q.shape[:2]
-    spans = sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _CHUNK_FWD_O(q, k, v, h, g, *spans, scale=scale, chunk=chunk, interpret=interpret, wide=wide)
+    return spanned(_CHUNK_FWD_O, q, k, v, h, g, chunk=chunk, spans=spans,
+                   scale=scale, interpret=interpret, wide=wide)
 
 
 def _rule(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool, keep: bool = True,
