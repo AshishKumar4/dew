@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, widened, with_gradients
 from residual_orders import orders, permuted, residual_width
 
 from dew.batch import coordinates
@@ -485,20 +485,28 @@ def one_tap(kind):
                                      conv_kernel=1)}[kind]()
 
 
+ONE_TAP_SEEDS = {"gated_delta_net": 8, "kimi_delta_attention": 8, "mamba": 8, "mamba2": 8}
+"""Each one-tap mixer's declared draws for its decode against its whole pass (check 1), sized by
+`seeds_for` paired with the decode on the CPU."""
+
+
 @pytest.mark.parametrize("kind", ["gated_delta_net", "kimi_delta_attention", "mamba", "mamba2"])
 def test_a_recurrent_mixer_whose_conv_takes_one_tap_decodes_as_its_whole_pass(kind):
     """A one-tap causal conv is a scale per channel with no history to hold: each recurrent mixer
-    builds with one, and its decode (a 3-token prefill, then one token a step) is within
-    tests/reference_error.py's rule of its whole pass against the float64 whole pass."""
+    builds with one, and its decode (a 3-token prefill, then one token a step) is on par with its
+    whole pass from the float64 whole pass over drawn inputs (check 1)."""
     from model_support import decode_through
-    from reference_error import assert_as_exact_as_the_reference
 
     module = one_tap(kind)
-    hidden = jax.random.normal(jax.random.key(4), (2, 9, module.emb_features), jnp.float32)
-    variables = module.init(jax.random.key(5), hidden)
-    whole = np.asarray(module.apply(variables, hidden), np.float64)
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
-        truth = np.asarray(module.clone(dtype=jnp.float64).apply(wide, jnp.asarray(hidden, jnp.float64)))
-    decoded = np.asarray(decode_through(module, variables, hidden, prefill=3)[0], np.float64)
-    assert_as_exact_as_the_reference(decoded, whole, truth, f"{kind} decode")
+    shape = (2, 9, module.emb_features)
+    variables = module.init(jax.random.key(5), jnp.zeros(shape, jnp.float32))
+
+    def draw(seed):
+        return (jax.random.normal(jax.random.key(seed), shape, jnp.float32),)
+
+    def truth(hidden):
+        return module.clone(dtype=jnp.float64).apply(widened(variables), hidden)
+
+    assert_as_exact(lambda hidden: decode_through(module, variables, hidden, prefill=3)[0],
+                    lambda hidden: module.apply(variables, hidden), draw, f"{kind} decode",
+                    seeds=ONE_TAP_SEEDS[kind], truth_fn=truth)
