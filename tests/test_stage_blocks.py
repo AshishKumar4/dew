@@ -6,10 +6,11 @@ are on par with one device's, both measured from float64 (check 1).
 
 Each model is the smallest that still splits into two stages of like blocks: a DiT of four blocks,
 a hybrid of four alternating SSM and attention blocks (two stages of one of each), an encoder of
-four, a clip's encoder of two spatial and temporal pairs, and a UNet whose levels each hold two
-transformers. The layouts put the stages beside fsdp and the rows over data (eight devices, two
-rows a device, one microbatch a stage), or beside a sequence axis (four rows a device over data,
-four microbatches), each model on one of them, the DiT on both."""
+four, a clip's encoder of two spatial and temporal pairs, and a UNet of one level over 8 x 8
+latents, whose attentions down, through the middle and up each hold two transformers. The layouts
+put the stages beside fsdp and the rows over data (eight devices, two rows a device, one microbatch
+a stage), or beside a sequence axis (four rows a device over data, four microbatches), the DiT and
+the UNet on both."""
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +31,9 @@ pytestmark = pytest.mark.mesh
 BATCH = 8
 RES = 16
 TINY_SHARD = 256
+LATENT_RES = 8
+"""The UNet's latents' side: its one level attends over all 64 positions, which a sequence axis of two
+splits."""
 CONTEXT, CONTEXT_FEATURES = 4, 16
 
 LAYOUTS = {
@@ -59,10 +63,8 @@ CASES = {
                    "images"),
     "jepa": ("jepa_encoder", {**VIT, "num_layers": 4}, "encoded"),
     "jepa_video": ("jepa_video_encoder", {**VIT, "num_layers": 2}, "clips"),
-    "unet": ("unet_2d_condition", {"stages": [{"features": 32, "heads": 4, "depth": 2},
-                                              {"features": 64, "heads": 4, "depth": 2}],
-                                   "blocks_per_level": 1, "in_channels": 4, "out_channels": 4},
-             "latents"),
+    "unet": ("unet_2d_condition", {"stages": [{"features": 32, "heads": 4, "depth": 2}],
+                                   "blocks_per_level": 1, "in_channels": 4, "out_channels": 4}, "latents"),
 }
 """Each model by its registry name and fields, and the inputs it reads."""
 
@@ -70,9 +72,10 @@ CELLS = [("dit", "fsdp2_stage2"), ("dit", "stage2_sequence2"), ("hybrid_dit", "f
          ("jepa", "stage2_sequence2"), ("jepa_video", "fsdp2_stage2"), ("unet", "fsdp2_stage2"),
          ("unet", "stage2_sequence2")]
 
-SEEDS = {"dit": 32, "hybrid_dit": 32, "jepa": 32, "jepa_video": 32, "unet": 64, "patch_conv": 8}
+SEEDS = {"dit": 32, "hybrid_dit": 32, "jepa": 32, "jepa_video": 32, "unet": 128, "patch_conv": 8}
 """Each model's check-1 seeds, the most any of its layouts took, sized paired by `seeds_for` (`dew_fn`, the
-layout's arm) on armada at 9efb77a3e: the arms share their inputs and variables."""
+layout's arm) on armada, at 9efb77a3e and the UNet's with the confirming block at 8ce8072b5 (64 over
+fsdp2_stage2, 128 beside the sequence axis): the arms share their inputs and variables."""
 
 
 def drawn(kind: str):
@@ -84,10 +87,10 @@ def drawn(kind: str):
                       rng.uniform(size=(BATCH,)).astype(np.float32))
             out = (BATCH, RES, RES, 3)
         elif kind == "latents":
-            inputs = (rng.normal(size=(BATCH, RES, RES, 4)).astype(np.float32),
+            inputs = (rng.normal(size=(BATCH, LATENT_RES, LATENT_RES, 4)).astype(np.float32),
                       rng.uniform(0, 1000, size=(BATCH,)).astype(np.float32),
                       rng.normal(size=(BATCH, CONTEXT, CONTEXT_FEATURES)).astype(np.float32))
-            out = (BATCH, RES, RES, 4)
+            out = (BATCH, LATENT_RES, LATENT_RES, 4)
         elif kind == "clips":
             inputs = (rng.normal(size=(BATCH, 2, RES, RES, 3)).astype(np.float32),)
             out = (BATCH, 2, (RES // 4) ** 2, 32)
@@ -143,14 +146,14 @@ def on_mesh(spec: MeshSpec, devices: int, model, variables, call, microbatches=N
 
 
 def float64_pulled(model, variables, call):
-    """`pulled` of the model computing in float64 over its variables widened, on the CPU: the truth."""
-    wide, held = model.clone(dtype=jnp.float64), widened(variables)
+    """`pulled` of the model computing in float64 over its variables widened: the truth, one program the
+    gate compiles for every draw. Returned to the host, the gate would run it as a NumPy truth, op by
+    op, which took a UNet cell's draw 1.2 s against the arms' 0.16 s."""
+    wide = model.clone(dtype=jnp.float64)
+    with jax.enable_x64(new_val=True):
+        held = jax.tree.map(jnp.asarray, widened(variables))
     run = pulled(wide, call)
-
-    def truth(inputs, cotangent):
-        with jax.default_device(jax.devices("cpu")[0]):
-            return jax.device_get(run(held, inputs, cotangent))
-    return truth
+    return lambda inputs, cotangent: run(held, inputs, cotangent)
 
 
 def runs_a_pipeline(spec: MeshSpec, model, variables, call, inputs, microbatches=None) -> bool:

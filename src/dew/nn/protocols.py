@@ -514,6 +514,27 @@ def head_table(model: nn.Module, variables) -> OutputTable | None:
     return table
 
 
+def label_logits(model: nn.Module, variables, answers: jax.Array, ids: Sequence[Sequence[int]]) -> jax.Array:
+    """`model`'s own logits `[B, N, K, V]` at each of the `[K, V]` label `ids` of each answer state of
+    `answers` `[B, N, features]`, a class read as its label's tokens' logits (a verbalizer): its output
+    table at the labels' columns alone, computed in fp32 (`OutputTable.columns`), where one matrix is
+    its head (`head_table`); else its exact head over the answer states, a few rows
+    (`LogitsFromHidden`), the labels' columns taken. No product is rebuilt from the vocabulary's rows,
+    which carry no bias and no softcap."""
+    held = np.asarray(ids, np.int64)
+    table = head_table(model, variables)
+    if table is not None:
+        return table.columns(answers, held.reshape(-1).tolist(), exact=True).reshape(
+            *answers.shape[:2], *held.shape)
+    if not isinstance(model, LogitsFromHidden):
+        raise TypeError(f"a readout of labels reads its backbone's exact head, which a "
+                        f"{type(model).__name__} does not give (AffineHead, LogitsFromHidden)")
+    full = jnp.asarray(model.apply(variables, answers, method="logits_from_hidden"))
+    picked = jnp.take(full, jnp.asarray(held.reshape(-1)), axis=-1)
+    return picked.astype(jnp.promote_types(picked.dtype, jnp.float32)).reshape(
+        *answers.shape[:2], *held.shape)
+
+
 @runtime_checkable
 class VocabularyRows(Protocol):
     """A model whose head scores its final states against one row per vocabulary token: each
@@ -634,7 +655,7 @@ class Recomputing(Protocol):
     own: a resumed run never compiles a lighter rung than it trained on.
     `recompute_half` is the model one rung up where that rung recomputes only
     the few values it names, a half rung the planner tries at each split
-    (`dew.training.planning.plan_step`), else None."""
+    (`dew.training.planning.FitSearch`), else None."""
 
     def recompute_record(self) -> JSON: ...
 
