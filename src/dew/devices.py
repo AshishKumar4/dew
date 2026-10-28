@@ -53,7 +53,8 @@ def _watch_opening() -> None:
         if not bridge.backends_are_initialized():
             _LOADED = os.environ.get('XLA_FLAGS', '')
         return opening()
-    bridge.backends = backends
+    # The function its callers look up in the module's namespace (`xla_bridge.backends`).
+    vars(bridge)["backends"] = backends
 
 
 def _loaded() -> str | None:
