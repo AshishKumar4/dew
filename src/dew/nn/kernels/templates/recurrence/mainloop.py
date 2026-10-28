@@ -1373,7 +1373,9 @@ def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
     if call.per_key:
         given = {"gates": ((CHUNK, width), gates), "lows": ((CHUNK, width), gates),
                  "scores": ((CHUNK, CHUNK), held)}
-        staging = _staging(held, (CHUNK, call.block))
+        # The local product's staged scores, then each key block's gated queries.
+        staging = (_staging(held, (CHUNK, CHUNK)) + _staging(call.given, *[(CHUNK, call.block)]
+                                                             * (width // call.block)),)
     else:
         given = {"keys": ((CHUNK, width), call.given)}
         staging = _staging(held, (CHUNK, CHUNK))
@@ -1392,21 +1394,21 @@ def _output_held(call: _Call, bv: int) -> _Held:
     whose products complete in turn. So an A100's need was 232, 240, None and 216 registers at value blocks
     16, 32, 64 and 128 wide of 128 values, and None at 128 of 256; an H100's 224, 224, 232/240 and None
     (the 1971 gate's dump: where both phases were stated at once, 456 refused 216). Under a decay a key
-    dimension the value block's phase and the key blocks': a key block's prefix halves, its decay raised from
-    them and its queries widened, the intra launch's scores in fp32 and their product's fragments."""
+    dimension the value block's phase beside the intra launch's scores in fp32 and their masks, and the
+    first step's: a key block's prefix halves, its decay raised from them and its queries widened, staged
+    for every step (`algebra.key_gated`), held as the scores' phase is."""
     held, memories, given, family = call.held, call.memories, call.given, call.family
     values = ([_f32(CHUNK, bv)] * (2 if family.products_overlap else 1) + _held(held, CHUNK, bv)
               + _widest(_product(call, (given, CHUNK, call.block), (memories, call.block, bv)),
                         _product(call, (held, CHUNK, CHUNK), (held, CHUNK, bv))))
     one_block = call.value_width // bv == 1
     if call.per_key:
-        # The key blocks' gated queries hold no value block's columns: across a walk of value blocks they
-        # are live with each one's sum (Kimi delta attention's output at value blocks 64 wide of 128
-        # spilled 100 bytes on an H100's), within one value block apart from it (at 128 wide an H100's held
-        # it at 248 registers, an A100's at 247, where both at once stated 360 and 424).
-        keyed = ([_f32(CHUNK, call.block)] * 4 + [_f32(CHUNK, CHUNK)]
-                 + _product(call, (given, CHUNK, call.block), (memories, call.block, bv)))
-        return _Held(phases=(values, keyed) if one_block else (values + keyed,))
+        # The intra launch's scores in fp32 and masked beside the value block's sum; at the first step the
+        # key blocks' gated queries, staged for every step.
+        values += [_f32(CHUNK, CHUNK)] + _masks(CHUNK, CHUNK)
+        keyed = [_f32(CHUNK, call.block)] * 4
+        return _Held(phases=(values, keyed) if one_block and not family.products_overlap
+                     else (values + keyed,))
     scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
               + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
               + _product(call, (given, CHUNK, call.block), (given, call.block, CHUNK)))
@@ -1458,13 +1460,21 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
             entered = functools.partial(block, "entered", memories, along_rows=True)
             value = _tile(slots, "values", held)
             if call.per_key:
-                def decays(c):
-                    return tuple(block(name, gates, c).value() for name in ("gates", "lows"))
+                local, *gated = staged
+
+                # Each key block's gated queries staged once, at the first step, for every value block's
+                # product: computed each step, they were live across the walk's steps beside each one's sum.
+                @pl.when(index == 0)
+                def _():
+                    for c, tile in enumerate(gated):
+                        decays = tuple(block(name, gates, c).value() for name in ("gates", "lows"))
+                        family.staged(algebra.key_gated(block("queries", call.given, c).value(), decays),
+                                      tile[0])
 
                 out = algebra.key_decayed_output(
-                    lambda c: block("queries", call.given, c).value(), decays, entered, width // call.block,
+                    lambda c: _Parts(gated[c], call.given.dtype), entered, width // call.block,
                     _tile(slots, "scores", held).value().astype(jnp.float32), value, scale,
-                    _Issuer(call, {"memory": staged, "local": staged}))
+                    _Issuer(call, {"local": local}))
             else:
                 assert loaded is not None, "a decay a head's prefix loads in the prologue"
                 (gate, low), laid = loaded
