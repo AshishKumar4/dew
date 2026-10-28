@@ -306,3 +306,29 @@ def test_a_requests_questions_share_one_encoding_of_its_state():
     assert encoded.count(state) == 1
     for name, row in zip(questions, rows, strict=True):
         assert row == layout.rows(ByteTokenizer(), bytes_specials, state, {name: questions[name]})[0]
+
+
+def test_a_label_that_merges_with_the_text_before_it_leaves_options_found_alike_by_their_lines():
+    """Under a real BPE whose merges join an option's last letter to its label (Laya's tiny fixture's
+    `n`+`t`, `e`+`d`), the label is no part of the option apart from it, so the whole line is compared:
+    a cut to the letter the options share leaves them alike, one that keeps the merged token apart."""
+    from pathlib import Path
+
+    from dew.data.text import HFTokenizer
+
+    bpe = HFTokenizer(str(Path(__file__).parent / "fixtures" / "laya" / "tiny" / "tokenizer"),
+                      local_files_only=True)
+    labels = Labels(names=("t", "d"), variants=("{}",))
+    segments = (Instructions({"choice": "{}"}), OptionLines(bare="{name}{label}"), State(), AnswerCue())
+    question = {"q": Choice("Which?", ["xn", "xe"])}
+    # Each option's text before its label is no prefix of its line's tokens: the label merged with it.
+    for name, label in (("xn", "t"), ("xe", "d")):
+        own, line = (bpe.encode(text, add_special_tokens=False) for text in (name, name + label))
+        assert line[:len(own)] != own
+
+    def row(option_tokens: int):
+        layout = StateFirstLayout(labels=labels, segments=segments, option_tokens=option_tokens)
+        [encoded] = layout.rows(bpe, Specials.of(bpe), "x", question)
+        return encoded
+
+    assert row(1).options_alike and not row(2).options_alike

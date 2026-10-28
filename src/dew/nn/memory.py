@@ -87,6 +87,7 @@ from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.kv_cache import ROUNDING_KEYS
 from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
+from dew.nn.scatter import gather_positions
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.optim import _orthogonalized
 from dew.quantization import decoded_frozen_fp8, decoded_stored, moving_weights, quantized_products
@@ -690,8 +691,7 @@ class InContextMemory(nn.Module):
         """The readouts `[B, S, H, F]` of rows of one document, chunk by chunk (the module docstring)."""
         batch, length = steps.real.shape
         order, _ = valid_order(steps.real)
-        gathered = jax.tree.map(lambda field: jnp.take_along_axis(
-            field, order.reshape(*order.shape, *(1,) * (field.ndim - 2)), axis=1), steps)
+        gathered = jax.tree.map(lambda field: gather_positions(field, order), steps)
         laid = jax.tree.map(lambda field: sequence_blocks(field, self.chunk, leading=True), gathered)
         count = laid.real.shape[0]
         rows = tuple(_rows(head.initial, steps.real) for head in heads)

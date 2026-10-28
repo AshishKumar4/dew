@@ -443,8 +443,9 @@ class Layout:
             return "unfit"
         return "options_alike" if row.options_alike else None
 
-    def bounds(self, encoder: Tokenizer, specials: Specials, context_length: int | None = None) -> Bounds:
-        """The most rows, questions and options a window of `max_len` tokens
+    def bounds(self, encoder: Tokenizer, specials: Specials, context_length: int | None = None,
+               segments: int | None = None, context_window: int | None = None) -> Bounds:
+        """The most rows, at most `segments`, questions and options a window of `max_len` tokens
         packs, from the fewest tokens each takes in this layout: a row of one
         one-option question about an empty state, and what one more option or
         one more one-option question adds to it, laid out with room to spare
@@ -453,8 +454,11 @@ class Layout:
         or option takes its own. The packer holds every window to these
         bounds, so a row shorter still starts a new window rather than
         outgrowing one. Where the questions are laid out in the row's context
-        (`Encoded.spans_in_context`), a window holds one row, and the questions
-        and options are those a context of `context_length` tokens holds."""
+        (`Encoded.spans_in_context`), each row reads a context of its own of at most `context_length`
+        tokens (`DecisionInputs.context_segments`), the window's contexts at most `context_window` (one
+        row's where none is given): a window holds as many rows as its tokens hold, and as many questions
+        and options as its contexts do, a context's schema of one question taking the place a row's
+        tokens take along them."""
         roomy = dataclasses.replace(self, max_len=1 << 30)
         empty = self.state(encoder, specials, "")
         probe = roomy.rows(encoder, specials, "", {"q": Choice("x", ["0"])}, tokens=empty)
@@ -462,30 +466,35 @@ class Layout:
         if in_context and context_length is None:
             raise ValueError("a layout that reads its questions in the row's context is bounded by the "
                              "context's length; give its context_length")
-        budget = context_length if in_context and context_length is not None else self.max_len
 
-        def size(*options: int) -> int:
+        def size(*options: int) -> tuple[int, int]:
+            # A row's tokens and its context's, of a one-option question about an empty state for each.
             asked = {f"q{index}": Choice("x", [str(option) for option in range(count)])
                      for index, count in enumerate(options)}
             laid = roomy.rows(encoder, specials, "", asked, tokens=empty)
-            return sum(len(row.context or ()) if in_context else len(row.tokens) for row in laid)
+            return sum(len(row.tokens) for row in laid), sum(len(row.context or ()) for row in laid)
 
-        row = size(1)
-        question, option = size(1, 1) - row, size(2) - row
-        if row > budget:
-            raise ValueError(f"{'context_length' if in_context else 'max_len'}={budget} holds no row of a "
-                             f"{type(self).__name__}, whose shortest is {row} tokens")
+        row, held = size(1)
+        if row > self.max_len:
+            raise ValueError(f"max_len={self.max_len} holds no row of a {type(self).__name__}, whose "
+                             f"shortest is {row} tokens")
+        most = self.max_len // row if segments is None else min(segments, self.max_len // row)
         if in_context:
-            # One row a window: as many questions and options as its context holds.
-            each = min(option, question)
-            left = budget - row
-            return Bounds(1, 1 + left // question, None if each <= 0 else 1 + left // each)
-        rows = range(1, self.max_len // row + 1)
+            assert context_length is not None
+            if held > context_length:
+                raise ValueError(f"context_length={context_length} holds no row's schema of a "
+                                 f"{type(self).__name__}, whose shortest is {held} tokens")
+            # Its questions and options stand along the window's contexts, each row's schema its own.
+            budget, row = context_window or context_length, held
+            question, option = size(1, 1)[1] - held, size(2)[1] - held
+        else:
+            budget = self.max_len
+            question, option = size(1, 1)[0] - row, size(2)[0] - row
+        rows = range(1, min(most, budget // row) + 1)
         each = min(option, question)
-        options = None if each <= 0 else max(count + int((self.max_len - count * row) // each)
-                                             for count in rows)
-        return Bounds(len(rows), max(count + (self.max_len - count * row) // question for count in rows),
-                      options)
+        options = None if each <= 0 else max(count + int((budget - count * row) // each) for count in rows)
+        # Its rows are as many as its tokens hold; their questions and options, those their stream holds.
+        return Bounds(most, max(count + (budget - count * row) // question for count in rows), options)
 
 
 LETTERS = tuple(chr(ord("A") + index) for index in range(26))
@@ -1676,11 +1685,14 @@ def _parallel(spans: list[tuple[int, int]], length: int) -> tuple[tuple[int, ...
     return tuple(positions), tuple(slots)
 
 
-def question_owners(segments, spans, questions, spans_in_context: bool, xp=np):
-    """The `[B, Q]` row each question of packed windows belongs to, 0 for a padding slot: the row its
-    span starts in, or, where the spans are the context's (`DecisionInputs.spans_in_context`), the
-    window's one row. `xp` is the array namespace, NumPy for host geometry and `jax.numpy` in a trace,
-    so the model's question grouping and the counted FLOPs read one owner."""
+def question_owners(segments, spans, questions, spans_in_context: bool, xp=np, rows=None):
+    """The `[B, Q]` row each question of packed windows belongs to, 0 for a padding slot: the row the
+    packer placed it in (`rows`, `PackedRows`' `question_rows`), or where none is given the row its
+    span starts in, and where the spans are the context's (`DecisionInputs.spans_in_context`) the
+    window's one row (`DecisionInputs.collate`). `xp` is the array namespace, NumPy for host geometry
+    and `jax.numpy` in a trace, so the model's question grouping and the counted FLOPs read one owner."""
+    if rows is not None:
+        return xp.where(questions, xp.asarray(rows), 0).astype(segments.dtype)
     if spans_in_context:
         return xp.asarray(questions).astype(segments.dtype)
     starts = xp.asarray(spans)[..., 0]
@@ -1709,7 +1721,10 @@ class DecisionInputs:
       backbone's cross-attention reads, `context_lengths` `[B]` how many are
       real, the padding after them, and `context_segments` `[B, C]` each one's
       row in the window as `segments` numbers it (0 for padding), which its
-      row's tokens alone read; or None for rows that carry none.
+      row's tokens alone read; or None for rows that carry none;
+    - `question_rows` `[B, Q]` each question's row in its window as the packer
+      placed it, numbered as `segments` numbers its tokens (0 for a padding
+      slot), or None where a question's row is the one its span starts in.
 
     A row of one question with one marker per option, Laya's, has spans one
     token long. A head that reads `option_slots` computes the real options
@@ -1731,6 +1746,7 @@ class DecisionInputs:
     context: jnp.ndarray | None = None
     context_lengths: jnp.ndarray | None = None
     context_segments: jnp.ndarray | None = None
+    question_rows: jnp.ndarray | None = None
     readout: jnp.ndarray | None = None
     """`[B, Q]` where a readout of labels reads each question's answer (`Laid.readout`), or None; the
     labels' ids are the readout head's own (`LabelReadout.label_ids`)."""
@@ -1758,7 +1774,8 @@ class DecisionInputs:
     @property
     def question_segments(self) -> jnp.ndarray:
         """Return the `[B, Q]` row each question belongs to, 0 for a padding slot (`question_owners`)."""
-        return question_owners(self.segments, self.spans, self.questions, self.spans_in_context, jnp)
+        return question_owners(self.segments, self.spans, self.questions, self.spans_in_context, jnp,
+                               self.question_rows)
 
     @property
     def markers(self) -> jnp.ndarray:

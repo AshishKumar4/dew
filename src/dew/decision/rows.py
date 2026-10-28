@@ -262,6 +262,9 @@ class FittedRow:
     """Why the layout refuses the row with a "none of the above" beside each of its answered choices
     (`Layout.refusal`), so a training read that draws the option for it lays it out as it was
     admitted (`Encoding`); None where the layout admits it or no read draws one (`Fit._declined`)."""
+    context: int = 0
+    """The context tokens the row reads beside its own: its example's, or its schema where the schema is
+    its context (`Encoded.spans_in_context`)."""
 
 
 def _cuts(rows: Iterable[FittedRow]) -> dict[str, tuple[int, int]]:
@@ -296,6 +299,9 @@ class Fit(pygrain.MapTransform):
     none_of_the_above: float = 0.0
     """The rate the training encoding adds a "none of the above" at (`Encoding`), for which a unit's
     rows are budgeted at their longest."""
+    context_window: int | None = None
+    """The most context tokens a packed window holds (`DecisionObjective.context_window`), which a unit's
+    rows' contexts fit in or the unit trains apart."""
     scored: bool = False
     """Whether the rows are scored, as a validation pass or a server reads them, not trained on: a row
     whose declared budgets cut its options alike is laid out as its release answers it, counted
@@ -360,8 +366,10 @@ class Fit(pygrain.MapTransform):
         if refused is not None:
             return Rejected(refused)
         unread: dict[str, int] = {}
+        contexts = [0] * len(laid)
         if self.context_length is not None:
-            with_context(laid, self.tokenizer, example.context, self.context_length)
+            contexts = [len(row.context or ()) for row in with_context(laid, self.tokenizer, example.context,
+                                                                       self.context_length)]
         elif example.context is not None and (lost := len(context_tokens(self.tokenizer, example.context,
                                                                            None))):
             # A backbone that reads no context leaves the example's unread, counted as a cut of it.
@@ -370,8 +378,8 @@ class Fit(pygrain.MapTransform):
         tokens = np.asarray(state, np.int32)
         return tuple(FittedRow(example, tuple(question.name for question in row.questions), len(row.tokens),
                                row.state_kept < row.state_tokens, tokens, {**row.cuts, **unread},
-                               self._declined(example, row, state))
-                     for row in laid)
+                               self._declined(example, row, state), context)
+                     for row, context in zip(laid, contexts, strict=True))
 
     def _declined(self, example: Example, row: Encoded, state: Sequence[int]) -> str | None:
         """Why the layout refuses `row` with a "none of the above" beside each of its answered choices,
@@ -416,29 +424,32 @@ class Fit(pygrain.MapTransform):
         return Rejected(next((reason for reason in ("unfit", "options_alike") if reason in reasons),
                              "unlabelled"))
 
-    def _longest(self, row: FittedRow) -> int:
+    def _longest(self, row: FittedRow) -> tuple[int, int]:
         """The most tokens `row` encodes to where the training encoding may give each answered choice a
-        "none of the above" (`Encoding`): the longest of the row as it is, with the option added beside
-        every answered choice's options, and with it in place of each one's right option. A row of a
-        question each is these three exactly, since its layout may trim its options together
-        (`QuestionLayout`), so that adding one can shorten the row; a row of several questions lays
-        them out untrimmed, where adding the option beside every one is the longest: it lengthens each
-        question by the option or leaves it as it is (`_none_of_the_above`), and the state takes the
-        room the rest leaves."""
+        "none of the above" (`Encoding`), and the most context tokens it reads: the longest of the row as
+        it is, with the option added beside every answered choice's options, and with it in place of
+        each one's right option. A row of a question each is these three exactly, since its layout may
+        trim its options together (`QuestionLayout`), so that adding one can shorten the row; a row of
+        several questions lays them out untrimmed, where adding the option beside every one is the
+        longest: it lengthens each question by the option or leaves it as it is (`_none_of_the_above`),
+        and the state takes the room the rest leaves. A schema read as the row's context lengthens as
+        its row does; an example's context does not change."""
         if not self.none_of_the_above:
-            return row.length
+            return row.length, row.context
         example = row.example
         labels = example.labels()
 
-        def laid_out(drop: bool) -> int:
+        def laid_out(drop: bool) -> tuple[int, int]:
             asked = {name: (_none_of_the_above(question, labels[name], drop=drop)[0]
                             if name in example.answers and isinstance(question, Choice) else question)
                      for name in row.names for question in (example.questions[name],)}
             laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked,
                                     tokens=row.tokens.tolist())
-            return sum(len(each.tokens) for each in laid)
+            schemas = sum(len(each.context or ()) for each in laid if each.spans_in_context)
+            return sum(len(each.tokens) for each in laid), schemas or row.context
 
-        return max(row.length, laid_out(drop=False), laid_out(drop=True))
+        sizes = [(row.length, row.context), laid_out(drop=False), laid_out(drop=True)]
+        return max(tokens for tokens, _ in sizes), max(context for _, context in sizes)
 
     def _unit(self, grouped: GroupedExamples) -> Batch | Rejected:
         """Grouped examples' rows as one unit, which the packer places in one window: each example's
@@ -462,11 +473,13 @@ class Fit(pygrain.MapTransform):
             if isinstance(fitted, Rejected):
                 return self._apart(grouped)
             rows.extend((index, row) for row in fitted)
-        length = sum(self._longest(row) for _, row in rows)
+        sizes = [self._longest(row) for _, row in rows]
+        length, contexts = sum(tokens for tokens, _ in sizes), sum(context for _, context in sizes)
         questions = sum(len(row.names) for _, row in rows)
         bounds = self.bounds
-        if length > self.layout.max_len or (bounds is not None and (len(rows) > bounds.segments
-                                                                    or questions > bounds.questions)):
+        held = self.context_window is None or contexts <= self.context_window
+        if length > self.layout.max_len or not held or (
+                bounds is not None and (len(rows) > bounds.segments or questions > bounds.questions)):
             return self._apart(grouped)
         options = max(len(grouped.examples[index].questions[name].options)
                       for index, row in rows for name in row.names)
@@ -616,20 +629,20 @@ def _along_fields(element: Batch, when: tuple[str, ...] = ("always", "trained"))
                  if field.name in element and field.when in when)
 
 
-def packing(layout: Layout, bounds: Bounds, context_length: int | None = None, grouped: bool = False) -> Pack:
+def packing(layout: Layout, bounds: Bounds, context_window: int | None = None, grouped: bool = False) -> Pack:
     """Rows of `layout` packed first-fit into windows of its `max_len`, each
     window's rows, questions and options within `bounds` (`Layout.bounds`),
-    and with a `context_length` each row's context along an axis of its own,
-    room for `bounds.segments` contexts of that many tokens, end to end in the
-    order their rows stand (`PackedRows`' `context_segments`)."""
+    and with a `context_window` each row's context along an axis of its own of
+    that many tokens, end to end in the order their rows stand (`PackedRows`'
+    `context_segments`): a window holds rows while both its streams do."""
     parallel = isinstance(layout, QuestionLayout) and layout.parallel
     blocked = isinstance(layout, QuestionLayout) and layout.blocks
     along = tuple((name, bounds.questions) for name in _along(layout, grouped))
-    if context_length is not None:
-        along = (*along, ("context", bounds.segments * context_length))
+    if context_window is not None:
+        along = (*along, ("context", context_window))
         if grouped:
             # Each context token's row in its unit, as `row` numbers the tokens'.
-            along = (*along, ("context_row", bounds.segments * context_length))
+            along = (*along, ("context_row", context_window))
     if grouped:
         # A unit of rows packs as one document, one entry a row on an axis of the window's rows.
         along = (*along, ("unit_rows", bounds.segments))
@@ -642,7 +655,8 @@ def _rows(batch: Batch, spans_in_context: bool = False) -> tuple[np.ndarray, np.
     """Each packed row's tokens, questions and options, window by window: a question the row its span
     starts in, or, where the spans are the context's, the window's one row (`question_owners`)."""
     segments = np.asarray(batch["segments"])
-    owners = question_owners(segments, batch["spans"], np.asarray(batch["questions"]), spans_in_context)
+    owners = question_owners(segments, batch["spans"], np.asarray(batch["questions"]), spans_in_context,
+                             rows=batch.get("question_rows"))
     options = np.sum(np.asarray(batch["options"], bool), axis=-1)
     counted = []
     for window, owner, option in zip(segments, owners, options, strict=True):
@@ -705,24 +719,32 @@ def _window_groups(element: Batch, owners: np.ndarray, options: np.ndarray
 @dataclass(frozen=True)
 class PackedRows(pygrain.MapTransform):
     """A window of packed rows (`packing`) as `DecisionInputs` reads it: each
-    row's spans moved to where it starts in the window, and with
-    `option_slots` the window's real options compacted to that many slots
-    (`compacted`). Every window is `max_length` tokens, which a token budget
-    divides into rows."""
+    question's row as the packer placed it (`question_rows`), each row's spans
+    moved to where it starts in the window, along its tokens, or along the
+    window's contexts where its spans are its context's (`spans_in_context`),
+    and with `option_slots` the window's real options compacted to that many
+    slots (`compacted`). Every window is `max_length` tokens, which a token
+    budget divides into rows."""
 
     max_length: int
     option_slots: int | None = None
+    spans_in_context: bool = False
 
     def map(self, element: Batch) -> Batch:
         units = np.asarray(element["tokens_segment_ids"])
         owned = np.asarray(element["kinds_segment_ids"])
         segments, owners, positions = _unit_rows(element, units, owned)
-        starts = np.concatenate([[0], np.cumsum(np.bincount(segments)[1:])]).astype(np.int32)
+        contexts = self._context_rows(element, units) if "context" in element else None
+        # A row's spans count from where it starts along the stream they index: its tokens, or its context.
+        along = contexts if self.spans_in_context and contexts is not None else segments
+        counts = np.bincount(along, minlength=int(owners.max(initial=0)) + 1)
+        starts = np.concatenate([[0], np.cumsum(counts[1:])]).astype(np.int32)
         moved = np.where(owners > 0, starts[np.maximum(owners - 1, 0)], 0)
         options = np.asarray(element["options"])
         laid = {name: element[name] for name in ("tokens", *_along_fields(element))} | {
             "segments": segments,
             "positions": element["positions"] if "slots" in element else positions,
+            "question_rows": owners.astype(np.int32),
             "spans": element["spans"] + moved[:, None],
             "option_spans": element["option_spans"] + (moved[:, None] * options)[..., None],
         }
@@ -737,13 +759,19 @@ class PackedRows(pygrain.MapTransform):
         if "blocks" in element:
             # Each row keeps its own blocks where the window packed it; the padding is in none.
             laid["blocks"] = np.where(segments > 0, np.asarray(element["blocks"]), -1).astype(np.int32)
-        if "context" in element:
-            # Each row's context in the order the rows stand, numbered as `segments` numbers its row.
-            contexts = np.asarray(element["context_segment_ids"])
+        if contexts is not None:
             laid["context"] = element["context"]
-            laid["context_segments"] = (_numbered(element, units)(contexts, element["context_row"])
-                                        if "row" in element else contexts.astype(np.int32))
+            laid["context_segments"] = contexts
             laid["context_lengths"] = np.int32(np.count_nonzero(contexts))
         if self.option_slots is not None:
             laid["option_slots"], laid["slotted"] = compacted(options, self.option_slots)
         return laid
+
+    @staticmethod
+    def _context_rows(element: Batch, units: np.ndarray) -> np.ndarray:
+        """Each context token's row in the window, its rows' contexts in the order the rows stand,
+        numbered as `segments` numbers their tokens (0 for padding)."""
+        contexts = np.asarray(element["context_segment_ids"])
+        if "row" in element:
+            return _numbered(element, units)(contexts, element["context_row"])
+        return contexts.astype(np.int32)
