@@ -122,12 +122,26 @@ def _custom(eqn, *operands, **params):
         return pull(jax.tree.map(jax.numpy.ones_like, outs))
 
     shapes = {aval.shape for aval in traced} - {()}
-    programs = [params["call_jaxpr"].jaxpr, jax.make_jaxpr(pulled)(*traced).jaxpr]
-    if len(shapes) > 1 or not all(_axis_free(program, *shapes) for program in programs):
-        raise Untransposable(f"a {eqn.primitive.name} whose program or derivative reads an axis")
+    programs = [params["call_jaxpr"], jax.make_jaxpr(pulled)(*traced)]
+    if len(shapes) > 1 or not all(_axis_free(program.jaxpr, *shapes) and not _tiles_in(program)
+                                  for program in programs):
+        raise Untransposable(f"a {eqn.primitive.name} whose program or derivative reads an axis or a "
+                             "constant tile")
     out = call(*[jax.lax.reshape(value, aval.shape) if aval.ndim == 2 else value
                  for value, aval in zip(operands, traced, strict=True)])
     return [jax.lax.reshape(value, _swapped(value.shape)) if value.ndim == 2 else value for value in out]
+
+
+def _tiles_in(closed) -> bool:
+    """Whether a closed program holds a constant tile, among its constants or its operations' literals, its
+    nested programs' too."""
+    def literal_tiles(jaxpr: jax_core.Jaxpr) -> bool:
+        return any(isinstance(var, jax_core.Literal) and _rank(var) == 2
+                   for eqn in jaxpr.eqns for var in eqn.invars) or any(
+            literal_tiles(inner) for eqn in jaxpr.eqns for inner in jax_core.jaxprs_in_params(eqn.params))
+
+    return (any(len(getattr(value, "shape", ())) == 2 for value in closed.consts)
+            or literal_tiles(closed.jaxpr))
 
 
 def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
@@ -164,8 +178,8 @@ RULES: dict[str, Callable] = {
 held operands with each axis it names swapped."""
 
 ENTRYWISE = frozenset({
-    "abs", "acos", "acosh", "add", "and", "asin", "asinh", "atan", "atan2", "atanh", "cbrt", "ceil", "clamp",
-    "convert_element_type", "copy", "copy_p", "cos", "cosh", "div", "eq", "erf", "erf_inv", "erfc", "exp",
+    "abs", "acos", "acosh", "add", "add_any", "and", "asin", "asinh", "atan", "atan2", "atanh", "cbrt", "ceil",
+    "clamp", "convert_element_type", "copy", "copy_p", "cos", "cosh", "div", "eq", "erf", "erf_inv", "erfc", "exp",
     "exp2", "expm1", "floor", "ge", "gt", "integer_pow", "is_finite", "le", "lgamma", "digamma", "log",
     "log1p", "logistic", "lt", "max", "min", "mul", "ne", "neg", "nextafter", "not", "or", "pow",
     "population_count", "rem", "round", "rsqrt", "select_n", "shift_left", "shift_right_arithmetic",

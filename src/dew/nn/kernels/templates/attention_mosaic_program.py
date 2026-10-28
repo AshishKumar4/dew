@@ -248,7 +248,7 @@ def transposable(hooks: Hooks) -> bool:
     """Whether the score hook and its pullback run on a tile held keys first (`[bk, bq]`, the dK/dV
     program's) as written for the reference's `[bq, bk]` (`layout.transposed`): traced, never run, at every
     tile shape a program takes (`TILE_SIDES`), which no operation it has no rule for refuses
-    (`layout.Untransposable`), and one entry at a time in the logits and its floating parameters
+    (`layout.Untransposable`), and at each one entry at a time in the logits and its floating parameters
     (`_entrywise`), as the slopes the backward multiplies its cotangents by assume (`algebra.scored`)."""
     if not callable(hooks.score_mod):
         return True
@@ -264,10 +264,12 @@ def _transposable(score_mod, params: tuple) -> bool:
             _score_jaxprs(layout.transposed(score_mod), params, tile, differentiated=True)
     except layout.Untransposable:
         return False
-    tile = (TILE_SIDES[0], TILE_SIDES[1])
-    canonical = _score_jaxprs(score_mod, params, tile, differentiated=False)[0]
-    floating = floating_params([_entries(kind, dtype, tile) for kind, dtype in params])
-    return _entrywise(canonical, {0, *(3 + index for index in floating)}, tile)
+    for tile in ((rows, columns) for rows in TILE_SIDES for columns in TILE_SIDES):
+        canonical = _score_jaxprs(score_mod, params, tile, differentiated=False)[0]
+        floating = floating_params([_entries(kind, dtype, tile) for kind, dtype in params])
+        if not _entrywise(canonical, {0, *(3 + index for index in floating)}, tile):
+            return False
+    return True
 
 
 def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -> bool:
