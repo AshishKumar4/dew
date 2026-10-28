@@ -65,9 +65,12 @@ class Family:
     divergences (`algebra.Forward.base2`), which run natural alone; whether its one divergence is its
     weighted values' sums passing fp32's largest (`overflows`), which a walk guarding its sums' headroom
     (`algebra.Forward.headroom`) keeps finite in either form; the slices the decode kernel cuts
-    each row's keys into (`splits`), whose states it merges; and whether it is a decode step's alone
+    each row's keys into (`splits`), whose states it merges; whether it is a decode step's alone
     (`decode_only`), a shape the template's interpreted mainloops would take too long over, which its
-    template twin covers in fewer programs. Its declared seeds are `SEEDS`'."""
+    template twin covers in fewer programs; and whether its queries' products with the keys pass fp32's
+    largest before the scale (`query_first`), where jax's attention, which scales its products, overflows,
+    so its reference takes the query scaled first, as Dew's reference path and flax's do (`_reference`).
+    Its declared seeds are `SEEDS`'."""
 
     draw: Callable[[int], tuple]
     keep: np.ndarray
@@ -78,6 +81,7 @@ class Family:
     dtype: str = "float32"
     splits: int = 1
     decode_only: bool = False
+    query_first: bool = False
 
 
 def _normal(seed: int, *shapes) -> list[np.ndarray]:
@@ -589,9 +593,9 @@ def _families() -> dict[str, Family]:
         # Its logits near fp32's largest, so the default form's fold takes them past it (the fold's documented
         # divergence, `algebra.Forward.base2`): the accurate form alone holds check 1.
         "a product past fp32's largest before a small scale, float32": Family(
-            _product_past_largest, _kept(1, 2), folded=False),
+            _product_past_largest, _kept(1, 2), folded=False, query_first=True),
         "a product past fp32's largest before a small scale, bfloat16": Family(
-            _product_past_largest, _kept(1, 2), folded=False, dtype="bfloat16"),
+            _product_past_largest, _kept(1, 2), folded=False, dtype="bfloat16", query_first=True),
         # A query's gradient that cancels across its keys, in either dtype (`algebra.cotangent_product`).
         "keys an ulp apart, float32": Family(_near_keys("float32"), _kept(1, 2)),
         "keys an ulp apart, bfloat16": Family(_near_keys("bfloat16"), _kept(1, 2), dtype="bfloat16"),
@@ -695,12 +699,20 @@ def _reference(family: Family, *, anchored: bool) -> Callable:
     the values' dtype for their products (the gate's ruling, row 1362), wherever its API holds the
     family; the written-out one where a family has sinks or a resumed state, which it has no input for,
     or a query of no keys, to which it gives the values' mean where Dew and the truth give zeros (every
-    such family fp32, whose probabilities round to nothing)."""
+    such family fp32, whose probabilities round to nothing). A family whose products pass fp32's largest
+    before the scale (`Family.query_first`) gives jax's attention the query scaled first and a scale of 1:
+    the scale, 1/4 at its width of 16, a power of two, scales it exactly, so the logits are the scaled
+    products', rounded alike, but finite."""
     jax_holds = not anchored and np.asarray(family.keep).any(-1).all()
 
     def attend(query, key, value, extra):
         if isinstance(extra, tuple):
             out = _resumed_attention(query, key, value, extra, family.keep)
+        elif extra is None and jax_holds and family.query_first:
+            scale = query.shape[-1] ** -0.5
+            assert float(np.log2(scale)).is_integer(), "a query scaled first is exact at a power of two alone"
+            out = jax.nn.dot_product_attention(query * jnp.asarray(scale, query.dtype), key, value, scale=1.0,
+                                               mask=jnp.asarray(family.keep), implementation="xla")
         elif extra is None and jax_holds:
             out = jax.nn.dot_product_attention(query, key, value, mask=jnp.asarray(family.keep),
                                                implementation="xla")
