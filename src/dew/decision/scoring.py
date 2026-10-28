@@ -6,7 +6,8 @@ distribution, so training on it rewards honest probabilities over
 overconfident ones. Each rule here serves both roles: called on logits inside
 a step it is a per-row loss, and as a `Metric` it averages the same charge
 over a validation pass's `Decisions`. Rules can be added and scaled, as in
-`LogLoss() + 0.5 * Brier()`.
+`LogLoss() + 0.5 * Brier()`. Each rule's charge is the categorical's (`dew.nn.categorical`), which any
+objective's criterion composes on.
 
 The charge is against a target distribution t over the row's options,
 one-hot or soft, smoothed in training, and is zero for a certain, correct
@@ -83,8 +84,7 @@ class Brier(ScoringRule):
     name = "brier"
 
     def charge(self, logits, target, options, ordinal):
-        p = categorical.probabilities(logits, options)
-        return jnp.sum(jnp.where(options, (p - target) ** 2, 0.0), axis=-1)
+        return categorical.brier(logits, target, options)
 
 
 @dataclass(frozen=True)
@@ -94,8 +94,7 @@ class Spherical(ScoringRule):
     name = "spherical"
 
     def charge(self, logits, target, options, ordinal):
-        p = categorical.probabilities(logits, options)
-        return 1.0 - jnp.sum(target * p, axis=-1) / jnp.linalg.norm(p, axis=-1)
+        return categorical.spherical(logits, target, options)
 
 
 @dataclass(frozen=True)
@@ -112,11 +111,7 @@ class RankedProbability(ScoringRule):
     name = "rps"
 
     def charge(self, logits, target, options, ordinal):
-        p = categorical.probabilities(logits, options)
-        gaps = (jnp.cumsum(p, axis=-1) - jnp.cumsum(jnp.where(options, target, 0.0), axis=-1)) ** 2
-        cuts = jnp.maximum(jnp.sum(options, axis=-1) - 1, 1)
-        # The last cut, past every level, is always zero.
-        return jnp.where(ordinal, jnp.sum(jnp.where(options, gaps, 0.0), axis=-1) / cuts, 0.0)
+        return jnp.where(ordinal, categorical.ranked_probability(logits, target, options), 0.0)
 
     def __call__(self, artifact: Artifact, batch: Batch, /) -> tuple[float, float]:
         total, _ = super().__call__(artifact, batch)

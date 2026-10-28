@@ -8,14 +8,12 @@ counting the questions with a known answer. The proper scoring rules
 
 from dataclasses import dataclass
 
-import jax.numpy as jnp
 import numpy as np
 
 from dew.artifacts import Artifact, Decisions
 from dew.batch import Batch
-from dew.decision.calibration import tied_prefixes
-from dew.eval.common import metric_device
-from dew.objectives.base import Objective, Shown, mean_of_totals, merge_totals
+from dew.eval.calibration import expected_calibration_error, reliability_bins, risk_coverage_area
+from dew.objectives.base import Shown, mean_of_totals, merge_totals
 
 
 @dataclass(frozen=True)
@@ -51,7 +49,7 @@ def _tops(artifact: Artifact) -> tuple[np.ndarray, np.ndarray]:
 
 @dataclass(frozen=True)
 class Accuracy:
-    """The share of rows whose most likely option is the right one."""
+    """The share of answered questions whose most likely option is the right one."""
 
     name = "accuracy"
     reads = Decisions
@@ -59,9 +57,7 @@ class Accuracy:
 
     def __call__(self, artifact: Artifact, batch: Batch, /) -> tuple[float, float]:
         _, correct = _tops(artifact)
-        with metric_device():
-            share = Objective.accuracy(jnp.asarray(correct, jnp.float32), {})
-        return float(share.total), float(share.mass)
+        return float(np.sum(correct)), float(correct.size)
 
     merge = staticmethod(merge_totals)
     finalize = staticmethod(mean_of_totals)
@@ -87,19 +83,14 @@ class ECE:
     def binned(self, tops: np.ndarray, correct: np.ndarray) -> np.ndarray:
         """Per bin, the row count, the summed top probability `tops` and the
         number `correct`, for answers however they were drawn: `finalize`
-        reads these, from a run's validation pass or a served benchmark's."""
-        edges = np.linspace(0.0, 1.0, self.bins + 1)
-        index = np.clip(np.searchsorted(edges, tops, side="left") - 1, 0, self.bins - 1)
-        return np.stack([np.bincount(index, minlength=self.bins).astype(np.float64),
-                         np.bincount(index, tops, self.bins), np.bincount(index, correct, self.bins)])
+        reads these, from a run's validation pass or a served benchmark's (`reliability_bins`)."""
+        return reliability_bins(tops, correct, self.bins)
 
     def merge(self, accumulated: np.ndarray, contribution: np.ndarray) -> np.ndarray:
         return accumulated + contribution
 
     def finalize(self, accumulated: np.ndarray) -> float:
-        rows, confidence, correct = accumulated
-        filled = rows > 0
-        return float(np.sum(np.abs(confidence[filled] - correct[filled])) / rows.sum())
+        return expected_calibration_error(accumulated)
 
 
 @dataclass(frozen=True)
@@ -125,7 +116,4 @@ class AURC:
                 np.concatenate([accumulated[1], contribution[1]]))
 
     def finalize(self, accumulated: tuple[np.ndarray, np.ndarray]) -> float:
-        tops, correct = accumulated
-        _, accepted, right = tied_prefixes(tops, correct)
-        risk = 1.0 - right / accepted
-        return float(np.sum(risk * np.diff(np.concatenate(([0], accepted)))) / len(tops))
+        return risk_coverage_area(*accumulated)

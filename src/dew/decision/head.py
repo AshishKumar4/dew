@@ -31,13 +31,13 @@ from dew.nn.attention import NormalAttention, l2_normalized
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, decoder_norm
 from dew.nn.blocks import TokenEmbedding
 from dew.nn.dense import Dense
-from dew.nn.flops import attention_flops, projection_flops, real_lengths
+from dew.nn.flops import attention_flops, matching_lengths, projection_flops, real_lengths
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
-from dew.nn.precision import accumulated, at_least_fp32, capped_logits, divided, scaled_logits
-from dew.nn.scatter import DROPPED
+from dew.nn.precision import accumulated, at_least_fp32, capped_logits, divided, scaled_logits, span_means
+from dew.nn.scatter import DROPPED, gather_positions
 from dew.registry import Record, component, from_record, import_path, record_fields
 
 
@@ -137,7 +137,7 @@ class DecisionHead(Head):
         """Full-row encoder layers and the scorer at real option markers; it pools no spans."""
         if pooled is not None:
             raise TypeError("Laya's head scores options at their markers in the row, and pools no context")
-        decision_geometry(lengths, questions, options)
+        matching_lengths(lengths, questions, options)
         per_layer = (12 * projection_flops(lengths, self.features, self.features)
                      + attention_flops(lengths, 1, self.features, self.features, causal=False))
         return (self.layers * per_layer + projection_flops(options, self.features, self.features)
@@ -185,7 +185,7 @@ class DecisionHead(Head):
             if not isinstance(x, jax.Array):
                 raise TypeError("the head's blocks carry one plain residual stream")
         batch, count, width = inputs.markers.shape
-        marked = _gathered(x, inputs.markers.reshape(batch, count * width))
+        marked = gather_positions(x, inputs.markers.reshape(batch, count * width))
         hidden = gelu_exact_torch(self.scorer_hidden(self.scorer_norm(marked)))
         scores = self.scorer_out(hidden)[..., 0].reshape(batch, count, width)
         return scores.astype(at_least_fp32(scores.dtype))
@@ -262,28 +262,6 @@ class _FieldLayer(nn.Module):
         return fields + mlp(_layer_norm(self.dtype, "norm3")(fields))
 
 
-def _span_means(values: jax.Array, spans: jax.Array) -> jax.Array:
-    """The mean of `values` `[B, L, D]` over each `[..., 2]` (start, end) span of its row.
-
-    `spans` is `[B, ...]`; an empty span, a padding slot's, gives zeros. A token no span of its row
-    reads is selected away before the product, so padding's NaN or infinity never reaches a mean (the
-    rule of `dew.nn.precision.weighted_total`).
-    """
-    positions = jnp.arange(values.shape[1])
-    inside = (positions >= spans[..., :1]) & (positions < spans[..., 1:])
-    counts = jnp.maximum(jnp.sum(inside, axis=-1, keepdims=True), 1)
-    flat = inside.reshape(inside.shape[0], -1, inside.shape[-1])
-    read = jnp.where(jnp.any(flat, axis=1)[..., None], values, 0)
-    summed = accumulated(functools.partial(jnp.einsum, "bnl,bld->bnd"), flat.astype(values.dtype), read)
-    summed = summed.reshape(*inside.shape[:-1], values.shape[-1])
-    return summed / counts.astype(values.dtype)
-
-
-def _gathered(values: jax.Array, indices: jax.Array) -> jax.Array:
-    """`values` `[B, N, ...]` at each row's `indices` `[B, P]`: `[B, P, ...]`."""
-    return jnp.take_along_axis(values, indices.reshape(*indices.shape, *(1,) * (values.ndim - 2)), axis=1)
-
-
 def _per_slot(values: jax.Array, owners: jax.Array, inputs: DecisionInputs) -> jax.Array:
     """Each question's `values` `[B, Q, F]` at its option slots, `[B, P, F]`: on the grid a question's
     `width` slots repeat it, a broadcast whose transpose sums them, and compacted slots gather by their
@@ -291,7 +269,7 @@ def _per_slot(values: jax.Array, owners: jax.Array, inputs: DecisionInputs) -> j
     joint head's three [8, 75, 1024] reads at [8, 7500, 1024] slots took 3.99 ms forward and backward
     on an A100 40GB as gathers, 0.18 as broadcasts."""
     if inputs.option_slots is not None:
-        return _gathered(values, owners)
+        return gather_positions(values, owners)
     batch, count, width = inputs.options.shape
     return jnp.broadcast_to(values[:, :, None], (batch, count, width, *values.shape[2:])).reshape(
         batch, count * width, *values.shape[2:])
@@ -362,7 +340,7 @@ class JointSchemaHead(Head):
         Span pooling is a masked matrix product and is counted. Lookup
         embeddings and pointwise normalization/gates are excluded.
         """
-        length, question, option = decision_geometry(lengths, questions, options)
+        length, question, option = matching_lengths(lengths, questions, options)
         width, hidden = self.width, self.hidden_size
         projected = np.sum(length + 2 * question + 2 * option) + np.count_nonzero(length)
         count = 2 * hidden * width * projected
@@ -434,17 +412,17 @@ class JointSchemaHead(Head):
         rows = inputs.question_segments
         own = (rows[:, :, None] == inputs.segments[:, None, :]) | (rows[:, :, None] == 0)
         last = jnp.max(jnp.where(own, jnp.arange(inputs.tokens.shape[1]), 0), axis=-1)
-        last_state = _gathered(hidden, last)
-        questions = _span_means(pooled, inputs.spans)
+        last_state = gather_positions(hidden, last)
+        questions = span_means(pooled, inputs.spans)
         count, width = inputs.options.shape[1:]
         # The option slots computed, `[B, P]` flat indices into the grid, and each one's question.
         slots = (jnp.broadcast_to(jnp.arange(count * width, dtype=jnp.int32), (batch, count * width))
                  if inputs.option_slots is None else inputs.option_slots)
         owners = slots // width
-        option_spans = _gathered(inputs.option_spans.reshape(batch, count * width, 2), slots)
-        contexts = _span_means(pooled, option_spans)
+        option_spans = gather_positions(inputs.option_spans.reshape(batch, count * width, 2), slots)
+        contexts = span_means(pooled, option_spans)
         rows_of_tokens = jnp.take(table, pooled_tokens, axis=0).astype(hidden.dtype)
-        lexical = _span_means(rows_of_tokens, option_spans)
+        lexical = span_means(rows_of_tokens, option_spans)
 
         queries = (self.option_context_projection(contexts) + self.option_lexical_projection(lexical)
                    + _per_slot(self.option_question_projection(questions), owners, inputs))
@@ -485,25 +463,17 @@ class JointSchemaHead(Head):
         return _laid_back(scores.astype(at_least_fp32(scores.dtype)), inputs)
 
 
-def decision_geometry(lengths, questions, options):
-    """One nonnegative integer geometry per row, widened before products."""
-    geometry = tuple(real_lengths(column) for column in (lengths, questions, options))
-    if any(column.shape != geometry[0].shape for column in geometry[1:]):
-        raise ValueError("decision FLOPs need lengths, questions and options of the same [rows] shape")
-    return geometry
-
-
 def _answers(states: jax.Array, inputs: DecisionInputs) -> jax.Array:
     """Each question's answer state `[B, Q, D]`, at its row's answer cue (`DecisionInputs.readout`)."""
     if inputs.readout is None:
         raise ValueError("a readout of labels reads rows whose options stand under labels (Labels)")
-    return _gathered(states, inputs.readout)
+    return gather_positions(states, inputs.readout)
 
 
 class LabelReadout(Head):
     """Dew's readout of labels: each option slot's logit is the backbone's own logit for its label at
     the question's answer cue (`dew.decision.layout.Labels`), through the output table's input QDQ,
-    scale, bias and softcap, computed in fp32 (`DecisionModel.label_logits`, `OutputTable.columns`).
+    scale, bias and softcap, computed in fp32 (`DecisionModel.readout_logits`, `OutputTable.columns`).
     A label read as several token variants (`label_ids[k]`, one id a variant) is their grouped logit,
     the logsumexp of theirs. Untrained, the head is the backbone's own readout.
 
@@ -550,7 +520,7 @@ class LabelReadout(Head):
     @nn.nowrap
     def decision_flops(self, lengths, questions, options) -> float:
         """The labels' product over each answer state: its slots' variants, a row each."""
-        decision_geometry(lengths, questions, options)
+        matching_lengths(lengths, questions, options)
         variants = len(self.label_ids[0]) if self.label_ids else 1
         return projection_flops(questions, self.features, len(self.label_ids) * variants)
 
@@ -615,7 +585,7 @@ class SlotReadout(Head):
     def decision_flops(self, lengths, questions, options) -> float:
         """Each real option's slot product and key, its affinity with its question's query, and its
         line's pooling over the row; each question's query."""
-        widths, _, counted = decision_geometry(lengths, questions, options)
+        widths, _, counted = matching_lengths(lengths, questions, options)
         return (projection_flops(questions, self.features, self.head_dim)
                 + projection_flops(options, self.features, 1 + self.head_dim)
                 + 2 * np.sum(counted) * self.head_dim + 2 * np.sum(counted * widths) * self.features)
@@ -645,7 +615,7 @@ class SlotReadout(Head):
         k = self.param("k", nn.initializers.zeros, (self.head_dim, self.features), drawn_dtype)
         states = states.astype(_wide(jnp.result_type(states, slots), self.dtype))
         answers = _answers(states, inputs)
-        pooled = _span_means(states, inputs.option_spans[:, :, :real])
+        pooled = span_means(states, inputs.option_spans[:, :, :real])
         highest = jax.lax.Precision.HIGHEST
         score = jnp.einsum("bqd,kd->bqk", answers, slots[:real], precision=highest)
         query = jnp.einsum("bqd,hd->bqh", answers, q, precision=highest)

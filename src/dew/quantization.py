@@ -46,13 +46,15 @@ calls raise an error that names the extra.
 """
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import functools
 import importlib
 import inspect
 import math
 import re
-from collections.abc import Callable, Hashable, Mapping, Sequence
+from collections.abc import Callable, Hashable, Iterator, Mapping, Sequence
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_checkable
 
@@ -65,10 +67,10 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from dew.cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.kernels.generation import backend, linear_map
-from dew.nn.precision import accumulated, bf16_dot_general, correctly_rounded_divide
+from dew.nn.precision import accumulated, at_least_fp32, bf16_dot_general, correctly_rounded_divide
 
 if TYPE_CHECKING:
-    from qwix import QArray, QuantizationProvider
+    from qwix import QArray, QtProvider, QuantizationProvider
 
     from dew.batch import Variables
     from dew.diffusion.process import Conditioning
@@ -397,6 +399,39 @@ def decoded_frozen_fp8(variables: Variables) -> Variables:
     decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
     decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **kernels})
     return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
+
+
+MOVING: contextvars.ContextVar[bool] = contextvars.ContextVar("dew.quantization.MOVING", default=False)
+"""Whether the products a trace forms multiply by moving weights (`moving_weights`)."""
+
+
+@contextlib.contextmanager
+def moving_weights() -> Iterator[None]:
+    """Trace a module's products at weights a layer moves from their stored values each call (an
+    in-context memory's network at the state its steps move from W_0): serving quantization multiplies
+    them as quantized training does, each rounded to its rule's dtype at each product and its gradient
+    rounded as the rule's backward fields ask (`_serving_provider`), as no stored quantized copy of a
+    moving weight exists. The products of every other weight are as the provider forms them."""
+    token = MOVING.set(True)
+    try:
+        yield
+    finally:
+        MOVING.reset(token)
+
+
+def decoded_stored(variables: Variables) -> Variables:
+    """`variables` with each weight serving quantization stores quantized (`Annotated`, Qwix's
+    post-training annotation) decoded by Qwix's public `dequantize` into the float its values and
+    scales hold: the stored weight a layer that moves its weights starts from (`dew.nn.memory`'s W_0),
+    every other leaf as it is."""
+    params = flatten_dict(dict(variables.get("params", {})),
+                          is_leaf=lambda _, leaf: isinstance(leaf, Annotated))
+    if not any(isinstance(leaf, Annotated) for leaf in params.values()):
+        return variables
+    dequantize = _qwix().dequantize
+    decoded = {path: dequantize(leaf.array) if isinstance(leaf, Annotated) else leaf
+               for path, leaf in params.items()}
+    return {**variables, "params": unflatten_dict(decoded)}
 
 
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
@@ -1128,9 +1163,10 @@ def _grouped_convolution_gradient() -> type:
         grouped convolution everywhere.
 
         An ungrouped convolution with quantized activations quantizes its
-        float32 operands and returns the input's dtype, so Qwix scales its
-        8-bit product in float32 as `GroupScaledConvolution` does a grouped
-        one's. From bf16 operands Qwix scaled it in bf16, and XLA:GPU, which
+        operands in at least float32 (`at_least_fp32`, float64 for float64
+        ones) and returns the input's dtype, so Qwix scales its 8-bit product
+        in float32 as `GroupScaledConvolution` does a grouped one's, and a
+        float64 run keeps float64 throughout. From bf16 operands Qwix scaled it in bf16, and XLA:GPU, which
         lowers an int8 convolution only with a float32 result, failed to
         compile a bf16 int8 convolution (`UNIMPLEMENTED: Can't lower one or
         more integer convolutions`, the RTX 4080)."""
@@ -1159,8 +1195,9 @@ def _grouped_convolution_gradient() -> type:
                         "Qwix 0.1.8's quantized gradients of a convolution (bwd_qtype) convolve two int8 "
                         "operands into an int32 accumulator, which XLA:GPU cannot run (UNIMPLEMENTED on "
                         "an A100); leave bwd_qtype unset, whose float gradients Dew computes")
+                wide = at_least_fp32(jnp.result_type(lhs, rhs))
                 return super().conv_general_dilated(
-                    lhs.astype(jnp.float32), rhs.astype(jnp.float32), window_strides, padding, lhs_dilation,
+                    lhs.astype(wide), rhs.astype(wide), window_strides, padding, lhs_dilation,
                     rhs_dilation, dimension_numbers, feature_group_count, batch_group_count, precision,
                     preferred_element_type, out_sharding).astype(lhs.dtype)
             if feature_group_count > 1 and rule.bwd_qtype is not None:
@@ -1173,9 +1210,10 @@ def _grouped_convolution_gradient() -> type:
                 raise ValueError("subchannel is not supported for conv_general_dilated.")
             rule, op_id = self._get_current_rule_and_op_id("conv_general_dilated")
             if feature_group_count == 1:
-                # Quantized from float32 and returned in the input's dtype, so the 8-bit product is
-                # scaled in float32 (the class docstring).
-                lhs, rhs, dtype = lhs.astype(jnp.float32), rhs.astype(jnp.float32), lhs.dtype
+                # Quantized from at least float32 and returned in the input's dtype, so the 8-bit product
+                # is scaled in at least float32 (the class docstring), float64 where the operands are.
+                wide = at_least_fp32(jnp.result_type(lhs, rhs))
+                lhs, rhs, dtype = lhs.astype(wide), rhs.astype(wide), lhs.dtype
             else:
                 dtype = None
             config = self._create_conv_general_qt_config(rule, op_id, lhs, rhs)
@@ -1348,12 +1386,23 @@ def _serving_provider() -> type:
     class PtqProvider(_group_scaled_convolution(), _complex_in_float(), qwix.PtqProvider):
         keeps_out_sharding: ClassVar[bool] = True  # ptq.py:180 passes it on
 
-        def __init__(self, rules: Sequence[object]) -> None:
+        def __init__(self, rules: Sequence[object], moving: Sequence[object]) -> None:
             super().__init__(
                 rules, _dot_general_fn=_scaled_in_float32(qwix.dot_general),
                 _einsum_fn=_scaled_in_float32(qwix.einsum),
                 _conv_general_dilated_fn=_scaled_in_float32(
                     _integer_convolution_on_cuda(qwix.conv_general_dilated)))
+            # The training provider over the spec's training rules, which forms a moving weight's
+            # products (`moving_weights`).
+            self._moving = _providers()[0](moving)
+
+        def _moved(self, op: str, weight) -> QtProvider | None:
+            """The training provider that multiplies `weight` where it is a moving weight a rule matches
+            (`moving_weights`), rounded at each product, as no stored copy of it exists; None for any
+            other weight."""
+            if not MOVING.get() or isinstance(weight, Annotated) or not self._matched(op):
+                return None
+            return self._moving
 
         def _recorded(self, op: str, weight) -> bool:
             """Whether `weight` is a stored quantized kernel that reaches `op` with no rule matching
@@ -1371,6 +1420,9 @@ def _serving_provider() -> type:
 
         def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
                         preferred_element_type=None, *, out_sharding=None):
+            if (moving := self._moved("dot_general", rhs)) is not None:
+                return moving.dot_general(lhs, rhs, dimension_numbers, precision, preferred_element_type,
+                                          out_sharding=out_sharding)
             if not self._recorded("dot_general", rhs):
                 return super().dot_general(lhs, rhs, dimension_numbers, precision, preferred_element_type,
                                            out_sharding=out_sharding)
@@ -1378,7 +1430,14 @@ def _serving_provider() -> type:
                                        dimension_numbers, out_sharding=out_sharding)
             return _honoured(out, preferred_element_type, None)
 
+        def conv_general_dilated(self, lhs, rhs, *args, **kwargs):
+            if (moving := self._moved("conv_general_dilated", rhs)) is not None:
+                return moving.conv_general_dilated(lhs, rhs, *args, **kwargs)
+            return super().conv_general_dilated(lhs, rhs, *args, **kwargs)
+
         def einsum(self, einsum_str, *operands, **kwargs):
+            if len(operands) == 2 and (moving := self._moved("einsum", operands[1])) is not None:
+                return moving.einsum(einsum_str, *operands, **kwargs)
             if len(operands) != 2 or not self._recorded("einsum", operands[1]):
                 return super().einsum(einsum_str, *operands, **kwargs)
             preferred = kwargs.pop("preferred_element_type", None)
@@ -1541,7 +1600,9 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     under `Quantization.apply` does, and a matmul of two quantized operands
     runs in the quantized dtype. `args` and `kwargs` are one example call of
     the model, which Qwix traces abstractly to find the kernels its
-    matmuls read. `spec`'s backward fields have nothing to do here.
+    matmuls read. A weight a layer moves from its stored value each call (an in-context memory's
+    W_0) is stored quantized too, and its moving products round as quantized training rounds them
+    (`moving_weights`), its backward fields included: those are the only products they rule here.
 
     A weight-only spec leaves convolutions in float: Qwix 0.1.8's serving
     provider quantizes a convolution's weights only together with its
@@ -1554,7 +1615,7 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     JAX parameters keep their placement through Qwix's operations.
     """
     rules = _rules(spec, training=False)
-    served = _quantized(model, _providers()[1](rules), spec)
+    served = _quantized(model, _providers()[1](rules, _rules(spec, training=True)), spec)
     def initialized(scope: core.Scope, supplied: Variables):
         # Initialization lets Qwix annotate each weight with its quantization
         # recipe. Seed the scope first so data-dependent module layouts, such
@@ -1569,5 +1630,5 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     return served, {**variables, "params": parameters}
 
 
-__all__ = ["InputQuantization", "Quantization", "QuantizedProducts", "QuantizedTrace", "quantize_with",
-           "split_columns"]
+__all__ = ["InputQuantization", "Quantization", "QuantizedProducts", "QuantizedTrace", "decoded_stored",
+           "moving_weights", "quantize_with", "split_columns"]
