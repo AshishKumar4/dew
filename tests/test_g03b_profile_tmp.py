@@ -37,4 +37,4 @@ def test_unet_run_once_phases(tmp_path):
         state = timed("trainer_place", lambda: trainer.place()[0])
         batch = timed("placed_batch", lambda: tool.placed(tool.drawn_batch(case, 0), trainer.device_mesh))
         timed("trainer_compile_other_layout", lambda: trainer.compile(state, batch))
-    assert not times, times
+    raise AssertionError("phases:\n" + "\n".join(f"{name}={seconds}" for name, seconds in times.items()))
