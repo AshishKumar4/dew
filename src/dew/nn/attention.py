@@ -209,19 +209,20 @@ def combined_attention_mask(query_length: int, key_length: int, causal: bool,
 
 def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: int | None,
               segment_ids=None, key_value_seq_lengths=None, key_value_seq_starts=None, *, block_groups=None,
-              image_groups=None, key_valid=None, key_runs=None, places=None,
-              rows: int | None = None) -> template.KeySpans:
+              image_groups=None, key_valid=None, key_runs=None, places=None, chunk: int | None = None,
+              query_slots=None, rows: int | None = None) -> template.KeySpans:
     """The keys each query of a call sees as the template's spans (`template.spans`), from the
-    coordinates `scaled_dot_product_attention` takes: causality, a window, documents (`CrossDocuments`
-    aligned to their last keys), key lengths and starts, block and image groups, and the keys' validity
-    `key_valid` `[B, K]`, and each query's key runs `key_runs` `[B, Q, R, 2]`, whose union it may see
-    (`template.spans`'s `runs`). `places` `[B, S]` are a call's own tokens' places a window counts by
-    (`counted_places`), by default their indices, or a pair, its queries' `[B, Q]` and its keys' `[B, K]`.
-    `rows` is the call's batch, by default the coordinates' own, or one where none carries it, which every
-    row shares."""
+    coordinates `scaled_dot_product_attention` takes: causality, a window, a chunk of `chunk` places
+    (`chunk_mask`), documents (`CrossDocuments` aligned to their last keys), key lengths and starts, block
+    and image groups, and the keys' validity `key_valid` `[B, K]`, and each query's key runs `key_runs`
+    `[B, Q, R, 2]`, whose union it may see (`template.spans`'s `runs`). `places` `[B, S]` are a call's own
+    tokens' places a window or a chunk counts by (`counted_places`), by default their indices, or a pair,
+    its queries' `[B, Q]` and its keys' `[B, K]`. `query_slots` `[B, Q]` are the queries' own keys in a
+    cache call, -1 for padding (`template.spans`' `slots`). `rows` is the call's batch, by default the
+    coordinates' own, or one where none carries it, which every row shares."""
     pair = places if isinstance(places, tuple) else (places, places)
     given = [None if segment_ids is None else document_ids(segment_ids)[0], key_value_seq_lengths,
-             key_value_seq_starts, block_groups, image_groups, key_valid, key_runs, pair[0]]
+             key_value_seq_starts, block_groups, image_groups, key_valid, key_runs, pair[0], query_slots]
     if rows is None:
         rows = next((jnp.shape(x)[0] for x in given if x is not None), 1)
     lengths, starts = (None if x is None else jnp.asarray(x, jnp.int32)
@@ -232,8 +233,9 @@ def key_spans(query_length: int, key_length: int, causal: bool, sliding_window: 
                      jnp.broadcast_to(jnp.atleast_2d(pair[1]), (rows, key_length)))
     valid = None if key_valid is None else jnp.broadcast_to(key_valid, (rows, key_length))
     return template.spans(query_length, key_length, rows, causal=causal, sliding_window=sliding_window,
-                          positions=positions, segment_ids=segment_ids, lengths=lengths, starts=starts,
-                          block_groups=block_groups, image_groups=image_groups, valid=valid, runs=key_runs)
+                          chunk=chunk, positions=positions, segment_ids=segment_ids, lengths=lengths,
+                          starts=starts, block_groups=block_groups, image_groups=image_groups, valid=valid,
+                          runs=key_runs, slots=query_slots)
 
 
 def visibility_mask(query_length: int, key_length: int, causal: bool, sliding_window: int | None, mask=None,

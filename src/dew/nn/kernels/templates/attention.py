@@ -153,7 +153,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
           chunk: int | None = None, positions: tuple[jax.Array, jax.Array] | None = None, segment_ids=None,
           lengths: jax.Array | None = None, starts: jax.Array | None = None,
           block_groups: jax.Array | None = None, image_groups: jax.Array | None = None,
-          valid: jax.Array | None = None, runs: jax.Array | None = None) -> KeySpans:
+          valid: jax.Array | None = None, runs: jax.Array | None = None,
+          slots: jax.Array | None = None) -> KeySpans:
     """The `KeySpans` of a call of `queries` queries over `keys` keys in `batch` rows, in the terms
     `dew.nn.attention.scaled_dot_product_attention` takes them: `causal` keeps query i to keys 0..i (top
     left aligned, as jax's `is_causal`); `sliding_window=w` keeps the keys `window_sides` gives, the w - 1
@@ -181,10 +182,13 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     rest: a window over `positions` is searched within each run alone, whose key places never decrease
     (its builder's contract: a layout whose places restart, as a decision row's options do, splits its
     runs there), so the spans keep R intervals a query `[B, Q, R]`, but one run a query, which is one
-    interval `[B, Q]` as every mainloop walks it. Lengths and starts are int32 token coordinates; places
+    interval `[B, Q]` as every mainloop walks it. `slots` `[B, Q]` are the queries' own keys' indices, a cache
+    call's slots (by default each query's index, or a cross call's aligned place): causality ends a query's
+    keys at its slot, a window without `positions` counts keys from it and a block reads the block holding
+    it; a negative slot (padding) sees no key. Lengths, starts and slots are int32 token coordinates; places
     and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
-    from dew.nn.visibility import block_ends, block_starts, window_sides
+    from dew.nn.visibility import window_sides
 
     index = jnp.broadcast_to(jnp.arange(queries, dtype=jnp.int32)[None, :], (batch, queries))
     place = index
@@ -207,6 +211,10 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
             # A cross call's query sits at its rank among its document's keys, counted from the
             # document's first key (`cross_document_mask`).
             place = first + aligned_places(segment_ids).astype(jnp.int32)
+    if slots is not None:
+        place = jnp.broadcast_to(jnp.asarray(slots, jnp.int32), (batch, queries))
+        end = jnp.where(place < 0, 0, end)
+        start = jnp.where(place < 0, 0, start)
     if causal:
         end = jnp.minimum(end, place + 1)
     # The query's own key, which its block holds: a query placed before its document's keys has none.
@@ -226,25 +234,14 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         before, after = window_sides(causal, min(sliding_window, queries + keys + 1))
         start = jnp.maximum(start, place - before)
         end = jnp.minimum(end, place + after + 1)
-    for groups, whole in ((block_groups, True), (image_groups, False)):
-        if groups is None or not causal or keys == 0:
-            continue
-        # The block of the query's own key runs on to its end, and a whole block from its start, within
-        # the query's document.
-        groups = jnp.asarray(groups)
-        at = jnp.clip(place, 0, keys - 1)
-        inside = own & (jnp.take_along_axis(groups, at, axis=1) >= 0)
-        ends = jnp.take_along_axis(block_ends(groups), at, axis=1)
-        end = jnp.where(inside, jnp.maximum(end, jnp.minimum(ends, bound)), end)
-        if whole:
-            begins = jnp.take_along_axis(block_starts(groups), at, axis=1)
-            start = jnp.where(inside, jnp.minimum(start, jnp.maximum(begins, floor)), start)
+    if causal and keys > 0:
+        start, end = _grouped(start, end, place, own, (floor, bound), block_groups, image_groups)
     # Each narrowing by places a run takes alone: its keys' values in index order, never decreasing within a
     # run, and each query's least and greatest it keeps (`_within_runs`).
     by_places = []
     if chunk is not None:
         query_places, key_places = (
-            (index, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
+            (place, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
             if positions is None else positions)
         wanted = _chunk_of(query_places, chunk)
         by_places.append((_chunk_of(key_places, chunk), wanted, wanted))
@@ -264,11 +261,34 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
             by_places.append((key_places, _moved(query_places, -before), _moved(query_places, after)))
         start, end = _within_runs(jnp.asarray(runs, jnp.int32), start, end, keys, by_places)
     blocks = True if causal and (block_groups is not None or image_groups is not None) else None
-    narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks, valid, runs)
+    narrowed = (sliding_window, chunk, segment_ids, lengths, starts, blocks, valid, runs, slots)
     form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
     if valid is not None:
         query_ids, key_ids = _valid_ids(query_ids, key_ids, jnp.asarray(valid, bool), batch, queries)
     return KeySpans(start, end, query_ids, key_ids, keys, form)
+
+
+def _grouped(start: jax.Array, end: jax.Array, place: jax.Array, own: jax.Array,
+             document: tuple[jax.Array, jax.Array], block_groups, image_groups
+             ) -> tuple[jax.Array, jax.Array]:
+    """A causal call's `[start, end)` widened by its groups (`spans`): the block or image holding a query's
+    own key (`own`, at `place`) runs on to its end, and a whole block (`block_groups`) from its start, each
+    within the query's `document`, its first key and one past its last."""
+    from dew.nn.visibility import block_ends, block_starts
+
+    floor, bound = document
+    for groups, whole in ((block_groups, True), (image_groups, False)):
+        if groups is None:
+            continue
+        groups = jnp.asarray(groups)
+        at = jnp.clip(place, 0, groups.shape[1] - 1)
+        inside = own & (jnp.take_along_axis(groups, at, axis=1) >= 0)
+        ends = jnp.take_along_axis(block_ends(groups), at, axis=1)
+        end = jnp.where(inside, jnp.maximum(end, jnp.minimum(ends, bound)), end)
+        if whole:
+            begins = jnp.take_along_axis(block_starts(groups), at, axis=1)
+            start = jnp.where(inside, jnp.minimum(start, jnp.maximum(begins, floor)), start)
+    return start, end
 
 
 def _narrowed(start: jax.Array, end: jax.Array, order: jax.Array, run_lo: jax.Array, run_hi: jax.Array,
