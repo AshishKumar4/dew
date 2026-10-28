@@ -39,17 +39,21 @@ from dew.nn.mixers.short_conv import ShortConvMixer
 
 _KINDS = ('conv', 'full_attention', 'sliding_attention')
 
+_FEED_FORWARD: Renames = (
+    ('feed_forward.w1', 'mlp.gate_proj'), ('feed_forward.w3', 'mlp.up_proj'),
+    ('feed_forward.w2', 'mlp.down_proj'))
+"""LFM3's feed-forward names onto the shared ones, whole: its attention has a `gate_proj` of its own,
+which a bare `w1` for `gate_proj` would respell on export."""
+
 _SANDWICH: Renames = (
-    ('model.embedding_norm', 'model.norm'), ('feed_forward', 'mlp'), ('w1', 'gate_proj'),
-    ('w3', 'up_proj'), ('w2', 'down_proj'), ('operator_norm', 'input_layernorm'),
+    ('model.embedding_norm', 'model.norm'), *_FEED_FORWARD, ('operator_norm', 'input_layernorm'),
     ('post_operator_norm', 'post_attention_layernorm'), ('ffn_norm', 'pre_feedforward_layernorm'),
     ('post_ffn_norm', 'post_feedforward_layernorm'))
 """LFM3's names onto the shared ones under sandwich norms (`use_sandwich_norm`): the norm before
 each mixer and after it, before the feed-forward and after it, Gemma's four."""
 
 _PLAIN: Renames = (
-    ('model.embedding_norm', 'model.norm'), ('feed_forward', 'mlp'), ('w1', 'gate_proj'),
-    ('w3', 'up_proj'), ('w2', 'down_proj'), ('operator_norm', 'input_layernorm'),
+    ('model.embedding_norm', 'model.norm'), *_FEED_FORWARD, ('operator_norm', 'input_layernorm'),
     ('ffn_norm', 'post_attention_layernorm'))
 """LFM3's names onto the shared ones without sandwich norms: one norm before each mixer and one
 before each feed-forward."""

@@ -101,6 +101,10 @@ def test_a_native_decoder_saves_as_lfm3_and_reloads_the_same_model(tmp_path, san
     expected = np.asarray(model.apply(variables, ids))
     PretrainedDecoder.from_model(model, variables).save(tmp_path / 'saved')
     assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['model_type'] == 'lfm3'
+    if sandwich:
+        # The release's own tensor names, its attention's gate_proj beside its feed-forward's w1.
+        written = load_file(tmp_path / 'saved' / 'model.safetensors')
+        assert sorted(written) == sorted(load_file(TINY / 'model.safetensors'))
     restored = Pretrained.load(tmp_path / 'saved', dtype='float32', attention_impl='reference')
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)), expected)
 
