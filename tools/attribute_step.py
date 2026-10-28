@@ -55,7 +55,12 @@ from collections.abc import Iterable, Iterator
 from pathlib import Path
 
 from dew.nn.kernels.generation import gpu_target
-from dew.telemetry.instrumentation import HloInstruction, custom_call_kind, hlo_instructions
+from dew.telemetry.instrumentation import (
+    HloInstruction,
+    custom_call_kind,
+    hlo_instructions,
+    reported_instruction,
+)
 from dew.telemetry.profile import report_table
 from dew.telemetry.trace import collective, device_events, overlap, program_of, union, window_split
 
@@ -119,9 +124,7 @@ def kind_of(row: dict, ops: dict[str, HloInstruction] | None = None) -> str:
     name = str(row.get("hlo_op_name") or "")
     known = (ops or {}).get(name)
     if known is None:
-        # The row's expression is one instruction, cut short: read as a module of it alone.
-        alone = hlo_instructions(f"ENTRY %row () -> () {{\n  {row.get('hlo_op_expression') or ''}\n}}")
-        found = next(iter(alone.values()), None)
+        found = reported_instruction(str(row.get("hlo_op_expression") or ""))
         op, target = (found.op, found.target) if found else ("", "")
         fused = frozenset(re.sub(r"\.\d+$", "", name).split("_")) if op == "fusion" else frozenset()
     else:
