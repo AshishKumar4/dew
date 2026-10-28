@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -137,17 +137,40 @@ class Coordinates:
     tokens; `starts` marks each document's first real token but a row's
     first, which continues whatever state the row holds. Each is None where
     it holds nothing (one document a row, every token real, no start), which
-    a layer's fast path reads as a static fact. `max_segments` bounds the
-    documents a row holds (the packer's static plan, else the row length) and
-    `right_padded` says every row's real tokens come first.
+    a layer's fast path reads as a static fact. `firsts` `[B, D]` are each
+    row's documents' first slots in order, the row's first slot among them,
+    `S` past its last (`document_firsts`): the packed documents' coordinates
+    every varlen kernel reads (`dew.nn.inputs.cu_seqlens`), built once a
+    step, never by a layer: by `coordinates` in a traced step, and for a batch
+    a host built (whose fields stay its loader's) by the model's entry
+    (`with_firsts`); each layer's own scan over the batch's flattened tokens,
+    which a mesh splits, ran one token a loop iteration on a 2xH100 run (row
+    1897). `max_segments` bounds the documents a row holds
+    (the packer's static plan, else the row length) and `right_padded` says
+    every row's real tokens come first.
     """
 
     positions: jax.Array | None = None
     segments: jax.Array | None = None
     valid: jax.Array | None = None
     starts: jax.Array | None = None
+    firsts: jax.Array | None = None
     max_segments: int = struct.field(pytree_node=False, default=1)
     right_padded: bool = struct.field(pytree_node=False, default=False)
+
+    TOKEN_ALIGNED: ClassVar[tuple[str, ...]] = ("positions", "segments", "valid", "starts")
+    """The fields one entry a token, `[B, S]`; `firsts` is one a document, `[B, D]`, its entries slots."""
+
+    def tokens(self) -> dict[str, jax.Array]:
+        """The token-aligned fields it holds (`TOKEN_ALIGNED`), by name: what a check of a batch's token
+        layout reads."""
+        return {name: getattr(self, name) for name in self.TOKEN_ALIGNED if getattr(self, name) is not None}
+
+    def along_tokens(self, transform: Callable[[jax.Array], jax.Array]) -> Coordinates:
+        """`transform` applied along the tokens to each token-aligned field (`TOKEN_ALIGNED`): a slice or a
+        rotation of the slots. The documents' firsts, which index the slots, go, their reader rebuilding
+        them from the moved starts (`with_firsts`, `dew.nn.inputs.cu_seqlens`)."""
+        return replace(self, firsts=None, **{name: transform(value) for name, value in self.tokens().items()})
 
     def places(self) -> jax.Array | None:
         """Each token's logical place in an uncached call: the given `positions`, else its rank among
@@ -193,10 +216,36 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
         real = real & (segments != 0)
         positions = xp.where(real, document_ranks(real, starts, xp=xp), 0)
     positions = None if positions is None else xp.asarray(positions, np.int32)
-    return Coordinates(positions, segments, valid, starts,
-                       max_segments=(1 if segments is None else length) if max_segments is None
-                       else max_segments,
+    max_segments = (1 if segments is None else length) if max_segments is None else max_segments
+    # The documents' firsts in a traced step; a host's batch keeps its loader's fields (`with_firsts`).
+    firsts = None if starts is None or xp is np else document_firsts(starts, max_segments + 1)
+    return Coordinates(positions, segments, valid, starts, firsts, max_segments=max_segments,
                        right_padded=right_padded)
+
+
+def with_firsts(tokens: Coordinates | None) -> Coordinates | None:
+    """`tokens` with their documents' firsts (`Coordinates.firsts`), built from their starts where a host
+    built them without: a model's entry calls it once a step, its layers reading them."""
+    if tokens is None or tokens.starts is None or tokens.firsts is not None:
+        return tokens
+    return replace(tokens, firsts=document_firsts(jnp.asarray(tokens.starts), tokens.max_segments + 1))
+
+
+def document_firsts(starts, documents: int, *, xp=jnp):
+    """Each row's first `documents` documents' first slots in order `[B, min(documents, S)]`, the row's
+    first slot and each of `starts` `[B, S]`, `S` past its last: a sort of each row's slots, which a mesh
+    splitting the rows sorts on each device (`Coordinates.firsts`)."""
+    rows, length = starts.shape
+    if xp is np:
+        begun = np.asarray(starts, bool).copy()
+        begun[:, 0] = True
+        slots = np.broadcast_to(np.arange(length, dtype=np.int32), (rows, length))
+    else:
+        # Placed as the starts are (an Explicit mesh's rows split), each row sorted on its own device.
+        begun = jnp.asarray(starts, bool).at[:, 0].set(True)
+        placed = jax.typeof(begun).sharding
+        slots = jax.lax.broadcasted_iota(jnp.int32, (rows, length), 1, out_sharding=placed)
+    return xp.sort(xp.where(begun, slots, length), axis=1)[:, :min(documents, length)].astype(np.int32)
 
 
 def document_ranks(real, starts, *, xp=jnp):

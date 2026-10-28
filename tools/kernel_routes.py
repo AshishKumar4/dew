@@ -132,8 +132,7 @@ def audited() -> tuple[str, ...]:
     return (*taken, *(name for name in ("sm100", "v6e") if name not in taken))
 
 
-LAYOUT_GAPS = {"mla": "ledger 830", "kpool_sparse_attention": "ledger 830",
-               "deepseek_v4": "ledger 831", "llama4": "ledger 784", "attention": "ledger 838"}
+LAYOUT_GAPS = {"attention": "ledger 838"}
 """The ledger row of each mixer that takes no cache layout but the default (`MixerRefused` for
 `kv_cache`)."""
 

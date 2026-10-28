@@ -282,7 +282,7 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     three things from the config: `layer_types`, one entry per layer; the MLA
     `mixer` record; and the routed `mixture`.
     """
-    ropes = read_rope(hf_config, used, PLAIN_SPELLING, ramps=('yarn',), per_kind=False)
+    ropes = read_rope(hf_config, used, PLAIN_SPELLING, ramps=('yarn', 'llama3'), per_kind=False)
     config = base_config(hf_config, used, rope=ropes)
     layer_types = _records.strings(config.get('layer_types'), 'layer_types')
     model_type = hf_config['model_type']
