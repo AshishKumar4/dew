@@ -212,8 +212,8 @@ def test_the_output_rounds_once_after_the_epilogue(hooks, ported):
     with jax.enable_x64(new_val=True):
         truth = np.asarray(reference(*widened((operands, beta)), jnp.float64))
     if np.array_equal(np.asarray(want, np.float64), truth):
-        # Exact data (a unit query and key against a gate of 0.1 and the skip): the residual is fp32's exactly,
-        # the reference's float64 value, which the op's must be too.
+        # Exact data (a unit query and key against a gate of 0.1 and the skip): the residual is fp32's
+        # exactly, the reference's float64 value, which the op's must be too.
         np.testing.assert_array_equal(np.asarray(found[:, 0], np.float64), truth)
     else:
         assert_as_exact_as_the_reference(np.asarray(found[:, 0]), np.asarray(want), truth,
