@@ -264,9 +264,9 @@ def _pointwise(score_mod, params: tuple) -> bool:
             *(entries(kind, dtype) for kind, dtype in params))
 
     def scored(arrays) -> list[np.ndarray]:
-        logits, slopes = algebra.scored(score_mod, *map(jnp.asarray, arrays[:3]),
-                                        tuple(map(jnp.asarray, arrays[3:])), slopes=True)
-        return [np.asarray(value) for value in (logits, *slopes)]
+        logits, q_pos, k_pos, *params = map(jnp.asarray, arrays)
+        logits, slopes = algebra.scored(score_mod, logits, q_pos, k_pos, tuple(params), slopes=True)
+        return [np.asarray(value) for value in (logits, *(slopes or ()))]
 
     try:
         with jax.ensure_compile_time_eval(), jax.default_device(jax.devices("cpu")[0]):
