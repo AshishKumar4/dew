@@ -184,13 +184,20 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
             lhs = prologue(lhs, *prologue_arrays).astype(lhs.dtype)
         lhs = jnp.where(routed[:, None], lhs, 0)
         wide = at_least_fp32(lhs.dtype)  # an fp64 product's sum in fp64
-        matrix = jnp.zeros((group_sizes.shape[0], lhs.shape[1], rhs.shape[1]), wide)
-        _, pullback = jax.vjp(lambda matrix: grouped_matmul.xla_ragged_dot(
-            lhs, matrix, group_sizes, precision=precision, preferred_element_type=wide), matrix)
-        return pullback(rhs.astype(lhs.dtype).astype(wide))[0].astype(out_dtype)
+        # Each group's rows contracted, XLA's ragged dot's own weight gradient (its transpose's form) on the
+        # operands as they are: a pullback from a matrix made here would hand a vmapped call (a pipeline
+        # stage's) an unbatched operand, which ragged_dot's batching rule refuses.
+        return jax.lax.ragged_dot_general(
+            lhs.astype(wide), rhs.astype(lhs.dtype).astype(wide), group_sizes, _CONTRACTED_ROWS,
+            precision=precision, preferred_element_type=wide).astype(out_dtype)
 
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays)
 
+
+_CONTRACTED_ROWS = jax.lax.RaggedDotDimensionNumbers(
+    dot_dimension_numbers=(([0], [0]), ([], [])), lhs_ragged_dimensions=[0], rhs_group_dimensions=[])
+"""A ragged dot over its rows, each group's rows of both operands contracted into the group's matrix: a
+grouped GEMM's weight gradient, `[rows, depth]` and `[rows, width]` to `[groups, depth, width]`."""
 
 _ACCUMULATOR = jax.ShapeDtypeStruct((), jnp.float32)
 """An epilogue's tile: the fp32 accumulator's."""
@@ -399,6 +406,19 @@ def _routed(group_sizes: jax.Array, rows: int) -> jax.Array:
 
 def _dispatched(kernel, portable, interpret_on_cpu: bool, *operands):
     """`kernel` where the call lowers for CUDA, interpreted on the CPU where asked, `portable` elsewhere
-    (`grouped_matmul._on_platform`)."""
+    (`grouped_matmul._on_platform`). Evaluated eagerly, `platform_dependent` knows its platform and runs
+    its branch alone, so a CPU's would skip the selection the kernel's branch makes (its routes, a named
+    kernel's refusal): an eager call is first traced abstractly as a jit traces it, every branch
+    selecting, then runs its platform's branch eagerly, op by op as any eager call does: run under a jit
+    of its own (83d19a780), a quantized block's reload no longer computed its logits bit for bit
+    (test_wrapped_runs)."""
     branches, default = grouped_matmul._on_platform(kernel, portable, interpret_on_cpu)
-    return jax.lax.platform_dependent(*operands, default=default, **branches)
+
+    def dispatched(*operands):
+        return jax.lax.platform_dependent(*operands, default=default, **branches)
+
+    from jax.core import Tracer
+
+    if not any(isinstance(leaf, Tracer) for leaf in jax.tree.leaves(operands)):
+        jax.eval_shape(dispatched, *operands)
+    return dispatched(*operands)

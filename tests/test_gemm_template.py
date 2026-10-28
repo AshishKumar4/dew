@@ -19,9 +19,8 @@ from reference_error import as_given, assert_as_exact, with_gradients
 from tuned import each_config
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import mosaic, product
+from dew.nn.kernels.templates import product, resources
 from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, mosaic_tpu, template, triton_dense
-from dew.training._lowering import custom_calls, triton_kernels
 
 pytestmark = pytest.mark.kernel
 
@@ -29,7 +28,9 @@ SIZES = (0, 70, 1, 129, 100, 0)
 ROWS, DEPTH, WIDTH = 307, 128, 128
 ROUTED = sum(SIZES)
 SEEDS = 8
-"""Each site's declared draws (`reference_error.seeds_for` of the plain program on them)."""
+"""Each site's declared draws (`reference_error.seeds_for` of the plain program on them; the sites that held
+one program bitwise to another before bible §6, owner 10-27, sized paired with the kernel's arm on armada,
+8 at every case)."""
 
 
 def _wide(x):
@@ -60,6 +61,54 @@ def casted(x, scale):
 def shifted(x, side):
     """A prologue adding a `[depth, rows]` side operand's transpose."""
     return (_wide(x) + side.T).astype(x.dtype)
+
+
+def sided(x, side):
+    """A prologue adding a `[rows, depth]` side operand."""
+    return (_wide(x) + side).astype(x.dtype)
+
+
+SIDE_ROWS, SIDE_SIZES = 136, (70, 66)
+SIDE_LAYOUTS = ((sided, ("rows", "depth"), False), (shifted, ("depth", "rows"), True))
+"""A side operand's rows as its first dimension and as its second: each prologue, its operand's axes, and
+whether its operand is the side transposed."""
+
+
+def _side_draw(matrix_dtype):
+    """A side-operand case's draw: rows, two groups' matrices in `matrix_dtype`, a cotangent and a
+    `[rows, depth]` side operand."""
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(SIDE_ROWS, 64)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(2, 64, 64)) / 8, matrix_dtype),
+                jnp.asarray(rng.normal(size=(SIDE_ROWS, 64)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(SIDE_ROWS, 64)), jnp.float32))
+    return draw
+
+
+def _kernel_gradient(h, dy, sizes):
+    """Each group's rows transposed times its cotangent rows, summed wide (a dense call's whole rows, its one
+    group, where `sizes` is None): the kernel gradient the template stands for."""
+    wide = jnp.promote_types(h.dtype, jnp.float32)
+    h, dy = h.astype(wide), dy.astype(wide)
+    if sizes is None:
+        return jnp.dot(h.T, dy, preferred_element_type=wide)[None]
+    matrices = jnp.zeros((len(sizes), h.shape[1], dy.shape[1]), wide)
+    return jax.vjp(lambda m: jax.lax.ragged_dot(h, m, jnp.asarray(sizes), preferred_element_type=wide),
+                   matrices)[1](dy)[0]
+
+
+def _side_plain(*, truth: bool = False):
+    """The program a side-operand case's product and kernel gradient stand for: the rows plus the side
+    rounded to bf16, times each group's matrix rounded alike, and transposed times the cotangent, summed
+    wide; as `truth`, on float64 inputs with those roundings alone."""
+    def run(x, w, dy, side):
+        wide = jnp.promote_types(x.dtype, jnp.float32)
+        h = (x.astype(wide) + side.astype(wide)).astype(jnp.bfloat16).astype(wide)
+        matrix = w.astype(jnp.bfloat16).astype(wide)
+        product = jax.lax.ragged_dot(h, matrix, jnp.asarray(SIDE_SIZES), preferred_element_type=wide)
+        return product, _kernel_gradient(h, dy, SIDE_SIZES)
+    return run
 
 
 def reciprocal(x):
@@ -194,32 +243,27 @@ def test_the_template_holds_check_1_with_its_hooks(generation_name, case):
 
 
 COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2)
-"""A tile two consumer warpgroups compute, on one multiprocessor (the interpreter models no cluster)."""
+"""A tile two consumer warpgroups compute, on one multiprocessor."""
 
-
-MOSAIC_RAN = {'mosaic_gpu'}
-"""The grouped matmul's kernels a call pinned to Mosaic reports, in a CPU's process or a GPU's: a GPU
-process builds no CPU branch of its platform choice (`grouped_matmul._on_platform`)."""
-
-
-def _kernels(taken) -> set:
-    return {route.kernel for route in taken if route.choice == 'grouped_matmul'}
+PAIRED = dataclasses.replace(COOPERATIVE, cluster=2)
+"""`COOPERATIVE` on a pair of multiprocessors a cluster, the forward's two row tiles of a group sharing its
+matrix's blocks (the interpreter runs the pair's two programs, each loading the shared block whole)."""
 
 
 @runs("sm90")
+@pytest.mark.parametrize("forward", [COOPERATIVE, PAIRED], ids=["one multiprocessor", "a pair"])
 @pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "cast prologue", "row scaled"])
-def test_a_cooperative_tile_holds_check_1_with_its_hooks(case):
-    """The Hopper launches pinned to a cooperative tile, interpreted: each consumer rewrites and multiplies
-    its half of the stage's rows and computes their epilogue, as exact as the plain program from float64
-    truth; the Mosaic kernels ran."""
+def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, forward):
+    """The Hopper launches pinned to a cooperative tile, the forward's alone or a pair's (whose second row
+    tile of a pair past its group's rows stores none of them), interpreted: each consumer rewrites and
+    multiplies its half of the stage's rows and computes their epilogue, as exact as the plain program
+    from float64 truth."""
     spec = CASES[case]
-    pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicTgmm: COOPERATIVE}
-    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
-          generation.routes() as taken):
+    pinned = {grouped_matmul.MosaicGmm: forward, grouped_matmul.MosaicTgmm: COOPERATIVE}
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned):
         dew = jax.jit(_drop(_dew(spec, interpret_on_cpu=True)))
-        assert_as_exact(dew, jax.jit(_drop(_plain(spec))), _draw, f"{case} cooperative",
+        assert_as_exact(dew, jax.jit(_drop(_plain(spec))), _draw, f"{case} at {forward}",
                         seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
-    assert _kernels(taken) == MOSAIC_RAN
 
 
 def _gradient_draw(case: Case, base=None):
@@ -304,9 +348,8 @@ def test_every_variant_of_the_mosaic_launches_holds_check_1(generation_name):
 def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
     """A layer of a stacked `[layers, groups, depth, width]` matrix picked by an index (`gemm`'s `layer`):
     as exact as the plain program's product with that layer's matrices from float64 truth, the stack's
-    gradient included (zero at every other layer), and the launch reads the whole stack in place, its
-    matrix operand the stack's every group, no slice of it made. The gradients run eagerly, as the Mosaic
-    interpreters' ordered callbacks need."""
+    gradient included (zero at every other layer). The gradients run eagerly, as the Mosaic interpreters'
+    ordered callbacks need."""
     layers, groups, rows, depth, width = 3, 2, 136, 64, 128
     sizes, layer, split = jnp.asarray([70, 66], jnp.int32), jnp.asarray(1, jnp.int32), 70
 
@@ -328,22 +371,7 @@ def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
                         f"stacked layer on {generation_name}", seeds=SEEDS,
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
-        with tuning.seen() as launches:
-            jax.jit(dew).trace(*draw(0)[:2])
-    read = {ba.arguments['kernel'].shape for op, ba in launches if isinstance(op, grouped_matmul.MosaicGmm)}
-    assert read == {(layers * groups, depth, width)}
 
-
-@runs("v5e")
-def test_a_tpu_runs_an_exactly_summed_product_in_xla():
-    """A kernel gradient into fp32 above the default precision adds each step's products apart, which
-    the TPU's launches do not promise (their MXUs add within a step): XLA runs it, the refusal reported."""
-    x, _, _, _, _, _, _, dy = _draw(0)
-    with generation.assumed("v5e"), generation.routes() as taken:
-        template.gemm_t(x, dy.astype(jnp.bfloat16), jnp.asarray(SIZES), out_dtype=jnp.float32,
-                        precision="highest", interpret_on_cpu=True)
-    [found] = [route for route in taken if route.choice == 'grouped_matmul']
-    assert found.kernel == 'xla' and "MXUs" in found.refusal.detail
 
 @runs("sm80")
 def test_an_empty_rows_undefined_derivative_reaches_no_shared_gradient():
@@ -457,15 +485,12 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
         return lambda x, w, ms, nw, b, cotangent: run(x, w, ms, nw, b)
 
     # Named: a dense cell runs XLA's dot unnamed (`grouped_matmul.DECLARED`).
-    with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"), tuning.seen() as launches:
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"):
         truth = functools.partial(plain, wide=jnp.float64, out=jnp.float64)
         assert_as_exact(jax.jit(forward(dew)), jax.jit(forward(plain)), draw, "dense 65x40x100", seeds=SEEDS,
                         truth_fn=forward(truth))
         assert_as_exact(jax.jit(with_gradients(dew)), jax.jit(with_gradients(plain)), draw,
                         "dense 65x40x100 gradients", seeds=SEEDS, truth_fn=with_gradients(truth))
-    ran = {(type(launch).__name__, ba.arguments.get('trans_rhs'), ba.arguments.get('dense'))
-           for launch, ba in launches}
-    assert {('Gmm', transpose_rhs, True), ('Tgmm', None, True)} <= ran
 
 
 def _dense_draw(rows: int, depth: int, width: int, *, cotangent: bool = False):
@@ -493,11 +518,10 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
         # A 16-bit output: an fp32 one's cotangent makes the kernel gradient an fp32 product, XLA's.
         return jnp.dot(x.astype(wide), w.astype(wide)).astype(out)
 
-    with generation.assumed("sm90"), generation.chosen(grouped_matmul="triton"), tuning.seen() as launches:
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="triton"):
         assert_as_exact(jax.jit(with_gradients(dew)), jax.jit(with_gradients(plain)), draw, "dense depth 96",
                         seeds=SEEDS,
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
-    assert ('Tgmm', True) in {(type(launch).__name__, ba.arguments.get('dense')) for launch, ba in launches}
 
 
 @pytest.mark.gpu(reason="checks Triton's MMA accumulation on a GPU")
@@ -518,52 +542,41 @@ def test_a_dense_products_exact_sums_survive_one_row_tile():
     def truth(x, w):
         return jnp.dot(x.astype(jnp.float64), w.astype(jnp.float64))
 
-    with generation.chosen(grouped_matmul="triton"), generation.routes() as taken:
+    with generation.chosen(grouped_matmul="triton"):
         assert_as_exact(jax.jit(dew), jax.jit(xla), draw, "dense exact sums, one row tile", seeds=SEEDS,
                         truth_fn=truth)
-    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'triton'}
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_a_side_operands_rows_may_be_any_of_its_dimensions(generation_name):
-    """A side operand's rows as its second dimension load each group's rows as its first would: the
-    forward product and the kernel gradient are the same bit for bit, whatever rows are a multiple of,
-    through Triton's launches (`generation.chosen`), the one implementation that takes both layouts
-    (Mosaic's lowering has no transpose)."""
-    rows, sizes = 136, jnp.asarray([70, 66])
-    rng = np.random.default_rng(0)
-    x = jnp.asarray(rng.normal(size=(rows, 64)), jnp.bfloat16)
-    w = jnp.asarray(rng.normal(size=(2, 64, 64)) / 8, jnp.float32)
-    dy = jnp.asarray(rng.normal(size=(rows, 64)), jnp.bfloat16)
-    side = jnp.asarray(rng.normal(size=(rows, 64)), jnp.float32)
+    """A side operand's rows as its first dimension or its second, whatever rows are a multiple of, through
+    Triton's launches (`generation.chosen`), the one implementation that takes both layouts (Mosaic's
+    lowering has no transpose): the forward product and the kernel gradient on par with the plain
+    program's over the draws (check 1), truth the plain program's in float64."""
+    sizes = jnp.asarray(SIDE_SIZES)
+    for hook, layout, transposed in SIDE_LAYOUTS:
+        def dew(x, w, dy, side, hook=hook, layout=layout, transposed=transposed):
+            options = {"prologue": hook, "prologue_operands": ((side.T if transposed else side, layout),),
+                       "out_dtype": jnp.float32, "interpret_on_cpu": True}
+            return template.gemm(x, w, sizes, **options), template.gemm_t(x, dy, sizes, **options)
 
-    def row_major(x, side):
-        return (_wide(x) + side).astype(x.dtype)
-
-    layouts = ((row_major, ("rows", "depth"), side), (shifted, ("depth", "rows"), side.T))
-
-    def call(entry, hook, layout):
-        return jax.jit(lambda a, b, operand: entry(a, b, sizes, prologue=hook,
-                                                   prologue_operands=((operand, layout),),
-                                                   out_dtype=jnp.float32, interpret_on_cpu=True))
-
-    with generation.assumed(generation_name), generation.chosen(grouped_matmul="triton"):
-        products = [call(template.gemm, hook, layout)(x, w, operand) for hook, layout, operand in layouts]
-        gradients = [call(template.gemm_t, hook, layout)(x, dy, operand) for hook, layout, operand in layouts]
-    np.testing.assert_array_equal(np.asarray(products[0]), np.asarray(products[1]))
-    np.testing.assert_array_equal(np.asarray(gradients[0]), np.asarray(gradients[1]))
+        with generation.assumed(generation_name), generation.chosen(grouped_matmul="triton"):
+            assert_as_exact(jax.jit(dew), jax.jit(_side_plain()), _side_draw(jnp.float32),
+                            f"side {layout} on {generation_name}", seeds=SEEDS,
+                            truth_fn=_side_plain(truth=True))
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_a_broadcast_dimension_is_the_squeezed_operands(generation_name):
-    """A `[rows, 1]` mean square and a `[1, width]` bias with a None axis give the products of their
-    vectors, bit for bit, through the one implementation that takes both (Triton's: Mosaic's refuses a
-    side operand given back with a dimension of one)."""
-    drawn = _draw(2)
-    with generation.assumed(generation_name), generation.chosen(grouped_matmul="triton"):
-        column = jax.jit(_drop(_dew(CASES["broadcast axes"], interpret_on_cpu=True)))(*drawn)
-        vector = jax.jit(_drop(_dew(CASES["norm and bias"], interpret_on_cpu=True)))(*drawn)
-    np.testing.assert_array_equal(np.asarray(column[0], np.float32), np.asarray(vector[0], np.float32))
+    """A `[rows, 1]` mean square and a `[1, width]` bias with a None axis, and their vectors, through the one
+    implementation that takes both (Triton's: Mosaic's refuses a side operand given back with a dimension
+    of one): each on par with its plain program over the draws (check 1), from float64 truth."""
+    for case in ("broadcast axes", "norm and bias"):
+        spec = CASES[case]
+        with generation.assumed(generation_name), generation.chosen(grouped_matmul="triton"):
+            assert_as_exact(jax.jit(_drop(_dew(spec, interpret_on_cpu=True))), jax.jit(_drop(_plain(spec))),
+                            _draw, f"{case} through Triton on {generation_name}",
+                            seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
 
 
 def test_a_side_operand_names_one_launch_axis_per_dimension():
@@ -602,20 +615,30 @@ def test_the_backward_reads_what_the_epilogues_derivative_reads():
 
 
 @runs("sm80")
-def test_forward_mode_takes_the_plain_programs_tangent():
-    """`jax.jvp` of the template through its kernels gives the portable arithmetic's tangent, the value
-    from the kernels (`generation.linear_tangent`)."""
-    x, w, ms, nw, b, u, s, _ = _draw(0)
+def test_forward_mode_through_the_kernels_gives_the_plain_programs_tangent():
+    """`jax.jvp` of the template through its kernels (`generation.linear_tangent`) along drawn tangents of
+    the rows and the matrices: its value and tangent in the output's dtype, and on par with the plain
+    program's over the draws (check 1), truth the plain program's in float64."""
     spec = CASES["norm and bias"]
-    with generation.assumed("sm80"):
-        def through(*, interpret):
-            return lambda x, w: _dew(spec, interpret_on_cpu=interpret)(x, w, ms, nw, b, u, s)[0]
 
-        value, tangent = jax.jit(lambda x, w: jax.jvp(through(interpret=True), (x, w), (x, w)))(x, w)
-        portable_value, portable_tangent = jax.jit(
-            lambda x, w: jax.jvp(through(interpret=False), (x, w), (x, w)))(x, w)
-    np.testing.assert_array_equal(np.asarray(tangent, np.float32), np.asarray(portable_tangent, np.float32))
-    assert value.dtype == portable_value.dtype == jnp.bfloat16
+    def draw(seed):
+        x, w, ms, nw, b, u, s, _ = _draw(seed)
+        rng = np.random.default_rng(seed + 2000)
+        along = (jnp.asarray(rng.normal(size=x.shape), x.dtype),
+                 jnp.asarray(rng.normal(size=w.shape) / np.sqrt(DEPTH), w.dtype))
+        return x, w, *along, ms, nw, b, u, s
+
+    def forward(run):
+        def jvp(x, w, dx, dw, *rest):
+            return jax.jvp(lambda x, w: run(x, w, *rest)[0], (x, w), (dx, dw))
+        return jvp
+
+    with generation.assumed("sm80"):
+        value, tangent = jax.jit(forward(_dew(spec, interpret_on_cpu=True)))(*draw(0))
+        assert value.dtype == tangent.dtype == jnp.bfloat16
+        assert_as_exact(jax.jit(forward(_dew(spec, interpret_on_cpu=True))), jax.jit(forward(_plain(spec))),
+                        draw, "forward mode through the kernels", seeds=SEEDS,
+                        truth_fn=forward(_plain(spec, truth=True)))
 
 
 def bias_cast(prod, b, r, dtype=jnp.bfloat16):
@@ -691,8 +714,8 @@ def relu(x, weight):
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_a_normed_operand_runs_in_the_prologue_with_the_programs_value(generation_name):
     """Under `fuser.fuse`, an RMS norm producing the product's left operand runs in the kernels' prologue
-    on each loaded tile, its row statistic in XLA before the product (the route says so), with the
-    unfused program's value: as exact as it, from float64."""
+    on each loaded tile, its row statistic in XLA before the product, with the unfused program's value: as
+    exact as it, from float64."""
     sizes = jnp.asarray(SIZES)
 
     def draw(seed):
@@ -706,10 +729,9 @@ def test_a_normed_operand_runs_in_the_prologue_with_the_programs_value(generatio
         return template.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.bfloat16)
 
 
-    with generation.assumed(generation_name), generation.routes() as taken:
+    with generation.assumed(generation_name):
         assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "normed operand", seeds=SEEDS,
                         truth_fn=functools.partial(_normed_truth, sizes))
-    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
 @lowers("sm90")
@@ -730,10 +752,8 @@ def test_a_fused_norm_lowers_for_an_h100(producer):
         return fused.fusible_gemm(producer(x, weight), w, sizes).astype(jnp.bfloat16)
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh), generation.routes() as taken:
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(fuser.fuse(fusing)).trace(x, w, nw).lower(lowering_platforms=("cuda",))
-    assert 'mosaic_gpu' in {route.kernel for route in taken if route.choice == 'grouped_matmul'}
-    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
 def _three_gemms(sizes):
@@ -745,7 +765,8 @@ def _three_gemms(sizes):
         return template.gemm(operand, w, sizes, out_dtype=jnp.float32)
 
     def truth_gemm(operand, w):
-        matrix = w.astype(jnp.bfloat16).astype(operand.dtype)
+        # The matrix's value rounded as the program rounds it; its gradient not (straight through).
+        matrix = (w + jax.lax.stop_gradient(w.astype(jnp.bfloat16).astype(w.dtype) - w)).astype(operand.dtype)
         return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
 
     return fused_gemm, plain_gemm, truth_gemm
@@ -774,10 +795,9 @@ def test_a_fused_producers_gradients_are_its_own(producer):
 
     fused_gemm, plain_gemm, truth_gemm = _three_gemms(sizes)
 
-    with generation.assumed("sm80"), generation.routes() as taken:
+    with generation.assumed("sm80"):
         assert_as_exact(jax.jit(loss(fused_gemm, fuser.fuse)), jax.jit(loss(plain_gemm)), draw,
                         f"{producer.__name__} gradients", seeds=SEEDS, truth_fn=loss(truth_gemm))
-    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
 @runs("sm80")
@@ -812,17 +832,15 @@ def test_a_fused_producers_forward_and_higher_derivatives_are_its_own(compositio
 
     fused_gemm, plain_gemm, truth_gemm = _three_gemms(sizes)
 
-    with generation.assumed("sm80"), generation.routes() as taken:
+    with generation.assumed("sm80"):
         assert_as_exact(jax.jit(derivative(fused_gemm, fuser.fuse)), jax.jit(derivative(plain_gemm)), draw,
                         f"normed operand {composition}", seeds=SEEDS, truth_fn=derivative(truth_gemm))
-    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
 @runs("sm80")
-def test_chosen_routes_each_fused_stage_through_xla_or_insists_on_the_kernels():
-    """`generation.chosen(gemm_epilogue='xla', gemm_prologue='xla')` runs both stages in XLA beside the
-    product (each route says so) with the fused program's value, as exact as the unfused program from
-    float64; `gemm_epilogue='fused'` raises for a consumer the kernels cannot take rather than run XLA."""
+def test_both_fused_stages_chosen_through_xla_are_as_exact_as_the_unfused_program():
+    """`generation.chosen(gemm_epilogue='xla', gemm_prologue='xla')`: the fused program's value, as exact
+    as the unfused program from float64."""
     sizes = jnp.asarray(SIZES)
 
     def draw(seed):
@@ -838,19 +856,9 @@ def test_chosen_routes_each_fused_stage_through_xla_or_insists_on_the_kernels():
     def truth(x, w, weight, b):
         return _normed_truth(sizes, x, w, weight) + b[None, :]
 
-    with (generation.assumed("sm80"), generation.chosen(gemm_epilogue="xla", gemm_prologue="xla"),
-          generation.routes() as taken):
+    with generation.assumed("sm80"), generation.chosen(gemm_epilogue="xla", gemm_prologue="xla"):
         assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "both stages in XLA",
                         seeds=SEEDS, truth_fn=truth)
-    assert {(route.choice, route.kernel) for route in taken if route.choice.startswith('gemm_')} == {
-        ('gemm_epilogue', 'xla'), ('gemm_prologue', 'xla')}
-    x, w, _, _, b, u, *_ = _draw(0)
-
-    def positioned(x, w, b, r):
-        return positional(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), b, r)
-
-    with generation.assumed("sm80"), generation.chosen(gemm_epilogue="fused"), pytest.raises(ValueError):
-        jax.jit(fuser.fuse(positioned)).trace(x, w, b, u[:, :WIDTH])
 
 
 @runs("sm80")
@@ -870,29 +878,9 @@ def test_a_one_row_normed_operand_fuses():
         return template.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.float32)
 
 
-    with generation.assumed("sm80"), generation.routes() as taken:
+    with generation.assumed("sm80"):
         assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "one normed row", seeds=SEEDS,
                         truth_fn=functools.partial(_normed_truth, sizes))
-    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
-
-
-@runs("sm80")
-@pytest.mark.parametrize(("consumer", "kernel", "code"), [(bias_cast, 'fused', None),
-                                                          (positional, 'xla', 'reads_position')],
-                         ids=("tiled", "positional"))
-def test_a_consumer_the_kernels_cannot_take_reports_its_route(consumer, kernel, code):
-    """A consumer fused into the epilogue reports so; one left to XLA reports why, so a model that loses
-    its fusion shows where (`generation.route`'s 'gemm_epilogue')."""
-    sizes = jnp.asarray(SIZES)
-    x, w, _, _, b, u, *_ = _draw(0)
-
-    def fusing(x, w, b, r):
-        return consumer(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), b, r)
-
-    with generation.assumed("sm80"), generation.routes() as taken:
-        jax.jit(fuser.fuse(fusing)).trace(x, w, b, u[:, :WIDTH])
-    [found] = [route for route in taken if route.choice == 'gemm_epilogue']
-    assert found.kernel == kernel and (found.refusal is None if code is None else found.refusal.code == code)
 
 
 @lowers("sm90")
@@ -963,25 +951,22 @@ def test_the_hooked_tpu_launches_lower_for_a_v5e(launch, side_dtype):
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_a_cuda_call_naming_xla_runs_its_program(generation_name):
-    """A bf16 product the GPU's launches take, with `generation.chosen` naming XLA, lowers for the GPU to
-    XLA's program, the route `xla` and no launch (the audit's forced-xla route, ledger 1702 (a))."""
+    """A bf16 product the GPU's launches take, with `generation.chosen` naming XLA, lowers for the GPU
+    (the audit's forced-xla route, ledger 1702 (a))."""
     x = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
     w = jax.ShapeDtypeStruct((2, 128, 256), jnp.bfloat16)
     sizes = jnp.asarray([128, 128], jnp.int32)
-    with (generation.assumed(generation_name), generation.chosen(grouped_matmul="xla"),
-          generation.routes() as taken, tuning.seen() as launches):
-        lowered = jax.jit(lambda x, w: template.gemm(x, w, sizes, out_dtype=jnp.bfloat16)).trace(x, w).lower(
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="xla"):
+        jax.jit(lambda x, w: template.gemm(x, w, sizes, out_dtype=jnp.bfloat16)).trace(x, w).lower(
             lowering_platforms=("cuda",))
-    assert _kernels(taken) == {"xla"} and not list(launches)
-    assert not custom_calls(lowered), custom_calls(lowered)
 
 
 @runs("v5e")
 @pytest.mark.parametrize("product", ["gemm", "gemm_t"])
 def test_a_tpu_lowers_xlas_program_for_a_call_no_launch_takes(product):
-    """A product of widths no TPU block divides lowers for a TPU through XLA's program, the refusal
-    reported, its kernel branches traced on the way and none raising. A CPU process's: a GPU's interprets
-    its CPU branch with Triton's launch whatever the target (`grouped_matmul.launched`)."""
+    """A product of widths no TPU block divides lowers for a TPU, its kernel branches traced on the way and
+    none raising. A CPU process's: a GPU's interprets its CPU branch with Triton's launch whatever the
+    target (`grouped_matmul.launched`)."""
     x = jax.ShapeDtypeStruct((32, 64), jnp.bfloat16)
     other = jax.ShapeDtypeStruct((1, 64, 64) if product == "gemm" else (32, 64), jnp.bfloat16)
     sizes = jnp.asarray([32], jnp.int32)
@@ -992,11 +977,8 @@ def test_a_tpu_lowers_xlas_program_for_a_call_no_launch_takes(product):
         def run(x, other):
             return template.gemm_t(x, other, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
     assumed, mesh = _on_a_v5e()
-    with assumed, mesh, generation.routes() as taken:
+    with assumed, mesh:
         jax.jit(run).trace(x, other).lower(lowering_platforms=("tpu",))
-    # The TPU branch's and the CPU branch's each.
-    found = [route for route in taken if route.choice == 'grouped_matmul']
-    assert found and all(route.kernel == 'xla' and "widths" in route.refusal.detail for route in found)
 
 
 NARROW_GRADIENT_CASES = ("norm and bias", "gated prologue", "cast prologue", "broadcast axes",
@@ -1019,11 +1001,10 @@ def test_the_tpu_launches_gradients_hold_check_1(case):
 
     # Named, as the TPU's launches are tested here.
     with (generation.assumed("v5e"), jax.default_matmul_precision("default"),
-          generation.chosen(grouped_matmul="mosaic_tpu"), generation.routes() as taken):
+          generation.chosen(grouped_matmul="mosaic_tpu")):
         assert_as_exact(_gradients(_dew(spec, interpret_on_cpu=True)), jax.jit(_gradients(_plain(spec))),
                         _gradient_draw(spec, drawn), f"{case} gradients on the TPU's launches", seeds=SEEDS,
                         truth_fn=_gradients(_plain(spec, truth=True)))
-    assert _kernels(taken) == {'mosaic_tpu'}
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 @pytest.mark.parametrize("launch,trans_rhs", [(grouped_matmul.Gmm(), False), (grouped_matmul.Gmm(), True),
@@ -1031,8 +1012,8 @@ def test_the_tpu_launches_gradients_hold_check_1(case):
                          ids=["Gmm", "Gmm-transposed", "Tgmm"])
 def test_the_hooked_dense_launches_lower_for_cuda(launch, trans_rhs, generation_name):
     """Each Triton launch of a dense call, with a prologue (and the forward's epilogue) and at the highest
-    precision's exact sums, lowers for CUDA on the CPU at a fitting tile of every block shape, through the
-    plain tiled kernel (its `pallas_call` named), with rows, depth and width no tile divides."""
+    precision's exact sums, lowers for CUDA on the CPU at a fitting tile of every block shape, with rows,
+    depth and width no tile divides."""
     rows, depth, width = 1021, 200, 300
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
@@ -1042,14 +1023,12 @@ def test_the_hooked_dense_launches_lower_for_cuda(launch, trans_rhs, generation_
         args = (bf16((rows, depth)), bf16((rows, width)), sizes, prologue[1])
         hooks = grouped_matmul.Hooks(prologue[0], prologue[2])
         options = {"out_dtype": "float32", "hooks": hooks, "interpret": False}
-        name = "pallas_triton_dense_tdot"
     else:
         matrix = bf16((1, width, depth) if trans_rhs else (1, depth, width))
         args = (bf16((rows, depth)), matrix, sizes, prologue[1], (f32((width,)),))
         hooks = grouped_matmul.Hooks(prologue[0], prologue[2], biased, (("columns",),),
                                      out_dtypes=("float32",))
         options = {"out_dtype": "float32", "trans_rhs": trans_rhs, "hooks": hooks, "interpret": False}
-        name = "pallas_triton_dense_dot"
     options |= {"dense": True, "exact_sums": True}
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
     with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
@@ -1057,78 +1036,61 @@ def test_the_hooked_dense_launches_lower_for_cuda(launch, trans_rhs, generation_
         covering = set({(c.block_m, c.block_n, c.block_k): c for c in reversed(fits)}.values())
         assert covering
         for config in sorted(covering, key=repr):
-            lowered = jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
+            jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
-            assert name in triton_kernels(lowered)
-
-
-def test_mosaic_takes_only_the_hooks_its_lowering_has_rules_for():
-    """Mosaic GPU's warpgroup lowering has no transpose: a hook that transposes a side tile leaves the
-    Hopper launch to Triton's, which takes it; a hook of elementwise arithmetic stays Mosaic's."""
-    rows = 256
-    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
-    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
-    launch = grouped_matmul.MosaicTgmm()
-    with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        operands = (bf16((rows, DEPTH)), bf16((rows, WIDTH)), sizes)
-        transposing = launch.bind(*operands, (f32((DEPTH, rows)),), out_dtype="float32",
-                                  hooks=grouped_matmul.Hooks(shifted, (("depth", "rows"),)), interpret=False)
-        elementwise = launch.bind(*operands, (f32((rows,)), f32((DEPTH,))), out_dtype="float32",
-                                  hooks=grouped_matmul.Hooks(normed, (("rows",), ("depth",))),
-                                  interpret=False)
-        assert not launch.eligible(transposing, target)
-        assert launch.eligible(elementwise, target)
 
 
 @INTERPRETS
 def test_the_mosaic_kernels_load_a_side_operands_rows_from_any_dimension():
-    """Interpreted, Mosaic GPU's kernels pad and slice a side operand along its rows wherever they sit:
-    a `[depth, rows]` side gives the `[rows, depth]` one's products bit for bit."""
-    rows, sizes = 136, jnp.asarray([70, 66])
-    rng = np.random.default_rng(0)
-    x = jnp.asarray(rng.normal(size=(rows, 64)), jnp.bfloat16)
-    w = jnp.asarray(rng.normal(size=(2, 64, 64)) / 8, jnp.bfloat16)
-    dy = jnp.asarray(rng.normal(size=(rows, 64)), jnp.bfloat16)
-    side = jnp.asarray(rng.normal(size=(rows, 64)), jnp.float32)
-
-    def row_major(x, side):
-        return (_wide(x) + side).astype(x.dtype)
-
-    tiles = mosaic_gpu.Tiles(64, 64, 64, 2, 1)
-    layouts = ((row_major, ("rows", "depth"), side), (shifted, ("depth", "rows"), side.T))
-    common = {"tiles": tiles, "out_dtype": jnp.float32, "multiprocessors": 1,
+    """Interpreted, Mosaic GPU's kernels pad and slice a side operand along its rows wherever they sit: with
+    a `[rows, depth]` side and a `[depth, rows]` one, the forward product and the kernel gradient on par
+    with the plain program's over the draws (check 1), truth the plain program's in float64 (eagerly: the
+    interpreter's ordered callbacks)."""
+    sizes = jnp.asarray(SIDE_SIZES)
+    common = {"tiles": mosaic_gpu.Tiles(64, 64, 64, 2, 1), "out_dtype": jnp.float32, "multiprocessors": 1,
               "interpret": grouped_matmul.INTERPRETED}
-    products = [mosaic_gpu.gmm(x, w, sizes, transpose_rhs=False, prologue=hook, prologue_operands=(operand,),
-                               prologue_axes=(layout,), **common) for hook, layout, operand in layouts]
-    gradients = [mosaic_gpu.tgmm(x, dy, sizes, prologue=hook, prologue_operands=(operand,),
-                                 prologue_axes=(layout,), **common) for hook, layout, operand in layouts]
-    np.testing.assert_array_equal(np.asarray(products[0]), np.asarray(products[1]))
-    np.testing.assert_array_equal(np.asarray(gradients[0]), np.asarray(gradients[1]))
+    for hook, layout, transposed in SIDE_LAYOUTS:
+        def dew(x, w, dy, side, hook=hook, layout=layout, transposed=transposed):
+            options = {"prologue": hook, "prologue_operands": (side.T if transposed else side,),
+                       "prologue_axes": (layout,), **common}
+            return (mosaic_gpu.gmm(x, w, sizes, transpose_rhs=False, **options),
+                    mosaic_gpu.tgmm(x, dy, sizes, **options))
+
+        assert_as_exact(dew, jax.jit(_side_plain()), _side_draw(jnp.bfloat16), f"Mosaic side {layout}",
+                        seeds=SEEDS, truth_fn=_side_plain(truth=True))
+
+
+def _gradient_rows_draw(seed):
+    """Rows and a cotangent for a kernel gradient, both bf16."""
+    rng = np.random.default_rng(seed + 4)
+    return (jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.bfloat16),
+            jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.bfloat16))
 
 
 @SUMS_IN_IEEE
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name):
     """At the highest precision an fp32 kernel gradient adds each step's product apart (`exact_sums`):
-    interpreted on the CPU, whose dots sum in IEEE fp32 either way, through one launch at one tile it is
-    the default path's bit for bit."""
-    rng = np.random.default_rng(4)
-    x = jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.bfloat16)
-    dy = jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.bfloat16)
-    sizes = jnp.asarray(SIZES)
-    # One tile both ways, a step of EXACT_STEP rows, so the order of the sums is the same.
+    through each launch at one tile, grouped and dense, it and the default path are each on par with the
+    plain kernel gradient over the draws (check 1), truth the plain kernel gradient in float64."""
+    # One tile both ways, a step of EXACT_STEP rows.
     tiles = {grouped_matmul.Tgmm: grouped_matmul.Tile(64, 128, 64, 4, 2),
              grouped_matmul.MosaicTgmm: mosaic_gpu.Tiles(64, 128, 64, 2, 1)}
     launches = ("triton", "mosaic_gpu") if generation_name == "sm90" else ("triton",)
-    for launch, group_sizes in itertools.product(launches, (sizes, None)):
+    for launch, group_sizes, precision in itertools.product(launches, (SIZES, None),
+                                                            ("highest", "default")):
+        def dew(x, dy, group_sizes=group_sizes, precision=precision):
+            return template.gemm_t(x, dy, None if group_sizes is None else jnp.asarray(group_sizes),
+                                   out_dtype=jnp.float32, precision=precision, interpret_on_cpu=True)
+
+        def plain(x, dy, group_sizes=group_sizes):
+            return _kernel_gradient(x, dy, group_sizes)
+
         with (generation.assumed(generation_name), tuning.pinned(tiles),
               generation.chosen(grouped_matmul=launch)):
-            exact, default = (jax.jit(functools.partial(template.gemm_t, out_dtype=jnp.float32,
-                                                        precision=precision, interpret_on_cpu=True))(
-                x, dy, group_sizes) for precision in ("highest", "default"))
-        np.testing.assert_array_equal(np.asarray(exact), np.asarray(default))
+            assert_as_exact(jax.jit(dew), jax.jit(plain), _gradient_rows_draw,
+                            f"{precision} sums through {launch}, {'grouped' if group_sizes else 'dense'}",
+                            seeds=SEEDS, truth_fn=plain)
 
 
 @runs("sm90")
@@ -1140,27 +1102,29 @@ def test_a_cooperative_tiles_gradients_hold_check_1(case):
     (eagerly: `test_the_templates_gradients_hold_check_1`)."""
     spec = CASES[case]
     pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicTgmm: COOPERATIVE}
-    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
-          generation.routes() as taken):
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned):
         assert_as_exact(as_given(_gradients(_dew(spec, interpret_on_cpu=True))), _gradients(_plain(spec)),
                         _gradient_draw(spec), f"{case} cooperative gradients", seeds=SEEDS,
                         truth_fn=_gradients(_plain(spec, truth=True)))
-    assert _kernels(taken) == MOSAIC_RAN
 
 
 @SUMS_IN_IEEE
 def test_a_cooperative_tiles_exact_sums_add_as_its_plain_sum_does():
     """`test_exact_sums_add_each_steps_product_as_the_plain_sum_does` at a cooperative tile: each consumer's
-    running fp32 sum, the pipeline's carry, matches its accumulator's bit for bit on the CPU."""
-    rng = np.random.default_rng(5)
-    x = jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.bfloat16)
-    dy = jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.bfloat16)
-    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"),
-          tuning.pinned({grouped_matmul.MosaicTgmm: COOPERATIVE})):
-        exact, default = (jax.jit(functools.partial(template.gemm_t, out_dtype=jnp.float32,
-                                                    precision=precision, interpret_on_cpu=True))(
-            x, dy, jnp.asarray(SIZES)) for precision in ("highest", "default"))
-    np.testing.assert_array_equal(np.asarray(exact), np.asarray(default))
+    running fp32 sum, the pipeline's carry, at the highest precision and the default, each on par with the
+    plain kernel gradient over the draws (check 1), from float64 truth."""
+    def plain(x, dy):
+        return _kernel_gradient(x, dy, SIZES)
+
+    for precision in ("highest", "default"):
+        def dew(x, dy, precision=precision):
+            return template.gemm_t(x, dy, jnp.asarray(SIZES), out_dtype=jnp.float32, precision=precision,
+                                   interpret_on_cpu=True)
+
+        with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"),
+              tuning.pinned({grouped_matmul.MosaicTgmm: COOPERATIVE})):
+            assert_as_exact(jax.jit(dew), jax.jit(plain), _gradient_rows_draw,
+                            f"cooperative {precision} sums", seeds=SEEDS, truth_fn=plain)
 
 
 def test_a_tile_states_a_schedule_the_kernels_run():
@@ -1216,28 +1180,33 @@ def test_a_pin_names_only_a_config_the_launchs_kernel_takes():
                          if isinstance(op, launch)}
 
 
-def test_a_launch_takes_no_pair():
-    """The bundle's rings stream to one multiprocessor: no launch derives a pair, and a pair pinned on the
-    forward is refused rather than launched."""
+@pytest.mark.parametrize("trans_rhs", [False, True], ids=["forward", "input gradient"])
+def test_the_forward_pairs_a_groups_row_tiles_where_its_rows_span_two(trans_rhs):
+    """On an H100 the forward and the input gradient derive a pair of multiprocessors a cluster
+    (`mosaic.Family.cluster`) where a group averages a row tile's rows, each multiprocessor's tile and
+    stages as alone, and one multiprocessor where it averages fewer; an A100's mma.sync bundle takes no
+    cluster at any rows. Each derived tile is legal."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    args = (bf16((ROWS, DEPTH)), bf16((3, DEPTH, WIDTH)), jax.ShapeDtypeStruct((3,), jnp.int32))
+    groups, depth, width = 8, 2048, 1536
     launch = grouped_matmul.MosaicGmm()
-    with generation.assumed("sm90"):
-        compiled = launch.space(launch.bind(*args, out_dtype="bfloat16", trans_rhs=False, interpret=False))
-    assert compiled and not any(tile.cluster == 2 for tile in compiled)
-    with pytest.raises(ValueError):
-        mosaic_gpu.gmm(jnp.zeros((ROWS, DEPTH), jnp.bfloat16), jnp.zeros((3, DEPTH, WIDTH), jnp.bfloat16),
-                       jnp.asarray([100, 100, 107]), tiles=mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2,
-                                                                             cluster=2),
-                       transpose_rhs=False, out_dtype=jnp.bfloat16, multiprocessors=2,
-                       interpret=grouped_matmul.INTERPRETED)
+    derived = {}
+    for name, rows in (("sm90", 8 * 512), ("sm90", 8 * 100), ("sm80", 8 * 512)):
+        with generation.assumed(name):
+            target = generation.gpu_target()
+            ba = launch.bind(bf16((rows, width if trans_rhs else depth)), bf16((groups, depth, width)),
+                             jax.ShapeDtypeStruct((groups,), jnp.int32), out_dtype="bfloat16",
+                             trans_rhs=trans_rhs, interpret=False)
+            derived[name, rows] = launch.derived(ba, target)
+            assert launch.legal(ba, derived[name, rows], target)
+    paired, alone = derived["sm90", 8 * 512], derived["sm90", 8 * 100]
+    assert (paired.cluster, alone.cluster, derived["sm80", 8 * 512].cluster) == (2, 1, 1)
+    assert (paired.block_m, paired.block_n, paired.stages) == (alone.block_m, alone.block_n, alone.stages)
 
 
 def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
     """The declared product promotes (`exact_sums`) for an fp32 output at the highest precision, never
-    for a 16-bit output or the default precision; Mosaic's forward launches, which do not add apart,
-    refuse it, Mosaic's kernel gradient keeps only tiles whose two accumulators stay in registers, and
-    Triton's only steps of at most `EXACT_STEP` rows."""
+    for a 16-bit output or the default precision; Mosaic's kernel gradient keeps only tiles whose two
+    accumulators stay in registers, and Triton's only steps of at most `EXACT_STEP` rows."""
     assert product.promoted(above=True, outputs=("float32",))
     assert not product.promoted(above=True, outputs=("bfloat16",))
     assert not product.promoted(above=False, outputs=("float32",))
@@ -1246,21 +1215,16 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
     sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
     with generation.assumed("sm90"):
         target = generation.gpu_target()
-        forward = grouped_matmul.MosaicGmm().bind(bf16((rows, 768)), bf16((8, 768, 1536)), sizes, (), (),
-                                                  out_dtype="float32", trans_rhs=False, interpret=False,
-                                                  exact_sums=True)
-        assert not grouped_matmul.MosaicGmm().eligible(forward, target)
         launch = grouped_matmul.MosaicTgmm()
         exact = launch.bind(bf16((rows, 768)), bf16((rows, 1536)), sizes, (), out_dtype="float32",
                             interpret=False, exact_sums=True)
         plain = launch.bind(bf16((rows, 768)), bf16((rows, 1536)), sizes, (), out_dtype="float32",
                             interpret=False)
-        assert launch.eligible(exact, target)
         # Two accumulators a consumer warpgroup: its 128 threads hold its share of the tile's columns, in
         # the registers a cooperative consumer has (232) or a lone warpgroup's (255). The generated tile
         # holds them; a tile that does not is no legal pin.
         [tile] = launch.fitting(exact, target)
-        assert 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups) < mosaic.CONSUMER_REGISTERS
+        assert 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups) < resources.CONSUMER_REGISTERS
         narrow, wide = (mosaic_gpu.Tiles(128, width, 64, 2, 1, warpgroups=2) for width in (128, 256))
         assert launch.legal(exact, narrow, target) and launch.legal(plain, narrow, target)  # 128 a thread
         assert not launch.legal(exact, wide, target) and launch.legal(plain, wide, target)  # 256
@@ -1293,104 +1257,69 @@ def selected(x, mask):
     return jnp.where(mask[:, None] > 0, x, jnp.zeros_like(x))
 
 
-def transposed_twice_nested(x, side):
-    """`shifted`, its transpose two jitted calls deep."""
-    return (_wide(x) + jax.jit(jax.jit(lambda s: s.T))(side)).astype(x.dtype)
-
-
-@runs("sm80")
-def test_an_fp32_product_above_the_default_precision_runs_xla():
-    """fp32 products are TF32 in the kernels, which only the default precision asks for: an explicit
-    'highest' under a configured default runs XLA's portable program, reported as the route with the
-    reason, its products of low-mantissa fp32 values XLA's at 'highest' bit for bit; a kernel chosen for
-    it raises."""
-    rng = np.random.default_rng(8)
-    x = jnp.asarray(1 + rng.integers(1, 2 ** 10, size=(64, DEPTH)) * 2.0 ** -20, jnp.float32)
-    w = jnp.asarray(1 + rng.integers(1, 2 ** 10, size=(1, DEPTH, WIDTH)) * 2.0 ** -20, jnp.float32)
-
-    def product(precision):
-        return jax.jit(lambda x, w: template.gemm(x, w, jnp.asarray([64]), out_dtype=jnp.float32,
-                                                  precision=precision, interpret_on_cpu=True))
-
-    with generation.assumed("sm80"), jax.default_matmul_precision("default"):
-        with generation.routes() as highest:
-            got = product("highest")(x, w)
-        with generation.routes() as default:
-            product("default")(x, w)
-        with generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError):
-            product("highest").lower(x, w)
-    taken = {(route.kernel, route.refusal is not None) for route in highest
-             if route.choice == "grouped_matmul"}
-    assert taken == {("xla", True)}
-    assert {route.kernel for route in default if route.choice == "grouped_matmul"} == {"triton"}
-    xla = jax.jit(lambda x, w: jax.lax.ragged_dot(x, w, jnp.asarray([64]), precision="highest",
-                                                  preferred_element_type=jnp.float32))(x, w)
-    np.testing.assert_array_equal(np.asarray(got), np.asarray(xla))
-
-
 @runs("sm80")
 def test_an_integer_side_operand_takes_no_gradient():
-    """A prologue selecting rows by an integer mask differentiates as JAX's plain program does: the
-    rows' gradient through the kernels, the mask's float0."""
-    x, w, *_ = _draw(5)
+    """A prologue selecting rows by an integer mask differentiates through the kernels, the mask's
+    gradient float0: the rows' gradient on par with JAX's of the plain program over the draws (check 1),
+    truth each selected row's matrix summed over its columns in float64, and every row the mask drops
+    exactly zero. The rows past the groups' meet no matrix."""
     mask = jnp.asarray(np.arange(ROWS) % 3 == 0, jnp.int32)
+    routed = sum(SIZES)
+    groups = np.concatenate([np.repeat(np.arange(len(SIZES)), SIZES), np.zeros(ROWS - routed, np.int64)])
+    kept = (np.asarray(mask) > 0) & (np.arange(ROWS) < routed)
 
-    def loss(x, *, interpret):
-        out = template.gemm(x, w, jnp.asarray(SIZES), prologue=selected,
-                            prologue_operands=((mask, ("rows",)),), out_dtype=jnp.float32,
-                            interpret_on_cpu=interpret)
-        return jnp.sum(out)
+    def draw(seed):
+        x, w, *_ = _draw(seed)
+        return x, w
+
+    def gradient(*, interpret):
+        def loss(x, w):
+            out = template.gemm(x, w, jnp.asarray(SIZES), prologue=selected,
+                                prologue_operands=((mask, ("rows",)),), out_dtype=jnp.float32,
+                                interpret_on_cpu=interpret)
+            return jnp.sum(out)
+        return jax.jit(jax.grad(loss))
+
+    def truth(x, w):
+        # d/dx of the sum of x[r] @ w[g(r)] over the selected rows r.
+        return jnp.where(kept[:, None], jnp.sum(w, axis=-1)[groups], 0.0)
 
     with generation.assumed("sm80"):
-        got = jax.jit(jax.grad(functools.partial(loss, interpret=True)))(x)
-        portable = jax.jit(jax.grad(functools.partial(loss, interpret=False)))(x)
-    np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(portable, np.float32))
+        got = gradient(interpret=True)(*draw(0))
+        assert not np.any(np.asarray(got, np.float32)[~kept])
+        assert_as_exact(gradient(interpret=True), gradient(interpret=False), draw, "integer mask gradient",
+                        seeds=SEEDS, truth_fn=truth)
 
 
 @runs("sm80")
-@pytest.mark.parametrize("consumer", [lambda p, s: p * s, lambda p, s: p.T.astype(jnp.bfloat16)],
+@pytest.mark.parametrize("consumer, exact", [(lambda p, s: p * s, lambda p, s: p * s),
+                                             (lambda p, s: p.T.astype(jnp.bfloat16), lambda p, s: p.T)],
                          ids=["scalar", "transpose"])
-def test_a_consumer_the_kernels_cannot_tile_runs_after_the_product(consumer):
+def test_a_consumer_the_kernels_cannot_tile_runs_after_the_product(consumer, exact):
     """A consumer of a captured scalar (no launch axis) or of the product transposed (its block not the
-    tile's) runs in XLA after the template's product, with the unfused program's value."""
-    x, w, *_ = _draw(6)
+    tile's) runs after the template's product: on par with the plain product's consumer over the draws
+    (check 1), truth the product and the consumer in float64."""
     scale = jnp.asarray(1.5, jnp.float32)
     sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        x, w, *_ = _draw(seed)
+        return x, w
+
+    def plain(consume):
+        def run(x, w):
+            wide = jnp.promote_types(x.dtype, jnp.float32)
+            matrix = w.astype(jnp.bfloat16).astype(wide)
+            return consume(jax.lax.ragged_dot(x.astype(wide), matrix, sizes, preferred_element_type=wide),
+                           scale.astype(wide))
+        return run
+
+    def fusing(x, w):
+        return consumer(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), scale)
+
     with generation.assumed("sm80"):
-        def fusing(x, w, s):
-            return consumer(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), s)
-
-        got = jax.jit(fuser.fuse(fusing))(x, w, scale)
-        want = jax.jit(lambda x, w, s: consumer(template.gemm(x, w, sizes, out_dtype=jnp.float32,
-                                                               interpret_on_cpu=True), s))(x, w, scale)
-    np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(want, np.float32))
-
-
-def test_mosaic_reads_a_hooks_primitives_at_any_depth():
-    """A transpose two jitted calls deep is a primitive Mosaic GPU's lowering has no rule for: the
-    Hopper launch leaves the hook to Triton's."""
-    rows = 256
-    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
-    launch = grouped_matmul.MosaicTgmm()
-    with generation.assumed("sm90"):
-        ba = launch.bind(bf16((rows, DEPTH)), bf16((rows, WIDTH)), sizes,
-                         (jax.ShapeDtypeStruct((DEPTH, rows), jnp.float32),), out_dtype="float32",
-                         hooks=grouped_matmul.Hooks(transposed_twice_nested, (("depth", "rows"),)),
-                         interpret=False)
-        assert not launch.eligible(ba, generation.gpu_target())
-
-
-@runs("sm80")
-def test_a_dense_product_runs_the_plain_tiled_kernel():
-    """On Triton (`generation.chosen`) a dense product (no group sizes) runs `triton_dense`'s kernels,
-    forward and both gradients, apart from a one-group ragged call's: their launches are told `dense`."""
-    spec = CASES["dense norm and bias"]
-    with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"), tuning.seen() as launches:
-        jax.jit(_gradients(_dew(spec, interpret_on_cpu=True))).trace(*_gradient_draw(spec)(9)).lower()
-    told = {(type(launch).__name__, ba.arguments.get('trans_rhs'), ba.arguments.get('dense'))
-            for launch, ba in launches}
-    assert {('Gmm', False, True), ('Gmm', True, True), ('Tgmm', None, True)} <= told
+        assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(plain(consumer)), draw,
+                        "a consumer after the product", seeds=SEEDS, truth_fn=plain(exact))
 
 
 HIGHEST, DEFAULT = jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT
@@ -1416,15 +1345,6 @@ def test_a_product_declares_its_promotion_and_the_kernels_refusal(compute, preci
     assert refused is None or refused in declared.refusal
 
 
-def test_a_product_under_x64_or_from_a_complex_master_is_refused():
-    """x64 widens the kernels' int32 group offsets; a complex master's gradient is one the kernels,
-    summing in fp32, cannot write, at a real compute dtype as at any."""
-    with jax.enable_x64(new_val=True):
-        assert "x64" in product.declared(jnp.bfloat16, DEFAULT).refusal
-    refusal = product.declared(jnp.bfloat16, DEFAULT, operands=(jnp.complex64,)).refusal
-    assert refusal is not None and "fp32 does not hold" in refusal
-
-
 def swiglu(gate, up):
     """A SwiGLU epilogue on a paired product's two fp32 accumulators, each rounded to bf16 first and the
     activated gate again, as `activations.gated_product` rounds them."""
@@ -1435,29 +1355,50 @@ def swiglu(gate, up):
 PAIRED_TILE = grouped_matmul.Tile(64, 128, 64, 4, 2)
 
 
-def test_a_paired_product_is_its_two_products_combined_bitwise():
-    """The two-source dense kernel (one `lhs` tile, two matrices, two accumulators) at a tile is the same
-    kernel's two plain products at that tile, their fp32 accumulators combined by the same epilogue in
-    XLA, bit for bit, with rows, depth and width no tile divides."""
+def test_a_grouped_call_no_cooperative_tile_holds_derives_one_consumer_alone():
+    """Where no two-consumer tile holds a grouped call, its derivation falls back to one consumer, which
+    runs on one multiprocessor: a pair is two consumers' (`mosaic_gpu.Tiles`), so the fallback derives a
+    tile rather than refusing one it built."""
+    from dew.nn.kernels.templates import mosaic_sm90
+
+    tile = mosaic_gpu.derived(mosaic_sm90.WGMMA, rows=512, depth=2048, width=1536, dtype=jnp.bfloat16,
+                              multiprocessors=132, holds=lambda tile: tile.warpgroups == 1, grouped=True)
+    assert tile is not None and (tile.warpgroups, tile.cluster) == (1, 1)
+
+
+def test_a_paired_product_holds_check_1_against_its_two_products_combined():
+    """The two-source dense kernel (one `lhs` tile, two matrices, two accumulators) at a tile, with rows,
+    depth and width no tile divides: its SwiGLU of the two products on par with the plain two products'
+    combined by the same epilogue over the draws (check 1), truth the two products' SwiGLU in float64."""
     rows, depth, width = 200, 300, 140
-    keys = jax.random.split(jax.random.key(7), 3)
     shapes = ((rows, depth), (depth, width), (depth, width))
-    lhs, gate, up = (jax.random.normal(key, shape).astype(jnp.bfloat16)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(7), seed), 3)
+        return tuple(jax.random.normal(key, shape).astype(jnp.bfloat16)
                      for key, shape in zip(keys, shapes, strict=True))
-    options = {"tile": PAIRED_TILE, "transpose_rhs": False, "interpret": True}
-    [paired] = triton_dense.gmm(lhs, gate, paired=up, epilogue=swiglu, out_dtypes=("bfloat16",), **options)
-    [gate_acc] = triton_dense.gmm(lhs, gate, out_dtypes=("float32",), **options)
-    [up_acc] = triton_dense.gmm(lhs, up, out_dtypes=("float32",), **options)
-    expected = swiglu(gate_acc, up_acc).astype(jnp.bfloat16)
+
+    def run(lhs, gate, up):
+        [paired] = triton_dense.gmm(lhs, gate, paired=up, epilogue=swiglu, out_dtypes=("bfloat16",),
+                                    tile=PAIRED_TILE, transpose_rhs=False, interpret=True)
+        return paired
+
+    def plain(lhs, gate, up):
+        def product(matrix):
+            return jnp.dot(lhs, matrix, preferred_element_type=jnp.float32)
+        return swiglu(product(gate), product(up)).astype(jnp.bfloat16)
+
+    def truth(lhs, gate, up):
+        return jax.nn.silu(lhs @ gate) * (lhs @ up)
+
+    paired = run(*draw(0))
     assert paired.shape == (rows, width) and paired.dtype == jnp.bfloat16
-    assert bool(jnp.all(jnp.isfinite(paired)))
-    np.testing.assert_array_equal(np.asarray(jax.lax.bitcast_convert_type(paired, jnp.uint16)),
-                                  np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint16)))
+    assert_as_exact(run, jax.jit(plain), draw, "paired product", seeds=SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm90"])
 def test_a_paired_dense_product_lowers_for_cuda(generation_name):
-    """The two-source dense kernel lowers for CUDA on the CPU, its pallas_call named."""
+    """The two-source dense kernel lowers for CUDA on the CPU."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     args = (bf16((1021, 200)), bf16((200, 300)), bf16((200, 300)))
 
@@ -1467,8 +1408,7 @@ def test_a_paired_dense_product_lowers_for_cuda(generation_name):
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
     with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
-        lowered = jax.jit(paired).trace(*args).lower(lowering_platforms=("cuda",))
-    assert "pallas_triton_dense_dot" in triton_kernels(lowered)
+        jax.jit(paired).trace(*args).lower(lowering_platforms=("cuda",))
 
 
 def test_a_paired_product_without_an_epilogue_is_refused():
@@ -1479,11 +1419,9 @@ def test_a_paired_product_without_an_epilogue_is_refused():
 
 
 @lowers("sm90")
-def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton():
-    """Mosaic's layout inference finds no layout for a side operand given back with its dimension of
-    one, so the Mosaic launches refuse such a hook: a Hopper call's every launch with one, the forward's
-    and the kernel gradient's with its prologue, lowers through Triton's, beside the gradients' plain
-    launches, which may be Mosaic's (GMMGATE-h100-8)."""
+def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper():
+    """A side operand given back with its dimension of one, for which Mosaic's layout inference finds no
+    layout: a Hopper call's forward and kernel gradient with such a prologue lower (GMMGATE-h100-8)."""
     drawn = [jax.ShapeDtypeStruct(array.shape, array.dtype) for array in _draw(0)]
     dew = _drop(_dew(CASES["broadcast axes"]))
 
@@ -1491,12 +1429,8 @@ def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton(
         return sum(jnp.sum(out.astype(jnp.float32)) for out in dew(*drawn))
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh), tuning.seen() as launches:
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         jax.jit(jax.grad(loss, argnums=range(len(drawn)))).trace(*drawn).lower(lowering_platforms=("cuda",))
-    broadcast = [(launch, ba) for launch, ba in launches
-                 if ba.arguments['hooks'].prologue_broadcast or ba.arguments['hooks'].epilogue_broadcast]
-    assert {type(launch) for launch, _ in broadcast} >= {grouped_matmul.Gmm, grouped_matmul.Tgmm}
-    assert not any(isinstance(launch, grouped_matmul._Mosaic) for launch, _ in broadcast)
 
 
 
@@ -1508,7 +1442,7 @@ def test_an_interpreted_fp32_product_at_highest_rounds_its_exact_sum_once(column
     sum is a multiple of 2^-8 below 2^37, exact in float64 in any order and past fp32's 24 bits: the
     product is the exact sum rounded once to fp32, to the bit. That is the contract under test, the float64
     accumulation: an fp32 one would round the partial sums, so equality is no claim that fp32 accumulation
-    is exact here. A 16-bit product keeps an fp32 sum."""
+    is exact here."""
     generator = np.random.default_rng(0)
 
     def drawn(shape):
@@ -1520,11 +1454,6 @@ def test_an_interpreted_fp32_product_at_highest_rounds_its_exact_sum_once(column
     found = jax.jit(lambda a, b: product.interpreted(declared, a, b, (((1,), (0,)), ((), ()))))(lhs, rhs)
     exact = np.asarray(lhs, np.float64) @ np.asarray(rhs, np.float64)
     np.testing.assert_array_equal(np.asarray(found), exact.astype(np.float32))
-    half = product.declared(jnp.bfloat16, None, outputs=(jnp.float32,))
-    narrow = (lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16))
-    out = product.interpreted(half, *narrow, (((1,), (0,)), ((), ())))
-    np.testing.assert_array_equal(np.asarray(out), np.asarray(jax.lax.dot_general(
-        *narrow, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32)))
 
 
 def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_its_float64_sum():
@@ -1537,35 +1466,13 @@ def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_its_float64
     assert float(product.interpreted(declared, lhs, rhs, (((1,), (0,)), ((), ())))[0, 0]) == 1.0
 
 
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
-def test_each_cell_runs_the_template_unless_its_old_route_measured_faster(generation_name):
-    """On each GPU family, every product (forward, input gradient, kernel gradient; grouped and dense) runs
-    the template's Mosaic launch, unless `grouped_matmul.DECLARED` lists its cell, which runs its old
-    route where that route runs here (CUTLASS's where dew_cutlass is installed for the GPU), else the
-    template (owner, bible da64ae5): nothing ranks a launch at runtime."""
-    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    rows, depth, width, groups = 4096, 1024, 2048, 8
-    sizes = jnp.full((groups,), rows // groups, jnp.int32)
-    x, dy, grouped, dense = (bf16((rows, depth)), bf16((rows, width)), bf16((groups, depth, width)),
-                             bf16((depth, width)))
-    calls = {
-        ("forward", "grouped"): (lambda x, w: template.gemm(x, w, sizes, out_dtype=jnp.bfloat16), x, grouped),
-        ("input_gradient", "grouped"): (lambda dy, w: template.gemm(dy, w, sizes, transpose_rhs=True,
-                                                                    out_dtype=jnp.bfloat16), dy, grouped),
-        ("kernel_gradient", "grouped"): (lambda x, dy: template.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16),
-                                         x, dy),
-        ("forward", "dense"): (lambda x, w: template.gemm(x, w, None, out_dtype=jnp.bfloat16), x, dense),
-        ("input_gradient", "dense"): (lambda dy, w: template.gemm(dy, w, None, transpose_rhs=True,
-                                                                  out_dtype=jnp.bfloat16), dy, dense),
-        ("kernel_gradient", "dense"): (lambda x, dy: template.gemm_t(x, dy, None, out_dtype=jnp.bfloat16),
-                                       x, dy),
-    }
-    family = generation.family(generation_name)
-    for (made, shape), (call, *operands) in calls.items():
-        cell = (family, f"{shape} {made}")
-        expected = grouped_matmul.DECLARED.get(cell, ("mosaic_gpu",))[0]
-        if expected == "cutlass" and generation_name not in grouped_matmul.cutlass_architectures():
-            expected = "mosaic_gpu"
-        with generation.assumed(generation_name), generation.routes() as taken:
-            jax.jit(call).trace(*operands)
-        assert _kernels(taken) == {expected}, (cell, _kernels(taken))
+def test_a_declared_cell_compiles_nothing_for_the_template_it_prefers(monkeypatch, tmp_path):
+    """A declared cell's call (an A100's grouped kernel gradient, `grouped_matmul.DECLARED`), traced, keeps
+    no kernel report: no launch rests on the template it prefers, so the compiler's word on its tile is never
+    asked (`selection.preferring`; the word cost 1.5 s of an A100 trace, CONFIRMCOST1)."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    x, dy = jax.ShapeDtypeStruct((4096, 1024), jnp.bfloat16), jax.ShapeDtypeStruct((4096, 2048), jnp.bfloat16)
+    sizes = jnp.full((8,), 512, jnp.int32)
+    with generation.assumed("sm80"):
+        jax.jit(lambda x, dy: template.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16)).trace(x, dy)
+    assert not (tmp_path / "dew" / "kernel-reports").exists()

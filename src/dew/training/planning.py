@@ -54,6 +54,7 @@ from dew.training.memory import (
 from dew.training.profiling import PGLE_CAPTURE
 
 if TYPE_CHECKING:
+    from dew.training._lowering import KernelReport
     from dew.training.rollout import Rollout
     from dew.training.trainer import StepFn
 
@@ -111,7 +112,8 @@ class Candidate:
     """A step a plan compiles: the shapes of the microbatch it reads, the
     loss's shapes, the narrow copies, the state's placement and shapes as it
     traces them, the bytes held beside it, the program lowered, None once its plan is admitted
-    (`Planned.released`), and its kernel launches (`dew.nn.kernels.tuning.tune`)."""
+    (`Planned.released`), its kernel launches (`dew.nn.kernels.tuning.tune`) and its kernel report
+    (`dew.training._lowering.KernelReport`: its dispatches' routes and lowered launches)."""
     micro: Batch
     shapes: object
     copies: dict
@@ -120,6 +122,7 @@ class Candidate:
     held: int
     program: jax.stages.Lowered | None
     launches: str
+    kernels: KernelReport
 
     @property
     def lowered(self) -> jax.stages.Lowered:
@@ -476,8 +479,12 @@ def settled(planned: Planned, plans: Sequence[Planned], seconds: Sequence[Sequen
             probes: Sequence[Probe]) -> dict[str, JSON]:
     """The record of `planned`, of `plans` a frontier timed at `seconds` a
     step (none where one plan fit first): every compile the search made,
-    `probes`, and each timed plan's split, rows, rung and seconds."""
-    return {**planned.record(), "probes": [probe.record() for probe in probes],
+    `probes`, each timed plan's split, rows, rung and seconds, and the
+    planned step's kernels (`KernelReport.record`: each dispatch's route
+    and each kernel's lowered launches), which the run log states."""
+    _log.info("the step's %s", planned.candidate.kernels.summary())
+    return {**planned.record(), "kernels": planned.candidate.kernels.record(),
+            "probes": [probe.record() for probe in probes],
             "timed": [{**plan.record(), "seconds": min(took)}
                       for plan, took in zip(plans, seconds, strict=True)] if seconds else None}
 
