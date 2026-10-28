@@ -336,6 +336,32 @@ def _muse_glimmer_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wr
     return _wrapper_fields("muse_glimmer", used, text, tower, projector, image, None, video=video)
 
 
+def _lfm3_vl_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Read an LFM3-VL wrapper (LiquidAI/LFM3-VL-2B): its LFM3 decoder under text_config. Its vision tower
+    (`lfm3_vl_vision`, convolutions between attention over patches) and its projector have no Dew port,
+    so a load reads its language model alone (`text_only`; `WrapperFields.unported`). d1's checkpoints
+    of it (LiquidAI/d1-2B) train their full-attention layers under a visibility of their own
+    (`d1_attention`), which no Dew layout reads: a load refuses it, the language model's function being
+    that visibility's."""
+    attention = hf_config.get("d1_attention")
+    if attention is not None:
+        refuse(f"d1_attention {attention!r}",
+               "d1 trains its full-attention layers to see across a state and its questions as no Dew "
+               "decision layout reads yet")
+    text = _wrapper_text(hf_config, used)
+    used.update(("downsample_factor", "projector_bias", "projector_hidden_act", "projector_hidden_size",
+                 "projector_layer_norm_eps", "video_token_id", "vision_start_token_id", "vision_end_token_id",
+                 "auto_map", "bos_token_id", "eos_token_id", "pad_token_id", "dtype"))
+    image = _wrapper_token_id(hf_config, used, "image_token_id")
+    video = hf_config.get("video_token_id")
+    fields = _wrapper_fields("lfm3_vl", used, text, None, None, image, None,
+                             video=None if video is None else _records.integer(video, "video_token_id"))
+    fields["unported"] = {
+        "vision_tower.": "LFM3-VL's vision tower (lfm3_vl_vision) has no Dew port",
+        "multi_modal_projector.": "LFM3-VL's projector reads its vision tower, which has no Dew port"}
+    return fields
+
+
 def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
     """Read a Gemma 3n wrapper: MobileNet tower, vocabulary embedders and its audio."""
     text = _wrapper_text(hf_config, used)
@@ -357,7 +383,7 @@ _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
     "gemma4_unified": _gemma4_unified_wrapper,
     **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper,
-    "muse_glimmer": _muse_glimmer_wrapper}
+    "muse_glimmer": _muse_glimmer_wrapper, "lfm3_vl": _lfm3_vl_wrapper}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
@@ -406,6 +432,9 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     audio = record.get("audio_projector") is not None
     bundled = _bundled(record["model_type"])
     bare = name.removeprefix("model.")
+    for prefix in record.get("unported", {}):
+        if bare.startswith(prefix):
+            return "unported", bare
     if bare.startswith("language_model."):
         tail = bare[len("language_model."):]
         return "language_model", tail if tail.startswith(

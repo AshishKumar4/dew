@@ -1767,6 +1767,11 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
                              "names the wrapper's modules, which its text checkpoint renames")
         config = decoders.language_model_config(config)
         route = source_route(config, remote=remote, pinned=pinned)
+    elif isinstance(route, WrapperRoute) and route.wrapper.get("unported"):
+        unported = route.wrapper.get("unported", {})
+        raise ValueError(f"{config.get('model_type')}'s {', '.join(sorted(unported))} cannot load: "
+                         f"{'; '.join(unported[prefix] for prefix in sorted(unported))}. text_only=True "
+                         "loads its language model alone")
     elif text_only and isinstance(route, DiffusionGemmaRoute):
         raise ValueError("text_only takes a media wrapper's language model; DiffusionGemma's decoder is "
                          "its whole model")

@@ -104,3 +104,51 @@ def test_a_config_that_omits_its_pattern_and_rotary_reads_lfm3s_own():
                    {'full_attention': {'rope_theta': 1e6}}):
         with pytest.raises(ValueError):
             translate_config({**config, 'num_hidden_layers': 9, 'rope_parameters': stated})
+
+
+def wrapped(directory: Path, **wrapper: object) -> Path:
+    """The tiny LFM3 as an LFM3-VL wrapper holds it: its decoder's tensors under
+    `model.language_model.`, a vision tower's and a projector's beside them, and `wrapper`'s fields."""
+    from safetensors.numpy import save_file
+
+    config = json.loads((TINY / 'config.json').read_text())
+    tensors = {f"model.language_model.{name.removeprefix('model.')}": tensor
+               for name, tensor in load_file(TINY / 'model.safetensors').items()}
+    tensors['model.vision_tower.embedding_norm.weight'] = np.ones(8, np.float32)
+    tensors['model.multi_modal_projector.linear_1.weight'] = np.ones((8, 8), np.float32)
+    directory.mkdir()
+    (directory / 'config.json').write_text(json.dumps({
+        'architectures': ['Lfm3VlForConditionalGeneration'], 'model_type': 'lfm3_vl', 'text_config': config,
+        'vision_config': {'model_type': 'lfm3_vl_vision', 'hidden_size': 8}, 'image_token_id': 5,
+        'downsample_factor': 2, 'projector_hidden_size': 8, 'tie_word_embeddings': True, **wrapper}))
+    save_file(tensors, directory / 'model.safetensors')
+    return directory
+
+
+def test_an_lfm3_vl_wrappers_language_model_loads_alone_and_its_unported_tower_refuses(tmp_path):
+    """LFM3-VL's wrapper (LiquidAI/LFM3-VL-2B) holds an LFM3 decoder beside a vision tower Dew has no port
+    of: `text_only` loads the decoder, computing the decoder's own logits bit for bit, and a multimodal
+    load refuses the tower by name. d1's checkpoint of it (LiquidAI/d1-2B), whose full-attention layers
+    train under a visibility of their own (`d1_attention`), refuses that by name."""
+    ids = jnp.asarray(fixture('input_ids'), jnp.int32)
+    alone = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
+    source = wrapped(tmp_path / 'wrapper')
+    text = Pretrained.load(source, dtype='float32', attention_impl='reference', text_only=True)
+    np.testing.assert_array_equal(np.asarray(text.model.apply(text.variables, ids)),
+                                  np.asarray(alone.model.apply(alone.variables, ids)))
+    with pytest.raises(ValueError):
+        Pretrained.load(source, dtype='float32', attention_impl='reference')
+    with pytest.raises(ValueError):
+        Pretrained.load(wrapped(tmp_path / 'd1', d1_attention='set', d1_set_size=16), text_only=True)
+
+
+@pytest.mark.network
+def test_the_released_lfm3_vl_and_d1_headers_load_their_language_model_or_refuse_d1s_attention():
+    """LiquidAI/LFM3-VL-2B's language model loads from its safetensors headers alone (`weights=False`,
+    `text_only`); LiquidAI/d1-2B's refuses its d1_attention by name."""
+    loaded = Pretrained.load('LiquidAI/LFM3-VL-2B', revision='f83d2b0a2296aaa277f394990a9b8b949ddf9691',
+                             weights=False, text_only=True)
+    assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(loaded.variables))
+    with pytest.raises(ValueError):
+        Pretrained.load('LiquidAI/d1-2B', revision='cfe5760ff5d5998f91d9ac56bd4b2dbd96996d41', weights=False,
+                        text_only=True)
