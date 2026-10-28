@@ -339,13 +339,14 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, para
     """A dK/dV consumer's query tile `index`, its keys the tile's rows (`[bk, bq]`, FlashAttention 3's order,
     hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp's SdP_swapAB): its scores `K Qᵀ` (the call's power taken after
     the product) and score cotangents from the query and output cotangent slots (`slots`) and its resident
-    keys and values (`resident`), under the tile's queries' statistics (`rows_of(first query, *places)`, in
-    a column's layout, each phase's read in it), its coordinates (`coords_of(first query)`) and its hook
-    parameters (`params_of(first query, like)`). The weights and the score cotangents, their keys as their rows, are dV's and dK's left operands
-    from the registers (`algebra.value_operands`, `cotangent_product`'s `aᵀ @ b`), issued into `accumulators`
-    in place; a fused launch stages the cotangents' parts in `staged` for dQ's product, their transpose its
-    left operand (`add_dq(first query, dQ)`). The key gradients' sums (`carry`) take the pulled cotangents'
-    row sums, and the tile gradients go to `store_tiles(first query, pieces)`, `[bk, bq]` each."""
+    keys and values (`resident`), under the tile's queries' statistics (`rows_of(first query, *places)`, in a
+    column's layout, each phase's read in it), its coordinates (`coords_of(first query)`) and its hook
+    parameters (`params_of(first query, like)`). The weights and the score cotangents, their keys as their
+    rows, are dV's and dK's left operands from the registers (`algebra.value_operands`, `cotangent_product`'s
+    `aᵀ @ b`), issued into `accumulators` in place; a fused launch stages the cotangents' parts in `staged`
+    for dQ's product, their transpose its left operand (`add_dq(first query, dQ)`). The key gradients' sums
+    (`carry`) take the pulled cotangents' row sums, and the tile gradients go to `store_tiles(first query,
+    pieces)`, `[bk, bq]` each."""
     k_smem, v_smem = resident
     family, tiles, kinds = walk.program.family, walk.program.tiles, walk.kinds
     shape = (tiles.block_k, tiles.block_q)
