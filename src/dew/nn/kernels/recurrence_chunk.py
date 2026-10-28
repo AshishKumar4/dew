@@ -589,7 +589,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                 raise kernel
             if kernel == 'mosaic_gpu':
                 return template_rule(query, key, value, g, beta, state, starts, firsts,
-                                     max_segments=max_segments, scale=scale, wide=epilogue, floor=hooks.floor)
+                                     max_segments=max_segments, scale=scale, delta=hooks.delta, wide=epilogue,
+                                     floor=hooks.floor)
             if kernel == 'fla':
                 # Unrounded where an epilogue follows, as on the portable math.
                 return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
@@ -711,7 +712,7 @@ def _trains(call: base.Call | None) -> bool:
 
 
 MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
-    *PORT_SUPPORTS[:3],
+    *PORT_SUPPORTS[1:3],
     Requirement('launch', lambda case: case.call is not None and case.call.eligible('mosaic_gpu'),
                 "the recurrence template's launches take no call of these dtypes or widths, or no config "
                 "fits this device, or no Mosaic bundle claims its instruction family", row='ledger 1294'),
@@ -724,11 +725,13 @@ MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
                 "(`mainloop.backward_holds`)", row='ledger 1294'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
-call: the port's form, trace and placement (the gated delta rule, its custom VJP, a Pallas call's results),
-its own launches' call (`Template.eligible`: dtypes, widths, a bundle for the device's family, a config that
-fits), a GPU, and for a training product its fast backward (`Mosaic.trains`; the rule's gradient takes no
-other, row 1926).
-A declared port cell runs the port first (`PORT_CELLS`, `GATED_DELTA`'s declared cells)."""
+call: the port's trace and placement (its custom VJP, a Pallas call's results), its own launches' call
+(`Template.eligible`: dtypes, widths, a decay a key dimension's floor, a bundle for the device's family, a
+config that fits) in every form its mainloop implements, the delta rule with a decay or without one and the
+forms without the delta rule alike (row 1963: the port's 'gated' form was the template's too), a GPU, and
+for a training product its fast backward (`Mosaic.trains`; the rule's gradient takes no other, row 1926). A
+declared port cell runs the port first where the port takes the call (`PORT_CELLS`, `GATED_DELTA`'s declared
+cells)."""
 
 MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
@@ -754,10 +757,8 @@ def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segm
     but for a form the rule's kernels do not run, which the portable math takes."""
     from .templates.recurrence import template
 
-    call = None
-    if delta and decayed:
-        call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
-                         max_segments=max_segments, scale=scale, delta=True, wide=wide, floor=floor)
+    call = base.call((template.MOSAIC,), query, key, value, g, beta, state, starts,
+                     max_segments=max_segments, scale=scale, delta=delta, wide=wide, floor=floor)
     family = generation.family(generation.device_generation()) if generation.backend() == 'gpu' else None
     case = PortCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
