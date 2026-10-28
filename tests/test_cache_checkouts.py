@@ -15,7 +15,7 @@ PROGRAM = """
 import json, sys
 import jax, jax.numpy as jnp
 from dew.cache import enable_compilation_cache
-from dew.nn.attention import rms_normalized
+from dew.nn.norms import rms_normalized
 from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
 enable_compilation_cache(sys.argv[1])
 count_compilation_cache()

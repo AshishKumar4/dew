@@ -123,7 +123,7 @@ task = dew.pipeline(sys.argv[1], dtype="bfloat16", param_dtype="auto")
 import jax
 import jax.numpy as jnp
 import numpy as np
-from dew.nn.attention import RMSNorm
+from dew.nn.norms import RMSNorm
 a = jax.random.normal(jax.random.key(0), (512, 64), jnp.bfloat16)
 b = (jax.random.normal(jax.random.key(1), (512, 64)) * 0.37).astype(jnp.bfloat16)
 norm = RMSNorm(epsilon=1e-5, scale_after_cast=True, dtype=jnp.bfloat16)
@@ -172,7 +172,7 @@ else:
             return jnp.sum(variables["params"]["w"] ** 2), Aux({})
     trainer = Trainer(Probe(), optax.sgd(0.1), key=0)
     trainer.initial_state()
-from dew.nn.attention import RMSNorm
+from dew.nn.norms import RMSNorm
 a = jax.random.normal(jax.random.key(0), (512,64), jnp.bfloat16)
 b = (jax.random.normal(jax.random.key(1), (512,64)) * 0.37).astype(jnp.bfloat16)
 norm = RMSNorm(epsilon=1e-5, scale_after_cast=True, dtype=jnp.bfloat16)
