@@ -638,7 +638,8 @@ def test_a_right_padded_row_convolves_as_the_masked_conv(case, history, packed):
 
 
 RIGHT_PADDED_SEEDS = 8
-"""The right-padded layer's declared draws against the masked call (check 1)."""
+"""The right-padded layer's declared draws against the masked call (check 1), sized by `seeds_for`
+paired with the declared call on the CPU."""
 
 
 def test_a_right_padded_layer_keeps_its_real_tokens_states(reference, geometry):
@@ -763,10 +764,11 @@ def test_the_chunked_rule_holds_with_aligned_keys():
     np.testing.assert_allclose(state, want_state, atol=2e-4)
 
 
-DECODE_SEEDS = {("small", jnp.float32): 8, ("small", jnp.bfloat16): 8, ("0.8b-3", jnp.float32): 8,
+DECODE_SEEDS = {("small", jnp.float32): 64, ("small", jnp.bfloat16): 64, ("0.8b-3", jnp.float32): 8,
                 ("0.8b-3", jnp.bfloat16): 8, ("0.8b-32", jnp.float32): 8, ("0.8b-32", jnp.bfloat16): 8}
 """Each decode kernel case's declared draws against the recurrence (check 1), by its geometry's id and
-the dtype its state is held in."""
+the dtype its state is held in: sized by `seeds_for` paired with the kernel, the small case on the CPU
+and an A100 alike (64 on each), the 0.8B's widths on the A100."""
 DECODE_GEOMETRIES = {"small": (3, 2, 64), "0.8b-3": (3, 16, 128), "0.8b-32": (32, 16, 128)}
 
 

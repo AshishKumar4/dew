@@ -485,7 +485,8 @@ def one_tap(kind):
 
 
 ONE_TAP_SEEDS = {"gated_delta_net": 8, "kimi_delta_attention": 8, "mamba": 8, "mamba2": 8}
-"""Each one-tap mixer's declared draws for its decode against its whole pass (check 1)."""
+"""Each one-tap mixer's declared draws for its decode against its whole pass (check 1), sized by
+`seeds_for` paired with the decode on the CPU."""
 
 
 @pytest.mark.parametrize("kind", ["gated_delta_net", "kimi_delta_attention", "mamba", "mamba2"])
