@@ -78,7 +78,7 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     leaves, treedef = jax.tree.flatten(values)
     axes = (generation.Refusal('scalar_prefetch', "the consumer reads scalar prefetch") if prefetch
             else _axes(consumer, values, acc))
-    if select(EPILOGUE, Tiling(axes)).kernel == 'xla' or isinstance(axes, generation.Refusal):
+    if select(EPILOGUE, Tiling(axes)).kernel == 'xla':
         summed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
                                interpret_on_cpu=interpret_on_cpu, **prologue)
         return consumer(values, summed)
@@ -143,7 +143,7 @@ def _prologue(fusion) -> tuple[jax.Array, dict]:
     # An operand as given has no producer to fuse, and no stage to choose.
     if isinstance(split, generation.Refusal) and split.code == 'no_producer':
         return fusion(), {}
-    if select(PROLOGUE, Tiling(split)).kernel == 'xla' or isinstance(split, generation.Refusal):
+    if select(PROLOGUE, Tiling(split)).kernel == 'xla':
         return fusion(), {}
     base, function, sides, axes, jvp = split
     return base, {'prologue': function, 'prologue_operands': tuple(zip(sides, axes, strict=True)),
