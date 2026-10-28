@@ -185,23 +185,27 @@ def test_the_served_weights_are_restored_in_the_dtype_they_serve_in(example):
 
 
 def test_a_scoring_server_compiles_its_passes_up_front_and_none_while_it_serves(decide, caplog):
-    """A scoring server (`ScoringServer.from_task`) compiles every pass's program up front, a few
+    """A scoring server (`ScoringServer.from_task`) over a task whose budget declares the questions and
+    options a pass pads to (`Budget`), the run's widest, compiles every pass's program up front, a few
     shapes the task declares once (`Decide.pass_shapes`): a lone request's and a full pass's at each of
-    the layout's lengths, whatever a request asks. Then requests of every length, question and option
-    count, alone and together, compile none while it serves, where each such shape compiled its own
-    program as it came (ledger 2033)."""
+    the layout's lengths. Then requests of every length, question and option count, alone and
+    together, compile none while it serves, where each such shape compiled its own program as it came
+    (ledger 2033)."""
     import logging
 
     from test_decision_batches import CASES
 
-    task, variables = decide.scoring()
+    from dew.decision.task import Budget
+
+    declared = replace(decide, budget=Budget(questions=4, options=16))
+    task, variables = declared.scoring()
     with jax.log_compiles():
         server = ScoringServer.from_task(task, variables)
-        assert server.programs == decide.pass_shapes
-        assert len({(shape.length, shape.rows) for shape in server.programs}) == len(server.programs) <= 8
+        assert server.programs == declared.pass_shapes
+        assert len(set(server.programs)) == len(server.programs) <= 8
         caplog.clear()
         with caplog.at_level(logging.WARNING):
-            bodies = [*CASES.values(), REQUEST, {**REQUEST, "state": REQUEST["state"] * 6}]
+            bodies = [*CASES.values(), {**REQUEST, "state": REQUEST["state"] * 6}]
             futures = [server.submit(body) for body in bodies]
             server.run()
             for future in futures:

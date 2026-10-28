@@ -66,7 +66,7 @@ from dew.decision.questions import (
 )
 from dew.files import write_atomically
 from dew.inference import scoring
-from dew.inference.tasks import SavedRun, SavedRunTask, length_ladder
+from dew.inference.tasks import SavedRun, SavedRunTask, length_ladder, shape_bucket
 from dew.interop.processors import Processor
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.sources import SourceReference
@@ -92,12 +92,20 @@ class Budget:
     """How much one forward pass may hold: at most `tokens` padded tokens and `rows` question rows.
 
     Laya's `predict_items` uses 16384 and 256. A pass pads to one of a few
-    shapes declared once (`Decide.pass_shapes`), so every pass shares one of a
-    few compiled programs.
+    lengths and row counts declared once (`Decide.pass_shapes`), and its
+    questions and options to `questions` and `options` where they are declared,
+    so every pass shares one of a few programs, compiled up front
+    (`Decide.compile_scoring`).
     """
 
     tokens: int = 16384
     rows: int = 256
+    questions: int | None = None
+    """The questions every row of a pass pads to, the run's widest (training's own static width); None
+    rounds each pass's widest up to a power of two, a program for each, compiled as it comes. A request
+    of more widens its pass, compiling it."""
+    options: int | None = None
+    """The options every question of a pass pads to, as `questions`."""
 
 
 @dataclass(frozen=True)
@@ -117,15 +125,14 @@ class Weights:
 
 @dataclass(frozen=True)
 class PassShape:
-    """The shape of one compiled scoring pass (`Decide.pass_shapes`): `rows` rows of `length` tokens,
-    each of up to `questions` questions of up to `options` options, its real options compacted to
-    `option_slots` (`DecisionInputs.collate`)."""
+    """The shape of one scoring pass (`Decide.pass_shapes`): `rows` rows of `length` tokens, each of
+    `questions` questions of `options` options (the budget's, None where it declares none: each pass's
+    own, rounded up to a power of two)."""
 
     length: int
     rows: int
-    questions: int
-    options: int
-    option_slots: int
+    questions: int | None
+    options: int | None
 
 
 @dataclass(frozen=True)
@@ -472,22 +479,16 @@ class Decide(SavedRunTask):
 
     @functools.cached_property
     def pass_shapes(self) -> tuple[PassShape, ...]:
-        """The shapes a text pass pads to, one program each, declared once: the layout's window and its
-        halvings (`dew.inference.tasks.length_ladder`), each as one row, a lone request's pass, and as
-        many rows as the budget's tokens and rows allow, every other pass's; each with the questions,
-        options and real options a window of its length holds (`Layout.bounds`), whatever a request
-        asks. `compile_scoring` compiles them all."""
-        shortest = len(self._probe[0].tokens)
+        """The shapes a text pass pads to, declared once: the layout's window and its halvings
+        (`dew.inference.tasks.length_ladder`), each as one row, a lone request's pass, and as many rows
+        as the budget's tokens and rows allow, every other pass's; each with the budget's questions and
+        options (`Budget`). Where the budget declares both, each shape is one program, which
+        `compile_scoring` compiles."""
         shapes = []
-        for length in length_ladder(self.layout.max_len, shortest):
-            bounds = replace(self.layout, max_len=length).bounds(self.tokenizer, self.specials,
-                                                                 self.context_length)
-            # Options that share the row's budget take no tokens of their own, so a window's tokens
-            # bound them: each still holds one.
-            options = length if bounds.options is None else bounds.options
-            slots = -(-options // OPTION_TILE) * OPTION_TILE
+        for length in length_ladder(self.layout.max_len, len(self._probe[0].tokens)):
             counts = sorted({1, max(1, min(self.budget.rows, self.budget.tokens // length))})
-            shapes.extend(PassShape(length, count, bounds.questions, options, slots) for count in counts)
+            shapes.extend(PassShape(length, count, self.budget.questions, self.budget.options)
+                          for count in counts)
         return tuple(shapes)
 
     def _shape(self, rows: Sequence[Encoded], *, alone: bool = True) -> PassShape:
@@ -501,8 +502,12 @@ class Decide(SavedRunTask):
 
     def compile_scoring(self, variables: Variables | None = None) -> tuple[PassShape, ...]:
         """Compile every text pass's program (`pass_shapes`) over `variables` (the task's own by
-        default), in parallel, by one pass of the layout's shortest row at each shape: a scorer then
-        compiles none while it serves. Returns the shapes, the programs it serves with."""
+        default), in parallel, by one pass of the layout's shortest row at each shape, so a scorer
+        compiles none while it serves; returns the shapes compiled. Where the budget declares no
+        questions or options (`Budget`), a pass's own decide its program, which it compiles as it
+        comes, and none is compiled here."""
+        if self.budget.questions is None or self.budget.options is None:
+            return ()
         with ThreadPoolExecutor(max_workers=len(self.pass_shapes)) as pool:
             list(pool.map(lambda shape: self._pass(self._probe, variables, shape), self.pass_shapes))
         return self.pass_shapes
@@ -600,9 +605,14 @@ class Decide(SavedRunTask):
         """One forward pass at its declared shape (`pass_shapes`, the shortest that holds `rows` unless
         `shape` is given), its rows placed on the weights' mesh (`RowPlan`)."""
         shape = self._shape(rows) if shape is None else shape
-        inputs = DecisionInputs.collate(rows, self.specials.pad, questions=shape.questions,
-                                        options=shape.options, option_slots=shape.option_slots,
-                                        context_length=self.context_length)
+        questions = shape.questions or shape_bucket(max(len(row.questions) for row in rows), 1)
+        options = shape.options or shape_bucket(
+            max(len(laid.options) for row in rows for laid in row.questions), 1)
+        # Declared widths fix the real options' slots too: as many as the grid holds.
+        slots = (None if shape.questions is None or shape.options is None
+                 else -(-questions * options // OPTION_TILE) * OPTION_TILE)
+        inputs = DecisionInputs.collate(rows, self.specials.pad, questions=questions, options=options,
+                                        option_slots=slots, context_length=self.context_length)
         length = shape.length
         inputs = replace(
             inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
