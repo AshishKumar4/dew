@@ -1392,3 +1392,27 @@ def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):
     assert [item["select"] for item in ci.gangs(grown)] == [
         "layouts and dense", "layouts and moe", "layouts and hybrid",
         "not (layouts and dense) and not (layouts and moe) and not (layouts and hybrid)"]
+
+
+def test_whole_suite_tests_run_on_a_whole_suite_run_alone(ci, tmp_path, monkeypatch):
+    """A test marked whole_suite runs where nothing is reused (the cache's policy off: the daily run, a
+    pushed full-* branch, a train's change to what every test reads) and is set aside where the policy is on
+    (a train's or a lane's run of what changed), as a whole-suite cell needs no rerun for a change it does
+    not read (owner, 2026-10-27, via OrganicMouse: G03's parallelism matrix marks 11 such cells)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_matrix.py": "import pytest\nfrom pathlib import Path\n"
+                                         "@pytest.mark.whole_suite\ndef test_cell():\n"
+                                         "    with Path('runs-cell').open('a') as runs: runs.write('x')\n"
+                                         "def test_contract():\n"
+                                         "    with Path('runs-contract').open('a') as runs: runs.write('x')\n"})
+    (tmp_path / ".verdict").mkdir()
+    out = tmp_path / ".verdict/verdict.json"
+
+    def ran(policy: str) -> list[int]:
+        rows = armada_task(ci, monkeypatch, out, policy)
+        assert [row["exitCode"] for row in rows] == [0]
+        return [len(path.read_text()) if path.exists() else 0
+                for path in (tmp_path / "runs-cell", tmp_path / "runs-contract")]
+
+    assert ran("on") == [0, 1]
+    assert ran("off") == [1, 2]
