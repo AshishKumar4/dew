@@ -1247,7 +1247,7 @@ class TorchCausalLM(nn.Module):
 
             # The runs as the mask they state, the stated visibility this path reads.
             length = jnp.shape(tokens)[1]
-            attention_pairwise_mask = visibility_mask(length, length, False, None,
+            attention_pairwise_mask = visibility_mask(length, length, causal=False, sliding_window=None,
                                                       key_runs=attention_key_runs)[:, 0]
         if attention_pairwise_mask is None:
             return self._run(tokens, train, laid)[1]
