@@ -1,5 +1,4 @@
-"""Every registered architecture's tiny configuration (tests/tiny_models.py builds them): the fields a
-test reads without building a model."""
+"""Every registered architecture's tiny configuration."""
 
 TINY = {"emb_features": 32}
 DIT = {"output_channels": 3, "patch_size": 4, "num_layers": 1, "num_heads": 2}

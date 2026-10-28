@@ -1,5 +1,4 @@
-"""Batches a language-model objective reads (`token_batch_of`), apart from tests/token_support.py's
-token stores and tokenizers, which need no objective."""
+"""Token batches as a language-model objective reads them."""
 
 import jax.numpy as jnp
 import numpy as np

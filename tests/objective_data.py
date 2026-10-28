@@ -1,6 +1,5 @@
-"""The data an objective's recipe trains on (tests/objective_cases.py's): the image fixture, the LM
-recipe's windows of byte tokens and a chain's first compiled batch, apart from the objectives, which a
-data-only test does not build."""
+"""The data the objectives' recipes train on: the image fixture, byte-token windows and a chain's
+first batch."""
 
 from pathlib import Path
 

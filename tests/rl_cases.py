@@ -1,5 +1,4 @@
-"""The rows an RL objective trains on (tests/objective_cases.py's GRPO and PPO cases): the sessions a
-rollout packs, apart from the other objectives' cases."""
+"""The packed session rows the RL objectives train on."""
 
 from objective_data import SEQ_LEN
 

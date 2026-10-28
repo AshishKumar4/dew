@@ -1,6 +1,4 @@
-"""A trainable tool policy over a compact tool vocabulary (`ToolPolicy`), which tests that serve, roll
-out or train a policy share: the vocabulary's tokens and its starting transitions, needing no RL stack
-(tests/episode_support.py builds episodes on it)."""
+"""A trainable bigram tool policy over a compact tool vocabulary, and its starting transitions."""
 
 from collections.abc import Callable
 

@@ -1,6 +1,4 @@
-"""The affine regression of tests/affine_run.py trained: the least run that readies a process
-(`fit_one_step`) and the trainer whose average a preference or RL objective reads (`frozen_trainer`),
-apart from the regression, which needs no trainer."""
+"""Training helpers for the affine regression of tests/affine_run.py."""
 
 import jax
 import optax

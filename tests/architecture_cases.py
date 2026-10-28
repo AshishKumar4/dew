@@ -1,5 +1,4 @@
-"""Every architecture at the smallest size that still exercises it (`CASES`, tests/test_architectures.py's
-cases), as plain data: a test that reads a case's configuration imports no part of Dew."""
+"""Every architecture at the smallest size that still exercises it."""
 
 from dataclasses import dataclass
 

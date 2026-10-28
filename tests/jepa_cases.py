@@ -1,5 +1,4 @@
-"""A JEPA case's masking (tests/test_architectures.py's `MASK`): 2x2 target blocks on the architecture
-cases' 4x4 grid, apart from the cases, which need no objective."""
+"""The JEPA cases' target-block mask."""
 
 from architecture_cases import GRID
 
