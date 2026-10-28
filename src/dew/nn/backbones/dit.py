@@ -13,13 +13,8 @@ from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rop
 from ..flops import MissingFlopsCount, counted_flops, patch_lengths
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
+from ..scatter import gather_positions
 from .decoder_stack import pipelined_blocks, pipelines
-
-
-def gather_tokens(tokens: jax.Array, kept: jax.Array) -> jax.Array:
-    """The `[B, K, F]` tokens at the `[B, K]` indices `kept`: TREAD's
-    `Router.start_route`."""
-    return jnp.take_along_axis(tokens, kept[..., None], axis=1)
 
 
 def scatter_tokens(held: jax.Array, kept: jax.Array, tokens: jax.Array) -> jax.Array:
@@ -137,7 +132,8 @@ class SimpleDiT(_DiTStackOptions):
             if index in starts:
                 ratio, end = starts[index]
                 held, kept = x_seq, self.kept_tokens(x_seq, ratio, index)
-                x_seq = gather_tokens(x_seq, kept)
+                # TREAD's `Router.start_route`: the tokens the router keeps.
+                x_seq = gather_positions(x_seq, kept)
                 if freqs_cis is not None:
                     rotation = rotary_freqs(kept, self.emb_features // self.num_heads, ROPE_THETA,
                                             dtype=at_least_fp32(x_seq.dtype))

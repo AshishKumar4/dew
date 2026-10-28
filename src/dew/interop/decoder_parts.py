@@ -24,6 +24,7 @@ from dew._model_types import SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
+from dew.interop.unread import Stored, equal, valued
 from dew.interop.weights import check_tree
 from dew.nn.activations import GatedActivation, Situ
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -75,21 +76,22 @@ def ungated_mlp(activation: str, accepted: Collection[str], field: str, family: 
     return UNGATED_ACTIVATIONS[activation]
 
 
-def fixed_attention_buffer(name: str, tensor: np.ndarray, attention: str,
+def fixed_attention_buffer(name: str, tensor: Stored, attention: str,
                            sentinels: Collection[float]) -> bool:
     """Whether `name` is one of a classic family's fixed attention buffers,
     under its `attention` module: `bias`, the triangular causal mask, or
     `masked_bias`, a mask sentinel among `sentinels`, which each family's
     releases spell their own. They describe the fixed mask, not learned
-    biases, so an altered one is refused."""
+    biases, so an altered one is refused; of a load without its weights, by its shape alone
+    (`valued`)."""
     if name.endswith(f'.{attention}.bias'):
         if (tensor.ndim != 4 or tensor.shape[:2] != (1, 1)
                 or tensor.shape[-2] != tensor.shape[-1]
-                or not np.array_equal(tensor, np.tril(np.ones_like(tensor)))):
+                or (valued(tensor) and not np.array_equal(tensor, np.tril(np.ones_like(tensor))))):
             raise ValueError(f'{name} must hold the fixed triangular causal mask')
         return True
     if name.endswith(f'.{attention}.masked_bias'):
-        if tensor.shape != () or float(tensor) not in sentinels:
+        if tensor.shape != () or (valued(tensor) and float(tensor) not in sentinels):
             raise ValueError(f'{name} must hold a historical mask sentinel, one of {sorted(sentinels)}')
         return True
     return False
@@ -1607,8 +1609,8 @@ class Packed:
         record but one whose parts are interleaved in runs (`chunks`), which it copies."""
         return self.chunks is None
 
-    def split(self, name: str, tensor: np.ndarray,
-              config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
+    def split(self, name: str, tensor: Stored,
+              config: Mapping[str, object] | None = None) -> dict[str, Stored]:
         """The parts of the source tensor `name`, as views of it, or copies
         where they are interleaved in runs."""
         stem = name.removesuffix(self.name)
@@ -1651,34 +1653,34 @@ class Packed:
                             chunks=None if runs == 1 else runs)
 
 
-def split_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed],
-                 config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
+def split_packed(tensors: Mapping[str, Stored], packed: Sequence[Packed],
+                 config: Mapping[str, object] | None = None) -> dict[str, Stored]:
     """`tensors` with each one a `packed` record names split into its parts
     (`Packed.split`), the rest as they are, each part held once
     (`_held_twice`)."""
-    split: dict[str, np.ndarray] = {}
+    split: dict[str, Stored] = {}
     for name, tensor in tensors.items():
         packing = next((packing for packing in packed if name.endswith(packing.name)), None)
         parts = {name: tensor} if packing is None else packing.split(name, tensor, config)
         for part, value in parts.items():
-            held = split.setdefault(part, value)
-            if held is not value:
-                _held_twice(name, part, held, value)
+            kept = split.setdefault(part, value)
+            if kept is not value:
+                _held_twice(name, part, kept, value)
     return split
 
 
-def _held_twice(name: str, part: str, held, value) -> None:
+def _held_twice(name: str, part: str, kept: Stored, value: Stored) -> None:
     """Refuse a second tensor for `part`, the stored tensor `name`'s, unless it is the one held.
 
     A fused tensor and a part stored under its own name, such as Qwen's
     `experts.gate_up_proj` beside `experts.gate_proj`, both hold that part,
     and the tree has one leaf for it, so the two must be the same tensor, of
-    one dtype and equal values; any other pair is refused, whichever the
-    checkpoint lists first."""
-    held, value = np.asarray(held), np.asarray(value)
-    if held.dtype != value.dtype or not np.array_equal(held, value):
+    one dtype and equal values (of a load without its weights, equal shapes:
+    `equal`); any other pair is refused, whichever the checkpoint lists
+    first."""
+    if kept.dtype != value.dtype or not equal(kept, value):
         raise ValueError(f"{name} holds {part} as {value.dtype}, which another of the "
-                         f"checkpoint's tensors holds as a different {held.dtype} tensor")
+                         f"checkpoint's tensors holds as a different {kept.dtype} tensor")
 
 
 class Part(NamedTuple):
@@ -1687,7 +1689,7 @@ class Part(NamedTuple):
     has no leaf for it."""
 
     name: str
-    tensor: np.ndarray
+    tensor: Stored
     path: tuple[str, ...] | None
 
 
@@ -1699,7 +1701,7 @@ class Reading(NamedTuple):
     tensor's parts are its stored tensor's."""
 
     name: str
-    stored: np.ndarray | None
+    stored: Stored | None
     packing: Packed | None
     parts: tuple[Part, ...]
 
@@ -1792,8 +1794,8 @@ FUSED_EXPERTS = (Packed('.experts.gate_up_proj', ('.experts.gate_proj', '.expert
 class WeightPreparer(Protocol):
     """Checkpoint storage transforms, with translated geometry where layout needs it."""
 
-    def __call__(self, tensors: Mapping[str, np.ndarray],
-                 config: Mapping[str, object] | None = None, /) -> Mapping[str, np.ndarray]: ...
+    def __call__(self, tensors: Mapping[str, Stored],
+                 config: Mapping[str, object] | None = None, /) -> Mapping[str, Stored]: ...
 
 
 @dataclass(frozen=True)
@@ -1893,7 +1895,7 @@ class DecoderFamily:
     Kimi Linear shares), or a config of the mixture-of-experts LLaDA sources, whose model_type 'llada'
     also names the dense one."""
 
-    def readings(self, tensors: Mapping[str, np.ndarray],
+    def readings(self, tensors: Mapping[str, Stored],
                  config: Mapping[str, object]) -> tuple[Reading, ...]:
         """The checkpoint's tensors as the path map reads them, in its order:
         `prepare`'s, each `packed` one split into its parts (`Packed.split`:

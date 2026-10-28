@@ -24,15 +24,38 @@ host, so attention traces its XLA path.
 
 from __future__ import annotations
 
+import json
+import logging
+import re
 from collections import Counter
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import jax
 from jax.extend.mlir import ir
 
-TRITON = "__gpu$xla.gpu.triton"
-"""The custom call Pallas lowers a Triton kernel to."""
+from dew.nn.kernels import generation
+from dew.nn.kernels.generation import Route
+from dew.telemetry.instrumentation import custom_call_kind, sizes
+
+_log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class KernelCall:
+    """One kernel call of a lowered program: its `kind` (`instrumentation.custom_call_kind`: a Pallas
+    kernel's compiler, 'triton', 'mosaic_gpu' or 'mosaic_tpu', a library's 'gemm', 'convolution' or
+    'attention', or None for a call nothing sizes), its kernel's `name` (Triton's config names it, a
+    Mosaic TPU call's `kernel_name`, a Mosaic GPU call's location, the name-stack entry its `mpmd_map`
+    lowers under; any other call's target), a Pallas kernel's IR as Pallas serialized it (Triton IR,
+    or Mosaic's module bytecode), its `config` (Triton's warps and stages, a Mosaic GPU kernel's hash),
+    and the FLOPs its kernel states (its cost estimate), None where it states none."""
+
+    kind: str | None
+    name: str
+    ir: bytes
+    config: str
+    flops: float | None
 
 
 @dataclass(frozen=True)
@@ -45,27 +68,15 @@ class CustomCall:
     results: tuple[tuple[int, ...], ...]
 
 
-@dataclass(frozen=True)
-class TritonCall:
-    """One Pallas-Triton call of a lowered program, as Pallas configured it (`mhlo.backend_config`)."""
-
-    name: str
-    ir: bytes
-    """The kernel's Triton IR, serialized as Pallas wrote it."""
-    warps: int
-    stages: int
-
-
-def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operation], T | None]) -> list[T]:
-    """What `read` makes of each custom call a lowered program makes, given its target and its
-    operation, in program order: the calls it makes something of."""
+def _read[T](lowered: jax.stages.Lowered, read: Callable[[ir.Operation], T | None]) -> list[T]:
+    """What `read` makes of each operation of a lowered program's StableHLO module, in program order: the
+    operations it makes something of."""
     found: list[T] = []
 
     def visit(operation: ir.Operation) -> ir.WalkResult:
-        if operation.name == "stablehlo.custom_call":
-            made = read(ir.StringAttr(operation.attributes["call_target_name"]).value, operation)
-            if made is not None:
-                found.append(made)
+        made = read(operation)
+        if made is not None:
+            found.append(made)
         return ir.WalkResult.ADVANCE
 
     module = lowered.compiler_ir(dialect="stablehlo")
@@ -73,6 +84,23 @@ def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operatio
     with module.context:
         module.operation.walk(visit, ir.WalkOrder.PRE_ORDER)
     return found
+
+
+def _read_calls[T](lowered: jax.stages.Lowered, read: Callable[[str, ir.Operation], T | None]) -> list[T]:
+    """What `read` makes of each custom call a lowered program makes, given its target and its
+    operation, in program order: the calls it makes something of."""
+    def call(operation: ir.Operation) -> T | None:
+        if operation.name != "stablehlo.custom_call":
+            return None
+        return read(ir.StringAttr(operation.attributes["call_target_name"]).value, operation)
+
+    return _read(lowered, call)
+
+
+def operations(lowered: jax.stages.Lowered) -> list[str]:
+    """The name of every operation a lowered program's StableHLO module holds, in program order (a
+    collective a `shard_map` body issues among them, `stablehlo.all_gather`)."""
+    return _read(lowered, lambda operation: operation.name)
 
 
 def custom_calls(lowered: jax.stages.Lowered) -> list[CustomCall]:
@@ -85,35 +113,152 @@ def custom_calls(lowered: jax.stages.Lowered) -> list[CustomCall]:
         target, shapes(operation.operands), shapes(operation.results)))
 
 
-def triton_calls(lowered: jax.stages.Lowered) -> list[TritonCall]:
-    """Every Pallas-Triton custom call a lowered program makes, in program order."""
-    def read(target: str, operation: ir.Operation) -> TritonCall | None:
-        if target != TRITON:
-            return None
-        config = ir.DictAttr(operation.attributes["mhlo.backend_config"])
-        return TritonCall(ir.StringAttr(config["name"]).value, ir.StringAttr(config["ir"]).value_bytes,
-                          ir.IntegerAttr(config["num_warps"]).value,
-                          ir.IntegerAttr(config["num_stages"]).value)
+def kernel_calls(lowered: jax.stages.Lowered) -> list[KernelCall]:
+    """Every kernel call a lowered program makes, in program order: each custom call but those that run
+    no matmul (`instrumentation.custom_call_kind`), the launches one dispatch expands into, forward and
+    backward, which only the lowered program shows (a dispatch's `generation.Route` holds its decision
+    alone)."""
+    def read(target: str, operation: ir.Operation) -> KernelCall | None:
+        kind = custom_call_kind(target)
+        return None if kind == "no_matmul" else _kernel_call(kind, target, operation)
 
     return _read_calls(lowered, read)
 
 
+def _kernel_call(kind: str | None, target: str, operation: ir.Operation) -> KernelCall:
+    """The `KernelCall` of a custom call `operation` of `kind` to `target`."""
+    attributes = operation.attributes
+    if kind == "triton":
+        config = ir.DictAttr(attributes["mhlo.backend_config"])
+        return KernelCall(kind, ir.StringAttr(config["name"]).value, ir.StringAttr(config["ir"]).value_bytes,
+                          f"warps={ir.IntegerAttr(config['num_warps']).value} "
+                          f"stages={ir.IntegerAttr(config['num_stages']).value}", None)
+    if kind == "mosaic_gpu":
+        config = ir.DictAttr(attributes["mhlo.backend_config"])
+        stated = (json.loads(ir.StringAttr(config["cost_estimate_json"]).value)
+                  if "cost_estimate_json" in config else {})
+        return KernelCall(kind, _kernel_name(operation.location), ir.StringAttr(config["module"]).value_bytes,
+                          ir.StringAttr(config["kernel_hash"]).value_bytes.hex()[:16], stated.get("flops"))
+    if kind == "mosaic_tpu":
+        config = json.loads(ir.StringAttr(attributes["backend_config"]).value)["custom_call_config"]
+        return KernelCall(kind, ir.StringAttr(attributes["kernel_name"]).value, config["body"].encode(), "",
+                          config.get("cost_estimate", {}).get("flops"))
+    return KernelCall(kind, target, b"", "", None)
+
+
+def _kernel_name(location: ir.Location) -> str:
+    """A Mosaic GPU call's kernel name: its location's name stack ends `<kernel>/mpmd_map`."""
+    found = re.match(r'loc\("([^"]+)"', str(location))
+    stack = found.group(1).split("/") if found else ["?"]
+    return stack[-2] if len(stack) > 1 and stack[-1] == "mpmd_map" else stack[-1]
+
+
+def triton_calls(lowered: jax.stages.Lowered) -> list[KernelCall]:
+    """The Pallas-Triton calls of `kernel_calls`."""
+    return [call for call in kernel_calls(lowered) if call.kind == "triton"]
+
+
 def triton_kernels(lowered: jax.stages.Lowered) -> dict[str, int]:
-    """The Pallas-Triton kernels a lowered program calls (`triton_calls`), by name, with the call
-    sites of each."""
+    """The Pallas-Triton kernels a lowered program calls (`triton_calls`), by name, with the call sites
+    of each."""
     return dict(sorted(Counter(call.name for call in triton_calls(lowered)).items()))
+
+
+@dataclass(frozen=True)
+class KernelReport:
+    """Which kernels a step runs: each dispatch's decision over the step's trace (`routes`: its choice,
+    kernel, the kernel it preferred and why that refused, its site; `generation.routes`) beside the
+    launches its lowered program makes (`calls`, `kernel_calls`: how many of each kernel, its config and
+    the FLOPs it states). The run log, the run record (`StepCompiled.kernels`, through `Planned`'s) and
+    the lowering tool (`Lowered.kernels`, tools/kernel_picks.py) read this one report, and the FLOP count
+    sizes each call as its `unsized` does (`instrumentation.sizes`)."""
+
+    routes: tuple[Route, ...]
+    calls: tuple[KernelCall, ...]
+
+    def record(self) -> dict:
+        """Its JSON: each distinct route with its count, each kernel's launches, configs and stated FLOPs
+        (None where any of its launches states none), and `unsized`, the launches whose work the FLOP
+        count cannot size (`instrumentation.sizes`)."""
+        routes = Counter((route.choice, route.kernel, route.preferred,
+                          None if route.refusal is None else route.refusal.detail, route.site)
+                         for route in self.routes)
+        launches: dict[tuple[str, str], dict] = {}
+        for call in self.calls:
+            entry = launches.setdefault((call.kind or "", call.name), {
+                "kind": call.kind, "name": call.name, "calls": 0, "configs": [], "flops": 0.0})
+            entry["calls"] += 1
+            if call.config not in entry["configs"]:
+                entry["configs"].append(call.config)
+            stated = entry["flops"] is not None and call.flops is not None
+            entry["flops"] = entry["flops"] + call.flops if stated else None
+
+        def order(counted) -> tuple:
+            (choice, kernel, _, _, site), _ = counted
+            return choice, site, kernel
+
+        return {"routes": [{"choice": choice, "kernel": kernel, "preferred": preferred, "refusal": refusal,
+                            "site": site, "count": count}
+                           for (choice, kernel, preferred, refusal, site), count in sorted(routes.items(),
+                                                                                         key=order)],
+                "launches": [launches[key] for key in sorted(launches)],
+                "unsized": sum(not sizes(call.kind, call.flops) for call in self.calls)}
+
+    def summary(self) -> str:
+        """One line for the run log: each kernel's launches, and the dispatches off their preferred kernel."""
+        launches = ", ".join(f"{entry['name']} x{entry['calls']}" for entry in self.record()["launches"])
+        off = sorted({f"{route.choice}: {route.kernel} not {route.preferred}" for route in self.routes
+                      if route.kernel != route.preferred})
+        return f"kernels: {launches or 'none'}" + (f"; off their preferred: {'; '.join(off)}" if off else "")
+
+
+def kernel_report(routes, lowered: jax.stages.Lowered) -> KernelReport:
+    """The `KernelReport` of a step whose trace reported `routes` and lowered to `lowered`, its calls without
+    their kernels' IR, which nothing that reads a report reads: a run keeps the report after it releases
+    the program (`planning.Planned.released`, TightLynx)."""
+    return KernelReport(tuple(routes), tuple(replace(call, ir=b"") for call in kernel_calls(lowered)))
+
+
+def routed[*Arguments](lower: Callable[[*Arguments], jax.stages.Lowered],
+                        *arguments: *Arguments) -> tuple[jax.stages.Lowered, list[Route]]:
+    """`lower(*arguments)`'s lowered program and the routes its dispatches reported as it traced
+    (`generation.routes`)."""
+    with generation.routes() as found:
+        lowered = lower(*arguments)
+    return lowered, found
+
+
+class Routed:
+    """A step's lowering, `lower()`, that keeps the routes and program of its last call (`routed`): a
+    tuning run lowers again where a config moved (`tuning.tune`), and the last is the one compiled."""
+
+    def __init__(self, lower: Callable[[], jax.stages.Lowered]):
+        self._lower = lower
+        self._last: tuple[jax.stages.Lowered, list[Route]] | None = None
+
+    def __call__(self) -> jax.stages.Lowered:
+        self._last = routed(self._lower)
+        return self._last[0]
+
+    def report(self) -> KernelReport:
+        """The last lowering's `KernelReport`."""
+        assert self._last is not None, "a report reads a lowering the step made"
+        lowered, found = self._last
+        return kernel_report(found, lowered)
 
 
 class Lowered(SystemExit):
     """Raised by `Trainer.fit` under `lower_for` once the run's first step has lowered for that GPU.
 
     Lowering was the whole run, so uncaught it ends the program with status 0
-    and no traceback. `kernels` names the Pallas-Triton kernels the step
-    calls (`triton_kernels`), and `lowered` is the step itself.
+    and no traceback, the step's kernels logged (`--trainer.lower-for`'s dry run). `kernels` is the step's
+    kernel report (`KernelReport`: its dispatches' routes and its lowered launches), and `lowered` is
+    the step itself.
     """
 
-    def __init__(self, generation: str, lowered: jax.stages.Lowered):
+    def __init__(self, target: str, lowered: jax.stages.Lowered, routes=()):
         super().__init__(0)
-        self.generation = generation
+        self.generation = target
         self.lowered = lowered
-        self.kernels = triton_kernels(lowered)
+        self.kernels = kernel_report(routes, lowered)
+        _log.info("the step lowered for %s; its %s", target, self.kernels.summary())
