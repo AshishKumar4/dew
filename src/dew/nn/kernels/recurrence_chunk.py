@@ -776,7 +776,12 @@ def _per_product(kernel_of: Callable[[str], str], run, *operands):
     forward = kernel_of('forward')
     try:
         training = kernel_of('training')
-    except KernelRefused as refused:
+    except KernelRefused as refusal:
+        # Bound beyond the handler, which unbinds its own name as it exits.
+        refused = refusal
+    else:
+        refused = None
+    if refused is not None:
         def refusing(*operands):
             raise refused
 

@@ -159,7 +159,7 @@ def test_the_port_is_as_exact_as_mamba_ssm(case):
     assert_as_exact(jax.jit(lambda index, arrays: tuple(form(index, arrays) for form in forms)),
                     as_given(lambda *args: (reference(*args),) * count), draw,
                     f"mamba_ssm {case}, heads {CASES[case]}", seeds=seeds,
-                    truth_fn=lambda *args: (truth(*args),) * count)
+                    truth_fn=as_given(lambda *args: (truth(*args),) * count))
 
 
 def test_the_port_takes_widths_padded_to_powers_of_two():

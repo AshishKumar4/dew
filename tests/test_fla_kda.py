@@ -10,11 +10,11 @@ the training shape, with grouped value heads, padded and packed.
 
 import functools
 
+import fla_gdn_support as support
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-import fla_gdn_support as support
 from delta_rule_support import NAMES, fla_side, float64_truth, math, plain_prefix, recurrence, through
 from reference_error import (
     as_given,
