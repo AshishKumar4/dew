@@ -28,6 +28,7 @@ from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_fp32_reduction_bound,
+    chain_roundings,
     declared_seeds,
     indexed_recording,
     recording,
@@ -1002,25 +1003,33 @@ def test_a_transitions_density_and_kl_hold_at_float32s_largest_variances():
     transition = GaussianTransition(jnp.asarray(mean), jnp.asarray(variance))
     density = np.asarray(transition.log_prob(jnp.asarray(mean)))
     assert np.all(np.isfinite(density))
-    half_log = np.float32(6) * (np.log(np.float32(2 * math.pi)) + np.log(variance))
-    truth = [reference.logpdf(np.zeros(12), np.zeros(12), float(value)) for value in variance]
-    assert_as_exact_as_the_reference(density, -half_log, np.asarray(truth), "a wide transition's density")
-    away = np.full_like(mean, 1e18)
-    kl = np.asarray(transition.kl(jnp.asarray(away)))
+    truth = np.asarray([reference.logpdf(np.zeros(12), np.zeros(12), float(value)) for value in variance])
+    # The oracle rule for a fixed input: within float32's rounding over each call's chain of roundings of
+    # its float64 value's terms (`_held_by_its_roundings`).
+    half_log = 6 * (abs(math.log(2 * math.pi)) + np.abs(np.log(variance.astype(np.float64))))
+    _held_by_its_roundings(density, truth, half_log, transition.log_prob, jnp.asarray(mean))
+    away = jnp.full_like(jnp.asarray(mean), 1e18)
+    kl = np.asarray(transition.kl(away))
     assert np.all(np.isfinite(kl))
-    error = np.float32(12) * np.float32(1e18) ** 2
-    assert_as_exact_as_the_reference(kl, error / np.float32(2) / variance,
-                                     12 * 1e36 / (2 * variance.astype(np.float64)), "a wide transition's KL")
+    wide = 12 * 1e36 / (2 * variance.astype(np.float64))
+    _held_by_its_roundings(kl, wide, wide, transition.kl, away)
     # A variance near float32's least: the KL, about 2e38, fits, where its twice the quotient would not.
     narrow = np.asarray([2e-38, 3e-38], np.float32)
     near = GaussianTransition(jnp.asarray(mean), jnp.asarray(narrow))
-    step = np.float32(np.sqrt(8 / 12))
-    kl = np.asarray(near.kl(jnp.full_like(jnp.asarray(mean), step)))
+    step = jnp.full_like(jnp.asarray(mean), np.float32(np.sqrt(8 / 12)))
+    kl = np.asarray(near.kl(step))
     assert np.all(np.isfinite(kl))
-    error = np.sum(np.full(12, step) ** 2, dtype=np.float32)
-    assert_as_exact_as_the_reference(kl, error / np.float32(2) / narrow,
-                                     12 * float(step) ** 2 / (2 * narrow.astype(np.float64)),
-                                     "a narrow transition's KL")
+    small = 12 * float(np.float32(np.sqrt(8 / 12))) ** 2 / (2 * narrow.astype(np.float64))
+    _held_by_its_roundings(kl, small, small, near.kl, step)
+
+
+def _held_by_its_roundings(found, truth, magnitude, fn, *arguments):
+    """The oracle rule for a fixed input, which no draw varies: `found` within float32's rounding of
+    `magnitude` (the float64 value's terms' size) over `fn`'s longest chain of roundings
+    (`chain_roundings`), and finite."""
+    assert np.all(np.isfinite(found))
+    assert_fp32_reduction_bound(found, truth, np.broadcast_to(magnitude, np.shape(truth)),
+                                chain_roundings(jax.make_jaxpr(fn)(*arguments)))
 
 
 def _kl_truth(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
@@ -1273,13 +1282,12 @@ def test_a_transitions_density_keeps_a_residual_whose_square_overflows():
     from dew.sampling.flow import GaussianTransition
 
     transition = GaussianTransition(jnp.zeros((1, 1), jnp.float32), jnp.asarray([2.0 ** 126], jnp.float32))
-    density = np.asarray(transition.log_prob(jnp.full((1, 1), 2.0 ** 64, jnp.float32)))
-    assert np.isfinite(density).all()
-    # The density's float32 formula on the standardized square, 4, and its float64 value.
-    half_log = np.float32(0.5) * (np.log(np.float32(2 * math.pi)) + np.float32(126) * np.log(np.float32(2)))
-    truth = -(2 + 0.5 * (math.log(2 * math.pi) + 126 * math.log(2)))
-    assert_as_exact_as_the_reference(density, [-(np.float32(2) + half_log)], [truth],
-                                     "an overflowing residual")
+    residual = jnp.full((1, 1), 2.0 ** 64, jnp.float32)
+    density = np.asarray(transition.log_prob(residual))
+    # The density on the standardized square, 4, in float64, held by the oracle rule for its fixed input.
+    half_log = 0.5 * (math.log(2 * math.pi) + 126 * math.log(2))
+    _held_by_its_roundings(density, np.asarray([-(2 + half_log)]), 2 + half_log, transition.log_prob,
+                           residual)
     # Differentiable at every order, as the plain density: at unit variance its Hessian in the mean is -I.
     unit = GaussianTransition(jnp.zeros((1, 3), jnp.float32), jnp.ones((1,), jnp.float32))
     def density(mean):

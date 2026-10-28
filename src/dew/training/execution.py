@@ -27,12 +27,13 @@ import dataclasses
 import functools
 import math
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding, PartitionSpec as P
+import numpy as np
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.batch import FROZEN, merge, select, thaw
 from dew.distributed.batches import batch_shardings
@@ -58,6 +59,8 @@ from dew.training.transaction import Realization, placed_as_rows
 
 if TYPE_CHECKING:
     from dew.data.pipeline import DeviceStep
+    from dew.distributed.placement import Placement
+    from dew.state import TrainState
 
 BANK_MEMORY = "pinned_host"
 """Where a layer's bank sits beside the accelerator: the stack fetches one
@@ -361,3 +364,65 @@ class HostExecution:
                                   layout=layout)
             return self.on_cpu(gradient)
         return Realization(stats, aux, pullback)
+
+
+def banked_frozen(objective, variables, stack, release=None):
+    """Stack each scanned run's shared leaves of the frozen collection of `variables` into one bank
+    (`dew.inference.banks.banked`), the runs `objective`'s stack declares (`stack_sites`).
+
+    That is the shape a placement and a checkpoint template take, and the
+    arrays the state holds."""
+    return banked(variables[FROZEN], stack_sites(objective, variables), stack, release)
+
+
+def placed_host(objective, fresh: Callable[[], TrainState], state_mesh: Mesh, device_mesh: Mesh,
+                shardings: Placement[TrainState]) -> TrainState:
+    """A fresh CPU-owned state, `fresh()` built on `state_mesh`'s first device, its leaves streamed into
+    place one at a time.
+
+    The tree is built eagerly on the CPU, where the held leaves the
+    objective hands over are read by reference and nothing of size is
+    computed. Each leaf is then moved to its placement and the source let
+    go as it lands (`host.stream`): a moving leaf to the companion, a
+    frozen one to where it stays resident (`resident`). The transient is
+    one leaf, not the tree, and one JIT could not have returned to the two
+    device sets anyway.
+    """
+    from dew.distributed.host import evict, place_leaf, stream
+    held = objective.held_variables()
+    with jax.default_device(state_mesh.local_devices[0]):
+        state = fresh()
+        if FROZEN in state.variables:
+            sites = stack_sites(objective, state.variables)
+            check_bank_pool(bank_bytes(state.variables[FROZEN], sites), device_mesh)
+            # A scanned run's frozen rows become its bank here and the bank lands where it stays
+            # resident before the next is stacked, so the host holds one bank in transit, not the
+            # stack; the rows' pages are let go as it lands and the held tree holds the placed bank
+            # where each row was. An objective placed this way holds banks at its rows afterwards and
+            # does not seed a second trainer.
+            targets = shardings.variables[FROZEN]
+
+            def stack(rows, path):
+                target = targets
+                for component in path:
+                    target = target[component]
+                bank = place_leaf(jnp.stack(rows), target)
+                for row in rows:
+                    evict(np.asarray(row))
+                return bank
+
+            def release(namespace, index, keys, bank):
+                # The rows sit under the held tree's own frozen split
+                # when it came split, or under its params when init split it.
+                node = None if held is None else held.get(FROZEN, held.get("params"))
+                for component in (*namespace, f"layers_{index}", *keys[:-1]):
+                    node = node.get(component) if isinstance(node, dict) else None
+                if isinstance(node, dict) and keys[-1] in node:
+                    node[keys[-1]] = bank
+            frozen = banked_frozen(objective, state.variables, stack, release)
+            state = dataclasses.replace(state, variables={**state.variables, FROZEN: frozen})
+    params = stream(state.variables, shardings.variables, held)
+    ema = None if state.ema is None else stream(state.ema, shardings.ema)
+    rest = dataclasses.replace(state, variables=None, ema=None)
+    placed = transfer(rest, dataclasses.replace(shardings, variables=None, ema=None))
+    return dataclasses.replace(placed, variables=params, ema=ema)
