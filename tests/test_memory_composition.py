@@ -512,7 +512,7 @@ def test_a_served_memory_rounds_its_moving_gradients_from_its_requests_stream():
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     task = TextGeneration(model, params, RunProcessor(Digits()),
                           sampling=Sampling(temperature=0, eos_token_ids=12))
-    bound = task.quantized(Quantization(patterns=(INNER,), bwd_stochastic_rounding="uniform"))
+    bound = task.quantized(Quantization(patterns=(INNER,), bwd_qtype="int8", bwd_stochastic_rounding="uniform"))
     first = bound("12", 4, key=3)
     assert bound("12", 4, key=3).text == first.text
     assert Server.from_task(bound, slots=2, capacity=64)(["12"], 4, key=3)[0].text == first.text
