@@ -691,6 +691,20 @@ CORE_CASES = {
         (2, 4), {"causal": True, "chunk": 2,
                  "segment_ids": CrossDocuments(jnp.asarray([[1, 1]]), jnp.asarray([[1, 1, 1, 1]]))},
         [[0, 0, 1, 0], [0, 0, 1, 1]]),
+    "runs in chunks over places": ((4, 4), {"chunk": 1, "positions": (jnp.asarray([[0, 1, 0, 1]]),) * 2,
+                                            "runs": jnp.asarray([[[[0, 2], [2, 4]]] * 4])},
+                                   [[1, 0, 1, 0], [0, 1, 0, 1], [1, 0, 1, 0], [0, 1, 0, 1]]),
+    "causal runs": ((4, 4), {"causal": True, "runs": jnp.asarray([[[[0, 1], [2, 4]]] * 4])},
+                    [[1, 0, 0, 0], [1, 0, 0, 0], [1, 0, 1, 0], [1, 0, 1, 1]]),
+    "runs over documents and an invalid key": (
+        (4, 4), {"segment_ids": jnp.asarray([[1, 1, 2, 2]]),
+                 "valid": jnp.asarray([[True, False, True, True]]),
+                 "runs": jnp.asarray([[[[0, 1], [1, 4]]] * 4])},
+        [[1, 0, 0, 0], [1, 0, 0, 0], [0, 0, 1, 1], [0, 0, 1, 1]]),
+    "runs under a window over places": (
+        (4, 4), {"sliding_window": 2, "positions": (jnp.asarray([[0, 1, 2, 3]]),) * 2,
+                 "runs": jnp.asarray([[[[0, 2], [2, 4]]] * 4])},
+        [[1, 1, 0, 0], [1, 1, 1, 0], [0, 1, 1, 1], [0, 0, 1, 1]]),
     "a window over places beside an invalid key": (
         (4, 4), {"causal": True, "sliding_window": 2, "valid": jnp.asarray([[True, False, True, True]]),
                  "positions": (jnp.asarray([[0, 1, 1, 2]]),) * 2},
@@ -711,13 +725,23 @@ def test_each_coordinate_keeps_the_keys_written_out(case):
     np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray([expected], bool))
 
 
-@pytest.mark.parametrize(("query", "key", "kept"), [(2, 1, True), (1, 2, True), (2, 2, True), (4, 1, False),
-                                                    (1, 4, False)])
-def test_a_two_sided_window_over_unsigned_places_keeps_its_neighbours(query, key, kept):
-    """A two-sided window of two (`windowed`) over unsigned coordinates keeps the keys one place either side
-    and the query's own, and none further: no distance wraps."""
-    found = windowed(jnp.asarray(query, jnp.uint32), jnp.asarray(key, jnp.uint32), 2, causal=False)
+@pytest.mark.parametrize(("dtype", "query", "key", "kept"), [
+    (jnp.uint32, 2, 1, True), (jnp.uint32, 1, 2, True), (jnp.uint32, 2, 2, True), (jnp.uint32, 4, 1, False),
+    (jnp.uint32, 1, 4, False), (jnp.int8, 127, -2, False), (jnp.int8, -2, 127, False),
+    (jnp.int32, 2**31 - 1, -2, False), (jnp.int32, -2, 2**31 - 1, False), (jnp.int32, -1, 0, True)])
+def test_a_two_sided_window_keeps_its_neighbours_and_no_wrapped_distance(dtype, query, key, kept):
+    """A two-sided window of two (`windowed`) keeps the keys one place either side and the query's own,
+    and none further, over unsigned coordinates and signed ones at their extremes alike: no distance
+    wraps."""
+    found = windowed(jnp.asarray(query, dtype), jnp.asarray(key, dtype), 2, causal=False)
     assert bool(found) == kept
+
+
+def test_key_spans_of_no_rows_broadcast_a_single_rows_coordinates():
+    """`key_spans` over coordinates of no rows beside one row's slots holds no rows: a batch broadcasts,
+    one row against none being none."""
+    spans = key_spans(1, 3, True, None, key_valid=jnp.ones((0, 3), bool), query_slots=jnp.asarray([[0]]))
+    assert spans.start.shape == (0, 1)
 
 
 SLOTS = np.asarray([[3, 4, 5], [1, 2, -1]], np.int32)
