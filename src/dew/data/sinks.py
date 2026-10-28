@@ -197,7 +197,9 @@ def _written(target: Store, prefix: str) -> list[Mapping[str, object]]:
     files = []
     for path in sorted(fs.find(directory)) if fs.exists(directory) else []:
         relative = path[len(directory):].lstrip("/")
-        if any(part.startswith(("_", ".")) for part in PurePosixPath(relative).parts):
+        # The directory's own marker, an empty object a store lists as the directory (Arrow's S3 client
+        # makes one), is no file the writer left.
+        if not relative or any(part.startswith(("_", ".")) for part in PurePosixPath(relative).parts):
             continue
         payload = fs.cat_file(path)
         # The store's own answer, not the listing's, which states no version.
