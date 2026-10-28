@@ -43,10 +43,10 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import tuning
+from dew.nn.kernels import recurrence_algebra as algebra, tuning
 from dew.nn.kernels.chunked_launch import read_rows, write_rows
 from dew.nn.kernels.fla_gdn import _dot
-from dew.nn.precision import compensated_add, float32_einsum, two_sum
+from dew.nn.precision import compensated_add, compensated_difference, float32_einsum, two_sum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -154,14 +154,6 @@ def _extracted(values, *, interpret: bool):
     return high, values - high
 
 
-def _apart(later: tuple, earlier: tuple):
-    """`acs_later - acs_earlier` from two reads of the compensated prefix (`ChunkCumsum`'s `(hi, lo)`):
-    the rounded halves' difference, exact where they are close, then their compensations'. Its rounded
-    sum alone lost the mild steps a steep one rounds away: subtracting two of them put a steep-then-mild
-    chunk's output 530 times the recurrence's distance from float64 (row 2066)."""
-    return (later[0] - earlier[0]) + (later[1] - earlier[1])
-
-
 def _read(prefix, index) -> tuple:
     """The compensated prefix's `(hi, lo)` at `index` (`prefix` its two refs)."""
     return prefix[0][index], prefix[1][index]
@@ -217,8 +209,9 @@ def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int,
     softplus and limit, for one chunk of `BH` heads: the step, zero past the row's end, and `A dt`
     cumulated over the chunk as a pair `(hi, lo)`, the running sums of its exactly summed high parts and
     of its low parts (`_extracted`), all fp32 in mamba_ssm's heads-first layout: every decay a kernel reads
-    is a difference of two of these sums (`_apart`), which the rounded sum alone gave 530 times the
-    recurrence's distance from float64 after a steep step (row 2066).
+    is a difference of two of these sums (`precision.compensated_difference`, `algebra.apart` pairwise),
+    which the rounded sum alone gave 530 times the recurrence's distance from float64 after a steep step
+    (row 2066).
 
     With documents, each document in the chunk cumulates its own steps alone, the others' zeroed,
     where mamba_ssm's sum runs on from the chunk's first step: every decay a kernel reads is a
@@ -253,13 +246,34 @@ def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int,
         seq[0][start], seq[0][start + chunk - 1] + 1, document, (zero, zero)))
 
 
+class _Cumsum(_Launch):
+    """The chunk cumsum's tiles and spans, its forward's and its backward's (`ChunkCumsum`,
+    `ChunkCumsumBwd`): one declaration for the pair, which runs over one geometry."""
+
+    PICKS = _picks(Tiles(16, 0, 0, 4, 3))
+    SPANS = (("dt", 2), None, None)
+
+
+class _Passing(_Launch):
+    """The state passing's tiles and spans, its forward's and its backward's (`StatePassing`,
+    `StatePassingBwd`)."""
+
+    PICKS = _picks(Tiles(512, 0, 0, 4, 3))
+    SPANS = ("state", None, None)
+
+
+class _StateGradient(_Launch):
+    """The state gradients' tiles, the keys' and the queries' (`ChunkStateBwdDb`, `ChunkScanBwdDc`, which
+    run one kernel, `_state_gradient`)."""
+
+    PICKS = _picks(Tiles(64, 128, 0, 4, 3, 64), Tiles(64, 64, 0, 4, 3, 64))
+
+
 @dataclasses.dataclass(frozen=True)
-class ChunkCumsum(_Launch):
+class ChunkCumsum(_Cumsum):
     """`chunk_cumsum`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_cumsum"
-    PICKS = _picks(Tiles(16, 0, 0, 4, 3))
-    SPANS = (("dt", 2), None, None)
 
     def _fwd(self, dt: jax.Array, A: jax.Array, seq: jax.Array | None, *, chunk: int, interpret: bool,
              config: Tiles, return_residuals: bool = False):
@@ -302,12 +316,10 @@ def _chunk_cumsum_bwd_kernel(dacs_ref, ddt_ref, dt_ref, a_ref, out_ref, da_ref, 
 
 
 @dataclasses.dataclass(frozen=True)
-class ChunkCumsumBwd(_Launch):
+class ChunkCumsumBwd(_Cumsum):
     """`chunk_cumsum_bwd`'s launch (tuning.KernelOp)."""
 
     NAME = "chunk_cumsum_bwd"
-    PICKS = _picks(Tiles(16, 0, 0, 4, 3))
-    SPANS = (("dt", 2), None, None)
 
     def _fwd(self, dacs: jax.Array, ddt: jax.Array, dt: jax.Array, A: jax.Array, *, chunk: int,
              interpret: bool, config: Tiles, return_residuals: bool = False):
@@ -347,7 +359,7 @@ def _chunk_state_kernel(x_ref, b_ref, dt_ref, da_ref, *refs, batch: int, length:
         rows = pl.ds(start + offset, bk)
         x = read_rows(x_ref.at[rows], _from(limit, offset))
         b = read_rows(b_ref.at[rows], _from(limit, offset)).astype(jnp.float32)
-        scale = jnp.exp(jnp.minimum(_apart(last, _read(da_ref, rows)), 0.0)) * dt_ref[rows]
+        scale = jnp.exp(jnp.minimum(compensated_difference(last, _read(da_ref, rows)), 0.0)) * dt_ref[rows]
         if seq:
             scale = jnp.where(seq[0][rows] == seq[0][start + chunk - 1], scale, 0.0)
         return acc + _dot(x.T, (b * scale[:, None]).astype(x.dtype), exact=exact)
@@ -421,12 +433,10 @@ def _state_passing_kernel(states_ref, da_ref, h0_ref, *refs, chunk: int):
 
 
 @dataclasses.dataclass(frozen=True)
-class StatePassing(_Launch):
+class StatePassing(_Passing):
     """`state_passing`'s launch (tuning.KernelOp)."""
 
     NAME = "state_passing"
-    PICKS = _picks(Tiles(512, 0, 0, 4, 3))
-    SPANS = ("state", None, None)
 
     def _fwd(self, states: jax.Array, da: jax.Array, h0: jax.Array, seq: jax.Array | None, *, chunk: int,
              dtype: str, interpret: bool, config: Tiles, return_residuals: bool = False):
@@ -531,8 +541,7 @@ def _chunk_scan_kernel(cb_ref, x_ref, dt_ref, da_ref, c_ref, states_ref, d_ref, 
         offset = k * bk
         steps = pl.ds(start + offset, bk)
         cb = cb_ref[pl.ds(m * bm, bm), pl.ds(offset, bk)]
-        cb = cb * jnp.exp(jnp.minimum(_apart(tuple(half[:, None] for half in da_m),
-                                             tuple(half[None, :] for half in _read(da_ref, steps))), 0.0))
+        cb = cb * jnp.exp(jnp.minimum(algebra.apart(*da_m, *_read(da_ref, steps)), 0.0))
         cb = cb * dt_ref[steps][None, :]
         cb = jnp.where(_causal(m * bm, bm, offset, bk), cb, 0.0).astype(x_ref.dtype)
         return acc + _dot(cb, read_rows(x_ref.at[steps], _from(limit, offset)), exact=exact)
@@ -676,12 +685,10 @@ def _state_passing_bwd_kernel(dout_ref, states_ref, da_ref, dfinal_ref, *refs, c
 
 
 @dataclasses.dataclass(frozen=True)
-class StatePassingBwd(_Launch):
+class StatePassingBwd(_Passing):
     """`state_passing_bwd`'s launch (tuning.KernelOp)."""
 
     NAME = "state_passing_bwd"
-    PICKS = _picks(Tiles(512, 0, 0, 4, 3))
-    SPANS = ("state", None, None)
 
     def _fwd(self, dout: jax.Array, states: jax.Array, da: jax.Array, dfinal: jax.Array,
              seq: jax.Array | None, *, chunk: int, dtype: str, interpret: bool, config: Tiles,
@@ -720,7 +727,7 @@ def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_re
     m, h, _, start, limit, rows = _row_block(batch, length, chunk, width, bm, bn)
     taken = _from(limit, m * bm)
     da_m = _read(da_ref, rows)
-    scale = jnp.exp(jnp.minimum(_apart(_read(da_ref, start + chunk - 1), da_m), 0.0))
+    scale = jnp.exp(jnp.minimum(compensated_difference(_read(da_ref, start + chunk - 1), da_m), 0.0))
     if seq:
         scale = jnp.where(seq[0][rows] == seq[0][start + chunk - 1], scale, 0.0)
     state = b_ref.shape[-1]
@@ -736,8 +743,7 @@ def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_re
         offset = m * bm + k * bk
         steps = pl.ds(start + offset, bk)
         cb = cb_ref[pl.ds(offset, bk), pl.ds(m * bm, bm)].T
-        cb = cb * jnp.exp(jnp.minimum(_apart(tuple(half[None, :] for half in _read(da_ref, steps)),
-                                             tuple(half[:, None] for half in da_m)), 0.0))
+        cb = cb * jnp.exp(jnp.minimum(algebra.apart(*_read(da_ref, steps), *da_m), 0.0).T)
         cb = jnp.where(_causal(offset, bk, m * bm, bm).T, cb, 0.0).astype(dout_ref.dtype)
         return acc + _dot(cb, read_rows(dout_ref.at[steps], _from(limit, offset)), exact=exact)
 
@@ -845,7 +851,7 @@ def _state_gradient_kernel(left_ref, states_ref, mat_ref, *refs, leaving: bool, 
         grad = _dot(left, states_ref[h].astype(left.dtype), exact=exact)
         if leaving:
             last = _read(da_ref, (h, start + chunk - 1))
-            decay = jnp.exp(jnp.minimum(_apart(last, _read(da_ref, (h, rows))), 0.0))
+            decay = jnp.exp(jnp.minimum(compensated_difference(last, _read(da_ref, (h, rows))), 0.0))
         else:
             decay = jnp.exp(sum(_read(da_ref, (h, rows))))
         scale = jnp.where(same, decay, 0.0)
@@ -891,11 +897,10 @@ def _state_gradient(left, states, mat, dt, da, seq, *, chunk: int, groups: int, 
 
 
 @dataclasses.dataclass(frozen=True)
-class ChunkStateBwdDb(_Launch):
+class ChunkStateBwdDb(_StateGradient):
     """`chunk_state_bwd_db`'s launch (tuning.KernelOp, `_state_gradient`)."""
 
     NAME = "chunk_state_bwd_db"
-    PICKS = _picks(Tiles(64, 128, 0, 4, 3, 64), Tiles(64, 64, 0, 4, 3, 64))
     SPANS = ("chunk", ("b", 3), None)
 
     def _fwd(self, x: jax.Array, dstates: jax.Array, b: jax.Array, dt: jax.Array, da: jax.Array,
@@ -906,11 +911,10 @@ class ChunkStateBwdDb(_Launch):
 
 
 @dataclasses.dataclass(frozen=True)
-class ChunkScanBwdDc(_Launch):
+class ChunkScanBwdDc(_StateGradient):
     """`chunk_scan_bwd_dc`'s launch (tuning.KernelOp, `_state_gradient`)."""
 
     NAME = "chunk_scan_bwd_dc"
-    PICKS = _picks(Tiles(64, 128, 0, 4, 3, 64), Tiles(64, 64, 0, 4, 3, 64))
     HEADS = "dout"
     SPANS = ("chunk", ("c", 3), None)
 
@@ -948,9 +952,8 @@ def _dcb_kernel(x_ref, dout_ref, dt_ref, da_ref, *refs, batch: int, length: int,
             dout = read_rows(dout_ref.at[rows_m, h], _from(limit, m * bm))
             x = read_rows(x_ref.at[rows_n, h], _from(limit, n * bn))
             dcb = _dot(dout, x.T, exact=exact) * dt_ref[h, rows_n][None, :]
-            decay = jnp.exp(jnp.minimum(_apart(tuple(half[:, None] for half in _read(da_ref, (h, rows_m))),
-                                               tuple(half[None, :] for half in _read(da_ref, (h, rows_n)))),
-                                        0.0))
+            pairs = algebra.apart(*_read(da_ref, (h, rows_m)), *_read(da_ref, (h, rows_n)))
+            decay = jnp.exp(jnp.minimum(pairs, 0.0))
             return compensated_add(acc, (dcb * decay, jnp.zeros((bm, bn), jnp.float32)))
 
         # The group's heads summed with their roundings kept: one fp32 accumulator's serial sum over 64
@@ -1076,8 +1079,7 @@ def _ddacs_kernel(x_ref, dout_ref, dt_ref, da_ref, cb_ref, out_ref, *, batch: in
         steps = pl.ds(start + offset, bn)
         acc = _dot(dout, read_rows(x_ref.at[steps], _from(limit, offset)).T, exact=exact)
         acc = acc * dt_ref[steps][None, :] * cb_ref[pl.ds(m * bm, bm), pl.ds(offset, bn)]
-        acc = acc * jnp.exp(jnp.minimum(_apart(tuple(half[:, None] for half in da_m),
-                                               tuple(half[None, :] for half in _read(da_ref, steps))), 0.0))
+        acc = acc * jnp.exp(jnp.minimum(algebra.apart(*da_m, *_read(da_ref, steps)), 0.0))
         strict = _causal(m * bm, bm, offset, bn, strict=True)
         acc = jnp.where(strict, acc, 0.0)
         total = rowsum + jnp.sum(acc, axis=1)

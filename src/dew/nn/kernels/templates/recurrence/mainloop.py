@@ -99,12 +99,15 @@ class Tiles:
     launch splits the values into (`block_v`), the chunks it has in flight (`stages`), the output
     launch's value block (`block_o`), the states launch's where None, and the value blocks of one sequence
     and head a walk program takes, one a consumer role beside one producer (`walkers`: the states and
-    reverse launches'; their chains overlap on one multiprocessor and their keys stream once)."""
+    reverse launches'; their chains overlap on one multiprocessor and their keys stream once). `forward`
+    are the tiles a forward without a gradient takes where they differ: no fast backward reads its states
+    launch's block, which a training call's tiles narrow to hold it."""
 
     block_v: int
     stages: int
     block_o: int | None = None
     walkers: int = 1
+    forward: "Tiles | None" = None
 
     @property
     def output_block(self) -> int:

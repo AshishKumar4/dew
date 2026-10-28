@@ -1073,14 +1073,14 @@ def _rule_fwd(q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interp
 
 
 def prefixed_fwd(cumulated, q, k, v, g, beta, h0, cu_seqlens, scale: float, chunk: int, interpret: bool,
-                 keep: bool, wide: bool):
+                 keep: bool, wide: bool, *, compensated: bool = False):
     """A port's forward from the natural log decay: the sequences `cu_seqlens` describes, the decay
-    cumulated in base 2 within each chunk (`recurrence.cumulated`), named 'delta_decay' for a block's
-    remat policy, then the port's `cumulated` forward on it (this module's `cumulated_fwd`, or
-    `fla_kda`'s)."""
+    cumulated in base 2 within each chunk (`recurrence.cumulated`; its `(hi, lo)` halves where
+    `compensated`), named 'delta_decay' for a block's remat policy, then the port's `cumulated` forward
+    on it (this module's `cumulated_fwd`, or `fla_kda`'s)."""
     spans = sequences(q.shape[0], q.shape[1], cu_seqlens, chunk=chunk)
     g = checkpoint_name(recurrence.cumulated(g, scale=RCP_LN2, chunk=chunk, spans=spans,
-                                             interpret=interpret),
+                                             compensated=compensated, interpret=interpret),
                         'delta_decay')
     return cumulated(q, k, v, g, beta, h0, spans, scale, chunk, interpret, keep, wide)
 
