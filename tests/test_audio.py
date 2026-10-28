@@ -7,6 +7,7 @@ forward bound allows accumulated GEMM/reduction rounding and rejects the
 wrong Gemma 4 left-window boundary (0.026 before correction).
 """
 
+import copy
 import dataclasses
 import json
 from pathlib import Path
@@ -17,7 +18,7 @@ import numpy as np
 import optax
 import pytest
 from interop_support import gemma_features
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew.nn.audio import AudioLinear, Gemma3nAudio, audio_config, audio_weight_path, audio_weights
@@ -92,13 +93,18 @@ def test_waveform_preprocessing_encoder_and_projection_match_reference(audio):
                                          data["encoded_bf16"][real], truth, "bf16 encoded")
 
 
+BLOCK_SEEDS = 8
+"""The quick_gelu tower's blocks' declared draws against transformers' blocks (check 1)."""
+
+
 def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_reference_does():
     """`hidden_act` may name any activation the shared table computes,
     quick_gelu here, and a tower so configured loads. Its feed-forwards and
     light convolution, the blocks the activation runs in, each compute the
     reference's block with the tower's own weights: in fp32, as exact as the
-    reference's fp32 block from its float64 run. The whole reference tower pins
-    its attention to float32, so the blocks run alone."""
+    reference's fp32 block from its float64 run over drawn inputs (check 1). The
+    whole reference tower pins its attention to float32, so the blocks run
+    alone."""
     import torch
     from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel
 
@@ -118,17 +124,30 @@ def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_ref
                                     ours.hidden_act)
     light_conv = AudioLightConv(ours.hidden_size, ours.conv_kernel_size, ours.rms_norm_eps,
                                 ours.gradient_clipping, linear, ours.hidden_act)
-    x = np.random.default_rng(5).normal(size=(2, 12, ours.hidden_size)).astype(np.float32)
     layer = reference.layers[0]
     blocks = {"feed_forward1": feed_forward, "lconv1d": light_conv, "feed_forward2": feed_forward}
-    for name, block in blocks.items():
-        theirs = getattr(layer, name)
-        with torch.no_grad():
-            wide, narrow = (theirs.to(dtype)(torch.from_numpy(x).to(dtype)).numpy()
-                            for dtype in (torch.float64, torch.float32))
-        variables = {collection: held["layers_0"][name] for collection, held in tree.items()
-                     if name in held.get("layers_0", {})}
-        assert_as_exact_as_the_reference(np.asarray(block.apply(variables, x)), narrow, wide, name)
+
+    def draw(seed):
+        return (np.random.default_rng(seed).normal(size=(2, 12, ours.hidden_size)).astype(np.float32),)
+
+    def mine(x):
+        return {name: block.apply({collection: held["layers_0"][name] for collection, held in tree.items()
+                                   if name in held.get("layers_0", {})}, x)
+                for name, block in blocks.items()}
+
+    def blocks_in(dtype):
+        # Each block a copy of its own in `dtype`, so the float32 one is never the float64 one moved.
+        copies = {name: copy.deepcopy(getattr(layer, name)).to(dtype) for name in blocks}
+
+        def run(x):
+            with torch.no_grad():
+                given = torch.from_numpy(np.asarray(x)).to(dtype)
+                return {name: block(given).double().numpy() for name, block in copies.items()}
+
+        return as_given(run)
+
+    assert_as_exact(mine, blocks_in(torch.float32), draw, "a quick_gelu tower's blocks", seeds=BLOCK_SEEDS,
+                    truth_fn=blocks_in(torch.float64))
 
 
 @on_gpu

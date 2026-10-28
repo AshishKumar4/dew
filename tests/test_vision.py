@@ -37,7 +37,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, float64_forward, ieee_fixture
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    float64_forward,
+    ieee_fixture,
+)
 from safetensors.numpy import load_file
 
 from dew.nn.vision import (
@@ -95,11 +101,15 @@ def test_a_tower_matches_the_reference_implementation(name, family, translate, p
     assert_tower_with_live_positions(tower, variables, fixture, positions)
 
 
+SIGLIP_SEEDS = 8
+"""The quick_gelu SigLIP tower's declared draws against transformers' (check 1)."""
+
+
 def test_a_siglip_tower_runs_any_layer_activation_and_an_inactive_dropout_as_the_reference_does():
     """A SigLIP config may name any activation the shared tower layer runs,
     quick_gelu here, and an attention dropout, which only a training forward
-    draws: the tower loads and its features are as exact as the reference's,
-    both measured from the reference in float64."""
+    draws: the tower loads and its features are on par with the reference's
+    from the reference in float64 over drawn pixels (check 1)."""
     import torch
     from transformers import SiglipVisionConfig, SiglipVisionModel
 
@@ -111,16 +121,27 @@ def test_a_siglip_tower_runs_any_layer_activation_and_an_inactive_dropout_as_the
     torch.manual_seed(5)
     reference = SiglipVisionModel(config).eval()
     tensors = {name: tensor.numpy().copy() for name, tensor in reference.state_dict().items()}
-    pixels = np.random.default_rng(11).random((2, 3, 28, 28)).astype(np.float32)
-
     wide = float64_twin(reference)
-    with torch.no_grad():
-        theirs = reference(pixel_values=torch.from_numpy(pixels)).last_hidden_state.numpy()
-        with float64():
-            truth = wide(pixel_values=torch.from_numpy(pixels).double()).last_hidden_state.numpy()
+
+    def draw(seed):
+        return (np.random.default_rng(seed).random((2, 3, 28, 28)).astype(np.float32),)
+
+    @as_given
+    def theirs(pixels):
+        with torch.no_grad():
+            given = torch.from_numpy(np.asarray(pixels, np.float32))
+            return reference(pixel_values=given).last_hidden_state.numpy()
+
+    @as_given
+    def truth(pixels):
+        with torch.no_grad(), float64():
+            given = torch.from_numpy(np.asarray(pixels, np.float64))
+            return wide(pixel_values=given).last_hidden_state.numpy()
+
     tower = towers.from_record(siglip.translate_siglip_vision_config(config.to_dict())).build()
-    ours = np.asarray(tower.apply(tower_variables("siglip", tensors, "float32")[0], pixels))
-    assert_as_exact_as_the_reference(ours, theirs, truth, "siglip quick_gelu features")
+    variables = tower_variables("siglip", tensors, "float32")[0]
+    assert_as_exact(lambda pixels: tower.apply(variables, pixels), theirs, draw,
+                    "siglip quick_gelu features", seeds=SIGLIP_SEEDS, truth_fn=truth)
 
 
 def test_gemma_projector_matches_the_reference_implementation():
