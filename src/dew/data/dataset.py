@@ -33,6 +33,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
+from dew._records import record
 from dew.batch import VALID_ROWS, Batch, padded_rows
 from dew.mesh import LayoutRefused, batch_axes
 
@@ -811,6 +812,13 @@ class Checkpointable(Protocol):
     def get_state(self) -> Position: ...
 
     def set_state(self, state: Position) -> None: ...
+
+
+def restore_parent(parent: pygrain.DatasetIterator, state: Mapping[str, object], key: str,
+                   what: str) -> None:
+    """Set `parent`, the stream a wrapper reads, to the position the wrapper's own `state` saved for it
+    under `key`, `what` naming it where the record is no position."""
+    parent.set_state(record(state[key], what))
 
 
 @runtime_checkable

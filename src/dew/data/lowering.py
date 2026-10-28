@@ -68,6 +68,7 @@ from dew.data.dataset import (
     _stacked,
     logged_run,
     record_batch,
+    restore_parent,
     stacked,
     take_batch,
 )
@@ -945,7 +946,7 @@ class _OverlappedCutsIterator(pygrain.DatasetIterator):
         return {"documents": self._documents.get_state(), "room": self._room}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self._documents.set_state(record(state["documents"], "packed documents"))
+        restore_parent(self._documents, state, "documents", "packed documents")
         self._room = integer(state["room"], "packed window room")
 
 
