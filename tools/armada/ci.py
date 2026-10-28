@@ -643,6 +643,8 @@ def plan(target: float, timings: dict) -> list[dict]:
     policy "off" every task's weight carries COLD_SECONDS, so armada sizes the pool by the work, not the
     longest task, as warm estimates did."""
     cache = os.environ.get("DEW_TEST_CACHE") or "on"
+    # The whole suite's run alone (DEW_WHOLE_SUITE, every fifth publish) runs whole_suite cells (`selected`).
+    cells = "1" if os.environ.get("DEW_WHOLE_SUITE") else "0"
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     recorded = recorded_tests()
     entries = []
@@ -675,14 +677,15 @@ def plan(target: float, timings: dict) -> list[dict]:
         for index, (names, group, weight) in enumerate(tasks, start=1):
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(names),
                             "split": group, "rows": [row(python, name, group) for name in names],
-                            "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), "cache": cache})
+                            "weight": weight + (COLD_SECONDS if cache == "off" else 0.0), "cache": cache,
+                            "whole": cells})
     rest = [] if cache == "off" else [name for name in every if name not in NEWEST_FILES]
     for index in range(COLLECT_TASKS if rest else 0):
         names = rest[index::COLLECT_TASKS]
         entries.append({"name": f"{PYTHONS[-1]}-{COLLECT}-{index + 1}", "python": PYTHONS[-1],
                         "tests": " ".join(names), "split": COLLECT,
                         "rows": [row(PYTHONS[-1], name, COLLECT) for name in names], "weight": target,
-                        "cache": cache})
+                        "cache": cache, "whole": cells})
     return entries
 
 
@@ -749,7 +752,7 @@ def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dic
 
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str = "on",
-         grace: float = session.GRACE, coverage: Path | None = None) -> int:
+         grace: float = session.GRACE, coverage: Path | None = None, whole: bool = False) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
     their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
@@ -759,12 +762,13 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     at 300 seconds ran a median of 392. With `coverage`, pytest runs under coverage.py, whose data
     file goes there (`coverage_items`)."""
     # Before any test writes under tests/, the inputs as the plan saw them.
-    return tested(python, tests, split, out, deadline, cache, grace, shared(python), {}, coverage)
+    return tested(python, tests, split, out, deadline, cache, grace, shared(python), {}, coverage,
+                  whole=whole)
 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: str, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None,
-           network: bool = False) -> int:
+           network: bool = False, whole: bool = False) -> int:
     """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's, a green row
     reused as the cache's policy (`policy`) allows. With `network`, the network-marked tests alone, with the
     Hub open, recorded on the network lane's class (`device_class`)."""
@@ -788,7 +792,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     # its data where COVERAGE_FILE says.
     measured = [] if coverage is None else ["-m", "coverage", "run"]
     environ = environ if coverage is None else {**environ, "COVERAGE_FILE": str(coverage / ".coverage")}
-    command = [*selected(session.pytest_run(python, report, *measured), network, cache), "-p", "executed",
+    command = [*selected(session.pytest_run(python, report, *measured), network, whole), "-p", "executed",
                *tests, *grouping]
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
@@ -1002,15 +1006,15 @@ def collected(python: str, marks: str) -> dict[str, int]:
     return counts
 
 
-def selected(command: list[str], network: bool, cache: str = "off") -> list[str]:
+def selected(command: list[str], network: bool, whole: bool = False) -> list[str]:
     """CI's pytest `command` (`session.pytest_run`), or with `network` the same selecting the network-marked
-    tests alone, every one the rest of CI sets aside. Where the cache's policy is "on" (a train's or a lane's
-    run of what changed) it sets aside the tests marked whole_suite too, which run where nothing is reused
-    (the policy "off": the daily run, a pushed full-* branch, a change to what every test reads) (owner,
-    2026-10-27)."""
+    tests alone, every one the rest of CI sets aside. It sets aside the tests marked whole_suite too, but on
+    the whole suite's own run (`whole`: DEW_WHOLE_SUITE, every fifth publish's ci/full-whole-*), whatever
+    the cache's policy: a policy-off train runs every file, never a whole-suite cell (Main, 2026-10-28:
+    train 250's policy-off suite ran G03's GRPO cells, 826-1,430 s each, to its deadline)."""
     at = command.index(session.SELECTION[1])
-    whole = " and not whole_suite" if cache == "on" else ""
-    return [*command[:at], "network" if network else session.SELECTION[1] + whole, *command[at + 1:]]
+    cells = "" if whole else " and not whole_suite"
+    return [*command[:at], "network" if network else session.SELECTION[1] + cells, *command[at + 1:]]
 
 
 GPU_HEADROOM = (1.25, 2 ** 30)
@@ -1334,6 +1338,23 @@ def pythons(*, check: bool) -> int:
     return 1 if problems else 0
 
 
+def task_arguments(running: argparse.ArgumentParser) -> None:
+    """The `task` operation's arguments, which armada's task command fills from a plan entry."""
+    running.add_argument("--python", choices=PYTHONS, required=True)
+    running.add_argument("--tests", required=True)
+    running.add_argument("--split", default="")
+    running.add_argument("--out", type=Path, required=True)
+    running.add_argument(
+        "--cache", required=True,
+        help="the plan's DEW_TEST_CACHE (`policy`): on, or off")
+    running.add_argument("--whole", choices=("0", "1"), default="0",
+                         help="the plan's DEW_WHOLE_SUITE: 1 on the whole suite's run, which runs its cells")
+    running.add_argument("--deadline", type=float, default=session.DEADLINE,
+                         help="seconds before armada's own task timeout (.armada.json) to interrupt at")
+    running.add_argument("--coverage", type=Path, default=None,
+                         help="run the files under coverage.py, its data file in this directory")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="tools/armada/ci.py")
     operations = parser.add_subparsers(dest="operation", required=True)
@@ -1342,18 +1363,7 @@ def main() -> int:
     planning = operations.add_parser("plan")
     planning.add_argument("--target", type=float, required=True)
     planning.add_argument("--timings", type=Path, required=True)
-    running = operations.add_parser("task")
-    running.add_argument("--python", choices=PYTHONS, required=True)
-    running.add_argument("--tests", required=True)
-    running.add_argument("--split", default="")
-    running.add_argument("--out", type=Path, required=True)
-    running.add_argument(
-        "--cache", required=True,
-        help="the plan's DEW_TEST_CACHE (`policy`): on, or off")
-    running.add_argument("--deadline", type=float, default=session.DEADLINE,
-                         help="seconds before armada's own task timeout (.armada.json) to interrupt at")
-    running.add_argument("--coverage", type=Path, default=None,
-                         help="run the files under coverage.py, its data file in this directory")
+    task_arguments(operations.add_parser("task"))
     selecting = operations.add_parser(
         "pytest", help="pytest on the arguments as a CI task runs it, CI's selection first; its exit status")
     selecting.add_argument("--python", choices=PYTHONS, required=True)
@@ -1443,7 +1453,7 @@ def main() -> int:
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
     return task(args.python, args.tests.split(), args.split, args.out, args.deadline, args.cache,
-                coverage=args.coverage)
+                coverage=args.coverage, whole=args.whole == "1")
 
 
 if __name__ == "__main__":
