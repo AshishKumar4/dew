@@ -187,9 +187,9 @@ def test_rows_whose_schema_is_their_context_pack_several_a_window_each_reading_i
     its own state's; the window's contexts end to end within its context budget."""
     from test_decision_context import windows_of
 
-    # A window of 128 tokens holds several rows of a short state, and one of 768 context tokens several of
+    # A window of 512 tokens holds several rows of a short state, and one of 768 context tokens several of
     # their schemas.
-    objective = read_in_context(segments=3, max_len=128)
+    objective = read_in_context(segments=3, max_len=512)
     rows = labelled()
     several = 0
     for window in windows_of(objective, rows, count=8):
@@ -229,5 +229,5 @@ def test_packed_rows_decide_each_schema_in_context_as_each_row_alone():
     parameters)."""
     from test_decision_context import assert_packed_as_alone
 
-    packed, alone = (read_in_context(segments=most, max_len=128) for most in (3, 1))
+    packed, alone = (read_in_context(segments=most, max_len=512) for most in (3, 1))
     assert_packed_as_alone(packed, alone, labelled()[:8], "packed schemas in context", PACKED_SCHEMA_SEEDS)
