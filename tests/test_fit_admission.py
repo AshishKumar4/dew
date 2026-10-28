@@ -20,6 +20,7 @@ from dew.config.jepa import JepaRunConfig
 from dew.data import TFDS, Loading, presets
 from dew.data.dataset import DataPartition, Loader, rows_of
 from dew.inputs import Field, InputSpec
+from dew.objectives.jepa.objective import JepaObjective
 from dew.objectives.supervised import Supervised
 from dew.registry import ModelConfig
 from dew.training import Trainer
@@ -47,6 +48,7 @@ def test_a_jepa_predictor_takes_the_width_its_encoder_was_built_at(tmp_path):
                 data=rows.read("memory").loading(Loading(workers=0)),
                 trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1))
     objective = run.prepare().train("built")
+    assert isinstance(objective, JepaObjective)
     assert (objective.encoder.emb_features, objective.predictor.emb_features) == (16, 16)
 
 
