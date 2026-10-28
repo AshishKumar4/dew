@@ -350,7 +350,8 @@ def test_each_launch_lowers_once_however_many_layers_call_it():
             total = jnp.float32(0.0)
             for layer in range(count):
                 # Each layer's own queries, as each layer projects its own.
-                out = mosaic_rule(query * (layer + 1), key, value, g, beta, tiles=mainloop.Tiles(32, 1))[0]
+                scaled = query * (layer + 1)
+                out = mosaic_rule(scaled, key, value, g, beta, tiles=mainloop.Tiles(32, 1))[0]
                 total = total + out.astype(jnp.float32).sum()
             return total
 
