@@ -1,8 +1,9 @@
 """Dew's decoders against the releases whose own modeling code is their reference, each recorded over
 seeds in the environment its code runs under (tools/remote_code_reference.py --record, the draws
-tests/remote_code_draws.py's): Liquid's LFM3 (LiquidAI/LFM3-1.7B@40ebe0a, transformers 5.18.0), MiMo-V2.6
-(XiaomiMiMo/MiMo-V2.6-Pro-MOPD@6a7f202, 5.1.0, the last whose masks its code calls), Dream (Dream-org/Dream-v0-Base-7B@6572adb, 4.46.3) and
-LLaDA (GSAI-ML/LLaDA-8B-Base@0f2787f, 4.46.3), each over a tiny random-weight checkpoint."""
+tests/remote_code_draws.py's): Liquid's LFM3 (LiquidAI/LFM3-1.7B@40ebe0a, transformers 5.18.0),
+MiMo-V2.6 (XiaomiMiMo/MiMo-V2.6-Pro-MOPD@6a7f202, 5.1.0, the last whose masks its code calls), Dream
+(Dream-org/Dream-v0-Base-7B@6572adb, 4.46.3) and LLaDA (GSAI-ML/LLaDA-8B-Base@0f2787f, 4.46.3), each
+over a tiny random-weight checkpoint."""
 
 import json
 from pathlib import Path
