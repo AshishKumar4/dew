@@ -889,13 +889,14 @@ def counted_source(name: str):
     return from_grain(grain.MapDataset.source(records), name).filter_map(reject_thirds)
 
 
-def delivered_and_counted(chain) -> tuple[dict[str, int], dict[str, float]]:
-    """Each corpus's rows a whole read of `chain` delivers, and the counts the read's position holds
-    of them (`state_counts`), as `Pipeline.stats` reads them."""
+def delivered_and_counted(chain, records: int) -> tuple[dict[str, int], dict[str, float]]:
+    """Each corpus's rows a read of `records` of `chain` delivers, and the counts the read's position
+    holds of them (`state_counts`), as `Pipeline.stats` reads them: a repeated mix reads on, its
+    corpora repeated, so its read is bounded as `stats` bounds it."""
     from dew.data.compile import _diagnostic
     from dew.data.mixing import data_metrics, state_counts
 
-    reader, delivered = _diagnostic(chain), {}
+    reader, delivered = _diagnostic(chain, records=records), {}
     try:
         for batch in reader:
             for name in np.asarray(batch["corpus"]).reshape(-1):
@@ -911,7 +912,7 @@ def test_a_nested_mix_repeated_whole_counts_every_corpus_it_delivered_on_both_pa
     across the outer rewind that reopens the inner mix (row 2059). Before, the inner mix's corpora,
     rewound past a member the outer mix had not opened, counted only their last pass."""
     delivered, counted = delivered_and_counted(
-        mix([mix([counted_source("a"), counted_source("b")]), counted_source("c")]).repeat(2))
+        mix([mix([counted_source("a"), counted_source("b")]), counted_source("c")]).repeat(2), 24)
     assert set(delivered) == {"a", "b", "c"}
     for name, rows in delivered.items():
         assert (counted[f"data/rows/{name}"], counted[f"data/rejected/{name}/third"]) == (rows, rows // 2)
@@ -932,7 +933,8 @@ def test_a_live_mix_rolled_back_to_where_it_opened_no_corpus_counts_none():
         assert data_metrics(state_counts(reader.get_state()).values())
         reader.set_state(start)
         rolled = data_metrics(state_counts(reader.get_state()).values())
-        counted = [value for name, value in rolled.items() if name.startswith(("data/rows/", "data/rejected/"))]
+        kinds = ("data/rows/", "data/rejected/")
+        counted = [value for name, value in rolled.items() if name.startswith(kinds)]
         assert all(value == 0 for value in counted)
     finally:
         reader.close()
