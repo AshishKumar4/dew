@@ -356,6 +356,10 @@ def _scope(family: mosaic.Family, allocations: tuple, reducing_warpgroups: int) 
     return resources.Scope(program=(scoped, *held), walks=walks, reducing_warpgroups=reducing_warpgroups)
 
 
+KEYS_FIRST_STATISTICS = 5
+"""The per-query statistics a keys-first dK/dV step holds as column vectors (`_backward_registers`)."""
+
+
 def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
                         accurate: bool, dq: bool) -> int:
     """The registers a backward launch's consumer holds at `config` (`resources.live_registers`): a dQ
@@ -372,7 +376,10 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     carried = [(block_k, width // config.columns, jnp.float32), (block_k, value_width // config.columns,
                                                                  jnp.float32)]
     fused = [(block_q, width, jnp.float32)] if config.fused else []
-    return resources.live_registers(family, carried, products, fused)
+    # The keys-first step's per-query statistics in its tiles' column layout (`Family.column_registers`): the
+    # maximum, the denominator, the anchor, D and the anchor key (`attention_mosaic_backward._scores`).
+    statistics = KEYS_FIRST_STATISTICS * family.column_registers(block_q, jnp.float32)
+    return resources.live_registers(family, carried, products, fused) + statistics
 
 
 @dataclasses.dataclass(frozen=True)
