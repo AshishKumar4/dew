@@ -1254,29 +1254,6 @@ type Handed = pygrain.MapDataset | pygrain.IterDataset | Mapping[str, np.ndarray
 elements, or arrays whole."""
 
 
-class _Shared:
-    """The `partition`'s share of each batch `batches` yields (`DataPartition`: rows `index :: count`),
-    its position the stream's own where it keeps one."""
-
-    def __init__(self, batches: Iterator[Batch], partition: DataPartition):
-        self.batches, self.partition = batches, partition
-
-    def __iter__(self):
-        return self
-
-    def __next__(self) -> Batch:
-        batch = next(self.batches)
-        if self.partition.count == 1:
-            return batch
-        return take_batch(batch, np.arange(self.partition.index, rows_of(batch), self.partition.count))
-
-    def get_state(self):
-        return self.batches.get_state()
-
-    def set_state(self, state) -> None:
-        self.batches.set_state(state)
-
-
 class _Whole:
     """The same batch every step, the arrays a run was handed whole; its position the steps read."""
 
@@ -1297,6 +1274,32 @@ class _Whole:
         self.read = int(state)
 
 
+def _share(batch: Batch, partition: DataPartition) -> Batch:
+    """`partition`'s share of `batch` (`DataPartition`: rows `index :: count`)."""
+    if partition.count == 1:
+        return batch
+    return take_batch(batch, np.arange(partition.index, rows_of(batch), partition.count))
+
+
+class _Shared:
+    """The `partition`'s share of each batch `batches` yields (`_share`), its position the stream's."""
+
+    def __init__(self, batches: pygrain.DatasetIterator | _Whole, partition: DataPartition):
+        self.batches, self.partition = batches, partition
+
+    def __iter__(self):
+        return self
+
+    def __next__(self) -> Batch:
+        return _share(next(self.batches), self.partition)
+
+    def get_state(self):
+        return self.batches.get_state()
+
+    def set_state(self, state) -> None:
+        self.batches.set_state(state)
+
+
 def native(handed: Handed, *, training: bool) -> Reader:
     """A reader of the data handed to `fit` as it is, each element a batch the run steps on, never
     batched again: a Grain dataset's elements (batched by Grain, `MapDataset.batch`), a map dataset's
@@ -1306,9 +1309,11 @@ def native(handed: Handed, *, training: bool) -> Reader:
         batch = {name: np.asarray(column) for name, column in handed.items()}
         if training:
             return lambda partition: _Shared(_Whole(batch), partition)
-        return lambda partition: _Shared(iter((batch,)), partition)
-    endless = handed.repeat() if training and isinstance(handed, pygrain.MapDataset) else handed
-    return lambda partition: _Shared(iter(endless), partition)
+        return lambda partition: [_share(batch, partition)]
+    stream = handed
+    if isinstance(handed, pygrain.MapDataset):
+        stream = (handed.repeat() if training else handed).to_iter_dataset()
+    return lambda partition: _Shared(iter(stream), partition)
 
 
 def native_loader(handed: Handed) -> Loader:
