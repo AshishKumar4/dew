@@ -148,12 +148,9 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     inverse_total = coords.queries(algebra.inverse(total), s)
     exponentials, weights = algebra.normalized(logits, coords.queries(peak, s), inverse_total, how)
     at_anchor = coords.k_pos == coords.queries(chosen, coords.k_pos)
-    multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
     cotangents = algebra.grad_scores(exponentials, dp, coords.queries(anchor, s), coords.queries(delta, s),
-                                     seen, at_anchor, inverse_total, multiplier=multiplier)
-    if multiplier is not None:
-        # dV's weights the dropped ones (`algebra.value_operands`).
-        exponentials, weights = exponentials * multiplier, weights * multiplier
+                                     seen, at_anchor, inverse_total,
+                                     multiplier=algebra.drawn(coords, coords.q_pos, coords.k_pos))
     return exponentials, weights, cotangents, slopes, seen
 
 
@@ -344,7 +341,11 @@ def _dkv_step(walk: _Backward, resident: tuple, powered, rows_of, staged, coords
     exponentials, weights, cotangents, slopes, seen = _scores(walk, coords, params, s, dp, *rows_of(q_first),
                                                              masked=True)
     logits, pieces = algebra.pulled(cotangents, slopes, seen, kinds, KEY_ROWS)
-    narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype, coords.drop is not None)
+    # dV's weights the dropped ones (`algebra.value_operands`); the dQ program's sums take them undropped.
+    multiplier = algebra.drawn(coords, coords.q_pos, coords.k_pos)
+    if multiplier is not None:
+        exponentials, weights = exponentials * multiplier, weights * multiplier
+    narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype, multiplier is not None)
     dv_acc = family.register_products(dv_acc, ((narrowed, None),), do_slot, walk.interpret)
     scaled = logits * walk.grad_scale
     if add_dq is None:
