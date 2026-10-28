@@ -47,8 +47,8 @@ def test_a_grouped_model_saves_in_the_remote_codes_layout(tmp_path):
 
 
 YARN_EXPORT_SEEDS = 8
-"""The single-group export's declared draws of ids against transformers' Llama read of it (check 1), sized by `seeds_for`
-paired with Dew's logits on the CPU."""
+"""The single-group export's declared draws of ids against transformers' Llama read of it (check 1),
+sized by `seeds_for` paired with Dew's logits on the CPU."""
 
 
 def test_a_single_group_exports_as_llama_with_its_yarn(tmp_path):

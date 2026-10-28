@@ -377,7 +377,8 @@ def test_public_parameter_storage_is_independent_of_compute_and_roundtrips(tmp_p
 
 
 RUN_EXPORT_SEEDS = 8
-"""A run's export's declared draws of ids against transformers' fp32 read of it (check 1)."""
+"""A run's export's declared draws of ids against transformers' fp32 read of it (check 1), sized by
+`seeds_for` paired with the run's logits on the CPU."""
 
 
 def assert_transformers_reads_the_run(export, task, ids, *, ordered_export=None):
