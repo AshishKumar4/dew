@@ -121,7 +121,7 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
         # The template walks only the key tiles its spans reach, in memory linear in the sequence, so it
         # takes the whole call: the window, or each query's run of its chunk's keys (`chunk_runs`), with
         # the documents, the valid keys, the sinks and the softcap as they are, no band and no mask.
-        runs = None if chunk is None else chunk_runs(places, segment_ids, query.shape[0], length, chunk)
+        runs = None if chunk is None else chunk_runs(places, segment_ids, valid, query.shape[0], length, chunk)
         return whole(implementation=implementation, causal=True, sliding_window=window,
                      segment_ids=segment_ids, max_segments=max_segments, key_valid=valid, key_runs=runs)
     # A mask built here is at most `[S, 2W]` per head, so cudnn takes it as
@@ -194,15 +194,19 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     return checkpoint_name(out, 'attention_output')
 
 
-def chunk_runs(places, segment_ids, rows: int, length: int, chunk: int) -> jax.Array:
+def chunk_runs(places, segment_ids, valid, rows: int, length: int, chunk: int) -> jax.Array:
     """Each query's run of keys `[lo, hi)` `[B, S, 1, 2]` (`template.spans`' `runs`): its own chunk's keys
     of `chunk` places at or before it within its document, chunked attention's, as the template's spans
     take a chunk (`template.spans`' `chunk`, the one algorithm), one interval a query, which every
-    mainloop walks. `places` `[S]` or `[B, S]`, None for the row index."""
+    mainloop walks. `places` `[S]` or `[B, S]`, None for the row index. The keys `valid` `[B, S]` does not
+    mark are no document's (id 0, padding): a compacted row's padding sits after its tokens at places
+    that restart (`compacted`), which the search along a document's places would read as its own."""
     positions = None
     if places is not None:
         place = jnp.broadcast_to(jnp.atleast_2d(jnp.asarray(places)), (rows, length))
         positions = place, place
+    if valid is not None:
+        segment_ids = jnp.where(valid, 1 if segment_ids is None else segment_ids, 0)
     spans = template.spans(length, length, rows, causal=True, chunk=chunk, positions=positions,
                            segment_ids=segment_ids)
     return jnp.stack([spans.start, spans.end], axis=-1)[:, :, None, :]
