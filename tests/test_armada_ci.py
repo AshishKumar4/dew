@@ -1948,3 +1948,43 @@ def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priorit
     # A train staged on the testing train's tip runs beside it, below it (owner and Main, 2026-10-28).
     assert priority("ci/stage-abc-1") == ["--priority=5"]
     assert priority("fix/lane") == []
+
+
+def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_path, monkeypatch, capsys):
+    """A test whose own seconds in a task's run pass the group target (.armada.json's `target`) is flagged
+    from the verdict's rows, as no cut can bring its group within the target; a whole_suite cell is flagged
+    too, marked as running on the whole suite alone, however pytest comes to mark it (its own mark, its
+    class's, a parameter set's, a mark held in a name), which the run records in its row (bible §7: every
+    test past the target is reported); and with main's durations record, a test it lacks fails the check, a
+    cell newly marked whole_suite too, while one main holds already passes (owner, 2026-10-28: a new slow test
+    fails its lane's check; row 2073's cell ran 1,540 s)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_slow.py": "import time\nimport pytest\ncell = pytest.mark.whole_suite\n"
+                       "def test_old(): time.sleep(0.4)\n"
+                       "def test_new(): time.sleep(0.6)\n"
+                       "def test_quick(): pass\n"
+                       "@pytest.mark.whole_suite\ndef test_cell(): time.sleep(0.4)\n"
+                       "@cell\ndef test_named(): time.sleep(0.4)\n"
+                       "class TestHeld:\n    pytestmark = cell\n    def test_inside(self): time.sleep(0.4)\n"
+                       "@pytest.mark.parametrize('n', [1, pytest.param(2, marks=cell, id='big')])\n"
+                       "def test_sized(n): time.sleep(0.3 * n)\n"})
+    (tmp_path / ".verdict").mkdir()
+    out = tmp_path / ".verdict/verdict.json"
+    # The whole suite's run, which runs the cells too.
+    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
+    verdict = tmp_path / "verdict.json"
+    verdict.write_text(json.dumps({"rows": armada_task(ci, monkeypatch, out, "off")}))
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 0.2}))
+    base = tmp_path / "base.json"
+    held = ("test_old", "test_sized[1]", "test_cell", "test_named", "TestHeld::test_inside")
+    base.write_text(json.dumps({f"tests/test_slow.py::{name}": 0.4 for name in held}))
+
+    def slow(*options: str) -> tuple[int, dict[str, bool]]:
+        monkeypatch.setattr(sys, "argv", ["ci.py", "slow", str(verdict), *options])
+        code = ci.main()
+        printed = [json.loads(line) for line in capsys.readouterr().out.splitlines() if line.startswith("{")]
+        return code, {item["test"].partition("::")[2]: item.get("whole_suite", False) for item in printed}
+
+    assert slow() == (0, {"test_new": False, "test_old": False, "test_sized[1]": False, "test_cell": True,
+                          "test_named": True, "TestHeld::test_inside": True, "test_sized[big]": True})
+    assert slow("--new", str(base)) == (1, {"test_new": False, "test_sized[big]": True})
