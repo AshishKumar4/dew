@@ -2272,8 +2272,9 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, call: _Call, *, scale: floa
     # The scores' gradient, the scores and the pairs' sums.
     work = Work(2 * CHUNK * CHUNK * (value_width + width + CHUNK), exponentials=CHUNK * CHUNK)
     # The scores' gradient fp32 and narrow, the pairs' decays, the scores and the pair terms, the masks, and
-    # the pairs' sum's product.
-    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * 5 + _held(held, CHUNK, CHUNK) + _masks(CHUNK, CHUNK)
+    # the pairs' sum's product: four fp32 tiles at once, the decays taken before the scores' product
+    # (`algebra.scores_gradient`); five stated an A100's 280 registers where ptxas needed 240.
+    held_tiles = _Held(phases=([_f32(CHUNK, CHUNK)] * 4 + _held(held, CHUNK, CHUNK) + _masks(CHUNK, CHUNK)
                                + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),))
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=tiles, stages=1, live=_taken(8), work=work,
