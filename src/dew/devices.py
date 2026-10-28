@@ -31,16 +31,35 @@ def apply_xla_flags(flags: str | None) -> None:
         return
     existing = os.environ.get('XLA_FLAGS', '')
     os.environ['XLA_FLAGS'] = f"{existing} {flags}".strip()
+    _loaded()
+
+
+_LOADED: str | None = None
+"""XLA_FLAGS as JAX's backend read them: their last value Dew saw while the backend was still closed
+(`_loaded`), at its import and at each flag it applied, or None where it saw none before the backend
+opened. The environment can change after the backend opened, to no effect on it."""
+
+
+def _loaded() -> str | None:
+    """The flags the backend reads or read (`_LOADED`): the environment's, while it is closed."""
+    global _LOADED
+    if not backend_open():
+        _LOADED = os.environ.get('XLA_FLAGS', '')
+    return _LOADED
 
 
 def flags_hold(flags: str) -> bool:
-    """Whether every flag of `flags` holds in XLA_FLAGS as XLA reads it (`xla_flag`): each read as XLA
-    reads `flags` alone, its last occurrence's value, a bare flag's 'true'."""
+    """Whether every flag of `flags` holds as JAX's backend reads its flags (`_loaded`), or read them
+    once it opened: each read as XLA reads `flags` alone, its last occurrence's value, a bare flag's
+    'true'. Flags Dew never saw before the backend opened hold nowhere."""
+    loaded = _loaded()
+    if loaded is None:
+        return False
     asked = {}
     for token in flags.split():
         name, equals, value = token.removeprefix("--").partition("=")
         asked[name] = value if equals else "true"
-    return all(xla_flag(name) == value for name, value in asked.items())
+    return all(_flag(loaded, name) == value for name, value in asked.items())
 
 
 def xla_flag(name: str) -> str | None:
@@ -51,8 +70,13 @@ def xla_flag(name: str) -> str | None:
     when it initializes a backend, so this reports what the run asked for,
     not what a live backend was built with.
     """
+    return _flag(os.environ.get('XLA_FLAGS', ''), name)
+
+
+def _flag(flags: str, name: str) -> str | None:
+    """The value `--<name>` carries in `flags`, as `xla_flag` reads it."""
     value = None
-    for token in os.environ.get('XLA_FLAGS', '').split():
+    for token in flags.split():
         if token == f"--{name}":
             value = 'true'
         elif token.startswith(f"--{name}="):
@@ -336,3 +360,7 @@ def gpu_free_bytes(ordinal: int) -> int | None:
             cuda.cuCtxPopCurrent_v2(ctypes.byref(ctypes.c_void_p()))
     finally:
         cuda.cuDevicePrimaryCtxRelease_v2(device)
+
+
+# What the backend will read, as `import dew` finds it (`_LOADED`).
+_loaded()

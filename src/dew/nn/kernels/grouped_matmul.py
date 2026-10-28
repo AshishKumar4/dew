@@ -1226,11 +1226,19 @@ DECLARED_ONLY = _Need('declared', lambda case: DECLARED.get(case.cell, ('',))[0]
 other cell: the template, then Triton by legality, run those."""
 
 
+DENSE_MEASURED = _Need('dense', lambda case: not case.kind.startswith('dense'),
+                      "Triton's dense launches measured slower than XLA's dot on every generation timed (DENSE1, "
+                      "10 projections at 8192 tokens: A100 1.735x to 1.947x, H100 1.149x to 1.738x)",
+                      row='bible da64ae5', kind='measured')
+"""What keeps Triton's launches off a dense product the template's own launches cannot run: XLA's dot runs it,
+as it measured faster than Triton's on every generation timed; a call naming Triton still runs them."""
+
+
 _GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm(), CutlassGmm())
 _TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm(), CutlassTgmm())
 
 GROUPED: selection.Op[GroupedCase] = selection.Op('grouped_matmul', (
-    *(_launch_kernel(launch.name, *((DECLARED_ONLY,) if launch.name == 'cutlass' else ()))
+    *(_launch_kernel(launch.name, *{'cutlass': (DECLARED_ONLY,), 'triton': (DENSE_MEASURED,)}.get(launch.name, ()))
       for launch in _GMMS),
     selection.Kernel[GroupedCase]('xla', (), generic=True)), declared=DECLARED)
 """The grouped selector, in a fixed order, the template first (owner, bible da64ae5): Mosaic GPU's launch
