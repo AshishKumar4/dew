@@ -1,15 +1,16 @@
 #!/bin/sh
-# Makes origin/main and its history present in this checkout, as the gates that hold a checkout to main need
-# them (tools/duplicates.py, the slop ratchet). A shallow checkout, as armada's are, or one without
-# origin/main fetches main from its origin remote, or, with none, from the project's repository
-# (pyproject.toml's [project.urls] Repository). A complete checkout that has origin/main is left as it is.
+# Makes origin/main, the base the gates that hold a checkout to main read (tools/duplicates.py, the slop
+# ratchet, the public-text gate), present in this checkout from the history it holds, fetching nothing: a
+# gate's container on armada carries its commit's history (.armada.json's history full) and is given BASE,
+# its commit's merge-base with main (the lanes' lint gate passes it), which origin/main then names. A
+# checkout that has origin/main is left as it is. One whose history lacks BASE fails, naming it: the
+# gates read no network, where a fetch of main failed lanes' lint (Main, 2026-10-28: curl 92 over HTTPS).
 set -e
-shallow=$(git rev-parse --is-shallow-repository)
-if [ "$shallow" = false ] && git rev-parse -q --verify origin/main > /dev/null; then exit 0; fi
-url=$(git remote get-url origin 2> /dev/null) || url=$("${PYTHON:-python3}" -c \
-  'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["urls"]["Repository"])')
-if [ "$shallow" = true ]; then
-  git fetch -q --unshallow "$url" main:refs/remotes/origin/main
-else
-  git fetch -q "$url" main:refs/remotes/origin/main
+if git rev-parse -q --verify origin/main > /dev/null; then exit 0; fi
+base=${BASE:-origin/main}
+if ! git merge-base --is-ancestor "$base" HEAD 2> /dev/null; then
+  echo "base_history: this checkout's history holds no $base: give the gate BASE, its commit's merge-base with" \
+    "main, in a checkout carrying its history (git fetch origin main, outside a gate's container)" >&2
+  exit 1
 fi
+git update-ref refs/remotes/origin/main "$(git rev-parse "$base^{commit}")"
