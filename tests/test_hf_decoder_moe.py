@@ -9,8 +9,9 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import fixture_ids, transformers_arms, transformers_model
 from model_support import flat_tree
-from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
+from reference_error import FACTOR, assert_as_exact, distance
 from test_hf_decoders import (
     GEMMA4_MOE,
     assert_padded_speculation_is_greedy,
@@ -27,48 +28,87 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
 ROUTED = {'qwen2-moe-tiny': 'Qwen2-MoE', 'granitemoe-tiny': 'Granite MoE', 'minimax-m2-tiny': 'MiniMax-M2'}
-"""Routed decoders whose recorded fixtures carry the reference's float32 and float64 logits, whole,
-padded and cached: Qwen2-MoE's fused experts and shared gate, Granite MoE's packed experts, MiniMax-M2's
-router state, recorded from the corrected reference."""
+"""Routed decoders with padded fixtures: Qwen2-MoE's fused experts and shared gate, Granite MoE's packed
+experts, MiniMax-M2's router state, recorded from the corrected reference."""
+
+IN_TEST = ('qwen2-moe-tiny', 'granitemoe-tiny')
+"""The routed decoders transformers 5.17.0 reads as their recorder did, run in the test."""
+
+ROUTED_SEEDS = {'qwen2-moe-tiny logits': 0, 'qwen2-moe-tiny cache': 0, 'qwen2-moe-tiny padded': 0, 'granitemoe-tiny logits': 0, 'granitemoe-tiny cache': 0, 'granitemoe-tiny padded': 0}
+"""Each in-test routed decoder's declared draws of ids against transformers' logits (check 1), by its
+label, whole, prefilled and stepped through the cache, and left-padded, sized by `seeds_for` paired with
+Dew's logits on the CPU."""
 
 
-@pytest.mark.parametrize('name', (*ROUTED, 'minimax-m2-fp8-tiny'))
+def routed_arms(directory, **fields):
+    """transformers' logits over the drawn ids, the fixture's padded rows' `fields` beside them, as check
+    1's reference and truth (`transformers_arms`)."""
+    import torch
+
+    tensors = {name: torch.from_numpy(value) for name, value in fields.items()}
+    valid = tensors.get('attention_mask')
+
+    def read(model, ids):
+        rows = ids if valid is None else torch.where(valid, ids, 0)
+        logits = model(rows, **tensors, use_cache=False).logits
+        return logits if valid is None else logits[valid]
+
+    return transformers_arms(transformers_model(directory), read)
+
+
+@pytest.mark.parametrize('name', IN_TEST)
 def test_a_routed_decoders_logits_match_the_reference(name):
+    """Dew's logits are on par with transformers', from its float64 twin's, over drawn ids (check 1),
+    with the same argmax."""
     directory = FIXTURES / name
     model, variables = fp32_decoder(directory)
-    reference = np.load(directory / 'logits.npy')
-    logits = np.asarray(model.apply(variables, np.load(directory / 'input_ids.npy')))
-    truth = np.load(directory / 'logits_f64.npy')
-    assert_as_exact_as_the_reference(logits, reference, truth, f'{name} logits')
-    np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
+    reference, truth = routed_arms(directory)
+    draw = fixture_ids(directory)
+    assert_as_exact(lambda ids: model.apply(variables, ids), reference, draw, f'{name} logits',
+                    seeds=ROUTED_SEEDS[f'{name} logits'], truth_fn=truth)
+    (ids,) = draw(0)
+    np.testing.assert_array_equal(np.asarray(model.apply(variables, ids)).argmax(-1),
+                                  reference(ids).argmax(-1))
 
 
-@pytest.mark.parametrize('name', ROUTED)
+@pytest.mark.parametrize('name', IN_TEST)
 def test_a_routed_decoders_prefill_and_token_steps_match_the_reference(name):
+    """Four ids prefilled into the cache and the rest stepped one at a time give logits on par with
+    transformers' uncached forward, from its float64 twin's, over drawn ids (check 1)."""
     directory = FIXTURES / name
     model, variables = fp32_decoder(directory)
-    ids = np.load(directory / 'input_ids.npy')
-    state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
-    out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
-    pieces = [np.asarray(out)]
-    for index in range(4, ids.shape[1]):
-        out, state = model.apply({**variables, **state}, ids[:, index:index + 1],
-                                 decode=True, mutable=['cache'])
-        pieces.append(np.asarray(out))
-    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1), np.load(directory / 'logits.npy'),
-                                     np.load(directory / 'logits_f64.npy'), f'{ROUTED[name]} cache')
+
+    def stepped(ids):
+        state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
+        out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
+        pieces = [out]
+        for index in range(4, ids.shape[1]):
+            out, state = model.apply({**variables, **state}, ids[:, index:index + 1],
+                                     decode=True, mutable=['cache'])
+            pieces.append(out)
+        return jnp.concatenate(pieces, axis=1)
+
+    reference, truth = routed_arms(directory)
+    assert_as_exact(stepped, reference, fixture_ids(directory), f'{ROUTED[name]} cache',
+                    seeds=ROUTED_SEEDS[f'{name} cache'], truth_fn=truth)
 
 
-@pytest.mark.parametrize('name', ROUTED)
+@pytest.mark.parametrize('name', IN_TEST)
 def test_a_routed_decoders_padded_routing_matches_the_reference(name):
-    model, variables = fp32_decoder(FIXTURES / name)
-    arrays = np.load(FIXTURES / name / 'padded.npz')
-    logits = np.asarray(model.apply(
-        variables, arrays['input_ids'], positions=arrays['position_ids'],
-        attention_mask=arrays['attention_mask']))
-    valid = arrays['attention_mask']
-    assert_as_exact_as_the_reference(logits[valid], arrays['logits'][valid],
-                                     arrays['logits_f64'][valid], f'{ROUTED[name]} padded')
+    """Left-padded rows under their mask and positions route as transformers' do: their logits are on par
+    with its, from its float64 twin's, over drawn ids (check 1)."""
+    directory = FIXTURES / name
+    model, variables = fp32_decoder(directory)
+    arrays = np.load(directory / 'padded.npz')
+    valid, positions = arrays['attention_mask'], arrays['position_ids']
+    reference, truth = routed_arms(directory, attention_mask=valid, position_ids=positions)
+
+    def padded(ids):
+        logits = model.apply(variables, jnp.where(valid, ids, 0), positions=positions, attention_mask=valid)
+        return logits[valid]
+
+    assert_as_exact(padded, reference, fixture_ids(directory), f'{ROUTED[name]} padded',
+                    seeds=ROUTED_SEEDS[f'{name} padded'], truth_fn=truth)
 
 
 @pytest.mark.parametrize('name', ROUTED)

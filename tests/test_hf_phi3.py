@@ -1,4 +1,4 @@
-"""Phi-3's fused GQA and LongRoPE against transformers 5.16.1."""
+"""Phi-3's fused GQA and LongRoPE against transformers 5.17.0."""
 
 import contextlib
 import dataclasses
@@ -8,13 +8,8 @@ from pathlib import Path
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import (
-    as_given,
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    float64_forward,
-    widened,
-)
+from interop_support import fixture_ids, transformers_arms, transformers_model
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.interop import Pretrained
 from dew.interop.sources import load_shards
@@ -23,24 +18,42 @@ ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 DIRECTORY = ROOT / 'phi3-tiny'
 
 
+LOGITS_SEEDS = {False: 0, True: 0}
+"""The long and short logits' declared draws of ids against transformers' (check 1), unpadded and
+left-padded, sized by `seeds_for` paired with Dew's logits on the CPU."""
+
+
 @pytest.mark.parametrize('padded', [False, True])
 def test_phi3_short_and_long_logits_match_transformers(padded):
+    """Rows past LongRoPE's 8-token original context read the long factors and their first four ids
+    alone the short ones: Dew's logits for each are on par with transformers', from its float64 twin's,
+    over drawn ids (check 1), with the same argmax; left-padded rows under their mask, at the positions
+    the mask counts, too."""
+    import torch
+
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
-    ids = np.load(DIRECTORY / ('padded_ids.npy' if padded else 'input_ids.npy'))
-    mask = np.load(DIRECTORY / 'attention_mask.npy') if padded else np.ones_like(ids, bool)
-    prefix = 'padded_' if padded else ''
-    actual = np.asarray(loaded.model.apply(loaded.variables, ids, attention_mask=mask))
-    _, terms = float64_forward(loaded.model, loaded.variables, ids, attention_mask=mask)
-    expected, truth = (np.load(DIRECTORY / f'{prefix}logits{suffix}.npy') for suffix in ('', '_f64'))
-    assert_as_exact_as_the_reference(actual[mask], expected[mask], truth[mask], 'Phi-3 long logits',
-                                     terms=np.asarray(terms)[mask])
-    np.testing.assert_array_equal(actual[mask].argmax(-1), expected[mask].argmax(-1))
-    if not padded:
-        short = loaded.model.apply(loaded.variables, ids[:, :4])
-        _, terms = float64_forward(loaded.model, loaded.variables, ids[:, :4])
-        assert_as_exact_as_the_reference(short, np.load(DIRECTORY / 'short_logits.npy'),
-                                         np.load(DIRECTORY / 'short_logits_f64.npy'), 'Phi-3 short logits',
-                                         terms=terms)
+    mask = np.load(DIRECTORY / 'attention_mask.npy') if padded else None
+    valid = np.ones(np.load(DIRECTORY / 'input_ids.npy').shape, bool) if mask is None else mask
+    # The fields its recorder (tools/hf_reference.py `write_classic_tiny`) gave each row.
+    positions = None if mask is None else np.maximum(np.cumsum(mask, -1) - 1, 0)
+    fields = {} if mask is None else {'attention_mask': torch.from_numpy(mask),
+                                      'position_ids': torch.from_numpy(positions)}
+    draw = fixture_ids(DIRECTORY, mask)
+
+    def ours(ids):
+        logits = {'long': loaded.model.apply(loaded.variables, ids, attention_mask=valid)[valid]}
+        return logits if padded else {**logits, 'short': loaded.model.apply(loaded.variables, ids[:, :4])}
+
+    def read(model, ids):
+        logits = {'long': model(ids, **fields, use_cache=False).logits[torch.from_numpy(valid)]}
+        return logits if padded else {**logits, 'short': model(ids[:, :4], use_cache=False).logits}
+
+    reference, truth = transformers_arms(transformers_model(DIRECTORY), read)
+    assert_as_exact(ours, reference, draw, f'Phi-3 {"padded " if padded else ""}logits',
+                    seeds=LOGITS_SEEDS[padded], truth_fn=truth)
+    (ids,) = draw(0)
+    np.testing.assert_array_equal(np.asarray(ours(jnp.asarray(ids))['long']).argmax(-1),
+                                  reference(ids)['long'].argmax(-1))
 
 
 def test_phi3_cached_greedy_crosses_the_longrope_boundary():
@@ -54,29 +67,38 @@ def test_phi3_cached_greedy_crosses_the_longrope_boundary():
     np.testing.assert_array_equal(generated.tokens, np.load(DIRECTORY / 'generated.npy'))
 
 
+CROSSING_SEEDS = 0
+"""The cached walk's declared draws of ids against transformers' uncached forward at each step (check 1),
+sized by `seeds_for` paired with Dew's walk on the CPU."""
+
+
 def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_the_crossing():
+    """Four ids prefilled and six more fed one at a time through the cache, which rebuilds where the
+    rows grow past LongRoPE's original context: each step's logits are on par with transformers'
+    uncached forward's last over the ids so far, its factor chosen by their length, from its float64
+    twin's, over drawn ids (check 1), with the same argmax."""
     from dew.nn.inputs import ModelInputs
     from dew.sampling.text import decode_ops, prefill_state
 
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
-    generated = np.load(DIRECTORY / 'generated.npy')
     ops = decode_ops(loaded.model, loaded.variables, 0, 0)
-    state, _ = prefill_state(loaded.model, loaded.variables,
-                        ModelInputs(jnp.asarray(generated[:, :4], jnp.int32)), ops)
-    outputs = []
-    for step in range(6):
-        outputs.append(np.asarray(state.logits))
-        state = ops.advance(state, jnp.asarray(generated[:, 4 + step]), jnp.ones(2, bool))
-    actual = np.stack(outputs, axis=1)
-    reference = np.load(DIRECTORY / 'generation_logits.npy')
-    truth = np.load(DIRECTORY / 'generation_logits_f64.npy')
-    for step in range(6):
-        # Each step's logits are the uncached forward's last over the tokens so far, LongRoPE's
-        # factor chosen by their length, as transformers' were.
-        _, terms = float64_forward(loaded.model, loaded.variables, generated[:, :4 + step])
-        assert_as_exact_as_the_reference(actual[:, step], reference[:, step], truth[:, step],
-                                         f'Phi-3 crossing step {step}', terms=np.asarray(terms)[:, -1])
-    np.testing.assert_array_equal(actual.argmax(-1), generated[:, 4:])
+
+    def ours(ids):
+        ids = jnp.asarray(ids)
+        state, _ = prefill_state(loaded.model, loaded.variables, ModelInputs(ids[:, :4]), ops)
+        steps = {}
+        for step in range(6):
+            steps[f'step {step}'] = state.logits
+            state = ops.advance(state, ids[:, 4 + step], jnp.ones(2, bool))
+        return steps
+
+    reference, truth = transformers_arms(transformers_model(DIRECTORY), lambda model, ids: {
+        f'step {step}': model(ids[:, :4 + step], use_cache=False).logits[:, -1] for step in range(6)})
+    draw = fixture_ids(DIRECTORY)
+    assert_as_exact(ours, reference, draw, 'Phi-3 crossing', seeds=CROSSING_SEEDS, truth_fn=truth)
+    (ids,) = draw(0)
+    for step, logits in ours(jnp.asarray(ids)).items():
+        np.testing.assert_array_equal(np.asarray(logits).argmax(-1), reference(ids)[step].argmax(-1))
 
 
 def test_a_kinds_longrope_rebuilds_the_cache_at_its_crossing_as_the_models_does():

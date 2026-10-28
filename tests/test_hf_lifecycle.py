@@ -1,6 +1,6 @@
 """Hugging Face sources through Dew's public lifecycle, one case per fixture.
 
-An untrained source exports, transformers 5.16.1 reads the export to Dew's
+An untrained source exports, transformers 5.17.0 reads the export to Dew's
 logits, and Dew reloads it to the same model, tree and logits. A causal
 source takes one public `Trainer` step of `LMObjective`, which lowers its
 loss, moves every module and keeps the state beside the parameters. The trained
@@ -17,8 +17,14 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from interop_support import assert_reloads, assert_same_stored_tensors
-from reference_error import assert_as_exact_as_the_reference, float64_forward
+from interop_support import (
+    assert_reloads,
+    assert_same_stored_tensors,
+    fixture_ids,
+    transformers_arms,
+    transformers_model,
+)
+from reference_error import assert_as_exact
 
 from dew.data.dataset import Loader
 from dew.interop import Pretrained, PretrainedDecoder
@@ -79,37 +85,34 @@ EXPORTS = (
 )
 
 
+EXPORT_SEEDS = {'gpt-bigcode-tiny': 0, 'gpt-bigcode-mha-tiny': 0, 'starcoder2-tiny': 0, 'falcon-tiny': 0, 'falcon-mha-tiny': 0, 'gptj-tiny': 0, 'phi-tiny': 0, 'phi3-tiny': 0, 'bloom-tiny': 0, 'gpt2-tiny': 0, 'gpt-neox-tiny': 0, 'opt-tiny': 0, 'gpt-neo-tiny': 0, 'mimo-v2-flash-tiny': 0, 'mamba-tiny': 0, 'modernbert-tiny': 0, 'gpt-bigcode-tiny-saved': 0, 'gpt-bigcode-mha-tiny-saved': 0, 'starcoder2-tiny-saved': 0, 'falcon-tiny-saved': 0, 'falcon-mha-tiny-saved': 0, 'gptj-tiny-saved': 0, 'phi-tiny-saved': 0, 'phi3-tiny-saved': 0, 'mamba-tiny-saved': 0}
+"""Each export's declared draws of ids against transformers' read of it (check 1), by its label, sized by
+`seeds_for` paired with Dew's logits on the CPU."""
+
+
 @pytest.mark.parametrize('case', EXPORTS, ids=lambda case: case.label)
 def test_an_untrained_export_reads_in_transformers_and_reloads_bit_for_bit(case, tmp_path):
     """The export names its family and holds the source's tensors byte for
     byte, unless it writes another family's. Transformers reads it on eager
-    attention and eager experts, and Dew's logits are as exact as its under
-    the float64 rule. Dew reads it back to the model, tree and logits it was
-    saved from."""
-    import torch
-    import transformers
-
+    attention and eager experts, and Dew's logits are on par with its, from
+    its float64 twin's, over drawn ids (check 1). Dew reads it back to the
+    model, tree and logits it was saved from."""
     directory = FIXTURES / case.fixture
     loaded = Pretrained.load(directory, dtype='float32', attention_impl='reference')
     exported = PretrainedDecoder.from_model(loaded.model, loaded.variables) if case.derived else loaded
     exported.save(tmp_path)
     family = case.writes or json.loads((directory / 'config.json').read_text())['model_type']
     assert json.loads((tmp_path / 'config.json').read_text())['model_type'] == family
-    auto = transformers.AutoModelForMaskedLM if case.masked else transformers.AutoModelForCausalLM
-    reference = auto.from_pretrained(tmp_path, attn_implementation='eager',
-                                     experts_implementation='eager').float().eval()
-    ids = np.load(directory / 'input_ids.npy')
-    with torch.no_grad():
-        expected = reference(torch.from_numpy(ids).long(),
-                             **({} if case.masked else {'use_cache': False})).logits.numpy()
-    actual = np.asarray(loaded.model.apply(loaded.variables, ids))
-    _, terms = float64_forward(loaded.model, loaded.variables, ids)
-    assert_as_exact_as_the_reference(actual, expected, np.load(directory / 'logits_f64.npy'),
-                                     f'{case.fixture} export', terms=terms)
+    fields = {} if case.masked else {'use_cache': False}
+    reference, truth = transformers_arms(transformers_model(tmp_path, masked=case.masked),
+                                         lambda model, ids: model(ids, **fields).logits)
+    draw = fixture_ids(directory)
+    assert_as_exact(lambda ids: loaded.model.apply(loaded.variables, ids), reference, draw,
+                    f'{case.fixture} export', seeds=EXPORT_SEEDS[case.label], truth_fn=truth)
 
     if case.writes is None:
         assert_same_stored_tensors(load_shards(tmp_path), load_shards(directory))
-    assert_reloads(loaded, tmp_path, ids)
+    assert_reloads(loaded, tmp_path, draw(0)[0])
 
 
 @dataclass(frozen=True)
