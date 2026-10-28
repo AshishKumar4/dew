@@ -402,8 +402,8 @@ class Processor:
         conditioning: dict[str, jax.Array] = {}
         if "pixel_values" in values or "pixel_values_videos" in values:
             if "pixel_values_videos" in values and self.config.get("model_type") not in VIDEO_MEDIA:
-                raise ValueError(f"video patch inputs require a visual tower that reads videos: "
-                                 f"{', '.join(VIDEO_MEDIA)}'s")
+                raise ValueError(f"video patch inputs require a visual tower that reads videos "
+                                 f"({', '.join(VIDEO_MEDIA)}), not {self.config.get('model_type')}'s")
             image_fields, conditioning = self._images(values, tokens)
             token_fields.update(image_fields)
             if self.config.get("model_type") in QWEN35_TYPES:
