@@ -20,7 +20,7 @@ import os
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import ClassVar, Literal, Protocol, cast, runtime_checkable
+from typing import ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
 import numpy as np
@@ -1349,7 +1349,7 @@ def native_loader(handed: Handed) -> Loader:
 
 def fitted[Entry](
     dataset: Dataset | Loader | Handed,
-    validation: Dataset | Handed | Mapping[str, Dataset | Handed | Entry] | None,
+    validation: Dataset | Mapping[str, Dataset | Entry] | None,
     *,
     objective: ObjectiveData,
     seed: int = 0,
@@ -1357,11 +1357,12 @@ def fitted[Entry](
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
     compiled with the objective's own stages and the run's data `seed`,
-    their stores provisioned, or read as handed (`native`). A training
-    dataset without a repeat repeats before its batch, so a run's length is
-    its steps, epochs or tokens, or
-    with `examples` reads that many records before they are packed and ends
-    (`compile`'s `examples`); a validation dataset without a batch takes the
+    their stores provisioned, or training data handed as it is read as
+    handed (`native`; `dew.training._fit.handed_splits` reads validation so).
+    A training dataset without a repeat repeats before its batch, so a run's
+    length is its steps, epochs or tokens, or with `examples` reads that many
+    records before they are packed and ends (`compile`'s `examples`); a
+    validation dataset without a batch takes the
     training batch, and is read and loaded as it asks. A Loader is already
     compiled, and an entry that is no Dataset (a reader, an evaluation suite)
     is passed on as it is."""
@@ -1376,23 +1377,11 @@ def fitted[Entry](
                          "has none: read it as a chain (dew.data.Grain, dew.data.Memory), or set steps=")
     else:
         loader = native_loader(dataset)
-    if validation is None:
+    named = {"val": validation} if isinstance(validation, Dataset) else validation
+    if named is None:
         return loader, None
-    named: Mapping[str, object]
-    if isinstance(validation, Dataset | pygrain.MapDataset | pygrain.IterDataset) or all(
-            isinstance(column, np.ndarray) for column in validation.values()):
-        named = {"val": validation}
-    else:
-        named = validation
-
-    def admitted(entry: object) -> Reader | Entry:
-        if isinstance(entry, Dataset):
-            return held(entry, objective=objective, batch=loader.batch, seed=seed)
-        if isinstance(entry, pygrain.MapDataset | pygrain.IterDataset | Mapping):
-            return native(entry, training=False)
-        # The caller's own entry, a reader or an evaluation suite, passed on as it came.
-        return cast(Entry, entry)
-    return loader, {name: admitted(entry) for name, entry in named.items()}
+    return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed)
+                    if isinstance(entry, Dataset) else entry for name, entry in named.items()}
 
 
 def _endless(chain: Pipeline) -> Pipeline:

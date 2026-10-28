@@ -150,7 +150,7 @@ def test_data_handed_as_it_is_steps_as_given(handed):
         data = grain.MapDataset.source(records).batch(8)
         validation = grain.MapDataset.source(records[:16]).batch(8)
     else:
-        data, validation = regression_rows(8, 0), regression_rows(8, 1)
+        data, validation = regression_rows(8, 0), {"val": regression_rows(8, 1)}
     state = Trainer(objective, optax.sgd(0.1), key=0).fit(data, validation=validation, steps=6, log_every=1)
     assert int(state.step) == 6
 

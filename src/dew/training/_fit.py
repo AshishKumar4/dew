@@ -11,6 +11,7 @@ import time
 import types
 from collections.abc import Iterator, Mapping, Sequence
 
+import grain.python as pygrain
 import jax
 from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
@@ -20,7 +21,7 @@ from dew._coordination import agreed_next
 from dew._records import JSON
 from dew.batch import Batch
 from dew.checkpoints import Checkpoints
-from dew.data.compile import Handed
+from dew.data.compile import Handed, native
 from dew.data.dataset import Closeable, DataPartition, Loader, PhasedStream, Reader
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature
@@ -433,6 +434,31 @@ def first_batch(loader: Loader, mesh: Mesh) -> Batch:
     if batch is None:
         raise ValueError("the training data holds no batch to read the model's input shape off")
     return batch
+
+
+type HandedSplits = (Dataset | pygrain.MapDataset | pygrain.IterDataset
+                     | Mapping[str, Dataset | Handed | Reader | EvalSuite])
+"""`fit`'s validation: a chain or a Grain dataset, the split `val`, or splits by name, each a chain, a
+Grain dataset, NumPy arrays, a reader or an evaluation suite."""
+
+
+def handed_splits(
+        validation: HandedSplits | None) -> Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None:
+    """`fit`'s validation with what was handed as it is read as handed (`dew.data.compile.native`): a
+    Grain dataset as the split `val`, and a named split's Grain dataset or NumPy arrays as that split.
+    Arrays are a split by name alone, as a mapping of splits is one by its names."""
+    if isinstance(validation, pygrain.MapDataset | pygrain.IterDataset):
+        return {"val": native(validation, training=False)}
+    if validation is None or isinstance(validation, Dataset):
+        return validation
+    return {name: _handed_split(entry) for name, entry in validation.items()}
+
+
+def _handed_split(entry: Dataset | Handed | Reader | EvalSuite) -> Dataset | Reader | EvalSuite:
+    """One split of `handed_splits`: read as handed where it is a Grain dataset or arrays."""
+    if isinstance(entry, Mapping | pygrain.MapDataset | pygrain.IterDataset):
+        return native(entry, training=False)
+    return entry
 
 
 def unrecorded_parts(objective: str, dataset: Dataset | Loader | Handed, *, optimized: bool,

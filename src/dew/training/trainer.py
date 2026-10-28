@@ -123,10 +123,12 @@ from dew.telemetry.records import (
 from dew.training._fit import (
     FitPlan,
     FitRun,
+    HandedSplits,
     Start,
     declarations,
     first_batch,
     fit_policies,
+    handed_splits,
     stage_reached,
     unrecorded_parts,
     waited_read,
@@ -1244,7 +1246,7 @@ class Trainer(Generic[Loss, Effects]):
         preview: bool = False,
         best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None = None,
         stop: Plateau | Pause | None = None,
-        validation: Dataset | Handed | Mapping[str, Dataset | Handed | Reader | EvalSuite] | None = None,
+        validation: HandedSplits | None = None,
         summaries: Sequence[Summary] = (),
         restore_best: bool = False,
         state: TrainState | None = None,
@@ -1300,7 +1302,8 @@ class Trainer(Generic[Loss, Effects]):
         # A schedule whose last stage ends its data bounds the run as tokens= does (`run_tokens`).
         run_length(steps, epochs, tokens, examples, required=False)
         ready_process()
-        loader, validation = fitted(dataset, validation, objective=self.objective.data(), examples=examples)
+        loader, validation = fitted(dataset, handed_splits(validation), objective=self.objective.data(),
+                                    examples=examples)
         tokens = run_tokens(loader, tokens, counts_tokens=self.objective.counts_tokens)
         self._device, self._prefetch = loader.device, device_prefetch
         steps = run_steps(loader, steps, epochs, tokens, self.accumulation, examples)
@@ -1319,8 +1322,7 @@ class Trainer(Generic[Loss, Effects]):
         run = FitRun(time.perf_counter())
         # A display of this fit's own: one before it may have run other steps.
         self._display = TrainingDisplay()
-        profile, checkpoints = self.profile, self.checkpoints
-        profiler = owned_capture(self.profile)
+        profile, checkpoints, profiler = self.profile, self.checkpoints, owned_capture(self.profile)
         # One boundary lookup at setup: the prefetch worker and the step scopes share whichever profiler
         # owns the capture.
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
@@ -1330,8 +1332,8 @@ class Trainer(Generic[Loss, Effects]):
                 checkpoint_every=saved, checkpoint_final=checkpoint_final, local_every=local,
                 metrics=metrics, preview=preview, best=selection, stop=plateau, suites=suites, pause=pause,
                 held_best=restore_best and checkpoints is None, observe=observe, summaries=tuple(summaries),
-                declared=declared,
-                branches=() if cooldowns is None else cooldowns.branches(steps, tokens, self.accumulation),
+                declared=declared, branches=() if cooldowns is None else cooldowns.branches(
+                    steps, tokens, self.accumulation),
             )
             trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state, resume)
             # The state a checkpoint would hold: the step rebuilds its narrow copies.
