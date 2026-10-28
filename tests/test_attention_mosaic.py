@@ -70,8 +70,8 @@ FORM_TILES = attention_mosaic.Tiles(64, 64, 2, 2)
 """The call forms' tiles: the template core's 100 queries over 96 keys (`test_attention_template.CASES`) in a
 pair of query blocks over two key tiles, so a block's spans begin and end within the keys it streams."""
 HEAD_WIDTHS = ((64, 128), (128, 64), (80, 48))
-"""The (query, value) head widths the forward and the backward are checked at: a value wider than its query, a narrower one, and
-both off a power of two (80 and 48 pad to 128 and 64, `attention.padded_call`)."""
+"""The (query, value) head widths the forward and the backward are checked at: a value wider than its
+query, a narrower one, and both off a power of two (80 and 48 pad to 128 and 64, `attention.padded_call`)."""
 
 
 def _drawn(shape: tuple[int, int, int, int], dtype, width: int = 128, keys: int | None = None,
