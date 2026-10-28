@@ -125,10 +125,13 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
     hooks = hooks_for(names, queries, value_width, gate_of(queries, value_width))
     pin = tuning.pinned({attention_triton.TritonForward: config})
 
-    # The maxima are in the logits' own units, raw products in the raw form (`algebra.Forward.raw`), taken
-    # to the reference's natural ones as the algebra takes them (`algebra.Forward.naturalized`).
-    spec = algebra.Forward(spans.form, keys, ids=spans.query_ids is not None, scale=width ** -0.5,
-                           score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None)
+    # The maxima are in the logits' own units, raw products in the raw form (`algebra.Forward.raw`), the
+    # query's taken by its scale's power of two (`template.prescale`), taken to the reference's natural ones
+    # as the algebra takes them (`algebra.Forward.naturalized`).
+    power, scale = template.prescale(dtype, width, width ** -0.5)
+    spec = algebra.Forward(spans.form, keys, ids=spans.query_ids is not None, scale=scale,
+                           score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None,
+                           prescale=power)
 
     def ours(query, key, value):
         if mainloop == "portable":

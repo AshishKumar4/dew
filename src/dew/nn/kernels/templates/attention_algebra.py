@@ -1324,7 +1324,8 @@ def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool) -> jax.A
 def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.Array, jax.Array]:
     """The block's residual rows (`finish`'s): the maximum (0 for a query that saw nothing and started from no
     state, as the reference's) in the units the backward recomputes its logits in, natural, or raw products
-    where the forward's are (`Forward.raw`), and the denominator, unshifted (`room`)."""
+    where the forward's are (`Forward.raw`), the products of the query its call's power of two took
+    (`Forward.prescale`), and the denominator, unshifted (`room`)."""
     m = state.m if spec.raw else spec.naturalized(state.m)
     if spec.guarded or initial:
         m = jnp.where(m == -jnp.inf, 0.0, m)
