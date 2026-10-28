@@ -679,6 +679,37 @@ def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_
     assert np.isfinite(float(loss))
 
 
+@pytest.mark.parametrize(("seconds", "remat"),
+                         [([[2.0], [1.0]], "minimal_offloaded"), ([[1.0], [2.0]], "full")],
+                         ids=["offloaded-faster", "full-faster"])
+def test_a_plan_at_remat_full_is_timed_against_its_offloading_sibling(monkeypatch, tmp_path, seconds, remat):
+    """A run at remat 'full' whose frontier is timed compiles beside it, at the same split,
+    'minimal_offloaded', which keeps as many bytes on the device and moves 'minimal''s residuals over
+    the host link where 'full' recomputes them, and keeps the faster, which an identical run then takes
+    from the plan recorded (row 1932); a run whose frontier is not timed, recording its own plan,
+    keeps 'full' and compiles no sibling."""
+    free(monkeypatch, LIMIT)
+    trainer = lm(remat="full")
+    state, _, _ = trainer.place()
+    trials = Timed(state, BATCH, given=seconds)
+    step = trainer.compile(state, BATCH, trials)
+    assert trials.asked == [2]
+    assert [plan["remat"] for plan in trainer.plan["timed"]] == ["full", "minimal_offloaded"]
+    assert trainer.plan["remat"] == remat
+    assert trainer.objective.model.remat == REMAT_POLICIES[remat]
+    state, loss, *_ = step(state, BATCH)
+    assert np.isfinite(float(loss))
+    replayed = lm(remat="full")
+    state, _, _ = replayed.place()
+    replayed.compile(state, BATCH)
+    assert (replayed.plan["remat"], replayed.objective.model.remat) == (remat, REMAT_POLICIES[remat])
+    monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "untimed"))
+    untimed = lm(remat="full")
+    state, _, _ = untimed.place()
+    untimed.compile(state, BATCH)
+    assert untimed.plan["remat"] == "full" and untimed.plan["timed"] is None
+
+
 @pytest.mark.mesh(devices=2)
 def test_a_plan_over_several_devices_that_fits_whole_is_timed_against_its_batch_whole_a_rung_up(monkeypatch):
     """Over two devices a plan that fits the batch whole without recomputing is timed against the batch
