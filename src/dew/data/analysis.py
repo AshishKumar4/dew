@@ -444,17 +444,20 @@ def _steps(pipeline: Pipeline) -> Iterator[Stage]:
 
 
 def _name(pipeline: Pipeline) -> str:
-    if pipeline.name is not None:
-        return pipeline.name
-    return "mixture" if isinstance(pipeline.source, (Mixture, Phases)) else pipeline.source.describe()
+    return _called(pipeline, lambda source: source.describe())
 
 
 def _label(pipeline: Pipeline) -> str:
     """The short name a corpus's metrics go by: the one it was given (`named`), else its store's
     (`Source.label`); its identity (`_name`) stays the plan's and the saved position's."""
+    return _called(pipeline, lambda source: source.label())
+
+
+def _called(pipeline: Pipeline, store: Callable[[Source], str]) -> str:
+    """The name `pipeline` was given (`named`), a mixture's, or what `store` calls its store."""
     if pipeline.name is not None:
         return pipeline.name
-    return "mixture" if isinstance(pipeline.source, (Mixture, Phases)) else pipeline.source.label()
+    return "mixture" if isinstance(pipeline.source, (Mixture, Phases)) else store(pipeline.source)
 
 
 def _members(pipelines: Sequence[Pipeline]) -> list[str]:
@@ -551,10 +554,15 @@ def _bind(stage: Configured, metadata: Mapping[str, object]) -> Map | RandomMap 
     resolved = stage.factory(metadata)
     if isinstance(resolved, pygrain.RandomMapTransform) != stage.random:
         raise ValueError(f"Configured {_identity(stage).name} random={stage.random} disagrees with its step")
+    if isinstance(resolved, Expansion) != stage.expands:
+        raise ValueError(f"Configured {_identity(stage).name} expands={stage.expands} disagrees with its "
+                         "step")
     if stage.one_to_one and (isinstance(resolved, Expansion) or _declares_rejects(resolved)):
         raise ValueError(f"Configured {_identity(stage).name} states one_to_one=True and binds to a step "
                          "that drops or expands records")
-    return record_stage(resolved, configured=binding)
+    bound = record_stage(resolved, configured=binding)
+    # An objective's expansion keeps the mark its configured step carried (`Configured.examples`).
+    return dataclasses.replace(bound, examples=True) if stage.examples else bound
 
 
 def _keyed(stage: Stage) -> bool:

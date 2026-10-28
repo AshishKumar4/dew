@@ -171,6 +171,43 @@ def record_site(site, output, device, *, shards=()):
         save(output, stored, reference="transformers Gemma4 Unified", license="Apache-2.0")
 
 
+REFERENCE_PACKAGES = ("torch", "transformers", "numpy")
+"""The packages the backward site's reference arm computes with: a pilot run's must be its verdict's."""
+
+
+def add_pilots(shards, output, host: str) -> None:
+    """The backward recording with the pilots of `shards` (`record_shard` over seeds from SIZING_FROM on,
+    `with_pilots`) beside its verdict seeds, written to `output`: the pilots only fix a count a paired
+    sizing gives (`seeds_for`), so they come from the verdict's reference arm in law, its device and
+    reference packages, not in bits (torch's CPU reductions vary with the host and its threads); the
+    pilot run's environment and `host`, where it ran and on how many threads, is kept in the provenance
+    beside the verdict's."""
+    import numpy as np
+    from recorded_references import save, with_pilots
+    from reference_error import recording
+
+    stored = dict(recording(ROOT / RECORDINGS / "backward.npz"))
+    verdict = json.loads(str(stored["provenance"]))
+    held, environments = [], set()
+    for path in shards:
+        with np.load(path, allow_pickle=False) as shard:
+            held.append({key: value for key, value in shard.items() if key != ENVIRONMENT})
+            environments.add(str(shard[ENVIRONMENT]))
+    if len(environments) != 1:
+        raise ValueError(f"the pilot shards were recorded in {len(environments)} environments")
+    pilots = json.loads(environments.pop())
+    if pilots["device"] != verdict["device"] or any(
+            pilots["packages"][name] != verdict["packages"][name] for name in REFERENCE_PACKAGES):
+        raise ValueError(f"the pilots' reference arm ({pilots['device']}, {pilots['packages']}) is not the "
+                         f"verdict's ({verdict['device']}, {verdict['packages']})")
+    stored = with_pilots("backward", stored, held)
+    stored["provenance"] = np.asarray(json.dumps({**verdict, "pilots": {**pilots, "recorded": host,
+        "command": "PYTHONPATH=src:tests:tools python tools/qualify_gemma4_unified.py backward --device cpu "
+                   "--shard START:STOP from 1048576 in shards, then --pilots SHARD.npz... --output "
+                   f"{RECORDINGS}/backward.npz"}}))
+    save(output, stored, reference="transformers Gemma4 Unified", license="Apache-2.0")
+
+
 def main():
     sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
     import numpy as np
@@ -190,9 +227,15 @@ def main():
                                         "for a --merge")
     parser.add_argument("--merge", type=Path, nargs="+", default=(),
                         help="the backward site's shards, joined into its recording at --output")
+    parser.add_argument("--pilots", type=Path, nargs="+", default=(),
+                        help="the backward site's pilot shards, from SIZING_FROM, added to its recording")
+    parser.add_argument("--pilot-host", help="where the pilot shards ran and on how many threads")
     args = parser.parse_args()
     torch.set_float32_matmul_precision("highest")
     torch.backends.cudnn.allow_tf32 = False
+    if args.pilots:
+        add_pilots(args.pilots, args.output, args.pilot_host)
+        return
     if args.shard is not None:
         start, stop = (int(bound) for bound in args.shard.split(":"))
         shard, _ = backward_recording(args.device, range(start, stop))

@@ -26,6 +26,7 @@ from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
 from dew._coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
 from dew.batch import Batch
+from dew.cleanup import attempted
 from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
 from dew.distributed.placement import Placement, placeable, placed_bytes, placed_shapes
 from dew.mesh import SEQUENCE_AXIS, batch_axes
@@ -560,12 +561,7 @@ class DevicePrefetchIterator:
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        try:
-            self.close()
-        except BaseException as error:
-            if exc is None:
-                raise
-            exc.add_note(f"Prefetch cleanup failed: {error!r}")
+        attempted((("Prefetch cleanup", self.close),), primary=exc)
 
     def __iter__(self):
         return self

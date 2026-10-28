@@ -184,6 +184,30 @@ def token_store(root, name, shift):
     return str(directory)
 
 
+def image_records(root: Path, pixels, pack: Callable[[dict[str, bytes]], bytes]) -> Path:
+    """`pixels` written as one ArrayRecord shard of image records under `root`/images, each packed by
+    `pack`: the reference checkout's packer here, and the one the checkout under test has where its
+    golden test writes the same records (tests/test_pipeline_golden.py)."""
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    image_root = root / "images"
+    image_root.mkdir()
+    writer = ArrayRecordWriter(str(image_root / "00.array_record"), "group_size:1")
+    for row in pixels:
+        writer.write(
+            pack(
+                {
+                    "image": row["image"].tobytes(),
+                    "shape": np.asarray([16, 16], "<i4").tobytes(),
+                    "caption": row["caption"].encode(),
+                    "label": np.asarray(row["label"], np.int32).tobytes(),
+                }
+            )
+        )
+    writer.close()
+    return image_root
+
+
 def fixture_inputs(root: Path):
     from dew.data.images import pack_dict_of_byte_arrays
     from dew.data.text import ByteTokenizer
@@ -235,23 +259,7 @@ def fixture_inputs(root: Path):
         for index in range(40)
     )
 
-    image_root = root / "images"
-    image_root.mkdir()
-    from array_record.python.array_record_module import ArrayRecordWriter
-
-    writer = ArrayRecordWriter(str(image_root / "00.array_record"), "group_size:1")
-    for row in pixels:
-        writer.write(
-            pack_dict_of_byte_arrays(
-                {
-                    "image": row["image"].tobytes(),
-                    "shape": np.asarray([16, 16], "<i4").tobytes(),
-                    "caption": row["caption"].encode(),
-                    "label": np.asarray(row["label"], np.int32).tobytes(),
-                }
-            )
-        )
-    writer.close()
+    image_root = image_records(root, pixels, pack_dict_of_byte_arrays)
     import cv2
     import pyarrow as pa
     import pyarrow.parquet as pq

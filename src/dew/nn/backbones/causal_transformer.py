@@ -501,6 +501,18 @@ class CausalTransformer(nn.Module):
         return hidden, output
 
     @property
+    def position_rows(self) -> int:
+        """The rows of the learned position table (`position_embedding_size`, else `max_seq_len`)."""
+        return self.position_embedding_size or self.max_seq_len
+
+    @property
+    def position_capacity(self) -> int | None:
+        """The places a row's learned positions cover, the table's rows past its reserved offset; None for
+        rotary or ALiBi positions, which cover any (`PositionCapacity`)."""
+        learned = self.position_embedding == 'learned'
+        return self.position_rows - self.position_embedding_offset if learned else None
+
+    @property
     def kv_heads(self) -> int:
         return self.num_heads if self.num_kv_heads is None else self.num_kv_heads
 
@@ -911,7 +923,7 @@ class CausalTransformer(nn.Module):
                 dtype=self.dtype, specs=self.norms)(name='embedding_layernorm')
         if self.position_embedding == 'learned':
             self.embed_positions = TokenEmbedding(
-                num_embeddings=self.position_embedding_size or self.max_seq_len,
+                num_embeddings=self.position_rows,
                 features=self.emb_features, dtype=self.dtype, name='embed_positions',
                 embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
                                 else nn.initializers.normal(self.initializer_range)))
@@ -1318,6 +1330,16 @@ class CausalTransformer(nn.Module):
     def in_context(self) -> bool:
         """Whether the model holds a continuum level an objective steps in context (`SteppedInContext`)."""
         return self.continuum is not None
+
+    def affine_head(self) -> bool:
+        """Whether the head past the continuum level (`head_logits`) is affine in its states, read from
+        the bound model: a table's product and a bias, with no transform, logit softcap, nGPT gains or
+        quantizer of the head's own input (`SteppedInContext`); a checkpoint's quantizer of the trunk's
+        modules alone leaves it affine, and a tied head reads its table with none."""
+        quantized = (isinstance(self, QuantizesInputs) and not self.tie_embeddings
+                     and self.input_quantizer(self.lm_head) is not None)
+        return (self.head_transform is None and self.final_logit_softcap is None and self.ngpt is None
+                and not quantized)
 
     @nn.nowrap
     def in_context_level(self, variables):
@@ -1734,7 +1756,7 @@ class CausalTransformer(nn.Module):
         if context is not None:
             # The context enters in the dtype a server holds it in (`context_dtype`), so a served and
             # a standalone call, and a cached and a full one, project the same values.
-            context = CrossContext(context.embeddings.astype(self.context_dtype), context.lengths)
+            context = dataclasses.replace(context, embeddings=context.embeddings.astype(self.context_dtype))
         # A layer whose mixer reads no pairwise mask or key runs refuses one (`MixerCall`).
         if key_positions is not None and pairwise_mask is None and key_runs is None:
             raise ValueError("attention_key_positions requires attention_pairwise_mask or "
@@ -1755,6 +1777,12 @@ class CausalTransformer(nn.Module):
         engram_ids = (None if self.engram is None else self.engram_hashes(
             tokens, None if coordinates is None else coordinates.valid,
             None if coordinates is None else coordinates.positions, decode, media_mask))
+        if context is not None and context.segments is not None:
+            # A context of several documents is read by the call's tokens of each document alone.
+            if coordinates is None or coordinates.segments is None:
+                raise ValueError("a context of several documents is read by packed rows, which name "
+                                 "their tokens' documents (segment_ids or coordinates)")
+            context = dataclasses.replace(context, queries=coordinates.segments)
         # A block router's blocks are numbered once for every routed layer.
         block = None if self.mixture is None else self.mixture.routing_block
         blocks = None if block is None else numbered_blocks(

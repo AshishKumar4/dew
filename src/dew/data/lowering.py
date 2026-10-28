@@ -68,6 +68,7 @@ from dew.data.dataset import (
     _stacked,
     logged_run,
     record_batch,
+    restore_parent,
     stacked,
     take_batch,
 )
@@ -426,7 +427,8 @@ def _run(
                 break
             drawn = True
         if isinstance(stage, FlatMap):
-            if drawn or (indexed and run):
+            # A corpus counts its source examples before an objective's step makes rows of them.
+            if drawn or (indexed and run) or (stage.examples and run):
                 break
             counted = True
         elif not marked and _drops(stage):
@@ -944,7 +946,7 @@ class _OverlappedCutsIterator(pygrain.DatasetIterator):
         return {"documents": self._documents.get_state(), "room": self._room}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self._documents.set_state(record(state["documents"], "packed documents"))
+        restore_parent(self._documents, state, "documents", "packed documents")
         self._room = integer(state["room"], "packed window room")
 
 
@@ -1524,7 +1526,7 @@ class _Build:
         carried = _carried(pipeline, consumed, marked=marked) if pooled and pool is not None else -1
         if self.elastic and carried >= 0:
             carried = min(carried, _handoff(pipeline.stages, consumed, marked=marked))
-        ran = consumed
+        ran, counting = consumed, _counts_own_rows(pipeline)
         # Where an endless repeat of indexed rows is written, and the rows of each of its passes.
         passes: tuple[int, int] | None = None
         for index, stage in enumerate(pipeline.stages[consumed:], start=consumed):
@@ -1544,6 +1546,11 @@ class _Build:
                 continue
             if isinstance(stage, Workers) and pool is not None:
                 continue
+            if isinstance(stage, FlatMap) and stage.examples and not self.global_order and counting:
+                # The corpus's counts are of its source examples: they are taken before an objective's
+                # step makes rows of them (`FlatMap.examples`), and not again after.
+                rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
+                counting = False
             if isinstance(stage, _RECORD):
                 # The record steps from here run as one operator (`_run`), up to where the workers
                 # hand their rows on.
@@ -1576,7 +1583,7 @@ class _Build:
         if carried == len(pipeline.stages) and pool is not None:
             rows = self.handed(rows, pipeline, partition, pool,
                                certain_after=_barren_bound(pipeline.stages, passes, carried))
-        if not self.global_order and _counts_own_rows(pipeline):
+        if not self.global_order and counting:
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
         return rows
 

@@ -176,13 +176,15 @@ export([{"text": ids[:held]}], "data/corpus-byte/val", format="array_record",
 | `z_loss` | `0.0` | PaLM's squared log-partition auxiliary. |
 | `token_accuracy` | `True` | Report argmax accuracy. |
 | `prefix` | `None` | A prefix run: each document's first tokens (an int) or its prompt (`"prompt"`) form one block the model reads whole, and no target inside it is scored ([Prefix blocks](#prefix-blocks)). |
-| `adaptation` | `None` | `ChunkAdaptation(window, rate, select)`: step the model's continuum level in context by this loss (test-time training over the task loss, below). `None` reads the level as trained. |
+| `adaptation` | `None` | `ChunkAdaptation(window, rate, select, damped)`: step the model's continuum level in context by this loss (test-time training over the task loss, below). `None` reads the level as trained. |
 
 The step reports `ce`, `perplexity` and `token_accuracy`. `LMObjective` refuses a model built with `causal=False`.
 
 ### Test-time training over the task loss
 
 A decoder built with `continuum=ContinuumLevel(hidden)` (`dew.nn.continuum`) reads a small residual level, `x + up(act(down(x)))`, on its final states before its head. `up` starts at zero, so the level starts as the identity and the decoder's logits are its own. `LMObjective(model, seq_len, adaptation=ChunkAdaptation(window=16, rate=0.01))` steps that level in context by the loss it scores, Nested Learning's continuum memory (Behrouz et al., arXiv 2512.24695, section 7.1, equation 71): every `window` tokens of a document the level steps by `rate` times the summed gradient of those tokens' weighted next-token losses, and the next window reads the stepped level. Each document, a packed row's included, starts from the level the run trains, and training learns that start through every step. Evaluation and validation score the same way. `select` names the level's parts that step (`down`, `up`); the others hold their trained values.
+
+A step whose rate times the loss's curvature passes 2 diverges, as gradient descent does: over weights drawn at 0.5 N(0, 1), a rate of a half grows a row's rounding 10^4-fold in three windows. `ChunkAdaptation(select=("up",), damped=True)` steps `up` at `rate / (1 + rate * L)` instead. `L` bounds the window's curvature in `up`'s kernel: half the head's squared Frobenius norm, which is at least its spectral norm for every head, times the window's weighted sum of `|act(down(x))|^2`. An adapter's factors on `up` hold. Under a head affine in its states (no head transform, logit softcap or nGPT gains), the loss is convex in `up`, so every damped step is non-expansive whatever the rate. Stepping `down`, the loss is not convex, and any positive rate expands a direction of negative curvature. So `damped` steps `up` alone, and other selections and heads are refused.
 
 No generation steps the level yet, so an adapted objective takes no `samples`, refuses a rollout's `policy` and records no inference task; its runs save and resume their trained state. A continuum level has no transformers counterpart, so a decoder with one does not export.
 
