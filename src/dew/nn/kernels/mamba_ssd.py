@@ -46,7 +46,7 @@ from jax.experimental import pallas as pl
 from dew.nn.kernels import tuning
 from dew.nn.kernels.chunked_launch import read_rows, write_rows
 from dew.nn.kernels.fla_gdn import _dot
-from dew.nn.precision import compensated_add, float32_einsum
+from dew.nn.precision import compensated_add, float32_einsum, two_sum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -228,7 +228,7 @@ def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int)
     # half, and its low parts' sum the compensation.
     parts = _extracted(dt * a_ref[heads].astype(jnp.float32)[:, None])
     if not seq:
-        hi_ref[:, steps], lo_ref[:, steps] = (jnp.cumsum(part, axis=1) for part in parts)
+        hi_ref[:, steps], lo_ref[:, steps] = two_sum(*(jnp.cumsum(part, axis=1) for part in parts))
         return
     documents = seq[0][steps][None, :]
 
@@ -237,9 +237,10 @@ def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int)
         return tuple(total + jnp.where(mine, jnp.cumsum(jnp.where(mine, part, 0.0), axis=1), 0.0)
                      for total, part in zip(summed, parts, strict=True))
 
-    # The documents count up along a row, from the chunk's first step's to its last's.
-    hi_ref[:, steps], lo_ref[:, steps] = jax.lax.fori_loop(
-        seq[0][start], seq[0][start + chunk - 1] + 1, document, (jnp.zeros(parts[0].shape, jnp.float32),) * 2)
+    # The documents count up along a row, from the chunk's first step's to its last's; the pair rounded
+    # once to its sum and what that dropped (`two_sum`).
+    hi_ref[:, steps], lo_ref[:, steps] = two_sum(*jax.lax.fori_loop(
+        seq[0][start], seq[0][start + chunk - 1] + 1, document, (jnp.zeros(parts[0].shape, jnp.float32),) * 2))
 
 
 @dataclasses.dataclass(frozen=True)
