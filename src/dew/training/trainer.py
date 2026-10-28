@@ -471,6 +471,14 @@ class Trainer(Generic[Loss, Effects]):
         with boxed(ruled_boxes(boxed_axes(initialized), self.layout.axis_rules)):
             return self.optimizer.init(params)
 
+    def _groups(self, state: TrainState) -> dict[str, str] | None:
+        """Where the optimizer's split sent each parameter (`OptimConfig.groups`), read under the axes the
+        modules boxed, as `_boxed_init` initialized its state; None for an optimizer given built."""
+        if self._config is None:
+            return None
+        with boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules)):
+            return self._config.groups(state.variables["params"])
+
     def _boxed_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
         """The axes the objective's modules box on their own parameters
         (`nn.with_logical_partitioning`), which its init returns and the state
@@ -1653,7 +1661,8 @@ class Trainer(Generic[Loss, Effects]):
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
-            seed=self.seed, tokens=plan.tokens, cadences=plan.recorded(self._config, self.accumulation))
+            seed=self.seed, tokens=plan.tokens, cadences=plan.recorded(self._config, self.accumulation),
+            groups=self._groups(state))
         self._report(started, current)
         if plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
