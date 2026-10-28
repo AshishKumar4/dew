@@ -906,13 +906,13 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
 
 
 def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
-    """`(A, Aqk)` of each chunk and value head under a decay a key dimension, `[R, HV * C]` each: its keys'
-    strictly lower system `A` fp32, unrounded, for the solve (`_solve`), and the chunk's scores as `call.held`,
-    each pair's decay factored over the chunk's sub-chunks (`algebra.key_decayed_pairs`, which the call's
-    declared floor bounds), their products on the tensor cores: fla_kda's intra rows. Without the delta rule,
-    `(Aqk,)` alone. Its key block is the widest whose tiles a thread holds (`_narrowed`). The solve is a launch
-    of its own: beside the pairs, Kimi delta attention's doubling needed more than an H100's 255 registers a
-    thread at every key block, where the pairs alone need 232 (ptxas, kda3/kda5)."""
+    """`(A, Aqk)` of each chunk and value head under a decay a key dimension, `[R, HV * C]` each: its
+    keys' strictly lower system `A` fp32, unrounded, for the solve (`_solve`), and the chunk's scores as
+    `call.held`, each pair's decay factored over the chunk's sub-chunks (`algebra.key_decayed_pairs`, which
+    the call's declared floor bounds), their products on the tensor cores: fla_kda's intra rows. Without
+    the delta rule, `(Aqk,)` alone. Its key block is the widest whose tiles a thread holds (`_narrowed`).
+    The solve is a launch of its own: beside the pairs, Kimi delta attention's doubling needed more than an
+    H100's 255 registers a thread at every key block, where the pairs alone need 232 (ptxas's need)."""
     call = _narrowed(call, _intra_held)
     width, held, gates = call.width, dataclasses.replace(call.held, rows=call.rows), call.gates
     square, family = dataclasses.replace(_SYSTEM, rows=call.rows), call.family
@@ -983,14 +983,16 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
 
 
 _SYSTEM = _Operand(0, 1, jnp.dtype(jnp.float32))
-"""A chunk's strictly lower system `A` as `_intra` stores it for the solve: fp32, unrounded (its rows a call's)."""
+"""A chunk's strictly lower system `A` as `_intra` stores it for the solve: fp32, unrounded (its rows a
+call's)."""
 
 
 def _solve(a, taken, call: _Call):
-    """`(I + A)^-1 - I` `[R, HV * C]` as `call.held` of each chunk's and value head's strictly lower system `A`
-    (`_intra`'s, fp32), by `algebra.doubled` on the tensor cores: the identity apart, as `algebra.weighted`
-    takes it, fla_kda's solve."""
-    held, system = dataclasses.replace(call.held, rows=call.rows), dataclasses.replace(_SYSTEM, rows=call.rows)
+    """`(I + A)^-1 - I` `[R, HV * C]` as `call.held` of each chunk's and value head's strictly lower system
+    `A` (`_intra`'s, fp32), by `algebra.doubled` on the tensor cores: the identity apart, as
+    `algebra.weighted` takes it, fla_kda's solve."""
+    held = dataclasses.replace(call.held, rows=call.rows)
+    system = dataclasses.replace(_SYSTEM, rows=call.rows)
     family = call.family
 
     def program(a_ref, taken_ref, out_ref, *, streams, staging, landing):
@@ -1009,9 +1011,10 @@ def _solve(a, taken, call: _Call):
         _walk(streams, views, step, call)
 
     return _kernel(program, call, out_type=held.shape(call.heads * CHUNK), grid=(call.chunks, call.heads),
-                   grid_names=("chunks", "heads"), blocks=_streamed(system=((CHUNK, CHUNK), system)), stages=1,
-                   live=_taken(1), work=Work(_inverse_flops()), held=_solve_held(), staging=_merges(call),
-                   landing={"square": held.landing(CHUNK, CHUNK)}, persistent=True)(a, taken)
+                   grid_names=("chunks", "heads"), blocks=_streamed(system=((CHUNK, CHUNK), system)),
+                   stages=1, live=_taken(1), work=Work(_inverse_flops()), held=_solve_held(),
+                   staging=_merges(call), landing={"square": held.landing(CHUNK, CHUNK)},
+                   persistent=True)(a, taken)
 
 
 def _solve_held() -> _Held:
