@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.experimental.topologies as topologies
+import jax.numpy as jnp
 from jax.experimental import serialize_executable
 
 from dew._records import JSON, record
@@ -271,8 +272,10 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
     plan, seconds = None, None
     if capacity is not None:
         began = time.perf_counter()
+        # A fresh state's window holds the run's accumulation, which `compile` reads as a number.
+        fresh = dataclasses.replace(start.abstract, window_size=jnp.asarray(trainer.accumulation, jnp.int32))
         with assumed(generation):
-            trainer.compile(start.abstract, step_batch(trainer, batch), capacity=capacity)
+            trainer.compile(fresh, step_batch(trainer, batch), capacity=capacity)
         plan, seconds = trainer.plan, time.perf_counter() - began
     return AheadOfTime(
         generation, len(devices), dict(trainer.device_mesh.shape), program_of(lowered), executable,
