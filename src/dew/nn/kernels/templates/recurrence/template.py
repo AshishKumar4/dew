@@ -94,9 +94,14 @@ class Mosaic(base.Template[mainloop.Tiles]):
     @staticmethod
     def launched() -> generation.GpuTarget:
         """The target a call's launches run for: this device's where a bundle claims its family, else the
-        interpreted bundle's generation's (`INTERPRETED_GENERATION`)."""
+        interpreted bundle's generation's (`INTERPRETED_GENERATION`), its multiprocessors unstated: an
+        interpreter runs a launch's programs one after another, no wave of them to fill, so the derivation
+        takes the widest tiles that hold (`derived`; packed documents' interpreted gradient took 21 s a draw
+        at the one-wave rule's 16-wide value block and 14 at 32, row 1850)."""
         target = generation.gpu_target()
-        return target if bundle(target) is not None else generation.gpu_target(INTERPRETED_GENERATION)
+        if bundle(target) is not None:
+            return target
+        return dataclasses.replace(generation.gpu_target(INTERPRETED_GENERATION), multiprocessors=None)
 
     def _launches(self, ba: tokamax.BoundArguments, config: mainloop.Tiles, target: generation.GpuTarget, *,
                   backward: bool) -> tuple[mainloop.Launch, ...]:
