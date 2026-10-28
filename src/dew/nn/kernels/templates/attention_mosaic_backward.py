@@ -14,7 +14,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
+from dew.nn.kernels.templates import attention_algebra as algebra, bundles, mosaic
 from dew.nn.kernels.templates.attention import DKV_GRADS, DQ_GRADS, Hooks, Kind, PaddedCall, Param, by_power
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
@@ -695,9 +695,14 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                      approx_math)
     padded = PaddedCall(query, key, value, start, end, query_ids, key_ids, (), (), query.shape[1], spec.keys)
     spans = _spans_of(spec, padded, tiles.block_q, tiles.block_k)
+    # The dK/dV launch on its own layout (`BackwardTiles.dkv`).
+    dkv_tiles = tiles.dkv
+    dkv_walk = dataclasses.replace(walk, program=dataclasses.replace(
+        program, family=bundles.named(dkv_tiles.family, query.dtype), tiles=dkv_tiles),
+        consumers=dkv_tiles.consumers)
     if walk.fused:
         dq, dk, dv = _dkv_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
-                                 spans, score_params, walk=walk)
+                                 spans, score_params, walk=dkv_walk)
         mass = algebra.split_mass(own, others_total, forward_total, shift)
         return (dq[..., :width], delta, anchor, maximum, forward_total, mass, chosen, dk[..., :width],
                 dv[..., :value_width])
@@ -714,7 +719,7 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                                                                   (total0, initial_term), maximum, anchor,
                                                                   delta, accurate=accurate)
     dk, dv, *key_tile = _dkv_launch(query, key, value, dout, maximum, denominator, anchor, refined, chosen,
-                                    spans, score_params, walk=walk)
+                                    spans, score_params, walk=dkv_walk)
     summed_kinds = [kind for kind in score_kinds if kind in DQ_GRADS]
     head_query = tuple(grad.sum(axis=-1)[None, :, :, None] if kind == Kind.HEAD else grad
                        for grad, kind in zip(dq_grads, summed_kinds, strict=True))

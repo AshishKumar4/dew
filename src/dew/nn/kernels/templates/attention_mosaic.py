@@ -478,23 +478,36 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         dtype = query.dtype
         width, value_width = (_width(array.shape[-1], family, dtype) for array in (query, value))
         padded_q, padded_k = _padded(query.shape[1], key.shape[1], config)
-        launches = [_dkv_allocations(family, config, width, value_width, dtype,
-                                     parts=_parts(self.accurate, dtype),
-                                     stages=min(config.stages, padded_q // config.block_q),
-                                     columns=config.columns)]
+        # Each launch on its own layout (`BackwardTiles.dkv`).
+        dkv_family = bundle_of(config.dkv, dtype)
+        launches = [(dkv_family, config.dkv, _dkv_allocations(
+            dkv_family, config.dkv, width, value_width, dtype, parts=_parts(self.accurate, dtype),
+            stages=min(config.stages, padded_q // config.block_q), columns=config.columns))]
         if not config.fused:
-            launches.append(_dq_allocations(family, config, width, value_width, dtype,
-                                            min(config.stages, padded_k // config.block_k)))
-        reduces = reducing(family, config.consumers, self.score_mod)
-        return max(resources.shared_bytes(family, _scope(family, allocations, reduces))
-                   for allocations in launches)
+            launches.append((family, config, _dq_allocations(family, config, width, value_width, dtype,
+                                                             min(config.stages, padded_k // config.block_k))))
+        return max(resources.shared_bytes(layout, _scope(layout, allocations, reducing(
+            layout, tiles.consumers, self.score_mod))) for layout, tiles, allocations in launches)
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
-        family = bundle_of(config, ba.arguments["query"].dtype)
+        return max(self._launch_registers(ba, config))
+
+    def _launch_registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> tuple[int, int]:
+        """Each launch's registers a consumer holds (`_backward_registers`): the dQ launch's at `config`, the
+        dK/dV launch's at its own tiles (`BackwardTiles.dkv`)."""
         query, value = ba.arguments["query"], ba.arguments["value"]
-        width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
-        return max(_backward_registers(family, config, width, value_width, query.dtype,
-                                       accurate=self.accurate, dq=dq) for dq in (False, True))
+        counts = []
+        for tiles, dq in ((config, True), (config.dkv, False)):
+            family = bundle_of(tiles, query.dtype)
+            width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
+            counts.append(_backward_registers(family, tiles, width, value_width, query.dtype,
+                                              accurate=self.accurate, dq=dq))
+        return counts[0], counts[1]
+
+    def _held(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> bool:
+        # Each launch's registers within its own layout's budget (`Family.registers`).
+        dq, dkv = self._launch_registers(ba, config)
+        return dq <= self.register_budget(config) and dkv <= self.register_budget(config.dkv)
 
 
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> str | None:
