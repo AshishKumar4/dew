@@ -665,12 +665,8 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     `Tiles.walkers`) holds each staging and landing tile once a role, along a leading axis a role indexes
     (`_roled`): one role's products' tiles are no other's to write while its products read them."""
     family = call.family
-    landing = landing or {}
-    if consumers > 1:
-        staging = jax.tree.map(lambda tile: plgpu.SMEM((consumers, *tile.shape), tile.dtype), staging)
-        landing = {name: ((consumers, *shape), dtype) for name, (shape, dtype) in landing.items()}
-    landed = _landed(landing, family)
-    staging = (*staging, landed)
+    staging, landing = _roles_staged(staging, landing or {}, consumers)
+    staging = (*staging, _landed(landing, family))
     tiles = math.prod(grid)
     threads = 128 * family.warpgroups(consumers)
 
@@ -1118,12 +1114,12 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
 
     def walk(role):
         walked_step = role_step = step(role)
-        if prefetch is not None:
+        if (fetch := prefetch) is not None:
             last = start + count - 1
 
             def walked_step(n, slots, carry, accumulators):
                 state, loaded = carry
-                ahead = prefetch(jnp.minimum(n + 1, last))
+                ahead = fetch(jnp.minimum(n + 1, last))
                 state, accumulators = role_step(n, slots, state, accumulators, loaded)
                 return (state, ahead), accumulators
 
@@ -1159,6 +1155,15 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
         family.stream(chunks, views, start, start + count)
 
     family.roles(walkers, consumer, producer)
+
+
+def _roles_staged(staging: tuple, landing: dict, consumers: int) -> tuple[tuple, dict]:
+    """`_kernel`'s staging and landing tiles for `consumers` roles: each once a role along a leading axis a
+    role indexes (`_roled`) where more than one role shares the program."""
+    if consumers == 1:
+        return staging, landing
+    return (jax.tree.map(lambda tile: plgpu.SMEM((consumers, *tile.shape), tile.dtype), staging),
+            {name: ((consumers, *shape), dtype) for name, (shape, dtype) in landing.items()})
 
 
 def _roled(staging, landing: dict, walkers: int):
@@ -1197,6 +1202,24 @@ def _gated_write(call: _Call, corrected, loaded, prefix: tuple, last, head) -> t
     (ending, ending_low), (gate, low), _ = loaded
     gated, decayed = algebra.scalar_write(corrected, ending, gate, ending_low, low)
     return gated, [decayed[:, None]] * slices
+
+
+def _last_write(call: _Call, keys: _Operand, k_ref, row, final_token, key_columns, columns, gated) -> tuple:
+    """`algebra.carried`'s `last` for a chunk at `row` whose last real token is its `final_token`-th: that
+    token's key slices as rows' vectors (its parts' rows summed, exactly, from `key_columns` on), its gated
+    write's row as a column's (`columns`, `_columns`), and its row, held to the fp32 recurrence outside the
+    write product, as the portable math peels it (`_peeled_chunk_inputs`). A chunk past its document's end
+    holds zeros after its tokens: its last slot's write left the last real one in the product, 2.0 times the
+    portable math's final memory from float64 under a steep decay (VisualOrca, interpreted and on an
+    H100)."""
+    family = call.family
+
+    def key_rows(i):
+        views = keys.vectors(k_ref, row + final_token, key_columns + i * call.block, call.block)
+        return functools.reduce(jnp.add, (family.rows_of(view).astype(jnp.float32) for view in views))
+
+    ends = family.iota(gated.shape, 0) == final_token
+    return key_rows, columns(jnp.where(ends, gated, 0.0)), final_token
 
 
 def _states_held(call: _Call, values: _Operand, keys: _Operand, bv: int) -> _Held:
@@ -1290,25 +1313,9 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, taken, call: _Call, tiles: Til
             held.store(corrected_ref, corrected, n * CHUNK, CHUNK, h * value_width + column, bv,
                        family=family, smem=lands["corrected"], wait=False)
             gated, decay = _gated_write(call, corrected, loaded, (hi_ref, lo_ref), last, h)
-            separate = None
-            if held.parts > 1:
-                # An fp32 call's last real token's write outside the product (`algebra.carried`), held to
-                # the fp32 recurrence, as the portable math peels it (`_peeled_chunk_inputs`); a 16-bit
-                # call's is fla's product. A chunk past its document's end holds zeros after its tokens: its
-                # last slot's write left the last real one in the product, 2.0 times the portable math's
-                # final memory from float64 under a steep decay (VisualOrca, interpreted and on an H100).
-                final_token = taken_ref[n] - 1
-
-                def key_rows(i):
-                    """The chunk's last real key's slice `i`, a row's vector: its parts' rows summed,
-                    exactly."""
-                    views = keys.vectors(k_ref, n * CHUNK + final_token, h // keyed * width + i * call.block,
-                                         call.block)
-                    return functools.reduce(jnp.add, (family.rows_of(view).astype(jnp.float32)
-                                                      for view in views))
-
-                ends = family.iota((CHUNK, bv), 0) == final_token
-                separate = key_rows, _columns(call, scratch)(jnp.where(ends, gated, 0.0)), final_token
+            # An fp32 call's last real token's write outside the product; a 16-bit call's is fla's product.
+            separate = (_last_write(call, keys, k_ref, n * CHUNK, taken_ref[n] - 1, h // keyed * width,
+                                    _columns(call, scratch), gated) if held.parts > 1 else None)
             state = algebra.carried(
                 state, lambda i: _tile(slots, "keys", keys, columns=pl.ds(i * call.block, call.block)), gated,
                 decay, held.dtype, issue, last=separate)
