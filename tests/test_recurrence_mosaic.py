@@ -417,7 +417,17 @@ class Unbudgeted(template.Mosaic):
         return True
 
 
-def compiled_cases(target: str, plans: dict, refused: list) -> list:
+GATE_GROUPS = [(name, dtype, training, packed) for name in RESOURCE_SHAPES
+               for dtype in (jnp.bfloat16, jnp.float32) for packed in (False, True) for training in (False, True)
+               if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
+               and not (training and (name, dtype) != ('qwen3.5-27b-gdn', jnp.bfloat16))]
+"""The resource gate's groups (`compiled_cases`' `only`), a test each so each compiles in its own group:
+every geometry's forward in a 16-bit and an fp32 call, one row and packed documents, and the gated delta
+rule's 16-bit training pass (Kimi's keys, 128 wide, past what an fp32 call takes under a decay a key
+dimension). One test compiling them all took 674 seconds on sm90."""
+
+
+def compiled_cases(target: str, plans: dict, refused: list, only: tuple | None = None) -> list:
     """The resource gate's cases on `target` (`KernelCase`s), each with its launches' register models (row
     1971): each `RESOURCE_SHAPES` geometry's forward in a 16-bit and an fp32 call, one row and packed
     documents, and the gated delta rule's 16-bit training pass, at the template's derived tiles and, one row's
@@ -512,12 +522,8 @@ def compiled_cases(target: str, plans: dict, refused: list) -> list:
 
         return KernelCase(label, call, {launch.name: _model(launch, family) for launch in plans[label]})
 
-    # Kimi's keys, 128 wide, past what an fp32 call takes under a decay a key dimension (`forward`).
-    compiled = [kernel for name in RESOURCE_SHAPES for dtype in (jnp.bfloat16, jnp.float32)
-                for packed in (False, True) if not (RESOURCE_SHAPES[name][4] and dtype == jnp.float32)
-                for kernel in cases(name, dtype, training=False, packed=packed)]
-    return compiled + [kernel for packed in (False, True)
-                       for kernel in cases('qwen3.5-27b-gdn', jnp.bfloat16, training=True, packed=packed)]
+    return [kernel for group in (GATE_GROUPS if only is None else [only])
+            for kernel in cases(group[0], group[1], training=group[2], packed=group[3])]
 
 
 def planned_failures(found: list, plans: dict) -> list[str]:
@@ -533,8 +539,11 @@ def planned_failures(found: list, plans: dict) -> list[str]:
             if kernel['shared'] is not None and not kernel['shared'] <= planned(record, kernel)]
 
 
+@pytest.mark.parametrize('group', GATE_GROUPS, ids=lambda group: (
+    f"{group[0]}-{jnp.dtype(group[1]).name}-{'training' if group[2] else 'forward'}"
+    f"{'-packed' if group[3] else ''}"))
 @pytest.mark.parametrize('target', ['sm80', 'sm90'])
-def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides(target):
+def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_decides(target, group):
     """The mainloop's launches (`compiled_cases`), compiled by Mosaic for a compile-only A100 and H100 on this
     CPU (tests/kernel_compile.py): every launch compiles within the multiprocessor's shared memory (163 KB,
     227 KB) and tensor memory and at most its plan's shared memory (`mainloop.planned`, from which the tiles
@@ -544,7 +553,7 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     shared memory lowered and failed on the GPU (the fast backward's readout's third staging tile). The gated
     delta rule's 16-bit call, the production cell, derives tiles on every family. A GPU host's ptxas builds
     for its own GPU and those before it, not a newer one's (an A100's refuses sm_90a), so there the newer
-    targets are the CPU suite's alone."""
+    targets are the CPU suite's alone. A test a group of cases (`GATE_GROUPS`)."""
     if jax.default_backend() == 'gpu':
         local = generation.capability(generation.device_generation())
         if local is not None and local < generation.capability(target):
@@ -552,7 +561,7 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_resources_as_its_model_de
     from kernel_compile import compile_mosaic_kernels, mosaic_failures
 
     plans, refused = {}, []
-    found = compile_mosaic_kernels(compiled_cases(target, plans, refused), target)
+    found = compile_mosaic_kernels(compiled_cases(target, plans, refused, only=group), target)
     failed = mosaic_failures(found) + planned_failures(found, plans)
     failed += [f"{case}: no tiles derived" for case in refused
                if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
