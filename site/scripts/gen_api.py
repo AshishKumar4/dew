@@ -75,6 +75,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                 "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal", "dew.nn.cross_attention",
                 "dew.nn.memory",
                 "dew.nn.autoencoders", "dew.nn.autoencoders.pretrained", "dew.nn.categorical", "dew.nn.inputs", "dew.nn.mixers.attention", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.nn.sharding",
+                "dew.nn.wrapping", "dew.nn.scatter", "dew.nn.precision",
                 "dew.lora"]),
     ("Diffusion and sampling", ["dew.diffusion", "dew.diffusion.process", "dew.diffusion.schedules",
                                 "dew.diffusion.schedules.source", "dew.diffusion.schedules.source_grids",
