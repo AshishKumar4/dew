@@ -1392,21 +1392,25 @@ def _output_held(call: _Call, bv: int) -> _Held:
     whose products complete in turn. So an A100's need was 232, 240, None and 216 registers at value blocks
     16, 32, 64 and 128 wide of 128 values, and None at 128 of 256; an H100's 224, 224, 232/240 and None
     (the 1971 gate's dump: where both phases were stated at once, 456 refused 216). Under a decay a key
-    dimension a key block's prefix halves, its decay raised from them and its queries widened, and the
-    scores in fp32 (at the halves alone an H100's compile spilled 100 bytes a thread, Kimi delta attention's
-    at 216 stated registers)."""
+    dimension the value block's phase and the key blocks': a key block's prefix halves, its decay raised from
+    them and its queries widened, the intra launch's scores in fp32 and their product's fragments."""
     held, memories, given, family = call.held, call.memories, call.given, call.family
-    if call.per_key:
-        values = [_f32(CHUNK, bv)] * 2 + _held(held, CHUNK, bv) + _fragments(
-            call, (given, CHUNK, call.block), (memories, call.block, bv), (held, CHUNK, CHUNK))
-        return _Held(phases=(values + [_f32(CHUNK, call.block)] * 4 + [_f32(CHUNK, CHUNK)],))
     values = ([_f32(CHUNK, bv)] * (2 if family.products_overlap else 1) + _held(held, CHUNK, bv)
               + _widest(_product(call, (given, CHUNK, call.block), (memories, call.block, bv)),
                         _product(call, (held, CHUNK, CHUNK), (held, CHUNK, bv))))
+    one_block = call.value_width // bv == 1
+    if call.per_key:
+        # The key blocks' gated queries hold no value block's columns: across a walk of value blocks they
+        # are live with each one's sum (Kimi delta attention's output at value blocks 64 wide of 128
+        # spilled 100 bytes on an H100's), within one value block apart from it (at 128 wide an H100's held
+        # it at 248 registers, an A100's at 247, where both at once stated 360 and 424).
+        keyed = ([_f32(CHUNK, call.block)] * 4 + [_f32(CHUNK, CHUNK)]
+                 + _product(call, (given, CHUNK, call.block), (memories, call.block, bv)))
+        return _Held(phases=(values, keyed) if one_block else (values + keyed,))
     scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
               + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])
               + _product(call, (given, CHUNK, call.block), (given, call.block, CHUNK)))
-    if call.value_width // bv == 1 and not family.products_overlap:
+    if one_block and not family.products_overlap:
         return _Held(phases=(values, scores))
     return _Held(phases=(values + scores,))
 
