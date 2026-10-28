@@ -33,6 +33,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.kernels.templates import layout
 from dew.nn.kernels.templates.attention import (
     LOG2E,
     NATURAL,
@@ -214,6 +215,11 @@ class Coords(NamedTuple):
     def key_count(self, like: jax.Array) -> int:
         """The keys the tile `like` holds."""
         return like.shape[0 if self.keys_first else 1]
+
+    def hooked(self, score_mod: Callable | None) -> Callable | None:
+        """`score_mod`, written over `[bq, bk]` tiles, as this tile's layout runs it: taken axis for axis on a
+        tile held keys first (`layout.transposed`)."""
+        return layout.transposed(score_mod) if self.keys_first and score_mod is not None else score_mod
 
 
 def intervals(start: jax.Array, end: jax.Array) -> tuple[tuple[jax.Array, jax.Array], ...]:

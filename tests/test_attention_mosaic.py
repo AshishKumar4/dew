@@ -47,25 +47,13 @@ SEEDS = 8
 against the reference's own."""
 ALL_HOOKS_SEEDS = 32
 """The draws of a site with every hook at once (`test_attention_triton.ALL_HOOKS_SEEDS`)."""
-
-
-def _backward_takes(hooks: str) -> bool:
-    """Whether the backward takes the score hooks `SCORE_HOOKS[hooks]`: a hook pointwise in its tile's
-    entries (`attention_mosaic_program.pointwise`), whose dK/dV tiles hold their keys first."""
-    score_mod, kinds, draw = score_hooks(SCORE_HOOKS[hooks], 16, 16)
-    params, _ = draw(0)
-    hooks_of = template.Hooks(score_mod, tuple(map(template.Param, params, kinds)))
-    return attention_mosaic_program.pointwise(hooks_of)
-
-
-BACKWARD_HOOKS = [hooks for hooks in SCORE_HOOKS if _backward_takes(hooks)]
-"""The backward's score hooks: every one it takes of those the template differentiates
-(`test_attention_triton.SCORE_HOOKS`); the hook indexed off the query's coordinates' column (ledger 1428),
-which reads an axis of its tile, the Triton mainloop's."""
-FORWARD_HOOKS = {**{name: (SCORE_HOOKS[name], False) for name in SCORE_HOOKS},
+BACKWARD_HOOKS = list(SCORE_HOOKS)
+"""The backward's score hooks: every one the backward differentiates (`test_attention_triton.SCORE_HOOKS`),
+the hook indexed off the query's coordinates' column, which forms a unit axis, among them (ledger 1428)."""
+FORWARD_HOOKS = {**{name: (SCORE_HOOKS[name], False) for name in BACKWARD_HOOKS},
                  "gate": ((), True),
                  "all": (("softcap", "custom", "sinks", "alibi", "temperature", "key", "tile"), True)}
-"""The forward's hooks: each score hook the template differentiates (`test_attention_triton.SCORE_HOOKS`:
+"""The forward's hooks: each score hook the backward differentiates (`test_attention_triton.SCORE_HOOKS`:
 every kind of parameter, the initial state as sinks or a resumed partial, a hook through a custom VJP), an
 output gate, and all at once; each `(score hooks, gate)`."""
 HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False),
@@ -1041,11 +1029,10 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
 def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     """A score hook that forms a unit column (`q_pos[:, :1]`, `axis` 0) or a unit row (`k_pos[:1, :]`, 1,
     which Mosaic GPU selects by a reduction across warps, its scratch the launch's warpgroups reserve,
-    ledger 1428), the training forward lowered and compiled by ptxas for an H100 on this CPU
-    (tests/kernel_compile.py), within its shared memory (`failures`: no lowering error, no block past it);
-    the backward, whose dK/dV tiles hold their keys first, takes such a hook on another mainloop
-    (`attention_mosaic_program.pointwise`). Its registers at the derived tiles are the template's register
-    model's (ledger 1617), hooked or not."""
+    ledger 1428), the training forward and the backward lowered and compiled by ptxas for an H100 on this
+    CPU (tests/kernel_compile.py), within its shared memory (`failures`: no lowering error, no block past
+    it). Its registers at the derived tiles are the template's register model's (ledger 1617), hooked or
+    not."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_mosaic_kernels, failures
 
@@ -1061,5 +1048,12 @@ def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
     def trained(query, key, value):
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=True)
 
-    found = compile_mosaic_kernels([KernelCase("forward", lambda: (trained, (query, key, key)))], "sm90")
+    def backward(query, key, value, dout):
+        residuals = trained(query, key, value)[1:]
+        grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals)
+        return grads.query, grads.key, grads.value
+
+    found = compile_mosaic_kernels([KernelCase("forward", lambda: (trained, (query, key, key))),
+                                    KernelCase("backward", lambda: (backward, (query, key, key, query)))],
+                                   "sm90")
     assert not failures(found), "\n".join(failures(found))

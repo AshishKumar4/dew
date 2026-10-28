@@ -132,7 +132,8 @@ def _scores(walk: _Backward, coords: algebra.Coords, params: tuple, s, dp, peak,
     hook parameters `params`, its mask (`algebra.seen` where `masked`) and its queries' statistics."""
     seen = algebra.seen(walk.spec, coords, s) if masked else None
     how = walk.how
-    logits, slopes = algebra.tile_logits(walk.spec.score_mod, s, seen, coords.q_pos, coords.k_pos, params,
+    logits, slopes = algebra.tile_logits(coords.hooked(walk.spec.score_mod), s, seen, coords.q_pos,
+                                         coords.k_pos, params,
                                          scale=walk.spec.scale if how.factor is None else 1.0, slopes=True)
     # Each query's statistics along the tile's own query axis (`algebra.Coords.queries`).
     inverse_total = coords.queries(algebra.inverse(total), s)

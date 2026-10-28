@@ -16,13 +16,12 @@ from jax import lax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_algebra as algebra, bundles, mosaic, mosaic_sm90
+from dew.nn.kernels.templates import attention_algebra as algebra, bundles, layout, mosaic, mosaic_sm90
 from dew.nn.kernels.templates.attention import (
     Hooks,
     KeySpans,
     Kind,
     PaddedCall,
-    Param,
     block_map,
     differentiable,
     floating_params,
@@ -163,9 +162,9 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
         return f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(dtype)}"
     if backward and width != value_width:
         return "the Mosaic backward stages dK and dV through one buffer: equal head widths"
-    if backward and callable(hooks.score_mod) and not pointwise(hooks):
-        return ("the Mosaic backward holds its tiles keys first, so it takes a score hook pointwise in its "
-                "entries; this one indexes, reduces or orders an axis of them")
+    if backward and not transposable(hooks):
+        return ("the Mosaic backward holds its tiles keys first, and its score hook takes an axis of them by "
+                "an operation no layout rule takes (`layout.RULES`)")
     widest = max(_width(width, family, dtype), _width(value_width, family, dtype))
     if family.copy_extent is not None and widest > family.copy_extent:
         return (f"the Mosaic mainloop loads a head {widest} wide in one copy, past the "
@@ -202,95 +201,69 @@ def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
                  differentiated: bool = False) -> list[jax_core.Jaxpr]:
     """`hooks` traced as a launch runs them on `tile`, its outputs `value_width` wide: the score hook (and,
     `differentiated`, its pullback along the logits and its floating parameters) and the output hook."""
-    rows, columns = tile
-
-    def entries(kind: Kind, dtype, width: int) -> jax.ShapeDtypeStruct:
-        # A parameter as `_param` gives it: a head's scalar, else the tile's entries.
-        return jax.ShapeDtypeStruct(() if kind == Kind.HEAD else (rows, width), kept_dtype(dtype))
-
     traced = []
     # A keyed launch's hook is its fingerprint (`tuning.program`), whose lowering its live call established.
-    score_mod = hooks.score_mod if callable(hooks.score_mod) else None
-    if score_mod is not None:
-        positions = jax.ShapeDtypeStruct(tile, jnp.int32)
-        params = [entries(param.kind, param.value.dtype, columns) for param in hooks.score_params]
-        logits = jax.ShapeDtypeStruct(tile, jnp.float32)
-        traced.append(jax.make_jaxpr(score_mod)(logits, positions, positions, *params).jaxpr)
-        if differentiated:
-            floating = floating_params(params)
-
-            def pulled(s, q_pos, k_pos, *values):
-                hooked = differentiable(score_mod, q_pos, k_pos, values, floating)
-                out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
-                return pull(jnp.ones_like(out))
-
-            traced.append(jax.make_jaxpr(pulled)(logits, positions, positions, *params).jaxpr)
+    if callable(hooks.score_mod):
+        traced += _score_jaxprs(hooks.score_mod, tuple((param.kind, param.value.dtype)
+                                                       for param in hooks.score_params),
+                                tile, differentiated=differentiated)
     if callable(hooks.output_mod):
         traced.append(jax.make_jaxpr(hooks.output_mod)(
-            jax.ShapeDtypeStruct((rows, value_width), jnp.float32),
-            *(entries(param.kind, param.value.dtype, value_width) for param in hooks.output_params)).jaxpr)
+            jax.ShapeDtypeStruct((tile[0], value_width), jnp.float32),
+            *(_entries(param.kind, param.value.dtype, (tile[0], value_width))
+              for param in hooks.output_params)).jaxpr)
     return traced
 
 
-ORDERED = frozenset({"iota", "rev", "sort", "cumsum", "cumprod", "cummax", "cummin", "cumlogsumexp"})
-"""The operations whose entries depend on their place along an axis though their shape is the tile's
-(`pointwise`)."""
+def _entries(kind: Kind, dtype, tile: tuple[int, int]) -> jax.ShapeDtypeStruct:
+    """A hook parameter as `_param` gives it on `tile`: a head's scalar, else the tile's entries."""
+    return jax.ShapeDtypeStruct(() if kind == Kind.HEAD else tile, kept_dtype(dtype))
+
+
+def _score_jaxprs(score_mod, params: tuple, tile: tuple[int, int], *,
+                  differentiated: bool) -> list[jax_core.Jaxpr]:
+    """`score_mod` under parameters of `params`' kinds and dtypes traced on `tile`, and with `differentiated`
+    its pullback along the logits and its floating parameters."""
+    positions, logits = jax.ShapeDtypeStruct(tile, jnp.int32), jax.ShapeDtypeStruct(tile, jnp.float32)
+    values = [_entries(kind, dtype, tile) for kind, dtype in params]
+    traced = [jax.make_jaxpr(score_mod)(logits, positions, positions, *values).jaxpr]
+    if differentiated:
+        floating = floating_params(values)
+
+        def pulled(s, q_pos, k_pos, *values):
+            hooked = differentiable(score_mod, q_pos, k_pos, values, floating)
+            out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
+            return pull(jnp.ones_like(out))
+
+        traced.append(jax.make_jaxpr(pulled)(logits, positions, positions, *values).jaxpr)
+    return traced
+
 
 TILE_SIDES = (64, 128, 192, 256)
-"""The sides a program's score tile may take, whose every shape a hook's legality traces (`pointwise`)."""
+"""The sides a program's score tile may take, at every shape of which a hook's legality traces it
+(`transposable`)."""
 
 
-def pointwise(hooks: Hooks) -> bool:
-    """Whether the score hook and its pullback are one function of a tile's entries however the tile is held,
-    so a program whose tiles hold their keys as rows (`[bk, bq]`, the dK/dV program's) runs them as the
-    reference's `[bq, bk]` ones do: traced at every tile shape a program takes (`TILE_SIDES`, either way
-    round), each operation's values are scalars (a value of one entry) or the whole tile, none orders an
-    axis (`ORDERED`), and every trace is the same program but for its shapes, so no constant depends on the
-    tile's sides. A hook that indexes, slices, reshapes or reduces an axis (a query's coordinate read off its
-    tile's first column), or takes a constant of its shape, is not."""
+def transposable(hooks: Hooks) -> bool:
+    """Whether the score hook and its pullback run on a tile held keys first (`[bk, bq]`, the dK/dV
+    program's) as written for the reference's `[bq, bk]` (`layout.transposed`): traced, never run, at every
+    tile shape a program takes (`TILE_SIDES`), which no operation it has no rule for refuses
+    (`layout.Untransposable`)."""
     if not callable(hooks.score_mod):
         return True
     params = tuple((param.kind, kept_dtype(param.value.dtype)) for param in hooks.score_params)
-    return _pointwise(hooks.score_mod, params)
+    return _transposable(hooks.score_mod, params)
 
 
 @functools.lru_cache(maxsize=256)
-def _pointwise(score_mod, params: tuple) -> bool:
-    """`pointwise` of `score_mod` under parameters of `params`' kinds and dtypes."""
-    def entire(jaxpr: jax_core.Jaxpr, tile: tuple[int, int]) -> bool:
-        for eqn in jaxpr.eqns:
-            shapes = [getattr(var.aval, "shape", ()) for var in (*eqn.invars, *eqn.outvars)]
-            if eqn.primitive.name in ORDERED or any(shape != tile and math.prod(shape) != 1
-                                                    for shape in shapes):
-                return False
-            if not all(entire(inner, tile) for inner in jax_core.jaxprs_in_params(eqn.params)):
-                return False
-        return True
-
-    def program(jaxpr: jax_core.Jaxpr) -> tuple:
-        # The operations, their literals and their parameters but the shapes they carry.
-        return tuple((eqn.primitive.name,
-                      tuple(repr(var.val) for var in eqn.invars if isinstance(var, jax_core.Literal)),
-                      tuple(program(inner) for inner in jax_core.jaxprs_in_params(eqn.params)),
-                      tuple(sorted((key, repr(value)) for key, value in eqn.params.items()
-                                   if key not in SHAPED_PARAMS
-                                   and not jax_core.jaxprs_in_params({key: value}))))
-                     for eqn in jaxpr.eqns)
-
-    hooks = Hooks(score_mod, tuple(Param(jax.ShapeDtypeStruct((), dtype), kind)
-                                   for kind, dtype in params))
-    programs = set()
-    for tile in ((rows, columns) for rows in TILE_SIDES for columns in TILE_SIDES):
-        traced = _hook_jaxprs(hooks, tile, 1, differentiated=True)
-        if not all(entire(jaxpr, tile) for jaxpr in traced):
-            return False
-        programs.add(tuple(program(jaxpr) for jaxpr in traced))
-    return len(programs) == 1
-
-
-SHAPED_PARAMS = frozenset({"shape", "new_sizes", "sizes", "broadcast_dimensions", "dimensions", "sharding"})
-"""The parameters an operation holds its operands' shapes in, which `pointwise` compares its traces
-apart from."""
+def _transposable(score_mod, params: tuple) -> bool:
+    """`transposable` of `score_mod` under parameters of `params`' kinds and dtypes."""
+    try:
+        for tile in ((rows, columns) for rows in TILE_SIDES for columns in TILE_SIDES):
+            _score_jaxprs(layout.transposed(score_mod), params, tile, differentiated=True)
+    except layout.Untransposable:
+        return False
+    return True
 
 
 def _primitives(jaxpr: jax_core.Jaxpr) -> set[str]:
