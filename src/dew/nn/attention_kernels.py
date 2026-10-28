@@ -15,7 +15,7 @@ from dew.devices import deterministic_ops_requested
 from .kernels import decode_attention, generation
 from .kernels.generation import INHERENT, Refusal, bf16_dot_runs, capability, device_generation, gpu_placed
 from .kernels.selection import Kernel, Op, Requirement
-from .kernels.templates import attention_mosaic_program, attention_route
+from .kernels.templates import attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
 
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
@@ -141,9 +141,11 @@ class AttentionCase:
     @property
     def cell(self) -> tuple[str | None, str]:
         """The call's cell among attention's declared ones (`DECLARED`): the target's instruction family and
-        attention's one kind of call, its forward and its training alike, as the kernel is chosen before
-        the call is differentiated (`attention_route.attend`'s `custom_vjp`)."""
-        return generation.family(device_generation()), 'attention'
+        the kind of call, a 16-bit call's or an fp32 call's ('float32 attention'), each its forward and its
+        training alike, as the kernel is chosen before the call is differentiated (`attention_route.attend`'s
+        `custom_vjp`)."""
+        kind = 'attention' if self.dtype in CUDNN_DTYPES else f"{jnp.dtype(self.dtype).name} attention"
+        return generation.family(device_generation()), kind
 
 
 _Need = Requirement[AttentionCase]
@@ -393,10 +395,10 @@ TEMPLATE_SUPPORTS = (
 """The attention template's requirements (`attention_route.attend`, the 'template' kernel): one dtype of fp32,
 bf16 and fp16 on the queries and keys alike, no arbitrary mask and no bias, no sharded sequence axis, and the
 call's default arithmetic. It takes every other call form: causality, windows, documents, key lengths and
-starts, block groups, sinks, a softcap, and probability dropout off a GPU (`attention_route.drops`). The
-call runs it by default on a family whose Mosaic template has a routed mainloop, where its declared old
-route does not take the call (`_attention_preferred`); elsewhere where a call names it
-(`implementation='template'`, or `generation.chosen(attention='template')`)."""
+starts, block groups, sinks, a softcap, and probability dropout off a GPU (`attention_route.drops`). A call
+on a GPU or a TPU runs it by default, where its cell's declared old route does not take the call
+(`_attention_preferred`, `DECLARED`), and anywhere a call names it (`implementation='template'`, or
+`generation.chosen(attention='template')`)."""
 
 
 DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
@@ -405,34 +407,36 @@ DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
                  "2 x 4096, 32 query heads over 8 key heads, CUPTI on an exclusive node): forward 0.588 "
                  "against 0.761 ms causal and 1.094 against 1.296 full, training forward and backward 2.53 "
                  "against 11.45 causal and 4.49 against 16.48 full (receipts DERIVED-benchx-h100, "
-                 "BWDSTAGES-h100)"),
+                 "BWDSTAGES-h100); a training step's attention at Qwen3-8B's widths, 2 x 4096 bf16, 2.44 "
+                 "against 11.38 ms causal and 4.26 against 15.61 full (CELLS-h100)"),
+    ('wgmma', 'float32 attention'): (
+        'xla', "jax.nn's xla attention measured faster than the template's fp32 route on an H100: a training "
+               "step's attention at Qwen3-8B's widths, 1 x 1024 fp32, 2.08 against 26.36 ms causal and 2.19 "
+               "against 46.21 full (CELLS-h100)"),
+    ('mma.sync', 'attention'): (
+        'flash', "FlashAttention-2 measured faster than the template on an A100: a training step's attention "
+                 "at Qwen3-8B's widths, 2 x 4096 bf16, 5.74 against 14.96 ms causal and 9.87 against 25.74 "
+                 "full (CELLS-a100, CUPTI, 11 interleaved rounds)"),
+    ('mma.sync', 'float32 attention'): (
+        'xla', "the template's fp32 training step at Qwen3-8B's widths, 1 x 1024, does not compile on an "
+               "A100 (its Triton launch asks 182272 bytes of shared memory, past the 166912 a block holds: "
+               "CELLS-a100), where jax.nn's xla attention runs"),
 }
 """Attention's declared cells (bible §4, owner 10-25; `Op.declared`), by (instruction family, kind of call)
-(`AttentionCase.cell`): where an old route measured faster than the family's Mosaic template, the old route
-and its receipt. Attention has one kind of call: its kernel is chosen before the call is differentiated
+(`AttentionCase.cell`): where an old route measured faster than the template, the old route and its receipt.
+A call's kind is its dtype's, 16-bit or fp32: its kernel is chosen before the call is differentiated
 (`attention_route.attend`'s `custom_vjp`), so its forward and its training run one kernel, and the receipts
-cover both. Every other call of a family whose Mosaic template has a routed mainloop
-(`attention_mosaic_program.bundle`) takes the template; a family with none (mma.sync's today) takes the
-op's order by legality. Nothing is ranked at runtime: the list shrinks as the template wins."""
+cover both. Every other call takes the template (`_attention_preferred`). Nothing is ranked at runtime: the
+list shrinks as the template wins."""
 
 
 def _attention_preferred(case: AttentionCase) -> str:
-    """The kernel `case` runs where its cell declares no old route that takes it (`DECLARED`): splash on a
-    TPU and xla on a CPU; on a GPU xla for a query no fused kernel takes the dtype of (the Mosaic template
-    takes 16-bit operands alone, so no family routes it another); the template on a family whose Mosaic
-    template has a routed mainloop, which hands a call it does not take to the next kernel by legality; and
-    elsewhere the op's order by legality, FlashAttention first (measured faster than cuDNN and tokamax's
-    Triton kernel on an A100 and an A10), a call with block groups, key validity or counted places, which no
-    old kernel's spans express, taking the generic path over the mask its spans mean (ledger 1537)."""
-    backend = generation.backend()
-    if backend != 'gpu':
-        return 'tpu' if backend == 'tpu' else 'xla'
-    if case.dtype not in CUDNN_DTYPES:
-        # No fused GPU kernel takes another dtype, so no measurement prefers one.
-        return 'xla'
-    if attention_mosaic_program.bundle(device_generation(), case.dtype) is not None:
-        return 'template'
-    return ATTENTION.kernels[0].name
+    """The kernel `case` runs where its cell declares no old route that takes it (`DECLARED`): the template
+    on every GPU, which hands a call it does not take to the next kernel by legality; splash on a TPU, until
+    a receipt (CELLS-v5e) measures the template there (theme A10); xla on a CPU, which has no instruction
+    family."""
+    del case
+    return {'gpu': 'template', 'tpu': 'tpu'}.get(generation.backend(), 'xla')
 
 
 def _hosted(kernel: str) -> str:
@@ -453,10 +457,9 @@ ATTENTION = Op[AttentionCase]('attention', (
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
 ), _attention_preferred, _hosted, DECLARED)
 """Attention's selector: a declared cell's old route where it takes the call (`DECLARED`), else the call's
-kernel (`_attention_preferred`: the template on a family with a routed Mosaic mainloop), then flash, triton,
-cuDNN, splash, xla and the reference path, the first that takes the call. The template comes last, after
-the reference path, which takes every call, so it runs where the preference names it (a templated family's
-calls) or a call names it."""
+kernel (`_attention_preferred`: the template on a GPU or a TPU, xla on a CPU), then flash, triton, cuDNN,
+splash, xla and the reference path, the first that takes the call. The template comes last, after the
+reference path, which takes every call, so it runs where the preference names it or a call names it."""
 
 
 
