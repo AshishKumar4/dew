@@ -964,11 +964,12 @@ def test_a_run_that_sets_its_remat_keeps_it_and_is_told_of_the_cheapest_rung_bel
     with caplog.at_level(logging.WARNING, logger="dew.training.planning"):
         trained(trainer, steps=0)
     assert trainer.plan["remat"] == "full" and trainer.objective.model.remat == REMAT_POLICIES["full"]
-    cheaper = trainer.plan["cheaper"]
+    cheaper = trainer.plan.get("cheaper")
+    assert cheaper is not None
     assert (cheaper["remat"], cheaper["fits"]) == (None if none <= room else "minimal", True)
     assert cheaper["headroom"] >= 0
     assert any("set remat to it" in record.getMessage() for record in caplog.records)
     monkeypatch.setenv("DEW_RUNG_RECORDS", str(tmp_path / "none"))
     unset = lm(split=1)
     trained(unset, steps=0)
-    assert unset.plan["cheaper"] is None
+    assert unset.plan.get("cheaper") is None
