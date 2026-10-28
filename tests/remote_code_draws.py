@@ -19,7 +19,8 @@ one token a call."""
 PADDED = 4
 """The left padding of a padded draw's second row (`biased`), shorter than a convolution's history."""
 
-SITES = {"lfm3-tiny": ("logits", "packed", "decode", "gradients"), "lfm3-biased-tiny": ("biased",)}
+SITES = {"lfm3-tiny": ("logits", "packed", "decode", "gradients"), "lfm3-biased-tiny": ("biased",),
+         "mimo-v2-tiny": ("logits",), "dream-tiny": ("logits",), "llada-tiny": ("logits",)}
 """Each release fixture's sites: its logits over plain rows; LFM3's over a packed row, through the decode
 cache in chunks, and its parameter gradients under a drawn cotangent; and, with its convolution's bias
 (`conv_bias`), over left-padded rows."""

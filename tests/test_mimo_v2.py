@@ -11,7 +11,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file, save_file
 
 from dew.interop import Pretrained, codecs
@@ -41,14 +40,6 @@ def fused(tensors, config):
                  for part, width in zip('qkv', widths, strict=True)]
         out[f'{stem}qkv_proj.weight'] = np.concatenate(parts, axis=1).reshape(-1, parts[0].shape[-1])
     return out
-
-
-def test_the_text_decoder_computes_the_remote_codes_logits():
-    """Full and sliding layers, sinks on the sliding ones alone, 12-wide
-    queries and keys over 8-wide scaled values, a third of each head rotated
-    under each kind's base and grouped sigmoid routing after a dense layer."""
-    _, ours = logits(TINY)
-    assert_as_exact_as_the_reference(ours, fixture('logits'), fixture('logits_f64'), 'MiMo-V2 logits')
 
 
 def test_a_fused_qkv_source_loads_to_the_same_model_and_saves_back_fused(tmp_path):
