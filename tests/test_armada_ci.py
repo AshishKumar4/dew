@@ -1171,6 +1171,25 @@ def commit(root: Path, message: str) -> str:
     return git(root, "rev-parse", "HEAD").strip()
 
 
+def test_a_watch_the_kernel_cannot_hold_whole_is_blind_and_keys_nothing(tmp_path):
+    """A tree with more directories than inotify will watch (fs.inotify.max_user_watches; here a user
+    namespace's own limit, lowered to 2) leaves the open watch blind: closing it gives no opened files, so no
+    record keeps a key, and nothing raises (Main, 2026-10-28: a failed watch left the reader unset, and its
+    close crashed)."""
+    for name in ("a", "b", "c"):
+        (tmp_path / "tests" / name).mkdir(parents=True)
+    script = (
+        "import sys\n"
+        "sys.path.insert(0, sys.argv[1])\n"
+        "from pathlib import Path\n"
+        "Path('/proc/sys/user/max_inotify_watches').write_text('2')\n"
+        "import watched\n"
+        "print(watched.Opens(sys.argv[2]).closed())\n")
+    ran = subprocess.run(["unshare", "--user", "--map-root-user", sys.executable, "-c", script,
+                          str(ROOT / "tools/armada"), str(tmp_path)], capture_output=True, text=True, timeout=60)
+    assert (ran.returncode, ran.stdout.strip()) == (0, "None"), ran.stderr
+
+
 def test_a_changed_workflow_reruns_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
     """A change under .github/ reruns the files whose runs read the changed file, which the records place as
     any of the checkout's files, and reuses every other file's green row, under the policy CI computes for
