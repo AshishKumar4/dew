@@ -47,18 +47,15 @@ SEEDS = 8
 against the reference's own."""
 ALL_HOOKS_SEEDS = 32
 """The draws of a site with every hook at once (`test_attention_triton.ALL_HOOKS_SEEDS`)."""
-BACKWARD_HOOKS = [name for name in SCORE_HOOKS if name != "row-indexed"]
-"""The backward's score hooks: every one the backward differentiates (`test_attention_triton.SCORE_HOOKS`) but
-the hook indexed off the query's coordinates' column, which forms a unit axis the mainloop refuses
-(`attention_mosaic_program.unlowered`, ledger row 1428): `test_a_hook_that_forms_a_unit_axis_is_refused`."""
+BACKWARD_HOOKS = list(SCORE_HOOKS)
+"""The backward's score hooks: every one the backward differentiates (`test_attention_triton.SCORE_HOOKS`),
+the hook indexed off the query's coordinates' column, which forms a unit axis, among them (ledger 1428)."""
 FORWARD_HOOKS = {**{name: (SCORE_HOOKS[name], False) for name in BACKWARD_HOOKS},
                  "gate": ((), True),
                  "all": (("softcap", "custom", "sinks", "alibi", "temperature", "key", "tile"), True)}
 """The forward's hooks: each score hook the backward differentiates (`test_attention_triton.SCORE_HOOKS`:
 every kind of parameter, the initial state as sinks or a resumed partial, a hook through a custom VJP), an
-output gate, and all at once; each `(score hooks, gate)`. The hook indexed off the query's coordinates'
-column forms a unit axis, which the mainloop refuses (`attention_mosaic_program.unlowered`, ledger row 1428):
-`test_a_hook_that_forms_a_unit_axis_is_refused`."""
+output gate, and all at once; each `(score hooks, gate)`."""
 HOOK_FORMS = {"bfloat16": (jnp.bfloat16, False), "float16": (jnp.float16, False),
               "bfloat16-natural": (jnp.bfloat16, True), "float16-natural": (jnp.float16, True)}
 """The hooked forward's dtypes and forms: the fold and natural logits over both 16-bit dtypes."""
@@ -205,7 +202,8 @@ def _check_hooks(hooks: str, dtype, natural: bool, *, interpret: bool):
 INTERPRETED_HOOK_SITES = {"none": ((1, 2, 1), 8), "alibi": ((1, 2, 1), 128), "key-bias": ((1, 2, 1), 16),
                           "custom-vjp": ((1, 2, 1), 8), "softcap": ((1, 2, 1), 8), "sinks": ((1, 4, 2), 16),
                           "temperature": ((1, 2, 1), 8), "tile-bias": ((1, 2, 1), 8),
-                          "resumed": ((1, 2, 1), 128), "softcap-sinks-alibi": ((2, 2, 1), 128)}
+                          "resumed": ((1, 2, 1), 128), "softcap-sinks-alibi": ((2, 2, 1), 128),
+                          "row-indexed": ((1, 2, 1), 8)}
 """The interpreted hooked backward's site under each hook: its rows, query heads and key heads, and its
 seeds, sized by `seeds_for` at that shape (the reference against itself), never the compiled site's. The
 claim interpreted is the hooked backward lowering and computing the template's gradients, so each site
@@ -634,19 +632,6 @@ def test_the_backward_is_on_par_from_the_triton_mainloops_residuals_interpreted(
                     residuals_from=attention_triton.forward)
 
 
-def test_a_hook_that_forms_a_unit_axis_is_refused():
-    """The hook indexed off the query's coordinates' column (`q_pos[:, :1]`) forms a `[bq, 1]` array, which
-    Mosaic GPU's layout inference takes no operation on: the mainloop, called on it, refuses it before any
-    launch rather than compute it (ledger row 1428)."""
-    queries, keys = core_geometry(CASES["causal"])
-    spans = template.spans(queries, keys, ROWS, causal=True)
-    query, key, value, _ = _drawn((ROWS, queries, 4, 2), jnp.bfloat16, width=64, keys=keys)(0)
-    with pytest.raises(NotImplementedError), _device(interpret=True):
-        attention_mosaic.forward(query, key, value, spans,
-                                 template.Hooks(score_hooks(("indexed",), queries, keys, 64)[0]),
-                                 interpret=True)
-
-
 @INTERPRETS
 def test_a_hook_shaped_to_the_launchs_tile_is_taken():
     """An output hook that reshapes its gate to the value width, on the launch's `[64, 128]` output tile as
@@ -1037,3 +1022,37 @@ def test_the_mosaic_launches_state_the_models_attention_flops(causal, queries, k
     assert counted(lambda q, k, v: attention_mosaic.forward(q, k, v, spans), query, key, key) == forward
     assert counted(trained, query, key, key) == forward
     assert counted(backward, query, key, key, query, residuals) == 2 * forward
+
+
+@pytest.mark.parametrize("axis", [0, 1])
+def test_a_hook_that_forms_a_unit_axis_compiles_for_an_h100(axis):
+    """A score hook that forms a unit column (`q_pos[:, :1]`, `axis` 0) or a unit row (`k_pos[:1, :]`, 1,
+    which Mosaic GPU selects by a reduction across warps, its scratch the launch's warpgroups reserve,
+    ledger 1428), the training forward and the backward lowered and compiled by ptxas for an H100 on this
+    CPU (tests/kernel_compile.py), within its shared memory (`failures`: no lowering error, no block past
+    it). Its registers at the derived tiles are the template's register model's (ledger 1617), hooked or
+    not."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_mosaic_kernels, failures
+
+    queries = 256
+    spans = template.spans(queries, queries, 1, causal=True)
+    def score_mod(s, q_pos, k_pos):
+        return s + 0.01 * (q_pos[:, :1] if axis == 0 else k_pos[:1, :]).astype(s.dtype)
+
+    hooks = template.Hooks(score_mod)
+    query = jax.ShapeDtypeStruct((1, queries, 4, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((1, queries, 2, 128), jnp.bfloat16)
+
+    def trained(query, key, value):
+        return attention_mosaic.forward(query, key, value, spans, hooks, residuals=True)
+
+    def backward(query, key, value, dout):
+        residuals = trained(query, key, value)[1:]
+        grads = attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals)
+        return grads.query, grads.key, grads.value
+
+    found = compile_mosaic_kernels([KernelCase("forward", lambda: (trained, (query, key, key))),
+                                    KernelCase("backward", lambda: (backward, (query, key, key, query)))],
+                                   "sm90")
+    assert not failures(found), "\n".join(failures(found))
