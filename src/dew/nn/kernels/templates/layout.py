@@ -102,6 +102,52 @@ def _call(eqn, *operands, **params):
     return _run(closed.jaxpr, closed.consts, operands)
 
 
+def _custom(eqn, *operands, **params):
+    # A custom derivative, its rule unread but traced: bound on the held tiles' entries at the shape it was
+    # traced at (a reshape keeps each entry's place in their order, its outputs' as its inputs'), where its
+    # program and its derivative's act one entry at a time (`_axis_free`), so any order of the entries is
+    # theirs.
+    traced = [var.aval for var in eqn.invars]
+
+    def call(*values):
+        return eqn.primitive.bind(*values, **eqn.primitive.get_bind_params(params))
+
+    floating = [index for index, aval in enumerate(traced)
+                if jax.numpy.issubdtype(aval.dtype, jax.numpy.inexact)]
+
+    def pulled(*values):
+        outs, pull = jax.vjp(lambda *chosen: call(*[chosen[floating.index(index)] if index in floating
+                                                     else value for index, value in enumerate(values)]),
+                             *(values[index] for index in floating))
+        return pull(jax.tree.map(jax.numpy.ones_like, outs))
+
+    shapes = {aval.shape for aval in traced} - {()}
+    programs = [params["call_jaxpr"].jaxpr, jax.make_jaxpr(pulled)(*traced).jaxpr]
+    if len(shapes) > 1 or not all(_axis_free(program, *shapes) for program in programs):
+        raise Untransposable(f"a {eqn.primitive.name} whose program or derivative reads an axis")
+    out = call(*[jax.lax.reshape(value, aval.shape) if aval.ndim == 2 else value
+                 for value, aval in zip(operands, traced, strict=True)])
+    return [jax.lax.reshape(value, _swapped(value.shape)) if value.ndim == 2 else value for value in out]
+
+
+def _axis_free(jaxpr: jax_core.Jaxpr, shape: tuple[int, ...] = ()) -> bool:
+    """Whether `jaxpr` acts one entry at a time: every value a scalar or of `shape`, every operation one of
+    `ENTRYWISE`, a scalar's broadcast or a call of a program so."""
+    for eqn in jaxpr.eqns:
+        if any(getattr(var.aval, "shape", ()) not in ((), shape) for var in (*eqn.invars, *eqn.outvars)):
+            return False
+        nested = list(jax_core.jaxprs_in_params(eqn.params))
+        name = eqn.primitive.name
+        if nested:
+            # A call, or the custom derivative's own primal (its pullback's trace evaluates it).
+            if name not in (*CALLS, "custom_jvp_call", "custom_vjp_call") or not all(
+                    _axis_free(inner, shape) for inner in nested):
+                return False
+        elif name not in ENTRYWISE and not (name == "broadcast_in_dim" and eqn.invars[0].aval.shape == ()):
+            return False
+    return True
+
+
 RULES: dict[str, Callable] = {
     "broadcast_in_dim": _broadcast, "reshape": _reshape, "squeeze": _squeeze, "iota": _iota,
     "reduce_sum": _reduced("reduce_sum"), "reduce_max": _reduced("reduce_max"),
@@ -112,7 +158,7 @@ RULES: dict[str, Callable] = {
     "cumlogsumexp": _along("axis"), "concatenate": _along("dimension"),
     "slice": _reversed("start_indices", "limit_indices", "strides"), "pad": _reversed("padding_config"),
     "dynamic_slice": _dynamic_slice, "transpose": _transpose,
-    "jit": _call, "pjit": _call, "closed_call": _call,
+    "jit": _call, "pjit": _call, "closed_call": _call, "custom_jvp_call": _custom, "custom_vjp_call": _custom,
 }
 """Each operation `transposed` takes that names an axis, by its primitive's name: its rule binds it on the
 held operands with each axis it names swapped."""
@@ -128,6 +174,9 @@ ENTRYWISE = frozenset({
 })
 """The operations of one entry at a time, whose operands are each a scalar or a value of their output's
 shape: bound on held tiles unchanged. An operation neither these nor `RULES` take is refused."""
+
+CALLS = frozenset({"jit", "pjit", "closed_call"})
+"""The operations that call a nested program as it is (`_axis_free` looks into them)."""
 
 
 def _run(jaxpr: jax_core.Jaxpr, consts, operands) -> list:
@@ -164,8 +213,9 @@ def transposed(fn: Callable) -> Callable:
     `fn(*tiles).T`, each of its tile outputs held transposed too. Its program is traced at the tiles' own
     shapes, so a choice it makes by their shape is the one it makes there, and run operation by operation,
     each axis an operation names swapped (`RULES`), one entry at a time unchanged (`ENTRYWISE`); it
-    differentiates as `fn` does. Any other operation (a custom derivative's among them, whose rules it cannot
-    read), a value past two axes or a constant tile raises `Untransposable` as it is traced."""
+    differentiates as `fn` does, a custom derivative's rule kept where it and its program act one entry at
+    a time. Any other operation, a value past two axes or a constant tile raises `Untransposable` as it is
+    traced."""
     def held(*operands):
         flat, tree = jax.tree.flatten(operands)
         # Each operand's type as the caller holds it (a Python scalar's weak), its tile's sides swapped back.

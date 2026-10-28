@@ -288,7 +288,8 @@ def _entrywise(jaxpr: jax_core.Jaxpr, inputs: set[int], tile: tuple[int, int]) -
         name = eqn.primitive.name
         nested = list(jax_core.jaxprs_in_params(eqn.params))
         if nested:
-            if name not in ("jit", "pjit", "closed_call") or not all(
+            # A call or a custom derivative's primal (whose rule `layout.transposed` checks).
+            if name not in (*layout.CALLS, "custom_jvp_call", "custom_vjp_call") or not all(
                     _entrywise(inner, set(read), tile) for inner in nested):
                 return False
         elif name not in layout.ENTRYWISE and not (name == "broadcast_in_dim" and shapes[0] == ()):
