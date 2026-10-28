@@ -39,7 +39,7 @@ from dew.interop.safetensors_io import (
 from dew.interop.unread import Unread, unread
 
 if TYPE_CHECKING:
-    from dew.interop.decoder_parts import ReleaseCode
+    from dew.interop.decoder_parts import SourceCode
 
 
 def load_shards(directory: Path) -> dict[str, np.ndarray]:
@@ -188,14 +188,40 @@ def remote_code(name_or_dir: str | Path, directory: Path) -> Path:
     return directory
 
 
-def release_code(code: ReleaseCode) -> Path:
-    """The directory holding a release's own modules (`ReleaseCode`) at its pinned commit, each fetched
-    through the hub's cache, which a cached commit's file is read from without the network: the snapshot
-    `PretrainedDecoder.from_model` writes beside an export."""
-    from huggingface_hub import hf_hub_download
+def code_modules(code: SourceCode) -> dict[str, Path]:
+    """A source's own modules (`SourceCode`), by their path in the source: those its config's `auto_map`
+    names, and every module they import relatively, as transformers resolves a remote module's imports
+    (`dynamic_module_utils.get_relative_imports`), fetched through the hub's cache at the code's commit,
+    which a cached commit's file is read from without the network, or a directory's own (one it does
+    not hold it does not bring, as it would not open with it either). An entry naming another repo's
+    code (`repo--module.Class`) brings none: its loader fetches it there. What `Pretrained.save` writes
+    beside the weights, so the save opens through the source's own transformers loader as the source
+    does."""
+    from transformers.dynamic_module_utils import get_relative_imports
 
-    fetched = [Path(hf_hub_download(code.repo, file, revision=code.revision)) for file in code.files]
-    return fetched[0].parent
+    local = os.path.isdir(code.source)
+
+    def located(file: str) -> Path:
+        if local:
+            return Path(code.source) / file
+        from huggingface_hub import hf_hub_download
+
+        return Path(hf_hub_download(str(code.source), file, revision=code.revision))
+
+    references = [reference for value in code.auto_map.values()
+                  for reference in (value if isinstance(value, list) else [value])
+                  if isinstance(reference, str) and "--" not in reference]
+    pending = [reference.rpartition(".")[0].replace(".", "/") + ".py" for reference in references]
+    modules: dict[str, Path] = {}
+    while pending:
+        file = pending.pop()
+        if file in modules or (local and not located(file).is_file()):
+            continue
+        modules[file] = located(file)
+        folder = file.rpartition("/")[0]
+        pending.extend(f"{folder}/{module}.py" if folder else f"{module}.py"
+                       for module in get_relative_imports(modules[file]))
+    return modules
 
 
 def repo_file(name_or_dir: str | Path, directory: Path, filename: str) -> Path:

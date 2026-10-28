@@ -1803,15 +1803,15 @@ class WeightPreparer(Protocol):
 
 
 @dataclass(frozen=True)
-class ReleaseCode:
-    """The Hub release whose own modeling code is a family's reference (`DecoderFamily.release_code`):
-    its `repo`, the commit Dew is held to it at, the modules that code is, and the `auto_map` its config
-    names them by, which an export writes beside them so transformers opens it with that code."""
+class SourceCode:
+    """A source's own modeling code, which a save writes beside the weights (`sources.code_modules`) so
+    transformers opens the save with it: the `source` holding it (a Hub repo, or a local directory), the
+    commit to read it at (None for a directory), and the `auto_map` its config names it by. A family's
+    reference release (`DecoderFamily.release_code`), or a loaded source's own (`Pretrained.code`)."""
 
-    repo: str
-    revision: str
-    files: tuple[str, ...]
-    auto_map: Mapping[str, str]
+    source: str | Path
+    revision: str | None
+    auto_map: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -1884,7 +1884,7 @@ class DecoderFamily:
     aliases: Mapping[str, str] = field(default_factory=dict)
     """The config class's `attribute_map`: another spelling of a field, read as that field before
     `defaults` fill what neither spells."""
-    release_code: ReleaseCode | None = None
+    release_code: SourceCode | None = None
     """The release whose own code is the family's reference, where transformers has no class for it:
     a model exported natively (`PretrainedDecoder.from_model`) writes its `auto_map` and its modules,
     fetched at that commit, so the export opens through that code as the release does."""

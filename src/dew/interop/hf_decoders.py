@@ -48,7 +48,7 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Reading,
-    ReleaseCode,
+    SourceCode,
     WrapperFields,
     _unread,
     held_parts,
@@ -1255,7 +1255,7 @@ def _family_of(fields: CausalTransformer) -> DecoderFamily:
     return next(family for family in ENTRIES if family.matches(fields))
 
 
-def release_code(model: CausalTransformer) -> ReleaseCode | None:
+def release_code(model: CausalTransformer) -> SourceCode | None:
     """The release whose own code is the exported family's reference (`DecoderFamily.release_code`),
     or None for a family transformers implements."""
     return _family_of(model).release_code

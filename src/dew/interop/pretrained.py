@@ -224,12 +224,12 @@ class Pretrained:
 
     It is used by a bundle that has no source processor to write (`from_model`).
     """
-    code: Path | None = None
-    """The directory of the source's own Python modules, which `save` writes beside the weights: the
-    modules a load ran (`trust_remote_code`), or, of a source Dew maps natively whose config names its
-    own code (`auto_map`), the modules that names, kept unexecuted, so a save opens through the source's
-    own transformers loader as the source does. The source's snapshot, which a weights conversion may not
-    be."""
+    code: decoder_parts.SourceCode | None = None
+    """The source's own modeling code, where its config names it (`auto_map`), which `save` writes
+    beside the weights, its modules and their relative imports (`sources.code_modules`), whether a load
+    ran them (`trust_remote_code`) or, mapped natively, kept them unexecuted, so a save opens through the
+    source's own transformers loader as the source does; read from the source's snapshot, which a
+    weights conversion may not be, when the save writes it."""
     names_tokenizer: ClassVar[bool] = True
     """Whether generation_config.json may record the tokenizer's name.
 
@@ -614,11 +614,10 @@ class Pretrained:
                                     tokenizer=self.processor if self.tokenizer is None else self.tokenizer,
                                     generation_config=dict(self.generation_config),
                                     named=self.names_tokenizer)
-        if self.code is not None:
-            for module in sorted(self.code.rglob("*.py")):
-                written = destination / module.relative_to(self.code)
-                written.parent.mkdir(parents=True, exist_ok=True)
-                written.write_bytes(module.read_bytes())
+        for name, module in sorted(({} if self.code is None else sources.code_modules(self.code)).items()):
+            written = destination / name
+            written.parent.mkdir(parents=True, exist_ok=True)
+            written.write_bytes(module.read_bytes())
         save_hf_layout(tensors, dict(self.config), destination, max_shard_size)
 
     def push_to_hub(self, repo_id: str, *, variables: Mapping[str, object] | None = None,
@@ -683,12 +682,11 @@ class PretrainedDecoder(Pretrained):
         # and `export` refuses the blocks themselves.
         config = decoders.export_config(decoder.with_cross_attention(None))
         built = record_fields(decoder, CausalTransformer)
-        released = decoders.release_code(decoder)
         return cls(decoder, variables, None, config, None, built,
                    {**decoders.GENERATION_DEFAULTS, 'use_cache': config.get('use_cache', decoder.causal)}
                    if generation_config is None else generation_config,
                    export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer,
-                   code=None if released is None else sources.release_code(released))
+                   code=decoders.release_code(decoder))
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """Build the text generation task this source describes.
@@ -1248,13 +1246,16 @@ def _unread_overrides(overrides: Mapping[str, object] | None, route: str) -> Non
 
 
 def _kept_code(route: SourceRoute, remote: Path | None, config: Mapping[str, object],
-               name_or_dir: str | Path, directory: Path) -> Path | None:
-    """The directory of the source's own modules a bundle keeps for `save` (`Pretrained.code`): those a
-    verification from parts ran, or, of a natively mapped source whose config names its own code
-    (`auto_map`), that code at the snapshot's commit, fetched and never run; None for any other."""
-    if isinstance(route, VerifiedRoute):
-        return remote if route.verified.source is not None else None
-    return sources.remote_code(name_or_dir, directory) if config.get("auto_map") else None
+               name_or_dir: str | Path, directory: Path) -> decoder_parts.SourceCode | None:
+    """The source's own code a bundle keeps for `save` (`Pretrained.code`), where its config names it
+    (`auto_map`): in the snapshot a verification from parts ran it from, or, of a natively mapped
+    source, at the snapshot's commit, never run."""
+    auto_map = config.get("auto_map")
+    if not isinstance(auto_map, Mapping):
+        return None
+    if isinstance(route, VerifiedRoute) and route.verified.source is not None and remote is not None:
+        return decoder_parts.SourceCode(remote, None, auto_map)
+    return decoder_parts.SourceCode(name_or_dir, directory.name, auto_map)
 
 
 def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,

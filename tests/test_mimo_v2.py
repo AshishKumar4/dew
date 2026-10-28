@@ -150,3 +150,42 @@ def test_a_store_dtype_mxfp4_source_loads_its_decoded_weights_and_saves_its_code
         else:
             assert written[name].dtype == tensor.dtype, name
             np.testing.assert_array_equal(written[name].view(np.uint8), tensor.view(np.uint8), err_msg=name)
+
+
+@pytest.mark.network
+def test_a_saved_release_opens_offline_through_its_own_code_and_computes_its_logits(tmp_path):
+    """A release whose config names its own code (`auto_map`), here the tiny checkpoint beside MiMo's code
+    at the pinned commit, loads natively and saves its modules and their relative imports
+    (`sources.code_modules`) beside its config; a fresh interpreter opens the save offline through that
+    code (`AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)`) and computes logits as
+    exact as the release's own over the fixture's tokens (ledger 2038)."""
+    import os
+    import subprocess
+    import sys
+
+    from huggingface_hub import hf_hub_download
+
+    repo, revision = 'XiaomiMiMo/MiMo-V2.6-Pro-MOPD', '6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8'
+    released = json.loads(Path(hf_hub_download(repo, 'config.json', revision=revision)).read_text())
+    source = tmp_path / 'release'
+    shutil.copytree(TINY, source)
+    config = json.loads((source / 'config.json').read_text())
+    (source / 'config.json').write_text(json.dumps({**config, 'auto_map': released['auto_map']}))
+    for file in ('configuration_mimo_v2.py', 'modeling_mimo_v2.py'):
+        shutil.copy(hf_hub_download(repo, file, revision=revision), source / file)
+    Pretrained.load(source, dtype='float32', attention_impl='reference').save(tmp_path / 'saved')
+    script = ("import sys, numpy, torch\n"
+              "from transformers import AutoModelForCausalLM\n"
+              "model = AutoModelForCausalLM.from_pretrained(sys.argv[1], trust_remote_code=True, "
+              "dtype=torch.float32)\n"
+              "with torch.no_grad():\n"
+              "    ids = torch.from_numpy(numpy.load(sys.argv[2]).astype('int64'))\n"
+              "    logits = model(input_ids=ids).logits\n"
+              "numpy.save(sys.argv[3], logits.numpy())\n")
+    subprocess.run([sys.executable, '-c', script, str(tmp_path / 'saved'), str(TINY / 'input_ids.npy'),
+                    str(tmp_path / 'logits.npy')], check=True,
+                   env={**os.environ, 'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
+                        'HF_MODULES_CACHE': str(tmp_path / 'modules')})
+    assert_as_exact_as_the_reference(np.load(tmp_path / 'logits.npy'), np.load(TINY / 'logits.npy'),
+                                     np.load(TINY / 'logits_f64.npy'), 'MiMo-V2 saved through its code')
+

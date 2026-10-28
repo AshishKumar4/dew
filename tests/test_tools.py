@@ -1747,8 +1747,9 @@ def test_a_family_whose_release_is_its_reference_pins_the_release_its_fixture_is
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
     code = LFM3.release_code
     assert code is not None
-    assert load("remote_code_reference").RELEASES["lfm3-tiny"][:3] == (code.repo, code.revision, code.files)
-    assert {reference.split(".")[0] + ".py" for reference in code.auto_map.values()} <= set(code.files)
+    repo, revision, files = load("remote_code_reference").RELEASES["lfm3-tiny"][:3]
+    assert (repo, revision) == (code.source, code.revision)
+    assert {f"{str(reference).rpartition('.')[0]}.py" for reference in code.auto_map.values()} <= set(files)
 
 
 def test_a_float64_twin_rotates_by_its_whole_complex_table():

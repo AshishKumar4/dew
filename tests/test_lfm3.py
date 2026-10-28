@@ -23,18 +23,25 @@ def fixture(name: str) -> np.ndarray:
     return np.load(TINY / f'{name}.npy')
 
 
+RELEASED = {'configuration_lfm3.py': 'from transformers import PretrainedConfig\n',
+            'modeling_lfm3.py': 'from .lfm3_conv import conv\n', 'lfm3_conv.py': 'conv = None\n'}
+"""Stand-ins for LFM3's release modules: its config's two auto_map modules, the modeling one importing a
+third relatively, as the release's does (modeling_lfm3.py:48)."""
+
+
 @pytest.fixture
 def release_cache(tmp_path, monkeypatch) -> Path:
-    """The hub's cache seeded with stand-ins for LFM3's release modules at the commit Dew is held to
-    (`DecoderFamily.release_code`), which a native export reads from it without the network: the
-    snapshot directory. The network test fetches the release's own."""
+    """The hub's cache seeded with stand-ins for LFM3's release modules (`RELEASED`) at the commit Dew is
+    held to (`DecoderFamily.release_code`), which a native export reads from it without the network:
+    the snapshot directory. The network test fetches the release's own."""
     import huggingface_hub.constants
 
     code = LFM3.release_code
-    snapshot = tmp_path / 'hub' / f"models--{code.repo.replace('/', '--')}" / 'snapshots' / code.revision
+    repository = f"models--{str(code.source).replace('/', '--')}"
+    snapshot = tmp_path / 'hub' / repository / 'snapshots' / code.revision
     snapshot.mkdir(parents=True)
-    for file in code.files:
-        (snapshot / file).write_text(f'# {file} at {code.revision}\n')
+    for file, text in RELEASED.items():
+        (snapshot / file).write_text(text)
     monkeypatch.setattr(huggingface_hub.constants, 'HF_HUB_CACHE', str(tmp_path / 'hub'))
     return snapshot
 
@@ -190,9 +197,10 @@ def test_the_released_lfm3_vl_and_d1_headers_load_their_language_model_or_refuse
 
 def test_a_saved_remote_code_release_keeps_the_modules_its_auto_map_names(tmp_path):
     """A release whose config names its own code (`auto_map`), which Dew maps natively and never runs,
-    saves those modules beside its config, which keeps the auto_map: the directory opens through the
+    saves those modules and every module they import relatively, as transformers resolves them, beside
+    its config, which keeps the auto_map, and no other file of its: the directory opens through the
     release's own transformers loader as the release does (ledger 2038). The modules here stand in for
-    the release's, which the network test fetches."""
+    the release's (`RELEASED`), which the network test loads through transformers."""
     import shutil
 
     source = tmp_path / 'release'
@@ -200,40 +208,65 @@ def test_a_saved_remote_code_release_keeps_the_modules_its_auto_map_names(tmp_pa
     config = json.loads((source / 'config.json').read_text())
     code = LFM3.release_code
     (source / 'config.json').write_text(json.dumps({**config, 'auto_map': dict(code.auto_map)}))
-    for file in code.files:
-        (source / file).write_text(f'# {file} of the release\n')
+    for file, text in {**RELEASED, 'unrelated.py': 'raise ImportError\n'}.items():
+        (source / file).write_text(text)
     loaded = Pretrained.load(source, dtype='float32', attention_impl='reference')
     loaded.save(tmp_path / 'saved')
     assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['auto_map'] == dict(code.auto_map)
-    for file in code.files:
-        assert (tmp_path / 'saved' / file).read_text() == (source / file).read_text()
+    assert {path.name for path in (tmp_path / 'saved').glob('*.py')} == set(RELEASED)
+    for file, text in RELEASED.items():
+        assert (tmp_path / 'saved' / file).read_text() == text
 
 
 def test_a_native_export_writes_its_familys_release_code_beside_itself(tmp_path, release_cache):
     """A model built in Dew of a family whose reference is a release's own code (`release_code`) exports
-    with that release's auto_map and its modules at the commit Dew is held to, fetched through the hub's
-    cache, so transformers opens the export with that code (ledger 2038)."""
+    with that release's auto_map and the modules it names and imports, at the commit Dew is held to,
+    read through the hub's cache, so transformers opens the export with that code (ledger 2038)."""
     from dew.interop import PretrainedDecoder
 
     code = LFM3.release_code
     loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / 'saved')
     assert json.loads((tmp_path / 'saved' / 'config.json').read_text())['auto_map'] == dict(code.auto_map)
-    for file in code.files:
-        assert (tmp_path / 'saved' / file).read_text() == (release_cache / file).read_text()
+    assert {path.name for path in (tmp_path / 'saved').glob('*.py')} == set(RELEASED)
+
+
+OPENED = """import json, sys, torch
+from transformers import AutoModelForCausalLM
+model, info = AutoModelForCausalLM.from_pretrained(sys.argv[1], trust_remote_code=True, dtype=torch.float32,
+                                                   output_loading_info=True)
+print(json.dumps({"class": type(model).__name__, **{key: sorted(value) for key, value in info.items()}}))
+"""
+"""A fresh interpreter's offline load of a saved directory through its own code's transformers loader: the
+class it builds and the loader's report of the weights it matched."""
+
+
+def opened_offline(directory: Path, tmp_path: Path) -> dict[str, object]:
+    """`OPENED` of `directory` in a fresh interpreter, the hub offline and its module cache fresh, so the
+    load reads the directory's own code alone."""
+    import os
+    import subprocess
+    import sys
+
+    run = subprocess.run([sys.executable, '-c', OPENED, str(directory)], check=True, capture_output=True,
+                         text=True, env={**os.environ, 'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
+                                         'HF_MODULES_CACHE': str(tmp_path / 'modules')})
+    return json.loads(run.stdout.strip().splitlines()[-1])
 
 
 @pytest.mark.network
-def test_a_native_export_fetches_its_familys_release_code_at_its_commit(tmp_path):
-    """The network's half of `test_a_native_export_writes_its_familys_release_code_beside_itself`: the
-    release's own modules, fetched at the commit, written beside the export."""
-    from huggingface_hub import hf_hub_download
-
+def test_an_export_opens_offline_through_the_releases_own_transformers_loader(tmp_path):
+    """The network's half (ledger 2038): a model built in Dew exports with its release's code at the
+    commit, the modules its auto_map names and lfm3_conv.py, which modeling_lfm3.py imports and no entry
+    names, and a fresh interpreter opens the export offline through the release's own loader
+    (`AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)`): the release's class, every
+    weight matched. (Its forward runs under transformers 5.18.0 on, which the fixture is recorded
+    under: tests/fixtures/hf/lfm3-tiny/source.json.)"""
     from dew.interop import PretrainedDecoder
 
-    code = LFM3.release_code
     loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / 'saved')
-    for file in code.files:
-        fetched = Path(hf_hub_download(code.repo, file, revision=code.revision))
-        assert (tmp_path / 'saved' / file).read_bytes() == fetched.read_bytes()
+    assert (tmp_path / 'saved' / 'lfm3_conv.py').is_file()
+    opened = opened_offline(tmp_path / 'saved', tmp_path)
+    assert opened['class'] == 'Lfm3ForCausalLM'
+    assert opened['missing_keys'] == opened['unexpected_keys'] == opened['mismatched_keys'] == []
