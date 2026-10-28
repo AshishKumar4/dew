@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn, struct
+from flax import linen as nn
 
 from dew.artifacts import Decisions
 from dew.batch import FROZEN, Batch, Variables, dicts, part
@@ -50,6 +50,7 @@ from dew.objectives.base import (
     Ratio,
     Source,
     Step,
+    Weighted,
     joined,
     model_rngs,
 )
@@ -80,17 +81,7 @@ def tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
             return None
 
 
-@struct.dataclass
-class DecisionStatistics:
-    """A decision loss's statistics where it adds a consistency term: the label loss and the groups'
-    divergence, each its own `Ratio`, their weighted sum the objective's value
-    (`DecisionObjective.reduce_loss`)."""
-
-    label: Ratio
-    consistency: Ratio
-
-
-class DecisionObjective(Objective[Ratio | DecisionStatistics]):
+class DecisionObjective(Objective[Ratio | Weighted]):
     """Trains a decision model on questions with known answers.
 
     The model is any backbone with final states (`dew.nn.protocols.HiddenStates`),
@@ -344,16 +335,16 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         return self._charged(logits, inputs, batch)
 
     def _charged(self, logits: jax.Array, inputs: DecisionInputs, batch: Batch
-                 ) -> tuple[Ratio | DecisionStatistics, Aux]:
-        """The loss and its accuracy report over the questions' option logits."""
+                 ) -> tuple[Ratio | Weighted, Aux]:
+        """The loss and its accuracy report over the questions' option logits: where it adds a consistency
+        term, the label loss and the groups' divergence, each its own `Ratio`, `consistency` weighing the
+        divergence (`Weighted`)."""
         options, scored = inputs.options, jnp.asarray(batch["scored"]).astype(jnp.float32)
         # A padding question has no options; it is scored nothing over a
         # finite, even distribution, so no NaN reaches its gradient.
         empty = ~jnp.any(options, axis=-1, keepdims=True)
         logits, options = jnp.where(empty, 0.0, logits), options | empty
-        count = jnp.sum(options, axis=-1, keepdims=True)
-        gold = jnp.asarray(batch["targets"])
-        target = jnp.where(options, (1.0 - self.label_smoothing) * gold + self.label_smoothing / count, 0.0)
+        target = categorical.smoothed(jnp.asarray(batch["targets"]), options, self.label_smoothing)
         charge = self.loss_rule.charge(logits, target, options, inputs.kinds == _SCORE)
         correct = (jnp.argmax(logits, axis=-1) == batch["labels"]).astype(jnp.float32)
         accuracy, _ = self.accuracy(correct, batch, scored).mean()
@@ -365,23 +356,15 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         divergence, members = categorical.group_divergence(logits, jnp.asarray(batch["groups"]),
                                                            jnp.asarray(batch["canonical"]), options)
         term = Ratio(self.row_mean(divergence, batch).total, self.row_mean(members, batch).total)
-        return (DecisionStatistics(loss, term),
+        return (Weighted((loss, term), (1.0, self.consistency)),
                 Aux(metrics={"accuracy": accuracy, "consistency": term.mean()[0]}))
-
-    def reduce_loss(self, stats: Ratio | DecisionStatistics) -> tuple[jax.Array, jax.Array]:
-        """The label loss, plus `consistency` times the groups' mean divergence where it adds one."""
-        if isinstance(stats, Ratio):
-            return stats.mean()
-        label, active = stats.label.mean()
-        divergence, grouped = stats.consistency.mean()
-        return label + self.consistency * divergence, active | grouped
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         return self._decisions(self._logits(self.evaluation_variables(params, step), inputs), inputs, batch)
 
     def _validation_scores(self, params: Variables, batch: Batch, step: Step
-                           ) -> tuple[Ratio | DecisionStatistics, Decisions]:
+                           ) -> tuple[Ratio | Weighted, Decisions]:
         inputs = laid_out(batch, self.bounds.segments, spans_in_context=self.schema_in_context)
         logits = self.model.logits(params, inputs)
         return self._charged(logits, inputs, batch)[0], self._decisions(logits, inputs, batch)

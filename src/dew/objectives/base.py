@@ -100,6 +100,27 @@ class Ratio:
         return jnp.where(active, value, 0), active
 
 
+@struct.dataclass
+class Weighted:
+    """A loss of several terms, each a `Ratio` normalized by its own mass, summed with `weights`:
+    `sum_i weight_i * term_i.mean()`, which has mass where any term of nonzero weight has.
+
+    Each term sums across microbatches and devices as a `Ratio` does, so every term is its mean over the
+    whole update before the weights combine them (`Objective.reduce_loss`).
+    """
+
+    terms: tuple[Ratio, ...]
+    weights: tuple[float, ...] = struct.field(pytree_node=False)
+
+    def mean(self) -> tuple[jax.Array, jax.Array]:
+        """Return the weighted sum of the terms' means, and whether any term of nonzero weight has mass."""
+        means = [(weight, *term.mean()) for weight, term in zip(self.weights, self.terms, strict=True)]
+        value = functools.reduce(jnp.add, [weight * mean for weight, mean, _ in means])
+        active = functools.reduce(jnp.logical_or, [active for weight, _, active in means if weight != 0],
+                                  jnp.asarray(a=False))
+        return value, active
+
+
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
 
@@ -1118,11 +1139,12 @@ class Objective(ABC, Generic[Loss, Effects]):
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """Return the objective value of summed statistics and whether they have any mass.
 
-        A `Ratio` reduces by `Ratio.mean`, and a scalar is its own value with
-        mass one. Composite statistics need an override, since the default
-        raises `TypeError` for them.
+        A `Ratio` reduces by `Ratio.mean`, terms `Weighted` together by
+        `Weighted.mean`, and a scalar is its own value with mass one. Other
+        composite statistics need an override, since the default raises
+        `TypeError` for them.
         """
-        if isinstance(stats, Ratio):
+        if isinstance(stats, (Ratio, Weighted)):
             return stats.mean()
         if isinstance(stats, (jax.Array, float, int)):
             value = jnp.asarray(stats)

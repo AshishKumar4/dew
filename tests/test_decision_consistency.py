@@ -30,11 +30,10 @@ from dew.decision import (
     Schema,
     StateFirstLayout,
 )
-from dew.decision.objective import DecisionStatistics
 from dew.decision.rows import Encoding, Fit, QuestionRows, _encoded_unit, _window_groups
 from dew.decision.task import laid_out
 from dew.nn import categorical
-from dew.objectives.base import Ratio, Step
+from dew.objectives.base import Ratio, Step, Weighted
 
 LAYOUT = JointLayout(max_len=1024)
 
@@ -99,10 +98,10 @@ def test_a_weight_of_zero_reads_no_groups_and_a_weight_adds_the_term_beside_the_
     step = Step(jnp.asarray(0), jax.random.key(1), None)
     labelled, _ = plain.loss(variables, batch, step)
     stats, aux = weighted.loss(variables, batch, step)
-    assert isinstance(labelled, Ratio) and isinstance(stats, DecisionStatistics)
-    assert np.array_equal(np.asarray(stats.label.total), np.asarray(labelled.total))
-    label, _ = stats.label.mean()
-    term, _ = stats.consistency.mean()
+    assert isinstance(labelled, Ratio) and isinstance(stats, Weighted) and stats.weights == (1.0, 0.5)
+    assert np.array_equal(np.asarray(stats.terms[0].total), np.asarray(labelled.total))
+    label, _ = stats.terms[0].mean()
+    term, _ = stats.terms[1].mean()
     value, _ = weighted.reduce_loss(stats)
     assert np.array_equal(np.asarray(value), np.asarray(label + 0.5 * term))
     assert "consistency" in aux.metrics
