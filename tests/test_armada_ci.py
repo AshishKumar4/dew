@@ -1275,17 +1275,71 @@ def test_a_fixture_reruns_its_readers_alone_though_a_native_reader_reads_it(
     assert run() == [2, 1]
 
 
-def test_a_tree_past_the_watch_limit_keeps_no_row(ci, tmp_path, monkeypatch, cache_worker):
-    """A checkout whose directories under tests/ and src/ outnumber the inotify watches a process may hold
-    (fs.inotify.max_user_watches) records no key, so its rows run every time: a record that saw only some
-    directories' opens would be partial (owner, 2026-10-27)."""
-    limit = int(Path("/proc/sys/fs/inotify/max_user_watches").read_text())
-    for index in range(limit + 1):
-        (tmp_path / "src/many" / f"d{index}").mkdir(parents=True)
-    (tmp_path / "tests/test_kept.py").write_text(
-        "from pathlib import Path\n"
-        "def test_kept():\n"
-        "    with Path('runs').open('a') as runs: runs.write('x')\n")
+def packed(root: Path, names: list[str]) -> None:
+    """The durations record timing each of `names` (tests/<name>) at a second, so the plan packs them into one
+    task, as CI packs small files."""
+    (root / "tests/test_durations.json").write_text(json.dumps(
+        {f"tests/{name}::{name[len('test_'):-len('.py')]}": 1.0 for name in names}))
+
+
+def test_a_reader_files_share_in_one_process_is_every_such_files_input(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A data file a reader opens is the input of every test file its pytest process ran, not only the
+    one that opened it: a session fixture's lazy reader, or a process-lived cache (dew.data.text's
+    load_tokenizer), opened under one file serves the next without reopening it, so a change to the data
+    reruns both (train 239's review, row 1987)."""
+    (tmp_path / "tests/fixtures").mkdir(parents=True)
+    (tmp_path / "tests/fixtures/shared.json").write_text("[1]\n")
+    (tmp_path / "tests/conftest.py").write_text(
+        "import functools, pytest\nfrom pathlib import Path\n"
+        "@pytest.fixture(scope='session')\ndef vocabulary():\n"
+        "    return functools.cache(lambda: Path('tests/fixtures/shared.json').read_text())\n")
+    body = ("from pathlib import Path\ndef test_{0}(vocabulary):\n"
+            "    with Path('runs-{0}').open('a') as runs: runs.write('x')\n    assert vocabulary()\n")
+    written(tmp_path, {"test_a.py": body.format("a"), "test_b.py": body.format("b")})
+    packed(tmp_path, ["test_a.py", "test_b.py"])
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+
+    def run() -> list[int]:
+        rows = armada_task(ci, monkeypatch, verdict)
+        assert [row["exitCode"] for row in rows] == [0, 0]
+        return [len((tmp_path / f"runs-{name}").read_text()) for name in ("a", "b")]
+
+    assert run() == [1, 1]
+    assert run() == [1, 1]
+    (tmp_path / "tests/fixtures/shared.json").write_text("[2]\n")
+    assert run() == [2, 2]
+
+
+def test_an_open_after_the_tests_ended_is_the_records_input(ci, tmp_path, monkeypatch, cache_worker):
+    """A data file opened after the last test ended, by a later session-finish hook, at exit or by a
+    thread, is the task's input as well: the task's supervisor reads the watch once pytest and its process
+    group stopped, so a change to it reruns the files and its hook's verdict is seen (train 239's review,
+    row 1988)."""
+    (tmp_path / "tests/fixtures").mkdir(parents=True)
+    (tmp_path / "tests/fixtures/verdict.txt").write_text("ok\n")
+    (tmp_path / "tests/conftest.py").write_text(
+        "import pytest\nfrom pathlib import Path\n"
+        "@pytest.hookimpl(trylast=True)\ndef pytest_sessionfinish(session):\n"
+        "    if Path('tests/fixtures/verdict.txt').read_text().strip() != 'ok':\n"
+        "        raise RuntimeError('the verdict file says no')\n")
+    written(tmp_path, {"test_late.py": "from pathlib import Path\ndef test_late():\n"
+                                       "    with Path('runs').open('a') as runs: runs.write('x')\n"})
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict)] == [0]
+    (tmp_path / "tests/fixtures/verdict.txt").write_text("no\n")
+    assert [row["exitCode"] for row in armada_task(ci, monkeypatch, verdict)] == [1]
+
+
+def test_a_watched_directory_lost_mid_run_keeps_no_row(ci, tmp_path, monkeypatch, cache_worker):
+    """A directory under tests/ or src/ deleted (or moved, or unmounted) while the task runs takes its
+    watch with it, and what is opened in it, or in one made again in its place, is not seen: the task's
+    records keep no key, so its rows run every time (train 239's review, row 1989)."""
+    (tmp_path / "tests/fixtures/scratch").mkdir(parents=True)
+    written(tmp_path, {"test_lost.py": "import shutil\nfrom pathlib import Path\ndef test_lost():\n"
+                                       "    with Path('runs').open('a') as runs: runs.write('x')\n"
+                                       "    shutil.rmtree('tests/fixtures/scratch')\n"
+                                       "    Path('tests/fixtures/scratch').mkdir()\n"})
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     assert [run(), run()] == [1, 2]
 
