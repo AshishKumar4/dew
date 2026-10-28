@@ -185,8 +185,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     interval `[B, Q]` as every mainloop walks it. `slots` `[B, Q]` are the queries' own keys' indices, a cache
     call's slots (by default each query's index, or a cross call's aligned place): causality ends a query's
     keys at its slot, a window or a chunk without `positions` counts keys from it and a block reads the
-    block holding it; a negative slot (padding) sees no key. Lengths, starts and slots are int32 token coordinates; places
-    and ids keep their own dtypes."""
+    block holding it; a negative slot (padding) sees no key. Lengths, starts and slots are int32 token
+    coordinates; places and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
     from dew.nn.visibility import window_sides
 
