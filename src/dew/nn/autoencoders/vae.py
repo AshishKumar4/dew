@@ -323,7 +323,7 @@ def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict 
             return {"config": config, "params": params}
         if weights == FLAX_WEIGHTS:
             with open(weights_path, "rb") as handle:
-                return {"config": config, "params": msgpack_restore(handle.read())}
+                return {"config": config, "params": _shared_upsamplers(msgpack_restore(handle.read()))}
         return {"config": config, "params": _read_vae_weights(Path(config_path).parent)}
     return None
 
