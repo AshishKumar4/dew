@@ -89,7 +89,7 @@ def packed(length, cuts):
     return segments
 
 
-@pytest.mark.parametrize("implementation", ["reference", "xla"])
+@pytest.mark.parametrize("implementation", ["reference", "xla", "template"])
 @pytest.mark.parametrize("length,window", [(37, 8), (64, 16), (5, 8)])
 def test_sliding_window_matches_splash_local_mask(implementation, length, window):
     keep = np.asarray(splash.LocalMask((length, length), (window - 1, 0), 0)[:, :])
@@ -100,7 +100,7 @@ def test_sliding_window_matches_splash_local_mask(implementation, length, window
                     f"{implementation} window {window} over {length}", seeds=SEEDS['window'])
 
 
-@pytest.mark.parametrize("implementation", ["reference", "xla"])
+@pytest.mark.parametrize("implementation", ["reference", "xla", "template"])
 @pytest.mark.parametrize("length,chunk", [(37, 8), (64, 16), (6, 8)])
 def test_chunks_match_splash_chunked_causal_mask(implementation, length, chunk):
     keep = np.asarray(splash.ChunkedCausalMask((length, length), chunk)[:, :])
@@ -111,13 +111,15 @@ def test_chunks_match_splash_chunked_causal_mask(implementation, length, chunk):
                     f"{implementation} chunk {chunk} over {length}", seeds=SEEDS['chunk'])
 
 
+@pytest.mark.parametrize("implementation", ["xla", "template"])
 @pytest.mark.parametrize("span", [{"window": 5}, {"chunk": 4}, {"window": 16}, {"chunk": 16}])
-def test_packed_documents_restart_their_windows_and_chunks(span):
+def test_packed_documents_restart_their_windows_and_chunks(span, implementation):
     """Chunks count each document's tokens from its first, as it would alone;
     windows count the tokens inside the document; an invalid slot among them
     counts in neither, as the cache counts them. Padding keys (segment 0 and
     invalid) are never read by a real query, one of a document and valid; a
-    padding query's output is no token's."""
+    padding query's output is no token's. The template takes the whole call as
+    its spans, a chunk each query's run of its keys (`chunk_runs`)."""
     length = 29
     segments = packed(length, (7, 18, 26))
     valid = np.ones((2, length), bool)
@@ -141,10 +143,10 @@ def test_packed_documents_restart_their_windows_and_chunks(span):
     def band(q, k, v):
         places = counted_places(segment_ids, jnp.asarray(valid))
         return on_rows(local_attention(q, k, v, **span, places=places, segment_ids=segment_ids,
-                                       valid=jnp.asarray(valid), implementation="xla"), real)
+                                       valid=jnp.asarray(valid), implementation=implementation), real)
 
-    assert_as_exact(jax.jit(band), jax.jit(masked(keep, real)), drawn(length), f"packed {span}",
-                    seeds=SEEDS['packed'])
+    assert_as_exact(jax.jit(band), jax.jit(masked(keep, real)), drawn(length),
+                    f"{implementation} packed {span}", seeds=SEEDS['packed'])
 
 
 @pytest.mark.parametrize("given", ["origin", "repeated"])
@@ -170,8 +172,9 @@ def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, le
                     f"{given} places over {length}", seeds=SEEDS['given places'])
 
 
+@pytest.mark.parametrize("implementation", ["xla", "template"])
 @pytest.mark.parametrize("span", [{"window": 6}, {"chunk": 8}])
-def test_gradients_match_the_dense_masked_kernel(span):
+def test_gradients_match_the_dense_masked_kernel(span, implementation):
     """The band's output and its gradients under a drawn readout, its cotangent, for the query, key and
     value, on par with the dense masked kernel's (check 1)."""
     length = 40
@@ -190,9 +193,12 @@ def test_gradients_match_the_dense_masked_kernel(span):
     def gradients(fn):
         return jax.jit(with_gradients(fn))
 
-    assert_as_exact(gradients(lambda q, k, v: local_attention(q, k, v, **span, implementation="xla")),
-                    gradients(masked(np.broadcast_to(keep, (2, length, length)))), draw, f"{span} gradients",
-                    seeds=SEEDS['gradients'])
+    def band(q, k, v):
+        return local_attention(q, k, v, **span, implementation=implementation)
+
+    assert_as_exact(gradients(band),
+                    gradients(masked(np.broadcast_to(keep, (2, length, length)))), draw,
+                    f"{implementation} {span} gradients", seeds=SEEDS['gradients'])
 
 
 def test_memory_grows_with_the_window_not_the_square_of_the_sequence():
