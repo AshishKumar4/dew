@@ -12,7 +12,6 @@ and the call's queries and keys pad to whole blocks, which their spans leave unr
 
 import dataclasses
 import functools
-import types
 from collections.abc import Callable, Sequence
 from typing import Literal, overload
 
@@ -40,6 +39,7 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     kept_dtype,
     kernel_dot,
+    launch_arguments,
     padded_call,
     prescaled,
     within,
@@ -103,19 +103,16 @@ def refused(spans: KeySpans, hooks: Hooks | None = None) -> str | None:
     return None
 
 
-def unfitted(query: jax.Array, value: jax.Array, *, backward: bool) -> str | None:
-    """Why no config of the forward's (or, `backward`, the backward's) launches fits the GPU's shared memory
-    for a call of `query` and `value`, or None: the route then takes another mainloop rather than a launch
-    that cannot run (`attention_route._mainloop`)."""
-    launch, space = (TritonBackward(), BACKWARD_SPACE) if backward else (TritonForward(), SPACE)
-    target = generation.gpu_target()
-    shapes = types.SimpleNamespace(arguments={"query": query, "value": value})
-    least = min(launch.staged_bytes(shapes, config, target) for config in space)
-    budget = generation.shared_budget(target)
-    if least <= budget:
+def unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
+             *, scale: float | None = None, natural: bool = NATURAL, residuals: bool = False) -> str | None:
+    """Why no config of `forward`'s launch, bound as it binds this call (`_forward_call`), fits the GPU: its
+    own fitting (`Template.fits`: its padding, the configs dividing it, the registers they hold and the
+    shared memory they stage), or None. The route then takes another mainloop rather than a launch that
+    cannot run (`attention_route._mainloop`); the backward's own launches hold the same tiles' operands."""
+    op, args, _ = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
+    if op.fits(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target()):
         return None
-    return (f"no Triton {'backward' if backward else 'forward'} config fits: the least stages {least} bytes, "
-            f"past the {budget} a block of the GPU holds")
+    return "no config of the Triton mainloop's forward fits the GPU's block and registers"
 
 
 def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None):
@@ -444,14 +441,29 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     `interpret` runs it on the CPU. A call over runs or under dropout is refused (`refused`)."""
     if reason := refused(spans, hooks):
         raise NotImplementedError(reason)
+    op, args, queries = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
+    value_width = value.shape[-1]
+    out = op(*args, residuals=residuals, interpret=interpret)
+    if not residuals:
+        return out[:, :queries, :, :value_width]
+    out, peak, total, anchors, others, own, others_total, shift = out
+    return (out[:, :queries, :, :value_width], peak[:, :, :queries], total[:, :, :queries],
+            anchors[:, :, :queries],
+            Split(others[:, :, :queries, :value_width], own[:, :, :queries], others_total[:, :, :queries],
+                  shift[:, :, :queries]))
+
+
+def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
+                  *, scale: float | None, natural: bool) -> tuple[TritonForward, tuple, int]:
+    """`forward`'s launch, its padded operands (`padded_call`) and the call's queries before padding."""
     hooks = Hooks() if hooks is None else hooks
     call = padded_call(query, key, value, spans, hooks, BLOCK)
-    queries, value_width = call.queries, value.shape[-1]
     initial = hooks.initial
     m0 = total0 = acc0 = None
     if initial is not None:
         m0, total0 = call.rows(initial.m, -jnp.inf), call.rows(initial.total)
-        acc0 = jnp.pad(call.rows(initial.acc), ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),))
+        acc0 = jnp.pad(call.rows(initial.acc),
+                       ((0, 0),) * 3 + ((0, call.value.shape[-1] - value.shape[-1]),))
     op = TritonForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
                        output_kinds=tuple(param.kind for param in hooks.output_params),
@@ -460,16 +472,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                        output_width=call.value.shape[-1],
                        scale=query.shape[3] ** -0.5 if scale is None else scale, form=spans.form,
                        keys=spans.keys, natural=natural)
-    out = op(call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
-             call.score_params, call.output_params, m0, total0, acc0, residuals=residuals,
-             interpret=interpret)
-    if not residuals:
-        return out[:, :queries, :, :value_width]
-    out, peak, total, anchors, others, own, others_total, shift = out
-    return (out[:, :queries, :, :value_width], peak[:, :, :queries], total[:, :, :queries],
-            anchors[:, :, :queries],
-            Split(others[:, :, :queries, :value_width], own[:, :, :queries], others_total[:, :, :queries],
-                  shift[:, :, :queries]))
+    return op, (call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
+                call.score_params, call.output_params, m0, total0, acc0), call.queries
 
 
 def _key_param(ref, kind: Kind, head, rows):
@@ -921,16 +925,37 @@ def _key_param_spec(kind: Kind, param: jax.Array, queries: int, block_k: int) ->
             raise ValueError("an output hook's parameter has no score tile")
 
 
-def _launch(*arrays, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
-            prescale: float, split: bool, natural: bool, accurate: bool, initial: bool, interpret: bool):
+def _backward_op(*, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
+                 prescale: float, split: bool, natural: bool, accurate: bool,
+                 initial: bool) -> TritonBackward:
     """The Triton mainloop's two launches under one tuning decision (`TritonBackward`), recomputing the
     weights as a forward of the call's form computed them (`algebra.recompute`), from the call's own query
     taken by `prescale` (`attention.prescale`) for its logits alone."""
     how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=scale, score_mod=score_mod,
                                             natural=natural, initial=initial, prescale=prescale))
-    op = TritonBackward(score_mod=score_mod, score_kinds=score_kinds, scale=scale, score_dtypes=score_dtypes,
-                        split=split, how=how, accurate=accurate, prescale=prescale)
-    return op(*arrays, interpret=interpret)
+    return TritonBackward(score_mod=score_mod, score_kinds=score_kinds, scale=scale,
+                          score_dtypes=score_dtypes, split=split, how=how, accurate=accurate,
+                          prescale=prescale)
+
+
+def _launch(*arrays, interpret: bool, **params):
+    """`_backward_op`'s launches on `gradients`' arrays."""
+    return _backward_op(**params)(*arrays, interpret=interpret)
+
+
+def backward_unfitted(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+                      hooks: Hooks | None, dout: jax.Array, *, residuals: tuple, scale: float | None = None,
+                      natural: bool = NATURAL, accurate: bool = ACCURATE) -> str | None:
+    """Why no config of `backward`'s launches, bound as `gradients` binds this call (`launch_arguments`),
+    fits the GPU (`Template.fits`), or None: the route then takes another mainloop (`attention_route`)."""
+    hooks = Hooks() if hooks is None else hooks
+    arrays, params, _ = launch_arguments(query, key, value, spans, hooks, dout, residuals, block=BLOCK,
+                                         scale=scale)
+    op = _backward_op(**params, split=True, natural=natural, accurate=accurate,
+                      initial=hooks.initial is not None)
+    if op.fits(op.bind(*arrays, interpret=False), generation.gpu_target()):
+        return None
+    return "no config of the Triton mainloop's backward fits the GPU's block and registers"
 
 
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,

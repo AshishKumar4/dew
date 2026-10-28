@@ -167,14 +167,12 @@ route, so the kernel-route audit sees a call on a GPU that leaves the Mosaic tem
 reason."""
 
 
-def _mainloop(declined: str | None, spans: KeySpans, hooks: Hooks, query: jax.Array, value: jax.Array, *,
-              backward: bool) -> str:
+def _mainloop(declined: str | None, spans: KeySpans, hooks: Hooks, unfitted) -> str:
     """The mainloop a pass runs, reported (`MAINLOOP`), from Mosaic's reason it `declined` the pass and the
     Triton mainloop's refusal of its spans and hooks (`attention_triton.refused`: a dropping call's) or of
-    its shapes, no config of which fits the GPU (`attention_triton.unfitted`)."""
+    the call, no config of whose launch fits the GPU (`unfitted()`, its own fitting)."""
     on_gpu = _on_gpu()
-    triton = (attention_triton.refused(spans, hooks)
-              or attention_triton.unfitted(query, value, backward=backward)) if on_gpu else None
+    triton = (attention_triton.refused(spans, hooks) or unfitted()) if on_gpu else None
     return selection.select(MAINLOOP, _Pass(on_gpu, declined, triton)).kernel
 
 
@@ -184,7 +182,8 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     form = {"scale": config.scale, "natural": config.natural}
     declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=residuals,
                                                  **form) if _on_gpu() else None
-    mainloop = _mainloop(declined, spans, hooks, query, value, backward=False)
+    mainloop = _mainloop(declined, spans, hooks, functools.partial(
+        attention_triton.unfitted, query, key, value, spans, hooks, residuals=residuals, **form))
     if mainloop == 'mosaic':
         return attention_mosaic.forward(query, key, value, spans, hooks, residuals=residuals, **form)
     if mainloop == 'triton':
@@ -214,7 +213,9 @@ def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     rounded = config.operand_dtype is None
     declined = (attention_mosaic.backward_declined(*call, residuals=residuals, **form) if _on_gpu()
                 else None)
-    mainloop = _mainloop(declined, spans, hooks, query, value, backward=True)
+    mainloop = _mainloop(declined, spans, hooks, functools.partial(
+        attention_triton.backward_unfitted, *call, residuals=residuals, scale=config.scale,
+        natural=config.natural, accurate=config.accurate))
     if mainloop == 'mosaic':
         return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, **form)
     if mainloop == 'triton':
