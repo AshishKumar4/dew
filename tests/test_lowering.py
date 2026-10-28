@@ -508,6 +508,41 @@ def _squeezed(shape) -> tuple[int, ...]:
     return tuple(size for size in shape if size != 1)
 
 
+def _template_launches(policy) -> int:
+    """The recurrence template's Mosaic GPU calls in a bf16 gated delta net's forward and gradient,
+    lowered for an assumed H100 (whose training cell the template takes), the loss under the remat rung
+    `policy` (`decoder_block.RematPolicy`; None, none)."""
+    from dew.nn.backbones.decoder_block import RematPolicy
+    from dew.nn.linear import GatedDeltaNet
+
+    layer = GatedDeltaNet(256, 1, 2, 128, 128, dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((1, 128, 256), jnp.bfloat16)
+    variables = jax.eval_shape(lambda: layer.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype)))
+
+    def loss(variables, x):
+        return jnp.asarray(layer.apply(variables, x)).astype(jnp.float32).sum()
+
+    if policy is not None:
+        loss = jax.checkpoint(loss, policy=RematPolicy(save=policy).checkpoint_policy())
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=("cuda",))
+    return sum(name == "stablehlo.custom_call" and target.startswith("mosaic_gpu")
+               for name, target, *_ in _operations(lowered))
+
+
+def test_a_remat_rung_keeping_the_delta_rules_residuals_runs_the_templates_forward_once():
+    """A gated delta net under a remat rung that saves its delta rule's names (`DELTA_RULE_RESIDUALS`: its
+    output and the template's inverse and memory, named as the port names its own) runs the template's
+    forward launches once, as the layer without remat does, where the rung that saves nothing ('full')
+    replays them in the backward: a Qwen3.5-4B training step under 'full' ran each GDN layer's forward twice,
+    63.6 ms of its 1.6 s on an H100 (row 2023)."""
+    from dew.nn.mixer_base import DELTA_RULE_RESIDUALS
+
+    unrematted, saved, full = (_template_launches(policy) for policy in (None, DELTA_RULE_RESIDUALS, ()))
+    assert unrematted == saved < full, (unrematted, saved, full)
+
+
 def test_a_packed_recurrence_runs_on_each_devices_own_rows():
     """A packed gated delta net on a mesh splitting its rows runs on each device's rows, as its lowered GPU
     program states it: lowered for an H100 over two devices and two rows, its recurrence template's Mosaic

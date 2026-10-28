@@ -32,6 +32,7 @@ from typing import NamedTuple, Protocol
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.attention import FORWARD_MODE, repeat_kv_heads
@@ -951,11 +952,13 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
             return rule(*operands), (operands, (None, None))
         # The chunks' inverses kept for the fast backward, as fla's keeps its `A`, and the launches' memories,
         # weighted keys and corrected values, as the port keeps its memory, but where the block's remat rung
-        # recomputes them (`RECOMPUTED`).
+        # recomputes them (`RECOMPUTED`). Each is named as the port names its own, so a rung that saves names
+        # keeps them rather than replaying the forward's launches for them (`mixer_base.DELTA_RESIDUALS`).
         out, final, (inverse, kept) = mainloop.kept_forward(*operands[:6], starts=operands[6],
                                                             firsts=operands[7], max_segments=max_segments,
                                                             scale=scale, delta=delta, wide=wide, **run)
-        return (out, final), (operands, (inverse, kept if "delta_memory" not in RECOMPUTED.get() else None))
+        kept = None if "delta_memory" in RECOMPUTED.get() else checkpoint_name(kept, 'delta_memory')
+        return (out, final), (operands, (checkpoint_name(inverse, 'delta_inverse'), kept))
 
     def backward(saved, grads):
         operands, (inverse, kept) = saved
