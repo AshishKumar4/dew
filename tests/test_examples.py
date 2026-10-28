@@ -427,31 +427,33 @@ def test_sft_gemma4_runs_its_documented_configuration_on_one_machine(tmp_path):
     assert (tmp_path / "run" / "export" / "model.safetensors").is_file()
 
 
+def commits_both_updates_one_behind(example, tmp_path, summary, *arguments):
+    """`example`'s smoke, then its `summary` file's account: both updates committed, the second on draws
+    submitted one update earlier."""
+    smoke(example, tmp_path, *arguments)
+    written = json.loads((tmp_path / summary).read_text())
+    assert written["updates"] == 2 and written["max_lag"] == 1
+
+
 def test_train_rlvr_smoke_commits_every_update_one_behind(tmp_path):
     """The smoke's completions all run out of their eight tokens, so a run
     that masked truncations would commit nothing and never push. The
     example scores them: both updates commit, and the second trains on
     draws submitted one update earlier."""
-    smoke("train_rlvr", tmp_path)
-    summary = json.loads((tmp_path / "rewards.json").read_text())
-    assert summary["updates"] == 2 and summary["max_lag"] == 1
+    commits_both_updates_one_behind("train_rlvr", tmp_path, "rewards.json")
 
 
 def test_train_rlvr_turns_smoke_trains_through_environment_source(tmp_path):
     """`--turns 2` runs its sessions through EnvironmentSource and commits both updates, one behind.
     The tiny model's attempts end on the token budget, so the feedback path
     is the next test's."""
-    smoke("train_rlvr", tmp_path, "--turns", "2")
-    summary = json.loads((tmp_path / "rewards.json").read_text())
-    assert summary["updates"] == 2 and summary["max_lag"] == 1
+    commits_both_updates_one_behind("train_rlvr", tmp_path, "rewards.json", "--turns", "2")
 
 
 def test_train_harbor_smoke_trains_on_gateway_recorded_harness_calls(tmp_path):
     """Two updates of Harbor trials whose model calls the stand-in gateway records from the policy's
     own draws; the second trains on sessions submitted one update earlier."""
-    smoke("train_harbor", tmp_path)
-    summary = json.loads((tmp_path / "summary.json").read_text())
-    assert summary["updates"] == 2 and summary["max_lag"] == 1
+    commits_both_updates_one_behind("train_harbor", tmp_path, "summary.json")
 
 
 def test_evaluate_and_serve_smoke_reports_perplexity_and_a_greedy_continuation(tmp_path):

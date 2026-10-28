@@ -68,8 +68,10 @@ def episode_from_record(value: Mapping[str, object]) -> Episode:
         Transition(draw_record(section(turn["action"], "action"), sampling),
                    observation_record(section(turn["observation"], "observation")))
         for turn in listed(record["transitions"], "transitions", read=section, what="a list of transitions"))
+    branch = identity.get("branch")
     return Episode(EpisodeId(integer(identity["task"], "task"), integer(identity["attempt"], "attempt"),
-                             integer(identity["sample"], "sample"), integers(identity["seed"], "seed")),
+                             integer(identity["sample"], "sample"), integers(identity["seed"], "seed"),
+                             None if branch is None else text(branch, "branch")),
                    integer(record["policy_step"], "policy_step"), sampling,
                    None if initial is None else observation_record(section(initial, "initial")),
                    transitions, EpisodeStatus(integer(record["status"], "status")),

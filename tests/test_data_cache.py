@@ -187,13 +187,19 @@ def test_conflicting_duplicate_writers_refuse_publication(second_row):
         cache.publish(key, source)
 
 
-def test_corrupt_shard_never_reaches_current():
+def _filled_one_record():
+    """A source of one record, and a cache whose fill of its row finished, not yet published."""
     source = Memory([{"id": 0}])
     cache, key = _cache(), _key()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
     rows[0]
     rows.finish()
     rows.close()
+    return source, cache, key
+
+
+def test_corrupt_shard_never_reaches_current():
+    source, cache, key = _filled_one_record()
     fs, path = Store(cache.url + "/" + key.key + "/shards").resolve()
     shard = fs.find(path)[0]
     intact = fs.cat_file(shard)
@@ -206,12 +212,7 @@ def test_corrupt_shard_never_reaches_current():
 
 
 def test_corrupt_committed_index_is_an_error_without_fallback():
-    source = Memory([{"id": 0}])
-    cache, key = _cache(), _key()
-    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key)
-    rows[0]
-    rows.finish()
-    rows.close()
+    source, cache, key = _filled_one_record()
     generation = cache.publish(key, source)
     manifest = json.loads(Store(generation.url + "/manifest.json").read())
     page = Store(generation.url + "/" + next(iter(manifest["pages"].values()))["path"])
@@ -447,6 +448,18 @@ def test_a_generation_reads_in_place_of_the_steps_it_ran_and_of_no_others(change
         iterate(other.cache(generation), read="indexed")
 
 
+def tagged(pipeline):
+    """`pipeline`'s records, each tagged ten times its id by a step a cache keys."""
+    return pipeline.map(lambda row: {**row, "tag": row["id"] * 10}, identity="tag@1")
+
+
+def tagged_ids(pipeline) -> list[tuple[int, int]]:
+    """Each record's id and tag as an indexed read of `pipeline` gives them."""
+    from dew.data.compile import iterate
+
+    return [(int(row["id"]), int(row["tag"])) for row in iterate(pipeline, read="indexed")]
+
+
 def test_a_generation_of_one_holdout_part_reads_as_that_part():
     """A generation published from a holdout part holds that part's rows, so it reads in place of
     that part whole, and the other part, whose rows it does not hold, is refused it; one published
@@ -455,43 +468,29 @@ def test_a_generation_of_one_holdout_part_reads_as_that_part():
     from dew.data.pipeline import Pipeline
 
     source = Memory([{"id": index} for index in range(12)])
-
-    def tagged(pipeline):
-        return pipeline.map(lambda row: {**row, "tag": row["id"] * 10}, identity="tag@1")
-
-    def ids(pipeline):
-        return [(int(row["id"]), int(row["tag"])) for row in iterate(pipeline, read="indexed")]
-
     train, held = Pipeline(source).holdout(records=5)
     part = publish(tagged(train), _cache(), read="indexed")
-    assert ids(tagged(train).cache(part)) == ids(tagged(train))
-    assert ids(tagged(train)) == [(index, index * 10) for index in range(5, 12)]
+    assert tagged_ids(tagged(train).cache(part)) == tagged_ids(tagged(train))
+    assert tagged_ids(tagged(train)) == [(index, index * 10) for index in range(5, 12)]
     with pytest.raises(ValueError):
         iterate(tagged(held).cache(part), read="indexed")
     store = publish(tagged(Pipeline(source)), _cache(), read="indexed")
-    served = [ids(tagged(branch).cache(store)) for branch in (train, held)]
-    assert served == [ids(tagged(train)), ids(tagged(held))]
+    served = [tagged_ids(tagged(branch).cache(store)) for branch in (train, held)]
+    assert served == [tagged_ids(tagged(train)), tagged_ids(tagged(held))]
 
 
 def test_a_generation_of_a_held_out_part_reads_under_the_holdouts_taken_from_that_part():
     """A generation published from a training part stands in for it under a second holdout taken
     from that part: the second holdout picks from the generation's rows as from the part's."""
-    from dew.data.compile import iterate, publish
+    from dew.data.compile import publish
     from dew.data.pipeline import Pipeline
 
     source = Memory([{"id": index} for index in range(12)])
-
-    def tagged(pipeline):
-        return pipeline.map(lambda row: {**row, "tag": row["id"] * 10}, identity="tag@1")
-
-    def ids(pipeline):
-        return [(int(row["id"]), int(row["tag"])) for row in iterate(pipeline, read="indexed")]
-
     part, _ = Pipeline(source).holdout(records=2)
     generation = publish(tagged(part), _cache(), read="indexed")
     for cached, uncached in zip(tagged(part).cache(generation).holdout(records=1),
                                 tagged(part).holdout(records=1), strict=True):
-        assert ids(cached) == ids(uncached)
+        assert tagged_ids(cached) == tagged_ids(uncached)
 
 
 def test_the_prompts_preset_reads_the_generation_its_memory_read_published():
@@ -575,6 +574,32 @@ def test_a_cache_reads_the_fill_an_earlier_run_completed_and_fills_another_key_a
     assert sorted(other.calls) == list(range(6))
 
 
+def share(data, index: int, count: int, steps: int, state=None):
+    """The ids of `steps` batches share `index` of `count` reads of `data`, from `state` where given,
+    and where it stops."""
+    from dew.data.dataset import DataPartition
+
+    reader = data.train(DataPartition(index=index, count=count))
+    try:
+        if state is not None:
+            reader.set_state(state)
+        return _ids(next(reader) for _ in range(steps)), reader.get_state()
+    finally:
+        reader.close()
+
+
+def first_batches(chain, read, loading):
+    """The ids of the first four batches of three a read of `chain`, repeated, gives."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+
+    reader = compile(chain.repeat().batch(3), read=read, loading=loading).train(DataPartition())
+    try:
+        return _ids(next(reader) for _ in range(4))
+    finally:
+        reader.close()
+
+
 def _ids(batches):
     return [[(int(row), int(value)) for row, value in zip(batch["id"], batch["value"], strict=True)]
             for batch in batches]
@@ -585,7 +610,7 @@ def test_a_cache_of_one_record_an_input_reads_each_share_as_the_uncached_order_d
     indexed read each read what the uncached chain's share reads, the shuffle one order over every
     input. A position saved at two shares restores at one, reading on as the uncached chain does."""
     from dew.data.compile import compile
-    from dew.data.dataset import DataPartition, Loading
+    from dew.data.dataset import Loading
     from dew.data.pipeline import Pipeline
 
     loading = Loading(workers=0, threads=1, read_buffer=1)
@@ -595,15 +620,6 @@ def test_a_cache_of_one_record_an_input_reads_each_share_as_the_uncached_order_d
         stepped = Pipeline(source).map(Offset(10))
         return compile((stepped if cache is None else stepped.cache(cache)).shuffle(0).repeat().batch(2),
                        read="indexed", loading=loading)
-
-    def share(data, index, count, steps, state=None):
-        reader = data.train(DataPartition(index=index, count=count))
-        try:
-            if state is not None:
-                reader.set_state(state)
-            return _ids(next(reader) for _ in range(steps)), reader.get_state()
-        finally:
-            reader.close()
 
     uncached, cached = built(None), built(str(tmp_path / "cache"))
     for index in range(2):
@@ -843,29 +859,23 @@ def test_a_published_generation_after_a_shuffle_reads_as_the_steps_it_stands_for
     step after a shuffle, read as the shuffled step's rows; one published from a step that drops
     rows holds no row for each input, so a shuffle before it is refused, naming the cache that
     reads it by input."""
-    from dew.data.compile import compile, publish
-    from dew.data.dataset import DataPartition, Loading
+    from dew.data.compile import publish
+    from dew.data.dataset import Loading
     from dew.data.pipeline import Pipeline
 
     loading = Loading(workers=0, threads=1, read_buffer=1)
     source = Memory([{"id": index} for index in range(12)])
 
-    def batches(chain):
-        reader = compile(chain.repeat().batch(3), read=read, loading=loading).train(DataPartition())
-        try:
-            return _ids(next(reader) for _ in range(4))
-        finally:
-            reader.close()
-
     generation = publish(Pipeline(source).map(Offset(10)), Cache(str(tmp_path / "one")), read="indexed",
                          loading=loading)
-    expected = batches(Pipeline(source).shuffle(3).map(Offset(10)))
-    assert batches(Pipeline(source).shuffle(3).map(Offset(10)).cache(generation)) == expected
+    expected = first_batches(Pipeline(source).shuffle(3).map(Offset(10)), read, loading)
+    cached = Pipeline(source).shuffle(3).map(Offset(10)).cache(generation)
+    assert first_batches(cached, read, loading) == expected
     kept = Pipeline(source).map(Offset(10)).filter_map(Keeps(5), identity="keeps@1")
     dropped = publish(kept, Cache(str(tmp_path / "kept")), read="indexed", loading=loading)
     with pytest.raises(ValueError):
-        batches(Pipeline(source).shuffle(3).map(Offset(10)).filter_map(Keeps(5), identity="keeps@1")
-                .cache(dropped))
+        first_batches(Pipeline(source).shuffle(3).map(Offset(10)).filter_map(Keeps(5), identity="keeps@1")
+                .cache(dropped), read, loading)
 
 
 @pytest.mark.parametrize("views", ["shuffled", "shuffled in windows", "repeated then shuffled", "taken"])
@@ -914,7 +924,7 @@ def test_a_cache_of_one_record_an_input_after_views_reads_each_share_as_the_unca
     each of two shares reads what the uncached chain's share reads, the take one over every input,
     and a position saved at two shares restores at one as the uncached chain's does."""
     from dew.data.compile import compile
-    from dew.data.dataset import DataPartition, Loading
+    from dew.data.dataset import Loading
     from dew.data.pipeline import Pipeline
 
     loading = Loading(workers=0, threads=1, read_buffer=1)
@@ -924,15 +934,6 @@ def test_a_cache_of_one_record_an_input_after_views_reads_each_share_as_the_unca
         stepped = Pipeline(source).shuffle(0).take(10).map(Offset(10))
         return compile((stepped if cache is None else stepped.cache(cache)).repeat().batch(2), read=read,
                        loading=loading)
-
-    def share(data, index, count, steps, state=None):
-        reader = data.train(DataPartition(index=index, count=count))
-        try:
-            if state is not None:
-                reader.set_state(state)
-            return _ids(next(reader) for _ in range(steps)), reader.get_state()
-        finally:
-            reader.close()
 
     uncached, cached = built(None), built(str(tmp_path / "cache"))
     for index in range(2):
@@ -1044,8 +1045,8 @@ def test_a_generation_of_a_configured_step_after_a_shuffle_reads_as_the_steps_it
     """A generation published from a configured step that states it keeps every record stands in for
     it after a shuffle, read as the uncached chain's rows; one that binds to a step dropping records
     against its statement is refused."""
-    from dew.data.compile import compile, publish
-    from dew.data.dataset import DataPartition, Loading
+    from dew.data.compile import publish
+    from dew.data.dataset import Loading
     from dew.data.pipeline import Configured, Pipeline
 
     loading = Loading(workers=0, threads=1, read_buffer=1)
@@ -1054,18 +1055,12 @@ def test_a_generation_of_a_configured_step_after_a_shuffle_reads_as_the_steps_it
     def stepped(chain):
         return chain.map(Configured(OffsetBy(Offset(10)), needs=(), one_to_one=True))
 
-    def batches(chain):
-        reader = compile(chain.repeat().batch(3), read=read, loading=loading).train(DataPartition())
-        try:
-            return _ids(next(reader) for _ in range(4))
-        finally:
-            reader.close()
-
     generation = publish(stepped(Pipeline(source)), Cache(str(tmp_path / "one")), read=read, loading=loading)
-    assert batches(stepped(Pipeline(source).shuffle(3)).cache(generation)) == batches(
-        stepped(Pipeline(source).shuffle(3)))
+    expected = first_batches(stepped(Pipeline(source).shuffle(3)), read, loading)
+    assert first_batches(stepped(Pipeline(source).shuffle(3)).cache(generation), read, loading) == expected
     with pytest.raises(ValueError):
-        batches(Pipeline(source).map(Configured(KeepsBy(Keeps(5)), needs=(), one_to_one=True)))
+        first_batches(Pipeline(source).map(Configured(KeepsBy(Keeps(5)), needs=(), one_to_one=True)), read,
+                      loading)
 
 
 @dataclass(frozen=True)
@@ -1263,31 +1258,19 @@ def rewritten_warm_read(tmp_path, read: str, loading):
     return loader.train(DataPartition())
 
 
-@pytest.mark.parametrize("read", ["indexed", "streamed"])
-def test_a_warm_cache_read_by_worker_processes_refuses_a_manifest_rewritten_since_it_was_committed(
-        tmp_path, read):
-    """Worker processes read a published generation's manifest checked against the size and digest
-    its cache's CURRENT committed it under, as the process that compiled the read does: a manifest
-    rewritten since, the same records in other bytes, is refused, not read."""
-    from dew.data.dataset import Loading
-
-    reader = rewritten_warm_read(tmp_path, read, Loading(workers=2, threads=1, read_buffer=2))
-    try:
-        with pytest.raises(OSError):
-            next(reader)
-    finally:
-        reader.close()
-
-
 @pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
+@pytest.mark.parametrize("workers", [0, 2], ids=["in process", "worker processes"])
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
-def test_a_cached_read_its_cache_refuses_leaves_no_shard_iterator_half_built(tmp_path, read):
-    """A read whose published generation the cache refuses, its manifest rewritten since it was
-    committed, raises where it opens, and the iterators it opened close whole: none is left half
-    built for the collector to close, so no close raises unraisably."""
+def test_a_cached_read_its_cache_refuses_raises_and_leaves_no_iterator_half_built(tmp_path, read, workers):
+    """A warm read of a published generation whose manifest was rewritten since its cache's CURRENT
+    committed it, the same records in other bytes, is refused, not read, in this process and in
+    worker processes, which check the manifest against the size and digest CURRENT committed it
+    under as the process that compiled the read does. The iterators it opened close whole, Dew's
+    and Grain's: Grain builds a pool's iterators here for their first state, which reads no storage,
+    so none is left half built for the collector to close and no close raises unraisably."""
     from dew.data.dataset import Loading
 
-    reader = rewritten_warm_read(tmp_path, read, Loading(workers=0, threads=1, read_buffer=0))
+    reader = rewritten_warm_read(tmp_path, read, Loading(workers=workers, threads=1, read_buffer=workers))
     try:
         with pytest.raises(OSError):
             next(reader)

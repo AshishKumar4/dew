@@ -108,6 +108,7 @@ __all__ = [
     "ProjectionGroup",
     "ProjectsParameters",
     "QuantizesInputs",
+    "ReadsTrain",
     "Recomputing",
     "RematChoosing",
     "RequiresText",
@@ -225,16 +226,30 @@ class OutputTable:
 
 
 @runtime_checkable
+class ReadsTrain(Protocol):
+    """A module whose call takes `train`, for a stochastic layer of its own (a token mixer's or a
+    feed-forward's dropout, a vision tower's drop path): its owner passes `train` where `reads_train`
+    says the call reads it, whatever the module's family."""
+
+    @property
+    def reads_train(self) -> bool: ...
+
+
+@runtime_checkable
 class SteppedInContext(Protocol):
     """A model whose head reads parameters an objective steps in context, a window at a time
     (`dew.nn.continuum`, `LMObjective(adaptation=...)`): the level's parameters within a tree of its
     variables, None without a level; the tree with others in their place; and the two halves of the
     head the steps run between, the level on final states (`continuum_states`) and the head past it
     (`head_logits`). Its owner keeps the level's place in its tree, so an objective never reads it.
-    `in_context` says whether the model holds a level."""
+    `in_context` says whether the model holds a level, and `affine_head`, read from the bound model,
+    whether `head_logits` is affine in its states, which a damped step's curvature bound needs
+    (`ChunkAdaptation.damped`)."""
 
     @property
     def in_context(self) -> bool: ...
+
+    def affine_head(self) -> bool: ...
 
     def in_context_level(self, variables: VariableDict) -> VariableDict | None: ...
 
@@ -799,6 +814,17 @@ class ShiftsLogits(Protocol):
 
     @property
     def shifted_logits(self) -> bool: ...
+
+
+@runtime_checkable
+class PositionCapacity(Protocol):
+    """A model that declares the most places a row may hold that its positions cover, which a row longer
+    than that would read past (a learned table's rows), None where its positions cover any (rotary,
+    ALiBi): what a training row's length is checked against, apart from its decode cache's capacity
+    (`Bounded.max_seq_len`). A model that declares none is checked for none."""
+
+    @property
+    def position_capacity(self) -> int | None: ...
 
 
 @runtime_checkable

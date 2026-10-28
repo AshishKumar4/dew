@@ -22,6 +22,7 @@ import numpy as np
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
+from dew.state import Accumulation
 from dew.telemetry.instrumentation import NO_FLOPS, StepFlops, model_flops_utilization
 from dew.training.display import TrainingDisplay
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount
@@ -190,9 +191,16 @@ class Interval:
     def real_tokens(self) -> int:
         """Lifetime real tokens: the runs before this fit's, its logged
         intervals' and the current interval's, read from the devices."""
+        return self.clocked(None)[0]
+
+    def clocked(self, window: Accumulation | None) -> tuple[int, int]:
+        """The lifetime real tokens (`real_tokens`) and the tokens an update's open `window` holds
+        (`Accumulation.tokens`; 0 for none), in one read off the devices."""
         counted = [tokens for tokens in (self.logged_tokens, self.book.tokens if self.tokens_counted and
                                          self.book is not None else None) if tokens is not None]
-        return self.tokens_before_log + sum(_TokenCount.host(tokens) for tokens in jax.device_get(counted))
+        read, held = jax.device_get((counted, None if window is None else window.tokens))
+        return (self.tokens_before_log + sum(_TokenCount.host(tokens) for tokens in read),
+                0 if held is None else _TokenCount.host(held))
 
     def take(self, step: int, loss: jax.Array, aux: Mapping[str, jax.Array], accepted: jax.Array,
              copies: tuple[jax.Array | None, jax.Array | None],
@@ -229,6 +237,40 @@ class Interval:
             self.resumable = step
         if self.book is not None and self.fresh is not None:
             self.book = self.book._replace(loss=self.fresh.loss)
+
+
+@dataclasses.dataclass
+class TokenClock:
+    """The committed-token clock as a fit's loop reads it (`dew.training._fit.FitPlan.committed`): `read`,
+    the count at its last read off the devices (`Interval.clocked`), and `bound`, above any count the
+    steps since can have brought it to, so the loop reads it again only where that reaches what a
+    budget, a cadence or a schedule reads next, and otherwise dispatches each step without waiting on
+    the last.
+
+    Committed tokens grow only by what an update's window held: `held` is the tokens the window open at
+    the last read held then, read with the count (`Accumulation.tokens`), and the most each step since
+    can add, its rows' tokens (`Objective.row_tokens`). So the bound holds however the windows fall, a
+    resumed run's restored window, a ramp's or a schedule's dropped one included. A step of no declared
+    tokens leaves it unknown (None) until the next read."""
+
+    read: int = 0
+    held: int | None = 0
+    """The most the window open at the last read and the steps since can commit; None where unknown."""
+
+    @property
+    def bound(self) -> int | None:
+        """The most the committed tokens can be after the latest step, or None where unknown."""
+        return None if self.held is None else self.read + self.held
+
+    def stepped(self, per_row: int | None, rows: int) -> None:
+        """Count a step of `rows` rows, each committing at most `per_row` tokens, None where they declare
+        none."""
+        self.held = None if self.held is None or per_row is None else self.held + per_row * rows
+
+    def reread(self, read: int, pending: int) -> None:
+        """Take `read`, the committed tokens off the devices after the latest step, and `pending`, those
+        of the window then open."""
+        self.read, self.held = read, pending
 
 
 @jax.jit

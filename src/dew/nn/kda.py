@@ -182,9 +182,10 @@ class KimiDeltaAttention(nn.Module):
                 return recurrent_delta_rule(query, key, value, g, beta, held, starts=starts)
             # A held history can make the convolved operands vary where the projections did not, so the
             # route is asked again of them.
+            # The batch's documents' firsts, built once with it (`Coordinates.firsts`).
             return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size,
                                           starts=starts, max_segments=tokens.max_segments,
-                                          floor=self.lower_bound)
+                                          floor=self.lower_bound, firsts=tokens.firsts)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
         # allocation-only call returns before any state is written. The conv

@@ -423,10 +423,12 @@ class Processor:
         extras. The second copies each chunk into `padded` at its row and image
         slot and writes `indices`, the slot each placeholder token reads.
 
-        The three branches are the three source layouts: Qwen's packed patch
-        runs, a per-patch position stream, and a fixed tokens-per-image grid.
+        The three branches are the three source layouts: Qwen's and Muse
+        Glimmer's packed patch runs, a per-patch position stream, and a fixed
+        tokens-per-image grid.
         """
         qwen = self.config.get("model_type") in QWEN35_TYPES
+        packed = qwen or self.config.get("model_type") == "muse_glimmer"
         gemma = self.config.get("model_type") in GEMMA4_TYPES
         image_id, video_id = _media_token_ids(self.record)
         pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))
@@ -438,11 +440,12 @@ class Processor:
         patch_positions = None
         grid = None
         merge = 1
-        if qwen:
-            expected_types = np.where(tokens == image_id, 1, np.where(tokens == video_id, 2, 0))
-            supplied_types = np.asarray(values.get("mm_token_type_ids"))
-            if not np.array_equal(supplied_types, expected_types):
-                raise ValueError("mm_token_type_ids must identify each image and video placeholder")
+        if packed:
+            if qwen:
+                expected_types = np.where(tokens == image_id, 1, np.where(tokens == video_id, 2, 0))
+                supplied_types = np.asarray(values.get("mm_token_type_ids"))
+                if not np.array_equal(supplied_types, expected_types):
+                    raise ValueError("mm_token_type_ids must identify each image and video placeholder")
             chunks, grid, merge = self._qwen_frames(values, tokens, runs)
             shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
             selected = [np.arange(length) for length in np.prod(grid, axis=1) // merge ** 2]
@@ -578,13 +581,16 @@ class Processor:
 
     def _merge_size(self) -> int:
         """The merger's spatial merge, as the projector's translation reads it, the reference's
-        default of 2 included."""
+        default of 2 included: Qwen 3.5's merger names it `spatial_merge_size`, Muse Glimmer's
+        adapter `merge_size`."""
         projector = _records.record(_records.record(self.record["projector"], "projector")["fields"],
                                    "projector fields")
-        return _records.integer(projector["spatial_merge_size"], "spatial_merge_size")
+        name = "spatial_merge_size" if "spatial_merge_size" in projector else "merge_size"
+        return _records.integer(projector[name], name)
 
     def _qwen_frames(self, values: Mapping[str, object], tokens: np.ndarray, runs):
-        """Return views of packed image/video patches in text order, one item per frame.
+        """Return views of packed image/video patches in text order, one item per frame: Qwen 3.5's
+        and Muse Glimmer's, whose processors pack alike.
 
         Qwen3.5 get_rope_index repeats video grids by their temporal count and
         resets each frame's temporal coordinate to zero. The processor places

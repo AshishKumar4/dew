@@ -253,12 +253,16 @@ class Session:
 @dataclass(frozen=True)
 class Snapshot:
     """The trainer's state at one rollout call, as an acquisition reads it: the `variables` the
-    step trains, its attempted `step` and committed `updates`, and the call's `key`."""
+    step trains, its attempted `step` and committed `updates`, the call's `key`, and the `branch` it
+    is drawn on, a cooldown branch's name (`RolloutScheduler.branch`) or None for the run's own, which
+    keeps what a collector records of a branch's calls apart from the run's at the same step and key
+    (an `EpisodeJournal`'s cohorts)."""
 
     variables: Variables
     step: int
     updates: int
     key: jax.Array
+    branch: str | None = None
 
 
 class Collector(Protocol):

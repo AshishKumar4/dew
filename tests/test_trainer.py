@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import itertools
 import json
+import logging
 import math
 import os
 import subprocess
@@ -28,7 +29,18 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import pytest
-from affine_run import BATCH, FEATURES, Counting, Features, Regression, Spread, dataset, raw_leaf, val_batches
+from affine_run import (
+    BATCH,
+    FEATURES,
+    Counting,
+    Features,
+    Regression,
+    Replaying,
+    Spread,
+    dataset,
+    raw_leaf,
+    val_batches,
+)
 from flax.core import FrozenDict, freeze as frozen_dict
 from recording import Preempting, RecordingTracker
 from reference_error import as_given, assert_as_exact
@@ -39,9 +51,14 @@ from dew import position
 from dew.artifacts import Representations
 from dew.batch import merge, under
 from dew.checkpoints import Ranking
+from dew.data import Memory, presets, schedule
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, replayed
+from dew.data.pipeline import Pipeline
+from dew.data.sources.tokens import TokenFiles
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Aux, EMASpec, Objective
+from dew.objectives.lm import LMObjective
 from dew.optim import Cosine, OptimConfig, Power
 from dew.state import CHECKPOINTED, TrainState
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, ema_update
@@ -214,6 +231,106 @@ def test_resumed_tokens_stay_exact_above_float32_integer_resolution(tmp_path, ca
     resumed = make_trainer(tmp_path, objective=LargeTokenRegression())
     state = resumed.fit(dataset(LargeTokenRows), tokens=65 * 262143 + 1, log_every=cadence)
     assert int(state.step) == 66
+
+
+LM_CONTEXT = 6
+LM_ROWS = 8
+
+
+def lm_data() -> Pipeline:
+    """Batches of eight rows of seven real ids, read again and again: each step commits its rows'
+    48 targets, the most they hold (`Objective.row_tokens`)."""
+    rows = (np.arange(2 * LM_ROWS * (LM_CONTEXT + 1), dtype=np.int32) % 13).reshape(-1, LM_CONTEXT + 1)
+    return Pipeline(Memory({"text": rows})).repeat().batch(LM_ROWS)
+
+
+def budget_lm_trainer(tmp_path=None, **kwargs) -> Trainer:
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=12, dtype="float32")
+    return make_trainer(tmp_path, objective=LMObjective(model, seq_len=LM_CONTEXT), **kwargs)
+
+
+@pytest.mark.parametrize("accumulation", [1, 2], ids=["one-step-updates", "two-step-windows"])
+def test_a_token_budget_reads_its_count_off_the_devices_as_often_in_a_longer_run(caplog, accumulation):
+    """An LM run's step commits at most its rows' targets (`Objective.row_tokens`), so a token budget
+    reads the committed count off the devices at its first step, whose window a checkpoint may have
+    begun, and at the steps whose rows could have brought it to the budget, never at those between, each
+    of which such a read waits on before the next step dispatches: a run of twenty steps reads it as
+    often as a run of four."""
+    def reads(steps: int) -> int:
+        caplog.clear()
+        with jax.transfer_guard_device_to_host("log_explicit"), caplog.at_level(logging.WARNING):
+            trainer = budget_lm_trainer(accumulation=accumulation)
+            state = trainer.fit(lm_data(), tokens=steps * LM_ROWS * LM_CONTEXT)
+        assert int(state.step) == steps
+        return sum("shape=(2,), dtype=uint32" in record.getMessage() for record in caplog.records)
+
+    assert reads(4) == reads(20)
+
+
+def varied_rows(position: int) -> dict[str, np.ndarray]:
+    """The batch read at `position`: eight rows of thirteen ids, twelve targets each, then rows of four
+    ids, three targets each, from there on."""
+    width = 13 if position == 0 else 4
+    return {"text": (np.arange(LM_ROWS * width, dtype=np.int32) % 13).reshape(LM_ROWS, width)}
+
+
+def test_a_token_budget_resumed_inside_an_update_ends_where_an_unbroken_run_does(tmp_path):
+    """A run of updates of three steps stopped after its first step resumes with that step's 96 targets
+    still to commit, more than any later step's 24: the update's commit at step 3 brings the run to the
+    budget of 144, so the resumed run ends there, as a run that never stopped does, where a bound of its
+    own steps alone would not reach the budget until step 6."""
+    def data():
+        return Loader(lambda partition: Replaying(varied_rows), None, batch=LM_ROWS, records=None)
+
+    budget = LM_ROWS * (12 + 3 + 3)
+    unbroken = budget_lm_trainer(tmp_path / "unbroken", accumulation=3).fit(data(), tokens=budget)
+    budget_lm_trainer(tmp_path / "broken", accumulation=3).fit(data(), steps=1)
+    resumed = budget_lm_trainer(tmp_path / "broken", accumulation=3).fit(data(), tokens=budget)
+    assert int(unbroken.step) == int(resumed.step) == 3
+
+
+def context_schedule(tmp_path, longer: int) -> Pipeline:
+    """A context-extension schedule over one token store: windows of LM_CONTEXT inputs until the run
+    commits two steps' targets, then windows of `longer`."""
+    corpus = write_token_corpus(tmp_path / "tokens", np.tile(np.arange(13), 64), tokenizer="symbols",
+                                vocab_size=13)
+
+    def stage(seq_len: int) -> Pipeline:
+        return TokenFiles(corpus.train).pipe(presets.token_windows, seq_len=seq_len, batch=None)
+
+    return schedule([(stage(LM_CONTEXT), 2 * LM_ROWS * LM_CONTEXT), (stage(longer), None)]).batch(LM_ROWS)
+
+
+def test_a_schedule_trains_each_stage_at_the_row_length_it_lays_out(tmp_path):
+    """The second stage of a context-extension schedule lays out windows of ten inputs, past the
+    objective's own six and within the model's context (max_seq_len 12): the run trains it at that
+    length, compiled when its first batch arrives, and commits every target of both stages, two steps
+    of 8 x 6, then steps of 8 x 10."""
+    tracker = RecordingTracker()
+    budget_lm_trainer(tracker=tracker).fit(context_schedule(tmp_path, 10), steps=4, log_every=1)
+    committed = [scalars["train/tokens"] for _, scalars in tracker.scalars if "train/tokens" in scalars]
+    assert committed == [LM_ROWS * LM_CONTEXT] * 2 + [LM_ROWS * 10] * 2
+
+
+def test_a_schedule_stage_past_the_models_context_is_refused(tmp_path):
+    """A stage whose windows hold thirteen inputs, past the model's max_seq_len of twelve, is refused
+    once its rows arrive, where a stage of twelve trains."""
+    budget_lm_trainer().fit(context_schedule(tmp_path / "held", 12), steps=4)
+    with pytest.raises(ValueError):
+        budget_lm_trainer().fit(context_schedule(tmp_path / "past", 13), steps=4)
+
+
+def test_an_objective_whose_rows_pass_a_learned_position_table_is_refused():
+    """A decoder whose positions are a learned table of twelve rows covers twelve places
+    (`PositionCapacity`), however long the rows its objective names: an objective of thirteen-token rows
+    is refused, whose rows, and the rows of any stage it reads up to them, would gather past the table,
+    and one of twelve is not."""
+    model = CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=12, position_embedding="learned", dtype="float32")
+    assert LMObjective(model, seq_len=12).context == 12
+    with pytest.raises(ValueError):
+        LMObjective(model, seq_len=13)
 
 
 @pytest.mark.parametrize("variant", ["ema", "accumulation", "schedule", "dynamic_scale", "checkpoints"])
@@ -393,6 +510,26 @@ class Keyed(Regression):
         return base * factor, aux
 
 
+def test_a_run_that_must_continue_refuses_to_start_afresh_and_one_that_must_not_refuses_to_continue(tmp_path):
+    """`fit(resume="require")` continues the latest checkpoint and refuses a directory with none, or a
+    run given its own state=, so a job that must continue never trains from scratch; `resume="never"`
+    trains a fresh directory and refuses one that holds a run, leaving that run's checkpoints as they
+    were, which the run that must continue then continues."""
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path).fit(dataset(), steps=2, resume="require")
+    assert int(make_trainer(tmp_path).fit(dataset(), steps=2, resume="never").step) == 2
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path).fit(dataset(), steps=4, resume="never")
+    given = make_trainer(tmp_path)
+    with pytest.raises(ValueError):
+        given.fit(dataset(), steps=4, resume="require", state=given.initial_state())
+    continued = make_trainer(tmp_path).fit(dataset(), steps=4, resume="require")
+    whole = make_trainer().fit(dataset(), steps=4)
+    for actual, expected in zip(jax.tree.leaves(continued.variables), jax.tree.leaves(whole.variables),
+                                strict=True):
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
 def test_a_resumed_run_continues_the_key_stream(tmp_path):
     """A resume continues fold_in(run_key, step) where it stopped.
 
@@ -540,9 +677,6 @@ def test_final_checkpoint_policy_is_independent_of_the_cadence(tmp_path, cadence
 def held_lm_trainer(container=dict, **settings):
     """A one-layer LM trainer over held weights, which the objective holds
     in `container` (Flax's FrozenDict, say)."""
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.lm import LMObjective
-
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     weights = jax.jit(LMObjective(model, seq_len=4).init)(jax.random.key(0))
@@ -624,9 +758,8 @@ def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
 
 
 def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_path):
-    from dew.data import Loading, presets
+    from dew.data import Loading
     from dew.data.dataset import Forwarding
-    from dew.data.sources.tokens import TokenFiles
 
     corpus = write_token_corpus(tmp_path / "tokens", np.arange(29))
 
@@ -700,10 +833,7 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
     before the backend opens. Check every state leaf, not just parameters.
     bf16 at the default precision runs the head that rounds its logits and
     their gradient to bf16, and resumes bit-exactly too."""
-    from dew.data import Loading, presets
-    from dew.data.sources.tokens import TokenFiles
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.objectives.lm import LMObjective
+    from dew.data import Loading
 
     corpus = write_token_corpus(tmp_path / "tokens", np.tile(np.arange(8), 256), tokenizer="symbols",
                                 vocab_size=8)
@@ -1251,39 +1381,65 @@ def test_a_cadence_may_be_a_share_of_the_run(tmp_path, written, expected):
 
 
 def cooldown_run(schedule, steps: int, accumulation: int, tracker=None, cooldowns=None,
-                 directory=None) -> TrainState:
+                 directory=None, rollout=None) -> TrainState:
     """Regression on AdamW at `schedule` for `steps`, scored once at its end, with any `cooldowns`,
-    checkpointed in `directory` where one is given."""
-    trainer = make_trainer(directory, tracker=tracker, accumulation=accumulation,
+    checkpointed in `directory` where one is given, its batches through any `rollout`."""
+    trainer = make_trainer(directory, tracker=tracker, accumulation=accumulation, rollout=rollout,
                            optimizer=OptimConfig(optimizer="adamw", learning_rate=schedule))
     return trainer.fit(dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps,
                        cooldowns=cooldowns)
 
 
+class NoisedTargets:
+    """A rollout whose batch is its state's and key's: the targets moved by noise its key draws, scaled
+    by its state's step, noting every step it is called at."""
+
+    def __init__(self):
+        self.steps: list[int] = []
+
+    def __call__(self, state, batch, key):
+        self.steps.append(int(state.step))
+        noise = np.asarray(jax.random.normal(key, np.shape(batch["y"])), np.float32)
+        return {**batch, "y": np.asarray(batch["y"]) + np.float32(0.01) * (1 + int(state.step)) * noise}
+
+
+@pytest.mark.parametrize("rollout", [False, True], ids=["batches", "rollout"])
 @pytest.mark.parametrize("accumulation", [1, 2])
-def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the_run_as_it_was(accumulation):
+def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the_run_as_it_was(
+        accumulation, rollout):
     """A linear cooldown of four updates from the fourth of a warmup-stable-decay run is the run whose
     decay begins there: the branch's `cooldown_val/loss`, recorded at the step it branched from, is that
     run's final `val/loss` bit for bit (its rates, 2^-4 times 1, 3/4, 1/2 and 1/4, exact), and the run
-    it branched from ends where a run with no cooldown ends, its parameters bit for bit."""
+    it branched from ends where a run with no cooldown ends, its parameters bit for bit. With a rollout
+    whose batches are its states' and keys' (`NoisedTargets`), the branch trains on what the rollout
+    draws from the branch's own states, as the decayed run trains on what it draws from its own, and
+    the run draws from its states again from the step it branched at."""
     from dew.optim import Linear
     from dew.telemetry.records import FitStarted
     from dew.training.cooldown import Cooldowns
 
     peak, at = 2.0 ** -4, 4 * accumulation
     stable = Linear(peak, decay_start=64, decay_steps=128)
-    tracker = RecordingTracker()
+    tracker, drawn = RecordingTracker(), NoisedTargets() if rollout else None
     branched = cooldown_run(stable, 3 * at, accumulation, tracker,
-                            Cooldowns(at=(at,), length=at, shape="linear"))
+                            Cooldowns(at=(at,), length=at, shape="linear"), rollout=drawn)
     cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
               if "cooldown_val/loss" in scalars}
     decayed = RecordingTracker()
-    cooldown_run(Linear(peak, decay_start=4, decay_steps=8), 2 * at, accumulation, decayed)
+    cooldown_run(Linear(peak, decay_start=4, decay_steps=8), 2 * at, accumulation, decayed,
+                 rollout=NoisedTargets() if rollout else None)
     finals = [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars]
     assert cooled == {at: finals[-1]}
+    if drawn is not None:
+        assert drawn.steps == [*range(at), *range(at, 2 * at), *range(at, 3 * at)]
+        # The branch trains on the rollout's batches, not the stream's: the run with none scores otherwise.
+        unrolled = RecordingTracker()
+        cooldown_run(stable, 3 * at, accumulation, unrolled, Cooldowns(at=(at,), length=at, shape="linear"))
+        assert {step: scalars["cooldown_val/loss"] for step, scalars in unrolled.scalars
+                if "cooldown_val/loss" in scalars} != cooled
     started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
     assert started.cadences["cooldowns.at"] == [at]
-    plain = cooldown_run(stable, 3 * at, accumulation)
+    plain = cooldown_run(stable, 3 * at, accumulation, rollout=NoisedTargets() if rollout else None)
     for ours, theirs in zip(jax.tree.leaves(branched.variables), jax.tree.leaves(plain.variables),
                             strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))

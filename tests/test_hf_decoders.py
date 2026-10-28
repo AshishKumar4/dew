@@ -188,6 +188,35 @@ def test_llama_checkpoint_with_training_metadata_keeps_reference_logits(tmp_path
     np.testing.assert_allclose(np.asarray(actual), expected, atol=1e-4, rtol=0)
 
 
+def test_a_llama_release_repeating_its_fields_under_megatrons_names_loads_as_it_states_them(tmp_path):
+    """Nanbeige4.3's Llama configs repeat five fields under Megatron's names (ffn_hidden_size,
+    num_query_groups, rotary_base, kv_channels, seq_length) beside the ones LlamaConfig reads, and
+    state its embedding and residual dropout, which LlamaModel never applies: the release loads as
+    the model its own fields state, the same model and variables bit for bit, and a repeat that
+    states another value than its field is refused by name (ledger 1883)."""
+    from shutil import copytree
+
+    original = FIXTURES / "llama-tiny"
+    plain = Pretrained.load(original, dtype="float32")
+    config = fixture_config("llama-tiny")
+    head_dim = config.get("head_dim", config["hidden_size"] // config["num_attention_heads"])
+    theta = config["rope_parameters"]["rope_theta"]
+    repeats = {"ffn_hidden_size": config["intermediate_size"],
+               "num_query_groups": config["num_key_value_heads"], "rotary_base": theta,
+               "kv_channels": head_dim, "seq_length": config["max_position_embeddings"]}
+    directory = tmp_path / "checkpoint"
+    copytree(original, directory)
+    stated = {**config, "head_dim": head_dim, **repeats, "embd_pdrop": 0.0, "resid_pdrop": 0.0}
+    (directory / "config.json").write_text(json.dumps(stated))
+    loaded = Pretrained.load(directory, dtype="float32")
+    assert loaded.model == plain.model
+    for got, want in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(plain.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    (directory / "config.json").write_text(json.dumps({**stated, "rotary_base": 2 * theta}))
+    with pytest.raises(ValueError):
+        Pretrained.load(directory, dtype="float32")
+
+
 @pytest.mark.parametrize("name, head", [("llama-tiny", "causal"), ("nemotron-h-tiny", "causal"),
                                         ("modernbert-tiny", "masked")])
 def test_a_biased_mlp_loads_and_exports_where_the_reference_reads_mlp_bias(name, head, tmp_path):
@@ -632,8 +661,8 @@ def test_a_plain_rope_scaling_clears_the_ramp_rope_parameters_names(tmp_path, na
     """The mixin replaces rope_parameters with a stated rope_scaling whole,
     so an explicit plain rope_scaling over a ramp is plain rope at the
     family's default base, as that spelling stated alone is. A family
-    whose mixer reads only one plain or YaRN entry refuses other ramps
-    and per-kind records through the same loader."""
+    whose mixer reads one rope entry refuses per-kind records through the
+    same loader, and GPT-OSS, whose mixer reads YaRN alone, other ramps."""
     plain = {"rope_type": "default"}
     conflicting = _respelled(name, tmp_path / "conflicting",
                              lambda config: {**config, "rope_scaling": plain})
@@ -648,11 +677,11 @@ def test_a_plain_rope_scaling_clears_the_ramp_rope_parameters_names(tmp_path, na
     if name == "llama31-tiny":
         assert np.max(np.abs(logits[0] - reference)) > 1e-3
     else:
-        for index, entry in enumerate((
-            {"rope_type": "llama3", "factor": 4.0, "low_freq_factor": 1.0,
-             "high_freq_factor": 4.0, "original_max_position_embeddings": 16},
-            {"full_attention": plain, "sliding_attention": plain},
-        )):
+        llama3 = {"rope_type": "llama3", "factor": 4.0, "low_freq_factor": 1.0,
+                  "high_freq_factor": 4.0, "original_max_position_embeddings": 16}
+        # DeepSeek's latent attention takes Llama 3.1's ramp beside YaRN's; GPT-OSS's reads YaRN alone.
+        for index, entry in enumerate((*(llama3,) * name.startswith("gpt-oss"),
+                                       {"full_attention": plain, "sliding_attention": plain})):
             unsupported = _respelled(name, tmp_path / f"unsupported-{index}",
                                       lambda config, entry=entry: {**config, "rope_scaling": entry})
             with pytest.raises(ValueError):
@@ -956,17 +985,20 @@ np.save(out, logits.to(torch.float32).numpy())
     return np.load(out)
 
 
+def assert_transformers_reads_the_export(model, variables, export, tmp_path) -> None:
+    """`model`'s export to `export` is a checkpoint transformers reads, computing Dew's logits over the
+    Qwen3 fixture's ids."""
+    PretrainedDecoder.from_model(model, variables).save(export)
+    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
+    ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
+    difference = float(np.max(np.abs(transformers_logits(export, ids, tmp_path) - ours)))
+    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+
+
 def test_our_export_loads_in_transformers_with_the_same_logits(tmp_path):
     """The export is a real HF checkpoint: transformers reads it and agrees."""
     model, variables = fp32_decoder(FIXTURES / "qwen3-tiny")
-    export = tmp_path / "exported"
-    PretrainedDecoder.from_model(model, variables).save(export)
-
-    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
-    ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(transformers_logits(export, ids, tmp_path) - ours)))
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert_transformers_reads_the_export(model, variables, tmp_path / "exported", tmp_path)
 
 
 def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rng):
@@ -975,13 +1007,7 @@ def test_a_biased_qwen3_export_carries_its_biases_into_transformers(tmp_path, rn
     does and a biased export is a checkpoint it reads."""
     model, variables = biased_qwen3(rng)
     export = tmp_path / "biased"
-    PretrainedDecoder.from_model(model, variables).save(export)
-
-    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
-    ours = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(transformers_logits(export, ids, tmp_path) - ours)))
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    assert_transformers_reads_the_export(model, variables, export, tmp_path)
 
     again, reloaded = fp32_decoder(export)
     assert again == model
@@ -1039,15 +1065,17 @@ def _diffusion_fp32(name):
             np.load(directory / "logits.npy"), np.load(directory / "logits_f64.npy"))
 
 
-def test_llada_logits_match_the_released_model_code():
-    """fp32 parity with LLaDA's own modeling_llada.py (GSAI-ML/LLaDA-8B-Base
-    at 0f2787f, run by tools/remote_code_reference.py under transformers
-    4.46.3) on a tiny random-weight checkpoint, held to the float64 rule:
-    Dew's RMS error from the release's float64 logits at most twice the
-    release's own fp32 error. A causal model on the same weights misses by
-    1.5, so the fixture exercises full attention."""
-    model, variables, ids, reference, truth = _diffusion_fp32("llada-tiny")
-    assert_as_exact_as_the_reference(model.apply(variables, ids), reference, truth, "llada-tiny logits")
+@pytest.mark.parametrize("name", ["llada-tiny", "dream-tiny"])
+def test_a_diffusion_decoders_logits_match_the_released_model_code(name):
+    """fp32 parity with the release's own modeling code, LLaDA's modeling_llada.py
+    (GSAI-ML/LLaDA-8B-Base at 0f2787f) and Dream's modeling_dream.py
+    (Dream-org/Dream-v0-Base-7B at 6572adb), each run by
+    tools/remote_code_reference.py under transformers 4.46.3 on a tiny
+    random-weight checkpoint, held to the float64 rule. A causal model on the
+    same weights misses by more than 1 (1.5 for LLaDA, 4.9 for Dream), so the
+    fixtures exercise full attention."""
+    model, variables, ids, reference, truth = _diffusion_fp32(name)
+    assert_as_exact_as_the_reference(model.apply(variables, ids), reference, truth, f"{name} logits")
     causal = model.clone(causal=True)
     assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
 
@@ -1325,18 +1353,6 @@ def test_glm5_next_prefill_and_token_steps_match_parallel(glm5_next_source):
     actual = np.concatenate(pieces, axis=1)
     assert scaled_difference(actual, full) < 1e-4
     np.testing.assert_array_equal(actual.argmax(-1), full.argmax(-1))
-
-
-def test_dream_logits_match_the_released_model_code():
-    """fp32 parity with Dream's own modeling_dream.py (Dream-org/Dream-v0-Base-7B
-    at 6572adb, run by tools/remote_code_reference.py under transformers
-    4.46.3) on a tiny random-weight checkpoint, held to the float64 rule. A
-    causal model on the same weights misses by 4.9, so the fixture exercises
-    full attention."""
-    model, variables, ids, reference, truth = _diffusion_fp32("dream-tiny")
-    assert_as_exact_as_the_reference(model.apply(variables, ids), reference, truth, "dream-tiny logits")
-    causal = model.clone(causal=True)
-    assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
 
 
 @pytest.mark.parametrize("mode", ["frozen", "trainable"])

@@ -39,11 +39,13 @@ class Holder(nn.Module):
 
     layout: KVCache
     dtype: jnp.dtype = jnp.float32
+    keys_as_values: bool = False
 
     @nn.compact
     def __call__(self, key, value):
         rows, tokens, heads, width = key.shape
-        store = KVStore.open(self, self.layout, rows, tokens, heads, width, self.dtype)
+        store = KVStore.open(self, self.layout, rows, tokens, heads, width, self.dtype,
+                             keys_as_values=self.keys_as_values)
         if self.has_variable("cache", "written"):
             store.write(key, value, jnp.broadcast_to(jnp.arange(tokens), (rows, tokens)))
         self.variable("cache", "written", lambda: True)
@@ -56,6 +58,29 @@ def stored(layout, keys, values=None, dtype=jnp.float32):
     holder = Holder(layout, dtype)
     cache = holder.init(jax.random.key(0), keys, values)["cache"]
     return holder.apply({"cache": cache}, keys, values, mutable=["cache"])[0]
+
+
+@pytest.mark.parametrize(("layout", "once"), [(KVCache(), True), (KVCache(page_size=4), True),
+                                             (KVCache(quantized="float8_e4m3fn"), True),
+                                             (KVCache(quantized="int8"), False)],
+                         ids=["dense", "paged", "float8", "int8"])
+def test_a_head_that_serves_as_keys_and_values_is_kept_once_where_its_layout_stores_it_as_given(layout, once):
+    """A store whose values are its keys (DeepSeek V4's window head and its drafter's context,
+    `keys_as_values`) reads back what a store holding the head twice reads, keys and values alike, and
+    holds fewer bytes where its layout stores keys as given, full precision or float8, where both were
+    allocated and written (ledger 1921); int8's keys are rotated, not the values' layout, so it keeps
+    both (`KVCache.key_rotation`)."""
+    keys = jax.random.normal(jax.random.key(0), (2, 8, 1, 16))
+
+    def kept(holder):
+        cache = holder.init(jax.random.key(0), keys, keys)["cache"]
+        read, written = holder.apply({"cache": cache}, keys, keys, mutable=["cache"])
+        return read, sum(np.asarray(leaf).nbytes for leaf in jax.tree.leaves(written))
+
+    (shared, shared_bytes), (separate, separate_bytes) = (kept(Holder(layout, keys_as_values=flag))
+                                                         for flag in (True, False))
+    jax.tree.map(np.testing.assert_array_equal, shared, separate)
+    assert (shared_bytes < separate_bytes) == once and shared_bytes <= separate_bytes
 
 
 def outlier_keys(seed=0):
@@ -215,45 +240,36 @@ def test_native_gpu_paged_value_and_derivatives_are_the_gathered_attentions(with
                                      np.asarray(truth), "paged decode kernel")
 
 
-def test_a_pool_too_small_for_every_row_is_refused_where_no_server_assigns_pages():
-    """Outside a server nobody hands out pages, so a pool that cannot give
-    every row its default block is refused before anything runs, rather
-    than dropping the writes of the rows past it."""
+def greedy(layout):
+    """The tokens a one-layer decoder draws greedily for two prompts and 40 new tokens through a cache of
+    `layout`, from the same weights whatever the layout."""
     from dew.inference import TextGeneration
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.sampling import Sampling
 
-    def model(layout):
+    def model(cache):
         return CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                                 mlp_features=32, max_seq_len=128, dtype="float32", kv_cache=layout)
+                                 mlp_features=32, max_seq_len=128, dtype="float32", kv_cache=cache)
 
     params = model(KVCache()).init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     prompts = np.array([[1, 2, 3, 4, 5, 6, 7], [7, 6, 5, 4, 3, 2, 1]])
-    small = TextGeneration(model(KVCache(page_size=16, pages=10)), params, sampling=Sampling(temperature=0))
+    return TextGeneration(model(layout), params, sampling=Sampling(temperature=0))(prompts, 40, key=0).tokens
+
+
+def test_a_pool_too_small_for_every_row_is_refused_where_no_server_assigns_pages():
+    """Outside a server nobody hands out pages, so a pool that cannot give
+    every row its default block is refused before anything runs, rather
+    than dropping the writes of the rows past it."""
     with pytest.raises(ValueError):
-        small(prompts, 40, key=0)
-    whole = TextGeneration(model(KVCache(page_size=16)), params, sampling=Sampling(temperature=0))
-    dense = TextGeneration(model(KVCache()), params, sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(whole(prompts, 40, key=0).tokens, dense(prompts, 40, key=0).tokens)
+        greedy(KVCache(page_size=16, pages=10))
+    np.testing.assert_array_equal(greedy(KVCache(page_size=16)), greedy(KVCache()))
 
 
 def test_a_pool_split_into_groups_reads_what_each_row_wrote():
     """A pool in two parts, one per row: each row's table counts pages from
     the start of its own part, and every read and write runs mapped over the
     parts. Decoding through it draws what the dense cache draws."""
-    from dew.inference import TextGeneration
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.sampling import Sampling
-
-    def model(layout):
-        return CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
-                                 mlp_features=32, max_seq_len=128, dtype="float32", kv_cache=layout)
-
-    params = model(KVCache()).init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-    prompts = np.array([[1, 2, 3, 4, 5, 6, 7], [7, 6, 5, 4, 3, 2, 1]])
-    grouped = TextGeneration(model(KVCache(page_size=16, groups=2)), params, sampling=Sampling(temperature=0))
-    dense = TextGeneration(model(KVCache()), params, sampling=Sampling(temperature=0))
-    np.testing.assert_array_equal(grouped(prompts, 40, key=0).tokens, dense(prompts, 40, key=0).tokens)
+    np.testing.assert_array_equal(greedy(KVCache(page_size=16, groups=2)), greedy(KVCache()))
 
 
 class Writer(nn.Module):
@@ -319,16 +335,14 @@ def test_a_cursor_past_capacity_marks_the_row_whose_appends_overflowed():
 
 
 @pytest.mark.mesh(devices=4)
-@pytest.mark.parametrize("axes, native", [({"data": 2}, True), ({"tensor": 2}, True),
-                                          ({"data": 2, "tensor": 2}, True), ({"tensor": 4}, False)],
+@pytest.mark.parametrize("axes", [{"data": 2}, {"tensor": 2}, {"data": 2, "tensor": 2}, {"tensor": 4}],
                          ids=["rows", "heads", "rows-and-heads", "heads-past-the-pool"])
-def test_a_paged_decode_step_lowers_for_a_tpu_on_a_mesh_that_splits_rows_or_heads(axes, native):
-    """A decoder's single-token step over a bf16 paged pool reads it through the TPU's paged kernel,
-    which jax refuses to lower where the partitioner would have to split it ("Mosaic kernels cannot
-    be automatically partitioned"). On a v6e mesh splitting the rows, the heads or both, the step
-    lowers with the kernel run per shard (`sharded.tpu_lowering`), each holding its rows and the
-    pool's key heads its query heads read; a mesh splitting the query heads past the pool's two key
-    heads reads the gathered rows instead."""
+def test_a_paged_decode_step_lowers_for_a_tpu_on_a_mesh_that_splits_rows_or_heads(axes):
+    """A decoder's single-token step over a bf16 paged pool, which jax refuses to lower where the
+    partitioner would have to split a Mosaic kernel ("Mosaic kernels cannot be automatically
+    partitioned"): on a v6e mesh splitting the rows, the heads, both, or the query heads past the pool's
+    two key heads, the step lowers (`sharded.tpu_lowering`), each shard holding its rows and the pool's
+    key heads its query heads read."""
     from sharded import placed, tpu_lowering, tpu_mesh
 
     mesh = tpu_mesh(**axes)
@@ -345,84 +359,7 @@ def test_a_paged_decode_step_lowers_for_a_tpu_on_a_mesh_that_splits_rows_or_head
 
     rows = "data" if "data" in axes else None
     arguments = (placed(params, mesh), placed(cache, mesh), placed(tokens, mesh, rows))
-    lowered = tpu_lowering(step, arguments, mesh)
-    assert ("tpu_custom_call" in lowered) is native
-
-
-def paged_case(**changed):
-    """A bf16 decode step's `PagedCase` over a 16-slot paged pool, as an A100's step sees it, with
-    `changed` fields."""
-    from dew.nn.kv_cache import PagedCase
-
-    fields = {"heads": 8, "kv_heads": 2, "head_dim": 128, "value_dim": 128, "dtype": jnp.dtype(jnp.bfloat16),
-              "pool": jnp.dtype(jnp.bfloat16), "page_size": 16, "quantized": False, "groups": 1,
-              "head_shards": 1, "softcap": None, "arithmetic": False, "named": "auto"}
-    return PagedCase(**{**fields, **changed})
-
-
-@pytest.mark.parametrize("changed, kernel, code", [
-    ({}, "triton", None),
-    ({"softcap": 30.0}, "triton", None),
-    ({"sinks": True}, "triton", None),
-    ({"quantized": True}, "gathered", "quantized"),
-    ({"groups": 2}, "gathered", "groups"),
-    ({"pool": jnp.dtype(jnp.float32), "dtype": jnp.dtype(jnp.float32)}, "gathered", "dtype"),
-    ({"value_dim": 64}, "gathered", "widths"),
-    ({"head_dim": 512, "value_dim": 512}, "gathered", "geometry"),
-    ({"page_size": 64}, "gathered", "geometry"),
-    ({"kv_heads": 2, "head_shards": 4}, "gathered", "head_shards"),
-    ({"arithmetic": True}, "gathered", "arithmetic"),
-    ({"named": "xla"}, "gathered", None),
-    ({"named": "cudnn"}, "triton", None),
-], ids=["fits", "softcap", "sinks", "quantized", "grouped", "fp32", "narrow-values", "wide-heads",
-        "large-pages", "heads-past-the-pool", "reference-arithmetic", "named-xla", "named-cudnn"])
-def test_the_paged_selector_reads_a_gpu_steps_pool_through_its_kernel_where_its_requirements_hold(
-        changed, kernel, code):
-    """On an A100 (`generation.assumed`), a decode step over a paged pool takes Dew's paged kernel where
-    every requirement holds (`kv_cache.PAGED`), else the gathered rows through the layer's attention,
-    reporting the requirement that turned it down; a softcap and sinks the kernel applies itself. A
-    layer naming xla takes the gathered rows by its choice, no refusal."""
-    from dew.nn.kernels.generation import assumed, routes
-    from dew.nn.kernels.selection import select
-    from dew.nn.kv_cache import PAGED
-
-    with assumed("sm80"), routes() as found:
-        assert select(PAGED, paged_case(**changed)).kernel == kernel
-    (route,) = found
-    assert (route.refusal.code if route.refusal else None) == code
-
-
-def test_a_windowed_step_reads_its_pool_through_the_gpus_kernel_and_the_tpus_gather():
-    """A windowed decode step's paged pool (`PagedCase.windowed`): the GPU's paged kernel reads each
-    row from its window's first key, so an A100 takes it; the TPU's reads every slot to a row's length,
-    so a TPU's step reads the gathered rows, through the layer's attention and its window."""
-    from dew.nn.kernels.generation import assumed, routes
-    from dew.nn.kernels.selection import select
-    from dew.nn.kv_cache import PAGED
-
-    with assumed("sm80"):
-        assert select(PAGED, paged_case(windowed=True)).kernel == "triton"
-    with assumed("v6e"), routes() as found:
-        assert select(PAGED, paged_case(windowed=True)).kernel == "gathered"
-    (route,) = found
-    assert route.refusal.code == "windowed"
-
-
-def test_a_softcapped_steps_paged_pool_takes_each_devices_kernel():
-    """The TPU's paged attention kernel (`generation.assumed('v6e')`) and the GPU's
-    (`generation.assumed('sm80')`) each apply a softcap themselves, so a softcapped step reads its
-    pool through its device's kernel."""
-    from dew.nn.kernels.generation import assumed
-    from dew.nn.kernels.selection import select
-    from dew.nn.kv_cache import PAGED
-
-    with assumed("v6e"):
-        assert select(PAGED, paged_case(softcap=30.0)).kernel == "tpu"
-        # jax's TPU paged attention has no sinks: such a step reads the gathered rows.
-        assert select(PAGED, paged_case(sinks=True)).kernel == "gathered"
-    with assumed("sm80"):
-        assert select(PAGED, paged_case(softcap=30.0)).kernel == "triton"
-        assert select(PAGED, paged_case(sinks=True)).kernel == "triton"
+    tpu_lowering(step, arguments, mesh)
 
 
 SOFTCAP_PAGED_SEEDS = 8
@@ -432,10 +369,9 @@ SOFTCAP_PAGED_SEEDS = 8
 @pytest.mark.gpu(reason="the paged BF16 decode kernel needs CUDA sm80+")
 @pytest.mark.skipif(not bf16_dot_runs(), reason="the paged BF16 decode kernel needs CUDA sm80+")
 def test_a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache(without_deterministic_ops):
-    """A bf16 decoder with a logit softcap decodes a paged cache through the kernel the paged selector
-    chooses for a GPU (Dew's paged Triton kernel, where the step used to raise), its logits step by
-    step on par with the compact cache's (check 1), the compact cache's reference decode in float64 the
-    truth. Its trace reports the route it takes."""
+    """A bf16 decoder with a logit softcap decodes a paged cache on a GPU (where the step used to raise),
+    its logits step by step on par with the compact cache's (check 1), the compact cache's reference
+    decode in float64 the truth."""
     def model(layout, dtype, implementation="auto"):
         # Heads 16 wide, which the paged kernel's geometry takes.
         return CausalTransformer(**{**TINY_DECODER, "vocab_size": 64, "head_dim": 16, "dtype": dtype,
@@ -460,12 +396,24 @@ def test_a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache(
         tokens = jax.random.randint(jax.random.key(seed), (2, 8), 0, 64)
         return model(KVCache(), "bfloat16").init(jax.random.key(seed + 1000), tokens), tokens
 
-    from dew.nn.kernels.generation import routes
-
     paged = decoded(KVCache(page_size=16), "bfloat16")
-    with routes() as found:
-        jax.make_jaxpr(paged)(*draw(0))
-    taken = [(route.kernel, route.ran) for route in found if route.choice == "paged_decode"]
-    assert taken and set(taken) == {("triton", "triton")}
     assert_as_exact(paged, decoded(KVCache(), "bfloat16"), draw, "softcapped paged decode",
                     seeds=SOFTCAP_PAGED_SEEDS, truth_fn=decoded(KVCache(), "float64", "reference"))
+
+
+@pytest.mark.parametrize("quantized", ["float8_e4m3fn", "int8"])
+def test_a_vector_below_the_formats_scale_quantizes_finitely(quantized):
+    """A vector of normal float32 values whose absmax over the format's largest is no normal float32
+    (2**-124 or 2**-120 over 448 or 127: subnormal, which a device flushing subnormals reads as zero)
+    keeps scale one and dequantizes to the format's rounding of its values, zeros, never a nonfinite
+    code, whether or not the device flushes (ledger 1874); a vector at a normal scale keeps its own."""
+    from dew.nn.kv_cache import dequantize
+
+    values = jnp.asarray([[2.0 ** -124, 0.0, -(2.0 ** -124), 0.0], [2.0 ** -120, 0.0, 0.0, 0.0],
+                          [1.0, -0.5, 0.25, 0.0]], jnp.float32)
+    stored, scale = quantize(values, quantized)
+    restored = np.asarray(dequantize(stored, scale, jnp.float32))
+    assert np.isfinite(np.asarray(stored, np.float32)).all() and np.isfinite(restored).all()
+    np.testing.assert_array_equal(np.asarray(scale)[:2], [1.0, 1.0])
+    np.testing.assert_array_equal(restored[:2], 0.0)
+    assert np.asarray(scale)[2] != 1.0

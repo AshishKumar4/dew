@@ -58,7 +58,7 @@ from dew.nn.dropout import Dropout
 from .activations import GatedActivation
 from .attention import CROSS_KEY, CROSS_VALUE, NormalAttention
 from .flops import counted_flops
-from .inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext
+from .inputs import CONTEXT, CONTEXT_LENGTHS, CONTEXT_SEGMENTS, CrossContext
 from .precision import L2NORM_EPS, at_least_fp32, float32_dot_general, l2norm, sqrt_or_zero
 
 NAME = "cross_attention"
@@ -90,9 +90,13 @@ over it in a pass of its own."""
 
 def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, lengths: jax.Array, *,
                    encoder: ContextEncoder, train: bool = False,
-                   rngs: dict[str, jax.Array] | None = None) -> dict[str, jax.Array]:
+                   rngs: dict[str, jax.Array] | None = None, segments: jax.Array | None = None,
+                   max_segments: int = 1) -> dict[str, jax.Array]:
     """The conditioning a model's cross-attention layers read (`CrossAttending`) for contexts of
-    token ids: `tokens` `[B, C]`, each row's first `lengths` real, as `encoder` says.
+    token ids: `tokens` `[B, C]`, each row's first `lengths` real, as `encoder` says, and where a row
+    packs the contexts of up to `max_segments` documents, each token's document, `segments` `[B, C]`
+    (`CONTEXT_SEGMENTS`), which the backbone pass reads each of alone and the call's own tokens of each
+    document read alone.
 
     `table` gives each token's row of the model's own table (`token_embeddings`); `backbone` the
     model's final states over each context alone (`HiddenStates`), its real tokens one document, with
@@ -117,7 +121,9 @@ def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, leng
             raise TypeError(f"a context's own pass reads final states, which a {type(model).__name__} "
                             "does not give (HiddenStates)")
         real = jnp.arange(tokens.shape[1])[None, :] < lengths[:, None]
-        laid = coordinates(segments=real.astype(jnp.int32), max_segments=1, right_padded=True)
+        documents = real.astype(jnp.int32) if segments is None else jnp.where(real, segments, 0)
+        laid = coordinates(segments=documents, max_segments=max_segments if segments is not None else 1,
+                           right_padded=True)
         states = model.apply(whole, tokens, train=train, coordinates=laid, method="hidden_states", rngs=rngs)
         if crosses_alone(variables.get("params", {})):
             states = jax.lax.stop_gradient(states)
@@ -125,7 +131,8 @@ def encode_context(model: nn.Module, variables: Mapping, tokens: jax.Array, leng
         raise ValueError(f"a context is encoded by the model's table or its own pass, not {encoder!r}")
     if not isinstance(states, jax.Array):
         raise TypeError(f"expected an array of context states, got {type(states).__name__}")
-    return {CONTEXT: states, CONTEXT_LENGTHS: lengths}
+    return {CONTEXT: states, CONTEXT_LENGTHS: lengths,
+            **({} if segments is None else {CONTEXT_SEGMENTS: segments})}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -240,10 +247,18 @@ class GatedCrossAttention(nn.Module):
         # A row without context reads its first slot, so its softmax stays finite: one over no keys
         # would be NaN, which the select below drops forward but not from the gradients.
         embeddings = None if context is None else context.embeddings
+        # A context of several documents is read by each document's own tokens alone (`CrossContext`).
+        documents = ({} if context is None or context.segments is None
+                     else {"segment_ids": context.queries, "key_segment_ids": context.segments})
         output = attention(self._normed("input_layernorm", x), embeddings,
                            key_value_seq_lengths=jnp.maximum(lengths, 1), cached=decode,
-                           cache_dtype=x.dtype if self.dtype is None else self.dtype)
+                           cache_dtype=x.dtype if self.dtype is None else self.dtype, **documents)
         present = (lengths > 0).reshape((-1,) + (1,) * (stream.ndim - 1))
+        if context is not None and context.segments is not None and context.queries is not None:
+            # A token whose document holds no context reads none, as its row alone would skip the block.
+            keys = context.segments[:, None, :]
+            owned = (context.queries[:, :, None] == keys) & (keys > 0)
+            present = jnp.any(owned, axis=-1).reshape(owned.shape[:2] + (1,) * (stream.ndim - 2))
         dropout = Dropout(rate=self.dropout_rate)
 
         def joined(stream: jax.Array, name: str, branch: jax.Array) -> jax.Array:

@@ -30,7 +30,8 @@ from dew.objectives.rl.sessions import (
     SEGMENT_IDS_KEY,
     SESSION_WEIGHTS_KEY,
 )
-from dew.telemetry.instrumentation import collective, hlo_instructions
+from dew.telemetry.instrumentation import hlo_instructions
+from dew.telemetry.trace import collective
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "agentic.npz"
 CHAIN = 7

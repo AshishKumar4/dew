@@ -37,6 +37,8 @@ httpx2 = import_module("httpx2")
 
 
 FIXTURE = Path(__file__).parent / "fixtures/hf/qwen2-tiny"
+FP8 = Path(__file__).parent / "fixtures/hf/minimax-m2-fp8-tiny"
+"""An FP8 source, whose export requantizes its E4M3 weights."""
 EOS = 7
 
 
@@ -645,9 +647,22 @@ def nccl_replicas(ordinal, count, refuses=()):
     return started
 
 
+def test_an_fp8_sources_push_has_a_collective_for_every_tensor_it_publishes():
+    """An FP8 source's push publication exports E4M3 weights, which vLLM's NCCL wrapper receives as
+    `ncclFloat8e4m3`: every dtype the publication exports has an NCCL code, so no push pauses its
+    replicas and then fails on a tensor it cannot send (ledger 1875)."""
+    from dew.inference.rollouts import _published
+
+    source = Pretrained.load(FP8, dtype="float32")
+    published = _published(source, source.variables, jnp.dtype("bfloat16"), phase="fp8 push gather")
+    dtypes = {str(tensor.dtype) for tensor in published.export().values()}
+    assert "float8_e4m3fn" in dtypes and dtypes <= _DTYPES.keys(), dtypes
+
+
 @pytest.mark.gpu(reason="an NCCL group joins two cuda devices")
 @pytest.mark.mesh(devices=2)
-def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu():
+@pytest.mark.parametrize("fixture", [FIXTURE, FP8], ids=["bfloat16", "fp8"])
+def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu(fixture):
     """A push over real NCCL groups from the trainer's GPU to two one-worker replicas on a second
     GPU, each standing in for vLLM's weight-transfer endpoints with a worker that receives as
     vLLM's does, in a group of its own. Each replica is asked its world size and joins its group
@@ -656,9 +671,9 @@ def test_an_nccl_push_delivers_every_tensor_to_each_replica_on_another_gpu():
     rank 0 of two. The tensors go one after another to both groups, in chunks smaller than the
     policy: every replica receives the whole listing after every replica started the update and
     before any finished it, and each worker holds every listed tensor, the trainer's export of the
-    pushed policy."""
+    pushed policy, an FP8 source's E4M3 weights among them."""
     engines = nccl_replicas(jax.devices()[1].local_hardware_id, 2)
-    source = Pretrained.load(FIXTURE, dtype="float32")
+    source = Pretrained.load(fixture, dtype="float32")
     changed = doubled(source)
     push = NCCLPush(source, tuple(server.url for server in engines), str(nccl_library()), chunk=4096,
                     timeout=120)
