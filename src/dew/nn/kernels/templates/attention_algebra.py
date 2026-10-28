@@ -60,9 +60,10 @@ class Forward:
     the call keeps its logits `natural` (`base2`), the accurate form, whether its weighted values can pass
     fp32's largest, so a program's walk is `guarded` (`headroom`), whether its softmax resumes from an
     `initial` state (`raw`), whether natural logits stay `scaled` whatever the scale (`raw`; the fold's
-    rewalk, `unfolded`), and the call's query count `queries` where a mainloop walks query rows past it
+    rewalk, `unfolded`), the call's query count `queries` where a mainloop walks query rows past it
     without spans (a full or causal call padded to whole tiles or whole programs, whose padding rows, a
-    tile's last ones or a whole tile of them, `seen` keeps from every key; None where none does)."""
+    tile's last ones or a whole tile of them, `seen` keeps from every key; None where none does), and
+    whether its walks keep what their running sums' additions drop (`compensated`, `compensates`)."""
 
     form: str
     keys: int
@@ -74,6 +75,7 @@ class Forward:
     initial: bool = False
     scaled: bool = False
     queries: int | None = None
+    compensated: bool = False
 
     @property
     def raw(self) -> bool:
@@ -217,18 +219,31 @@ class Guard(NamedTuple):
     live: jax.Array
 
 
+class Low(NamedTuple):
+    """What a compensated walk's running sums' additions dropped (`compensated`, `kept_in_turn`), each
+    beside its sum: the weighted values' `acc` and the denominator's `total`, and on the guarded walk the
+    unshifted sums' (`Guard.plain`, `plain_total`; None on the plain walk)."""
+
+    acc: jax.Array
+    total: jax.Array
+    plain: Any = None
+    plain_total: Any = None
+
+
 class Partial(NamedTuple):
     """A query block's softmax state, unhooked: the weighted values `acc` `[..., bq, Dv]` (or, where a
     mainloop's accumulators hold them, the blocks of their columns it holds, `Keys.accumulate`), the running
     maximum `m` `[..., bq]` (in base 2 where the step's logits are) and the denominator `total`
     `[..., bq]`, fp32, both sums at each row's shift on the guarded path, whose `Guard` it carries (None on
-    the plain path). `rescale`, `merge` and `finish` take any leading axes, so states a launch wrote per
-    slice merge in XLA after it (`exported`, `imported`)."""
+    the plain path), and within a compensated walk what its sums' additions dropped (`low`, `compensated`;
+    None elsewhere: a walk's state is `settled` when it ends). `rescale`, `merge` and `finish` take any
+    leading axes, so states a launch wrote per slice merge in XLA after it (`exported`, `imported`)."""
 
     acc: Any
     m: jax.Array
     total: jax.Array
     guard: Guard | None = None
+    low: Low | None = None
 
 
 def exported(state: Partial) -> tuple[jax.Array, ...]:
@@ -415,13 +430,16 @@ def natural_exp(x: jax.Array, scale: float = 1.0) -> jax.Array:
     """The natural form's forward exponential (`Forward.power`): `exp(x * scale)` as the hardware's
     base-2 exponential of `x * scale * log2(e)`, the logits staying natural. The conversion keeps its
     rounded product and its residual (`two_product`), the factor's own rounding among them, and the
-    exponential takes the residual as a linear correction on the reduced exponent's fractional part
-    (`power2` the integral one), so the conversion's rounding does not reach a large value under a small
-    weight: one rounding more than `jnp.exp` no longer, where XLA had folded `exp2(x * log2(e))` back to
-    `exp(x)` until JAX 0.12 stopped reassociating constant products (jax-ml/jax 2d3744395). The residual is
-    about an fp32 ulp of the exponent, whose square is below the exponential's rounding. The factors that
-    carry a state take it too (`Forward.power`); the backward's weights keep `jnp.exp`, as the reference
-    does."""
+    residual joins the reduced exponent's fractional part (`power2` takes the integral one), so the
+    conversion's rounding does not reach a large value under a small weight, where XLA had folded
+    `exp2(x * log2(e))` back to `exp(x)` until JAX 0.12 stopped reassociating constant products
+    (jax-ml/jax 2d3744395). The joined exponent lies within an ulp of the conversion of [-1/2, 1/2] and
+    rounds at its own ulp, at most 2^-25 there, which moves the weight by at most a quarter of its ulp: the
+    weight's error is about the base-2 exponential's on that interval, as the reference's `exp` is
+    (libdevice's reduces its argument so and takes the same exponential), where a correction added after
+    the exponential rounded the weight once more, half an ulp (1.55 times the reference's error on an
+    A100's and an H100's edge weights). The factors that carry a
+    state take it too (`Forward.power`); the backward's weights keep `jnp.exp`, as the reference does."""
     # Normalize the factor before splitting: at a tiny raw scale its residual would be subnormal.
     factor, exponent = np.frexp(scale * LOG2E)
     x = x * np.float32(2.0 ** int(exponent))
@@ -437,10 +455,7 @@ def natural_exp(x: jax.Array, scale: float = 1.0) -> jax.Array:
     exponent += (bounded - exponent >= 0.5).astype(x.dtype)
     live = (jnp.abs(x) < jnp.inf) & (hi >= -150.0) & (hi <= 128.0)
     lo = jnp.where(live, lo, 0.0)
-    base = jnp.exp2(bounded - exponent)
-    # Add the small correction, rather than rounding 1 + correction before its product.
-    corrected = base + base * (lo * np.float32(np.log(2.0)))
-    return power2(corrected, exponent)
+    return power2(jnp.exp2((bounded - exponent) + lo), exponent)
 
 
 def headroom(dtype) -> bool:
@@ -450,6 +465,24 @@ def headroom(dtype) -> bool:
     below the 2^103 that rounds fp32's largest past it; so an fp16 call compiles no guard (`guarded`),
     from a state or none."""
     return float(jnp.finfo(dtype).max) * 2 >= 2.0 ** HEADROOM
+
+
+def compensates(dtype) -> bool:
+    """Whether a walk over values of `dtype` keeps what its running sums' additions drop
+    (`Forward.compensated`): fp32's, whose products round at fp32's own precision, so where a row holds many
+    comparable terms the order of their sum leads the output's error, and a chain of them errs past the
+    reference's, which sums a row as a tree (jax's attention on an A100 and an H100: 1.7 to 2.1 times its
+    error over equal weights, whose products are exact, a tile's chain of 32 keys then the tiles' chain). A
+    16-bit dtype's weights round to it first, as the reference's do, an error beside which the sums' order
+    is nothing."""
+    return jnp.dtype(dtype) == jnp.float32
+
+
+CHUNK = 16
+"""The keys a compensated walk sums in one chain (`products_of`): the fewest a Triton dot takes, a chain of
+fused multiply-adds, each chunk's product then added with its rounding kept (`kept_in_turn`). Against jax's
+attention on an A100 over 40 seeds of the three equal-weight fp32 families: 1.20, 1.32 and 1.23 times its
+error, where chunks of 8 keys would give 0.82 to 1.01 and the tile's one chain 2.08, 1.67 and 1.86."""
 
 
 RAW_SCALES = (2.0 ** -120, 2.0 ** 100)
@@ -539,21 +572,83 @@ def denominator_after(total: jax.Array, factor: jax.Array, p: jax.Array, held: R
     return carry_factor(total, factor, held) + beyond_weights(p.sum(axis=-1), held)
 
 
-def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, product: jax.Array,
-            held: Room | None, times: Callable[[jax.Array], jax.Array]) -> Partial:
-    """The state after a tile: its sums taken by `factor` (`carry_factor`) and the tile's `product` of its
-    weights `p` and their sum added at the row's shift (`beyond_weights`; `tile`), with the tile's
-    unshifted weights' product, which the mainloop issues as `times` of them (their product with the
-    tile's values), kept unshifted (`Guard.plain`); the plain walk's arithmetic where `held` is None,
-    which issues no other product."""
-    denominator = denominator_after(state.total, factor, p, held)
-    acc = carry_factor(state.acc, factor, held) + beyond_weights(product, held)
+def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, products: tuple[jax.Array, ...],
+            held: Room | None, times: Callable[[jax.Array], tuple[jax.Array, ...]]) -> Partial:
+    """The state after a tile: its sums taken by `factor` (`carry_factor`) and the tile's `products` of its
+    weights `p` with its values (a chunk of keys each in a compensated walk, `products_of`) and their sum
+    added at the row's shift (`beyond_weights`; `tile`), with the tile's unshifted weights' products, which
+    the mainloop issues as `times` of them, kept unshifted (`Guard.plain`); each addition's rounding kept
+    where the state carries them (`kept_in_turn`); the plain walk's arithmetic where `held` is None, which
+    issues no other product."""
+    low = state.low
+    total, acc = carry_factor(state.total, factor, held), carry_factor(state.acc, factor, held)
+    weights = (beyond_weights(p.sum(axis=-1), held),)
+    sums = tuple(beyond_weights(product, held) for product in products)
+    kept = None
+    if low is None:
+        total, acc = in_turn(total, weights), in_turn(acc, sums)
+    else:
+        total, total_low = kept_in_turn(total, carry_factor(low.total, factor, held), weights)
+        acc, acc_low = kept_in_turn(acc, carry_factor(low.acc, factor, held), sums)
+        kept = Low(acc_low, total_low)
     if held is None:
-        return Partial(acc, m, denominator)
+        return Partial(acc, m, total, low=kept)
     # The unshifted sums beside them: finite in every column the plain walk kept finite (`finish`).
-    plain = rescale(held.before.plain, held.alpha) + times(held.plain)
-    plain_total = held.alpha * held.before.plain_total + held.plain.sum(axis=-1)
-    return Partial(acc, m, denominator, Guard(held.shift, held.reach, plain, plain_total, held.before.live))
+    plain, plain_total = rescale(held.before.plain, held.alpha), held.alpha * held.before.plain_total
+    plain_sums, plain_weights = times(held.plain), (held.plain.sum(axis=-1),)
+    if kept is None or low is None:
+        plain, plain_total = in_turn(plain, plain_sums), in_turn(plain_total, plain_weights)
+    else:
+        plain, plain_low = kept_in_turn(plain, rescale(low.plain, held.alpha), plain_sums)
+        plain_total, plain_total_low = kept_in_turn(plain_total, held.alpha * low.plain_total, plain_weights)
+        kept = kept._replace(plain=plain_low, plain_total=plain_total_low)
+    return Partial(acc, m, total, Guard(held.shift, held.reach, plain, plain_total, held.before.live), kept)
+
+
+def in_turn(total: jax.Array, terms: tuple[jax.Array, ...]) -> jax.Array:
+    """`total` with each of `terms` added in turn."""
+    for term in terms:
+        total = total + term
+    return total
+
+
+def kept_in_turn(total: jax.Array, dropped: jax.Array, terms: tuple[jax.Array, ...]
+                 ) -> tuple[jax.Array, jax.Array]:
+    """`total` with each of `terms` added in turn and what earlier additions dropped, `dropped` (a compensated
+    walk's, `Low`), with each one's rounding added (Knuth's TwoSum, `two_sum`). An infinite sum's rounding is
+    no number (`settled`)."""
+    for term in terms:
+        total, error = two_sum(total, term)
+        dropped = dropped + error
+    return total, dropped
+
+
+def compensated(spec: Forward, state: Partial) -> Partial:
+    """A walk's start in `spec`'s form: where it compensates its running sums (`Forward.compensated`), with
+    nothing dropped yet beside each (`Low`), the guarded walk's unshifted sums' too; else as it is."""
+    if not spec.compensated:
+        return state
+    guard = state.guard
+    return state._replace(low=Low(jnp.zeros_like(state.acc), jnp.zeros_like(state.total),
+                                  None if guard is None else jnp.zeros_like(guard.plain),
+                                  None if guard is None else jnp.zeros_like(guard.plain_total)))
+
+
+def settled(state: Partial) -> Partial:
+    """A walk's end: each running sum with what its additions dropped added back (`compensated`), rounded
+    once, and none carried; a sum that passed fp32's largest stays infinite, its residual no number."""
+    low = state.low
+    if low is None:
+        return state
+
+    def joined(total: jax.Array, dropped: jax.Array) -> jax.Array:
+        return total + jnp.where(finite(dropped), dropped, 0.0)
+
+    guard = state.guard
+    if guard is not None:
+        guard = guard._replace(plain=joined(guard.plain, low.plain),
+                               plain_total=joined(guard.plain_total, low.plain_total))
+    return Partial(joined(state.acc, low.acc), state.m, joined(state.total, low.total), guard)
 
 
 def room(guard: Guard, total: jax.Array, alpha: jax.Array, p: jax.Array, largest: jax.Array,
@@ -807,13 +902,35 @@ def drawn(coords: Coords, queries: jax.Array, keys: jax.Array) -> jax.Array | No
 
 
 def _times(dot: Callable[[jax.Array, jax.Array], jax.Array], value: jax.Array, p: jax.Array,
-           multiplier: jax.Array | None = None) -> jax.Array:
-    """Weights `p` narrowed to the values' dtype times the tile's `value`s, as the mainloop's `dot`; with a
-    dropout `multiplier`, the dropped weights `p * multiplier` narrowed at the scale `weights_parts` gives
-    them."""
+           multiplier: jax.Array | None = None, chunk: int | None = None) -> tuple[jax.Array, ...]:
+    """Weights `p` narrowed to the values' dtype times the tile's `value`s, as the mainloop's `dot`, a
+    `chunk` of keys at a time (`products_of`); with a dropout `multiplier`, the dropped weights
+    `p * multiplier` narrowed at the scale `weights_parts` gives them."""
     if multiplier is not None:
-        return summed_products(weights_parts(p * multiplier, value.dtype), value, dot)
-    return dot(narrow(p, value.dtype), value)
+        return products_of(weights_parts(p * multiplier, value.dtype), value, dot, chunk)
+    return products_of(((narrow(p, value.dtype), None),), value, dot, chunk)
+
+
+def products_of(parts: Parts, value: jax.Array, dot: Callable[[jax.Array, jax.Array], jax.Array],
+                chunk: int | None) -> tuple[jax.Array, ...]:
+    """The weights' `parts` `[bq, bk]` times a tile's `value`s `[bk, Dv]` (`summed_products`): one product,
+    or in a compensated walk one a `chunk` of keys (`chunk_of`), each a chain of `chunk` additions, whose
+    sum the walk takes with each addition's rounding kept (`kept_in_turn`)."""
+    if chunk is None or value.shape[0] <= chunk:
+        return (summed_products(parts, value, dot),)
+    count = value.shape[0] // chunk
+    values = jnp.split(value, count, axis=0)
+    pieces = [jnp.split(part, count, axis=-1) for part, _ in parts]
+    return tuple(summed_products(tuple((piece[index], exponent) for piece, (_, exponent) in zip(pieces, parts,
+                                                                                               strict=True)),
+                                 values[index], dot)
+                 for index in range(count))
+
+
+def chunk_of(spec: Forward) -> int | None:
+    """The keys a walk in `spec`'s form sums in one chain: `CHUNK` where it compensates its sums, else a
+    tile's whole (None)."""
+    return CHUNK if spec.compensated else None
 
 
 def _softmax(spec: Forward, state: Partial, keys: Keys):
@@ -843,7 +960,7 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
                               ((narrow(p, value.dtype), None),), value)
         return Partial(acc, m, denominator_after(state.total, factor, p))
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
-    times = functools.partial(_times, keys.dot, value, multiplier=multiplier)
+    times = functools.partial(_times, keys.dot, value, multiplier=multiplier, chunk=chunk_of(spec))
     return stepped(state, m, factor, p, times(p), held, times)
 
 
@@ -890,9 +1007,18 @@ def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Gathered) -> tu
 
     accumulate = keys.accumulate if held is None else None
     if accumulate is None:
-        times = functools.partial(_times, keys.dot, value, multiplier=multiplier)
-        after = stepped(state, m, factor, p, jnp.zeros_like(state.acc), held, times)
-        acc = taken(state.acc) + beyond_weights(summed_products(parts, value, keys.dot), held)
+        chunk = chunk_of(spec)
+        times = functools.partial(_times, keys.dot, value, multiplier=multiplier, chunk=chunk)
+        # `B` takes the old anchor's term before the factor (`split_taken`), its rounding kept where the walk
+        # compensates (`kept_in_turn`), then the tile's other keys' products as a step takes them.
+        low, term = state.low, (split_term(own, moved, rows(arg.key), arg.multiplier),)
+        if low is None:
+            joined = state._replace(acc=in_turn(state.acc, term))
+        else:
+            acc, acc_low = kept_in_turn(state.acc, low.acc, term)
+            joined = state._replace(acc=acc, low=low._replace(acc=acc_low))
+        after = stepped(joined, m, factor, p, products_of(parts, value, keys.dot, chunk), held, times)
+        acc = after.acc
     else:
         # The tile's fp32 weights done with before its products, so they hold no registers through them.
         after = Partial(state.acc, m, denominator_after(state.total, factor, p))
@@ -932,8 +1058,10 @@ def anchored_step(spec: Forward, carry: Carry, keys: Keys) -> Carry:
 
 
 def plain_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial) -> Partial:
-    """A program's walk of its key tiles `lo` to `hi` (`keys_at(index)`) from `start`."""
-    return jax.lax.fori_loop(lo, hi, lambda index, state: plain_step(spec, state, keys_at(index)), start)
+    """A program's walk of its key tiles `lo` to `hi` (`keys_at(index)`) from `start`, its sums compensated
+    where its form takes them so (`compensated`, `settled`)."""
+    return settled(jax.lax.fori_loop(lo, hi, lambda index, state: plain_step(spec, state, keys_at(index)),
+                                     compensated(spec, start)))
 
 
 def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
@@ -941,8 +1069,10 @@ def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
     """A training forward's walk (`plain_walk`), its carry also holding the anchor key and the split
     sums, from none (`training_step`)."""
     nothing = jnp.zeros(start.total.shape, jnp.float32)
-    return jax.lax.fori_loop(lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows)[0],
-                             (start, no_argmax(start.total.shape[0], dropping), nothing, nothing))
+    state, arg, own, others_total = jax.lax.fori_loop(
+        lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows)[0],
+        (compensated(spec, start), no_argmax(start.total.shape[0], dropping), nothing, nothing))
+    return settled(state), arg, own, others_total
 
 
 def joined(carry: Carry, rows: Callable[[jax.Array], jax.Array]) -> Partial:
@@ -1035,13 +1165,19 @@ def anchor_split(narrowed: jax.Array, at_anchor: jax.Array) -> tuple[jax.Array, 
 def split_taken(others: jax.Array, own: jax.Array, alpha: jax.Array, moved: jax.Array, old_value: jax.Array,
                 held: Room | None = None, old_multiplier: jax.Array | None = None) -> jax.Array:
     """A training step's split sums before the tile's product joins them (`training_step`): where the
-    anchor moved, the old anchor's term (its weight `own` before the tile, under dropout times its draw's
-    multiplier `old_multiplier`, times its value row `old_value`) joined, then taken to the new maximum by
-    `alpha`. A mainloop that accumulates the product in place applies this to its accumulator first."""
+    anchor moved, the old anchor's term joined (`split_term`), then taken to the new maximum by `alpha`. A
+    mainloop that accumulates the product in place applies this to its accumulator first."""
+    return carry_factor(others + split_term(own, moved, old_value, old_multiplier), alpha, held)
+
+
+def split_term(own: jax.Array, moved: jax.Array, old_value: jax.Array,
+               old_multiplier: jax.Array | None = None) -> jax.Array:
+    """The old anchor's term a training step's split sums join where the anchor moved (`moved` `[bq]`): its
+    weight `own` before the tile (under dropout times its draw's multiplier `old_multiplier`) times its value
+    row `old_value` `[bq, Dv]`; zero elsewhere."""
     old = old_value.astype(jnp.float32)
     anchored = own if old_multiplier is None else own * old_multiplier
-    joined = jnp.where(expand(moved, old), expand(anchored, old) * old, 0.0)
-    return carry_factor(others + joined, alpha, held)
+    return jnp.where(expand(moved, old), expand(anchored, old) * old, 0.0)
 
 
 def split_rows(own: jax.Array, others_total: jax.Array, alpha: jax.Array, moved: jax.Array, rest: jax.Array,

@@ -227,7 +227,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     # fold its logits' reach (`algebra.walked`).
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
                            query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural,
-                           algebra.headroom(value.dtype), hooks.initial is not None)
+                           algebra.headroom(value.dtype), hooks.initial is not None,
+                           compensated=algebra.compensates(value.dtype))
     if not residuals:
         out, _ = padded_walk(spec, call, hooks, block_q=block_q, block_k=block_k, residuals=False)
         return out[:, :queries, :, :value_width]
