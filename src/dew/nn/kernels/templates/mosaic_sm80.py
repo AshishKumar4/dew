@@ -361,16 +361,6 @@ class Mma(mosaic.Family):
             acc = plgpu.mma(acc, self._left(mosaic.unscaled_part(formed)), operand, m_warps=self.m_warps)
         return acc
 
-    def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
-        del interpret
-        mosaic.unscaled(parts)
-        operand = plgpu.load(rhs, layout=self.rhs)
-        for place, (part, _) in enumerate(parts):
-            buffers.at[place][...] = part.astype(buffers.dtype)
-            staged = buffers.at[place].transpose((1, 0)) if transposed else buffers.at[place]
-            acc = plgpu.mma(acc, plgpu.load(staged, layout=self.lhs), operand, m_warps=self.m_warps)
-        return acc
-
     def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
         return self.register_products(scale(acc), parts, rhs, interpret)
 

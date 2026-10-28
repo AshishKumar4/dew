@@ -25,7 +25,8 @@ nothing (spans, a score hook) guards its maxima and denominators against an empt
 import dataclasses
 import functools
 import math
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
+from types import MappingProxyType
 from typing import Any, NamedTuple
 
 import jax
@@ -183,7 +184,7 @@ def expand(x: jax.Array, like: jax.Array) -> jax.Array:
 
 def across(x: jax.Array, like: jax.Array) -> jax.Array:
     """A per-key `x` (`[bk]`) broadcast over `like`'s rows `[bq, bk]`, as `x[None, :]` broadcasts."""
-    return jax.lax.broadcast_in_dim(x, like.shape, (like.ndim - 1,))
+    return jax.lax.broadcast_in_dim(x, like.shape, tuple(range(like.ndim - x.ndim, like.ndim)))
 
 
 class Coords(NamedTuple):
@@ -191,13 +192,28 @@ class Coords(NamedTuple):
     indices `q_pos` `[bq, 1]` and key indices `k_pos` `[1, bk]`, and where the spans narrow, each
     query's intervals `spans`, one a run (a call's runs, `KeySpans`; one where it has none), each its
     first and past-last keys `[bq]` (`intervals`), with documents the queries' and keys' ids `ids`,
-    `[bq]` and `[bk]`, and with dropout its entries' draw `drop` (`Draw`)."""
+    `[bq]` and `[bk]`, and with dropout its entries' draw `drop` (`Draw`). A tile whose rows are its keys
+    (`keys_first`: `[bk, bq]`, a program's `K Qᵀ`) holds them so too, `q_pos` `[1, bq]` and `k_pos`
+    `[bk, 1]`; its queries' and keys' vectors broadcast along its own axes (`queries`, `keys`)."""
 
     q_pos: jax.Array
     k_pos: jax.Array
     spans: tuple[tuple[jax.Array, jax.Array], ...] | None = None
     ids: tuple[jax.Array, jax.Array] | None = None
     drop: Draw | None = None
+    keys_first: bool = False
+
+    def queries(self, x: jax.Array, like: jax.Array) -> jax.Array:
+        """A per-query `x` (`[bq]`) broadcast over the tile `like`."""
+        return across(x, like) if self.keys_first else expand(x, like)
+
+    def keys(self, x: jax.Array, like: jax.Array) -> jax.Array:
+        """A per-key `x` (`[bk]`) broadcast over the tile `like`."""
+        return expand(x, like) if self.keys_first else across(x, like)
+
+    def key_count(self, like: jax.Array) -> int:
+        """The keys the tile `like` holds."""
+        return like.shape[0 if self.keys_first else 1]
 
 
 def intervals(start: jax.Array, end: jax.Array) -> tuple[tuple[jax.Array, jax.Array], ...]:
@@ -766,13 +782,14 @@ def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
     there, undefined at its padded parameters, reaches no reduction over the rows)."""
     visible = None
     if coords.spans is not None:
-        ids = None if coords.ids is None else (expand(coords.ids[0], like), across(coords.ids[1], like))
-        visible = functools.reduce(jnp.logical_or, (within(coords.k_pos, expand(start, like),
-                                                           expand(end, like), ids)
+        ids = None if coords.ids is None else (coords.queries(coords.ids[0], like),
+                                               coords.keys(coords.ids[1], like))
+        visible = functools.reduce(jnp.logical_or, (within(coords.k_pos, coords.queries(start, like),
+                                                           coords.queries(end, like), ids)
                                                     for start, end in coords.spans))
     elif spec.form == "causal":
         visible = coords.k_pos <= coords.q_pos
-    if spec.form != "spans" and spec.keys % like.shape[1]:
+    if spec.form != "spans" and spec.keys % coords.key_count(like):
         # A tile past the call's last key reads padding.
         visible = coords.k_pos < spec.keys if visible is None else visible & (coords.k_pos < spec.keys)
     if spec.form != "spans" and spec.queries is not None:
@@ -1424,12 +1441,19 @@ def scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
                                                   for index in range(len(params))))
 
 
+ROW_SUMS: Mapping[Kind, Callable[[jax.Array], jax.Array]] = MappingProxyType({
+    Kind.HEAD: lambda x: x.sum(axis=-1), Kind.QUERY: lambda x: x.sum(axis=-1),
+    Kind.KEY: lambda x: x.sum(axis=0)})
+"""`pulled`'s sums of a tile `[bq, bk]`: a head's and a query's over its keys, a key's over its queries."""
+
+
 def pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...],
-           column_sums: Callable[[jax.Array], jax.Array] | None = None):
+           sums: Mapping[Kind, Callable[[jax.Array], jax.Array]] = ROW_SUMS):
     """The score cotangents `cotangents` through `score_mod`, its entries' derivatives `slopes`
     (`scored`; None without a hook): the logits' tile, and each parameter's, a head's or a query's its
-    queries' sums `[block_q]`, a key's its keys' `[block_k]` (`column_sums`, the mainloop's sum over a
-    tile's rows where it takes one: `Family.column_sums`), a tile's the tile. Each entry is masked before
+    queries' sums `[block_q]`, a key's its keys' `[block_k]`, each by its kind's of `sums` (the mainloop's
+    own where it takes one, `Family.column_sums`, or a tile whose rows are its keys'), a tile's the tile;
+    None for a kind `sums` omits, whose gradient the mainloop does not write. Each entry is masked before
     any sum, so one the call never sees (padding, another document) adds nothing even where the hook's
     derivative there is not finite. fp32."""
     if slopes is None:
@@ -1438,9 +1462,7 @@ def pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...],
     pieces = []
     for slope, kind in zip(slopes[1:], kinds, strict=True):
         entries = where_seen(seen, cotangents * slope, 0.0)
-        key_sums = (lambda x: x.sum(axis=0)) if column_sums is None else column_sums
-        pieces.append(key_sums(entries) if kind == Kind.KEY else entries if kind == Kind.TILE
-                      else entries.sum(axis=-1))
+        pieces.append(entries if kind == Kind.TILE else sums[kind](entries) if kind in sums else None)
     return logits, tuple(pieces)
 
 
@@ -1793,11 +1815,12 @@ def exponent(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.
     return jnp.minimum(logits - peak, 0.0)
 
 
-def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array, how: Recompute = PLAIN
+def normalized(logits: jax.Array, peak: jax.Array, inverse_total: jax.Array, how: Recompute = PLAIN
                ) -> tuple[jax.Array, jax.Array]:
-    """A tile's unnormalized weights `exp(s - m)` (`below`) and its weights `p`, fp32."""
+    """A tile's unnormalized weights `exp(s - m)` (`below`) and its weights `p`, those over each query's
+    denominator (`inverse_total`, its `inverse`), fp32."""
     exponentials = below(logits, peak, how)
-    return exponentials, exponentials * expand(inverse(total), exponentials)
+    return exponentials, exponentials * expand(inverse_total, exponentials)
 
 
 def dropped_products(products: jax.Array, multiplier: jax.Array | None) -> jax.Array:

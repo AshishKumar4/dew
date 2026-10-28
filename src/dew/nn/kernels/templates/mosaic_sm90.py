@@ -85,19 +85,6 @@ class Wgmma(mosaic.RingFamily):
 
         return pl.run_scoped(run, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
-    def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
-        mosaic.unscaled(parts)
-        for place, (part, _) in enumerate(parts):
-            buffers.at[place][...] = part.astype(buffers.dtype)
-        plgpu.commit_smem()
-        for place in range(len(parts)):
-            lhs = buffers.at[place].transpose((1, 0)) if transposed else buffers.at[place]
-            if interpret:
-                acc = acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
-            else:
-                plgpu.wgmma(acc, lhs, rhs)
-        return acc
-
     def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
         if interpret:
             return self.register_products(scale(acc), parts, rhs, interpret)

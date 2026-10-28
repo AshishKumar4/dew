@@ -369,10 +369,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     mainloop issues that the hardware decides, so a mainloop holds no instruction, layout or barrier of its
     own. Its facts (`name`, the MMA's row unit `rows`), its launch and roles (`kernel`, `roles`), its operand
     streams (`streams`, `opened`, `stream` the producer's, `walk` and `passed` the consumer's), its products
-    (`product` into a fresh accumulator, `products`, `register_products` and `staged_products` in place,
-    `settled`), and its accumulator's layouts (`layout`, `row`, `column`, which `zeros`, `full`, `iota`,
-    `rows_of`, `columns_of`, `column_zeros`, `column_sums` and `as_row` read). It is generic in its streams'
-    allocations (`Allocated`, `streams`'), its opened streams (`Opened`, `opened`'s) and the accumulator its
+    (`product` into a fresh accumulator, `products` and `register_products` in place, `settled`), and its
+    accumulator's layouts (`layout`, `row`, `column`, which `zeros`, `full`, `iota`, `rows_of`, `columns_of`,
+    `column_sums` and `as_row` read). It is generic in its streams' allocations (`Allocated`, `streams`'), its
+    opened streams (`Opened`, `opened`'s) and the accumulator its
     products issue into in place (`Accumulator`: a warpgroup accumulator ref, or a register array)."""
 
     name: str
@@ -505,10 +505,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         return consumers
 
     def staged(self, value: jax.Array, buffer) -> Ref:
-        """`value` in the shared-memory tile `buffer`, in its dtype, for a product to read: a register right
-        operand's way to an MMA (`staged_products` stages left ones). Mosaic GPU brackets a store with the
-        warpgroup's barriers (its automatic barriers), so every warp's reads of `buffer` are done before it
-        and its writes seen after; the family publishes them to its asynchronous readers (`published`)."""
+        """`value` in the shared-memory tile `buffer`, in its dtype, for a product to read: a register
+        operand's way to an MMA. Mosaic GPU brackets a store with the warpgroup's barriers (its automatic
+        barriers), so every warp's reads of `buffer` are done before it and its writes seen after; the
+        family publishes them to its asynchronous readers (`published`)."""
         buffer[...] = value.astype(buffer.dtype)
         self.published()
         return buffer
@@ -654,12 +654,6 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         (`attention_algebra.formed_parts`)."""
 
     @abc.abstractmethod
-    def staged_products(self, acc: Accumulator, parts, rhs, buffers, interpret: bool, *,
-                        transposed: bool = False) -> Accumulator:
-        """`register_products` of `parts` each staged in `buffers` first (its transpose the left operand
-        where `transposed`)."""
-
-    @abc.abstractmethod
     def rescaled_products(self, acc: Accumulator, scale, parts, rhs, interpret: bool) -> Accumulator:
         """`acc` taken by `scale(value)` in place, then `register_products` of `parts` with `rhs` into it."""
 
@@ -691,10 +685,6 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def tile_of(self, ref) -> jax.Array:
         """A tile read from `ref` (`[rows, columns]`) in the accumulator's layout."""
         return plgpu.load(ref, layout=self.layout, optimized=False)
-
-    def column_zeros(self, count: int) -> jax.Array:
-        """fp32 zeros `[count]` in a column's layout (`columns_of`'s), the carry of a tile's key sums."""
-        return plgpu.layout_cast(jnp.zeros((count,), jnp.float32), self.column)
 
     column_scratch: int
     """The fp32 entries of shared memory a consumer's `column_sums` takes: a reduction across the warps
