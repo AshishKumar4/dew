@@ -13,6 +13,7 @@ roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
 
 import functools
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -411,10 +412,10 @@ def compiled_cases(target: str, plans: dict, refused: list) -> list:
     """The resource gate's cases on `target` (`KernelCase`s), each with its launches' register models (row
     1971): each `RESOURCE_SHAPES` geometry's forward in a 16-bit and an fp32 call, one row and packed
     documents, and the gated delta rule's 16-bit training pass, at the template's derived tiles and, one row's
-    forward, at each of their variants: every tile the derivation admits, held to ptxas exactly (Main,
-    10-28). Its wrong refusals are measured apart (row 1965: the output launch's need does not follow its
-    tiles). Each case's plan by its label into `plans` (`mainloop.planned`), each call the template refuses
-    into `refused`."""
+    forward, at each of their variants; beside them the tiles the derivation takes where every register held
+    (`Template._held`) and refused for registers alone, and the fast backward its launches' registers refuse,
+    so a model over ptxas's need fails as one under it does. Each case's plan by its label into `plans`
+    (`mainloop.planned`), each call the template refuses into `refused`."""
     from fla_gdn_support import KernelCase
 
     family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
@@ -438,31 +439,42 @@ def compiled_cases(target: str, plans: dict, refused: list) -> list:
                                      floor=FLOOR if per_key else None)
         with generation.assumed(facts):
             derived = template.MOSAIC.derived(bound, facts)
+            with mock.patch.object(template.Mosaic, '_held', lambda *_: True):
+                held = template.MOSAIC.derived(bound, facts)
+            # The tile the derivation takes where every register held, refused for its registers alone.
+            unheld = [] if held is None or held == derived else [(held, 'refused ')]
             if derived is None:
                 # Refused: a launch's registers or shared memory past the device's at every tile.
                 refused.append(f"{name} {jnp.dtype(dtype).name}{' training' if training else ''}")
                 assert not template.MOSAIC.eligible(bound, facts)
-                return []
+                return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed,
+                             kind=kind) for tiles, kind in unheld]
             variants = template.MOSAIC.variants(bound)
             if training and not mainloop.backward_holds(
                     *args, tiles=derived, family=family, shared=shared, starts=starts,
                     max_segments=8 if packed else None):
                 # The rule's gradient is the port's or the portable math's where the fast backward's
-                # launches do not hold (`mainloop.backward_holds`): no launch of it to compile.
+                # launches do not hold (`mainloop.backward_holds`); where only their registers refuse them,
+                # the gate compiles them, held to ptxas's need.
                 refused.append(f"{name} {jnp.dtype(dtype).name} fast backward{' packed' if packed else ''}")
-                return []
+                launches = template.MOSAIC._launches(bound, derived, facts, backward=True)
+                if any(launch.shared > shared for launch in launches):
+                    return []
+                return [case(name, dtype, args, starts, bound, derived, training=True, packed=packed,
+                             kind='refused ')]
         assert variants[0] == derived, f"{name} on {target}: variants {variants} lead with no {derived}"
-        return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed)
-                for tiles in (variants[:1] if training or packed else variants)]
+        derived_tiles = [(tiles, '') for tiles in (variants[:1] if training or packed else variants)]
+        return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed, kind=kind)
+                for tiles, kind in derived_tiles + ([] if training else unheld)]
 
-    def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool):
+    def case(name: str, dtype, args, starts, bound, tiles, *, training: bool, packed: bool, kind: str):
         _, value_heads, key_width, value_width, per_key = RESOURCE_SHAPES[name]
 
         def array(*shape, kind=dtype):
             return jax.ShapeDtypeStruct(shape, kind)
 
         label = (f"{name} {jnp.dtype(dtype).name} {'training' if training else 'forward'}"
-                 f"{' packed' if packed else ''} {tiles}")
+                 f"{' packed' if packed else ''} {kind}{tiles}")
         plans[label] = template.MOSAIC._launches(bound, tiles, facts, backward=training)
 
         def call():
