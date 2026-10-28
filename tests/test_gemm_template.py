@@ -89,12 +89,12 @@ def _side_draw(matrix_dtype):
 
 
 def _kernel_gradient(h, dy, sizes):
-    """Each group's rows transposed times its cotangent rows, summed wide (a dense call's whole rows where
-    `sizes` is None): the kernel gradient the template stands for."""
+    """Each group's rows transposed times its cotangent rows, summed wide (a dense call's whole rows, its one
+    group, where `sizes` is None): the kernel gradient the template stands for."""
     wide = jnp.promote_types(h.dtype, jnp.float32)
     h, dy = h.astype(wide), dy.astype(wide)
     if sizes is None:
-        return jnp.dot(h.T, dy, preferred_element_type=wide)
+        return jnp.dot(h.T, dy, preferred_element_type=wide)[None]
     matrices = jnp.zeros((len(sizes), h.shape[1], dy.shape[1]), wide)
     return jax.vjp(lambda m: jax.lax.ragged_dot(h, m, jnp.asarray(sizes), preferred_element_type=wide),
                    matrices)[1](dy)[0]
