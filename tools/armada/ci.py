@@ -210,7 +210,7 @@ def shared(python: str) -> str:
         for path in sorted(Path(top).rglob("*")):
             # A fetched payload is its manifest's (`contents`), which the walk reads in its place.
             if (not path.is_file() or built(path) or path == session.DURATIONS
-                    or path.with_name(path.name + FETCHED).is_file()):
+                    or (path.parent / (path.name + FETCHED)).is_file()):
                 continue
             if path.suffix == ".py" and (top == "src" or path.name.startswith("test_")):
                 continue
@@ -245,8 +245,8 @@ def contents(name: str) -> bytes:
     build's (`built`), or b"missing". A fetched fixture's payload is the digest its manifest pins, whether
     it is downloaded here or not, so a planner that never fetches it keys it as a task does."""
     path = Path(name)
-    manifest = path.with_name(path.name + FETCHED)
-    if manifest.is_file():
+    manifest = path.parent / (path.name + FETCHED)
+    if path.name and manifest.is_file():
         return bytes.fromhex(json.loads(manifest.read_text())["sha256"])
     if path.is_file():
         return hashlib.sha256(path.read_bytes()).digest()
