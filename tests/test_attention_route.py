@@ -368,6 +368,35 @@ def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean(name):
                     f"dropped {name} over its spans' mask", seeds=SEEDS)
 
 
+SIDE_OF_ONE_SEEDS = 16
+"""Check 1's declared seeds for a bf16 attention with a side of one."""
+
+
+@pytest.mark.parametrize("sides", [(1, 12), (5, 1)], ids=["one query", "one key"])
+def test_a_bf16_attention_with_a_side_of_one_is_on_par_with_float64(sides):
+    """A bf16 attention whose queries or keys are one, a grouped decode step's or a one-key read's, is
+    on par (check 1, float64 truth) on the device it runs on, its gradients too: an A100 computes jax.nn's
+    BF16_BF16_F32 query-key product with a side of one off round-to-nearest-even at its ties (row 1550),
+    which a call carried into its output."""
+    from dew.nn.attention import reference_attention
+
+    queries, keys = sides
+
+    def drawn(seed):
+        rng = np.random.default_rng(seed)
+        return tuple(jnp.asarray(rng.standard_normal(shape), jnp.bfloat16) for shape in (
+            (2, queries, HEADS, WIDTH), (2, keys, KV_HEADS, WIDTH), (2, keys, KV_HEADS, WIDTH)))
+
+    def attended(attend):
+        return lambda query, key, value: with_gradients(attend)(query, key, value, jnp.ones_like(query))
+
+    def named(query, key, value):
+        return scaled_dot_product_attention(query, key, value, implementation="xla")
+
+    assert_as_exact(jax.jit(attended(named)), jax.jit(attended(reference_attention)), drawn,
+                    f"bf16 attention of {queries} queries over {keys} keys", seeds=SIDE_OF_ONE_SEEDS)
+
+
 @pytest.mark.skipif(generation.device_generation() != "sm90",
                     reason="composes the route's mainloops, on an H100")
 @pytest.mark.gpu(reason="composes the route's Mosaic forward and Triton backward, on an H100")
