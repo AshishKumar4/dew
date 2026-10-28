@@ -449,9 +449,9 @@ def test_an_earlier_yarn_record_reloads_its_saved_decoder(tmp_path):
     record = objective.inference_record()
 
     def earlier(fields):
+        # Today's union field writes its class beside its fields; the YaRN field wrote the fields alone.
         scaling = fields.pop("rope_scaling")
-        return {**fields, "rope_scaling": None,
-                "yarn": {key: value for key, value in scaling.items() if key != "rope_type"}}
+        return {**fields, "rope_scaling": None, "yarn": scaling["fields"]}
 
     fields = record["model"]["fields"]
     fields["kinds"]["sliding_attention"] = earlier(fields["kinds"]["sliding_attention"])

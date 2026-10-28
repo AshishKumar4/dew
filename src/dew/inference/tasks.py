@@ -449,8 +449,10 @@ def _earlier_scalings(record: Mapping[str, object]) -> Mapping[str, object]:
                 if yarn is not None:
                     if fields["rope_scaling"] is not None:
                         raise ValueError("an earlier record sets yarn and rope_scaling, two rope scalings")
-                    fields["rope_scaling"] = ({"rope_type": "yarn", **yarn} if isinstance(yarn, Mapping)
-                                              else yarn)
+                    # The record names its class and fields, or (written by hand) holds the fields alone.
+                    held = yarn.get("fields", yarn) if isinstance(yarn, Mapping) else yarn
+                    fields["rope_scaling"] = ({"rope_type": "yarn", **held} if isinstance(held, Mapping)
+                                              else held)
             return fields
         if isinstance(value, list | tuple):
             return [current(field) for field in value]

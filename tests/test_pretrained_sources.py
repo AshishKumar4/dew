@@ -88,8 +88,8 @@ def test_the_r1_0528_qwen3_yarn_is_the_references_table():
     record = hf_decoders.translate_config(released)
     expected, attention_factor = ROPE_INIT_FUNCTIONS["yarn"](Qwen3Config.from_dict(released), None)
 
-    scaling = record["rope_scaling"]
-    assert isinstance(scaling, YarnScaling)
+    assert record["rope_scaling"]["rope_type"] == "yarn"
+    scaling = YarnScaling(**record["rope_scaling"])
     assert scaling.factor == 4.0 and scaling.original_max_position_embeddings == 32768
     assert (
         np.max(np.abs(np.asarray(yarn_inv_freq(128, 1e6, scaling, dtype=np.float32)) - expected.numpy()))
