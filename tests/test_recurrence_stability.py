@@ -301,9 +301,11 @@ GRADIENT_HEADS = 16
 head each, which two heads do not resolve within 512 seeds."""
 
 RATED_HEADS = 64
-"""A rated decay's gradient arms' value heads: its rate, a head's one factor of every token's decay, did not
-resolve within 512 seeds at 16 heads under aligned keys, decays near zero, the decay bound and steep then
-mild."""
+"""A rated decay's value heads, in its gradient arms and the SSD port's: its rate, a head's one factor of
+every token's decay, did not resolve within 512 seeds at 16 heads under aligned keys, decays near zero, the
+decay bound and steep then mild, and the port's final memory, every element of a head's a sum over the
+same few steps, not at 2 heads under resets on chunk edges and spread gates (A100, receipt
+tmp/Gate/gpu/ssd-port/receipts/gate-1341-ssd-port-sizing)."""
 
 
 def restarting(fn, regime: str):
@@ -384,11 +386,9 @@ PORT_SEEDS = {
     'resets on chunk edges': 32, 'saturated gates': 8, 'spread gates': 128, 'a long sequence': 16,
     'a fading memory': 16, 'steep then mild': 128,
 }
-"""Each regime's declared seeds for the SSD port's output and final memory (check 1), sized by `seeds_for`
-paired with the port on an A100, where the port compiles (a CPU's interpretation of a kernel judges its
-host's arithmetic, not the kernel's; receipt tmp/Gate/gpu/ssd-port/receipts/gate-1341-ssd-port-sizing),
-and LAST_WRITE's by their output alone (receipt
-tmp/Gate/gpu/ssd-port2/receipts/gate-1341-ssd-port-sizing-2)."""
+"""Each regime's declared seeds for the SSD port's output and final memory over RATED_HEADS value heads
+(check 1), sized by `seeds_for` paired with the port on an A100, where the port compiles (a CPU's
+interpretation of a kernel judges its host's arithmetic, not the kernel's)."""
 
 PORT_GRADIENT_SEEDS = {
     'decays near one': 16, 'decays near zero': 256, 'the decay bound': 512, 'aligned keys': 32,
@@ -396,12 +396,6 @@ PORT_GRADIENT_SEEDS = {
     'a fading memory': 256, 'steep then mild': 128,
 }
 """Each regime's declared seeds for the SSD port's gradient (check 1), sized as `PORT_SEEDS` are."""
-
-LAST_WRITE = ('resets on chunk edges', 'spread gates')
-"""The regimes whose final memory the port holds as the last token's write alone, a document starting on
-the last token, or spread gates' steep decays leaving its write alone: one rounding a value, which check 1's
-pooled parity did not resolve within 512 seeds on an A100 (row 2049). Check 1 holds their output; their
-final memory is held finite where float64's is."""
 
 PORT = pytest.mark.gpu(reason="the SSD port compiled, as a GPU runs it")
 
@@ -415,8 +409,7 @@ def test_the_ssd_port_stays_finite_and_exact_where_chunked_forms_break(regime):
     hooks = SITES['rated']
     dew = functools.partial(ssd_port, hooks, chunk_size=CHUNK)
     reference = functools.partial(token_by_token, hooks)
-    draws = functools.partial(stressed, hooks, regime)
-    judged = (lambda fn: lambda *operands: fn(*operands)[0]) if regime in LAST_WRITE else (lambda fn: fn)
+    draws = functools.partial(stressed, hooks, regime, value_heads=RATED_HEADS)
     for seed in range(PORT_SEEDS[regime]):
         operands = draws(seed)
         mine = jax.jit(dew)(*operands)
@@ -426,8 +419,7 @@ def test_the_ssd_port_stays_finite_and_exact_where_chunked_forms_break(regime):
             finite = np.isfinite(np.asarray(exact))
             assert np.all(np.isfinite(np.asarray(ours))[finite]), (
                 f'{leaf}: not finite where float64 is, seed {seed}')
-    assert_as_exact(judged(dew), judged(reference), draws, f'the SSD port under {regime}',
-                    seeds=PORT_SEEDS[regime])
+    assert_as_exact(dew, reference, draws, f'the SSD port under {regime}', seeds=PORT_SEEDS[regime])
 
 
 @PORT
