@@ -567,13 +567,15 @@ def test_a_cached_memorys_rounding_is_each_rows_own():
     assert not np.array_equal(np.asarray(decoded(keys, jax.random.key(6))), brought)
 
 
-@pytest.mark.parametrize("stochastic", [False, True], ids=["deterministic", "stochastic"])
-def test_a_served_memorys_prefix_is_its_rounding_streams_alone(stochastic):
+@pytest.mark.parametrize(("network", "weight_only", "stochastic"),
+                         [(None, None, False), (None, False, True), ("convolved", True, False)],
+                         ids=["unquantized", "stochastic", "weight-only-convolution"])
+def test_a_served_memorys_prefix_is_its_rounding_streams_alone(network, weight_only, stochastic):
     """A paged server's prefix cache shares a memory decoder's prompt state across requests where the
-    state is the tokens' alone: a memory that rounds deterministically (here, unquantized) keeps no
-    rounding key, so a second key reuses the first's prefix; one whose quantized backward rounds
-    stochastically keeps its request's key in the cache (`dew.nn.kv_cache.ROUNDING_KEYS`), so only its
-    own key reuses it (ledger 2036)."""
+    state is the tokens' alone: a memory that rounds deterministically keeps no rounding key, so a
+    second key reuses the first's prefix, unquantized or under a weight-only rule that quantizes no
+    product of its convolution; one whose quantized backward rounds stochastically keeps its request's
+    key in the cache (`dew.nn.kv_cache.ROUNDING_KEYS`), so only its own key reuses it (ledger 2036)."""
     from model_support import Digits
 
     from dew.inference import RunProcessor, TextGeneration
@@ -581,15 +583,18 @@ def test_a_served_memorys_prefix_is_its_rounding_streams_alone(stochastic):
     from dew.nn.kv_cache import KVCache
     from dew.sampling import Sampling
 
-    model = decoder().clone(max_seq_len=64)
+    memory = None if network is None else InContextMemory(
+        network=ConvolvedMemory(), heads=2, head_features=8, chunk=4, normalize=True,
+        learning_rate=Gate(scale=STEP), momentum=Gate(), retention=Gate(bias=-2.0))
+    model = decoder(memory).clone(max_seq_len=64)
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     task = TextGeneration(model, params, RunProcessor(Digits()),
                           sampling=Sampling(temperature=0, eos_token_ids=12))
-    if stochastic:
+    if weight_only is not None:
         pytest.importorskip("qwix")
         from dew.quantization import Quantization
 
-        task = task.quantized(Quantization(patterns=(INNER,), bwd_qtype="int8",
+        task = task.quantized(Quantization(patterns=(INNER,), weight_only=weight_only, bwd_qtype="int8",
                                            bwd_stochastic_rounding="uniform"))
     server = Server.from_task(task, slots=2, capacity=64, kv_cache=KVCache(page_size=16), prefix_cache=True)
     prompt = "1" * 33

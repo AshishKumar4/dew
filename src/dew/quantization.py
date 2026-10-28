@@ -313,8 +313,14 @@ def quantized_products(module: nn.Module, name: str) -> QuantizedProducts:
     scopes = {scope, *((*scope, *leaf[:-1]) for leaf in params)}
     if all(policy.rule_for(path) is None for path in scopes):
         return QuantizedProducts(inputs=False, weights=False)
+    # A weight-only rule quantizes the matmuls alone (`_rules`), each by an [in, out] kernel; a
+    # convolution's kernel holds its window too, and its products stay float.
+    selected = [leaf for leaf in params
+                if policy.rule_for(scope) is not None or policy.rule_for((*scope, *leaf[:-1])) is not None]
+    rounded = not policy.weight_only or any(leaf[-1] == "kernel" and np.ndim(params[leaf]) == 2
+                                            for leaf in selected)
     return QuantizedProducts(inputs=not policy.weight_only or policy.bwd_qtype is not None, weights=True,
-                             stochastic=policy.bwd_qtype is not None
+                             stochastic=rounded and policy.bwd_qtype is not None
                              and policy.bwd_stochastic_rounding is not None)
 
 
