@@ -5,6 +5,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- RL rollout metrics report each data source's status shares and mean trained reward
+  (`source/<source>/status/<name>`, `source/<source>/reward/mean`) where a step's prompts come from two or
+  more (`Session.source`, the prompt's `PromptRecord.data_source`).
 - Liquid's LFM3 (`lfm3`, LiquidAI/LFM3-1.7B and the text backbone of LFM3-VL and d1) loads, trains, decodes
   and saves: its gated short convolution layers are a mixer of their own (`short_conv`, its last inputs
   through the decode cache), and attention gates each head by its own sigmoid (`gate_projection='head'`).

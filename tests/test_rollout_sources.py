@@ -590,6 +590,10 @@ def test_a_prompt_sessions_source_is_its_data_source_and_the_metrics_report_each
     assert metrics["reward/mean"] == 0.5
     exported = json.loads(json.dumps(to_verl(sessions)))
     assert [trajectory.session for trajectory in from_verl(exported)] == sessions
+    # An export from before sessions named their source imports with none.
+    for row in exported:
+        del row["extra_fields"]["dew"]["session"]["source"]
+    assert {trajectory.session.source for trajectory in from_verl(exported)} == {""}
 
 
 def test_the_prompt_sources_calls_carry_the_draws_routing_into_the_packed_batch():
