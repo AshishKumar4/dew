@@ -14,7 +14,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import attention_algebra as algebra, mosaic
-from dew.nn.kernels.templates.attention import DKV_GRADS, DQ_GRADS, Hooks, Kind, PaddedCall, Param
+from dew.nn.kernels.templates.attention import DKV_GRADS, DQ_GRADS, Hooks, Kind, PaddedCall, Param, by_power
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
     _columns,
@@ -95,6 +95,19 @@ class _Backward:
         return self.spec.scale
 
     @property
+    def grad_scale(self) -> float:
+        """The scale the gradients' cotangents take: the call's whole scale, the logits' times the power its
+        query took before its products (`algebra.Forward.prescale`), against the call's own keys for dQ and
+        its own queries for dK, so their products stay within the call's own range."""
+        return self.spec.scale * self.spec.prescale
+
+    @property
+    def scaled(self) -> bool:
+        """Whether the dK/dV program's logits take the query by its power (`by_power`), formed in registers
+        from the call's own streamed one, which dK takes."""
+        return self.spec.prescale != 1.0
+
+    @property
     def summed(self) -> tuple[bool, ...]:
         """Which score parameters the dQ program sums per query (`DQ_GRADS`); the others' gradients the dK/dV
         program writes."""
@@ -150,7 +163,7 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
         scored = _scores(walk, coords_of(k_first), masked, params, s, dp, peak, prior, anchor, delta, chosen)
         exponentials, _, cotangents, slopes, seen = scored
         terms, parts, keyed = algebra.dq_issued(sums, exponentials, cotangents, slopes, seen, k_slot.dtype,
-                                                prior, scale=walk.scale, kinds=walk.kinds,
+                                                prior, scale=walk.grad_scale, kinds=walk.kinds,
                                                 summed=walk.summed, accurate=walk.accurate)
         row_sums = (terms.residual, terms.mass, terms.grads, terms.weighed, terms.keyed_mass,
                     terms.keyed_shift)
@@ -289,7 +302,10 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, buffers, coords_of, par
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
     peak, denominator, centre, rest, chosen = rows_of(q_first)
-    s = family.product(q_slot, k_smem.transpose((1, 0)), shape)
+    # The logits from the query taken by its power in registers (`_Backward.scaled`), dK from the call's own.
+    keys = k_smem.transpose((1, 0))
+    s = (family.registers_product(by_power(family.tile_of(q_slot), walk.spec.prescale), keys, walk.interpret)
+         if walk.scaled else family.product(q_slot, keys, shape))
     dp = family.product(do_slot, v_smem.transpose((1, 0)), shape)
     params = params_of(q_first, s)
 
@@ -307,7 +323,7 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, buffers, coords_of, par
     exponentials, weights, logits, pieces = lax.cond(whole(index), functools.partial(scores, masked=False),
                                                      functools.partial(scores, masked=True))
     narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
-    parts = algebra.cotangent_parts(logits * walk.scale, q_slot.dtype, accurate=walk.accurate)
+    parts = algebra.cotangent_parts(logits * walk.grad_scale, q_slot.dtype, accurate=walk.accurate)
     # Each staged part's transpose the left operand (`algebra.cotangent_product`'s `aᵀ @ b`).
     dv_acc = family.staged_products(dv_acc, ((narrowed, None),), do_slot, buffers.at[pl.ds(0, 1)],
                                     walk.interpret, transposed=True)
@@ -463,7 +479,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 
 def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value,
                      shift, others, own, others_total, forward_total, start, end, query_ids, key_ids,
-                     score_params, *, score_mod, score_kinds, score_dtypes, scale: float,
+                     score_params, *, score_mod, score_kinds, score_dtypes, scale: float, prescale: float,
                      spec: algebra.Forward, accurate: bool, tiles: BackwardTiles, family: mosaic.Family,
                      interpret: bool):
     """`gradients`' launch on this mainloop: D from the forward's split sums, each query's anchor key as the
@@ -478,8 +494,9 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     its dQ fp32); two launches, in a fixed order, otherwise. Returns what `gradients` takes: dQ, the softmax's
     rows, each query's anchor key, the dQ parameters' gradients (`DQ_GRADS`; a head's as per-query sums
     `[1, B, H, 1]`, which `gradients` sums over the batch), then dK, dV and the dK/dV parameters'
-    (`DKV_GRADS`)."""
-    del scale
+    (`DKV_GRADS`). The query arrives the call's own: its logits are those of the query taken by `prescale`
+    (`by_power`) at `scale`, the scale left (`gradients`), which `spec` takes."""
+    spec = dataclasses.replace(spec, scale=scale, prescale=prescale)
     width, value_width = query.shape[-1], value.shape[-1]
     _, state_total = algebra.off_anchor_start(peak0, total0, maximum, value_width, shift)
     cotangent = jnp.swapaxes(dout, 1, 2).astype(jnp.float32)
@@ -503,8 +520,9 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
         mass = algebra.split_mass(own, others_total, forward_total, shift)
         return (dq[..., :width], delta, anchor, maximum, forward_total, mass, chosen, dk[..., :width],
                 dv[..., :value_width])
-    dq_sum, keyed, rows = _dq_launch(query, key, value, dout, maximum, forward_total, anchor, delta, chosen,
-                                     spans, score_params, walk=walk)
+    # The dQ program reads its queries for their logits alone.
+    dq_sum, keyed, rows = _dq_launch(by_power(query, prescale), key, value, dout, maximum, forward_total,
+                                     anchor, delta, chosen, spans, score_params, walk=walk)
     count = sum(walk.summed)
     dq_swapped = jnp.swapaxes(dq_sum, 1, 2)
     # The fast form's keyed sums are never read (`dq_finish`): a placeholder there.
