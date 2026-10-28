@@ -49,11 +49,13 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     of the decoder over the prompt, its groups (the prefix run's where it carries none) and the tokens
     drawn before it, from the float64 twin's. `task` draws greedily and stops at its `budget` alone.
 
-    Without `alone`, the tokens scored are the server's own draws, each draw one run of it: a model whose
-    products round at boundaries (a quantized memory's moving weights, ledger 2032) draws, from one
-    program of its arithmetic and another, tokens that need not agree, a lone task batched with itself
-    among them. `truth` is the decoder and float variables whose float64 twin is the truth where the
-    task's own do not widen to one (a served quantization's stored codes); the task's by default."""
+    Without `alone`, the tokens scored are the server's own draws, each draw one run of it, and the lone
+    task's own draws are held to the same full forward after it, so served and alone are each on par with
+    it: a model whose products round at boundaries (a quantized memory's moving weights, ledger 2032)
+    draws, from one program of its arithmetic and another, tokens that need not agree, a lone task
+    batched with itself among them. `truth` is the decoder and float variables whose float64 twin is the
+    truth where the task's own do not widen to one (a served quantization's stored codes); the task's by
+    default."""
     if rounds is None:
         rounds = (len(requests),) if hits is None else (1,) * len(requests)
     decoder, variables, vocab = task.model, task.variables, task.model.vocab_size
@@ -129,3 +131,18 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     reference, truth = explicit(decoder), explicit(wide, wide_weights=True)
     seeds = seeds_for(reference, draw, label, truth_fn=truth, dew_fn=served)
     assert_as_exact(served, reference, draw, label, seeds=seeds, truth_fn=truth)
+    if alone:
+        return
+
+    def drawn_alone(seed):
+        """The lone task's draws of the seed's requests and their likelihoods as it scored them."""
+        row = np.random.default_rng([0x1536, seed]).integers(1, vocab, width).astype(np.int32)
+        generations = [task(served_inputs(row, request, vocab), budget, key=index).host()
+                       for index, request in enumerate(requests)]
+        return row, tuple(np.asarray(generation.tokens)[0, -budget:] for generation in generations), \
+            likelihoods(generations)
+
+    # The lone task held to the same full forward: served and alone each on par with it, so with each other.
+    lone = as_given(lambda row, drawn, scored: scored)
+    alone_seeds = seeds_for(reference, drawn_alone, f"{label} alone", truth_fn=truth, dew_fn=lone)
+    assert_as_exact(lone, reference, drawn_alone, f"{label} alone", seeds=alone_seeds, truth_fn=truth)

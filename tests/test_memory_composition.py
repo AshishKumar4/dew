@@ -26,7 +26,7 @@ from memory_support import (
     layer,
     written,
 )
-from reference_error import as_given, assert_as_exact
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -545,11 +545,12 @@ def test_a_server_serves_a_quantized_memory_decoder_on_par_with_its_full_forward
     """A memory decoder served quantized (`TextGeneration.quantized`: every inner Dense of its heads'
     networks, weights and activations) through a server's two slots draws tokens whose likelihoods are on
     par with the served decoder's full forward over the same tokens, against quantized training from its
-    stored W_0 in float64 (check 1; `assert_served_as_exact`). The tokens scored are the server's own: a
-    moving weight's quantization rounds at boundaries that a 1e-7 relative change of the weights crosses,
-    moving the likelihoods by 1.2e-2 where the unquantized decoder moves by 1.4e-6, so a lone task batched
-    with itself already moves its likelihoods by 8.8e-4 and no two programs of it draw alike by rule
-    (ledger 2032; armada probes IG2032 and IG2032c at main 783ea620a)."""
+    stored W_0 in float64 (check 1; `assert_served_as_exact`), as is the lone task's over its own draws.
+    The tokens scored are each one's own: a moving weight's quantization rounds at boundaries that a 1e-7
+    relative change of the weights crosses, moving the likelihoods by 1.2e-2 where the unquantized
+    decoder moves by 1.4e-6, so a lone task batched with itself already moves its likelihoods by 8.8e-4
+    and no two programs of it draw alike by rule (ledger 2032; armada probes IG2032 and IG2032c at main
+    783ea620a)."""
     pytest.importorskip("qwix")
     from model_support import Digits
     from serving_support import Served, assert_served_as_exact
@@ -563,10 +564,13 @@ def test_a_server_serves_a_quantized_memory_decoder_on_par_with_its_full_forward
     spec = Quantization(patterns=(INNER,))
     task = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
     bound = task.quantized(spec)
-    # The served decoder computes quantized training from the float its stored W_0 decodes to (`served_site`).
+    # The served decoder computes quantized training from the float its stored W_0 decodes to (`served_site`),
+    # each code times its scale in float64 for the truth, as the decoder's own decode computes it exactly.
+    with jax.enable_x64(new_val=True):
+        start = decoded_stored(widened(bound.variables))
     assert_served_as_exact(bound, (Served(3), Served(5)), "served quantized memory",
                            serving={"slots": 2, "capacity": 64}, alone=False,
-                           truth=(spec.apply(model), decoded_stored(bound.variables)))
+                           truth=(spec.apply(model), start))
 
 
 def test_a_cached_memorys_rounding_is_each_rows_own():
