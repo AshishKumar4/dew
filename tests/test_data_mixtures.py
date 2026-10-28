@@ -1763,3 +1763,43 @@ def test_a_finite_mixture_resumed_after_a_member_ends_reads_what_the_uninterrupt
             resumed.close()
 
 
+
+
+class Seen:
+    """`rows` records of a corpus that marks itself in `touched` whenever one of them is read."""
+
+    def __init__(self, rows: int, corpus: int, touched: set[int]):
+        self.rows, self.corpus, self.touched = rows, corpus, touched
+
+    def __len__(self) -> int:
+        return self.rows
+
+    def __getitem__(self, index: int) -> dict:
+        self.touched.add(self.corpus)
+        return {"id": np.int64(self.corpus * 1000 + index)}
+
+
+def test_a_mix_of_hundreds_of_corpora_reads_with_one_read_budget_and_only_the_corpora_it_draws():
+    """A mix of 300 corpora, each shuffled and repeated as a run's sources are, read with Loading's
+    16 threads and 16-batch read-ahead: its reader holds no more threads than one read of them all,
+    and reads only the corpora it draws, here the two that carry its weight. Before, each corpus read
+    with the whole budget and the mix read every corpus's first row before its first: 300 thread
+    pools and every corpus read (row 2016)."""
+    import threading
+
+    touched: set[int] = set()
+    corpora = [Pipeline(Memory(Seen(64, corpus, touched), identity=f"seen-{corpus}")).shuffle(corpus).repeat()
+               for corpus in range(300)]
+    weights = [1.0, 1.0] + [1e-9] * 298
+    data = compile(mix(corpora, weights).batch(8), read="indexed", seed=0,
+                   loading=Loading(workers=0, threads=16, read_buffer=16, cache=False))
+    before = threading.active_count()
+    touched.clear()
+    reader = data.train(DataPartition())
+    try:
+        for _ in range(4):
+            next(reader)
+        assert threading.active_count() - before <= 16
+        assert touched == {0, 1}
+    finally:
+        reader.close()
