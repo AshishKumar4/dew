@@ -28,11 +28,9 @@ SIZES = (0, 70, 1, 129, 100, 0)
 ROWS, DEPTH, WIDTH = 307, 128, 128
 ROUTED = sum(SIZES)
 SEEDS = 8
-"""Each site's declared draws (`reference_error.seeds_for` of the plain program on them)."""
-PAIRED_SEEDS = {"jvp": 8, "side": 8, "broadcast": 8, "exact sums": 8, "consumer": 8, "paired": 8}
-"""The declared draws of the sites that held one program bitwise to another before bible §6 (owner 10-27),
-sized by `reference_error.seeds_for` paired with the kernel's arm, on armada: the most any of a site's
-cases took."""
+"""Each site's declared draws (`reference_error.seeds_for` of the plain program on them; the sites that held
+one program bitwise to another before bible §6, owner 10-27, sized paired with the kernel's arm on armada,
+8 at every case)."""
 
 
 def _wide(x):
@@ -569,7 +567,7 @@ def test_a_side_operands_rows_may_be_any_of_its_dimensions(generation_name):
 
         with generation.assumed(generation_name), generation.chosen(grouped_matmul="triton"):
             assert_as_exact(jax.jit(dew), jax.jit(_side_plain()), _side_draw(jnp.float32),
-                            f"side {layout} on {generation_name}", seeds=PAIRED_SEEDS["side"],
+                            f"side {layout} on {generation_name}", seeds=SEEDS,
                             truth_fn=_side_plain(truth=True))
 
 
@@ -583,7 +581,7 @@ def test_a_broadcast_dimension_is_the_squeezed_operands(generation_name):
         with generation.assumed(generation_name), generation.chosen(grouped_matmul="triton"):
             assert_as_exact(jax.jit(_drop(_dew(spec, interpret_on_cpu=True))), jax.jit(_drop(_plain(spec))),
                             _draw, f"{case} through Triton on {generation_name}",
-                            seeds=PAIRED_SEEDS["broadcast"], truth_fn=_drop(_plain(spec, truth=True)))
+                            seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
 
 
 def test_a_side_operand_names_one_launch_axis_per_dimension():
@@ -644,7 +642,7 @@ def test_forward_mode_through_the_kernels_gives_the_plain_programs_tangent():
         value, tangent = jax.jit(forward(_dew(spec, interpret_on_cpu=True)))(*draw(0))
         assert value.dtype == tangent.dtype == jnp.bfloat16
         assert_as_exact(jax.jit(forward(_dew(spec, interpret_on_cpu=True))), jax.jit(forward(_plain(spec))),
-                        draw, "forward mode through the kernels", seeds=PAIRED_SEEDS["jvp"],
+                        draw, "forward mode through the kernels", seeds=SEEDS,
                         truth_fn=forward(_plain(spec, truth=True)))
 
 
@@ -1063,7 +1061,7 @@ def test_the_mosaic_kernels_load_a_side_operands_rows_from_any_dimension():
                     mosaic_gpu.tgmm(x, dy, sizes, **options))
 
         assert_as_exact(dew, jax.jit(_side_plain()), _side_draw(jnp.bfloat16), f"Mosaic side {layout}",
-                        seeds=PAIRED_SEEDS["side"], truth_fn=_side_plain(truth=True))
+                        seeds=SEEDS, truth_fn=_side_plain(truth=True))
 
 
 def _gradient_rows_draw(seed):
@@ -1096,7 +1094,7 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
               generation.chosen(grouped_matmul=launch)):
             assert_as_exact(jax.jit(dew), jax.jit(plain), _gradient_rows_draw,
                             f"{precision} sums through {launch}, {'grouped' if group_sizes else 'dense'}",
-                            seeds=PAIRED_SEEDS["exact sums"], truth_fn=plain)
+                            seeds=SEEDS, truth_fn=plain)
 
 
 @runs("sm90")
@@ -1130,7 +1128,7 @@ def test_a_cooperative_tiles_exact_sums_add_as_its_plain_sum_does():
         with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"),
               tuning.pinned({grouped_matmul.MosaicTgmm: COOPERATIVE})):
             assert_as_exact(jax.jit(dew), jax.jit(plain), _gradient_rows_draw,
-                            f"cooperative {precision} sums", seeds=PAIRED_SEEDS["exact sums"], truth_fn=plain)
+                            f"cooperative {precision} sums", seeds=SEEDS, truth_fn=plain)
 
 
 def test_a_tile_states_a_schedule_the_kernels_run():
@@ -1325,7 +1323,7 @@ def test_a_consumer_the_kernels_cannot_tile_runs_after_the_product(consumer, exa
 
     with generation.assumed("sm80"):
         assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(plain(consumer)), draw,
-                        "a consumer after the product", seeds=PAIRED_SEEDS["consumer"], truth_fn=plain(exact))
+                        "a consumer after the product", seeds=SEEDS, truth_fn=plain(exact))
 
 
 HIGHEST, DEFAULT = jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT
@@ -1399,7 +1397,7 @@ def test_a_paired_product_holds_check_1_against_its_two_products_combined():
 
     paired = run(*draw(0))
     assert paired.shape == (rows, width) and paired.dtype == jnp.bfloat16
-    assert_as_exact(run, jax.jit(plain), draw, "paired product", seeds=PAIRED_SEEDS["paired"], truth_fn=truth)
+    assert_as_exact(run, jax.jit(plain), draw, "paired product", seeds=SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm90"])
