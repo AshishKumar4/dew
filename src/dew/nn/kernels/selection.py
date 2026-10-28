@@ -3,9 +3,9 @@ the call (the op's case, the `C` its `Op[C]`, kernels and requirements share, so
 another op's case fails the type check) and what each kernel declares it takes (its `SUPPORTS`, ordered
 `Requirement`s), the one place a kernel's eligibility is written.
 
-An op that measures states its preference: the target's measured kernel (its row in
-`generation.TARGETS`, read through `measured_kernel`) comes first, then the op's own order; any other
-op prefers the first of its kernels whose requirements hold, in its fixed order. The first kernel
+An op states its preference: its own rule over the call (`Op.preferred`), else the first of its kernels
+whose requirements hold, in its fixed order; a cell a measurement found another kernel faster on
+(`Op.declared`: the receipt beside it) runs that kernel. The first kernel
 whose requirements all hold takes the call, and the route names the preferred kernel's first failed
 requirement as its refusal (`generation.route`). A kernel the caller forces
 (`generation.chosen`, or a layer's named implementation) that does not take the call raises, listing
@@ -73,9 +73,10 @@ class Kernel[C]:
 
 @runtime_checkable
 class Celled(Protocol):
-    """A case an op with declared cells reads (`Op.declared`): its `cell`, the device's instruction
-    family (`generation.family`, None outside every family) and the kind of call it is (a GEMM's
-    'grouped forward', a recurrence's product)."""
+    """A case an op with declared cells reads (`Op.declared`): its `cell`, the scope a receipt measures
+    (a template's instruction family, `generation.family`, None outside every family; a standalone
+    kernel's device generation, `generation.device_generation`) and the kind of call it is (a GEMM's
+    'grouped forward', a recurrence's product, a norm's 'bfloat16')."""
 
     @property
     def cell(self) -> tuple[str | None, str]: ...
@@ -83,14 +84,15 @@ class Celled(Protocol):
 
 @dataclasses.dataclass(frozen=True)
 class Op[C]:
-    """A family of ops one selector serves: its `choice` (the name `TARGETS` rows, `chosen` and routes
-    use), its `kernels` in the order the selector tries them after the preferred one, `preferred(case)`
-    the kernel the target measured fastest for the case where the op measures (else the first of its
-    kernels that takes the case, `select`), `hosted(kernel)` what this host runs for the target's
-    kernel (`generation.gpu_placed`), and `declared`: the cells where an old route measured faster than
-    the op's template (owner, bible da64ae5), each cell `(family, kind)` (`Celled.cell`) to its old
-    route's kernel and the receipt that measured it. A declared cell runs its old route where that kernel
-    takes the call; any other call, and a declared one its old route cannot run, the op's order."""
+    """A family of ops one selector serves: its `choice` (the name `chosen` and routes use), its `kernels`
+    in the order the selector tries them after the preferred one, `preferred(case)` the op's own rule for
+    the kernel it prefers (else the first of its kernels that takes the case, `select`), `hosted(kernel)`
+    what this host runs for the target's kernel (`generation.gpu_placed`), and `declared`: the cells where
+    a measurement found another kernel faster than the op's preference (a template's old route, owner,
+    bible da64ae5; a standalone kernel against XLA's program), each cell (`Celled.cell`: the scope the
+    receipt measured, a template's instruction family or a device's generation, and the kind of call) to
+    that kernel and the receipt. A declared cell runs its kernel where it takes the call; any other call,
+    and a declared one its kernel cannot run, the op's order."""
 
     choice: str
     kernels: tuple[Kernel[C], ...]
@@ -178,9 +180,9 @@ def _decided[C](op: Op[C], case: C, named: str | None,
 
 
 def _old_route[C](op: Op[C], case: C) -> tuple[Kernel[C], str, Refusal | None] | None:
-    """The old route a declared cell runs (`Op.declared`): its kernel where it takes the call, the
-    kernel the op would prefer otherwise, and that one's refusal naming the receipt; None where the call's
-    cell is not declared or its old route cannot run it."""
+    """The kernel a declared cell runs (`Op.declared`): its kernel where it takes the call, the kernel the
+    op would prefer otherwise, and that one's refusal naming the receipt; None where the call's cell is
+    not declared or its kernel cannot run it."""
     if not op.declared or not isinstance(case, Celled):
         return None
     cell = case.cell
@@ -194,8 +196,8 @@ def _old_route[C](op: Op[C], case: C) -> tuple[Kernel[C], str, Refusal | None] |
     if preferred == name:
         return kernel, name, None
     return kernel, preferred, Refusal(
-        'old_route', f"{name} measured faster on this cell ({', '.join(part for part in cell if part)}): "
-                     f"{receipt}", 'bible da64ae5')
+        'measured', f"{name} measured faster than {preferred} on this cell "
+                    f"({', '.join(part for part in cell if part)}): {receipt}", 'bible da64ae5')
 
 
 def _preferred[C](op: Op[C], case: C) -> str:

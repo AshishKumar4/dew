@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from grain.experimental import FirstFitPackIterDataset
 
-from dew.batch import VALID_ROWS
+from dew.batch import VALID_ROWS, Coordinates
 from dew.data import Loading, Memory
 from dew.data.compile import compile, validation
 from dew.data.dataset import DataPartition
@@ -144,8 +144,11 @@ def test_a_memory_read_packs_by_the_policy_an_indexed_read_packs_by(policy, over
         try:
             # The windows' arrays: each read declares its own bound on the documents a window holds
             # (`Coordinates.max_segments`), the memory read the most it packed into one and the
-            # indexed read, packing as it streams, its window's length.
-            return [[np.asarray(value).tolist() for value in jax.tree.leaves(batch)] for batch in reader]
+            # indexed read, packing as it streams, its window's length, which its documents' firsts are
+            # as wide as: their token-aligned fields compared.
+            return [[np.asarray(value).tolist() for value in jax.tree.leaves(
+                {name: value.tokens() if isinstance(value, Coordinates) else value
+                 for name, value in batch.items()})] for batch in reader]
         finally:
             reader.close()
 

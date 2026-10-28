@@ -24,9 +24,10 @@ from dew.data.dataset import rows_of
 from dew.devices import gpu_free_bytes, xla_flag
 from dew.distributed.placement import parameter_axes
 from dew.mesh import batch_axes, mesh_axes
+from dew.nn.backbones.decoder_block import DECODER_REMAT, remat_record
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import Option, compiler_options
-from dew.nn.protocols import Recomputing, TritonGemm
+from dew.nn.protocols import Recomputing, RematChoosing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
 
@@ -79,8 +80,8 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
 
     Only an objective whose rows hold tokens gives them (`Objective.row_tokens`), so any other
     objective's frozen step runs apart. Triton GEMM fusions are turned off where
-    `gpu_target().kernels['xla_triton_gemm']` measured a win and no module the step runs
-    keeps them (`TritonGemm`), and wherever a module the step runs computes in int8
+    the GPU measured a win without them (`GpuTarget.triton_gemm_fusions`) and no module the step
+    runs keeps them (`TritonGemm`), and wherever a module the step runs computes in int8
     (`compiler_options`).
     """
     generation = device_generation()
@@ -92,7 +93,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
             and not (frozen and small)):
         options['xla_gpu_dot_merger_threshold_mb'] = 0
     modules = [entry.module for entry in objective.program_key()]
-    if (gpu_target(generation).kernels.get('xla_triton_gemm') == 'off'
+    if (not gpu_target(generation).triton_gemm_fusions
             and xla_flag('xla_gpu_enable_triton_gemm') is None
             and modules and not any(isinstance(module, TritonGemm) and module.keeps_triton_gemm
                                     for module in modules)):
@@ -484,6 +485,32 @@ def remat_half[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list |
     objective.substitute([entry.module if module is None else module
                           for module, entry in zip(half, entries, strict=True)])
     return held
+
+
+def remat_below[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> list[list]:
+    """The modules the objective trains at each rung of their remat ladders below where they stand,
+    cheapest first, each the list `objective.substitute` takes. Each module's own rungs are those its
+    climb from no recomputation stands at (`RematChoosing.with_remat`, `Recomputing.recompute_more`)
+    before the ladder reaches its own policy (`DECODER_REMAT`, a rung that keeps what the next keeps
+    passed as the search passes it); the k-th list holds each module at its k-th, or at its own where
+    it has fewer. Empty where no trained module chooses a remat on its ladder above none."""
+    entries = objective.program_key()
+    ladder = [remat_record(policy) for policy in DECODER_REMAT]
+    prefixes: list[list | None] = []
+    for entry in entries:
+        module = entry.module
+        if not (entry.trained and isinstance(module, Recomputing) and isinstance(module, RematChoosing)
+                and module.recompute_record() in ladder):
+            prefixes.append(None)
+            continue
+        own, rungs, climbed = ladder.index(module.recompute_record()), [], module.with_remat(None)
+        while climbed is not None and ladder.index(climbed.recompute_record()) < own:
+            rungs.append(climbed)
+            climbed = climbed.recompute_more()
+        prefixes.append(rungs)
+    depth = max((len(rungs) for rungs in prefixes if rungs is not None), default=0)
+    return [[entry.module if not rungs else rungs[min(index, len(rungs) - 1)]
+             for entry, rungs in zip(entries, prefixes, strict=True)] for index in range(depth)]
 
 
 def remat_more[LossT, EffectsT](objective: Objective[LossT, EffectsT]) -> bool:

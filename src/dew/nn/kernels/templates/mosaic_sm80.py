@@ -16,6 +16,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 from dew.nn.kernels.templates import cost, mosaic, resources
+from dew.nn.sharding import per_shard
 
 _TILING: Callable[[tuple[int, int]], object] = plgpu.TilingTransform
 _SWIZZLE: Callable[[int], object] = plgpu.SwizzleTransform
@@ -86,6 +87,7 @@ class Mma(mosaic.Family):
     bounded_loads = False
     role_rows = 4 * 16
     operands_in_registers = True
+    products_overlap = False
     stores_through_registers = True
 
     @classmethod
@@ -169,6 +171,7 @@ class Mma(mosaic.Family):
                cluster: int = 1, cost: pl.CostEstimate | None = None) -> Callable:
         # Its one warpgroup is its consumer, no producer beside it, and no cluster.
         _one(consumers, clustered=cluster > 1)
+        per_shard(name or self.name)
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             compiler_params=plgpu.CompilerParams(approx_math=approx_math),
                             interpret=mosaic.interpreted(interpret), kernel_name=name, cost_estimate=cost)
@@ -207,7 +210,8 @@ class Mma(mosaic.Family):
                 # Unoptimized, as `copied`'s transfers: JAX 0.12 takes an unflagged store as optimized-only,
                 # which its layout inference searched to exhaustion beside the ladder's copies (ns-gate3).
                 plgpu.store(smem, value.astype(smem.dtype), optimized=False)
-                mosaic.store_rows(smem, ref, *place, copy=mosaic.copied)
+                mosaic.store_rows(smem, ref, *place, copy=mosaic.copied,
+                                  widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
             @plgpu.nd_loop(tiles, collective_axes=axis)
             def _(loop: plgpu.NDLoopInfo):
@@ -281,7 +285,8 @@ class Mma(mosaic.Family):
                 mosaic.copied(smem, view)
                 continue
             rows = smem.shape[0]
-            mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.copied)
+            mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.copied,
+                              widest=resources.copied_rows(smem.shape[1], smem.dtype))
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
         # Element-wise atomic adds into global memory (`red.global`; no TMA reduction before Hopper), so

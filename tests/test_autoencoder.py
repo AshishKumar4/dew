@@ -326,6 +326,33 @@ def test_a_kl_loader_refuses_another_autoencoders_checkpoint(tmp_path, family):
         StableDiffusionVAE(str(folder), dtype=jnp.float32)
 
 
+def test_a_flax_layout_vae_binds_as_its_torch_layout_does(tmp_path):
+    """One KL autoencoder's parameters as diffusers' Flax msgpack (the SD1-era layout) and as its torch
+    safetensors (the committed sd3-tiny) bind into one tree through the one loader (`load_kl_vae`, which a
+    standalone load and `StableDiffusionVAE` reach): the same parameters, the msgpack's in the dtype it
+    stores, and the same source layouts, each written back as the torch tensor it reads from, so either
+    exports as the torch checkpoint."""
+    from flax.serialization import msgpack_serialize
+
+    from dew.nn.autoencoders.pretrained import load_kl_vae
+
+    _, torch_params, torch_layouts, _ = load_kl_vae(FIXTURES / "sd3-tiny", jnp.float32, subfolder="")
+    shutil.copy(FIXTURES / "sd3-tiny" / "config.json", tmp_path / "config.json")
+    stored = jax.tree.map(lambda leaf: np.asarray(leaf, jnp.bfloat16), torch_params)
+    (tmp_path / "diffusion_flax_model.msgpack").write_bytes(msgpack_serialize(stored))
+    vae, flax_params, flax_layouts, _ = load_kl_vae(tmp_path, jnp.float32, subfolder=None)
+    assert jax.tree.map(lambda leaf: leaf.dtype, flax_params) == jax.tree.map(lambda leaf: leaf.dtype, stored)
+    jax.tree.map(np.testing.assert_array_equal, flax_params, stored)
+    def written(layouts):
+        return sorted((layout.name, layout.paths, layout.shape, layout.transpose) for layout in layouts)
+
+    assert written(flax_layouts) == written(torch_layouts)
+    latent = jax.random.normal(jax.random.key(0), (1, 2, 2, 16))
+    standalone = StableDiffusionVAE(str(tmp_path), dtype=jnp.float32)
+    np.testing.assert_array_equal(np.asarray(standalone.decode(standalone.params, latent)),
+                                  np.asarray(vae.decode(flax_params, latent)))
+
+
 def test_a_kl_config_naming_no_class_is_an_autoencoder_kls():
     """An older AutoencoderKL's config names no class; the KL loaders take it as one."""
     from dew.nn.autoencoders.api import check_class

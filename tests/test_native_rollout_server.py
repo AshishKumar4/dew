@@ -14,8 +14,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from episode_support import ToolPolicy
 from process_support import assert_exits_cleanly
+from tool_policy import ToolPolicy
 
 from dew.inference import NativeRolloutServer, TextGeneration
 from dew.inference.serving import Server

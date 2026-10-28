@@ -429,7 +429,8 @@ def test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_on
     import dataclasses
 
     import optax
-    from objective_cases import SEQ_LEN, packed
+    from objective_data import SEQ_LEN
+    from rl_cases import packed
 
     from dew.objectives.lm import LMObjective
     from dew.objectives.rl import GRPOObjective, PPOObjective, ValueHead

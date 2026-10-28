@@ -19,10 +19,10 @@ apart; a memory fading over a long sequence, whose output falls far below its sc
 eighth token between mild ones, whose pairs after it are differences of large, nearly equal prefixes. Each
 runs the portable math (`recurrence_chunk.chunk`'s `chunk_delta_rule`) forward and through its gradient
 (`reference_error.with_gradients`, each seed's cotangents drawn with its operands), held to the recurrence's
-by check 1; a decay a key dimension no steeper than the regime's floor (`FLOORS`), Kimi Linear's domain. A
-GPU's kernels take their arms here when the recurrence template's GPU mainloops land; the suite runs
-compiled on a GPU as on a CPU, where a CPU's interpretation of a kernel judges its host's arithmetic, not
-the kernel's."""
+by check 1; a decay a key dimension no steeper than the regime's floor (`FLOORS`), Kimi Linear's domain. The
+template's Mosaic path, the default on a GPU, takes the same sites and regimes in
+test_recurrence_template_stability (row 1968); this suite runs compiled on a GPU as on a CPU, where a CPU's
+interpretation of a kernel judges its host's arithmetic, not the kernel's."""
 
 import dataclasses
 import functools

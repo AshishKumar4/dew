@@ -14,7 +14,8 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 
-from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig, media_field
+from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig
+from dew.config.media import media_field
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
 from dew.objectives.jepa.masking import MultiBlockMask

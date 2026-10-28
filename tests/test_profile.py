@@ -281,7 +281,7 @@ def test_a_capture_that_holds_less_than_its_run_says_why():
     assert missing_tracks({"/device:GPU:0": 19160, "/device:GPU:1": 18800}, 2, 2_097_152) == []
     [untracked] = missing_tracks({"/device:GPU:0": 7451}, 2, 2_097_152)
     assert "1 of 2" in untracked
-    # No device plane at all: the device profiler's whole contribution was lost (a 2 GB XSpace).
+    # No device plane at all: the device profiler's whole contribution was lost (a 2 GB XSpace's).
     [lost] = missing_tracks({}, 2, 2_097_152)
     assert "2 GB" in lost
     # The cap's boundary: within 1% of it is reached (CUPTI drops whole buffers), below that is whole.
