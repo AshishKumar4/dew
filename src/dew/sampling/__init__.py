@@ -12,7 +12,6 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
     from dew.sampling.guidance import APG, CFG, Autoguidance, CFGPlusPlus, Guidance
     from dew.sampling.guided import Grammar
-    from dew.sampling.sample import sample
     from dew.sampling.solvers import (
         DDIM,
         DDPM,
@@ -35,6 +34,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     )
     from dew.sampling.strategies import Beam, Sample, Speculative, Strategy
     from dew.sampling.text import Generation, Sampling, generate, with_ids_of
+    from dew.sampling.walks import sample
 
 _EXPORTS = {
     "LogitsTransform": "dew.sampling.decoding",
@@ -49,7 +49,7 @@ _EXPORTS = {
     "CFGPlusPlus": "dew.sampling.guidance",
     "Guidance": "dew.sampling.guidance",
     "Grammar": "dew.sampling.guided",
-    "sample": "dew.sampling.sample",
+    "sample": "dew.sampling.walks",
     "DDIM": "dew.sampling.solvers",
     "DDPM": "dew.sampling.solvers",
     "DEIS": "dew.sampling.solvers",
