@@ -648,9 +648,11 @@ class FitSearch[LossT, EffectsT]:
         held = [entry.module for entry in self.objective.program_key()]
         tile, fused = head_tile_of(self.objective), head_fused_of(self.objective)
         defaults, narrow = self.xla_defaults, self.narrow
-        self.objective.restore_head(admitted.tile, fused=admitted.fused)
-        self.xla_defaults, self.narrow = admitted.xla_defaults, admitted.narrow
         try:
+            # The admitted plan's modules, as a frontier asked past it leaves the objective a rung up.
+            self.objective.substitute(list(admitted.modules))
+            self.objective.restore_head(admitted.tile, fused=admitted.fused)
+            self.xla_defaults, self.narrow = admitted.xla_defaults, admitted.narrow
             for modules in remat_below(self.objective):
                 self.objective.substitute(modules)
                 _, _, probe = self.measured(admitted.split, self.lower(admitted.split, admitted.narrow))

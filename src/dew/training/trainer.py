@@ -1048,13 +1048,17 @@ class Trainer(Generic[Loss, Effects]):
     @staticmethod
     def _cheaper(search: FitSearch, planned: Planned, recorded: JSON,
                  resumed: JSON) -> dict[str, JSON] | None:
-        """The cheaper remat rung the run is told of (`FitSearch.cheaper`): the one a recorded plan's run
-        measured, none for a resumed run, which continues its checkpoint's rung, else measured now."""
-        if recorded is not None:
-            told = json_value(record(recorded, 'recorded plan').get('cheaper'), 'recorded cheaper rung')
-            return told if isinstance(told, dict) else None
+        """The cheaper remat rung the run is told of (`FitSearch.cheaper`): none for a resumed run, which
+        continues its checkpoint's rung; the one a recorded plan's run measured, where the run took that
+        plan, its split and rung, and none where the search moved off it; else measured now."""
         if resumed is not None:
             return None
+        if recorded is not None:
+            kept = record(recorded, 'recorded plan')
+            told = json_value(kept.get('cheaper'), 'recorded cheaper rung')
+            plan = {**planned.rung, 'split': planned.split}
+            taken = all(kept.get(field) == value for field, value in plan.items())
+            return told if taken and isinstance(told, dict) else None
         probe = search.cheaper(planned)
         return None if probe is None else probe.record()
 
