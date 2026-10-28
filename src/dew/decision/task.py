@@ -504,8 +504,8 @@ class Decide(SavedRunTask):
 
     def compile_scoring(self, variables: Variables | None = None) -> tuple[PassShape, ...]:
         """Compile every text pass's program (`pass_shapes`) over `variables` (the task's own by
-        default), in parallel, by one pass of the layout's shortest row at each shape, so a scorer
-        compiles none while it serves; returns the shapes compiled. Where the budget declares no
+        default), in parallel, by one pass of the layout's shortest row at each shape that holds it, so
+        a scorer compiles none while it serves; returns the shapes compiled. Where the budget declares no
         questions or options (`Budget`), a pass's own decide its program, which it compiles as it
         comes, and none is compiled here."""
         if self.budget.questions is None or self.budget.options is None:
@@ -517,9 +517,13 @@ class Decide(SavedRunTask):
             with contextlib.nullcontext() if mesh is None else jax.set_mesh(mesh):
                 self._pass(self._probe, variables, shape)
 
-        with ThreadPoolExecutor(max_workers=len(self.pass_shapes)) as pool:
-            list(pool.map(compiled, self.pass_shapes))
-        return self.pass_shapes
+        # A layout that keeps a schema whole lays the probe out past a window too small for it, and
+        # that window's shapes compile on their first pass.
+        held = tuple(shape for shape in self.pass_shapes
+                     if shape.length >= max(len(row.tokens) for row in self._probe))
+        with ThreadPoolExecutor(max_workers=max(1, len(held))) as pool:
+            list(pool.map(compiled, held))
+        return held
 
     @functools.cached_property
     def _probe(self) -> list[Encoded]:
