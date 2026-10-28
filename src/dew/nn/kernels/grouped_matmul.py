@@ -667,8 +667,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         rows, depth, width = self._generated_extents(ba)
         return mosaic_gpu.derived(family, rows=rows, depth=depth, width=width,
                                   dtype=ba.arguments['tokens'].dtype,
-                                  multiprocessors=_multiprocessors(target),
-                                  holds=lambda tile: self.legal(ba, tile, target), grouped=depth is not None)
+                                  multiprocessors=_multiprocessors(target), target=target,
+                                  candidate=lambda tile: self.candidate(ba, tile, target),
+                                  launch_of=lambda tile: self.launch_of(ba, tile), grouped=depth is not None)
 
     def neighbours(self, ba, config: mosaic_gpu.Tiles) -> tuple[mosaic_gpu.Tiles, ...]:
         # The derived tile with one of its choices moved a step either way: a stage more or fewer, the
@@ -695,14 +696,39 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return tuple(found)
 
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
-        """Whether `config` runs the call on `target` (`Template.legal`): of the launch's family there, in
-        its granularity (whole roles of rows for each consumer, whole column units, one of its depths, at
-        most its consumers, at most the programs its registers hold) with a ring of two stages at least (a
-        walk keeping one step's products in flight holds its slot while the next step's loads fill
-        another), its blocks dividing the call's extents, its cluster at most the family's
+        """Whether `config` runs the call on `target` (`Template.legal`): a candidate (`candidate`) whose
+        ring of `config.stages` and registers the planner holds at its programs (`resources.plan`, as the
+        derivation sizes them). A cluster's legality is each multiprocessor's: its staged bytes and
+        registers are a tile's alone."""
+        if not self.candidate(ba, config, target):
+            return False
+        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+        launch = dataclasses.replace(self.launch_of(ba, config), floor=config.stages, most=config.stages)
+        return resources.plan([launch], family, target, programs=config.programs) is not None
+
+    def launch_of(self, ba, config: mosaic_gpu.Tiles) -> resources.Launch:
+        """The launch the planner sizes at `config`'s shape (`resources.plan`): its allocations at a ring
+        depth (`_allocations`), its consumers, its registers a consumer thread (`registers`), and at most
+        the stages its program's share of the family's shared memory holds of a step's two operand blocks
+        at an element a byte, at least two."""
+        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
+
+        def scope(stages: int) -> resources.Scope:
+            staged = dataclasses.replace(config, stages=stages)
+            return self._allocations(ba, staged, family).scope(family, staged)
+
+        shared = resources.program_shared(family.most_shared, config.programs)
+        most = shared // ((config.block_m + config.block_n) * config.block_k)
+        return resources.Launch(scope, config.warpgroups, self.registers(ba, config), most=most)
+
+    def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
+        """Whether `config` is a tile of the call on `target` apart from its resources: of the launch's
+        family there, in its granularity (whole roles of rows for each consumer, whole column units, one of
+        its depths, at most its consumers, at most the programs its registers hold) with a ring of two
+        stages at least (a walk keeping one step's products in flight holds its slot while the next step's
+        loads fill another), its blocks dividing the call's extents, its cluster at most the family's
         (`mosaic.Family.cluster`), and a one-dimensional side operand's block, copied untiled, at most one
-        copy's extent along its axis (`mosaic.Family.copy_extent`). A cluster's legality is each
-        multiprocessor's: its staged bytes and registers are a tile's alone."""
+        copy's extent along its axis (`mosaic.Family.copy_extent`)."""
         family = self._family(ba, target)
         if (family is None or config.family != family.name or config.cluster > family.cluster
                 or not self._divides(ba, config)):
@@ -722,9 +748,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # tiles: its block along its axis whole roles (ns-regs: a 32-element depth vector on sm86 failed
         # to cast to the 64-row layout).
         extent, least = family.copy_extent, 1 if family.copies_vectors else family.role_rows
-        copied = all((extent is None or self.extents(config)[axis] <= extent)
-                     and self.extents(config)[axis] % least == 0 for axis in axes)
-        return copied and super().legal(ba, config, target)
+        return all((extent is None or self.extents(config)[axis] <= extent)
+                   and self.extents(config)[axis] % least == 0 for axis in axes)
 
     @abc.abstractmethod
     def _divides(self, ba, config: mosaic_gpu.Tiles) -> bool:
@@ -752,7 +777,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # 16384-byte output, GEN4-gpu-l4).
         del target
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
-        return resources.shared_bytes(family, self._allocations(ba, config, family).scope(family, config))
+        return resources.shared_bytes(family, self.launch_of(ba, config).scope(config.stages))
 
     @abc.abstractmethod
     def _allocations(self, ba, config: mosaic_gpu.Tiles, family: mosaic.Family) -> mosaic_gpu.Allocations:
@@ -845,11 +870,11 @@ class MosaicTgmm(_Mosaic):
         rows, _, width = self._generated_extents(ba)
         return rows % config.block_m == 0 and width % config.block_n == 0
 
-    def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
-        """`_Mosaic.legal` on one multiprocessor a tile (`mosaic_gpu.tgmm` takes no pair), a family whose
-        products read registers loading its transposed stage in whole roles of rows (the step, `block_k`: a
-        32-row stage failed to cast to the 64-row layout, ns-regs2)."""
-        if config.cluster != 1 or not super().legal(ba, config, target):
+    def candidate(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
+        """`_Mosaic.candidate` on one multiprocessor a tile (`mosaic_gpu.tgmm` takes no pair), a family
+        whose products read registers loading its transposed stage in whole roles of rows (the step,
+        `block_k`: a 32-row stage failed to cast to the 64-row layout, ns-regs2)."""
+        if config.cluster != 1 or not super().candidate(ba, config, target):
             return False
         family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
         return not (family.operands_in_registers and config.block_k % family.role_rows)

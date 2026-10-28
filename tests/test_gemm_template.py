@@ -1414,7 +1414,10 @@ def test_a_grouped_call_no_cooperative_tile_holds_derives_one_consumer_alone():
     from dew.nn.kernels.templates import mosaic_sm90
 
     tile = mosaic_gpu.derived(mosaic_sm90.WGMMA, rows=512, depth=2048, width=1536, dtype=jnp.bfloat16,
-                              multiprocessors=132, holds=lambda tile: tile.warpgroups == 1, grouped=True)
+                              multiprocessors=132, target=generation.TARGETS["sm90"],
+                              candidate=lambda tile: tile.warpgroups == 1,
+                              launch_of=lambda tile: resources.Launch(lambda stages: resources.Scope(),
+                                                                      tile.warpgroups, 0), grouped=True)
     assert tile is not None and (tile.warpgroups, tile.cluster) == (1, 1)
 
 
