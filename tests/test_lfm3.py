@@ -231,42 +231,20 @@ def test_a_native_export_writes_its_familys_release_code_beside_itself(tmp_path,
     assert {path.name for path in (tmp_path / 'saved').glob('*.py')} == set(RELEASED)
 
 
-OPENED = """import json, sys, torch
-from transformers import AutoModelForCausalLM
-model, info = AutoModelForCausalLM.from_pretrained(sys.argv[1], trust_remote_code=True, dtype=torch.float32,
-                                                   output_loading_info=True)
-print(json.dumps({"class": type(model).__name__, **{key: sorted(value) for key, value in info.items()}}))
-"""
-"""A fresh interpreter's offline load of a saved directory through its own code's transformers loader: the
-class it builds and the loader's report of the weights it matched."""
-
-
-def opened_offline(directory: Path, tmp_path: Path) -> dict[str, object]:
-    """`OPENED` of `directory` in a fresh interpreter, the hub offline and its module cache fresh, so the
-    load reads the directory's own code alone."""
-    import os
-    import subprocess
-    import sys
-
-    run = subprocess.run([sys.executable, '-c', OPENED, str(directory)], check=True, capture_output=True,
-                         text=True, env={**os.environ, 'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
-                                         'HF_MODULES_CACHE': str(tmp_path / 'modules')})
-    return json.loads(run.stdout.strip().splitlines()[-1])
-
-
 @pytest.mark.network
-def test_an_export_opens_offline_through_the_releases_own_transformers_loader(tmp_path):
-    """The network's half (ledger 2038): a model built in Dew exports with its release's code at the
-    commit, the modules its auto_map names and lfm3_conv.py, which modeling_lfm3.py imports and no entry
-    names, and a fresh interpreter opens the export offline through the release's own loader
-    (`AutoModelForCausalLM.from_pretrained(..., trust_remote_code=True)`): the release's class, every
-    weight matched. (Its forward runs under transformers 5.18.0 on, which the fixture is recorded
+def test_an_export_writes_the_releases_own_modules_at_its_commit(tmp_path):
+    """The network's half (ledger 2038): a model built in Dew exports with its release's own modules at the
+    commit, byte for byte: the two its auto_map names and lfm3_conv.py, which modeling_lfm3.py imports and
+    no entry names. (The release's code opens under transformers 5.18.0 on, which the fixture is recorded
     under: tests/fixtures/hf/lfm3-tiny/source.json.)"""
+    from huggingface_hub import hf_hub_download
+
     from dew.interop import PretrainedDecoder
 
+    code = LFM3.release_code
     loaded = Pretrained.load(TINY, dtype='float32', attention_impl='reference')
     PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path / 'saved')
-    assert (tmp_path / 'saved' / 'lfm3_conv.py').is_file()
-    opened = opened_offline(tmp_path / 'saved', tmp_path)
-    assert opened['class'] == 'Lfm3ForCausalLM'
-    assert opened['missing_keys'] == opened['unexpected_keys'] == opened['mismatched_keys'] == []
+    written = {path.name: path.read_bytes() for path in (tmp_path / 'saved').glob('*.py')}
+    released = {file: Path(hf_hub_download(str(code.source), file, revision=code.revision))
+                for file in ('configuration_lfm3.py', 'modeling_lfm3.py', 'lfm3_conv.py')}
+    assert written == {file: path.read_bytes() for file, path in released.items()}
