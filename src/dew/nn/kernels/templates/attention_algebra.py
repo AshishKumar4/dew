@@ -220,9 +220,9 @@ class Guard(NamedTuple):
 
 
 class Low(NamedTuple):
-    """What a compensated walk's running sums' additions dropped (`compensated`, `added`), each beside its
-    sum: the weighted values' `acc` and the denominator's `total`, and on the guarded walk the unshifted
-    sums' (`Guard.plain`, `plain_total`; None on the plain walk)."""
+    """What a compensated walk's running sums' additions dropped (`compensated`, `kept_in_turn`), each
+    beside its sum: the weighted values' `acc` and the denominator's `total`, and on the guarded walk the
+    unshifted sums' (`Guard.plain`, `plain_total`; None on the plain walk)."""
 
     acc: jax.Array
     total: jax.Array
@@ -480,7 +480,7 @@ def compensates(dtype) -> bool:
 
 CHUNK = 16
 """The keys a compensated walk sums in one chain (`products_of`): the fewest a Triton dot takes, a chain of
-fused multiply-adds, each chunk's product then added with its rounding kept (`added`). Against jax's
+fused multiply-adds, each chunk's product then added with its rounding kept (`kept_in_turn`). Against jax's
 attention on an A100 over 40 seeds of the three equal-weight fp32 families: 1.20, 1.32 and 1.23 times its
 error, where chunks of 8 keys would give 0.82 to 1.01 and the tile's one chain 2.08, 1.67 and 1.86."""
 
@@ -578,37 +578,48 @@ def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, produ
     weights `p` with its values (a chunk of keys each in a compensated walk, `products_of`) and their sum
     added at the row's shift (`beyond_weights`; `tile`), with the tile's unshifted weights' products, which
     the mainloop issues as `times` of them, kept unshifted (`Guard.plain`); each addition's rounding kept
-    where the state carries them (`added`); the plain walk's arithmetic where `held` is None, which issues
-    no other product."""
+    where the state carries them (`kept_in_turn`); the plain walk's arithmetic where `held` is None, which
+    issues no other product."""
     low = state.low
-    dropped = (None, None) if low is None else (carry_factor(low.total, factor, held),
-                                                 carry_factor(low.acc, factor, held))
-    total, total_low = added(carry_factor(state.total, factor, held), dropped[0],
-                             (beyond_weights(p.sum(axis=-1), held),))
-    acc, acc_low = added(carry_factor(state.acc, factor, held), dropped[1],
-                         tuple(beyond_weights(product, held) for product in products))
+    total, acc = carry_factor(state.total, factor, held), carry_factor(state.acc, factor, held)
+    weights = (beyond_weights(p.sum(axis=-1), held),)
+    sums = tuple(beyond_weights(product, held) for product in products)
+    kept = None
+    if low is None:
+        total, acc = in_turn(total, weights), in_turn(acc, sums)
+    else:
+        total, total_low = kept_in_turn(total, carry_factor(low.total, factor, held), weights)
+        acc, acc_low = kept_in_turn(acc, carry_factor(low.acc, factor, held), sums)
+        kept = Low(acc_low, total_low)
     if held is None:
-        return Partial(acc, m, total, low=None if low is None else Low(acc_low, total_low))
+        return Partial(acc, m, total, low=kept)
     # The unshifted sums beside them: finite in every column the plain walk kept finite (`finish`).
-    plain, plain_low = added(rescale(held.before.plain, held.alpha),
-                             None if low is None else rescale(low.plain, held.alpha), times(held.plain))
-    plain_total, plain_total_low = added(held.alpha * held.before.plain_total,
-                                         None if low is None else held.alpha * low.plain_total,
-                                         (held.plain.sum(axis=-1),))
-    return Partial(acc, m, total, Guard(held.shift, held.reach, plain, plain_total, held.before.live),
-                   None if low is None else Low(acc_low, total_low, plain_low, plain_total_low))
+    plain, plain_total = rescale(held.before.plain, held.alpha), held.alpha * held.before.plain_total
+    plain_sums, plain_weights = times(held.plain), (held.plain.sum(axis=-1),)
+    if kept is None or low is None:
+        plain, plain_total = in_turn(plain, plain_sums), in_turn(plain_total, plain_weights)
+    else:
+        plain, plain_low = kept_in_turn(plain, rescale(low.plain, held.alpha), plain_sums)
+        plain_total, plain_total_low = kept_in_turn(plain_total, held.alpha * low.plain_total, plain_weights)
+        kept = kept._replace(plain=plain_low, plain_total=plain_total_low)
+    return Partial(acc, m, total, Guard(held.shift, held.reach, plain, plain_total, held.before.live), kept)
 
 
-def added(total: jax.Array, dropped: jax.Array | None, terms: tuple[jax.Array, ...]) -> tuple[jax.Array, Any]:
-    """`total` with each of `terms` added in turn, and where `dropped` holds what earlier additions dropped (a
-    compensated walk's, `Low`), each one's rounding added to it (Knuth's TwoSum, `two_sum`); else the plain
-    sum and None. An infinite sum's rounding is no number (`settled`)."""
+def in_turn(total: jax.Array, terms: tuple[jax.Array, ...]) -> jax.Array:
+    """`total` with each of `terms` added in turn."""
     for term in terms:
-        if dropped is None:
-            total = total + term
-        else:
-            total, error = two_sum(total, term)
-            dropped = dropped + error
+        total = total + term
+    return total
+
+
+def kept_in_turn(total: jax.Array, dropped: jax.Array, terms: tuple[jax.Array, ...]
+                 ) -> tuple[jax.Array, jax.Array]:
+    """`total` with each of `terms` added in turn and what earlier additions dropped, `dropped` (a compensated
+    walk's, `Low`), with each one's rounding added (Knuth's TwoSum, `two_sum`). An infinite sum's rounding is
+    no number (`settled`)."""
+    for term in terms:
+        total, error = two_sum(total, term)
+        dropped = dropped + error
     return total, dropped
 
 
@@ -904,7 +915,7 @@ def products_of(parts: Parts, value: jax.Array, dot: Callable[[jax.Array, jax.Ar
                 chunk: int | None) -> tuple[jax.Array, ...]:
     """The weights' `parts` `[bq, bk]` times a tile's `value`s `[bk, Dv]` (`summed_products`): one product,
     or in a compensated walk one a `chunk` of keys (`chunk_of`), each a chain of `chunk` additions, whose
-    sum the walk takes with each addition's rounding kept (`added`)."""
+    sum the walk takes with each addition's rounding kept (`kept_in_turn`)."""
     if chunk is None or value.shape[0] <= chunk:
         return (summed_products(parts, value, dot),)
     count = value.shape[0] // chunk
@@ -999,11 +1010,13 @@ def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Gathered) -> tu
         chunk = chunk_of(spec)
         times = functools.partial(_times, keys.dot, value, multiplier=multiplier, chunk=chunk)
         # `B` takes the old anchor's term before the factor (`split_taken`), its rounding kept where the walk
-        # compensates (`added`), then the tile's other keys' products as a step takes them.
-        low = state.low
-        acc, acc_low = added(state.acc, None if low is None else low.acc,
-                             (split_term(own, moved, rows(arg.key), arg.multiplier),))
-        joined = state._replace(acc=acc, low=None if low is None else low._replace(acc=acc_low))
+        # compensates (`kept_in_turn`), then the tile's other keys' products as a step takes them.
+        low, term = state.low, (split_term(own, moved, rows(arg.key), arg.multiplier),)
+        if low is None:
+            joined = state._replace(acc=in_turn(state.acc, term))
+        else:
+            acc, acc_low = kept_in_turn(state.acc, low.acc, term)
+            joined = state._replace(acc=acc, low=low._replace(acc=acc_low))
         after = stepped(joined, m, factor, p, products_of(parts, value, keys.dot, chunk), held, times)
         acc = after.acc
     else:
