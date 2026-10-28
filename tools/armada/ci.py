@@ -220,7 +220,8 @@ def shared(python: str) -> str:
     """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock,
     .armada.json's parts a test process sees (`armada_seen`), and the names of the Python files under
     tests/ but its test modules and of src/'s own entries, whose arrival can change what an import finds
-    (a conftest.py, a helper or a top-level package that shadows another), which a record does not see. A
+    (a conftest.py, a helper or a top-level package that shadows another), and of every fixture and package
+    data file (an existence query no record sees), which a record does not see. A
     module within a package under src/ is its importers' input alone, with its package's other modules
     (`inputs`), a test module is no other file's, and a fixture or a package's data is its openers'
     (executed.py's `Opens`): so a train that loses a head runs again only what that head's files reached
@@ -229,6 +230,14 @@ def shared(python: str) -> str:
     for path in sorted(Path("tests").rglob("*.py")):
         if "__pycache__" not in path.parts and not path.name.startswith("test_"):
             digest.update(str(path).encode())
+    # The names of every fixture and every package's data: a test may ask whether one exists (`Path.exists`,
+    # a collection by presence) without opening it, which no record sees, so an arrival or a removal is every
+    # file's input; a file's contents stay its openers' (train 253's review: a test asserting a fixture's
+    # absence was reused green once the fixture came).
+    for root in ("tests", "src"):
+        for path in sorted(Path(root).rglob("*")):
+            if path.is_file() and path.suffix != ".py" and "__pycache__" not in path.parts:
+                digest.update(b"fixture:" + str(path).encode())
     armada = Path(".armada.json")
     digest.update(armada_seen(armada.read_text() if armada.is_file() else None).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), "src"}):
@@ -1417,8 +1426,8 @@ def main() -> int:
         print(policy(args.base))
         return 0
     if args.operation == "plan":
-        timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
-        print(json.dumps({"include": plan(args.target, timings)}))
+        print(json.dumps({"include": plan(args.target, json.loads(args.timings.read_text())
+                                          if args.timings.is_file() else {})}))
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
