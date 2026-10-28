@@ -561,6 +561,13 @@ def _operations(lowered: jax.stages.Lowered) -> list[Operation]:
     return found
 
 
+def _mosaic_calls(operations: list[Operation]) -> list[tuple]:
+    """The Mosaic GPU calls among a lowered program's `operations` (`_operations`), each its operands' and
+    results' shapes."""
+    return [(operands, results) for name, target, operands, results in operations
+            if name == "stablehlo.custom_call" and target.startswith("mosaic_gpu")]
+
+
 def _collective(name: str) -> str | None:
     """The collective a lowered operation `name` is (`instrumentation.collective`, its StableHLO dialect's
     name in HLO's spelling), None for any other."""
@@ -621,12 +628,8 @@ def test_a_packed_recurrence_runs_on_each_devices_own_rows():
     cause absent from the program it compiles."""
     (sharded, parameters), (local, _) = _packed_step(rows=2, devices=2), _packed_step(rows=1, devices=1)
     operations = _operations(sharded)
-
-    def mosaic(operations: list[Operation]) -> list[tuple]:
-        return [(operands, results) for name, target, operands, results in operations
-                if name == "stablehlo.custom_call" and target.startswith("mosaic_gpu")]
-
-    assert mosaic(operations) and mosaic(operations) == mosaic(_operations(local))
+    calls = _mosaic_calls(operations)
+    assert calls and calls == _mosaic_calls(_operations(local))
     scanned = [operands for name, target, operands, _ in operations
                if name == "stablehlo.reduce_window" or (name == "func.call" and target.startswith("cumsum"))]
     assert scanned and all(2 * 128 not in shape for operand in scanned for shape, _ in operand), scanned
@@ -653,20 +656,15 @@ def _ssd_forward(generation: str, rows: int, devices: int) -> jax.stages.Lowered
         return jax.jit(layer.apply).trace(variables, x).lower(lowering_platforms=("cuda",))
 
 
-@pytest.mark.parametrize("generation", ["sm80", "sm90"])
-def test_a_mamba2_forward_runs_its_template_scan_on_each_devices_own_rows(generation):
+def test_a_mamba2_forward_runs_its_template_scan_on_each_devices_own_rows():
     """A Mamba-2 layer's forward on a mesh splitting its rows runs the recurrence template's scan on each
-    device's rows (`SCAN`'s template, `recurrence_chunk.template_rule`, a per-shard map), as its lowered GPU
+    device's rows (`SCAN`'s template, `recurrence_chunk.template_rule`, a per-shard map), as its lowered H100
     program states it: lowered over two devices and two rows, its Mosaic GPU calls are one device's over one
-    row, operand for operand, and it holds no collective (bible 7's multi-device lowering, row 1963)."""
-    sharded = _operations(_ssd_forward(generation, rows=2, devices=2))
-
-    def mosaic(operations: list[Operation]) -> list[tuple]:
-        return [(operands, results) for name, target, operands, results in operations
-                if name == "stablehlo.custom_call" and target.startswith("mosaic_gpu")]
-
-    local = _operations(_ssd_forward(generation, rows=1, devices=1))
-    assert mosaic(sharded) and mosaic(sharded) == mosaic(local)
+    row, operand for operand, and it holds no collective (bible 7's multi-device lowering, row 1963). An
+    A100's template refuses this scan: no config of mma.sync's fits it."""
+    sharded = _operations(_ssd_forward("sm90", rows=2, devices=2))
+    calls = _mosaic_calls(sharded)
+    assert calls and calls == _mosaic_calls(_operations(_ssd_forward("sm90", rows=1, devices=1)))
     assert not [name for name, *_ in sharded if _collective(name)]
 
 
