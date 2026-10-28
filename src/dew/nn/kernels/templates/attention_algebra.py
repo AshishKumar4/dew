@@ -1600,6 +1600,15 @@ NO_SHIFT = -1024.0
 exponent is the larger, and `power2` of a zero mantissa by it stays zero."""
 
 
+def no_dq_sums(rows: int, width: int, kinds: int) -> DqSums:
+    """A dQ pass's sums before its first key (`DqSums`) over `rows` queries `width` wide and `kinds` HEAD and
+    QUERY hook parameters: zeros, and an empty sum of coefficients (`NO_SHIFT`)."""
+    nothing = jnp.zeros((rows,), jnp.float32)
+    zeros = jnp.zeros((rows, width), jnp.float32)
+    params = (nothing,) * kinds
+    return DqSums(zeros, nothing, nothing, params, params, zeros, nothing, jnp.full((rows,), NO_SHIFT, jnp.float32))
+
+
 def _split(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Each entry of `x` as a mantissa of magnitude in (1/2, 1] and its power of two's exponent (0 for a
     zero), so a product of several taken mantissa by mantissa and exponent by exponent neither overflows

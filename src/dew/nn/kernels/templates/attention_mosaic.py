@@ -34,6 +34,7 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     kept_dtype,
     power_of_two,
+    prescale,
 )
 from dew.nn.kernels.templates.attention_mosaic_backward import (
     _dkv_allocations,
@@ -446,7 +447,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         padded_q, padded_k = _padded(query.shape[1], key.shape[1], config)
         dkv = _staged(_dkv_allocations(family, config, width, value_width, dtype,
                                        parts=_parts(self.accurate, dtype),
-                                       stages=min(config.stages, padded_q // config.block_q)))
+                                       stages=min(config.stages, padded_q // config.block_q),
+                                       scaled=prescale(dtype, query.shape[-1], self.scale)[0] != 1.0))
         if config.fused:
             return dkv
         dq = _staged(_dq_allocations(family, config, width, value_width, dtype,
