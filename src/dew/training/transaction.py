@@ -383,7 +383,7 @@ class Transaction:
         hostmem.json). XLA:GPU still holds the whole state for the update, so keeping it on the host
         frees nothing at a step's peak: a Dew decoder's step peaked at 8.427 GB either way.
         """
-        self.fetch = (lambda state: state) if fetch is None else fetch
+        self.fetch = fetch
         self.record = record
         self.objective = objective
         self.optimizer = optimizer
@@ -394,6 +394,21 @@ class Transaction:
         self.shared = isinstance(stats_shape, (Ratio, jax.ShapeDtypeStruct))
         self.stats_tree = jax.tree.structure(stats_shape)
         self.effects_tree = jax.tree.structure(self.aux_shape.effects)
+
+    def fetched(self, state: TrainState) -> TrainState:
+        """`state` with the fields `fetch` brings to the device there, `state` itself where nothing is."""
+        return state if self.fetch is None else self.fetch(state)
+
+    def past(self, state: TrainState, gradient) -> TrainState:
+        """`state` for the commit, its host-resident fields (`fetch`) brought to the device past `gradient`:
+        they pass an optimization barrier with it, so the device takes them only once it is ready. Where
+        nothing rests on the host the state is the commit's as it is: with the barrier there too, a step
+        that fit by a byte past its own rung found no rung (tests/test_narrow.py, at f001b108c)."""
+        if self.fetch is None:
+            return state
+        resting = {field: getattr(state, field) for field in COMMIT_FIELDS}
+        _, kept = jax.lax.optimization_barrier((gradient, resting))
+        return self.fetch(dataclasses.replace(state, **kept))
 
     def realize(self, variables: Variables, batch: Batch, step_info: Step) -> Realization:
         """Evaluate the objective's loss and keep the pullback of that trace.
@@ -508,7 +523,7 @@ class Transaction:
         accepted, attempt = state.microstep - fill + index, previous.attempts[index]
         # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
         step_info = Step(accepted // self.split, jax.random.fold_in(state.key, attempt),
-                         with_ema(variables, self.fetch(state).ema), committed=state.updates,
+                         with_ema(variables, self.fetched(state).ema), committed=state.updates,
                          record=self.record, qk_stats=clips_qk(state.opt_state),
                          **self.examples(state, index, batch, part=attempt % self.split,
                                          rejected=attempt - accepted))
@@ -721,7 +736,7 @@ class Transaction:
             # Every attempt the run made and did not accept, so a rejected one's slot draws afresh.
             rejected = attempt - state.microstep
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
-                             with_ema(state.variables, self.fetch(state).ema), committed=state.updates,
+                             with_ema(state.variables, self.fetched(state).ema), committed=state.updates,
                              record=self.record, qk_stats=clips_qk(state.opt_state),
                              **self.examples(state, state.microstep % self.size, batch, part, rejected))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
@@ -785,14 +800,10 @@ class Transaction:
                 # producers into the optimizer's arithmetic, which then rounds
                 # otherwise than the host's compiled commit on the same platform.
                 # One barrier a leaf, so each leaf's update can start as soon as
-                # its own gradient is ready. The host-resident fields pass the
-                # barrier with the gradient, so the device takes them only past it.
+                # its own gradient is ready.
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
-                _, kept = jax.lax.optimization_barrier((gradient, {field: getattr(state, field)
-                                                                  for field in COMMIT_FIELDS}))
-                fetched = self.fetch(dataclasses.replace(state, **kept))
-                return finish(fetched, batch, aux, pending, gradient, attempt, tokens)
+                return finish(self.past(state, gradient), batch, aux, pending, gradient, attempt, tokens)
             moving, held = apart(state)
             advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,
                                                     tokens)

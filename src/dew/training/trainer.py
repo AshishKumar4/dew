@@ -1082,10 +1082,12 @@ class Trainer(Generic[Loss, Effects]):
         (`apart`): the moving state, which it donates and returns advanced, and the frozen tree, which
         it reads and neither donates nor returns, so the frozen arrays stay the ones the run (and the
         objective's held tree) holds, and no output copies them."""
-        # The transaction brings the optimizer state and the EMA to the device once its gradient is ready
-        # (`Transaction.fetch`); a custom step, and every other field, reads them from its start.
-        late = () if self.step is not None else COMMIT_FIELDS
-        body = self._step_body(shapes, copies, split, lambda state: self._fetched(state, shardings, late))
+        # The transaction brings the optimizer state and the EMA the layout keeps on the host to the device
+        # once its gradient is ready (`Transaction.past`); a custom step, and every other field, reads them
+        # from its start.
+        late = () if self.step is not None else tuple(set(COMMIT_FIELDS) & set(self.layout.host))
+        body = self._step_body(shapes, copies, split, (lambda state: self._fetched(state, shardings, late))
+                               if late else None)
         moving, frozen = apart(shardings)
 
         def step(current, held, batch, part):
