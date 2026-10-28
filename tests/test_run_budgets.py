@@ -447,7 +447,8 @@ def test_a_clocked_run_paused_at_half_its_examples_and_resumed_trains_on_as_one_
     def paused(x):
         return clocked_run(2, tmp_path / str(next(directories)), (Pause(0.5), None))(x)
 
-    assert_as_exact(as_given(paused), clocked_run(2), clocked_records, "paused clocked run", seeds=PAUSE_SEEDS)
+    assert_as_exact(as_given(paused), clocked_run(2), clocked_records, "paused clocked run",
+                    seeds=PAUSE_SEEDS)
 
 
 @pytest.mark.parametrize("accumulation", [1, 2])
