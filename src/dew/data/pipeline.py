@@ -31,6 +31,25 @@ if TYPE_CHECKING:
 class Rejected:
     reason: str
     permanent: bool = True
+    consumed: int = 0
+    """The source examples a rejected row was the last of (`CONSUMED`), which the next row its corpus keeps
+    carries on (`dew.data.mixing.Accepted`)."""
+
+
+CONSUMED = "_dew_consumed"
+"""A row's count of the source examples it is the last row of, set on each source example a run bounded in
+examples reads (`Consumed`) and carried through every step to the batch: each example's count goes to the last
+row a step makes of it, the next row kept where a step rejects or makes none of it, and a packed window's is
+its rows' sum. A batch's sum is the source examples its dispatch consumes (`dew.batch.EXAMPLES_CONSUMED`)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Consumed:
+    """The step that marks each source example a run bounded in examples reads as one consumed by the row it
+    is read in (`CONSUMED`), set where the bound is (`dew.data.compile`)."""
+
+    def __call__(self, element: Batch) -> Batch:
+        return {**element, CONSUMED: 1}
 
 
 type Cuts = Mapping[str, tuple[int, int]]

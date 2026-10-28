@@ -114,17 +114,19 @@ def _only_when(due, taken, kept, operand):
 
 
 def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux, committed: jax.Array | None,
-            batch: Batch, stepped: jax.typing.ArrayLike) -> tuple:
+            batch: Batch, stepped: jax.typing.ArrayLike, consumed: jax.Array) -> tuple:
     """What a compiled step returns (`Trainer.compile`) of the transaction it ran from `current` on
-    `batch`, wherever it ran: the advanced state, its step counting `stepped`, the loss, the metrics
-    with the batch's counts, and whether the loss is finite, the microbatch accepted and the window
-    committed."""
+    `batch`, wherever it ran: the advanced state, its step counting `stepped` and its clock the source
+    examples its microbatch `consumed` (`TrainState.consumed`, where the run keeps one), the loss, the
+    metrics with the batch's counts, and whether the loss is finite, the microbatch accepted and the
+    window committed."""
     metrics = {**aux.metrics, **step_counts(batch)}
     if aux.record is not None:
         assert "evaluated" in aux.record, "a recording transaction stacks its evaluations (`recorded`)"
         metrics |= recorded_metrics(aux.record)
-    return (dataclasses.replace(advanced, step=current.step + stepped), loss, metrics, jnp.isfinite(loss),
-            advanced.microstep > current.microstep, committed)
+    clock = None if current.consumed is None else current.consumed + consumed
+    return (dataclasses.replace(advanced, step=current.step + stepped, consumed=clock), loss, metrics,
+            jnp.isfinite(loss), advanced.microstep > current.microstep, committed)
 
 
 def evaluation_of(aux: Aux) -> Evaluated | None:

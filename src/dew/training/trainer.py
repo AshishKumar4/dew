@@ -169,6 +169,7 @@ from dew.training.model_flops import (
     TOKENS,
     TRAINING_FLOPS,
     _TokenCount,
+    batch_consumed,
     batch_tokens,
     model_batch,
     prepare_counts,
@@ -1110,7 +1111,8 @@ class Trainer(Generic[Loss, Effects]):
             early = [field for field in self.layout.host if field not in late]
             advanced, loss, aux, committed = body(self._fetched(current, shardings, early),
                                                   self._model_batch(micro), part, batch_tokens(micro))
-            stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1)
+            stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1,
+                                     batch_consumed(micro))
             return (apart(stepped)[0], *rest)
 
         return jax.jit(step, in_shardings=(moving, frozen, placement, replicated),
@@ -1206,7 +1208,8 @@ class Trainer(Generic[Loss, Effects]):
                     current = self._initialize_accumulation(current, batch, shapes, window=self.accumulation)
                 # The device steps run in the accelerator's forward (`HostExecution`).
                 advanced, loss, aux, committed = body(current, model_batch(batch), 0, batch_tokens(batch))
-                advanced, *stepped = outcome(current, advanced, loss, aux, committed, batch, 1)
+                advanced, *stepped = outcome(current, advanced, loss, aux, committed, batch, 1,
+                                             batch_consumed(batch))
                 # A leaf already where its placement says stays the array it
                 # is: the resident frozen collection crosses no boundary.
                 return transfer(advanced, placement), *stepped

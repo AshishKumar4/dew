@@ -87,6 +87,7 @@ from dew.data.pipeline import (
     Batched,
     BatchStage,
     Configured,
+    Consumed,
     Costly,
     Dataset,
     DeviceStep,
@@ -415,7 +416,8 @@ def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
             isinstance(stage, Repeat) for stage in pipeline.stages[at:]):
         raise ValueError(f"{_name(pipeline)} repeats with a count, or after the records it packs or batches, "
                          f"which a bound of {examples} examples would cut or repeat; leave the repeat out")
-    bound = (Limit(examples),) if repeats else (Repeat(None), Limit(examples))
+    # Each example the bound reads is consumed by the last row a step makes of it (`Consumed`).
+    bound = (*(() if repeats else (Repeat(None),)), Limit(examples), Map(Consumed()))
     batch = dataclasses.replace(pipeline.stages[batched], drop_remainder=False)
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *bound, *pipeline.stages[at:batched],
                                                  batch, *pipeline.stages[batched + 1:]))

@@ -74,6 +74,13 @@ trainer's transaction reads it for the examples' draws (`Step.example_index`) an
 batch the objective sees."""
 
 
+EXAMPLES_CONSUMED = "examples_consumed"
+"""A training batch's column of the source examples each row is the last of, int32, in a run bounded in
+examples (`dew.data.pipeline.CONSUMED`): the batch's sum over its real rows is the examples its dispatch
+consumes, which the trainer's step adds to the run's clock (`TrainState.consumed`) and takes out of the
+batch the objective sees. A repeat filling out a short batch holds none."""
+
+
 def padded_rows(rows: int, count: int) -> tuple[np.ndarray, np.ndarray]:
     """The rows `count` places hold of `rows` real ones, cycling through them, and which places hold
     a repeat: the rule a batch filled out with its own rows (`dew.data.dataset.FilledBatch`) and a

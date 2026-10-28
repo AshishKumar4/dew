@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.batch import VALID_ROWS, Batch
+from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch
 from dew.data.dataset import rows_of
 from dew.objectives.base import Objective
 
@@ -91,7 +91,15 @@ def batch_tokens(batch: Batch) -> jax.Array:
     return _TokenCount.sum(batch[TOKENS]) if TOKENS in batch else jnp.zeros((2,), jnp.uint32)
 
 
+def batch_consumed(batch: Batch) -> jax.Array:
+    """The source examples `batch`'s rows consume (`EXAMPLES_CONSUMED`), summed over the whole batch
+    wherever its rows lie, int32; none where it carries no count."""
+    if EXAMPLES_CONSUMED not in batch:
+        return jnp.zeros((), jnp.int32)
+    return jnp.sum(jnp.asarray(batch[EXAMPLES_CONSUMED], jnp.int32))
+
+
 def model_batch(batch: Batch) -> Batch:
     """The objective sees only its own inputs, not the trainer's accounting columns."""
     return {name: value for name, value in batch.items()
-            if name not in (TRAINING_FLOPS, TOKENS)}
+            if name not in (TRAINING_FLOPS, TOKENS, EXAMPLES_CONSUMED)}

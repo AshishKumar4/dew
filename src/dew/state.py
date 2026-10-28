@@ -93,6 +93,11 @@ class TrainState:
     scale: DynamicScale | None
     window_size: jax.Array
     accumulation: Accumulation | None = None
+    consumed: jax.Array | None = None
+    """The source examples the run's dispatched batches consumed, int32, in a run bounded in examples
+    (`dew.batch.EXAMPLES_CONSUMED`): each step adds what its microbatch's real rows were the last rows of,
+    whether or not the update it joins commits, so the run's schedules and cadences read its progress
+    exactly, the same on every process; None in a run counted otherwise."""
     compute: Variables | None = struct.field(default=None,
                                              metadata={'checkpointed': False, 'variables': True})
     """The lower-precision copies of the parameters that the forward pass reads, such as bf16 copies

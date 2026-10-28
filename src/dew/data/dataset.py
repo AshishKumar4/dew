@@ -34,7 +34,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
 from dew._records import record
-from dew.batch import VALID_ROWS, Batch, padded_rows
+from dew.batch import EXAMPLES_CONSUMED, VALID_ROWS, Batch, padded_rows
 from dew.mesh import LayoutRefused, batch_axes
 
 _log = logging.getLogger(__name__)
@@ -1054,7 +1054,11 @@ class FilledBatch(pygrain.MapTransform):
         valid = ~repeats & self._real
         if VALID_ROWS in element:
             valid = valid & np.asarray(element[VALID_ROWS], bool)[indices]
-        return {**take_batch(element, indices), VALID_ROWS: valid}
+        filled = {**take_batch(element, indices), VALID_ROWS: valid}
+        if EXAMPLES_CONSUMED in element:
+            # A repeat consumes nothing: its row's examples are the real row's.
+            filled[EXAMPLES_CONSUMED] = np.where(valid, filled[EXAMPLES_CONSUMED], 0).astype(np.int32)
+        return filled
 
 
 def rows_of(batch: Mapping[str, object]) -> int:

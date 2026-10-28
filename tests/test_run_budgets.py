@@ -181,6 +181,76 @@ def test_an_examples_budget_counts_examples_before_the_objective_expands_them(ex
         [passes + 1] * rest + [passes] * (RECORDS - rest) if passes else [1] * rest)
 
 
+class Fanned:
+    """An objective's expansion of each record `id` into `id % 4` rows, none for some, each row's two
+    tokens naming it (`id * 10 + question`)."""
+
+    def flat_map(self, element):
+        record = int(element["id"])
+        return tuple({"text": np.full(2, record * 10 + question, np.int32)} for question in range(record % 4))
+
+
+class LastDropped(grain.MapTransform):
+    """An objective's filter of the rows after an expansion: the last row of every fifth record."""
+
+    rejects = True
+
+    def map(self, element):
+        from dew.data.pipeline import Rejected
+
+        record, question = divmod(int(element["text"][0]), 10)
+        return Rejected("dropped") if record % 5 == 0 and question == record % 4 - 1 else element
+
+
+def consumed_by_row(examples: int) -> dict[int, int]:
+    """The oracle of where each of the first `examples` records read in order is consumed: by the row
+    (`id * 10 + question`) its expansion makes last, or where it makes none, or its last row is dropped,
+    by the next row kept after it."""
+    owed, pending = collections.Counter(), 0
+    for record in range(1, examples + 1):
+        rows = record % 4
+        if not rows:
+            pending += 1
+        for question in range(rows):
+            last = question == rows - 1
+            if record % 5 == 0 and last:
+                pending += 1
+                continue
+            owed[record * 10 + question] += pending + int(last)
+            pending = 0
+    assert not pending, "the oracle's last record is consumed by a row of its own"
+    return owed
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["rows", "packed"])
+def test_each_batch_consumes_the_examples_whose_last_rows_it_holds(packed):
+    """A run bounded to 23 examples, read in order as a stream, whose objective makes 0 to 3 rows of each
+    and drops the last row of every fifth: each batch's consumed examples (`EXAMPLES_CONSUMED`) are those
+    whose last row it holds, an example of no rows, or of a dropped last row, consumed by the next row
+    kept, rows packed into windows or batched as they are; the batches together consume all 23."""
+    from dew.batch import EXAMPLES_CONSUMED
+    from dew.data.pipeline import ObjectiveData
+
+    owed = consumed_by_row(23)
+    chain = Pipeline(Memory({"id": np.arange(1, 24, dtype=np.int32)}))
+    chain = chain.pack(8) if packed else chain
+    loader = compile(chain.batch(BATCH), read="streamed",
+                     objective=ObjectiveData(train=(Fanned(), LastDropped())), examples=23)
+    stream = loader.train(DataPartition())
+    total = 0
+    try:
+        for batch in stream:
+            real = np.asarray(batch.get(VALID_ROWS, np.ones(len(batch["text"]), bool)), bool)
+            held = np.asarray(batch["text"])[real]
+            expected = sum(owed[row] for window in held for row in set(window[window > 0].tolist()))
+            assert int(np.sum(batch[EXAMPLES_CONSUMED])) == expected
+            total += expected
+    finally:
+        if isinstance(stream, Closeable):
+            stream.close()
+    assert total == 23
+
+
 class Evens(grain.MapTransform):
     """An objective's filter of the odd records, which it states it drops (`rejects`)."""
 
