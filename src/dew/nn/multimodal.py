@@ -496,6 +496,10 @@ class MultimodalTransformer(DecoderWrapper):
         """Whether the decoder holds a continuum level (`SteppedInContext`)."""
         return self.language_model.in_context
 
+    def affine_head(self) -> bool:
+        """Whether the decoder's head past its level is affine in its states (`SteppedInContext`)."""
+        return self.language_model.affine_head()
+
     @nn.nowrap
     def in_context_level(self, variables):
         """The decoder's continuum level's parameters in `variables` (`SteppedInContext`)."""
