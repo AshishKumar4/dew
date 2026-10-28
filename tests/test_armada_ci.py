@@ -965,11 +965,8 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
         "from pathlib import Path\n"
         "def test_ok():\n"
         "    with Path('runs').open('a') as runs: runs.write('x')\n"
-        "    Path('tests/fixture.json').read_text()\n"
         "    assert not os.environ.get('FAIL')\n"
         "    if os.environ.get('EXIT'): os._exit(3)\n")
-    fixture = tmp_path / "tests/fixture.json"
-    fixture.write_text("[]")
     interpreter(tmp_path, "3.12")
     url, _, _ = cache_worker
     cached(monkeypatch, url)
@@ -1000,19 +997,21 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
     assert run("GenuineIntel-6-143", policy="off") == 7
     monkeypatch.delenv("EXIT")
     assert run("GenuineIntel-6-143") == 8
-    # Another commit's run between a commit's run and its retry: the fixture the test reads is its input.
-    fixture.write_text("{}")
+    # Another commit's run between a commit's run and its retry: a file every test process reads
+    # (`SHARED`) differs between them, so each has a record of its own.
+    shared = tmp_path / "constraints.txt"
+    shared.write_text("")
     assert run("GenuineIntel-6-143") == 9
-    fixture.write_text('{"changed": true}')
+    shared.write_text("a-package==1\n")
     assert run("GenuineIntel-6-143") == 10
-    fixture.write_text("{}")
+    shared.write_text("")
     assert run("GenuineIntel-6-143") == 10
     monkeypatch.setenv("FAIL", "1")
     assert run("GenuineIntel-6-143", policy="off") == 11
     monkeypatch.delenv("FAIL")
-    fixture.write_text('{"changed": true}')
+    shared.write_text("a-package==1\n")
     assert run("GenuineIntel-6-143") == 11
-    fixture.write_text("{}")
+    shared.write_text("")
     assert run("GenuineIntel-6-143") == 12
 
 
