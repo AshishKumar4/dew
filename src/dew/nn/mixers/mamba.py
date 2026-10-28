@@ -239,19 +239,21 @@ class Mamba(nn.Module):
         return xs, step, B, C
 
 
-def _sequence_conv(mixed, segments, valid, taps, bias, *, dtype):
+def _sequence_conv(mixed, segments, valid, weights, *, dtype):
     """This shard's slice of the conv, inside a `shard_map` that holds the sequence axis manual
     (`over_sequence`): each real token reading the `K-1` real tokens before it in its document, from the
-    earlier shards too (`sequence_conv`)."""
+    earlier shards too (`sequence_conv`); `weights` its taps and bias."""
+    taps, bias = weights
     return sequence_conv(mixed, taps, bias, segments, valid, dtype=dtype)
 
 
-def _sequence_scan(xs, step, B, C, starts, A, D, *, chunk_size: int):
+def _sequence_scan(xs, step, B, C, starts, weights, *, chunk_size: int):
     """This shard's slice of the selective scan, inside a `shard_map` that holds the sequence axis manual
     (`over_sequence`): run from zero, the state it leaves and its span's log decay `A sum(dt)` (a document
     start in it zeroing the decay, `RESET_DECAY`) give the state the earlier shards leave it
     (`entering_state`), and the scan runs again from that state, a start in it dropping it as on one
-    device."""
+    device. `weights` are the channels' `A` and `D`."""
+    A, D = weights
     _, leaving = selective_scan(xs, step, A, B, C, D, None, starts, chunk_size)
     decay = jnp.sum(step, axis=1)[..., None] * A                    # [B, D, N]
     if starts is not None:
