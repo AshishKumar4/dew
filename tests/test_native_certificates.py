@@ -62,10 +62,19 @@ def input_gradient_products(dy, w, sizes) -> np.ndarray:
 
 
 def forward_of(x, w, sizes, out_dtype=jnp.bfloat16) -> np.ndarray:
-    """The template's native forward of the bf16 rows and matrices, its output in `out_dtype`."""
-    return np.asarray(jax.jit(lambda rows: template.gemm(
-        rows, jnp.asarray(w, jnp.bfloat16), jnp.asarray(sizes, jnp.int32), out_dtype=out_dtype))(
-        jnp.asarray(x, jnp.bfloat16)), np.float64)
+    """The template's native forward of the bf16 rows and matrices, its output in `out_dtype`, traced at JAX's
+    own default precision as a model runs it (`as_run`)."""
+    with as_run():
+        return np.asarray(jax.jit(lambda rows: template.gemm(
+            rows, jnp.asarray(w, jnp.bfloat16), jnp.asarray(sizes, jnp.int32), out_dtype=out_dtype))(
+            jnp.asarray(x, jnp.bfloat16)), np.float64)
+
+
+def as_run():
+    """JAX's own default matmul precision, as a model calls the template: the test lane sets 'highest' for
+    every product that states none, at which the template takes no fp32 output, and the certificate is of
+    the kernel a model runs."""
+    return jax.default_matmul_precision(None)
 
 
 def input_gradient_of(x, w, dy, sizes) -> np.ndarray:
@@ -76,7 +85,8 @@ def input_gradient_of(x, w, dy, sizes) -> np.ndarray:
                           rows)
         return pull(cotangent)[0]
 
-    pulled = jax.jit(pulled)(jnp.asarray(x, jnp.bfloat16), jnp.asarray(dy, jnp.bfloat16))
+    with as_run():
+        pulled = jax.jit(pulled)(jnp.asarray(x, jnp.bfloat16), jnp.asarray(dy, jnp.bfloat16))
     return np.asarray(pulled, np.float64)
 
 
