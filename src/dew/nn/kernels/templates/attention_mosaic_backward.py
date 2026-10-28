@@ -50,18 +50,16 @@ def _dq_allocations(family: mosaic.Family, config: BackwardTiles, width: int, va
 
 
 def _dkv_allocations(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
-                     parts: int, stages: int, prescaled: bool) -> tuple[list, dict]:
+                     parts: int, stages: int) -> tuple[list, dict]:
     """The dK/dV program's allocations as `Family.scoped` takes them, in `_dkv_launch`'s order: its
-    consumers' resident keys and values; where the call's query takes a power before its products
-    (`prescaled`), a step's queries taken by it (`_dkv_step`); a fused launch's score cotangents' `parts`
+    consumers' resident keys and values; a fused launch's score cotangents' `parts`
     staged for dQ's product (`algebra.cotangent_parts`); dK's and dV's output stage, which a fused launch's
     dQ tiles take too (fp32); each consumer's stage for its key gradients' sums; the two loads' barriers; and
     its query and output-cotangent streams in `stages` slots (`Family.streams`)."""
     consumers, block_q, block_k = config.consumers, config.block_q, config.block_k
-    powered = [plgpu.SMEM((consumers, block_q, width), dtype)] if prescaled else []
     staged = [plgpu.SMEM((consumers, parts, block_k, block_q), dtype)] if config.fused else []
     scoped = [plgpu.SMEM((consumers, block_k, width), dtype),
-              plgpu.SMEM((consumers, block_k, value_width), dtype), *powered, *staged,
+              plgpu.SMEM((consumers, block_k, value_width), dtype), *staged,
               plgpu.SMEM((consumers, max(block_q, block_k), width), jnp.float32),
               plgpu.SMEM((consumers, block_k), jnp.float32),
               plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_barriers=consumers)]
@@ -107,8 +105,8 @@ class _Backward:
 
     @property
     def scaled(self) -> bool:
-        """Whether the dK/dV program's logits take the query by its power (`by_power`), formed in registers
-        from the call's own streamed one, which dK takes."""
+        """Whether the dK/dV program's logits take the query's power (`by_power`), after their product of the
+        call's own streamed queries, which dK takes."""
         return self.spec.prescale != 1.0
 
     @property
@@ -295,32 +293,31 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
     return dq, keyed, rows
 
 
-def _dkv_step(walk: _Backward, resident: tuple, powered, rows_of, staged, coords_of, params_of, add_dq,
-              store_tiles, index, slots, carry, accumulators):
+def _dkv_step(walk: _Backward, resident: tuple, rows_of, staged, coords_of, params_of, add_dq, store_tiles,
+              index, slots, carry, accumulators):
     """A dK/dV consumer's query tile `index`, its keys the tile's rows (`[bk, bq]`, FlashAttention 3's order,
-    hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp's SdP_swapAB): its scores `K Qᵀ` and score cotangents from the
-    query and output cotangent slots (`slots`), the queries taken by the call's power for the logits in
-    `powered` where it takes one (as the forward takes them, `by_power`), and its resident keys and values
-    (`resident`), under the tile's queries' statistics (`rows_of(first query)`, in a column's layout), its
-    coordinates (`coords_of(first query)`) and its hook parameters (`params_of(first query, like)`). The
-    weights and the score cotangents, their keys as their rows, are dV's and dK's left operands from the
-    registers (`algebra.value_operands`, `cotangent_product`'s `aᵀ @ b`), issued into `accumulators` in
-    place; a fused launch stages the cotangents' parts in `staged` for dQ's product, their transpose its left
-    operand (`add_dq(first query, dQ)`). The key gradients' sums (`carry`) take the pulled cotangents' row
-    sums, and the tile gradients go to `store_tiles(first query, pieces)`, `[bk, bq]` each."""
+    hopper/mainloop_bwd_sm90_tma_gmma_ws.hpp's SdP_swapAB): its scores `K Qᵀ` (the call's power taken after
+    the product) and score cotangents from the query and output cotangent slots (`slots`) and its resident
+    keys and values (`resident`), under the tile's queries' statistics (`rows_of(first query)`, in a column's
+    layout), its coordinates (`coords_of(first query)`) and its hook parameters (`params_of(first query,
+    like)`). The weights and the score cotangents, their keys as their rows, are dV's and dK's left operands
+    from the registers (`algebra.value_operands`, `cotangent_product`'s `aᵀ @ b`), issued into `accumulators`
+    in place; a fused launch stages the cotangents' parts in `staged` for dQ's product, their transpose its
+    left operand (`add_dq(first query, dQ)`). The key gradients' sums (`carry`) take the pulled cotangents'
+    row sums, and the tile gradients go to `store_tiles(first query, pieces)`, `[bk, bq]` each."""
     k_smem, v_smem = resident
     family, tiles, kinds = walk.program.family, walk.program.tiles, walk.kinds
     shape = (tiles.block_k, tiles.block_q)
     dk_acc, dv_acc = accumulators
     q_slot, do_slot = slots["queries"], slots["douts"]
     q_first = index * tiles.block_q
-    # The logits' queries the forward's own, by its power (`by_power`), staged as the product's operand: the
-    # keys by it would differ where one leaves bf16's range (a key of 2^-126 under a power of 2^-9).
-    queries = q_slot
-    if powered is not None:
-        family.staged(by_power(family.tile_of(q_slot), walk.spec.prescale), powered)
-        queries = powered
-    s = family.product(k_smem, queries.transpose((1, 0)), shape)
+    # The logits from the call's queries, the power taken after the product, exact in fp32: the forward's
+    # `(Q 2^p) Kᵀ` but where a query's entry times the power leaves bf16's normal range (below 2^-126). A
+    # query staged by the power a step cost a third of the launch (ET-SWAPABL-h100: 3.32 against 2.21 ms
+    # causal at Qwen3-8B 2 x 4096); the keys by it would differ where a key leaves that range instead.
+    s = family.product(k_smem, q_slot.transpose((1, 0)), shape)
+    if walk.scaled:
+        s = s * walk.spec.prescale
     dp = family.product(v_smem, do_slot.transpose((1, 0)), shape)
     params = params_of(q_first, s)
     # Every tile masked, its queries' statistics read past its products: a tile chosen masked or whole at
@@ -372,14 +369,13 @@ def _unread_tiles(family: mosaic.Family, store_tiles, count: int, shape: tuple[i
         store_tiles(tile * shape[1], [zeros] * count)
 
 
-def _dkv_scoped(refs, *, prescaled: bool, fused: bool) -> tuple:
-    """The dK/dV program's allocations (`_dkv_allocations`) by role: its resident keys and values, a step's
-    queries by the call's power (None unless `prescaled`), its staged score cotangents (None unless
-    `fused`), its output and key gradients' stages and its two loads' barriers."""
+def _dkv_scoped(refs, *, fused: bool) -> tuple:
+    """The dK/dV program's allocations (`_dkv_allocations`) by role: its resident keys and values, its staged
+    score cotangents (None unless `fused`), its output and key gradients' stages and its two loads'
+    barriers."""
     keys, values, refs = refs[0], refs[1], refs[2:]
-    powered, refs = (refs[0], refs[1:]) if prescaled else (None, refs)
     staged, refs = (refs[0], refs[1:]) if fused else (None, refs)
-    return keys, values, powered, staged, *refs
+    return keys, values, staged, *refs
 
 
 def _keys_last(arrays, kinds) -> tuple[jax.Array, ...]:
@@ -440,8 +436,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         dq_ref, refs = (refs[0], refs[1:]) if walk.fused else (None, refs)
         dk_ref, dv_ref, *refs = refs
         grad_refs, refs = refs[:len(graded)], refs[len(graded):]
-        k_smem, v_smem, powered, staged, out_smem, rows_smem, k_loaded, v_loaded = _dkv_scoped(
-            refs, prescaled=walk.scaled, fused=walk.fused)
+        k_smem, v_smem, staged, out_smem, rows_smem, k_loaded, v_loaded = _dkv_scoped(refs, fused=walk.fused)
         key_refs = [ref for ref, kind in zip(grad_refs, graded, strict=True) if kind == Kind.KEY]
         tile_refs = [ref for ref, kind in zip(grad_refs, graded, strict=True) if kind == Kind.TILE]
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
@@ -483,8 +478,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head,
                                           k_first=k_first, keys_first=True)
             resident = k_smem.at[index], v_smem.at[index]
-            powers = None if powered is None else powered.at[index]
-            step = functools.partial(_dkv_step, walk, resident, powers, rows_of,
+            step = functools.partial(_dkv_step, walk, resident, rows_of,
                                      None if staged is None else staged.at[index], coords_of, params_of, adds,
                                      store_tiles)
             key_sums, (dk, dv) = family.walk(streams, ((step, lo, hi),),
@@ -509,8 +503,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
         family.roles(consumers, consumer, producer)
 
     scoped, rings = _dkv_allocations(family, program.tiles, width, value_width, query.dtype,
-                                     parts=_parts(walk.accurate, query.dtype), stages=stages,
-                                     prescaled=walk.scaled)
+                                     parts=_parts(walk.accurate, query.dtype), stages=stages)
 
     def entry(*refs):
         family.scoped(functools.partial(body, *refs), *scoped, streams=rings)
