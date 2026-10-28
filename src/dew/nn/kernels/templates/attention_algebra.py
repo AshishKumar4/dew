@@ -998,11 +998,14 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     mainloop's own running sums taking it where it holds them (`Keys.accumulate`, the state's `acc` in its
     form)."""
     m, factor, p, value, held = _softmax(spec, state, keys)
-    if held is None and keys.accumulate is not None:
-        acc = keys.accumulate(state.acc, lambda acc: carry_factor(acc, factor, None),
-                              ((narrow(p, value.dtype), None),), value)
-        return Partial(acc, m, denominator_after(state.total, factor, p))
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
+    if held is None and keys.accumulate is not None:
+        # The weights the walk accumulates dropped where the call drops (`_times`' parts); the denominator
+        # the undropped weights'.
+        parts = (((narrow(p, value.dtype), None),) if multiplier is None
+                 else weights_parts(p * multiplier, value.dtype))
+        acc = keys.accumulate(state.acc, lambda acc: carry_factor(acc, factor, None), parts, value)
+        return Partial(acc, m, denominator_after(state.total, factor, p))
     times = functools.partial(_times, keys.dot, value, multiplier=multiplier, chunk=chunk_of(spec))
     return stepped(state, m, factor, p, times(p), held, times)
 
