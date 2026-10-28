@@ -38,7 +38,7 @@ from dew.data.dataset import CAPTION, DataPartition, GlobalStream, Loader, Phase
 from dew.data.images import EncodeCaptions
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
-from dew.data.sources import TokenFiles
+from dew.data.sources import Grain, TokenFiles
 from dew.objectives.base import Aux, Objective, Ratio
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
@@ -1801,8 +1801,10 @@ def test_a_mix_of_hundreds_of_corpora_reads_with_one_read_budget_and_only_the_co
     touched: set[int] = set()
     # Each corpus filters its records, as a run's sources drop what they reject, so the mix reads each
     # as a stream of its own share (as a token-budget batch reads them too).
-    corpora = [Pipeline(Memory(Seen(64, corpus, touched), identity=f"seen-{corpus}")).shuffle(corpus).repeat()
-               .filter(Kept()) for corpus in range(300)]
+    # Grain stores, each read by index as a run's files are: one held in memory is scanned for the
+    # records it holds before it is read (`_Present`).
+    corpora = [Pipeline(Grain(pygrain.MapDataset.source(Seen(64, corpus, touched)), name=f"seen-{corpus}"))
+               .shuffle(corpus).repeat().filter(Kept()) for corpus in range(300)]
     weights = [1.0, 1.0] + [1e-9] * 298
     data = compile(mix(corpora, weights).batch(8), read="indexed", seed=0,
                    loading=Loading(workers=0, threads=16, read_buffer=16, cache=False))
