@@ -29,7 +29,6 @@ cotangents through `gemm` and `gemm_t` and the hooks' through their VJPs in XLA,
 accumulator only where the epilogue's VJP reads it.
 """
 
-import contextlib
 import functools
 
 import jax
@@ -99,8 +98,9 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     named = selection.forced(grouped_matmul.GROUPED.choice)
 
     def backward(saved, operands, cotangent, live):
-        choice = {grouped_matmul.GROUPED.choice: named}
-        with generation.chosen(**choice) if named else contextlib.nullcontext():
+        if named is None:
+            return _pulled(operands, cotangent, live)
+        with generation.chosen(**{grouped_matmul.GROUPED.choice: named}):
             return _pulled(operands, cotangent, live)
 
     def _pulled(operands, cotangent, live):
