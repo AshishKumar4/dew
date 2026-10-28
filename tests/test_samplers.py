@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 from diffusion_support import SourceOracle, relative_gap, walk
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
 
 from dew.diffusion import (
     ConsistencyBoundary,
@@ -825,13 +825,15 @@ def test_ddim_at_eta_one_steps_from_the_ddpm_posterior_on_every_gaussian_process
         a_t, s_t, a_s, s_s, std = coefficients(t, t_next)
         return a_s * denoised + a_t * s_s ** 2 / (a_s * s_t) * eps + std * noise
 
-    with jax.enable_x64(new_val=True):
-        drawn = widened(draw(0))
-        assert np.all(np.asarray(coefficients(*drawn[1:3])[-1]) > 0)
-        # The two forms are one in float64, to its rounding of each term.
-        exact = np.asarray(posterior(*drawn))
-        np.testing.assert_allclose(np.asarray(ddim(*drawn)), exact, rtol=1e-12,
-                                   atol=1e-12 * float(np.abs(exact).max()))
+    # The two forms are one in float64, to its rounding of each term, on the first draw's float32 rates.
+    _, t, t_next, denoised, eps, noise, _ = draw(0)
+    a_t, s_t, a_s, s_s = (np.asarray(rate, np.float64) for rate in coefficients(t, t_next)[:4])
+    std = s_s / s_t * np.sqrt(s_t ** 2 - (a_t / a_s) ** 2 * s_s ** 2)
+    assert np.all(std > 0)
+    denoised, eps, noise = (np.asarray(value, np.float64) for value in (denoised, eps, noise))
+    exact = a_s * denoised + a_t * s_s ** 2 / (a_s * s_t) * eps + std * noise
+    np.testing.assert_allclose(a_s * denoised + np.sqrt(s_s ** 2 - std ** 2) * eps + std * noise, exact,
+                               rtol=1e-12, atol=1e-12 * float(np.abs(exact).max()))
     assert_as_exact(jax.jit(stepped), jax.jit(ddim), draw, f"DDIM at eta 1 on the {case} process",
                     seeds=POSTERIOR_SEEDS, truth_fn=posterior)
 
@@ -914,8 +916,8 @@ def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
             return np.stack(latents)
         return run
 
-    assert_as_exact(walked, source(torch.float32), draw, "DDIM at eta 1 against Diffusers", seeds=WALK_SEEDS,
-                    truth_fn=source(torch.float64))
+    assert_as_exact(as_given(walked), as_given(source(torch.float32)), draw,
+                    "DDIM at eta 1 against Diffusers", seeds=WALK_SEEDS, truth_fn=as_given(source(torch.float64)))
 
 
 def test_rk4s_update_divides_by_six_as_ieee_division_does():
