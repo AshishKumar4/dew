@@ -35,6 +35,57 @@ def test_gemma4_logits_match_the_reference_implementation(name):
     assert difference < 1e-5, f"max |logit difference| {difference:.3e}"
 
 
+def test_a_kv_shared_layers_stored_keys_and_values_load_unused_and_save_back(tmp_path):
+    """google/gemma-4-E4B-it stores its kv-shared layers' own k_proj, v_proj and k_norm (layers 24-41),
+    which transformers builds and never computes with, as the layer reads its provider's keys and
+    values: a load leaves them unplaced, building the variables a release without them builds, and a
+    save writes them back as stored (ledger 2010)."""
+    import shutil
+
+    from safetensors import numpy as safetensors_numpy
+
+    from dew.interop import Pretrained
+    from dew.interop.safetensors_io import read_weights
+
+    directory = tmp_path / "gemma4-kvshare"
+    shutil.copytree(FIXTURES / "gemma4-kvshare", directory)
+    stored = safetensors_numpy.load_file(directory / "model.safetensors")
+    config = json.loads((directory / "config.json").read_text())
+    layers, shared = config["num_hidden_layers"], config["num_kv_shared_layers"]
+    rng = np.random.default_rng(0)
+    unused = {}
+    for layer in range(layers - shared, layers):
+        for part in ("k_proj", "v_proj", "k_norm"):
+            # The layer of the same type before the shared run stores the shapes this one's would have.
+            like = stored[f"model.layers.{layer - shared}.self_attn.{part}.weight"]
+            unused[f"model.layers.{layer}.self_attn.{part}.weight"] = rng.standard_normal(like.shape).astype(
+                like.dtype)
+    safetensors_numpy.save_file({**stored, **unused}, directory / "model.safetensors",
+                                metadata={"format": "pt"})
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    alone = Pretrained.load(FIXTURES / "gemma4-kvshare", dtype="float32", attention_impl="reference")
+    assert jax.tree.structure(loaded.variables) == jax.tree.structure(alone.variables)
+    for ours, theirs in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(alone.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    loaded.save(tmp_path / "saved")
+    saved = read_weights(tmp_path / "saved")
+    for name, tensor in unused.items():
+        np.testing.assert_array_equal(saved[name], tensor)
+
+
+@pytest.mark.network
+def test_gemma4_e4b_builds_from_its_released_tensors():
+    """google/gemma-4-E4B-it as released (@ee0ef60), read from its safetensors header alone
+    (`weights=False`), its kv-shared layers' unused keys, values and key norms among its tensors,
+    builds its model: the release's own tensor list, which no fixture holds (ledger 2010)."""
+    from dew.interop import Pretrained
+
+    loaded = Pretrained.load("google/gemma-4-E4B-it", revision="ee0ef6023621cff504d758262d4e04895a5af4a2",
+                             weights=False)
+    shapes = jax.tree.leaves(loaded.variables)
+    assert shapes and all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in shapes)
+
+
 def test_the_router_bias_lands_in_the_moe_collection():
     """DeepSeek's `e_score_correction_bias` is router state a training step
     moves, not a weight, and `Router` keeps it in the `moe` collection. The
