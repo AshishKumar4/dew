@@ -112,6 +112,37 @@ def pairwise(g):
     return g[..., :, None] - g[..., None, :]
 
 
+def solve_inverse(kc, bc, gc):
+    """The inverse of `I + tril(beta k k^T exp2(g_s - g_t), -1)` of chunked keys, beta and cumulated decay
+    (`head_chunks`' layout), each chunk and head's, by a direct inverse (`jnp.linalg.inv`) in whatever dtype
+    they are given: the reference every test of the solve and the WY products reads, written apart from
+    the port's and the template's forward substitution."""
+    lower = jnp.tril(jnp.einsum('bnhsk,bnhtk->bnhst', kc, kc, precision=jax.lax.Precision.HIGHEST)
+                     * jnp.exp2(pairwise(gc)) * bc[..., :, None], -1)
+    return jnp.linalg.inv(jnp.eye(kc.shape[-2], dtype=kc.dtype) + lower)
+
+
+def wy(kc, vc, bc, gc):
+    """The WY representation `(w, u, inverse)` of chunked keys, values, beta and cumulated decay
+    (`solve_inverse`'s), in whatever dtype they are given."""
+    inverse = solve_inverse(kc, bc, gc)
+    return inverse @ (kc * (bc * jnp.exp2(gc))[..., None]), inverse @ (vc * bc[..., None]), inverse
+
+
+def range_gradient(pairs, after):
+    """Each token's decay gradient from terms through ranges of its chunk's cumulated decay, by the
+    ranges' definition: `pairs` `[..., C, C]`, each `(i, j)` a term through `(j, i]`, and `after`
+    `[..., C]`, each `s` a term through `[0, s]`; token `t` sums the terms whose range holds it, every
+    `(i, j)` with `j < t <= i` and every `s >= t`, as one masked sum over the three indices. Written apart
+    from production's running-sum form (`fla_gdn._summed_back`), so it catches a defect there rather than
+    repeating it."""
+    index = jnp.arange(pairs.shape[-1])
+    t, i, j = index[:, None, None], index[None, :, None], index[None, None, :]
+    holds = (j < t) & (t <= i)
+    through = jnp.sum(jnp.where(holds, pairs[..., None, :, :], 0.0), axis=(-2, -1))
+    return through + jnp.sum(jnp.where(index[None, :] >= index[:, None], after[..., None, :], 0.0), axis=-1)
+
+
 def _slotted(passing, rows):
     """Memories passing between a row's chunks `[B, C - 1, ...]` and a row's own `[B, ...]` at their
     slots (`chunked_launch.Sequences`): the passing ones row by row, then the rows'."""
@@ -181,11 +212,7 @@ def reference_kkt_solve(k, g, beta, *, chunk: int = 64):
 
     kc, bc = head_chunks(k, chunk), head_chunks(beta.astype(jnp.float32), chunk)
     gc = head_chunks(g.astype(jnp.float32), chunk)
-    a = jnp.einsum('bnhsk,bnhtk->bnhst', kc, kc, precision=jax.lax.Precision.HIGHEST)
-    a = a * jnp.exp2(pairwise(gc))
-    a = a * bc[..., :, None]
-    a = jnp.tril(a, -1)
-    inverse = jnp.linalg.inv(jnp.eye(chunk) + a)
+    inverse = solve_inverse(kc, bc, gc)
     return jnp.moveaxis(inverse, 2, 3).reshape(batch, length, heads, chunk).astype(dtype)
 
 
@@ -311,8 +338,7 @@ def reference_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
     pairs = pairs.at[..., -1, :].add(jnp.where(index < chunk - 1, leaving, 0.0))
     after = jnp.moveaxis(jnp.einsum('bnshk,bnshk->bnsh', dq, qc.astype(f32)), 3, 2)
     after = after.at[..., -1].add(dg_last)
-    through = jnp.cumsum(pairs, axis=-1) - pairs
-    dg = jnp.moveaxis(jnp.sum(jnp.where(causal, through + after[..., :, None], 0.0), axis=-2), 2, 3)
+    dg = jnp.moveaxis(range_gradient(pairs, after), 2, 3)
     ds = ds.astype(k_dtype).astype(f32)
     dq = dq + jnp.einsum('bnhst,bnthk->bnshk', ds, kc.astype(f32), precision=exact)
     dk = dk + jnp.einsum('bnhst,bnshk->bnthk', ds, qc.astype(f32), precision=exact)

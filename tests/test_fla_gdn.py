@@ -272,13 +272,9 @@ def test_a_tokens_decay_gradient_sums_only_the_terms_through_it():
 
 
 def wy_math(k, v, beta, g, chunk=64):
-    """`(w, u, inverse)` from `(k, v, beta, g)` through the inverse of `I + tril(beta k k^T
-    exp2(g_s - g_t), -1)`, per chunk and head: the WY representation in whatever dtype it is given."""
-    kc, vc, bc, gc = (support.head_chunks(x, chunk) for x in (k, v, beta, g))
-    decay = jnp.exp2(gc[..., :, None] - gc[..., None, :])
-    lower = jnp.tril(jnp.einsum('bnhsk,bnhtk->bnhst', kc, kc) * decay * bc[..., :, None], -1)
-    inverse = jnp.linalg.inv(jnp.eye(chunk, dtype=k.dtype) + lower)
-    return inverse @ (kc * (bc * jnp.exp2(gc))[..., None]), inverse @ (vc * bc[..., None]), inverse
+    """`(w, u, inverse)` from `(k, v, beta, g)` per chunk and head (`support.wy`): the WY representation in
+    whatever dtype it is given."""
+    return support.wy(*(support.head_chunks(x, chunk) for x in (k, v, beta, g)))
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 2e-2)])
