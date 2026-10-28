@@ -58,7 +58,8 @@ def test_a_time_step_bound_that_is_no_number_or_infinity_refuses_the_load(tmp_pa
 
 
 STREAM_SEEDS = 8
-"""The bf16 residual stream's declared draws of token ids against transformers' bf16 forward (check 1)."""
+"""The bf16 residual stream's declared draws of token ids against transformers' bf16 forward (check 1),
+sized by `seeds_for` paired with the stream on the CPU."""
 
 
 def test_a_bf16_mamba2_sums_its_residual_stream_in_fp32(tmp_path, tensors):
