@@ -36,6 +36,7 @@ take it rather than run XLA (`selection.KernelRefused`).
 
 import dataclasses
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -87,10 +88,11 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc.shape)
     dtypes = tuple(leaf.dtype for leaf in out_leaves)
     several = len(dtypes) > 1
+    # The selector took the stage, so the analysis found its axes (a refusal is a requirement it fails).
     consumed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
-                             epilogue_operands=tuple(zip(leaves, axes, strict=True)), out_dtype=dtypes[0],
-                             out_dtypes=dtypes if several else None, interpret_on_cpu=interpret_on_cpu,
-                             **prologue)
+                             epilogue_operands=tuple(zip(leaves, cast(tuple, axes), strict=True)),
+                             out_dtype=dtypes[0], out_dtypes=dtypes if several else None,
+                             interpret_on_cpu=interpret_on_cpu, **prologue)
     return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))
 
 
@@ -145,7 +147,8 @@ def _prologue(fusion) -> tuple[jax.Array, dict]:
         return fusion(), {}
     if select(PROLOGUE, Tiling(split)).kernel == 'xla':
         return fusion(), {}
-    base, function, sides, axes, jvp = split
+    # The selector took the stage, so the analysis split it (a refusal is a requirement it fails).
+    base, function, sides, axes, jvp = cast(tuple, split)
     return base, {'prologue': function, 'prologue_operands': tuple(zip(sides, axes, strict=True)),
                   'prologue_jvp': jvp}
 

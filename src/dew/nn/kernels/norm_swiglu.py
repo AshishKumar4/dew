@@ -80,7 +80,7 @@ from jax.experimental.pallas import triton as plgpu
 from dew.mesh import logical_spec
 
 from ..precision import at_least_fp32, compensated_add, compensated_total, rounded_to, two_product
-from ..sharding import manual_map
+from ..sharding import automatic_axes, manual_map
 from . import generation, tuning
 from .generation import INHERENT, measured_kernel
 from .selection import Kernel, Op, Requirement, select
@@ -261,12 +261,6 @@ def _runs(case) -> bool:
     return generation.triton_runs()
 
 
-def _split() -> bool:
-    """Whether a mesh axis the context leaves to the partitioner splits anything."""
-    mesh = jax.sharding.get_abstract_mesh()
-    return any(mesh.shape[name] > 1 for name in mesh.axis_names if name not in mesh.manual_axes)
-
-
 def _placed(axes, operands, *, whole_last: bool) -> bool:
     """Whether the kernel can run on its `operands`' shards: none varies in a
     `shard_map` that checks varying axes, and on a split mesh the caller
@@ -274,7 +268,7 @@ def _placed(axes, operands, *, whole_last: bool) -> bool:
     leave its last axis whole."""
     if any(jax.typeof(operand).mat.varying for operand in operands if operand is not None):
         return False
-    if not _split():
+    if not automatic_axes():
         return True
     first = operands[0]
     return axes is not None and (not whole_last or len(logical_spec(axes, first.shape)) < first.ndim)
@@ -285,7 +279,7 @@ def _per_shard(local, axes, operands, replicated):
     each shard (`manual_map`), the operands placed as `axes` names and those
     marked `replicated` (a norm's weight) whole on every shard, so the weight's
     gradient sums over the shards. Every output takes the first operand's place."""
-    if not _split():
+    if not automatic_axes():
         return local(*operands)
     spec = logical_spec(axes, operands[0].shape)
     specs = tuple(None if operand is None else jax.sharding.PartitionSpec() if whole else spec
@@ -1029,7 +1023,7 @@ def packed_swiglu(gate_up, portable, *, axes=None):
                                       lambda saved, operands, dy: _packed_bwd(interpret, operands[0], dy),
                                       portable)
 
-    if not _split():
+    if not automatic_axes():
         return local(gate_up)
     if axes is None:
         raise ValueError("a mesh splits the packed SwiGLU's operands, and it places them by their logical "

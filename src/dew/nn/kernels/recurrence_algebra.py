@@ -623,16 +623,16 @@ def corrected(values, weights: Load | None, state, dtype, issue: Issue):
 def carried(state, keys: Load, values, decay, dtype, issue: Issue, last: tuple | None = None) -> list:
     """The memory leaving a chunk, slice by key slice: `state[i] decay[i] + keys(i)^T values` ('write'), the
     values cast to the keys' `dtype`; `decay[i]` scales each slice's rows `[K_i, 1]` or the whole. `last`,
-    `(key_rows, value_row)`, takes the chunk's last token's write out of the product, its key slice
-    `key_rows(i)` as a row's vector and its values `value_row` as a column's: the write that weighs most
-    under steep decays, added on its own where a tensor core's truncating sum (mma.sync's) would lose its
-    last bit."""
+    `(key_rows, value_row, row)`, takes the chunk's last real token's write, its row `row`, out of the
+    product, its key slice `key_rows(i)` as a row's vector and its values `value_row` as a column's: the
+    write that weighs most under steep decays, added on its own where a tensor core's truncating sum
+    (mma.sync's) would lose its last bit."""
     values = values.astype(dtype)
     if last is None:
         return [part * decay[i] + issue("write", keys(i).T, values) for i, part in enumerate(state)]
-    key_rows, value_row = last
+    key_rows, value_row, row = last
     rows, _ = _grid(values.shape)
-    earlier = jnp.where(rows < values.shape[0] - 1, values, jnp.zeros((), values.dtype))
+    earlier = jnp.where(rows != row, values, jnp.zeros((), values.dtype))
     return [part * decay[i] + (issue("write", keys(i).T, earlier) + key_rows(i)[:, None] * value_row[None, :])
             for i, part in enumerate(state)]
 

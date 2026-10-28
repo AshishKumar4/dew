@@ -27,10 +27,12 @@ from test_recurrence_mosaic import (
     template_call,
 )
 
+from dew.nn.backbones.decoder_block import RematPolicy
 from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, mosaic_rule, recomputing
 from dew.nn.kernels.templates import bundles
 from dew.nn.kernels.templates.recurrence import mainloop, template
+from dew.nn.mixer_base import DELTA_RULE_RESIDUALS
 
 pytestmark = pytest.mark.kernel
 
@@ -45,8 +47,10 @@ seconds)."""
 GRADIENT_CASES = [case for case, shape in SHAPES.items() if not shape.get('per_key')]
 """The cases whose gradient the mainloop takes: a decay a head's (the gated delta rule's)."""
 
-REMATS = {'kept': (), 'recomputed': ('delta_memory',)}
-"""The remat rungs a gradient case runs under: the forward's memories kept, or recomputed in the backward."""
+REMATS = {'kept': ((), None), 'recomputed': (('delta_memory',), None), 'saved': ((), DELTA_RULE_RESIDUALS)}
+"""The remat rungs a gradient case runs under, each the names its layers recompute (`recomputing`) and those a
+checkpoint saves (`decoder_block.RematPolicy.save`, None for no checkpoint): the forward's memories kept,
+recomputed in the backward, or kept by their names under a checkpoint saving the delta rule's (row 2023)."""
 
 
 def drawn(dtype, seed: int, **shape) -> tuple[Chunk, tuple[jax.Array, jax.Array]]:
@@ -67,13 +71,14 @@ def restarted(fn, case: str):
 
 
 @pytest.mark.parametrize(('case', 'dtype', 'remat'), interpreted(
-    [(case, dtype, remat) for remat in ('kept', 'recomputed') for dtype in DTYPES for case in GRADIENT_CASES],
+    [(case, dtype, remat) for remat in REMATS for dtype in DTYPES for case in GRADIENT_CASES],
     INTERPRETED_GRADIENT))
 def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast
     backward (`mainloop.gradients`, fla's DAG) against the fla port's, whose numbers it runs, from the
-    forward's memories kept or, under a remat rung that recomputes them (`recomputing`), recomputed. A call
+    forward's memories kept, under a remat rung that recomputes them (`recomputing`) recomputed, or under a
+    checkpoint saving the delta rule's names kept by them. A call
     the template refuses is checked refused and its gradient on the mainloop's rule (`on_the_mainloop`). A
     gradient the fast backward does not take, an fp32 call's or one whose launches the device does not hold
     (`Mosaic.trains`), the rule refuses as it is traced: the delta rule's selector gives it the port or the
@@ -86,9 +91,14 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
 
     # Plain functions: the gate compiles both arms alike (`reference_error._arms`).
     def compiled(fn):
+        recomputed, saved = REMATS[remat]
+
         def traced(*arguments):
-            with recomputing(REMATS[remat]):
-                return with_gradients(restarted(functools.partial(fn, **bound), case))(*arguments)
+            run = restarted(functools.partial(fn, **bound), case)
+            if saved is not None:
+                run = jax.checkpoint(run, policy=RematPolicy(save=saved).checkpoint_policy())
+            with recomputing(recomputed):
+                return with_gradients(run)(*arguments)
 
         return traced
 
