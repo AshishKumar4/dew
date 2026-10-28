@@ -1951,43 +1951,38 @@ def test_base_pushes_and_the_background_suite_run_at_a_lanes_whole_suite_priorit
 
 
 def test_a_test_past_the_group_target_is_flagged_and_a_new_one_fails(ci, tmp_path, monkeypatch, capsys):
-    """A test whose own seconds pass the group target (.armada.json's `target`) is flagged from a verdict's
-    rows, as no cut can bring its group within the target; a whole_suite cell is not, as it runs on the whole
-    suite alone; and with the record a change is measured against, a test the record lacks fails the check
-    (owner, 2026-10-28: a test file past the group target is its owner's P1 the run it is measured, and a new
-    slow test fails its lane's check; row 2073's cell ran 1,540 s)."""
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / ".armada.json").write_text(json.dumps({"target": 120}))
-    (tmp_path / "tests").mkdir(exist_ok=True)
-    (tmp_path / "tests/test_slow.py").write_text(
-        "import pytest\n"
-        "def test_old(): pass\n"
-        "def test_new(): pass\n"
-        "def test_quick(): pass\n"
-        "@pytest.mark.whole_suite\n"
-        "def test_cell(): pass\n"
-        "@pytest.mark.parametrize('n', [1, pytest.param(2, marks=pytest.mark.whole_suite, id='big')])\n"
-        "def test_sized(n): pass\n")
+    """A test whose own seconds in a task's run pass the group target (.armada.json's `target`) is flagged from the
+    verdict's rows, as no cut can bring its group within the target; a whole_suite cell is not, as it runs on the
+    whole suite alone, however pytest comes to mark it (its own mark, its class's, a parameter set's, a mark held
+    in a name), which the run records in its row; and with the record a change is measured against, a test the
+    record lacks fails the check (owner, 2026-10-28: a test file past the group target is its owner's P1 the run it
+    is measured, and a new slow test fails its lane's check; row 2073's cell ran 1,540 s)."""
+    interpreter(tmp_path, "3.12")
+    written(tmp_path, {"test_slow.py": "import time\nimport pytest\ncell = pytest.mark.whole_suite\n"
+                       "def test_old(): time.sleep(0.4)\n"
+                       "def test_new(): time.sleep(0.6)\n"
+                       "def test_quick(): pass\n"
+                       "@pytest.mark.whole_suite\ndef test_cell(): time.sleep(0.4)\n"
+                       "@cell\ndef test_named(): time.sleep(0.4)\n"
+                       "class TestHeld:\n    pytestmark = cell\n    def test_inside(self): time.sleep(0.4)\n"
+                       "@pytest.mark.parametrize('n', [1, pytest.param(2, marks=cell, id='big')])\n"
+                       "def test_sized(n): time.sleep(0.3 * n)\n"})
+    (tmp_path / ".verdict").mkdir()
+    out = tmp_path / ".verdict/verdict.json"
+    # The whole suite's run, which runs the cells too.
+    monkeypatch.setenv("DEW_WHOLE_SUITE", "1")
     verdict = tmp_path / "verdict.json"
-    verdict.write_text(json.dumps({"rows": [
-        {"name": "3.12:tests/test_slow.py", "exitCode": 0, "seconds": 2000.0, "tests": {
-            "tests/test_slow.py::test_old": 300.0, "tests/test_slow.py::test_new": 500.0,
-            "tests/test_slow.py::test_quick": 3.0, "tests/test_slow.py::test_cell": 900.0,
-            "tests/test_slow.py::test_sized[1]": 130.0, "tests/test_slow.py::test_sized[big]": 800.0}}]}))
+    verdict.write_text(json.dumps({"rows": armada_task(ci, monkeypatch, out, "off")}))
+    (tmp_path / ".armada.json").write_text(json.dumps({"target": 0.2}))
     base = tmp_path / "base.json"
-    base.write_text(json.dumps({"tests/test_slow.py::test_old": 290.0,
-                                "tests/test_slow.py::test_sized[1]": 125.0}))
+    base.write_text(json.dumps({"tests/test_slow.py::test_old": 0.4, "tests/test_slow.py::test_sized[1]": 0.3}))
 
-    def slow(*options: str) -> tuple[int, list[dict]]:
+    def slow(*options: str) -> tuple[int, list[str]]:
         monkeypatch.setattr(sys, "argv", ["ci.py", "slow", str(verdict), *options])
         code = ci.main()
         printed = capsys.readouterr().out.splitlines()
-        return code, [json.loads(line) for line in printed if line.startswith("{")]
+        return code, [json.loads(line)["test"] for line in printed if line.startswith("{")]
 
-    code, found = slow()
-    assert code == 0
-    assert [(item["test"], item["seconds"]) for item in found] == [
-        ("tests/test_slow.py::test_new", 500.0), ("tests/test_slow.py::test_old", 300.0),
-        ("tests/test_slow.py::test_sized[1]", 130.0)]
-    code, found = slow("--new", str(base))
-    assert code == 1 and [item["test"] for item in found] == ["tests/test_slow.py::test_new"]
+    assert slow() == (0, ["tests/test_slow.py::test_new", "tests/test_slow.py::test_old",
+                          "tests/test_slow.py::test_sized[1]"])
+    assert slow("--new", str(base)) == (1, ["tests/test_slow.py::test_new"])
