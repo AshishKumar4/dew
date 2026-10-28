@@ -10,7 +10,6 @@ import json
 import os
 import re
 import shutil
-import sqlite3
 import tempfile
 import threading
 import time
@@ -32,7 +31,7 @@ from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
-from dew._records import JSON, json_value
+from dew._records import JSON, json_value, record, text
 from dew.cache import dew_cache_dir
 from dew.data.retention import LocalRetention, evictable, read_pin
 from dew.files import write_atomically
@@ -353,30 +352,30 @@ def _local_file_key(path: str, size: int) -> tuple[str, int, int, int]:
 
 
 def content_version(fs: AbstractFileSystem, path: str, size: int) -> str:
-    """A local file's full SHA256, persisted in Dew's cache until its metadata changes."""
+    """A local file's full SHA256, persisted in Dew's cache until its metadata changes: one record a
+    file, its metadata beside the checksum, replaced whole (`write_atomically`) when the file changes,
+    so versioning one file never waits on another's, in this process or any other that shares the
+    cache, and a file rewritten keeps one record."""
+    # A record a file, not one database of them: under load one process's write held a shared
+    # database past the others' wait, which failed them ("database is locked").
     directory = Path(dew_cache_dir()) / "content-versions"
     directory.mkdir(parents=True, exist_ok=True)
-    lock = hashlib.sha256(os.path.realpath(path).encode()).hexdigest()
-    with FileLock(str(directory / (lock + ".lock"))), contextlib.closing(
-        sqlite3.connect(directory / "versions.sqlite")
-    ) as versions:
-        key = _local_file_key(path, size)
-        fingerprint = hashlib.sha256(json.dumps(key).encode()).hexdigest()
-        versions.execute(
-            "CREATE TABLE IF NOT EXISTS versions (file TEXT PRIMARY KEY, sha256 TEXT NOT NULL)"
-        )
-        cached = versions.execute("SELECT sha256 FROM versions WHERE file = ?", (fingerprint,)).fetchone()
-        if cached is not None:
-            return str(cached[0])
+    named = hashlib.sha256(os.path.realpath(path).encode()).hexdigest()
+    kept = directory / (named + ".json")
+    with FileLock(str(directory / (named + ".lock"))):
+        key = list(_local_file_key(path, size))
+        if kept.exists():
+            held = record(json.loads(kept.read_text()), "content version")
+            if held["key"] == key:
+                return text(held["sha256"], "content version's checksum")
         with fs.open(path, "rb") as file:
             digest = hashlib.sha256()
             while payload := file.read(2**20):
                 digest.update(payload)
         checksum = digest.hexdigest()
-        if _local_file_key(path, size) != key:
+        if list(_local_file_key(path, size)) != key:
             raise OSError(f"local file changed while its content was versioned: {path}")
-        with versions:
-            versions.execute("INSERT INTO versions VALUES (?, ?)", (fingerprint, checksum))
+        write_atomically(kept, json.dumps({"key": key, "sha256": checksum}))
         return checksum
 
 

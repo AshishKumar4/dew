@@ -12,6 +12,7 @@ import json
 import multiprocessing
 import sys
 import threading
+from concurrent import futures
 from typing import ClassVar
 
 import numpy as np
@@ -272,19 +273,62 @@ def test_an_elastic_expansion_reads_one_readers_pieces_in_or_out_of_workers(work
             share.close()
 
 
-def test_automatic_loading_sizes_an_elastic_reads_workers_by_the_groups_they_read(caplog):
-    """An elastic read by index reads in its workers a batch's count of inputs a group, so automatic
-    loading sizes its read-ahead by groups: eight 64 KiB images make a 512 KiB group, so 2 MiB holds
-    four of them ahead, where sized by the record it held sixteen, 8 MiB."""
-    images = Memory(tuple({"image": np.full((128, 128, 4), index, np.uint8)} for index in range(64)))
-    chain = Pipeline(images).shuffle(1).repeat().filter(Unkept("image", -1)).batch(BATCH).elastic()
-    loading = Loading(workers="auto", ram_budget_mb=2, threads=2)
-    with caplog.at_level("INFO", logger="dew.data.dataset"):
-        reader_ = compile(chain, read="indexed", loading=loading, seed=0).train(DataPartition(0, 2))
-        reader_.close()
-    resolved = [message for message in (record.getMessage() for record in caplog.records)
-                if "automatic loading" in message]
-    assert resolved and "holding 4 reads ahead" in resolved[-1]
+class Inline(futures.Executor):
+    """Grain's prefetch thread pool, which runs each read as the prefetch submits it, so the reads
+    it asks for ahead are made before the read that asked returns. The pool is where reads leave the
+    reading thread: with its threads, what a prefetch holds ahead is seen only by waiting for reads
+    that should not come, and Grain names no other place to count them. A read asked for is counted
+    as made, so the count is the prefetch's reads in flight and buffered together."""
+
+    def __init__(self, max_workers: int, *, thread_name_prefix: str = ""):
+        super().__init__()
+
+    def submit(self, fn, /, *args, **kwargs):
+        done = futures.Future()
+        try:
+            done.set_result(fn(*args, **kwargs))
+        except BaseException as error:
+            done.set_exception(error)
+        return done
+
+
+class CountedImages:
+    """Sixty-four 64 KiB images by index, each read of one counted."""
+
+    def __init__(self):
+        self.reads = 0
+
+    def __len__(self) -> int:
+        return 64
+
+    def __getitem__(self, index):
+        self.reads += 1
+        return {"image": np.full((128, 128, 4), index, np.uint8)}
+
+
+def test_automatic_loading_reads_an_elastic_read_ahead_by_the_groups_it_reads(monkeypatch):
+    """An elastic read by index reads its inputs in groups of a batch's count, so automatic loading
+    sizes its read-ahead in groups: eight 64 KiB images make a 512 KiB group, and 2 MiB holds four
+    of them ahead, where sized by the record it would hold sixteen, 8 MiB. Counted at the source
+    from the reader's open through its first batch, Grain's prefetch filling its four places, handing
+    one on and filling it again, the read reads four whole groups, 32 images, more than one that
+    holds nothing ahead; the reads both make at open, a scan of every image, cancel out."""
+    # Grain's prefetch reads the pool's class from `concurrent.futures` as it builds the pool.
+    monkeypatch.setattr(futures, "ThreadPoolExecutor", Inline)
+
+    def first_batch_reads(loading: Loading) -> int:
+        images = CountedImages()
+        chain = Pipeline(Memory(images)).shuffle(1).repeat().filter(Unkept("image", -1)).batch(BATCH)
+        stream = compile(chain.elastic(), read="indexed", loading=loading, seed=0).train(DataPartition(0, 2))
+        try:
+            opened = images.reads
+            next(stream)
+            return images.reads - opened
+        finally:
+            stream.close()
+
+    automatic = first_batch_reads(Loading(workers="auto", ram_budget_mb=2, threads=2))
+    assert automatic - first_batch_reads(Loading(workers=0, threads=0)) == 4 * BATCH
 
 
 REFUSED, READ_A_BATCH = 3, 4
