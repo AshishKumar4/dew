@@ -19,17 +19,16 @@ from collections.abc import Callable, Sequence
 
 import jax
 import jax.extend.core as jcore
-import numpy as np
 from jax.core import ShapedArray
 
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
 from dew.distributed.placement import placed_bytes
-from dew.mesh import batch_axes
 from dew.objectives.base import Objective, Step
 from dew.optim import clips_qk
 from dew.state import TrainState
+from dew.training.narrow import forward_variables
 from dew.training.transaction import with_ema
 
 
@@ -57,19 +56,21 @@ class Footprint:
         return {"residuals": self.residuals, "gradients": self.gradients, "held": self.held}
 
 
-def residual_bytes(loss: Callable, params, arguments: Sequence, rows: int, shards: int) -> int:
+def residual_bytes(loss: Callable, params, arguments: Sequence) -> int:
     """The device bytes the pullback of `loss(params, *arguments)` in `params` keeps, a device's share:
     each value its traced program (`jax.make_jaxpr` of `jax.vjp`'s pullback) closes over, once,
     that is neither one of its inputs, which the state and the batch already hold, nor a literal,
-    and lives in device memory, an offloaded one on the host. A residual whose leading axis is the batch's
-    `rows` is split over the `shards` the batch is read in; any other is counted whole."""
+    and lives in device memory, an offloaded one on the host. Each residual uses its own traced
+    sharding; one whose trace states none counts whole. Matching an axis's size to the batch size
+    cannot identify its sharding: a weight or a scan's layer axis can have that size too."""
     def pullback(params, *arguments):
         return jax.vjp(lambda trainable: loss(trainable, *arguments), params, has_aux=True)[1]
 
-    program = jax.make_jaxpr(pullback)(params, *arguments).jaxpr
-    seen = set(program.invars)
+    closed, shapes = jax.make_jaxpr(pullback, return_shape=True)(params, *arguments)
+    program = closed.jaxpr
+    seen = {*program.invars, *program.constvars}
     total = 0
-    for value in program.outvars:
+    for value, shape in zip(program.outvars, jax.tree.leaves(shapes), strict=True):
         if isinstance(value, jcore.Literal) or value in seen:
             continue
         seen.add(value)
@@ -78,8 +79,7 @@ def residual_bytes(loss: Callable, params, arguments: Sequence, rows: int, shard
             raise TypeError(f"a pullback keeps {aval}, which is no array")
         if aval.memory_space != jax.memory.Space.Device:
             continue
-        size = int(np.prod(aval.shape)) * np.dtype(aval.dtype).itemsize
-        total += size // shards if aval.shape and aval.shape[0] == rows else size
+        total += placed_bytes(shape)
     return total
 
 
@@ -100,19 +100,18 @@ def traced_loss[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: T
     return loss, (variables, state.microstep, state.key, state.step, state.ema)
 
 
-def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT], state: TrainState,
-                                          micro: Batch, window: int, mesh, prepared: TrainState,
+def candidate_footprint[LossT, EffectsT](objective: Objective[LossT, EffectsT],
+                                          micro: Batch, window: int, prepared: TrainState,
                                           held: int) -> Footprint:
     """What a step over microbatches of `micro`'s shapes, its state `prepared` as placed, takes of a
-    device beside that state (`Footprint`): its loss's residuals at one microbatch, split over the
-    axes its rows split over (`batch_axes`), its trained parameters' gradient, laid out as they are,
+    device beside that state (`Footprint`): its loss's residuals at one microbatch, each at the
+    sharding its trace states, its trained parameters' gradient, laid out as they are,
     and `held`."""
-    loss, (variables, *rest) = traced_loss(objective, state, window)
+    loss, (variables, *rest) = traced_loss(objective, prepared, window)
+    variables = forward_variables(variables, prepared.compute)
 
     def trained(params, variables, batch, *rest):
         return loss({**variables, "params": params}, batch, *rest)
 
-    shards = int(np.prod([mesh.shape[axis] for axis in batch_axes(mesh)]))
-    residuals = residual_bytes(trained, variables["params"], (variables, micro, *rest), rows_of(micro),
-                               shards)
+    residuals = residual_bytes(trained, variables["params"], (variables, micro, *rest))
     return Footprint(residuals, placed_bytes(prepared.variables["params"]), held)

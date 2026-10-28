@@ -1099,8 +1099,8 @@ class Trainer(Generic[Loss, Effects]):
         else:
             # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
             lowered, launches = lower(), launches or "[]"
-        footprint = candidate_footprint(self.objective, state, self._model_shapes(micro),
-                                        split * self.accumulation, self.device_mesh, prepared, held)
+        footprint = None if self.step is not None else candidate_footprint(
+            self.objective, self._model_shapes(micro), split * self.accumulation, prepared, held)
         return Candidate(micro, shapes, copies, shardings, prepared, held, lowered, launches, lower.report(),
                          footprint)
 

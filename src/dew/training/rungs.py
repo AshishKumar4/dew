@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING
 import jax
 import numpy as np
 from jax.sharding import Mesh
+from jaxlib.xla_client import LoadedExecutable
 
 from dew._records import JSON, json_value, record
 from dew.files import write_atomically
@@ -145,7 +146,8 @@ def plan_flops(recorded: JSON, executable: jax.stages.Compiled) -> tuple[StepFlo
     apart two steps that differ in an objective's arguments alone; the
     executable can."""
     runtime = executable.runtime_executable()
-    fingerprint = None if runtime is None else runtime.fingerprint
+    # An executable compiled for absent devices is not loaded and has no runtime fingerprint.
+    fingerprint = runtime.fingerprint if isinstance(runtime, LoadedExecutable) else None
     named = fingerprint.hex() if isinstance(fingerprint, bytes) else None
     counted = record(recorded, 'recorded plan').get('flops') if recorded is not None else None
     if named is not None and isinstance(counted, list) and len(counted) == 4 and counted[:1] == [named]:

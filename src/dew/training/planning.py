@@ -126,8 +126,8 @@ class Candidate:
     program: jax.stages.Lowered | None
     launches: str
     kernels: KernelReport
-    footprint: Footprint
-    """What it takes of a device beside the state, derived from its shapes before it compiles."""
+    footprint: Footprint | None
+    """Its derived device footprint; None for a custom step not differentiating the objective."""
 
     @property
     def lowered(self) -> jax.stages.Lowered:
@@ -217,7 +217,7 @@ class Probe:
     headroom: int | None
     temp: int | None
     argument: int | None
-    derived: Footprint
+    derived: Footprint | None
     ahead: bool = False
     """Whether the executable is the step compiled ahead (`FitSearch.ahead`), not the search's own."""
     compile_seconds: float = 0.0
@@ -235,7 +235,7 @@ class Probe:
     def record(self) -> dict[str, JSON]:
         return {"split": self.split, "rows": self.rows, **self.rung, "fits": self.fits,
                 "headroom": self.headroom, "temp": self.temp, "argument": self.argument,
-                "derived": self.derived.record(), "ahead": self.ahead,
+                "derived": None if self.derived is None else self.derived.record(), "ahead": self.ahead,
                 "compile_seconds": self.compile_seconds}
 
     def named(self) -> str:

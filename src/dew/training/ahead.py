@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.experimental.topologies as topologies
+import numpy as np
 from jax.experimental import serialize_executable
 
 from dew._records import JSON, record
@@ -55,7 +56,7 @@ THREADS_PER_MULTIPROCESSOR = {(8, 0): 2048, (9, 0): 2048, (10, 0): 2048}
 (CUDA C++ Programming Guide, "Technical Specifications per Compute Capability")."""
 
 
-def target_config(generation: str) -> str:
+def target_config(generation: str, capacity: int | None = None) -> str:
     """The `gpu_device_info` XLA compiles for, from the CUDA `generation`'s target
     (`generation.TARGETS`): its compute capability, the shared memory a block may opt into, its
     multiprocessors, clock and bandwidth; CUDA's per-capability limits for the rest. The fields past
@@ -78,6 +79,7 @@ def target_config(generation: str) -> str:
   block_dim_limit_y: 65535
   block_dim_limit_z: 65535
   memory_bandwidth: {int(bandwidth)}
+  device_memory_size: {0 if capacity is None else capacity}
   clock_rate_ghz: {clock / 1e9}
   shared_memory_per_block_optin: {shared}
   cuda_compute_capability {{
@@ -93,10 +95,13 @@ device_description_str: "{target.device_kind}"
 
 
 @functools.cache
-def compile_only_gpus(generation: str, count: int = 1) -> tuple:
+def compile_only_gpus(generation: str, count: int = 1, capacity: int | None = None) -> tuple:
     """`count` compile-only devices of the CUDA `generation`, none attached: XLA's CUDA backend compiles a
-    program over them, a mesh's collectives included, as for that many of the generation's GPUs."""
-    topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=target_config(generation),
+    program over them, a mesh's collectives included, as for that many of the generation's GPUs.
+    `capacity` states bytes per device to XLA's scheduler and rematerialization pass, not only Dew's
+    admission check; absent it, XLA's target states zero rather than a hardware capacity."""
+    config = target_config(generation, capacity)
+    topology = topologies.get_topology_desc("dew-compile", "cuda", target_config=config,
                                             topology=f"1x1x{count}")
     return tuple(topology.devices[:count])
 
@@ -264,6 +269,11 @@ def compile_ahead[LossT, EffectsT](trainer: Trainer[LossT, EffectsT], batch: Bat
                          "mesh is built over (MeshSpec.build(compile_only_gpus(generation, count))); this "
                          f"mesh holds {sorted({device.device_kind for device in devices})}")
     (generation,) = generations
+    if capacity is not None:
+        mesh = trainer.device_mesh
+        devices = compile_only_gpus(generation, len(devices), capacity)
+        trainer.mesh = jax.sharding.Mesh(np.asarray(devices).reshape(mesh.devices.shape), mesh.axis_names,
+                                         axis_types=mesh.axis_types)
     began = time.perf_counter()
     start = trainer._started()
     with assumed(generation):
