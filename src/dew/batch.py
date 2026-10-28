@@ -306,6 +306,24 @@ def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=No
                        right_padded=right_padded)
 
 
+def token_coordinates(shape: tuple[int, int], given: Coordinates | None = None, *, segments=None,
+                      valid=None, positions=None, right_padded: bool = False) -> Coordinates | None:
+    """A call's token layout as one `Coordinates`, the one conversion of its fields: `given` as it is,
+    else built from the flat `segments` (`segment_ids`), `valid` (the validity field) and `positions`
+    (`coordinates`), None where the call gives none. A call giving both is refused: its coordinates
+    would silently drop its fields (ledger 1122)."""
+    fields = (("segment_ids", segments), (VALIDITY_FIELD, valid), ("positions", positions))
+    flat = [name for name, value in fields if value is not None] + (["right_padded"] if right_padded else [])
+    if given is not None:
+        if flat:
+            raise ValueError(f"a call's tokens are laid out by their coordinates or by their fields, not "
+                             f"both: coordinates with {', '.join(flat)}")
+        return given
+    if not flat:
+        return None
+    return coordinates(shape, segments=segments, valid=valid, positions=positions, right_padded=right_padded)
+
+
 def document_firsts(starts, documents: int, *, xp=jnp):
     """Each row's first `documents` documents' first slots in order `[B, min(documents, S)]`, the row's
     first slot and each of `starts` `[B, S]`, `S` past its last: a sort of each row's slots, which a mesh

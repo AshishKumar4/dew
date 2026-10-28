@@ -13,7 +13,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew._model_types import GEMMA4_TYPES
-from dew.batch import Coordinates, coordinates as build_coordinates, prefix_sum
+from dew.batch import Coordinates, coordinates as build_coordinates, prefix_sum, token_coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import CrossContext, next_position
@@ -423,10 +423,8 @@ class MultimodalTransformer(DecoderWrapper):
         """
         # The tokens as the decoder reads them (`Coordinates`), whichever fields the caller gave
         # them in, so the cursor counts the places the layers do.
-        if coordinates is None and (segment_ids is not None or attention_mask is not None
-                                    or positions is not None or right_padded):
-            coordinates = build_coordinates(tokens.shape, segments=segment_ids, valid=attention_mask,
-                                            positions=positions, right_padded=right_padded)
+        coordinates = token_coordinates(tokens.shape, coordinates, segments=segment_ids, valid=attention_mask,
+                                        positions=positions, right_padded=right_padded)
         if decode:
             allocated = self.has_variable("cache", POSITION)
             cursor = self.variable("cache", POSITION, jnp.zeros, (tokens.shape[0],), jnp.int32)
