@@ -1268,6 +1268,29 @@ def test_a_run_that_read_its_limits_runs_again_where_they_change(ci, tmp_path, m
     assert run() == [1, 2]
 
 
+def test_a_fixture_added_or_removed_reruns_every_file(ci, tmp_path, monkeypatch, cache_worker):
+    """A fixture's arrival or removal is every file's input, as a test may ask whether one exists
+    (`Path.exists`, a collection by presence) without opening it, which no record sees; its contents stay
+    its openers' alone (train 253's review: a test asserting a fixture's absence was reused green once the
+    fixture came)."""
+    (tmp_path / "tests/fixtures").mkdir(parents=True)
+    (tmp_path / "tests/fixtures/present.json").write_text("{}\n")
+    (tmp_path / "tests/test_absent.py").write_text(
+        "from pathlib import Path\n"
+        "def test_absent():\n"
+        "    with Path('runs-absent').open('a') as runs: runs.write('x')\n"
+        "    assert not Path('tests/fixtures/unexpected.json').exists()\n")
+    verdict = cached_checkout(ci, tmp_path, monkeypatch, cache_worker)
+    base = commit(tmp_path, "base")
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+    assert [row["exitCode"] for row in rows] == [0]
+    (tmp_path / "tests/fixtures/unexpected.json").write_text("{}\n")
+    git(tmp_path, "add", "tests/fixtures/unexpected.json")
+    commit(tmp_path, "a fixture arrives")
+    rows = armada_task(ci, monkeypatch, verdict, ci.policy(base))
+    assert [row["exitCode"] for row in rows] != [0] and len((tmp_path / "runs-absent").read_text()) == 2
+
+
 def test_a_changed_tool_runs_again_only_the_files_that_read_it(ci, tmp_path, monkeypatch, cache_worker):
     """A change under tools/ reruns the files whose runs executed or read the changed tool, which their keys
     hash, and reuses every other file's green row, though it read another tool: the policy CI computes for
