@@ -44,10 +44,12 @@ from torch_precision import replaced
 EDM = "008a4e5316c8e3bfe61a62f874bddba254295afb"
 EDM2 = "4bf8162f601bcc09472ce8a32dd0cbe8889dc8fc"
 FIXTURE = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "edm_loss" / "seeds.npz"
-IMAGES, CHANNELS, SIZE, LOGVAR_CHANNELS = 1024, 3, 4, 16
-"""A draw's images: 1024, so each draw's error averages that many lognormal training sigmas. At 6 a draw,
+IMAGES, CHANNELS, SIZE, LOGVAR_CHANNELS = 1024, 1, 2, 16
+"""A draw's images: 1024 of one channel 2 by 2, so each draw's error averages that many lognormal training
+sigmas while its leaves stay small enough for a recording's sizing to hold its draws. At 6 images a draw
 EDM's paired sizing took all 512 seeds and EDM2's logvar weight gradient did not resolve within them; at
-64 and 256, EDM's sigmas did not; at 1024 EDM's resolve at 128 and EDM2's at 32 (armada, 10-28)."""
+64 and 256, EDM's sigmas did not; at 1024, 3 channels 4 by 4, EDM's resolved at 128 and EDM2's at 32
+(armada, 10-28), and the recording's draws past 12 GiB."""
 TINY_UNET = {"model_channels": 8, "channel_mult": [1], "num_blocks": 1, "attn_resolutions": []}
 """Precond builds a U-Net it is then given the stand-in in place of; a tiny one."""
 
