@@ -131,6 +131,20 @@ def _row_block(batch: int, length: int, chunk: int, width: int, bm: int, bn: int
     return m, h, c, start, _limit(c, length, chunk), pl.ds(start + m * bm, bm)
 
 
+def _extracted(values):
+    """`values` `[rows, n]` split into parts whose sums along a row keep every bit: `(high, low)`, `high`
+    each value rounded to a multiple of its row's unit, a power of two past `n` times its largest
+    magnitude over 2^23, so any running sum of `high` is exact, and `low` what the rounding left, whose
+    sums round only far below it (Rump's ExtractScalar). A row with a non-finite value keeps its values
+    whole as `high`. Elementwise and a row maximum: a Triton kernel's own ops, where a sequential loop over
+    a tile's columns lowered to garbage on an A100's."""
+    largest = jnp.max(jnp.abs(values), axis=1, keepdims=True) * values.shape[1]
+    unit = jnp.exp2(jnp.ceil(jnp.log2(jnp.where(largest > 0, largest, 1.0))) + 1.0)
+    finite = jnp.isfinite(unit)
+    high = jnp.where(finite, (unit + values) - unit, values)
+    return high, values - high
+
+
 def _apart(later: tuple, earlier: tuple):
     """`acs_later - acs_earlier` from two reads of the compensated prefix (`ChunkCumsum`'s `(hi, lo)`):
     the rounded halves' difference, exact where they are close, then their compensations'. Its rounded
@@ -192,10 +206,10 @@ def _documents(batch: int, padded: int):
 def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int):
     """mamba_ssm's `_chunk_cumsum_fwd_kernel` (ssd_chunk_state.py:39-86) without the step's bias,
     softplus and limit, for one chunk of `BH` heads: the step, zero past the row's end, and `A dt`
-    cumulated over the chunk as a compensated pair `(hi, lo)` (`compensated_add`, a step at a time), all
-    fp32 in mamba_ssm's heads-first layout: every decay a kernel reads is a difference of two of these
-    sums (`_apart`), which the rounded sum alone gave 530 times the recurrence's distance from float64
-    after a steep step (row 2066).
+    cumulated over the chunk as a pair `(hi, lo)`, the running sums of its exactly summed high parts and
+    of its low parts (`_extracted`), all fp32 in mamba_ssm's heads-first layout: every decay a kernel reads
+    is a difference of two of these sums (`_apart`), which the rounded sum alone gave 530 times the
+    recurrence's distance from float64 after a steep step (row 2066).
 
     With documents, each document in the chunk cumulates its own steps alone, the others' zeroed,
     where mamba_ssm's sum runs on from the chunk's first step: every decay a kernel reads is a
@@ -210,20 +224,22 @@ def _chunk_cumsum_kernel(dt_ref, a_ref, *refs, length: int, chunk: int, bh: int)
     steps = pl.ds(start, chunk)
     dt = read_rows(dt_ref.at[steps, heads], _limit(c, length, chunk)).astype(jnp.float32).T
     step_ref[:, steps] = dt
-    # The steps' decays staged in the prefix's rounded half, which the running sum overwrites in turn.
-    hi_ref[:, steps] = dt * a_ref[heads].astype(jnp.float32)[:, None]
+    # Each step's decay split so its high parts' running sum is exact (`_extracted`): the prefix's rounded
+    # half, and its low parts' sum the compensation.
+    parts = _extracted(dt * a_ref[heads].astype(jnp.float32)[:, None])
+    if not seq:
+        hi_ref[:, steps], lo_ref[:, steps] = (jnp.cumsum(part, axis=1) for part in parts)
+        return
+    documents = seq[0][steps][None, :]
 
-    def step(k, summed):
-        column = pl.ds(start + k, 1)
-        if seq:
-            # A document's first step starts its sum afresh.
-            restarts = (k > 0) & (seq[0][start + k] != seq[0][start + jnp.maximum(k - 1, 0)])
-            summed = tuple(jnp.where(restarts, 0.0, part) for part in summed)
-        summed = compensated_add(summed, (hi_ref[:, column], jnp.zeros((bh, 1), jnp.float32)))
-        hi_ref[:, column], lo_ref[:, column] = summed
-        return summed
+    def document(d, summed):
+        mine = documents == d
+        return tuple(total + jnp.where(mine, jnp.cumsum(jnp.where(mine, part, 0.0), axis=1), 0.0)
+                     for total, part in zip(summed, parts, strict=True))
 
-    jax.lax.fori_loop(0, chunk, step, (jnp.zeros((bh, 1), jnp.float32),) * 2)
+    # The documents count up along a row, from the chunk's first step's to its last's.
+    hi_ref[:, steps], lo_ref[:, steps] = jax.lax.fori_loop(
+        seq[0][start], seq[0][start + chunk - 1] + 1, document, (jnp.zeros(parts[0].shape, jnp.float32),) * 2)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -259,8 +275,8 @@ def _chunk_cumsum_bwd_kernel(dacs_ref, ddt_ref, dt_ref, a_ref, out_ref, da_ref, 
                              chunk: int, bh: int):
     """mamba_ssm's `_chunk_cumsum_bwd_kernel` (ssd_chunk_state.py:101-174) without the step's bias,
     softplus and limit, for one chunk of `BH` heads: the step's gradient `ddA A + ddt` back in Dew's
-    `[T, H]`, and `A`'s `sum ddA dt` over the chunk for XLA to sum, a step at a time with its roundings
-    kept (`compensated_add`): summed plainly, a steep-then-mild chunk's rate gradient was 2.79 times the
+    `[T, H]`, and `A`'s `sum ddA dt` over the chunk for XLA to sum, its high parts summed exactly
+    (`_extracted`): summed plainly, a steep-then-mild chunk's rate gradient was 2.79 times the
     recurrence's distance from float64, 1.20 compensated (row 2066)."""
     c, h = pl.program_id(1), pl.program_id(2)
     heads = pl.ds(h * bh, bh)
@@ -269,15 +285,9 @@ def _chunk_cumsum_bwd_kernel(dacs_ref, ddt_ref, dt_ref, a_ref, out_ref, da_ref, 
     dacs = dacs_ref[:, steps]
     ddt = dacs * a_ref[heads].astype(jnp.float32)[:, None] + ddt_ref[:, steps]
     write_rows(out_ref.at[steps, heads], limit, ddt.T)
-
-    def step(k, summed):
-        at = c * chunk + k
-        dt = dt_ref[pl.ds(jnp.minimum(at, length - 1), 1), heads].astype(jnp.float32).T
-        product = dacs_ref[:, pl.ds(at, 1)] * jnp.where(at < length, dt, 0.0)
-        return compensated_add(summed, (product, jnp.zeros((bh, 1), jnp.float32)))
-
-    summed = jax.lax.fori_loop(0, chunk, step, (jnp.zeros((bh, 1), jnp.float32),) * 2)
-    da_ref[...] = sum(summed)[:, 0]
+    dt = read_rows(dt_ref.at[steps, heads], limit).astype(jnp.float32).T
+    high, low = _extracted(dacs * dt)
+    da_ref[...] = jnp.sum(high, axis=1) + jnp.sum(low, axis=1)
 
 
 @dataclasses.dataclass(frozen=True)
