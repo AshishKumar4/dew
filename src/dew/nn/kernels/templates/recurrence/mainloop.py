@@ -1429,8 +1429,8 @@ def _output_held(call: _Call, bv: int) -> _Held:
         # in fp32 and their masked narrow form; apart from it, at the first step, the key blocks' gated
         # queries, staged before any product (an A100's held 64- and 128-wide value blocks at 247 registers,
         # an H100's 128-wide at 248).
-        values = ([_f32(CHUNK, bv)] + _held(held, CHUNK, bv) + [_f32(CHUNK, CHUNK)]
-                  + _held(held, CHUNK, CHUNK) + products)
+        values = [_f32(CHUNK, bv), *_held(held, CHUNK, bv), _f32(CHUNK, CHUNK), *_held(held, CHUNK, CHUNK),
+                  *products]
         return _Held(phases=(values, [_f32(CHUNK, call.block)] * 4))
     values = [_f32(CHUNK, bv)] * (2 if family.products_overlap else 1) + _held(held, CHUNK, bv) + products
     scores = ([_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
@@ -1942,8 +1942,8 @@ def _local_back(q, k, do, hi, lo, taken, call: _Call, *, scale: float):
     held_tiles = _Held(phases=(
         [_f32(CHUNK, CHUNK)] * 2 + _masks(CHUNK, CHUNK)
         + _fragments(call, (given, CHUNK, call.block), (given, CHUNK, call.block)),
-        _held(held, CHUNK, CHUNK) + [_f32(CHUNK, value_width)] + _held(held, CHUNK, value_width)
-        + _fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, value_width))))
+        [*_held(held, CHUNK, CHUNK), _f32(CHUNK, value_width), *_held(held, CHUNK, value_width),
+         *_fragments(call, (held, CHUNK, CHUNK), (given, CHUNK, value_width))]))
     return _kernel(program, call, out_type=held.shape(call.heads * value_width),
                    grid=(call.chunks, call.heads), grid_names=("chunks", "heads"), blocks=tiles, stages=1,
                    live=_taken(7), work=work, held=held_tiles, staging=_staging(held, (CHUNK, CHUNK)),

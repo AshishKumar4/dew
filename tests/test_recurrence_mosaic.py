@@ -13,7 +13,6 @@ roles' streams, not proof of its kernels, which the GPU gate is;
 the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
 
 import functools
-from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -409,6 +408,15 @@ def _model(launch: mainloop.Launch, family: mosaic.Family) -> dict:
             "producer": resources.PRODUCER_REGISTERS if producer else 0}
 
 
+class Unbudgeted(template.Mosaic):
+    """The recurrence template with every launch's registers held: its derivation takes the tile it would
+    where only registers refuse one (`compiled_cases`' refused tiles)."""
+
+    def _held(self, ba, config) -> bool:
+        del ba, config
+        return True
+
+
 def compiled_cases(target: str, plans: dict, refused: list) -> list:
     """The resource gate's cases on `target` (`KernelCase`s), each with its launches' register models (row
     1971): each `RESOURCE_SHAPES` geometry's forward in a 16-bit and an fp32 call, one row and packed
@@ -440,8 +448,7 @@ def compiled_cases(target: str, plans: dict, refused: list) -> list:
                                      floor=FLOOR if per_key else None)
         with generation.assumed(facts):
             derived = template.MOSAIC.derived(bound, facts)
-            with mock.patch.object(template.Mosaic, '_held', lambda *_: True):
-                held = template.MOSAIC.derived(bound, facts)
+            held = Unbudgeted().derived(bound, facts)
             # The tile the derivation takes where every register held, refused for its registers alone.
             unheld = [] if held is None or held == derived else [(held, 'refused ')]
             if derived is None:
