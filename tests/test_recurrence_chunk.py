@@ -139,7 +139,7 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
     work = jnp.promote_types(operands.value.dtype, jnp.float32)
     state = operands.state.astype(work)
     rows, length = operands.value.shape[:2]
-    starts = jnp.zeros((rows, length), bool) if operands.starts is None else operands.starts
+    starts = jnp.zeros((rows, length), bool) if operands.starts is None else jnp.asarray(operands.starts)
 
     def one_token(state, t):
         state = jnp.where(starts[:, t, None, None, None], 0.0, state)
