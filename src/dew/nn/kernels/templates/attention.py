@@ -184,8 +184,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     runs there), so the spans keep R intervals a query `[B, Q, R]`, but one run a query, which is one
     interval `[B, Q]` as every mainloop walks it. `slots` `[B, Q]` are the queries' own keys' indices, a cache
     call's slots (by default each query's index, or a cross call's aligned place): causality ends a query's
-    keys at its slot, a window without `positions` counts keys from it and a block reads the block holding
-    it; a negative slot (padding) sees no key. Lengths, starts and slots are int32 token coordinates; places
+    keys at its slot, a window or a chunk without `positions` counts keys from it and a block reads the
+    block holding it; a negative slot (padding) sees no key. Lengths, starts and slots are int32 token coordinates; places
     and ids keep their own dtypes."""
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
     from dew.nn.visibility import window_sides
@@ -240,8 +240,10 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     # run, and each query's least and greatest it keeps (`_within_runs`).
     by_places = []
     if chunk is not None:
+        # Without places a chunk counts a query by its slot where the call gives one, else by its index.
         query_places, key_places = (
-            (place, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
+            (index if slots is None else place,
+             jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
             if positions is None else positions)
         wanted = _chunk_of(query_places, chunk)
         by_places.append((_chunk_of(key_places, chunk), wanted, wanted))
