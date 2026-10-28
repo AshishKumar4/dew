@@ -140,8 +140,8 @@ restart at each option, so a suffix's chunk holds keys of every option."""
 
 
 def band_runs(width: int) -> np.ndarray:
-    """One run a query `[2, 100, 1, 2]`, the `width` keys up to its own, as a chunked or banded local-attention
-    layer passes its runs (`local_attention.chunk_runs`)."""
+    """One run a query `[2, 100, 1, 2]`, the `width` keys up to its own, as a chunked or banded
+    local-attention layer passes its runs (`local_attention.chunk_runs`)."""
     index = np.arange(QUERIES, dtype=np.int32)
     run = np.stack([np.maximum(index + 1 - width, 0), index + 1], axis=-1)
     return np.broadcast_to(run[None, :, None], (ROWS, QUERIES, 1, 2))
